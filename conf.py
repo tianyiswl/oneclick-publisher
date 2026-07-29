@@ -1,0 +1,15 @@
+"""一键发桌面演示版的隔离运行配置。"""
+
+from pathlib import Path
+
+
+RESOURCE_DIR = Path(__file__).resolve().parent
+BASE_DIR = RESOURCE_DIR / "demo-runtime"
+XHS_SERVER = ""
+LOCAL_CHROME_PATH = ""
+USE_SYSTEM_BROWSER = False
+ACTIVATION_SERVER_URL = ""
+ACTIVATION_TIMEOUT_SECONDS = 1
+REQUIRE_ONLINE_ENTITLEMENTS = False
+DEBUG_SKIP_FINAL_PUBLISH = True
+DEBUG_DRY_RUN_HOLD_SECONDS = 0

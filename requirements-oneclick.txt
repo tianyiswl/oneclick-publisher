@@ -1,0 +1,7 @@
+PyQt6==6.11.0
+playwright==1.60.0
+xhs==0.2.13
+biliup==1.2.1
+loguru==0.7.3
+qrcode==8.2
+requests==2.34.2

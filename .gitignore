@@ -1,0 +1,26 @@
+# Python 缓存与本机配置
+__pycache__/
+*.py[cod]
+.DS_Store
+.env
+.env.*
+
+# 一键发本机运行数据：可能包含账号、会话、素材、日志与授权状态
+demo-runtime/
+runtime/
+db/
+cookies/
+cookiesFile/
+videoFile/
+avatars/
+logs/
+oneclick-browser-profiles/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# 构建产物
+build/
+dist/
+*.spec
