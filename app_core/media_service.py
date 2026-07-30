@@ -219,8 +219,10 @@ def media_stats() -> dict:
     }
 
 
-def import_files(paths: list[str], *, category: str = "其他") -> int:
-    count = 0
+def import_files_with_records(paths: list[str], *, category: str = "其他") -> list[dict]:
+    """导入素材并返回本次新建记录，供内容包安全回填使用。"""
+
+    imported: list[dict] = []
     category = str(category or "其他").strip() or "其他"
     VIDEO_DIR.mkdir(parents=True, exist_ok=True)
     with connect() as conn:
@@ -241,9 +243,20 @@ def import_files(paths: list[str], *, category: str = "其他") -> int:
                 cover_name = generate_video_cover(dest, int(media_id))
                 if cover_name:
                     conn.execute("UPDATE file_records SET coverPath = ? WHERE id = ?", (cover_name, media_id))
-            count += 1
+            imported.append(
+                {
+                    "id": int(media_id),
+                    "filename": src.name,
+                    "file_path": stored_name,
+                    "sourcePath": str(src.resolve()),
+                }
+            )
         conn.commit()
-    return count
+    return imported
+
+
+def import_files(paths: list[str], *, category: str = "其他") -> int:
+    return len(import_files_with_records(paths, category=category))
 
 
 def rename_media(file_id: int, new_name: str) -> None:

@@ -54,6 +54,7 @@ from app_core import (
     publish_config_service,
     publish_service,
     task_service,
+    wechat_content_bundle,
     oneclick_capabilities,
 )
 from app_core.paths import VIDEO_DIR
@@ -389,6 +390,12 @@ class PublishPage(QWidget):
         package_btn = button("导入发布包", variant="secondary")
         package_btn.clicked.connect(self.import_release_bundle)
         mode_layout.addWidget(package_btn)
+        wechat_package_btn = button("导入公众号内容包", variant="secondary")
+        wechat_package_btn.setToolTip(
+            "导入本地公众号文字内容包，仅带入标题、正文和封面；不会上传、保存草稿或发表。"
+        )
+        wechat_package_btn.clicked.connect(self.import_wechat_content_bundle)
+        mode_layout.addWidget(wechat_package_btn)
         self.refresh_btn = button("刷新", variant="secondary")
         self.refresh_btn.clicked.connect(lambda: self.refresh(force=True))
         mode_layout.addWidget(self.refresh_btn)
@@ -2844,6 +2851,81 @@ class PublishPage(QWidget):
                 if self.active_task_background_mode
                 else "任务已开始。程序会依次显示各平台发布页面并停在最终发布前。"
             ),
+        )
+
+    def import_wechat_content_bundle(self) -> None:
+        """安全带入公众号文字内容包，始终停留在编辑和预检阶段。"""
+
+        if self.active_task_id and self.task_timer.isActive():
+            QMessageBox.information(self, "导入公众号内容包", "当前发布任务正在执行，请等待完成后再导入。")
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择公众号内容包 manifest.json",
+            str(Path.home()),
+            "公众号内容包 (manifest.json);;JSON 文件 (*.json)",
+        )
+        if not path:
+            return
+        try:
+            bundle = wechat_content_bundle.load_wechat_content_bundle(path)
+            imported = media_service.import_files_with_records(
+                [bundle["coverPath"]],
+                category="公众号内容包",
+            )
+            if len(imported) != 1:
+                raise ValueError("封面导入失败，请确认内容包中的封面图片可读取")
+        except Exception as exc:
+            QMessageBox.warning(self, "导入公众号内容包", str(exc))
+            return
+
+        # 内容包只适配公众号文字发布：清空原素材和目标，避免混入其它平台任务。
+        self._select_content_type(2)
+        self.preflight.setChecked(True)
+        self._selected_media_ids.clear()
+        self._selected_account_ids = {
+            int(row["id"])
+            for row in account_service.list_accounts()
+            if int(row.get("type") or 0) == 10
+        }
+        self.common_title_input.setText(bundle["title"])
+        self.title_input.setPlainText(bundle["body"])
+        if 10 in self.platform_titles:
+            self.platform_titles[10].setText(bundle["title"])
+        if 10 in self.platform_texts:
+            self.platform_texts[10].setPlainText(bundle["body"])
+
+        cover_stored_name = str(imported[0]["file_path"])
+        self.refresh(force=True)
+        self._set_combo_data(self.cover_34, cover_stored_name)
+        self._set_combo_data(self.cover_43, cover_stored_name)
+        self._set_combo_data(self.platform_cover_34[10], cover_stored_name)
+        self._set_combo_data(self.platform_cover_43[10], cover_stored_name)
+        self._refresh_platform_cover_previews()
+        self.update_cover_summary()
+
+        selected_cover = self._preferred_cover_path(10, self._platform_cover_paths(10))
+        if not selected_cover:
+            QMessageBox.warning(
+                self,
+                "内容已导入，封面待选择",
+                "标题和正文已带入，封面也已导入素材库；但它不符合当前客户端的 3:4 或 4:3 封面比例。"
+                "请换一张 3:4 或 4:3 封面后再执行预发布检查。",
+            )
+            return
+
+        account_count = len(self._selected_account_ids)
+        account_hint = (
+            f"已选择 {account_count} 个公众号账号。"
+            if account_count
+            else "尚未发现公众号账号，请先到账号管理完成登录后再预检。"
+        )
+        QMessageBox.information(
+            self,
+            "公众号内容包已导入",
+            "已带入标题、正文与封面，并强制切换为“预发布检查”。\n\n"
+            f"{account_hint}\n"
+            "导入本身不会上传、保存草稿或发表；请核对内容后再点击“开始预检”。",
         )
 
     def poll_task(self) -> None:
