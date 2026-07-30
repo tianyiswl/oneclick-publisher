@@ -55,6 +55,7 @@ from app_core import (
     publish_service,
     task_service,
     wechat_content_bundle,
+    xhs_content_bundle,
     oneclick_capabilities,
 )
 from app_core.paths import VIDEO_DIR
@@ -278,6 +279,68 @@ class PublishConfirmDialog(QDialog):
         layout.addWidget(buttons)
 
 
+class WechatContentBundlePickerDialog(QDialog):
+    """允许直接粘贴路径的公众号内容包选择框，规避 macOS 原生选择框搜索限制。"""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("导入公众号内容包")
+        self.setMinimumWidth(620)
+        self.manifest_path = ""
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(10)
+        title = QLabel("选择公众号内容包文件夹")
+        title.setObjectName("dialogTitle")
+        layout.addWidget(title)
+        hint = QLabel("可直接粘贴内容包文件夹路径，程序会自动读取其中的 manifest.json。")
+        hint.setWordWrap(True)
+        hint.setProperty("role", "muted")
+        layout.addWidget(hint)
+
+        path_layout = QHBoxLayout()
+        self.path_input = QLineEdit()
+        self.path_input.setPlaceholderText("例如：/Users/你的用户名/Documents/我的公众号文章")
+        self.path_input.returnPressed.connect(self.accept)
+        path_layout.addWidget(self.path_input, 1)
+        browse_button = button("选择文件夹", variant="secondary", compact=True)
+        browse_button.clicked.connect(self._choose_folder)
+        path_layout.addWidget(browse_button)
+        layout.addLayout(path_layout)
+
+        self.path_help = QLabel("也可以粘贴 manifest.json 的完整路径。")
+        self.path_help.setProperty("role", "caption")
+        layout.addWidget(self.path_help)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("导入内容包")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _choose_folder(self) -> None:
+        initial = self.path_input.text().strip() or str(Path.home() / "Documents")
+        folder = QFileDialog.getExistingDirectory(self, "选择公众号内容包文件夹", initial)
+        if folder:
+            self.path_input.setText(folder)
+
+    def accept(self) -> None:
+        raw = self.path_input.text().strip()
+        if not raw:
+            self.path_help.setText("请粘贴内容包文件夹路径，或选择一个文件夹。")
+            return
+        candidate = Path(raw).expanduser()
+        manifest = candidate / "manifest.json" if candidate.is_dir() else candidate
+        if not manifest.is_file() or manifest.name != "manifest.json":
+            self.path_help.setText("未找到 manifest.json；请确认输入的是内容包文件夹或该文件的完整路径。")
+            return
+        self.manifest_path = str(manifest.resolve())
+        super().accept()
+
+
 class PublishPage(QWidget):
     def __init__(self) -> None:
         super().__init__()
@@ -390,6 +453,12 @@ class PublishPage(QWidget):
         package_btn = button("导入发布包", variant="secondary")
         package_btn.clicked.connect(self.import_release_bundle)
         mode_layout.addWidget(package_btn)
+        xhs_package_btn = button("导入小红书内容包", variant="secondary")
+        xhs_package_btn.setToolTip(
+            "导入本地小红书图文内容包，仅带入标题、正文、话题和图片；不会登录、上传、保存草稿或发表。"
+        )
+        xhs_package_btn.clicked.connect(self.import_xhs_content_bundle)
+        mode_layout.addWidget(xhs_package_btn)
         wechat_package_btn = button("导入公众号内容包", variant="secondary")
         wechat_package_btn.setToolTip(
             "导入本地公众号文字内容包，仅带入标题、正文和封面；不会上传、保存草稿或发表。"
@@ -2853,22 +2922,78 @@ class PublishPage(QWidget):
             ),
         )
 
+    def import_xhs_content_bundle(self) -> None:
+        """安全带入小红书图文内容包，始终停留在编辑和预检阶段。"""
+
+        if self.active_task_id and self.task_timer.isActive():
+            QMessageBox.information(self, "导入小红书内容包", "当前发布任务正在执行，请等待完成后再导入。")
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择小红书图文内容包 manifest.json",
+            str(Path.home()),
+            "小红书内容包 (manifest.json);;JSON 文件 (*.json)",
+        )
+        if not path:
+            return
+        try:
+            bundle = xhs_content_bundle.load_xhs_content_bundle(path)
+            imported = media_service.import_files_with_records(
+                bundle["imagePaths"],
+                category="小红书内容包",
+            )
+            if len(imported) != len(bundle["imagePaths"]):
+                raise ValueError("图片导入不完整，请确认内容包中的图片均可读取")
+        except Exception as exc:
+            QMessageBox.warning(self, "导入小红书内容包", str(exc))
+            return
+
+        # 内容包只适配小红书图文：清空原素材和目标，避免混入其它平台任务。
+        self._select_content_type(1)
+        self.preflight.setChecked(True)
+        self._selected_account_ids = {
+            int(row["id"])
+            for row in account_service.list_accounts()
+            if int(row.get("type") or 0) == 1
+        }
+        self._selected_media_ids = {int(row["id"]) for row in imported}
+        tags_text = " ".join(f"#{tag}" for tag in bundle["tags"])
+        self.common_title_input.setText(bundle["title"])
+        self.title_input.setPlainText(bundle["body"])
+        self.tags_input.setPlainText(tags_text)
+        if 1 in self.platform_titles:
+            self.platform_titles[1].setText(bundle["title"])
+        if 1 in self.platform_texts:
+            self.platform_texts[1].setPlainText(bundle["body"])
+        if 1 in self.platform_tags:
+            self.platform_tags[1].setPlainText(tags_text)
+
+        self.refresh(force=True)
+        account_count = len(self._selected_account_ids)
+        account_hint = (
+            f"已选择 {account_count} 个小红书账号。"
+            if account_count
+            else "尚未发现小红书账号，请先到账号管理完成登录后再预检。"
+        )
+        QMessageBox.information(
+            self,
+            "小红书内容包已导入",
+            "已带入标题、正文、话题与图片，并强制切换为“预发布检查”。\n\n"
+            f"{account_hint}\n"
+            "导入本身不会登录、上传、保存草稿或发表；请核对内容后再点击“开始预检”。",
+        )
+
     def import_wechat_content_bundle(self) -> None:
         """安全带入公众号文字内容包，始终停留在编辑和预检阶段。"""
 
         if self.active_task_id and self.task_timer.isActive():
             QMessageBox.information(self, "导入公众号内容包", "当前发布任务正在执行，请等待完成后再导入。")
             return
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "选择公众号内容包 manifest.json",
-            str(Path.home()),
-            "公众号内容包 (manifest.json);;JSON 文件 (*.json)",
-        )
-        if not path:
+        picker = WechatContentBundlePickerDialog(self)
+        if picker.exec() != QDialog.DialogCode.Accepted:
             return
         try:
-            bundle = wechat_content_bundle.load_wechat_content_bundle(path)
+            bundle = wechat_content_bundle.load_wechat_content_bundle(picker.manifest_path)
             imported = media_service.import_files_with_records(
                 [bundle["coverPath"]],
                 category="公众号内容包",
