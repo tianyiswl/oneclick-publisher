@@ -84,6 +84,10 @@ async def _xhs_preflight(page, payload: dict) -> str:
         raise PreflightError("小红书预检缺少可读取的本地素材")
     content_type = str(payload.get("contentType") or "video")
     title, description = _payload_text(payload, "小红书预检")
+    tags = [str(tag).strip().lstrip("#") for tag in payload.get("tags") or []]
+    tags = [tag for tag in tags if tag]
+    if tags:
+        description = f"{description}\n\n" + " ".join(f"#{tag}" for tag in tags)
     await page.goto(_XHS_PUBLISH_URL, wait_until="domcontentloaded", timeout=45_000)
     await page.wait_for_timeout(800)
     if content_type == "article":

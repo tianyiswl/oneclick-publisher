@@ -49,6 +49,7 @@ from app_core import (
     account_browser_service,
     account_service,
     collection_service,
+    content_bundle,
     media_service,
     mobai_release_importer,
     publish_config_service,
@@ -280,18 +281,18 @@ class PublishConfirmDialog(QDialog):
 
 
 class WechatContentBundlePickerDialog(QDialog):
-    """允许直接粘贴路径的公众号内容包选择框，规避 macOS 原生选择框搜索限制。"""
+    """允许直接粘贴路径的内容包选择框，规避 macOS 原生选择框搜索限制。"""
 
-    def __init__(self, parent=None) -> None:
+    def __init__(self, parent=None, content_label: str = "内容包") -> None:
         super().__init__(parent)
-        self.setWindowTitle("导入公众号内容包")
+        self.setWindowTitle(f"导入{content_label}")
         self.setMinimumWidth(620)
         self.manifest_path = ""
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 18, 20, 18)
         layout.setSpacing(10)
-        title = QLabel("选择公众号内容包文件夹")
+        title = QLabel(f"选择{content_label}文件夹")
         title.setObjectName("dialogTitle")
         layout.addWidget(title)
         hint = QLabel("可直接粘贴内容包文件夹路径，程序会自动读取其中的 manifest.json。")
@@ -323,7 +324,7 @@ class WechatContentBundlePickerDialog(QDialog):
 
     def _choose_folder(self) -> None:
         initial = self.path_input.text().strip() or str(Path.home() / "Documents")
-        folder = QFileDialog.getExistingDirectory(self, "选择公众号内容包文件夹", initial)
+        folder = QFileDialog.getExistingDirectory(self, "选择内容包文件夹", initial)
         if folder:
             self.path_input.setText(folder)
 
@@ -450,21 +451,13 @@ class PublishPage(QWidget):
         mode_layout.addWidget(self.run_mode_label)
         mode_layout.addStretch()
 
-        package_btn = button("导入发布包", variant="secondary")
-        package_btn.clicked.connect(self.import_release_bundle)
-        mode_layout.addWidget(package_btn)
-        xhs_package_btn = button("导入小红书内容包", variant="secondary")
-        xhs_package_btn.setToolTip(
-            "导入本地小红书图文内容包，仅带入标题、正文、话题和图片；不会登录、上传、保存草稿或发表。"
-        )
-        xhs_package_btn.clicked.connect(self.import_xhs_content_bundle)
-        mode_layout.addWidget(xhs_package_btn)
-        wechat_package_btn = button("导入公众号内容包", variant="secondary")
-        wechat_package_btn.setToolTip(
-            "导入本地公众号文字内容包，仅带入标题、正文和封面；不会上传、保存草稿或发表。"
-        )
-        wechat_package_btn.clicked.connect(self.import_wechat_content_bundle)
-        mode_layout.addWidget(wechat_package_btn)
+        for label, content_type in (("视频包", "video"), ("图文包", "article"), ("文字包", "text")):
+            package_btn = button(f"导入{label}", variant="secondary")
+            package_btn.setToolTip("只带入本地内容与素材，不会上传、保存草稿或发表。")
+            package_btn.clicked.connect(
+                lambda _checked=False, expected=content_type: self.import_content_bundle(expected)
+            )
+            mode_layout.addWidget(package_btn)
         self.refresh_btn = button("刷新", variant="secondary")
         self.refresh_btn.clicked.connect(lambda: self.refresh(force=True))
         mode_layout.addWidget(self.refresh_btn)
@@ -3049,6 +3042,91 @@ class PublishPage(QWidget):
             self,
             "公众号内容包已导入",
             "已带入标题、正文与封面，并强制切换为“预发布检查”。\n\n"
+            f"{account_hint}\n"
+            "导入本身不会上传、保存草稿或发表；请核对内容后再点击“开始预检”。",
+        )
+
+    def import_content_bundle(self, expected_type: str) -> None:
+        """导入统一内容包，并只把平台差异作为可选覆盖字段带入。"""
+
+        if self.active_task_id and self.task_timer.isActive():
+            QMessageBox.information(self, "导入内容包", "当前发布任务正在执行，请等待完成后再导入。")
+            return
+        labels = {"video": "视频包", "article": "图文包", "text": "文字包"}
+        indexes = {"video": 0, "article": 1, "text": 2}
+        picker = WechatContentBundlePickerDialog(self, labels[expected_type])
+        if picker.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            bundle = content_bundle.load_content_bundle(
+                picker.manifest_path,
+                expected_type=expected_type,
+            )
+            source_paths = list(dict.fromkeys([
+                *bundle["assetPaths"],
+                *bundle["coverPaths"].values(),
+            ]))
+            imported = media_service.import_files_with_records(source_paths, category="内容包")
+            if len(imported) != len(source_paths):
+                raise ValueError("部分素材导入失败，请确认内容包内的素材均可读取")
+        except Exception as exc:
+            QMessageBox.warning(self, "导入内容包", str(exc))
+            return
+
+        by_source = {str(row["sourcePath"]): row for row in imported}
+        self._select_content_type(indexes[expected_type])
+        self.preflight.setChecked(True)
+        self._selected_media_ids = {
+            int(by_source[path]["id"])
+            for path in bundle["assetPaths"]
+        }
+        preferred_platforms = set(bundle["preferredPlatforms"])
+        self._selected_account_ids = {
+            int(row["id"])
+            for row in account_service.list_accounts()
+            if row.get("platformName") in preferred_platforms
+            and oneclick_capabilities.supports(str(row.get("platformName") or ""), expected_type)
+        }
+        self.common_title_input.setText(bundle["title"])
+        self.title_input.setPlainText(bundle["body"])
+        self.tags_input.setPlainText("\n".join(f"#{tag}" for tag in bundle["tags"]))
+        for platform_type in self.platform_titles:
+            self.platform_titles[platform_type].clear()
+            self.platform_texts[platform_type].clear()
+            self.platform_tags[platform_type].clear()
+        type_by_platform = {
+            oneclick_capabilities.canonical_platform(name): platform_type
+            for platform_type, name in account_service.PLATFORMS.items()
+        }
+        for platform, override in bundle["platformOverrides"].items():
+            platform_type = type_by_platform.get(oneclick_capabilities.canonical_platform(platform))
+            if platform_type not in self.platform_titles:
+                continue
+            if "title" in override:
+                self.platform_titles[platform_type].setText(override["title"])
+            if "body" in override:
+                self.platform_texts[platform_type].setPlainText(override["body"])
+            if "tags" in override:
+                self.platform_tags[platform_type].setPlainText(
+                    "\n".join(f"#{tag}" for tag in override["tags"])
+                )
+
+        self.refresh(force=True)
+        for ratio, source_path in bundle["coverPaths"].items():
+            combo = self.cover_34 if ratio == "3:4" else self.cover_43
+            self._set_combo_data(combo, str(by_source[source_path]["file_path"]))
+        self._refresh_platform_cover_previews()
+        self.update_cover_summary()
+        selected_count = len(self._selected_account_ids)
+        account_hint = (
+            f"已按内容包偏好选择 {selected_count} 个可用账号。"
+            if selected_count
+            else "内容包未匹配到可用账号，请在左侧手动选择目标账号。"
+        )
+        QMessageBox.information(
+            self,
+            f"{labels[expected_type]}已导入",
+            "已带入内容、素材、封面和可选平台覆盖，并强制切换为“预发布检查”。\n\n"
             f"{account_hint}\n"
             "导入本身不会上传、保存草稿或发表；请核对内容后再点击“开始预检”。",
         )
