@@ -367,7 +367,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self._build_shell())
         self._set_current_page(0)
         self.menuBar().setVisible(False)
-        # 演示版不自动检测账号，避免启动时触发任何登录流程。
+        # 启动时不自动检测账号，避免在用户未发起操作时触发平台访问。
 
     def _apply_initial_window_geometry(self) -> None:
         """Windows 使用大屏自适应尺寸，其他平台保留原始窗口大小。"""
@@ -424,7 +424,7 @@ class MainWindow(QMainWindow):
         brand_text.setSpacing(0)
         brand_title = QLabel("一键发")
         brand_title.setObjectName("brandTitle")
-        brand_subtitle = QLabel("多类型发布助手 · 演示版")
+        brand_subtitle = QLabel("多平台内容发布工作台")
         brand_subtitle.setObjectName("brandSubtitle")
         brand_text.addWidget(brand_title)
         brand_text.addWidget(brand_subtitle)
@@ -477,14 +477,38 @@ class MainWindow(QMainWindow):
             sidebar_layout.addWidget(feature_button)
 
         sidebar_layout.addStretch()
+        feedback_card = QFrame()
+        feedback_card.setObjectName("feedbackCard")
+        feedback_layout = QVBoxLayout(feedback_card)
+        feedback_layout.setContentsMargins(12, 10, 12, 10)
+        feedback_layout.setSpacing(4)
+        feedback_title = QLabel("问题反馈")
+        feedback_title.setObjectName("feedbackTitle")
+        feedback_copy = QLabel(
+            "产品仍在持续优化中。使用中遇到任何问题，"
+            "或有功能优化建议，欢迎联系我。"
+        )
+        feedback_copy.setObjectName("feedbackCopy")
+        feedback_copy.setWordWrap(True)
+        feedback_wechat = QLabel("微信：tianyiswl")
+        feedback_wechat.setObjectName("feedbackContact")
+        feedback_store = QLabel("淘宝店铺：逆浪风")
+        feedback_store.setObjectName("feedbackContact")
+        feedback_layout.addWidget(feedback_title)
+        feedback_layout.addWidget(feedback_copy)
+        feedback_layout.addSpacing(3)
+        feedback_layout.addWidget(feedback_wechat)
+        feedback_layout.addWidget(feedback_store)
+        sidebar_layout.addWidget(feedback_card)
+        sidebar_layout.addSpacing(8)
         local_badge = QFrame()
         local_badge.setObjectName("localWorkspaceBadge")
         local_badge_layout = QVBoxLayout(local_badge)
         local_badge_layout.setContentsMargins(12, 10, 12, 10)
         local_badge_layout.setSpacing(2)
-        local_title = QLabel("本地工作台")
+        local_title = QLabel("安全预检模式")
         local_title.setObjectName("localWorkspaceTitle")
-        local_version = QLabel(f"版本 {APP_VERSION}")
+        local_version = QLabel("最终发布需人工确认")
         local_version.setObjectName("localWorkspaceVersion")
         local_badge_layout.addWidget(local_title)
         local_badge_layout.addWidget(local_version)

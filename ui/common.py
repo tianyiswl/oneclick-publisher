@@ -144,9 +144,9 @@ def apply_style(app: QApplication) -> None:
             color: #172033;
             letter-spacing: 0;
         }
-        QMainWindow, QDialog, QWidget#pageRoot { background: #F3F6F8; }
+        QMainWindow, QDialog, QWidget#pageRoot { background: #F6F8FB; }
         QWidget#appShell, QFrame#contentShell, QStackedWidget#mainStack {
-            background: #F3F6F8;
+            background: #F6F8FB;
         }
         QFrame#appSidebar {
             background: #17243A;
@@ -157,12 +157,12 @@ def apply_style(app: QApplication) -> None:
         QLabel#brandIcon { background: transparent; }
         QLabel#brandTitle {
             color: #FFFFFF;
-            font-size: 18px;
+            font-size: 19px;
             font-weight: 700;
         }
         QLabel#brandSubtitle {
             color: #9FAEC0;
-            font-size: 11px;
+            font-size: 10px;
         }
         QLabel#navSectionLabel {
             color: #7F91A8;
@@ -189,9 +189,9 @@ def apply_style(app: QApplication) -> None:
             color: #075F59;
         }
         QFrame#localWorkspaceBadge {
-            background: #203049;
-            border: 1px solid #2B3D59;
-            border-radius: 6px;
+            background: #1D304B;
+            border: 1px solid #304564;
+            border-radius: 9px;
         }
         QLabel#localWorkspaceTitle {
             color: #DCE4ED;
@@ -202,10 +202,30 @@ def apply_style(app: QApplication) -> None:
             color: #8192A8;
             font-size: 11px;
         }
+        QFrame#feedbackCard {
+            background: #1A2B43;
+            border: 1px solid #31435D;
+            border-radius: 9px;
+        }
+        QLabel#feedbackTitle {
+            color: #F2F6FA;
+            font-size: 12px;
+            font-weight: 700;
+        }
+        QLabel#feedbackCopy {
+            color: #AAB8C9;
+            font-size: 11px;
+            line-height: 1.35;
+        }
+        QLabel#feedbackContact {
+            color: #D9E4F0;
+            font-size: 11px;
+            font-weight: 600;
+        }
         QFrame#utilityBar {
             background: #FFFFFF;
             border: 0;
-            border-bottom: 1px solid #DCE3EA;
+            border-bottom: 1px solid #E3EAF1;
         }
         QLabel#currentWorkspaceLabel {
             color: #667085;
@@ -227,7 +247,7 @@ def apply_style(app: QApplication) -> None:
         }
 
         QLabel { color: #172033; background: transparent; }
-        QLabel#pageTitle { font-size: 22px; font-weight: 700; color: #111827; }
+        QLabel#pageTitle { font-size: 24px; font-weight: 700; color: #101828; }
         QLabel#dialogTitle { font-size: 18px; font-weight: 700; color: #111827; }
         QLabel#metricValue { font-size: 28px; font-weight: 700; color: #111827; }
         QLabel[role="sectionTitle"] { font-size: 15px; font-weight: 700; color: #172033; }
@@ -442,27 +462,31 @@ def apply_style(app: QApplication) -> None:
             border-color: #075F59;
         }
         QPushButton#publishTypeEntryButton {
-            min-height: 126px;
-            padding: 0 22px;
+            min-height: 156px;
+            padding: 0 26px;
             background: #FFFFFF;
-            border: 1px solid #D7E2EA;
-            border-radius: 14px;
-            color: #1D2939;
-            font-size: 19px;
+            border: 1px solid #D8E2EC;
+            border-top: 4px solid #5BC8BF;
+            border-radius: 16px;
+            color: #182230;
+            font-size: 21px;
             font-weight: 700;
         }
         QPushButton#publishTypeEntryButton:hover {
-            background: #EAF7F5;
+            background: #F0FAF8;
             border: 2px solid #0B766E;
+            border-top: 4px solid #0B766E;
             color: #075F59;
         }
         QPushButton#publishTypeEntryButton:pressed {
             background: #D8F0EC;
             border: 2px solid #075F59;
+            border-top: 4px solid #075F59;
             color: #075F59;
         }
         QPushButton#publishTypeEntryButton:focus {
             border: 2px solid #2DD4BF;
+            border-top: 4px solid #0B766E;
         }
         QToolButton:focus {
             border: 1px solid #2DD4BF;

@@ -486,8 +486,8 @@ class PublishPage(QWidget):
 
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(52, 48, 52, 48)
-        layout.setSpacing(18)
+        layout.setContentsMargins(52, 40, 52, 48)
+        layout.setSpacing(16)
         layout.addStretch(1)
 
         eyebrow = QLabel("发布中心 · 第一步")
@@ -510,7 +510,7 @@ class PublishPage(QWidget):
         # 限制宽度避免大屏上变成长条，保持三个入口的视觉重心。
         cards_widget = QWidget()
         cards_widget.setObjectName("publishTypeEntryGroup")
-        cards_widget.setMaximumWidth(960)
+        cards_widget.setFixedWidth(960)
         cards = QHBoxLayout(cards_widget)
         cards.setContentsMargins(0, 0, 0, 0)
         cards.setSpacing(16)
@@ -518,7 +518,7 @@ class PublishPage(QWidget):
         for index, title_text in enumerate(("视频发布", "图文发布", "文字发布")):
             card = QPushButton(title_text)
             card.setObjectName("publishTypeEntryButton")
-            card.setMinimumSize(220, 126)
+            card.setMinimumSize(240, 156)
             card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             card.setCursor(Qt.CursorShape.PointingHandCursor)
             card.clicked.connect(

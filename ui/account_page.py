@@ -195,7 +195,7 @@ class AccountPage(QWidget):
         filter_layout.addWidget(self.account_platform_filter, 1, 1)
 
         self.account_search = QLineEdit()
-        self.account_search.setPlaceholderText("搜索主体、账号名、备注或登录文件")
+        self.account_search.setPlaceholderText("搜索主体、账号名或备注")
         self.account_search.textChanged.connect(self.refresh)
         search_label = QLabel("搜索")
         search_label.setProperty("role", "caption")
@@ -243,9 +243,9 @@ class AccountPage(QWidget):
             self._update_validation_progress
         )
 
-        self.table = QTableWidget(0, 8)
+        self.table = QTableWidget(0, 6)
         self.table.setObjectName("dataTable")
-        self.table.setHorizontalHeaderLabels(["主体", "平台", "状态", "账号名", "备注", "登录文件", "登录与预计有效期", "操作"])
+        self.table.setHorizontalHeaderLabels(["主体", "平台", "状态", "账号名", "备注", "操作"])
         table_header = self.table.horizontalHeader()
         table_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         table_header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
@@ -253,9 +253,7 @@ class AccountPage(QWidget):
         self.table.setColumnWidth(1, 95)
         self.table.setColumnWidth(2, 78)
         self.table.setColumnWidth(3, 135)
-        self.table.setColumnWidth(5, 250)
-        self.table.setColumnWidth(6, 245)
-        self.table.setColumnWidth(7, 150)
+        self.table.setColumnWidth(5, 150)
         self.table.verticalHeader().setVisible(False)
         self.table.setShowGrid(False)
         self.table.setAlternatingRowColors(True)
@@ -282,15 +280,11 @@ class AccountPage(QWidget):
         self._apply_table_column_widths()
 
     def _apply_table_column_widths(self) -> None:
-        """窄窗口收紧固定列，避免备注列被压缩到不可读。"""
+        """窄窗口收紧固定列，优先保证账号名与备注可读。"""
 
         compact = self.table.viewport().width() < 1180
-        widths = (
-            (108, 82, 70, 118, 185, 205, 138)
-            if compact
-            else (130, 95, 78, 135, 250, 245, 150)
-        )
-        for column, width in zip((0, 1, 2, 3, 5, 6, 7), widths):
+        widths = (108, 82, 70, 150, 138) if compact else (130, 95, 78, 175, 150)
+        for column, width in zip((0, 1, 2, 3, 5), widths):
             self.table.setColumnWidth(column, width)
 
     def start_auto_checking(self) -> None:
@@ -351,21 +345,7 @@ class AccountPage(QWidget):
             self.table.setItem(row_idx, 3, account_item)
             self.table.setCellWidget(row_idx, 3, _account_identity_cell(row))
             self.table.setItem(row_idx, 4, table_item(row["remark"]))
-            file_path = str(row.get("filePath") or "")
-            file_item = table_item(Path(file_path).name if file_path else "")
-            file_item.setToolTip(file_path)
-            self.table.setItem(row_idx, 5, file_item)
-            last_login_at = row.get("lastLoginAt") or "未记录"
-            if int(row.get("type") or 0) == 2:
-                expiry_text = row.get("estimatedExpiryText") or "登录后计算"
-                login_summary = f"登录：{last_login_at}\n失效：{expiry_text}"
-            else:
-                login_summary = f"登录：{last_login_at}\n失效：以实时检测为准"
-            login_item = table_item(login_summary)
-            checked_at = row.get("lastCheckedAt") or "未完成有效检测"
-            login_item.setToolTip(f"最近有效检测：{checked_at}")
-            self.table.setItem(row_idx, 6, login_item)
-            self.table.setCellWidget(row_idx, 7, self._actions(row))
+            self.table.setCellWidget(row_idx, 5, self._actions(row))
             self.table.item(row_idx, 0).setData(Qt.ItemDataRole.UserRole, row)
             self.table.setRowHeight(row_idx, 54)
         if not rows:
@@ -379,7 +359,7 @@ class AccountPage(QWidget):
     def _searchable_text(self, row: dict) -> str:
         return " ".join(
             str(row.get(key) or "")
-            for key in ("profileName", "platformName", "statusText", "userName", "remark", "filePath")
+            for key in ("profileName", "platformName", "statusText", "userName", "remark")
         ).lower()
 
     def _refresh_filters(self) -> None:
