@@ -48,6 +48,36 @@ _LOGIN_RESPONSE_PATHS = {
 }
 
 
+def authorization_browser_launch_options() -> dict[str, bool]:
+    """绑定/重新登录必须让用户看到官方页面。"""
+
+    return {"headless": False}
+
+
+def session_check_browser_launch_options() -> dict[str, bool]:
+    """登录态检测默认在后台静默运行。"""
+
+    return {"headless": True}
+
+
+def saved_identity_matches(account: dict, detected_name: object) -> bool:
+    """已登录身份必须与本地账号一致，避免误用其他账号会话。"""
+
+    detected = " ".join(str(detected_name or "").split())
+    if not detected:
+        return False
+    expected = " ".join(
+        str(account.get("userName") or account.get("profileName") or "").split()
+    )
+    placeholders = {
+        "",
+        "未命名账号",
+        "B站账号",
+        "哔哩哔哩账号",
+    }
+    return expected in placeholders or detected == expected
+
+
 def _safe_fragment(value: str) -> str:
     cleaned = re.sub(r"[^a-zA-Z0-9\u4e00-\u9fff_-]+", "-", str(value or "").strip())
     return cleaned.strip("-_")[:48] or "default"
@@ -162,7 +192,7 @@ class AuthorizationSession:
         try:
             context = await playwright.chromium.launch_persistent_context(
                 user_data_dir=str(plan.profile_directory),
-                headless=False,
+                **authorization_browser_launch_options(),
             )
             page = context.pages[0] if context.pages else await context.new_page()
             page.on("response", self._response_observer)
@@ -288,7 +318,7 @@ def start_authorization(
 
 
 async def _verify_saved_session_async(account: dict) -> bool:
-    """在用户显式点击“检测登录”后，访问官方页面复核当前会话。"""
+    """在后台访问官方页面复核已保存会话。"""
 
     platform_type = int(account.get("type") or 0)
     plan = authorization_plan(platform_type, str(account.get("profileName") or ""))
@@ -303,8 +333,12 @@ async def _verify_saved_session_async(account: dict) -> bool:
     browser = None
     context = None
     try:
-        # 使用可见官方页面，避免隐身检测、stealth 或静默后台核验。
-        browser = await playwright.chromium.launch(headless=False)
+        # 这里只读取已保存 storage state 并监听官方身份回执，
+        # 不填写、不保存新会话，因此默认静默运行。失效时由 UI
+        # 单独打开可见官方页面，避免每次检测都弹窗。
+        browser = await playwright.chromium.launch(
+            **session_check_browser_launch_options()
+        )
         context = await browser.new_context(storage_state=str(state_file))
         page = await context.new_page()
 
@@ -324,11 +358,22 @@ async def _verify_saved_session_async(account: dict) -> bool:
 
         page.on("response", observe)
         await page.goto(plan.login_url, wait_until="domcontentloaded", timeout=45_000)
-        try:
-            await asyncio.wait_for(confirmed.wait(), timeout=12)
-        except TimeoutError:
-            return False
-        return True
+        # 大多数平台通过身份接口回执确认。B站创作中心
+        # 首页在已登录时不一定重新请求 cookie/info，但官方 nav
+        # 身份接口可读到当前昵称。两种证据任一成立即结束，
+        # 不用页面上含糊的“登录”文字作为判定。
+        for _attempt in range(24):
+            if confirmed.is_set():
+                return True
+            if platform_type == 5:
+                detected_name = await account_service._detect_display_name(
+                    page,
+                    platform_type,
+                )
+                if saved_identity_matches(account, detected_name):
+                    return True
+            await asyncio.sleep(0.5)
+        return False
     finally:
         if context:
             await context.close()
@@ -338,6 +383,6 @@ async def _verify_saved_session_async(account: dict) -> bool:
 
 
 def verify_saved_session(account: dict) -> bool:
-    """同步封装，供账号管理页的显式“检测登录”动作调用。"""
+    """同步封装；正常检测不显示浏览器。"""
 
     return bool(asyncio.run(_verify_saved_session_async(dict(account))))

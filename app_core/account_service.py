@@ -391,7 +391,7 @@ def validate_accounts(
     account_ids: Iterable[int] | None = None,
     progress_callback: Callable[[dict], None] | None = None,
 ) -> dict:
-    """由用户显式触发的一键发官方页面登录态复核。"""
+    """静默复核登录态；仅返回需用户介入的账号，不自行弹浏览器。"""
     from .oneclick_authorization import verify_saved_session
 
     accounts = list_accounts()
@@ -440,6 +440,9 @@ def validate_accounts(
         "normal": [row for row in checked if row.get("status") == 1],
         "abnormal": [row for row in checked if row.get("status") == 0],
         "pending": [row for row in checked if row.get("status") == 2],
+        "interventionRequired": [
+            row for row in checked if row.get("status") == 0
+        ],
     }
 
 

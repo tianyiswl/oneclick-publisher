@@ -15,6 +15,7 @@ QT_BIN_DIR = ROOT_DIR / "runtime" / "python" / "Lib" / "site-packages" / "PyQt6"
 if os.name == "nt" and QT_BIN_DIR.exists():
     os.add_dll_directory(str(QT_BIN_DIR))
 
+from PyQt6.QtCore import QTimer
 from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import QApplication
 
@@ -132,16 +133,14 @@ def main() -> int:
         if not activation_service.license_status().get("accessAllowed"):
             return 0
     window = MainWindow()
-    if args.page:
-        page_indexes = {
-            "workspace": 0,
-            "accounts": 1,
-            "media": 2,
-            "publish": 3,
-            "tasks": 4,
-        }
-        window._set_current_page(page_indexes[args.page])
     window.show()
+    if args.page:
+        # 窗口首次 show 后再应用启动页，避免 Qt 初始布局将
+        # 导航选中态与 QStackedWidget 内容重置为不同页。
+        QTimer.singleShot(
+            0,
+            lambda page_key=args.page: window.set_current_page_by_key(page_key),
+        )
     return app.exec()
 
 

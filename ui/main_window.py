@@ -602,12 +602,31 @@ class MainWindow(QMainWindow):
         return menu
 
     def _set_current_page(self, index: int) -> None:
-        self.tabs.setCurrentIndex(index)
+        if not 0 <= int(index) < len(self.page_definitions):
+            raise ValueError("工作页索引无效")
+        target_page = self.page_definitions[index][1]
+        self.tabs.setCurrentWidget(target_page)
         self._refresh_active_page(index)
         for button_index, nav_button in enumerate(self.nav_buttons):
             nav_button.setChecked(button_index == index)
         if hasattr(self, "current_workspace_label"):
             self.current_workspace_label.setText(self.page_definitions[index][0])
+
+    def set_current_page_by_key(self, page_key: str) -> None:
+        """按开发启动参数切换页面，并确保导航与内容同步。"""
+
+        page_indexes = {
+            "workspace": 0,
+            "accounts": 1,
+            "media": 2,
+            "publish": 3,
+            "tasks": 4,
+        }
+        try:
+            index = page_indexes[str(page_key)]
+        except KeyError as exc:
+            raise ValueError(f"未知工作页：{page_key}") from exc
+        self._set_current_page(index)
 
     def _page_changed(self, index: int) -> None:
         for button_index, nav_button in enumerate(self.nav_buttons):

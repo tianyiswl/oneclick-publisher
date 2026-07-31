@@ -8,7 +8,6 @@ from pathlib import Path
 from PyQt6.QtCore import QSize, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap
 from PyQt6.QtWidgets import (
-    QCheckBox,
     QComboBox,
     QDialog,
     QFrame,
@@ -152,12 +151,13 @@ class AccountPage(QWidget):
         header.addWidget(self.result_label)
         header.addStretch()
 
-        self.background_login_checkbox = QCheckBox("显示官方授权页")
-        self.background_login_checkbox.setChecked(True)
-        self.background_login_checkbox.setToolTip(
-            "一键发始终使用可见的平台官网完成登录和扫码，不会隐藏浏览器或复用其它客户端登录态。"
+        browser_mode_hint = QLabel("绑定显示官方页 · 检测默认静默")
+        browser_mode_hint.setProperty("role", "muted")
+        browser_mode_hint.setToolTip(
+            "绑定和重新登录需要用户操作，始终显示官方页面；"
+            "检测登录在后台运行，仅异常时显示官方页面。"
         )
-        header.addWidget(self.background_login_checkbox)
+        header.addWidget(browser_mode_hint)
 
         self.check_all_btn = button("检测登录", variant="secondary")
         self.check_all_btn.clicked.connect(self.check_all)
@@ -435,7 +435,7 @@ class AccountPage(QWidget):
         menu.exec(self.table.mapToGlobal(pos))
 
     def bind_account(self) -> None:
-        dialog = LoginDialog(self, background_login=self.background_login_checkbox.isChecked())
+        dialog = LoginDialog(self, background_login=True)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.refresh()
 
@@ -443,7 +443,7 @@ class AccountPage(QWidget):
         dialog = LoginDialog(
             self,
             row,
-            background_login=self.background_login_checkbox.isChecked(),
+            background_login=True,
         )
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.refresh()
@@ -555,6 +555,8 @@ class AccountPage(QWidget):
         self._set_status(
             f"{prefix}：正常 {len(normal)} 个，已登录待检测 {len(pending)} 个，异常 {len(abnormal)} 个。"
         )
+        if self._present_validation_intervention(payload):
+            return
         if silent:
             return
         lines = [
@@ -566,6 +568,38 @@ class AccountPage(QWidget):
             lines.append("")
             lines.extend(payload["failures"])
         QMessageBox.information(self, "检测登录", "\n".join(lines))
+
+    def _present_validation_intervention(self, payload: dict) -> bool:
+        """仅在静默检测发现异常时显示官方页面。"""
+
+        rows = list(payload.get("interventionRequired") or [])
+        if not rows:
+            return False
+        first = rows[0]
+        platform = str(first.get("platformName") or "平台")
+        account_name = str(first.get("userName") or first.get("profileName") or "账号")
+        browser_note = ""
+        try:
+            account_browser_service.open_account_backend(first)
+            browser_note = f"\n\n已打开 {platform} 官方页面供你确认。"
+        except Exception as exc:
+            browser_note = (
+                "\n\n未能打开官方页面："
+                f"{exc}\n请使用“重新登录”恢复会话。"
+            )
+        remaining = (
+            f"\n另有 {len(rows) - 1} 个异常账号，请检查列表。"
+            if len(rows) > 1
+            else ""
+        )
+        QMessageBox.warning(
+            self,
+            "登录状态需处理",
+            f"{platform} | {account_name} 的会话未通过静默检测。"
+            f"{browser_note}{remaining}\n\n"
+            "一键发不会在后台自动登录；如需扫码或验证码，请由你完成。",
+        )
+        return True
 
     def _fail_validation(self, message: str, *, silent: bool = False) -> None:
         self._set_status("检测失败，请查看提示后重试。")

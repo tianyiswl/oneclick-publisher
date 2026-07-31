@@ -3,10 +3,38 @@
 
 import unittest
 
-from app_core.oneclick_authorization import authorization_plan, identity_response_display_name, login_response_confirms
+from app_core.oneclick_authorization import (
+    authorization_browser_launch_options,
+    authorization_plan,
+    identity_response_display_name,
+    login_response_confirms,
+    saved_identity_matches,
+    session_check_browser_launch_options,
+)
 
 
 class OneClickAuthorizationTests(unittest.TestCase):
+    def test_binding_is_visible_but_session_check_is_headless(self) -> None:
+        self.assertEqual(
+            authorization_browser_launch_options(),
+            {"headless": False},
+        )
+        self.assertEqual(
+            session_check_browser_launch_options(),
+            {"headless": True},
+        )
+
+    def test_bilibili_saved_identity_requires_expected_account(self) -> None:
+        self.assertTrue(
+            saved_identity_matches({"userName": "墨白手记"}, "墨白手记")
+        )
+        self.assertFalse(
+            saved_identity_matches({"userName": "墨白手记"}, "其他账号")
+        )
+        self.assertTrue(
+            saved_identity_matches({"userName": "B站账号"}, "真实昵称")
+        )
+
     def test_six_domestic_platforms_use_official_urls_and_local_profiles(self) -> None:
         expected_hosts = {
             1: "creator.xiaohongshu.com",

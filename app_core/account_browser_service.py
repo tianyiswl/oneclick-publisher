@@ -46,6 +46,7 @@ async def _open_backend(account: dict) -> None:
         context = await browser.new_context(storage_state=str(state_file))
         page = await context.new_page()
         await page.goto(plan.login_url, wait_until="domcontentloaded", timeout=45_000)
+        await page.bring_to_front()
         # 不在这里做登录检测或任何发布操作；用户可像普通浏览器一样查看后台。
         await page.wait_for_event("close")
     finally:

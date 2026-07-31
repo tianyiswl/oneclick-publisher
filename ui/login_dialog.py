@@ -170,7 +170,7 @@ class LoginDialog(QDialog):
         self.log.clear()
         self.qr_label.clear()
         if background_login:
-            self.log.append("一键发账号授权始终使用可见官方页面，已忽略后台运行设置。")
+            self.log.append("绑定账号需要你登录或扫码，即将打开可见官方页面。")
         self.qr_label.setText("正在打开平台官方登录页面...")
         self.start_btn.setEnabled(False)
         self.save_btn.setEnabled(False)
