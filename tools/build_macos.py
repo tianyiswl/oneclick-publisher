@@ -177,7 +177,6 @@ def assert_archive_safe(zip_path: Path) -> None:
         ["zipinfo", "-1", str(zip_path)],
         cwd=ROOT,
         check=True,
-        text=True,
         stdout=subprocess.PIPE,
     )
     forbidden = (
@@ -189,8 +188,14 @@ def assert_archive_safe(zip_path: Path) -> None:
         "access_token",
         "refresh_token",
     )
+    # zipinfo 会按 ZIP 文件名编码原样输出；中文应用名不保证是 UTF-8。
+    # 禁止项均为 ASCII，直接在原始字节中检查，避免因文件名解码失败跳过安全门禁。
     lowered = result.stdout.lower()
-    hits = [item for item in forbidden if item.lower() in lowered]
+    hits = [
+        item
+        for item in forbidden
+        if item.lower().encode("ascii") in lowered
+    ]
     if hits:
         raise RuntimeError("安装包包含禁止的运行数据标识：" + "、".join(hits))
 
