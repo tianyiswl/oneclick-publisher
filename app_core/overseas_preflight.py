@@ -57,6 +57,47 @@ def validate_overseas_preflight_payload(payload: dict[str, Any]) -> dict[str, An
     if payload.get("enableTimer"):
         errors.append(f"{platform_name} 浏览器预检尚未回读定时时间，请先关闭定时")
 
+    title = str(payload.get("title") or "").strip()
+    description = str(payload.get("description") or "").strip()
+    tags = [
+        str(item).strip().lstrip("#")
+        for item in payload.get("tags") or []
+        if str(item).strip().lstrip("#")
+    ]
+    caption_parts = [part for part in (title, description) if part]
+    if tags:
+        caption_parts.append(" ".join(f"#{item}" for item in tags))
+    caption = "\n\n".join(caption_parts)
+    if platform_type == 7:
+        if len(title) > 100:
+            errors.append("YouTube 标题不能超过 100 个字符")
+        if len(description.encode("utf-8")) > 5000:
+            errors.append("YouTube 描述不能超过 5000 字节")
+        if payload.get("notifySubscribers") is False:
+            errors.append(
+                "YouTube 浏览器预检尚无法稳定回读“不通知订阅者”；"
+                "请改用官方 API 账号或保持默认通知"
+            )
+    elif platform_type in {6, 8, 9}:
+        limit = 2048 if platform_type == 9 else 2200
+        if not caption:
+            errors.append(f"{platform_name} 必须填写标题、正文或话题")
+        elif len(caption) > limit:
+            errors.append(
+                f"{platform_name} 合并文案不能超过 {limit} 个字符，"
+                "一键发不会静默截断"
+            )
+    if platform_type == 8 and payload.get("shareToFeed") is False:
+        errors.append(
+            "Instagram 浏览器预检尚无法稳定回读“仅 Reels”；"
+            "请改用官方 API 账号或保持同时分享到动态"
+        )
+    if platform_type in {8, 9} and payload.get("aiGenerated") is True:
+        errors.append(
+            f"{platform_name} 浏览器执行器尚未可靠回读 AI 声明；"
+            "为避免遗漏合规字段，请改用官方 API 通道"
+        )
+
     files = [Path(str(item)) for item in payload.get("fileList") or []]
     if not files:
         errors.append("海外视频预检缺少视频素材")
@@ -115,6 +156,12 @@ def run_overseas_preflight_sync(payload: dict[str, Any]) -> dict[str, Any]:
             dry_run_hold_browser=bool(
                 payload.get("debugDryRunHoldBrowser", not background_mode)
             ),
+            visibility=str(payload.get("visibility") or "private"),
+            collection_name=str(payload.get("collectionName") or ""),
+            ai_generated=bool(payload.get("aiGenerated", False)),
+            made_for_kids=bool(payload.get("madeForKids", False)),
+            notify_subscribers=bool(payload.get("notifySubscribers", True)),
+            share_to_feed=bool(payload.get("shareToFeed", True)),
         )
     return {
         "type": platform_type,

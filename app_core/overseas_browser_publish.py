@@ -90,6 +90,16 @@ def validate_meta_browser_publish_payload(payload: dict[str, Any]) -> dict[str, 
         errors.append("Meta Reels 标题不能为空")
     if str(payload.get("visibility") or "public") != "public":
         errors.append("Meta Reels 浏览器正式通道当前只允许公开发布")
+    if platform_type == 8 and payload.get("shareToFeed") is False:
+        errors.append(
+            "Instagram 浏览器正式通道尚无法回读“仅 Reels”，"
+            "请改用官方 API 账号"
+        )
+    if payload.get("aiGenerated") is True:
+        errors.append(
+            f"{PLATFORM_NAMES.get(platform_type, 'Meta')} 浏览器正式通道"
+            "尚未可靠回读 AI 声明，请改用官方 API 账号"
+        )
     schedule = None
     try:
         schedule = _schedule_time(payload)
@@ -134,6 +144,10 @@ def run_meta_browser_publish_sync(payload: dict[str, Any]) -> dict[str, Any]:
             automation_acknowledged=bool(
                 payload[META_BROWSER_AUTOMATION_ACKNOWLEDGED]
             ),
+            visibility=str(payload.get("visibility") or "public"),
+            collection_name=str(payload.get("collectionName") or ""),
+            ai_generated=bool(payload.get("aiGenerated", False)),
+            share_to_feed=bool(payload.get("shareToFeed", True)),
         )
     normalized = [item for item in (results or []) if isinstance(item, dict)]
     expected_status = "scheduled" if checked["scheduleTime"] else "published"

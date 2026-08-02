@@ -191,6 +191,15 @@ def _attach_publish_options(app, data, publish_datetime):
     app.short_title = str(data.get("shortTitle") or "").strip()
     app.original_declaration = _option_bool(data.get("originalDeclaration"))
     app.ai_generated = _option_bool(data.get("aiGenerated"))
+    app.made_for_kids = _option_bool(data.get("madeForKids"))
+    app.notify_subscribers = not (
+        data.get("notifySubscribers") is not None
+        and not _option_bool(data.get("notifySubscribers"))
+    )
+    app.share_to_feed = not (
+        data.get("shareToFeed") is not None
+        and not _option_bool(data.get("shareToFeed"))
+    )
     app.sync_to_toutiao = _option_bool(data.get("syncToToutiao"))
     app.visibility = str(data.get("visibility") or "public")
     app.publish_date = 0 if _option_bool(data.get("saveDraftOnly")) else publish_datetime
@@ -808,6 +817,12 @@ def _post_video_overseas(
     dry_run_hold_browser=True,
     publish_confirmed=False,
     automation_acknowledged=False,
+    visibility="private",
+    collection_name="",
+    ai_generated=False,
+    made_for_kids=False,
+    notify_subscribers=True,
+    share_to_feed=True,
 ):
     tags = normalize_publish_tags(tags, max_count=get_publish_tag_limit(platform_type))
     account_files = [Path(BASE_DIR / "cookiesFile" / file) for file in account_file]
@@ -828,7 +843,12 @@ def _post_video_overseas(
         "tags": tags,
         "coverPath": cover_path,
         "coverPaths": cover_paths or {},
-        "visibility": "private",
+        "visibility": visibility,
+        "collectionName": collection_name,
+        "aiGenerated": ai_generated,
+        "madeForKids": made_for_kids,
+        "notifySubscribers": notify_subscribers,
+        "shareToFeed": share_to_feed,
         "metaBrowserPublishConfirmed": publish_confirmed,
         "metaBrowserAutomationAcknowledged": automation_acknowledged,
     }
@@ -849,20 +869,20 @@ def _post_video_overseas(
     return results
 
 
-def post_video_tiktok(title, files, tags, account_file, category=None, enableTimer=False, videos_per_day=1, daily_times=None, start_days=0, description=None, cover_path=None, cover_paths=None, schedule_time=None, jitter_minutes=0, dry_run=True, dry_run_hold_browser=True):
-    return _post_video_overseas(6, title, files, tags, account_file, enableTimer, videos_per_day, daily_times, start_days, description=description, cover_path=cover_path, cover_paths=cover_paths, schedule_time=schedule_time, jitter_minutes=jitter_minutes, dry_run=dry_run, dry_run_hold_browser=dry_run_hold_browser)
+def post_video_tiktok(title, files, tags, account_file, category=None, enableTimer=False, videos_per_day=1, daily_times=None, start_days=0, description=None, cover_path=None, cover_paths=None, schedule_time=None, jitter_minutes=0, dry_run=True, dry_run_hold_browser=True, **platform_options):
+    return _post_video_overseas(6, title, files, tags, account_file, enableTimer, videos_per_day, daily_times, start_days, description=description, cover_path=cover_path, cover_paths=cover_paths, schedule_time=schedule_time, jitter_minutes=jitter_minutes, dry_run=dry_run, dry_run_hold_browser=dry_run_hold_browser, **platform_options)
 
 
-def post_video_youtube(title, files, tags, account_file, category=None, enableTimer=False, videos_per_day=1, daily_times=None, start_days=0, description=None, cover_path=None, cover_paths=None, schedule_time=None, jitter_minutes=0, dry_run=True, dry_run_hold_browser=True):
-    return _post_video_overseas(7, title, files, tags, account_file, enableTimer, videos_per_day, daily_times, start_days, description=description, cover_path=cover_path, cover_paths=cover_paths, schedule_time=schedule_time, jitter_minutes=jitter_minutes, dry_run=dry_run, dry_run_hold_browser=dry_run_hold_browser)
+def post_video_youtube(title, files, tags, account_file, category=None, enableTimer=False, videos_per_day=1, daily_times=None, start_days=0, description=None, cover_path=None, cover_paths=None, schedule_time=None, jitter_minutes=0, dry_run=True, dry_run_hold_browser=True, **platform_options):
+    return _post_video_overseas(7, title, files, tags, account_file, enableTimer, videos_per_day, daily_times, start_days, description=description, cover_path=cover_path, cover_paths=cover_paths, schedule_time=schedule_time, jitter_minutes=jitter_minutes, dry_run=dry_run, dry_run_hold_browser=dry_run_hold_browser, **platform_options)
 
 
-def post_video_instagram(title, files, tags, account_file, category=None, enableTimer=False, videos_per_day=1, daily_times=None, start_days=0, description=None, cover_path=None, cover_paths=None, schedule_time=None, jitter_minutes=0, dry_run=True, dry_run_hold_browser=True, publish_confirmed=False, automation_acknowledged=False):
-    return _post_video_overseas(8, title, files, tags, account_file, enableTimer, videos_per_day, daily_times, start_days, description=description, cover_path=cover_path, cover_paths=cover_paths, schedule_time=schedule_time, jitter_minutes=jitter_minutes, dry_run=dry_run, dry_run_hold_browser=dry_run_hold_browser, publish_confirmed=publish_confirmed, automation_acknowledged=automation_acknowledged)
+def post_video_instagram(title, files, tags, account_file, category=None, enableTimer=False, videos_per_day=1, daily_times=None, start_days=0, description=None, cover_path=None, cover_paths=None, schedule_time=None, jitter_minutes=0, dry_run=True, dry_run_hold_browser=True, publish_confirmed=False, automation_acknowledged=False, **platform_options):
+    return _post_video_overseas(8, title, files, tags, account_file, enableTimer, videos_per_day, daily_times, start_days, description=description, cover_path=cover_path, cover_paths=cover_paths, schedule_time=schedule_time, jitter_minutes=jitter_minutes, dry_run=dry_run, dry_run_hold_browser=dry_run_hold_browser, publish_confirmed=publish_confirmed, automation_acknowledged=automation_acknowledged, **platform_options)
 
 
-def post_video_facebook(title, files, tags, account_file, category=None, enableTimer=False, videos_per_day=1, daily_times=None, start_days=0, description=None, cover_path=None, cover_paths=None, schedule_time=None, jitter_minutes=0, dry_run=True, dry_run_hold_browser=True, publish_confirmed=False, automation_acknowledged=False):
-    return _post_video_overseas(9, title, files, tags, account_file, enableTimer, videos_per_day, daily_times, start_days, description=description, cover_path=cover_path, cover_paths=cover_paths, schedule_time=schedule_time, jitter_minutes=jitter_minutes, dry_run=dry_run, dry_run_hold_browser=dry_run_hold_browser, publish_confirmed=publish_confirmed, automation_acknowledged=automation_acknowledged)
+def post_video_facebook(title, files, tags, account_file, category=None, enableTimer=False, videos_per_day=1, daily_times=None, start_days=0, description=None, cover_path=None, cover_paths=None, schedule_time=None, jitter_minutes=0, dry_run=True, dry_run_hold_browser=True, publish_confirmed=False, automation_acknowledged=False, **platform_options):
+    return _post_video_overseas(9, title, files, tags, account_file, enableTimer, videos_per_day, daily_times, start_days, description=description, cover_path=cover_path, cover_paths=cover_paths, schedule_time=schedule_time, jitter_minutes=jitter_minutes, dry_run=dry_run, dry_run_hold_browser=dry_run_hold_browser, publish_confirmed=publish_confirmed, automation_acknowledged=automation_acknowledged, **platform_options)
 
 
 

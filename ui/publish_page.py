@@ -1083,6 +1083,9 @@ class PublishPage(QWidget):
         self.platform_cover_34: dict[int, QComboBox] = {}
         self.platform_cover_43: dict[int, QComboBox] = {}
         self.platform_cover_previews: dict[tuple[int, str], CoverPreviewCanvas] = {}
+        self.youtube_made_for_kids: QCheckBox | None = None
+        self.youtube_notify_subscribers: QCheckBox | None = None
+        self.instagram_share_to_feed: QCheckBox | None = None
         self.douyin_sync_toutiao: QCheckBox | None = None
         self.douyin_location_keyword: QLineEdit | None = None
         self.douyin_location_search_button: QPushButton | None = None
@@ -1324,6 +1327,29 @@ class PublishPage(QWidget):
             visibility.addItem("不公开", "unlisted")
             self.platform_visibility[platform_type] = visibility
             settings_layout.addRow("可见性", visibility)
+            self.youtube_made_for_kids = QCheckBox("内容面向儿童")
+            self.youtube_made_for_kids.setToolTip(
+                "仅在内容确实面向儿童时开启，会写入 YouTube 官方受众字段。"
+            )
+            settings_layout.addRow("受众", self.youtube_made_for_kids)
+            self.youtube_notify_subscribers = QCheckBox("通知订阅者")
+            self.youtube_notify_subscribers.setChecked(True)
+            self.youtube_notify_subscribers.setToolTip(
+                "YouTube 默认会通知订阅者；取消勾选时明确传递 notifySubscribers=false。"
+            )
+            settings_layout.addRow("通知", self.youtube_notify_subscribers)
+            body_layout.addWidget(settings)
+        elif platform_type == 8:
+            settings = QFrame()
+            settings.setProperty("subPanel", True)
+            settings_layout = QFormLayout(settings)
+            settings_layout.setContentsMargins(12, 10, 12, 10)
+            self.instagram_share_to_feed = QCheckBox("同时分享到 Instagram 动态")
+            self.instagram_share_to_feed.setChecked(True)
+            self.instagram_share_to_feed.setToolTip(
+                "开启时 Reel 也会显示在主页动态；取消勾选时仅发布到 Reels。"
+            )
+            settings_layout.addRow("展示位置", self.instagram_share_to_feed)
             body_layout.addWidget(settings)
         elif platform_type == 10:
             settings = QFrame()
@@ -2707,6 +2733,12 @@ class PublishPage(QWidget):
         self._set_douyin_location_status("未添加定位")
         if self.wechat_group_notification:
             self.wechat_group_notification.setChecked(True)
+        if self.youtube_made_for_kids:
+            self.youtube_made_for_kids.setChecked(False)
+        if self.youtube_notify_subscribers:
+            self.youtube_notify_subscribers.setChecked(True)
+        if self.instagram_share_to_feed:
+            self.instagram_share_to_feed.setChecked(True)
 
         self._refresh_platform_cover_previews()
         self.update_cover_summary()
@@ -3155,6 +3187,20 @@ class PublishPage(QWidget):
                         "biliType": self.bili_type.currentText(),
                         "biliDesc": description,
                     }
+                )
+            if platform_type == 7:
+                payload["madeForKids"] = bool(
+                    self.youtube_made_for_kids
+                    and self.youtube_made_for_kids.isChecked()
+                )
+                payload["notifySubscribers"] = bool(
+                    self.youtube_notify_subscribers is None
+                    or self.youtube_notify_subscribers.isChecked()
+                )
+            if platform_type == 8:
+                payload["shareToFeed"] = bool(
+                    self.instagram_share_to_feed is None
+                    or self.instagram_share_to_feed.isChecked()
                 )
             if platform_type == 3:
                 payload["syncToToutiao"] = bool(
@@ -4287,6 +4333,20 @@ class PublishPage(QWidget):
                         "  B站草稿限制：平台不会保留新版分区值，"
                         "重新打开可能显示“影视”；正式发布时会重新选择并校验"
                     )
+            if int(payload.get("type")) == 7:
+                lines.append(
+                    "  YouTube 受众："
+                    + ("面向儿童" if payload.get("madeForKids") else "不面向儿童")
+                )
+                lines.append(
+                    "  订阅者通知："
+                    + ("开启" if payload.get("notifySubscribers", True) else "关闭")
+                )
+            if int(payload.get("type")) == 8:
+                lines.append(
+                    "  Instagram 同时分享到动态："
+                    + ("开启" if payload.get("shareToFeed", True) else "关闭")
+                )
             if int(payload.get("type")) == 3:
                 lines.append(
                     "  今日头条同步："
@@ -4357,6 +4417,18 @@ class PublishPage(QWidget):
             "biliPartition": self.bili_partition.currentText(),
             "biliType": self.bili_type.currentText(),
             "platformVisibility": {str(k): v.currentData() for k, v in self.platform_visibility.items()},
+            "youtubeMadeForKids": bool(
+                self.youtube_made_for_kids
+                and self.youtube_made_for_kids.isChecked()
+            ),
+            "youtubeNotifySubscribers": bool(
+                self.youtube_notify_subscribers is None
+                or self.youtube_notify_subscribers.isChecked()
+            ),
+            "instagramShareToFeed": bool(
+                self.instagram_share_to_feed is None
+                or self.instagram_share_to_feed.isChecked()
+            ),
             "douyinSyncToutiao": bool(
                 self.douyin_sync_toutiao
                 and self.douyin_sync_toutiao.isChecked()
@@ -4621,6 +4693,18 @@ class PublishPage(QWidget):
             if combo:
                 index = combo.findData(value)
                 combo.setCurrentIndex(index if index >= 0 else 0)
+        if self.youtube_made_for_kids:
+            self.youtube_made_for_kids.setChecked(
+                bool(payload.get("youtubeMadeForKids", False))
+            )
+        if self.youtube_notify_subscribers:
+            self.youtube_notify_subscribers.setChecked(
+                bool(payload.get("youtubeNotifySubscribers", True))
+            )
+        if self.instagram_share_to_feed:
+            self.instagram_share_to_feed.setChecked(
+                bool(payload.get("instagramShareToFeed", True))
+            )
         if self.douyin_sync_toutiao:
             self.douyin_sync_toutiao.setChecked(
                 bool(payload.get("douyinSyncToutiao", False))

@@ -19,6 +19,12 @@ SUPPORTED_VIDEO_SUFFIXES = frozenset({".mp4", ".mov"})
 MAX_VIDEO_BYTES = 1_000_000_000
 TERMINAL_CONTAINER_STATES = frozenset({"FINISHED", "PUBLISHED"})
 FAILED_CONTAINER_STATES = frozenset({"ERROR", "EXPIRED"})
+FACEBOOK_TERMINAL_STATES = frozenset(
+    {"complete", "completed", "published", "ready", "success"}
+)
+FACEBOOK_FAILED_STATES = frozenset(
+    {"error", "failed", "expired", "rejected"}
+)
 
 
 class MetaApiError(RuntimeError):
@@ -86,7 +92,7 @@ def _validate_video(path: Path) -> tuple[Path, int]:
     return video_path, size
 
 
-def _caption(request: UploadRequest) -> str:
+def _caption(request: UploadRequest, *, max_length: int = 2200) -> str:
     parts = [
         part.strip()
         for part in (request.title, request.description)
@@ -100,7 +106,13 @@ def _caption(request: UploadRequest) -> str:
                 if str(tag).strip().lstrip("#")
             )
         )
-    return "\n\n".join(part for part in parts if part)[:2200]
+    caption = "\n\n".join(part for part in parts if part)
+    if len(caption) > max_length:
+        raise ValueError(
+            f"Meta 合并文案不能超过 {max_length} 个字符，"
+            "一键发不会静默截断"
+        )
+    return caption
 
 
 class MetaApiClient:
@@ -250,8 +262,8 @@ class MetaApiClient:
         data: dict[str, str] = {
             "media_type": "REELS",
             "upload_type": "resumable",
-            "caption": _caption(request),
-            "share_to_feed": "true",
+            "caption": _caption(request, max_length=2200),
+            "share_to_feed": "true" if request.share_to_feed else "false",
         }
         if request.ai_generated:
             data["is_ai_generated"] = "true"
@@ -359,7 +371,10 @@ class MetaApiClient:
             f"/{str(media_id or '').strip()}",
             token=asset.page_access_token,
             params={
-                "fields": "id,permalink,media_type,media_product_type,timestamp"
+                "fields": (
+                    "id,permalink,media_type,media_product_type,timestamp,"
+                    "caption,is_ai_generated"
+                )
             },
         )
         return _response_json(response, "Instagram Reel 结果回读失败")
@@ -421,7 +436,7 @@ class MetaApiClient:
                 "upload_phase": "finish",
                 "video_id": str(video_id or "").strip(),
                 "video_state": "PUBLISHED",
-                "description": _caption(request),
+                "description": _caption(request, max_length=2048),
                 "title": str(request.title or "").strip()[:255],
             },
         )
@@ -438,6 +453,40 @@ class MetaApiClient:
             "GET",
             f"/{str(video_id or '').strip()}",
             token=asset.page_access_token,
-            params={"fields": "id,status,permalink_url,created_time"},
+            params={
+                "fields": (
+                    "id,status,permalink_url,created_time,title,description"
+                )
+            },
         )
         return _response_json(response, "Facebook Reel 状态回读失败")
+
+    def wait_facebook_reel(
+        self,
+        video_id: str,
+        asset: MetaPageAsset,
+        *,
+        attempts: int = 40,
+        interval_seconds: float = 3.0,
+    ) -> dict[str, Any]:
+        """等待 Facebook Reel 进入可验证的最终发布状态。"""
+
+        last: dict[str, Any] = {}
+        for index in range(max(1, int(attempts))):
+            last = self.read_facebook_reel(video_id, asset)
+            status = last.get("status") if isinstance(last.get("status"), dict) else {}
+            publishing = (
+                status.get("publishing_phase")
+                if isinstance(status.get("publishing_phase"), dict)
+                else {}
+            )
+            state = str(
+                publishing.get("status") or status.get("video_status") or ""
+            ).strip().lower()
+            if state in FACEBOOK_TERMINAL_STATES:
+                return last
+            if state in FACEBOOK_FAILED_STATES:
+                raise MetaApiError(f"Facebook Reel 发布失败：{state}")
+            if index + 1 < attempts:
+                self.sleep(max(0.0, float(interval_seconds)))
+        raise MetaApiError("Facebook Reel 发布结果回读超时")

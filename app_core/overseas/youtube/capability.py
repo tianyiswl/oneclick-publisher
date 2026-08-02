@@ -72,6 +72,53 @@ def _publication_state(video: dict[str, Any]) -> tuple[str, str, str]:
     return state, upload_status, processing_status
 
 
+def _metadata_readback(
+    video: dict[str, Any],
+    request: UploadRequest,
+) -> tuple[bool, str]:
+    snippet = video.get("snippet") if isinstance(video.get("snippet"), dict) else {}
+    status = video.get("status") if isinstance(video.get("status"), dict) else {}
+    actual_tags = {
+        str(item).strip().lstrip("#")
+        for item in snippet.get("tags") or []
+        if str(item).strip().lstrip("#")
+    }
+    expected_tags = {
+        str(item).strip().lstrip("#")
+        for item in request.tags
+        if str(item).strip().lstrip("#")
+    }
+    checks = {
+        "标题": str(snippet.get("title") or "") == str(request.title or "").strip(),
+        "描述": str(snippet.get("description") or "") == str(request.description or ""),
+        "标签": actual_tags == expected_tags,
+        "儿童受众": bool(status.get("selfDeclaredMadeForKids"))
+        == bool(request.made_for_kids),
+        "AI 声明": bool(status.get("containsSyntheticMedia"))
+        == bool(request.ai_generated),
+    }
+    if request.mode is PublicationMode.SCHEDULED:
+        expected_publish_at = (
+            request.scheduled_at.astimezone(timezone.utc)
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z")
+            if request.scheduled_at is not None
+            else ""
+        )
+        checks["定时时间"] = (
+            str(status.get("publishAt") or "") == expected_publish_at
+        )
+    failed = [label for label, verified in checks.items() if not verified]
+    return not failed, (
+        "YouTube 标题、描述、标签、受众、AI 声明"
+        + ("与定时时间" if request.mode is PublicationMode.SCHEDULED else "")
+        + "已逐项回读"
+        if not failed
+        else "YouTube 字段回读不一致：" + "、".join(failed)
+    )
+
+
 class YouTubeCapability(OverseasPlatformCapability):
     """YouTube OAuth、刷新、上传和结果回读的完整纵向链路。"""
 
@@ -262,9 +309,17 @@ class YouTubeCapability(OverseasPlatformCapability):
             PublicationMode.PUBLIC: "public",
         }[request.mode]
         publication_verified = actual_state == expected_state
+        metadata_verified, metadata_message = _metadata_readback(
+            readback,
+            request,
+        )
         return UploadResult(
             platform=OverseasPlatform.YOUTUBE,
-            accepted=publication_verified and thumbnail_verified,
+            accepted=(
+                publication_verified
+                and thumbnail_verified
+                and metadata_verified
+            ),
             operation_reference=video_id,
             evidence=(
                 upload_evidence,
@@ -275,6 +330,13 @@ class YouTubeCapability(OverseasPlatformCapability):
                     message=(
                         f"目标状态 {expected_state}，平台回读 {actual_state}"
                     ),
+                    recorded_at=current,
+                    reference=video_id,
+                ),
+                EvidenceRecord(
+                    stage=EvidenceStage.RESULT_READBACK,
+                    verified=metadata_verified,
+                    message=metadata_message,
                     recorded_at=current,
                     reference=video_id,
                 ),

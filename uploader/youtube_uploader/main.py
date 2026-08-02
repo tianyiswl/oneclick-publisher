@@ -152,6 +152,50 @@ class YouTubeVideo:
         if not await _click_if_present(page, text_selector, 3000):
             youtube_logger.warning("[youtube] 未识别到 AI/合成内容声明控件，请在预发布页人工确认")
 
+    async def set_audience(self, page) -> None:
+        """按一键发设置选择 YouTube 受众，并从真实控件回读。"""
+
+        made_for_kids = bool(getattr(self, "made_for_kids", False))
+        selectors = (
+            (
+                "tp-yt-paper-radio-button[name='VIDEO_MADE_FOR_KIDS_MFK']",
+                "tp-yt-paper-radio-button:has-text(\"Yes, it's made for kids\")",
+                "tp-yt-paper-radio-button:has-text('是的，此视频是面向儿童的')",
+            )
+            if made_for_kids
+            else (
+                "tp-yt-paper-radio-button[name='VIDEO_MADE_FOR_KIDS_NOT_MFK']",
+                "tp-yt-paper-radio-button:has-text(\"No, it's not made for kids\")",
+                "tp-yt-paper-radio-button:has-text('不，此视频不是面向儿童的')",
+            )
+        )
+        for selector in selectors:
+            candidate = page.locator(selector).first
+            try:
+                if not await candidate.count() or not await candidate.is_visible():
+                    continue
+                await candidate.click()
+                await page.wait_for_timeout(250)
+                checked = await candidate.evaluate(
+                    """element =>
+                      element.getAttribute('aria-checked') === 'true'
+                      || element.getAttribute('aria-selected') === 'true'
+                      || element.hasAttribute('checked')
+                      || element.checked === true
+                    """
+                )
+                if checked:
+                    youtube_logger.info(
+                        "[youtube] 受众已设置并回读："
+                        + ("面向儿童" if made_for_kids else "不面向儿童")
+                    )
+                    return
+            except Exception:
+                continue
+        raise RuntimeError(
+            "YouTube 受众设置后无法回读确认，已停止在最终保存前"
+        )
+
     async def upload(self, playwright: Playwright) -> None:
         if not self.dry_run:
             raise RuntimeError(FORMAL_LOCK_MESSAGE)
@@ -197,17 +241,7 @@ class YouTubeVideo:
                 except Exception as exc:
                     youtube_logger.warning(f"[youtube] 封面暂未自动填入，可在预发布页手动确认：{exc}")
 
-            if not await _click_if_present(
-                page,
-                "tp-yt-paper-radio-button[name='VIDEO_MADE_FOR_KIDS_NOT_MFK']",
-                10000,
-            ):
-                await _click_if_present(
-                    page,
-                    "tp-yt-paper-radio-button:has-text('not made for kids'), "
-                    "tp-yt-paper-radio-button:has-text('不是面向儿童')",
-                    5000,
-                )
+            await self.set_audience(page)
 
             if self.tags:
                 try:

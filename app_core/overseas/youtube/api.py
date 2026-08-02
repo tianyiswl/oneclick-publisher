@@ -145,8 +145,8 @@ class YouTubeApiClient:
             raise ValueError("YouTube 标题不能为空")
         if len(title) > 100:
             raise ValueError("YouTube 标题不能超过 100 个字符")
-        if len(description) > 5000:
-            raise ValueError("YouTube 描述不能超过 5000 个字符")
+        if len(description.encode("utf-8")) > 5000:
+            raise ValueError("YouTube 描述不能超过 5000 字节")
         if not str(category_id or "").isdigit():
             raise ValueError("YouTube 分类 ID 格式错误")
 
@@ -198,7 +198,13 @@ class YouTubeApiClient:
         response = self._request(
             "POST",
             f"{UPLOAD_ROOT}/videos",
-            params={"uploadType": "resumable", "part": "snippet,status"},
+            params={
+                "uploadType": "resumable",
+                "part": "snippet,status",
+                "notifySubscribers": (
+                    "true" if request.notify_subscribers else "false"
+                ),
+            },
             headers={
                 "Content-Type": "application/json; charset=UTF-8",
                 "X-Upload-Content-Length": str(total_size),

@@ -181,6 +181,8 @@ class UploadRequest:
     scheduled_at: datetime | None = None
     made_for_kids: bool = False
     ai_generated: bool = False
+    notify_subscribers: bool = True
+    share_to_feed: bool = True
     user_confirmed_upload: bool = False
 
 

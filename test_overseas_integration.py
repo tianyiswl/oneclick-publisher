@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 import tempfile
 import unittest
@@ -12,6 +13,8 @@ from unittest.mock import patch
 
 from app_core import account_service, login_service, overseas_preflight, publish_service
 from myUtils import login as recovered_login
+from myUtils import postVideo as recovered_publish
+from uploader.youtube_uploader.main import YouTubeVideo
 
 
 class OverseasAccountEntryTests(unittest.TestCase):
@@ -170,15 +173,81 @@ class OverseasPreflightTests(unittest.TestCase):
                 patch.object(overseas_preflight, "COOKIE_DIR", root),
                 patch.dict(overseas_preflight.PREFLIGHT_HANDLERS, {6: handler}),
             ):
-                result = overseas_preflight.run_overseas_preflight_sync(
-                    self._payload(video)
+                payload = self._payload(video)
+                payload.update(
+                    {
+                        "visibility": "private",
+                        "collectionName": "测试合集",
+                        "aiGenerated": True,
+                        "madeForKids": True,
+                        "notifySubscribers": False,
+                        "shareToFeed": False,
+                    }
                 )
+                result = overseas_preflight.run_overseas_preflight_sync(payload)
 
         self.assertTrue(result["ok"])
         self.assertEqual(len(calls), 1)
         self.assertTrue(calls[0][1]["dry_run"])
         self.assertFalse(calls[0][1]["dry_run_hold_browser"])
         self.assertIsNone(calls[0][1]["schedule_time"])
+        self.assertEqual(calls[0][1]["visibility"], "private")
+        self.assertEqual(calls[0][1]["collection_name"], "测试合集")
+        self.assertTrue(calls[0][1]["ai_generated"])
+        self.assertTrue(calls[0][1]["made_for_kids"])
+        self.assertFalse(calls[0][1]["notify_subscribers"])
+        self.assertFalse(calls[0][1]["share_to_feed"])
+
+    def test_browser_validation_blocks_silent_field_loss(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            video = root / "video.mp4"
+            video.write_bytes(b"video")
+            (root / "tiktok.json").write_text("{}", encoding="utf-8")
+            youtube = self._payload(video)
+            youtube.update({"type": 7, "notifySubscribers": False})
+            instagram = self._payload(video)
+            instagram.update({"type": 8, "shareToFeed": False})
+            facebook = self._payload(video)
+            facebook.update({"type": 9, "aiGenerated": True})
+            with patch.object(overseas_preflight, "COOKIE_DIR", root):
+                youtube_result = overseas_preflight.validate_overseas_preflight_payload(
+                    youtube
+                )
+                instagram_result = overseas_preflight.validate_overseas_preflight_payload(
+                    instagram
+                )
+                facebook_result = overseas_preflight.validate_overseas_preflight_payload(
+                    facebook
+                )
+        self.assertTrue(any("不通知订阅者" in item for item in youtube_result["errors"]))
+        self.assertTrue(any("仅 Reels" in item for item in instagram_result["errors"]))
+        self.assertTrue(any("AI 声明" in item for item in facebook_result["errors"]))
+
+    def test_recovered_app_receives_platform_specific_options(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            video = Path(raw) / "video.mp4"
+            video.write_bytes(b"video")
+            app = recovered_publish._make_platform_app(
+                {
+                    "type": 7,
+                    "title": "透传测试",
+                    "description": "离线",
+                    "tags": [],
+                    "visibility": "unlisted",
+                    "madeForKids": True,
+                    "notifySubscribers": False,
+                    "aiGenerated": True,
+                },
+                str(video),
+                0,
+                Path(raw) / "youtube.json",
+                dry_run=True,
+            )
+        self.assertEqual(app.visibility, "unlisted")
+        self.assertTrue(app.made_for_kids)
+        self.assertFalse(app.notify_subscribers)
+        self.assertTrue(app.ai_generated)
 
     def test_schedule_is_rejected_until_platform_time_is_read_back(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -208,6 +277,91 @@ class OverseasPreflightTests(unittest.TestCase):
                         }
                     ]
                 )
+
+
+class YouTubeBrowserFieldTests(unittest.TestCase):
+    def test_audience_selection_uses_target_control_and_readback(self) -> None:
+        class Locator:
+            def __init__(self, matched: bool):
+                self.matched = matched
+                self.first = self
+                self.clicked = False
+
+            async def count(self):
+                return 1 if self.matched else 0
+
+            async def is_visible(self):
+                return self.matched
+
+            async def click(self):
+                self.clicked = True
+
+            async def evaluate(self, _script):
+                return self.clicked
+
+        class Page:
+            def __init__(self):
+                self.locators = {}
+
+            def locator(self, selector):
+                matched = "VIDEO_MADE_FOR_KIDS_MFK" in selector
+                result = Locator(matched)
+                self.locators[selector] = result
+                return result
+
+            async def wait_for_timeout(self, _milliseconds):
+                return None
+
+        app = YouTubeVideo(
+            "受众测试",
+            "/not/used.mp4",
+            [],
+            "/not/used.json",
+        )
+        app.made_for_kids = True
+        page = Page()
+        asyncio.run(app.set_audience(page))
+        target = next(
+            locator
+            for selector, locator in page.locators.items()
+            if "VIDEO_MADE_FOR_KIDS_MFK" in selector
+        )
+        self.assertTrue(target.clicked)
+
+    def test_audience_selection_stops_when_readback_is_missing(self) -> None:
+        class Locator:
+            first = None
+
+            def __init__(self):
+                self.first = self
+
+            async def count(self):
+                return 1
+
+            async def is_visible(self):
+                return True
+
+            async def click(self):
+                return None
+
+            async def evaluate(self, _script):
+                return False
+
+        class Page:
+            def locator(self, _selector):
+                return Locator()
+
+            async def wait_for_timeout(self, _milliseconds):
+                return None
+
+        app = YouTubeVideo(
+            "受众测试",
+            "/not/used.mp4",
+            [],
+            "/not/used.json",
+        )
+        with self.assertRaisesRegex(RuntimeError, "无法回读确认"):
+            asyncio.run(app.set_audience(Page()))
 
 
 if __name__ == "__main__":

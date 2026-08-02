@@ -76,6 +76,71 @@ def _facebook_state(payload: dict[str, Any]) -> str:
     ).strip().lower()
 
 
+def _instagram_fields_match(
+    payload: dict[str, Any],
+    request: UploadRequest,
+) -> tuple[bool, str]:
+    expected_caption_parts = [
+        part.strip()
+        for part in (request.title, request.description)
+        if str(part or "").strip()
+    ]
+    if request.tags:
+        expected_caption_parts.append(
+            " ".join(
+                f"#{str(tag).strip().lstrip('#')}"
+                for tag in request.tags
+                if str(tag).strip().lstrip("#")
+            )
+        )
+    expected_caption = "\n\n".join(expected_caption_parts)
+    checks = {
+        "Reels 类型": str(payload.get("media_product_type") or "").upper()
+        == "REELS",
+        "文案": str(payload.get("caption") or "") == expected_caption,
+        "AI 声明": bool(payload.get("is_ai_generated"))
+        == bool(request.ai_generated),
+    }
+    failed = [label for label, verified in checks.items() if not verified]
+    return not failed, (
+        "Instagram Reels 类型、文案与 AI 声明已回读"
+        if not failed
+        else "Instagram 字段回读不一致：" + "、".join(failed)
+    )
+
+
+def _facebook_fields_match(
+    payload: dict[str, Any],
+    request: UploadRequest,
+) -> tuple[bool, str]:
+    expected_description_parts = [
+        part.strip()
+        for part in (request.title, request.description)
+        if str(part or "").strip()
+    ]
+    if request.tags:
+        expected_description_parts.append(
+            " ".join(
+                f"#{str(tag).strip().lstrip('#')}"
+                for tag in request.tags
+                if str(tag).strip().lstrip("#")
+            )
+        )
+    expected_description = "\n\n".join(expected_description_parts)
+    checks = {
+        "标题": str(payload.get("title") or "")
+        == str(request.title or "").strip()[:255],
+        "描述": str(payload.get("description") or "")
+        == expected_description,
+    }
+    failed = [label for label, verified in checks.items() if not verified]
+    return not failed, (
+        "Facebook Reel 标题与描述已回读"
+        if not failed
+        else "Facebook 字段回读不一致：" + "、".join(failed)
+    )
+
+
 class _MetaCapabilityBase(OverseasPlatformCapability):
     platform: OverseasPlatform
     operations: frozenset[OverseasOperation]
@@ -251,9 +316,13 @@ class InstagramCapability(_MetaCapabilityBase):
         media_id = self.api.publish_instagram_reel(container_id, asset)
         media = self.api.read_instagram_media(media_id, asset)
         found = str(media.get("id") or "").strip() == media_id
+        fields_verified, fields_message = _instagram_fields_match(
+            media,
+            request,
+        )
         return UploadResult(
             platform=self.platform,
-            accepted=found,
+            accepted=found and fields_verified,
             operation_reference=f"media:{asset.instagram_account_id}:{media_id}",
             evidence=(
                 upload_evidence,
@@ -266,8 +335,12 @@ class InstagramCapability(_MetaCapabilityBase):
                 ),
                 EvidenceRecord(
                     stage=EvidenceStage.RESULT_READBACK,
-                    verified=found,
-                    message="Instagram 已回读到目标 Reel" if found else "Instagram 尚未回读到目标 Reel",
+                    verified=found and fields_verified,
+                    message=(
+                        fields_message
+                        if found
+                        else "Instagram 尚未回读到目标 Reel"
+                    ),
                     recorded_at=current,
                     reference=media_id,
                 ),
@@ -331,13 +404,17 @@ class FacebookCapability(_MetaCapabilityBase):
         video_id = str(upload.get("video_id") or "").strip()
         self.api.upload_facebook_video(upload, asset, request.video_path)
         self.api.finish_facebook_reel(video_id, asset, request)
-        readback = self.api.read_facebook_reel(video_id, asset)
+        readback = self.api.wait_facebook_reel(video_id, asset)
         state = _facebook_state(readback)
         found = str(readback.get("id") or "").strip() == video_id
+        fields_verified, fields_message = _facebook_fields_match(
+            readback,
+            request,
+        )
         current = _now()
         return UploadResult(
             platform=self.platform,
-            accepted=found,
+            accepted=found and fields_verified,
             operation_reference=f"{asset.page_id}:{video_id}",
             evidence=(
                 EvidenceRecord(
@@ -356,8 +433,11 @@ class FacebookCapability(_MetaCapabilityBase):
                 ),
                 EvidenceRecord(
                     stage=EvidenceStage.RESULT_READBACK,
-                    verified=found,
-                    message=f"Facebook 平台回读状态 {state}",
+                    verified=found and fields_verified,
+                    message=(
+                        f"Facebook 平台回读状态 {state}；"
+                        f"{fields_message}"
+                    ),
                     recorded_at=current,
                     reference=video_id,
                 ),

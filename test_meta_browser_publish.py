@@ -111,6 +111,23 @@ class MetaBrowserServiceTests(unittest.TestCase):
         self.assertFalse(checked["ok"])
         self.assertTrue(any("两项独立确认" in item for item in checked["errors"]))
 
+    def test_validation_blocks_options_the_browser_cannot_read_back(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            video = root / "video.mp4"
+            video.write_bytes(b"video")
+            account = root / "meta.json"
+            account.write_text("{}", encoding="utf-8")
+            payload = self._payload(video, account.name)
+            payload.update({"shareToFeed": False, "aiGenerated": True})
+            with patch.object(overseas_browser_publish, "COOKIE_DIR", root):
+                checked = overseas_browser_publish.validate_meta_browser_publish_payload(
+                    payload
+                )
+        self.assertFalse(checked["ok"])
+        self.assertTrue(any("仅 Reels" in item for item in checked["errors"]))
+        self.assertTrue(any("AI 声明" in item for item in checked["errors"]))
+
     def test_verified_wrapper_requires_platform_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

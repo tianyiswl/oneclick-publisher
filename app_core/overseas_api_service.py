@@ -41,6 +41,57 @@ PLATFORM_NAMES = {
 }
 
 
+def _combined_caption(payload: dict[str, Any]) -> str:
+    parts = [
+        value
+        for value in (
+            str(payload.get("title") or "").strip(),
+            str(payload.get("description") or "").strip(),
+        )
+        if value
+    ]
+    tags = [
+        str(item).strip().lstrip("#")
+        for item in payload.get("tags") or []
+        if str(item).strip().lstrip("#")
+    ]
+    if tags:
+        parts.append(" ".join(f"#{item}" for item in tags))
+    return "\n\n".join(parts)
+
+
+def _platform_field_errors(
+    payload: dict[str, Any],
+    platform_type: int,
+) -> list[str]:
+    """校验会被官方通道真实写入的平台字段。"""
+
+    errors: list[str] = []
+    title = str(payload.get("title") or "").strip()
+    description = str(payload.get("description") or "")
+    if platform_type == 7:
+        if len(title) > 100:
+            errors.append("YouTube 标题不能超过 100 个字符")
+        if len(description.encode("utf-8")) > 5000:
+            errors.append("YouTube 描述不能超过 5000 字节")
+    elif platform_type in {8, 9}:
+        limit = 2200 if platform_type == 8 else 2048
+        caption = _combined_caption(payload)
+        if not caption:
+            errors.append(f"{PLATFORM_NAMES[platform_type]} 合并文案不能为空")
+        elif len(caption) > limit:
+            errors.append(
+                f"{PLATFORM_NAMES[platform_type]} 合并文案不能超过 "
+                f"{limit} 个字符，一键发不会静默截断"
+            )
+    if platform_type == 9 and payload.get("aiGenerated") is True:
+        errors.append(
+            "Facebook Reels 官方发布端点尚未提供已验证的 "
+            "AI 自声明字段；已阻止遗漏声明的发布"
+        )
+    return errors
+
+
 def _run(coroutine):
     """在同步服务线程中执行官方适配器协程。"""
 
@@ -148,6 +199,7 @@ def validate_official_preflight_payload(payload: dict[str, Any]) -> dict[str, An
         errors.append("视频素材不存在")
     if not str(payload.get("title") or "").strip():
         errors.append("平台标题不能为空")
+    errors.extend(_platform_field_errors(payload, platform_type))
     if payload.get("enableTimer"):
         try:
             _schedule(payload)
@@ -197,8 +249,12 @@ def run_official_preflight_sync(payload: dict[str, Any]) -> dict[str, Any]:
         "uploaded": False,
         "published": False,
         "message": (
-            f"{PLATFORM_NAMES[platform_type]} 官方 API 本地预检通过；"
-            "已验证账号引用、授权状态、视频、标题与可见性，"
+            "TikTok 官方收件箱本地预检通过；已验证账号引用、"
+            "授权状态与视频。收件箱接口只传视频，标题、文案和发布"
+            "仍需在 TikTok 内完成；未调用上传或发布接口"
+            if platform_type == 6
+            else f"{PLATFORM_NAMES[platform_type]} 官方 API 本地预检通过；"
+            "已验证账号引用、授权状态、视频及平台字段，"
             "未调用平台上传或发布接口"
         ),
     }
@@ -474,6 +530,7 @@ def validate_official_publish_payload(payload: dict[str, Any]) -> dict[str, Any]
         errors.append("视频素材不存在")
     if not str(payload.get("title") or "").strip():
         errors.append("平台标题不能为空")
+    errors.extend(_platform_field_errors(payload, platform_type))
 
     if payload.get("enableTimer"):
         try:
@@ -546,6 +603,8 @@ def run_official_publish_sync(payload: dict[str, Any]) -> dict[str, Any]:
             scheduled_at=scheduled_at,
             made_for_kids=bool(payload.get("madeForKids", False)),
             ai_generated=bool(payload.get("aiGenerated", False)),
+            notify_subscribers=bool(payload.get("notifySubscribers", True)),
+            share_to_feed=bool(payload.get("shareToFeed", True)),
             user_confirmed_upload=True,
         )
         result = _run(capability.upload(request))
