@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import platform
 import plistlib
@@ -77,7 +78,63 @@ def build_icon(icon_png: Path, icon_root: Path) -> Path:
     return icon_path
 
 
-def write_spec(spec_path: Path, icon_path: Path) -> None:
+def resolve_playwright_browser_dirs(
+    browser_cache: Path,
+    browsers_manifest: Path,
+) -> list[Path]:
+    """解析当前 Playwright 版本实际需要随客户端携带的 Chromium 资源。"""
+
+    required_names = {"chromium", "chromium-headless-shell", "ffmpeg"}
+    manifest = json.loads(browsers_manifest.read_text(encoding="utf-8"))
+    records = {
+        item.get("name"): item
+        for item in manifest.get("browsers", [])
+        if item.get("name") in required_names
+    }
+    missing_records = sorted(required_names - records.keys())
+    if missing_records:
+        raise RuntimeError(
+            "Playwright 浏览器清单缺少：" + "、".join(missing_records)
+        )
+
+    browser_dirs: list[Path] = []
+    missing_dirs: list[str] = []
+    for name in ("chromium", "chromium-headless-shell", "ffmpeg"):
+        revision = str(records[name]["revision"])
+        directory_name = f"{name.replace('-', '_')}-{revision}"
+        source = browser_cache / directory_name
+        if source.is_dir():
+            browser_dirs.append(source.resolve())
+        else:
+            missing_dirs.append(directory_name)
+    if missing_dirs:
+        raise RuntimeError(
+            "缺少打包所需的 Playwright 浏览器资源："
+            + "、".join(missing_dirs)
+            + "。请先执行 .venv/bin/python -m playwright install chromium"
+        )
+    return browser_dirs
+
+
+def find_playwright_browser_dirs() -> list[Path]:
+    """从当前虚拟环境清单和本机 Playwright 缓存确定资源版本。"""
+
+    import playwright
+
+    package_root = Path(playwright.__file__).resolve().parent
+    manifest = package_root / "driver" / "package" / "browsers.json"
+    configured_cache = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip()
+    if configured_cache and configured_cache != "0":
+        browser_cache = Path(configured_cache).expanduser()
+    else:
+        browser_cache = Path.home() / "Library" / "Caches" / "ms-playwright"
+    return resolve_playwright_browser_dirs(browser_cache, manifest)
+
+
+def write_spec(
+    spec_path: Path,
+    icon_path: Path,
+) -> None:
     assets = ROOT / "ui" / "assets"
     stealth = ROOT / "utils" / "stealth.min.js"
     spec = f'''# -*- mode: python ; coding: utf-8 -*-
@@ -145,6 +202,28 @@ app = BUNDLE(
 )
 '''
     spec_path.write_text(spec, encoding="utf-8")
+
+
+def bundle_playwright_browsers(
+    app_path: Path,
+    browser_dirs: list[Path],
+) -> Path:
+    """在 PyInstaller 完成后原样复制浏览器，避免破坏 Chromium 内嵌签名结构。"""
+
+    target_root = (
+        app_path
+        / "Contents"
+        / "Resources"
+        / "runtime"
+        / "playwright-browsers"
+    )
+    target_root.mkdir(parents=True, exist_ok=True)
+    for source in browser_dirs:
+        target = target_root / source.name
+        if target.exists():
+            raise RuntimeError(f"浏览器资源目标已存在：{target}")
+        shutil.copytree(source, target, symlinks=True)
+    return target_root
 
 
 def set_bundle_metadata(app_path: Path) -> None:
@@ -232,6 +311,7 @@ def main() -> int:
         build_root / "icon",
     )
     spec_path = build_root / "一键发.spec"
+    playwright_browser_dirs = find_playwright_browser_dirs()
     write_spec(spec_path, icon_path)
     run(
         [
@@ -248,6 +328,7 @@ def main() -> int:
 
     app_path = release_root / f"{APP_NAME}.app"
     set_bundle_metadata(app_path)
+    bundle_playwright_browsers(app_path, playwright_browser_dirs)
     run(["xattr", "-cr", str(app_path)])
     run(["codesign", "--force", "--deep", "--sign", "-", str(app_path)])
     run(["codesign", "--verify", "--deep", "--strict", str(app_path)])
@@ -267,6 +348,19 @@ def main() -> int:
     )
     if "NATIVE_DESKTOP_UI_OK" not in completed.stdout:
         raise RuntimeError("打包客户端未通过离屏界面自检")
+
+    browser_completed = subprocess.run(
+        [str(executable), "--browser-self-test"],
+        cwd=ROOT,
+        env=test_env,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=90,
+    )
+    if "NATIVE_DESKTOP_BROWSER_OK" not in browser_completed.stdout:
+        raise RuntimeError("打包客户端未通过内置浏览器自检")
 
     zip_path = release_parent / f"一键发_{APP_VERSION}_macOS_arm64_{args.date}.zip"
     if zip_path.exists():

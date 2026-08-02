@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from app_core import publish_runtime
 from myUtils import postVideo
@@ -26,6 +27,24 @@ class EmbeddedCapabilitiesTests(unittest.TestCase):
         script_path = ROOT_DIR / "utils" / "stealth.min.js"
         self.assertTrue(script_path.is_file())
         self.assertGreater(script_path.stat().st_size, 100)
+
+    def test_macos_bundle_resources_are_browser_candidates(self) -> None:
+        executable = Path("/Applications/一键发.app/Contents/MacOS/一键发")
+        with (
+            patch.object(
+                base_social_media.sys,
+                "_MEIPASS",
+                "/tmp/Frameworks",
+                create=True,
+            ),
+            patch.object(base_social_media.sys, "executable", str(executable)),
+        ):
+            candidates = base_social_media._runtime_base_dirs()
+
+        self.assertIn(
+            Path("/Applications/一键发.app/Contents/Resources"),
+            candidates,
+        )
 
     def test_domestic_platform_entrypoints_are_callable(self) -> None:
         entrypoints = (

@@ -88,17 +88,34 @@ def is_publish_background_mode() -> bool:
     return bool(get_publish_context().get("background_mode"))
 
 
-def _runtime_base_dir() -> Path:
+def _runtime_base_dirs() -> list[Path]:
+    """返回源码态及 macOS 应用包内可能的只读资源根目录。"""
+
+    candidates: list[Path] = []
     frozen_base = getattr(sys, "_MEIPASS", None)
-    return Path(frozen_base) if frozen_base else Path(RESOURCE_DIR)
+    if frozen_base:
+        candidates.append(Path(frozen_base))
+        # PyInstaller 的 macOS BUNDLE 会把数据文件放在 Contents/Resources，
+        # 而 _MEIPASS 在部分版本中指向 Contents/Frameworks。
+        candidates.append(Path(sys.executable).resolve().parent.parent / "Resources")
+    candidates.append(Path(RESOURCE_DIR))
+
+    unique: list[Path] = []
+    for candidate in candidates:
+        if candidate not in unique:
+            unique.append(candidate)
+    return unique
 
 
 def _configure_bundled_playwright_browsers(announce: bool = True) -> Path | None:
-    candidates = [
-        _runtime_base_dir() / "runtime" / "playwright-browsers",
-        Path(RESOURCE_DIR) / "runtime" / "playwright-browsers",
-        Path(RESOURCE_DIR) / "third_party" / "playwright" / "ms-playwright",
-    ]
+    candidates = []
+    for base_dir in _runtime_base_dirs():
+        candidates.extend(
+            (
+                base_dir / "runtime" / "playwright-browsers",
+                base_dir / "third_party" / "playwright" / "ms-playwright",
+            )
+        )
     for candidate in candidates:
         if candidate.exists():
             os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(candidate)
