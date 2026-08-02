@@ -551,6 +551,49 @@ def apply_style(app: QApplication) -> None:
         QListWidget::item { padding: 7px 8px; border-bottom: 1px solid #F0F2F5; }
         QListWidget::item:hover { background: #F7F9FB; }
         QListWidget::item:selected { background: #E8F5F3; color: #075F59; }
+        QListWidget#douyinLocationResults {
+            background: #FFFFFF;
+            border: 1px solid #DCE5E8;
+            border-radius: 10px;
+            padding: 4px;
+            outline: none;
+        }
+        QListWidget#douyinLocationResults::item {
+            min-height: 82px;
+            padding: 0;
+            border-bottom: 1px solid #EEF2F3;
+            border-radius: 7px;
+        }
+        QListWidget#douyinLocationResults::item:hover {
+            background: #F4F9F8;
+        }
+        QListWidget#douyinLocationResults::item:selected {
+            background: #E1F3EF;
+            color: #075F59;
+        }
+        QLabel#douyinLocationResultsTitle {
+            color: #536273;
+            font-size: 12px;
+            font-weight: 600;
+            padding: 5px 2px 0;
+        }
+        QLabel#douyinLocationName {
+            color: #182230;
+            font-size: 14px;
+            font-weight: 700;
+        }
+        QLabel#douyinLocationAddress {
+            color: #667085;
+            font-size: 12px;
+        }
+        QLabel#douyinLocationDistance {
+            color: #0B766E;
+            background: #E8F5F3;
+            border-radius: 5px;
+            padding: 2px 6px;
+            font-size: 11px;
+            font-weight: 600;
+        }
         QListWidget#accountTargetList::item {
             min-height: 34px;
             padding: 3px 7px;

@@ -50,16 +50,18 @@ from app_core import (
     account_service,
     collection_service,
     content_bundle,
+    douyin_location_service,
     media_service,
     mobai_release_importer,
     publish_config_service,
     publish_service,
     task_service,
     wechat_content_bundle,
-    xhs_content_bundle,
+    wechat_publish_policy,
     oneclick_capabilities,
 )
 from app_core.paths import VIDEO_DIR
+from app_core.wechat_verification import verification_broker
 
 from .common import ROOT_DIR, button
 from .background_task import BackgroundTaskRunner
@@ -67,6 +69,7 @@ from .login_dialog import LoginDialog
 from .media_context_menu import build_media_context_menu
 from .platform_open import open_path, reveal_in_folder
 from .timer_dialog import TimerDialog
+from .wechat_verification_dialog import WechatVerificationDialog
 
 
 BILI_PARTITIONS = [
@@ -357,10 +360,23 @@ class PublishPage(QWidget):
         self._media_rows: list[dict] = []
         self._selected_account_ids: set[int] = set()
         self._selected_media_ids: set[int] = set()
+        self._imported_article_image_specs: dict[int, dict[str, str]] = {}
+        self._imported_ai_disclosure: dict[str, object] = {}
+        self._ai_declaration_explicitly_confirmed = False
         self._cover_rows_signature: tuple | None = None
         self._cover_pixmap_cache: dict[str, tuple[int, int, QPixmap]] = {}
+        self._wechat_verification_dialog: WechatVerificationDialog | None = None
         self.collection_tasks = BackgroundTaskRunner(self)
+        self.location_tasks = BackgroundTaskRunner(self)
         self.account_health_tasks = BackgroundTaskRunner(self)
+        self._douyin_selected_location: dict[str, object] = {}
+        self._douyin_location_query = ""
+        self._douyin_location_search_timer = QTimer(self)
+        self._douyin_location_search_timer.setSingleShot(True)
+        self._douyin_location_search_timer.setInterval(450)
+        self._douyin_location_search_timer.timeout.connect(
+            self.search_douyin_locations
+        )
         self.content_type = "video"
 
         root_layout = QVBoxLayout(self)
@@ -549,6 +565,11 @@ class PublishPage(QWidget):
         self.restore_publish_content(show_message=False)
         self._sync_content_type_interface()
         self.workflow_stack.setCurrentWidget(self.type_selector_page)
+
+    def _mark_ai_declaration_explicitly_confirmed(self, checked: bool) -> None:
+        """只把用户亲自点击视为平台 AI 声明授权。"""
+
+        self._ai_declaration_explicitly_confirmed = bool(checked)
 
     def _build_content_type_selector(self) -> QWidget:
         """发布中心入口：先明确内容类型，再进入对应的适配界面。"""
@@ -854,6 +875,9 @@ class PublishPage(QWidget):
         self.original_declaration.setToolTip("仅在确认拥有完整原创权利时开启。")
         self.ai_generated_content = QCheckBox("AI 生成内容")
         self.ai_generated_content.setToolTip("作品包含 AI 生成或合成的画面、声音等内容时开启。")
+        self.ai_generated_content.clicked.connect(
+            self._mark_ai_declaration_explicitly_confirmed
+        )
         self.common_visibility = QComboBox()
         self.common_visibility.setMinimumWidth(118)
         self.common_visibility.addItem("公开", "public")
@@ -947,6 +971,12 @@ class PublishPage(QWidget):
         self.platform_cover_43: dict[int, QComboBox] = {}
         self.platform_cover_previews: dict[tuple[int, str], CoverPreviewCanvas] = {}
         self.douyin_sync_toutiao: QCheckBox | None = None
+        self.douyin_location_keyword: QLineEdit | None = None
+        self.douyin_location_search_button: QPushButton | None = None
+        self.douyin_location_results_title: QLabel | None = None
+        self.douyin_location_results: QListWidget | None = None
+        self.douyin_location_status: QLabel | None = None
+        self.wechat_group_notification: QCheckBox | None = None
         for platform_type in account_service.PLATFORM_ORDER:
             editor = self._build_platform_editor(platform_type)
             self.platform_editors[platform_type] = editor
@@ -1078,7 +1108,75 @@ class PublishPage(QWidget):
             settings_layout.setContentsMargins(12, 10, 12, 10)
             self.douyin_sync_toutiao = QCheckBox("同步发布到今日头条")
             self.douyin_sync_toutiao.setChecked(False)
-            settings_layout.addRow("同步发布", self.douyin_sync_toutiao)
+            self.douyin_location_keyword = QLineEdit()
+            self.douyin_location_keyword.setPlaceholderText("输入地点名称；留空不添加")
+            self.douyin_location_keyword.setClearButtonEnabled(True)
+            self.douyin_location_keyword.setMaxLength(80)
+            self.douyin_location_keyword.setToolTip(
+                "输入至少 2 个字后，使用当前抖音会话在后台搜索官方地点。"
+            )
+            self.douyin_location_keyword.textEdited.connect(
+                self._douyin_location_text_edited
+            )
+            self.douyin_location_keyword.returnPressed.connect(
+                self.search_douyin_locations
+            )
+            self.douyin_location_search_button = button(
+                "搜索", variant="secondary", compact=True
+            )
+            self.douyin_location_search_button.setToolTip(
+                "使用当前已选抖音账号的本地会话读取官方地点候选"
+            )
+            self.douyin_location_search_button.clicked.connect(
+                self.search_douyin_locations
+            )
+            settings_layout.setHorizontalSpacing(14)
+            settings_layout.setVerticalSpacing(10)
+            settings_layout.addRow("同步设置", self.douyin_sync_toutiao)
+
+            douyin_location_search_row = QWidget()
+            douyin_location_search_layout = QHBoxLayout(douyin_location_search_row)
+            douyin_location_search_layout.setContentsMargins(0, 0, 0, 0)
+            douyin_location_search_layout.setSpacing(8)
+            douyin_location_search_layout.addWidget(
+                self.douyin_location_keyword,
+                1,
+            )
+            douyin_location_search_layout.addWidget(
+                self.douyin_location_search_button
+            )
+            settings_layout.addRow("发布定位", douyin_location_search_row)
+
+            self.douyin_location_results_title = QLabel(
+                "地点候选 · 名称与完整地址"
+            )
+            self.douyin_location_results_title.setObjectName(
+                "douyinLocationResultsTitle"
+            )
+            self.douyin_location_results_title.setVisible(False)
+            settings_layout.addRow(self.douyin_location_results_title)
+            self.douyin_location_results = QListWidget()
+            self.douyin_location_results.setObjectName("douyinLocationResults")
+            self.douyin_location_results.setAlternatingRowColors(False)
+            self.douyin_location_results.setHorizontalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+            )
+            self.douyin_location_results.setVerticalScrollMode(
+                QListWidget.ScrollMode.ScrollPerPixel
+            )
+            self.douyin_location_results.setFixedHeight(292)
+            self.douyin_location_results.itemClicked.connect(
+                self._select_douyin_location_item
+            )
+            self.douyin_location_results.setVisible(False)
+            settings_layout.addRow(self.douyin_location_results)
+
+            self.douyin_location_status = QLabel(
+                "输入至少 2 个字，一键发会在后台读取抖音官方地点"
+            )
+            self.douyin_location_status.setProperty("role", "muted")
+            self.douyin_location_status.setWordWrap(True)
+            settings_layout.addRow("", self.douyin_location_status)
             body_layout.addWidget(settings)
         elif platform_type == 5:
             settings = QFrame()
@@ -1113,6 +1211,19 @@ class PublishPage(QWidget):
             visibility.addItem("不公开", "unlisted")
             self.platform_visibility[platform_type] = visibility
             settings_layout.addRow("可见性", visibility)
+            body_layout.addWidget(settings)
+        elif platform_type == 10:
+            settings = QFrame()
+            settings.setProperty("subPanel", True)
+            settings_layout = QFormLayout(settings)
+            settings_layout.setContentsMargins(12, 10, 12, 10)
+            self.wechat_group_notification = QCheckBox("开启群发通知")
+            self.wechat_group_notification.setChecked(True)
+            self.wechat_group_notification.setToolTip(
+                "公众号新发布默认开启；只有你明确取消勾选时才关闭。"
+                "分组通知由公众号根据群发设置联动。"
+            )
+            settings_layout.addRow("通知方式", self.wechat_group_notification)
             body_layout.addWidget(settings)
 
         body_layout.addStretch()
@@ -1264,7 +1375,7 @@ class PublishPage(QWidget):
         if names:
             account_text = f"{len(accounts)} 个账号共同" if len(accounts) > 1 else "当前账号"
             self._set_collection_status(platform_type, f"已加载{account_text}合集 {len(names)} 个", "success")
-        elif any(by_account.values()):
+        elif isinstance(by_account, dict) and any(by_account.values()):
             self._set_collection_status(platform_type, "已缓存合集，但所选账号没有共同合集", "warning")
         else:
             self._set_collection_status(platform_type, "尚未同步")
@@ -1349,6 +1460,259 @@ class PublishPage(QWidget):
         )
         if not started:
             self._set_collection_status(platform_type, "合集同步任务正在运行")
+
+    def _set_douyin_location_status(
+        self,
+        text: str,
+        role: str = "muted",
+    ) -> None:
+        if self.douyin_location_status is None:
+            return
+        self.douyin_location_status.setText(text)
+        self.douyin_location_status.setProperty("role", role)
+        self.douyin_location_status.style().unpolish(self.douyin_location_status)
+        self.douyin_location_status.style().polish(self.douyin_location_status)
+
+    def _douyin_location_text_edited(self, value: str) -> None:
+        """用户改动搜索词后作废旧 POI，避免界面文字与任务地点不一致。"""
+
+        self._douyin_selected_location = {}
+        self._douyin_location_query = ""
+        if self.douyin_location_results is not None:
+            self.douyin_location_results.clear()
+            self.douyin_location_results.setVisible(False)
+        if self.douyin_location_results_title is not None:
+            self.douyin_location_results_title.setVisible(False)
+        self._douyin_location_search_timer.stop()
+        keyword = " ".join(str(value or "").split())
+        if not keyword:
+            self._set_douyin_location_status("未添加定位")
+            return
+        if len(keyword) < douyin_location_service.MIN_KEYWORD_LENGTH:
+            self._set_douyin_location_status("再输入 1 个字即可搜索官方地点")
+            return
+        self._set_douyin_location_status("等待搜索…")
+        self._douyin_location_search_timer.start()
+
+    def search_douyin_locations(self) -> None:
+        """在后台读取抖音官方 POI 候选，不上传素材或创建平台内容。"""
+
+        if self.douyin_location_keyword is None:
+            return
+        self._douyin_location_search_timer.stop()
+        keyword = " ".join(self.douyin_location_keyword.text().split())
+        try:
+            keyword = douyin_location_service.normalize_location_keyword(keyword)
+        except Exception as exc:
+            self._set_douyin_location_status(str(exc), "warning")
+            return
+
+        accounts = self._platform_accounts(3)
+        if len(accounts) != 1:
+            message = (
+                "请先勾选一个抖音账号再搜索地点"
+                if not accounts
+                else "同时选中了多个抖音账号，请保留一个后搜索地点"
+            )
+            self._set_douyin_location_status(message, "warning")
+            return
+        if self.location_tasks.is_running("douyin-location-search"):
+            self._set_douyin_location_status("当前地点搜索尚未完成，已记录最新输入…")
+            return
+
+        account = dict(accounts[0])
+        source_account_id = int(account.get("id") or 0)
+        self._douyin_location_query = keyword
+        search_button = self.douyin_location_search_button
+
+        def on_started() -> None:
+            if search_button:
+                search_button.setEnabled(False)
+                search_button.setText("搜索中")
+            self._set_douyin_location_status(
+                f"正在后台读取“{keyword}”的抖音官方地点…"
+            )
+
+        def on_success(rows: object) -> None:
+            current = " ".join(self.douyin_location_keyword.text().split())
+            current_accounts = {
+                int(item.get("id") or 0)
+                for item in self._platform_accounts(3)
+            }
+            if current != keyword or source_account_id not in current_accounts:
+                return
+            self._show_douyin_location_results(
+                rows if isinstance(rows, list) else [],
+                source_account_id=source_account_id,
+            )
+
+        def on_error(message: str) -> None:
+            current = " ".join(self.douyin_location_keyword.text().split())
+            if current == keyword:
+                self._set_douyin_location_status(message, "danger")
+                if self.douyin_location_results is not None:
+                    self.douyin_location_results.clear()
+                    self.douyin_location_results.setVisible(False)
+                if self.douyin_location_results_title is not None:
+                    self.douyin_location_results_title.setVisible(False)
+
+        def on_finished() -> None:
+            if search_button:
+                search_button.setEnabled(True)
+                search_button.setText("搜索")
+            current = " ".join(self.douyin_location_keyword.text().split())
+            if (
+                current
+                and current != keyword
+                and len(current) >= douyin_location_service.MIN_KEYWORD_LENGTH
+            ):
+                self._douyin_location_search_timer.start()
+
+        self.location_tasks.run(
+            "douyin-location-search",
+            lambda: douyin_location_service.search_douyin_locations(
+                account,
+                keyword,
+            ),
+            on_started=on_started,
+            on_success=on_success,
+            on_error=on_error,
+            on_finished=on_finished,
+        )
+
+    def _show_douyin_location_results(
+        self,
+        rows: list[object],
+        *,
+        source_account_id: int,
+    ) -> None:
+        if self.douyin_location_results is None:
+            return
+        self.douyin_location_results.clear()
+        valid_rows = []
+        for value in rows:
+            candidate = douyin_location_service.normalize_location_candidate(value)
+            if not candidate:
+                continue
+            candidate["sourceAccountId"] = source_account_id
+            valid_rows.append(candidate)
+            address = candidate.get("address") or "平台未返回详细地址"
+            tooltip = f"{candidate['name']}\n{address}"
+            if candidate.get("distance"):
+                tooltip += f"\n距离：{candidate['distance']}"
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole, candidate)
+            item.setToolTip(tooltip)
+            item.setSizeHint(QSize(0, 82))
+            self.douyin_location_results.addItem(item)
+            self.douyin_location_results.setItemWidget(
+                item,
+                self._douyin_location_candidate_widget(candidate),
+            )
+        self.douyin_location_results.setVisible(bool(valid_rows))
+        if self.douyin_location_results_title is not None:
+            self.douyin_location_results_title.setVisible(bool(valid_rows))
+        if valid_rows:
+            self._set_douyin_location_status(
+                f"找到 {len(valid_rows)} 个官方地点，请明确选择一项",
+                "success",
+            )
+        else:
+            self._set_douyin_location_status(
+                "未找到匹配地点，请尝试更完整的地点名称",
+                "warning",
+            )
+
+    @staticmethod
+    def _douyin_location_candidate_widget(candidate: dict[str, object]) -> QWidget:
+        """以双行信息卡完整呈现地点，避免 Qt 默认委托省略地址。"""
+
+        card = QWidget()
+        card.setObjectName("douyinLocationCandidateCard")
+        card.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(12, 8, 12, 8)
+        layout.setSpacing(4)
+
+        heading = QWidget()
+        heading.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        heading_layout = QHBoxLayout(heading)
+        heading_layout.setContentsMargins(0, 0, 0, 0)
+        heading_layout.setSpacing(10)
+
+        name = QLabel(str(candidate.get("name") or "未命名地点"))
+        name.setObjectName("douyinLocationName")
+        name.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        heading_layout.addWidget(name, 1)
+
+        distance_text = str(candidate.get("distance") or "").strip()
+        if distance_text:
+            distance = QLabel(distance_text)
+            distance.setObjectName("douyinLocationDistance")
+            distance.setAttribute(
+                Qt.WidgetAttribute.WA_TransparentForMouseEvents,
+                True,
+            )
+            heading_layout.addWidget(distance, 0, Qt.AlignmentFlag.AlignTop)
+        layout.addWidget(heading)
+
+        address = QLabel(
+            str(candidate.get("address") or "平台未返回详细地址")
+        )
+        address.setObjectName("douyinLocationAddress")
+        address.setWordWrap(True)
+        address.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        address.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        layout.addWidget(address)
+        return card
+
+    def _select_douyin_location_item(self, item: QListWidgetItem) -> None:
+        candidate = douyin_location_service.normalize_location_candidate(
+            item.data(Qt.ItemDataRole.UserRole)
+        )
+        if not candidate or not self.douyin_location_keyword:
+            self._set_douyin_location_status("当前地点候选数据无效，请重新搜索", "danger")
+            return
+        raw = item.data(Qt.ItemDataRole.UserRole) or {}
+        candidate["sourceAccountId"] = int(raw.get("sourceAccountId") or 0)
+        self._douyin_selected_location = candidate
+        self.douyin_location_keyword.blockSignals(True)
+        self.douyin_location_keyword.setText(candidate["name"])
+        self.douyin_location_keyword.blockSignals(False)
+        if self.douyin_location_results is not None:
+            self.douyin_location_results.setVisible(False)
+        if self.douyin_location_results_title is not None:
+            self.douyin_location_results_title.setVisible(False)
+        detail = candidate.get("address") or "平台未返回详细地址"
+        if candidate.get("distance"):
+            detail += f"  ·  {candidate['distance']}"
+        self._set_douyin_location_status(
+            f"已选择：{candidate['name']}\n{detail}",
+            "success",
+        )
+
+    def _ensure_douyin_location_account_consistency(self) -> None:
+        if not self._douyin_selected_location:
+            return
+        selected_ids = {
+            int(account.get("id") or 0)
+            for account in self._platform_accounts(3)
+        }
+        source_id = int(self._douyin_selected_location.get("sourceAccountId") or 0)
+        if source_id in selected_ids:
+            return
+        self._douyin_selected_location = {}
+        if self.douyin_location_results is not None:
+            self.douyin_location_results.clear()
+            self.douyin_location_results.setVisible(False)
+        if self.douyin_location_results_title is not None:
+            self.douyin_location_results_title.setVisible(False)
+        self._set_douyin_location_status(
+            "抖音账号已变更，请重新搜索并选择发布定位",
+            "warning",
+        )
 
     def refresh_platform_navigation(self) -> None:
         current_item = self.platform_nav.currentItem()
@@ -1720,6 +2084,7 @@ class PublishPage(QWidget):
             self.log.append(
                 f"[info] {account.get('platformName') or '平台'}登录检测完成：{status_text}"
             )
+            self._present_account_login_intervention(payload)
 
         self.account_health_tasks.run(
             task_key,
@@ -1729,11 +2094,30 @@ class PublishPage(QWidget):
             on_error=self._show_account_health_error,
         )
 
+    def _present_account_login_intervention(self, payload: dict) -> bool:
+        """检测正常时保持静默，异常时只提示手动重新登录。"""
+
+        rows = list(payload.get("interventionRequired") or [])
+        if not rows:
+            return False
+        first = rows[0]
+        platform = str(first.get("platformName") or "平台")
+        account_name = str(first.get("userName") or first.get("profileName") or "账号")
+        message = (
+            f"{platform} | {account_name} 未通过后台登录检测。\n\n"
+            "本次检测只更新账号状态，不会打开平台登录页。\n"
+            "如需扫码、验证码或恢复会话，请使用账号操作中的“重新登录”。"
+        )
+        self.account_health_label.setText("账号状态：需用户处理")
+        self.log.append(f"[warning] {message}")
+        QMessageBox.warning(self, "登录状态需处理", message)
+        return True
+
     def relogin_account(self, account: dict) -> None:
         dialog = LoginDialog(
             self,
             account,
-            background_login=self.background_mode.isChecked(),
+            background_login=True,
         )
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.refresh_accounts()
@@ -2057,9 +2441,13 @@ class PublishPage(QWidget):
             "publish_account_health",
             lambda: account_service.validate_accounts(stale_ids),
             on_started=lambda: self.account_health_label.setText("账号状态：检测中"),
-            on_success=lambda _payload: self.refresh_accounts(),
+            on_success=self._finish_selected_account_health,
             on_error=self._show_account_health_error,
         )
+
+    def _finish_selected_account_health(self, payload: dict) -> None:
+        self.refresh_accounts()
+        self._present_account_login_intervention(payload)
 
     def _show_account_health_error(self, _message: str) -> None:
         self.account_health_label.setText("账号状态：检测失败")
@@ -2078,6 +2466,7 @@ class PublishPage(QWidget):
             self._selected_account_ids.discard(account_id)
         self.update_selected_labels()
         self._reload_selected_collection_caches()
+        self._ensure_douyin_location_account_consistency()
 
     def _media_item_changed(self, item: QListWidgetItem) -> None:
         media = item.data(Qt.ItemDataRole.UserRole) or {}
@@ -2143,6 +2532,7 @@ class PublishPage(QWidget):
         self.tags_input.clear()
         self.original_declaration.setChecked(False)
         self.ai_generated_content.setChecked(False)
+        self._ai_declaration_explicitly_confirmed = False
         public_index = self.common_visibility.findData("public")
         self.common_visibility.setCurrentIndex(public_index if public_index >= 0 else 0)
         self.common_schedule_enabled.setChecked(False)
@@ -2178,6 +2568,20 @@ class PublishPage(QWidget):
         self.bili_type.setCurrentIndex(0)
         if self.douyin_sync_toutiao:
             self.douyin_sync_toutiao.setChecked(False)
+        if self.douyin_location_keyword is not None:
+            self.douyin_location_keyword.blockSignals(True)
+            self.douyin_location_keyword.clear()
+            self.douyin_location_keyword.blockSignals(False)
+        self._douyin_selected_location = {}
+        self._douyin_location_search_timer.stop()
+        if self.douyin_location_results is not None:
+            self.douyin_location_results.clear()
+            self.douyin_location_results.setVisible(False)
+        if self.douyin_location_results_title is not None:
+            self.douyin_location_results_title.setVisible(False)
+        self._set_douyin_location_status("未添加定位")
+        if self.wechat_group_notification:
+            self.wechat_group_notification.setChecked(True)
 
         self._refresh_platform_cover_previews()
         self.update_cover_summary()
@@ -2555,15 +2959,38 @@ class PublishPage(QWidget):
                 "backgroundMode": self.background_mode.isChecked(),
                 "originalDeclaration": self.original_declaration.isChecked(),
                 "aiGenerated": self.ai_generated_content.isChecked(),
+                "aiDeclarationExplicitlyConfirmed": (
+                    self._ai_declaration_explicitly_confirmed
+                ),
                 "visibility": self.common_visibility.currentData(),
                 "collectionName": self._platform_collection_name(platform_type),
                 "enableTimer": bool(schedule_time),
                 "scheduleTime": schedule_time or None,
+                "scheduleTimezone": wechat_publish_policy.local_timezone_name(),
                 "videosPerDay": 1,
                 "dailyTimes": [schedule_time[-5:]] if schedule_time else [],
                 "startDays": 0,
                 "timeJitterMinutes": 0,
             }
+            if platform_type == 10 and self.content_type == "article":
+                payload["imagePlacements"] = [
+                    {
+                        **self._imported_article_image_specs.get(
+                            int(item.get("id") or 0),
+                            {},
+                        ),
+                        "path": str(item.get("file_path") or ""),
+                    }
+                    for item in media
+                    if item.get("file_path")
+                ]
+            if platform_type in {1, 10}:
+                payload["aiDisclosure"] = dict(self._imported_ai_disclosure)
+            if platform_type == 10:
+                payload["wechatGroupNotification"] = bool(
+                    self.wechat_group_notification
+                    and self.wechat_group_notification.isChecked()
+                )
             if platform_type == 5:
                 payload.update(
                     {
@@ -2578,6 +3005,32 @@ class PublishPage(QWidget):
                     self.douyin_sync_toutiao
                     and self.douyin_sync_toutiao.isChecked()
                 )
+                location_text = (
+                    self.douyin_location_keyword.text().strip()
+                    if self.douyin_location_keyword is not None
+                    else ""
+                )
+                location = douyin_location_service.normalize_location_candidate(
+                    self._douyin_selected_location
+                )
+                if location_text:
+                    if not location or location["name"] != " ".join(location_text.split()):
+                        raise ValueError(
+                            "请从抖音官方地点搜索结果中选择发布定位，不能只填写关键词"
+                        )
+                    source_account_id = int(
+                        self._douyin_selected_location.get("sourceAccountId") or 0
+                    )
+                    selected_account_ids = {
+                        int(account.get("id") or 0) for account in selected
+                    }
+                    if source_account_id and source_account_id not in selected_account_ids:
+                        raise ValueError("抖音账号已变更，请重新搜索并选择发布定位")
+                    payload["locationKeyword"] = location["name"]
+                    payload["locationPoi"] = location
+                else:
+                    payload["locationKeyword"] = ""
+                    payload["locationPoi"] = {}
             if platform_type in self.platform_categories:
                 payload["category"] = self.platform_categories[platform_type].currentData() or None
             if platform_type in self.platform_visibility:
@@ -2915,67 +3368,6 @@ class PublishPage(QWidget):
             ),
         )
 
-    def import_xhs_content_bundle(self) -> None:
-        """安全带入小红书图文内容包，始终停留在编辑和预检阶段。"""
-
-        if self.active_task_id and self.task_timer.isActive():
-            QMessageBox.information(self, "导入小红书内容包", "当前发布任务正在执行，请等待完成后再导入。")
-            return
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "选择小红书图文内容包 manifest.json",
-            str(Path.home()),
-            "小红书内容包 (manifest.json);;JSON 文件 (*.json)",
-        )
-        if not path:
-            return
-        try:
-            bundle = xhs_content_bundle.load_xhs_content_bundle(path)
-            imported = media_service.import_files_with_records(
-                bundle["imagePaths"],
-                category="小红书内容包",
-            )
-            if len(imported) != len(bundle["imagePaths"]):
-                raise ValueError("图片导入不完整，请确认内容包中的图片均可读取")
-        except Exception as exc:
-            QMessageBox.warning(self, "导入小红书内容包", str(exc))
-            return
-
-        # 内容包只适配小红书图文：清空原素材和目标，避免混入其它平台任务。
-        self._select_content_type(1)
-        self.preflight.setChecked(True)
-        self._selected_account_ids = {
-            int(row["id"])
-            for row in account_service.list_accounts()
-            if int(row.get("type") or 0) == 1
-        }
-        self._selected_media_ids = {int(row["id"]) for row in imported}
-        tags_text = " ".join(f"#{tag}" for tag in bundle["tags"])
-        self.common_title_input.setText(bundle["title"])
-        self.title_input.setPlainText(bundle["body"])
-        self.tags_input.setPlainText(tags_text)
-        if 1 in self.platform_titles:
-            self.platform_titles[1].setText(bundle["title"])
-        if 1 in self.platform_texts:
-            self.platform_texts[1].setPlainText(bundle["body"])
-        if 1 in self.platform_tags:
-            self.platform_tags[1].setPlainText(tags_text)
-
-        self.refresh(force=True)
-        account_count = len(self._selected_account_ids)
-        account_hint = (
-            f"已选择 {account_count} 个小红书账号。"
-            if account_count
-            else "尚未发现小红书账号，请先到账号管理完成登录后再预检。"
-        )
-        QMessageBox.information(
-            self,
-            "小红书内容包已导入",
-            "已带入标题、正文、话题与图片，并强制切换为“预发布检查”。\n\n"
-            f"{account_hint}\n"
-            "导入本身不会登录、上传、保存草稿或发表；请核对内容后再点击“开始预检”。",
-        )
-
     def import_wechat_content_bundle(self) -> None:
         """安全带入公众号文字内容包，始终停留在编辑和预检阶段。"""
 
@@ -3062,6 +3454,15 @@ class PublishPage(QWidget):
                 picker.manifest_path,
                 expected_type=expected_type,
             )
+            publish_schedule = dict(bundle.get("publishSchedule") or {})
+            if publish_schedule.get("enabled"):
+                local_timezone = wechat_publish_policy.local_timezone_name()
+                if publish_schedule.get("timezone") != local_timezone:
+                    raise ValueError(
+                        "内容包定时时区与当前客户端不一致："
+                        f"内容包={publish_schedule.get('timezone')}，"
+                        f"客户端={local_timezone}"
+                    )
             source_paths = list(dict.fromkeys([
                 *bundle["assetPaths"],
                 *bundle["coverPaths"].values(),
@@ -3074,12 +3475,47 @@ class PublishPage(QWidget):
             return
 
         by_source = {str(row["sourcePath"]): row for row in imported}
+        self._imported_article_image_specs.clear()
+        self._imported_ai_disclosure = dict(bundle.get("aiDisclosure") or {})
+        self._ai_declaration_explicitly_confirmed = False
+        self.ai_generated_content.setChecked(
+            bool(
+                self._imported_ai_disclosure.get("containsAiGeneratedContent")
+                and self._imported_ai_disclosure.get(
+                    "allowPlatformAutoDeclaration"
+                )
+            )
+        )
+        self.original_declaration.setChecked(
+            bool(bundle.get("originalDeclaration", False))
+        )
+        publish_schedule = dict(bundle.get("publishSchedule") or {})
+        if publish_schedule.get("enabled"):
+            date_text, time_text = str(publish_schedule["localTime"]).split(" ", 1)
+            self.timer_values = {
+                "enableTimer": True,
+                "scheduleTime": publish_schedule["localTime"],
+                "videosPerDay": 1,
+                "dailyTimes": [time_text],
+                "startDays": 0,
+                "timeJitterMinutes": 0,
+            }
+            self._update_timer_status()
         self._select_content_type(indexes[expected_type])
         self.preflight.setChecked(True)
         self._selected_media_ids = {
             int(by_source[path]["id"])
             for path in bundle["assetPaths"]
         }
+        if expected_type == "article":
+            self._imported_article_image_specs = {
+                int(by_source[item["path"]]["id"]): {
+                    "placement": str(item.get("placement") or ""),
+                    "anchor": str(item.get("anchor") or ""),
+                    "explicit": bool(item.get("explicit")),
+                }
+                for item in bundle["articleImages"]
+            }
         preferred_platforms = set(bundle["preferredPlatforms"])
         self._selected_account_ids = {
             int(row["id"])
@@ -3123,11 +3559,22 @@ class PublishPage(QWidget):
             if selected_count
             else "内容包未匹配到可用账号，请在左侧手动选择目标账号。"
         )
+        ai_notice = ""
+        if self._imported_ai_disclosure.get("containsAiGeneratedContent"):
+            if self._imported_ai_disclosure.get(
+                "allowPlatformAutoDeclaration"
+            ):
+                ai_notice = "\nAI 内容依据已验证，内容包明确允许自动声明。"
+            else:
+                ai_notice = (
+                    "\n内容包标记了 AI 辅助，但未授权自动声明；"
+                    "正式发布前需由你亲自勾选确认。"
+                )
         QMessageBox.information(
             self,
             f"{labels[expected_type]}已导入",
             "已带入内容、素材、封面和可选平台覆盖，并强制切换为“预发布检查”。\n\n"
-            f"{account_hint}\n"
+            f"{account_hint}{ai_notice}\n"
             "导入本身不会上传、保存草稿或发表；请核对内容后再点击“开始预检”。",
         )
 
@@ -3149,6 +3596,8 @@ class PublishPage(QWidget):
             message = event.get("message") or event.get("eventType") or ""
             level = event.get("level") or "info"
             self.log.append(f"[{created}] [{level}] {message}")
+            if event.get("eventType") == "wechat_verification_required":
+                self._show_wechat_verification()
         if task.get("status") not in ("pending", "running"):
             self.task_timer.stop()
             status_text = self._status_text(status)
@@ -3174,6 +3623,26 @@ class PublishPage(QWidget):
             else:
                 self.active_task_id = None
                 QMessageBox.information(self, "发布任务完成", self._finish_message(task, status_text))
+
+    def _show_wechat_verification(self) -> None:
+        """把后台执行器的二维码带回一键发前台，不主动显示浏览器。"""
+
+        if not self.active_task_id:
+            return
+        request_id = verification_broker.request_for_task(self.active_task_id)
+        if not request_id:
+            self.log.append("[error] 微信验证请求不存在，发布已保持暂停")
+            return
+        if self._wechat_verification_dialog:
+            self._wechat_verification_dialog.raise_()
+            self._wechat_verification_dialog.activateWindow()
+            return
+        dialog = WechatVerificationDialog(request_id, self)
+        self._wechat_verification_dialog = dialog
+        try:
+            dialog.exec()
+        finally:
+            self._wechat_verification_dialog = None
 
     def preflight_complete_choice(self, task: dict, status_text: str) -> str:
         try:
@@ -3221,6 +3690,7 @@ class PublishPage(QWidget):
         try:
             payloads = json.loads(task.get("payloadJson") or "[]")
             for payload in payloads:
+                payload["runtimeMode"] = "publish"
                 payload["debugDryRun"] = False
                 payload["debugDryRunHoldBrowser"] = False
             new_task = publish_service.start_desktop_publish(payloads)
@@ -3430,6 +3900,25 @@ class PublishPage(QWidget):
                     "  今日头条同步："
                     + ("开启" if payload.get("syncToToutiao") else "关闭")
                 )
+                location = payload.get("locationPoi") or {}
+                location_text = str(location.get("name") or "").strip()
+                location_address = str(location.get("address") or "").strip()
+                if location_text and location_address:
+                    location_text = f"{location_text}（{location_address}）"
+                lines.append(f"  发布定位：{location_text or '不添加'}")
+            if int(payload.get("type")) == 10:
+                lines.append(
+                    "  群发通知："
+                    + ("开启" if payload.get("wechatGroupNotification", True) else "关闭")
+                )
+                lines.append(
+                    "  原创作者："
+                    + (
+                        "选择当前账号第一个可用作者并回读"
+                        if payload.get("originalDeclaration")
+                        else "完全跳过作者控件"
+                    )
+                )
 
         lines.append("")
         lines.append("封面设置：")
@@ -3479,6 +3968,21 @@ class PublishPage(QWidget):
             "douyinSyncToutiao": bool(
                 self.douyin_sync_toutiao
                 and self.douyin_sync_toutiao.isChecked()
+            ),
+            "douyinLocationKeyword": (
+                self.douyin_location_keyword.text().strip()
+                if self.douyin_location_keyword is not None
+                else ""
+            ),
+            "douyinLocation": (
+                douyin_location_service.normalize_location_candidate(
+                    self._douyin_selected_location
+                )
+                or {}
+            ),
+            "wechatGroupNotification": bool(
+                self.wechat_group_notification
+                and self.wechat_group_notification.isChecked()
             ),
         }
 
@@ -3633,6 +4137,12 @@ class PublishPage(QWidget):
 
         self.refresh_accounts()
         self.refresh_media()
+        if self._douyin_selected_location:
+            selected_douyin = self._platform_accounts(3)
+            if len(selected_douyin) == 1:
+                self._douyin_selected_location["sourceAccountId"] = int(
+                    selected_douyin[0].get("id") or 0
+                )
         self.refresh_covers()
         self._apply_platform_collection_values(saved_collections)
         covers = payload.get("coverPaths") or {}
@@ -3669,6 +4179,9 @@ class PublishPage(QWidget):
         self.tags_input.setPlainText(payload.get("tags", ""))
         self.original_declaration.setChecked(bool(payload.get("originalDeclaration", False)))
         self.ai_generated_content.setChecked(bool(payload.get("aiGenerated", False)))
+        self._ai_declaration_explicitly_confirmed = bool(
+            payload.get("aiDeclarationExplicitlyConfirmed", False)
+        )
         visibility_index = self.common_visibility.findData(payload.get("commonVisibility", "public"))
         self.common_visibility.setCurrentIndex(visibility_index if visibility_index >= 0 else 0)
         self.timer_values = dict(payload.get("timerValues") or {"enableTimer": False})
@@ -3719,6 +4232,41 @@ class PublishPage(QWidget):
         if self.douyin_sync_toutiao:
             self.douyin_sync_toutiao.setChecked(
                 bool(payload.get("douyinSyncToutiao", False))
+            )
+        if self.douyin_location_keyword is not None:
+            location = douyin_location_service.normalize_location_candidate(
+                payload.get("douyinLocation")
+            )
+            keyword = str(payload.get("douyinLocationKeyword") or "").strip()
+            self.douyin_location_keyword.blockSignals(True)
+            self.douyin_location_keyword.setText(
+                location["name"] if location else keyword
+            )
+            self.douyin_location_keyword.blockSignals(False)
+            self._douyin_selected_location = {}
+            if location:
+                selected_douyin = self._platform_accounts(3)
+                location["sourceAccountId"] = (
+                    int(selected_douyin[0].get("id") or 0)
+                    if len(selected_douyin) == 1
+                    else 0
+                )
+                self._douyin_selected_location = location
+                detail = location.get("address") or "平台未返回详细地址"
+                self._set_douyin_location_status(
+                    f"已恢复：{location['name']}\n{detail}",
+                    "success",
+                )
+            elif keyword:
+                self._set_douyin_location_status(
+                    "旧模板只保存了地点关键词，请重新搜索并选择官方地点",
+                    "warning",
+                )
+            else:
+                self._set_douyin_location_status("未添加定位")
+        if self.wechat_group_notification:
+            self.wechat_group_notification.setChecked(
+                bool(payload.get("wechatGroupNotification", True))
             )
 
     def _apply_platform_cover_values(self, values: dict) -> None:

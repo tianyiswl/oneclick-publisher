@@ -48,7 +48,9 @@ async def _open_backend(account: dict) -> None:
         await page.goto(plan.login_url, wait_until="domcontentloaded", timeout=45_000)
         await page.bring_to_front()
         # 不在这里做登录检测或任何发布操作；用户可像普通浏览器一样查看后台。
-        await page.wait_for_event("close")
+        # Playwright 等待事件默认 30 秒超时；账号后台是交给用户手动操作的
+        # 长驻窗口，必须一直保持到用户主动关闭页面。
+        await page.wait_for_event("close", timeout=0)
     finally:
         if context:
             await context.close()

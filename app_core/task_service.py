@@ -348,8 +348,9 @@ def mark_platform_result(
     ok: bool,
     message: str,
     content_type: str | None = None,
+    event_type: str = "platform_preflight",
 ) -> None:
-    """按平台与内容类型回填预检结果；成功只代表预检完成，不代表已发布。"""
+    """按平台与内容类型回填结果；事件类型必须准确表达预检或正式提交。"""
 
     now = _now()
     status = "success" if ok else "failed"
@@ -394,14 +395,28 @@ def mark_platform_result(
             """
             UPDATE publish_tasks
             SET status = ?, successCount = ?, failedCount = ?, skippedCount = 0,
-                lastError = CASE WHEN ? THEN ? ELSE lastError END,
+                lastError = CASE
+                    WHEN ? THEN ?
+                    WHEN ? = 0 THEN NULL
+                    ELSE lastError
+                END,
                 finishedAt = CASE WHEN ? = 0 THEN ? ELSE finishedAt END
             WHERE id = ?
             """,
-            (task_status, success, failed, 1 if not ok else 0, message, active, now, int(task_id)),
+            (
+                task_status,
+                success,
+                failed,
+                1 if not ok else 0,
+                message,
+                failed,
+                active,
+                now,
+                int(task_id),
+            ),
         )
         conn.execute(
-            "INSERT INTO publish_task_events (taskId, level, eventType, message, createdAt) VALUES (?, ?, 'platform_preflight', ?, ?)",
-            (int(task_id), "info" if ok else "error", message, now),
+            "INSERT INTO publish_task_events (taskId, level, eventType, message, createdAt) VALUES (?, ?, ?, ?, ?)",
+            (int(task_id), "info" if ok else "error", str(event_type), message, now),
         )
         conn.commit()

@@ -23,7 +23,6 @@ from myUtils.postVideo import (
     post_video_ks,
     post_video_tiktok,
     post_video_tencent,
-    post_video_xhs,
     post_video_youtube,
 )
 from utils.publish_limits import get_publish_tag_limit, normalize_publish_tags
@@ -42,6 +41,7 @@ from .account_service import (
     DRAFT_UNSUPPORTED_PLATFORM_MESSAGES,
     PLATFORMS,
 )
+from . import oneclick_preflight, xhs_publish_executor
 from .paths import COOKIE_DIR, VIDEO_DIR
 
 
@@ -345,6 +345,51 @@ def run_with_publish_context(
         return callback(*args, **kwargs)
 
 
+def _run_oneclick_xhs(
+    data: dict[str, Any],
+    task: dict[str, Any],
+) -> dict[str, Any]:
+    """旧 API 入口也强制转入一键发内置小红书执行器。"""
+
+    runtime_mode = publish_runtime_mode(data)
+    if runtime_mode == "preflight":
+        result = oneclick_preflight.run_preflight_sync(data)
+    elif runtime_mode == "publish":
+        result = xhs_publish_executor.run_xhs_publish_sync(
+            data,
+            task_id=int(task["id"]),
+        )
+        result = {"type": 1, **result}
+    else:
+        raise RuntimeError("小红书平台草稿未开放，不能调用旧发布器回退")
+    if result.get("ok") is not True:
+        raise RuntimeError(result.get("message") or "小红书内置执行器失败")
+    return result
+
+
+def _run_oneclick_xhs_batch(
+    data_list: list[dict[str, Any]],
+    task: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """批量入口中的小红书任务逐项走一键发内置执行器。"""
+
+    results: list[dict[str, Any]] = []
+    for data in data_list:
+        try:
+            result = _run_oneclick_xhs(data, task)
+            results.append(
+                {
+                    "type": 1,
+                    "ok": True,
+                    "message": result.get("message"),
+                }
+            )
+        except Exception as exc:
+            results.append({"type": 1, "ok": False, "message": str(exc)})
+            break
+    return results
+
+
 def execute_single_publish(data: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
     platform_type = int(data.get("type"))
     runtime_mode = publish_runtime_mode(data)
@@ -396,7 +441,7 @@ def execute_single_publish(data: dict[str, Any], task: dict[str, Any]) -> dict[s
     )
     try:
         if platform_type == 1:
-            run_with_publish_context(task, "single", post_video_xhs, title, file_list, tags, account_list, category, enable_timer, videos_per_day, daily_times, start_days, cover_path=cover_path, cover_paths=cover_paths, schedule_time=data.get("scheduleTime"), jitter_minutes=jitter_minutes, dry_run=dry_run, dry_run_hold_browser=dry_run_hold_browser, save_draft_only=save_draft_only, background_mode=background_mode)
+            _run_oneclick_xhs(data, task)
         elif platform_type == 2:
             run_with_publish_context(task, "single", post_video_tencent, title, file_list, tags, account_list, category, enable_timer, videos_per_day, daily_times, start_days, cover_path=cover_path, cover_paths=cover_paths, schedule_time=data.get("scheduleTime"), jitter_minutes=jitter_minutes, dry_run=dry_run, dry_run_hold_browser=dry_run_hold_browser, save_draft_only=save_draft_only, background_mode=background_mode)
         elif platform_type == 3:
@@ -493,15 +538,21 @@ def execute_batch_publish(data_list: list[dict[str, Any]], task: dict[str, Any])
         "browser_mode_selected",
         "发布流程将在无窗口后台运行" if background_mode else "发布浏览器将显示在前台",
     )
+    xhs_data = [item for item in data_list if int(item.get("type") or 0) == 1]
+    legacy_data = [item for item in data_list if int(item.get("type") or 0) != 1]
     if all_dry_run:
         try:
-            results = run_with_publish_context(
-                task,
-                "batch",
-                post_video_batch_dry_run_tabs,
-                data_list,
-                background_mode=background_mode,
-            )
+            results = _run_oneclick_xhs_batch(xhs_data, task)
+            if legacy_data:
+                results.extend(
+                    run_with_publish_context(
+                        task,
+                        "batch",
+                        post_video_batch_dry_run_tabs,
+                        legacy_data,
+                        background_mode=background_mode,
+                    )
+                )
         except Exception as exc:
             fail_task(task["id"], f"预发布检查失败：{exc}")
             return {"code": 500, "msg": f"预发布检查失败：{exc}", "data": {"taskId": task["id"], "taskNo": task["taskNo"]}}
@@ -524,14 +575,18 @@ def execute_batch_publish(data_list: list[dict[str, Any]], task: dict[str, Any])
         return {"code": 200, "msg": None, "data": {"results": results, "taskId": task["id"], "taskNo": task["taskNo"]}}
 
     try:
-        results = run_with_publish_context(
-            task,
-            "batch",
-            post_video_batch_tabs,
-            data_list,
-            dry_run=False,
-            background_mode=background_mode,
-        )
+        results = _run_oneclick_xhs_batch(xhs_data, task)
+        if legacy_data:
+            results.extend(
+                run_with_publish_context(
+                    task,
+                    "batch",
+                    post_video_batch_tabs,
+                    legacy_data,
+                    dry_run=False,
+                    background_mode=background_mode,
+                )
+            )
     except Exception as exc:
         fail_task(task["id"], f"发布失败：{exc}")
         return {"code": 500, "msg": f"发布失败：{exc}", "data": {"taskId": task["id"], "taskNo": task["taskNo"]}}

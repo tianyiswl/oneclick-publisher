@@ -14,6 +14,7 @@ import threading
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from . import account_service
 from .paths import COOKIE_DIR, USER_DATA_DIR, ensure_runtime_dirs
@@ -76,6 +77,34 @@ def saved_identity_matches(account: dict, detected_name: object) -> bool:
         "哔哩哔哩账号",
     }
     return expected in placeholders or detected == expected
+
+
+def wechat_home_session_confirms(
+    account: dict,
+    current_url: object,
+    *,
+    home_visible: bool,
+    login_visible: bool,
+    detected_name: object,
+) -> bool:
+    """用公众号后台首页与账号身份共同确认已登录会话。
+
+    新版公众号后台在复用有效 storage_state 时不一定重新请求旧版
+    ``bizlogin?action=login`` 接口，因此接口监听只能作为第一证据。首页
+    兜底必须同时满足官方域名、后台首页、可见首页导航、无可见登录控件，
+    并且页面账号名与本地账号记录一致；不能只凭 URL 判定登录成功。
+    """
+
+    parsed = urlsplit(str(current_url or ""))
+    if parsed.scheme != "https" or parsed.hostname != "mp.weixin.qq.com":
+        return False
+    if parsed.path.rstrip("/") != "/cgi-bin/home":
+        return False
+    return bool(
+        home_visible
+        and not login_visible
+        and saved_identity_matches(account, detected_name)
+    )
 
 
 def _safe_fragment(value: str) -> str:
@@ -371,6 +400,41 @@ async def _verify_saved_session_async(account: dict) -> bool:
                     platform_type,
                 )
                 if saved_identity_matches(account, detected_name):
+                    return True
+            if platform_type == 10:
+                detected_name = await account_service._detect_display_name(
+                    page,
+                    platform_type,
+                )
+                home_link = page.locator(
+                    'a[href*="/cgi-bin/home"], a[href*="cgi-bin/home"]'
+                ).first
+                login_controls = page.locator(
+                    '.login__type__container__scan, .login_qrcode, .qrcode, '
+                    'button:has-text("登录"), a:has-text("登录")'
+                )
+                try:
+                    home_visible = bool(
+                        await home_link.count()
+                        and await home_link.is_visible(timeout=300)
+                    )
+                except Exception:
+                    home_visible = False
+                login_visible = False
+                try:
+                    for index in range(min(await login_controls.count(), 8)):
+                        if await login_controls.nth(index).is_visible(timeout=200):
+                            login_visible = True
+                            break
+                except Exception:
+                    login_visible = True
+                if wechat_home_session_confirms(
+                    account,
+                    page.url,
+                    home_visible=home_visible,
+                    login_visible=login_visible,
+                    detected_name=detected_name,
+                ):
                     return True
             await asyncio.sleep(0.5)
         return False

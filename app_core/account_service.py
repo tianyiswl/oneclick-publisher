@@ -480,7 +480,13 @@ _ACCOUNT_NAME_SELECTORS = {
     # B站创作中心首页的 .name 大量用于数据指标（如“弹幕”），不能用作
     # 账号昵称回退。B站昵称统一由官方 nav 身份接口读取，见 _detect_display_name。
     5: (),
-    10: (".weui-desktop-account__name", ".account_info .name", "#js_name"),
+    10: (
+        ".acount_box-nickname",
+        ".weui-desktop_name",
+        ".weui-desktop-account__name",
+        ".account_info .name",
+        "#js_name",
+    ),
 }
 
 

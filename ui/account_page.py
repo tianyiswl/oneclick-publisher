@@ -155,7 +155,7 @@ class AccountPage(QWidget):
         browser_mode_hint.setProperty("role", "muted")
         browser_mode_hint.setToolTip(
             "绑定和重新登录需要用户操作，始终显示官方页面；"
-            "检测登录在后台运行，仅异常时显示官方页面。"
+            "检测登录始终在后台运行，异常时只更新状态并提示手动重新登录。"
         )
         header.addWidget(browser_mode_hint)
 
@@ -436,8 +436,10 @@ class AccountPage(QWidget):
 
     def bind_account(self) -> None:
         dialog = LoginDialog(self, background_login=True)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.refresh()
+        result = dialog.exec()
+        self.refresh()
+        if dialog.lifecycle_message:
+            self._set_status(dialog.lifecycle_message)
 
     def relogin(self, row: dict) -> None:
         dialog = LoginDialog(
@@ -445,8 +447,10 @@ class AccountPage(QWidget):
             row,
             background_login=True,
         )
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.refresh()
+        result = dialog.exec()
+        self.refresh()
+        if dialog.lifecycle_message:
+            self._set_status(dialog.lifecycle_message)
 
     def check_all(self) -> None:
         self.start_validation(None)
@@ -570,7 +574,7 @@ class AccountPage(QWidget):
         QMessageBox.information(self, "检测登录", "\n".join(lines))
 
     def _present_validation_intervention(self, payload: dict) -> bool:
-        """仅在静默检测发现异常时显示官方页面。"""
+        """异常时只提示手动处理，不从检测流程自动打开登录页。"""
 
         rows = list(payload.get("interventionRequired") or [])
         if not rows:
@@ -578,15 +582,6 @@ class AccountPage(QWidget):
         first = rows[0]
         platform = str(first.get("platformName") or "平台")
         account_name = str(first.get("userName") or first.get("profileName") or "账号")
-        browser_note = ""
-        try:
-            account_browser_service.open_account_backend(first)
-            browser_note = f"\n\n已打开 {platform} 官方页面供你确认。"
-        except Exception as exc:
-            browser_note = (
-                "\n\n未能打开官方页面："
-                f"{exc}\n请使用“重新登录”恢复会话。"
-            )
         remaining = (
             f"\n另有 {len(rows) - 1} 个异常账号，请检查列表。"
             if len(rows) > 1
@@ -596,8 +591,9 @@ class AccountPage(QWidget):
             self,
             "登录状态需处理",
             f"{platform} | {account_name} 的会话未通过静默检测。"
-            f"{browser_note}{remaining}\n\n"
-            "一键发不会在后台自动登录；如需扫码或验证码，请由你完成。",
+            f"{remaining}\n\n"
+            "本次检测只更新账号状态，不会打开平台登录页。\n"
+            "如需恢复会话，请在该账号的操作菜单中点击“重新登录”。",
         )
         return True
 

@@ -10,6 +10,7 @@ from app_core.oneclick_authorization import (
     login_response_confirms,
     saved_identity_matches,
     session_check_browser_launch_options,
+    wechat_home_session_confirms,
 )
 
 
@@ -59,6 +60,45 @@ class OneClickAuthorizationTests(unittest.TestCase):
         self.assertTrue(login_response_confirms(10, "https://mp.weixin.qq.com/cgi-bin/bizlogin?action=login", {"base_resp": {"ret": 0}}))
         self.assertFalse(login_response_confirms(10, "https://mp.weixin.qq.com/cgi-bin/bizlogin?action=login", {"base_resp": {"ret": -1}}))
         self.assertFalse(login_response_confirms(2, "https://channels.weixin.qq.com/other", {"finderUser": {}}))
+
+    def test_wechat_home_fallback_requires_matching_identity_and_visible_home(self) -> None:
+        account = {"userName": "硅基进化", "profileName": "硅基进化"}
+        self.assertTrue(
+            wechat_home_session_confirms(
+                account,
+                "https://mp.weixin.qq.com/cgi-bin/home?t=home/index&token=redacted",
+                home_visible=True,
+                login_visible=False,
+                detected_name="硅基进化",
+            )
+        )
+        for kwargs in (
+            {"detected_name": "其他公众号"},
+            {"home_visible": False},
+            {"login_visible": True},
+        ):
+            evidence = {
+                "home_visible": True,
+                "login_visible": False,
+                "detected_name": "硅基进化",
+            }
+            evidence.update(kwargs)
+            self.assertFalse(
+                wechat_home_session_confirms(
+                    account,
+                    "https://mp.weixin.qq.com/cgi-bin/home?t=home/index",
+                    **evidence,
+                )
+            )
+        self.assertFalse(
+            wechat_home_session_confirms(
+                account,
+                "https://example.com/cgi-bin/home",
+                home_visible=True,
+                login_visible=False,
+                detected_name="硅基进化",
+            )
+        )
 
     def test_bilibili_cookie_response_confirms(self) -> None:
         self.assertTrue(
