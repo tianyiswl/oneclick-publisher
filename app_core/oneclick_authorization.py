@@ -37,6 +37,13 @@ _DOMESTIC_LOGIN_URLS = {
     10: "https://mp.weixin.qq.com/",
 }
 
+_OVERSEAS_LOGIN_URLS = {
+    6: "https://www.tiktok.com/tiktokstudio/upload?lang=en",
+    7: "https://studio.youtube.com/",
+    8: "https://business.facebook.com/latest/composer/",
+    9: "https://business.facebook.com/latest/composer/",
+}
+
 # 规则来自恢复包 local-rpa 的授权回执监听。这里只保留“已登录”判断，
 # 不保存、显示或上传接口返回的账号资料。
 _LOGIN_RESPONSE_PATHS = {
@@ -116,7 +123,10 @@ def authorization_plan(platform_type: int, profile_name: str) -> AuthorizationPl
     """返回一键发将要打开的官方授权页，不产生浏览器或网络访问。"""
 
     platform_type = int(platform_type)
-    login_url = _DOMESTIC_LOGIN_URLS.get(platform_type)
+    login_url = (
+        _DOMESTIC_LOGIN_URLS.get(platform_type)
+        or _OVERSEAS_LOGIN_URLS.get(platform_type)
+    )
     if not login_url:
         platform = account_service.PLATFORMS.get(platform_type, "该平台")
         raise ValueError(f"{platform}的一键发授权执行器尚未迁入。")
@@ -354,6 +364,13 @@ async def _verify_saved_session_async(account: dict) -> bool:
     state_file = COOKIE_DIR / Path(str(account.get("filePath") or "")).name
     if not state_file.is_file():
         return False
+
+    # 恢复的蚁小二海外平台代码已包含各自的官方后台判定。
+    # 直接复用这些只读检测，不用国内平台的通用页面文字猜测。
+    if platform_type in account_service.OVERSEAS_PLATFORM_TYPES:
+        from myUtils.auth import check_cookie
+
+        return bool(await check_cookie(platform_type, state_file.name, preview=False))
 
     from playwright.async_api import async_playwright
 

@@ -61,11 +61,16 @@ from app_core import (
     oneclick_capabilities,
 )
 from app_core.paths import VIDEO_DIR
+from app_core.overseas.meta.browser_policy import (
+    META_BROWSER_AUTOMATION_ACKNOWLEDGED,
+    META_BROWSER_PUBLISH_CONFIRMED,
+)
 from app_core.wechat_verification import verification_broker
 
 from .common import ROOT_DIR, button
 from .background_task import BackgroundTaskRunner
 from .login_dialog import LoginDialog
+from .overseas_authorization_dialog import OverseasAuthorizationDialog
 from .media_context_menu import build_media_context_menu
 from .platform_open import open_path, reveal_in_folder
 from .timer_dialog import TimerDialog
@@ -278,6 +283,114 @@ class PublishConfirmDialog(QDialog):
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.button(QDialogButtonBox.StandardButton.Ok).setText("确认执行")
         buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("返回修改")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+
+class OfficialApiActionConfirmDialog(QDialog):
+    """官方 API 真实上传前的独立、一次性确认。"""
+
+    def __init__(self, payloads: list[dict], *, inbox_only: bool = False, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(
+            "确认上传到 TikTok 收件箱"
+            if inbox_only
+            else "确认官方 API 发布"
+        )
+        self.resize(660, 430)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(22, 20, 22, 20)
+        layout.setSpacing(12)
+        title = QLabel(
+            "本次会真实上传到 TikTok 收件箱"
+            if inbox_only
+            else "本次会调用平台官方 API"
+        )
+        title.setObjectName("dialogTitle")
+        layout.addWidget(title)
+        platform_lines = []
+        for payload in payloads:
+            platform_type = int(payload.get("type") or 0)
+            platform_name = account_service.PLATFORMS.get(platform_type, "海外平台")
+            account_names = [
+                str(item).strip()
+                for item in payload.get("accountDisplayNames") or []
+                if str(item).strip()
+            ]
+            platform_lines.append(
+                f"• {platform_name} | {account_names[0] if account_names else '已选官方授权账号'}"
+            )
+        detail = QLabel("\n".join(platform_lines))
+        detail.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(detail)
+        boundary = QLabel(
+            (
+                "TikTok 将接收视频并返回收件箱任务状态，但不会公开发布。"
+                "你仍需在 TikTok 内检查、编辑并确认发布。"
+                if inbox_only
+                else
+                "YouTube / Instagram / Facebook 会按页面中的可见性与定时设置"
+                "执行真实上传或公开发布。一键发只在平台回读目标状态后记为成功。"
+            )
+        )
+        boundary.setObjectName("warningCallout")
+        boundary.setWordWrap(True)
+        layout.addWidget(boundary)
+        self.acknowledgement = QCheckBox(
+            "我已核对账号、标题、视频、封面、可见性与定时设置，确认执行本次真实上传。"
+        )
+        layout.addWidget(self.acknowledgement)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        confirm = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        confirm.setText("确认真实上传")
+        confirm.setEnabled(False)
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("返回修改")
+        self.acknowledgement.toggled.connect(confirm.setEnabled)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+
+class MetaBrowserPublishConfirmDialog(QDialog):
+    """Meta 可见浏览器正式发布的第二道显式确认。"""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("确认 Meta 浏览器自动发布")
+        self.resize(620, 340)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(22, 20, 22, 20)
+        layout.setSpacing(12)
+        title = QLabel("Instagram / Facebook 将执行最终发布")
+        title.setObjectName("dialogTitle")
+        layout.addWidget(title)
+        explanation = QLabel(
+            "一键发会复用本机 Meta 登录状态，自动上传、填写并点击 "
+            "Publish 或 Schedule。\n\n"
+            "这是恢复的受控浏览器能力：必须保持窗口可见；"
+            "如果 Meta 要求验证码、双重验证或安全检查，流程会停下等待用户。"
+            "只有收到平台成功提示或进入内容管理页才会记为成功。"
+        )
+        explanation.setWordWrap(True)
+        explanation.setObjectName("warningCallout")
+        layout.addWidget(explanation)
+        self.acknowledgement = QCheckBox(
+            "我已核对全部内容，并确认使用可见浏览器执行 Meta 最终发布"
+        )
+        layout.addWidget(self.acknowledgement)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        confirm = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        confirm.setText("确认并自动发布")
+        confirm.setEnabled(False)
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("返回修改")
+        self.acknowledgement.toggled.connect(confirm.setEnabled)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
@@ -1987,6 +2100,8 @@ class PublishPage(QWidget):
                 account["userName"] or "未命名账号",
                 account["statusText"],
             ]
+            if str(account.get("authMode") or "browser") == "official_api":
+                display_parts.append("官方 API")
             if remark:
                 display_parts.append(f"备注：{remark}")
             text = " · ".join(display_parts)
@@ -1995,6 +2110,9 @@ class PublishPage(QWidget):
                 f"主体：{account['profileName']}",
                 f"账号名：{account['userName'] or '未命名账号'}",
                 f"状态：{account['statusText']}",
+                "通道：官方 OAuth/API"
+                if str(account.get("authMode") or "browser") == "official_api"
+                else "通道：一键发本地浏览器会话",
             ]
             if remark:
                 tooltip_lines.append(f"备注：{remark}")
@@ -2044,7 +2162,9 @@ class PublishPage(QWidget):
             lambda _checked=False, row=account: self.check_account_login(row),
         )
         menu.addAction(
-            "重新登录",
+            "重新官方授权"
+            if str(account.get("authMode") or "browser") == "official_api"
+            else "重新登录",
             lambda _checked=False, row=account: self.relogin_account(row),
         )
         return menu
@@ -2114,6 +2234,11 @@ class PublishPage(QWidget):
         return True
 
     def relogin_account(self, account: dict) -> None:
+        if str(account.get("authMode") or "browser") == "official_api":
+            dialog = OverseasAuthorizationDialog(self, account=account)
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                self.refresh_accounts()
+            return
         dialog = LoginDialog(
             self,
             account,
@@ -2905,6 +3030,23 @@ class PublishPage(QWidget):
             if platform_type not in {account["type"] for account in accounts}:
                 continue
             selected = [account for account in accounts if account["type"] == platform_type]
+            auth_modes = {
+                str(account.get("authMode") or "browser")
+                for account in selected
+            }
+            if (
+                platform_type in account_service.OVERSEAS_PLATFORM_TYPES
+                and len(auth_modes) > 1
+            ):
+                raise ValueError(
+                    f"{account_service.PLATFORMS[platform_type]}不能在同一任务混用"
+                    "浏览器会话账号与官方 API 账号"
+                )
+            if "official_api" in auth_modes and len(selected) != 1:
+                raise ValueError(
+                    f"{account_service.PLATFORMS[platform_type]}官方 API 通道"
+                    "每次必须精确选择一个账号"
+                )
             description = self.platform_texts[platform_type].toPlainText().strip() or common_description
             title = self.platform_titles[platform_type].text().strip() or common_title
             if not title:
@@ -2949,6 +3091,19 @@ class PublishPage(QWidget):
                 "tags": tags,
                 "fileList": file_list,
                 "accountList": [account["filePath"] for account in selected],
+                "accountIds": [int(account["id"]) for account in selected],
+                "accountAuthModes": [
+                    str(account.get("authMode") or "browser")
+                    for account in selected
+                ],
+                "accountReferences": [
+                    str(account.get("accountReference") or "")
+                    for account in selected
+                ],
+                "accountDisplayNames": [
+                    str(account.get("userName") or account.get("profileName") or "")
+                    for account in selected
+                ],
                 "coverPath": preferred_cover,
                 "coverPaths": cover_paths,
                 "oneclickCapability": capability_check,
@@ -2971,6 +3126,7 @@ class PublishPage(QWidget):
                 "dailyTimes": [schedule_time[-5:]] if schedule_time else [],
                 "startDays": 0,
                 "timeJitterMinutes": 0,
+                "officialApiConfirmed": False,
             }
             if platform_type == 10 and self.content_type == "article":
                 payload["imagePlacements"] = [
@@ -3056,6 +3212,32 @@ class PublishPage(QWidget):
         if PublishConfirmDialog(summary, self).exec() != QDialog.DialogCode.Accepted:
             self.task_status_label.setText("发布任务：已返回修改")
             return
+        official_payloads = [
+            payload
+            for payload in payloads
+            if int(payload.get("type") or 0)
+            in account_service.OVERSEAS_PLATFORM_TYPES
+            and set(payload.get("accountAuthModes") or []) == {"official_api"}
+        ]
+        if runtime_mode == "publish" and official_payloads:
+            if OfficialApiActionConfirmDialog(
+                official_payloads,
+                parent=self,
+            ).exec() != QDialog.DialogCode.Accepted:
+                self.task_status_label.setText("官方 API 发布：已返回修改")
+                return
+            for payload in official_payloads:
+                payload["officialApiConfirmed"] = True
+        meta_browser_payloads = [
+            payload
+            for payload in payloads
+            if int(payload.get("type") or 0) in {8, 9}
+            and set(payload.get("accountAuthModes") or []) == {"browser"}
+        ]
+        if runtime_mode == "publish" and meta_browser_payloads:
+            if not self.confirm_meta_browser_publish(meta_browser_payloads):
+                self.task_status_label.setText("Meta 发布任务：已返回修改")
+                return
         try:
             task = publish_service.start_desktop_publish(payloads)
         except Exception as exc:
@@ -3064,7 +3246,9 @@ class PublishPage(QWidget):
         self.active_task_id = int(task["id"])
         self.active_task_is_preflight = self.preflight.isChecked()
         self.active_task_mode = runtime_mode
-        self.active_task_background_mode = self.background_mode.isChecked()
+        self.active_task_background_mode = all(
+            bool(payload.get("backgroundMode", True)) for payload in payloads
+        )
         self.active_task_started_at = datetime.now()
         self.seen_event_ids.clear()
         self.log.clear()
@@ -3076,13 +3260,41 @@ class PublishPage(QWidget):
         self._set_running(True, f"{mode_text}运行中：{task['taskNo']}")
         self.task_timer.start()
         if self.preflight.isChecked():
-            contains_overseas = any(int(payload.get("type", 0)) in account_service.OVERSEAS_PLATFORM_TYPES for payload in payloads)
+            overseas_payloads = [
+                payload
+                for payload in payloads
+                if int(payload.get("type", 0))
+                in account_service.OVERSEAS_PLATFORM_TYPES
+            ]
+            contains_locked_overseas = any(
+                (
+                    int(payload.get("type", 0)) in {6, 7}
+                    and set(payload.get("accountAuthModes") or [])
+                    != {"official_api"}
+                )
+                or int(payload.get("type", 0)) == 6
+                for payload in overseas_payloads
+            )
+            contains_meta_browser = any(
+                int(payload.get("type", 0)) in {8, 9}
+                and set(payload.get("accountAuthModes") or []) == {"browser"}
+                for payload in overseas_payloads
+            )
+            contains_official_publish = any(
+                int(payload.get("type", 0)) in {7, 8, 9}
+                and set(payload.get("accountAuthModes") or []) == {"official_api"}
+                for payload in overseas_payloads
+            )
             if self.active_task_background_mode:
                 message = "任务已开始。上传和表单检查将在无窗口后台完成，预检结束后自动关闭会话。"
             else:
                 message = "任务已开始。程序会显示发布页面并停在最终发布前，检查完成后请关闭自动化浏览器。"
-            if contains_overseas:
-                message += "海外平台第一阶段不会出现自动正式发布选项。"
+            if contains_locked_overseas:
+                message += "任务包含仍保持正式发布锁定的海外目标。"
+            elif contains_meta_browser:
+                message += "完成后可选择 Meta 可见浏览器确认式发布。"
+            elif contains_official_publish:
+                message += "完成后可选择官方 API 发布，届时会再次明确确认。"
             else:
                 message += "完成后会再次询问是否启动正式发布。"
             QMessageBox.information(self, "预发布检查", message)
@@ -3102,16 +3314,23 @@ class PublishPage(QWidget):
                 "当前发布任务正在执行，请等待完成后再保存平台草稿。",
             )
             return
+        selected_account_rows = self.selected_accounts()
         selected_types = {
             int(account.get("type", 0) or 0)
-            for account in self.selected_accounts()
+            for account in selected_account_rows
         }
+        official_tiktok_only = bool(selected_account_rows) and all(
+            int(account.get("type") or 0) != 6
+            or str(account.get("authMode") or "browser") == "official_api"
+            for account in selected_account_rows
+        )
         unsupported_draft_platforms = [
             account_service.DRAFT_UNSUPPORTED_PLATFORM_MESSAGES[platform_type]
             for platform_type in account_service.PLATFORM_ORDER
             if platform_type in selected_types
             and platform_type
             in account_service.DRAFT_UNSUPPORTED_PLATFORM_MESSAGES
+            and not (platform_type == 6 and official_tiktok_only)
         ]
         if unsupported_draft_platforms:
             platform_text = "\n".join(
@@ -3121,7 +3340,8 @@ class PublishPage(QWidget):
                 self,
                 "所选平台不支持保存草稿",
                 f"{platform_text}\n\n"
-                "国内五个平台目前只有视频号和B站可以保存平台草稿。"
+                "国内平台目前只有视频号和B站可以保存平台草稿；"
+                "TikTok 只有官方 API 账号可上传到收件箱。"
                 "为避免误报成功，桌面端不会为上述平台创建草稿任务。\n\n"
                 "请取消选择上述平台后再保存草稿；上述平台请使用前台"
                 "“预发布检查”，确认页面内容和定时时间后再人工发布。",
@@ -3181,14 +3401,24 @@ class PublishPage(QWidget):
                 return
         try:
             payloads = self.collect_payloads("draft")
-            overseas = [
-                account_service.PLATFORMS.get(int(payload.get("type", 0)), "海外平台")
+            unsupported_overseas = [
+                account_service.PLATFORMS.get(
+                    int(payload.get("type", 0)),
+                    "海外平台",
+                )
                 for payload in payloads
-                if int(payload.get("type", 0)) in account_service.OVERSEAS_PLATFORM_TYPES
+                if int(payload.get("type", 0))
+                in account_service.OVERSEAS_PLATFORM_TYPES
+                and not (
+                    int(payload.get("type", 0)) == 6
+                    and set(payload.get("accountAuthModes") or [])
+                    == {"official_api"}
+                )
             ]
-            if overseas:
+            if unsupported_overseas:
                 raise ValueError(
-                    "海外平台登录已暂缓，保存平台草稿时请只选择五个国内平台。"
+                    "以下海外目标没有可验证的官方草稿通道："
+                    + "、".join(unsupported_overseas)
                 )
             summary = self.build_publish_summary(payloads, "draft")
         except Exception as exc:
@@ -3198,6 +3428,30 @@ class PublishPage(QWidget):
         if PublishConfirmDialog(summary, self).exec() != QDialog.DialogCode.Accepted:
             self.task_status_label.setText("平台草稿：已返回修改")
             return
+        official_tiktok_payloads = [
+            payload
+            for payload in payloads
+            if int(payload.get("type") or 0) == 6
+            and set(payload.get("accountAuthModes") or []) == {"official_api"}
+        ]
+        if official_tiktok_payloads:
+            if len(official_tiktok_payloads) != len(payloads):
+                QMessageBox.warning(
+                    self,
+                    "保存平台草稿",
+                    "TikTok 官方收件箱上传请作为独立任务执行，"
+                    "不要与国内平台草稿混合。",
+                )
+                return
+            if OfficialApiActionConfirmDialog(
+                official_tiktok_payloads,
+                inbox_only=True,
+                parent=self,
+            ).exec() != QDialog.DialogCode.Accepted:
+                self.task_status_label.setText("TikTok 收件箱上传：已取消")
+                return
+            for payload in official_tiktok_payloads:
+                payload["officialApiConfirmed"] = True
         try:
             task = publish_service.start_desktop_publish(payloads)
         except Exception as exc:
@@ -3614,11 +3868,26 @@ class PublishPage(QWidget):
                     self.active_task_id = None
             elif self.active_task_mode == "draft":
                 self.active_task_id = None
+                try:
+                    draft_payloads = json.loads(task.get("payloadJson") or "[]")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    draft_payloads = []
+                draft_boundary = (
+                    "\nTikTok 成功项仅代表视频已进入官方收件箱，仍未公开发布；"
+                    "其他成功项均已获得平台草稿证据。"
+                    if any(
+                        int(item.get("type") or 0) == 6
+                        for item in draft_payloads
+                        if isinstance(item, dict)
+                    )
+                    else "\n已成功的执行项均已获得平台草稿证据；"
+                    "失败项不会记为已保存。"
+                )
                 QMessageBox.information(
                     self,
                     "平台草稿任务完成",
                     self._finish_message(task, status_text)
-                    + "\n已成功的执行项均已获得平台草稿证据；失败项不会记为已保存。",
+                    + draft_boundary,
                 )
             else:
                 self.active_task_id = None
@@ -3654,6 +3923,32 @@ class PublishPage(QWidget):
             for payload in payloads
             if isinstance(payload, dict)
         )
+        overseas_payloads = [
+            payload
+            for payload in payloads
+            if isinstance(payload, dict)
+            and int(payload.get("type", 0) or 0)
+            in account_service.OVERSEAS_PLATFORM_TYPES
+        ]
+        official_overseas = [
+            payload
+            for payload in overseas_payloads
+            if set(payload.get("accountAuthModes") or []) == {"official_api"}
+        ]
+        official_publish_ready = bool(overseas_payloads) and (
+            len(official_overseas) == len(overseas_payloads)
+            and all(int(payload.get("type") or 0) in {7, 8, 9} for payload in official_overseas)
+        )
+        browser_meta = [
+            payload
+            for payload in overseas_payloads
+            if int(payload.get("type") or 0) in {8, 9}
+            and set(payload.get("accountAuthModes") or []) == {"browser"}
+        ]
+        meta_browser_ready = bool(overseas_payloads) and (
+            len(browser_meta) == len(overseas_payloads)
+        )
+        formal_overseas_ready = official_publish_ready or meta_browser_ready
         box = QMessageBox(self)
         box.setWindowTitle("预发布检查完成")
         box.setIcon(QMessageBox.Icon.Information)
@@ -3663,24 +3958,53 @@ class PublishPage(QWidget):
             if self.active_task_background_mode
             else "前台检查会话已经结束；本次结果不是可恢复的平台草稿。"
         )
-        if contains_overseas:
+        if contains_overseas and not formal_overseas_ready:
+            has_tiktok_official = any(
+                int(payload.get("type") or 0) == 6
+                and set(payload.get("accountAuthModes") or []) == {"official_api"}
+                for payload in overseas_payloads
+            )
+            next_hint = (
+                "TikTok 官方通道只能另行选择“保存平台草稿”上传到收件箱，"
+                "不会公开发布。\n"
+                if has_tiktok_official
+                else ""
+            )
             box.setInformativeText(
                 f"{self._finish_message(task, status_text)}\n\n"
-                "海外平台第一阶段只开放预发布检查，自动正式发布保持锁定。\n"
+                "浏览器会话海外平台只开放预发布检查，正式发布保持锁定。\n"
+                f"{next_hint}"
                 f"{session_note}"
             )
             manual_btn = box.addButton("我已了解", QMessageBox.ButtonRole.AcceptRole)
             box.setDefaultButton(manual_btn)
             box.exec()
             return "manual"
+        action_hint = (
+            "继续官方 API 发布：将再显示一次独立上传确认，"
+            "然后使用平台官方接口执行。\n"
+            if official_publish_ready
+            else (
+                "继续 Meta 确认式发布：将再显示一次独立确认，"
+                "并在可见浏览器中执行。\n"
+                if meta_browser_ready
+                else "继续一键发布：使用同一配置重新上传并执行正式发布。\n"
+            )
+        )
         box.setInformativeText(
             f"{self._finish_message(task, status_text)}\n\n"
             f"{session_note}\n\n"
-            "请选择下一步操作：\n"
-            "继续一键发布：使用同一配置重新上传并执行正式发布。\n"
+            f"请选择下一步操作：\n{action_hint}"
             "暂不发布：只保留本次预检结果。"
         )
-        formal_btn = box.addButton("继续一键发布", QMessageBox.ButtonRole.AcceptRole)
+        formal_btn = box.addButton(
+            "继续官方 API 发布"
+            if official_publish_ready
+            else "继续 Meta 确认式发布"
+            if meta_browser_ready
+            else "继续一键发布",
+            QMessageBox.ButtonRole.AcceptRole,
+        )
         manual_btn = box.addButton("暂不发布", QMessageBox.ButtonRole.DestructiveRole)
         box.setDefaultButton(formal_btn)
         box.exec()
@@ -3693,6 +4017,39 @@ class PublishPage(QWidget):
                 payload["runtimeMode"] = "publish"
                 payload["debugDryRun"] = False
                 payload["debugDryRunHoldBrowser"] = False
+            official_payloads = [
+                payload
+                for payload in payloads
+                if int(payload.get("type") or 0)
+                in account_service.OVERSEAS_PLATFORM_TYPES
+                and set(payload.get("accountAuthModes") or []) == {"official_api"}
+            ]
+            if official_payloads:
+                if OfficialApiActionConfirmDialog(
+                    official_payloads,
+                    parent=self,
+                ).exec() != QDialog.DialogCode.Accepted:
+                    self.log.append("官方 API 真实上传已取消。")
+                    self.task_status_label.setText("预发布检查完成：未启动官方 API 发布")
+                    self.active_task_id = None
+                    return
+                for payload in official_payloads:
+                    payload["officialApiConfirmed"] = True
+            meta_browser_payloads = [
+                payload
+                for payload in payloads
+                if int(payload.get("type") or 0) in {8, 9}
+                and set(payload.get("accountAuthModes") or []) == {"browser"}
+            ]
+            if meta_browser_payloads and not self.confirm_meta_browser_publish(
+                meta_browser_payloads
+            ):
+                self.log.append("Meta 浏览器最终发布已取消。")
+                self.task_status_label.setText(
+                    "预发布检查完成：未启动 Meta 最终发布"
+                )
+                self.active_task_id = None
+                return
             new_task = publish_service.start_desktop_publish(payloads)
         except Exception as exc:
             QMessageBox.warning(self, "正式发布", f"启动正式发布失败：{exc}")
@@ -3713,6 +4070,20 @@ class PublishPage(QWidget):
         self._update_task_progress({"status": "pending", "dryRun": 0, "itemCount": new_task.get("itemCount", 0)})
         self._set_running(True, f"正式发布运行中：{new_task['taskNo']}")
         self.task_timer.start()
+
+    def confirm_meta_browser_publish(self, payloads: list[dict]) -> bool:
+        """一次性写入 Meta 浏览器发布的两项独立确认。"""
+
+        if MetaBrowserPublishConfirmDialog(self).exec() != QDialog.DialogCode.Accepted:
+            return False
+        for payload in payloads:
+            if int(payload.get("type") or 0) not in {8, 9}:
+                continue
+            payload[META_BROWSER_PUBLISH_CONFIRMED] = True
+            payload[META_BROWSER_AUTOMATION_ACKNOWLEDGED] = True
+            payload["backgroundMode"] = False
+            payload["debugDryRunHoldBrowser"] = False
+        return True
 
     def _set_running(self, running: bool, message: str) -> None:
         self.start_btn.setEnabled(not running)
@@ -3851,7 +4222,13 @@ class PublishPage(QWidget):
             f"浏览器模式：{'无窗口后台运行' if self.background_mode.isChecked() else '前台显示'}",
         ]
         if runtime_mode == "draft":
-            lines.append("安全边界：只保存平台草稿，不点击最终发布按钮")
+            if any(int(item.get("type") or 0) == 6 for item in payloads):
+                lines.append(
+                    "安全边界：TikTok 官方收件箱会真实接收视频，"
+                    "但不会公开发布"
+                )
+            else:
+                lines.append("安全边界：只保存平台草稿，不点击最终发布按钮")
         if self.timer_values.get("enableTimer"):
             lines.append(f"通用定时发布：{self.timer_values.get('scheduleTime') or '未设置'}")
         else:
@@ -3864,7 +4241,15 @@ class PublishPage(QWidget):
         lines.append(f"账号数量：{len(accounts)}")
         for account in accounts:
             remark = f" | {account.get('remark')}" if account.get("remark") else ""
-            lines.append(f"- {account['profileName']} | {account['platformName']} | {account['userName']}{remark}")
+            channel = (
+                "官方 API"
+                if str(account.get("authMode") or "browser") == "official_api"
+                else "浏览器会话"
+            )
+            lines.append(
+                f"- {account['profileName']} | {account['platformName']} | "
+                f"{account['userName']} | {channel}{remark}"
+            )
 
         lines.append("")
         lines.append(f"素材数量：{len(media)}")
@@ -3886,6 +4271,13 @@ class PublishPage(QWidget):
             lines.append(f"  文案：{description} / {tags}")
             lines.append(f"  合集：{payload.get('collectionName') or '不选择'}")
             lines.append(f"  发布时间：{payload.get('scheduleTime') or '立即发布'}")
+            if int(payload.get("type") or 0) in account_service.OVERSEAS_PLATFORM_TYPES:
+                channel = (
+                    "官方 OAuth/API"
+                    if set(payload.get("accountAuthModes") or []) == {"official_api"}
+                    else "一键发受控浏览器"
+                )
+                lines.append(f"  海外执行通道：{channel}")
             visibility_labels = {"public": "公开", "private": "私密", "unlisted": "不公开"}
             lines.append(f"  谁可以看：{visibility_labels.get(payload.get('visibility'), '公开')}")
             if int(payload.get("type")) == 5:

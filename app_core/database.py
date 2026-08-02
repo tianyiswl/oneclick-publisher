@@ -72,7 +72,13 @@ def ensure_schema() -> None:
                 ("remark", "TEXT"),
                 ("lastCheckedAt", "TEXT"),
                 ("lastLoginAt", "TEXT"),
+                ("authMode", "TEXT NOT NULL DEFAULT 'browser'"),
+                ("accountReference", "TEXT"),
             ),
+        )
+        conn.execute(
+            "UPDATE user_info SET authMode = 'browser' "
+            "WHERE authMode IS NULL OR TRIM(authMode) = ''"
         )
         conn.execute("UPDATE user_info SET profileName = userName WHERE profileName IS NULL OR profileName = ''")
 

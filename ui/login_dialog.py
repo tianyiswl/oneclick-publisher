@@ -80,6 +80,7 @@ class LoginDialog(QDialog):
         self.scan_notified = False
         self.lifecycle_message = ""
         self.readback_runner = BackgroundTaskRunner(self)
+        self._saved_account_ids: list[int] = []
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(22, 20, 22, 20)
@@ -179,6 +180,7 @@ class LoginDialog(QDialog):
         self.save_btn.setEnabled(False)
         self.scan_notified = False
         self.success = False
+        self._saved_account_ids.clear()
         self.session = login_service.start_login(
             platform_type,
             profile,
@@ -277,17 +279,22 @@ class LoginDialog(QDialog):
                 self._verify_saved_account(account_id)
                 return
             if msg.startswith("ACCOUNT_ID:"):
-                self.log.append("扫码成功，正在保存登录数据...")
-                self.qr_label.setText("扫码成功，正在保存账号数据...")
+                account_id = int(msg.split(":", 1)[1])
+                if account_id not in self._saved_account_ids:
+                    self._saved_account_ids.append(account_id)
+                self.log.append("登录已校验，正在保存一键发账号数据...")
+                self.qr_label.setText("登录已校验，正在保存账号数据...")
                 if not self.scan_notified:
                     self.scan_notified = True
-                    QMessageBox.information(self, "账号登录", "扫码成功，正在保存账号数据，请稍等。")
                 continue
             if msg == "200":
-                # 兼容旧登录服务。新授权服务走 ACCOUNT_SAVED 并携带账号 ID。
-                self.lifecycle_message = "旧登录服务未返回账号回读标识，已返回账号管理。"
                 self.timer.stop()
-                self.reject()
+                if self._saved_account_ids:
+                    self._verify_saved_accounts(self._saved_account_ids)
+                else:
+                    self.lifecycle_message = "登录流程未返回可回读的账号标识，未保存账号。"
+                    self.log.append(self.lifecycle_message)
+                    self.reject()
                 return
             if msg in ("500", "CANCELLED"):
                 self.timer.stop()
@@ -326,6 +333,40 @@ class LoginDialog(QDialog):
         except Exception as exc:
             self.log.append(f"二维码显示失败：{exc}")
         self.qr_label.setText(src)
+
+    def _verify_saved_accounts(self, account_ids: list[int]) -> None:
+        """回读恢复流程保存的账号；Meta 会产生两个发布目标。"""
+
+        expected = {int(item) for item in account_ids if int(item) > 0}
+        self.qr_label.setText("会话已保存，正在静默回读海外平台状态...")
+
+        def verify() -> dict:
+            return account_service.validate_accounts(sorted(expected))
+
+        def verified(payload: dict) -> None:
+            normal = {
+                int(item.get("id"))
+                for item in payload.get("normal", [])
+                if item.get("id") is not None
+            }
+            if expected and expected.issubset(normal):
+                self._finish_success_after_readback(min(expected))
+                return
+            self.lifecycle_message = "账号会话已保存，但海外平台发布入口回读未全部通过。"
+            self.log.append(self.lifecycle_message)
+            self.reject()
+
+        def verify_failed(message: str) -> None:
+            self.lifecycle_message = f"海外账号回读失败：{message}"
+            self.log.append(self.lifecycle_message)
+            self.reject()
+
+        self.readback_runner.run(
+            "verify_saved_overseas_accounts",
+            verify,
+            on_success=verified,
+            on_error=verify_failed,
+        )
 
     def closeEvent(self, event) -> None:
         if self.session and self.timer.isActive() and not self.success:

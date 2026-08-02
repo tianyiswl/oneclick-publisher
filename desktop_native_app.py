@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""发射台· 多平台发布助手桌面端入口。"""
+"""一键发·多平台内容发布工作台桌面端入口。"""
 
 from __future__ import annotations
 

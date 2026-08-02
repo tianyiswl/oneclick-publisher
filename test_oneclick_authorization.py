@@ -50,9 +50,22 @@ class OneClickAuthorizationTests(unittest.TestCase):
             self.assertIn(host, plan.login_url)
             self.assertIn("oneclick-browser-profiles", str(plan.profile_directory))
 
-    def test_non_migrated_platform_is_rejected_without_browser_start(self) -> None:
+    def test_overseas_platforms_use_recovered_official_backends(self) -> None:
+        expected_hosts = {
+            6: "tiktok.com",
+            7: "studio.youtube.com",
+            8: "business.facebook.com",
+            9: "business.facebook.com",
+        }
+        for platform_type, host in expected_hosts.items():
+            self.assertIn(
+                host,
+                authorization_plan(platform_type, "海外主体").login_url,
+            )
+
+    def test_unknown_platform_is_rejected_without_browser_start(self) -> None:
         with self.assertRaisesRegex(ValueError, "尚未迁入"):
-            authorization_plan(6, "海外主体")
+            authorization_plan(99, "未知主体")
 
     def test_login_response_rules_require_platform_identity_evidence(self) -> None:
         self.assertTrue(login_response_confirms(3, "https://creator.douyin.com/media/user/info", {"user": {"id": "x"}}))

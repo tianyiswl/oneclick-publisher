@@ -333,6 +333,12 @@ def _make_platform_app(data, file_path, publish_datetime, cookie_path, dry_run=T
             thumbnail_path=thumbnail,
             thumbnail_paths=thumbs,
             dry_run=dry_run,
+            publish_confirmed=_option_bool(
+                data.get("metaBrowserPublishConfirmed")
+            ),
+            automation_acknowledged=_option_bool(
+                data.get("metaBrowserAutomationAcknowledged")
+            ),
         ), data, publish_datetime)
     raise ValueError(f"unsupported platform: {platform_type}")
 
@@ -372,7 +378,7 @@ async def _run_observed_upload(app, playwright, platform_name):
 
 async def _run_observed_main(app, platform_name):
     with publish_step("platform_upload", f"{platform_name}发布流程"):
-        await app.main()
+        return await app.main()
 
 
 def _run_observed_platform_main(app, platform_type, file_path, cookie_path, dry_run):
@@ -386,12 +392,13 @@ def _run_observed_platform_main(app, platform_type, file_path, cookie_path, dry_
     ):
         try:
             publish_event("platform_item_start", f"{platform_name}开始处理当前素材")
-            asyncio.run(_run_observed_main(app, platform_name), debug=False)
+            result = asyncio.run(_run_observed_main(app, platform_name), debug=False)
         except Exception as e:
             publish_event("platform_item_failed", f"{platform_name}当前素材处理失败：{e}", level="error", error=str(e))
             raise
         else:
             publish_event("platform_item_success", f"{platform_name}当前素材处理完成")
+            return result
 
 
 async def _prepare_batch_pages(context, jobs):
@@ -799,6 +806,8 @@ def _post_video_overseas(
     jitter_minutes=0,
     dry_run=True,
     dry_run_hold_browser=True,
+    publish_confirmed=False,
+    automation_acknowledged=False,
 ):
     tags = normalize_publish_tags(tags, max_count=get_publish_tag_limit(platform_type))
     account_files = [Path(BASE_DIR / "cookiesFile" / file) for file in account_file]
@@ -820,12 +829,24 @@ def _post_video_overseas(
         "coverPath": cover_path,
         "coverPaths": cover_paths or {},
         "visibility": "private",
+        "metaBrowserPublishConfirmed": publish_confirmed,
+        "metaBrowserAutomationAcknowledged": automation_acknowledged,
     }
+    results = []
     for index, file in enumerate(video_files):
         for cookie in account_files:
             app = _make_platform_app(data, str(file), publish_datetimes[index], cookie, dry_run=dry_run)
             app.dry_run_hold_browser = dry_run_hold_browser
-            _run_observed_platform_main(app, platform_type, file, cookie, dry_run)
+            results.append(
+                _run_observed_platform_main(
+                    app,
+                    platform_type,
+                    file,
+                    cookie,
+                    dry_run,
+                )
+            )
+    return results
 
 
 def post_video_tiktok(title, files, tags, account_file, category=None, enableTimer=False, videos_per_day=1, daily_times=None, start_days=0, description=None, cover_path=None, cover_paths=None, schedule_time=None, jitter_minutes=0, dry_run=True, dry_run_hold_browser=True):
@@ -836,12 +857,12 @@ def post_video_youtube(title, files, tags, account_file, category=None, enableTi
     return _post_video_overseas(7, title, files, tags, account_file, enableTimer, videos_per_day, daily_times, start_days, description=description, cover_path=cover_path, cover_paths=cover_paths, schedule_time=schedule_time, jitter_minutes=jitter_minutes, dry_run=dry_run, dry_run_hold_browser=dry_run_hold_browser)
 
 
-def post_video_instagram(title, files, tags, account_file, category=None, enableTimer=False, videos_per_day=1, daily_times=None, start_days=0, description=None, cover_path=None, cover_paths=None, schedule_time=None, jitter_minutes=0, dry_run=True, dry_run_hold_browser=True):
-    return _post_video_overseas(8, title, files, tags, account_file, enableTimer, videos_per_day, daily_times, start_days, description=description, cover_path=cover_path, cover_paths=cover_paths, schedule_time=schedule_time, jitter_minutes=jitter_minutes, dry_run=dry_run, dry_run_hold_browser=dry_run_hold_browser)
+def post_video_instagram(title, files, tags, account_file, category=None, enableTimer=False, videos_per_day=1, daily_times=None, start_days=0, description=None, cover_path=None, cover_paths=None, schedule_time=None, jitter_minutes=0, dry_run=True, dry_run_hold_browser=True, publish_confirmed=False, automation_acknowledged=False):
+    return _post_video_overseas(8, title, files, tags, account_file, enableTimer, videos_per_day, daily_times, start_days, description=description, cover_path=cover_path, cover_paths=cover_paths, schedule_time=schedule_time, jitter_minutes=jitter_minutes, dry_run=dry_run, dry_run_hold_browser=dry_run_hold_browser, publish_confirmed=publish_confirmed, automation_acknowledged=automation_acknowledged)
 
 
-def post_video_facebook(title, files, tags, account_file, category=None, enableTimer=False, videos_per_day=1, daily_times=None, start_days=0, description=None, cover_path=None, cover_paths=None, schedule_time=None, jitter_minutes=0, dry_run=True, dry_run_hold_browser=True):
-    return _post_video_overseas(9, title, files, tags, account_file, enableTimer, videos_per_day, daily_times, start_days, description=description, cover_path=cover_path, cover_paths=cover_paths, schedule_time=schedule_time, jitter_minutes=jitter_minutes, dry_run=dry_run, dry_run_hold_browser=dry_run_hold_browser)
+def post_video_facebook(title, files, tags, account_file, category=None, enableTimer=False, videos_per_day=1, daily_times=None, start_days=0, description=None, cover_path=None, cover_paths=None, schedule_time=None, jitter_minutes=0, dry_run=True, dry_run_hold_browser=True, publish_confirmed=False, automation_acknowledged=False):
+    return _post_video_overseas(9, title, files, tags, account_file, enableTimer, videos_per_day, daily_times, start_days, description=description, cover_path=cover_path, cover_paths=cover_paths, schedule_time=schedule_time, jitter_minutes=jitter_minutes, dry_run=dry_run, dry_run_hold_browser=dry_run_hold_browser, publish_confirmed=publish_confirmed, automation_acknowledged=automation_acknowledged)
 
 
 

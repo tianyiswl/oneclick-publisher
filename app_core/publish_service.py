@@ -12,10 +12,15 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from myUtils.postVideo import post_video_batch_draft_tabs
+
 from . import (
     douyin_location_service,
     oneclick_capabilities,
     oneclick_preflight,
+    overseas_api_service,
+    overseas_browser_publish,
+    overseas_preflight,
     task_service,
     wechat_publish_executor,
     wechat_publish_policy,
@@ -28,7 +33,11 @@ _publish_lock = threading.Lock()
 _active_threads: dict[int, threading.Thread] = {}
 
 
-_PLATFORM_NAMES = {1: "小红书", 2: "视频号", 3: "抖音", 4: "快手", 5: "B站", 10: "公众号"}
+_PLATFORM_NAMES = {
+    1: "小红书", 2: "视频号", 3: "抖音", 4: "快手", 5: "B站",
+    6: "TikTok", 7: "YouTube", 8: "Instagram Reels", 9: "Facebook Reels",
+    10: "公众号",
+}
 
 
 def _runtime_media_path(value: object) -> str:
@@ -92,18 +101,67 @@ def _validate_payloads(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if runtime_mode == "preflight":
             if payload.get("debugDryRun") is not True:
                 raise ValueError("预发布检查必须保持 debugDryRun=true")
+            if (
+                platform_type in overseas_api_service.OFFICIAL_API_PLATFORM_TYPES
+                and set(payload.get("accountAuthModes") or []) == {"official_api"}
+            ):
+                checked = overseas_api_service.validate_official_preflight_payload(
+                    payload
+                )
+                if not checked["ok"]:
+                    raise ValueError("；".join(checked["errors"]))
         elif runtime_mode == "publish":
-            if platform_type not in {1, 10}:
+            official_overseas = (
+                platform_type in overseas_api_service.OFFICIAL_API_PLATFORM_TYPES
+                and set(payload.get("accountAuthModes") or []) == {"official_api"}
+            )
+            meta_browser = (
+                platform_type in {8, 9}
+                and set(payload.get("accountAuthModes") or []) == {"browser"}
+            )
+            if (
+                platform_type not in {1, 10}
+                and not official_overseas
+                and not meta_browser
+            ):
                 raise ValueError("当前正式发布执行器只开放小红书和公众号")
             if payload.get("debugDryRun") is not False:
                 raise ValueError("正式发布必须明确 debugDryRun=false")
-            if platform_type == 1:
+            if official_overseas:
+                checked = overseas_api_service.validate_official_publish_payload(
+                    payload
+                )
+                if not checked["ok"]:
+                    raise ValueError("；".join(checked["errors"]))
+            elif meta_browser:
+                checked = overseas_browser_publish.validate_meta_browser_publish_payload(
+                    payload
+                )
+                if not checked["ok"]:
+                    raise ValueError("；".join(checked["errors"]))
+            elif platform_type == 1:
                 if str(payload.get("contentType") or "") not in {"article", "video"}:
                     raise ValueError("小红书正式发布只支持图文或视频")
                 if payload.get("enableTimer") is True and not payload.get("scheduleTime"):
                     raise ValueError("小红书已开启定时发布，但未设置发布时间")
             else:
                 wechat_publish_policy.normalize_wechat_publish_preferences(payload)
+        elif runtime_mode == "draft":
+            if (
+                platform_type == 6
+                and set(payload.get("accountAuthModes") or [])
+                == {"official_api"}
+            ):
+                checked = overseas_api_service.validate_official_inbox_payload(
+                    payload
+                )
+                if not checked["ok"]:
+                    raise ValueError("；".join(checked["errors"]))
+            elif platform_type not in {2, 5}:
+                raise ValueError(
+                    "当前平台没有可验证的草稿保存通道；"
+                    "国内仅视频号和B站支持，TikTok 仅支持官方收件箱"
+                )
         else:
             raise ValueError("当前任务模式不支持")
         capability = oneclick_capabilities.validate_payload(
@@ -146,14 +204,29 @@ def _run_preflight(task: dict, payloads: list[dict[str, Any]]) -> None:
         for payload in payloads:
             platform_type = int(payload["type"])
             task_service.record_task_event(task["id"], "platform_started", f"开始检查{platform_type}号平台的素材上传与表单填写")
-            result = oneclick_preflight.run_preflight_sync(payload)
-            task_service.mark_platform_result(
-                task["id"],
-                platform_type,
-                ok=bool(result.get("ok")),
-                message=str(result.get("message") or "预发布检查结束"),
-                content_type=str(payload.get("contentType") or ""),
-            )
+            try:
+                if platform_type in {6, 7, 8, 9}:
+                    if set(payload.get("accountAuthModes") or []) == {"official_api"}:
+                        result = overseas_api_service.run_official_preflight_sync(payload)
+                    else:
+                        result = overseas_preflight.run_overseas_preflight_sync(payload)
+                else:
+                    result = oneclick_preflight.run_preflight_sync(payload)
+                task_service.mark_platform_result(
+                    task["id"],
+                    platform_type,
+                    ok=bool(result.get("ok")),
+                    message=str(result.get("message") or "预发布检查结束"),
+                    content_type=str(payload.get("contentType") or ""),
+                )
+            except Exception as exc:
+                task_service.mark_platform_result(
+                    task["id"],
+                    platform_type,
+                    ok=False,
+                    message=f"预检任务异常：{type(exc).__name__}：{exc}",
+                    content_type=str(payload.get("contentType") or ""),
+                )
     except Exception as exc:
         task_service.mark_platform_result(
             task["id"], int(payloads[0]["type"]), ok=False,
@@ -189,33 +262,54 @@ def _run_publish(task: dict, payloads: list[dict[str, Any]]) -> None:
                 "platform_publish_started",
                 f"开始执行{platform_name}字段回读与正式提交",
             )
-            if platform_type == 1:
-                result = xhs_publish_executor.run_xhs_publish_sync(
-                    payload,
-                    task_id=int(task["id"]),
-                )
-            else:
-                result = wechat_publish_executor.run_wechat_publish_sync(
-                    payload,
-                    task_id=int(task["id"]),
-                )
-            task_service.mark_platform_result(
-                task["id"],
-                platform_type,
-                ok=bool(result.get("ok")),
-                message=str(
-                    result.get("message")
-                    or (
-                        (
-                            f"小红书定时发布成功：{result.get('scheduledAt')}"
-                            if platform_type == 1 and result.get("scheduled")
-                            else f"{platform_name}正式提交结束"
-                        )
+            try:
+                if platform_type == 1:
+                    result = xhs_publish_executor.run_xhs_publish_sync(
+                        payload,
+                        task_id=int(task["id"]),
                     )
-                ),
-                content_type=str(payload.get("contentType") or ""),
-                event_type="platform_publish",
-            )
+                elif platform_type == 10:
+                    result = wechat_publish_executor.run_wechat_publish_sync(
+                        payload,
+                        task_id=int(task["id"]),
+                    )
+                elif platform_type in overseas_api_service.OFFICIAL_API_PLATFORM_TYPES:
+                    if set(payload.get("accountAuthModes") or []) == {"official_api"}:
+                        result = overseas_api_service.run_official_publish_sync(payload)
+                    elif platform_type in {8, 9}:
+                        result = overseas_browser_publish.run_meta_browser_publish_sync(
+                            payload
+                        )
+                    else:
+                        raise ValueError(f"{platform_name}浏览器正式发布保持锁定")
+                else:
+                    raise ValueError(f"{platform_name}尚未接入受控正式发布执行器")
+                task_service.mark_platform_result(
+                    task["id"],
+                    platform_type,
+                    ok=bool(result.get("ok")),
+                    message=str(
+                        result.get("message")
+                        or (
+                            (
+                                f"小红书定时发布成功：{result.get('scheduledAt')}"
+                                if platform_type == 1 and result.get("scheduled")
+                                else f"{platform_name}正式提交结束"
+                            )
+                        )
+                    ),
+                    content_type=str(payload.get("contentType") or ""),
+                    event_type="platform_publish",
+                )
+            except Exception as exc:
+                task_service.mark_platform_result(
+                    task["id"],
+                    platform_type,
+                    ok=False,
+                    message=f"正式发布异常：{type(exc).__name__}：{exc}",
+                    content_type=str(payload.get("contentType") or ""),
+                    event_type="platform_publish",
+                )
     except Exception as exc:
         task_service.mark_platform_result(
             task["id"],
@@ -230,6 +324,96 @@ def _run_publish(task: dict, payloads: list[dict[str, Any]]) -> None:
         _active_threads.pop(int(task["id"]), None)
 
 
+def _run_draft(task: dict, payloads: list[dict[str, Any]]) -> None:
+    """执行 TikTok 官方收件箱上传，不会公开发布。"""
+
+    if not _publish_lock.acquire(blocking=False):
+        task_service.mark_platform_result(
+            task["id"],
+            int(payloads[0]["type"]),
+            ok=False,
+            message="已有发布任务正在执行，请稍后重试",
+            content_type=str(payloads[0].get("contentType") or ""),
+            event_type="platform_draft",
+        )
+        _active_threads.pop(int(task["id"]), None)
+        return
+    try:
+        task_service.mark_task_running(
+            task["id"],
+            (
+                "一键发开始上传到 TikTok 官方收件箱"
+                if all(int(item.get("type") or 0) == 6 for item in payloads)
+                else "一键发开始执行受控平台草稿保存"
+            ),
+        )
+        if not all(int(item.get("type") or 0) == 6 for item in payloads):
+            results = post_video_batch_draft_tabs(payloads)
+            by_platform: dict[int, list[dict[str, Any]]] = {}
+            for result in results or []:
+                try:
+                    result_type = int(result.get("type") or 0)
+                except (AttributeError, TypeError, ValueError):
+                    continue
+                by_platform.setdefault(result_type, []).append(result)
+            for payload in payloads:
+                platform_type = int(payload["type"])
+                platform_results = by_platform.get(platform_type, [])
+                failed = [
+                    item for item in platform_results if item.get("ok") is False
+                ]
+                ok = bool(platform_results) and not failed
+                message = (
+                    str(failed[0].get("message") or "平台草稿保存失败")
+                    if failed
+                    else "平台已返回可验证的草稿保存结果"
+                    if ok
+                    else "平台草稿执行器未返回可验证结果"
+                )
+                task_service.mark_platform_result(
+                    task["id"],
+                    platform_type,
+                    ok=ok,
+                    message=message,
+                    content_type=str(payload.get("contentType") or ""),
+                    event_type="platform_draft",
+                )
+            return
+        for payload in payloads:
+            platform_type = int(payload["type"])
+            try:
+                result = overseas_api_service.run_official_inbox_upload_sync(payload)
+                task_service.mark_platform_result(
+                    task["id"],
+                    platform_type,
+                    ok=bool(result.get("ok")),
+                    message=str(result.get("message") or "TikTok 收件箱上传结束"),
+                    content_type=str(payload.get("contentType") or ""),
+                    event_type="platform_draft",
+                )
+            except Exception as exc:
+                task_service.mark_platform_result(
+                    task["id"],
+                    platform_type,
+                    ok=False,
+                    message=f"收件箱上传异常：{type(exc).__name__}：{exc}",
+                    content_type=str(payload.get("contentType") or ""),
+                    event_type="platform_draft",
+                )
+    except Exception as exc:
+        task_service.mark_platform_result(
+            task["id"],
+            int(payloads[0]["type"]),
+            ok=False,
+            message=f"收件箱上传异常：{type(exc).__name__}：{exc}",
+            content_type=str(payloads[0].get("contentType") or ""),
+            event_type="platform_draft",
+        )
+    finally:
+        _publish_lock.release()
+        _active_threads.pop(int(task["id"]), None)
+
+
 def start_desktop_publish(payloads: list[dict[str, Any]]) -> dict:
     """按载荷启动预检或已确认的公众号正式发布任务。"""
 
@@ -238,15 +422,25 @@ def start_desktop_publish(payloads: list[dict[str, Any]]) -> dict:
     if any(str(item.get("runtimeMode") or "preflight") != runtime_mode for item in prepared):
         raise ValueError("同一任务不能混合预检与正式发布")
     is_publish = runtime_mode == "publish"
+    is_draft = runtime_mode == "draft"
     task = task_service.create_pending_task(
         prepared,
-        mode="oneclick_publish" if is_publish else "oneclick_preflight",
+        mode=(
+            "oneclick_publish"
+            if is_publish
+            else "oneclick_draft"
+            if is_draft
+            else "oneclick_preflight"
+        ),
     )
     worker = threading.Thread(
-        target=_run_publish if is_publish else _run_preflight,
+        target=_run_publish if is_publish else _run_draft if is_draft else _run_preflight,
         args=(task, prepared),
         daemon=True,
-        name=f"oneclick-{'publish' if is_publish else 'preflight'}-{task['id']}",
+        name=(
+            f"oneclick-{'publish' if is_publish else 'draft' if is_draft else 'preflight'}-"
+            f"{task['id']}"
+        ),
     )
     _active_threads[int(task["id"])] = worker
     worker.start()
