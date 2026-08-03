@@ -830,7 +830,11 @@ async def run_wechat_publish(payload: dict[str, Any], *, task_id: int) -> dict[s
             preflight_payload = dict(payload)
             preflight_payload["runtimeMode"] = "preflight"
             preflight_payload["debugDryRun"] = True
-            preflight_message = await _wechat_preflight(page, preflight_payload)
+            preflight_message = await _wechat_preflight(
+                page,
+                preflight_payload,
+                account=account,
+            )
             editor_account = await account_service._detect_display_name(page, 10)
             expected_account = str(account.get("profileName") or account.get("userName") or "")
             if editor_account != expected_account:

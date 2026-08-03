@@ -25,6 +25,7 @@ ARTICLE_IMAGE_PLACEMENTS = {
     "after_heading",
 }
 AI_CONTENT_KINDS = {"image", "text", "video", "audio"}
+WECHAT_ARTICLE_TEMPLATES = {"silicon-evolution-tech-v1"}
 
 
 class ContentBundleError(ValueError):
@@ -169,6 +170,19 @@ def _original_declaration(value: Any) -> bool:
     if value is None:
         return False
     return _bool(value, "originalDeclaration")
+
+
+def _wechat_article_template(value: Any) -> str:
+    """读取可选公众号正文模板；旧内容包保持空值并走账号默认。"""
+
+    if value is None:
+        return ""
+    if not isinstance(value, str) or not value.strip():
+        raise ContentBundleError("wechatArticleTemplate 必须是非空字符串")
+    template_id = value.strip()
+    if template_id not in WECHAT_ARTICLE_TEMPLATES:
+        raise ContentBundleError(f"wechatArticleTemplate 不支持：{template_id}")
+    return template_id
 
 
 def _covers(data: Mapping[str, Any], root: Path) -> dict[str, str]:
@@ -372,6 +386,19 @@ def load_content_bundle(manifest_path: str | Path, *, expected_type: str | None 
         raise ContentBundleError("内容包必须保持 publishAllowed=false")
     root = path.parent.resolve()
     asset_paths, article_images = _assets(data, root, content_type)
+    preferred_platforms = _platforms(data.get("preferredPlatforms"))
+    wechat_article_template = _wechat_article_template(
+        data.get("wechatArticleTemplate")
+    )
+    if wechat_article_template:
+        if "微信公众号" not in preferred_platforms:
+            raise ContentBundleError(
+                "wechatArticleTemplate 仅可用于包含微信公众号目标的内容包"
+            )
+        if content_type not in {"article", "text"}:
+            raise ContentBundleError(
+                "wechatArticleTemplate 仅支持公众号图文或文字内容包"
+            )
     return {
         "schemaVersion": SCHEMA_VERSION,
         "contentType": content_type,
@@ -381,12 +408,13 @@ def load_content_bundle(manifest_path: str | Path, *, expected_type: str | None 
         "assetPaths": asset_paths,
         "articleImages": article_images,
         "coverPaths": _covers(data, root),
-        "preferredPlatforms": _platforms(data.get("preferredPlatforms")),
+        "preferredPlatforms": preferred_platforms,
         "platformOverrides": _overrides(data.get("platformOverrides")),
         "aiDisclosure": _ai_disclosure(data, root),
         "originalDeclaration": _original_declaration(
             data.get("originalDeclaration")
         ),
+        "wechatArticleTemplate": wechat_article_template,
         "publishSchedule": _publish_schedule(data.get("publishSchedule")),
         "sourcePath": str(path),
     }

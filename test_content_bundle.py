@@ -61,6 +61,29 @@ class ContentBundleTests(unittest.TestCase):
         self.assertEqual(bundle["articleImages"][0]["placement"], "after_intro")
         self.assertEqual(bundle["platformOverrides"]["小红书"]["tags"], ["测试话题"])
 
+    def test_loads_explicit_silicon_evolution_wechat_template(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = self._write_bundle(root, "article")
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            data["wechatArticleTemplate"] = "silicon-evolution-tech-v1"
+            manifest.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            bundle = load_content_bundle(manifest)
+        self.assertEqual(
+            bundle["wechatArticleTemplate"],
+            "silicon-evolution-tech-v1",
+        )
+
+    def test_rejects_unknown_wechat_article_template(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = self._write_bundle(root)
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            data["wechatArticleTemplate"] = "unknown-theme"
+            manifest.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            with self.assertRaisesRegex(ContentBundleError, "wechatArticleTemplate 不支持"):
+                load_content_bundle(manifest)
+
     def test_article_images_support_placement_and_keep_cover_separate(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

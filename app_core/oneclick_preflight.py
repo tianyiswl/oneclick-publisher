@@ -89,7 +89,46 @@ _WECHAT_AUTHOR_NON_OPTION_MARKERS = (
     "去设置",
 )
 _WECHAT_DEFAULT_TEMPLATE = "warm-jade"
+_WECHAT_SILICON_EVOLUTION_TEMPLATE = "silicon-evolution-tech-v1"
 _WECHAT_MOBILE_TEMPLATES = {
+    _WECHAT_SILICON_EVOLUTION_TEMPLATE: {
+        "name": "硅基进化科技编辑版",
+        "section": (
+            "font-family:-apple-system,BlinkMacSystemFont,Segoe UI,PingFang SC,"
+            "Hiragino Sans GB,Microsoft YaHei,sans-serif;font-size:16px;"
+            "line-height:1.92;color:#263247;word-break:break-word;"
+            "background:#ffffff;padding:20px 16px 10px;"
+        ),
+        "paragraph": (
+            "margin:0 0 22px;font-size:16px;line-height:1.92;"
+            "letter-spacing:0.02em;color:#263247;text-align:justify;"
+        ),
+        "heading2": (
+            "margin:44px 0 18px;padding:0 0 0 14px;"
+            "border-left:4px solid #6557f5;font-size:21px;line-height:1.4;"
+            "font-weight:700;color:#111827;letter-spacing:-0.02em;"
+        ),
+        "heading3": (
+            "margin:30px 0 13px;padding-left:10px;border-left:2px solid #aeb8ff;"
+            "font-size:18px;line-height:1.45;font-weight:700;color:#344054;"
+        ),
+        "list": "margin:6px 0 24px;padding-left:1.45em;color:#263247;",
+        "list_item": (
+            "margin:8px 0;font-size:16px;line-height:1.88;"
+            "color:#263247;padding-left:2px;"
+        ),
+        "quote": (
+            "margin:26px 0;padding:16px 18px;border-left:3px solid #aeb8ff;"
+            "background:#f7f8ff;color:#475467;font-size:15px;line-height:1.88;"
+            "border-radius:4px;"
+        ),
+        "rule": "border:0;border-top:1px solid #d7deea;margin:36px 0;",
+        "link": "#4b46c6",
+        "link_border": "#aeb8ff",
+        "strong": "#111827",
+        "code": "#4b46c6",
+        "code_background": "#f2f4ff",
+    },
     "warm-jade": {
         "name": "暖纸青墨",
         "section": (
@@ -180,6 +219,38 @@ def _account_for_payload(payload: dict) -> dict:
         if int(account.get("type") or 0) == platform_type and Path(str(account.get("filePath") or "")).name in files:
             return account
     raise PreflightError("未找到一键发已登录账号，请先在账号管理中完成登录")
+
+
+def _wechat_template_for_payload(payload: dict, account: dict | None = None) -> str:
+    """根据明确内容包标记或账号身份选择公众号正文模板。"""
+
+    requested = str(payload.get("wechatArticleTemplate") or "").strip()
+    resolved_account = account
+    if resolved_account is None:
+        try:
+            resolved_account = _account_for_payload(payload)
+        except PreflightError:
+            resolved_account = None
+
+    names = {
+        _normalized_page_text(value)
+        for value in (
+            (resolved_account or {}).get("profileName"),
+            (resolved_account or {}).get("userName"),
+        )
+        if _normalized_page_text(value)
+    }
+    is_silicon_evolution = any("硅基进化" in name for name in names)
+
+    if requested:
+        if requested not in _WECHAT_MOBILE_TEMPLATES:
+            raise PreflightError(f"公众号正文模板不支持：{requested}")
+        if requested == _WECHAT_SILICON_EVOLUTION_TEMPLATE and not is_silicon_evolution:
+            raise PreflightError("硅基进化科技编辑版仅可用于硅基进化公众号账号")
+        return requested
+    if is_silicon_evolution:
+        return _WECHAT_SILICON_EVOLUTION_TEMPLATE
+    return _WECHAT_DEFAULT_TEMPLATE
 
 
 def _storage_state(account: dict) -> Path:
@@ -448,10 +519,14 @@ def _wechat_markdown_visible_text(value: str) -> str:
     return "\n".join(visible_lines)
 
 
-async def _wechat_fill_rich_text(editor, markdown_text: str) -> str:
+async def _wechat_fill_rich_text(
+    editor,
+    markdown_text: str,
+    template_id: str = _WECHAT_DEFAULT_TEMPLATE,
+) -> str:
     """写入结构化富文本并返回预期的可见全文；不提交编辑器内容。"""
 
-    html = _wechat_markdown_to_html(markdown_text)
+    html = _wechat_markdown_to_html(markdown_text, template_id)
     if not html:
         raise PreflightError("公众号正文转换后为空")
     await editor.evaluate(
@@ -1488,7 +1563,12 @@ async def _wechat_prepare_article_images(
     )
 
 
-async def _wechat_preflight(page, payload: dict) -> str:
+async def _wechat_preflight(
+    page,
+    payload: dict,
+    *,
+    account: dict | None = None,
+) -> str:
     title, description = _wechat_payload_text(payload)
     cover = Path(str(payload.get("coverPath") or "")).resolve()
     if not cover.is_file():
@@ -1497,6 +1577,7 @@ async def _wechat_preflight(page, payload: dict) -> str:
     files = [Path(str(item)).resolve() for item in payload.get("fileList") or []]
     if content_type == "article" and (not files or not all(path.is_file() for path in files)):
         raise PreflightError("公众号图文预检缺少可读取的正文图片素材")
+    template_id = _wechat_template_for_payload(payload, account)
     await _wechat_open_article_editor(page)
     # 新版公众号将标题和正文都实现为 ProseMirror：第一个是标题，第二个是正文。
     editors = page.locator("div.ProseMirror")
@@ -1505,7 +1586,11 @@ async def _wechat_preflight(page, payload: dict) -> str:
     title_editor = editors.nth(0)
     editor = editors.nth(1)
     await title_editor.fill(title, force=True, timeout=10_000)
-    visible_description = await _wechat_fill_rich_text(editor, description)
+    visible_description = await _wechat_fill_rich_text(
+        editor,
+        description,
+        template_id,
+    )
     if _normalized_page_text(await title_editor.inner_text()) != _normalized_page_text(title):
         raise PreflightError("公众号标题字段未能回读测试值")
     if _normalized_page_text(await editor.inner_text()) != _normalized_page_text(visible_description):
@@ -1534,6 +1619,7 @@ async def _wechat_preflight(page, payload: dict) -> str:
         author_name = await _wechat_select_default_author(page)
         author_message = f"原创作者已选择并回读：{author_name}；"
     content_label = "图文" if content_type == "article" else "文字"
+    template_name = _WECHAT_MOBILE_TEMPLATES[template_id]["name"]
     # 安全边界：不点击“保存为草稿”“预览”“发表”。
     image_message = (
         f"正文图片已插入并完成最终位置回读 {inserted_images} 张；"
@@ -1541,7 +1627,7 @@ async def _wechat_preflight(page, payload: dict) -> str:
         else ""
     )
     return (
-        f"公众号{content_label}封面已上传，标题和正文已回读；"
+        f"公众号{content_label}封面已上传，标题和正文已回读，已套用{template_name}；"
         f"{image_message}{author_message}"
         "未保存草稿、未预览、未发表"
     )
@@ -2240,7 +2326,7 @@ async def run_preflight(payload: dict) -> dict:
             elif operation == _WECHAT_COVER_ONLY_OPERATION:
                 message = await _wechat_cover_only_preflight(page, payload)
             elif not operation:
-                message = await _wechat_preflight(page, payload)
+                message = await _wechat_preflight(page, payload, account=account)
             else:
                 raise PreflightError(f"公众号预检操作不支持：{operation}")
         return {"type": platform_type, "ok": True, "message": message}

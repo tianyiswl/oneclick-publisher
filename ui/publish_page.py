@@ -475,6 +475,7 @@ class PublishPage(QWidget):
         self._selected_media_ids: set[int] = set()
         self._imported_article_image_specs: dict[int, dict[str, str]] = {}
         self._imported_ai_disclosure: dict[str, object] = {}
+        self._imported_wechat_article_template = ""
         self._ai_declaration_explicitly_confirmed = False
         self._cover_rows_signature: tuple | None = None
         self._cover_pixmap_cache: dict[str, tuple[int, int, QPixmap]] = {}
@@ -3175,6 +3176,10 @@ class PublishPage(QWidget):
             if platform_type in {1, 10}:
                 payload["aiDisclosure"] = dict(self._imported_ai_disclosure)
             if platform_type == 10:
+                if self._imported_wechat_article_template:
+                    payload["wechatArticleTemplate"] = (
+                        self._imported_wechat_article_template
+                    )
                 payload["wechatGroupNotification"] = bool(
                     self.wechat_group_notification
                     and self.wechat_group_notification.isChecked()
@@ -3693,6 +3698,7 @@ class PublishPage(QWidget):
         self._select_content_type(2)
         self.preflight.setChecked(True)
         self._selected_media_ids.clear()
+        self._imported_wechat_article_template = ""
         self._selected_account_ids = {
             int(row["id"])
             for row in account_service.list_accounts()
@@ -3777,6 +3783,9 @@ class PublishPage(QWidget):
         by_source = {str(row["sourcePath"]): row for row in imported}
         self._imported_article_image_specs.clear()
         self._imported_ai_disclosure = dict(bundle.get("aiDisclosure") or {})
+        self._imported_wechat_article_template = str(
+            bundle.get("wechatArticleTemplate") or ""
+        )
         self._ai_declaration_explicitly_confirmed = False
         self.ai_generated_content.setChecked(
             bool(
@@ -3870,11 +3879,16 @@ class PublishPage(QWidget):
                     "\n内容包标记了 AI 辅助，但未授权自动声明；"
                     "正式发布前需由你亲自勾选确认。"
                 )
+        template_notice = (
+            "\n公众号将使用“硅基进化科技编辑版”正文模板。"
+            if self._imported_wechat_article_template == "silicon-evolution-tech-v1"
+            else ""
+        )
         QMessageBox.information(
             self,
             f"{labels[expected_type]}已导入",
             "已带入内容、素材、封面和可选平台覆盖，并强制切换为“预发布检查”。\n\n"
-            f"{account_hint}{ai_notice}\n"
+            f"{account_hint}{ai_notice}{template_notice}\n"
             "导入本身不会上传、保存草稿或发表；请核对内容后再点击“开始预检”。",
         )
 

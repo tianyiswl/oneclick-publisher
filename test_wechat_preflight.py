@@ -16,6 +16,7 @@ from app_core.oneclick_preflight import (
     _WECHAT_AUTHOR_TRIGGER_SELECTORS,
     _WECHAT_COVER_ONLY_OPERATION,
     _WECHAT_MOBILE_TEMPLATES,
+    _WECHAT_SILICON_EVOLUTION_TEMPLATE,
     _normalized_page_text,
     _wechat_author_display_name,
     _wechat_author_only_preflight,
@@ -35,6 +36,7 @@ from app_core.oneclick_preflight import (
     _wechat_resolve_body_image_anchors,
     _wechat_select_default_author,
     _wechat_select_cover_from_content,
+    _wechat_template_for_payload,
     _wechat_verify_body_image_placements,
     _wechat_wait_cover_crop_ready,
     _wechat_wait_cover_return_to_editor,
@@ -257,6 +259,58 @@ class WechatPreflightTests(unittest.TestCase):
             )
         self.assertEqual(_WECHAT_MOBILE_TEMPLATES["warm-jade"]["name"], "暖纸青墨")
         self.assertEqual(_WECHAT_MOBILE_TEMPLATES["warm-umber"]["name"], "暖纸赭棕")
+
+    def test_silicon_evolution_template_matches_tech_editorial_contract(self):
+        body = (
+            "第一段正文。\n\n"
+            "## 章节标题\n\n"
+            "这里有**重点**和[来源](https://example.com/report)。\n\n"
+            "### 子标题\n\n"
+            "> 原文引用。\n\n"
+            "- 列表项\n\n"
+            "`代码片段`"
+        )
+        html = _wechat_markdown_to_html(body, _WECHAT_SILICON_EVOLUTION_TEMPLATE)
+        self.assertIn('data-oneclick-theme="silicon-evolution-tech-v1"', html)
+        self.assertIn("font-size:16px;line-height:1.92;color:#263247", html)
+        self.assertIn("background:#ffffff", html)
+        self.assertIn("border-left:4px solid #6557f5", html)
+        self.assertIn("font-size:21px;line-height:1.4", html)
+        self.assertIn("border-left:2px solid #aeb8ff", html)
+        self.assertIn("background:#f7f8ff", html)
+        self.assertIn('color:#4b46c6;text-decoration:none', html)
+        self.assertNotIn("linear-gradient", html)
+        self.assertEqual(
+            _normalized_page_text(_wechat_markdown_visible_text(body)),
+            _normalized_page_text("第一段正文。 章节标题 这里有重点和来源。 子标题 原文引用。 列表项 代码片段"),
+        )
+
+    def test_silicon_evolution_account_selects_only_its_tech_template(self):
+        silicon_account = {
+            "id": 10,
+            "type": 10,
+            "filePath": "silicon-wechat.json",
+            "profileName": "硅基进化",
+            "userName": "硅基进化",
+        }
+        payload = {"type": 10, "accountList": ["silicon-wechat.json"]}
+        with patch(
+            "app_core.oneclick_preflight.account_service.list_accounts",
+            return_value=[silicon_account],
+        ):
+            self.assertEqual(
+                _wechat_template_for_payload(payload),
+                _WECHAT_SILICON_EVOLUTION_TEMPLATE,
+            )
+            payload["wechatArticleTemplate"] = _WECHAT_SILICON_EVOLUTION_TEMPLATE
+            self.assertEqual(
+                _wechat_template_for_payload(payload),
+                _WECHAT_SILICON_EVOLUTION_TEMPLATE,
+            )
+
+        other_account = {**silicon_account, "profileName": "另一账号", "userName": "另一账号"}
+        with self.assertRaisesRegex(PreflightError, "仅可用于硅基进化"):
+            _wechat_template_for_payload(payload, other_account)
 
     def test_page_text_readback_ignores_only_layout_whitespace_and_zero_width_marks(self):
         expected = "第一段\n第二段"
