@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """构建一键发 macOS arm64 客户端。
 
-仅把源码与只读资源加入应用；账号、会话、数据库、OAuth 令牌和素材目录
+仅把源码与只读资源加入应用；账号、会话、数据库和素材目录
 均不属于 PyInstaller datas，也不会进入压缩包。
 """
 
@@ -143,7 +143,6 @@ from PyInstaller.utils.hooks import collect_all, collect_submodules
 datas = [({str(assets)!r}, "ui/assets"), ({str(stealth)!r}, "utils")]
 binaries = []
 hiddenimports = []
-hiddenimports += collect_submodules("app_core.overseas")
 hiddenimports += collect_submodules("myUtils")
 hiddenimports += collect_submodules("utils")
 hiddenimports += collect_submodules("uploader")

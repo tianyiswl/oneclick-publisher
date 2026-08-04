@@ -27,11 +27,22 @@ _KUAISHOU_VIDEO_URL = "https://cp.kuaishou.com/article/publish/video"
 _BILIBILI_VIDEO_URL = "https://member.bilibili.com/platform/upload/video/frame?page_from=creative_home_top_upload"
 _BILIBILI_ARTICLE_URL = "https://member.bilibili.com/platform/upload/text/new-edit"
 _TEST_PREFIX = "一键发功能测试"
-_DOUYIN_LOCATION_TRIGGER_SELECTORS = (
-    'div.semi-select span:has-text("输入地理位置")',
-    'div.semi-select span:has-text("添加位置")',
-    '[role="combobox"]:has-text("输入地理位置")',
-    '[role="combobox"]:has-text("添加位置")',
+# 新版抖音发布页会在同一个选择控件内嵌套多个同文案 span。不能再直接
+# 把文字节点当作入口，否则一个实际控件会被误判成多个入口。这里先定位
+# 可交互的控件根节点，再根据控件自身及其字段上下文识别“发布定位”。
+_DOUYIN_LOCATION_CONTROL_ROOT_SELECTORS = (
+    "div.semi-select",
+    '[role="combobox"]',
+)
+_DOUYIN_LOCATION_CONTROL_TEXTS = (
+    "输入地理位置",
+    "添加地理位置",
+    "添加位置",
+    "添加地点",
+    "选择地理位置",
+    "选择位置",
+    "选择地点",
+    "发布定位",
 )
 _DOUYIN_LOCATION_INPUT_SELECTORS = (
     'div[role="listbox"] input',
@@ -40,9 +51,19 @@ _DOUYIN_LOCATION_INPUT_SELECTORS = (
     'input[placeholder*="地理位置"]',
     'input[placeholder*="位置"]',
 )
+_DOUYIN_LOCATION_INLINE_INPUT_SELECTORS = (
+    # 新版地点控件点击后会把无 placeholder 的输入框直接插入当前
+    # semi-select 内，因此必须以已唯一确认的控件为作用域，不能全页
+    # 模糊匹配任意空 placeholder 输入框。
+    'input.semi-input',
+    'input',
+    'textarea',
+)
 _DOUYIN_LOCATION_OPTION_SELECTORS = (
-    'div[role="listbox"] [role="option"]',
+    # 新版地点搜索返回 semi-select-option；页面同时可能残留其它模块的
+    # role=option（例如活动/话题空提示），必须优先当前下拉真实候选。
     '.semi-select-option-list .semi-select-option',
+    'div[role="listbox"] [role="option"]',
     '[role="listbox"] [class*="option"]',
 )
 _WECHAT_AUTHOR_ONLY_OPERATION = "wechat_author_only"
@@ -323,8 +344,15 @@ def _douyin_location_match_indexes(
         )
         for value in structured
     ]
-    if any(visible_ids):
-        return [index for index, value in enumerate(visible_ids) if value == expected_id]
+    id_indexes = [
+        index for index, value in enumerate(visible_ids) if value == expected_id
+    ]
+    if id_indexes:
+        return id_indexes
+
+    # 新版控件有时会把列表行序号等非 POI 值放进 data-value。只有真正
+    # 与用户已选 poiId 一致时才把它视为决定性身份；否则退回到名称和
+    # 完整地址的唯一匹配，仍不允许在同名多地址时猜选。
 
     name_indexes = [
         index
@@ -347,6 +375,53 @@ def _douyin_location_match_indexes(
         ):
             address_indexes.append(index)
     return address_indexes or name_indexes
+
+
+def _douyin_location_control_indexes(controls: list[object]) -> list[int]:
+    """返回可唯一判断为“发布定位”的控件根节点序号。
+
+    ``controls`` 是从页面中读取的轻量描述，不包含会话、Cookie 或表单值。
+    同一个控件可能因嵌套节点或不同选择器重复出现，需按根节点 identity
+    去重；不同 identity 即使文案相同仍保持多个，交由调用方安全停止。
+    """
+
+    direct_matched: list[int] = []
+    context_matched: list[int] = []
+    direct_seen: set[str] = set()
+    context_seen: set[str] = set()
+    labels = tuple(item.casefold() for item in _DOUYIN_LOCATION_CONTROL_TEXTS)
+    for index, value in enumerate(controls):
+        if not isinstance(value, dict):
+            continue
+        direct_text = " ".join(
+            _normalized_page_text(value.get(field))
+            for field in (
+                "text",
+                "ariaLabel",
+                "placeholder",
+                "testId",
+                "e2e",
+            )
+            if _normalized_page_text(value.get(field))
+        ).casefold()
+        context_text = _normalized_page_text(value.get("context")).casefold()
+        identity = _normalized_page_text(value.get("identity"))
+        if direct_text and any(label in direct_text for label in labels):
+            if not identity or identity not in direct_seen:
+                direct_matched.append(index)
+                if identity:
+                    direct_seen.add(identity)
+            continue
+        if context_text and any(label in context_text for label in labels):
+            if not identity or identity not in context_seen:
+                context_matched.append(index)
+                if identity:
+                    context_seen.add(identity)
+
+    # 新版页面的多个选择框可能共享一个包含“发布定位”的设置区父节点。
+    # 只要控件自身的文字或属性已有命中，就不能再让父级上下文把“合集”
+    # 等其他选择框带进结果；仅在控件自身完全无命中时才使用上下文兜底。
+    return direct_matched or context_matched
 
 
 def _wechat_payload_text(payload: dict) -> tuple[str, str]:
@@ -1888,6 +1963,110 @@ async def _douyin_wait_visible_nodes(
     return []
 
 
+async def _douyin_location_control_descriptor(control) -> dict[str, str]:
+    """读取发布定位控件的非敏感结构化描述，用于根节点级去重。"""
+
+    try:
+        result = await control.evaluate(
+            """element => {
+                const normalize = value => String(value || '')
+                    .replace(/\\u200b/g, ' ')
+                    .replace(/\\s+/g, ' ')
+                    .trim();
+                const attribute = name => normalize(element.getAttribute(name));
+                const input = element.querySelector('input, textarea');
+                let context = '';
+                let parent = element.parentElement;
+                for (let depth = 0; parent && depth < 4; depth += 1) {
+                    const className = String(parent.className || '');
+                    if (/(?:form|field|item|row|setting)/i.test(className)) {
+                        context = normalize(parent.innerText || parent.textContent);
+                        break;
+                    }
+                    parent = parent.parentElement;
+                }
+                const rect = element.getBoundingClientRect();
+                const identity = [
+                    attribute('id'),
+                    attribute('data-e2e'),
+                    attribute('data-testid'),
+                    attribute('aria-controls'),
+                    attribute('aria-labelledby'),
+                    element.tagName,
+                    String(element.className || ''),
+                    `${Math.round(rect.x)}:${Math.round(rect.y)}:${Math.round(rect.width)}:${Math.round(rect.height)}`,
+                ].filter(Boolean).join('|');
+                return {
+                    identity,
+                    text: normalize(element.innerText || element.textContent),
+                    context,
+                    ariaLabel: attribute('aria-label'),
+                    placeholder: normalize(input && input.getAttribute('placeholder')),
+                    testId: attribute('data-testid'),
+                    e2e: attribute('data-e2e'),
+                };
+            }"""
+        )
+    except Exception:
+        return {}
+    return result if isinstance(result, dict) else {}
+
+
+async def _douyin_visible_location_controls(page) -> list:
+    """从新版页面定位唯一的“发布定位”控件根节点。
+
+    优先只取 ``.semi-select`` 根节点，避免其内部的标题、占位文案、图标
+    都被算成不同入口；只有页面没有该结构时才回退到 role=combobox。
+    """
+
+    for selector in _DOUYIN_LOCATION_CONTROL_ROOT_SELECTORS:
+        # 发布定位在新版页面的“扩展信息”区，初始常位于首屏下方。
+        # 这里不能复用通用的“必须已在视口内”筛选，否则会把真实地点
+        # 控件排除在候选之外。仍要求节点真实可见、可用，命中后再滚入
+        # 视口，绝不因滚动而放宽唯一性判断。
+        controls = []
+        matches = page.locator(selector)
+        for index in range(await matches.count()):
+            control = matches.nth(index)
+            try:
+                if await control.is_visible() and await control.is_enabled():
+                    controls.append(control)
+            except Exception:
+                continue
+        if not controls:
+            continue
+        descriptors = [
+            await _douyin_location_control_descriptor(control)
+            for control in controls
+        ]
+        matched_indexes = _douyin_location_control_indexes(descriptors)
+        if matched_indexes:
+            result = [controls[index] for index in matched_indexes]
+            for control in result:
+                try:
+                    await control.scroll_into_view_if_needed(timeout=5_000)
+                except Exception:
+                    # 滚动失败时随后点击会按平台的正常超时失败，不猜测坐标。
+                    pass
+            return result
+    return []
+
+
+async def _douyin_click_location_control(control) -> None:
+    """点击已唯一识别的控件；优先点击其单一选择区，无法确认时点根节点。"""
+
+    click_targets = await _douyin_first_visible_nodes(
+        control,
+        (
+            ":scope > .semi-select-selection",
+            ".semi-select-selection",
+            '[role="combobox"]',
+        ),
+    )
+    target = click_targets[0] if len(click_targets) == 1 else control
+    await target.click(timeout=8_000)
+
+
 async def _douyin_location_option_name(option) -> str:
     """优先读取地点选项的结构化名称，再回退到选项首行。"""
 
@@ -1969,6 +2148,125 @@ async def _douyin_location_option_identity(option) -> dict[str, str]:
     return {"poiId": poi_id, "name": name, "address": address}
 
 
+async def _douyin_open_location_search(page, keyword: str):
+    """打开或复用当前地点搜索框，并填入关键词。
+
+    带货分步流程会先读取候选、再由用户确认其中一项。候选读取后下拉可能仍
+    保持展开；再次点击会把它收起，因此这里优先复用已可见的输入框。
+    """
+
+    triggers = await _douyin_visible_location_controls(page)
+    if len(triggers) != 1:
+        raise PreflightError(
+            "抖音发布页未找到唯一可用的“发布定位”入口，已停止以避免误操作"
+        )
+    trigger = triggers[0]
+    try:
+        is_select_root = await trigger.evaluate(
+            "element => element.classList.contains('semi-select')"
+        )
+    except Exception:
+        is_select_root = False
+    selection_container = trigger if is_select_root else trigger.locator(
+        'xpath=ancestor::div[contains(@class,"semi-select")][1]'
+    )
+    if await selection_container.count() != 1:
+        raise PreflightError("抖音发布定位控件结构已变化，已安全停止")
+
+    inputs = await _douyin_first_visible_nodes(
+        selection_container,
+        _DOUYIN_LOCATION_INLINE_INPUT_SELECTORS,
+    )
+    if len(inputs) != 1:
+        portal_inputs = await _douyin_first_visible_nodes(
+            page,
+            _DOUYIN_LOCATION_INPUT_SELECTORS,
+        )
+        if len(portal_inputs) == 1:
+            inputs = portal_inputs
+        elif not inputs and not portal_inputs:
+            await _douyin_click_location_control(trigger)
+            inputs = await _douyin_wait_visible_nodes(
+                selection_container,
+                _DOUYIN_LOCATION_INLINE_INPUT_SELECTORS,
+                page,
+            )
+            if len(inputs) != 1:
+                inputs = await _douyin_wait_visible_nodes(
+                    page,
+                    _DOUYIN_LOCATION_INPUT_SELECTORS,
+                    page,
+                )
+        else:
+            raise PreflightError("抖音地点搜索输入框未唯一显示，已安全停止")
+    if len(inputs) != 1:
+        raise PreflightError("抖音地点搜索输入框未唯一显示，已安全停止")
+    await inputs[0].fill(keyword, timeout=8_000)
+    return selection_container
+
+
+async def _douyin_visible_location_options(page) -> tuple[list, list[dict[str, str]]]:
+    """读取当前可见地点候选一次，不在这里重复等待。"""
+
+    options = await _douyin_first_visible_nodes(
+        page,
+        _DOUYIN_LOCATION_OPTION_SELECTORS,
+    )
+    candidates = [
+        await _douyin_location_option_identity(option)
+        for option in options
+    ]
+    return options, candidates
+
+
+async def _douyin_wait_location_options(page) -> tuple[list, list[dict[str, str]]]:
+    """有上限地等待抖音地点候选；加载中的空态不算最终无结果。"""
+
+    options: list = []
+    candidates: list[dict[str, str]] = []
+    for _ in range(24):
+        options, candidates = await _douyin_visible_location_options(page)
+        if any(
+            _normalized_page_text(candidate.get("poiId"))
+            and _normalized_page_text(candidate.get("name"))
+            for candidate in candidates
+        ):
+            return options, candidates
+        await page.wait_for_timeout(250)
+    return options, candidates
+
+
+async def search_douyin_location_candidates(page, keyword: object) -> list[dict[str, str]]:
+    """只读当前编辑页的地点候选，供客户端让用户明确选择。
+
+    该函数不点击任何地点选项。候选缺少 POI、名称或完整地址时一律拒绝，
+    因为后续带货发布定位回读和最终确认都需要该身份。
+    """
+
+    normalized_keyword = _normalized_page_text(keyword)
+    if not normalized_keyword:
+        raise PreflightError("请输入地点关键词")
+    await _douyin_open_location_search(page, normalized_keyword)
+    _options, candidates = await _douyin_wait_location_options(page)
+    rows: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        poi_id = _normalized_page_text(candidate.get("poiId"))
+        name = _normalized_page_text(candidate.get("name"))
+        address = _normalized_page_text(candidate.get("address"))
+        if not poi_id or not name or not address:
+            continue
+        if poi_id in seen:
+            raise PreflightError("抖音地点候选出现重复 POI，无法安全选择")
+        seen.add(poi_id)
+        rows.append({"poiId": poi_id, "name": name, "address": address, "distance": ""})
+    if not rows:
+        raise PreflightError(
+            f"抖音未返回地点“{normalized_keyword}”的完整可选 POI"
+        )
+    return rows
+
+
 async def _douyin_set_location(page, payload: dict) -> str:
     """
     使用抖音官方发布页的地点搜索并回读。
@@ -1989,42 +2287,22 @@ async def _douyin_set_location(page, payload: dict) -> str:
     if not selected_poi:
         raise PreflightError("抖音任务只包含地点关键词，缺少已选择的官方 POI，已安全停止")
 
-    triggers = await _douyin_wait_visible_nodes(
-        page,
-        _DOUYIN_LOCATION_TRIGGER_SELECTORS,
-        page,
-    )
-    if len(triggers) != 1:
-        raise PreflightError(
-            "抖音发布页未找到唯一可用的“发布定位”入口，已停止以避免误操作"
-        )
-    trigger = triggers[0]
-    selection_container = trigger.locator(
-        'xpath=ancestor::div[contains(@class,"semi-select")][1]'
-    )
-    if await selection_container.count() != 1:
-        raise PreflightError("抖音发布定位控件结构已变化，已安全停止")
-    await trigger.click(timeout=8_000)
+    selection_container = await _douyin_open_location_search(page, keyword)
 
-    inputs = await _douyin_wait_visible_nodes(
-        page,
-        _DOUYIN_LOCATION_INPUT_SELECTORS,
-        page,
-    )
-    if len(inputs) != 1:
-        raise PreflightError("抖音地点搜索输入框未唯一显示，已安全停止")
-    await inputs[0].fill(keyword, timeout=8_000)
-
-    options = await _douyin_wait_visible_nodes(
-        page,
-        _DOUYIN_LOCATION_OPTION_SELECTORS,
-        page,
-        attempts=24,
-    )
+    # 输入后的首帧可能短暂显示“未搜索到相关位置”，随后才替换为真实
+    # POI 列表。不能把这个加载中空态当作最终结果；在上限内等待到已选
+    # POI 出现且唯一匹配，仍不允许在相似候选中猜选。
+    options: list = []
+    candidates: list[dict[str, str]] = []
+    matched_indexes = []
+    for _ in range(24):
+        options, candidates = await _douyin_visible_location_options(page)
+        matched_indexes = _douyin_location_match_indexes(selected_poi, candidates)
+        if len(matched_indexes) == 1:
+            break
+        await page.wait_for_timeout(250)
     if not options:
         raise PreflightError(f"抖音未返回地点“{keyword}”的可选结果")
-    candidates = [await _douyin_location_option_identity(option) for option in options]
-    matched_indexes = _douyin_location_match_indexes(selected_poi, candidates)
     if len(matched_indexes) != 1:
         matched = "、".join(
             " / ".join(

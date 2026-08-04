@@ -225,3 +225,43 @@ def search_douyin_locations(account: dict, keyword: object) -> list[dict[str, st
     rows = asyncio.run(_search(dict(account), normalized_keyword))
     _store_cache(account_id, normalized_keyword, rows)
     return deepcopy(rows)
+
+
+async def search_douyin_locations_in_editor(page: Any, keyword: object) -> list[dict[str, str]]:
+    """通过当前已上传的抖音编辑页可见控件搜索 POI。
+
+    抖音带货流程必须复用同一编辑会话；不能为地点查询另开无头浏览器，也不
+    依赖私有接口或签名请求。该操作只打开地点搜索、输入关键词并回读候选，
+    不选择候选、不写入地点、更不保存草稿或发布。
+    """
+
+    normalized_keyword = normalize_location_keyword(keyword)
+    try:
+        # 延迟导入，避免 oneclick_preflight 的传统流程与本服务产生导入环。
+        from . import oneclick_preflight
+
+        rows = await oneclick_preflight.search_douyin_location_candidates(
+            page,
+            normalized_keyword,
+        )
+    except Exception as exc:
+        if isinstance(exc, DouyinLocationSearchError):
+            raise
+        raise DouyinLocationSearchError(_normalized(str(exc)) or "抖音地点搜索失败") from exc
+    result: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for row in rows:
+        candidate = normalize_location_candidate(row)
+        if not candidate:
+            continue
+        if not candidate["address"]:
+            # 带货任务必须在客户端和确认页展示完整地点，地址缺失就不把
+            # 候选提供给用户，避免后续绑定了无法核对的门店。
+            continue
+        if candidate["poiId"] in seen:
+            raise DouyinLocationSearchError("抖音地点候选出现重复 POI，无法安全选择")
+        seen.add(candidate["poiId"])
+        result.append(candidate)
+    if not result:
+        raise DouyinLocationSearchError("抖音页面未返回带完整地址的可选官方地点")
+    return result

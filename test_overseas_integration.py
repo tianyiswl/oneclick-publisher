@@ -267,7 +267,7 @@ class OverseasPreflightTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             video = Path(raw) / "video.mp4"
             video.write_bytes(b"video")
-            with self.assertRaisesRegex(ValueError, "只开放小红书和公众号"):
+            with self.assertRaisesRegex(ValueError, "Meta 浏览器通道"):
                 publish_service._validate_payloads(
                     [
                         {

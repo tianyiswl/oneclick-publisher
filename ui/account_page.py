@@ -31,7 +31,6 @@ from app_core.paths import AVATAR_DIR
 from .background_task import BackgroundTaskRunner
 from .common import PLATFORM_COLORS, button, table_item
 from .login_dialog import LoginDialog
-from .overseas_authorization_dialog import OverseasAuthorizationDialog
 
 
 ACCOUNT_AVATAR_SIZE = 36
@@ -169,16 +168,12 @@ class AccountPage(QWidget):
         header.addWidget(self.refresh_btn)
 
         bind_btn = button("绑定账号", variant="primary")
-        bind_btn.setToolTip("在一键发内发起平台授权；不会读取蚁小二客户端的账号或登录态。")
+        bind_btn.setToolTip(
+            "在一键发独立浏览器会话中登录平台；"
+            "不会读取蚁小二客户端的账号或登录态。"
+        )
         bind_btn.clicked.connect(self.bind_account)
         header.addWidget(bind_btn)
-        official_bind_btn = button("官方 API 授权", variant="secondary")
-        official_bind_btn.setToolTip(
-            "导入项目自有的 YouTube / TikTok / Meta 开发者配置，"
-            "并由一键发完成官方 OAuth 授权。"
-        )
-        official_bind_btn.clicked.connect(self.bind_official_account)
-        header.addWidget(official_bind_btn)
         layout.addLayout(header)
 
         filters = QFrame()
@@ -399,16 +394,11 @@ class AccountPage(QWidget):
         layout.setSpacing(4)
         menu = QMenu(box)
         menu.addAction("检测登录状态", lambda _checked=False, r=row: self.check_one(r))
-        official_api = str(row.get("authMode") or "browser") == "official_api"
-        menu.addAction(
-            "重新官方授权" if official_api else "重新登录",
-            lambda _checked=False, r=row: self.relogin(r),
-        )
+        menu.addAction("重新登录", lambda _checked=False, r=row: self.relogin(r))
         refresh_action = menu.addAction(
             "刷新账号信息",
             lambda _checked=False, r=row: self.refresh_avatar(r),
         )
-        refresh_action.setEnabled(not official_api)
         menu.addAction("编辑备注", lambda _checked=False, r=row: self.edit_remark(r))
         menu.addSeparator()
         menu.addAction("删除账号", lambda _checked=False, r=row: self.delete_one(r))
@@ -442,18 +432,13 @@ class AccountPage(QWidget):
         if not row:
             return
         menu = QMenu(self)
-        official_api = str(row.get("authMode") or "browser") == "official_api"
-        menu.addAction(
-            "重新官方授权" if official_api else "重新登录",
-            lambda: self.relogin(row),
-        )
+        menu.addAction("重新登录", lambda: self.relogin(row))
         menu.addAction("打开后台", lambda: self.open_backend(row))
         menu.addAction("检测登录", lambda: self.check_one(row))
-        refresh_action = menu.addAction(
+        menu.addAction(
             "刷新头像/登录信息",
             lambda: self.refresh_avatar(row),
         )
-        refresh_action.setEnabled(not official_api)
         menu.addAction("编辑备注", lambda: self.edit_remark(row))
         menu.addAction("删除账号", lambda: self.delete_one(row))
         menu.exec(self.table.mapToGlobal(pos))
@@ -465,21 +450,7 @@ class AccountPage(QWidget):
         if dialog.lifecycle_message:
             self._set_status(dialog.lifecycle_message)
 
-    def bind_official_account(self) -> None:
-        dialog = OverseasAuthorizationDialog(self)
-        dialog.exec()
-        self.refresh()
-        if dialog.lifecycle_message:
-            self._set_status(dialog.lifecycle_message)
-
     def relogin(self, row: dict) -> None:
-        if str(row.get("authMode") or "browser") == "official_api":
-            dialog = OverseasAuthorizationDialog(self, account=row)
-            dialog.exec()
-            self.refresh()
-            if dialog.lifecycle_message:
-                self._set_status(dialog.lifecycle_message)
-            return
         dialog = LoginDialog(
             self,
             row,

@@ -16,7 +16,7 @@ from typing import Any
 from myUtils.postVideo import post_video_facebook, post_video_instagram
 from utils.publish_observer import publish_context
 
-from .overseas.meta.browser_policy import (
+from .meta_browser_policy import (
     META_BROWSER_AUTOMATION_ACKNOWLEDGED,
     META_BROWSER_PLATFORM_TYPES,
     META_BROWSER_PUBLISH_CONFIRMED,
@@ -70,8 +70,6 @@ def validate_meta_browser_publish_payload(payload: dict[str, Any]) -> dict[str, 
         errors.append("Meta 正式发布必须明确 debugDryRun=false")
     if not browser_publish_confirmation_valid(payload):
         errors.append("缺少 Meta 浏览器正式发布的两项独立确认")
-    if set(payload.get("accountAuthModes") or []) != {"browser"}:
-        errors.append("Meta 浏览器通道不能混用官方 API 账号")
     account_files = [
         Path(str(item)).name
         for item in payload.get("accountList") or []
@@ -93,12 +91,12 @@ def validate_meta_browser_publish_payload(payload: dict[str, Any]) -> dict[str, 
     if platform_type == 8 and payload.get("shareToFeed") is False:
         errors.append(
             "Instagram 浏览器正式通道尚无法回读“仅 Reels”，"
-            "请改用官方 API 账号"
+            "请保持“同时分享到动态”开启"
         )
     if payload.get("aiGenerated") is True:
         errors.append(
             f"{PLATFORM_NAMES.get(platform_type, 'Meta')} 浏览器正式通道"
-            "尚未可靠回读 AI 声明，请改用官方 API 账号"
+            "尚未可靠回读 AI 声明，已安全停止"
         )
     schedule = None
     try:

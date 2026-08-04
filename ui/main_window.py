@@ -39,6 +39,7 @@ from .background_task import BackgroundTaskRunner
 from .common import button
 from .account_page import AccountPage
 from .dashboard_page import DashboardPage
+from .douyin_commerce_page import DouyinCommercePage
 from .help_dialog import HelpDialog
 from .media_page import MediaPage
 from .publish_page import PublishPage
@@ -345,12 +346,14 @@ class MainWindow(QMainWindow):
         self.accounts = AccountPage()
         self.media = MediaPage()
         self.publish = PublishPage()
+        self.douyin_commerce = DouyinCommercePage()
         self.tasks = TaskPage()
         self.page_definitions = (
             ("工作台", self.dashboard, "ui/assets/nav-dashboard.svg"),
             ("账号管理", self.accounts, "ui/assets/nav-accounts.svg"),
             ("素材管理", self.media, "ui/assets/nav-media.svg"),
             ("发布中心", self.publish, "ui/assets/nav-publish.svg"),
+            ("抖音带货", self.douyin_commerce, "ui/assets/nav-publish.svg"),
             ("任务记录", self.tasks, "ui/assets/nav-tasks.svg"),
         )
         self.coming_soon_definitions = (
@@ -620,7 +623,8 @@ class MainWindow(QMainWindow):
             "accounts": 1,
             "media": 2,
             "publish": 3,
-            "tasks": 4,
+            "commerce": 4,
+            "tasks": 5,
         }
         try:
             index = page_indexes[str(page_key)]

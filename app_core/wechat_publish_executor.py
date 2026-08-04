@@ -18,6 +18,7 @@ from typing import Any
 from . import account_service, task_service
 from .oneclick_preflight import (
     PreflightError,
+    _WECHAT_HOME_URL,
     _account_for_payload,
     _storage_state,
     _wechat_preflight,
@@ -39,6 +40,31 @@ from .wechat_verification import (
 
 class WechatPublishError(RuntimeError):
     """公众号正式发表无法安全继续。"""
+
+
+_NAVIGATION_TRANSIENT_MARKERS = (
+    "Execution context was destroyed",
+    "Cannot find context with specified id",
+    "Most likely the page has been closed",
+)
+
+
+def _normalized_text(value: object) -> str:
+    """统一页面与任务回读文本，忽略空白差异。"""
+
+    return " ".join(str(value or "").replace("\u200b", "").split())
+
+
+def _is_transient_navigation_error(error: BaseException) -> bool:
+    """判断是否为页面跳转中的暂态异常，而不是发表失败。
+
+    公众号扫码成功后会从验证弹层立即跳转。Playwright 的
+    ``page.wait_for_timeout`` 本身也会通过页面执行上下文计时，因此若在
+    跳转瞬间调用，会把正常导航误报为 ``Page.evaluate`` 失败。
+    """
+
+    message = str(error)
+    return any(marker in message for marker in _NAVIGATION_TRANSIENT_MARKERS)
 
 
 async def _visible_nodes(locator) -> list[Any]:
@@ -129,6 +155,7 @@ async def _page_state(page, expected_title: str) -> dict[str, Any]:
               href: link.href || '',
             }));
           const scheduledCards = [];
+          const publishedCards = [];
           if (expectedTitle) {
             const titleNodes = Array.from(document.querySelectorAll(
               'a,p,span,div,h1,h2,h3,h4'
@@ -147,6 +174,17 @@ async def _page_state(page, expected_title: str) -> dict[str, Any]:
                 current = current.parentElement;
               }
             }
+            for (const titleNode of titleNodes) {
+              let current = titleNode;
+              for (let depth = 0; current && depth < 9; depth += 1) {
+                const text = normalize(current.innerText || current.textContent);
+                if (text.includes('已发表') && text.includes(expectedTitle)) {
+                  publishedCards.push(text.slice(0, 1200));
+                  break;
+                }
+                current = current.parentElement;
+              }
+            }
           }
           return {
             url: location.href,
@@ -157,6 +195,7 @@ async def _page_state(page, expected_title: str) -> dict[str, Any]:
             successMarkers,
             links,
             scheduledCards: Array.from(new Set(scheduledCards)),
+            publishedCards: Array.from(new Set(publishedCards)),
             titleVisible: bodyText.includes(expectedTitle),
             textHead: bodyText.slice(0, 1000),
             textTail: bodyText.slice(-1200),
@@ -181,21 +220,16 @@ async def _page_state_after_navigation(
             return await _page_state(page, expected_title)
         except Exception as exc:
             message = str(exc)
-            if not any(
-                marker in message
-                for marker in (
-                    "Execution context was destroyed",
-                    "Cannot find context with specified id",
-                    "Most likely the page has been closed",
-                )
-            ):
+            if not _is_transient_navigation_error(exc):
                 raise
             last_error = exc
             try:
                 await page.wait_for_load_state("domcontentloaded", timeout=2_000)
             except Exception:
                 pass
-            await page.wait_for_timeout(250)
+            # 不能用 page.wait_for_timeout：它会在导航中的旧执行上下文内
+            # 运行，反而把正常扫码跳转报告成 Page.evaluate 失败。
+            await asyncio.sleep(0.25)
     raise WechatPublishError(
         f"平台跳转后页面状态未在限定时间内稳定：{last_error or '未知导航错误'}"
     )
@@ -235,6 +269,218 @@ def _scheduled_home_readback(
         "ok": False,
         "reason": "公众号首页未找到标题关联的准确定时卡片",
     }
+
+
+def _immediate_home_readback(
+    state: dict[str, Any],
+    expected_title: str,
+) -> dict[str, Any]:
+    """验证公众号首页“近期发表”卡片，避免把已发表误记为失败。
+
+    平台扫码后不保证保留传统的“发表成功”提示，有时会直接回到首页。
+    只有同一标题位于可见的“已发表”卡片内，且能回读对应文章链接时，
+    才把它当成正式发表成功；普通标题文本、草稿和定时卡片均不通过。
+    """
+
+    title = _normalized_text(expected_title)
+    if not title:
+        return {"ok": False, "reason": "缺少待回读文章标题"}
+    cards = [
+        " ".join(str(card or "").split())
+        for card in state.get("publishedCards") or []
+    ]
+    matched = [
+        card
+        for card in cards
+        if title in card and "已发表" in card
+    ]
+    if not matched:
+        return {"ok": False, "reason": "公众号首页未找到标题关联的已发表卡片"}
+
+    links = [
+        item
+        for item in state.get("links") or []
+        if isinstance(item, dict)
+        and _normalized_text(item.get("text")) == title
+        and str(item.get("href") or "").startswith("https://mp.weixin.qq.com/s")
+    ]
+    if len(links) != 1:
+        return {
+            "ok": False,
+            "reason": f"公众号首页文章链接不是唯一可回读结果（实际 {len(links)}）",
+        }
+
+    card = matched[0]
+    time_match = re.search(r"(?:今天|昨天|\d{1,2}月\d{1,2}日|星期\S+)\s*(\d{1,2}:\d{2})\s*已发表", card)
+    return {
+        "ok": True,
+        "card": card,
+        "publishedAt": time_match.group(1) if time_match else "",
+        "link": str(links[0]["href"]),
+    }
+
+
+async def _readback_immediate_publish_from_home(
+    page,
+    expected_title: str,
+    *,
+    attempts: int = 1,
+    settle_seconds: float = 1.5,
+) -> dict[str, Any]:
+    """只读进入公众号首页，确认刚提交文章的已发表状态。
+
+    发表/扫码后首页卡片可能需要短暂同步；只读重试不会点击发表、保存或
+    改变文章字段。每次都要求标题与文章链接同时唯一匹配，不能把其它文章
+    当作本次发表成功。
+    """
+
+    count = max(1, int(attempts))
+    last_state: dict[str, Any] = {}
+    last_error = ""
+    for attempt in range(count):
+        try:
+            await page.goto(
+                _WECHAT_HOME_URL,
+                wait_until="domcontentloaded",
+                timeout=45_000,
+            )
+            await asyncio.sleep(max(0.0, float(settle_seconds)))
+            state = await _page_state_after_navigation(page, expected_title)
+            last_state = state
+            readback = _immediate_home_readback(state, expected_title)
+            if readback.get("ok"):
+                return {"readback": readback, "state": state}
+            last_error = str(readback.get("reason") or "公众号首页尚未出现当前文章")
+        except Exception as exc:
+            if not _is_transient_navigation_error(exc):
+                raise
+            last_error = str(exc)
+        if attempt + 1 < count:
+            await asyncio.sleep(1.5)
+    return {
+        "readback": {"ok": False, "reason": last_error or "公众号首页未回读发表结果"},
+        "state": last_state,
+    }
+
+
+async def _readback_scheduled_publish_from_home(
+    page,
+    expected_title: str,
+    preferences: dict[str, Any],
+    *,
+    attempts: int = 1,
+    settle_seconds: float = 1.5,
+) -> dict[str, Any]:
+    """只读回读本次定时发表的标题、时间与群发状态。"""
+
+    count = max(1, int(attempts))
+    last_state: dict[str, Any] = {}
+    last_error = ""
+    for attempt in range(count):
+        try:
+            await page.goto(
+                _WECHAT_HOME_URL,
+                wait_until="domcontentloaded",
+                timeout=45_000,
+            )
+            await asyncio.sleep(max(0.0, float(settle_seconds)))
+            state = await _page_state_after_navigation(page, expected_title)
+            last_state = state
+            readback = _scheduled_home_readback(state, preferences)
+            if readback.get("ok"):
+                return {"readback": readback, "state": state}
+            last_error = str(readback.get("reason") or "公众号首页尚未出现本次定时发表")
+        except Exception as exc:
+            if not _is_transient_navigation_error(exc):
+                raise
+            last_error = str(exc)
+        if attempt + 1 < count:
+            await asyncio.sleep(1.5)
+    return {
+        "readback": {"ok": False, "reason": last_error or "公众号首页未回读定时发表结果"},
+        "state": last_state,
+    }
+
+
+async def _recover_post_submit_result(
+    page,
+    *,
+    title: str,
+    preferences: dict[str, Any],
+    ai_accepted: bool,
+    preflight_message: str,
+    execution_record: dict[str, Any],
+) -> dict[str, Any] | None:
+    """提交已发生后，仅以首页精确回读恢复导航瞬断的真实结果。
+
+    此处不得重试发表按钮，也不得重建草稿。它仅在已经点击最终发表后，用
+    当前同一受控会话打开公众号首页并按标题、链接或定时卡片回读。
+    """
+
+    if preferences.get("scheduledPublish"):
+        home_result = await _readback_scheduled_publish_from_home(
+            page,
+            title,
+            preferences,
+            attempts=6,
+            settle_seconds=2.0,
+        )
+        readback = dict(home_result.get("readback") or {})
+        if not readback.get("ok"):
+            return None
+        schedule_text = str(preferences.get("scheduleLocal") or "")
+        return {
+            "ok": True,
+            "message": f"公众号定时发表已由提交后首页回读确认：{schedule_text}",
+            "actuallyPublished": False,
+            "scheduled": True,
+            "scheduledAt": schedule_text or None,
+            "title": title,
+            "links": [],
+            "publishedAt": None,
+            "aiDeclarationAccepted": ai_accepted,
+            "preflightMessage": preflight_message,
+            "executionRecord": execution_record,
+            "recoveredAfterNavigation": True,
+        }
+
+    home_result = await _readback_immediate_publish_from_home(
+        page,
+        title,
+        attempts=6,
+        settle_seconds=2.0,
+    )
+    readback = dict(home_result.get("readback") or {})
+    if not readback.get("ok"):
+        return None
+    return {
+        "ok": True,
+        "message": "公众号已正式发表并由提交后首页回读确认",
+        "actuallyPublished": True,
+        "scheduled": False,
+        "scheduledAt": None,
+        "title": title,
+        "links": [{"text": title, "href": readback["link"]}],
+        "publishedAt": readback.get("publishedAt") or None,
+        "aiDeclarationAccepted": ai_accepted,
+        "preflightMessage": preflight_message,
+        "executionRecord": execution_record,
+        "recoveredAfterNavigation": True,
+    }
+
+
+async def _close_publish_session(context, browser) -> None:
+    """清理临时会话，但不能用清理异常覆盖已回读的发表结果。"""
+
+    for resource in (context, browser):
+        if resource is None:
+            continue
+        try:
+            await resource.close()
+        except Exception:
+            # 平台跳转后 Playwright driver 可能先行断开；此时任务结果已经由
+            # 平台页面回读确认，关闭失败不应把成功改写为失败。
+            continue
 
 
 def _sanitize_dialog_text(value: object) -> str:
@@ -740,7 +986,7 @@ async def _wait_for_qr_image(page, *, timeout_seconds: float = 15) -> bytes:
             return await _capture_qr_image(page)
         except WechatPublishError as exc:
             last_error = str(exc)
-            await page.wait_for_timeout(400)
+            await asyncio.sleep(0.4)
     raise WechatPublishError(last_error or "微信验证二维码加载超时")
 
 
@@ -769,7 +1015,7 @@ async def _handle_qr_verification(page, task_id: int) -> None:
     task_service.record_task_event(
         task_id,
         "wechat_verification_required",
-        "公众号定时发表需要微信验证，请在一键发客户端扫码",
+        "公众号发表需要微信验证，请在一键发客户端扫码",
         level="warning",
     )
     try:
@@ -778,7 +1024,9 @@ async def _handle_qr_verification(page, task_id: int) -> None:
             broker_state = verification_broker.snapshot(request_id)
             if broker_state["state"] in {"cancelled", "failed"}:
                 raise WechatPublishError(str(broker_state["message"]))
-            await page.wait_for_timeout(800)
+            # 扫码成功时页面会主动导航；使用事件循环等待，不能把导航中断
+            # 误记为 Playwright 的页面执行上下文错误。
+            await asyncio.sleep(0.8)
             state = await _page_state_after_navigation(page, "")
             if state.get("qrCount") or state.get("qrText"):
                 if "已扫码" in str(state.get("textTail") or ""):
@@ -825,6 +1073,11 @@ async def run_wechat_publish(payload: dict[str, Any], *, task_id: int) -> dict[s
             viewport={"width": 1440, "height": 1000},
         )
         page = await context.new_page()
+        preflight_message = ""
+        execution_record: dict[str, Any] = {}
+        ai_accepted = False
+        group_scope_accepted = False
+        final_clicked = False
         try:
             # 正式模式仅改变最终提交边界；字段写入与四项回读复用已验证链路。
             preflight_payload = dict(payload)
@@ -859,12 +1112,11 @@ async def run_wechat_publish(payload: dict[str, Any], *, task_id: int) -> dict[s
                 raise WechatPublishError("公众号初始发表入口不是唯一可用控件")
             await buttons[0].click(timeout=10_000)
 
-            ai_accepted = False
-            group_scope_accepted = False
-            final_clicked = False
             last_state: dict[str, Any] = {}
             for _ in range(180):
-                await page.wait_for_timeout(500)
+                # 发表确认或微信扫码后可能立即跳转；不能在旧页面上下文中
+                # 计时，否则正常跳转会被误报为 Page.evaluate 失败。
+                await asyncio.sleep(0.5)
                 last_state = await _page_state_after_navigation(page, title)
 
                 if last_state.get("qrCount") or last_state.get("qrText"):
@@ -958,7 +1210,12 @@ async def run_wechat_publish(payload: dict[str, Any], *, task_id: int) -> dict[s
                     last_state,
                     preferences,
                 )
-                if last_state.get("successMarkers") or scheduled_home.get("ok"):
+                immediate_home = _immediate_home_readback(last_state, title)
+                if (
+                    last_state.get("successMarkers")
+                    or scheduled_home.get("ok")
+                    or immediate_home.get("ok")
+                ):
                     schedule_text = str(preferences.get("scheduleLocal") or "")
                     if preferences["scheduledPublish"] and not scheduled_home.get("ok"):
                         page_text = (
@@ -968,30 +1225,86 @@ async def run_wechat_publish(payload: dict[str, Any], *, task_id: int) -> dict[s
                         normalized_schedule = schedule_text.replace("-", "/")
                         if schedule_text not in page_text and normalized_schedule not in page_text:
                             raise WechatPublishError("平台成功页未回读到指定定时时间")
+                    if immediate_home.get("ok"):
+                        task_service.record_task_event(
+                            task_id,
+                            "wechat_home_publish_readback",
+                            "公众号首页近期发表已回读当前标题与文章链接",
+                        )
                     return {
                         "ok": True,
                         "message": (
                             f"公众号定时发表已提交并回读：{schedule_text}"
                             if preferences["scheduledPublish"]
-                            else "公众号已正式发表并回读成功"
+                            else (
+                                "公众号已正式发表并由首页近期发表记录回读成功"
+                                if immediate_home.get("ok")
+                                else "公众号已正式发表并回读成功"
+                            )
                         ),
                         "actuallyPublished": not preferences["scheduledPublish"],
                         "scheduled": preferences["scheduledPublish"],
                         "scheduledAt": schedule_text or None,
                         "title": title,
-                        "links": list(last_state.get("links") or []),
+                        "links": (
+                            [{"text": title, "href": immediate_home["link"]}]
+                            if immediate_home.get("ok")
+                            else list(last_state.get("links") or [])
+                        ),
+                        "publishedAt": immediate_home.get("publishedAt") or None,
                         "aiDeclarationAccepted": ai_accepted,
                         "preflightMessage": preflight_message,
                         "executionRecord": execution_record,
                     }
+            if final_clicked:
+                try:
+                    recovered = await _recover_post_submit_result(
+                        page,
+                        title=title,
+                        preferences=preferences,
+                        ai_accepted=ai_accepted,
+                        preflight_message=preflight_message,
+                        execution_record=execution_record,
+                    )
+                except Exception:
+                    recovered = None
+                if recovered:
+                    task_service.record_task_event(
+                        task_id,
+                        "wechat_post_submit_home_readback",
+                        "提交后平台页面未给出稳定提示，已由公众号首页精确回读恢复结果",
+                    )
+                    return recovered
             raise WechatPublishError(
                 "提交后未在限定时间内出现可靠成功状态或明确阻断"
             )
         except PreflightError as exc:
             raise WechatPublishError(str(exc)) from exc
+        except Exception as exc:
+            # 只针对扫码后真实页面导航的暂态错误做首页只读恢复。未知弹窗、
+            # 风控、内容合规或其它执行错误不会被自动跨过。
+            if final_clicked and _is_transient_navigation_error(exc):
+                try:
+                    recovered = await _recover_post_submit_result(
+                        page,
+                        title=title,
+                        preferences=preferences,
+                        ai_accepted=ai_accepted,
+                        preflight_message=preflight_message,
+                        execution_record=execution_record,
+                    )
+                except Exception:
+                    recovered = None
+                if recovered:
+                    task_service.record_task_event(
+                        task_id,
+                        "wechat_post_submit_navigation_recovered",
+                        "扫码后页面跳转中断已由公众号首页精确回读恢复结果",
+                    )
+                    return recovered
+            raise
         finally:
-            await context.close()
-            await browser.close()
+            await _close_publish_session(context, browser)
 
 
 def run_wechat_publish_sync(

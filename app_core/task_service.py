@@ -20,6 +20,10 @@ CONTENT_TYPE_LABELS = {
     "mixed": "混合类型",
 }
 
+WORKFLOW_LABELS = {
+    "douyin-commerce": "抖音带货",
+}
+
 
 def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -43,14 +47,20 @@ def content_type_for_payloads(payloads: list[dict]) -> str:
     return "mixed" if types else ""
 
 
-def content_type_from_payload_json(payload_json: object) -> str:
-    """兼容历史任务，从已存参数推断类型，不改写原任务。"""
+def _payloads_from_json(payload_json: object) -> list[dict]:
+    """安全读取历史载荷，不对历史任务做回写。"""
 
     try:
         payloads = json.loads(str(payload_json or "[]"))
     except (TypeError, ValueError, json.JSONDecodeError):
-        return ""
-    return content_type_for_payloads(payloads if isinstance(payloads, list) else [])
+        return []
+    return [dict(item) for item in payloads if isinstance(item, dict)] if isinstance(payloads, list) else []
+
+
+def content_type_from_payload_json(payload_json: object) -> str:
+    """兼容历史任务，从已存参数推断类型，不改写原任务。"""
+
+    return content_type_for_payloads(_payloads_from_json(payload_json))
 
 
 def content_type_label(content_type: object) -> str:
@@ -68,10 +78,68 @@ def display_task_no(task_no: object) -> str:
     return value
 
 
+def workflow_from_payload_json(payload_json: object) -> str:
+    """从任务载荷识别场景；混合场景明确标记而不猜测。"""
+
+    workflows = {
+        str(payload.get("workflow") or "").strip()
+        for payload in _payloads_from_json(payload_json)
+        if str(payload.get("workflow") or "").strip()
+    }
+    if len(workflows) == 1:
+        return next(iter(workflows))
+    return "mixed" if workflows else ""
+
+
+def workflow_label(workflow: object) -> str:
+    value = str(workflow or "")
+    if not value:
+        return "常规发布"
+    if value == "mixed":
+        return "混合场景"
+    return WORKFLOW_LABELS.get(value, "自定义场景")
+
+
+def commerce_summary_from_payload_json(payload_json: object) -> str:
+    """提取带货任务的地点、声明与发布方式，不保留会话敏感信息。"""
+
+    for payload in _payloads_from_json(payload_json):
+        if str(payload.get("workflow") or "") != "douyin-commerce":
+            continue
+        poi = payload.get("locationPoi") if isinstance(payload.get("locationPoi"), dict) else {}
+        location_name = str(poi.get("name") or payload.get("locationKeyword") or "").strip()
+        location_address = str(poi.get("address") or "").strip()
+        scope = str(payload.get("locationScope") or "").strip()
+        declaration = str(payload.get("contentDeclaration") or "").strip()
+        schedule = str(payload.get("scheduleTime") or "").strip()
+        fields = []
+        if location_name:
+            fields.append(f"地点：{location_name}{f'（{location_address}）' if location_address else ''}")
+        if scope:
+            scope_label = {"local": "本地", "domestic": "国内"}.get(scope, scope)
+            fields.append(f"范围：{scope_label}")
+        if declaration:
+            fields.append(f"声明：{declaration}")
+        if payload.get("enableTimer") is True and schedule:
+            fields.append(f"定时：{schedule}（北京时间）")
+        elif payload.get("enableTimer") is not True:
+            fields.append("发布方式：立即发表")
+        return "\n".join(fields)
+    return ""
+
+
 def _attach_content_type(task: dict) -> dict:
     if not task.get("contentType"):
         task["contentType"] = content_type_from_payload_json(task.get("payloadJson"))
     task["contentTypeLabel"] = content_type_label(task.get("contentType"))
+    task["workflow"] = workflow_from_payload_json(task.get("payloadJson"))
+    task["workflowLabel"] = workflow_label(task.get("workflow"))
+    task["commerceSummary"] = commerce_summary_from_payload_json(task.get("payloadJson"))
+    task["taskTypeLabel"] = (
+        f"{task['contentTypeLabel']} · {task['workflowLabel']}"
+        if task.get("workflow")
+        else task["contentTypeLabel"]
+    )
     task["taskNoDisplay"] = display_task_no(task.get("taskNo"))
     return task
 

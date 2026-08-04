@@ -2,12 +2,13 @@
 """账号检测与启动页导航的本地 UI 契约测试。"""
 
 import os
+import importlib.util
 import unittest
 from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtWidgets import QApplication, QMessageBox
+from PyQt6.QtWidgets import QApplication, QMessageBox, QPushButton
 
 from app_core import account_browser_service
 from ui.account_page import AccountPage
@@ -33,6 +34,24 @@ class AccountDetectionUiTests(unittest.TestCase):
         open_backend.assert_not_called()
         warning.assert_not_called()
         page.close()
+
+    def test_account_page_only_exposes_browser_binding(self) -> None:
+        page = AccountPage()
+        labels = {
+            button.text() for button in page.findChildren(QPushButton)
+        }
+        self.assertIn("绑定账号", labels)
+        self.assertFalse(any("API" in label for label in labels))
+        self.assertFalse(any("开发者配置" in label for label in labels))
+        page.close()
+
+    def test_removed_authorization_modules_are_not_importable(self) -> None:
+        self.assertIsNone(
+            importlib.util.find_spec("app_core.overseas_api_service")
+        )
+        self.assertIsNone(
+            importlib.util.find_spec("ui.overseas_authorization_dialog")
+        )
 
     def test_abnormal_session_only_prompts_manual_relogin(self) -> None:
         page = AccountPage()

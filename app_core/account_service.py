@@ -194,8 +194,6 @@ def estimated_login_expiry(
 
 def _row_to_dict(row) -> dict:
     data = dict(row)
-    data["authMode"] = str(data.get("authMode") or "browser")
-    data["accountReference"] = str(data.get("accountReference") or "")
     raw_status = int(data.get("status") or 0)
     if raw_status == 2:
         health_status = "pending"
@@ -227,9 +225,9 @@ def list_accounts() -> list[dict]:
         rows = conn.execute(
             """
             SELECT id, type, filePath, userName, status, profileName, avatarPath,
-                   avatarUpdatedAt, remark, lastCheckedAt, lastLoginAt,
-                   authMode, accountReference
+                   avatarUpdatedAt, remark, lastCheckedAt, lastLoginAt
             FROM user_info
+            WHERE COALESCE(authMode, 'browser') = 'browser'
             ORDER BY profileName COLLATE NOCASE, type
             """
         ).fetchall()
@@ -270,8 +268,7 @@ def save_oneclick_authorized_account(
                 UPDATE user_info
                 SET type = ?, filePath = ?, userName = CASE WHEN ? = '' THEN userName ELSE ? END,
                     status = 1, profileName = ?,
-                    lastLoginAt = ?, lastCheckedAt = ?, authMode = 'browser',
-                    accountReference = NULL
+                    lastLoginAt = ?, lastCheckedAt = ?
                 WHERE id = ?
                 """,
                 (
@@ -293,68 +290,6 @@ def save_oneclick_authorized_account(
             VALUES (?, ?, ?, 1, ?, ?, ?, ?)
             """,
             (platform_type, storage_file_name, user_name, profile_name, "", now, now),
-        )
-        return int(cursor.lastrowid)
-
-
-def save_official_api_account(
-    platform_type: int,
-    profile_name: str,
-    account_reference: str,
-    display_name: str,
-) -> int:
-    """保存一键发官方 OAuth/API 账号引用。
-
-    OAuth Token 不写入数据库；数据库只保存平台返回的账号 ID
-    和可见名称，令牌由 ``app_core.overseas`` 在系统私密目录管理。
-    """
-
-    platform_type = int(platform_type)
-    if platform_type not in OVERSEAS_PLATFORM_TYPES:
-        raise ValueError("官方 API 账号只用于海外平台")
-    profile_name = str(profile_name or "").strip()
-    account_reference = str(account_reference or "").strip()
-    display_name = str(display_name or "").strip()
-    if not profile_name or not account_reference or not display_name:
-        raise ValueError("账号主体、平台账号 ID 和显示名称不能为空")
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    file_path = f"official-api:{platform_type}:{account_reference}"
-    with connect() as conn:
-        existing = conn.execute(
-            """
-            SELECT id FROM user_info
-            WHERE type = ? AND authMode = 'official_api' AND accountReference = ?
-            """,
-            (platform_type, account_reference),
-        ).fetchone()
-        if existing:
-            account_id = int(existing["id"])
-            conn.execute(
-                """
-                UPDATE user_info
-                SET filePath = ?, userName = ?, status = 1, profileName = ?,
-                    lastLoginAt = ?, lastCheckedAt = ?
-                WHERE id = ?
-                """,
-                (file_path, display_name, profile_name, now, now, account_id),
-            )
-            return account_id
-        cursor = conn.execute(
-            """
-            INSERT INTO user_info (
-                type, filePath, userName, status, profileName, remark,
-                lastLoginAt, lastCheckedAt, authMode, accountReference
-            ) VALUES (?, ?, ?, 1, ?, '', ?, ?, 'official_api', ?)
-            """,
-            (
-                platform_type,
-                file_path,
-                display_name,
-                profile_name,
-                now,
-                now,
-                account_reference,
-            ),
         )
         return int(cursor.lastrowid)
 
@@ -466,8 +401,6 @@ def validate_accounts(
 ) -> dict:
     """静默复核登录态；仅返回需用户介入的账号，不自行弹浏览器。"""
     from .oneclick_authorization import verify_saved_session
-    from .overseas_api_service import validate_official_account
-
     accounts = list_accounts()
     wanted = {int(item) for item in account_ids or []}
     selected = [row for row in accounts if not wanted or row["id"] in wanted]
@@ -492,11 +425,7 @@ def validate_accounts(
         }
         report({**base_event, "phase": "checking"})
         try:
-            valid = (
-                validate_official_account(row)
-                if str(row.get("authMode") or "browser") == "official_api"
-                else verify_saved_session(row)
-            )
+            valid = verify_saved_session(row)
         except Exception as exc:
             valid = False
             failures.append(f"{row['platformName']}：检测失败（{type(exc).__name__}）。")
@@ -530,8 +459,7 @@ def refresh_account_avatar(account_id: int) -> dict:
         row = conn.execute(
             """
             SELECT id, type, filePath, userName, status, profileName, avatarPath,
-                   avatarUpdatedAt, remark, lastCheckedAt, lastLoginAt,
-                   authMode, accountReference
+                   avatarUpdatedAt, remark, lastCheckedAt, lastLoginAt
             FROM user_info
             WHERE id = ?
             """,
@@ -742,13 +670,11 @@ def run_async_capture_account_avatar(account_id: int) -> tuple[str | None, str |
     async def _capture() -> tuple[str | None, str | None]:
         with connect() as conn:
             row = conn.execute(
-                "SELECT id, type, filePath, authMode FROM user_info WHERE id = ?",
+                "SELECT id, type, filePath FROM user_info WHERE id = ?",
                 (account_id,),
             ).fetchone()
         if not row:
             raise RuntimeError("账号不存在")
-        if str(row["authMode"] or "browser") == "official_api":
-            raise RuntimeError("官方 API 账号不使用浏览器头像抓取；请重新官方授权以刷新账号信息")
         cookie_file = COOKIE_DIR / Path(row["filePath"]).name
         if not cookie_file.exists():
             raise RuntimeError("账号登录文件不存在，请重新登录")

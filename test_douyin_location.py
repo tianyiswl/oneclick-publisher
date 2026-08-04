@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -87,6 +87,157 @@ class DouyinLocationMatchingTests(unittest.TestCase):
             ),
             [1],
         )
+
+    def test_non_poi_dom_value_falls_back_to_unique_name_and_address(self) -> None:
+        """新版列表的 data-value 可能是行值，不能阻断真实 POI 的唯一回退。"""
+
+        self.assertEqual(
+            oneclick_preflight._douyin_location_match_indexes(
+                {
+                    "poiId": "6601124346666682376",
+                    "name": "北海银滩景区",
+                    "address": "广西壮族自治区北海市银海区银滩大道中段",
+                },
+                [
+                    {
+                        "poiId": "row-0",
+                        "name": "北海银滩景区",
+                        "address": "广西壮族自治区北海市银海区银滩大道西段",
+                    },
+                    {
+                        "poiId": "row-1",
+                        "name": "北海银滩景区",
+                        "address": "广西壮族自治区北海市银海区银滩大道中段",
+                    },
+                ],
+            ),
+            [1],
+        )
+
+    def test_location_control_indexes_dedupe_nested_text_nodes(self) -> None:
+        """同一 semi-select 内多个 span 不应被当成多个发布定位入口。"""
+
+        self.assertEqual(
+            oneclick_preflight._douyin_location_control_indexes(
+                [
+                    {
+                        "identity": "semi-select|location|120:420:620:40",
+                        "text": "输入地理位置",
+                        "context": "发布定位",
+                    },
+                    {
+                        "identity": "semi-select|location|120:420:620:40",
+                        "text": "输入地理位置",
+                        "context": "发布定位",
+                    },
+                    {
+                        "identity": "semi-select|collection|120:360:620:40",
+                        "text": "不选择合集",
+                        "context": "合集设置",
+                    },
+                ]
+            ),
+            [0],
+        )
+
+    def test_distinct_location_controls_remain_ambiguous(self) -> None:
+        """两个真实控件不能因文案相同而盲选第一个。"""
+
+        self.assertEqual(
+            oneclick_preflight._douyin_location_control_indexes(
+                [
+                    {
+                        "identity": "semi-select|location-a|120:420:620:40",
+                        "text": "输入地理位置",
+                    },
+                    {
+                        "identity": "semi-select|location-b|120:510:620:40",
+                        "text": "输入地理位置",
+                    },
+                ]
+            ),
+            [0, 1],
+        )
+
+    def test_direct_location_control_beats_shared_parent_context(self) -> None:
+        """共享父级含发布定位时，不能把合集控件误判为地点入口。"""
+
+        shared_context = "合集/播放列表 同步设置 发布定位"
+        self.assertEqual(
+            oneclick_preflight._douyin_location_control_indexes(
+                [
+                    {
+                        "identity": "semi-select|collection|120:360:620:40",
+                        "text": "不选择合集",
+                        "context": shared_context,
+                    },
+                    {
+                        "identity": "semi-select|location|120:420:620:40",
+                        "text": "输入地理位置",
+                        "context": shared_context,
+                    },
+                ]
+            ),
+            [1],
+        )
+
+    def test_location_control_below_viewport_is_scrolled_after_unique_match(self) -> None:
+        """新版扩展信息区在首屏下方时，仍应识别后再滚动，而不是提前丢弃。"""
+
+        class FakeControl:
+            def __init__(self, name: str) -> None:
+                self.name = name
+                self.scroll_calls = 0
+
+            async def is_visible(self) -> bool:
+                return True
+
+            async def is_enabled(self) -> bool:
+                return True
+
+            async def scroll_into_view_if_needed(self, **_kwargs) -> None:
+                self.scroll_calls += 1
+
+        class FakeLocator:
+            def __init__(self, controls) -> None:
+                self.controls = controls
+
+            async def count(self) -> int:
+                return len(self.controls)
+
+            def nth(self, index: int):
+                return self.controls[index]
+
+        class FakePage:
+            def __init__(self, controls) -> None:
+                self.controls = controls
+
+            def locator(self, _selector: str):
+                return FakeLocator(self.controls)
+
+        collection = FakeControl("collection")
+        location = FakeControl("location")
+
+        async def descriptor(control):
+            return {
+                "identity": control.name,
+                "text": "输入地理位置" if control is location else "请选择合集",
+            }
+
+        with patch.object(
+            oneclick_preflight,
+            "_douyin_location_control_descriptor",
+            side_effect=descriptor,
+        ):
+            controls = asyncio.run(
+                oneclick_preflight._douyin_visible_location_controls(
+                    FakePage([collection, location])
+                )
+            )
+
+        self.assertEqual(controls, [location])
+        self.assertEqual(location.scroll_calls, 1)
+        self.assertEqual(collection.scroll_calls, 0)
 
     def test_blank_location_skips_platform_controls(self) -> None:
         page = MagicMock()
@@ -196,6 +347,29 @@ class DouyinLocationUiTests(unittest.TestCase):
 
 
 class DouyinLocationServiceTests(unittest.TestCase):
+    def test_commerce_editor_search_reuses_current_editor_without_raw_request(self) -> None:
+        page = object()
+        expected = [
+            {
+                "poiId": "poi-1",
+                "name": "北海银滩景区",
+                "address": "广西壮族自治区北海市银海区银滩大道中段",
+                "distance": "",
+            }
+        ]
+        with patch.object(
+            oneclick_preflight,
+            "search_douyin_location_candidates",
+            new_callable=AsyncMock,
+            return_value=expected,
+        ) as search:
+            result = asyncio.run(
+                douyin_location_service.search_douyin_locations_in_editor(page, "北海")
+            )
+
+        search.assert_awaited_once_with(page, "北海")
+        self.assertEqual(result, expected)
+
     def test_normalizes_and_deduplicates_official_poi_results(self) -> None:
         result = douyin_location_service.normalize_location_response(
             {

@@ -52,23 +52,26 @@ class TaskDetailDialog(QDialog):
         summary.setContentsMargins(14, 12, 14, 12)
         summary.setHorizontalSpacing(14)
         summary.setVerticalSpacing(8)
-        summary_values = (
+        summary_values = [
             ("任务号", task.get("taskNoDisplay") or task.get("taskNo"), 0, 0, 1),
             ("任务类型", task.get("contentTypeLabel"), 0, 2, 1),
+            ("任务场景", task.get("workflowLabel"), 0, 4, 1),
             (
                 "状态",
                 STATUS_LABELS.get(task.get("status"), task.get("status") or ""),
+                1,
                 0,
-                4,
                 1,
             ),
-            ("标题", task.get("title"), 1, 0, 5),
+            ("标题", task.get("title"), 1, 2, 3),
             ("账号", task.get("accountSummary"), 2, 0, 5),
             ("平台", task.get("platformSummary"), 3, 0, 5),
             ("创建时间", task.get("createdAt"), 4, 0, 1),
             ("完成时间", task.get("finishedAt"), 4, 2, 1),
-            ("失败原因", task.get("lastError"), 5, 0, 5),
-        )
+        ]
+        if task.get("commerceSummary"):
+            summary_values.append(("带货信息", task.get("commerceSummary"), 5, 0, 5))
+        summary_values.append(("失败原因", task.get("lastError"), 6, 0, 5))
         for label_text, value, row, column, span in summary_values:
             label = QLabel(label_text)
             label.setProperty("role", "caption")
@@ -202,22 +205,23 @@ class TaskPage(QWidget):
         filter_layout.setColumnStretch(0, 1)
         layout.addWidget(filters)
 
-        self.table = QTableWidget(0, 9)
+        self.table = QTableWidget(0, 10)
         self.table.setObjectName("dataTable")
         self.table.setHorizontalHeaderLabels(
-            ["选择", "任务号", "任务类型", "标题", "状态", "账号", "平台", "执行结果", "创建时间"]
+            ["选择", "任务号", "任务类型", "任务场景", "标题", "状态", "账号", "平台", "执行结果", "创建时间"]
         )
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         self.table.setColumnWidth(0, 48)
         self.table.setColumnWidth(1, 128)
         self.table.setColumnWidth(2, 86)
-        self.table.setColumnWidth(4, 90)
-        self.table.setColumnWidth(5, 210)
-        self.table.setColumnWidth(6, 110)
-        self.table.setColumnWidth(7, 150)
-        self.table.setColumnWidth(8, 158)
+        self.table.setColumnWidth(3, 98)
+        self.table.setColumnWidth(5, 90)
+        self.table.setColumnWidth(6, 210)
+        self.table.setColumnWidth(7, 110)
+        self.table.setColumnWidth(8, 150)
+        self.table.setColumnWidth(9, 158)
         self.table.verticalHeader().setVisible(False)
         self.table.setShowGrid(False)
         self.table.setAlternatingRowColors(True)
@@ -294,7 +298,7 @@ class TaskPage(QWidget):
                 continue
             searchable = " ".join(
                 str(row.get(key) or "")
-                for key in ("taskNo", "contentTypeLabel", "title", "accountSummary", "platformSummary", "createdAt", "finishedAt", "lastError")
+                for key in ("taskNo", "contentTypeLabel", "workflowLabel", "commerceSummary", "title", "accountSummary", "platformSummary", "createdAt", "finishedAt", "lastError")
             ).lower()
             if keyword and keyword not in searchable:
                 continue
@@ -335,6 +339,7 @@ class TaskPage(QWidget):
             values = [
                 row.get("taskNoDisplay") or row.get("taskNo"),
                 row.get("contentTypeLabel"),
+                row.get("workflowLabel"),
                 row.get("title"),
                 STATUS_LABELS.get(row.get("status"), row.get("status")),
                 account_text,
@@ -344,20 +349,20 @@ class TaskPage(QWidget):
             ]
             for col, value in enumerate(values):
                 color = None
-                if col == 3:
+                if col == 4:
                     color = STATUS_COLORS.get(row.get("status"))
-                elif col == 6 and row.get("failedCount"):
+                elif col == 7 and row.get("failedCount"):
                     color = "#dc2626"
-                elif col == 6 and row.get("successCount"):
+                elif col == 7 and row.get("successCount"):
                     color = "#059669"
-                elif col == 5:
+                elif col == 6:
                     color = "#2563eb"
                 item = table_item(value, color)
                 if col == 0 and row.get("taskNoDisplay") and row.get("taskNoDisplay") != row.get("taskNo"):
                     item.setToolTip(f"完整任务号：{row.get('taskNo')}")
                     self.table.setItem(row_idx, col + 1, item)
                     continue
-                if col == 4 and account_parts["remarks"]:
+                if col == 5 and account_parts["remarks"]:
                     item.setToolTip(
                         f"{value or ''}\n备注：{account_parts['remarks']}"
                     )

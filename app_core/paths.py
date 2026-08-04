@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import shutil
-import sys
 from pathlib import Path
 
 from conf import BASE_DIR as CONFIGURED_USER_DATA_DIR
@@ -14,14 +13,6 @@ from conf import RESOURCE_DIR
 ROOT_DIR = Path(RESOURCE_DIR)
 LEGACY_RUNTIME_ROOT = Path(__file__).resolve().parent.parent
 USER_DATA_DIR = Path(CONFIGURED_USER_DATA_DIR)
-# OAuth 客户端密钥和平台令牌比普通演示数据更敏感。开发版的
-# USER_DATA_DIR 位于仓库 demo-runtime，因此官方 OAuth 数据仍必须单独放入
-# 系统用户目录，避免被 Git、打包资源或演示数据误收集。
-PRIVATE_DATA_DIR = (
-    Path.home() / "Library" / "Application Support" / "一键发"
-    if sys.platform == "darwin"
-    else Path.home() / ".oneclick-publisher"
-)
 DB_PATH = USER_DATA_DIR / "db" / "database.db"
 VIDEO_DIR = USER_DATA_DIR / "videoFile"
 COOKIE_DIR = USER_DATA_DIR / "cookiesFile"
@@ -76,6 +67,5 @@ def ensure_runtime_dirs() -> None:
         LOG_DIR,
         COVER_DIR,
         USER_DATA_DIR,
-        PRIVATE_DATA_DIR,
     ):
         path.mkdir(parents=True, exist_ok=True)

@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import threading
-import webbrowser
 from pathlib import Path
 
 from .oneclick_authorization import authorization_plan
@@ -17,14 +16,6 @@ from .paths import COOKIE_DIR, ensure_runtime_dirs
 
 _session_lock = threading.Lock()
 _backend_threads: dict[int, threading.Thread] = {}
-
-_OFFICIAL_BACKEND_URLS = {
-    6: "https://www.tiktok.com/tiktokstudio/",
-    7: "https://studio.youtube.com/",
-    8: "https://business.facebook.com/latest/home/",
-    9: "https://business.facebook.com/latest/home/",
-}
-
 
 def _account_key(account: dict) -> int:
     account_id = int(account.get("id") or 0)
@@ -80,15 +71,6 @@ def open_account_backend(account: dict) -> bool:
 
     ensure_runtime_dirs()
     account_id = _account_key(account)
-    if str(account.get("authMode") or "browser") == "official_api":
-        url = _OFFICIAL_BACKEND_URLS.get(int(account.get("type") or 0))
-        if not url:
-            raise RuntimeError("当前官方 API 账号没有可打开的平台后台")
-        # 只在用户点击“打开后台”后交给系统浏览器；
-        # 不带 Cookie、Token 或账号参数。
-        if not webbrowser.open(url, new=2):
-            raise RuntimeError("系统浏览器未能打开平台后台")
-        return False
     # 在启动线程前完成本地参数校验，让界面能立即给出可理解的错误。
     authorization_plan(int(account.get("type") or 0), str(account.get("profileName") or ""))
     state_file = COOKIE_DIR / Path(str(account.get("filePath") or "")).name

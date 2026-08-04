@@ -76,7 +76,7 @@ def validate_overseas_preflight_payload(payload: dict[str, Any]) -> dict[str, An
         if payload.get("notifySubscribers") is False:
             errors.append(
                 "YouTube 浏览器预检尚无法稳定回读“不通知订阅者”；"
-                "请改用官方 API 账号或保持默认通知"
+                "请保持默认通知"
             )
     elif platform_type in {6, 8, 9}:
         limit = 2048 if platform_type == 9 else 2200
@@ -90,12 +90,12 @@ def validate_overseas_preflight_payload(payload: dict[str, Any]) -> dict[str, An
     if platform_type == 8 and payload.get("shareToFeed") is False:
         errors.append(
             "Instagram 浏览器预检尚无法稳定回读“仅 Reels”；"
-            "请改用官方 API 账号或保持同时分享到动态"
+            "请保持同时分享到动态"
         )
     if platform_type in {8, 9} and payload.get("aiGenerated") is True:
         errors.append(
             f"{platform_name} 浏览器执行器尚未可靠回读 AI 声明；"
-            "为避免遗漏合规字段，请改用官方 API 通道"
+            "为避免遗漏合规字段已安全停止"
         )
 
     files = [Path(str(item)) for item in payload.get("fileList") or []]

@@ -139,6 +139,15 @@ def ensure_schema() -> None:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS douyin_commerce_content_drafts (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                payloadJson TEXT NOT NULL,
+                updatedAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS platform_collections (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 accountId INTEGER NOT NULL,

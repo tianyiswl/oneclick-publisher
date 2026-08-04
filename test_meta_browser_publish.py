@@ -15,7 +15,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt6.QtWidgets import QApplication, QDialogButtonBox
 
 from app_core import overseas_browser_publish
-from app_core.overseas.meta.browser_policy import (
+from app_core.meta_browser_policy import (
     META_BROWSER_AUTOMATION_ACKNOWLEDGED,
     META_BROWSER_PUBLISH_CONFIRMED,
     browser_publish_confirmation_valid,
@@ -88,7 +88,6 @@ class MetaBrowserServiceTests(unittest.TestCase):
             "tags": ["oneclick"],
             "fileList": [str(video)],
             "accountList": [account_file],
-            "accountAuthModes": ["browser"],
             "visibility": "public",
             "enableTimer": False,
             META_BROWSER_PUBLISH_CONFIRMED: True,

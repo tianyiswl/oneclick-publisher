@@ -148,6 +148,19 @@ class DouYinVideo(object):
         self.form_verification = None
         self.cover_verification = None
         self.draft_save_result = None
+        self.location_payload = None
+        self.location_verification = ""
+        self.commerce_payload = None
+        self.commerce_verification = {}
+        self.commerce_discovery_payload = None
+        self.commerce_candidates = []
+        # 抖音带货视频不设置独立封面，避免封面裁剪弹层遮挡后续的地点、
+        # 带货和定时控件。普通抖音发布仍沿用原有封面流程。
+        self.skip_thumbnail = False
+        self.music_payload = None
+        self.music_verification = {}
+        self.schedule_verification = ""
+        self.publish_result = None
         if self.save_draft_only and self.dry_run:
             raise ValueError("保存草稿模式与 dry_run 预发布检查不能同时开启")
 
@@ -155,18 +168,51 @@ class DouYinVideo(object):
         target_time = publish_date.strftime("%Y-%m-%d %H:%M")
         douyin_logger.info(f"正在设置抖音定时发布时间：{target_time}")
 
-        schedule_radio = page.locator("[class^='radio']:has-text('定时发布')").last
-        await schedule_radio.wait_for(state="visible", timeout=15000)
+        # 新版页面中文字 span 不可点击，真实可交互元素是外层 label。
+        # 先精确找出一个可见标签，避免同名提示或隐藏模板导致误点。
+        schedule_radio = None
+        labels = page.locator("label")
+        for index in range(await labels.count()):
+            label = labels.nth(index)
+            try:
+                if not await label.is_visible():
+                    continue
+                if " ".join((await label.inner_text()).split()) == "定时发布":
+                    if schedule_radio is not None:
+                        raise RuntimeError("抖音定时发布开关出现多个可点击节点，已安全停止")
+                    schedule_radio = label
+            except RuntimeError:
+                raise
+            except Exception:
+                continue
+        if schedule_radio is None:
+            raise RuntimeError("抖音未找到唯一可点击的定时发布开关")
         for _ in range(3):
-            radio_class = await schedule_radio.get_attribute("class") or ""
-            radio_text = await schedule_radio.inner_text(timeout=2000)
-            if "checked" in radio_class or "已选" in radio_text:
+            checked = (await schedule_radio.get_attribute("data-checked") or "").lower()
+            if checked == "true":
                 break
-            await schedule_radio.click(force=True, timeout=5000)
+            await schedule_radio.click(timeout=5000)
             await page.wait_for_timeout(1000)
+        checked = (await schedule_radio.get_attribute("data-checked") or "").lower()
+        if checked != "true":
+            raise RuntimeError("抖音定时发布开关点击后未保持选中")
 
-        date_input = page.locator('.semi-input[placeholder="日期和时间"]').last
-        await date_input.wait_for(state="visible", timeout=15000)
+        date_input = None
+        date_inputs = page.locator('.semi-input[placeholder="日期和时间"]')
+        for index in range(await date_inputs.count()):
+            candidate = date_inputs.nth(index)
+            try:
+                if not await candidate.is_visible() or not await candidate.is_enabled():
+                    continue
+                if date_input is not None:
+                    raise RuntimeError("抖音定时日期输入框出现多个可用节点，已安全停止")
+                date_input = candidate
+            except RuntimeError:
+                raise
+            except Exception:
+                continue
+        if date_input is None:
+            raise RuntimeError("抖音开启定时发布后未找到可用日期输入框")
         await date_input.click(force=True, timeout=5000)
         await date_input.fill(target_time, timeout=5000)
         await page.keyboard.press("Enter")
@@ -192,8 +238,9 @@ class DouYinVideo(object):
             actual_time = ""
 
         if self._schedule_time_matches(actual_time, target_time):
+            self.schedule_verification = actual_time or target_time
             douyin_logger.success(f"抖音定时发布时间已确认：{actual_time or target_time}")
-            return
+            return self.schedule_verification
 
         raise RuntimeError(f"抖音定时发布时间写入失败，目标={target_time}，实际={actual_time}")
 
@@ -794,37 +841,41 @@ class DouYinVideo(object):
                 await context.close()
                 await browser.close()
 
-    async def upload(self, playwright: Playwright) -> None:
-        page = getattr(self, "external_page", None)
-        context = getattr(self, "external_context", None)
-        browser = getattr(self, "external_browser", None)
-        managed_browser = page is None
-        if managed_browser:
-            # 使用 Chromium 浏览器启动一个浏览器实例
-            browser = await launch_publish_browser(playwright, executable_path=self.local_executable_path)
-            # 创建一个浏览器上下文，使用指定的 cookie 文件
-            context = await new_publish_context(
-                browser,
-                storage_state=f"{self.account_file}",
-            )
-            context = await set_init_script(context)
+    async def prepare_uploaded_video_editor(
+        self,
+        page: Page,
+        *,
+        reveal_editor: bool = True,
+    ) -> None:
+        """进入抖音视频编辑页、上传视频并回读标题/文案。
 
-            # 创建一个新的页面
-            page = await context.new_page()
-            self._managed_context = context
-            self._managed_browser = browser
+        这段是“上传完成”与后续平台字段的明确边界。普通发布仍由
+        :meth:`upload` 在同一次调用中继续处理封面、音乐、地点等字段；抖音
+        带货分步向导则在同一受控会话中先调用本方法，再等待用户从客户端选择
+        收藏音乐和地点。无论哪种路径，这里都不会保存草稿或点击发布。
 
+        ``reveal_editor=False`` 仅用于带货向导的后台上传阶段：浏览器窗口保持
+        隐藏，直到遇到必须人工处理的登录/验证才由上层明确前置。
+        """
         try:
-            await goto_and_reveal(
-                page,
-                "https://creator.douyin.com/creator-micro/content/post/video?enter_from=publish_page",
-                timeout=30000,
-            )
+            if reveal_editor:
+                await goto_and_reveal(
+                    page,
+                    "https://creator.douyin.com/creator-micro/content/post/video?enter_from=publish_page",
+                    timeout=30000,
+                )
+            else:
+                await page.goto(
+                    "https://creator.douyin.com/creator-micro/content/post/video?enter_from=publish_page",
+                    wait_until="domcontentloaded",
+                    timeout=30000,
+                )
             douyin_logger.info("[+] 成功进入version_2发布页面!")
         except Exception as e:
             douyin_logger.error(f"  [-] 超时未进入视频发布页面，cookies过期或者其他原因，重新尝试...{e}")
-            if self.save_draft_only:
-                raise RuntimeError("保存草稿模式未能确认进入抖音发布页，已停止后续操作") from e
+            if self.save_draft_only or not reveal_editor:
+                mode = "带货后台上传" if not reveal_editor else "保存草稿模式"
+                raise RuntimeError(f"{mode}未能确认进入抖音发布页，已停止后续操作") from e
 
         if self.save_draft_only:
             await page.wait_for_timeout(1200)
@@ -865,11 +916,43 @@ class DouYinVideo(object):
                 f"抖音视频上传在 {self.UPLOAD_WAIT_ATTEMPTS * 2} 秒内未完成，已停止后续操作{screenshot_note}"
             )
 
-        #上传视频封面
-        await self.set_thumbnail(page, self.thumbnail_path)
+        # 抖音带货视频由平台使用视频首帧/平台默认展示，不进入“设置封面”
+        # 裁剪弹层；普通发布保持原有封面逻辑不变。
+        if getattr(self, "skip_thumbnail", False):
+            douyin_logger.info("抖音带货已跳过封面设置，等待用户选择收藏音乐")
+        else:
+            await self.set_thumbnail(page, self.thumbnail_path)
         await asyncio.sleep(1)
+
+    async def upload(self, playwright: Playwright) -> None:
+        page = getattr(self, "external_page", None)
+        context = getattr(self, "external_context", None)
+        browser = getattr(self, "external_browser", None)
+        managed_browser = page is None
+        if managed_browser:
+            # 使用 Chromium 浏览器启动一个浏览器实例
+            browser = await launch_publish_browser(playwright, executable_path=self.local_executable_path)
+            # 创建一个浏览器上下文，使用指定的 cookie 文件
+            context = await new_publish_context(
+                browser,
+                storage_state=f"{self.account_file}",
+            )
+            context = await set_init_script(context)
+
+            # 创建一个新的页面
+            page = await context.new_page()
+            self._managed_context = context
+            self._managed_browser = browser
+
+        await self.prepare_uploaded_video_editor(page)
+        await self.set_favorite_music(page)
         await self.set_collection(page)
-        await self.set_ai_generated_declaration(page)
+        await self.set_structured_location(page)
+        await self.set_commerce_store(page)
+        if getattr(self, "content_declaration", ""):
+            await self.set_content_declaration(page)
+        else:
+            await self.set_ai_generated_declaration(page)
         if hasattr(self, "sync_to_toutiao"):
             await self.set_toutiao_sync(page)
 
@@ -913,7 +996,7 @@ class DouYinVideo(object):
         try:
             self._assert_formal_publish_allowed()
             await publish_button.click(timeout=10000)
-            await self._wait_formal_publish_result(page)
+            self.publish_result = await self._wait_formal_publish_result(page)
             douyin_logger.success("  [-]视频发布成功")
         except Exception as e:
             screenshot_path = os.path.join(DOUYIN_SCREENSHOT_DIR, f"douyin_publish_timeout_{int(asyncio.get_event_loop().time()*1000)}.png")
@@ -935,6 +1018,7 @@ class DouYinVideo(object):
         if managed_browser:
             await context.close()
             await browser.close()
+        return self.publish_result
 
     async def _click_visible_exact_text(self, page: Page, text: str):
         items = await self._visible_enabled_items(page.get_by_text(text, exact=True))
@@ -988,14 +1072,145 @@ class DouYinVideo(object):
             return
         douyin_logger.info(f"抖音合集已选择并回读确认：{collection_name}")
 
-    async def set_ai_generated_declaration(self, page: Page):
-        if not getattr(self, "ai_generated", False):
-            return
+    async def set_structured_location(self, page: Page) -> str:
+        """使用一键发已选官方 POI 填写新版“发布定位”并做控件回读。
 
-        await self._click_visible_exact_text(page, "请选择自主声明")
-        await page.wait_for_timeout(500)
-        raw_option_texts = await page.evaluate(
+        恢复上传器此前只支持裸关键词，且其旧选择器无法适配新版嵌套
+        ``semi-select``。这里复用一键发预检已验证的唯一控件识别与 POI
+        匹配规则；没有选择地点时明确跳过，绝不猜选相似地点。
+        """
+
+        payload = getattr(self, "location_payload", None)
+        if not isinstance(payload, dict):
+            self.location_verification = ""
+            return ""
+
+        # 抖音上传完成后偶尔会自行展示“横封面展示”提示。带货流程不设置
+        # 独立封面，这个提示若遮挡定位控件，只允许关闭提示再重试一次，绝不
+        # 点击“立即设置”或进入封面编辑器。
+        overlay_state = "absent"
+        if getattr(self, "skip_thumbnail", False):
+            overlay_state = await self._dismiss_commerce_cover_promotion(page)
+        if overlay_state == "blocked":
+            raise RuntimeError(
+                "抖音封面展示提示遮挡发布定位，未进入封面设置且无法安全关闭"
+            )
+        try:
+            from app_core.oneclick_preflight import _douyin_set_location
+
+            selected = await _douyin_set_location(page, payload)
+        except Exception as exc:
+            if (
+                getattr(self, "skip_thumbnail", False)
+                and self._is_commerce_cover_promotion_interception(exc)
+            ):
+                retry_state = await self._dismiss_commerce_cover_promotion(page)
+                if retry_state != "blocked":
+                    try:
+                        selected = await _douyin_set_location(page, payload)
+                    except Exception as retry_exc:
+                        exc = retry_exc
+                    else:
+                        self.location_verification = str(selected or "")
+                        if self.location_verification:
+                            douyin_logger.info(
+                                "抖音发布定位已选择并回读："
+                                f"{self.location_verification}（已跳过封面提示）"
+                            )
+                        return self.location_verification
+            detail = " ".join(str(exc).splitlines()[0:1]).strip()
+            if "intercepts pointer events" in str(exc):
+                detail = "页面仍有未关闭的抖音浮层遮挡定位控件"
+            raise RuntimeError(f"抖音发布定位未能唯一确认：{detail}") from exc
+        self.location_verification = str(selected or "")
+        if self.location_verification:
+            douyin_logger.info(
+                f"抖音发布定位已选择并回读：{self.location_verification}"
+            )
+        return self.location_verification
+
+    @staticmethod
+    def _is_commerce_cover_promotion_interception(error: object) -> bool:
+        """识别抖音“横封面展示”提示的确定性遮挡，不把普通控件错误混入。"""
+
+        text = " ".join(str(error or "").casefold().split())
+        return (
+            "coverimgcontainer" in text
+            or "你的作品可能会在精选频道" in text
+            or ("立即设置" in text and "封面" in text and "intercepts pointer events" in text)
+        )
+
+    async def _dismiss_commerce_cover_promotion(self, page: Page) -> str:
+        """只关闭已确认的封面展示提示，返回 absent/dismissed/blocked。
+
+        页面仍保留平台原生的“设置封面”区域，但带货工作流绝不打开封面编辑
+        器。若平台提示没有可验证的关闭方式，本方法返回 ``blocked``，由上层
+        安全停止，而不是猜测点击任何封面操作。
+        """
+
+        async def visible_prompt_count() -> int:
+            result = await page.evaluate(
+                """() => {
+                    const normalize = value => String(value || '')
+                        .replace(/[\\u200b\\u00a0]/g, ' ')
+                        .replace(/\\s+/g, ' ')
+                        .trim();
+                    const visible = node => {
+                        if (!(node instanceof HTMLElement)) return false;
+                        const rect = node.getBoundingClientRect();
+                        const style = getComputedStyle(node);
+                        return rect.width > 0 && rect.height > 0
+                            && style.display !== 'none' && style.visibility !== 'hidden';
+                    };
+                    // ``dy-creator-content-portal`` 本身可能是零尺寸的挂载根，
+                    // 真正可见的是它内部的 modal-wrap。此前按 portal 根节点是否
+                    // 可见过滤，会把已在前台遮挡的横封面提示误判为不存在。
+                    const portals = Array.from(document.querySelectorAll(
+                        '[class*="dy-creator-content-portal"]'
+                    ));
+                    return portals.filter(portal => {
+                        const hasVisibleDescendant = [portal, ...portal.querySelectorAll('*')]
+                            .some(visible);
+                        if (!hasVisibleDescendant) return false;
+                        const text = normalize(portal.innerText || portal.textContent);
+                        return text.includes('你的作品可能会在精选频道')
+                            || (text.includes('立即设置') && text.includes('横封面'));
+                    }).length;
+                }"""
+            )
+            return int(result or 0)
+
+        count = await visible_prompt_count()
+        if count == 0:
+            return "absent"
+        if count != 1:
+            return "blocked"
+        try:
+            # Escape 是平台弹层的关闭手势，不会打开“立即设置”、上传封面或
+            # 修改视频字段。只有已确认的提示可见时才发送。
+            await page.keyboard.press("Escape")
+        except Exception:
+            return "blocked"
+        for _ in range(10):
+            await page.wait_for_timeout(150)
+            if await visible_prompt_count() == 0:
+                douyin_logger.info("抖音带货已关闭遮挡定位的封面展示提示，未设置封面")
+                return "dismissed"
+        return "blocked"
+
+    async def _content_declaration_dialog_state(self, page: Page) -> dict:
+        """定位当前真实可见的“作品内容声明”弹层。
+
+        抖音编辑器会同时保留主页面、门户根节点和其他浮层。不能以全页的文本
+        定位“无需添加自主声明”，否则文本节点可能位于被遮挡层或隐藏模板中。
+        这里以标题和至少三项平台原生声明选项共同识别最内层弹层，并临时标记
+        唯一根节点，后续点击和确认都严格限制在该弹层内。
+        """
+
+        result = await page.evaluate(
             """() => {
+                const marker = 'data-oneclick-douyin-declaration-dialog';
+                document.querySelectorAll(`[${marker}]`).forEach(node => node.removeAttribute(marker));
                 const normalize = value => String(value || '')
                     .replace(/[\\u200b\\u00a0]/g, ' ')
                     .replace(/\\s+/g, ' ')
@@ -1005,104 +1220,451 @@ class DouYinVideo(object):
                     const rect = node.getBoundingClientRect();
                     const style = getComputedStyle(node);
                     return rect.width > 0 && rect.height > 0
-                        && style.display !== 'none'
-                        && style.visibility !== 'hidden';
+                        && style.display !== 'none' && style.visibility !== 'hidden';
                 };
-                const values = [];
-                for (const node of document.querySelectorAll('body *')) {
-                    if (!visible(node)) continue;
+                const title = '对作品内容添加声明';
+                const choices = [
+                    '内容由AI生成',
+                    '内容为个人观点或见解',
+                    '内容为转载信息',
+                    '内容含营销推广信息',
+                    '虚构演绎，仅供娱乐',
+                    '无需添加自主声明',
+                ];
+                const roots = Array.from(document.querySelectorAll(
+                    '[role="dialog"], [role="none"][class*="modal"], [class*="modal-wrap"], [class*="Modal"]'
+                )).filter(visible).filter(node => {
                     const text = normalize(node.innerText || node.textContent);
-                    if (!text || !/AI.*生成|生成.*AI/i.test(text)) continue;
-                    if (/智能推荐封面/i.test(text)) continue;
-                    if (node.childElementCount > 2) continue;
-                    values.push(text);
+                    if (!text.includes(title)) return false;
+                    const choiceCount = choices.filter(choice => text.includes(choice)).length;
+                    return choiceCount >= 3;
+                });
+                // 同一个弹层的 portal 外壳与内部 modal-wrap 都可能满足条件；只
+                // 保留最内层候选，避免将其他提示一起包进可点击范围。
+                const innerRoots = roots.filter(root => !roots.some(
+                    other => other !== root && root.contains(other)
+                ));
+                if (innerRoots.length === 1) {
+                    innerRoots[0].setAttribute(marker, 'active');
                 }
-                return Array.from(new Set(values)).sort(
-                    (left, right) => left.length - right.length
-                );
+                return {
+                    count: innerRoots.length,
+                    texts: innerRoots.map(node => normalize(node.innerText || node.textContent).slice(0, 160)),
+                };
             }"""
         )
-        option_texts = []
-        for value in raw_option_texts or []:
-            text = " ".join(str(value or "").split()).strip()
-            if (
-                not text
-                or len(text) > 32
-                or re.search(r"封面|智能推荐|作品描述|配音|画面", text)
-                or not re.search(r"AI.*生成|生成.*AI", text, re.IGNORECASE)
-            ):
-                continue
-            option_texts.append(text)
-        option_texts.sort(
-            key=lambda text: (
-                0 if text == "AI生成" else 1,
-                0 if "内容" in text else 1,
-                len(text),
-            )
-        )
-        if not option_texts:
-            detail = "自主声明中未找到可用的 AI 生成选项"
-            if not self.save_draft_only:
-                raise RuntimeError(f"抖音{detail}")
-            douyin_logger.warning(f"抖音 AI 自主声明未完成：{detail}")
-            record_draft_field_warning("抖音", "AI 自主声明", detail)
-            try:
-                await page.keyboard.press("Escape")
-            except Exception:
-                pass
-            return
-
-        option_text = str(option_texts[0])
+        if not isinstance(result, dict):
+            return {"count": 0, "texts": []}
         try:
-            await self._click_visible_exact_text(page, option_text)
-        except RuntimeError as exc:
-            if not self.save_draft_only:
-                raise
-            detail = f"未能选择“{option_text}”：{exc}"
-            douyin_logger.warning(f"抖音 AI 自主声明未完成：{detail}")
-            record_draft_field_warning("抖音", "AI 自主声明", detail)
+            count = int(result.get("count") or 0)
+        except (TypeError, ValueError):
+            count = 0
+        texts = result.get("texts")
+        return {
+            "count": count,
+            "texts": [str(item) for item in texts] if isinstance(texts, list) else [],
+        }
+
+    async def _mark_content_declaration_select_opener(self, page: Page, labels) -> dict:
+        """标记新版编辑页中唯一可见的“自主声明”下拉控件。
+
+        抖音新版主页面会把“自主声明”和当前选项拆成多个 DOM 文本节点。
+        因此 ``get_by_text(..., exact=True)`` 在第二次切换时可能找不到完整
+        的“自主声明 + 当前选项”，尽管视觉上入口已经存在。这里只在原有的
+        精确文本入口全部落空后，收敛到页面实际使用的 ``semi-select`` 控件
+        根节点；仍要求唯一、可见且普通点击，不会使用 force-click 或猜测
+        其他页面元素。
+        """
+
+        result = await page.evaluate(
+            """labels => {
+                const marker = 'data-oneclick-douyin-declaration-opener';
+                document.querySelectorAll(`[${marker}]`).forEach(node => node.removeAttribute(marker));
+                const normalize = value => String(value || '')
+                    .replace(/[\\u200b\\u00a0]/g, ' ')
+                    .replace(/\\s+/g, ' ')
+                    .trim();
+                const visible = node => {
+                    if (!(node instanceof HTMLElement)) return false;
+                    const rect = node.getBoundingClientRect();
+                    const style = getComputedStyle(node);
+                    return rect.width > 0 && rect.height > 0
+                        && style.display !== 'none' && style.visibility !== 'hidden';
+                };
+                const selectedOptions = labels
+                    .filter(label => label.startsWith('自主声明 '))
+                    .map(label => label.slice('自主声明 '.length));
+                const initialLabel = '请选择自主声明';
+                const roots = new Set();
+                for (const node of document.querySelectorAll('div.semi-select, [class*="semi-select"]')) {
+                    const root = node.closest('div.semi-select') || node;
+                    if (visible(root)) roots.add(root);
+                }
+                const candidates = [...roots].filter(root => {
+                    const text = normalize(root.innerText || root.textContent);
+                    const attributes = normalize([
+                        root.getAttribute('aria-label'),
+                        root.getAttribute('title'),
+                        root.getAttribute('data-testid'),
+                    ].filter(Boolean).join(' '));
+                    const value = `${text} ${attributes}`;
+                    if (value.includes(initialLabel)) return true;
+                    return selectedOptions.some(option => value.includes(option));
+                });
+                // 2026 年新版编辑器并不总是使用 semi-select：部分账号页面把
+                // “自主声明”标题、当前值和可点击容器拆成并列节点。此时不能以
+                // 全页的当前值反查，因为移动端预览也会出现同一声明。改为从
+                // “自主声明”的直接文本节点向上限定一个局部范围，再在该范围内
+                // 找唯一的当前选项并向上收敛到最小可点击容器。
+                if (candidates.length === 0) {
+                    const directText = node => normalize(Array.from(node.childNodes || [])
+                        .filter(child => child.nodeType === Node.TEXT_NODE)
+                        .map(child => child.textContent || '')
+                        .join(' '));
+                    const allVisible = Array.from(document.querySelectorAll('body *'))
+                        .filter(visible);
+                    const declarationLabels = allVisible.filter(node => {
+                        const text = normalize(node.innerText || node.textContent);
+                        return directText(node) === '自主声明' || text === '自主声明';
+                    });
+                    const nearestInteractive = (node, boundary) => {
+                        let current = node;
+                        while (current instanceof HTMLElement) {
+                            const role = current.getAttribute('role') || '';
+                            const tabIndex = current.getAttribute('tabindex');
+                            const className = String(current.className || '');
+                            const style = getComputedStyle(current);
+                            const interactive = current.matches(
+                                'button, input, select, [role="button"], [role="combobox"]'
+                            ) || role === 'listbox' || /select/i.test(className)
+                                || style.cursor === 'pointer'
+                                || (tabIndex !== null && Number(tabIndex) >= 0);
+                            if (interactive && visible(current)) return current;
+                            if (current === boundary) break;
+                            current = current.parentElement;
+                        }
+                        return node;
+                    };
+                    for (const labelNode of declarationLabels) {
+                        let scope = labelNode.parentElement;
+                        for (let depth = 0; scope && depth < 6; depth += 1) {
+                            const matchingValues = allVisible.filter(node => {
+                                if (!scope.contains(node)) return false;
+                                const text = normalize(node.innerText || node.textContent);
+                                return selectedOptions.includes(text);
+                            });
+                            // 同一段文本可能存在 span 与其父节点两层；保留最内层
+                            // 文本节点，避免把外层卡片和移动端预览一并纳入候选。
+                            const leafValues = matchingValues.filter(node => !matchingValues.some(
+                                other => other !== node && node.contains(other)
+                            ));
+                            if (leafValues.length === 1) {
+                                const target = nearestInteractive(leafValues[0], scope);
+                                if (visible(target)) candidates.push(target);
+                                break;
+                            }
+                            scope = scope.parentElement;
+                        }
+                    }
+                }
+                const uniqueCandidates = [...new Set(candidates)];
+                if (uniqueCandidates.length === 1) {
+                    uniqueCandidates[0].setAttribute(marker, 'active');
+                }
+                return {
+                    count: uniqueCandidates.length,
+                    texts: uniqueCandidates.map(node => normalize(node.innerText || node.textContent).slice(0, 160)),
+                };
+            }""",
+            list(labels),
+        )
+        if not isinstance(result, dict):
+            return {"count": 0, "texts": []}
+        try:
+            count = int(result.get("count") or 0)
+        except (TypeError, ValueError):
+            count = 0
+        texts = result.get("texts")
+        return {
+            "count": count,
+            "texts": [str(item) for item in texts] if isinstance(texts, list) else [],
+        }
+
+    async def _open_content_declaration_dialog(self, page: Page):
+        """返回唯一可见的声明弹层；缺失时只打开声明入口一次。"""
+
+        state = await self._content_declaration_dialog_state(page)
+        if state["count"] == 0:
+            # 声明入口不能沿用通用的 force-click：若遇到未知合规/风控浮层，
+            # 强制穿透会破坏“未知提示一律停住”的边界。这里仅允许一个真实可见
+            # 且可用的入口，并执行普通点击。
+            #
+            # 首次未选择时，抖音显示“请选择自主声明”；选择过任一项后，入口会
+            # 原地变为“自主声明 + 当前选项”。此前只识别首次文案，导致第二次
+            # 切换时错误报出 0 个入口。这里仅接受这两类平台固定、完整的入口
+            # 文案，既支持切换，也不会把移动端预览中的“作者声明”误作入口。
+            from app_core.douyin_commerce_service import CONTENT_DECLARATION_OPTIONS
+
+            opener_labels = (
+                "请选择自主声明",
+                *tuple(
+                    f"自主声明 {option}" for option in CONTENT_DECLARATION_OPTIONS
+                ),
+            )
+            openers = []
+            for label in opener_labels:
+                candidates = await self._visible_enabled_items(
+                    page.get_by_text(label, exact=True)
+                )
+                if len(candidates) > 1:
+                    raise RuntimeError(
+                        f"抖音作品内容声明入口“{label}”不是唯一可点击节点（实际 {len(candidates)} 个）"
+                    )
+                openers.extend(candidates)
+            if not openers:
+                # 新版页面将“自主声明”和当前值拆分为相邻节点时，精确文本
+                # 定位会得到 0 个。此处只允许唯一的可见 semi-select 控件作为
+                # 受控后备入口；多个或零个均继续安全停止并带回最小诊断信息。
+                fallback = await self._mark_content_declaration_select_opener(
+                    page, opener_labels
+                )
+                if fallback["count"] != 1:
+                    detail = "；".join(fallback.get("texts") or [])[:240]
+                    suffix = f"：{detail}" if detail else ""
+                    raise RuntimeError(
+                        "抖音作品内容声明入口不是唯一可点击节点"
+                        f"（实际 {fallback['count']} 个）{suffix}"
+                    )
+                marked_openers = await self._visible_enabled_items(
+                    page.locator('[data-oneclick-douyin-declaration-opener="active"]')
+                )
+                if len(marked_openers) != 1:
+                    raise RuntimeError(
+                        "抖音作品内容声明入口标记后不是唯一可点击节点"
+                        f"（实际 {len(marked_openers)} 个）"
+                    )
+                openers = marked_openers
+            if len(openers) != 1:
+                raise RuntimeError(
+                    f"抖音作品内容声明入口不是唯一可点击节点（实际 {len(openers)} 个）"
+                )
+            opener = openers[0]
+            await opener.scroll_into_view_if_needed(timeout=3_000)
+            await opener.click(timeout=5_000)
+            for _ in range(10):
+                await page.wait_for_timeout(150)
+                state = await self._content_declaration_dialog_state(page)
+                if state["count"]:
+                    break
+        if state["count"] != 1:
+            detail = "；".join(state.get("texts") or [])[:240]
+            suffix = f"：{detail}" if detail else ""
+            raise RuntimeError(
+                f"抖音作品内容声明弹层无法唯一识别（实际 {state['count']} 个）{suffix}"
+            )
+        dialog = page.locator('[data-oneclick-douyin-declaration-dialog="active"]')
+        if await dialog.count() != 1:
+            raise RuntimeError("抖音作品内容声明弹层标记后不唯一，已安全停止")
+        try:
+            if not await dialog.first.is_visible():
+                raise RuntimeError("抖音作品内容声明弹层标记后不可见，已安全停止")
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise RuntimeError("抖音作品内容声明弹层无法确认可见状态，已安全停止") from exc
+        return dialog.first
+
+    async def set_favorite_music(self, page: Page) -> dict:
+        """为抖音带货视频选择收藏列表第一首音乐并做页面回读。
+
+        ``music_payload`` 未设置时，此步骤对历史通用发布完全无影响。带货
+        流程只允许 ``favorite-first``，收藏为空、控件不唯一或选择没有回读
+        时立即失败，不会继续带货绑定或最终提交。
+        """
+
+        payload = getattr(self, "music_payload", None)
+        if not isinstance(payload, dict):
+            self.music_verification = {}
+            return {}
+        douyin_logger.info("抖音带货开始选择收藏列表第一首音乐")
+        try:
+            from app_core.douyin_music_service import (
+                DouyinMusicError,
+                select_first_favorite_music,
+                validate_favorite_music_mode,
+            )
+
+            validate_favorite_music_mode(payload.get("mode"))
+            selected = await select_first_favorite_music(page)
+        except DouyinMusicError as exc:
+            raise RuntimeError(f"抖音收藏音乐未能唯一选择并回读：{exc}") from exc
+        except Exception as exc:
+            detail = " ".join(str(exc).splitlines()[:1]).strip() or exc.__class__.__name__
+            douyin_logger.error(f"抖音收藏音乐步骤异常：{detail}")
+            raise RuntimeError(
+                f"抖音收藏音乐步骤异常，已安全停止：{detail[:220]}"
+            ) from exc
+        self.music_verification = dict(selected or {})
+        if not self.music_verification:
+            raise RuntimeError("抖音收藏音乐未返回页面回读，已安全停止")
+        douyin_logger.info(
+            "抖音已选择并回读收藏音乐："
+            f"{self.music_verification.get('title') or ''}"
+        )
+        return dict(self.music_verification)
+
+    async def set_commerce_store(self, page: Page) -> dict:
+        """读取候选或绑定唯一可回读的本地团购门店。"""
+
+        discovery_payload = getattr(self, "commerce_discovery_payload", None)
+        if isinstance(discovery_payload, dict):
             try:
-                await page.keyboard.press("Escape")
-            except Exception:
-                pass
-            return
-        await page.wait_for_timeout(500)
+                from app_core.douyin_commerce_service import (
+                    read_commerce_store_candidates,
+                )
+
+                candidates = await read_commerce_store_candidates(
+                    page,
+                    discovery_payload.get("locationPoi") or {},
+                )
+            except Exception as exc:
+                raise RuntimeError(f"抖音带货门店候选未能唯一读取：{exc}") from exc
+            self.commerce_candidates = [dict(item) for item in candidates]
+            if not self.commerce_candidates:
+                raise RuntimeError("抖音未返回可唯一回读的团购门店候选")
+            douyin_logger.info(
+                f"抖音带货已读取 {len(self.commerce_candidates)} 个可绑定门店候选"
+            )
+            # 候选读取阶段不选择门店、不保存草稿、不点击发表。
+            self.commerce_verification = {}
+            return {}
+
+        payload = getattr(self, "commerce_payload", None)
+        if not isinstance(payload, dict):
+            self.commerce_verification = {}
+            return {}
+        try:
+            from app_core.douyin_commerce_service import apply_commerce_store_to_page
+
+            selected = await apply_commerce_store_to_page(
+                page,
+                payload.get("commerceStore") or {},
+                payload.get("locationPoi") or {},
+            )
+        except Exception as exc:
+            raise RuntimeError(f"抖音带货门店未能唯一绑定并回读：{exc}") from exc
+        self.commerce_verification = dict(selected or {})
+        if not self.commerce_verification:
+            raise RuntimeError("抖音带货门店未返回可用回读，已安全停止")
+        douyin_logger.info(
+            "抖音带货门店已绑定并回读："
+            f"{self.commerce_verification.get('name') or ''}"
+        )
+        return dict(self.commerce_verification)
+
+    async def set_content_declaration(self, page: Page, declaration: str | None = None) -> str:
+        """选择用户明确指定的一项抖音“自主声明”，并从页面回读。
+
+        不根据素材、标题或 AI 标记推断声明；调用方必须传入平台当前可见的精确
+        选项。控件、选项、确认按钮或最终回读任一不唯一时立即停止。
+        """
+
+        from app_core.douyin_commerce_service import normalize_content_declaration
+
+        option_text = normalize_content_declaration(
+            declaration if declaration is not None else getattr(self, "content_declaration", "")
+        )
+        # 带货流程不设置独立封面，但抖音上传后可能延迟弹出“横封面展示”
+        # 提示。它不是声明弹窗的一部分，若仍停在前台会遮住声明选项。只在
+        # 文案精确命中已知提示时按 Escape 关闭；绝不点击“立即设置”，也不对
+        # 任何未知弹窗执行关闭或强制点击。
+        if getattr(self, "skip_thumbnail", False):
+            overlay_state = await self._dismiss_commerce_cover_promotion(page)
+            if overlay_state == "blocked":
+                raise RuntimeError(
+                    "抖音横封面展示提示遮挡作品内容声明，未进入封面设置且无法安全关闭"
+                )
+        dialog = await self._open_content_declaration_dialog(page)
+
+        async def unique_option(current_dialog):
+            # 实机 DOM/无障碍树已确认：声明文字只是单选行内部的展示节点，真正
+            # 可交互的是带名称的 ``radio``。点击文字节点会被同层的说明浮层或
+            # 行容器拦截，即使声明弹层本身已经定位正确。因此必须以平台原生
+            # 单选控件为目标，不能再以 get_by_text() 代替。
+            options = await self._visible_enabled_items(
+                current_dialog.get_by_role("radio", name=option_text, exact=True)
+            )
+            if len(options) != 1:
+                raise RuntimeError(
+                    f"抖音作品内容声明弹层中“{option_text}”不是唯一可点击的单选控件，已安全停止"
+                )
+            return options[0]
+
+        option = await unique_option(dialog)
+        try:
+            await option.click(timeout=5_000)
+        except Exception as exc:
+            # 先由页面真实可见状态确认是否存在“横封面展示”提示，不依赖
+            # Playwright 错误文本是否被客户端截断。只有这个已知提示可按 Escape
+            # 关闭后重试；未知浮层、验证码或风控提示一律不穿透。
+            overlay_state = "absent"
+            if getattr(self, "skip_thumbnail", False):
+                overlay_state = await self._dismiss_commerce_cover_promotion(page)
+            if overlay_state == "blocked":
+                raise RuntimeError(
+                    "抖音横封面展示提示遮挡作品内容声明，未进入封面设置且无法安全关闭"
+                ) from exc
+            if overlay_state != "dismissed":
+                # 页面没有精确命中可安全关闭的横封面提示时，保留原始错误，避免
+                # 将任意未知弹层误判为封面提示后继续操作。
+                raise
+            # Escape 由抖音最上层弹层接收：有的版本会保留声明弹层，有的版本会
+            # 一并收起。统一重新定位，必要时仅重新打开“请选择自主声明”。
+            dialog = await self._open_content_declaration_dialog(page)
+            option = await unique_option(dialog)
+            try:
+                await option.click(timeout=5_000)
+            except Exception as retry_exc:
+                raise RuntimeError(
+                    "关闭横封面展示提示后，抖音作品内容声明仍无法安全选择"
+                ) from retry_exc
+        await page.wait_for_timeout(300)
         confirm_buttons = []
         for button_name in ("确定", "确认", "完成", "保存"):
             confirm_buttons = await self._visible_enabled_items(
-                page.get_by_role("button", name=button_name, exact=True)
+                dialog.get_by_role("button", name=button_name, exact=True)
             )
-            if confirm_buttons:
+            if len(confirm_buttons) == 1:
                 break
-        if not confirm_buttons:
-            for button_name in ("确定", "确认"):
-                confirm_buttons = await self._visible_enabled_items(
-                    page.get_by_text(button_name, exact=True)
-                )
-                if confirm_buttons:
-                    break
-        if not confirm_buttons:
-            if not self.save_draft_only:
-                raise RuntimeError("抖音 AI 自主声明未找到可用的确定按钮")
-            detail = f"已选择“{option_text}”，但平台未提供可识别的确认按钮"
-            douyin_logger.warning(f"抖音 AI 自主声明未完成：{detail}")
-            record_draft_field_warning("抖音", "AI 自主声明", detail)
-            try:
-                await page.keyboard.press("Escape")
-            except Exception:
-                pass
-            return
-        await confirm_buttons[-1].click(force=True, timeout=5000)
-        await page.wait_for_timeout(500)
+            if len(confirm_buttons) > 1:
+                raise RuntimeError("抖音自主声明确认按钮不唯一，已安全停止")
+        if len(confirm_buttons) != 1:
+            raise RuntimeError("抖音自主声明未找到唯一可用的确认按钮")
+        await confirm_buttons[0].click(timeout=5_000)
+        dialog_closed = False
+        for _ in range(10):
+            await page.wait_for_timeout(150)
+            state = await self._content_declaration_dialog_state(page)
+            if state["count"] == 0:
+                dialog_closed = True
+                break
+        if not dialog_closed:
+            raise RuntimeError("抖音自主声明确认后弹层未关闭，无法确认页面回读")
         selected = await self._visible_exact_text(page, {option_text})
         if option_text not in selected:
-            if not self.save_draft_only:
-                raise RuntimeError(f"抖音 AI 自主声明选择后未能回读：{option_text}")
-            detail = f"选择后平台未能回读“{option_text}”"
-            douyin_logger.warning(f"抖音 AI 自主声明未完成：{detail}")
-            record_draft_field_warning("抖音", "AI 自主声明", detail)
-            return
+            raise RuntimeError(f"抖音自主声明选择后未能回读：{option_text}")
+        self.content_declaration_verification = option_text
         douyin_logger.info(f"抖音自主声明已选择并回读确认：{option_text}")
+        return option_text
+
+    async def set_ai_generated_declaration(self, page: Page):
+        """兼容旧发布路径的 AI 声明入口，实际委托给受控的自主声明选择。"""
+
+        if not getattr(self, "ai_generated", False):
+            return ""
+        if not getattr(self, "content_declaration", ""):
+            self.content_declaration = "内容由AI生成"
+        return await self.set_content_declaration(page)
 
     async def _radio_checked_for_text(self, page: Page, text: str):
         return await page.evaluate(

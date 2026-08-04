@@ -21,7 +21,6 @@ def _video_payload(video: Path, platform_type: int, mode: str) -> dict:
         "description": "不会连接平台",
         "fileList": [str(video)],
         "accountList": ["offline-account.json"],
-        "accountAuthModes": ["browser"],
         "enableTimer": False,
     }
 
@@ -65,35 +64,11 @@ class PublishServiceRoutingTests(unittest.TestCase):
         self.assertTrue(mark.call_args.kwargs["ok"])
         self.assertEqual(mark.call_args.args[1], 2)
 
-    def test_official_youtube_routes_to_official_service(self) -> None:
+    def test_youtube_browser_publish_remains_locked(self) -> None:
         payload = _video_payload(self.video, 7, "publish")
-        payload.update(
-            {
-                "debugDryRun": False,
-                "accountAuthModes": ["official_api"],
-                "officialApiConfirmed": True,
-            }
-        )
-        result = {
-            "ok": True,
-            "published": True,
-            "scheduled": False,
-            "message": "官方回读成功",
-        }
-        with (
-            patch.object(
-                publish_service.overseas_api_service,
-                "run_official_publish_sync",
-                return_value=result,
-            ) as runner,
-            patch.object(publish_service.task_service, "mark_task_running"),
-            patch.object(publish_service.task_service, "record_task_event"),
-            patch.object(publish_service.task_service, "mark_platform_result") as mark,
-        ):
-            publish_service._run_publish({"id": 102}, [payload])
-        runner.assert_called_once_with(payload)
-        self.assertTrue(mark.call_args.kwargs["ok"])
-        self.assertEqual(mark.call_args.args[1], 7)
+        payload["debugDryRun"] = False
+        with self.assertRaisesRegex(ValueError, "Meta 浏览器通道"):
+            publish_service._validate_payloads([payload])
 
     def test_meta_browser_routes_only_after_confirmation_contract(self) -> None:
         payload = _video_payload(self.video, 8, "publish")

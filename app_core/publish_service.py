@@ -15,10 +15,11 @@ from typing import Any
 from myUtils.postVideo import post_video_batch_draft_tabs
 
 from . import (
+    douyin_commerce_service,
     douyin_location_service,
+    douyin_publish_executor,
     oneclick_capabilities,
     oneclick_preflight,
-    overseas_api_service,
     overseas_browser_publish,
     overseas_preflight,
     task_service,
@@ -98,42 +99,30 @@ def _validate_payloads(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
             else:
                 payload["locationKeyword"] = ""
                 payload["locationPoi"] = {}
+            if str(payload.get("workflow") or "") == "douyin-commerce":
+                try:
+                    payload.update(
+                        douyin_commerce_service.validate_douyin_commerce_payload(payload)
+                    )
+                except douyin_commerce_service.DouyinCommerceError as exc:
+                    raise ValueError(str(exc)) from exc
         if runtime_mode == "preflight":
             if payload.get("debugDryRun") is not True:
                 raise ValueError("预发布检查必须保持 debugDryRun=true")
-            if (
-                platform_type in overseas_api_service.OFFICIAL_API_PLATFORM_TYPES
-                and set(payload.get("accountAuthModes") or []) == {"official_api"}
-            ):
-                checked = overseas_api_service.validate_official_preflight_payload(
-                    payload
-                )
-                if not checked["ok"]:
-                    raise ValueError("；".join(checked["errors"]))
         elif runtime_mode == "publish":
-            official_overseas = (
-                platform_type in overseas_api_service.OFFICIAL_API_PLATFORM_TYPES
-                and set(payload.get("accountAuthModes") or []) == {"official_api"}
-            )
-            meta_browser = (
-                platform_type in {8, 9}
-                and set(payload.get("accountAuthModes") or []) == {"browser"}
-            )
-            if (
-                platform_type not in {1, 10}
-                and not official_overseas
-                and not meta_browser
-            ):
-                raise ValueError("当前正式发布执行器只开放小红书和公众号")
+            if platform_type not in {1, 3, 8, 9, 10}:
+                raise ValueError(
+                    "当前正式发布执行器只开放小红书、抖音、公众号和 Meta 浏览器通道"
+                )
             if payload.get("debugDryRun") is not False:
                 raise ValueError("正式发布必须明确 debugDryRun=false")
-            if official_overseas:
-                checked = overseas_api_service.validate_official_publish_payload(
-                    payload
+            if platform_type == 3:
+                # 抖音正式发布强制前台并规范化结构化 POI，写回任务载荷，
+                # 让任务记录、执行器与页面实际行为保持一致。
+                payload.update(
+                    douyin_publish_executor.validate_douyin_publish_payload(payload)
                 )
-                if not checked["ok"]:
-                    raise ValueError("；".join(checked["errors"]))
-            elif meta_browser:
+            elif platform_type in {8, 9}:
                 checked = overseas_browser_publish.validate_meta_browser_publish_payload(
                     payload
                 )
@@ -147,20 +136,10 @@ def _validate_payloads(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
             else:
                 wechat_publish_policy.normalize_wechat_publish_preferences(payload)
         elif runtime_mode == "draft":
-            if (
-                platform_type == 6
-                and set(payload.get("accountAuthModes") or [])
-                == {"official_api"}
-            ):
-                checked = overseas_api_service.validate_official_inbox_payload(
-                    payload
-                )
-                if not checked["ok"]:
-                    raise ValueError("；".join(checked["errors"]))
-            elif platform_type not in {2, 5}:
+            if platform_type not in {2, 5}:
                 raise ValueError(
                     "当前平台没有可验证的草稿保存通道；"
-                    "国内仅视频号和B站支持，TikTok 仅支持官方收件箱"
+                    "目前仅视频号和B站支持"
                 )
         else:
             raise ValueError("当前任务模式不支持")
@@ -205,11 +184,16 @@ def _run_preflight(task: dict, payloads: list[dict[str, Any]]) -> None:
             platform_type = int(payload["type"])
             task_service.record_task_event(task["id"], "platform_started", f"开始检查{platform_type}号平台的素材上传与表单填写")
             try:
-                if platform_type in {6, 7, 8, 9}:
-                    if set(payload.get("accountAuthModes") or []) == {"official_api"}:
-                        result = overseas_api_service.run_official_preflight_sync(payload)
-                    else:
-                        result = overseas_preflight.run_overseas_preflight_sync(payload)
+                if (
+                    platform_type == 3
+                    and str(payload.get("workflow") or "") == "douyin-commerce"
+                ):
+                    result = douyin_publish_executor.run_douyin_commerce_preflight_sync(
+                        payload,
+                        task_id=int(task["id"]),
+                    )
+                elif platform_type in {6, 7, 8, 9}:
+                    result = overseas_preflight.run_overseas_preflight_sync(payload)
                 else:
                     result = oneclick_preflight.run_preflight_sync(payload)
                 task_service.mark_platform_result(
@@ -268,20 +252,20 @@ def _run_publish(task: dict, payloads: list[dict[str, Any]]) -> None:
                         payload,
                         task_id=int(task["id"]),
                     )
+                elif platform_type == 3:
+                    result = douyin_publish_executor.run_douyin_publish_sync(
+                        payload,
+                        task_id=int(task["id"]),
+                    )
                 elif platform_type == 10:
                     result = wechat_publish_executor.run_wechat_publish_sync(
                         payload,
                         task_id=int(task["id"]),
                     )
-                elif platform_type in overseas_api_service.OFFICIAL_API_PLATFORM_TYPES:
-                    if set(payload.get("accountAuthModes") or []) == {"official_api"}:
-                        result = overseas_api_service.run_official_publish_sync(payload)
-                    elif platform_type in {8, 9}:
-                        result = overseas_browser_publish.run_meta_browser_publish_sync(
-                            payload
-                        )
-                    else:
-                        raise ValueError(f"{platform_name}浏览器正式发布保持锁定")
+                elif platform_type in {8, 9}:
+                    result = overseas_browser_publish.run_meta_browser_publish_sync(
+                        payload
+                    )
                 else:
                     raise ValueError(f"{platform_name}尚未接入受控正式发布执行器")
                 task_service.mark_platform_result(
@@ -325,7 +309,7 @@ def _run_publish(task: dict, payloads: list[dict[str, Any]]) -> None:
 
 
 def _run_draft(task: dict, payloads: list[dict[str, Any]]) -> None:
-    """执行 TikTok 官方收件箱上传，不会公开发布。"""
+    """执行已接入并可回读的国内平台草稿保存。"""
 
     if not _publish_lock.acquire(blocking=False):
         task_service.mark_platform_result(
@@ -340,72 +324,44 @@ def _run_draft(task: dict, payloads: list[dict[str, Any]]) -> None:
         return
     try:
         task_service.mark_task_running(
-            task["id"],
-            (
-                "一键发开始上传到 TikTok 官方收件箱"
-                if all(int(item.get("type") or 0) == 6 for item in payloads)
-                else "一键发开始执行受控平台草稿保存"
-            ),
+            task["id"], "一键发开始执行受控平台草稿保存"
         )
-        if not all(int(item.get("type") or 0) == 6 for item in payloads):
-            results = post_video_batch_draft_tabs(payloads)
-            by_platform: dict[int, list[dict[str, Any]]] = {}
-            for result in results or []:
-                try:
-                    result_type = int(result.get("type") or 0)
-                except (AttributeError, TypeError, ValueError):
-                    continue
-                by_platform.setdefault(result_type, []).append(result)
-            for payload in payloads:
-                platform_type = int(payload["type"])
-                platform_results = by_platform.get(platform_type, [])
-                failed = [
-                    item for item in platform_results if item.get("ok") is False
-                ]
-                ok = bool(platform_results) and not failed
-                message = (
-                    str(failed[0].get("message") or "平台草稿保存失败")
-                    if failed
-                    else "平台已返回可验证的草稿保存结果"
-                    if ok
-                    else "平台草稿执行器未返回可验证结果"
-                )
-                task_service.mark_platform_result(
-                    task["id"],
-                    platform_type,
-                    ok=ok,
-                    message=message,
-                    content_type=str(payload.get("contentType") or ""),
-                    event_type="platform_draft",
-                )
-            return
+        results = post_video_batch_draft_tabs(payloads)
+        by_platform: dict[int, list[dict[str, Any]]] = {}
+        for result in results or []:
+            try:
+                result_type = int(result.get("type") or 0)
+            except (AttributeError, TypeError, ValueError):
+                continue
+            by_platform.setdefault(result_type, []).append(result)
         for payload in payloads:
             platform_type = int(payload["type"])
-            try:
-                result = overseas_api_service.run_official_inbox_upload_sync(payload)
-                task_service.mark_platform_result(
-                    task["id"],
-                    platform_type,
-                    ok=bool(result.get("ok")),
-                    message=str(result.get("message") or "TikTok 收件箱上传结束"),
-                    content_type=str(payload.get("contentType") or ""),
-                    event_type="platform_draft",
-                )
-            except Exception as exc:
-                task_service.mark_platform_result(
-                    task["id"],
-                    platform_type,
-                    ok=False,
-                    message=f"收件箱上传异常：{type(exc).__name__}：{exc}",
-                    content_type=str(payload.get("contentType") or ""),
-                    event_type="platform_draft",
-                )
+            platform_results = by_platform.get(platform_type, [])
+            failed = [
+                item for item in platform_results if item.get("ok") is False
+            ]
+            ok = bool(platform_results) and not failed
+            message = (
+                str(failed[0].get("message") or "平台草稿保存失败")
+                if failed
+                else "平台已返回可验证的草稿保存结果"
+                if ok
+                else "平台草稿执行器未返回可验证结果"
+            )
+            task_service.mark_platform_result(
+                task["id"],
+                platform_type,
+                ok=ok,
+                message=message,
+                content_type=str(payload.get("contentType") or ""),
+                event_type="platform_draft",
+            )
     except Exception as exc:
         task_service.mark_platform_result(
             task["id"],
             int(payloads[0]["type"]),
             ok=False,
-            message=f"收件箱上传异常：{type(exc).__name__}：{exc}",
+            message=f"平台草稿异常：{type(exc).__name__}：{exc}",
             content_type=str(payloads[0].get("contentType") or ""),
             event_type="platform_draft",
         )

@@ -11,11 +11,16 @@ from pathlib import Path
 import qrcode
 
 from app_core.publish_service import _validate_payloads
+from app_core.douyin_publish_executor import DouyinPublishError
 from app_core.wechat_publish_executor import (
     WechatPublishError,
     _capture_qr_image,
+    _close_publish_session,
+    _immediate_home_readback,
+    _is_transient_navigation_error,
     _page_state_after_navigation,
     _platform_date_label,
+    _recover_post_submit_result,
     _safe_dialog_report,
     _scheduled_home_readback,
 )
@@ -43,13 +48,13 @@ class WechatPublishExecutorBoundaryTests(unittest.TestCase):
             "originalDeclaration": False,
         }
 
-    def test_formal_publish_rejects_platforms_outside_xhs_and_wechat(self):
+    def test_formal_publish_rejects_douyin_non_video_content(self):
         with tempfile.TemporaryDirectory() as directory:
             payload = self._payload(Path(directory))
             self.assertEqual(_validate_payloads([payload])[0]["type"], 10)
             payload["type"] = 3
-            with self.assertRaisesRegex(ValueError, "小红书和公众号"):
-                _validate_payloads([payload])
+        with self.assertRaisesRegex(DouyinPublishError, "只接入视频类型"):
+            _validate_payloads([payload])
 
     def test_formal_publish_requires_explicit_non_dry_run(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -161,6 +166,65 @@ class WechatPublishExecutorBoundaryTests(unittest.TestCase):
         }
         self.assertFalse(_scheduled_home_readback(state, preferences)["ok"])
 
+    def test_immediate_home_card_confirms_title_and_unique_article_link(self):
+        title = "具身 AI 从会动走向能交接任务"
+        result = _immediate_home_readback(
+            {
+                "publishedCards": [
+                    f"今天 15:05 已发表 {title} 0 0 0 0",
+                ],
+                "links": [
+                    {
+                        "text": title,
+                        "href": "https://mp.weixin.qq.com/s/example",
+                    }
+                ],
+            },
+            title,
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["publishedAt"], "15:05")
+        self.assertEqual(result["link"], "https://mp.weixin.qq.com/s/example")
+
+    def test_immediate_home_card_rejects_draft_or_ambiguous_link(self):
+        title = "即刻发表回读测试"
+        draft = _immediate_home_readback(
+            {
+                "publishedCards": [f"今天 15:05 草稿 {title}"],
+                "links": [
+                    {
+                        "text": title,
+                        "href": "https://mp.weixin.qq.com/s/example",
+                    }
+                ],
+            },
+            title,
+        )
+        self.assertFalse(draft["ok"])
+        ambiguous = _immediate_home_readback(
+            {
+                "publishedCards": [f"今天 15:05 已发表 {title}"],
+                "links": [
+                    {"text": title, "href": "https://mp.weixin.qq.com/s/first"},
+                    {"text": title, "href": "https://mp.weixin.qq.com/s/second"},
+                ],
+            },
+            title,
+        )
+        self.assertFalse(ambiguous["ok"])
+
+    def test_navigation_context_error_is_recoverable_only_when_exactly_matched(self):
+        self.assertTrue(
+            _is_transient_navigation_error(
+                RuntimeError("Page.evaluate: Execution context was destroyed")
+            )
+        )
+        self.assertFalse(
+            _is_transient_navigation_error(
+                RuntimeError("平台出现未知合规确认")
+            )
+        )
+
 
 class WechatQrCaptureTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -214,6 +278,7 @@ class WechatQrCaptureTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self):
                 self.calls = 0
                 self.waited = False
+                self.page_timeout_calls = 0
 
             async def evaluate(self, _script, _title):
                 self.calls += 1
@@ -227,12 +292,106 @@ class WechatQrCaptureTests(unittest.IsolatedAsyncioTestCase):
                 self.waited = timeout == 2_000
 
             async def wait_for_timeout(self, _milliseconds):
-                return None
+                self.page_timeout_calls += 1
+                raise AssertionError("导航重试不应依赖页面执行上下文计时")
 
         page = NavigatingPage()
         state = await _page_state_after_navigation(page, "", timeout_seconds=3)
         self.assertIn("定时发表成功", state["successMarkers"])
         self.assertTrue(page.waited)
+        self.assertEqual(page.page_timeout_calls, 0)
+
+    async def test_post_submit_navigation_recovers_exact_immediate_home_readback(self):
+        title = "扫码后跳转回读测试"
+
+        class HomePage:
+            def __init__(self, case):
+                self.case = case
+                self.goto_calls = 0
+
+            async def goto(self, _url, *, wait_until, timeout):
+                self.goto_calls += 1
+                self.case.assertEqual(wait_until, "domcontentloaded")
+                self.case.assertEqual(timeout, 45_000)
+
+            async def evaluate(self, _script, expected_title):
+                self.case.assertEqual(expected_title, title)
+                return {
+                    "publishedCards": [f"今天 15:05 已发表 {title}"],
+                    "links": [
+                        {
+                            "text": title,
+                            "href": "https://mp.weixin.qq.com/s/example",
+                        }
+                    ],
+                    "successMarkers": [],
+                }
+
+        page = HomePage(self)
+        result = await _recover_post_submit_result(
+            page,
+            title=title,
+            preferences={"scheduledPublish": False, "scheduleLocal": ""},
+            ai_accepted=False,
+            preflight_message="本地预检完成",
+            execution_record={},
+        )
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["actuallyPublished"])
+        self.assertTrue(result["recoveredAfterNavigation"])
+        self.assertEqual(page.goto_calls, 1)
+
+    async def test_post_submit_navigation_recovers_exact_scheduled_home_card(self):
+        target = datetime.now() + timedelta(days=1)
+        target = target.replace(hour=9, minute=0, second=0, microsecond=0)
+        title = "扫码后定时回读测试"
+        preferences = {
+            "scheduledPublish": True,
+            "scheduleLocal": target.strftime("%Y-%m-%d %H:%M"),
+            "groupNotification": True,
+        }
+        date_label = _platform_date_label(target.date())
+
+        class HomePage:
+            async def goto(self, _url, *, wait_until, timeout):
+                return None
+
+            async def evaluate(self, _script, expected_title):
+                return {
+                    "scheduledCards": [
+                        f"定时发表 {date_label} 09:00 已开启群发通知 {expected_title}"
+                    ],
+                    "links": [],
+                    "successMarkers": [],
+                }
+
+        result = await _recover_post_submit_result(
+            HomePage(),
+            title=title,
+            preferences=preferences,
+            ai_accepted=False,
+            preflight_message="本地预检完成",
+            execution_record={},
+        )
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["scheduled"])
+        self.assertFalse(result["actuallyPublished"])
+        self.assertEqual(result["scheduledAt"], preferences["scheduleLocal"])
+
+    async def test_cleanup_failure_cannot_override_a_verified_publish_result(self):
+        class BrokenCloser:
+            def __init__(self):
+                self.calls = 0
+
+            async def close(self):
+                self.calls += 1
+                raise RuntimeError("Connection closed while reading from the driver")
+
+        context = BrokenCloser()
+        browser = BrokenCloser()
+        await _close_publish_session(context, browser)
+        self.assertEqual(context.calls, 1)
+        self.assertEqual(browser.calls, 1)
 
 
 if __name__ == "__main__":
