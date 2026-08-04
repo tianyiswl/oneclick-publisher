@@ -1296,6 +1296,37 @@ class DouyinCommerceUiTests(unittest.TestCase):
         self.assertTrue(self.page.location_search_button.isEnabled())
         self.assertEqual(self.page.status_badge.text(), "继续配置")
 
+    def test_completed_choices_collapse_empty_lists_and_keep_safe_music_replacement(self) -> None:
+        """已回读的选择不应留下大块空白，但允许用户重新读取收藏音乐。"""
+
+        self.page._session_id = "session-demo"
+        self.page._selected_music = {
+            "musicId": "music-001",
+            "title": "出埃及记",
+            "creator": "石Yuchi",
+            "duration": "01:08",
+        }
+        self.page._locations = [dict(self.location_a)]
+        self.page.location_result_list.addItem("北海银滩景区")
+        self.page._location_applied = True
+        self.page._sync_view()
+
+        self.assertTrue(self.page.music_list.isHidden())
+        self.assertTrue(self.page.location_result_list.isHidden())
+        self.assertTrue(self.page.load_music_button.isEnabled())
+        self.assertEqual(self.page.load_music_button.text(), "更换收藏音乐")
+
+    def test_progress_stepper_allows_return_without_skipping_required_steps(self) -> None:
+        self.page._session_id = "session-demo"
+        self.page.pages.setCurrentIndex(1)
+        self.page._sync_view()
+
+        self.assertTrue(self.page.step_labels[0].isEnabled())
+        self.assertTrue(self.page.step_labels[1].isEnabled())
+        self.assertFalse(self.page.step_labels[2].isEnabled())
+        self.page.step_labels[0].click()
+        self.assertEqual(self.page.pages.currentIndex(), 0)
+
     def test_selected_declaration_cannot_enter_review_before_platform_readback(self) -> None:
         self.page._session_id = "session-demo"
         self.page._selected_music = {

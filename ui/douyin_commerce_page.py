@@ -31,6 +31,7 @@ from PyQt6.QtWidgets import (
     QPlainTextEdit,
     QScrollArea,
     QSizePolicy,
+    QSplitter,
     QStackedWidget,
     QTimeEdit,
     QVBoxLayout,
@@ -95,6 +96,7 @@ class DouyinCommerceConfirmDialog(QDialog):
 
         panel = QFrame()
         panel.setProperty("subPanel", True)
+        panel.setProperty("douyinCommerceCard", True)
         grid = QGridLayout(panel)
         grid.setContentsMargins(14, 12, 14, 12)
         grid.setHorizontalSpacing(16)
@@ -146,6 +148,12 @@ class DouyinCommercePage(QWidget):
     """单账号、单视频的抖音带货分步向导。"""
 
     _STEPS = ("内容准备", "音乐与定位", "声明与定时", "检查与提交")
+    _STEP_HINTS = (
+        "选择账号、视频并完成本地内容准备。",
+        "在同一抖音编辑页依次选择收藏音乐和发布定位。",
+        "选择作品内容声明，并决定立即发表或定时。",
+        "只读预检通过后，再进行一次独立提交确认。",
+    )
 
     def __init__(self) -> None:
         super().__init__()
@@ -166,50 +174,80 @@ class DouyinCommercePage(QWidget):
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(28, 22, 28, 26)
-        root.setSpacing(16)
+        root.setContentsMargins(30, 24, 30, 28)
+        root.setSpacing(14)
 
-        header = QHBoxLayout()
+        hero = QFrame()
+        hero.setObjectName("douyinCommerceHero")
+        header = QHBoxLayout(hero)
+        header.setContentsMargins(22, 18, 20, 18)
+        header.setSpacing(18)
         titles = QVBoxLayout()
-        titles.setSpacing(4)
+        titles.setSpacing(3)
+        eyebrow = QLabel("抖音本地团购视频")
+        eyebrow.setObjectName("douyinCommerceEyebrow")
         title = QLabel("抖音带货")
         title.setObjectName("pageTitle")
-        subtitle = QLabel("本地团购视频 · 用户自选收藏音乐 · 发布定位与自主声明 · 可选北京时间定时")
+        subtitle = QLabel("把一条团购视频按抖音真实编辑顺序准备好，再决定是否定时提交。")
         subtitle.setObjectName("pageSubtitle")
         subtitle.setWordWrap(True)
+        self.hero_detail_label = QLabel("尚未开始平台操作")
+        self.hero_detail_label.setObjectName("douyinCommerceHeroDetail")
+        self.hero_detail_label.setWordWrap(True)
+        titles.addWidget(eyebrow)
         titles.addWidget(title)
         titles.addWidget(subtitle)
+        titles.addWidget(self.hero_detail_label)
         header.addLayout(titles)
         header.addStretch()
+        status_column = QVBoxLayout()
+        status_column.setSpacing(6)
         self.status_badge = QLabel("等待内容准备")
         self.status_badge.setProperty("role", "countBadge")
-        header.addWidget(self.status_badge)
-        self.abandon_button = button("放弃本次上传", variant="secondary")
+        self.session_hint_label = QLabel("本机内容准备")
+        self.session_hint_label.setObjectName("douyinCommerceSessionHint")
+        self.session_hint_label.setAlignment(Qt.AlignmentFlag.AlignRight)
+        status_column.addWidget(self.status_badge, 0, Qt.AlignmentFlag.AlignRight)
+        status_column.addWidget(self.session_hint_label)
+        header.addLayout(status_column)
+        self.abandon_button = button("放弃本次上传", variant="secondary", compact=True)
         self.abandon_button.setObjectName("douyinCommerceAbandon")
         self.abandon_button.clicked.connect(self.abandon_session)
         header.addWidget(self.abandon_button)
-        root.addLayout(header)
+        root.addWidget(hero)
 
         guidance = QLabel(
-            "先上传一次视频；上传完成后由你从收藏中选择音乐，再在默认“国内”范围下搜索，或切换为“本地”，"
-            "按抖音实际的“位置 → 带货模式”路径确认发布定位。随后选择作品内容声明并回读。"
-            "本流程不读取或绑定门店、不设置独立封面、不保存草稿，最终提交始终需要单独确认。"
+            "上传只会执行一次。音乐、发布定位和作品内容声明会在同一抖音编辑页逐项回读；"
+            "本流程不保存平台草稿，不设置独立封面，最终提交始终需要你单独确认。"
         )
         guidance.setObjectName("infoCallout")
         guidance.setWordWrap(True)
         root.addWidget(guidance)
 
+        progress_panel = QFrame()
+        progress_panel.setObjectName("douyinCommerceProgress")
+        progress_layout = QVBoxLayout(progress_panel)
+        progress_layout.setContentsMargins(14, 12, 14, 12)
+        progress_layout.setSpacing(8)
         self.step_row = QHBoxLayout()
-        self.step_row.setSpacing(8)
-        self.step_labels: list[QLabel] = []
+        self.step_row.setSpacing(7)
+        self.step_labels = []
         for index, label_text in enumerate(self._STEPS):
-            label = QLabel(f"{index + 1}. {label_text}")
-            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            label.setMinimumHeight(34)
-            label.setProperty("role", "caption")
-            self.step_row.addWidget(label, 1)
-            self.step_labels.append(label)
-        root.addLayout(self.step_row)
+            step_button = button(f"{index + 1}. {label_text}", variant="ghost", compact=True)
+            step_button.setObjectName("douyinCommerceStep")
+            step_button.setMinimumHeight(38)
+            step_button.setProperty("stepState", "pending")
+            step_button.clicked.connect(
+                lambda _checked=False, target=index: self._go_to_step(target)
+            )
+            self.step_row.addWidget(step_button, 1)
+            self.step_labels.append(step_button)
+        progress_layout.addLayout(self.step_row)
+        self.progress_context_label = QLabel(self._STEP_HINTS[0])
+        self.progress_context_label.setObjectName("douyinCommerceProgressContext")
+        self.progress_context_label.setWordWrap(True)
+        progress_layout.addWidget(self.progress_context_label)
+        root.addWidget(progress_panel)
 
         self.pages = QStackedWidget()
         self.pages.setObjectName("douyinCommerceWizard")
@@ -217,11 +255,27 @@ class DouyinCommercePage(QWidget):
         self.pages.addWidget(self._build_music_location_page())
         self.pages.addWidget(self._build_store_schedule_page())
         self.pages.addWidget(self._build_review_page())
-        root.addWidget(self.pages, 1)
+
+        workspace = QSplitter(Qt.Orientation.Horizontal)
+        workspace.setObjectName("douyinCommerceWorkspace")
+        workspace.setChildrenCollapsible(False)
+        workspace.setHandleWidth(8)
+        flow_host = QWidget()
+        flow_layout = QVBoxLayout(flow_host)
+        flow_layout.setContentsMargins(0, 0, 0, 0)
+        flow_layout.addWidget(self.pages)
+        self.summary_rail = self._build_summary_rail()
+        workspace.addWidget(flow_host)
+        workspace.addWidget(self.summary_rail)
+        workspace.setStretchFactor(0, 5)
+        workspace.setStretchFactor(1, 1)
+        workspace.setSizes([1020, 310])
+        root.addWidget(workspace, 1)
 
     @staticmethod
     def _scroll_page(body: QWidget) -> QScrollArea:
         scroll = QScrollArea()
+        scroll.setObjectName("douyinCommerceStepScroll")
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setWidget(body)
@@ -243,11 +297,87 @@ class DouyinCommercePage(QWidget):
         layout.addWidget(helper_label)
         return panel, layout
 
+    def _build_summary_rail(self) -> QScrollArea:
+        """构造持续可见的任务事实摘要，不调用平台或写入任务。"""
+
+        scroll = QScrollArea()
+        scroll.setObjectName("douyinCommerceSummaryRail")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setMinimumWidth(286)
+        scroll.setMaximumWidth(352)
+        rail = QFrame()
+        rail.setObjectName("douyinCommerceSummaryRailContent")
+        rail.setMinimumWidth(286)
+        layout = QVBoxLayout(rail)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(12)
+
+        title = QLabel("本次任务")
+        title.setObjectName("douyinCommerceRailTitle")
+        layout.addWidget(title)
+        subtitle = QLabel("这里显示已确认事实；“待完成”不会被当成平台已写入。")
+        subtitle.setObjectName("douyinCommerceRailSubtitle")
+        subtitle.setWordWrap(True)
+        layout.addWidget(subtitle)
+
+        action_card = QFrame()
+        action_card.setObjectName("douyinCommerceActionCard")
+        action_layout = QVBoxLayout(action_card)
+        action_layout.setContentsMargins(12, 11, 12, 11)
+        action_layout.setSpacing(4)
+        action_title = QLabel("下一步")
+        action_title.setObjectName("douyinCommerceActionTitle")
+        self.rail_action_label = QLabel("选择账号、视频并填写内容")
+        self.rail_action_label.setObjectName("douyinCommerceActionValue")
+        self.rail_action_label.setWordWrap(True)
+        action_layout.addWidget(action_title)
+        action_layout.addWidget(self.rail_action_label)
+        layout.addWidget(action_card)
+
+        self.sidebar_summary_values: dict[str, QLabel] = {}
+        for label_text, key in (
+            ("账号", "account"),
+            ("视频", "video"),
+            ("音乐", "music"),
+            ("定位", "location"),
+            ("声明", "declaration"),
+            ("发布方式", "schedule"),
+        ):
+            row = QFrame()
+            row.setObjectName("douyinCommerceSummaryRow")
+            row_layout = QVBoxLayout(row)
+            row_layout.setContentsMargins(0, 7, 0, 8)
+            row_layout.setSpacing(3)
+            label = QLabel(label_text)
+            label.setObjectName("douyinCommerceSummaryLabel")
+            value = QLabel("待完成")
+            value.setObjectName("douyinCommerceSummaryValue")
+            value.setWordWrap(True)
+            value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            row_layout.addWidget(label)
+            row_layout.addWidget(value)
+            layout.addWidget(row)
+            self.sidebar_summary_values[key] = value
+
+        layout.addStretch()
+        boundary = QLabel(
+            "安全边界\n预检只填写并回读。二维码、验证码、登录失效或未知提示会停在前台，"
+            "不会被当成提交成功。"
+        )
+        boundary.setObjectName("douyinCommerceBoundary")
+        boundary.setWordWrap(True)
+        layout.addWidget(boundary)
+        scroll.setWidget(rail)
+        return scroll
+
     def _build_content_page(self) -> QWidget:
         body = QWidget()
+        body.setObjectName("douyinCommerceStepBody")
         layout = QVBoxLayout(body)
-        layout.setContentsMargins(0, 0, 12, 0)
-        layout.setSpacing(14)
+        layout.setContentsMargins(0, 0, 14, 0)
+        layout.setSpacing(16)
 
         account_panel, account_layout = self._section(
             "1. 选择抖音账号",
@@ -266,8 +396,8 @@ class DouyinCommercePage(QWidget):
         layout.addWidget(account_panel)
 
         content_panel, content_layout = self._section(
-            "2. 视频与文案",
-            "首版只支持一个本地视频。抖音带货不设置独立封面；上传后由你选择收藏音乐。",
+            "2. 视频与发布文案",
+            "首版只支持一个本地视频。不设置独立封面；视频上传完成后，再由你从收藏中选择音乐。",
         )
         grid = QGridLayout()
         grid.setHorizontalSpacing(12)
@@ -300,8 +430,8 @@ class DouyinCommercePage(QWidget):
         self.description_input.setFixedHeight(130)
         self.description_input.textChanged.connect(self._content_changed)
         content_layout.addWidget(self.description_input)
-        self.content_notice = QLabel("填写完成后上传一次视频，后续步骤不会重复上传。")
-        self.content_notice.setProperty("role", "caption")
+        self.content_notice = QLabel("填写完成后上传一次视频。后续音乐、定位和声明都复用同一编辑会话。")
+        self.content_notice.setObjectName("douyinCommerceInlineNotice")
         self.content_notice.setWordWrap(True)
         content_layout.addWidget(self.content_notice)
         saved_content_row = QHBoxLayout()
@@ -323,7 +453,7 @@ class DouyinCommercePage(QWidget):
 
         actions = QHBoxLayout()
         actions.addStretch()
-        self.upload_button = button("上传并继续", variant="primary")
+        self.upload_button = button("上传视频并继续", variant="primary")
         self.upload_button.setObjectName("douyinCommerceUpload")
         self.upload_button.clicked.connect(self.start_upload)
         actions.addWidget(self.upload_button)
@@ -333,24 +463,24 @@ class DouyinCommercePage(QWidget):
 
     def _build_music_location_page(self) -> QWidget:
         body = QWidget()
+        body.setObjectName("douyinCommerceStepBody")
         layout = QVBoxLayout(body)
-        layout.setContentsMargins(0, 0, 12, 0)
-        layout.setSpacing(14)
+        layout.setContentsMargins(0, 0, 14, 0)
+        layout.setSpacing(16)
 
         music_panel, music_layout = self._section(
             "3. 选择收藏音乐",
-            "点击后只读取当前抖音账号在编辑页可见的“收藏”列表。不会默认选择第一首，"
-            "也不会搜索或填写任意音乐名。",
+            "先读取当前编辑页可见的“收藏”列表，再由你选定一首。不会默认选第一首，也不会替你搜索音乐。",
         )
         music_actions = QHBoxLayout()
         self.load_music_button = button("读取收藏音乐", variant="primary")
         self.load_music_button.setObjectName("douyinCommerceLoadMusic")
         self.load_music_button.clicked.connect(self.load_music)
-        self.use_music_button = button("使用所选音乐", variant="secondary")
+        self.use_music_button = button("确认使用这首音乐", variant="secondary")
         self.use_music_button.setObjectName("douyinCommerceUseMusic")
         self.use_music_button.clicked.connect(self.use_selected_music)
         self.music_status = QLabel("视频上传完成后可读取收藏音乐")
-        self.music_status.setProperty("role", "caption")
+        self.music_status.setObjectName("douyinCommerceInlineNotice")
         self.music_status.setWordWrap(True)
         music_actions.addWidget(self.load_music_button)
         music_actions.addWidget(self.use_music_button)
@@ -368,8 +498,8 @@ class DouyinCommercePage(QWidget):
 
         location_panel, location_layout = self._section(
             "4. 选择发布定位",
-            "地点范围默认“国内”，可切换为“本地”；再按平台实际顺序：位置 → 带货模式 → "
-            "输入地点。候选会显示完整地址；本步骤只选择并回读发布定位，不读取或绑定门店。",
+            "地点范围默认“国内”，可切换为“本地”。平台会按“位置 → 带货模式 → 输入地点”的顺序处理；"
+            "候选完整地址始终可见，本步骤不会绑定门店。",
         )
         search_row = QHBoxLayout()
         self.location_scope_combo = QComboBox()
@@ -394,7 +524,7 @@ class DouyinCommercePage(QWidget):
         self.location_keyword.setPlaceholderText("输入地点，例如：北海夜南香")
         self.location_keyword.returnPressed.connect(self.search_locations)
         self.location_keyword.textEdited.connect(self._location_keyword_edited)
-        self.location_search_button = button("搜索地点", variant="secondary")
+        self.location_search_button = button("搜索发布定位", variant="secondary")
         self.location_search_button.clicked.connect(self.search_locations)
         search_row.addWidget(self.location_scope_combo)
         search_row.addWidget(self.location_keyword, 1)
@@ -402,7 +532,6 @@ class DouyinCommercePage(QWidget):
         location_layout.addLayout(search_row)
         self.location_status = QLabel("完成音乐选择后，可从当前抖音编辑页搜索发布定位（默认范围：国内）")
         self.location_status.setObjectName("douyinCommerceLocationStatus")
-        self.location_status.setProperty("role", "caption")
         self.location_status.setWordWrap(True)
         location_layout.addWidget(self.location_status)
         self.location_result_list = QListWidget()
@@ -421,7 +550,7 @@ class DouyinCommercePage(QWidget):
         location_layout.addWidget(self.location_card)
         location_actions = QHBoxLayout()
         location_actions.addStretch()
-        self.apply_location_button = button("使用所选发布定位", variant="secondary")
+        self.apply_location_button = button("确认并写入发布定位", variant="secondary")
         self.apply_location_button.setObjectName("douyinCommerceApplyLocation")
         self.apply_location_button.clicked.connect(self.apply_selected_location)
         location_actions.addWidget(self.apply_location_button)
@@ -431,7 +560,7 @@ class DouyinCommercePage(QWidget):
         navigation = QHBoxLayout()
         back = button("返回内容准备", variant="secondary")
         back.clicked.connect(lambda: self._go_to_step(0))
-        self.to_declaration_button = button("继续到声明与定时", variant="secondary")
+        self.to_declaration_button = button("继续：声明与发布方式", variant="secondary")
         self.to_declaration_button.setObjectName("douyinCommerceToDeclaration")
         self.to_declaration_button.clicked.connect(lambda: self._go_to_step(2))
         navigation.addWidget(back)
@@ -442,14 +571,15 @@ class DouyinCommercePage(QWidget):
 
     def _build_store_schedule_page(self) -> QWidget:
         body = QWidget()
+        body.setObjectName("douyinCommerceStepBody")
         layout = QVBoxLayout(body)
-        layout.setContentsMargins(0, 0, 12, 0)
-        layout.setSpacing(14)
+        layout.setContentsMargins(0, 0, 14, 0)
+        layout.setSpacing(16)
 
         declaration_panel, declaration_layout = self._section(
             "5. 作品内容声明（自主声明）",
-            "从抖音当前页面的真实声明选项中选择一项。不会根据素材、标题或 AI 字样自动猜测；"
-            "选择后必须由编辑页回读确认。",
+            "从抖音当前页面的真实选项中选择一项。不会根据素材、标题或 AI 字样自动猜测；"
+            "选择后需要由编辑页回读确认。",
         )
         declaration_row = QHBoxLayout()
         self.declaration_combo = QComboBox()
@@ -458,7 +588,7 @@ class DouyinCommercePage(QWidget):
         for declaration in douyin_commerce_service.CONTENT_DECLARATION_OPTIONS:
             self.declaration_combo.addItem(declaration, declaration)
         self.declaration_combo.currentIndexChanged.connect(self._declaration_changed)
-        self.apply_declaration_button = button("写入所选声明", variant="secondary")
+        self.apply_declaration_button = button("确认并写入声明", variant="secondary")
         self.apply_declaration_button.setObjectName("douyinCommerceApplyDeclaration")
         self.apply_declaration_button.clicked.connect(self.apply_selected_declaration)
         declaration_row.addWidget(self.declaration_combo, 1)
@@ -474,8 +604,12 @@ class DouyinCommercePage(QWidget):
         layout.addWidget(declaration_panel)
 
         schedule_panel, schedule_layout = self._section(
-            "6. 发布方式", "可立即发表，或开启定时发表；定时按 Asia/Shanghai（北京时间）校验且必须是未来时间。"
+            "6. 发布方式", "默认立即发表。只有你明确开启定时，才会按 Asia/Shanghai（北京时间）校验未来时间。"
         )
+        self.publish_mode_hint = QLabel("当前为立即发表；仍需经过预检和最终确认，系统不会自动提交。")
+        self.publish_mode_hint.setObjectName("douyinCommercePublishModeHint")
+        self.publish_mode_hint.setWordWrap(True)
+        schedule_layout.addWidget(self.publish_mode_hint)
         self.timer_enabled = QCheckBox("开启定时发表")
         self.timer_enabled.setChecked(False)
         self.timer_enabled.toggled.connect(self._timer_enabled_changed)
@@ -513,14 +647,15 @@ class DouyinCommercePage(QWidget):
 
     def _build_review_page(self) -> QWidget:
         body = QWidget()
+        body.setObjectName("douyinCommerceStepBody")
         layout = QVBoxLayout(body)
-        layout.setContentsMargins(0, 0, 12, 0)
-        layout.setSpacing(14)
+        layout.setContentsMargins(0, 0, 14, 0)
+        layout.setSpacing(16)
 
         panel, panel_layout = self._section(
             "7. 检查并提交",
-            "先进行只填写与回读的预检。预检通过只代表当前编辑页字段已回读，不代表平台已定时；"
-            "只有最终提交后收到平台管理页回执，任务才会记为已定时。",
+            "先做只填写与回读的预检。预检通过不代表已定时或已发布；"
+            "只有最终提交后收到平台管理页回执，任务才会记录为已定时或已发布。",
         )
         self.summary_grid = QGridLayout()
         self.summary_grid.setHorizontalSpacing(12)
@@ -552,7 +687,7 @@ class DouyinCommercePage(QWidget):
         self.validation_label.setWordWrap(True)
         panel_layout.addWidget(self.validation_label)
         actions = QHBoxLayout()
-        self.preflight_button = button("开始预检", variant="primary")
+        self.preflight_button = button("执行发布前检查", variant="primary")
         self.preflight_button.setObjectName("douyinCommercePreflight")
         self.preflight_button.clicked.connect(self.start_preflight)
         self.submit_button = button("确认立即发表", variant="secondary")
@@ -792,7 +927,7 @@ class DouyinCommercePage(QWidget):
         self._preflight_fingerprint = ""
         self._refresh_saved_content_status()
         self.content_notice.setText(
-            "已恢复本机保存的内容。请核对账号与视频后，再点击“上传并继续”；不会自动上传。"
+            "已恢复本机保存的内容。请核对账号与视频后，再点击“上传视频并继续”；不会自动上传。"
         )
         if missing:
             QMessageBox.warning(
@@ -804,7 +939,7 @@ class DouyinCommercePage(QWidget):
             QMessageBox.information(
                 self,
                 "内容已恢复",
-                "已恢复本机保存的内容。请核对后手动点击“上传并继续”；不会自动上传。",
+                "已恢复本机保存的内容。请核对后手动点击“上传视频并继续”；不会自动上传。",
             )
         self._sync_view()
 
@@ -812,7 +947,7 @@ class DouyinCommercePage(QWidget):
         if self._session_id:
             self._content_dirty_after_upload = True
             self.content_notice.setText(
-                "账号、素材或文案已变更。请点击“重新上传并继续”；旧临时编辑页会被放弃，"
+                "账号、素材或文案已变更。请点击“重新上传视频并继续”；旧临时编辑页会被放弃，"
                 "不会保存草稿。"
             )
         self._preflight_fingerprint = ""
@@ -889,7 +1024,7 @@ class DouyinCommercePage(QWidget):
         self.declaration_status.setText(
             "请选择作品内容声明；不选择时不会自动推断。"
             if not selected
-            else "已选择声明，点击“写入所选声明”后才会在平台页生效。"
+            else "已选择声明，点击“确认并写入声明”后才会在平台页生效。"
         )
         self._preflight_fingerprint = ""
         self._sync_view()
@@ -938,44 +1073,108 @@ class DouyinCommercePage(QWidget):
         control.style().unpolish(control)
         control.style().polish(control)
 
+    @staticmethod
+    def _set_widget_property(control, name: str, value: object) -> None:
+        """只在状态变化时重刷 Qt 样式，避免高频刷新造成界面闪烁。"""
+
+        if control.property(name) == value:
+            return
+        control.setProperty(name, value)
+        control.style().unpolish(control)
+        control.style().polish(control)
+
+    def _next_action_hint(self) -> str:
+        """给右侧摘要提供唯一、可执行的下一步，不触发平台动作。"""
+
+        if self._busy():
+            return "正在等待抖音页面完成当前操作，请不要重复点击。"
+        if not self._session_id:
+            if self._content_is_valid():
+                return "点击“上传视频并继续”，建立一次性的抖音编辑会话。"
+            return "选择已登录账号、一个视频，并补齐标题与文案。"
+        if self._content_dirty_after_upload:
+            return "内容已改动，请重新上传，避免复用旧编辑会话。"
+        if self._music_candidates:
+            if self._selected_music_candidate():
+                return "确认使用你刚选择的收藏音乐。"
+            return "从当前收藏列表选择一首音乐。"
+        if self._selected_music is None:
+            return "读取当前抖音编辑页的收藏音乐。"
+        if not self._location_applied:
+            if self._selected_location():
+                return "确认并写入当前选择的发布定位。"
+            return "在“国内”或“本地”范围中搜索并选择发布定位。"
+        if not self._declaration_applied:
+            if self._selected_declaration():
+                return "确认并写入你选择的作品内容声明。"
+            return "选择一项作品内容声明。"
+        if not self._preflight_fingerprint:
+            return "进入检查后执行发布前检查，只回读，不提交。"
+        return "预检已通过。核对右侧任务摘要后，再决定是否最终提交。"
+
+    def _session_status_hint(self) -> str:
+        if self._busy():
+            return "正在与抖音编辑页同步"
+        if self._session_id:
+            return "同一抖音编辑会话"
+        if self._saved_content_available:
+            return "已保存本机内容"
+        return "本机内容准备"
+
+    def _update_summary_rail(self, summary: dict[str, str]) -> None:
+        for key, value in self.sidebar_summary_values.items():
+            value.setText(summary.get(key) or "待完成")
+        self.rail_action_label.setText(self._next_action_hint())
+
     def _sync_view(self) -> None:
         current_step = self.pages.currentIndex()
         for index, label in enumerate(self.step_labels):
             if index == current_step:
-                label.setStyleSheet(
-                    "background:#E8F3FF; color:#155EEF; border:1px solid #B2DDFF;"
-                    "border-radius:8px; padding:6px 10px; font-weight:700;"
-                )
+                state = "active"
             elif self._step_complete(index):
-                label.setStyleSheet(
-                    "background:#ECFDF3; color:#067647; border:1px solid #ABEFC6;"
-                    "border-radius:8px; padding:6px 10px; font-weight:600;"
-                )
+                state = "complete"
             else:
-                label.setStyleSheet(
-                    "background:#F8FAFC; color:#667085; border:1px solid #EAECF0;"
-                    "border-radius:8px; padding:6px 10px;"
-                )
+                state = "pending"
+            self._set_widget_property(label, "stepState", state)
+            can_visit = index <= current_step or self._step_complete(index)
+            label.setEnabled(can_visit and not self._busy())
+        self.progress_context_label.setText(self._STEP_HINTS[current_step])
 
         upload_ready = self._content_is_valid()
         self.upload_button.setEnabled(upload_ready and not self._busy())
-        self.upload_button.setText("重新上传并继续" if self._session_id else "上传并继续")
+        self.upload_button.setText(
+            "重新上传视频并继续" if self._session_id else "上传视频并继续"
+        )
         self.abandon_button.setEnabled(bool(self._session_id) and not self._busy())
         self.save_content_button.setEnabled(not self._busy())
         self.restore_content_button.setEnabled(
             self._saved_content_available and not self._session_id and not self._busy()
         )
 
-        can_load_music = bool(self._session_id) and not self._content_dirty_after_upload and not self._music_candidates and self._selected_music is None
-        can_use_music = bool(self._selected_music_candidate()) and bool(self._music_candidates) and not self._busy()
+        can_load_music = (
+            bool(self._session_id)
+            and not self._content_dirty_after_upload
+            and not self._music_candidates
+        )
+        can_use_music = (
+            bool(self._selected_music_candidate())
+            and bool(self._music_candidates)
+            and not self._busy()
+        )
         self.load_music_button.setEnabled(can_load_music and not self._busy())
         self.use_music_button.setEnabled(can_use_music)
+        self.load_music_button.setText(
+            "更换收藏音乐" if self._selected_music is not None else "读取收藏音乐"
+        )
+        self.use_music_button.setText("确认使用这首音乐")
+        self.music_list.setVisible(bool(self._music_candidates))
         self._set_button_variant(self.load_music_button, "primary" if can_load_music else "secondary")
         self._set_button_variant(self.use_music_button, "primary" if can_use_music else "secondary")
 
         can_search_location = (
             bool(self._session_id)
             and self._selected_music is not None
+            and not self._music_candidates
             and not self._content_dirty_after_upload
             and not self._busy()
         )
@@ -991,16 +1190,29 @@ class DouyinCommercePage(QWidget):
             and self._selected_music is not None
             and bool(self._session_id)
             and not self._busy()
+            and not self._location_applied
+        )
+        self.location_result_list.setVisible(
+            bool(self._locations) and not self._location_applied
         )
         self.apply_location_button.setEnabled(can_apply_location)
+        self._set_button_variant(
+            self.location_search_button,
+            "primary" if can_search_location and not can_apply_location else "secondary",
+        )
         self._set_button_variant(self.apply_location_button, "primary" if can_apply_location else "secondary")
         self.to_declaration_button.setEnabled(self._location_applied and not self._busy())
+        self._set_button_variant(
+            self.to_declaration_button,
+            "primary" if self._location_applied and not self._busy() else "secondary",
+        )
 
         can_apply_declaration = (
             self._location_applied
             and bool(self._selected_declaration())
             and bool(self._session_id)
             and not self._busy()
+            and not self._declaration_applied
         )
         self.declaration_combo.setEnabled(self._location_applied and not self._busy())
         self.apply_declaration_button.setEnabled(can_apply_declaration)
@@ -1013,10 +1225,23 @@ class DouyinCommercePage(QWidget):
         self.schedule_date.setEnabled(can_configure_timer and self.timer_enabled.isChecked())
         self.schedule_time.setEnabled(can_configure_timer and self.timer_enabled.isChecked())
         self.to_review_button.setEnabled(self._can_review() and not self._busy())
+        self._set_button_variant(
+            self.to_review_button,
+            "primary" if self._can_review() and not self._busy() else "secondary",
+        )
+        if self.timer_enabled.isChecked():
+            self.publish_mode_hint.setText(
+                "已开启定时发表。请设置一个未来的北京时间；平台回读一致前不会记为已定时。"
+            )
+        else:
+            self.publish_mode_hint.setText(
+                "当前为立即发表。仍需经过预检和最终确认，系统不会自动提交。"
+            )
 
         summary = self._summary()
         for key, value in self.summary_values.items():
             value.setText(summary.get(key) or "待完成")
+        self._update_summary_rail(summary)
         try:
             self.collect_payload("preflight")
             valid = self._can_review()
@@ -1050,7 +1275,10 @@ class DouyinCommercePage(QWidget):
         self.preflight_button.setEnabled(preflight_ready)
         self.submit_button.setEnabled(submit_ready)
         self.submit_button.setText("确认定时提交" if self.timer_enabled.isChecked() else "确认立即发表")
-        self._set_button_variant(self.preflight_button, "primary" if preflight_ready else "secondary")
+        self._set_button_variant(
+            self.preflight_button,
+            "primary" if preflight_ready and not submit_ready else "secondary",
+        )
         self._set_button_variant(self.submit_button, "primary" if submit_ready else "secondary")
 
         if self._busy():
@@ -1061,6 +1289,17 @@ class DouyinCommercePage(QWidget):
             self.status_badge.setText("继续配置")
         else:
             self.status_badge.setText("等待内容准备")
+        self.session_hint_label.setText(self._session_status_hint())
+        if self._busy():
+            self.hero_detail_label.setText("正在与当前抖音编辑页同步。请等待本步完成，避免重复点击。")
+        elif self._session_id:
+            self.hero_detail_label.setText(
+                "已建立同一抖音编辑会话。后续步骤不会重复上传视频，也不会保存平台草稿。"
+            )
+        elif self._saved_content_available:
+            self.hero_detail_label.setText("已检测到本机保存内容。恢复后仍需由你手动上传视频。")
+        else:
+            self.hero_detail_label.setText("先完成本机内容准备；此时不会访问抖音平台。")
 
     def _step_complete(self, step: int) -> bool:
         if step == 0:
@@ -1216,7 +1455,7 @@ class DouyinCommercePage(QWidget):
         try:
             payload = self.collect_upload_payload()
         except (ValueError, douyin_commerce_service.DouyinCommerceError) as exc:
-            QMessageBox.warning(self, "上传并继续", str(exc))
+            QMessageBox.warning(self, "上传视频并继续", str(exc))
             return
         if self.runner.is_running("douyin_commerce_upload"):
             return
@@ -1228,7 +1467,7 @@ class DouyinCommercePage(QWidget):
             "douyin_commerce_upload",
             lambda: douyin_commerce_session.commerce_session_manager.start_upload(payload),
             on_success=self._upload_succeeded,
-            on_error=lambda message: self._show_error("上传并继续", message),
+            on_error=lambda message: self._show_error("上传视频并继续", message),
             on_finished=self._sync_view,
         )
 
@@ -1265,7 +1504,10 @@ class DouyinCommercePage(QWidget):
             lambda: douyin_commerce_session.commerce_session_manager.load_favorite_music(self._session_id),
             on_success=self._show_music_candidates,
             on_error=lambda message: self._show_error("读取收藏音乐", message),
-            on_finished=lambda: self._reset_button(self.load_music_button, "读取收藏音乐"),
+            on_finished=lambda: self._reset_button(
+                self.load_music_button,
+                "更换收藏音乐" if self._selected_music is not None else "读取收藏音乐",
+            ),
         )
 
     def _show_music_candidates(self, rows: list[dict[str, str]]) -> None:
@@ -1285,7 +1527,7 @@ class DouyinCommercePage(QWidget):
     def use_selected_music(self) -> None:
         candidate = self._selected_music_candidate()
         if not candidate or not self._session_id:
-            QMessageBox.warning(self, "使用所选音乐", "请先从当前收藏列表选择一首音乐。")
+            QMessageBox.warning(self, "确认使用这首音乐", "请先从当前收藏列表选择一首音乐。")
             return
         if self.runner.is_running("douyin_commerce_music"):
             return
@@ -1299,8 +1541,8 @@ class DouyinCommercePage(QWidget):
                 self._session_id, music_id
             ),
             on_success=self._music_selected,
-            on_error=lambda message: self._show_error("使用所选音乐", message),
-            on_finished=lambda: self._reset_button(self.use_music_button, "使用所选音乐"),
+            on_error=lambda message: self._show_error("确认使用这首音乐", message),
+            on_finished=lambda: self._reset_button(self.use_music_button, "确认使用这首音乐"),
         )
 
     def _music_selected(self, music: dict[str, str]) -> None:
@@ -1335,7 +1577,7 @@ class DouyinCommercePage(QWidget):
             ),
             on_success=self._show_locations,
             on_error=self._location_search_error,
-            on_finished=lambda: self._reset_button(self.location_search_button, "搜索地点"),
+            on_finished=lambda: self._reset_button(self.location_search_button, "搜索发布定位"),
         )
 
     def _show_locations(self, rows: list[dict[str, str]]) -> None:
@@ -1380,7 +1622,7 @@ class DouyinCommercePage(QWidget):
     def apply_selected_location(self) -> None:
         location = self._selected_location()
         if not location or not self._session_id:
-            QMessageBox.warning(self, "使用所选发布定位", "请选择一项平台发布定位候选。")
+            QMessageBox.warning(self, "确认并写入发布定位", "请选择一项平台发布定位候选。")
             return
         if self.runner.is_running("douyin_commerce_location"):
             return
@@ -1394,8 +1636,8 @@ class DouyinCommercePage(QWidget):
                 self._session_id, location
             ),
             on_success=self._location_applied_success,
-            on_error=lambda message: self._show_error("使用所选发布定位", message),
-            on_finished=lambda: self._reset_button(self.apply_location_button, "使用所选发布定位"),
+            on_error=lambda message: self._show_error("确认并写入发布定位", message),
+            on_finished=lambda: self._reset_button(self.apply_location_button, "确认并写入发布定位"),
         )
 
     def _location_applied_success(self, result: dict) -> None:
@@ -1427,7 +1669,7 @@ class DouyinCommercePage(QWidget):
             ),
             on_success=self._declaration_applied_success,
             on_error=self._declaration_error,
-            on_finished=lambda: self._reset_button(self.apply_declaration_button, "写入所选声明"),
+            on_finished=lambda: self._reset_button(self.apply_declaration_button, "确认并写入声明"),
         )
 
     def _declaration_applied_success(self, declaration: str) -> None:
