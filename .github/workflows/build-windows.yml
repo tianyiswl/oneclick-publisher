@@ -36,6 +36,28 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements-oneclick.txt PyInstaller==6.21.0
 
+      - name: 验证 Windows 源码离屏界面
+        shell: pwsh
+        run: |
+          $stdout = Join-Path $env:RUNNER_TEMP "oneclick-source-ui-test.stdout"
+          $stderr = Join-Path $env:RUNNER_TEMP "oneclick-source-ui-test.stderr"
+          $env:QT_QPA_PLATFORM = "offscreen"
+          $process = Start-Process -FilePath "python" -ArgumentList @("desktop_native_app.py", "--ui-test") -WorkingDirectory $env:GITHUB_WORKSPACE -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+          if (-not $process.WaitForExit(30000)) {
+            Stop-Process -Id $process.Id -Force
+            if (Test-Path $stdout) { Get-Content $stdout }
+            if (Test-Path $stderr) { Get-Content $stderr }
+            throw "源码离屏界面自检在 30 秒内未退出"
+          }
+          if (Test-Path $stdout) { Get-Content $stdout }
+          if (Test-Path $stderr) { Get-Content $stderr }
+          if ($process.ExitCode -ne 0) {
+            throw "源码离屏界面自检失败，退出码：$($process.ExitCode)"
+          }
+          if (-not (Select-String -Path $stdout -SimpleMatch "NATIVE_DESKTOP_UI_OK" -Quiet)) {
+            throw "源码离屏界面自检未输出成功标识"
+          }
+
       - name: 安装内置 Chromium
         run: python -m playwright install chromium
 

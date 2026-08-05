@@ -139,6 +139,8 @@ class WindowsBuildTests(unittest.TestCase):
         self.assertIn("codex/finalize-macos-feedback", workflow)
         self.assertIn("windows-latest", workflow)
         self.assertIn("contents: read", workflow)
+        self.assertIn("验证 Windows 源码离屏界面", workflow)
+        self.assertIn('"desktop_native_app.py", "--ui-test"', workflow)
         self.assertIn("python -m playwright install chromium", workflow)
         self.assertIn("tools/build_windows.py", workflow)
         self.assertIn("actions/upload-artifact@v4", workflow)
