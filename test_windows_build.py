@@ -117,8 +117,16 @@ class WindowsBuildTests(unittest.TestCase):
 
         self.assertIn("desktop_native_app.py", spec)
         self.assertIn("name='Fashetai'", spec)
+        self.assertIn('"tzdata"', spec)
         self.assertIn("COLLECT(", spec)
         self.assertNotIn("BUNDLE(", spec)
+
+    def test_windows_build_requirements_include_timezone_database(self) -> None:
+        requirements = (
+            Path(__file__).resolve().parent / "requirements-oneclick.txt"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("tzdata==2026.3", requirements)
 
     def test_non_windows_platform_fails_before_real_build(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "Windows"):

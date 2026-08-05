@@ -171,7 +171,7 @@ hiddenimports = []
 hiddenimports += collect_submodules("myUtils")
 hiddenimports += collect_submodules("utils")
 hiddenimports += collect_submodules("uploader")
-for package in ("playwright", "xhs", "biliup"):
+for package in ("playwright", "xhs", "biliup", "tzdata"):
     package_data, package_binaries, package_hidden = collect_all(package)
     datas += package_data
     binaries += package_binaries
