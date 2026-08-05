@@ -124,7 +124,9 @@ class WindowsBuildTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Windows"):
             assert_windows_platform("darwin")
 
-    def test_windows_workflow_is_manual_and_uploads_private_artifact(self) -> None:
+    def test_windows_workflow_has_temporary_branch_trigger_and_uploads_private_artifact(
+        self,
+    ) -> None:
         workflow = (
             Path(__file__).resolve().parent
             / ".github"
@@ -133,6 +135,8 @@ class WindowsBuildTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         self.assertIn("workflow_dispatch", workflow)
+        self.assertIn("push:", workflow)
+        self.assertIn("codex/finalize-macos-feedback", workflow)
         self.assertIn("windows-latest", workflow)
         self.assertIn("contents: read", workflow)
         self.assertIn("python -m playwright install chromium", workflow)
