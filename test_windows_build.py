@@ -153,7 +153,7 @@ class WindowsBuildTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Windows"):
             assert_windows_platform("darwin")
 
-    def test_windows_workflow_has_temporary_branch_trigger_and_uploads_private_artifact(
+    def test_windows_workflow_requires_manual_trigger_and_uploads_private_artifact(
         self,
     ) -> None:
         workflow = (
@@ -164,8 +164,8 @@ class WindowsBuildTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         self.assertIn("workflow_dispatch", workflow)
-        self.assertIn("push:", workflow)
-        self.assertIn("codex/finalize-macos-feedback", workflow)
+        self.assertNotIn("push:", workflow)
+        self.assertNotIn("codex/finalize-macos-feedback", workflow)
         self.assertIn("windows-latest", workflow)
         self.assertIn("contents: read", workflow)
         self.assertIn("验证 Windows 源码离屏界面", workflow)
