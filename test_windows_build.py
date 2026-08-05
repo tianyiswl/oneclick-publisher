@@ -124,6 +124,23 @@ class WindowsBuildTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Windows"):
             assert_windows_platform("darwin")
 
+    def test_windows_workflow_is_manual_and_uploads_private_artifact(self) -> None:
+        workflow = (
+            Path(__file__).resolve().parent
+            / ".github"
+            / "workflows"
+            / "build-windows.yml"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("workflow_dispatch", workflow)
+        self.assertIn("windows-latest", workflow)
+        self.assertIn("contents: read", workflow)
+        self.assertIn("python -m playwright install chromium", workflow)
+        self.assertIn("tools/build_windows.py", workflow)
+        self.assertIn("actions/upload-artifact@v4", workflow)
+        self.assertIn("retention-days: 30", workflow)
+        self.assertNotIn("create-release", workflow.lower())
+
 
 if __name__ == "__main__":
     unittest.main()
