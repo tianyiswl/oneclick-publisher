@@ -11,8 +11,10 @@ from pathlib import Path
 
 from tools.build_windows import (
     archive_filename,
+    assert_windows_platform,
     assert_archive_safe,
     bundle_playwright_browsers,
+    render_spec,
     resolve_playwright_browser_dirs,
 )
 
@@ -109,6 +111,18 @@ class WindowsBuildTests(unittest.TestCase):
 
             with self.assertRaisesRegex(RuntimeError, "cookiesFile"):
                 assert_archive_safe(archive)
+
+    def test_windows_spec_uses_ascii_executable_and_no_macos_bundle(self) -> None:
+        spec = render_spec(Path(r"C:\work\oneclick"))
+
+        self.assertIn("desktop_native_app.py", spec)
+        self.assertIn("name='Fashetai'", spec)
+        self.assertIn("COLLECT(", spec)
+        self.assertNotIn("BUNDLE(", spec)
+
+    def test_non_windows_platform_fails_before_real_build(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "Windows"):
+            assert_windows_platform("darwin")
 
 
 if __name__ == "__main__":
