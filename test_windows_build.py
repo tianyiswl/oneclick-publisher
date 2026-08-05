@@ -9,6 +9,7 @@ import unittest
 import zipfile
 from pathlib import Path
 
+from conf import resolve_user_data_dir
 from tools.build_windows import (
     archive_filename,
     assert_windows_platform,
@@ -20,6 +21,23 @@ from tools.build_windows import (
 
 
 class WindowsBuildTests(unittest.TestCase):
+    def test_frozen_windows_uses_local_app_data_outside_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            bundle_root = root / "bundle"
+            local_app_data = root / "AppData" / "Local"
+
+            data_dir = resolve_user_data_dir(
+                frozen=True,
+                platform_name="win32",
+                home=root / "home",
+                local_app_data=local_app_data,
+                source_dir=bundle_root,
+            )
+
+            self.assertEqual(data_dir, local_app_data / "一键发")
+            self.assertNotIn(bundle_root, data_dir.parents)
+
     def test_archive_filename_is_ascii_and_versioned(self) -> None:
         self.assertEqual(
             archive_filename("20260805", "0.4.1"),
