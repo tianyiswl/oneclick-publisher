@@ -21,9 +21,10 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime
+import logging
 from pathlib import Path
 import threading
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 from uuid import uuid4
 
 from . import (
@@ -34,8 +35,45 @@ from . import (
 from .oneclick_preflight import _account_for_payload, _storage_state
 
 
+_LOGGER = logging.getLogger(__name__)
+
+
 class DouyinCommerceSessionError(RuntimeError):
     """分步编辑会话无法继续时抛出。"""
+
+
+@dataclass(frozen=True)
+class CommerceProgressEvent:
+    """仅供桌面端显示的非敏感后台处理进度。"""
+
+    phase: str
+    label: str
+    state: str = "running"
+
+    def to_public_dict(self) -> dict[str, str]:
+        """返回可以跨线程传递的最小状态，不暴露平台诊断细节。"""
+
+        return {
+            "phase": self.phase,
+            "label": self.label,
+            "state": self.state,
+        }
+
+
+def _emit_progress(
+    callback: Callable[[dict[str, str]], None] | None,
+    phase: str,
+    label: str,
+    state: str = "running",
+) -> None:
+    """投递状态；界面刷新异常不得中断受控的上传会话。"""
+
+    if callback is None:
+        return
+    try:
+        callback(CommerceProgressEvent(phase, label, state).to_public_dict())
+    except Exception:
+        _LOGGER.debug("抖音带货进度回调失败", exc_info=True)
 
 
 def _normalized(value: object) -> str:
@@ -142,16 +180,55 @@ class DouyinCommerceSessionManager:
         return future.result()
 
     @staticmethod
-    def _upload_fingerprint(payload: Mapping[str, Any]) -> str:
+    def _session_identity_fingerprint(payload: Mapping[str, Any]) -> str:
         return "|".join(
             (
                 _normalized((payload.get("accountList") or [""])[0]),
                 _normalized((payload.get("fileList") or [""])[0]),
+            )
+        )
+
+    @staticmethod
+    def _content_fingerprint(payload: Mapping[str, Any]) -> str:
+        return "|".join(
+            (
                 _normalized(payload.get("title")),
                 _normalized(payload.get("description")),
                 ",".join(_normalized(item) for item in payload.get("tags") or []),
             )
         )
+
+    @classmethod
+    def _upload_fingerprint(cls, payload: Mapping[str, Any]) -> str:
+        return "|".join(
+            (
+                cls._session_identity_fingerprint(payload),
+                cls._content_fingerprint(payload),
+            )
+        )
+
+    @staticmethod
+    def _background_upload_mode(payload: Mapping[str, Any]) -> bool:
+        """上传默认后台运行；仅显式 false 保留受控兼容入口。"""
+
+        if "backgroundMode" not in payload:
+            return True
+        return bool(payload.get("backgroundMode"))
+
+    @classmethod
+    def _commerce_browser_launch_options(cls, payload: Mapping[str, Any]) -> dict[str, bool]:
+        """返回带货编辑会话的浏览器可见性策略。
+
+        默认后台模式必须直接使用真正无头浏览器，不能依赖最小化或离屏窗口。
+        登录失效会作为受控结果回到账号管理处理；显式关闭后台模式时才使用普通
+        有窗口浏览器，供开发诊断使用。
+        """
+
+        background_mode = cls._background_upload_mode(payload)
+        return {
+            "headless": background_mode,
+            "hide_until_ready": False,
+        }
 
     @staticmethod
     def _preflight_fingerprint(payload: Mapping[str, Any]) -> str:
@@ -169,13 +246,38 @@ class DouyinCommerceSessionManager:
             )
         )
 
-    def start_upload(self, payload: Mapping[str, Any]) -> dict[str, str]:
+    def start_upload(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        on_progress: Callable[[dict[str, str]], None] | None = None,
+    ) -> dict[str, str]:
         """后台上传一次视频并停在同一编辑会话，尚不选音乐、地点或声明。"""
 
         checked = douyin_commerce_service.validate_douyin_commerce_upload_payload(
             payload
         )
-        return self._call(self._start_upload(dict(checked)))
+        return self._call(self._start_upload(dict(checked), on_progress=on_progress))
+
+    def synchronize_content(
+        self,
+        session_id: str,
+        payload: Mapping[str, Any],
+        *,
+        on_progress: Callable[[dict[str, str]], None] | None = None,
+    ) -> dict[str, Any]:
+        """在当前编辑会话中同步标题、文案和标签，不重新上传视频。"""
+
+        checked = douyin_commerce_service.validate_douyin_commerce_upload_payload(
+            payload
+        )
+        return self._call(
+            self._synchronize_content(
+                session_id,
+                dict(checked),
+                on_progress=on_progress,
+            )
+        )
 
     def load_favorite_music(self, session_id: str) -> list[dict[str, str]]:
         """读取当前编辑页收藏音乐候选，供用户在客户端选择。"""
@@ -214,6 +316,17 @@ class DouyinCommerceSessionManager:
 
         normalized = douyin_commerce_service.normalize_content_declaration(declaration)
         return self._call(self._select_content_declaration(session_id, normalized))
+
+    def sync_schedule(self, session_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """进入检查页前，读取并按需同步当前编辑页的定时设置。"""
+
+        checked = douyin_commerce_service.validate_douyin_commerce_payload(payload)
+        if (
+            str(checked.get("runtimeMode") or "") != "preflight"
+            or checked.get("debugDryRun") is not True
+        ):
+            raise DouyinCommerceSessionError("抖音带货定时同步必须保持预检模式")
+        return self._call(self._sync_schedule(session_id, dict(checked)))
 
     def load_stores(self, session_id: str) -> list[dict[str, str]]:
         """从当前编辑页读取可绑定的带货门店，不创建本地门店库。"""
@@ -263,37 +376,187 @@ class DouyinCommerceSessionManager:
             raise DouyinCommerceSessionError("抖音临时编辑页已关闭，请重新上传视频")
         return session
 
-    async def _start_upload(self, payload: dict[str, Any]) -> dict[str, str]:
+    async def _synchronize_content(
+        self,
+        session_id: str,
+        payload: Mapping[str, Any],
+        *,
+        on_progress: Callable[[dict[str, str]], None] | None = None,
+    ) -> dict[str, Any]:
+        """向同一编辑页写入内容字段，并用页面回读更新会话快照。"""
+
+        session = await self._current(session_id)
+        self._ensure_editor_not_blocked_by_music_picker(session)
+        if self._session_identity_fingerprint(payload) != self._session_identity_fingerprint(
+            session.upload_payload
+        ):
+            raise DouyinCommerceSessionError("账号或视频已变化，请重新上传")
+        if session.uploader is None:
+            raise DouyinCommerceSessionError("当前抖音编辑会话不可写入，请重新上传视频")
+
+        _emit_progress(on_progress, "syncing_content", "正在同步内容")
+        try:
+            result = await session.uploader.sync_uploaded_editor_content(
+                session.page,
+                title=str(payload.get("title") or ""),
+                description=str(payload.get("description") or ""),
+                tags=list(payload.get("tags") or []),
+            )
+        except DouyinCommerceSessionError:
+            raise
+        except Exception as exc:
+            _emit_progress(on_progress, "sync_failed", "内容同步未完成", "failed")
+            raise DouyinCommerceSessionError(
+                f"抖音带货内容同步未完成：{_normalized(str(exc))[:260]}"
+            ) from exc
+
+        confirmed = dict(result or {})
+        session.upload_payload = {
+            **dict(payload),
+            "title": _normalized(confirmed.get("title") or payload.get("title")),
+            "description": str(confirmed.get("description") or payload.get("description") or ""),
+            "tags": [
+                _normalized(tag).lstrip("#")
+                for tag in confirmed.get("tags") or payload.get("tags") or []
+                if _normalized(tag).lstrip("#")
+            ],
+        }
+        session.preflight_fingerprint = ""
+        self._refresh_editor_stage(session)
+        _emit_progress(on_progress, "content_synced", "内容已同步", "succeeded")
+        return {
+            "status": "synced",
+            "sessionId": session.session_id,
+            "account": session.account_name,
+            "title": session.upload_payload["title"],
+            "description": session.upload_payload["description"],
+            "tags": list(session.upload_payload["tags"]),
+            "form": dict(confirmed.get("form") or {}),
+        }
+
+    @staticmethod
+    def _refresh_editor_stage(session: _CommerceEditorSession) -> None:
+        """用已回读字段生成展示阶段，不再把平台设置人为串成单一路径。"""
+
+        if session.preflight_fingerprint:
+            session.stage = "preflighted"
+        elif session.music_picker_page is not None or session.music_dialog is not None:
+            session.stage = "music_candidates_loaded"
+        elif session.selected_declaration:
+            session.stage = "declaration_selected"
+        elif session.location is not None:
+            session.stage = "location_selected"
+        elif session.selected_music is not None:
+            session.stage = "music_selected"
+        else:
+            session.stage = "uploaded"
+
+    @staticmethod
+    def _ensure_editor_not_blocked_by_music_picker(session: _CommerceEditorSession) -> None:
+        """音乐抽屉在真实平台上打开时，只阻止并发操作，不制造长期顺序依赖。"""
+
+        if session.music_picker_page is not None or session.music_dialog is not None:
+            raise DouyinCommerceSessionError(
+                "当前收藏音乐选择器仍打开，请先完成或取消音乐选择后再设置其他项"
+            )
+
+    @staticmethod
+    def _login_required_result() -> dict[str, str]:
+        """将明确登录页统一投影为客户端可处理的安全结果。"""
+
+        return {
+            "status": "needs_login",
+            "message": "登录已失效，请到账号管理重新登录",
+        }
+
+    @staticmethod
+    async def _is_login_required_page(page: Any) -> bool:
+        """仅基于已加载页面的可见登录语义判断是否需要重新登录。"""
+
+        try:
+            url = _normalized(getattr(page, "url", "")).lower()
+        except Exception:
+            url = ""
+        if any(marker in url for marker in ("/login", "passport", "scan_login")):
+            return True
+
+        try:
+            text = _normalized(
+                await page.locator("body").inner_text(timeout=1_200)
+            )[:1_200]
+        except Exception:
+            return False
+        return any(
+            marker in text
+            for marker in (
+                "扫码登录",
+                "请登录后继续",
+                "手机号登录",
+                "验证码登录",
+                "请输入验证码",
+                "请使用抖音扫码",
+            )
+        )
+
+    async def _start_upload(
+        self,
+        payload: dict[str, Any],
+        *,
+        on_progress: Callable[[dict[str, str]], None] | None = None,
+    ) -> dict[str, str]:
         await self._close(None)
         from playwright.async_api import async_playwright
         from uploader.douyin_uploader.main import DouYinVideo
-        from utils.base_social_media import launch_publish_browser, new_publish_context, set_init_script
+        from utils.base_social_media import (
+            launch_chromium_with_codecs,
+            new_publish_context,
+            set_init_script,
+        )
         from utils.publish_observer import publish_context
 
+        _emit_progress(on_progress, "checking_session", "正在核对账号会话")
         account = _account_for_payload(payload)
         expected_account = _normalized(account.get("profileName") or account.get("userName"))
         if not expected_account:
             raise DouyinCommerceSessionError("抖音账号缺少可回读的账号名，请先在账号管理中重新绑定")
         storage_state = _storage_state(account)
+        _emit_progress(on_progress, "opening_editor", "正在打开后台编辑会话")
         playwright = await async_playwright().start()
         browser = context = page = None
         success = False
         try:
+            browser_options = self._commerce_browser_launch_options(payload)
+            background_mode = self._background_upload_mode(payload)
             with publish_context(
                 mode="douyin_commerce_upload",
-                background_mode=False,
+                background_mode=background_mode,
                 platform_type=3,
                 platform_name="抖音",
             ):
-                browser = await launch_publish_browser(playwright)
+                browser = await launch_chromium_with_codecs(
+                    playwright,
+                    force_bundled=True,
+                    **browser_options,
+                )
                 context = await new_publish_context(browser, storage_state=str(storage_state))
                 context = await set_init_script(context)
                 page = await context.new_page()
-                actual_account = await douyin_publish_executor._readback_douyin_session_identity(
-                    page,
-                    expected_account,
-                    reveal=False,
-                )
+                try:
+                    actual_account = await douyin_publish_executor._readback_douyin_session_identity(
+                        page,
+                        expected_account,
+                        reveal=False,
+                    )
+                except Exception:
+                    if await self._is_login_required_page(page):
+                        _emit_progress(
+                            on_progress,
+                            "needs_login",
+                            "登录已失效，请到账号管理重新登录",
+                            "needs_login",
+                        )
+                        return self._login_required_result()
+                    raise
                 uploader = DouYinVideo(
                     title=str(payload["title"]),
                     file_path=str(payload["fileList"][0]),
@@ -314,6 +577,7 @@ class DouyinCommerceSessionManager:
                 uploader.external_page = page
                 uploader.external_context = context
                 uploader.external_browser = browser
+                uploader.progress_callback = on_progress
                 await uploader.prepare_uploaded_video_editor(page, reveal_editor=False)
 
             session = _CommerceEditorSession(
@@ -328,13 +592,24 @@ class DouyinCommerceSessionManager:
             )
             self._session = session
             success = True
+            _emit_progress(on_progress, "ready", "已进入平台设置", "succeeded")
             return {
+                "status": "ready",
                 "sessionId": session.session_id,
                 "account": actual_account,
                 "video": Path(str(payload["fileList"][0])).name,
                 "message": "视频已上传并回读标题、文案；尚未选择音乐、地点、声明或定时。",
             }
         except Exception as exc:
+            if page is not None and await self._is_login_required_page(page):
+                _emit_progress(
+                    on_progress,
+                    "needs_login",
+                    "登录已失效，请到账号管理重新登录",
+                    "needs_login",
+                )
+                return self._login_required_result()
+            _emit_progress(on_progress, "failed", "上传未完成", "failed")
             raise DouyinCommerceSessionError(
                 f"抖音带货后台上传未完成：{_normalized(str(exc))[:260]}"
             ) from exc
@@ -348,10 +623,9 @@ class DouyinCommerceSessionManager:
 
     async def _load_favorite_music(self, session_id: str) -> list[dict[str, str]]:
         session = await self._current(session_id)
-        if session.stage == "music_candidates_loaded":
+        if session.music_candidates and session.music_dialog is not None:
             return [_public_music(item) for item in session.music_candidates]
-        if session.stage != "uploaded":
-            raise DouyinCommerceSessionError("请在上传完成后、选择地点前读取收藏音乐")
+        self._ensure_editor_not_blocked_by_music_picker(session)
         try:
             picker_page, dialog, candidates = await douyin_music_service.open_favorite_music_choices(
                 session.page
@@ -361,7 +635,7 @@ class DouyinCommerceSessionManager:
         session.music_picker_page = picker_page
         session.music_dialog = dialog
         session.music_candidates = [dict(item) for item in candidates]
-        session.stage = "music_candidates_loaded"
+        self._refresh_editor_stage(session)
         return [_public_music(item) for item in session.music_candidates]
 
     async def _select_favorite_music(
@@ -370,7 +644,7 @@ class DouyinCommerceSessionManager:
         music_id: str,
     ) -> dict[str, str]:
         session = await self._current(session_id)
-        if session.stage != "music_candidates_loaded":
+        if not session.music_candidates or session.music_dialog is None:
             raise DouyinCommerceSessionError("请先读取当前账号的收藏音乐，再选择其中一首")
         candidates = [
             item
@@ -393,7 +667,9 @@ class DouyinCommerceSessionManager:
         session.music_dialog = None
         # 瞬态 marker 仅在刚才的点击中存在，选择完成后立即清除。
         session.music_candidates = []
-        session.stage = "music_selected"
+        session.preflight_fingerprint = ""
+        session.schedule_time = ""
+        self._refresh_editor_stage(session)
         return dict(session.selected_music)
 
     async def _search_locations(
@@ -403,15 +679,7 @@ class DouyinCommerceSessionManager:
         scope: object,
     ) -> list[dict[str, Any]]:
         session = await self._current(session_id)
-        if session.stage not in {
-            "music_selected",
-            "location_selected",
-            "declaration_selected",
-            "stores_loaded",
-            "store_selected",
-            "preflighted",
-        }:
-            raise DouyinCommerceSessionError("请先由用户选择并确认收藏音乐")
+        self._ensure_editor_not_blocked_by_music_picker(session)
         try:
             selected_scope = douyin_commerce_service.normalize_commerce_location_scope(scope)
             candidates = await douyin_commerce_service.search_commerce_location_store_candidates(
@@ -428,12 +696,11 @@ class DouyinCommerceSessionManager:
         session.commerce_location_candidates = [dict(item) for item in candidates]
         session.location = None
         session.location_scope = selected_scope
-        session.selected_declaration = ""
         session.stores = []
         session.selected_store = None
         session.preflight_fingerprint = ""
         session.schedule_time = ""
-        session.stage = "music_selected"
+        self._refresh_editor_stage(session)
         return [dict(item) for item in session.commerce_location_candidates]
 
     async def _apply_location(
@@ -442,15 +709,7 @@ class DouyinCommerceSessionManager:
         candidate: dict[str, Any],
     ) -> dict[str, Any]:
         session = await self._current(session_id)
-        if session.stage not in {
-            "music_selected",
-            "location_selected",
-            "declaration_selected",
-            "stores_loaded",
-            "store_selected",
-            "preflighted",
-        }:
-            raise DouyinCommerceSessionError("请先由用户选择并确认收藏音乐")
+        self._ensure_editor_not_blocked_by_music_picker(session)
         normalized_candidate = douyin_commerce_service.normalize_commerce_location_candidate(
             candidate
         )
@@ -482,14 +741,13 @@ class DouyinCommerceSessionManager:
         # 发布定位只写入地点回读。门店必须由后续单独步骤读取、选择并验证，
         # 不能把同一控件中展示的商品摘要误记录成已绑定门店。
         session.location = {key: _normalized(location.get(key)) for key in ("poiId", "name", "address", "distance")}
-        session.selected_declaration = ""
         session.stores = []
         session.selected_store = None
         if session.uploader is not None:
             session.uploader.location_verification = session.location["name"]
         session.preflight_fingerprint = ""
         session.schedule_time = ""
-        session.stage = "location_selected"
+        self._refresh_editor_stage(session)
         return {"location": dict(session.location)}
 
     async def _select_content_declaration(
@@ -498,8 +756,7 @@ class DouyinCommerceSessionManager:
         declaration: str,
     ) -> str:
         session = await self._current(session_id)
-        if session.stage not in {"location_selected", "declaration_selected", "preflighted"}:
-            raise DouyinCommerceSessionError("请先选择并回读发布定位")
+        self._ensure_editor_not_blocked_by_music_picker(session)
         selected = douyin_commerce_service.normalize_content_declaration(declaration)
         try:
             actual = await session.uploader.set_content_declaration(session.page, selected)
@@ -513,8 +770,85 @@ class DouyinCommerceSessionManager:
         session.selected_declaration = actual_value
         session.preflight_fingerprint = ""
         session.schedule_time = ""
-        session.stage = "declaration_selected"
+        self._refresh_editor_stage(session)
         return actual_value
+
+    async def _sync_schedule(
+        self,
+        session_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """以当前编辑页为准核对定时；仅在不一致时写入新的未来时间。"""
+
+        session = await self._current(session_id)
+        self._ensure_editor_not_blocked_by_music_picker(session)
+        self._assert_payload_matches_session(session, payload)
+        return await self._sync_schedule_for_session(session, payload)
+
+    async def _sync_schedule_for_session(
+        self,
+        session: _CommerceEditorSession,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """读取平台定时状态；客户端与页面不同才写入，并做第二次回读。"""
+
+        if session.uploader is None:
+            raise DouyinCommerceSessionError("当前抖音编辑会话不可读取定时，请重新上传视频")
+        target_schedule = douyin_publish_executor._scheduled_time(payload)
+        target_text = (
+            target_schedule.strftime("%Y-%m-%d %H:%M")
+            if target_schedule is not None
+            else ""
+        )
+        try:
+            actual_before = _normalized(
+                await session.uploader.read_schedule_time_douyin(session.page)
+            )
+        except Exception as exc:
+            raise DouyinCommerceSessionError(
+                f"抖音定时状态未能回读：{_normalized(str(exc))[:260]}"
+            ) from exc
+
+        if target_schedule is None:
+            if actual_before:
+                try:
+                    await session.uploader.clear_schedule_time_douyin(session.page)
+                    actual_after = _normalized(
+                        await session.uploader.read_schedule_time_douyin(session.page)
+                    )
+                except Exception as exc:
+                    raise DouyinCommerceSessionError(
+                        f"抖音取消定时未能同步：{_normalized(str(exc))[:260]}"
+                    ) from exc
+                if actual_after:
+                    raise DouyinCommerceSessionError("抖音切回立即发表后仍回读到定时")
+                session.schedule_time = ""
+                session.preflight_fingerprint = ""
+                self._refresh_editor_stage(session)
+                return {"status": "updated", "scheduledAt": None}
+            session.schedule_time = ""
+            return {"status": "unchanged", "scheduledAt": None}
+
+        if session.uploader._schedule_time_matches(actual_before, target_text):
+            session.schedule_time = target_text
+            return {"status": "unchanged", "scheduledAt": target_text}
+
+        try:
+            await session.uploader.set_schedule_time_douyin(session.page, target_schedule)
+            actual_after = _normalized(
+                await session.uploader.read_schedule_time_douyin(session.page)
+            )
+        except Exception as exc:
+            raise DouyinCommerceSessionError(
+                f"抖音定时时间未能同步：{_normalized(str(exc))[:260]}"
+            ) from exc
+        if not session.uploader._schedule_time_matches(actual_after, target_text):
+            raise DouyinCommerceSessionError("抖音定时时间回读与指定北京时间不一致")
+
+        session.schedule_time = target_text
+        session.preflight_fingerprint = ""
+        self._refresh_editor_stage(session)
+        return {"status": "updated", "scheduledAt": target_text}
 
     async def _load_stores(self, session_id: str) -> list[dict[str, str]]:
         session = await self._current(session_id)
@@ -584,17 +918,8 @@ class DouyinCommerceSessionManager:
             or not session.selected_declaration
         ):
             raise DouyinCommerceSessionError("音乐、地点和作品内容声明均完成平台回读后才能开始预检")
-        target_schedule = douyin_publish_executor._scheduled_time(payload)
-        if target_schedule is None and session.schedule_time:
-            # 同一临时编辑页此前已被写入过定时。新版控件没有可靠的“清空定时”
-            # 回读路径时，不能把客户端切到“立即发表”就假定平台也已切回；要求
-            # 用户重新上传，避免意外沿用旧定时。
-            raise DouyinCommerceSessionError(
-                "当前编辑页此前已写入定时；如需改为立即发表，请重新上传视频后再预检"
-            )
         try:
-            if target_schedule is not None:
-                await session.uploader.set_schedule_time_douyin(session.page, target_schedule)
+            schedule_result = await self._sync_schedule_for_session(session, payload)
             form = await session.uploader.verify_prepublish_form(
                 session.page,
                 require_covers=False,
@@ -603,20 +928,9 @@ class DouyinCommerceSessionManager:
             raise DouyinCommerceSessionError(
                 f"抖音带货预检未能完成字段回读：{_normalized(str(exc))[:260]}"
             ) from exc
-        if target_schedule is not None:
-            schedule_value = _normalized(getattr(session.uploader, "schedule_verification", ""))
-            if not session.uploader._schedule_time_matches(
-                schedule_value,
-                target_schedule.strftime("%Y-%m-%d %H:%M"),
-            ):
-                raise DouyinCommerceSessionError("抖音定时时间未能回读为指定的北京时间")
         if _normalized(session.uploader.location_verification) != session.location["name"]:
             raise DouyinCommerceSessionError("抖音带货位置最终回读不一致")
-        session.schedule_time = (
-            target_schedule.strftime("%Y-%m-%d %H:%M")
-            if target_schedule is not None
-            else ""
-        )
+        session.schedule_time = _normalized(schedule_result.get("scheduledAt"))
         session.preflight_fingerprint = self._preflight_fingerprint(payload)
         session.stage = "preflighted"
         return {
@@ -625,14 +939,14 @@ class DouyinCommerceSessionManager:
             "message": (
                 "抖音带货预检已在同一编辑会话回读账号、标题、文案、用户所选收藏音乐、"
                 "发布定位、作品内容声明与"
-                f"{'定时' if target_schedule is not None else '立即发表'}状态；尚未保存草稿或提交发布。"
+                f"{'定时' if session.schedule_time else '立即发表'}状态；尚未保存草稿或提交发布。"
             ),
             "account": session.account_name,
             "form": dict(form or {}),
             "music": dict(session.selected_music),
             "location": dict(session.location),
             "contentDeclaration": session.selected_declaration,
-            "scheduled": target_schedule is not None,
+            "scheduled": bool(session.schedule_time),
             "scheduledAt": session.schedule_time or None,
         }
 
@@ -647,32 +961,42 @@ class DouyinCommerceSessionManager:
             raise DouyinCommerceSessionError(
                 "当前编辑页仍保留已回读的定时；不能安全改为立即发表，请重新上传并预检"
             )
+        background_mode = self._background_upload_mode(session.upload_payload)
         try:
-            # 定时提交前再次写入并回读；立即发表则保持上传后默认的立即状态，
-            # 不猜测点击任何“取消定时”控件。
-            if target_schedule is not None:
-                await session.uploader.set_schedule_time_douyin(session.page, target_schedule)
-                schedule_value = _normalized(getattr(session.uploader, "schedule_verification", ""))
-                if not session.uploader._schedule_time_matches(
-                    schedule_value,
-                    target_schedule.strftime("%Y-%m-%d %H:%M"),
-                ):
-                    raise DouyinCommerceSessionError("抖音最终提交前定时时间回读不一致")
-            from utils.base_social_media import reveal_page_window
+            from utils.publish_observer import publish_context
 
-            # 最终不可逆步骤前明确前置受控页面；二维码、验证码和新提示都由
-            # 用户在这个窗口处理，程序不会尝试绕过。
-            await reveal_page_window(session.page)
-            publish_button = await session.uploader.wait_publish_button_ready(session.page)
-            await publish_button.click(timeout=10_000)
-            receipt = await session.uploader._wait_formal_publish_result(session.page)
-            scheduled = None
-            if target_schedule is not None:
-                scheduled = await douyin_publish_executor._scheduled_submission_readback(
-                    session.page,
-                    title=str(payload["title"]),
-                    target=target_schedule,
-                )
+            with publish_context(
+                mode="douyin_commerce_submit",
+                background_mode=background_mode,
+                platform_type=3,
+                platform_name="抖音",
+            ):
+                # 定时提交前再次写入并回读；立即发表则保持上传后默认的立即状态，
+                # 不猜测点击任何“取消定时”控件。
+                if target_schedule is not None:
+                    await session.uploader.set_schedule_time_douyin(session.page, target_schedule)
+                    schedule_value = _normalized(getattr(session.uploader, "schedule_verification", ""))
+                    if not session.uploader._schedule_time_matches(
+                        schedule_value,
+                        target_schedule.strftime("%Y-%m-%d %H:%M"),
+                    ):
+                        raise DouyinCommerceSessionError("抖音最终提交前定时时间回读不一致")
+                # 默认会话始终保持无头。显式关闭后台模式的开发诊断会话，才允许
+                # 在最终不可逆步骤前前置窗口。
+                if not background_mode:
+                    from utils.base_social_media import reveal_page_window
+
+                    await reveal_page_window(session.page)
+                publish_button = await session.uploader.wait_publish_button_ready(session.page)
+                await publish_button.click(timeout=10_000)
+                receipt = await session.uploader._wait_formal_publish_result(session.page)
+                scheduled = None
+                if target_schedule is not None:
+                    scheduled = await douyin_publish_executor._scheduled_submission_readback(
+                        session.page,
+                        title=str(payload["title"]),
+                        target=target_schedule,
+                    )
         except DouyinCommerceSessionError:
             raise
         except Exception as exc:
@@ -680,9 +1004,8 @@ class DouyinCommerceSessionManager:
                 f"抖音带货最终提交未能获得平台回执：{_normalized(str(exc))[:260]}"
             ) from exc
         finally:
-            # 成功或失败后都不把临时编辑会话留成可误复用状态。若平台要求扫码
-            # /验证码，``_wait_formal_publish_result`` 会在前台等待用户处理后才
-            # 返回或报错，因此不会在用户操作前走到这里。
+            # 成功或失败后都不把临时编辑会话留成可误复用状态。后台模式遇到
+            # 二次验证会立即安全停止，不会假定用户能在隐藏浏览器中处理。
             await self._close(session_id)
         return {
             "ok": True,
@@ -711,8 +1034,14 @@ class DouyinCommerceSessionManager:
         session: _CommerceEditorSession,
         payload: Mapping[str, Any],
     ) -> None:
-        if self._upload_fingerprint(payload) != self._upload_fingerprint(session.upload_payload):
-            raise DouyinCommerceSessionError("账号、视频、标题、文案或话题已变更，请重新上传")
+        if self._session_identity_fingerprint(payload) != self._session_identity_fingerprint(
+            session.upload_payload
+        ):
+            raise DouyinCommerceSessionError("账号或视频已变化，请重新上传")
+        if self._content_fingerprint(payload) != self._content_fingerprint(
+            session.upload_payload
+        ):
+            raise DouyinCommerceSessionError("标题、文案或标签已变化，请先同步内容")
         selected_music = payload.get("selectedMusic") if isinstance(payload.get("selectedMusic"), Mapping) else {}
         if session.selected_music is None or not _same_music(selected_music, session.selected_music):
             raise DouyinCommerceSessionError("任务中的音乐与当前编辑页用户所选音乐不一致")

@@ -2,8 +2,9 @@
 """抖音带货“内容准备”的本地保存。
 
 这里只保存用户在客户端已选择的账号引用、视频引用、标题、文案和话题，方便
-下次重新进入流程时恢复填写内容。音乐、地点、门店、临时编辑器会话、Cookie、
-二维码及任何平台回读均不落盘；它不是平台草稿，也不会触发上传或发表。
+下次重新进入流程时恢复填写内容。话题历史只保存用户主动输入过的纯文本标签，
+用于本机快速复用。音乐、地点、门店、临时编辑器会话、Cookie、二维码及任何
+平台回读均不落盘；它不是平台草稿，也不会触发上传或发表。
 """
 
 from __future__ import annotations
@@ -97,3 +98,42 @@ def load_content_draft() -> dict[str, Any] | None:
         "payload": normalize_content_draft(raw),
         "updatedAt": _text(row["updatedAt"]),
     }
+
+
+def list_tag_history(*, limit: int = 12) -> list[str]:
+    """读取本机历史标签，按最近使用优先，不触发任何平台动作。"""
+
+    safe_limit = max(1, min(int(limit or 12), 40))
+    with database.connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT tag FROM tag_history
+            WHERE TRIM(tag) <> ''
+            ORDER BY lastUsedAt DESC, id DESC
+            LIMIT ?
+            """,
+            (safe_limit,),
+        ).fetchall()
+    return [tag for row in rows if (tag := _text(row["tag"]).lstrip("#"))]
+
+
+def remember_tag_history(tags: object) -> list[str]:
+    """记录用户主动保存的标签历史；只写本机 SQLite 的非敏感文本。"""
+
+    normalized = _tags(tags)
+    if not normalized:
+        return list_tag_history()
+    updated_at = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    with database.connect() as conn:
+        for tag in normalized:
+            conn.execute(
+                """
+                INSERT INTO tag_history (tag, useCount, lastUsedAt)
+                VALUES (?, 1, ?)
+                ON CONFLICT(tag) DO UPDATE SET
+                    useCount = tag_history.useCount + 1,
+                    lastUsedAt = excluded.lastUsedAt
+                """,
+                (tag, updated_at),
+            )
+    return list_tag_history()

@@ -153,6 +153,9 @@ async def launch_chromium_with_codecs(
     _configure_bundled_playwright_browsers()
     if not headless:
         if hide_until_ready:
+            # 先请求最小化，再用页面创建后的 CDP 最小化回执兜底。macOS 对离屏
+            # 坐标没有强制保证，二者配合才能避免上传阶段抢占用户当前窗口。
+            launch_args.append("--start-minimized")
             launch_args.append(f"--window-position={HIDDEN_WINDOW_X},{HIDDEN_WINDOW_Y}")
         else:
             launch_args.append(f"--window-position={PUBLISH_WINDOW_X},{PUBLISH_WINDOW_Y}")
@@ -321,6 +324,33 @@ async def reveal_page_window(page):
     except Exception as e:
         print(f"[launch] reveal via window api failed: {e}")
     return False
+
+
+async def hide_page_window(page):
+    """最小化受控浏览器窗口，并以 CDP 回执作为后台运行的最低保证。
+
+    ``--window-position`` 在 macOS 上只是启动建议，窗口管理器可能仍把有窗口
+    Chromium 放到前台。带货上传需要保留同一有窗口会话，供后续二维码或最终
+    确认时恢复，因此不能改成不可恢复的 headless；这里在创建页面后立即最小化。
+    如果 CDP 无法确认最小化，调用方必须停止，而不能继续在可见窗口中上传。
+    """
+
+    try:
+        session = await page.context.new_cdp_session(page)
+        window_info = await session.send("Browser.getWindowForTarget")
+        window_id = window_info["windowId"]
+        await session.send(
+            "Browser.setWindowBounds",
+            {
+                "windowId": window_id,
+                "bounds": {"windowState": "minimized"},
+            },
+        )
+        _REVEALED_WINDOW_IDS.discard(window_id)
+        return True
+    except Exception as e:
+        print(f"[launch] hide via cdp failed: {e}")
+        return False
 
 
 async def goto_and_reveal(page, url: str, wait_until: str = "domcontentloaded", timeout: Optional[int] = None):

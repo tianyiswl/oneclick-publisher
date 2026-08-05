@@ -64,6 +64,18 @@ class DouyinCommerceContentDraftTests(unittest.TestCase):
         ):
             douyin_commerce_draft_service.load_content_draft()
 
+    def test_tag_history_only_remembers_plain_local_tags(self) -> None:
+        first = douyin_commerce_draft_service.remember_tag_history(
+            ["北海", "本地团购", "北海", "#探店"]
+        )
+        second = douyin_commerce_draft_service.remember_tag_history(["本地团购", "短视频"])
+
+        self.assertIn("北海", first)
+        self.assertIn("探店", first)
+        self.assertIn("短视频", second)
+        self.assertEqual(len(second), len(set(second)))
+        self.assertNotIn("cookie", " ".join(second).lower())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
+import json
 import shutil
 import subprocess
 import uuid
@@ -52,6 +54,114 @@ def _ffmpeg_path() -> Path | None:
         if candidate.exists():
             return candidate
     return None
+
+
+def _ffprobe_path() -> Path | None:
+    """返回本机可用的视频信息读取器；仅用于本地素材，不访问平台。"""
+
+    executable = shutil.which("ffprobe")
+    candidates = [
+        ROOT_DIR / "runtime" / "ffmpeg" / "bin" / "ffprobe.exe",
+        ROOT_DIR / "runtime" / "ffmpeg" / "bin" / "ffprobe",
+    ]
+    if executable:
+        candidates.append(Path(executable))
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _duration_text(value: object) -> str:
+    """将本机探测到的秒数转换为紧凑、可读的时长。"""
+
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if ":" in raw:
+        return raw
+    try:
+        seconds = max(0, round(float(raw)))
+    except (TypeError, ValueError):
+        return raw
+    hours, remainder = divmod(seconds, 3600)
+    minutes, remaining_seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours:02}:{minutes:02}:{remaining_seconds:02}"
+    return f"{minutes:02}:{remaining_seconds:02}"
+
+
+@lru_cache(maxsize=256)
+def _probe_local_video_metadata(stored_path: str) -> dict[str, str]:
+    """从本机视频文件读取时长和尺寸；失败时返回空值，不影响素材选择。"""
+
+    video_path = Path(stored_path)
+    if not video_path.is_file():
+        return {}
+    ffprobe = _ffprobe_path()
+    if not ffprobe:
+        return {}
+    command = [
+        str(ffprobe),
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height:format=duration",
+        "-of",
+        "json",
+        str(video_path),
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if completed.returncode != 0:
+        return {}
+    try:
+        data = json.loads(completed.stdout or "{}")
+    except json.JSONDecodeError:
+        return {}
+    stream = next(
+        (
+            item
+            for item in data.get("streams") or []
+            if isinstance(item, dict) and item.get("width") and item.get("height")
+        ),
+        {},
+    )
+    duration = _duration_text((data.get("format") or {}).get("duration"))
+    resolution = ""
+    if stream:
+        resolution = f"{stream['width']} × {stream['height']}"
+    return {"durationText": duration, "resolution": resolution}
+
+
+def video_display_metadata(row: dict) -> dict[str, str]:
+    """为界面提供本机视频的简洁信息，不写入发布载荷或平台。"""
+
+    duration = _duration_text(row.get("durationText") or row.get("duration"))
+    resolution = str(row.get("resolution") or "").strip()
+    if not resolution:
+        width = str(row.get("width") or "").strip()
+        height = str(row.get("height") or "").strip()
+        if width and height:
+            resolution = f"{width} × {height}"
+    if duration and resolution:
+        return {"durationText": duration, "resolution": resolution}
+    local = _probe_local_video_metadata(str(row.get("storedPath") or ""))
+    return {
+        "durationText": duration or local.get("durationText", ""),
+        "resolution": resolution or local.get("resolution", ""),
+    }
 
 
 def generate_video_cover(video_path: Path, media_id: int) -> str:

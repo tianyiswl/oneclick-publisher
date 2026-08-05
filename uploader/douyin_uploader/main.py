@@ -161,32 +161,32 @@ class DouYinVideo(object):
         self.music_verification = {}
         self.schedule_verification = ""
         self.publish_result = None
+        # 仅由抖音带货临时会话注入；普通发布保持没有客户端进度回调的旧行为。
+        self.progress_callback = None
         if self.save_draft_only and self.dry_run:
             raise ValueError("保存草稿模式与 dry_run 预发布检查不能同时开启")
+
+    def _report_commerce_progress(
+        self,
+        phase: str,
+        label: str,
+        state: str = "running",
+    ) -> None:
+        """把非敏感阶段投递给带货桌面端，不影响普通发布或上传本身。"""
+
+        callback = getattr(self, "progress_callback", None)
+        if not callable(callback):
+            return
+        try:
+            callback({"phase": phase, "label": label, "state": state})
+        except Exception:
+            douyin_logger.debug("抖音带货客户端进度回调失败")
 
     async def set_schedule_time_douyin(self, page, publish_date):
         target_time = publish_date.strftime("%Y-%m-%d %H:%M")
         douyin_logger.info(f"正在设置抖音定时发布时间：{target_time}")
 
-        # 新版页面中文字 span 不可点击，真实可交互元素是外层 label。
-        # 先精确找出一个可见标签，避免同名提示或隐藏模板导致误点。
-        schedule_radio = None
-        labels = page.locator("label")
-        for index in range(await labels.count()):
-            label = labels.nth(index)
-            try:
-                if not await label.is_visible():
-                    continue
-                if " ".join((await label.inner_text()).split()) == "定时发布":
-                    if schedule_radio is not None:
-                        raise RuntimeError("抖音定时发布开关出现多个可点击节点，已安全停止")
-                    schedule_radio = label
-            except RuntimeError:
-                raise
-            except Exception:
-                continue
-        if schedule_radio is None:
-            raise RuntimeError("抖音未找到唯一可点击的定时发布开关")
+        schedule_radio = await self._schedule_radio_douyin(page)
         for _ in range(3):
             checked = (await schedule_radio.get_attribute("data-checked") or "").lower()
             if checked == "true":
@@ -197,22 +197,7 @@ class DouYinVideo(object):
         if checked != "true":
             raise RuntimeError("抖音定时发布开关点击后未保持选中")
 
-        date_input = None
-        date_inputs = page.locator('.semi-input[placeholder="日期和时间"]')
-        for index in range(await date_inputs.count()):
-            candidate = date_inputs.nth(index)
-            try:
-                if not await candidate.is_visible() or not await candidate.is_enabled():
-                    continue
-                if date_input is not None:
-                    raise RuntimeError("抖音定时日期输入框出现多个可用节点，已安全停止")
-                date_input = candidate
-            except RuntimeError:
-                raise
-            except Exception:
-                continue
-        if date_input is None:
-            raise RuntimeError("抖音开启定时发布后未找到可用日期输入框")
+        date_input = await self._schedule_time_input_douyin(page)
         await date_input.click(force=True, timeout=5000)
         await date_input.fill(target_time, timeout=5000)
         await page.keyboard.press("Enter")
@@ -232,10 +217,7 @@ class DouYinVideo(object):
             await page.keyboard.press("Escape")
         await page.wait_for_timeout(800)
 
-        try:
-            actual_time = (await date_input.input_value(timeout=3000)).strip()
-        except Exception:
-            actual_time = ""
+        actual_time = await self._schedule_time_input_value(date_input)
 
         if self._schedule_time_matches(actual_time, target_time):
             self.schedule_verification = actual_time or target_time
@@ -243,6 +225,102 @@ class DouYinVideo(object):
             return self.schedule_verification
 
         raise RuntimeError(f"抖音定时发布时间写入失败，目标={target_time}，实际={actual_time}")
+
+    async def clear_schedule_time_douyin(self, page) -> str:
+        """切回实际可见的“立即发布”，并回读确认没有遗留定时。"""
+
+        immediate_radio = await self._publish_mode_radio_douyin(page, "立即发布")
+        for _ in range(3):
+            checked = (await immediate_radio.get_attribute("data-checked") or "").lower()
+            if checked == "true":
+                break
+            await immediate_radio.click(timeout=5000)
+            await page.wait_for_timeout(800)
+        checked = (await immediate_radio.get_attribute("data-checked") or "").lower()
+        if checked != "true":
+            raise RuntimeError("抖音立即发布开关点击后未保持选中")
+
+        schedule_radio = await self._schedule_radio_douyin(page)
+        schedule_checked = (await schedule_radio.get_attribute("data-checked") or "").lower()
+        if schedule_checked == "true":
+            raise RuntimeError("抖音切回立即发布后定时发布仍处于选中状态")
+
+        actual_time = await self.read_schedule_time_douyin(page)
+        if actual_time:
+            raise RuntimeError(f"抖音切回立即发布后仍回读到定时：{actual_time}")
+        self.schedule_verification = ""
+        douyin_logger.success("抖音发布方式已切回立即发布")
+        return ""
+
+    async def read_schedule_time_douyin(self, page) -> str:
+        """只读回当前编辑页的定时状态，不点击、不修改平台字段。"""
+
+        schedule_radio = await self._schedule_radio_douyin(page)
+        checked = (await schedule_radio.get_attribute("data-checked") or "").lower()
+        if checked != "true":
+            return ""
+        date_input = await self._schedule_time_input_douyin(page)
+        actual_time = await self._schedule_time_input_value(date_input)
+        if not actual_time:
+            raise RuntimeError("抖音定时发布已开启但未能回读日期和时间")
+        return actual_time
+
+    @staticmethod
+    async def _schedule_time_input_value(date_input) -> str:
+        try:
+            return (await date_input.input_value(timeout=3000)).strip()
+        except Exception:
+            return ""
+
+    async def _schedule_radio_douyin(self, page):
+        """定位新版抖音定时发布的唯一可见标签。"""
+
+        return await self._publish_mode_radio_douyin(page, "定时发布")
+
+    async def _publish_mode_radio_douyin(self, page, expected_text: str):
+        """定位发布设置中唯一可见的“立即发布”或“定时发布”选项。"""
+
+        mode_radio = None
+        labels = page.locator("label")
+        for index in range(await labels.count()):
+            label = labels.nth(index)
+            try:
+                if not await label.is_visible():
+                    continue
+                if " ".join((await label.inner_text()).split()) == expected_text:
+                    if mode_radio is not None:
+                        raise RuntimeError(
+                            f"抖音发布方式“{expected_text}”出现多个可点击节点，已安全停止"
+                        )
+                    mode_radio = label
+            except RuntimeError:
+                raise
+            except Exception:
+                continue
+        if mode_radio is None:
+            raise RuntimeError(f"抖音未找到唯一可点击的发布方式“{expected_text}”")
+        return mode_radio
+
+    async def _schedule_time_input_douyin(self, page):
+        """定位开启定时后唯一可用的日期时间输入框。"""
+
+        date_input = None
+        date_inputs = page.locator('.semi-input[placeholder="日期和时间"]')
+        for index in range(await date_inputs.count()):
+            candidate = date_inputs.nth(index)
+            try:
+                if not await candidate.is_visible() or not await candidate.is_enabled():
+                    continue
+                if date_input is not None:
+                    raise RuntimeError("抖音定时日期输入框出现多个可用节点，已安全停止")
+                date_input = candidate
+            except RuntimeError:
+                raise
+            except Exception:
+                continue
+        if date_input is None:
+            raise RuntimeError("抖音开启定时发布后未找到可用日期输入框")
+        return date_input
 
     @staticmethod
     def _schedule_time_matches(actual_time: str, target_time: str) -> bool:
@@ -325,6 +403,37 @@ class DouYinVideo(object):
 
         self.form_verification = await self.verify_prepublish_form(page, require_covers=False)
         douyin_logger.info(f"抖音作品详情已写入，并确认{len(confirmed_topics)}个候选话题组件")
+
+    async def sync_uploaded_editor_content(
+        self,
+        page: Page,
+        *,
+        title: str,
+        description: str,
+        tags: list[str],
+    ) -> dict[str, object]:
+        """在现有抖音编辑页同步文字字段并完成页面回读。
+
+        此入口只处理标题、文案与平台话题组件；不触碰视频上传、封面、音乐、
+        定位、声明、定时、草稿、预览或发表。
+        """
+
+        self.title = str(title or "").strip()
+        self.description = str(description or "").strip()
+        self.tags = [
+            str(tag).strip().lstrip("#")
+            for tag in tags
+            if str(tag).strip().lstrip("#")
+        ]
+        await self.clear_platform_title(page)
+        await self.fill_description_and_topics(page)
+        form = dict(self.form_verification or {})
+        return {
+            "title": self.title,
+            "description": self.description,
+            "tags": list(self.tags),
+            "form": form,
+        }
 
     async def _apply_platform_topics(self, page, editor, body, expected_topics):
         confirmed_topics = []
@@ -881,10 +990,12 @@ class DouYinVideo(object):
             await page.wait_for_timeout(1200)
             await self._assert_no_existing_draft(page)
 
+        self._report_commerce_progress("uploading_video", "正在上传视频")
         await page.locator("div[class^='upload-card'] input[type=file]").set_input_files(self.file_path)  #上传视频
         douyin_logger.info(f'[+]正在上传-------{self.title}.mp4')
         await asyncio.sleep(1)
 
+        self._report_commerce_progress("reading_content", "正在回读标题与文案")
         await self.clear_platform_title(page)
         await self.fill_description_and_topics(page)
 
@@ -899,6 +1010,8 @@ class DouYinVideo(object):
                     upload_completed = True
                     break
                 else:
+                    if upload_attempt == 0:
+                        self._report_commerce_progress("waiting_platform", "正在等待平台处理")
                     douyin_logger.info("  [-] 正在上传视频中...")
                     await asyncio.sleep(2)
 

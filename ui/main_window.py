@@ -347,6 +347,9 @@ class MainWindow(QMainWindow):
         self.media = MediaPage()
         self.publish = PublishPage()
         self.douyin_commerce = DouyinCommercePage()
+        self.douyin_commerce.request_account_management.connect(
+            lambda: self._set_current_page(1)
+        )
         self.tasks = TaskPage()
         self.page_definitions = (
             ("工作台", self.dashboard, "ui/assets/nav-dashboard.svg"),
