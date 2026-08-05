@@ -103,13 +103,23 @@ def assert_archive_safe(zip_path: Path) -> None:
 
     with zipfile.ZipFile(zip_path) as archive:
         names = [name.replace("\\", "/").lower() for name in archive.namelist()]
-    hits = [
-        marker
+    matched_entries = {
+        marker: [name for name in names if marker.lower() in name]
         for marker in FORBIDDEN_ARCHIVE_MARKERS
-        if any(marker.lower() in name for name in names)
-    ]
+    }
+    hits = [marker for marker, entries in matched_entries.items() if entries]
     if hits:
-        raise RuntimeError("安装包包含禁止的运行数据标识：" + "、".join(hits))
+        samples: list[str] = []
+        for marker in hits:
+            entry = matched_entries[marker][0]
+            marker_index = entry.find(marker.lower())
+            samples.append(entry[: marker_index + len(marker)] + "<redacted>")
+        raise RuntimeError(
+            "安装包包含禁止的运行数据标识："
+            + "、".join(hits)
+            + "；命中路径："
+            + "、".join(samples)
+        )
 
 
 def assert_windows_platform(actual_platform: str | None = None) -> None:

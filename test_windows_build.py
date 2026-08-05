@@ -109,7 +109,10 @@ class WindowsBuildTests(unittest.TestCase):
             with zipfile.ZipFile(archive, "w") as handle:
                 handle.writestr("Fashetai/cookiesFile/account.json", "secret")
 
-            with self.assertRaisesRegex(RuntimeError, "cookiesFile"):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "fashetai/cookiesfile/<redacted>",
+            ):
                 assert_archive_safe(archive)
 
     def test_windows_spec_uses_ascii_executable_and_no_macos_bundle(self) -> None:
