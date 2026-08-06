@@ -31,11 +31,13 @@ from app_core import (
 )
 from uploader.douyin_uploader.main import DouYinVideo
 from app_core import douyin_verification
+from app_core.douyin_commerce_batch_executor import DouyinCommerceBatchExecutor
 from app_core.douyin_verification import DouyinVerificationBroker, VerificationChallenge
 from ui.background_task import BackgroundTask
 from ui.douyin_commerce_page import DouyinCommercePage
 from ui.runtime_log import runtime_log_bus
 from utils import base_social_media
+from test_douyin_commerce_batch_executor import FakeCommerceSessionManager
 
 
 class DouyinCommercePayloadTests(unittest.TestCase):
@@ -4379,6 +4381,66 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.page.close()
 
+    class _InlineRunner:
+        """让页面的后台任务在离线 UI 测试中同步完成。"""
+
+        def is_running(self, _key: str) -> bool:
+            return False
+
+        def run(
+            self,
+            _key: str,
+            *,
+            with_progress,
+            on_progress=None,
+            on_success=None,
+            on_error=None,
+            on_finished=None,
+        ) -> bool:
+            try:
+                result = with_progress(lambda event: on_progress(event) if on_progress else None)
+                if on_success:
+                    on_success(result)
+            except Exception as exc:
+                if on_error:
+                    on_error(str(exc))
+                else:
+                    raise
+            finally:
+                if on_finished:
+                    on_finished()
+            return True
+
+    class _BatchTaskStore:
+        """批量执行器所需的最小内存任务存储，不触碰本机任务库。"""
+
+        def __init__(self) -> None:
+            self._next_task_id = 1
+            self._tasks: dict[int, dict] = {}
+            self.progress: list[dict] = []
+
+        def create(self, batch: dict, mode: str = "oneclick_preflight") -> dict:
+            del mode
+            task_id = self._next_task_id
+            self._next_task_id += 1
+            task = {
+                "id": task_id,
+                "items": [
+                    {"id": task_id * 100 + index}
+                    for index, _item in enumerate(batch["items"], start=1)
+                ],
+            }
+            self._tasks[task_id] = task
+            return {"id": task_id}
+
+        def get_task(self, task_id: int) -> dict | None:
+            return self._tasks.get(int(task_id))
+
+        def mark_batch_item_result(self, task_id: int, item_id: int, **kwargs) -> None:
+            self.progress.append(
+                {"taskId": int(task_id), "itemId": int(item_id), **kwargs}
+            )
+
     def test_batch_page_allows_multiple_videos_and_shows_account_identity(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             videos = []
@@ -4549,6 +4611,98 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.assertFalse(self.page.platform_session_status.isHidden())
         self.assertIn(expected, self.page.platform_session_status.text())
         self.assertEqual(self.page._batch_content_change_kind(), "reupload")
+
+    def test_batch_preflight_reuploads_every_video_after_real_title_edit_and_session_close(self) -> None:
+        """页面完成预检后编辑标题，下一轮必须逐条重新创建上传会话。"""
+
+        with tempfile.TemporaryDirectory() as root:
+            videos = []
+            for number in range(2):
+                path = Path(root) / f"batch-{number}.mp4"
+                path.write_bytes(b"offline-video")
+                videos.append(
+                    {
+                        "id": number + 1,
+                        "typeText": "视频",
+                        "storedPath": str(path),
+                        "filename": path.name,
+                    }
+                )
+            account = {
+                "id": 75,
+                "type": 3,
+                "status": 1,
+                "filePath": "douyin-75.json",
+                "profileName": "主体",
+                "userName": "账号",
+            }
+            with patch("ui.douyin_commerce_page.account_service.list_accounts", return_value=[account]), patch(
+                "ui.douyin_commerce_page.media_service.list_media", return_value=videos
+            ):
+                self.page.refresh()
+            self.page.account_combo.setCurrentIndex(1)
+            self.page.select_video_indexes([1, 2])
+            self.page.title_input.setText("预检前标题")
+            self.page.description_input.setPlainText("用于验证批量编辑会话重建的作品文案。")
+            self.page._set_tags(["批量测试"])
+            self.page._selected_music = {
+                "musicId": "music-001",
+                "title": "测试音乐",
+                "creator": "测试作者",
+                "duration": "01:08",
+            }
+            self.page._set_selected_declaration("无需添加自主声明")
+            for video in videos:
+                self.page._batch_locations[video["storedPath"]] = {
+                    # FakeCommerceSessionManager 仅回传这个当前编辑页候选；两条
+                    # 视频复用同一官方地点仍会分别走一次真实匹配与写入回读。
+                    "poiId": "poi-001",
+                    "name": "北海银滩景区",
+                    "address": "广西壮族自治区北海市银海区银滩大道中段",
+                    "scope": "domestic",
+                }
+
+            manager = FakeCommerceSessionManager()
+            task_store = self._BatchTaskStore()
+            self.page._batch_executor = DouyinCommerceBatchExecutor(
+                manager,
+                task_store=task_store,
+            )
+            self.page.runner = self._InlineRunner()
+            with patch(
+                "ui.douyin_commerce_page.task_service.create_douyin_batch_task",
+                side_effect=task_store.create,
+            ), patch("ui.douyin_commerce_page.task_service.mark_task_running"):
+                self.page.start_batch_preflight()
+
+                self.assertTrue(self.page._batch_preflight_fingerprint)
+                self.assertTrue(self.page._batch_editor_session_ended)
+                self.assertEqual(
+                    [call for call in manager.calls if call.startswith("start_upload:")],
+                    ["start_upload:0", "start_upload:1"],
+                )
+
+                # 真实控件编辑，而非直接改内部字段；Qt 信号必须清除预检指纹。
+                self.page.title_input.setText("预检后的新标题")
+                self.app.processEvents()
+                self.assertEqual(self.page._batch_preflight_fingerprint, "")
+                self.assertIn(
+                    "编辑会话已结束；预检将为每条视频重新建立上传会话",
+                    self.page.content_notice.text(),
+                )
+
+                self.page.start_batch_preflight()
+
+            self.assertEqual(
+                [call for call in manager.calls if call.startswith("start_upload:")],
+                [
+                    "start_upload:0",
+                    "start_upload:1",
+                    "start_upload:2",
+                    "start_upload:3",
+                ],
+            )
+            self.assertTrue(self.page._batch_preflight_fingerprint)
 
     def test_batch_shared_content_uses_sync_only_for_live_matching_editor_session(self) -> None:
         with tempfile.TemporaryDirectory() as root:
