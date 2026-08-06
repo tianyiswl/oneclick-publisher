@@ -690,12 +690,28 @@ class DouYinVideo(object):
                 raise RuntimeError("抖音验证页面状态无法识别，发布已安全停止")
             return None
 
-        inputs = await self._visible_enabled_items(
-            verification_container.get_by_role("textbox")
-        )
-        buttons = await self._visible_enabled_items(
-            verification_container.get_by_role("button")
-        )
+        # 抖音真实短信面板在“获取验证码”前禁用输入框；此时不能误判为二维码。
+        try:
+            sms_marker = verification_container.get_by_text("接收短信验证码", exact=True)
+            has_sms_marker = bool(await sms_marker.count())
+        except AttributeError:
+            has_sms_marker = False
+        if has_sms_marker:
+            request_controls = await self._visible_enabled_items(
+                verification_container.get_by_text("获取验证码", exact=True)
+            )
+            if len(request_controls) != 1:
+                raise RuntimeError("抖音获取验证码控件无法唯一确认，发布已安全停止")
+            await request_controls[0].click(timeout=10_000)
+            for _ in range(20):
+                inputs, buttons = await self._sms_verification_controls(verification_container)
+                if len(inputs) == 1 and len(buttons) == 1:
+                    break
+                await page.wait_for_timeout(250)
+            from app_core.douyin_verification import VerificationChallenge
+            return VerificationChallenge(kind="sms", message="请在一键发客户端输入短信验证码")
+
+        inputs, buttons = await self._sms_verification_controls(verification_container)
         if inputs:
             if len(inputs) != 1:
                 raise RuntimeError("抖音验证输入框无法唯一确认，发布已安全停止")
@@ -740,12 +756,7 @@ class DouYinVideo(object):
         verification_container = await self._unique_publish_verification_container(page)
         if verification_container is None:
             raise RuntimeError("抖音验证容器无法唯一确认，发布已安全停止")
-        inputs = await self._visible_enabled_items(
-            verification_container.get_by_role("textbox")
-        )
-        buttons = await self._visible_enabled_items(
-            verification_container.get_by_role("button")
-        )
+        inputs, buttons = await self._sms_verification_controls(verification_container)
         if len(inputs) != 1:
             raise RuntimeError("抖音验证输入框无法唯一确认，发布已安全停止")
         if len(buttons) != 1:
@@ -812,6 +823,19 @@ class DouYinVideo(object):
     async def _unique_publish_verification_container(self, page):
         """由验证文案反查唯一可见弹层，避免把编辑页控件误作验证控件。"""
 
+        # 2026-08 实测抖音二次验证页的实际容器。它没有标准 dialog role，
+        # 但该 class 是验证面板本身；优先使用可避免遮罩、文章布局等祖先
+        # 同时被验证文案反查命中。
+        try:
+            panels = await self._visible_enabled_items(page.locator(".second-verify-panel"))
+            if len(panels) == 1:
+                return panels[0]
+            if len(panels) > 1:
+                raise RuntimeError("抖音验证容器无法唯一确认，发布已安全停止")
+        except AttributeError:
+            # 离线替身不需要实现 CSS locator，继续走通用安全路径。
+            pass
+
         container_xpath = (
             "xpath=ancestor-or-self::*["
             "@role='dialog' or @aria-modal='true' or "
@@ -867,6 +891,23 @@ class DouYinVideo(object):
         if len(containers) != 1:
             raise RuntimeError("抖音验证容器无法唯一确认，发布已安全停止")
         return next(iter(containers.values()))
+
+    async def _sms_verification_controls(self, container):
+        """只在已锁定的验证面板内定位验证码输入与“验证”动作。"""
+
+        try:
+            inputs = await self._visible_enabled_items(container.locator("input"))
+        except AttributeError:
+            inputs = []
+        if not inputs:
+            inputs = await self._visible_enabled_items(container.get_by_role("textbox"))
+        try:
+            confirms = await self._visible_enabled_items(container.get_by_text("验证", exact=True))
+        except AttributeError:
+            confirms = []
+        if not confirms:
+            confirms = await self._visible_enabled_items(container.get_by_role("button", name="验证", exact=True))
+        return inputs, confirms
 
     @staticmethod
     async def _visible_exact_text(page, values):
