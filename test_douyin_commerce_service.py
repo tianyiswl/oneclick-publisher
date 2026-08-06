@@ -4508,6 +4508,48 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.assertEqual(self.page.music_combo.count(), 2)
         self.assertEqual(self.page.music_combo.itemData(1)["musicId"], "m-1")
 
+    def test_batch_cached_music_candidate_click_selects_locally_without_editor_write(self) -> None:
+        """未上传时点击本地收藏候选，只更新批量草稿，不访问编辑会话。"""
+
+        candidate = {
+            "musicId": "m-local-1",
+            "title": "本地收藏歌",
+            "creator": "作者",
+            "duration": "00:30",
+        }
+        self.page._selected_video_indexes = [1]
+        self.page._session_id = ""
+        self.page._batch_preflight_fingerprint = "旧预检"
+        self.page._show_music_candidates([candidate], source="account-cache")
+
+        with patch.object(self.page, "_start_music_write") as write:
+            self.page.music_candidate_list.itemClicked.emit(
+                self.page.music_candidate_list.item(0)
+            )
+            self.app.processEvents()
+
+        write.assert_not_called()
+        self.assertEqual(self.page._selected_music, candidate)
+        self.assertEqual(self.page._batch_preflight_fingerprint, "")
+        self.assertIn("已选择", self.page.music_status.text())
+
+    def test_batch_editor_session_end_explains_rebuild_for_shared_content_changes(self) -> None:
+        """批量会话关闭后只改共享字段，页面必须说明下次预检会重建会话。"""
+
+        self.page._selected_video_indexes = [1]
+        self.page._session_id = ""
+        self.page._uploaded_editor_payload = None
+        self.page._batch_editor_session_ended = True
+
+        self.page._sync_view()
+
+        expected = "编辑会话已结束；预检将为每条视频重新建立上传会话"
+        self.assertFalse(self.page.content_notice.isHidden())
+        self.assertIn(expected, self.page.content_notice.text())
+        self.assertFalse(self.page.platform_session_status.isHidden())
+        self.assertIn(expected, self.page.platform_session_status.text())
+        self.assertEqual(self.page._batch_content_change_kind(), "reupload")
+
     def test_batch_shared_content_uses_sync_only_for_live_matching_editor_session(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             video = Path(root) / "one.mp4"

@@ -340,6 +340,7 @@ class DouyinCommercePage(QWidget):
     _PLATFORM_STAGE_ORDER = ("blocked", "music", "location", "declaration", "schedule")
     _IMMEDIATE_WRITE_KEY = "douyin_commerce_immediate_write"
     _DEFAULT_CONTENT_DECLARATION = "无需添加自主声明"
+    _BATCH_EDITOR_SESSION_ENDED_HINT = "编辑会话已结束；预检将为每条视频重新建立上传会话"
     _UPLOAD_PROGRESS = {
         "checking_session": (1, "正在检查账号"),
         "opening_editor": (2, "正在打开上传会话"),
@@ -421,6 +422,9 @@ class DouyinCommercePage(QWidget):
         self._batch_task_id: int | None = None
         self._batch_preflight_fingerprint = ""
         self._batch_progress_text = ""
+        # 批量执行器会在每条视频完成后主动关闭无头编辑会话。这个标记只用于
+        # 向用户解释“为什么共享文字改完后要在下次预检重建会话”，不保存会话信息。
+        self._batch_editor_session_ended = False
         self._batch_executor = DouyinCommerceBatchExecutor()
         self._stage_error_labels: dict[str, QLabel] = {}
         self._commerce_progress_phase = ""
@@ -2482,14 +2486,18 @@ class DouyinCommercePage(QWidget):
             self._load_favorite_music_candidates()
             return
         if self.selected_video_count() >= 1:
-            # 批量选择只保留用户明确选择的音乐身份；真正平台写入和回读属于
-            # 每条预检执行器，不能把本地选择冒充为已经写入。
-            self._selected_music = dict(candidate)
-            self._batch_preflight_fingerprint = ""
-            self.music_status.setText("已选择；预检时逐条写入并回读")
-            self._sync_view()
+            self._select_batch_music_locally(candidate)
             return
         self._start_music_write(dict(candidate))
+
+    def _select_batch_music_locally(self, candidate: dict[str, str]) -> None:
+        """保存批量共享音乐选择，不在内容准备阶段创建或写入编辑会话。"""
+
+        self._selected_music = dict(candidate)
+        self._pending_music = None
+        self._batch_preflight_fingerprint = ""
+        self.music_status.setText("已选择；预检时逐条写入并回读")
+        self._sync_view()
 
     def _toggle_music_candidate_list(self) -> None:
         """在音乐卡内展开候选，避免原生下拉浮层遮挡声明区。"""
@@ -2506,6 +2514,9 @@ class DouyinCommercePage(QWidget):
         if not isinstance(data, dict):
             return
         self.music_candidate_list.setVisible(False)
+        if self.selected_video_count() >= 1:
+            self._select_batch_music_locally(data)
+            return
         self._start_music_write(dict(data))
 
     def _declaration_toggled(self, declaration: str, checked: bool) -> None:
@@ -2749,6 +2760,7 @@ class DouyinCommercePage(QWidget):
 
     def _sync_workbench(self) -> None:
         current_step = self.pages.currentIndex()
+        batch_mode = self.selected_video_count() >= 1
         for index, label in enumerate(self.step_labels):
             if index == current_step:
                 state = "active"
@@ -2766,6 +2778,10 @@ class DouyinCommercePage(QWidget):
             )
             self.review_back_button.setEnabled(not self._busy())
         self._sync_content_cards()
+
+        if batch_mode and self._batch_editor_session_ended and not self._session_id:
+            self.content_notice.setText(self._BATCH_EDITOR_SESSION_ENDED_HINT)
+            self.content_notice.setVisible(True)
 
         upload_ready = self._content_is_valid()
         self.upload_button.setEnabled(upload_ready and not self._busy())
@@ -2834,7 +2850,6 @@ class DouyinCommercePage(QWidget):
         self._render_batch_review_rows()
         # 一条视频同样必须走批量工作台。这样单条和 1..20 条视频不会分裂为
         # 两套上传/验证实现，也不会悄悄回退到旧单视频页面。
-        batch_mode = self.selected_video_count() >= 1
         if batch_mode:
             try:
                 batch_payload = self.collect_batch_payload()
@@ -2945,12 +2960,16 @@ class DouyinCommercePage(QWidget):
             self.platform_session_status.setText("账号或视频已变更，请重新上传")
         elif busy:
             self.platform_session_status.setText("正在处理，请稍候")
+        elif batch_mode and self._batch_editor_session_ended:
+            self.platform_session_status.setText(self._BATCH_EDITOR_SESSION_ENDED_HINT)
         elif session_ready:
             self.platform_session_status.setText("编辑会话已就绪")
         else:
             self.platform_session_status.setText("等待上传视频")
         self.platform_session_status.setVisible(
-            busy or (bool(self._session_id) and not session_ready)
+            busy
+            or (bool(self._session_id) and not session_ready)
+            or (batch_mode and self._batch_editor_session_ended)
         )
 
         # 批量的收藏音乐仍只允许“用户选择”，但可先使用已有的本机候选缓存；
@@ -2959,7 +2978,9 @@ class DouyinCommercePage(QWidget):
         self.music_combo.setEnabled(can_choose_music)
         self.music_refresh_button.setEnabled(can_choose_music)
         if not busy:
-            if not session_ready:
+            if batch_mode and self._selected_music:
+                self.music_status.setText("已选择；预检时逐条写入并回读")
+            elif not session_ready:
                 self.music_status.setText("上传后选择")
             elif self._selected_music:
                 self.music_status.setText("")
@@ -3343,6 +3364,7 @@ class DouyinCommercePage(QWidget):
             return
         task = task_service.create_douyin_batch_task(payload, mode="oneclick_preflight")
         self._batch_task_id = int(task["id"])
+        self._batch_editor_session_ended = False
         task_service.mark_task_running(self._batch_task_id, "抖音带货批量开始逐条发布前检查")
         self.validation_label.setText(f"正在检查 0/{len(payload['items'])} 条视频…")
         self.runner.run(
@@ -3375,6 +3397,7 @@ class DouyinCommercePage(QWidget):
             self._batch_operation_failed("批量预检未取得全部逐条回读")
             return
         self._batch_preflight_fingerprint = self._batch_fingerprint(payload)
+        self._batch_editor_session_ended = True
         self.validation_label.setText("全部视频已完成发布前检查；尚未提交。")
 
     def _batch_operation_failed(self, message: str) -> None:

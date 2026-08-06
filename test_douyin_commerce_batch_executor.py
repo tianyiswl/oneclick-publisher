@@ -397,6 +397,26 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
         with self.assertRaisesRegex(DouyinCommerceBatchExecutorError, "总确认"):
             executor.run_publish(self.batch, task_id=self.task["id"])
 
+    def test_second_preflight_rebuilds_all_editor_sessions_after_previous_sessions_close(self) -> None:
+        """前一轮预检收束会话后，下一轮必须重新为每条视频创建上传会话。"""
+
+        manager = FakeCommerceSessionManager()
+        executor = DouyinCommerceBatchExecutor(manager)
+        executor.run_preflight(self.batch, task_id=self.task["id"])
+        second_task = task_service.create_douyin_batch_task(self.batch)
+
+        result = executor.run_preflight(self.batch, task_id=second_task["id"])
+
+        self.assertEqual([row["status"] for row in result], ["preflighted"] * 3)
+        self.assertEqual(
+            [call for call in manager.calls if call.startswith("start_upload:")],
+            [
+                "start_upload:0", "start_upload:1", "start_upload:2",
+                "start_upload:3", "start_upload:4", "start_upload:5",
+            ],
+        )
+        self.assertEqual(manager.open_sessions, 0)
+
     def test_public_module_has_no_dict_to_success_bridge(self) -> None:
         import app_core.douyin_commerce_batch_executor as executor_module
 
