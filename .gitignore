@@ -27,6 +27,9 @@ dist/
 *.spec
 release/
 
+# 本机隔离开发工作树
+.worktrees/
+
 # 本机预检与视觉审阅材料：可能包含尚未公开的内容和截图
 preflight-fixtures/
 design-reviews/
