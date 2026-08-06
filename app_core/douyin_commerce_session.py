@@ -29,6 +29,7 @@ from uuid import uuid4
 
 from . import (
     douyin_commerce_service,
+    douyin_favorite_music_cache,
     douyin_music_service,
     douyin_publish_executor,
 )
@@ -121,6 +122,7 @@ class _CommerceEditorSession:
     page: Any
     playwright: Any
     uploader: Any
+    account_id: int = 0
     stage: str = "uploaded"
     music_picker_page: Any | None = None
     music_dialog: Any | None = None
@@ -284,10 +286,29 @@ class DouyinCommerceSessionManager:
 
         return self._call(self._load_favorite_music(session_id))
 
+    def cached_favorite_music(self, session_id: str) -> list[dict[str, str]]:
+        """读取当前账号已同步的收藏音乐缓存，不打开平台页面。"""
+
+        return self._call(self._cached_favorite_music(session_id))
+
+    def refresh_favorite_music(self, session_id: str) -> list[dict[str, str]]:
+        """由用户明确触发，读取当前编辑页收藏音乐并更新本地缓存。"""
+
+        return self._call(self._refresh_favorite_music(session_id))
+
     def select_favorite_music(self, session_id: str, music_id: str) -> dict[str, str]:
         """选择用户指定的当前收藏音乐并回读。"""
 
         return self._call(self._select_favorite_music(session_id, music_id))
+
+    def select_cached_favorite_music(
+        self,
+        session_id: str,
+        music_id: str,
+    ) -> dict[str, str]:
+        """选择缓存音乐；写入前必须在当前收藏抽屉中精确重识别。"""
+
+        return self._call(self._select_cached_favorite_music(session_id, music_id))
 
     def search_locations(
         self,
@@ -595,6 +616,7 @@ class DouyinCommerceSessionManager:
                 page=page,
                 playwright=playwright,
                 uploader=uploader,
+                account_id=int(account.get("id") or 0),
             )
             self._session = session
             success = True
@@ -644,6 +666,26 @@ class DouyinCommerceSessionManager:
         self._refresh_editor_stage(session)
         return [_public_music(item) for item in session.music_candidates]
 
+    async def _cached_favorite_music(self, session_id: str) -> list[dict[str, str]]:
+        """从本地缓存读取当前账号音乐，不触碰浏览器或当前抽屉。"""
+
+        session = await self._current(session_id)
+        if session.account_id <= 0:
+            return []
+        return douyin_favorite_music_cache.list_cached_favorite_music(session.account_id)
+
+    async def _refresh_favorite_music(self, session_id: str) -> list[dict[str, str]]:
+        """显式刷新当前账号的收藏音乐，并仅持久化稳定、非敏感元数据。"""
+
+        session = await self._current(session_id)
+        await self._load_favorite_music(session_id)
+        if session.account_id <= 0:
+            return []
+        return douyin_favorite_music_cache.replace_cached_favorite_music(
+            session.account_id,
+            session.music_candidates,
+        )
+
     async def _select_favorite_music(
         self,
         session_id: str,
@@ -683,6 +725,29 @@ class DouyinCommerceSessionManager:
         session.schedule_time = ""
         self._refresh_editor_stage(session)
         return dict(session.selected_music)
+
+    async def _select_cached_favorite_music(
+        self,
+        session_id: str,
+        music_id: str,
+    ) -> dict[str, str]:
+        """在当前收藏列表中精确重识别缓存音乐后再选择并回读。"""
+
+        session = await self._current(session_id)
+        if not session.music_candidates or session.music_dialog is None:
+            await self._load_favorite_music(session_id)
+        try:
+            candidate = douyin_music_service.find_favorite_music_by_id(
+                session.music_candidates,
+                music_id,
+            )
+        except douyin_music_service.DouyinMusicError as exc:
+            # 不清空当前弹层候选，用户可显式刷新后继续从本次真实列表选择；
+            # 严禁以标题近似或首条候选替代过期缓存项。
+            raise DouyinCommerceSessionError(
+                "抖音收藏音乐缓存已过期，请刷新后重新选择"
+            ) from exc
+        return await self._select_favorite_music(session_id, candidate["musicId"])
 
     async def _search_locations(
         self,

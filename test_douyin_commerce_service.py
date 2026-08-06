@@ -2740,6 +2740,87 @@ class DouyinCommerceTaskPresentationTests(unittest.TestCase):
 
 
 class DouyinCommerceSessionContractTests(unittest.TestCase):
+    def test_cached_music_is_read_only_and_scoped_to_current_account(self) -> None:
+        """缓存读取不打开平台页面，只按当前已上传账号读取安全字段。"""
+
+        class OpenPage:
+            def is_closed(self) -> bool:
+                return False
+
+        manager = douyin_commerce_session.DouyinCommerceSessionManager()
+        manager._session = douyin_commerce_session._CommerceEditorSession(
+            session_id="session-demo",
+            upload_payload={},
+            account_name="测试账号",
+            browser=None,
+            context=None,
+            page=OpenPage(),
+            playwright=None,
+            uploader=None,
+            account_id=31,
+        )
+        cached = [
+            {
+                "musicId": "music-001",
+                "title": "收藏歌曲",
+                "creator": "收藏作者",
+                "duration": "03:21",
+                "syncedAt": "2026-08-06T10:00:00+08:00",
+            }
+        ]
+
+        with patch(
+            "app_core.douyin_favorite_music_cache.list_cached_favorite_music",
+            return_value=cached,
+        ) as list_cached:
+            result = asyncio.run(manager._cached_favorite_music("session-demo"))
+
+        self.assertEqual(result, cached)
+        list_cached.assert_called_once_with(31)
+
+    def test_cached_music_selection_rejects_stale_current_list_item(self) -> None:
+        """缓存命中后仍必须在当前抽屉精确匹配，过期项不可猜选。"""
+
+        class OpenPage:
+            def is_closed(self) -> bool:
+                return False
+
+        manager = douyin_commerce_session.DouyinCommerceSessionManager()
+        manager._session = douyin_commerce_session._CommerceEditorSession(
+            session_id="session-demo",
+            upload_payload={},
+            account_name="测试账号",
+            browser=None,
+            context=None,
+            page=OpenPage(),
+            playwright=None,
+            uploader=None,
+            account_id=31,
+        )
+        current_candidate = {
+            "musicId": "music-current",
+            "title": "当前收藏歌曲",
+            "creator": "当前作者",
+            "duration": "03:21",
+            "marker": "row-current",
+        }
+        with patch.object(
+            douyin_commerce_session.douyin_music_service,
+            "open_favorite_music_choices",
+            new_callable=AsyncMock,
+            return_value=(object(), object(), [current_candidate]),
+        ):
+            with self.assertRaisesRegex(
+                douyin_commerce_session.DouyinCommerceSessionError,
+                "缓存已过期",
+            ):
+                asyncio.run(
+                    manager._select_cached_favorite_music("session-demo", "music-cached")
+                )
+
+        self.assertEqual(manager._session.music_candidates, [current_candidate])
+        self.assertIsNotNone(manager._session.music_dialog)
+
     def test_progress_event_only_exposes_phase_label_and_state(self) -> None:
         event = douyin_commerce_session.CommerceProgressEvent(
             phase="uploading_video",

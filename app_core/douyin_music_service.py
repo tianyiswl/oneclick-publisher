@@ -80,6 +80,33 @@ def normalize_music_readback(value: object) -> dict[str, str] | None:
     }
 
 
+def find_favorite_music_by_id(
+    candidates: object,
+    music_id: object,
+) -> dict[str, str]:
+    """从本次已打开的收藏抽屉中精确找回一条可点击音乐。
+
+    本地缓存只保存稳定的平台音乐 ID；真正写入前仍必须在当前编辑会话的
+    收藏抽屉中找到同一个 ID，拿到瞬态 ``marker`` 后才允许点击。缺失 ID、
+    过期缓存项或重复条目都不能退化为标题模糊匹配或“第一首”。
+    """
+
+    expected = _normalized(music_id)
+    if not expected or expected.startswith(("visible:", "favorite-index:")):
+        raise DouyinMusicError("抖音收藏音乐缺少可复用的平台身份，无法安全选择")
+    if not isinstance(candidates, list):
+        raise DouyinMusicError("抖音收藏音乐当前候选不可用，请刷新后重新选择")
+    matches = [
+        dict(item)
+        for item in candidates
+        if isinstance(item, Mapping)
+        and _normalized(item.get("musicId")) == expected
+    ]
+    if len(matches) != 1:
+        raise DouyinMusicError("抖音收藏音乐缓存项不在当前收藏列表，请刷新后重新选择")
+    return matches[0]
+
+
 async def _unique_visible_text_control(page, label: str, purpose: str):
     """按实际视口去重定位一个精确文案控件。"""
 
