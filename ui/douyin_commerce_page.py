@@ -159,7 +159,7 @@ def _future_schedule_text(date: QDate, time: QTime) -> str:
 
 
 class _LazyMusicComboBox(QComboBox):
-    """首次点击读取收藏音乐；已读取时展开卡片内候选列表。"""
+    """优先展开已读候选；没有本地缓存时只提示用户刷新。"""
 
     picker_requested = pyqtSignal()
     candidate_list_requested = pyqtSignal()
@@ -306,9 +306,11 @@ class DouyinCommercePage(QWidget):
         self.runner = BackgroundTaskRunner(self)
         self._session_id = ""
         self._music_candidates: list[dict[str, str]] = []
+        self._music_candidate_source = ""
         self._selected_music: dict[str, str] | None = None
         self._pending_music: dict[str, str] | None = None
         self._open_music_picker_after_load = False
+        self._cache_load_pending = False
         self._locations: list[dict[str, str]] = []
         # 候选列表会在用户确认后收起；因此已选地点不能依赖 QListWidget 的选中态。
         self._selected_location_data: dict[str, str] | None = None
@@ -1032,6 +1034,11 @@ class DouyinCommercePage(QWidget):
         self.music_combo.candidate_list_requested.connect(self._toggle_music_candidate_list)
         self.music_combo.activated.connect(self._music_combo_activated)
         music_actions.addWidget(self.music_combo, 1)
+        self.music_refresh_button = button("刷新", variant="secondary", compact=True)
+        self.music_refresh_button.setObjectName("douyinCommerceRefreshFavoriteMusic")
+        self.music_refresh_button.setAccessibleName("刷新收藏音乐")
+        self.music_refresh_button.clicked.connect(self._refresh_favorite_music_candidates)
+        music_actions.addWidget(self.music_refresh_button)
         panel_layout.addLayout(music_actions)
         self.music_candidate_list = QListWidget()
         self.music_candidate_list.setObjectName("douyinCommerceMusicCandidates")
@@ -1457,6 +1464,7 @@ class DouyinCommercePage(QWidget):
         """清空瞬态收藏列表，不让旧会话的候选流入新上传会话。"""
 
         self._music_candidates = []
+        self._music_candidate_source = ""
         self._pending_music = None
         self._open_music_picker_after_load = False
         self.music_candidate_list.clear()
@@ -1473,6 +1481,7 @@ class DouyinCommercePage(QWidget):
         """丢弃仅对当次弹窗有效的候选，并保留已确认音乐的展示。"""
 
         self._music_candidates = []
+        self._music_candidate_source = ""
         self._pending_music = None
         self._open_music_picker_after_load = False
         self.music_candidate_list.clear()
@@ -2213,12 +2222,15 @@ class DouyinCommercePage(QWidget):
             self._immediate_write_kind = ""
         self._sync_view()
         if (
-            kind == "music_read"
+            kind in {"music_read", "music_refresh"}
             and self._open_music_picker_after_load
             and self._music_candidates
         ):
             self._open_music_picker_after_load = False
             QTimer.singleShot(0, self._open_music_picker_if_ready)
+        if kind == "declaration" and self._cache_load_pending:
+            self._cache_load_pending = False
+            QTimer.singleShot(0, self._load_cached_favorite_music_candidates)
 
     def _open_music_picker_if_ready(self) -> None:
         """仅在读取完成且控件恢复可用后展开同一音乐下拉框。"""
@@ -2408,6 +2420,7 @@ class DouyinCommercePage(QWidget):
 
         can_choose_music = session_ready and not busy
         self.music_combo.setEnabled(can_choose_music)
+        self.music_refresh_button.setEnabled(can_choose_music)
         if not busy:
             if not session_ready:
                 self.music_status.setText("上传后选择")
@@ -2416,9 +2429,9 @@ class DouyinCommercePage(QWidget):
             elif self._music_candidates:
                 self.music_status.setText("直接选择一首收藏音乐")
             else:
-                self.music_status.setText("打开下拉读取收藏音乐")
+                self.music_status.setText("暂无本地收藏音乐，可点击刷新")
         self.music_status.setVisible(
-            self._immediate_write_kind in {"music", "music_read"}
+            self._immediate_write_kind in {"music", "music_read", "music_cache", "music_refresh"}
         )
         self.music_card.setVisible(False)
 
@@ -2874,6 +2887,7 @@ class DouyinCommercePage(QWidget):
         self.location_scope_combo.setCurrentIndex(2)
         self.location_scope_combo.blockSignals(False)
         self._clear_declaration("正在写入默认声明")
+        self._cache_load_pending = True
         self._preflight_fingerprint = ""
         self._uploaded_editor_payload = dict(self._pending_upload_payload or {}) or None
         self._pending_upload_payload = None
@@ -2882,8 +2896,23 @@ class DouyinCommercePage(QWidget):
         self._go_to_step(1)
         self._start_declaration_write(self._DEFAULT_CONTENT_DECLARATION)
 
+    def _load_cached_favorite_music_candidates(self) -> None:
+        """视频上传后优先读取当前账号本地缓存，不打开抖音编辑页。"""
+
+        if not self._session_id:
+            return
+        session_id = self._session_id
+        self._start_immediate_write(
+            "music_cache",
+            lambda: douyin_commerce_session.commerce_session_manager.cached_favorite_music(
+                session_id
+            ),
+            lambda rows: self._show_music_candidates(rows, source="cache"),
+            self._music_cache_load_failed,
+        )
+
     def _load_favorite_music_candidates(self) -> None:
-        """仅在用户打开下拉框时读取收藏列表，不用音乐操作锁住其他设置。"""
+        """只展开本机缓存；真实平台读取必须由用户点“刷新”触发。"""
 
         if not self._session_id:
             QMessageBox.warning(self, "选择收藏音乐", "请先上传视频。")
@@ -2891,19 +2920,35 @@ class DouyinCommercePage(QWidget):
         if self._music_candidates:
             self.music_combo.showPopup()
             return
+        self.music_status.setText("暂无本地收藏音乐，请点击刷新。")
+        self.music_status.setVisible(True)
+
+    def _refresh_favorite_music_candidates(self) -> None:
+        """用户明确刷新时才打开当前抖音编辑页的收藏列表。"""
+
+        if not self._session_id:
+            QMessageBox.warning(self, "刷新收藏音乐", "请先上传视频。")
+            return
         session_id = self._session_id
-        self.music_status.setText("正在读取收藏音乐…")
+        self.music_status.setText("正在刷新收藏音乐…")
+        self.music_status.setVisible(True)
         self._open_music_picker_after_load = self._start_immediate_write(
-            "music_read",
-            lambda: douyin_commerce_session.commerce_session_manager.load_favorite_music(
+            "music_refresh",
+            lambda: douyin_commerce_session.commerce_session_manager.refresh_favorite_music(
                 session_id
             ),
-            self._show_music_candidates,
+            lambda rows: self._show_music_candidates(rows, source="session"),
             self._music_load_failed,
         )
 
-    def _show_music_candidates(self, rows: list[dict[str, str]]) -> None:
+    def _show_music_candidates(
+        self,
+        rows: list[dict[str, str]],
+        *,
+        source: str = "session",
+    ) -> None:
         self._music_candidates = [dict(item) for item in rows]
+        self._music_candidate_source = source if self._music_candidates else ""
         self._clear_stage_error("music")
         self.music_candidate_list.clear()
         self.music_combo.blockSignals(True)
@@ -2923,7 +2968,16 @@ class DouyinCommercePage(QWidget):
             self._restore_music_combo(self._selected_music)
         finally:
             self.music_combo.blockSignals(False)
-        self.music_status.setText(f"已读取 {len(self._music_candidates)} 首收藏音乐，直接选择即可。")
+        self.music_status.setText(
+            f"已加载 {len(self._music_candidates)} 首收藏音乐。"
+            if self._music_candidates
+            else "暂无可用收藏音乐，请点击刷新。"
+        )
+        self._sync_view()
+
+    def _music_cache_load_failed(self, message: str) -> None:
+        self.music_status.setText("本地收藏音乐未读取完成，可点击刷新。")
+        _LOGGER.warning("读取抖音收藏音乐本地缓存失败：%s", _normalized(message))
         self._sync_view()
 
     def _music_load_failed(self, message: str) -> None:
@@ -2941,12 +2995,18 @@ class DouyinCommercePage(QWidget):
             QMessageBox.warning(self, "选择收藏音乐", "请先从当前收藏列表选择一首音乐。")
             return
         self._pending_music = candidate
-        self.music_status.setText("正在将用户所选音乐写入抖音编辑页并回读…")
+        self.music_status.setText("正在写入音乐…")
         session_id = self._session_id
         self._start_immediate_write(
             "music",
-            lambda: douyin_commerce_session.commerce_session_manager.select_favorite_music(
-                session_id, music_id
+            lambda: (
+                douyin_commerce_session.commerce_session_manager.select_cached_favorite_music(
+                    session_id, music_id
+                )
+                if self._music_candidate_source == "cache"
+                else douyin_commerce_session.commerce_session_manager.select_favorite_music(
+                    session_id, music_id
+                )
             ),
             self._music_selected,
             self._immediate_music_failed,

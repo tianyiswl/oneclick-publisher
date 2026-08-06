@@ -1539,23 +1539,89 @@ class DouyinCommerceUiTests(unittest.TestCase):
         self.assertIs(self.page.music_candidate_list.parentWidget(), self.page.music_panel)
         self.assertFalse(self.page.music_combo.view().isVisible())
 
-    def test_first_music_dropdown_click_reads_then_reopens_same_dropdown(self) -> None:
-        """首次点击音乐下拉只读取，任务完成后应直接展开同一个选择器。"""
+    def test_first_music_dropdown_click_only_uses_local_cache(self) -> None:
+        """首次点击没有缓存时不访问平台，用户必须明确点刷新。"""
+
+        self.page._session_id = "session-demo"
+        with patch.object(
+            self.page, "_refresh_favorite_music_candidates"
+        ) as refresh:
+            self.page.music_combo.showPopup()
+        refresh.assert_not_called()
+        self.assertIn("点击刷新", self.page.music_status.text())
+
+    def test_refresh_music_is_explicit_and_candidates_remain_selectable(self) -> None:
+        """刷新才读取当前抖音页；刷新结果保留为当前会话候选。"""
 
         self.page._session_id = "session-demo"
         with patch.object(
             self.page, "_start_immediate_write", return_value=True
         ) as start:
-            self.page.music_combo.showPopup()
-        self.assertEqual(start.call_args.args[0], "music_read")
+            self.page._refresh_favorite_music_candidates()
+        self.assertEqual(start.call_args.args[0], "music_refresh")
 
+        self.page._show_music_candidates(
+            [
+                {
+                    "musicId": "music-001",
+                    "title": "出埃及记",
+                    "creator": "石Yuchi",
+                    "duration": "01:08",
+                }
+            ],
+            source="session",
+        )
+        self.assertEqual(self.page._music_candidate_source, "session")
+
+    def test_cached_music_selection_uses_exact_current_editor_recheck(self) -> None:
+        """缓存候选点击后必须走受控重识别入口，不能直接复用本地数据。"""
+
+        self.page._session_id = "session-demo"
+        candidate = {
+            "musicId": "music-001",
+            "title": "出埃及记",
+            "creator": "石Yuchi",
+            "duration": "01:08",
+        }
+        self.page._show_music_candidates([candidate], source="cache")
+        with patch.object(self.page.runner, "is_running", return_value=False), patch.object(
+            self.page.runner, "run", return_value=True
+        ) as run:
+            self.page._start_music_write(candidate)
+
+        work = run.call_args.args[1]
+        with patch.object(
+            douyin_commerce_session.commerce_session_manager,
+            "select_cached_favorite_music",
+            return_value=candidate,
+        ) as select_cached:
+            self.assertEqual(work(), candidate)
+        select_cached.assert_called_once_with("session-demo", "music-001")
+
+    def test_cached_music_results_are_displayed_without_platform_refresh(self) -> None:
+        self.page._show_music_candidates(
+            [
+                {
+                    "musicId": "music-cache-001",
+                    "title": "本地缓存歌曲",
+                    "creator": "收藏作者",
+                    "duration": "03:21",
+                }
+            ],
+            source="cache",
+        )
+        self.assertEqual(self.page._music_candidate_source, "cache")
+        self.assertEqual(self.page.music_combo.count(), 2)
+        self.assertIn("本地缓存歌曲", self.page.music_combo.itemText(1))
+
+    def test_music_refresh_completion_reopens_candidate_list(self) -> None:
         self.page._music_candidates = [
             {"musicId": "music-001", "title": "出埃及记"}
         ]
-        self.page._immediate_write_kind = "music_read"
+        self.page._immediate_write_kind = "music_refresh"
         self.page._open_music_picker_after_load = True
         with patch("ui.douyin_commerce_page.QTimer.singleShot") as reopen:
-            self.page._finish_immediate_write("music_read")
+            self.page._finish_immediate_write("music_refresh")
 
         reopen.assert_called_once()
         self.assertFalse(self.page._open_music_picker_after_load)
@@ -2820,6 +2886,49 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
 
         self.assertEqual(manager._session.music_candidates, [current_candidate])
         self.assertIsNotNone(manager._session.music_dialog)
+
+    def test_manual_refresh_updates_only_current_account_cache(self) -> None:
+        """刷新读取当前抽屉一次，并将稳定候选交给当前账号缓存服务。"""
+
+        class OpenPage:
+            def is_closed(self) -> bool:
+                return False
+
+        manager = douyin_commerce_session.DouyinCommerceSessionManager()
+        manager._session = douyin_commerce_session._CommerceEditorSession(
+            session_id="session-demo",
+            upload_payload={},
+            account_name="测试账号",
+            browser=None,
+            context=None,
+            page=OpenPage(),
+            playwright=None,
+            uploader=None,
+            account_id=31,
+        )
+        current = [
+            {
+                "musicId": "music-current",
+                "title": "当前收藏歌曲",
+                "creator": "当前作者",
+                "duration": "03:21",
+                "marker": "row-current",
+            }
+        ]
+        with patch.object(
+            douyin_commerce_session.douyin_music_service,
+            "open_favorite_music_choices",
+            new_callable=AsyncMock,
+            return_value=(object(), object(), current),
+        ) as open_choices, patch(
+            "app_core.douyin_favorite_music_cache.replace_cached_favorite_music",
+            return_value=[],
+        ) as replace:
+            result = asyncio.run(manager._refresh_favorite_music("session-demo"))
+
+        self.assertEqual(result[0]["musicId"], "music-current")
+        open_choices.assert_awaited_once_with(manager._session.page)
+        replace.assert_called_once_with(31, manager._session.music_candidates)
 
     def test_progress_event_only_exposes_phase_label_and_state(self) -> None:
         event = douyin_commerce_session.CommerceProgressEvent(

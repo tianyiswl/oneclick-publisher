@@ -678,13 +678,15 @@ class DouyinCommerceSessionManager:
         """显式刷新当前账号的收藏音乐，并仅持久化稳定、非敏感元数据。"""
 
         session = await self._current(session_id)
-        await self._load_favorite_music(session_id)
+        current = await self._load_favorite_music(session_id)
         if session.account_id <= 0:
-            return []
-        return douyin_favorite_music_cache.replace_cached_favorite_music(
-            session.account_id,
-            session.music_candidates,
+            return current
+        douyin_favorite_music_cache.replace_cached_favorite_music(
+            session.account_id, session.music_candidates
         )
+        # 刷新后的本次列表仍可能含只能在当前弹层使用的临时身份。它们不会
+        # 入库，但用户仍可在本次打开的真实抽屉中手动选择并完成回读。
+        return current
 
     async def _select_favorite_music(
         self,
