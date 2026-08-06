@@ -1004,13 +1004,17 @@ class DouyinCommerceSessionManager:
                     raise DouyinCommerceSessionError("等待抖音验证超时，发布已安全停止")
 
                 if kind == "sms":
-                    code = verification_broker.consume_code(request_id)
+                    code = verification_broker.claim_code(request_id)
                     if code:
                         try:
+                            verification_broker.ensure_processing(request_id)
                             await session.uploader.apply_sms_verification_code(
                                 session.page,
                                 challenge,
                                 code,
+                                before_submit=lambda: verification_broker.ensure_processing(
+                                    request_id
+                                ),
                             )
                         except Exception as exc:
                             verification_broker.fail(request_id)
@@ -1030,8 +1034,11 @@ class DouyinCommerceSessionManager:
                             "抖音扫码验证页面状态无法确认，发布已安全停止"
                         ) from exc
                     if current is None:
-                        verification_broker.succeed(request_id)
-                        return
+                        if "/creator-micro/content/manage" in str(session.page.url or ""):
+                            verification_broker.succeed(request_id)
+                            return
+                        await session.page.wait_for_timeout(250)
+                        continue
                     if getattr(current, "kind", "") != "qr":
                         verification_broker.fail(request_id)
                         raise DouyinCommerceSessionError(

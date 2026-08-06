@@ -146,6 +146,41 @@ class DouyinVerificationBrokerTests(unittest.TestCase):
         with self.assertRaises(DouyinVerificationError):
             broker.submit_code(request_id, "123456")
 
+    def test_claimed_sms_code_stops_when_cancelled_or_expired_before_page_write(self):
+        """领取、取消和超时必须有可检测的状态边界，不能静默标记成功。"""
+
+        now = [100.0]
+        broker = DouyinVerificationBroker(clock=lambda: now[0])
+        cancelled_id = broker.create_sms(task_id=52, message="需要短信验证")
+        broker.submit_code(cancelled_id, "123456")
+        broker.cancel(cancelled_id)
+
+        with self.assertRaises(DouyinVerificationError):
+            broker.claim_code(cancelled_id)
+        with self.assertRaises(DouyinVerificationError):
+            broker.succeed(cancelled_id)
+
+        expired_id = broker.create_sms(
+            task_id=53,
+            message="需要短信验证",
+            expires_in_seconds=1,
+        )
+        broker.submit_code(expired_id, "123456")
+        now[0] = 102.0
+
+        with self.assertRaises(DouyinVerificationError):
+            broker.claim_code(expired_id)
+        with self.assertRaises(DouyinVerificationError):
+            broker.succeed(expired_id)
+
+    def test_invalid_sms_code_never_enters_pending_submission(self):
+        broker = DouyinVerificationBroker()
+        request_id = broker.create_sms(task_id=54, message="需要短信验证")
+
+        with self.assertRaises(DouyinVerificationError):
+            broker.submit_code(request_id, "invalid")
+        self.assertIsNone(broker.claim_code(request_id))
+
     def test_expiry_and_error_are_safe_terminal_states(self):
         now = [100.0]
         broker = DouyinVerificationBroker(clock=lambda: now[0])

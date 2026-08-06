@@ -3,12 +3,17 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta
+from io import BytesIO
 import tempfile
 from pathlib import Path
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
+
+import qrcode
+from PIL import Image
 
 from app_core import douyin_publish_executor
 from uploader.douyin_uploader.main import DouYinVideo
@@ -288,8 +293,6 @@ class DouyinPublishPayloadTests(unittest.TestCase):
             await video.apply_sms_verification_code(page, challenge, "123456")
 
         with patch("utils.base_social_media.reveal_page_window") as reveal:
-            import asyncio
-
             receipt = asyncio.run(
                 video._wait_formal_publish_result(
                     page,
@@ -356,11 +359,108 @@ class DouyinPublishPayloadTests(unittest.TestCase):
             description="测试文案",
         )
         page = AmbiguousPage()
-        import asyncio
-
         with self.assertRaisesRegex(RuntimeError, "无法唯一确认"):
             asyncio.run(video.detect_publish_verification(page))
         self.assertEqual([item.value for item in page.inputs], ["", ""])
+
+    def test_qr_challenge_requires_a_real_decoder_result(self) -> None:
+        """有效二维码可经解码器确认，普通高对比方图绝不能仅凭形状通过。"""
+
+        class Controls:
+            def __init__(self, items) -> None:
+                self.items = list(items)
+
+            async def count(self) -> int:
+                return len(self.items)
+
+            def nth(self, index: int):
+                return self.items[index]
+
+        class Marker:
+            async def is_visible(self) -> bool:
+                return True
+
+        class ImageControl:
+            def __init__(self, payload: bytes) -> None:
+                self.payload = payload
+
+            async def is_visible(self) -> bool:
+                return True
+
+            async def is_enabled(self) -> bool:
+                return True
+
+            async def screenshot(self) -> bytes:
+                return self.payload
+
+        class QrPage:
+            url = "https://creator.douyin.com/verification"
+
+            def __init__(self, payload: bytes) -> None:
+                self.image = ImageControl(payload)
+
+            def get_by_text(self, text: str, *, exact: bool):
+                if text == "使用原设备扫码" and exact:
+                    return Controls([Marker()])
+                return Controls([])
+
+            def get_by_role(self, role: str, **_kwargs):
+                if role == "img":
+                    return Controls([self.image])
+                return Controls([])
+
+        qr = qrcode.make("offline-verification")
+        qr_output = BytesIO()
+        qr.save(qr_output, format="PNG")
+        checker = Image.new("1", (240, 240), "white")
+        for left in range(0, 240, 12):
+            for top in range(0, 240, 12):
+                if (left // 12 + top // 12) % 2:
+                    for x in range(left, left + 12):
+                        for y in range(top, top + 12):
+                            checker.putpixel((x, y), 0)
+        checker_output = BytesIO()
+        checker.save(checker_output, format="PNG")
+
+        video = DouYinVideo(
+            title="测试标题",
+            file_path="/tmp/demo.mp4",
+            tags=[],
+            publish_date=datetime.now(),
+            account_file="/tmp/account.json",
+            description="测试文案",
+        )
+        challenge = asyncio.run(video.detect_publish_verification(QrPage(qr_output.getvalue())))
+        self.assertEqual(challenge.kind, "qr")
+        with self.assertRaisesRegex(RuntimeError, "二维码"):
+            asyncio.run(video.detect_publish_verification(QrPage(checker_output.getvalue())))
+
+    def test_unknown_verification_page_never_becomes_qr_success(self) -> None:
+        """仍在验证页却缺少可识别控件时，必须停止而不是返回 None。"""
+
+        class Controls:
+            async def count(self) -> int:
+                return 0
+
+            def nth(self, _index: int):
+                raise AssertionError("不应读取不存在控件")
+
+        class Page:
+            url = "https://creator.douyin.com/verification"
+
+            def get_by_text(self, _text: str, *, exact: bool):
+                return Controls()
+
+        video = DouYinVideo(
+            title="测试标题",
+            file_path="/tmp/demo.mp4",
+            tags=[],
+            publish_date=datetime.now(),
+            account_file="/tmp/account.json",
+            description="测试文案",
+        )
+        with self.assertRaisesRegex(RuntimeError, "验证页面状态无法识别"):
+            asyncio.run(video.detect_publish_verification(Page()))
 
 
 @unittest.skipIf(publish_service is None, "当前离线环境未安装 Playwright，跳过桌面路由测试")

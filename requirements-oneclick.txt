@@ -4,5 +4,6 @@ xhs==0.2.13
 biliup==1.2.1
 loguru==0.7.3
 qrcode==8.2
+zxing-cpp==3.0.0
 requests==2.34.2
 tzdata==2026.3

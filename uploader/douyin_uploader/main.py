@@ -650,6 +650,26 @@ class DouYinVideo(object):
         if self.save_draft_only:
             raise RuntimeError("保存草稿模式已在代码层禁止定位或点击正式发布按钮")
 
+    @staticmethod
+    def _decode_qr_image(qr_image: bytes) -> None:
+        """仅接受真实二维码解码器确认的图像，绝不把方形高对比图当作二维码。"""
+
+        try:
+            import zxingcpp
+        except ImportError as exc:
+            raise RuntimeError("抖音验证二维码解码器不可用，发布已安全停止") from exc
+        try:
+            with Image.open(BytesIO(qr_image)) as image:
+                image.load()
+                results = zxingcpp.read_barcodes(
+                    image,
+                    formats=zxingcpp.BarcodeFormat.QRCode,
+                )
+        except Exception as exc:
+            raise RuntimeError("抖音验证二维码无法由解码器确认，发布已安全停止") from exc
+        if len(results) != 1 or not getattr(results[0], "text", ""):
+            raise RuntimeError("当前图像不是可解码二维码，发布已安全停止")
+
     async def detect_publish_verification(self, page: Page):
         """识别当前页面唯一、可受控的发布验证挑战。
 
@@ -666,6 +686,11 @@ class DouYinVideo(object):
             self.PUBLISH_SECURITY_VERIFICATION_TEXTS,
         )
         if not markers:
+            if any(
+                fragment in current_url.lower()
+                for fragment in ("verification", "verify", "security")
+            ):
+                raise RuntimeError("抖音验证页面状态无法识别，发布已安全停止")
             return None
 
         inputs = await self._visible_enabled_items(page.get_by_role("textbox"))
@@ -689,6 +714,7 @@ class DouYinVideo(object):
                 _validate_qr_image,
             )
 
+            self._decode_qr_image(qr_image)
             return VerificationChallenge(
                 kind="qr",
                 message="请在一键发客户端扫码完成验证",
@@ -697,7 +723,13 @@ class DouYinVideo(object):
         except Exception as exc:
             raise RuntimeError("抖音验证二维码无法在内存中解析，发布已安全停止") from exc
 
-    async def apply_sms_verification_code(self, page: Page, challenge, code: str) -> None:
+    async def apply_sms_verification_code(
+        self,
+        page: Page,
+        challenge,
+        code: str,
+        before_submit=None,
+    ) -> None:
         """在原 Playwright 会话填入已由原生客户端提交的短信验证码。"""
 
         if getattr(challenge, "kind", "") != "sms":
@@ -709,9 +741,13 @@ class DouYinVideo(object):
         if len(buttons) != 1:
             raise RuntimeError("抖音验证确认按钮无法唯一确认，发布已安全停止")
 
+        if callable(before_submit):
+            before_submit()
         await inputs[0].fill(str(code))
         if await inputs[0].input_value() != str(code):
             raise RuntimeError("抖音验证码填写后未能回读，发布已安全停止")
+        if callable(before_submit):
+            before_submit()
         await buttons[0].click(timeout=10_000)
         for _ in range(20):
             if await self.detect_publish_verification(page) is None:

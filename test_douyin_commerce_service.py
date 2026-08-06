@@ -3317,6 +3317,13 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
                     raise AssertionError("验证请求标识不匹配")
                 return "123456"
 
+            def claim_code(self, request_id: str):
+                return self.consume_code(request_id)
+
+            def ensure_processing(self, request_id: str) -> None:
+                if request_id != "request-demo":
+                    raise AssertionError("验证请求标识不匹配")
+
             def succeed(self, request_id: str) -> None:
                 self.succeeded.append(request_id)
 
@@ -3369,6 +3376,183 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
         self.assertEqual(broker.succeeded, ["request-demo"])
         self.assertEqual(broker.cleared, ["request-demo"])
         self.assertIsNone(manager._session)
+
+    def test_cancelled_or_expired_sms_claim_stops_before_page_write_or_receipt(self) -> None:
+        """验证码被领取后若已取消或超时，不能再填写、点击或返回成功回执。"""
+
+        class Page:
+            async def wait_for_timeout(self, _milliseconds: int) -> None:
+                return None
+
+        class Uploader:
+            def __init__(self) -> None:
+                self.apply_sms_verification_code = AsyncMock()
+
+        class Broker:
+            def __init__(self, state: str) -> None:
+                self.state = state
+                self.cleared = []
+
+            def create_sms(self, **_kwargs) -> str:
+                return "request-race"
+
+            def snapshot(self, _request_id: str) -> dict:
+                return {"state": "waiting"}
+
+            def consume_code(self, _request_id: str) -> str:
+                return "123456"
+
+            def claim_code(self, _request_id: str) -> str:
+                return "123456"
+
+            def ensure_processing(self, _request_id: str) -> None:
+                raise RuntimeError(self.state)
+
+            def succeed(self, _request_id: str) -> None:
+                return None
+
+            def fail(self, _request_id: str) -> None:
+                return None
+
+            def clear(self, request_id: str) -> None:
+                self.cleared.append(request_id)
+
+        for state in ("cancelled", "expired"):
+            with self.subTest(state=state):
+                uploader = Uploader()
+                manager = douyin_commerce_session.DouyinCommerceSessionManager()
+                session = douyin_commerce_session._CommerceEditorSession(
+                    session_id="session-race",
+                    upload_payload={},
+                    account_name="测试账号",
+                    browser=None,
+                    context=None,
+                    page=Page(),
+                    playwright=None,
+                    uploader=uploader,
+                )
+                broker = Broker(state)
+                with patch.object(
+                    douyin_commerce_session,
+                    "verification_broker",
+                    broker,
+                ):
+                    with self.assertRaisesRegex(
+                        douyin_commerce_session.DouyinCommerceSessionError,
+                        "验证",
+                    ):
+                        asyncio.run(
+                            manager._handle_publish_verification(
+                                session,
+                                VerificationChallenge(
+                                    kind="sms",
+                                    message="请在一键发客户端输入短信验证码",
+                                ),
+                                task_id=78,
+                            )
+                        )
+
+                uploader.apply_sms_verification_code.assert_not_awaited()
+                self.assertEqual(broker.cleared, ["request-race"])
+
+    def test_verification_without_task_id_stops_before_broker_or_page_write(self) -> None:
+        class Page:
+            async def wait_for_timeout(self, _milliseconds: int) -> None:
+                return None
+
+        class Uploader:
+            apply_sms_verification_code = AsyncMock()
+
+        manager = douyin_commerce_session.DouyinCommerceSessionManager()
+        session = douyin_commerce_session._CommerceEditorSession(
+            session_id="session-no-task",
+            upload_payload={},
+            account_name="测试账号",
+            browser=None,
+            context=None,
+            page=Page(),
+            playwright=None,
+            uploader=Uploader(),
+        )
+        with self.assertRaisesRegex(
+            douyin_commerce_session.DouyinCommerceSessionError,
+            "缺少任务号",
+        ):
+            asyncio.run(
+                manager._handle_publish_verification(
+                    session,
+                    VerificationChallenge(
+                        kind="sms",
+                        message="请在一键发客户端输入短信验证码",
+                    ),
+                    task_id=None,
+                )
+            )
+        session.uploader.apply_sms_verification_code.assert_not_awaited()
+
+    def test_rejected_sms_code_stops_without_success_receipt(self) -> None:
+        """平台拒绝已填写的验证码时，不得伪造验证或发布成功。"""
+
+        class Page:
+            async def wait_for_timeout(self, _milliseconds: int) -> None:
+                return None
+
+        class Uploader:
+            apply_sms_verification_code = AsyncMock(
+                side_effect=RuntimeError("验证码被平台拒绝")
+            )
+
+        class Broker:
+            failed = []
+
+            def create_sms(self, **_kwargs) -> str:
+                return "request-rejected"
+
+            def snapshot(self, _request_id: str) -> dict:
+                return {"state": "waiting"}
+
+            def claim_code(self, _request_id: str) -> str:
+                return "123456"
+
+            def ensure_processing(self, _request_id: str) -> None:
+                return None
+
+            def fail(self, request_id: str) -> None:
+                self.failed.append(request_id)
+
+            def clear(self, _request_id: str) -> None:
+                return None
+
+        uploader = Uploader()
+        session = douyin_commerce_session._CommerceEditorSession(
+            session_id="session-rejected",
+            upload_payload={},
+            account_name="测试账号",
+            browser=None,
+            context=None,
+            page=Page(),
+            playwright=None,
+            uploader=uploader,
+        )
+        broker = Broker()
+        with patch.object(douyin_commerce_session, "verification_broker", broker):
+            with self.assertRaisesRegex(
+                douyin_commerce_session.DouyinCommerceSessionError,
+                "短信验证",
+            ):
+                asyncio.run(
+                    douyin_commerce_session.DouyinCommerceSessionManager()._handle_publish_verification(
+                        session,
+                        VerificationChallenge(
+                            kind="sms",
+                            message="请在一键发客户端输入短信验证码",
+                        ),
+                        task_id=79,
+                    )
+                )
+
+        uploader.apply_sms_verification_code.assert_awaited_once()
+        self.assertEqual(broker.failed, ["request-rejected"])
 
     def test_preflight_payload_must_match_same_uploaded_editor_session(self) -> None:
         manager = douyin_commerce_session.DouyinCommerceSessionManager()
