@@ -15,6 +15,8 @@ from typing import Any
 from myUtils.postVideo import post_video_batch_draft_tabs
 
 from . import (
+    douyin_commerce_batch_executor,
+    douyin_commerce_batch_service,
     douyin_commerce_service,
     douyin_location_service,
     douyin_publish_executor,
@@ -39,6 +41,76 @@ _PLATFORM_NAMES = {
     6: "TikTok", 7: "YouTube", 8: "Instagram Reels", 9: "Facebook Reels",
     10: "公众号",
 }
+
+
+_DOUYIN_COMMERCE_BATCH_WORKFLOW = "douyin-commerce-batch"
+
+
+def _is_douyin_commerce_batch_payload(payload: object) -> bool:
+    """判断是否为必须交给批量执行器的批次信封。
+
+    ``batchWorkflow`` 只会出现在批次内部生成的单视频操作载荷中；它同样不能
+    回流到通用发布服务，否则旧的按平台汇总结果会绕过逐视频最终回执。
+    """
+
+    return isinstance(payload, dict) and (
+        str(payload.get("workflow") or "").strip()
+        == _DOUYIN_COMMERCE_BATCH_WORKFLOW
+        or str(payload.get("batchWorkflow") or "").strip()
+        == _DOUYIN_COMMERCE_BATCH_WORKFLOW
+    )
+
+
+def _prepare_douyin_commerce_batch_request(
+    payloads: list[dict[str, Any]],
+    *,
+    expected_mode: str,
+) -> dict[str, Any]:
+    """校验批量入口运行边界并返回白名单批次信封。
+
+    批次执行器只消费 ``validate_batch_payload`` 返回的字段。运行模式与最终确认
+    只在通用入口处作为门槛验证，不会混入持久化批次或下沉给单视频旧执行器。
+    """
+
+    if len(payloads) != 1 or not _is_douyin_commerce_batch_payload(payloads[0]):
+        raise ValueError("抖音带货批量任务一次只能传入一个批次信封")
+    raw = dict(payloads[0])
+    workflow = str(raw.get("workflow") or "").strip()
+    if workflow != _DOUYIN_COMMERCE_BATCH_WORKFLOW:
+        raise ValueError("批次内部单视频载荷不能进入通用发布服务")
+
+    runtime_mode = str(raw.get("runtimeMode") or "preflight").strip()
+    if runtime_mode != expected_mode:
+        raise ValueError(f"抖音带货批量{('预检' if expected_mode == 'preflight' else '发布')}必须明确 runtimeMode={expected_mode}")
+    if expected_mode == "preflight":
+        if raw.get("debugDryRun", True) is not True:
+            raise ValueError("抖音带货批量预检必须明确 debugDryRun=true")
+    else:
+        if raw.get("debugDryRun") is not False:
+            raise ValueError("抖音带货批量正式发布必须明确 debugDryRun=false")
+        if raw.get("batchConfirmed") is not True:
+            raise ValueError("抖音带货批量正式发布必须先完成批量确认")
+    try:
+        return douyin_commerce_batch_service.validate_batch_payload(raw)
+    except douyin_commerce_batch_service.DouyinCommerceBatchError as exc:
+        raise ValueError(str(exc)) from exc
+
+
+def _record_douyin_batch_progress(task_id: int, event: object) -> None:
+    """记录不含浏览器状态的批次进度，供任务记录和客户端轮询使用。"""
+
+    public = event.to_public_dict() if hasattr(event, "to_public_dict") else {}
+    if not isinstance(public, dict):
+        return
+    index = int(public.get("index") or 0) + 1
+    total = int(public.get("total") or 0)
+    message = " ".join(str(public.get("message") or "").split())
+    if message:
+        task_service.record_task_event(
+            int(task_id),
+            "douyin_commerce_batch_progress",
+            f"第 {index}/{total} 条：{message}",
+        )
 
 
 def _runtime_media_path(value: object) -> str:
@@ -177,7 +249,84 @@ def _validate_payloads(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return validated
 
 
+def _run_douyin_commerce_batch_preflight(task: dict, payloads: list[dict[str, Any]]) -> None:
+    """执行批量 dry-run；此路径没有也不会调用最终提交。"""
+
+    batch = _prepare_douyin_commerce_batch_request(payloads, expected_mode="preflight")
+    if not _publish_lock.acquire(blocking=False):
+        task_service.record_task_event(
+            int(task["id"]),
+            "douyin_commerce_batch_busy",
+            "已有发布或预检任务正在执行，批量预检未启动",
+            level="warning",
+        )
+        _active_threads.pop(int(task["id"]), None)
+        return
+    try:
+        task_service.mark_task_running(int(task["id"]), "抖音带货批量开始逐视频预检")
+        results = douyin_commerce_batch_executor.batch_executor.run_preflight(
+            batch,
+            task_id=int(task["id"]),
+            progress=lambda event: _record_douyin_batch_progress(int(task["id"]), event),
+        )
+        if not all(isinstance(item, dict) and item.get("status") == "preflighted" for item in results):
+            task_service.record_task_event(
+                int(task["id"]),
+                "douyin_commerce_batch_preflight_incomplete",
+                "批量预检未取得全部逐视频编辑页回读，未进入提交",
+                level="warning",
+            )
+    except Exception as exc:
+        task_service.record_task_event(
+            int(task["id"]),
+            "douyin_commerce_batch_preflight_failed",
+            f"批量预检异常：{type(exc).__name__}：{exc}",
+            level="error",
+        )
+    finally:
+        _publish_lock.release()
+        _active_threads.pop(int(task["id"]), None)
+
+
+def _run_douyin_commerce_batch_publish(task: dict, payloads: list[dict[str, Any]]) -> None:
+    """执行已总确认的批量最终提交，成功状态只由批量执行器平台回执写入。"""
+
+    batch = _prepare_douyin_commerce_batch_request(payloads, expected_mode="publish")
+    if not _publish_lock.acquire(blocking=False):
+        task_service.record_task_event(
+            int(task["id"]),
+            "douyin_commerce_batch_busy",
+            "已有发布或预检任务正在执行，批量提交未启动",
+            level="warning",
+        )
+        _active_threads.pop(int(task["id"]), None)
+        return
+    try:
+        task_service.mark_task_running(int(task["id"]), "抖音带货批量开始逐视频最终提交")
+        douyin_commerce_batch_executor.batch_executor.run_publish(
+            batch,
+            task_id=int(task["id"]),
+            confirmed=True,
+            progress=lambda event: _record_douyin_batch_progress(int(task["id"]), event),
+        )
+    except Exception as exc:
+        # 这里绝不调用 mark_platform_result：批量任务每条的成功只能由执行器在
+        # 同一 submit 会话取得平台最终回读后写入。异常仅记录为任务事件。
+        task_service.record_task_event(
+            int(task["id"]),
+            "douyin_commerce_batch_publish_failed",
+            f"批量最终提交异常：{type(exc).__name__}：{exc}",
+            level="error",
+        )
+    finally:
+        _publish_lock.release()
+        _active_threads.pop(int(task["id"]), None)
+
+
 def _run_preflight(task: dict, payloads: list[dict[str, Any]]) -> None:
+    if payloads and _is_douyin_commerce_batch_payload(payloads[0]):
+        _run_douyin_commerce_batch_preflight(task, payloads)
+        return
     if not _publish_lock.acquire(blocking=False):
         task_service.mark_platform_result(
             task["id"], int(payloads[0]["type"]), ok=False,
@@ -232,6 +381,10 @@ def _run_preflight(task: dict, payloads: list[dict[str, Any]]) -> None:
 
 def _run_publish(task: dict, payloads: list[dict[str, Any]]) -> None:
     """执行已获用户确认的小红书图文/视频或公众号正式提交。"""
+
+    if payloads and _is_douyin_commerce_batch_payload(payloads[0]):
+        _run_douyin_commerce_batch_publish(task, payloads)
+        return
 
     if not _publish_lock.acquire(blocking=False):
         task_service.mark_platform_result(
@@ -380,6 +533,32 @@ def _run_draft(task: dict, payloads: list[dict[str, Any]]) -> None:
 
 def start_desktop_publish(payloads: list[dict[str, Any]]) -> dict:
     """按载荷启动预检或已确认的公众号正式发布任务。"""
+
+    if payloads and _is_douyin_commerce_batch_payload(payloads[0]):
+        raw_batch = dict(payloads[0])
+        runtime_mode = str(raw_batch.get("runtimeMode") or "preflight").strip()
+        if runtime_mode not in {"preflight", "publish"}:
+            raise ValueError("抖音带货批量只支持预检或已确认的正式发布")
+        batch = _prepare_douyin_commerce_batch_request(
+            [raw_batch], expected_mode=runtime_mode
+        )
+        task = task_service.create_douyin_batch_task(
+            batch,
+            mode="oneclick_publish" if runtime_mode == "publish" else "oneclick_preflight",
+        )
+        worker = threading.Thread(
+            target=(
+                _run_douyin_commerce_batch_publish
+                if runtime_mode == "publish"
+                else _run_douyin_commerce_batch_preflight
+            ),
+            args=(task, [raw_batch]),
+            daemon=True,
+            name=f"oneclick-douyin-commerce-batch-{runtime_mode}-{task['id']}",
+        )
+        _active_threads[int(task["id"])] = worker
+        worker.start()
+        return task
 
     prepared = _validate_payloads(payloads)
     runtime_mode = str(prepared[0].get("runtimeMode") or "preflight")

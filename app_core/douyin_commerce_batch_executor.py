@@ -531,3 +531,8 @@ class DouyinCommerceBatchExecutor:
         finally:
             if session_id and not retain_session:
                 self._manager.close(session_id)
+
+
+# 发布服务只通过这个受控实例进入批量执行器；实际成功回执仍只能由同一 submit
+# 会话的内部写入器落库，模块实例本身不暴露任何“字典写成功”入口。
+batch_executor = DouyinCommerceBatchExecutor()

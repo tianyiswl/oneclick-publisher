@@ -34,6 +34,15 @@ def _is_commerce_workflow(payload: Mapping[str, Any]) -> bool:
     return str(payload.get("workflow") or "") == douyin_commerce_service.DOUYIN_COMMERCE_WORKFLOW
 
 
+def _is_commerce_batch_workflow(payload: Mapping[str, Any]) -> bool:
+    """批次信封和内部条目均不得误入旧单视频执行器。"""
+
+    return (
+        str(payload.get("workflow") or "") == "douyin-commerce-batch"
+        or str(payload.get("batchWorkflow") or "") == "douyin-commerce-batch"
+    )
+
+
 def _normalized(value: object) -> str:
     return " ".join(str(value or "").replace("\u200b", " ").split())
 
@@ -137,6 +146,8 @@ def validate_douyin_publish_payload(payload: Mapping[str, Any]) -> dict[str, Any
     """校验抖音正式发布的最小可审计边界，不触发浏览器或平台动作。"""
 
     checked = dict(payload)
+    if _is_commerce_batch_workflow(checked):
+        raise DouyinPublishError("抖音带货批量任务请使用抖音带货批量执行器")
     if _is_commerce_workflow(checked):
         try:
             checked = douyin_commerce_service.validate_douyin_commerce_payload(checked)
@@ -564,6 +575,8 @@ async def run_douyin_commerce_preflight(
 ) -> dict[str, Any]:
     """执行抖音带货发布前预检，只填写/回读，绝不点击最终发表。"""
 
+    if _is_commerce_batch_workflow(payload):
+        raise DouyinPublishError("抖音带货批量任务请使用抖音带货批量执行器")
     if str(payload.get("runtimeMode") or "") != "preflight":
         raise DouyinPublishError("抖音带货预检必须明确 runtimeMode=preflight")
     if payload.get("debugDryRun") is not True:

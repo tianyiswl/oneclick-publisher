@@ -856,6 +856,18 @@ class DouyinPublishRoutingTests(unittest.TestCase):
         execute.assert_called_once_with(prepared[0], task_id=301)
         self.assertTrue(mark.call_args.kwargs["ok"])
 
+    def test_single_video_executor_rejects_batch_workflow(self) -> None:
+        batch_payload = {
+            **self.payload,
+            "workflow": "douyin-commerce-batch",
+            "batchWorkflow": "douyin-commerce-batch",
+        }
+
+        with self.assertRaisesRegex(
+            douyin_publish_executor.DouyinPublishError, "批量执行器"
+        ):
+            douyin_publish_executor.validate_douyin_publish_payload(batch_payload)
+
 
 if __name__ == "__main__":
     unittest.main()

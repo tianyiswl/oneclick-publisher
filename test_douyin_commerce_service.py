@@ -4774,5 +4774,99 @@ class DouyinCommerceRoutingTests(unittest.TestCase):
         self.assertTrue(mark.call_args.kwargs["ok"])
 
 
+class DouyinCommerceBatchRoutingTests(unittest.TestCase):
+    """批次信封必须经专用执行器，不能降级为单视频或通用任务。"""
+
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.video = Path(self.tempdir.name) / "batch-routing.mp4"
+        self.video.write_bytes(b"batch-routing-video")
+        self.payload = {
+            "type": 3,
+            "workflow": "douyin-commerce-batch",
+            "commerceMode": "local-group-buy",
+            "contentType": "video",
+            "runtimeMode": "preflight",
+            "debugDryRun": True,
+            "accountList": ["oneclick_3_offline.json"],
+            "shared": {
+                "title": "批量路由测试",
+                "description": "只验证专用批量路由，不触发浏览器。",
+                "tags": ["测试"],
+                "selectedMusic": {
+                    "musicId": "music-routing",
+                    "title": "测试收藏音乐",
+                    "creator": "一键发",
+                    "duration": "01:00",
+                },
+                "contentDeclaration": "无需添加自主声明",
+            },
+            "publishMode": "immediate",
+            "schedule": {},
+            "items": [
+                {
+                    "mediaPath": str(self.video),
+                    "locationPreset": {
+                        "poiId": "poi-routing",
+                        "name": "北海银滩景区",
+                        "address": "广西壮族自治区北海市银海区银滩大道中段",
+                        "scope": "domestic",
+                    },
+                }
+            ],
+        }
+
+    def tearDown(self) -> None:
+        self.tempdir.cleanup()
+
+    def test_publish_service_routes_batch_preflight_without_final_submit(self) -> None:
+        with patch.object(
+            publish_service.douyin_commerce_batch_executor.batch_executor,
+            "run_preflight",
+            return_value=[{"status": "preflighted"}],
+        ) as preflight, patch.object(
+            publish_service.task_service, "mark_task_running"
+        ), patch.object(
+            publish_service.task_service, "record_task_event"
+        ):
+            publish_service._run_preflight({"id": 41, "dryRun": 1}, [self.payload])
+
+        preflight.assert_called_once()
+        self.assertEqual(preflight.call_args.kwargs["task_id"], 41)
+        self.assertNotIn("confirmed", preflight.call_args.kwargs)
+
+    def test_batch_publish_requires_explicit_confirmed_flag(self) -> None:
+        payload = {
+            **self.payload,
+            "runtimeMode": "publish",
+            "debugDryRun": False,
+            "batchConfirmed": False,
+        }
+        with self.assertRaisesRegex(ValueError, "批量确认"):
+            publish_service._run_publish({"id": 42, "dryRun": 0}, [payload])
+
+    def test_batch_publish_routes_only_after_all_explicit_runtime_gates(self) -> None:
+        payload = {
+            **self.payload,
+            "runtimeMode": "publish",
+            "debugDryRun": False,
+            "batchConfirmed": True,
+        }
+        with patch.object(
+            publish_service.douyin_commerce_batch_executor.batch_executor,
+            "run_publish",
+            return_value=[{"status": "published"}],
+        ) as publish, patch.object(
+            publish_service.task_service, "mark_task_running"
+        ), patch.object(
+            publish_service.task_service, "record_task_event"
+        ):
+            publish_service._run_publish({"id": 43, "dryRun": 0}, [payload])
+
+        publish.assert_called_once()
+        self.assertEqual(publish.call_args.kwargs["task_id"], 43)
+        self.assertTrue(publish.call_args.kwargs["confirmed"])
+
+
 if __name__ == "__main__":
     unittest.main()
