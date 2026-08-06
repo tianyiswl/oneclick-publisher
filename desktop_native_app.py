@@ -34,6 +34,7 @@ from app_core.branding import APP_ICON_RELATIVE_PATH, APP_TITLE, APP_VERSION, PR
 from app_core.database import ensure_schema
 from ui.common import apply_style
 from ui.main_window import LicenseDialog, MainWindow
+from ui.runtime_log import install_runtime_log_capture
 
 
 def configure_application(app: QApplication) -> None:
@@ -45,6 +46,22 @@ def configure_application(app: QApplication) -> None:
     icon_path = ROOT_DIR / APP_ICON_RELATIVE_PATH
     if icon_path.exists():
         app.setWindowIcon(QIcon(str(icon_path)))
+
+
+def hide_windows_console() -> None:
+    """正常桌面启动时隐藏 Python 控制台，运行记录改在客户端内显示。"""
+
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        console = ctypes.windll.kernel32.GetConsoleWindow()
+        if console:
+            ctypes.windll.user32.ShowWindow(console, 0)
+    except Exception:
+        # 隐藏控制台失败不影响桌面客户端本身启动。
+        return
 
 
 def run_self_test() -> None:
@@ -258,10 +275,12 @@ def main() -> int:
             parser.error("--verify-release 必须同时提供 --manifest 和 --signature")
         run_release_verification(args.verify_release, args.manifest, args.signature)
         return 0
-    ensure_schema()
     app = QApplication(sys.argv)
     configure_application(app)
+    install_runtime_log_capture()
+    hide_windows_console()
     apply_style(app)
+    ensure_schema()
     status = activation_service.license_status()
     if not status.get("accessAllowed"):
         dialog = LicenseDialog(activation_required=True)

@@ -516,7 +516,8 @@ class DouyinCommerceSessionManager:
 
         _emit_progress(on_progress, "checking_session", "正在核对账号会话")
         account = _account_for_payload(payload)
-        expected_account = _normalized(account.get("profileName") or account.get("userName"))
+        # 账号主体编号不等于抖音昵称；与普通抖音发布保持同一身份回读规则。
+        expected_account = douyin_publish_executor._expected_account_name(account)
         if not expected_account:
             raise DouyinCommerceSessionError("抖音账号缺少可回读的账号名，请先在账号管理中重新绑定")
         storage_state = _storage_state(account)
@@ -661,6 +662,12 @@ class DouyinCommerceSessionManager:
                 candidates[0],
             )
         except douyin_music_service.DouyinMusicError as exc:
+            # 收藏列表的 marker 依附于当前音乐弹窗。写入失败后不复用它，下一次
+            # 选择必须重新打开并读取，避免将已重绘的条目误认成同一首音乐。
+            session.music_picker_page = None
+            session.music_dialog = None
+            session.music_candidates = []
+            self._refresh_editor_stage(session)
             raise DouyinCommerceSessionError(f"抖音收藏音乐未能选择并回读：{exc}") from exc
         session.selected_music = _public_music(selected)
         session.music_picker_page = None

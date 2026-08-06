@@ -30,6 +30,7 @@ from app_core import (
 from uploader.douyin_uploader.main import DouYinVideo
 from ui.background_task import BackgroundTask
 from ui.douyin_commerce_page import DouyinCommercePage
+from ui.runtime_log import runtime_log_bus
 from utils import base_social_media
 
 
@@ -120,6 +121,14 @@ class DouyinCommercePayloadTests(unittest.TestCase):
         payload["commerceStore"] = {"storeId": "old-store", "poiId": "other-poi"}
         checked = douyin_commerce_service.validate_douyin_commerce_payload(payload)
         self.assertNotIn("commerceStore", checked)
+
+    def test_title_and_tags_are_optional_when_description_is_present(self) -> None:
+        checked = douyin_commerce_service.validate_douyin_commerce_upload_payload(
+            dict(self.payload, title="", tags=[])
+        )
+
+        self.assertEqual(checked["title"], "")
+        self.assertEqual(checked.get("tags"), [])
 
     def test_requires_explicit_location_scope_and_content_declaration(self) -> None:
         with self.assertRaisesRegex(
@@ -1242,6 +1251,98 @@ class DouyinCommerceUiTests(unittest.TestCase):
 
         self.assertEqual(events[0]["phase"], "uploading_video")
 
+    def test_content_layout_moves_video_tags_and_local_content_to_requested_areas(self) -> None:
+        """内容页必须以账号含视频、内容含标签历史和本地内容、右侧日志呈现。"""
+
+        self.assertEqual(
+            self.page.video_preview.parentWidget().objectName(),
+            "douyinCommerceContentAccountColumn",
+        )
+        self.assertEqual(
+            self.page.tag_history_host.parentWidget().objectName(),
+            "douyinCommerceContentBodyColumn",
+        )
+        self.assertEqual(
+            self.page.content_save_status.parentWidget().objectName(),
+            "douyinCommerceContentBodyColumn",
+        )
+        self.assertEqual(
+            self.page.content_execution_log.objectName(),
+            "douyinCommerceExecutionLog",
+        )
+        self.assertEqual(
+            self.page.platform_execution_log.objectName(),
+            "douyinCommerceExecutionLog",
+        )
+        self.assertEqual(
+            self.page.review_execution_log.objectName(),
+            "douyinCommerceExecutionLog",
+        )
+
+    def test_execution_log_panel_receives_runtime_output(self) -> None:
+        """三个日志面板均订阅同一运行日志总线。"""
+
+        marker = "日志面板回归标识"
+        runtime_log_bus().publish(marker)
+        self.app.processEvents()
+
+        self.assertIn(marker, self.page.content_execution_log.output.toPlainText())
+        self.assertIn(marker, self.page.platform_execution_log.output.toPlainText())
+        self.assertIn(marker, self.page.review_execution_log.output.toPlainText())
+
+    def test_execution_log_panel_copies_visible_log_text(self) -> None:
+        """复制按钮应将当前执行日志完整写入系统剪贴板。"""
+
+        runtime_log_bus().publish("复制日志回归标识")
+        self.app.processEvents()
+        with patch("ui.runtime_log.QApplication.clipboard") as clipboard:
+            self.page.content_execution_log.copy_execution_log()
+
+        copied = clipboard.return_value.setText.call_args.args[0]
+        self.assertIn("复制日志回归标识", copied)
+        self.assertIn("已复制", self.page.content_execution_log.copy_button.text())
+
+    def test_execution_log_columns_keep_the_content_page_width_ratio(self) -> None:
+        """三个步骤的日志列保持相同的 27% 布局比例和最小宽度。"""
+
+        self.assertEqual(self.page.content_columns.columnStretch(2), 27)
+        self.assertEqual(self.page.content_columns.columnMinimumWidth(2), 300)
+        self.assertEqual(self.page.platform_columns.columnStretch(2), 27)
+        self.assertEqual(self.page.platform_columns.columnMinimumWidth(2), 300)
+        self.assertEqual(self.page.review_columns.columnStretch(1), 27)
+        self.assertEqual(self.page.review_columns.columnMinimumWidth(1), 300)
+
+    def test_declaration_summary_card_is_not_rendered_in_platform_settings(self) -> None:
+        """声明单选项已足够表达状态，不应再占用额外的长摘要框。"""
+
+        declaration_layout = self.page.declaration_panel.layout()
+        self.assertIsNotNone(declaration_layout)
+        self.assertEqual(declaration_layout.indexOf(self.page.declaration_card), -1)
+
+    def test_review_log_is_a_sibling_module_not_part_of_review_panel(self) -> None:
+        """检查页日志必须是独立模块，不能嵌套在检查提交卡中。"""
+
+        self.assertIs(self.page.review_panel.parentWidget(), self.page.review_execution_log.parentWidget())
+        self.assertFalse(self.page.review_panel.isAncestorOf(self.page.review_execution_log))
+        self.assertEqual(self.page.review_execution_log.objectName(), "douyinCommerceExecutionLog")
+
+    def test_review_summary_formats_account_subject_and_video_metadata(self) -> None:
+        """检查摘要需提供账号主体及本机视频的完整基础信息。"""
+
+        account = {"userName": "逆浪风", "profileName": "3199"}
+        video = {"filename": "doubao_video_9.mp4", "storedPath": "C:/demo.mp4"}
+        with patch.object(self.page, "_selected_account", return_value=account), patch.object(
+            self.page, "_selected_video", return_value=video
+        ), patch.object(
+            media_service,
+            "video_display_metadata",
+            return_value={"durationText": "00:10", "resolution": "1280 × 720"},
+        ):
+            summary = self.page._summary()
+
+        self.assertEqual(summary["account"], "逆浪风\n主体：3199")
+        self.assertEqual(summary["video"], "doubao_video_9.mp4\n00:10 · 1280 × 720")
+
     def test_upload_progress_uses_only_fixed_non_sensitive_phase_copy(self) -> None:
         self.page._set_commerce_progress(
             {
@@ -1419,6 +1520,22 @@ class DouyinCommerceUiTests(unittest.TestCase):
         )
         self.assertIsNone(self.page._selected_music)
 
+    def test_music_candidates_expand_inside_music_card_without_overlaying_declaration(self) -> None:
+        """收藏音乐候选必须使用卡片内滚动列表，而不是覆盖声明区的原生浮层。"""
+
+        candidates = [
+            {"musicId": f"music-{index}", "title": f"音乐 {index}", "creator": "作者"}
+            for index in range(8)
+        ]
+        self.page._show_music_candidates(candidates)
+        self.page.music_combo.showPopup()
+
+        self.assertFalse(self.page.music_candidate_list.isHidden())
+        self.assertEqual(self.page.music_candidate_list.count(), 8)
+        self.assertEqual(self.page.music_candidate_list.maximumHeight(), 184)
+        self.assertIs(self.page.music_candidate_list.parentWidget(), self.page.music_panel)
+        self.assertFalse(self.page.music_combo.view().isVisible())
+
     def test_first_music_dropdown_click_reads_then_reopens_same_dropdown(self) -> None:
         """首次点击音乐下拉只读取，任务完成后应直接展开同一个选择器。"""
 
@@ -1458,10 +1575,10 @@ class DouyinCommerceUiTests(unittest.TestCase):
             self.page.declaration_buttons["无需添加自主声明"].isEnabled()
         )
 
-    def test_failed_immediate_music_write_restores_last_confirmed_dropdown_value(
+    def test_failed_immediate_music_write_discards_stale_dropdown_candidates(
         self,
     ) -> None:
-        """平台回读失败后不能把客户端暂选误当成已写入结果。"""
+        """平台回读失败后不能复用客户端暂存的失效候选。"""
 
         old_music = {"musicId": "music-old", "title": "旧音乐"}
         new_music = {"musicId": "music-new", "title": "新音乐"}
@@ -1472,7 +1589,29 @@ class DouyinCommerceUiTests(unittest.TestCase):
         self.page._immediate_music_failed("平台回读不一致")
 
         self.assertEqual(self.page._selected_music, old_music)
-        self.assertEqual(self.page.music_combo.currentData(), old_music)
+        self.assertEqual(self.page._music_candidates, [])
+        self.assertIsNone(self.page.music_combo.currentData())
+        self.assertIn("当前音乐：旧音乐", self.page.music_combo.currentText())
+
+    def test_successful_music_write_discards_transient_candidates_before_change(
+        self,
+    ) -> None:
+        """更换过一次音乐后，下次点击必须重新读取当前抖音弹窗。"""
+
+        selected_music = {"musicId": "music-new", "title": "新音乐"}
+        self.page._show_music_candidates(
+            [{"musicId": "music-old", "title": "旧音乐"}, selected_music]
+        )
+
+        self.page._music_selected(selected_music)
+
+        self.assertEqual(self.page._music_candidates, [])
+        self.assertEqual(self.page.music_combo.count(), 1)
+        self.assertIsNone(self.page.music_combo.currentData())
+        self.assertIn("当前音乐：新音乐", self.page.music_combo.currentText())
+        with patch.object(self.page, "_load_favorite_music_candidates") as load:
+            self.page._music_combo_activated(0)
+        load.assert_called_once_with()
 
     def test_location_click_immediately_starts_platform_write(self) -> None:
         """地点候选点击后直接进入同一编辑会话回读，不再要求二次确认。"""
@@ -1766,39 +1905,34 @@ class DouyinCommerceUiTests(unittest.TestCase):
         self.assertLessEqual(header.height() + progress.height(), 104)
 
     def test_content_workbench_places_restore_save_and_upload_in_separate_roles(self) -> None:
-        """恢复在账号栏，保存归视频栏底部，底栏只保留上传主操作。"""
+        """账号区含视频，内容区末尾保存本机内容，底栏只保留上传主操作。"""
 
         self.page.pages.setCurrentIndex(0)
         self.page._sync_view()
 
         account_column = self.page.findChild(QFrame, "douyinCommerceContentAccountColumn")
         content_column = self.page.findChild(QFrame, "douyinCommerceContentBodyColumn")
-        video_column = self.page.findChild(QFrame, "douyinCommerceContentVideoColumn")
+        log_column = self.page.findChild(QFrame, "douyinCommerceExecutionLog")
 
         self.assertIsNotNone(account_column)
         self.assertIsNotNone(content_column)
-        self.assertIsNotNone(video_column)
-        self.assertTrue(account_column.isAncestorOf(self.page.restore_content_button))
-        self.assertFalse(content_column.isAncestorOf(self.page.save_content_button))
-        self.assertTrue(video_column.isAncestorOf(self.page.save_content_button))
-        video_layout = video_column.layout()
-        self.assertIsNotNone(video_layout)
-        self.assertIs(
-            video_layout.itemAt(video_layout.count() - 1).widget(),
-            self.page.save_content_button,
-        )
+        self.assertIsNotNone(log_column)
+        self.assertTrue(account_column.isAncestorOf(self.page.video_preview))
+        self.assertTrue(content_column.isAncestorOf(self.page.restore_content_button))
+        self.assertTrue(content_column.isAncestorOf(self.page.save_content_button))
+        self.assertTrue(content_column.isAncestorOf(self.page.tag_history_host))
         self.assertEqual(self.page.video_replace_button.text(), "选择视频")
         self.assertIs(self.page.operation_dock_upload.parent(), self.page.operation_dock)
         self.assertFalse(self.page.operation_dock.isHidden())
 
     def test_content_cards_keep_only_primary_section_titles(self) -> None:
-        """三栏卡片不得再展示重复的副标题，避免用户先读说明再找操作。"""
+        """内容准备的输入栏只保留账号、内容两个主标题。"""
 
         headings = self.page.findChildren(
             QLabel, "douyinCommerceReferenceCardEyebrow"
         )
 
-        self.assertEqual([heading.text() for heading in headings], ["账号", "内容", "视频"])
+        self.assertEqual([heading.text() for heading in headings], ["账号", "内容"])
         self.assertIsNone(
             self.page.findChild(QLabel, "douyinCommerceReferenceCardTitle")
         )
@@ -1878,12 +2012,9 @@ class DouyinCommerceUiTests(unittest.TestCase):
         self.app.processEvents()
 
         cards = [
-            self.page.findChild(QFrame, object_name)
-            for object_name in (
-                "douyinCommerceContentAccountColumn",
-                "douyinCommerceContentBodyColumn",
-                "douyinCommerceContentVideoColumn",
-            )
+            self.page.findChild(QFrame, "douyinCommerceContentAccountColumn"),
+            self.page.findChild(QFrame, "douyinCommerceContentBodyColumn"),
+            self.page.content_execution_log,
         ]
         self.assertTrue(all(card is not None and card.height() >= 500 for card in cards))
         self.assertLessEqual(max(card.y() for card in cards) - min(card.y() for card in cards), 3)
@@ -1989,6 +2120,42 @@ class DouyinCommerceUiTests(unittest.TestCase):
         run.assert_not_called()
         self.assertEqual(self.page._session_id, "")
 
+    def test_clear_current_content_keeps_saved_content_recoverable(self) -> None:
+        """清空按钮只能清当前表单，不得删除本机已保存内容或启动平台操作。"""
+
+        self.page.account_combo.addItem(
+            "测试账号",
+            {"id": 31, "type": 3, "status": 1, "filePath": "oneclick_3_demo.json"},
+        )
+        self.page.video_combo.addItem(
+            "测试视频.mp4",
+            {"id": 42, "storedPath": "/tmp/demo.mp4", "filename": "测试视频.mp4"},
+        )
+        self.page.account_combo.setCurrentIndex(self.page.account_combo.count() - 1)
+        self.page.video_combo.setCurrentIndex(self.page.video_combo.count() - 1)
+        self.page.title_input.setText("待清空标题")
+        self.page.description_input.setPlainText("待清空文案")
+        self.page._set_tags(["北海", "团购"])
+        self.page._uploaded_editor_payload = {"title": "旧标题"}
+        self.page._pending_upload_payload = {"title": "旧标题"}
+        self.page._preflight_fingerprint = "旧预检"
+        self.page._saved_content_available = True
+
+        with patch.object(self.page.runner, "run") as run:
+            self.page.clear_current_content()
+
+        self.assertEqual(self.page.account_combo.currentIndex(), 0)
+        self.assertEqual(self.page.video_combo.currentIndex(), 0)
+        self.assertEqual(self.page.title_input.text(), "")
+        self.assertEqual(self.page.description_input.toPlainText(), "")
+        self.assertEqual(self.page._tags(), [])
+        self.assertIsNone(self.page._uploaded_editor_payload)
+        self.assertIsNone(self.page._pending_upload_payload)
+        self.assertEqual(self.page._preflight_fingerprint, "")
+        self.assertTrue(self.page._saved_content_available)
+        self.assertTrue(self.page.restore_content_button.isEnabled())
+        run.assert_not_called()
+
     def test_video_card_shows_compact_material_metadata(self) -> None:
         """素材卡只保留文件名、时长和尺寸，避免把素材库内部状态暴露给用户。"""
 
@@ -2055,6 +2222,29 @@ class DouyinCommerceUiTests(unittest.TestCase):
         self.page._session_id = "session-demo"
         self.page._content_changed()
         self.assertTrue(self.page.content_notice.isHidden())
+
+    def test_editing_content_after_review_clears_old_failure_and_offers_sync(self) -> None:
+        """从检查页返回编辑标题、文案、标签时应同步，而不是保留失败或要求重传。"""
+
+        payload = {
+            "accountList": ["oneclick_3_demo.json"],
+            "fileList": ["/tmp/demo.mp4"],
+            "title": "原标题",
+            "description": "原文案",
+            "tags": ["北海"],
+        }
+        changed = dict(payload, description="修改后的文案")
+        self.page._session_id = "session-demo"
+        self.page._uploaded_editor_payload = dict(payload)
+        self.page.pages.setCurrentIndex(0)
+        self.page._set_stage_error("content", "上次同步失败")
+
+        with patch.object(self.page, "collect_upload_payload", return_value=changed):
+            self.page._content_changed()
+            self.assertEqual(self.page._content_change_kind(), "sync")
+            self.assertEqual(self.page.upload_button.text(), "同步内容并继续")
+
+        self.assertTrue(self.page._stage_error_labels["content"].isHidden())
 
     def test_unchanged_content_returns_to_platform_settings_without_runner_work(self) -> None:
         """回到内容页但未改任何字段时，只切换页面，不启动后台任务。"""
@@ -2166,6 +2356,28 @@ class DouyinCommerceUiTests(unittest.TestCase):
         self.assertIs(
             self.page.location_view_stack.currentWidget(), self.page.location_search_view
         )
+        self.assertEqual(self.page._locations, [])
+        self.assertEqual(self.page.location_result_list.count(), 0)
+
+    def test_location_write_failure_discards_stale_candidates_before_retry(self) -> None:
+        """平台下拉已关闭时，旧候选不能继续被当作当前可点击项。"""
+
+        self.page._show_locations([self.location_a])
+        with patch.object(self.page, "_start_location_write"):
+            self.page.location_result_list.setCurrentRow(0)
+        with patch.object(self.page, "_platform_action_error"):
+            self.page._immediate_location_failed("页面未找到唯一匹配的发布定位")
+
+        self.assertEqual(self.page._locations, [])
+        self.assertEqual(self.page.location_result_list.count(), 0)
+        self.assertIs(
+            self.page.location_view_stack.currentWidget(), self.page.location_search_view
+        )
+
+    def test_location_and_tag_placeholders_do_not_expose_specific_places(self) -> None:
+        self.assertNotIn("北海", self.page.tags_input.placeholderText())
+        self.assertNotIn("北海", self.page.location_keyword.placeholderText())
+        self.assertNotIn("夜南香", self.page.location_keyword.placeholderText())
 
     def test_progress_indicator_is_noninteractive_and_back_navigation_does_not_skip(self) -> None:
         """步骤条只表达状态；真正的前进/返回由当前页操作按钮控制。"""
@@ -2199,6 +2411,25 @@ class DouyinCommerceUiTests(unittest.TestCase):
         self.page._pending_declaration = "内容由AI生成"
         self.page._declaration_applied_success("内容由AI生成")
         self.assertTrue(self.page._can_review())
+
+    def test_review_return_becomes_new_content_after_editor_session_ends(self) -> None:
+        """提交完成关闭编辑会话后，检查页必须仍能回到内容准备。"""
+
+        self.page.pages.setCurrentIndex(2)
+        self.page._session_id = ""
+        self.page.return_from_review()
+
+        self.assertEqual(self.page.pages.currentIndex(), 0)
+        self.assertEqual(self.page.review_back_button.text(), "开始新内容")
+
+    def test_content_preparation_requires_account_video_and_description_only(self) -> None:
+        self.page.title_input.clear()
+        self.page._set_tags([])
+        self.page.description_input.setPlainText("仅填写作品文案")
+        with patch.object(self.page, "_selected_account", return_value={"id": 1}), patch.object(
+            self.page, "_selected_video", return_value={"id": 2}
+        ):
+            self.assertTrue(self.page._content_is_valid())
 
     def test_timer_is_optional_and_enters_review_after_required_platform_readbacks(self) -> None:
         self.page._session_id = "session-demo"
@@ -2482,6 +2713,48 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
         self.assertEqual(result["message"], "登录已失效，请到账号管理重新登录")
         self.assertNotIn("sessionId", result)
         self.assertNotIn("Locator", str(result))
+
+    def test_music_selection_failure_discards_transient_platform_candidates(self) -> None:
+        """音乐弹窗回读失败后，不得将旧 marker 留给下一次更换操作。"""
+
+        class OpenPage:
+            def is_closed(self) -> bool:
+                return False
+
+        old_music = {"musicId": "music-old", "title": "旧音乐"}
+        candidate = {"musicId": "music-new", "title": "新音乐", "marker": "row-1"}
+        manager = douyin_commerce_session.DouyinCommerceSessionManager()
+        manager._session = douyin_commerce_session._CommerceEditorSession(
+            session_id="session-demo",
+            upload_payload={},
+            account_name="测试账号",
+            browser=None,
+            context=None,
+            page=OpenPage(),
+            playwright=None,
+            uploader=None,
+            music_picker_page=object(),
+            music_dialog=object(),
+            music_candidates=[candidate],
+            selected_music=old_music,
+        )
+        with patch.object(
+            douyin_commerce_session.douyin_music_service,
+            "select_favorite_music_choice",
+            new_callable=AsyncMock,
+            side_effect=douyin_music_service.DouyinMusicError("平台条目已刷新"),
+        ):
+            with self.assertRaisesRegex(
+                douyin_commerce_session.DouyinCommerceSessionError,
+                "未能选择并回读",
+            ):
+                asyncio.run(manager._select_favorite_music("session-demo", "music-new"))
+
+        self.assertIsNone(manager._session.music_picker_page)
+        self.assertIsNone(manager._session.music_dialog)
+        self.assertEqual(manager._session.music_candidates, [])
+        self.assertEqual(manager._session.selected_music, old_music)
+        self.assertEqual(manager._session.stage, "music_selected")
 
     def test_session_manager_defaults_upload_context_to_background(self) -> None:
         """上传会话默认后台；显式 false 才允许兼容旧调用。"""

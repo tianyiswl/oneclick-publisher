@@ -41,11 +41,25 @@ def _resolve_log_root() -> Path | None:
 LOG_ROOT = _resolve_log_root()
 
 
-def configure_console_logger(sink) -> bool:
+def configure_console_logger(sink, *, colorize: bool = True) -> int | None:
+    if sink is None:
+        return None
+    return logger.add(sink, colorize=colorize, format=log_formatter)
+
+
+def redirect_console_logger(sink) -> bool:
+    """将 Loguru 的控制台输出改投到桌面客户端日志面板。"""
+
+    global _CONSOLE_HANDLER_ID
     if sink is None:
         return False
-    logger.add(sink, colorize=True, format=log_formatter)
-    return True
+    if _CONSOLE_HANDLER_ID is not None:
+        try:
+            logger.remove(_CONSOLE_HANDLER_ID)
+        except ValueError:
+            pass
+    _CONSOLE_HANDLER_ID = configure_console_logger(sink, colorize=False)
+    return _CONSOLE_HANDLER_ID is not None
 
 
 def create_logger(log_name: str, file_path: str):
@@ -77,7 +91,7 @@ def create_logger(log_name: str, file_path: str):
 # Remove all existing handlers
 logger.remove()
 # Windows 的 PyInstaller windowed 模式没有 stdout，日志不能阻断应用启动。
-configure_console_logger(stdout)
+_CONSOLE_HANDLER_ID = configure_console_logger(stdout)
 
 douyin_logger = create_logger('douyin', 'logs/douyin.log')
 tencent_logger = create_logger('tencent', 'logs/tencent.log')

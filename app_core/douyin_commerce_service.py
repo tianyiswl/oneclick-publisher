@@ -340,8 +340,6 @@ def _validate_douyin_commerce_content(
         raise DouyinCommerceError("抖音带货需要且只允许一条可读取的视频素材")
     checked["fileList"] = files
 
-    if not _normalized(checked.get("title")):
-        raise DouyinCommerceError(f"{action}缺少标题")
     if not _normalized(checked.get("description")):
         raise DouyinCommerceError(f"{action}缺少作品描述")
     return checked

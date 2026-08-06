@@ -39,7 +39,14 @@ def _normalized(value: object) -> str:
 
 
 def _expected_account_name(account: Mapping[str, Any]) -> str:
-    return _normalized(account.get("profileName") or account.get("userName"))
+    """返回用于官方身份回读的抖音昵称。
+
+    ``profileName`` 是一键发的主体归属字段，可以是内部编号，不能作为
+    抖音创作中心回执昵称的首选依据。只有账号登录时保存的 ``userName``
+    才是可与官方昵称逐字核对的值；旧账号没有昵称时才兼容回退到主体名。
+    """
+
+    return _normalized(account.get("userName") or account.get("profileName"))
 
 
 def _scheduled_time(payload: Mapping[str, Any]) -> datetime | None:

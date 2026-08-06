@@ -7,10 +7,11 @@ from datetime import datetime, timedelta
 import tempfile
 from pathlib import Path
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
 from app_core import douyin_publish_executor
+from uploader.douyin_uploader.main import DouYinVideo
 
 try:
     from app_core import publish_service
@@ -129,6 +130,22 @@ class DouyinPublishPayloadTests(unittest.TestCase):
         ):
             douyin_publish_executor._verified_douyin_identity("知言", "")
 
+    def test_identity_readback_uses_platform_nickname_before_profile_name(self) -> None:
+        """主体编号不能替代抖音官方回执中的账号昵称。"""
+
+        self.assertEqual(
+            douyin_publish_executor._expected_account_name(
+                {"profileName": "3199", "userName": "逆浪风"}
+            ),
+            "逆浪风",
+        )
+        self.assertEqual(
+            douyin_publish_executor._expected_account_name(
+                {"profileName": "旧主体", "userName": ""}
+            ),
+            "旧主体",
+        )
+
     def test_only_final_confirmation_failures_hold_foreground(self) -> None:
         self.assertTrue(
             douyin_publish_executor._requires_foreground_hold(
@@ -155,6 +172,40 @@ class DouyinPublishPayloadTests(unittest.TestCase):
                 "抖音页面要求扫码登录后继续"
             )
         )
+
+    def test_editor_body_retries_when_previous_text_is_appended(self) -> None:
+        """Windows 富文本编辑器保留旧文本时，应清空后重试而非直接报同步失败。"""
+
+        video = DouYinVideo(
+            title="测试标题",
+            file_path="/tmp/demo.mp4",
+            tags=[],
+            publish_date=datetime.now(),
+            account_file="/tmp/account.json",
+            description="测试",
+        )
+        editor = MagicMock()
+        editor.fill = AsyncMock()
+        editor.click = AsyncMock()
+        page = MagicMock()
+        page.keyboard.press = AsyncMock()
+        page.keyboard.insert_text = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+
+        # 第一次写入后回读为“测试测试”，第二次清空、写入后回读正确。
+        with patch.object(
+            video,
+            "_read_raw_editor_text",
+            new_callable=AsyncMock,
+            side_effect=["", "测试测试", "", "测试"],
+        ) as read_back:
+            import asyncio
+
+            asyncio.run(video._fill_editor_body(page, editor, "测试"))
+
+        self.assertEqual(editor.fill.await_count, 2)
+        self.assertEqual(read_back.await_count, 4)
+        self.assertEqual(page.keyboard.insert_text.await_count, 2)
 
 
 @unittest.skipIf(publish_service is None, "当前离线环境未安装 Playwright，跳过桌面路由测试")

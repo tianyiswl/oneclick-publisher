@@ -351,24 +351,16 @@ class DouYinVideo(object):
 
     async def clear_platform_title(self, page):
         title_inputs = await self._visible_title_inputs(page)
-        if self.description is None:
-            if title_inputs:
-                await title_inputs[0].fill("")
-                douyin_logger.info("抖音独立标题已留空，统一使用作品描述承载标题和话题")
-            return
-
         if len(title_inputs) != 1:
             raise RuntimeError(
                 f"抖音独立标题输入框数量异常：{len(title_inputs)}，已停止填写"
             )
         title = (self.title or "").strip()
-        if not title:
-            raise RuntimeError("抖音标题为空，已停止填写")
         await title_inputs[0].fill(title)
         actual_title = (await title_inputs[0].input_value()).strip()
         if actual_title != title:
             raise RuntimeError(f"抖音标题写入后不一致：期望={title}，实际={actual_title}")
-        douyin_logger.info("抖音独立标题已填写并回读确认")
+        douyin_logger.info("抖音独立标题已填写并回读确认" if title else "抖音独立标题已留空并回读确认")
 
     async def fill_description_and_topics(self, page):
         douyin_logger.info("正在填充抖音作品描述...")
@@ -450,15 +442,57 @@ class DouYinVideo(object):
         return confirmed_topics, skipped_topics
 
     async def _fill_editor_body(self, page, editor, body):
-        await editor.fill("")
-        await editor.click(force=True)
-        lines = body.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-        for index, line in enumerate(lines):
-            if line:
-                await page.keyboard.insert_text(line)
-            if index < len(lines) - 1:
-                await page.keyboard.press("Enter")
-        await page.wait_for_timeout(300)
+        """清空后写入作品文案，并确认编辑器没有保留旧内容。
+
+        Windows 端的抖音富文本编辑器偶尔会吞掉 ``fill(\"\")`` 的清空事件，
+        导致新输入的文案追加在旧内容之后。这里通过键盘全选删除和两次页面回读
+        确认写入结果；有限重试后仍不一致才停止流程，避免保存错误草稿。
+        """
+
+        expected_body = self._normalize_body_text(body)
+        lines = str(body or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        for attempt in range(1, 4):
+            await editor.fill("")
+            await editor.click(force=True)
+            await page.keyboard.press("Control+A")
+            await page.keyboard.press("Backspace")
+            await page.wait_for_timeout(250)
+
+            actual_after_clear = self._normalize_body_text(
+                await self._read_raw_editor_text(editor)
+            )
+            if actual_after_clear:
+                if attempt < 3:
+                    douyin_logger.warning(
+                        f"抖音详情编辑器未清空，第{attempt}次重试：{actual_after_clear!r}"
+                    )
+                    continue
+                raise RuntimeError(
+                    "抖音详情编辑器未能清空旧文案，已停止同步以避免内容重复"
+                )
+
+            for index, line in enumerate(lines):
+                if line:
+                    await page.keyboard.insert_text(line)
+                if index < len(lines) - 1:
+                    await page.keyboard.press("Enter")
+            await page.wait_for_timeout(350)
+
+            actual_after_write = self._normalize_body_text(
+                await self._read_raw_editor_text(editor)
+            )
+            if actual_after_write == expected_body:
+                return
+            if attempt < 3:
+                douyin_logger.warning(
+                    "抖音详情编辑器写入回读不一致，"
+                    f"第{attempt}次重试：期望={expected_body!r}，实际={actual_after_write!r}"
+                )
+                continue
+            raise RuntimeError(
+                "抖音详情写入后回读不一致，已停止同步以避免内容重复；"
+                f"期望={expected_body!r}，实际={actual_after_write!r}"
+            )
 
     @staticmethod
     def _normalize_topic_mention(value):

@@ -763,16 +763,59 @@ def apply_style(app: QApplication) -> None:
             border: 1px solid #DDE6EB;
             border-radius: 12px;
         }
+        QFrame#douyinCommerceReviewPanel {
+            background: #FFFFFF;
+            border: 1px solid #D7E2EC;
+            border-radius: 16px;
+        }
+        QLabel#douyinCommerceReviewSummarySection {
+            color: #1F4E72;
+            background: #EEF7FF;
+            border: 1px solid #D3E8F8;
+            border-radius: 8px;
+            padding: 6px 10px;
+            font-size: 12px;
+            font-weight: 750;
+        }
+        QFrame#douyinCommerceReviewSummaryItem {
+            background: #F8FAFC;
+            border: 1px solid #E2E8F0;
+            border-radius: 10px;
+        }
+        QLabel#douyinCommerceReviewSummaryLabel {
+            color: #718096;
+            background: transparent;
+            border: 0;
+            font-size: 11px;
+            font-weight: 700;
+        }
+        QLabel#douyinCommerceReviewSummaryValue {
+            color: #1D2939;
+            background: transparent;
+            border: 0;
+            font-size: 13px;
+            font-weight: 650;
+        }
+        QLabel#douyinCommerceReviewValidation {
+            color: #526174;
+            background: #F7FAFC;
+            border-left: 3px solid #89B9B3;
+            border-radius: 6px;
+            padding: 8px 10px;
+            font-size: 12px;
+        }
         QFrame#douyinCommerceContentAccountColumn,
         QFrame#douyinCommerceContentBodyColumn,
-        QFrame#douyinCommerceContentVideoColumn {
+        QFrame#douyinCommerceContentVideoColumn,
+        QFrame#douyinCommerceExecutionLog {
             background: #FFFFFF;
             border: 1px solid #DDE6EB;
             border-radius: 12px;
         }
         QFrame#douyinCommercePlatformWorkspace,
         QFrame#douyinCommercePlatformLeftColumn,
-        QFrame#douyinCommercePlatformRightColumn {
+        QFrame#douyinCommercePlatformRightColumn,
+        QFrame#douyinCommerceReviewWorkspace {
             background: transparent;
             border: 0;
         }
@@ -1217,10 +1260,68 @@ def apply_style(app: QApplication) -> None:
         }
         QFrame#douyinCommerceContentAccountColumn,
         QFrame#douyinCommerceContentBodyColumn,
-        QFrame#douyinCommerceContentVideoColumn {
+        QFrame#douyinCommerceContentVideoColumn,
+        QFrame#douyinCommerceExecutionLog {
             background: #FFFFFF;
             border: 1px solid #D7E2EC;
             border-radius: 16px;
+        }
+        QLabel#douyinCommerceExecutionLogTitle {
+            color: #22334A;
+            font-size: 16px;
+            font-weight: 750;
+        }
+        QLabel#douyinCommerceExecutionLogHint {
+            color: #087C78;
+            background: #E8F7F5;
+            border: 1px solid #BCE8E1;
+            border-radius: 8px;
+            padding: 2px 7px;
+            font-size: 11px;
+            font-weight: 700;
+        }
+        QListWidget#douyinCommerceMusicCandidates {
+            color: #243B53;
+            background: #F8FBFC;
+            border: 1px solid #BFD8E6;
+            border-radius: 8px;
+            padding: 3px;
+            outline: 0;
+        }
+        QListWidget#douyinCommerceMusicCandidates::item {
+            min-height: 30px;
+            border-radius: 5px;
+            padding: 4px 7px;
+        }
+        QListWidget#douyinCommerceMusicCandidates::item:hover,
+        QListWidget#douyinCommerceMusicCandidates::item:selected {
+            color: #075F59;
+            background: #E8F7F5;
+        }
+        QPushButton#douyinCommerceCopyExecutionLog {
+            min-height: 26px;
+            color: #167A9F;
+            background: #F4FAFC;
+            border: 1px solid #C7E2EE;
+            border-radius: 7px;
+            padding: 0 8px;
+            font-size: 11px;
+            font-weight: 700;
+        }
+        QPushButton#douyinCommerceCopyExecutionLog:hover {
+            color: #075F59;
+            background: #E8F7F5;
+            border-color: #9ED8CF;
+        }
+        QPlainTextEdit#douyinCommerceExecutionLogOutput {
+            color: #C7E9E3;
+            background: #17243A;
+            border: 1px solid #29415E;
+            border-radius: 10px;
+            padding: 9px;
+            font-family: "Cascadia Mono", "Consolas", monospace;
+            font-size: 13px;
+            selection-background-color: #315C6B;
         }
         QFrame#douyinCommerceReferenceCardHead {
             background: transparent;
