@@ -27,11 +27,19 @@ from .douyin_location_preset_service import (
     DouyinLocationPresetError,
     match_location_preset,
 )
-from .douyin_verification import DouyinVerificationError, VerificationChallenge
+from .douyin_verification import (
+    DouyinVerificationError,
+    VerificationChallenge,
+    verification_broker as _default_verification_broker,
+)
 
 
 _SHANGHAI = ZoneInfo(SHANGHAI_TIMEZONE)
 _INTERVENTION_MARKERS = ("验证", "验证码", "二维码", "登录", "风控", "合规", "未知")
+_LOGIN_PAUSE_STATUSES = frozenset(
+    {"needs_login", "login_required", "requires_login", "login_expired"}
+)
+_ACTIVE_VERIFICATION_STATES = frozenset({"waiting", "processing"})
 
 
 class DouyinCommerceBatchExecutorError(RuntimeError):
@@ -70,6 +78,15 @@ def _is_intervention_error(error: Exception) -> bool:
         return True
     message = _text(error).casefold()
     return any(marker in message for marker in _INTERVENTION_MARKERS)
+
+
+def _controlled_upload_pause_status(upload: object) -> str:
+    """只识别会话管理器明确返回的登录失效状态，避免猜测异常文本。"""
+
+    if not isinstance(upload, Mapping):
+        return ""
+    status = _text(upload.get("status")).casefold().replace("-", "_").replace(" ", "_")
+    return "waiting_login" if status in _LOGIN_PAUSE_STATUSES else ""
 
 
 def _runtime_payload(
@@ -130,10 +147,12 @@ class DouyinCommerceBatchExecutor:
         *,
         task_store: Any = task_service,
         now: Callable[[], datetime] | None = None,
+        verification_broker: Any = _default_verification_broker,
     ) -> None:
         self._manager = manager
         self._task_store = task_store
         self._now = now or (lambda: datetime.now(_SHANGHAI))
+        self._verification_broker = verification_broker
 
     def run_preflight(
         self,
@@ -247,6 +266,72 @@ class DouyinCommerceBatchExecutor:
         except ValueError as exc:
             raise DouyinCommerceBatchExecutorError(str(exc)) from exc
 
+    def _has_active_verification(self, task_id: int) -> bool:
+        """仅信任仍由同一进程 broker 持有的 active 验证请求。
+
+        验证被取消、过期或失败后，broker 不会再返回 active 请求。此时绝不能
+        用异常文本把失败伪装成可恢复的 ``waiting_verification``。
+        """
+
+        try:
+            request_id = self._verification_broker.request_for_task(int(task_id))
+            if not request_id:
+                return False
+            snapshot = self._verification_broker.snapshot(request_id)
+        except Exception:
+            return False
+        return _text(snapshot.get("state")) in _ACTIVE_VERIFICATION_STATES
+
+    def _record_login_waiting(
+        self,
+        task_id: int,
+        item_id: int,
+        *,
+        index: int,
+        total: int,
+        progress: Callable[[BatchProgressEvent], None] | None,
+    ) -> dict[str, object]:
+        self._record_progress(
+            task_id,
+            item_id,
+            ok=True,
+            event_type="login_waiting",
+            message=f"第 {index + 1} 条视频需要到账号管理重新登录，批量已暂停",
+        )
+        self._emit(
+            progress,
+            index=index,
+            total=total,
+            phase="waiting_login",
+            message=f"第 {index + 1} 条视频等待重新登录",
+        )
+        return {"index": index, "status": "waiting_login"}
+
+    def _record_active_verification_waiting(
+        self,
+        task_id: int,
+        item_id: int,
+        *,
+        index: int,
+        total: int,
+        progress: Callable[[BatchProgressEvent], None] | None,
+    ) -> dict[str, object]:
+        self._record_progress(
+            task_id,
+            item_id,
+            ok=True,
+            event_type="verification_waiting",
+            message=f"第 {index + 1} 条视频需要用户完成抖音验证，批量已暂停",
+        )
+        self._emit(
+            progress,
+            index=index,
+            total=total,
+            phase="waiting_verification",
+            message=f"第 {index + 1} 条视频等待用户验证",
+        )
+        return {"index": index, "status": "waiting_verification"}
+
     def _verification_progress_callback(
         self,
         *,
@@ -263,20 +348,16 @@ class DouyinCommerceBatchExecutor:
             if isinstance(challenge, VerificationChallenge):
                 # 这份副本只存在回调栈中；二维码字节仍由 broker 在内存托管。
                 challenge = replace(challenge, item_index=index, item_label=label)
-            self._record_progress(
-                task_id,
-                item_id,
-                ok=True,
-                event_type="verification_waiting",
-                message=f"第 {index + 1} 条视频需要用户完成抖音验证，批量已暂停",
-            )
-            self._emit(
-                progress,
-                index=index,
-                total=total,
-                phase="waiting_verification",
-                message=f"第 {index + 1} 条视频等待用户验证",
-            )
+            # session manager 仅会在 broker 请求已经创建后调用回调。没有 active
+            # 请求时不落 waiting 事件，以免已取消/过期的验证码留下可恢复假象。
+            if self._has_active_verification(task_id):
+                self._record_active_verification_waiting(
+                    task_id,
+                    item_id,
+                    index=index,
+                    total=total,
+                    progress=progress,
+                )
             return challenge
 
         return _callback
@@ -311,7 +392,11 @@ class DouyinCommerceBatchExecutor:
                 progress=progress,
             )
             results.append(result)
-            if result["status"] == "waiting_verification":
+            if result["status"] in {
+                "waiting_login",
+                "waiting_verification",
+                "verification_failed",
+            }:
                 paused = True
         return results
 
@@ -329,6 +414,7 @@ class DouyinCommerceBatchExecutor:
     ) -> dict[str, object]:
         label = _safe_item_label(item, index)
         session_id = ""
+        retain_session = False
         # 上传、内容写入、地点和预检都必须留在 dry-run 会话；只有通过同一
         # 会话的最终 submit 才可显式切换为 publish。
         payload = _runtime_payload(batch, item, mode="preflight")
@@ -338,6 +424,16 @@ class DouyinCommerceBatchExecutor:
         try:
             self._emit(progress, index=index, total=total, phase="uploading", message=f"正在上传第 {index + 1} 条视频")
             upload = self._manager.start_upload(payload)
+            login_pause = _controlled_upload_pause_status(upload)
+            if login_pause:
+                waiting = self._record_login_waiting(
+                    task_id,
+                    item_id,
+                    index=index,
+                    total=total,
+                    progress=progress,
+                )
+                return {**waiting, "label": label}
             if not isinstance(upload, Mapping) or not _text(upload.get("sessionId")):
                 raise DouyinCommerceBatchExecutorError("抖音上传会话未返回唯一会话标识")
             session_id = _text(upload.get("sessionId"))
@@ -398,13 +494,34 @@ class DouyinCommerceBatchExecutor:
             self._emit(progress, index=index, total=total, phase="published", message=f"第 {index + 1} 条视频已取得平台回读")
             return {"index": index, "label": label, "status": "published"}
         except Exception as exc:
+            if self._has_active_verification(task_id):
+                # 仅 broker 仍持有同一 active 请求时才保留会话。真实 manager 在
+                # 该会话内等待用户输入并从当前 submit 调用继续，因此不会重复提交。
+                retain_session = True
+                waiting = self._record_active_verification_waiting(
+                    task_id,
+                    item_id,
+                    index=index,
+                    total=total,
+                    progress=progress,
+                )
+                return {**waiting, "label": label}
             if _is_intervention_error(exc):
                 self._record_progress(
-                    task_id, item_id, ok=True, event_type="verification_waiting",
-                    message=f"第 {index + 1} 条视频需要用户完成抖音验证，批量已暂停",
+                    task_id,
+                    item_id,
+                    ok=False,
+                    event_type="verification_failed",
+                    message=f"第 {index + 1} 条视频的抖音验证未完成，批量已安全停止",
                 )
-                self._emit(progress, index=index, total=total, phase="waiting_verification", message=f"第 {index + 1} 条视频等待用户验证")
-                return {"index": index, "label": label, "status": "waiting_verification"}
+                self._emit(
+                    progress,
+                    index=index,
+                    total=total,
+                    phase="verification_failed",
+                    message=f"第 {index + 1} 条视频验证失败或已取消，批量已停止",
+                )
+                return {"index": index, "label": label, "status": "verification_failed"}
             self._record_progress(
                 task_id, item_id, ok=False, event_type="batch_item_failed",
                 message=f"第 {index + 1} 条视频未完成平台回读，已跳过继续下一条",
@@ -412,5 +529,5 @@ class DouyinCommerceBatchExecutor:
             self._emit(progress, index=index, total=total, phase="failed", message=f"第 {index + 1} 条视频未完成，继续下一条")
             return {"index": index, "label": label, "status": "failed"}
         finally:
-            if session_id:
+            if session_id and not retain_session:
                 self._manager.close(session_id)

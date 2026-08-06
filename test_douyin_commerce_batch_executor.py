@@ -19,7 +19,11 @@ from app_core.douyin_commerce_batch_executor import (
 )
 from app_core.douyin_commerce_batch_service import apply_interval_schedule, validate_batch_payload
 from app_core.douyin_location_service import normalize_location_candidate
-from app_core.douyin_verification import DouyinVerificationError, VerificationChallenge
+from app_core.douyin_verification import (
+    DouyinVerificationBroker,
+    DouyinVerificationError,
+    VerificationChallenge,
+)
 
 
 class FakeCommerceSessionManager:
@@ -30,10 +34,16 @@ class FakeCommerceSessionManager:
         *,
         fail_item_indexes: set[int] | None = None,
         challenge_on_index: int | None = None,
+        login_on_index: int | None = None,
+        verification_mode: str = "",
+        verification_broker: DouyinVerificationBroker | None = None,
         location_candidates: list[dict] | None = None,
     ) -> None:
         self.fail_item_indexes = fail_item_indexes or set()
         self.challenge_on_index = challenge_on_index
+        self.login_on_index = login_on_index
+        self.verification_mode = verification_mode
+        self.verification_broker = verification_broker
         self.location_candidates = location_candidates
         self.calls: list[str] = []
         self.open_sessions = 0
@@ -47,6 +57,11 @@ class FakeCommerceSessionManager:
         index = len([call for call in self.calls if call.startswith("start_upload:")])
         session_id = f"session-{index}"
         self.calls.append(f"start_upload:{index}")
+        if self.login_on_index == index:
+            return {
+                "status": "needs_login",
+                "message": "登录已失效，请到账号管理重新登录",
+            }
         self._index_by_session[session_id] = index
         self.open_sessions += 1
         self.max_open_sessions = max(self.max_open_sessions, self.open_sessions)
@@ -95,9 +110,8 @@ class FakeCommerceSessionManager:
         session_id: str,
         _payload: dict,
         task_id: int | None = None,
-        **_kwargs,
+        **kwargs,
     ) -> dict:
-        del task_id
         if _payload.get("runtimeMode") != "publish" or _payload.get("debugDryRun") is not False:
             raise AssertionError("最终提交必须明确发布模式")
         index = self._index_by_session[session_id]
@@ -106,6 +120,43 @@ class FakeCommerceSessionManager:
             raise RuntimeError(f"第 {index} 条平台回读失败")
         if self.challenge_on_index == index and not self._challenge_seen:
             self._challenge_seen = True
+            callback = kwargs.get("on_verification")
+            if self.verification_broker is not None and callback is not None:
+                request_id = self.verification_broker.create_sms(
+                    task_id=int(task_id or 0),
+                    message="请在一键发客户端输入短信验证码",
+                )
+                callback(VerificationChallenge(kind="sms", message="需要短信验证"))
+                if self.verification_mode == "active_success":
+                    self.assert_active_request(request_id)
+                    self.verification_broker.submit_code(request_id, "123456")
+                    if self.verification_broker.claim_code(request_id) != "123456":
+                        raise AssertionError("验证码必须在同一 active 请求中被领取")
+                    self.verification_broker.succeed(request_id)
+                    return {
+                        "ok": True,
+                        "scheduled": False,
+                        "message": f"第 {index} 条作品已由平台管理页回读",
+                        "platformReceipt": {
+                            "platformPostId": f"post-{index}",
+                            "publishedAt": "2026-08-06 10:00",
+                            "timezone": "Asia/Shanghai",
+                        },
+                    }
+                elif self.verification_mode == "cancelled":
+                    if not self.verification_broker.cancel(request_id):
+                        raise AssertionError("active 验证必须允许被取消")
+                    raise DouyinVerificationError("用户已取消抖音验证，发布已安全停止")
+                elif self.verification_mode == "failed":
+                    self.verification_broker.fail(request_id)
+                    raise DouyinVerificationError("抖音短信验证未通过，发布已安全停止")
+                elif self.verification_mode == "timed_out":
+                    self.verification_broker.wait(request_id, timeout_seconds=0.000001)
+                    raise DouyinVerificationError("等待抖音验证超时，发布已安全停止")
+                elif self.verification_mode == "active_pending":
+                    raise DouyinVerificationError("抖音需要短信验证")
+                else:
+                    raise AssertionError("测试替身缺少验证状态模式")
             raise DouyinVerificationError("抖音需要短信验证")
         return {
             "ok": True,
@@ -125,6 +176,13 @@ class FakeCommerceSessionManager:
 
     def status(self) -> dict[str, str]:
         return {"active": "true" if self.open_sessions else "false", "stage": ""}
+
+    def assert_active_request(self, request_id: str) -> None:
+        if self.verification_broker is None:
+            raise AssertionError("测试替身缺少验证代理")
+        snapshot = self.verification_broker.snapshot(request_id)
+        if snapshot.get("state") != "waiting":
+            raise AssertionError("验证请求必须在用户输入前保持 active")
 
 
 class DouyinCommerceBatchExecutorTests(unittest.TestCase):
@@ -200,15 +258,116 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
         self.assertTrue(any(event.phase == "uploading" for event in events))
 
     def test_login_or_verification_pauses_batch_without_submitting_later_items(self) -> None:
-        manager = FakeCommerceSessionManager(challenge_on_index=1)
+        broker = DouyinVerificationBroker()
+        manager = FakeCommerceSessionManager(
+            challenge_on_index=1,
+            verification_mode="active_pending",
+            verification_broker=broker,
+        )
 
-        result = DouyinCommerceBatchExecutor(manager).run_publish(
+        result = DouyinCommerceBatchExecutor(manager, verification_broker=broker).run_publish(
             self.batch, task_id=self.task["id"], confirmed=True
         )
 
         self.assertEqual([row["status"] for row in result], ["published", "waiting_verification", "pending"])
         self.assertNotIn("submit:2", manager.calls)
+        self.assertNotIn("close:1", manager.calls)
+        self.assertEqual(manager.open_sessions, 1)
         self.assertEqual(task_service.get_task(self.task["id"])["items"][1]["status"], "running")
+
+    def test_needs_login_controlled_status_pauses_whole_batch_without_marking_item_failed(self) -> None:
+        manager = FakeCommerceSessionManager(login_on_index=1)
+
+        result = DouyinCommerceBatchExecutor(manager).run_publish(
+            self.batch, task_id=self.task["id"], confirmed=True
+        )
+
+        self.assertEqual(
+            [row["status"] for row in result],
+            ["published", "waiting_login", "pending"],
+        )
+        self.assertNotIn("submit:1", manager.calls)
+        self.assertNotIn("start_upload:2", manager.calls)
+        self.assertEqual(
+            [item["status"] for item in task_service.get_task(self.task["id"])["items"]],
+            ["success", "running", "pending"],
+        )
+
+    def test_active_sms_verification_keeps_current_session_and_continues_same_item_once(self) -> None:
+        broker = DouyinVerificationBroker()
+        manager = FakeCommerceSessionManager(
+            challenge_on_index=1,
+            verification_mode="active_success",
+            verification_broker=broker,
+        )
+        events: list[BatchProgressEvent] = []
+
+        result = DouyinCommerceBatchExecutor(
+            manager,
+            verification_broker=broker,
+        ).run_publish(
+            self.batch,
+            task_id=self.task["id"],
+            confirmed=True,
+            progress=events.append,
+        )
+
+        self.assertEqual([row["status"] for row in result], ["published"] * 3)
+        self.assertEqual(manager.calls.count("submit:1"), 1)
+        self.assertEqual(manager.calls.count("start_upload:1"), 1)
+        self.assertEqual(manager.max_open_sessions, 1)
+        self.assertIn("close:1", manager.calls)
+        self.assertTrue(any(event.phase == "waiting_verification" for event in events))
+        self.assertTrue(any(event.phase == "published" and event.index == 1 for event in events))
+
+    def test_cancelled_sms_verification_stops_batch_and_never_claims_waiting_resume(self) -> None:
+        broker = DouyinVerificationBroker()
+        manager = FakeCommerceSessionManager(
+            challenge_on_index=1,
+            verification_mode="cancelled",
+            verification_broker=broker,
+        )
+
+        result = DouyinCommerceBatchExecutor(
+            manager,
+            verification_broker=broker,
+        ).run_publish(self.batch, task_id=self.task["id"], confirmed=True)
+
+        self.assertEqual(
+            [row["status"] for row in result],
+            ["published", "verification_failed", "pending"],
+        )
+        self.assertNotIn("submit:2", manager.calls)
+        self.assertIn("close:1", manager.calls)
+        self.assertIsNone(broker.request_for_task(self.task["id"]))
+        self.assertEqual(
+            [item["status"] for item in task_service.get_task(self.task["id"])["items"]],
+            ["success", "failed", "pending"],
+        )
+
+    def test_failed_or_timed_out_sms_verification_stops_batch_without_waiting_resume(self) -> None:
+        for mode in ("failed", "timed_out"):
+            with self.subTest(mode=mode):
+                broker = DouyinVerificationBroker()
+                task = task_service.create_douyin_batch_task(self.batch)
+                manager = FakeCommerceSessionManager(
+                    challenge_on_index=1,
+                    verification_mode=mode,
+                    verification_broker=broker,
+                )
+
+                result = DouyinCommerceBatchExecutor(
+                    manager,
+                    verification_broker=broker,
+                ).run_publish(self.batch, task_id=task["id"], confirmed=True)
+
+                self.assertEqual(
+                    [row["status"] for row in result],
+                    ["published", "verification_failed", "pending"],
+                )
+                self.assertIsNone(broker.request_for_task(task["id"]))
+                event_types = [event["eventType"] for event in task_service.get_task(task["id"])["events"]]
+                self.assertEqual(event_types[-1], "verification_failed")
 
     def test_location_preset_must_exactly_match_current_editor_candidates(self) -> None:
         different_address = normalize_location_candidate(
