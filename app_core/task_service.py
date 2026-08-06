@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import re
 import uuid
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -30,10 +31,16 @@ _BATCH_READBACK_FIELDS = {
     "postUrl",
     "publishedAt",
     "scheduleTime",
+    "timezone",
 }
-# 仅批量执行器内部持有的来源哨兵；事件名本身不是平台回执凭据。
-_CONTROLLED_BATCH_RECEIPT_SOURCE = object()
+_SHANGHAI_TIMEZONE = "Asia/Shanghai"
 _BEIJING_SCHEDULE_RE = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}")
+
+
+@dataclass(frozen=True)
+class _ControlledBatchReceipt:
+    event_type: str
+    readback: dict[str, str]
 
 
 def _now() -> str:
@@ -95,6 +102,22 @@ def _has_final_batch_receipt(event_type: str, readback: dict[str, str]) -> bool:
     if event_type == "platform_publish_receipt":
         return bool(readback.get("platformPostId") or readback.get("postUrl"))
     return False
+
+
+def _build_controlled_batch_receipt(
+    event_type: str, readback: object, *, timezone: str
+) -> _ControlledBatchReceipt:
+    """仅供批量执行器在平台最终回读后构造可信回执。"""
+
+    if timezone != _SHANGHAI_TIMEZONE:
+        raise ValueError("批量定时回执必须使用 Asia/Shanghai")
+    safe_readback = _batch_readback_projection(readback)
+    safe_readback["timezone"] = _SHANGHAI_TIMEZONE
+    if event_type not in {"platform_publish_receipt", "platform_scheduled_receipt"}:
+        raise ValueError("批量可信回执类型无效")
+    if not _has_final_batch_receipt(event_type, safe_readback):
+        raise ValueError("批量可信回执缺少必要平台字段")
+    return _ControlledBatchReceipt(event_type=event_type, readback=safe_readback)
 
 
 def content_type_from_payload_json(payload_json: object) -> str:
@@ -599,7 +622,7 @@ def mark_platform_result(
         conn.commit()
 
 
-def mark_batch_item_result(
+def _write_batch_item_result(
     task_id: int,
     item_id: int,
     *,
@@ -607,22 +630,12 @@ def mark_batch_item_result(
     message: str,
     event_type: str,
     readback: dict | None,
-    receipt_source: object | None = None,
+    status: str,
 ) -> None:
-    """按视频条目写入平台事件；只有最终平台回执可标记成功。"""
+    """写入已由公开事件入口或受控回执入口判定的条目状态。"""
 
     now = _now()
     safe_readback = _batch_readback_projection(readback)
-    final_receipts = {"platform_publish_receipt", "platform_scheduled_receipt"}
-    requested_status = (
-        "failed"
-        if not ok
-        else "success"
-        if event_type in final_receipts
-        and receipt_source is _CONTROLLED_BATCH_RECEIPT_SOURCE
-        and _has_final_batch_receipt(event_type, safe_readback)
-        else "running"
-    )
     with connect() as conn:
         item = conn.execute(
             "SELECT id, status FROM publish_task_items WHERE id = ? AND taskId = ?", (int(item_id), int(task_id))
@@ -630,7 +643,7 @@ def mark_batch_item_result(
         if not item:
             raise ValueError("批量视频条目不属于该任务")
         # 已确认的平台成功是终态；后续编辑/预检事件只补充审计，不得回退。
-        status = "success" if item["status"] == "success" else requested_status
+        status = "success" if item["status"] == "success" else status
         conn.execute(
             """
             UPDATE publish_task_items
@@ -680,3 +693,33 @@ def mark_batch_item_result(
             ),
         )
         conn.commit()
+
+
+def mark_batch_item_result(
+    task_id: int,
+    item_id: int,
+    *,
+    ok: bool,
+    message: str,
+    event_type: str,
+    readback: dict | None,
+) -> None:
+    """公开事件入口只可记录进展或失败，永远不能把条目置为成功。"""
+
+    _write_batch_item_result(
+        task_id, item_id, ok=ok, message=message, event_type=event_type,
+        readback=readback, status="failed" if not ok else "running",
+    )
+
+
+def _mark_controlled_batch_receipt(
+    task_id: int, item_id: int, receipt: _ControlledBatchReceipt, message: str
+) -> None:
+    """批量执行器内部唯一的成功回填入口。"""
+
+    if not isinstance(receipt, _ControlledBatchReceipt):
+        raise ValueError("批量成功回填必须使用受控可信回执")
+    _write_batch_item_result(
+        task_id, item_id, ok=True, message=message, event_type=receipt.event_type,
+        readback=receipt.readback, status="success",
+    )
