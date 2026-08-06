@@ -73,6 +73,7 @@ class DouyinCommerceBatchTaskTests(unittest.TestCase):
             message="平台已定时",
             event_type="platform_scheduled_receipt",
             readback={"scheduleTime": "2026-08-07 09:00"},
+            receipt_source=task_service._CONTROLLED_BATCH_RECEIPT_SOURCE,
         )
         self.assertEqual(task_service.get_task(task_id)["items"][0]["status"], "success")
 
@@ -104,9 +105,48 @@ class DouyinCommerceBatchTaskTests(unittest.TestCase):
             message="平台已发布",
             event_type="platform_publish_receipt",
             readback={"platformPostId": "post-001", "publishedAt": "2026-08-06 10:00"},
+            receipt_source=task_service._CONTROLLED_BATCH_RECEIPT_SOURCE,
         )
 
         self.assertEqual(task_service.get_task(task_id)["items"][0]["status"], "success")
+
+    def test_scheduled_receipt_requires_controlled_source_and_beijing_time(self) -> None:
+        task = task_service.create_douyin_batch_task(self.batch)
+        task_id = task["id"]
+        item_id = task_service.get_task(task_id)["items"][0]["id"]
+
+        for readback, receipt_source in (
+            ({"scheduleTime": "2026-08-07"}, task_service._CONTROLLED_BATCH_RECEIPT_SOURCE),
+            ({"scheduleTime": True}, task_service._CONTROLLED_BATCH_RECEIPT_SOURCE),
+            ({"scheduleTime": "2026-08-07 09:00"}, "forged-source"),
+        ):
+            task_service.mark_batch_item_result(
+                task_id,
+                item_id,
+                ok=True,
+                message="平台已定时",
+                event_type="platform_scheduled_receipt",
+                readback=readback,
+                receipt_source=receipt_source,
+            )
+            self.assertEqual(task_service.get_task(task_id)["items"][0]["status"], "running")
+
+    def test_publish_receipt_rejects_boolean_and_non_string_identity(self) -> None:
+        task = task_service.create_douyin_batch_task(self.batch)
+        task_id = task["id"]
+        item_id = task_service.get_task(task_id)["items"][0]["id"]
+
+        for readback in ({"platformPostId": True}, {"platformPostId": 1}, {"postUrl": False}):
+            task_service.mark_batch_item_result(
+                task_id,
+                item_id,
+                ok=True,
+                message="平台已发布",
+                event_type="platform_publish_receipt",
+                readback=readback,
+                receipt_source=task_service._CONTROLLED_BATCH_RECEIPT_SOURCE,
+            )
+            self.assertEqual(task_service.get_task(task_id)["items"][0]["status"], "running")
 
     def test_readback_is_whitelisted_before_persistence(self) -> None:
         task = task_service.create_douyin_batch_task(self.batch)
@@ -127,6 +167,7 @@ class DouyinCommerceBatchTaskTests(unittest.TestCase):
                 "session": {"id": "must-not-store"},
                 "account": "must-not-store",
             },
+            receipt_source=task_service._CONTROLLED_BATCH_RECEIPT_SOURCE,
         )
 
         event = task_service.get_task(task_id)["events"][-1]
@@ -146,6 +187,7 @@ class DouyinCommerceBatchTaskTests(unittest.TestCase):
             message="平台已定时",
             event_type="platform_scheduled_receipt",
             readback={"scheduleTime": "2026-08-07 09:00"},
+            receipt_source=task_service._CONTROLLED_BATCH_RECEIPT_SOURCE,
         )
 
         task_service.mark_batch_item_result(

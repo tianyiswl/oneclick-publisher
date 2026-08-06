@@ -31,6 +31,9 @@ _BATCH_READBACK_FIELDS = {
     "publishedAt",
     "scheduleTime",
 }
+# 仅批量执行器内部持有的来源哨兵；事件名本身不是平台回执凭据。
+_CONTROLLED_BATCH_RECEIPT_SOURCE = object()
+_BEIJING_SCHEDULE_RE = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}")
 
 
 def _now() -> str:
@@ -73,7 +76,7 @@ def _batch_readback_projection(readback: object) -> dict[str, str]:
     return {
         key: str(value).strip()
         for key, value in readback.items()
-        if key in _BATCH_READBACK_FIELDS and isinstance(value, (str, int, float)) and str(value).strip()
+        if key in _BATCH_READBACK_FIELDS and isinstance(value, str) and value.strip()
     }
 
 
@@ -81,7 +84,14 @@ def _has_final_batch_receipt(event_type: str, readback: dict[str, str]) -> bool:
     """最终回执必须含平台可复核的身份或定时时间。"""
 
     if event_type == "platform_scheduled_receipt":
-        return bool(readback.get("scheduleTime"))
+        schedule_time = readback.get("scheduleTime") or ""
+        if not _BEIJING_SCHEDULE_RE.fullmatch(schedule_time):
+            return False
+        try:
+            datetime.strptime(schedule_time, "%Y-%m-%d %H:%M")
+        except ValueError:
+            return False
+        return True
     if event_type == "platform_publish_receipt":
         return bool(readback.get("platformPostId") or readback.get("postUrl"))
     return False
@@ -597,6 +607,7 @@ def mark_batch_item_result(
     message: str,
     event_type: str,
     readback: dict | None,
+    receipt_source: object | None = None,
 ) -> None:
     """按视频条目写入平台事件；只有最终平台回执可标记成功。"""
 
@@ -607,7 +618,9 @@ def mark_batch_item_result(
         "failed"
         if not ok
         else "success"
-        if event_type in final_receipts and _has_final_batch_receipt(event_type, safe_readback)
+        if event_type in final_receipts
+        and receipt_source is _CONTROLLED_BATCH_RECEIPT_SOURCE
+        and _has_final_batch_receipt(event_type, safe_readback)
         else "running"
     )
     with connect() as conn:
