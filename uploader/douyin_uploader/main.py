@@ -725,6 +725,15 @@ class DouYinVideo(object):
             verification_container.get_by_role("img")
         )
         if len(images) != 1:
+            # 短信提交后的平台过渡态仍保留二次验证面板及“原设备扫码”入口，
+            # 但尚未实际展示二维码。它既不是新的扫码挑战，也不能判作成功；
+            # 交给外层继续等待管理页或明确的短信失败状态。
+            try:
+                panel_class = await verification_container.get_attribute("class") or ""
+            except Exception:
+                panel_class = ""
+            if "second-verify-panel" in panel_class:
+                return None
             raise RuntimeError("抖音验证二维码无法唯一确认，发布已安全停止")
         try:
             qr_image = await images[0].screenshot()
