@@ -148,6 +148,29 @@ def ensure_schema() -> None:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS douyin_commerce_batch_drafts (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                payloadJson TEXT NOT NULL,
+                updatedAt TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS douyin_location_presets (
+                id TEXT PRIMARY KEY,
+                accountId INTEGER NOT NULL,
+                poiId TEXT NOT NULL,
+                name TEXT NOT NULL,
+                address TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                verifiedAt TEXT NOT NULL,
+                UNIQUE(accountId, poiId)
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS douyin_favorite_music_cache (
                 accountId INTEGER NOT NULL,
                 musicId TEXT NOT NULL,
