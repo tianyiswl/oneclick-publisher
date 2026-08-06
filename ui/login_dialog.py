@@ -24,6 +24,7 @@ from PyQt6.QtWidgets import (
 from app_core import account_service, login_service
 
 from .common import button
+from .background_task import BackgroundTaskRunner
 
 
 QR_CANVAS_SIZE = 248
@@ -77,6 +78,9 @@ class LoginDialog(QDialog):
         self.account = account
         self.background_login = bool(background_login)
         self.scan_notified = False
+        self.lifecycle_message = ""
+        self.readback_runner = BackgroundTaskRunner(self)
+        self._saved_account_ids: list[int] = []
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(22, 20, 22, 20)
@@ -170,12 +174,13 @@ class LoginDialog(QDialog):
         self.log.clear()
         self.qr_label.clear()
         if background_login:
-            self.log.append("一键发账号授权始终使用可见官方页面，已忽略后台运行设置。")
+            self.log.append("绑定账号需要你登录或扫码，即将打开可见官方页面。")
         self.qr_label.setText("正在打开平台官方登录页面...")
         self.start_btn.setEnabled(False)
         self.save_btn.setEnabled(False)
         self.scan_notified = False
         self.success = False
+        self._saved_account_ids.clear()
         self.session = login_service.start_login(
             platform_type,
             profile,
@@ -196,8 +201,57 @@ class LoginDialog(QDialog):
     def cancel_login(self) -> None:
         if self.session:
             self.session.cancel()
-        self.save_btn.setEnabled(False)
-        self.log.append("登录流程已取消")
+        self.lifecycle_message = "登录已取消，未修改账号会话。"
+        self.log.append(self.lifecycle_message)
+        self.timer.stop()
+        self.reject()
+
+    def _finish_success_after_readback(self, account_id: int) -> None:
+        """仅在本地会话保存且账号静默回读正常后关闭登录窗口。"""
+
+        self.success = True
+        self.timer.stop()
+        self.lifecycle_message = "登录成功：会话已保存，账号状态回读正常。"
+        self.log.append(self.lifecycle_message)
+        self.qr_label.setText("账号会话已保存，状态回读正常；正在返回账号管理")
+        # 成功不再弹出需要用户确认的信息框，避免主窗口看似被自动关闭。
+        QTimer.singleShot(0, self.accept)
+
+    def _verify_saved_account(self, account_id: int) -> None:
+        """把最终状态回读放到后台，避免扫码后冻结主窗口。"""
+
+        self.qr_label.setText("会话已保存，正在静默回读账号状态...")
+        self.log.append("正在回读一键发保存的账号状态。")
+
+        def verify() -> dict:
+            return account_service.validate_accounts([account_id])
+
+        def verified(payload: dict) -> None:
+            normal = {
+                int(item.get("id"))
+                for item in payload.get("normal", [])
+                if item.get("id") is not None
+            }
+            if int(account_id) in normal:
+                self._finish_success_after_readback(account_id)
+                return
+            self.lifecycle_message = "登录会话已保存，但账号状态回读未通过；请从账号管理重新登录。"
+            self.log.append(self.lifecycle_message)
+            self.timer.stop()
+            self.reject()
+
+        def verify_failed(message: str) -> None:
+            self.lifecycle_message = f"登录会话已保存，但账号状态回读失败：{message}"
+            self.log.append(self.lifecycle_message)
+            self.timer.stop()
+            self.reject()
+
+        self.readback_runner.run(
+            "verify_saved_account",
+            verify,
+            on_success=verified,
+            on_error=verify_failed,
+        )
 
     def poll_messages(self) -> None:
         if not self.session:
@@ -220,51 +274,43 @@ class LoginDialog(QDialog):
                 self.log.append("已检测到平台身份回执，正在自动保存一键发本地会话。")
                 continue
             if msg.startswith("ACCOUNT_SAVED:"):
-                self.success = True
                 self.timer.stop()
-                self.log.append("一键发本地登录会话已自动保存，登录状态正常。")
-                self.qr_label.setText("账号会话已自动保存，登录状态正常")
-                QMessageBox.information(
-                    self,
-                    "一键发账号登录",
-                    "账号会话已自动保存，登录状态正常。发布资格仍由任务预检单独判断。",
-                )
-                self.accept()
+                account_id = int(msg.split(":", 1)[1])
+                self._verify_saved_account(account_id)
                 return
             if msg.startswith("ACCOUNT_ID:"):
-                self.log.append("扫码成功，正在保存登录数据...")
-                self.qr_label.setText("扫码成功，正在保存账号数据...")
+                account_id = int(msg.split(":", 1)[1])
+                if account_id not in self._saved_account_ids:
+                    self._saved_account_ids.append(account_id)
+                self.log.append("登录已校验，正在保存一键发账号数据...")
+                self.qr_label.setText("登录已校验，正在保存账号数据...")
                 if not self.scan_notified:
                     self.scan_notified = True
-                    QMessageBox.information(self, "账号登录", "扫码成功，正在保存账号数据，请稍等。")
                 continue
             if msg == "200":
-                self.success = True
                 self.timer.stop()
-                self.log.append("登录成功，账号数据已保存。")
-                QMessageBox.information(self, "账号登录", "登录成功，账号数据已保存。")
-                self.accept()
+                if self._saved_account_ids:
+                    self._verify_saved_accounts(self._saved_account_ids)
+                else:
+                    self.lifecycle_message = "登录流程未返回可回读的账号标识，未保存账号。"
+                    self.log.append(self.lifecycle_message)
+                    self.reject()
                 return
             if msg in ("500", "CANCELLED"):
                 self.timer.stop()
                 if msg == "CANCELLED":
-                    self.log.append("登录已取消。")
-                    self.qr_label.clear()
-                    self.qr_label.setText("登录已取消，请点击“开始登录”重试")
+                    self.lifecycle_message = "登录已取消，未修改账号会话。"
                 else:
-                    self.log.append("登录失败。")
-                    self.qr_label.clear()
-                    self.qr_label.setText("登录失败，请检查提示后点击“开始登录”重试")
-                self.start_btn.setEnabled(True)
-                self.save_btn.setEnabled(False)
+                    self.lifecycle_message = "登录失败，未修改账号会话。"
+                self.log.append(self.lifecycle_message)
+                self.reject()
                 return
             if msg.startswith("ERROR:"):
-                self.log.append(msg.replace("ERROR:", "错误：", 1))
+                self.lifecycle_message = msg.replace("ERROR:", "登录失败：", 1)
+                self.log.append(self.lifecycle_message)
                 self.timer.stop()
-                self.start_btn.setEnabled(True)
-                self.save_btn.setEnabled(False)
-                self.qr_label.setText("未能打开官方登录页，请查看错误提示后重试")
-                continue
+                self.reject()
+                return
             if msg.startswith("http") or msg.startswith("data:image"):
                 self.show_qr(msg)
                 self.log.append("二维码已获取，请扫码。")
@@ -288,8 +334,44 @@ class LoginDialog(QDialog):
             self.log.append(f"二维码显示失败：{exc}")
         self.qr_label.setText(src)
 
+    def _verify_saved_accounts(self, account_ids: list[int]) -> None:
+        """回读恢复流程保存的账号；Meta 会产生两个发布目标。"""
+
+        expected = {int(item) for item in account_ids if int(item) > 0}
+        self.qr_label.setText("会话已保存，正在静默回读海外平台状态...")
+
+        def verify() -> dict:
+            return account_service.validate_accounts(sorted(expected))
+
+        def verified(payload: dict) -> None:
+            normal = {
+                int(item.get("id"))
+                for item in payload.get("normal", [])
+                if item.get("id") is not None
+            }
+            if expected and expected.issubset(normal):
+                self._finish_success_after_readback(min(expected))
+                return
+            self.lifecycle_message = "账号会话已保存，但海外平台发布入口回读未全部通过。"
+            self.log.append(self.lifecycle_message)
+            self.reject()
+
+        def verify_failed(message: str) -> None:
+            self.lifecycle_message = f"海外账号回读失败：{message}"
+            self.log.append(self.lifecycle_message)
+            self.reject()
+
+        self.readback_runner.run(
+            "verify_saved_overseas_accounts",
+            verify,
+            on_success=verified,
+            on_error=verify_failed,
+        )
+
     def closeEvent(self, event) -> None:
         if self.session and self.timer.isActive() and not self.success:
             self.session.cancel()
             self.timer.stop()
+        if not self.lifecycle_message and not self.success:
+            self.lifecycle_message = "登录窗口已关闭，账号会话未变更。"
         super().closeEvent(event)

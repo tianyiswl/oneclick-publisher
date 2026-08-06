@@ -14,6 +14,7 @@ import threading
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from . import account_service
 from .paths import COOKIE_DIR, USER_DATA_DIR, ensure_runtime_dirs
@@ -36,6 +37,13 @@ _DOMESTIC_LOGIN_URLS = {
     10: "https://mp.weixin.qq.com/",
 }
 
+_OVERSEAS_LOGIN_URLS = {
+    6: "https://www.tiktok.com/tiktokstudio/upload?lang=en",
+    7: "https://studio.youtube.com/",
+    8: "https://business.facebook.com/latest/composer/",
+    9: "https://business.facebook.com/latest/composer/",
+}
+
 # 规则来自恢复包 local-rpa 的授权回执监听。这里只保留“已登录”判断，
 # 不保存、显示或上传接口返回的账号资料。
 _LOGIN_RESPONSE_PATHS = {
@@ -48,6 +56,64 @@ _LOGIN_RESPONSE_PATHS = {
 }
 
 
+def authorization_browser_launch_options() -> dict[str, bool]:
+    """绑定/重新登录必须让用户看到官方页面。"""
+
+    return {"headless": False}
+
+
+def session_check_browser_launch_options() -> dict[str, bool]:
+    """登录态检测默认在后台静默运行。"""
+
+    return {"headless": True}
+
+
+def saved_identity_matches(account: dict, detected_name: object) -> bool:
+    """已登录身份必须与本地账号一致，避免误用其他账号会话。"""
+
+    detected = " ".join(str(detected_name or "").split())
+    if not detected:
+        return False
+    expected = " ".join(
+        str(account.get("userName") or account.get("profileName") or "").split()
+    )
+    placeholders = {
+        "",
+        "未命名账号",
+        "B站账号",
+        "哔哩哔哩账号",
+    }
+    return expected in placeholders or detected == expected
+
+
+def wechat_home_session_confirms(
+    account: dict,
+    current_url: object,
+    *,
+    home_visible: bool,
+    login_visible: bool,
+    detected_name: object,
+) -> bool:
+    """用公众号后台首页与账号身份共同确认已登录会话。
+
+    新版公众号后台在复用有效 storage_state 时不一定重新请求旧版
+    ``bizlogin?action=login`` 接口，因此接口监听只能作为第一证据。首页
+    兜底必须同时满足官方域名、后台首页、可见首页导航、无可见登录控件，
+    并且页面账号名与本地账号记录一致；不能只凭 URL 判定登录成功。
+    """
+
+    parsed = urlsplit(str(current_url or ""))
+    if parsed.scheme != "https" or parsed.hostname != "mp.weixin.qq.com":
+        return False
+    if parsed.path.rstrip("/") != "/cgi-bin/home":
+        return False
+    return bool(
+        home_visible
+        and not login_visible
+        and saved_identity_matches(account, detected_name)
+    )
+
+
 def _safe_fragment(value: str) -> str:
     cleaned = re.sub(r"[^a-zA-Z0-9\u4e00-\u9fff_-]+", "-", str(value or "").strip())
     return cleaned.strip("-_")[:48] or "default"
@@ -57,7 +123,10 @@ def authorization_plan(platform_type: int, profile_name: str) -> AuthorizationPl
     """返回一键发将要打开的官方授权页，不产生浏览器或网络访问。"""
 
     platform_type = int(platform_type)
-    login_url = _DOMESTIC_LOGIN_URLS.get(platform_type)
+    login_url = (
+        _DOMESTIC_LOGIN_URLS.get(platform_type)
+        or _OVERSEAS_LOGIN_URLS.get(platform_type)
+    )
     if not login_url:
         platform = account_service.PLATFORMS.get(platform_type, "该平台")
         raise ValueError(f"{platform}的一键发授权执行器尚未迁入。")
@@ -162,7 +231,7 @@ class AuthorizationSession:
         try:
             context = await playwright.chromium.launch_persistent_context(
                 user_data_dir=str(plan.profile_directory),
-                headless=False,
+                **authorization_browser_launch_options(),
             )
             page = context.pages[0] if context.pages else await context.new_page()
             page.on("response", self._response_observer)
@@ -288,13 +357,20 @@ def start_authorization(
 
 
 async def _verify_saved_session_async(account: dict) -> bool:
-    """在用户显式点击“检测登录”后，访问官方页面复核当前会话。"""
+    """在后台访问官方页面复核已保存会话。"""
 
     platform_type = int(account.get("type") or 0)
     plan = authorization_plan(platform_type, str(account.get("profileName") or ""))
     state_file = COOKIE_DIR / Path(str(account.get("filePath") or "")).name
     if not state_file.is_file():
         return False
+
+    # 恢复的蚁小二海外平台代码已包含各自的官方后台判定。
+    # 直接复用这些只读检测，不用国内平台的通用页面文字猜测。
+    if platform_type in account_service.OVERSEAS_PLATFORM_TYPES:
+        from myUtils.auth import check_cookie
+
+        return bool(await check_cookie(platform_type, state_file.name, preview=False))
 
     from playwright.async_api import async_playwright
 
@@ -303,8 +379,12 @@ async def _verify_saved_session_async(account: dict) -> bool:
     browser = None
     context = None
     try:
-        # 使用可见官方页面，避免隐身检测、stealth 或静默后台核验。
-        browser = await playwright.chromium.launch(headless=False)
+        # 这里只读取已保存 storage state 并监听官方身份回执，
+        # 不填写、不保存新会话，因此默认静默运行。失效时由 UI
+        # 单独打开可见官方页面，避免每次检测都弹窗。
+        browser = await playwright.chromium.launch(
+            **session_check_browser_launch_options()
+        )
         context = await browser.new_context(storage_state=str(state_file))
         page = await context.new_page()
 
@@ -324,11 +404,57 @@ async def _verify_saved_session_async(account: dict) -> bool:
 
         page.on("response", observe)
         await page.goto(plan.login_url, wait_until="domcontentloaded", timeout=45_000)
-        try:
-            await asyncio.wait_for(confirmed.wait(), timeout=12)
-        except TimeoutError:
-            return False
-        return True
+        # 大多数平台通过身份接口回执确认。B站创作中心
+        # 首页在已登录时不一定重新请求 cookie/info，但官方 nav
+        # 身份接口可读到当前昵称。两种证据任一成立即结束，
+        # 不用页面上含糊的“登录”文字作为判定。
+        for _attempt in range(24):
+            if confirmed.is_set():
+                return True
+            if platform_type == 5:
+                detected_name = await account_service._detect_display_name(
+                    page,
+                    platform_type,
+                )
+                if saved_identity_matches(account, detected_name):
+                    return True
+            if platform_type == 10:
+                detected_name = await account_service._detect_display_name(
+                    page,
+                    platform_type,
+                )
+                home_link = page.locator(
+                    'a[href*="/cgi-bin/home"], a[href*="cgi-bin/home"]'
+                ).first
+                login_controls = page.locator(
+                    '.login__type__container__scan, .login_qrcode, .qrcode, '
+                    'button:has-text("登录"), a:has-text("登录")'
+                )
+                try:
+                    home_visible = bool(
+                        await home_link.count()
+                        and await home_link.is_visible(timeout=300)
+                    )
+                except Exception:
+                    home_visible = False
+                login_visible = False
+                try:
+                    for index in range(min(await login_controls.count(), 8)):
+                        if await login_controls.nth(index).is_visible(timeout=200):
+                            login_visible = True
+                            break
+                except Exception:
+                    login_visible = True
+                if wechat_home_session_confirms(
+                    account,
+                    page.url,
+                    home_visible=home_visible,
+                    login_visible=login_visible,
+                    detected_name=detected_name,
+                ):
+                    return True
+            await asyncio.sleep(0.5)
+        return False
     finally:
         if context:
             await context.close()
@@ -338,6 +464,6 @@ async def _verify_saved_session_async(account: dict) -> bool:
 
 
 def verify_saved_session(account: dict) -> bool:
-    """同步封装，供账号管理页的显式“检测登录”动作调用。"""
+    """同步封装；正常检测不显示浏览器。"""
 
     return bool(asyncio.run(_verify_saved_session_async(dict(account))))

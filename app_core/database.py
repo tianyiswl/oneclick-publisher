@@ -72,7 +72,13 @@ def ensure_schema() -> None:
                 ("remark", "TEXT"),
                 ("lastCheckedAt", "TEXT"),
                 ("lastLoginAt", "TEXT"),
+                ("authMode", "TEXT NOT NULL DEFAULT 'browser'"),
+                ("accountReference", "TEXT"),
             ),
+        )
+        conn.execute(
+            "UPDATE user_info SET authMode = 'browser' "
+            "WHERE authMode IS NULL OR TRIM(authMode) = ''"
         )
         conn.execute("UPDATE user_info SET profileName = userName WHERE profileName IS NULL OR profileName = ''")
 
@@ -125,6 +131,15 @@ def ensure_schema() -> None:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS publish_drafts (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                payloadJson TEXT NOT NULL,
+                updatedAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS douyin_commerce_content_drafts (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 payloadJson TEXT NOT NULL,
                 updatedAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP

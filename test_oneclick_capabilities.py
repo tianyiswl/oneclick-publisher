@@ -36,6 +36,17 @@ class OneClickCapabilityTests(unittest.TestCase):
             self.assertIsNotNone(capability)
             self.assertEqual(capability.native_publish_type, native_type)
 
+    def test_four_overseas_platforms_only_expose_recovered_video_channel(self) -> None:
+        platforms = ("TikTok", "YouTube", "Instagram Reels", "Facebook Reels")
+        for platform in platforms:
+            self.assertTrue(adapter.supports(platform, "video"))
+            self.assertFalse(adapter.supports(platform, "article"))
+            self.assertFalse(adapter.supports(platform, "text"))
+        self.assertEqual(
+            adapter.canonical_platform("Instagram"),
+            "Instagram Reels",
+        )
+
     def test_unsupported_type_is_blocked_before_task_creation(self) -> None:
         result = adapter.validate_payload({
             "platform": "公众号", "content_type": "video", "title": "测试视频",

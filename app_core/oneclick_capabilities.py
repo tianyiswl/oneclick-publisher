@@ -40,6 +40,8 @@ CONTENT_TYPE_LABELS = {
 PLATFORM_ALIASES = {
     "公众号": "微信公众号",
     "B站": "哔哩哔哩",
+    "Instagram": "Instagram Reels",
+    "Facebook": "Facebook Reels",
 }
 
 
@@ -80,8 +82,9 @@ def _capability(
     )
 
 
-# 国内六平台的可执行能力矩阵。图文在 B 站、公众号转换为 article 通道；
-# 纯文字只保留已恢复的 article Schema 证明支持的三个平台。
+# 国内六平台与已恢复的四个海外视频通道能力矩阵。
+# 海外平台首先开放视频预发布检查；图文与纯文字在没有恢复代码
+# 或官方能力证据前保持不支持，不会为了显示全平台而创建空任务。
 CAPABILITIES: dict[tuple[str, str], PlatformCapability] = {
     ("小红书", ContentType.VIDEO.value): _capability(
         "小红书", ContentType.VIDEO, "video", requires_assets=True,
@@ -139,6 +142,22 @@ CAPABILITIES: dict[tuple[str, str], PlatformCapability] = {
         "微信公众号", ContentType.TEXT, "article", requires_cover=True,
         notes="纯文字会转换为公众号文章，平台要求单独封面。",
     ),
+    ("TikTok", ContentType.VIDEO.value): _capability(
+        "TikTok", ContentType.VIDEO, "video", requires_assets=True,
+        notes="使用已恢复的 TikTok Studio 视频通道，预检会停在 Post 之前。",
+    ),
+    ("YouTube", ContentType.VIDEO.value): _capability(
+        "YouTube", ContentType.VIDEO, "video", requires_assets=True,
+        notes="使用已恢复的 YouTube Studio 视频通道，预检会停在 Done 之前。",
+    ),
+    ("Instagram Reels", ContentType.VIDEO.value): _capability(
+        "Instagram Reels", ContentType.VIDEO, "video", requires_assets=True,
+        notes="使用已恢复的 Meta Business Suite Reels 通道，预检不点击 Share。",
+    ),
+    ("Facebook Reels", ContentType.VIDEO.value): _capability(
+        "Facebook Reels", ContentType.VIDEO, "video", requires_assets=True,
+        notes="使用已恢复的 Meta Business Suite Reels 通道，预检不点击 Share。",
+    ),
 }
 
 
@@ -166,7 +185,10 @@ def unsupported_message(platform: str, content_type: str) -> str:
 
 
 def supported_platforms(content_type: str) -> tuple[str, ...]:
-    order = ("抖音", "视频号", "哔哩哔哩", "小红书", "快手", "微信公众号")
+    order = (
+        "抖音", "视频号", "哔哩哔哩", "小红书", "快手", "微信公众号",
+        "TikTok", "YouTube", "Instagram Reels", "Facebook Reels",
+    )
     return tuple(platform for platform in order if supports(platform, content_type))
 
 

@@ -8,7 +8,6 @@ from pathlib import Path
 from PyQt6.QtCore import QSize, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap
 from PyQt6.QtWidgets import (
-    QCheckBox,
     QComboBox,
     QDialog,
     QFrame,
@@ -152,12 +151,13 @@ class AccountPage(QWidget):
         header.addWidget(self.result_label)
         header.addStretch()
 
-        self.background_login_checkbox = QCheckBox("显示官方授权页")
-        self.background_login_checkbox.setChecked(True)
-        self.background_login_checkbox.setToolTip(
-            "一键发始终使用可见的平台官网完成登录和扫码，不会隐藏浏览器或复用其它客户端登录态。"
+        browser_mode_hint = QLabel("绑定显示官方页 · 检测默认静默")
+        browser_mode_hint.setProperty("role", "muted")
+        browser_mode_hint.setToolTip(
+            "绑定和重新登录需要用户操作，始终显示官方页面；"
+            "检测登录始终在后台运行，异常时只更新状态并提示手动重新登录。"
         )
-        header.addWidget(self.background_login_checkbox)
+        header.addWidget(browser_mode_hint)
 
         self.check_all_btn = button("检测登录", variant="secondary")
         self.check_all_btn.clicked.connect(self.check_all)
@@ -168,7 +168,10 @@ class AccountPage(QWidget):
         header.addWidget(self.refresh_btn)
 
         bind_btn = button("绑定账号", variant="primary")
-        bind_btn.setToolTip("在一键发内发起平台授权；不会读取蚁小二客户端的账号或登录态。")
+        bind_btn.setToolTip(
+            "在一键发独立浏览器会话中登录平台；"
+            "不会读取蚁小二客户端的账号或登录态。"
+        )
         bind_btn.clicked.connect(self.bind_account)
         header.addWidget(bind_btn)
         layout.addLayout(header)
@@ -195,7 +198,7 @@ class AccountPage(QWidget):
         filter_layout.addWidget(self.account_platform_filter, 1, 1)
 
         self.account_search = QLineEdit()
-        self.account_search.setPlaceholderText("搜索主体、账号名、备注或登录文件")
+        self.account_search.setPlaceholderText("搜索主体、账号名或备注")
         self.account_search.textChanged.connect(self.refresh)
         search_label = QLabel("搜索")
         search_label.setProperty("role", "caption")
@@ -243,9 +246,9 @@ class AccountPage(QWidget):
             self._update_validation_progress
         )
 
-        self.table = QTableWidget(0, 8)
+        self.table = QTableWidget(0, 6)
         self.table.setObjectName("dataTable")
-        self.table.setHorizontalHeaderLabels(["主体", "平台", "状态", "账号名", "备注", "登录文件", "登录与预计有效期", "操作"])
+        self.table.setHorizontalHeaderLabels(["主体", "平台", "状态", "账号名", "备注", "操作"])
         table_header = self.table.horizontalHeader()
         table_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         table_header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
@@ -253,9 +256,7 @@ class AccountPage(QWidget):
         self.table.setColumnWidth(1, 95)
         self.table.setColumnWidth(2, 78)
         self.table.setColumnWidth(3, 135)
-        self.table.setColumnWidth(5, 250)
-        self.table.setColumnWidth(6, 245)
-        self.table.setColumnWidth(7, 150)
+        self.table.setColumnWidth(5, 150)
         self.table.verticalHeader().setVisible(False)
         self.table.setShowGrid(False)
         self.table.setAlternatingRowColors(True)
@@ -282,15 +283,11 @@ class AccountPage(QWidget):
         self._apply_table_column_widths()
 
     def _apply_table_column_widths(self) -> None:
-        """窄窗口收紧固定列，避免备注列被压缩到不可读。"""
+        """窄窗口收紧固定列，优先保证账号名与备注可读。"""
 
         compact = self.table.viewport().width() < 1180
-        widths = (
-            (108, 82, 70, 118, 185, 205, 138)
-            if compact
-            else (130, 95, 78, 135, 250, 245, 150)
-        )
-        for column, width in zip((0, 1, 2, 3, 5, 6, 7), widths):
+        widths = (108, 82, 70, 150, 138) if compact else (130, 95, 78, 175, 150)
+        for column, width in zip((0, 1, 2, 3, 5), widths):
             self.table.setColumnWidth(column, width)
 
     def start_auto_checking(self) -> None:
@@ -351,21 +348,7 @@ class AccountPage(QWidget):
             self.table.setItem(row_idx, 3, account_item)
             self.table.setCellWidget(row_idx, 3, _account_identity_cell(row))
             self.table.setItem(row_idx, 4, table_item(row["remark"]))
-            file_path = str(row.get("filePath") or "")
-            file_item = table_item(Path(file_path).name if file_path else "")
-            file_item.setToolTip(file_path)
-            self.table.setItem(row_idx, 5, file_item)
-            last_login_at = row.get("lastLoginAt") or "未记录"
-            if int(row.get("type") or 0) == 2:
-                expiry_text = row.get("estimatedExpiryText") or "登录后计算"
-                login_summary = f"登录：{last_login_at}\n失效：{expiry_text}"
-            else:
-                login_summary = f"登录：{last_login_at}\n失效：以实时检测为准"
-            login_item = table_item(login_summary)
-            checked_at = row.get("lastCheckedAt") or "未完成有效检测"
-            login_item.setToolTip(f"最近有效检测：{checked_at}")
-            self.table.setItem(row_idx, 6, login_item)
-            self.table.setCellWidget(row_idx, 7, self._actions(row))
+            self.table.setCellWidget(row_idx, 5, self._actions(row))
             self.table.item(row_idx, 0).setData(Qt.ItemDataRole.UserRole, row)
             self.table.setRowHeight(row_idx, 54)
         if not rows:
@@ -379,7 +362,7 @@ class AccountPage(QWidget):
     def _searchable_text(self, row: dict) -> str:
         return " ".join(
             str(row.get(key) or "")
-            for key in ("profileName", "platformName", "statusText", "userName", "remark", "filePath")
+            for key in ("profileName", "platformName", "statusText", "userName", "remark")
         ).lower()
 
     def _refresh_filters(self) -> None:
@@ -412,7 +395,10 @@ class AccountPage(QWidget):
         menu = QMenu(box)
         menu.addAction("检测登录状态", lambda _checked=False, r=row: self.check_one(r))
         menu.addAction("重新登录", lambda _checked=False, r=row: self.relogin(r))
-        menu.addAction("刷新账号信息", lambda _checked=False, r=row: self.refresh_avatar(r))
+        refresh_action = menu.addAction(
+            "刷新账号信息",
+            lambda _checked=False, r=row: self.refresh_avatar(r),
+        )
         menu.addAction("编辑备注", lambda _checked=False, r=row: self.edit_remark(r))
         menu.addSeparator()
         menu.addAction("删除账号", lambda _checked=False, r=row: self.delete_one(r))
@@ -449,24 +435,31 @@ class AccountPage(QWidget):
         menu.addAction("重新登录", lambda: self.relogin(row))
         menu.addAction("打开后台", lambda: self.open_backend(row))
         menu.addAction("检测登录", lambda: self.check_one(row))
-        menu.addAction("刷新头像/登录信息", lambda: self.refresh_avatar(row))
+        menu.addAction(
+            "刷新头像/登录信息",
+            lambda: self.refresh_avatar(row),
+        )
         menu.addAction("编辑备注", lambda: self.edit_remark(row))
         menu.addAction("删除账号", lambda: self.delete_one(row))
         menu.exec(self.table.mapToGlobal(pos))
 
     def bind_account(self) -> None:
-        dialog = LoginDialog(self, background_login=self.background_login_checkbox.isChecked())
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.refresh()
+        dialog = LoginDialog(self, background_login=True)
+        result = dialog.exec()
+        self.refresh()
+        if dialog.lifecycle_message:
+            self._set_status(dialog.lifecycle_message)
 
     def relogin(self, row: dict) -> None:
         dialog = LoginDialog(
             self,
             row,
-            background_login=self.background_login_checkbox.isChecked(),
+            background_login=True,
         )
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.refresh()
+        result = dialog.exec()
+        self.refresh()
+        if dialog.lifecycle_message:
+            self._set_status(dialog.lifecycle_message)
 
     def check_all(self) -> None:
         self.start_validation(None)
@@ -575,6 +568,8 @@ class AccountPage(QWidget):
         self._set_status(
             f"{prefix}：正常 {len(normal)} 个，已登录待检测 {len(pending)} 个，异常 {len(abnormal)} 个。"
         )
+        if self._present_validation_intervention(payload):
+            return
         if silent:
             return
         lines = [
@@ -586,6 +581,30 @@ class AccountPage(QWidget):
             lines.append("")
             lines.extend(payload["failures"])
         QMessageBox.information(self, "检测登录", "\n".join(lines))
+
+    def _present_validation_intervention(self, payload: dict) -> bool:
+        """异常时只提示手动处理，不从检测流程自动打开登录页。"""
+
+        rows = list(payload.get("interventionRequired") or [])
+        if not rows:
+            return False
+        first = rows[0]
+        platform = str(first.get("platformName") or "平台")
+        account_name = str(first.get("userName") or first.get("profileName") or "账号")
+        remaining = (
+            f"\n另有 {len(rows) - 1} 个异常账号，请检查列表。"
+            if len(rows) > 1
+            else ""
+        )
+        QMessageBox.warning(
+            self,
+            "登录状态需处理",
+            f"{platform} | {account_name} 的会话未通过静默检测。"
+            f"{remaining}\n\n"
+            "本次检测只更新账号状态，不会打开平台登录页。\n"
+            "如需恢复会话，请在该账号的操作菜单中点击“重新登录”。",
+        )
+        return True
 
     def _fail_validation(self, message: str, *, silent: bool = False) -> None:
         self._set_status("检测失败，请查看提示后重试。")

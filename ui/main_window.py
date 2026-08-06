@@ -39,6 +39,7 @@ from .background_task import BackgroundTaskRunner
 from .common import button
 from .account_page import AccountPage
 from .dashboard_page import DashboardPage
+from .douyin_commerce_page import DouyinCommercePage
 from .help_dialog import HelpDialog
 from .media_page import MediaPage
 from .publish_page import PublishPage
@@ -345,12 +346,17 @@ class MainWindow(QMainWindow):
         self.accounts = AccountPage()
         self.media = MediaPage()
         self.publish = PublishPage()
+        self.douyin_commerce = DouyinCommercePage()
+        self.douyin_commerce.request_account_management.connect(
+            lambda: self._set_current_page(1)
+        )
         self.tasks = TaskPage()
         self.page_definitions = (
             ("工作台", self.dashboard, "ui/assets/nav-dashboard.svg"),
             ("账号管理", self.accounts, "ui/assets/nav-accounts.svg"),
             ("素材管理", self.media, "ui/assets/nav-media.svg"),
             ("发布中心", self.publish, "ui/assets/nav-publish.svg"),
+            ("抖音带货", self.douyin_commerce, "ui/assets/nav-publish.svg"),
             ("任务记录", self.tasks, "ui/assets/nav-tasks.svg"),
         )
         self.coming_soon_definitions = (
@@ -367,7 +373,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self._build_shell())
         self._set_current_page(0)
         self.menuBar().setVisible(False)
-        # 演示版不自动检测账号，避免启动时触发任何登录流程。
+        # 启动时不自动检测账号，避免在用户未发起操作时触发平台访问。
 
     def _apply_initial_window_geometry(self) -> None:
         """Windows 使用大屏自适应尺寸，其他平台保留原始窗口大小。"""
@@ -424,7 +430,7 @@ class MainWindow(QMainWindow):
         brand_text.setSpacing(0)
         brand_title = QLabel("一键发")
         brand_title.setObjectName("brandTitle")
-        brand_subtitle = QLabel("多类型发布助手 · 演示版")
+        brand_subtitle = QLabel("多平台内容发布工作台")
         brand_subtitle.setObjectName("brandSubtitle")
         brand_text.addWidget(brand_title)
         brand_text.addWidget(brand_subtitle)
@@ -477,14 +483,38 @@ class MainWindow(QMainWindow):
             sidebar_layout.addWidget(feature_button)
 
         sidebar_layout.addStretch()
+        feedback_card = QFrame()
+        feedback_card.setObjectName("feedbackCard")
+        feedback_layout = QVBoxLayout(feedback_card)
+        feedback_layout.setContentsMargins(12, 10, 12, 10)
+        feedback_layout.setSpacing(4)
+        feedback_title = QLabel("问题反馈")
+        feedback_title.setObjectName("feedbackTitle")
+        feedback_copy = QLabel(
+            "产品仍在持续优化中。使用中遇到任何问题，"
+            "或有功能优化建议，欢迎联系我。"
+        )
+        feedback_copy.setObjectName("feedbackCopy")
+        feedback_copy.setWordWrap(True)
+        feedback_wechat = QLabel("微信：tianyiswl")
+        feedback_wechat.setObjectName("feedbackContact")
+        feedback_store = QLabel("淘宝店铺：逆浪风")
+        feedback_store.setObjectName("feedbackContact")
+        feedback_layout.addWidget(feedback_title)
+        feedback_layout.addWidget(feedback_copy)
+        feedback_layout.addSpacing(3)
+        feedback_layout.addWidget(feedback_wechat)
+        feedback_layout.addWidget(feedback_store)
+        sidebar_layout.addWidget(feedback_card)
+        sidebar_layout.addSpacing(8)
         local_badge = QFrame()
         local_badge.setObjectName("localWorkspaceBadge")
         local_badge_layout = QVBoxLayout(local_badge)
         local_badge_layout.setContentsMargins(12, 10, 12, 10)
         local_badge_layout.setSpacing(2)
-        local_title = QLabel("本地工作台")
+        local_title = QLabel("安全预检模式")
         local_title.setObjectName("localWorkspaceTitle")
-        local_version = QLabel(f"版本 {APP_VERSION}")
+        local_version = QLabel("最终发布需人工确认")
         local_version.setObjectName("localWorkspaceVersion")
         local_badge_layout.addWidget(local_title)
         local_badge_layout.addWidget(local_version)
@@ -578,12 +608,32 @@ class MainWindow(QMainWindow):
         return menu
 
     def _set_current_page(self, index: int) -> None:
-        self.tabs.setCurrentIndex(index)
+        if not 0 <= int(index) < len(self.page_definitions):
+            raise ValueError("工作页索引无效")
+        target_page = self.page_definitions[index][1]
+        self.tabs.setCurrentWidget(target_page)
         self._refresh_active_page(index)
         for button_index, nav_button in enumerate(self.nav_buttons):
             nav_button.setChecked(button_index == index)
         if hasattr(self, "current_workspace_label"):
             self.current_workspace_label.setText(self.page_definitions[index][0])
+
+    def set_current_page_by_key(self, page_key: str) -> None:
+        """按开发启动参数切换页面，并确保导航与内容同步。"""
+
+        page_indexes = {
+            "workspace": 0,
+            "accounts": 1,
+            "media": 2,
+            "publish": 3,
+            "commerce": 4,
+            "tasks": 5,
+        }
+        try:
+            index = page_indexes[str(page_key)]
+        except KeyError as exc:
+            raise ValueError(f"未知工作页：{page_key}") from exc
+        self._set_current_page(index)
 
     def _page_changed(self, index: int) -> None:
         for button_index, nav_button in enumerate(self.nav_buttons):

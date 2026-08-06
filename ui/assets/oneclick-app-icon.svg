@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <title>一键发 B 版应用图标</title>
+  <desc>原始 B 概念的无描边矢量重绘：白色飞箭、点击环、触发线与手势</desc>
+  <rect width="1024" height="1024" rx="224" fill="#3157D5"/>
+  <!-- 飞箭：严格沿用 B 版的上扬纸飞机轮廓。 -->
+  <path d="M116 478 L859 165 L582 858 L425 858 L466 784 L184 856 L253 559 Z" fill="#FFFFFF"/>
+  <!-- 点击环与触发线：保留 B 版的一键触发语义。 -->
+  <path d="M300 689 A151 151 0 0 1 526 689" fill="none" stroke="#3157D5" stroke-width="37" stroke-linecap="round"/>
+  <path d="M382 495 L367 454 M455 482 L456 436 M521 506 L557 485" fill="none" stroke="#3157D5" stroke-width="31" stroke-linecap="round"/>
+  <!-- 手势：作为前景层进入点击环，避免与飞箭主体竞争。 -->
+  <path d="M329 858 L329 807 L386 750 L419 650 C426 628 447 616 467 624 C485 631 493 650 487 669 L468 731 L490 710 C505 696 529 697 543 712 C553 722 557 737 553 751 L530 830 C524 848 508 858 488 858 Z" fill="#3157D5"/>
+</svg>

@@ -34,6 +34,9 @@ LOGIN_PLATFORM_OPTIONS = [
     (1, "小红书"),
     (4, "快手"),
     (10, "公众号"),
+    (6, "TikTok"),
+    (7, "YouTube"),
+    (8, "Instagram / Facebook（Meta）"),
 ]
 OVERSEAS_PLATFORM_TYPES = {6, 7, 8, 9}
 DRAFT_SUPPORTED_PLATFORM_TYPES = frozenset({2, 5})
@@ -50,6 +53,10 @@ DRAFT_UNSUPPORTED_PLATFORM_MESSAGES = {
         "快手当前仅提供自动化浏览器本地缓存（未发布的视频），"
         "不能验证为平台后台草稿；请改用前台预发布检查"
     ),
+    6: "TikTok 浏览器通道仅支持预发布检查，不会冒充平台草稿。",
+    7: "YouTube 浏览器通道仅支持预发布检查，不会冒充平台草稿。",
+    8: "Instagram Reels 当前不开放平台草稿保存。",
+    9: "Facebook Reels 当前不开放平台草稿保存。",
 }
 STATUS_TEXT = {2: "待检测", 1: "正常", 0: "异常"}
 ACCOUNT_CHECK_TTL_MINUTES = 24 * 60
@@ -220,6 +227,7 @@ def list_accounts() -> list[dict]:
             SELECT id, type, filePath, userName, status, profileName, avatarPath,
                    avatarUpdatedAt, remark, lastCheckedAt, lastLoginAt
             FROM user_info
+            WHERE COALESCE(authMode, 'browser') = 'browser'
             ORDER BY profileName COLLATE NOCASE, type
             """
         ).fetchall()
@@ -391,9 +399,8 @@ def validate_accounts(
     account_ids: Iterable[int] | None = None,
     progress_callback: Callable[[dict], None] | None = None,
 ) -> dict:
-    """由用户显式触发的一键发官方页面登录态复核。"""
+    """静默复核登录态；仅返回需用户介入的账号，不自行弹浏览器。"""
     from .oneclick_authorization import verify_saved_session
-
     accounts = list_accounts()
     wanted = {int(item) for item in account_ids or []}
     selected = [row for row in accounts if not wanted or row["id"] in wanted]
@@ -440,6 +447,9 @@ def validate_accounts(
         "normal": [row for row in checked if row.get("status") == 1],
         "abnormal": [row for row in checked if row.get("status") == 0],
         "pending": [row for row in checked if row.get("status") == 2],
+        "interventionRequired": [
+            row for row in checked if row.get("status") == 0
+        ],
     }
 
 
@@ -464,6 +474,10 @@ _ACCOUNT_AVATAR_SELECTORS = {
     3: ("#header-avatar [class*='avatar']", "#header-avatar"),
     4: (".user-info-dpd img", ".user-info img"),
     5: (".cc-header .custom-lazy-img", ".header .custom-lazy-img"),
+    6: ('[data-e2e*="avatar" i] img', 'img[alt*="avatar" i]'),
+    7: ("#avatar-btn img", "yt-img-shadow#avatar img"),
+    8: ('img[alt*="profile picture" i]', '[aria-label*="profile" i] img'),
+    9: ('img[alt*="profile picture" i]', '[aria-label*="profile" i] img'),
     10: (".weui-desktop-account__avatar img", ".account_info img", "img[alt*='头像']"),
 }
 
@@ -477,7 +491,17 @@ _ACCOUNT_NAME_SELECTORS = {
     # B站创作中心首页的 .name 大量用于数据指标（如“弹幕”），不能用作
     # 账号昵称回退。B站昵称统一由官方 nav 身份接口读取，见 _detect_display_name。
     5: (),
-    10: (".weui-desktop-account__name", ".account_info .name", "#js_name"),
+    6: ('[data-e2e*="nickname" i]', '[data-e2e*="username" i]'),
+    7: ("#channel-title", "ytcp-entity-page-header-view-model #text"),
+    8: ('[aria-label*="profile" i]', '[data-pagelet*="Profile" i]'),
+    9: ('[aria-label*="profile" i]', '[data-pagelet*="Profile" i]'),
+    10: (
+        ".acount_box-nickname",
+        ".weui-desktop_name",
+        ".weui-desktop-account__name",
+        ".account_info .name",
+        "#js_name",
+    ),
 }
 
 
@@ -645,7 +669,10 @@ def run_async_capture_account_avatar(account_id: int) -> tuple[str | None, str |
 
     async def _capture() -> tuple[str | None, str | None]:
         with connect() as conn:
-            row = conn.execute("SELECT id, type, filePath FROM user_info WHERE id = ?", (account_id,)).fetchone()
+            row = conn.execute(
+                "SELECT id, type, filePath FROM user_info WHERE id = ?",
+                (account_id,),
+            ).fetchone()
         if not row:
             raise RuntimeError("账号不存在")
         cookie_file = COOKIE_DIR / Path(row["filePath"]).name
