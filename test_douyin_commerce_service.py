@@ -4365,6 +4365,56 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
             asyncio.run(synchronize("session-demo", changed_account))
         uploader.sync_uploaded_editor_content.assert_not_awaited()
 
+class DouyinCommerceBatchUiTests(unittest.TestCase):
+    """批量工作台仅验证本地控件，不触发浏览器或平台。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        self.page = DouyinCommercePage()
+
+    def tearDown(self) -> None:
+        self.page.close()
+
+    def test_batch_page_allows_multiple_videos_and_shows_account_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            videos = []
+            for number, name in enumerate(("a.mp4", "b.mp4", "c.mp4"), start=1):
+                path = Path(root) / name
+                path.write_bytes(b"offline-video")
+                videos.append({"id": number, "typeText": "视频", "storedPath": str(path), "filename": name})
+            account = {"id": 71, "type": 3, "status": 1, "filePath": "douyin-71.json", "profileName": "主体", "userName": "账号"}
+            with patch("ui.douyin_commerce_page.account_service.list_accounts", return_value=[account]), patch(
+                "ui.douyin_commerce_page.media_service.list_media", return_value=videos
+            ):
+                self.page.refresh()
+            self.page.account_combo.setCurrentIndex(1)
+            self.page.select_video_indexes([1, 2, 3])
+            self.page._sync_content_cards()
+
+            self.assertEqual(self.page.selected_video_count(), 3)
+            self.assertFalse(self.page.account_avatar.pixmap().isNull())
+            self.assertIn("主体", self.page.account_card.text())
+            self.assertEqual(self.page.batch_video_list.count(), 3)
+
+    def test_batch_defaults_to_immediate_and_only_generates_interval_when_enabled(self) -> None:
+        self.page.video_combo.clear()
+        self.page.video_combo.addItem("请选择视频", None)
+        for index in range(3):
+            self.page.video_combo.addItem(f"{index}.mp4", {"storedPath": f"/tmp/{index}.mp4", "filename": f"{index}.mp4"})
+        self.page._refresh_batch_video_list()
+        self.page.select_video_indexes([1, 2, 3])
+
+        self.assertFalse(self.page.batch_timer_enabled.isChecked())
+        self.assertEqual(self.page.item_schedule_text(1), "立即发布")
+        self.page.batch_timer_enabled.setChecked(True)
+        self.page.batch_interval_minutes.setValue(30)
+        self.assertEqual(self.page.item_schedule_text(1), "09:30")
+        self.page.set_item_schedule_override(2, "2026-08-07 15:00")
+        self.assertEqual(self.page.item_schedule_text(2), "15:00")
+
 
 class DouyinCommerceRoutingTests(unittest.TestCase):
     def test_preflight_routes_to_commerce_executor(self) -> None:

@@ -117,6 +117,19 @@ class DouyinVerificationDialogTests(unittest.TestCase):
         self.assertEqual(dialog.result(), 0)
         dialog.accept()
 
+    def test_batch_verification_context_shows_only_index_and_file_name(self):
+        request_id = self.broker.create_sms(task_id=59, message="需要短信验证")
+        dialog = DouyinVerificationDialog(
+            request_id,
+            broker=self.broker,
+            item_index=3,
+            item_total=12,
+            item_label="探店视频.mp4",
+        )
+        self.assertEqual(dialog.item_context_label.text(), "第 3/12 条：探店视频.mp4")
+        self.assertNotIn("验证码", dialog.item_context_label.text())
+        dialog.close()
+
     def test_window_close_cancels_waiting_but_not_processing_request(self):
         waiting_id = self.broker.create_sms(task_id=54, message="需要短信验证")
         waiting_dialog = DouyinVerificationDialog(waiting_id, broker=self.broker)

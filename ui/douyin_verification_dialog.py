@@ -26,6 +26,9 @@ class DouyinVerificationDialog(QDialog):
         parent=None,
         *,
         broker: DouyinVerificationBroker = verification_broker,
+        item_index: int | None = None,
+        item_total: int | None = None,
+        item_label: str = "",
     ) -> None:
         super().__init__(parent)
         self.request_id = str(request_id)
@@ -43,6 +46,19 @@ class DouyinVerificationDialog(QDialog):
         title = QLabel("需要抖音验证")
         title.setObjectName("dialogTitle")
         layout.addWidget(title)
+
+        self.item_context_label = QLabel()
+        self.item_context_label.setObjectName("douyinVerificationItemContext")
+        self.item_context_label.setWordWrap(True)
+        self.item_context_label.setProperty("role", "caption")
+        safe_label = str(item_label or "").replace("\n", " ").strip()
+        if isinstance(item_index, int) and item_index >= 1 and isinstance(item_total, int) and item_total >= item_index:
+            self.item_context_label.setText(
+                f"第 {item_index}/{item_total} 条：{safe_label or '当前视频'}"
+            )
+            layout.addWidget(self.item_context_label)
+        else:
+            self.item_context_label.setVisible(False)
 
         self.description_label = QLabel()
         self.description_label.setWordWrap(True)
