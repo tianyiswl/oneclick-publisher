@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from io import BytesIO
 import math
+from pathlib import Path
 import threading
 import unittest
 
@@ -32,6 +33,13 @@ def _blank_image_bytes() -> bytes:
     output = BytesIO()
     Image.new("RGB", (240, 240), "white").save(output, format="PNG")
     return output.getvalue()
+
+
+class ReadmeContractTests(unittest.TestCase):
+    def test_readme_states_douyin_verification_stays_in_native_client(self):
+        content = Path("README.md").read_text(encoding="utf-8")
+
+        self.assertIn("抖音带货无头验证由客户端原生弹窗承接，浏览器不前置", content)
 
 
 class DouyinVerificationBrokerTests(unittest.TestCase):
