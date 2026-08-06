@@ -34,6 +34,16 @@ class DouyinCommerceBatchError(ValueError):
     """批量带货任务缺少安全执行所需的本地字段。"""
 
 
+def current_shanghai_time() -> datetime:
+    """返回批量任务入口唯一可传递的北京时间时钟值。
+
+    调用方应在一次“创建任务 + 启动执行”的入口只取一次该值，并将同一个值
+    传给本模块。这样任务明细、排期和执行器不会因分别读取机器时钟而产生不一致。
+    """
+
+    return datetime.now(_SHANGHAI).replace(second=0, microsecond=0)
+
+
 def _text(value: object) -> str:
     return " ".join(str(value or "").replace("\u200b", " ").split())
 
@@ -251,6 +261,22 @@ def apply_interval_schedule(payload: Mapping[str, Any], now: datetime) -> dict[s
         item["scheduleTime"] = candidate
         item["enableTimer"] = True
     return result
+
+
+def prepare_batch_for_execution(
+    payload: Mapping[str, Any],
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """生成每条可直接建任务和执行的排期字段。
+
+    ``validate_batch_payload`` 故意只保存用户配置，避免把过期的运行排期写入本地
+    草稿；所有会创建任务的入口都必须经过这里，确保每项都具有显式
+    ``enableTimer``，定时项还具有经过同一北京时间校验的 ``scheduleTime``。
+    """
+
+    controlled_now = current_shanghai_time() if now is None else _as_shanghai(now)
+    return apply_interval_schedule(payload, now=controlled_now)
 
 
 def item_publish_payload(batch: Mapping[str, Any], item: Mapping[str, Any]) -> dict[str, Any]:

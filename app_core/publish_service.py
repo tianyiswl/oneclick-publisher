@@ -9,8 +9,10 @@
 from __future__ import annotations
 
 import threading
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from myUtils.postVideo import post_video_batch_draft_tabs
 
@@ -44,6 +46,7 @@ _PLATFORM_NAMES = {
 
 
 _DOUYIN_COMMERCE_BATCH_WORKFLOW = "douyin-commerce-batch"
+_SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 def _is_douyin_commerce_batch_payload(payload: object) -> bool:
@@ -65,6 +68,7 @@ def _prepare_douyin_commerce_batch_request(
     payloads: list[dict[str, Any]],
     *,
     expected_mode: str,
+    schedule_now: datetime | None = None,
 ) -> dict[str, Any]:
     """校验批量入口运行边界并返回白名单批次信封。
 
@@ -91,7 +95,10 @@ def _prepare_douyin_commerce_batch_request(
         if raw.get("batchConfirmed") is not True:
             raise ValueError("抖音带货批量正式发布必须先完成批量确认")
     try:
-        return douyin_commerce_batch_service.validate_batch_payload(raw)
+        return douyin_commerce_batch_service.prepare_batch_for_execution(
+            raw,
+            now=(schedule_now or datetime.now(_SHANGHAI).replace(second=0, microsecond=0)),
+        )
     except douyin_commerce_batch_service.DouyinCommerceBatchError as exc:
         raise ValueError(str(exc)) from exc
 
@@ -249,10 +256,15 @@ def _validate_payloads(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return validated
 
 
-def _run_douyin_commerce_batch_preflight(task: dict, payloads: list[dict[str, Any]]) -> None:
+def _run_douyin_commerce_batch_preflight(
+    task: dict,
+    payloads: list[dict[str, Any]],
+    *,
+    prepared_batch: dict | None = None,
+) -> None:
     """执行批量 dry-run；此路径没有也不会调用最终提交。"""
 
-    batch = _prepare_douyin_commerce_batch_request(payloads, expected_mode="preflight")
+    batch = prepared_batch or _prepare_douyin_commerce_batch_request(payloads, expected_mode="preflight")
     if not _publish_lock.acquire(blocking=False):
         task_service.record_task_event(
             int(task["id"]),
@@ -288,10 +300,15 @@ def _run_douyin_commerce_batch_preflight(task: dict, payloads: list[dict[str, An
         _active_threads.pop(int(task["id"]), None)
 
 
-def _run_douyin_commerce_batch_publish(task: dict, payloads: list[dict[str, Any]]) -> None:
+def _run_douyin_commerce_batch_publish(
+    task: dict,
+    payloads: list[dict[str, Any]],
+    *,
+    prepared_batch: dict | None = None,
+) -> None:
     """执行已总确认的批量最终提交，成功状态只由批量执行器平台回执写入。"""
 
-    batch = _prepare_douyin_commerce_batch_request(payloads, expected_mode="publish")
+    batch = prepared_batch or _prepare_douyin_commerce_batch_request(payloads, expected_mode="publish")
     if not _publish_lock.acquire(blocking=False):
         task_service.record_task_event(
             int(task["id"]),
@@ -539,12 +556,14 @@ def start_desktop_publish(payloads: list[dict[str, Any]]) -> dict:
         runtime_mode = str(raw_batch.get("runtimeMode") or "preflight").strip()
         if runtime_mode not in {"preflight", "publish"}:
             raise ValueError("抖音带货批量只支持预检或已确认的正式发布")
+        controlled_now = datetime.now(_SHANGHAI).replace(second=0, microsecond=0)
         batch = _prepare_douyin_commerce_batch_request(
-            [raw_batch], expected_mode=runtime_mode
+            [raw_batch], expected_mode=runtime_mode, schedule_now=controlled_now
         )
         task = task_service.create_douyin_batch_task(
             batch,
             mode="oneclick_publish" if runtime_mode == "publish" else "oneclick_preflight",
+            schedule_now=controlled_now,
         )
         worker = threading.Thread(
             target=(
@@ -553,6 +572,7 @@ def start_desktop_publish(payloads: list[dict[str, Any]]) -> dict:
                 else _run_douyin_commerce_batch_preflight
             ),
             args=(task, [raw_batch]),
+            kwargs={"prepared_batch": batch},
             daemon=True,
             name=f"oneclick-douyin-commerce-batch-{runtime_mode}-{task['id']}",
         )

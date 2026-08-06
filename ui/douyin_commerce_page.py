@@ -3217,24 +3217,28 @@ class DouyinCommercePage(QWidget):
                 ).strftime("%Y-%m-%d %H:%M"),
                 "intervalMinutes": self.batch_interval_minutes.value(),
             }
-        return douyin_commerce_batch_service.validate_batch_payload(
-            {
-                "type": 3,
-                "workflow": "douyin-commerce-batch",
-                "commerceMode": "local-group-buy",
-                "contentType": "video",
-                "accountList": [str(account.get("filePath") or "")],
-                "shared": {
-                    "title": self.title_input.text().strip(),
-                    "description": self.description_input.toPlainText().strip(),
-                    "tags": self._tags(),
-                    "selectedMusic": dict(self._selected_music or {}),
-                    "contentDeclaration": self._selected_declaration(),
-                },
-                "publishMode": publish_mode,
-                "schedule": schedule,
-                "items": items,
-            }
+        raw_batch = {
+            "type": 3,
+            "workflow": "douyin-commerce-batch",
+            "commerceMode": "local-group-buy",
+            "contentType": "video",
+            "accountList": [str(account.get("filePath") or "")],
+            "shared": {
+                "title": self.title_input.text().strip(),
+                "description": self.description_input.toPlainText().strip(),
+                "tags": self._tags(),
+                "selectedMusic": dict(self._selected_music or {}),
+                "contentDeclaration": self._selected_declaration(),
+            },
+            "publishMode": publish_mode,
+            "schedule": schedule,
+            "items": items,
+        }
+        # 一次点击只读取一次北京时间，并用它同时生成任务明细和执行排期。
+        # 后续预检会重新验证“仍为未来”，但不会丢掉本次显式逐条字段。
+        return douyin_commerce_batch_service.prepare_batch_for_execution(
+            raw_batch,
+            now=datetime.now(_SHANGHAI_TZ).replace(second=0, microsecond=0),
         )
 
     def _batch_draft_payload(self) -> dict:

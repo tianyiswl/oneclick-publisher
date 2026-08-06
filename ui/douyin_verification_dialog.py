@@ -120,6 +120,10 @@ class DouyinVerificationDialog(QDialog):
             self.submit_button = button("提交验证码", variant="primary")
             self.submit_button.clicked.connect(self.submit_code)
             self.content_layout.addWidget(self.submit_button)
+            self.resend_button = button("重新发送（60 秒）", variant="secondary")
+            self.resend_button.setObjectName("douyinVerificationResend")
+            self.resend_button.clicked.connect(self.resend_code)
+            self.content_layout.addWidget(self.resend_button)
         elif kind == "qr":
             self.description_label.setText("请扫码验证，验证完成后会自动继续提交。")
             self.qr_label = QLabel("正在从本机内存读取二维码…")
@@ -181,6 +185,18 @@ class DouyinVerificationDialog(QDialog):
         if kind == "sms" and hasattr(self, "submit_button"):
             self.submit_button.setEnabled(state == "waiting")
             self.code_input.setEnabled(state == "waiting")
+            if hasattr(self, "resend_button"):
+                remaining = int(snapshot.get("resendInSeconds") or 0)
+                in_flight = bool(snapshot.get("resendInFlight"))
+                available = bool(snapshot.get("canResend"))
+                self.resend_button.setEnabled(state == "waiting" and available)
+                self.resend_button.setText(
+                    "正在重新发送…"
+                    if in_flight
+                    else "重新发送验证码"
+                    if available
+                    else f"重新发送（{remaining} 秒）"
+                )
         if state == "success":
             self._terminal = True
             self.timer.stop()
@@ -200,6 +216,18 @@ class DouyinVerificationDialog(QDialog):
             return
         self.code_input.clear()
         self.status_label.setText("验证码已提交，正在验证。")
+
+    def resend_code(self) -> None:
+        """只请求当前内存验证的受控重发，绝不重建验证码请求。"""
+
+        try:
+            self.broker.request_sms_resend(self.request_id)
+        except DouyinVerificationError as exc:
+            self.status_label.setText(str(exc))
+            self.poll_state()
+            return
+        self.status_label.setText("验证码已重新发送，请输入收到的数字验证码。")
+        self.poll_state()
 
     def cancel_verification(self) -> None:
         try:

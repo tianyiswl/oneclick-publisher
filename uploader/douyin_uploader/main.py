@@ -829,6 +829,51 @@ class DouYinVideo(object):
         # 平台仍可能在异步校验中；外层只会等待管理页，不会再次发送短信或误判二维码。
         return
 
+    async def resend_sms_verification_code(self, page: Page, challenge) -> None:
+        """在同一可见短信验证面板中重发一次验证码。
+
+        本方法不接受文本、电话或请求参数：只在仍处于当前短信挑战、且“重新获取”
+        控件唯一可见可点击时执行。上层 broker 负责 60 秒单调时钟冷却；这里再做
+        平台控件与输入框回读，任何歧义均停止而不是点击猜测目标。
+        """
+
+        if getattr(challenge, "kind", "") != "sms":
+            raise RuntimeError("当前抖音验证不是短信验证码，发布已安全停止")
+        verification_container = await self._unique_publish_verification_container(page)
+        if verification_container is None:
+            raise RuntimeError("抖音验证容器无法唯一确认，发布已安全停止")
+
+        candidates = []
+        for label in ("重新获取", "重新发送", "获取验证码"):
+            try:
+                candidates.extend(
+                    await self._visible_enabled_items(
+                        verification_container.get_by_text(label, exact=True)
+                    )
+                )
+            except Exception:
+                continue
+        # 同一节点有时会被不同语义查询重复加入，按对象身份去重后仍必须唯一。
+        unique = []
+        seen = set()
+        for candidate in candidates:
+            marker = id(candidate)
+            if marker not in seen:
+                seen.add(marker)
+                unique.append(candidate)
+        if len(unique) != 1:
+            raise RuntimeError("抖音重新发送验证码控件无法唯一确认，发布已安全停止")
+        await unique[0].click(timeout=10_000)
+
+        # 点击后必须仍能从同一面板唯一读到短信输入与确认控件，才向客户端报告
+        # 重发可继续；不从倒计时文案猜测短信是否送达。
+        for _ in range(20):
+            inputs, buttons = await self._sms_verification_controls(verification_container)
+            if len(inputs) == 1 and len(buttons) == 1:
+                return
+            await page.wait_for_timeout(250)
+        raise RuntimeError("抖音重新发送验证码后未能回读短信验证控件，发布已安全停止")
+
     async def _wait_formal_publish_result(self, page: Page, on_verification=None):
         security_verification_seen = False
         for attempt in range(self.PUBLISH_RESULT_WAIT_ATTEMPTS):

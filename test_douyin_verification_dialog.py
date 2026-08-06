@@ -85,6 +85,29 @@ class DouyinVerificationDialogTests(unittest.TestCase):
         self.assertEqual(rejected_dialog.code_input.text(), "")
         rejected_dialog.close()
 
+    def test_sms_dialog_disables_resend_during_cooldown_and_uses_same_request_after_60_seconds(self):
+        now = [100.0]
+        calls: list[str] = []
+        broker = DouyinVerificationBroker(clock=lambda: now[0])
+        request_id = broker.create_sms(
+            task_id=87,
+            message="需要短信验证",
+            resend_handler=lambda: calls.append("resend") or True,
+        )
+        dialog = DouyinVerificationDialog(request_id, broker=broker)
+
+        dialog.poll_state()
+        self.assertFalse(dialog.resend_button.isEnabled())
+        self.assertIn("60", dialog.resend_button.text())
+        now[0] = 160.0
+        dialog.poll_state()
+        self.assertTrue(dialog.resend_button.isEnabled())
+        dialog.resend_button.click()
+        self.assertEqual(calls, ["resend"])
+        self.assertFalse(dialog.resend_button.isEnabled())
+        self.assertEqual(broker.snapshot(request_id)["requestId"], request_id)
+        dialog.close()
+
     def test_qr_dialog_renders_memory_bytes_without_sms_input_and_can_cancel(self):
         request_id = self.broker.create_qr(
             task_id=52,

@@ -431,15 +431,38 @@ def create_pending_task(payloads: list[dict], mode: str = "desktop") -> dict:
     return {"id": task_id, "taskNo": task_no, "itemCount": len(items)}
 
 
-def create_douyin_batch_task(batch: dict, mode: str = "oneclick_publish") -> dict:
+def create_douyin_batch_task(
+    batch: dict,
+    mode: str = "oneclick_publish",
+    *,
+    schedule_now=None,
+) -> dict:
     """为批量信封中的每条视频创建独立、可审计的发布项。"""
 
-    from .douyin_commerce_batch_service import item_publish_payload
+    from .douyin_commerce_batch_service import (
+        item_publish_payload,
+        prepare_batch_for_execution,
+    )
 
-    items = batch.get("items") if isinstance(batch, dict) else None
+    # 新批量入口必须始终经过完整契约和同一受控时钟，以避免创建任务时遗漏
+    # enableTimer/scheduleTime。保留下面的窄兼容分支，仅用于历史任务服务已
+    # 规范化的内部快照（它们没有批次信封字段，但每条已有显式开关）。
+    if str(batch.get("workflow") or "").strip() == "douyin-commerce-batch":
+        prepared_batch = prepare_batch_for_execution(batch, now=schedule_now)
+    else:
+        prepared_batch = dict(batch)
+        raw_items = prepared_batch.get("items")
+        if not isinstance(raw_items, list) or not raw_items:
+            raise ValueError("抖音带货批量任务至少需要一条视频")
+        for index, raw_item in enumerate(raw_items, start=1):
+            if not isinstance(raw_item, dict) or type(raw_item.get("enableTimer")) is not bool:
+                raise ValueError(f"第 {index} 条批量视频缺少明确的 enableTimer")
+            if raw_item["enableTimer"] is True and not str(raw_item.get("scheduleTime") or "").strip():
+                raise ValueError(f"第 {index} 条批量视频缺少明确的 scheduleTime")
+    items = prepared_batch.get("items") if isinstance(prepared_batch, dict) else None
     if not isinstance(items, list) or not items:
         raise ValueError("抖音带货批量任务至少需要一条视频")
-    payloads = [item_publish_payload(batch, item) for item in items]
+    payloads = [item_publish_payload(prepared_batch, item) for item in items]
     task = create_pending_task(payloads, mode=mode)
     now = _now()
     with connect() as conn:

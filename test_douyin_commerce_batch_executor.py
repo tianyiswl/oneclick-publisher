@@ -38,6 +38,7 @@ class FakeCommerceSessionManager:
         verification_mode: str = "",
         verification_broker: DouyinVerificationBroker | None = None,
         location_candidates: list[dict] | None = None,
+        scheduled_readback_time: str = "",
     ) -> None:
         self.fail_item_indexes = fail_item_indexes or set()
         self.challenge_on_index = challenge_on_index
@@ -45,6 +46,7 @@ class FakeCommerceSessionManager:
         self.verification_mode = verification_mode
         self.verification_broker = verification_broker
         self.location_candidates = location_candidates
+        self.scheduled_readback_time = scheduled_readback_time
         self.calls: list[str] = []
         self.open_sessions = 0
         self.max_open_sessions = 0
@@ -158,6 +160,16 @@ class FakeCommerceSessionManager:
                 else:
                     raise AssertionError("测试替身缺少验证状态模式")
             raise DouyinVerificationError("抖音需要短信验证")
+        if self.scheduled_readback_time:
+            return {
+                "ok": True,
+                "scheduled": True,
+                "message": f"第 {index} 条定时作品已由平台管理页回读",
+                "scheduledReadback": {
+                    "scheduledAt": self.scheduled_readback_time,
+                    "timezone": "Asia/Shanghai",
+                },
+            }
         return {
             "ok": True,
             "scheduled": False,
@@ -256,6 +268,49 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
         self.assertIn("submit:2", manager.calls)
         self.assertEqual([item["status"] for item in task_service.get_task(self.task["id"])["items"]], ["success", "failed", "success"])
         self.assertTrue(any(event.phase == "uploading" for event in events))
+
+    def test_scheduled_item_only_succeeds_when_final_readback_exactly_matches_its_schedule(self) -> None:
+        from datetime import datetime
+
+        target = "2026-08-07 10:00"
+        scheduled_batch = apply_interval_schedule(
+            validate_batch_payload(
+                {
+                    **self.batch,
+                    "publishMode": "interval-schedule",
+                    "schedule": {
+                        "timezone": "Asia/Shanghai",
+                        "startTime": target,
+                        "intervalMinutes": 30,
+                    },
+                },
+                now=datetime(2026, 8, 6, 10, 0),
+            ),
+            now=datetime(2026, 8, 6, 10, 0),
+        )
+        mismatch_task = task_service.create_douyin_batch_task(
+            scheduled_batch,
+            schedule_now=datetime(2026, 8, 6, 10, 0),
+        )
+        mismatch = DouyinCommerceBatchExecutor(
+            FakeCommerceSessionManager(scheduled_readback_time="2026-08-07 10:01"),
+            now=lambda: datetime(2026, 8, 6, 10, 0),
+        ).run_publish(scheduled_batch, task_id=mismatch_task["id"], confirmed=True)
+
+        self.assertEqual(mismatch[0]["status"], "failed")
+        self.assertEqual(task_service.get_task(mismatch_task["id"])["items"][0]["status"], "failed")
+
+        matching_task = task_service.create_douyin_batch_task(
+            scheduled_batch,
+            schedule_now=datetime(2026, 8, 6, 10, 0),
+        )
+        matching = DouyinCommerceBatchExecutor(
+            FakeCommerceSessionManager(scheduled_readback_time=target),
+            now=lambda: datetime(2026, 8, 6, 10, 0),
+        ).run_publish(scheduled_batch, task_id=matching_task["id"], confirmed=True)
+
+        self.assertEqual(matching[0]["status"], "published")
+        self.assertEqual(task_service.get_task(matching_task["id"])["items"][0]["status"], "success")
 
     def test_login_or_verification_pauses_batch_without_submitting_later_items(self) -> None:
         broker = DouyinVerificationBroker()

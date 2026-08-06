@@ -103,7 +103,11 @@ def _runtime_payload(
     return payload
 
 
-def _final_receipt_from_submit_result(result: object) -> tuple[str, dict[str, str], str]:
+def _final_receipt_from_submit_result(
+    result: object,
+    *,
+    expected_schedule_time: str,
+) -> tuple[str, dict[str, str], str]:
     """只接受会话 submit 返回的最终管理页回读，不补造日期或时区。"""
 
     if not isinstance(result, Mapping) or result.get("ok") is not True:
@@ -113,6 +117,10 @@ def _final_receipt_from_submit_result(result: object) -> tuple[str, dict[str, st
         raise DouyinCommerceBatchExecutorError("抖音批量执行器缺少平台最终回读说明")
 
     if result.get("scheduled") is True:
+        if not expected_schedule_time:
+            raise DouyinCommerceBatchExecutorError(
+                "抖音立即发布任务却返回了定时回读，发布已安全停止"
+            )
         readback = result.get("scheduledReadback")
         if not isinstance(readback, Mapping):
             raise DouyinCommerceBatchExecutorError("抖音定时提交缺少平台管理页回读")
@@ -120,7 +128,16 @@ def _final_receipt_from_submit_result(result: object) -> tuple[str, dict[str, st
             "scheduleTime": _text(readback.get("scheduledAt")),
             "timezone": _text(readback.get("timezone")),
         }
+        if receipt["scheduleTime"] != expected_schedule_time:
+            raise DouyinCommerceBatchExecutorError(
+                "抖音定时提交平台回读时间与当前视频设定时间不一致"
+            )
         return "platform_scheduled_receipt", receipt, message
+
+    if expected_schedule_time:
+        raise DouyinCommerceBatchExecutorError(
+            "抖音定时提交未返回平台定时回读，发布已安全停止"
+        )
 
     readback = result.get("platformReceipt")
     if not isinstance(readback, Mapping):
@@ -250,10 +267,15 @@ class DouyinCommerceBatchExecutor:
         task_id: int,
         item_id: int,
         result: object,
+        *,
+        expected_schedule_time: str,
     ) -> None:
         """执行器唯一的成功写入点：只消费本次 submit 最终回读。"""
 
-        event_type, receipt, message = _final_receipt_from_submit_result(result)
+        event_type, receipt, message = _final_receipt_from_submit_result(
+            result,
+            expected_schedule_time=expected_schedule_time,
+        )
         try:
             _write_final_batch_receipt(
                 int(task_id),
@@ -490,7 +512,12 @@ class DouyinCommerceBatchExecutor:
                     progress=progress,
                 ),
             )
-            self._record_final_submit_result(task_id, item_id, submitted)
+            self._record_final_submit_result(
+                task_id,
+                item_id,
+                submitted,
+                expected_schedule_time=_text(publish_payload.get("scheduleTime")),
+            )
             self._emit(progress, index=index, total=total, phase="published", message=f"第 {index + 1} 条视频已取得平台回读")
             return {"index": index, "label": label, "status": "published"}
         except Exception as exc:

@@ -3546,7 +3546,7 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
                 self.succeeded = []
                 self.cleared = []
 
-            def create_sms(self, *, task_id: int, message: str) -> str:
+            def create_sms(self, *, task_id: int, message: str, **_kwargs) -> str:
                 self.sms_task_id = task_id
                 return "request-demo"
 
@@ -3796,6 +3796,82 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
 
         uploader.apply_sms_verification_code.assert_awaited_once()
         self.assertEqual(broker.failed, ["request-rejected"])
+
+    def test_sms_resend_returns_to_the_same_running_editor_session(self) -> None:
+        """60 秒后重发必须回到同一 Playwright 会话，不能新建验证码请求。"""
+
+        now = [100.0]
+        request_ready = threading.Event()
+        worker_errors: list[Exception] = []
+
+        class Page:
+            async def wait_for_timeout(self, _milliseconds: int) -> None:
+                await asyncio.sleep(0.005)
+
+        class Uploader:
+            def __init__(self) -> None:
+                self.resend_calls: list[tuple[object, object]] = []
+
+            async def resend_sms_verification_code(self, page, challenge) -> None:
+                self.resend_calls.append((page, challenge))
+
+        class Broker(douyin_verification.DouyinVerificationBroker):
+            def __init__(self) -> None:
+                super().__init__(clock=lambda: now[0])
+                self.request_id = ""
+
+            def create_sms(self, **kwargs) -> str:
+                self.request_id = super().create_sms(**kwargs)
+                request_ready.set()
+                return self.request_id
+
+        broker = Broker()
+        page = Page()
+        uploader = Uploader()
+        session = douyin_commerce_session._CommerceEditorSession(
+            session_id="session-resend",
+            upload_payload={},
+            account_name="测试账号",
+            browser=None,
+            context=None,
+            page=page,
+            playwright=None,
+            uploader=uploader,
+        )
+
+        def request_resend_then_cancel() -> None:
+            try:
+                if not request_ready.wait(timeout=1):
+                    raise AssertionError("短信验证请求未创建")
+                now[0] = 160.0
+                broker.request_sms_resend(broker.request_id)
+                broker.cancel(broker.request_id)
+            except Exception as exc:
+                worker_errors.append(exc)
+
+        worker = threading.Thread(target=request_resend_then_cancel)
+        worker.start()
+        try:
+            with patch.object(douyin_commerce_session, "verification_broker", broker):
+                with self.assertRaisesRegex(
+                    douyin_commerce_session.DouyinCommerceSessionError,
+                    "验证已取消",
+                ):
+                    asyncio.run(
+                        douyin_commerce_session.DouyinCommerceSessionManager()._handle_publish_verification(
+                            session,
+                            VerificationChallenge(kind="sms", message="需要短信验证码"),
+                            task_id=81,
+                        )
+                    )
+        finally:
+            worker.join(timeout=2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(worker_errors, [])
+        self.assertEqual(len(uploader.resend_calls), 1)
+        self.assertIs(uploader.resend_calls[0][0], page)
+        self.assertEqual(broker.request_for_task(81), None)
 
     def test_sms_processing_is_atomic_across_fill_click_cancel_and_expiry(self) -> None:
         """真实 await 交错时，fill/click 期间的取消与 wait 超时不能撕裂事务。"""
@@ -4478,6 +4554,33 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.page.set_item_schedule_override(2, "2026-08-07 15:00")
         self.assertEqual(self.page.item_schedule_text(2), "15:00")
 
+    def test_collect_batch_payload_generates_explicit_item_timer_fields_before_ui_task_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            video = Path(root) / "collect.mp4"
+            video.write_bytes(b"offline-video")
+            account = {"id": 78, "type": 3, "status": 1, "filePath": "douyin-78.json", "profileName": "主体", "userName": "账号"}
+            media = {"id": 1, "typeText": "视频", "storedPath": str(video), "filename": video.name}
+            with patch("ui.douyin_commerce_page.account_service.list_accounts", return_value=[account]), patch(
+                "ui.douyin_commerce_page.media_service.list_media", return_value=[media]
+            ):
+                self.page.refresh()
+            self.page.account_combo.setCurrentIndex(1)
+            self.page.select_video_indexes([1])
+            self.page.description_input.setPlainText("用于验证客户端任务前的逐条排期字段。")
+            self.page._selected_music = {
+                "musicId": "music-001", "title": "测试音乐", "creator": "测试", "duration": "01:08"
+            }
+            self.page._set_selected_declaration("无需添加自主声明")
+            self.page._batch_locations[str(video)] = {
+                "poiId": "poi-001", "name": "北海银滩景区",
+                "address": "广西壮族自治区北海市银海区银滩大道中段", "scope": "domestic",
+            }
+
+            payload = self.page.collect_batch_payload()
+
+        self.assertIs(payload["items"][0]["enableTimer"], False)
+        self.assertNotIn("scheduleTime", payload["items"][0])
+
     def test_one_selected_video_uses_batch_preflight_instead_of_legacy_single_flow(self) -> None:
         """1 条也必须走 1..20 批量入口，不能悄悄退回旧单视频发布。"""
 
@@ -4866,6 +4969,37 @@ class DouyinCommerceBatchRoutingTests(unittest.TestCase):
         publish.assert_called_once()
         self.assertEqual(publish.call_args.kwargs["task_id"], 43)
         self.assertTrue(publish.call_args.kwargs["confirmed"])
+
+    def test_desktop_batch_route_prepares_all_item_timer_fields_before_task_creation(self) -> None:
+        """通用桌面入口不能把仅有用户配置的信封直接交给任务服务。"""
+
+        captured: dict[str, object] = {}
+
+        class FakeThread:
+            def __init__(self, **kwargs) -> None:
+                captured["thread"] = kwargs
+
+            def start(self) -> None:
+                captured["started"] = True
+
+        def create(batch, **kwargs):
+            captured["batch"] = batch
+            captured["create_kwargs"] = kwargs
+            return {"id": 909}
+
+        with patch.object(publish_service.task_service, "create_douyin_batch_task", side_effect=create), patch.object(
+            publish_service.threading, "Thread", FakeThread
+        ):
+            task = publish_service.start_desktop_publish([self.payload])
+
+        self.assertEqual(task["id"], 909)
+        prepared = captured["batch"]
+        self.assertTrue(all(item["enableTimer"] is False for item in prepared["items"]))
+        self.assertTrue(captured["started"])
+        self.assertEqual(
+            captured["thread"]["kwargs"]["prepared_batch"]["items"][0]["enableTimer"],
+            False,
+        )
 
 
 if __name__ == "__main__":

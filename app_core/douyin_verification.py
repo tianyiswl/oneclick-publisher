@@ -53,6 +53,11 @@ class VerificationRequest:
     expires_at: float
     qr_image: bytes = field(default=b"", repr=False)
     pending_code: str = field(default="", repr=False)
+    # 重新发送只允许由仍持有同一编辑器会话的执行器注册；回调绝不写入快照、
+    # 任务事件或日志，避免被 UI 用新建验证请求绕过平台的 60 秒限制。
+    resend_handler: Callable[[], object] | None = field(default=None, repr=False)
+    resend_available_at: float = field(default=0.0, repr=False)
+    resend_in_flight: bool = field(default=False, repr=False)
     state: str = "waiting"
     condition: threading.Condition = field(
         default_factory=threading.Condition,
@@ -140,12 +145,14 @@ class DouyinVerificationBroker:
         task_id: int,
         message: str,
         expires_in_seconds: float = 600,
+        resend_handler: Callable[[], object] | None = None,
     ) -> str:
         return self._create(
             task_id=task_id,
             kind="sms",
             message=message,
             expires_in_seconds=expires_in_seconds,
+            resend_handler=resend_handler,
         )
 
     def create_qr(
@@ -172,6 +179,7 @@ class DouyinVerificationBroker:
         message: str,
         expires_in_seconds: float,
         qr_image: bytes = b"",
+        resend_handler: Callable[[], object] | None = None,
     ) -> str:
         try:
             normalized_task_id = int(task_id)
@@ -193,6 +201,8 @@ class DouyinVerificationBroker:
             message=_snapshot_message(kind, "waiting"),
             expires_at=self._clock() + expires_in_seconds,
             qr_image=qr_image,
+            resend_handler=resend_handler if kind == "sms" else None,
+            resend_available_at=(self._clock() + 60.0) if kind == "sms" else 0.0,
         )
         with self._lock:
             previous_id = self._task_requests.get(normalized_task_id)
@@ -241,7 +251,7 @@ class DouyinVerificationBroker:
         request = self._get(request_id)
         with request.condition:
             state = self._state(request)
-            return {
+            snapshot = {
                 "requestId": request.request_id,
                 "taskId": request.task_id,
                 "kind": request.kind,
@@ -250,6 +260,76 @@ class DouyinVerificationBroker:
                 "expiresInSeconds": max(0, round(request.expires_at - self._clock())),
                 "hasQrImage": bool(request.qr_image),
             }
+            if request.kind == "sms":
+                remaining = max(0, round(request.resend_available_at - self._clock()))
+                snapshot.update(
+                    {
+                        "canResend": (
+                            state == "waiting"
+                            and callable(request.resend_handler)
+                            and not request.resend_in_flight
+                            and remaining == 0
+                        ),
+                        "resendInSeconds": remaining,
+                        "resendInFlight": bool(request.resend_in_flight),
+                    }
+                )
+            return snapshot
+
+    def request_sms_resend(self, request_id: str) -> None:
+        """在同一有效短信请求中受控地请求重发。
+
+        此方法从不新建请求；只有请求仍在 ``waiting``、仍绑定活跃会话且本机
+        单调时钟满 60 秒时才调用执行器回调。回调无法确认时安全停止，避免在
+        用户界面上伪装为“已重发”。
+        """
+
+        request = self._get(request_id)
+        with request.condition:
+            state = self._state(request)
+            if request.kind != "sms" or state != "waiting":
+                raise DouyinVerificationError("当前抖音验证不能重新发送验证码")
+            if not callable(request.resend_handler):
+                raise DouyinVerificationError("当前抖音验证没有可用的重新发送通道")
+            if request.resend_in_flight:
+                raise DouyinVerificationError("验证码正在重新发送，请稍候")
+            remaining = request.resend_available_at - self._clock()
+            if remaining > 0:
+                raise DouyinVerificationError(f"请在 {max(1, round(remaining))} 秒后重新发送验证码")
+            request.resend_in_flight = True
+            request.condition.notify_all()
+
+        try:
+            confirmed = request.resend_handler()
+            if confirmed is not True:
+                raise DouyinVerificationError("抖音未确认验证码重新发送，发布已安全停止")
+        except DouyinVerificationError:
+            with request.condition:
+                if self._state(request) == "waiting":
+                    request.state = "failed"
+                    request.pending_code = ""
+                    request.message = _snapshot_message(request.kind, "failed")
+                    request.condition.notify_all()
+            raise
+        except Exception as exc:
+            with request.condition:
+                if self._state(request) == "waiting":
+                    request.state = "failed"
+                    request.pending_code = ""
+                    request.message = _snapshot_message(request.kind, "failed")
+                    request.condition.notify_all()
+            raise DouyinVerificationError("抖音验证码重新发送失败，发布已安全停止") from exc
+        finally:
+            with request.condition:
+                request.resend_in_flight = False
+                request.condition.notify_all()
+
+        with request.condition:
+            if self._state(request) != "waiting":
+                raise DouyinVerificationError("抖音验证已取消、失败或超时，不能重新发送验证码")
+            request.pending_code = ""
+            request.resend_available_at = self._clock() + 60.0
+            request.condition.notify_all()
 
     def qr_image(self, request_id: str) -> bytes:
         """供原生二维码对话框从同一进程内存读取图像。"""
@@ -336,7 +416,7 @@ class DouyinVerificationBroker:
 
         request = self._get(request_id)
         with request.condition:
-            if self._state(request) != "waiting":
+            if self._state(request) != "waiting" or request.resend_in_flight:
                 return False
             request.state = "cancelled"
             request.message = _snapshot_message(request.kind, "cancelled")
@@ -387,6 +467,8 @@ class DouyinVerificationBroker:
                     request.message = _snapshot_message(request.kind, "cancelled")
                 request.pending_code = ""
                 request.qr_image = b""
+                request.resend_handler = None
+                request.resend_in_flight = False
                 request.condition.notify_all()
             if self._task_requests.get(request.task_id) == request.request_id:
                 self._task_requests.pop(request.task_id, None)

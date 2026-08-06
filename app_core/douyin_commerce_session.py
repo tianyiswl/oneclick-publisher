@@ -1056,9 +1056,33 @@ class DouyinCommerceSessionManager:
 
         kind = getattr(challenge, "kind", "")
         if kind == "sms":
+            loop = asyncio.get_running_loop()
+
+            def _resend_same_sms_request() -> bool:
+                """从原生窗口回到同一 Playwright 会话请求重发。
+
+                不创建第二个 broker 请求，也不把浏览器或挑战详情交给界面；任何
+                控件不唯一、会话关闭或平台未回读都会返回失败并由 broker 收束。
+                """
+
+                async def _resend() -> bool:
+                    await session.uploader.resend_sms_verification_code(
+                        session.page,
+                        challenge,
+                    )
+                    return True
+
+                try:
+                    future = asyncio.run_coroutine_threadsafe(_resend(), loop)
+                    return future.result(timeout=15) is True
+                except Exception:
+                    _LOGGER.warning("抖音短信验证码重新发送未获平台确认", exc_info=True)
+                    return False
+
             request_id = verification_broker.create_sms(
                 task_id=normalized_task_id,
                 message="请在一键发客户端输入短信验证码",
+                resend_handler=_resend_same_sms_request,
             )
         elif kind == "qr":
             request_id = verification_broker.create_qr(

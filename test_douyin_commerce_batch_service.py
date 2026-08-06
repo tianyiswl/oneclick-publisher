@@ -13,6 +13,7 @@ from app_core.douyin_commerce_batch_service import (
     DouyinCommerceBatchError,
     apply_interval_schedule,
     item_publish_payload,
+    prepare_batch_for_execution,
     validate_batch_payload,
 )
 
@@ -158,6 +159,18 @@ class DouyinCommerceBatchServiceTests(unittest.TestCase):
         self.assertFalse(checked["items"][0]["enableTimer"])
         self.assertNotIn("scheduleTime", checked["items"][0])
         self.assertEqual(item_publish_payload(checked, checked["items"][0])["scheduleTime"], "")
+
+    def test_execution_preparation_always_adds_explicit_per_item_timer_fields(self) -> None:
+        immediate = prepare_batch_for_execution(
+            {**self.batch, "publishMode": "immediate", "schedule": {}},
+            now=self.shanghai_now,
+        )
+        self.assertTrue(all(item["enableTimer"] is False for item in immediate["items"]))
+        self.assertTrue(all("scheduleTime" not in item for item in immediate["items"]))
+
+        scheduled = prepare_batch_for_execution(self.batch, now=self.shanghai_now)
+        self.assertTrue(all(item["enableTimer"] is True for item in scheduled["items"]))
+        self.assertTrue(all(item["scheduleTime"] for item in scheduled["items"]))
 
 
 if __name__ == "__main__":
