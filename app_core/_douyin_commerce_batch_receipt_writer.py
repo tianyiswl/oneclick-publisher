@@ -70,6 +70,12 @@ def _validated_receipt(
                 f"批量最终平台回执缺少有效的北京时间 {field_name}"
             ) from exc
 
+    # 即使某类事件带上另一种日期字段，也必须逐一严格验证，不能把混入的
+    # 非法日期当作无关字符串落库。
+    for date_field in ("publishedAt", "scheduleTime"):
+        if date_field in safe_readback:
+            _validate_beijing_datetime(date_field)
+
     normalized_event = str(event_type)
     if normalized_event == "platform_scheduled_receipt":
         _validate_beijing_datetime("scheduleTime")
@@ -93,7 +99,7 @@ def _write_final_batch_receipt(
     """验证并原子写入批量执行器取得的最终平台回执。
 
     该函数故意保持模块私有；生产代码只能经
-    ``douyin_commerce_batch_executor.write_verified_platform_result`` 调用。
+    DouyinCommerceBatchExecutor 在同一会话的最终回读后调用。
     """
 
     normalized_event, safe_readback = _validated_receipt(

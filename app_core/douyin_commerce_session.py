@@ -372,13 +372,22 @@ class DouyinCommerceSessionManager:
         session_id: str,
         payload: Mapping[str, Any],
         task_id: int | None = None,
+        *,
+        on_verification: Callable[[object], object | None] | None = None,
     ) -> dict[str, Any]:
         """在已预检的同一会话中执行明确确认后的最终定时提交。"""
 
         checked = douyin_commerce_service.validate_douyin_commerce_payload(payload)
         if str(checked.get("runtimeMode") or "") != "publish" or checked.get("debugDryRun") is not False:
             raise DouyinCommerceSessionError("抖音带货最终提交必须明确 runtimeMode=publish")
-        return self._call(self._submit(session_id, dict(checked), task_id=task_id))
+        return self._call(
+            self._submit(
+                session_id,
+                dict(checked),
+                task_id=task_id,
+                on_verification=on_verification,
+            )
+        )
 
     def close(self, session_id: str | None = None) -> None:
         """放弃本次临时编辑页，不保存草稿或任何会话状态。"""
@@ -1034,6 +1043,7 @@ class DouyinCommerceSessionManager:
         session: _CommerceEditorSession,
         challenge,
         task_id: int | None,
+        on_verification: Callable[[object], object | None] | None = None,
     ) -> None:
         """在原 Playwright 事件循环内完成单次、内存态验证挑战。"""
 
@@ -1058,6 +1068,16 @@ class DouyinCommerceSessionManager:
             )
         else:
             raise DouyinCommerceSessionError("抖音返回了无法处理的验证类型，发布已安全停止")
+
+        # 只把瞬态挑战对象交给当前进程内的客户端；回调不得写二维码、验证码或
+        # 原始页面信息。回调失败不影响浏览器会话的安全等待和后续清理。
+        if on_verification is not None:
+            try:
+                annotated = on_verification(challenge)
+                if annotated is not None:
+                    challenge = annotated
+            except Exception:
+                _LOGGER.debug("抖音验证进度回调失败", exc_info=True)
 
         loop = asyncio.get_running_loop()
         deadline = loop.time() + 600
@@ -1121,6 +1141,7 @@ class DouyinCommerceSessionManager:
         session_id: str,
         payload: dict[str, Any],
         task_id: int | None = None,
+        on_verification: Callable[[object], object | None] | None = None,
     ) -> dict[str, Any]:
         session = await self._current(session_id)
         self._assert_payload_matches_session(session, payload)
@@ -1160,6 +1181,7 @@ class DouyinCommerceSessionManager:
                         session,
                         challenge,
                         task_id,
+                        on_verification,
                     ),
                 )
                 scheduled = None

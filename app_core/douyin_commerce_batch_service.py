@@ -20,7 +20,7 @@ from .douyin_commerce_service import (
     normalize_content_declaration,
 )
 from .douyin_location_service import normalize_location_candidate
-from .douyin_music_service import normalize_music_readback
+from .douyin_music_service import FAVORITE_MANUAL_MUSIC_MODE, normalize_music_readback
 
 
 BATCH_WORKFLOW = "douyin-commerce-batch"
@@ -269,6 +269,8 @@ def item_publish_payload(batch: Mapping[str, Any], item: Mapping[str, Any]) -> d
         "description": batch["shared"]["description"],
         "tags": list(batch["shared"]["tags"]),
         "selectedMusic": dict(batch["shared"]["selectedMusic"]),
+        # 批量任务共享的是用户已选择并回读的收藏音乐，不能退回历史首条策略。
+        "musicMode": FAVORITE_MANUAL_MUSIC_MODE,
         "contentDeclaration": batch["shared"]["contentDeclaration"],
         "locationPoi": dict(item["locationPreset"]),
         "locationKeyword": item["locationPreset"]["name"],

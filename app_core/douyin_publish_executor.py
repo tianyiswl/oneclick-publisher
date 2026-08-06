@@ -117,6 +117,7 @@ async def _scheduled_submission_readback(
             return {
                 "title": expected_title,
                 "scheduledAt": target.strftime("%Y-%m-%d %H:%M"),
+                "timezone": "Asia/Shanghai",
                 "url": str(page.url or ""),
             }
         # 最终提交后的管理页会先进入空壳，再异步刷新作品卡片。每十秒仅

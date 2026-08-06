@@ -39,6 +39,9 @@ class VerificationChallenge:
     kind: Literal["sms", "qr"]
     message: str
     qr_image: bytes = field(default=b"", repr=False, compare=False)
+    # 仅用于当前进程内客户端提示，绝不写入任务事件、发布包或数据库。
+    item_index: int | None = None
+    item_label: str = ""
 
 
 @dataclass

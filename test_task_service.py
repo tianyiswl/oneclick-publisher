@@ -214,6 +214,15 @@ class DouyinCommerceBatchTaskTests(unittest.TestCase):
                 "Asia/Shanghai",
             ),
             (
+                "platform_scheduled_receipt",
+                {
+                    "scheduleTime": "2026-08-07 09:00",
+                    "publishedAt": "not-a-datetime",
+                    "timezone": "Asia/Shanghai",
+                },
+                "Asia/Shanghai",
+            ),
+            (
                 "platform_publish_receipt",
                 {"publishedAt": "2026-08-06 10:00", "timezone": "Asia/Shanghai"},
                 "Asia/Shanghai",
@@ -472,41 +481,18 @@ class DouyinCommerceBatchTaskTests(unittest.TestCase):
             "pending",
         )
 
-    def test_batch_executor_bridge_requires_timezoned_receipt_and_writes_legal_result(self) -> None:
+    def test_public_batch_module_does_not_expose_a_dict_to_success_bridge(self) -> None:
         task = task_service.create_douyin_batch_task(self.batch)
         task_id = task["id"]
         item_id = task_service.get_task(task_id)["items"][0]["id"]
 
-        with self.assertRaisesRegex(
-            douyin_commerce_batch_executor.DouyinCommerceBatchExecutorError,
-            "Asia/Shanghai",
-        ):
-            douyin_commerce_batch_executor.write_verified_platform_result(
-                task_id,
-                item_id,
-                {
-                    "ok": True,
-                    "scheduled": True,
-                    "message": "平台已定时",
-                    "scheduledReadback": {"scheduledAt": "2026-08-07 09:00"},
-                },
+        self.assertFalse(
+            hasattr(
+                douyin_commerce_batch_executor,
+                "write_verified_platform_result",
             )
-        self.assertEqual(task_service.get_task(task_id)["items"][0]["status"], "pending")
-
-        douyin_commerce_batch_executor.write_verified_platform_result(
-            task_id,
-            item_id,
-            {
-                "ok": True,
-                "scheduled": True,
-                "message": "平台已定时",
-                "scheduledReadback": {
-                    "scheduledAt": "2026-08-07 09:00",
-                    "timezone": "Asia/Shanghai",
-                },
-            },
         )
-        self.assertEqual(task_service.get_task(task_id)["items"][0]["status"], "success")
+        self.assertEqual(task_service.get_task(task_id)["items"][0]["status"], "pending")
 
 
 if __name__ == "__main__":
