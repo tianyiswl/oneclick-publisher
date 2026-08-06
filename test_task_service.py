@@ -9,7 +9,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from app_core import database, task_service
+from app_core import (
+    database,
+    douyin_commerce_batch_executor,
+    publish_service,
+    publish_runtime,
+    task_service,
+)
+from utils import publish_tasks
 
 
 class DouyinCommerceBatchTaskTests(unittest.TestCase):
@@ -18,6 +25,8 @@ class DouyinCommerceBatchTaskTests(unittest.TestCase):
         self.db_path = Path(self.tempdir.name) / "database.db"
         self.db_patch = patch.object(database, "DB_PATH", self.db_path)
         self.db_patch.start()
+        self.publish_task_db_patch = patch.object(publish_tasks, "DB_PATH", self.db_path)
+        self.publish_task_db_patch.start()
         database.ensure_schema()
         self.batch = {
             "accountFile": "oneclick_3_offline.json",
@@ -44,6 +53,7 @@ class DouyinCommerceBatchTaskTests(unittest.TestCase):
         }
 
     def tearDown(self) -> None:
+        self.publish_task_db_patch.stop()
         self.db_patch.stop()
         self.tempdir.cleanup()
 
@@ -52,10 +62,10 @@ class DouyinCommerceBatchTaskTests(unittest.TestCase):
         """通过未来批量执行器唯一允许导入的内部写入模块执行。"""
 
         from app_core._douyin_commerce_batch_receipt_writer import (
-            write_final_batch_receipt,
+            _write_final_batch_receipt,
         )
 
-        write_final_batch_receipt(*args, **kwargs)
+        _write_final_batch_receipt(*args, **kwargs)
 
     def test_batch_task_creates_one_publish_item_per_video_and_keeps_location_time(self) -> None:
         task = task_service.create_douyin_batch_task(self.batch)
@@ -192,13 +202,36 @@ class DouyinCommerceBatchTaskTests(unittest.TestCase):
                 {"scheduleTime": "2026-08-07 09:00", "timezone": "UTC"},
                 "Asia/Shanghai",
             ),
+            (
+                "platform_scheduled_receipt",
+                {"scheduleTime": "2026-08-07 09:00"},
+                "Asia/Shanghai",
+            ),
             ("platform_scheduled_receipt", {}, "Asia/Shanghai"),
             (
                 "platform_scheduled_receipt",
                 {"scheduleTime": "2026-02-30 09:00"},
                 "Asia/Shanghai",
             ),
-            ("platform_publish_receipt", {"publishedAt": "2026-08-06 10:00"}, "Asia/Shanghai"),
+            (
+                "platform_publish_receipt",
+                {"publishedAt": "2026-08-06 10:00", "timezone": "Asia/Shanghai"},
+                "Asia/Shanghai",
+            ),
+            (
+                "platform_publish_receipt",
+                {"platformPostId": "post-001", "publishedAt": "2026-08-06 10:00"},
+                "Asia/Shanghai",
+            ),
+            (
+                "platform_publish_receipt",
+                {
+                    "platformPostId": "post-001",
+                    "publishedAt": "2026-02-30 10:00",
+                    "timezone": "Asia/Shanghai",
+                },
+                "Asia/Shanghai",
+            ),
             ("platform_publish_receipt", {"platformPostId": True}, "Asia/Shanghai"),
             (
                 "platform_publish_receipt",
@@ -255,7 +288,10 @@ class DouyinCommerceBatchTaskTests(unittest.TestCase):
             task_id,
             item_id,
             event_type="platform_scheduled_receipt",
-            readback={"scheduleTime": "2026-08-07 09:00"},
+            readback={
+                "scheduleTime": "2026-08-07 09:00",
+                "timezone": "Asia/Shanghai",
+            },
             timezone="Asia/Shanghai",
             message="平台已定时",
         )
@@ -271,7 +307,11 @@ class DouyinCommerceBatchTaskTests(unittest.TestCase):
             published_task_id,
             published_item_id,
             event_type="platform_publish_receipt",
-            readback={"platformPostId": "post-001"},
+            readback={
+                "platformPostId": "post-001",
+                "publishedAt": "2026-08-07 09:00",
+                "timezone": "Asia/Shanghai",
+            },
             timezone="Asia/Shanghai",
             message="平台已发布",
         )
@@ -352,7 +392,10 @@ class DouyinCommerceBatchTaskTests(unittest.TestCase):
             task_id,
             item_id,
             event_type="platform_scheduled_receipt",
-            readback={"scheduleTime": "2026-08-07 09:00"},
+            readback={
+                "scheduleTime": "2026-08-07 09:00",
+                "timezone": "Asia/Shanghai",
+            },
             timezone="Asia/Shanghai",
             message="平台已定时",
         )
@@ -366,6 +409,103 @@ class DouyinCommerceBatchTaskTests(unittest.TestCase):
             readback={"session": "must-not-store"},
         )
 
+        self.assertEqual(task_service.get_task(task_id)["items"][0]["status"], "success")
+
+    def test_legacy_task_success_writers_cannot_bypass_batch_receipts(self) -> None:
+        task = task_service.create_douyin_batch_task(self.batch)
+        task_id = task["id"]
+
+        legacy_writers = (
+            lambda: publish_tasks.mark_items(task_id, "success", "伪造成功"),
+            lambda: publish_tasks.mark_platform_results(
+                task_id, [{"type": 3, "ok": True}], "伪造平台成功"
+            ),
+            lambda: publish_tasks.complete_task(task_id, "伪造完成"),
+        )
+        for writer in legacy_writers:
+            with self.subTest(writer=writer), self.assertRaisesRegex(ValueError, "批量执行器"):
+                writer()
+            self.assertEqual(
+                [item["status"] for item in task_service.get_task(task_id)["items"]],
+                ["pending", "pending", "pending"],
+            )
+
+    def test_legacy_publish_runtime_rejects_batch_before_any_success_writer(self) -> None:
+        task = task_service.create_douyin_batch_task(self.batch)
+        task_id = task["id"]
+        payload = json.loads(task_service.get_task(task_id)["payloadJson"])[0]
+
+        for runner, arguments in (
+            (publish_runtime.execute_single_publish, (payload, task)),
+            (publish_runtime.execute_batch_publish, ([payload], task)),
+        ):
+            with self.subTest(runner=runner.__name__):
+                result = runner(*arguments)
+                self.assertEqual(result["code"], 409)
+                self.assertIn("批量执行器", result["msg"])
+                self.assertEqual(
+                    [item["status"] for item in task_service.get_task(task_id)["items"]],
+                    ["pending", "pending", "pending"],
+                )
+
+    def test_generic_desktop_publish_service_cannot_create_a_success_path_for_batch_item(self) -> None:
+        task = task_service.create_douyin_batch_task(self.batch)
+        batch_payload = json.loads(task_service.get_task(task["id"])["payloadJson"])[0]
+
+        with self.assertRaisesRegex(ValueError, "批量执行器"):
+            publish_service._validate_payloads([batch_payload])
+
+        generic_task = task_service.create_pending_task(
+            [batch_payload], mode="oneclick_publish"
+        )
+        with self.assertRaisesRegex(ValueError, "批量执行器"):
+            task_service.mark_platform_result(
+                generic_task["id"],
+                3,
+                ok=True,
+                message="通用服务伪造成功",
+                content_type="video",
+                event_type="platform_publish",
+            )
+        self.assertEqual(
+            task_service.get_task(generic_task["id"])["items"][0]["status"],
+            "pending",
+        )
+
+    def test_batch_executor_bridge_requires_timezoned_receipt_and_writes_legal_result(self) -> None:
+        task = task_service.create_douyin_batch_task(self.batch)
+        task_id = task["id"]
+        item_id = task_service.get_task(task_id)["items"][0]["id"]
+
+        with self.assertRaisesRegex(
+            douyin_commerce_batch_executor.DouyinCommerceBatchExecutorError,
+            "Asia/Shanghai",
+        ):
+            douyin_commerce_batch_executor.write_verified_platform_result(
+                task_id,
+                item_id,
+                {
+                    "ok": True,
+                    "scheduled": True,
+                    "message": "平台已定时",
+                    "scheduledReadback": {"scheduledAt": "2026-08-07 09:00"},
+                },
+            )
+        self.assertEqual(task_service.get_task(task_id)["items"][0]["status"], "pending")
+
+        douyin_commerce_batch_executor.write_verified_platform_result(
+            task_id,
+            item_id,
+            {
+                "ok": True,
+                "scheduled": True,
+                "message": "平台已定时",
+                "scheduledReadback": {
+                    "scheduledAt": "2026-08-07 09:00",
+                    "timezone": "Asia/Shanghai",
+                },
+            },
+        )
         self.assertEqual(task_service.get_task(task_id)["items"][0]["status"], "success")
 
 

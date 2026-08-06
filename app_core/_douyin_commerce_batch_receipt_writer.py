@@ -24,7 +24,7 @@ _RECEIPT_FIELDS = {
     "timezone",
 }
 _SHANGHAI_TIMEZONE = "Asia/Shanghai"
-_BEIJING_SCHEDULE_RE = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}")
+_BEIJING_DATETIME_RE = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}")
 
 
 def _now() -> str:
@@ -56,26 +56,32 @@ def _validated_receipt(
         safe_readback[key] = value.strip()
 
     receipt_timezone = safe_readback.get("timezone")
-    if receipt_timezone and receipt_timezone != _SHANGHAI_TIMEZONE:
+    if receipt_timezone != _SHANGHAI_TIMEZONE:
         raise ValueError("批量最终平台回执字段 timezone 必须是 Asia/Shanghai")
-    safe_readback["timezone"] = _SHANGHAI_TIMEZONE
+
+    def _validate_beijing_datetime(field_name: str) -> None:
+        value = safe_readback.get(field_name, "")
+        if not _BEIJING_DATETIME_RE.fullmatch(value):
+            raise ValueError(f"批量最终平台回执缺少有效的北京时间 {field_name}")
+        try:
+            datetime.strptime(value, "%Y-%m-%d %H:%M")
+        except ValueError as exc:
+            raise ValueError(
+                f"批量最终平台回执缺少有效的北京时间 {field_name}"
+            ) from exc
 
     normalized_event = str(event_type)
     if normalized_event == "platform_scheduled_receipt":
-        schedule_time = safe_readback.get("scheduleTime", "")
-        if not _BEIJING_SCHEDULE_RE.fullmatch(schedule_time):
-            raise ValueError("批量定时回执缺少有效的北京时间 scheduleTime")
-        try:
-            datetime.strptime(schedule_time, "%Y-%m-%d %H:%M")
-        except ValueError as exc:
-            raise ValueError("批量定时回执缺少有效的北京时间 scheduleTime") from exc
-    elif not (safe_readback.get("platformPostId") or safe_readback.get("postUrl")):
-        raise ValueError("批量发布回执缺少 platformPostId 或 postUrl")
+        _validate_beijing_datetime("scheduleTime")
+    else:
+        if not (safe_readback.get("platformPostId") or safe_readback.get("postUrl")):
+            raise ValueError("批量发布回执缺少 platformPostId 或 postUrl")
+        _validate_beijing_datetime("publishedAt")
 
     return normalized_event, safe_readback
 
 
-def write_final_batch_receipt(
+def _write_final_batch_receipt(
     task_id: int,
     item_id: int,
     *,
@@ -84,7 +90,11 @@ def write_final_batch_receipt(
     timezone: str,
     message: str,
 ) -> None:
-    """验证并原子写入批量执行器取得的最终平台回执。"""
+    """验证并原子写入批量执行器取得的最终平台回执。
+
+    该函数故意保持模块私有；生产代码只能经
+    ``douyin_commerce_batch_executor.write_verified_platform_result`` 调用。
+    """
 
     normalized_event, safe_readback = _validated_receipt(
         event_type, readback, timezone

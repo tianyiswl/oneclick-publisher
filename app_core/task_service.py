@@ -515,14 +515,23 @@ def mark_platform_result(
     with connect() as conn:
         batch_item = conn.execute(
             """
-            SELECT 1
-            FROM publish_task_items
-            WHERE taskId = ? AND batchItemIndex IS NOT NULL
+            SELECT task.payloadJson,
+                   EXISTS(
+                       SELECT 1
+                       FROM publish_task_items AS item
+                       WHERE item.taskId = task.id AND item.batchItemIndex IS NOT NULL
+                   ) AS hasBatchItems
+            FROM publish_tasks AS task
+            WHERE task.id = ?
             LIMIT 1
             """,
             (int(task_id),),
         ).fetchone()
-        if batch_item:
+        if batch_item and (
+            bool(batch_item["hasBatchItems"])
+            or workflow_from_payload_json(batch_item["payloadJson"])
+            == "douyin-commerce-batch"
+        ):
             raise ValueError("抖音带货批量任务必须由批量执行器逐视频回填")
         if content_type:
             conn.execute(

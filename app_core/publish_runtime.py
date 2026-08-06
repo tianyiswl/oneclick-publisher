@@ -54,6 +54,26 @@ OVERSEAS_DRAFT_DISABLED_MESSAGE = "海外平台登录已暂缓，当前不执行
 PUBLISH_RUNTIME_MODES = {"preflight", "draft", "publish"}
 
 
+def _is_douyin_commerce_batch_payload(data: object) -> bool:
+    """旧发布运行时不能接管逐视频批量工作流。"""
+
+    return isinstance(data, dict) and (
+        str(data.get("workflow") or "").strip() == "douyin-commerce-batch"
+        or str(data.get("batchWorkflow") or "").strip() == "douyin-commerce-batch"
+    )
+
+
+def _batch_runtime_rejection(task: dict[str, Any]) -> dict[str, Any]:
+    """在旧入口发生浏览器动作前拒绝批量载荷，防止通用完成接口伪造成功。"""
+
+    message = "抖音带货批量任务必须使用批量执行器逐视频回读，旧发布运行时已拒绝执行"
+    return {
+        "code": 409,
+        "msg": message,
+        "data": {"taskId": task["id"], "taskNo": task["taskNo"]},
+    }
+
+
 def run_async(coro):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -391,6 +411,8 @@ def _run_oneclick_xhs_batch(
 
 
 def execute_single_publish(data: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
+    if _is_douyin_commerce_batch_payload(data):
+        return _batch_runtime_rejection(task)
     platform_type = int(data.get("type"))
     runtime_mode = publish_runtime_mode(data)
     if platform_type in OVERSEAS_PLATFORM_TYPES and runtime_mode == "publish":
@@ -486,6 +508,8 @@ def execute_single_publish(data: dict[str, Any], task: dict[str, Any]) -> dict[s
 
 
 def execute_batch_publish(data_list: list[dict[str, Any]], task: dict[str, Any]) -> dict[str, Any]:
+    if any(_is_douyin_commerce_batch_payload(data) for data in data_list):
+        return _batch_runtime_rejection(task)
     formal_overseas = [
         data for data in data_list
         if int(data.get("type", 0) or 0) in OVERSEAS_PLATFORM_TYPES

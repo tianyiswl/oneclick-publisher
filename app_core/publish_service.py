@@ -60,6 +60,14 @@ def _validate_payloads(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
     validated: list[dict[str, Any]] = []
     for raw in payloads:
         payload = dict(raw)
+        if (
+            str(payload.get("workflow") or "").strip() == "douyin-commerce-batch"
+            or str(payload.get("batchWorkflow") or "").strip()
+            == "douyin-commerce-batch"
+        ):
+            raise ValueError(
+                "抖音带货批量任务必须使用批量执行器，不能进入通用发布服务"
+            )
         payload["fileList"] = [
             _runtime_media_path(item)
             for item in payload.get("fileList") or []

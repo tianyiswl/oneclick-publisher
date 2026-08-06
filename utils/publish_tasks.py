@@ -45,6 +45,41 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
+def _is_douyin_commerce_batch_task(conn: sqlite3.Connection, task_id: int) -> bool:
+    """识别由新批量执行器管理的任务，避免旧运行时写出伪成功。
+
+    ``utils.publish_tasks`` 仍服务历史多平台发布，因此不能仅按抖音平台号
+    判断。批量任务的内部单视频载荷会保留 ``batchWorkflow``，这是唯一可审计
+    的任务边界；解析失败时按历史任务处理，避免把损坏的旧任务误判为批量。
+    """
+
+    row = conn.execute(
+        "SELECT payloadJson FROM publish_tasks WHERE id = ?", (int(task_id),)
+    ).fetchone()
+    if not row:
+        return False
+    try:
+        payloads = json.loads(str(row["payloadJson"] or "[]"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return isinstance(payloads, list) and any(
+        isinstance(payload, dict)
+        and str(payload.get("batchWorkflow") or "").strip()
+        == "douyin-commerce-batch"
+        for payload in payloads
+    )
+
+
+def _reject_batch_success_writer(conn: sqlite3.Connection, task_id: int, operation: str) -> None:
+    """旧通用成功写入器不得处理逐视频批量任务。"""
+
+    if _is_douyin_commerce_batch_task(conn, task_id):
+        raise ValueError(
+            f"抖音带货批量任务不能通过{operation}写入成功；"
+            "必须由批量执行器逐视频写入可信平台回执"
+        )
+
+
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
 
@@ -341,6 +376,8 @@ def mark_items(
     platform_type: int | None = None,
 ) -> None:
     with _connect() as conn:
+        if status == "success":
+            _reject_batch_success_writer(conn, task_id, "通用任务状态接口")
         now = _now()
         params: list[Any] = [status, message, now, task_id]
         where = "taskId = ?"
@@ -377,6 +414,9 @@ def mark_items(
 
 
 def mark_platform_results(task_id: int, results: list[dict[str, Any]], default_message: str | None = None) -> None:
+    with _connect() as conn:
+        _reject_batch_success_writer(conn, task_id, "通用平台结果接口")
+
     by_platform: dict[int, list[dict[str, Any]]] = {}
     for result in results or []:
         try:
@@ -415,6 +455,8 @@ def fail_task(task_id: int, message: str) -> None:
 
 
 def complete_task(task_id: int, message: str = "发布任务已完成") -> None:
+    with _connect() as conn:
+        _reject_batch_success_writer(conn, task_id, "完成任务接口")
     mark_items(task_id, "success", message)
 
 
