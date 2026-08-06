@@ -771,6 +771,14 @@ class DouYinVideo(object):
             before_submit()
         await buttons[0].click(timeout=10_000)
         for _ in range(20):
+            # 短信提交后抖音常保留同一浮层显示“验证成功/处理中”，而不是
+            # 立刻跳转管理页。该状态不应被当成二维码或新的短信挑战。
+            try:
+                panel_text = await verification_container.inner_text(timeout=1_000)
+            except Exception:
+                panel_text = ""
+            if any(marker in panel_text for marker in ("验证成功", "验证通过", "验证完成", "正在验证", "验证中")):
+                return
             if await self.detect_publish_verification(page) is None:
                 return
             await page.wait_for_timeout(250)
