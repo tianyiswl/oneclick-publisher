@@ -559,6 +559,65 @@ class DouyinPublishPayloadTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "验证容器无法唯一确认"):
             asyncio.run(video.detect_publish_verification(Page()))
 
+    def test_hidden_verification_container_stops_before_reading_controls(self) -> None:
+        """验证文案祖先不可见时，不能读取其中的短信、确认或二维码控件。"""
+
+        class Controls:
+            def __init__(self, items) -> None:
+                self.items = list(items)
+
+            async def count(self) -> int:
+                return len(self.items)
+
+            def nth(self, index: int):
+                return self.items[index]
+
+        class HiddenContainer:
+            def __init__(self) -> None:
+                self.queried_roles: list[str] = []
+
+            async def is_visible(self) -> bool:
+                return False
+
+            def get_by_role(self, role: str, **_kwargs):
+                self.queried_roles.append(role)
+                return Controls([])
+
+        class Marker:
+            def __init__(self, container) -> None:
+                self.container = container
+
+            async def is_visible(self) -> bool:
+                return True
+
+            def locator(self, _selector: str):
+                return Controls([self.container])
+
+        class Page:
+            url = "https://creator.douyin.com/verification"
+
+            def __init__(self) -> None:
+                self.container = HiddenContainer()
+                self.marker = Marker(self.container)
+
+            def get_by_text(self, text: str, *, exact: bool):
+                if text == "接收短信验证码" and exact:
+                    return Controls([self.marker])
+                return Controls([])
+
+        page = Page()
+        video = DouYinVideo(
+            title="测试标题",
+            file_path="/tmp/demo.mp4",
+            tags=[],
+            publish_date=datetime.now(),
+            account_file="/tmp/account.json",
+            description="测试文案",
+        )
+        with self.assertRaisesRegex(RuntimeError, "验证容器无法唯一确认"):
+            asyncio.run(video.detect_publish_verification(page))
+        self.assertEqual(page.container.queried_roles, [])
+
     def test_qr_challenge_requires_a_real_decoder_result(self) -> None:
         """有效二维码可经解码器确认，普通高对比方图绝不能仅凭形状通过。"""
 
