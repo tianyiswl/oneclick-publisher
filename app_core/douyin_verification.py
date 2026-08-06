@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from io import BytesIO
+import math
 import re
 import threading
 import time
@@ -104,14 +105,20 @@ def _validate_qr_image(qr_image: bytes) -> bytes:
     return bytes(qr_image)
 
 
-def _safe_message(kind: Literal["sms", "qr"], message: str) -> str:
-    """保留本机提示，同时隐藏可能意外混入说明的敏感数字。"""
+def _snapshot_message(kind: Literal["sms", "qr"], state: str) -> str:
+    """返回不依赖平台输入的固定安全说明。"""
 
-    value = str(message).strip()
-    if not value:
-        return "请在一键发客户端完成验证"
-    value = re.sub(r"\d{4,}", "已隐藏", value)
-    return value
+    if state == "waiting":
+        if kind == "sms":
+            return "请在一键发客户端输入短信验证码"
+        return "请在一键发客户端扫码完成验证"
+    messages = {
+        "success": "验证成功，发布会话将自动继续",
+        "failed": "抖音验证失败，发布已安全停止",
+        "cancelled": "用户已取消抖音验证，发布已安全停止",
+        "expired": "抖音验证已过期，发布已安全停止",
+    }
+    return messages.get(state, "抖音验证状态异常，发布已安全停止")
 
 
 class DouyinVerificationBroker:
@@ -168,15 +175,19 @@ class DouyinVerificationBroker:
             raise DouyinVerificationError("抖音验证缺少有效任务号") from exc
         if normalized_task_id <= 0:
             raise DouyinVerificationError("抖音验证缺少有效任务号")
-        if expires_in_seconds <= 0:
+        try:
+            expires_in_seconds = float(expires_in_seconds)
+        except (TypeError, ValueError) as exc:
+            raise DouyinVerificationError("抖音验证有效期必须为有限正数") from exc
+        if not math.isfinite(expires_in_seconds) or expires_in_seconds <= 0:
             raise DouyinVerificationError("抖音验证有效期必须大于零")
 
         request = VerificationRequest(
             request_id=uuid.uuid4().hex,
             task_id=normalized_task_id,
             kind=kind,
-            message=_safe_message(kind, message),
-            expires_at=self._clock() + float(expires_in_seconds),
+            message=_snapshot_message(kind, "waiting"),
+            expires_at=self._clock() + expires_in_seconds,
             qr_image=qr_image,
         )
         with self._lock:
@@ -214,7 +225,7 @@ class DouyinVerificationBroker:
                 "taskId": request.task_id,
                 "kind": request.kind,
                 "state": state,
-                "message": request.message,
+                "message": _snapshot_message(request.kind, state),
                 "expiresInSeconds": max(0, round(request.expires_at - self._clock())),
                 "hasQrImage": bool(request.qr_image),
             }
@@ -249,25 +260,26 @@ class DouyinVerificationBroker:
             return code or None
 
     def succeed(self, request_id: str) -> None:
-        self._transition(request_id, "success", "验证成功，发布会话将自动继续")
+        self._transition(request_id, "success")
 
     def fail(
         self,
         request_id: str,
         message: str = "抖音验证失败，发布已安全停止",
     ) -> None:
-        self._transition(request_id, "failed", _safe_message("sms", message))
+        del message
+        self._transition(request_id, "failed")
 
     def cancel(self, request_id: str) -> None:
-        self._transition(request_id, "cancelled", "用户已取消抖音验证，发布已安全停止")
+        self._transition(request_id, "cancelled")
 
-    def _transition(self, request_id: str, state: str, message: str) -> None:
+    def _transition(self, request_id: str, state: str) -> None:
         request = self._get(request_id)
         with request.condition:
             if self._state(request) in TERMINAL_STATES:
                 return
             request.state = state
-            request.message = message
+            request.message = _snapshot_message(request.kind, state)
             request.pending_code = ""
             request.condition.notify_all()
 
@@ -283,7 +295,7 @@ class DouyinVerificationBroker:
                 remaining = deadline - self._clock()
                 if remaining <= 0:
                     request.state = "failed"
-                    request.message = "等待抖音验证超时，发布已安全停止"
+                    request.message = _snapshot_message(request.kind, "failed")
                     request.pending_code = ""
                     request.condition.notify_all()
                     break
@@ -300,7 +312,7 @@ class DouyinVerificationBroker:
             with request.condition:
                 if request.state not in TERMINAL_STATES:
                     request.state = "cancelled"
-                    request.message = "抖音验证已清理，发布已安全停止"
+                    request.message = _snapshot_message(request.kind, "cancelled")
                 request.pending_code = ""
                 request.qr_image = b""
                 request.condition.notify_all()

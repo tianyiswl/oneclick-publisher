@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from io import BytesIO
+import math
 import threading
 import unittest
 
@@ -86,6 +87,47 @@ class DouyinVerificationBrokerTests(unittest.TestCase):
                 qr_image=_qr_bytes(),
                 expires_in_seconds=30,
             )
+
+    def test_rejects_non_finite_verification_expiry(self):
+        broker = DouyinVerificationBroker()
+
+        for label, expires_in_seconds in (
+            ("nan", math.nan),
+            ("positive-infinity", math.inf),
+            ("negative-infinity", -math.inf),
+        ):
+            with self.subTest(kind=label):
+                with self.assertRaises(DouyinVerificationError):
+                    broker.create_sms(
+                        task_id=50,
+                        message="需要短信验证",
+                        expires_in_seconds=expires_in_seconds,
+                    )
+
+    def test_untrusted_request_or_error_message_never_enters_snapshot(self):
+        broker = DouyinVerificationBroker()
+        untrusted_message = (
+            "Cookie=session=private; 手机号=138-0013-8000; "
+            "<form action='/verify?token=private'>"
+        )
+        request_id = broker.create_sms(
+            task_id=51,
+            message=untrusted_message,
+        )
+
+        waiting_snapshot = broker.snapshot(request_id)
+        broker.fail(request_id, untrusted_message)
+        failed_snapshot = broker.snapshot(request_id)
+
+        for snapshot in (waiting_snapshot, failed_snapshot):
+            rendered = str(snapshot)
+            self.assertNotIn("Cookie", rendered)
+            self.assertNotIn("session=private", rendered)
+            self.assertNotIn("138-0013-8000", rendered)
+            self.assertNotIn("<form", rendered)
+            self.assertNotIn("token=private", rendered)
+        self.assertEqual(waiting_snapshot["message"], "请在一键发客户端输入短信验证码")
+        self.assertEqual(failed_snapshot["message"], "抖音验证失败，发布已安全停止")
 
     def test_cancel_unblocks_waiter_and_prevents_later_code_submission(self):
         broker = DouyinVerificationBroker()
