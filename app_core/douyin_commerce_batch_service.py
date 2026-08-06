@@ -175,12 +175,37 @@ def _schedule(value: object, *, publish_mode: str) -> dict[str, Any]:
     }
 
 
-def validate_batch_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
-    """验证批次信封并仅返回白名单字段，不执行任何平台动作。"""
+def _validate_future_schedule(batch: Mapping[str, Any], *, now: datetime) -> None:
+    """以调用方明确提供的北京时间校验定时与覆盖时间。"""
+
+    if batch["publishMode"] != "interval-schedule":
+        return
+    current = _as_shanghai(now)
+    start = _parse_shanghai_time(batch["schedule"]["startTime"], field_name="定时起始时间")
+    interval = timedelta(minutes=batch["schedule"]["intervalMinutes"])
+    for index, item in enumerate(batch["items"]):
+        candidate = item["scheduleTimeOverride"] or (start + interval * index).strftime(
+            _DATETIME_FORMAT
+        )
+        _future_shanghai_time(candidate, now=current, field_name=f"第 {index + 1} 条视频发布时间")
+
+
+def validate_batch_payload(
+    payload: Mapping[str, Any], now: datetime | None = None
+) -> dict[str, Any]:
+    """验证批次信封并仅返回白名单字段，不执行任何平台动作。
+
+    ``now`` 仅由需要判定“未来”的调用方显式传入，避免本地契约校验依赖机器
+    时钟；排期生成会把自己的时钟原样传入。
+    """
 
     if not isinstance(payload, Mapping):
         raise DouyinCommerceBatchError("抖音带货批量任务格式无效")
-    if int(payload.get("type") or 0) != 3:
+    try:
+        platform_type = int(payload.get("type") or 0)
+    except (TypeError, ValueError) as exc:
+        raise DouyinCommerceBatchError("抖音带货批量只能选择抖音平台") from exc
+    if platform_type != 3:
         raise DouyinCommerceBatchError("抖音带货批量只能选择抖音平台")
     if _text(payload.get("workflow")) != BATCH_WORKFLOW:
         raise DouyinCommerceBatchError("抖音带货批量缺少 workflow=douyin-commerce-batch")
@@ -200,26 +225,15 @@ def validate_batch_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         "schedule": _schedule(payload.get("schedule"), publish_mode=publish_mode),
         "items": _items(payload.get("items")),
     }
-    # 定时配置不能只在真正执行时才暴露为历史时间；这里先按当前北京时间
-    # 做一次安全检查，调用方随后可用 apply_interval_schedule 的显式 now
-    # 再做可复现的最终校验。
-    if checked["publishMode"] == "interval-schedule":
-        current = datetime.now(_SHANGHAI)
-        start = _parse_shanghai_time(checked["schedule"]["startTime"], field_name="定时起始时间")
-        interval = timedelta(minutes=checked["schedule"]["intervalMinutes"])
-        for index, item in enumerate(checked["items"]):
-            candidate = item["scheduleTimeOverride"] or (start + interval * index).strftime(
-                _DATETIME_FORMAT
-            )
-            _future_shanghai_time(candidate, now=current, field_name=f"第 {index + 1} 条视频发布时间")
+    if now is not None:
+        _validate_future_schedule(checked, now=now)
     return checked
 
 
 def apply_interval_schedule(payload: Mapping[str, Any], now: datetime) -> dict[str, Any]:
     """以给定当前时间生成每条发布时间，并验证其均晚于北京时间当前时刻。"""
 
-    batch = validate_batch_payload(payload)
-    current = _as_shanghai(now)
+    batch = validate_batch_payload(payload, now=now)
     result = deepcopy(batch)
     if result["publishMode"] == "immediate":
         for item in result["items"]:
@@ -232,9 +246,9 @@ def apply_interval_schedule(payload: Mapping[str, Any], now: datetime) -> dict[s
     for index, item in enumerate(result["items"]):
         generated = start + interval * index
         candidate = item["scheduleTimeOverride"] or generated.strftime(_DATETIME_FORMAT)
-        item["scheduleTime"] = _future_shanghai_time(
-            candidate, now=current, field_name=f"第 {index + 1} 条视频发布时间"
-        )
+        # validate_batch_payload 已使用同一个显式 now 完成未来时间校验；
+        # 此处只写入已验证的排期，避免再次读取或推断机器时钟。
+        item["scheduleTime"] = candidate
         item["enableTimer"] = True
     return result
 

@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 import tempfile
 import unittest
@@ -17,9 +17,6 @@ from app_core.douyin_commerce_batch_service import (
 )
 
 
-SHANGHAI_NOW = datetime(2026, 8, 6, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
-
-
 class DouyinCommerceBatchServiceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
@@ -29,6 +26,9 @@ class DouyinCommerceBatchServiceTests(unittest.TestCase):
             path = root / name
             path.write_bytes(b"local-video")
             self.media_paths.append(str(path))
+        self.shanghai_now = datetime.now(ZoneInfo("Asia/Shanghai")).replace(second=0, microsecond=0)
+        self.schedule_start = self.shanghai_now + timedelta(days=1)
+        self.schedule_override = self.schedule_start + timedelta(hours=6)
         self.batch = {
             "type": 3,
             "workflow": "douyin-commerce-batch",
@@ -50,15 +50,20 @@ class DouyinCommerceBatchServiceTests(unittest.TestCase):
             "publishMode": "interval-schedule",
             "schedule": {
                 "timezone": "Asia/Shanghai",
-                "startTime": "2026-08-07 09:00",
+                "startTime": self.schedule_start.strftime("%Y-%m-%d %H:%M"),
                 "intervalMinutes": 30,
             },
             "items": [
                 self._item(self.media_paths[0]),
                 self._item(self.media_paths[1]),
-                self._item(self.media_paths[2], schedule_time_override="2026-08-07 15:00"),
+                self._item(
+                    self.media_paths[2],
+                    schedule_time_override=self.schedule_override.strftime("%Y-%m-%d %H:%M"),
+                ),
             ],
             "cookie": "must-not-enter-contract",
+            "verificationCode": "must-not-enter-contract",
+            "browserState": {"session": "must-not-enter-contract"},
         }
 
     def tearDown(self) -> None:
@@ -78,12 +83,15 @@ class DouyinCommerceBatchServiceTests(unittest.TestCase):
         }
 
     def test_interval_schedule_defaults_to_shanghai_and_allows_item_override(self) -> None:
-        batch = validate_batch_payload(self.batch)
-        result = apply_interval_schedule(batch, now=SHANGHAI_NOW)
+        batch = validate_batch_payload(self.batch, now=self.shanghai_now)
+        result = apply_interval_schedule(batch, now=self.shanghai_now)
 
-        self.assertEqual(result["items"][0]["scheduleTime"], "2026-08-07 09:00")
-        self.assertEqual(result["items"][1]["scheduleTime"], "2026-08-07 09:30")
-        self.assertEqual(result["items"][2]["scheduleTime"], "2026-08-07 15:00")
+        self.assertEqual(result["items"][0]["scheduleTime"], self.schedule_start.strftime("%Y-%m-%d %H:%M"))
+        self.assertEqual(
+            result["items"][1]["scheduleTime"],
+            (self.schedule_start + timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M"),
+        )
+        self.assertEqual(result["items"][2]["scheduleTime"], self.schedule_override.strftime("%Y-%m-%d %H:%M"))
         self.assertTrue(all(item["enableTimer"] for item in result["items"]))
 
     def test_batch_rejects_more_than_twenty_items_or_more_than_one_account(self) -> None:
@@ -93,7 +101,9 @@ class DouyinCommerceBatchServiceTests(unittest.TestCase):
             validate_batch_payload({**self.batch, "accountList": ["a.json", "b.json"]})
 
     def test_item_payload_keeps_single_video_workflow_and_excludes_sensitive_fields(self) -> None:
-        scheduled = apply_interval_schedule(validate_batch_payload(self.batch), now=SHANGHAI_NOW)
+        scheduled = apply_interval_schedule(
+            validate_batch_payload(self.batch, now=self.shanghai_now), now=self.shanghai_now
+        )
         payload = item_publish_payload(scheduled, scheduled["items"][0])
 
         self.assertEqual(payload["workflow"], "douyin-commerce")
@@ -103,9 +113,47 @@ class DouyinCommerceBatchServiceTests(unittest.TestCase):
         self.assertNotIn("cookie", payload)
         self.assertNotIn("commerceStore", payload)
 
+    def test_batch_contract_whitelist_excludes_sensitive_fields(self) -> None:
+        raw = {
+            **self.batch,
+            "shared": {**self.batch["shared"], "cookie": "no", "verificationCode": "no"},
+            "items": [
+                {**self.batch["items"][0], "browser": {"state": "no"}, "cookie": "no"}
+            ],
+        }
+
+        checked = validate_batch_payload(raw, now=self.shanghai_now)
+
+        self.assertEqual(
+            set(checked),
+            {"type", "workflow", "commerceMode", "contentType", "accountFile", "shared", "publishMode", "schedule", "items"},
+        )
+        self.assertNotIn("cookie", checked["shared"])
+        self.assertNotIn("verificationCode", checked["shared"])
+        self.assertNotIn("browser", checked["items"][0])
+        self.assertNotIn("cookie", checked["items"][0])
+
+    def test_non_numeric_platform_type_raises_batch_error(self) -> None:
+        with self.assertRaisesRegex(DouyinCommerceBatchError, "抖音平台"):
+            validate_batch_payload({**self.batch, "type": "not-a-number"})
+
+    def test_explicit_clock_rejects_a_non_future_interval_schedule(self) -> None:
+        expired = {
+            **self.batch,
+            "schedule": {
+                **self.batch["schedule"],
+                "startTime": self.shanghai_now.strftime("%Y-%m-%d %H:%M"),
+            },
+        }
+
+        with self.assertRaisesRegex(DouyinCommerceBatchError, "晚于当前北京时间"):
+            apply_interval_schedule(expired, now=self.shanghai_now)
+
     def test_immediate_items_never_keep_a_schedule_time(self) -> None:
         immediate = dict(self.batch, publishMode="immediate", schedule={})
-        checked = apply_interval_schedule(validate_batch_payload(immediate), now=SHANGHAI_NOW)
+        checked = apply_interval_schedule(
+            validate_batch_payload(immediate, now=self.shanghai_now), now=self.shanghai_now
+        )
 
         self.assertFalse(checked["items"][0]["enableTimer"])
         self.assertNotIn("scheduleTime", checked["items"][0])
