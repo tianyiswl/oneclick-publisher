@@ -25,6 +25,13 @@ WORKFLOW_LABELS = {
     "douyin-commerce-batch": "抖音带货批量",
 }
 
+_BATCH_READBACK_FIELDS = {
+    "platformPostId",
+    "postUrl",
+    "publishedAt",
+    "scheduleTime",
+}
+
 
 def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -56,6 +63,28 @@ def _payloads_from_json(payload_json: object) -> list[dict]:
     except (TypeError, ValueError, json.JSONDecodeError):
         return []
     return [dict(item) for item in payloads if isinstance(item, dict)] if isinstance(payloads, list) else []
+
+
+def _batch_readback_projection(readback: object) -> dict[str, str]:
+    """只保留可审计的非敏感平台回执字段。"""
+
+    if not isinstance(readback, dict):
+        return {}
+    return {
+        key: str(value).strip()
+        for key, value in readback.items()
+        if key in _BATCH_READBACK_FIELDS and isinstance(value, (str, int, float)) and str(value).strip()
+    }
+
+
+def _has_final_batch_receipt(event_type: str, readback: dict[str, str]) -> bool:
+    """最终回执必须含平台可复核的身份或定时时间。"""
+
+    if event_type == "platform_scheduled_receipt":
+        return bool(readback.get("scheduleTime"))
+    if event_type == "platform_publish_receipt":
+        return bool(readback.get("platformPostId") or readback.get("postUrl"))
+    return False
 
 
 def content_type_from_payload_json(payload_json: object) -> str:
@@ -572,14 +601,23 @@ def mark_batch_item_result(
     """按视频条目写入平台事件；只有最终平台回执可标记成功。"""
 
     now = _now()
+    safe_readback = _batch_readback_projection(readback)
     final_receipts = {"platform_publish_receipt", "platform_scheduled_receipt"}
-    status = "failed" if not ok else "success" if event_type in final_receipts else "running"
+    requested_status = (
+        "failed"
+        if not ok
+        else "success"
+        if event_type in final_receipts and _has_final_batch_receipt(event_type, safe_readback)
+        else "running"
+    )
     with connect() as conn:
         item = conn.execute(
-            "SELECT id FROM publish_task_items WHERE id = ? AND taskId = ?", (int(item_id), int(task_id))
+            "SELECT id, status FROM publish_task_items WHERE id = ? AND taskId = ?", (int(item_id), int(task_id))
         ).fetchone()
         if not item:
             raise ValueError("批量视频条目不属于该任务")
+        # 已确认的平台成功是终态；后续编辑/预检事件只补充审计，不得回退。
+        status = "success" if item["status"] == "success" else requested_status
         conn.execute(
             """
             UPDATE publish_task_items
@@ -624,7 +662,7 @@ def mark_batch_item_result(
                 "info" if ok else "error",
                 str(event_type),
                 message,
-                json.dumps(readback or {}, ensure_ascii=False),
+                json.dumps(safe_readback, ensure_ascii=False),
                 now,
             ),
         )
