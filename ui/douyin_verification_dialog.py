@@ -94,7 +94,7 @@ class DouyinVerificationDialog(QDialog):
                 Qt.InputMethodHint.ImhDigitsOnly
             )
             self.code_input.setValidator(
-                QRegularExpressionValidator(QRegularExpression(r"\\d{0,8}"), self)
+                QRegularExpressionValidator(QRegularExpression(r"\d{0,8}"), self)
             )
             self.code_input.setMaxLength(8)
             self.code_input.setPlaceholderText("输入 4 至 8 位数字验证码")
@@ -205,7 +205,6 @@ class DouyinVerificationDialog(QDialog):
                     self.timer.stop()
                 elif snapshot.get("state") == "processing":
                     self.status_label.setText("正在验证，无法取消")
-                    self.hide()
                     event.ignore()
                     return
             except DouyinVerificationError:

@@ -10,6 +10,8 @@ import unittest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import qrcode
+from PyQt6.QtCore import Qt
+from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QLineEdit
 
 from app_core.douyin_verification import DouyinVerificationBroker
@@ -48,6 +50,40 @@ class DouyinVerificationDialogTests(unittest.TestCase):
         self.assertNotIn("123456", dialog.status_label.text())
         self.assertNotIn("13800138000", dialog.status_label.text())
         dialog.close()
+
+    def test_sms_dialog_accepts_typed_and_pasted_digits_but_rejects_non_digits(self):
+        """真实输入事件必须可提交数字，验证器不能把数字当作字面量拒绝。"""
+
+        typed_id = self.broker.create_sms(task_id=56, message="需要短信验证")
+        typed_dialog = DouyinVerificationDialog(typed_id, broker=self.broker)
+        typed_dialog.code_input.setFocus()
+        QTest.keyClicks(typed_dialog.code_input, "123456")
+        typed_dialog.submit_button.click()
+        self.assertEqual(self.broker.consume_code(typed_id), "123456")
+        self.assertNotIn("123456", typed_dialog.status_label.text())
+        typed_dialog.close()
+
+        pasted_id = self.broker.create_sms(task_id=57, message="需要短信验证")
+        pasted_dialog = DouyinVerificationDialog(pasted_id, broker=self.broker)
+        QApplication.clipboard().setText("654321")
+        pasted_dialog.code_input.setFocus()
+        QTest.keyClick(
+            pasted_dialog.code_input,
+            Qt.Key.Key_V,
+            Qt.KeyboardModifier.ControlModifier,
+        )
+        self.assertEqual(pasted_dialog.code_input.text(), "654321")
+        pasted_dialog.submit_button.click()
+        self.assertEqual(self.broker.consume_code(pasted_id), "654321")
+        self.assertNotIn("654321", pasted_dialog.status_label.text())
+        pasted_dialog.close()
+
+        rejected_id = self.broker.create_sms(task_id=58, message="需要短信验证")
+        rejected_dialog = DouyinVerificationDialog(rejected_id, broker=self.broker)
+        rejected_dialog.code_input.setFocus()
+        QTest.keyClicks(rejected_dialog.code_input, "abc")
+        self.assertEqual(rejected_dialog.code_input.text(), "")
+        rejected_dialog.close()
 
     def test_qr_dialog_renders_memory_bytes_without_sms_input_and_can_cancel(self):
         request_id = self.broker.create_qr(
@@ -97,6 +133,7 @@ class DouyinVerificationDialogTests(unittest.TestCase):
         self.app.processEvents()
         self.assertEqual(self.broker.snapshot(processing_id)["state"], "processing")
         self.assertIn("正在验证，无法取消", processing_dialog.status_label.text())
+        self.assertTrue(processing_dialog.isVisible())
         processing_dialog.accept()
 
 
