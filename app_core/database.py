@@ -148,6 +148,19 @@ def ensure_schema() -> None:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS douyin_favorite_music_cache (
+                accountId INTEGER NOT NULL,
+                musicId TEXT NOT NULL,
+                title TEXT NOT NULL,
+                creator TEXT NOT NULL,
+                duration TEXT NOT NULL,
+                syncedAt TEXT NOT NULL,
+                PRIMARY KEY(accountId, musicId)
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS platform_collections (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 accountId INTEGER NOT NULL,
