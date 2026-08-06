@@ -160,6 +160,11 @@ class DouYinVideo(object):
         self.music_verification = {}
         self.schedule_verification = ""
         self.publish_result = None
+        # 二次验证在同一无头会话内可能经历“获取验证码 → 输入验证码 →
+        # 平台处理”的多个短暂页面态。必须记住本次会话是否已请求/提交短信，
+        # 防止提交后把仍在场的短信面板重新当作二维码或再次发送验证码。
+        self._sms_verification_requested = False
+        self._sms_verification_submitted = False
         # 仅由抖音带货临时会话注入；普通发布保持没有客户端进度回调的旧行为。
         self.progress_callback = None
         if self.save_draft_only and self.dry_run:
@@ -697,6 +702,19 @@ class DouYinVideo(object):
         except AttributeError:
             has_sms_marker = False
         if has_sms_marker:
+            if self._sms_verification_submitted:
+                try:
+                    panel_text = await verification_container.inner_text(timeout=1_000)
+                except Exception:
+                    panel_text = ""
+                if any(marker in panel_text for marker in ("验证码错误", "验证码不正确", "验证失败", "验证已过期")):
+                    raise RuntimeError("抖音短信验证未通过，发布已安全停止")
+                # 已提交验证码后，平台可能短时间保留短信弹层或异步跳转。
+                # 这不是新的挑战，交给外层等待明确成功回执。
+                return None
+            if self._sms_verification_requested:
+                from app_core.douyin_verification import VerificationChallenge
+                return VerificationChallenge(kind="sms", message="请在一键发客户端输入短信验证码")
             request_controls = await self._visible_enabled_items(
                 verification_container.get_by_text("获取验证码", exact=True)
             )
@@ -708,6 +726,7 @@ class DouYinVideo(object):
                 if len(inputs) == 1 and len(buttons) == 1:
                     break
                 await page.wait_for_timeout(250)
+            self._sms_verification_requested = True
             from app_core.douyin_verification import VerificationChallenge
             return VerificationChallenge(kind="sms", message="请在一键发客户端输入短信验证码")
 
@@ -724,6 +743,18 @@ class DouYinVideo(object):
         images = await self._visible_enabled_items(
             verification_container.get_by_role("img")
         )
+        try:
+            panel_text = await verification_container.inner_text(timeout=1_000)
+        except Exception:
+            panel_text = ""
+        # “使用原设备扫码”会作为短信页的备用动作常驻。短信主态、已提交短信
+        # 后的处理态，以及没有明确扫码态的面板，均不能尝试把任意图片解码为二维码。
+        if (
+            "接收短信验证码" in panel_text
+            or "使用原设备扫码" not in panel_text
+            or self._sms_verification_submitted
+        ):
+            return None
         if len(images) != 1:
             # 短信提交后的平台过渡态仍保留二次验证面板及“原设备扫码”入口，
             # 但尚未实际展示二维码。它既不是新的扫码挑战，也不能判作成功；
@@ -779,6 +810,7 @@ class DouYinVideo(object):
         if callable(before_submit):
             before_submit()
         await buttons[0].click(timeout=10_000)
+        self._sms_verification_submitted = True
         for _ in range(20):
             # 短信提交后抖音常保留同一浮层显示“验证成功/处理中”，而不是
             # 立刻跳转管理页。该状态不应被当成二维码或新的短信挑战。
@@ -788,10 +820,14 @@ class DouYinVideo(object):
                 panel_text = ""
             if any(marker in panel_text for marker in ("验证成功", "验证通过", "验证完成", "正在验证", "验证中")):
                 return
-            if await self.detect_publish_verification(page) is None:
+            current_url = str(page.url or "")
+            if "/creator-micro/content/manage" in current_url:
                 return
+            if any(marker in panel_text for marker in ("验证码错误", "验证码不正确", "验证失败", "验证已过期")):
+                raise RuntimeError("抖音短信验证未通过，发布已安全停止")
             await page.wait_for_timeout(250)
-        raise RuntimeError("抖音验证码确认后仍停留在验证页，发布已安全停止")
+        # 平台仍可能在异步校验中；外层只会等待管理页，不会再次发送短信或误判二维码。
+        return
 
     async def _wait_formal_publish_result(self, page: Page, on_verification=None):
         security_verification_seen = False

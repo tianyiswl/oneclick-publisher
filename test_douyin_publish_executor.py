@@ -655,6 +655,12 @@ class DouyinPublishPayloadTests(unittest.TestCase):
             async def evaluate(self, _script: str) -> str:
                 return "qr-verification-container"
 
+            async def inner_text(self, *, timeout: int) -> str:
+                del timeout
+                # 仅扫码主态会暴露该文案；短信页的“使用原设备扫码”备用入口
+                # 不应被当成二维码状态。
+                return "使用原设备扫码"
+
             def get_by_role(self, role: str, **_kwargs):
                 if role == "img":
                     return Controls([self.image])
@@ -735,6 +741,46 @@ class DouyinPublishPayloadTests(unittest.TestCase):
         self.assertEqual(challenge.kind, "qr")
         with self.assertRaisesRegex(RuntimeError, "二维码"):
             asyncio.run(video.detect_publish_verification(QrPage(checker_output.getvalue())))
+
+    def test_submitted_sms_panel_never_restarts_sms_or_parses_ordinary_image(self) -> None:
+        """短信已提交的过渡态不能重发验证码，也不能误把普通图片视为二维码。"""
+
+        class Controls:
+            def __init__(self, count: int) -> None:
+                self._count = count
+
+            async def count(self) -> int:
+                return self._count
+
+        class Panel:
+            def get_by_text(self, text: str, *, exact: bool):
+                if text != "接收短信验证码" or not exact:
+                    raise AssertionError("只应读取短信主态标记")
+                return Controls(1)
+
+            async def inner_text(self, *, timeout: int) -> str:
+                del timeout
+                return "接收短信验证码 使用原设备扫码"
+
+            def get_by_role(self, _role: str, **_kwargs):
+                raise AssertionError("短信已提交的过渡态不应读取图片或其他控件")
+
+        class Page:
+            url = "https://creator.douyin.com/verification"
+
+        video = DouYinVideo(
+            title="测试标题",
+            file_path="/tmp/demo.mp4",
+            tags=[],
+            publish_date=datetime.now(),
+            account_file="/tmp/account.json",
+            description="测试文案",
+        )
+        video._sms_verification_submitted = True
+        panel = Panel()
+        with patch.object(video, "_unique_publish_verification_container", new_callable=AsyncMock, return_value=panel):
+            challenge = asyncio.run(video.detect_publish_verification(Page()))
+        self.assertIsNone(challenge)
 
     def test_unknown_verification_page_never_becomes_qr_success(self) -> None:
         """仍在验证页却缺少可识别控件时，必须停止而不是返回 None。"""
