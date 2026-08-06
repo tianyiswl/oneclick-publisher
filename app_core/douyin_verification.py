@@ -22,7 +22,6 @@ from PIL import Image, UnidentifiedImageError
 MAX_QR_BYTES = 2 * 1024 * 1024
 MIN_QR_SIDE = 120
 TERMINAL_STATES = {"success", "failed", "cancelled", "expired"}
-ACTIVE_STATES = {"waiting", "processing"}
 
 
 class DouyinVerificationError(RuntimeError):
@@ -212,7 +211,7 @@ class DouyinVerificationBroker:
         return request
 
     def _state(self, request: VerificationRequest) -> str:
-        if request.state in ACTIVE_STATES and self._clock() >= request.expires_at:
+        if request.state == "waiting" and self._clock() >= request.expires_at:
             request.state = "expired"
             request.pending_code = ""
             request.condition.notify_all()
@@ -276,6 +275,16 @@ class DouyinVerificationBroker:
             request.condition.notify_all()
             return code
 
+    def begin_processing(self, request_id: str) -> None:
+        """原子进入不可取消的认证处理临界态。"""
+
+        request = self._get(request_id)
+        with request.condition:
+            if self._state(request) != "waiting":
+                raise DouyinVerificationError("抖音验证已取消、失败或超时")
+            request.state = "processing"
+            request.condition.notify_all()
+
     def ensure_processing(self, request_id: str) -> None:
         """确认验证码写入前仍未被取消或超时。"""
 
@@ -285,7 +294,14 @@ class DouyinVerificationBroker:
                 raise DouyinVerificationError("抖音验证码提交已取消或超时")
 
     def succeed(self, request_id: str) -> None:
-        self._transition(request_id, "success", strict=True)
+        request = self._get(request_id)
+        with request.condition:
+            if self._state(request) != "processing":
+                raise DouyinVerificationError("抖音验证未处于可确认成功的处理状态")
+            request.state = "success"
+            request.message = _snapshot_message(request.kind, "success")
+            request.pending_code = ""
+            request.condition.notify_all()
 
     def fail(
         self,
@@ -295,15 +311,23 @@ class DouyinVerificationBroker:
         del message
         self._transition(request_id, "failed")
 
-    def cancel(self, request_id: str) -> None:
-        self._transition(request_id, "cancelled")
+    def cancel(self, request_id: str) -> bool:
+        """只取消尚未开始的验证；处理临界态必须由执行器收束。"""
 
-    def _transition(self, request_id: str, state: str, *, strict: bool = False) -> None:
+        request = self._get(request_id)
+        with request.condition:
+            if self._state(request) != "waiting":
+                return False
+            request.state = "cancelled"
+            request.message = _snapshot_message(request.kind, "cancelled")
+            request.pending_code = ""
+            request.condition.notify_all()
+            return True
+
+    def _transition(self, request_id: str, state: str) -> None:
         request = self._get(request_id)
         with request.condition:
             if self._state(request) in TERMINAL_STATES:
-                if strict:
-                    raise DouyinVerificationError("抖音验证已取消、失败或超时")
                 return
             request.state = state
             request.message = _snapshot_message(request.kind, state)

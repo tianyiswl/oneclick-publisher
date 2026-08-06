@@ -1035,6 +1035,7 @@ class DouyinCommerceSessionManager:
                         ) from exc
                     if current is None:
                         if "/creator-micro/content/manage" in str(session.page.url or ""):
+                            verification_broker.begin_processing(request_id)
                             verification_broker.succeed(request_id)
                             return
                         await session.page.wait_for_timeout(250)

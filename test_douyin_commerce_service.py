@@ -28,6 +28,7 @@ from app_core import (
     task_service,
 )
 from uploader.douyin_uploader.main import DouYinVideo
+from app_core import douyin_verification
 from app_core.douyin_verification import VerificationChallenge
 from ui.background_task import BackgroundTask
 from ui.douyin_commerce_page import DouyinCommercePage
@@ -3553,6 +3554,143 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
 
         uploader.apply_sms_verification_code.assert_awaited_once()
         self.assertEqual(broker.failed, ["request-rejected"])
+
+    def test_sms_processing_is_atomic_across_fill_click_cancel_and_expiry(self) -> None:
+        """fill/click 的 await 边界内取消或到期都不能撕裂已开始的验证事务。"""
+
+        class Controls:
+            def __init__(self, items) -> None:
+                self.items = list(items)
+
+            async def count(self) -> int:
+                return len(self.items)
+
+            def nth(self, index: int):
+                return self.items[index]
+
+        class Marker:
+            async def is_visible(self) -> bool:
+                return True
+
+        class Textbox:
+            def __init__(self, page) -> None:
+                self.page = page
+                self.value = ""
+
+            async def is_visible(self) -> bool:
+                return True
+
+            async def is_enabled(self) -> bool:
+                return True
+
+            async def fill(self, value: str) -> None:
+                self.page.cancel_results.append(
+                    self.page.broker.cancel(self.page.broker.request_id)
+                )
+                if self.page.advance_clock:
+                    self.page.now[0] += 601
+                self.value = value
+                await asyncio.sleep(0)
+
+            async def input_value(self) -> str:
+                return self.value
+
+        class ConfirmButton:
+            def __init__(self, page) -> None:
+                self.page = page
+
+            async def is_visible(self) -> bool:
+                return True
+
+            async def is_enabled(self) -> bool:
+                return True
+
+            async def click(self, *, timeout: int) -> None:
+                del timeout
+                self.page.cancel_results.append(
+                    self.page.broker.cancel(self.page.broker.request_id)
+                )
+                self.page.url = "https://creator.douyin.com/creator-micro/content/manage"
+                await asyncio.sleep(0)
+
+        class Page:
+            def __init__(self, broker, now, advance_clock: bool) -> None:
+                self.broker = broker
+                self.now = now
+                self.advance_clock = advance_clock
+                self.cancel_results = []
+                self.url = "https://creator.douyin.com/verification"
+                self.textbox = Textbox(self)
+                self.confirm = ConfirmButton(self)
+
+            def get_by_text(self, text: str, *, exact: bool):
+                if self.url.endswith("/verification") and text == "接收短信验证码" and exact:
+                    return Controls([Marker()])
+                return Controls([])
+
+            def get_by_role(self, role: str, **_kwargs):
+                if role == "textbox":
+                    return Controls([self.textbox])
+                if role == "button":
+                    return Controls([self.confirm])
+                return Controls([])
+
+            async def wait_for_timeout(self, _milliseconds: int) -> None:
+                return None
+
+        class Broker(douyin_verification.DouyinVerificationBroker):
+            def __init__(self, now) -> None:
+                super().__init__(clock=lambda: now[0])
+                self.request_id = ""
+                self.success_states = []
+
+            def create_sms(self, **kwargs) -> str:
+                request_id = super().create_sms(**kwargs, expires_in_seconds=600)
+                self.request_id = request_id
+                self.submit_code(request_id, "123456")
+                return request_id
+
+            def succeed(self, request_id: str) -> None:
+                super().succeed(request_id)
+                self.success_states.append(self.snapshot(request_id)["state"])
+
+        for advance_clock in (False, True):
+            with self.subTest(advance_clock=advance_clock):
+                now = [100.0]
+                broker = Broker(now)
+                page = Page(broker, now, advance_clock)
+                uploader = DouYinVideo(
+                    title="测试标题",
+                    file_path="/tmp/demo.mp4",
+                    tags=[],
+                    publish_date=datetime.now(),
+                    account_file="/tmp/account.json",
+                    description="测试文案",
+                )
+                session = douyin_commerce_session._CommerceEditorSession(
+                    session_id="session-atomic",
+                    upload_payload={},
+                    account_name="测试账号",
+                    browser=None,
+                    context=None,
+                    page=page,
+                    playwright=None,
+                    uploader=uploader,
+                )
+                with patch.object(douyin_commerce_session, "verification_broker", broker):
+                    asyncio.run(
+                        douyin_commerce_session.DouyinCommerceSessionManager()._handle_publish_verification(
+                            session,
+                            VerificationChallenge(
+                                kind="sms",
+                                message="请在一键发客户端输入短信验证码",
+                            ),
+                            task_id=80,
+                        )
+                    )
+
+                self.assertEqual(page.cancel_results, [False, False])
+                self.assertEqual(broker.success_states, ["success"])
 
     def test_preflight_payload_must_match_same_uploaded_editor_session(self) -> None:
         manager = douyin_commerce_session.DouyinCommerceSessionManager()
