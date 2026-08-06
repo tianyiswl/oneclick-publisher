@@ -214,6 +214,33 @@ class DouyinVerificationBrokerTests(unittest.TestCase):
 
         self.assertEqual(broker.snapshot(retry_request_id)["state"], "waiting")
 
+    def test_wait_timeout_cannot_override_processing_qr_request(self):
+        """扫码已进入处理态后，观察者超时不能把执行器的临界态改写为失败。"""
+
+        broker = DouyinVerificationBroker()
+        request_id = broker.create_qr(
+            task_id=55,
+            qr_image=_qr_bytes(),
+            expires_in_seconds=30,
+        )
+        broker.begin_processing(request_id)
+        observed_states: list[str] = []
+
+        waiter = threading.Thread(
+            target=lambda: observed_states.append(
+                broker.wait(request_id, timeout_seconds=0.01)["state"]
+            ),
+        )
+        waiter.start()
+        waiter.join(timeout=1)
+
+        self.assertFalse(waiter.is_alive())
+        self.assertEqual(observed_states, ["processing"])
+        self.assertEqual(broker.snapshot(request_id)["state"], "processing")
+
+        broker.succeed(request_id)
+        self.assertEqual(broker.snapshot(request_id)["state"], "success")
+
     def test_clear_removes_request_and_releases_task_for_retry(self):
         broker = DouyinVerificationBroker()
         request_id = broker.create_sms(task_id=48, message="需要短信验证")

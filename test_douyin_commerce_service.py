@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import threading
 import unittest
 from unittest.mock import AsyncMock, call, patch
 from zoneinfo import ZoneInfo
@@ -3556,7 +3557,7 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
         self.assertEqual(broker.failed, ["request-rejected"])
 
     def test_sms_processing_is_atomic_across_fill_click_cancel_and_expiry(self) -> None:
-        """fill/click 的 await 边界内取消或到期都不能撕裂已开始的验证事务。"""
+        """真实 await 交错时，fill/click 期间的取消与 wait 超时不能撕裂事务。"""
 
         class Controls:
             def __init__(self, items) -> None:
@@ -3584,13 +3585,8 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
                 return True
 
             async def fill(self, value: str) -> None:
-                self.page.cancel_results.append(
-                    self.page.broker.cancel(self.page.broker.request_id)
-                )
-                if self.page.advance_clock:
-                    self.page.now[0] += 601
+                await self.page.pause_for_external_race("fill")
                 self.value = value
-                await asyncio.sleep(0)
 
             async def input_value(self) -> str:
                 return self.value
@@ -3607,21 +3603,59 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
 
             async def click(self, *, timeout: int) -> None:
                 del timeout
-                self.page.cancel_results.append(
-                    self.page.broker.cancel(self.page.broker.request_id)
-                )
+                await self.page.pause_for_external_race("click")
                 self.page.url = "https://creator.douyin.com/creator-micro/content/manage"
-                await asyncio.sleep(0)
 
         class Page:
-            def __init__(self, broker, now, advance_clock: bool) -> None:
+            def __init__(self, broker) -> None:
                 self.broker = broker
-                self.now = now
-                self.advance_clock = advance_clock
                 self.cancel_results = []
+                self.wait_states = []
+                self.states_during_pause = []
+                self.race_errors = []
+                self.race_threads = []
                 self.url = "https://creator.douyin.com/verification"
                 self.textbox = Textbox(self)
                 self.confirm = ConfirmButton(self)
+
+            async def pause_for_external_race(self, phase: str) -> None:
+                paused = threading.Event()
+                release = threading.Event()
+
+                def race_worker() -> None:
+                    try:
+                        if not paused.wait(timeout=2):
+                            raise AssertionError(f"{phase} 未进入 await 暂停")
+                        self.cancel_results.append(
+                            self.broker.cancel(self.broker.request_id)
+                        )
+                        self.wait_states.append(
+                            self.broker.wait(
+                                self.broker.request_id,
+                                timeout_seconds=0.01,
+                            )["state"]
+                        )
+                        self.states_during_pause.append(
+                            self.broker.snapshot(self.broker.request_id)["state"]
+                        )
+                    except Exception as exc:  # 测试线程中的错误必须回传主线程。
+                        self.race_errors.append(exc)
+                    finally:
+                        release.set()
+
+                worker = threading.Thread(target=race_worker)
+                self.race_threads.append(worker)
+                worker.start()
+                paused.set()
+                released = await asyncio.to_thread(release.wait, 2)
+                if not released:
+                    raise AssertionError(f"{phase} 的并发控制线程未释放 await")
+
+            def join_races(self) -> None:
+                for worker in self.race_threads:
+                    worker.join(timeout=1)
+                    if worker.is_alive():
+                        self.race_errors.append(AssertionError("并发控制线程未结束"))
 
             def get_by_text(self, text: str, *, exact: bool):
                 if self.url.endswith("/verification") and text == "接收短信验证码" and exact:
@@ -3639,8 +3673,8 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
                 return None
 
         class Broker(douyin_verification.DouyinVerificationBroker):
-            def __init__(self, now) -> None:
-                super().__init__(clock=lambda: now[0])
+            def __init__(self) -> None:
+                super().__init__()
                 self.request_id = ""
                 self.success_states = []
 
@@ -3654,43 +3688,46 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
                 super().succeed(request_id)
                 self.success_states.append(self.snapshot(request_id)["state"])
 
-        for advance_clock in (False, True):
-            with self.subTest(advance_clock=advance_clock):
-                now = [100.0]
-                broker = Broker(now)
-                page = Page(broker, now, advance_clock)
-                uploader = DouYinVideo(
-                    title="测试标题",
-                    file_path="/tmp/demo.mp4",
-                    tags=[],
-                    publish_date=datetime.now(),
-                    account_file="/tmp/account.json",
-                    description="测试文案",
-                )
-                session = douyin_commerce_session._CommerceEditorSession(
-                    session_id="session-atomic",
-                    upload_payload={},
-                    account_name="测试账号",
-                    browser=None,
-                    context=None,
-                    page=page,
-                    playwright=None,
-                    uploader=uploader,
-                )
-                with patch.object(douyin_commerce_session, "verification_broker", broker):
-                    asyncio.run(
-                        douyin_commerce_session.DouyinCommerceSessionManager()._handle_publish_verification(
-                            session,
-                            VerificationChallenge(
-                                kind="sms",
-                                message="请在一键发客户端输入短信验证码",
-                            ),
-                            task_id=80,
-                        )
+        broker = Broker()
+        page = Page(broker)
+        uploader = DouYinVideo(
+            title="测试标题",
+            file_path="/tmp/demo.mp4",
+            tags=[],
+            publish_date=datetime.now(),
+            account_file="/tmp/account.json",
+            description="测试文案",
+        )
+        session = douyin_commerce_session._CommerceEditorSession(
+            session_id="session-atomic",
+            upload_payload={},
+            account_name="测试账号",
+            browser=None,
+            context=None,
+            page=page,
+            playwright=None,
+            uploader=uploader,
+        )
+        try:
+            with patch.object(douyin_commerce_session, "verification_broker", broker):
+                asyncio.run(
+                    douyin_commerce_session.DouyinCommerceSessionManager()._handle_publish_verification(
+                        session,
+                        VerificationChallenge(
+                            kind="sms",
+                            message="请在一键发客户端输入短信验证码",
+                        ),
+                        task_id=80,
                     )
+                )
+        finally:
+            page.join_races()
 
-                self.assertEqual(page.cancel_results, [False, False])
-                self.assertEqual(broker.success_states, ["success"])
+        self.assertEqual(page.cancel_results, [False, False])
+        self.assertEqual(page.wait_states, ["processing", "processing"])
+        self.assertEqual(page.states_during_pause, ["processing", "processing"])
+        self.assertEqual(page.race_errors, [])
+        self.assertEqual(broker.success_states, ["success"])
 
     def test_preflight_payload_must_match_same_uploaded_editor_session(self) -> None:
         manager = douyin_commerce_session.DouyinCommerceSessionManager()

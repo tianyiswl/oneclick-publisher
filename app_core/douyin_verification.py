@@ -335,7 +335,7 @@ class DouyinVerificationBroker:
             request.condition.notify_all()
 
     def wait(self, request_id: str, *, timeout_seconds: float = 600) -> dict:
-        """等待终态；等待超时一律安全停止，不会推断验证成功。"""
+        """等待状态变化；仅未开始的请求会在本次等待超时时安全停止。"""
 
         if timeout_seconds <= 0:
             raise DouyinVerificationError("抖音验证等待时限必须大于零")
@@ -345,10 +345,11 @@ class DouyinVerificationBroker:
             while self._state(request) not in TERMINAL_STATES:
                 remaining = deadline - self._clock()
                 if remaining <= 0:
-                    request.state = "failed"
-                    request.message = _snapshot_message(request.kind, "failed")
-                    request.pending_code = ""
-                    request.condition.notify_all()
+                    if request.state == "waiting":
+                        request.state = "failed"
+                        request.message = _snapshot_message(request.kind, "failed")
+                        request.pending_code = ""
+                        request.condition.notify_all()
                     break
                 request.condition.wait(timeout=min(0.25, remaining))
             return self.snapshot(request_id)
