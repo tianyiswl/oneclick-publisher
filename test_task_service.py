@@ -47,6 +47,16 @@ class DouyinCommerceBatchTaskTests(unittest.TestCase):
         self.db_patch.stop()
         self.tempdir.cleanup()
 
+    @staticmethod
+    def _write_final_receipt(*args, **kwargs) -> None:
+        """通过未来批量执行器唯一允许导入的内部写入模块执行。"""
+
+        from app_core._douyin_commerce_batch_receipt_writer import (
+            write_final_batch_receipt,
+        )
+
+        write_final_batch_receipt(*args, **kwargs)
+
     def test_batch_task_creates_one_publish_item_per_video_and_keeps_location_time(self) -> None:
         task = task_service.create_douyin_batch_task(self.batch)
         detail = task_service.get_task(task["id"])
@@ -108,21 +118,168 @@ class DouyinCommerceBatchTaskTests(unittest.TestCase):
 
         self.assertEqual(task_service.get_task(task_id)["items"][0]["status"], "running")
 
-    def test_controlled_executor_receipt_marks_item_success_with_shanghai_timezone(self) -> None:
+    def test_generic_platform_result_cannot_mark_batch_items_success(self) -> None:
+        task = task_service.create_douyin_batch_task(self.batch)
+        task_id = task["id"]
+
+        with self.assertRaisesRegex(ValueError, "批量执行器"):
+            task_service.mark_platform_result(
+                task_id,
+                3,
+                ok=True,
+                message="调用方伪造的平台成功",
+                content_type="video",
+                event_type="platform_publish_receipt",
+            )
+
+        self.assertEqual(
+            [item["status"] for item in task_service.get_task(task_id)["items"]],
+            ["pending", "pending", "pending"],
+        )
+
+    def test_caller_cannot_construct_private_receipt_and_mark_item_success(self) -> None:
         task = task_service.create_douyin_batch_task(self.batch)
         task_id = task["id"]
         item_id = task_service.get_task(task_id)["items"][0]["id"]
-        receipt = task_service._build_controlled_batch_receipt(
-            "platform_scheduled_receipt",
-            {"scheduleTime": "2026-08-07 09:00"},
-            timezone="Asia/Shanghai",
+
+        class ForgedReceipt:
+            event_type = "platform_scheduled_receipt"
+            readback = {
+                "scheduleTime": "2026-08-07 09:00",
+                "timezone": "Asia/Shanghai",
+            }
+
+        for forged_readback in (
+            ForgedReceipt(),
+            {
+                "scheduleTime": "2026-08-07 09:00",
+                "timezone": "Asia/Shanghai",
+            },
+        ):
+            task_service.mark_batch_item_result(
+                task_id,
+                item_id,
+                ok=True,
+                message="调用方伪造的平台已定时",
+                event_type="platform_scheduled_receipt",
+                readback=forged_readback,
+            )
+            self.assertEqual(task_service.get_task(task_id)["items"][0]["status"], "running")
+
+        with self.assertRaises(AttributeError):
+            getattr(task_service, "_mark_controlled_batch_receipt")(
+                task_id, item_id, ForgedReceipt(), "伪造的平台已定时"
+            )
+
+    def test_internal_writer_rejects_utc_missing_fields_and_invalid_events(self) -> None:
+        class ForgedTimezone:
+            def __ne__(self, _other: object) -> bool:
+                return False
+
+        invalid_receipts = (
+            (
+                "platform_scheduled_receipt",
+                {"scheduleTime": "2026-08-07 09:00"},
+                "UTC",
+            ),
+            (
+                "platform_scheduled_receipt",
+                {"scheduleTime": "2026-08-07 09:00"},
+                ForgedTimezone(),
+            ),
+            (
+                "platform_scheduled_receipt",
+                {"scheduleTime": "2026-08-07 09:00", "timezone": "UTC"},
+                "Asia/Shanghai",
+            ),
+            ("platform_scheduled_receipt", {}, "Asia/Shanghai"),
+            (
+                "platform_scheduled_receipt",
+                {"scheduleTime": "2026-02-30 09:00"},
+                "Asia/Shanghai",
+            ),
+            ("platform_publish_receipt", {"publishedAt": "2026-08-06 10:00"}, "Asia/Shanghai"),
+            ("platform_publish_receipt", {"platformPostId": True}, "Asia/Shanghai"),
+            (
+                "platform_publish_receipt",
+                {"platformPostId": "post-001", "cookie": "must-not-store"},
+                "Asia/Shanghai",
+            ),
+            ("editor_written", {"platformPostId": "post-001"}, "Asia/Shanghai"),
         )
 
-        task_service._mark_controlled_batch_receipt(task_id, item_id, receipt, "平台已定时")
+        for event_type, readback, timezone in invalid_receipts:
+            with self.subTest(event_type=event_type, readback=readback, timezone=timezone):
+                task = task_service.create_douyin_batch_task(self.batch)
+                task_id = task["id"]
+                item_id = task_service.get_task(task_id)["items"][0]["id"]
+
+                with self.assertRaises(ValueError):
+                    self._write_final_receipt(
+                        task_id,
+                        item_id,
+                        event_type=event_type,
+                        readback=readback,
+                        timezone=timezone,
+                        message="无效最终回执",
+                    )
+
+                self.assertEqual(task_service.get_task(task_id)["items"][0]["status"], "pending")
+
+    def test_internal_writer_rejects_manually_constructed_receipt_object(self) -> None:
+        task = task_service.create_douyin_batch_task(self.batch)
+        task_id = task["id"]
+        item_id = task_service.get_task(task_id)["items"][0]["id"]
+
+        class ForgedReceipt:
+            scheduleTime = "2026-08-07 09:00"
+
+        with self.assertRaises(ValueError):
+            self._write_final_receipt(
+                task_id,
+                item_id,
+                event_type="platform_scheduled_receipt",
+                readback=ForgedReceipt(),
+                timezone="Asia/Shanghai",
+                message="伪造的平台已定时",
+            )
+
+        self.assertEqual(task_service.get_task(task_id)["items"][0]["status"], "pending")
+
+    def test_internal_writer_accepts_legal_platform_receipt_and_persists_timezone(self) -> None:
+        task = task_service.create_douyin_batch_task(self.batch)
+        task_id = task["id"]
+        item_id = task_service.get_task(task_id)["items"][0]["id"]
+
+        self._write_final_receipt(
+            task_id,
+            item_id,
+            event_type="platform_scheduled_receipt",
+            readback={"scheduleTime": "2026-08-07 09:00"},
+            timezone="Asia/Shanghai",
+            message="平台已定时",
+        )
 
         detail = task_service.get_task(task_id)
         self.assertEqual(detail["items"][0]["status"], "success")
         self.assertEqual(json.loads(detail["events"][-1]["detailJson"])["timezone"], "Asia/Shanghai")
+
+        published_task = task_service.create_douyin_batch_task(self.batch)
+        published_task_id = published_task["id"]
+        published_item_id = task_service.get_task(published_task_id)["items"][0]["id"]
+        self._write_final_receipt(
+            published_task_id,
+            published_item_id,
+            event_type="platform_publish_receipt",
+            readback={"platformPostId": "post-001"},
+            timezone="Asia/Shanghai",
+            message="平台已发布",
+        )
+
+        self.assertEqual(
+            task_service.get_task(published_task_id)["items"][0]["status"],
+            "success",
+        )
 
     def test_scheduled_receipt_requires_controlled_source_and_beijing_time(self) -> None:
         task = task_service.create_douyin_batch_task(self.batch)
@@ -191,15 +348,13 @@ class DouyinCommerceBatchTaskTests(unittest.TestCase):
         task = task_service.create_douyin_batch_task(self.batch)
         task_id = task["id"]
         item_id = task_service.get_task(task_id)["items"][0]["id"]
-        task_service._mark_controlled_batch_receipt(
+        self._write_final_receipt(
             task_id,
             item_id,
-            task_service._build_controlled_batch_receipt(
-                "platform_scheduled_receipt",
-                {"scheduleTime": "2026-08-07 09:00"},
-                timezone="Asia/Shanghai",
-            ),
-            "平台已定时",
+            event_type="platform_scheduled_receipt",
+            readback={"scheduleTime": "2026-08-07 09:00"},
+            timezone="Asia/Shanghai",
+            message="平台已定时",
         )
 
         task_service.mark_batch_item_result(
