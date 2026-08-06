@@ -207,6 +207,161 @@ class DouyinPublishPayloadTests(unittest.TestCase):
         self.assertEqual(read_back.await_count, 4)
         self.assertEqual(page.keyboard.insert_text.await_count, 2)
 
+    def test_headless_sms_challenge_waits_for_native_code_without_revealing_page(self) -> None:
+        """验证码应只在同一无头页面填写，不能转为前台浏览器。"""
+
+        class Controls:
+            def __init__(self, items) -> None:
+                self.items = list(items)
+
+            async def count(self) -> int:
+                return len(self.items)
+
+            def nth(self, index: int):
+                return self.items[index]
+
+        class Textbox:
+            def __init__(self) -> None:
+                self.value = ""
+
+            async def is_visible(self) -> bool:
+                return True
+
+            async def is_enabled(self) -> bool:
+                return True
+
+            async def fill(self, value: str) -> None:
+                self.value = value
+
+            async def input_value(self) -> str:
+                return self.value
+
+        class ConfirmButton:
+            def __init__(self, page) -> None:
+                self.page = page
+
+            async def is_visible(self) -> bool:
+                return True
+
+            async def is_enabled(self) -> bool:
+                return True
+
+            async def click(self, *, timeout: int) -> None:
+                self.page.url = "https://creator.douyin.com/creator-micro/content/manage"
+
+        class Marker:
+            async def is_visible(self) -> bool:
+                return True
+
+        class SmsChallengePage:
+            def __init__(self) -> None:
+                self.url = "https://creator.douyin.com/verification"
+                self.textbox = Textbox()
+                self.confirm = ConfirmButton(self)
+
+            def get_by_text(self, text: str, *, exact: bool):
+                if text == "接收短信验证码" and exact:
+                    return Controls([Marker()])
+                return Controls([])
+
+            def get_by_role(self, role: str, **_kwargs):
+                if role == "textbox":
+                    return Controls([self.textbox])
+                if role == "button":
+                    return Controls([self.confirm])
+                return Controls([])
+
+            async def wait_for_timeout(self, _milliseconds: int) -> None:
+                return None
+
+        page = SmsChallengePage()
+        video = DouYinVideo(
+            title="测试标题",
+            file_path="/tmp/demo.mp4",
+            tags=[],
+            publish_date=datetime.now(),
+            account_file="/tmp/account.json",
+            description="测试文案",
+        )
+
+        async def submit_native_sms_code(challenge) -> None:
+            await video.apply_sms_verification_code(page, challenge, "123456")
+
+        with patch("utils.base_social_media.reveal_page_window") as reveal:
+            import asyncio
+
+            receipt = asyncio.run(
+                video._wait_formal_publish_result(
+                    page,
+                    on_verification=submit_native_sms_code,
+                )
+            )
+
+        self.assertEqual(receipt["status"], "published")
+        reveal.assert_not_called()
+        self.assertEqual(page.textbox.value, "123456")
+
+    def test_multiple_visible_sms_inputs_stop_without_filling_any_value(self) -> None:
+        """多个可见验证码输入框不能猜测目标控件。"""
+
+        class Controls:
+            def __init__(self, items) -> None:
+                self.items = list(items)
+
+            async def count(self) -> int:
+                return len(self.items)
+
+            def nth(self, index: int):
+                return self.items[index]
+
+        class Textbox:
+            def __init__(self) -> None:
+                self.value = ""
+
+            async def is_visible(self) -> bool:
+                return True
+
+            async def is_enabled(self) -> bool:
+                return True
+
+            async def fill(self, value: str) -> None:
+                self.value = value
+
+        class Marker:
+            async def is_visible(self) -> bool:
+                return True
+
+        class AmbiguousPage:
+            url = "https://creator.douyin.com/verification"
+
+            def __init__(self) -> None:
+                self.inputs = [Textbox(), Textbox()]
+
+            def get_by_text(self, text: str, *, exact: bool):
+                if text == "接收短信验证码" and exact:
+                    return Controls([Marker()])
+                return Controls([])
+
+            def get_by_role(self, role: str, **_kwargs):
+                if role == "textbox":
+                    return Controls(self.inputs)
+                return Controls([])
+
+        video = DouYinVideo(
+            title="测试标题",
+            file_path="/tmp/demo.mp4",
+            tags=[],
+            publish_date=datetime.now(),
+            account_file="/tmp/account.json",
+            description="测试文案",
+        )
+        page = AmbiguousPage()
+        import asyncio
+
+        with self.assertRaisesRegex(RuntimeError, "无法唯一确认"):
+            asyncio.run(video.detect_publish_verification(page))
+        self.assertEqual([item.value for item in page.inputs], ["", ""])
+
 
 @unittest.skipIf(publish_service is None, "当前离线环境未安装 Playwright，跳过桌面路由测试")
 class DouyinPublishRoutingTests(unittest.TestCase):

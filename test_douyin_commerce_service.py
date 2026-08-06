@@ -28,6 +28,7 @@ from app_core import (
     task_service,
 )
 from uploader.douyin_uploader.main import DouYinVideo
+from app_core.douyin_verification import VerificationChallenge
 from ui.background_task import BackgroundTask
 from ui.douyin_commerce_page import DouyinCommercePage
 from ui.runtime_log import runtime_log_bus
@@ -2783,7 +2784,7 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
         )
         self.assertEqual(
             options({"backgroundMode": False}),
-            {"headless": False, "hide_until_ready": False},
+            {"headless": True, "hide_until_ready": False},
         )
 
     def test_background_upload_minimizes_the_window_after_page_creation(self) -> None:
@@ -3252,8 +3253,16 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
                 self.wait_publish_button_ready = AsyncMock(return_value=publish_button)
                 self.background_mode_at_receipt = None
 
-                async def wait_for_receipt(_page):
+                self.apply_sms_verification_code = AsyncMock()
+
+                async def wait_for_receipt(_page, on_verification):
                     self.background_mode_at_receipt = base_social_media.is_publish_background_mode()
+                    await on_verification(
+                        VerificationChallenge(
+                            kind="sms",
+                            message="请在一键发客户端输入短信验证码",
+                        )
+                    )
                     return {"status": "published"}
 
                 self._wait_formal_publish_result = AsyncMock(side_effect=wait_for_receipt)
@@ -3287,6 +3296,34 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
         }
         publish_button = PublishButton()
         uploader = Uploader(publish_button)
+
+        class VerificationBroker:
+            def __init__(self) -> None:
+                self.sms_task_id = None
+                self.succeeded = []
+                self.cleared = []
+
+            def create_sms(self, *, task_id: int, message: str) -> str:
+                self.sms_task_id = task_id
+                return "request-demo"
+
+            def snapshot(self, request_id: str) -> dict:
+                if request_id != "request-demo":
+                    raise AssertionError("验证请求标识不匹配")
+                return {"state": "waiting"}
+
+            def consume_code(self, request_id: str):
+                if request_id != "request-demo":
+                    raise AssertionError("验证请求标识不匹配")
+                return "123456"
+
+            def succeed(self, request_id: str) -> None:
+                self.succeeded.append(request_id)
+
+            def clear(self, request_id: str) -> None:
+                self.cleared.append(request_id)
+
+        broker = VerificationBroker()
         manager = douyin_commerce_session.DouyinCommerceSessionManager()
         manager._session = douyin_commerce_session._CommerceEditorSession(
             session_id="session-demo",
@@ -3311,8 +3348,13 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
             douyin_publish_executor,
             "_scheduled_submission_readback",
             new_callable=AsyncMock,
-        ) as scheduled_readback:
-            result = asyncio.run(manager._submit("session-demo", payload))
+        ) as scheduled_readback, patch.object(
+            douyin_commerce_session,
+            "verification_broker",
+            broker,
+            create=True,
+        ):
+            result = asyncio.run(manager._submit("session-demo", payload, task_id=77))
 
         reveal.assert_not_awaited()
         self.assertTrue(uploader.background_mode_at_receipt)
@@ -3322,6 +3364,10 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
         self.assertFalse(result["scheduled"])
         self.assertIsNone(result["scheduledAt"])
         self.assertEqual(result["platformReceipt"], {"status": "published"})
+        self.assertEqual(broker.sms_task_id, 77)
+        uploader.apply_sms_verification_code.assert_awaited_once()
+        self.assertEqual(broker.succeeded, ["request-demo"])
+        self.assertEqual(broker.cleared, ["request-demo"])
         self.assertIsNone(manager._session)
 
     def test_preflight_payload_must_match_same_uploaded_editor_session(self) -> None:

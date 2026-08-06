@@ -33,6 +33,7 @@ from . import (
     douyin_publish_executor,
 )
 from .oneclick_preflight import _account_for_payload, _storage_state
+from .douyin_verification import verification_broker
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -219,14 +220,13 @@ class DouyinCommerceSessionManager:
     def _commerce_browser_launch_options(cls, payload: Mapping[str, Any]) -> dict[str, bool]:
         """返回带货编辑会话的浏览器可见性策略。
 
-        默认后台模式必须直接使用真正无头浏览器，不能依赖最小化或离屏窗口。
-        登录失效会作为受控结果回到账号管理处理；显式关闭后台模式时才使用普通
-        有窗口浏览器，供开发诊断使用。
+        带货编辑与最终提交一律使用真正无头浏览器，不能依赖最小化或离屏窗口。
+        登录失效会作为受控结果回到账号管理处理，不为验证或诊断打开前台浏览器。
         """
 
-        background_mode = cls._background_upload_mode(payload)
+        del payload
         return {
-            "headless": background_mode,
+            "headless": True,
             "hide_until_ready": False,
         }
 
@@ -346,13 +346,18 @@ class DouyinCommerceSessionManager:
             raise DouyinCommerceSessionError("抖音带货预检必须保持 dry-run 模式")
         return self._call(self._preflight(session_id, dict(checked)))
 
-    def submit(self, session_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+    def submit(
+        self,
+        session_id: str,
+        payload: Mapping[str, Any],
+        task_id: int | None = None,
+    ) -> dict[str, Any]:
         """在已预检的同一会话中执行明确确认后的最终定时提交。"""
 
         checked = douyin_commerce_service.validate_douyin_commerce_payload(payload)
         if str(checked.get("runtimeMode") or "") != "publish" or checked.get("debugDryRun") is not False:
             raise DouyinCommerceSessionError("抖音带货最终提交必须明确 runtimeMode=publish")
-        return self._call(self._submit(session_id, dict(checked)))
+        return self._call(self._submit(session_id, dict(checked), task_id=task_id))
 
     def close(self, session_id: str | None = None) -> None:
         """放弃本次临时编辑页，不保存草稿或任何会话状态。"""
@@ -527,7 +532,7 @@ class DouyinCommerceSessionManager:
         success = False
         try:
             browser_options = self._commerce_browser_launch_options(payload)
-            background_mode = self._background_upload_mode(payload)
+            background_mode = True
             with publish_context(
                 mode="douyin_commerce_upload",
                 background_mode=background_mode,
@@ -957,7 +962,91 @@ class DouyinCommerceSessionManager:
             "scheduledAt": session.schedule_time or None,
         }
 
-    async def _submit(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    async def _handle_publish_verification(
+        self,
+        session: _CommerceEditorSession,
+        challenge,
+        task_id: int | None,
+    ) -> None:
+        """在原 Playwright 事件循环内完成单次、内存态验证挑战。"""
+
+        try:
+            normalized_task_id = int(task_id) if task_id is not None else 0
+        except (TypeError, ValueError):
+            normalized_task_id = 0
+        if normalized_task_id <= 0:
+            raise DouyinCommerceSessionError("抖音验证缺少任务号，发布已安全停止")
+
+        kind = getattr(challenge, "kind", "")
+        if kind == "sms":
+            request_id = verification_broker.create_sms(
+                task_id=normalized_task_id,
+                message="请在一键发客户端输入短信验证码",
+            )
+        elif kind == "qr":
+            request_id = verification_broker.create_qr(
+                task_id=normalized_task_id,
+                qr_image=bytes(getattr(challenge, "qr_image", b"")),
+                expires_in_seconds=600,
+            )
+        else:
+            raise DouyinCommerceSessionError("抖音返回了无法处理的验证类型，发布已安全停止")
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 600
+        try:
+            while True:
+                snapshot = verification_broker.snapshot(request_id)
+                if snapshot.get("state") != "waiting":
+                    raise DouyinCommerceSessionError("抖音验证已取消、失败或超时，发布已安全停止")
+                if loop.time() >= deadline:
+                    verification_broker.fail(request_id)
+                    raise DouyinCommerceSessionError("等待抖音验证超时，发布已安全停止")
+
+                if kind == "sms":
+                    code = verification_broker.consume_code(request_id)
+                    if code:
+                        try:
+                            await session.uploader.apply_sms_verification_code(
+                                session.page,
+                                challenge,
+                                code,
+                            )
+                        except Exception as exc:
+                            verification_broker.fail(request_id)
+                            raise DouyinCommerceSessionError(
+                                "抖音短信验证未通过或页面状态无法确认，发布已安全停止"
+                            ) from exc
+                        verification_broker.succeed(request_id)
+                        return
+                else:
+                    try:
+                        current = await session.uploader.detect_publish_verification(
+                            session.page
+                        )
+                    except Exception as exc:
+                        verification_broker.fail(request_id)
+                        raise DouyinCommerceSessionError(
+                            "抖音扫码验证页面状态无法确认，发布已安全停止"
+                        ) from exc
+                    if current is None:
+                        verification_broker.succeed(request_id)
+                        return
+                    if getattr(current, "kind", "") != "qr":
+                        verification_broker.fail(request_id)
+                        raise DouyinCommerceSessionError(
+                            "抖音扫码验证页面状态已变化，发布已安全停止"
+                        )
+                await session.page.wait_for_timeout(250)
+        finally:
+            verification_broker.clear(request_id)
+
+    async def _submit(
+        self,
+        session_id: str,
+        payload: dict[str, Any],
+        task_id: int | None = None,
+    ) -> dict[str, Any]:
         session = await self._current(session_id)
         self._assert_payload_matches_session(session, payload)
         expected_fingerprint = self._preflight_fingerprint(payload)
@@ -968,7 +1057,7 @@ class DouyinCommerceSessionManager:
             raise DouyinCommerceSessionError(
                 "当前编辑页仍保留已回读的定时；不能安全改为立即发表，请重新上传并预检"
             )
-        background_mode = self._background_upload_mode(session.upload_payload)
+        background_mode = True
         try:
             from utils.publish_observer import publish_context
 
@@ -988,15 +1077,16 @@ class DouyinCommerceSessionManager:
                         target_schedule.strftime("%Y-%m-%d %H:%M"),
                     ):
                         raise DouyinCommerceSessionError("抖音最终提交前定时时间回读不一致")
-                # 默认会话始终保持无头。显式关闭后台模式的开发诊断会话，才允许
-                # 在最终不可逆步骤前前置窗口。
-                if not background_mode:
-                    from utils.base_social_media import reveal_page_window
-
-                    await reveal_page_window(session.page)
                 publish_button = await session.uploader.wait_publish_button_ready(session.page)
                 await publish_button.click(timeout=10_000)
-                receipt = await session.uploader._wait_formal_publish_result(session.page)
+                receipt = await session.uploader._wait_formal_publish_result(
+                    session.page,
+                    on_verification=lambda challenge: self._handle_publish_verification(
+                        session,
+                        challenge,
+                        task_id,
+                    ),
+                )
                 scheduled = None
                 if target_schedule is not None:
                     scheduled = await douyin_publish_executor._scheduled_submission_readback(

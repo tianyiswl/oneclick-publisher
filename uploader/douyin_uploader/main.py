@@ -17,7 +17,6 @@ from utils.base_social_media import (
     launch_publish_browser,
     new_publish_context,
     goto_and_reveal,
-    is_publish_background_mode,
     keep_browser_open_for_dry_run,
     save_context_storage_state,
 )
@@ -651,7 +650,76 @@ class DouYinVideo(object):
         if self.save_draft_only:
             raise RuntimeError("保存草稿模式已在代码层禁止定位或点击正式发布按钮")
 
-    async def _wait_formal_publish_result(self, page: Page):
+    async def detect_publish_verification(self, page: Page):
+        """识别当前页面唯一、可受控的发布验证挑战。
+
+        此方法只保留挑战类型及二维码内存字节；不读取或返回页面文本、选择器、
+        二维码地址等平台诊断数据。任何控件不唯一均不猜测目标。
+        """
+
+        current_url = str(page.url or "")
+        if "/creator-micro/content/manage" in current_url:
+            return None
+
+        markers = await self._visible_exact_text(
+            page,
+            self.PUBLISH_SECURITY_VERIFICATION_TEXTS,
+        )
+        if not markers:
+            return None
+
+        inputs = await self._visible_enabled_items(page.get_by_role("textbox"))
+        buttons = await self._visible_enabled_items(page.get_by_role("button"))
+        if inputs:
+            if len(inputs) != 1:
+                raise RuntimeError("抖音验证输入框无法唯一确认，发布已安全停止")
+            if len(buttons) != 1:
+                raise RuntimeError("抖音验证确认按钮无法唯一确认，发布已安全停止")
+            from app_core.douyin_verification import VerificationChallenge
+
+            return VerificationChallenge(kind="sms", message="请在一键发客户端输入短信验证码")
+
+        images = await self._visible_enabled_items(page.get_by_role("img"))
+        if len(images) != 1:
+            raise RuntimeError("抖音验证二维码无法唯一确认，发布已安全停止")
+        try:
+            qr_image = await images[0].screenshot()
+            from app_core.douyin_verification import (
+                VerificationChallenge,
+                _validate_qr_image,
+            )
+
+            return VerificationChallenge(
+                kind="qr",
+                message="请在一键发客户端扫码完成验证",
+                qr_image=_validate_qr_image(qr_image),
+            )
+        except Exception as exc:
+            raise RuntimeError("抖音验证二维码无法在内存中解析，发布已安全停止") from exc
+
+    async def apply_sms_verification_code(self, page: Page, challenge, code: str) -> None:
+        """在原 Playwright 会话填入已由原生客户端提交的短信验证码。"""
+
+        if getattr(challenge, "kind", "") != "sms":
+            raise RuntimeError("当前抖音验证不是短信验证码，发布已安全停止")
+        inputs = await self._visible_enabled_items(page.get_by_role("textbox"))
+        buttons = await self._visible_enabled_items(page.get_by_role("button"))
+        if len(inputs) != 1:
+            raise RuntimeError("抖音验证输入框无法唯一确认，发布已安全停止")
+        if len(buttons) != 1:
+            raise RuntimeError("抖音验证确认按钮无法唯一确认，发布已安全停止")
+
+        await inputs[0].fill(str(code))
+        if await inputs[0].input_value() != str(code):
+            raise RuntimeError("抖音验证码填写后未能回读，发布已安全停止")
+        await buttons[0].click(timeout=10_000)
+        for _ in range(20):
+            if await self.detect_publish_verification(page) is None:
+                return
+            await page.wait_for_timeout(250)
+        raise RuntimeError("抖音验证码确认后仍停留在验证页，发布已安全停止")
+
+    async def _wait_formal_publish_result(self, page: Page, on_verification=None):
         security_verification_seen = False
         for attempt in range(self.PUBLISH_RESULT_WAIT_ATTEMPTS):
             current_url = str(page.url or "")
@@ -662,32 +730,22 @@ class DouYinVideo(object):
                     "url": current_url,
                 }
 
-            verification_markers = await self._visible_exact_text(
-                page,
-                self.PUBLISH_SECURITY_VERIFICATION_TEXTS,
-            )
-            if verification_markers:
-                if is_publish_background_mode():
-                    raise RuntimeError(
-                        "抖音正式发布需要二次安全验证（短信验证码或原设备扫码）。"
-                        "后台模式无法完成人工验证，请取消“后台运行”后重试；"
-                        "本次未确认发布成功"
-                    )
-                if not security_verification_seen:
-                    security_verification_seen = True
-                    douyin_logger.warning(
-                        "抖音要求二次安全验证，请在当前浏览器完成短信验证码"
-                        "或原设备扫码；验证完成后程序会继续确认发布结果"
-                    )
+            challenge = await self.detect_publish_verification(page)
+            if challenge is not None:
+                security_verification_seen = True
+                if not callable(on_verification):
+                    raise RuntimeError("抖音要求二次安全验证，但当前会话没有可用验证协调器，发布已安全停止")
+                result = on_verification(challenge)
+                if hasattr(result, "__await__"):
+                    await result
+                continue
 
             if attempt < self.PUBLISH_RESULT_WAIT_ATTEMPTS - 1:
                 await page.wait_for_timeout(1000)
 
         if security_verification_seen:
             raise RuntimeError(
-                "抖音正在等待二次安全验证，但 5 分钟内未完成。"
-                "请重新以前台模式发布，并在浏览器中完成短信验证码或原设备扫码；"
-                "本次未确认发布成功"
+                "抖音二次安全验证后 5 分钟内未进入作品管理页，本次未确认发布成功"
             )
         raise RuntimeError(
             "抖音点击发布后 5 分钟内未进入作品管理页，本次未确认发布成功"
