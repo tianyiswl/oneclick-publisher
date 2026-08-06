@@ -387,12 +387,12 @@ git commit -m "feat: 重构抖音带货批量工作台"
 ```python
 def test_publish_service_routes_batch_preflight_without_final_submit():
     with patch("app_core.douyin_commerce_batch_executor.batch_executor.run_preflight") as preflight:
-        publish_service.run_preflight(BATCH_PAYLOAD)
+        publish_service._run_preflight({"id": 41, "dryRun": 1}, [BATCH_PAYLOAD])
     preflight.assert_called_once()
 
 def test_batch_publish_requires_explicit_confirmed_flag():
     with self.assertRaisesRegex(ValueError, "批量确认"):
-        publish_service.run_publish({**BATCH_PAYLOAD, "batchConfirmed": False})
+        publish_service._run_publish({"id": 41, "dryRun": 0}, [{**BATCH_PAYLOAD, "batchConfirmed": False}])
 ```
 
 - [ ] **Step 2: 运行路由测试，确认失败**
