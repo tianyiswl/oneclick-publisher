@@ -22,6 +22,7 @@ CONTENT_TYPE_LABELS = {
 
 WORKFLOW_LABELS = {
     "douyin-commerce": "抖音带货",
+    "douyin-commerce-batch": "抖音带货批量",
 }
 
 
@@ -81,9 +82,17 @@ def display_task_no(task_no: object) -> str:
 def workflow_from_payload_json(payload_json: object) -> str:
     """从任务载荷识别场景；混合场景明确标记而不猜测。"""
 
+    payloads = _payloads_from_json(payload_json)
+    batch_workflows = {
+        str(payload.get("batchWorkflow") or "").strip()
+        for payload in payloads
+        if str(payload.get("batchWorkflow") or "").strip()
+    }
+    if len(batch_workflows) == 1:
+        return next(iter(batch_workflows))
     workflows = {
         str(payload.get("workflow") or "").strip()
-        for payload in _payloads_from_json(payload_json)
+        for payload in payloads
         if str(payload.get("workflow") or "").strip()
     }
     if len(workflows) == 1:
@@ -103,7 +112,13 @@ def workflow_label(workflow: object) -> str:
 def commerce_summary_from_payload_json(payload_json: object) -> str:
     """提取带货任务的地点、声明与发布方式，不保留会话敏感信息。"""
 
-    for payload in _payloads_from_json(payload_json):
+    payloads = _payloads_from_json(payload_json)
+    is_batch = any(
+        str(payload.get("batchWorkflow") or "") == "douyin-commerce-batch"
+        for payload in payloads
+    )
+    batch_lines = []
+    for payload in payloads:
         if str(payload.get("workflow") or "") != "douyin-commerce":
             continue
         poi = payload.get("locationPoi") if isinstance(payload.get("locationPoi"), dict) else {}
@@ -112,6 +127,18 @@ def commerce_summary_from_payload_json(payload_json: object) -> str:
         scope = str(payload.get("locationScope") or "").strip()
         declaration = str(payload.get("contentDeclaration") or "").strip()
         schedule = str(payload.get("scheduleTime") or "").strip()
+        if is_batch:
+            file_list = payload.get("fileList") if isinstance(payload.get("fileList"), list) else []
+            file_name = Path(str(file_list[0])).name if file_list else "未命名视频"
+            location = f"{location_name}（{location_address}）" if location_address else location_name
+            batch_lines.extend(
+                [
+                    f"视频：{file_name}",
+                    f"地点：{location}",
+                    f"发布方式：北京时间定时 {schedule}" if payload.get("enableTimer") is True and schedule else "发布方式：立即发布",
+                ]
+            )
+            continue
         fields = []
         if location_name:
             fields.append(f"地点：{location_name}{f'（{location_address}）' if location_address else ''}")
@@ -125,6 +152,8 @@ def commerce_summary_from_payload_json(payload_json: object) -> str:
         elif payload.get("enableTimer") is not True:
             fields.append("发布方式：立即发表")
         return "\n".join(fields)
+    if is_batch:
+        return "\n".join(batch_lines)
     return ""
 
 
@@ -382,6 +411,47 @@ def create_pending_task(payloads: list[dict], mode: str = "desktop") -> dict:
     return {"id": task_id, "taskNo": task_no, "itemCount": len(items)}
 
 
+def create_douyin_batch_task(batch: dict, mode: str = "oneclick_publish") -> dict:
+    """为批量信封中的每条视频创建独立、可审计的发布项。"""
+
+    from .douyin_commerce_batch_service import item_publish_payload
+
+    items = batch.get("items") if isinstance(batch, dict) else None
+    if not isinstance(items, list) or not items:
+        raise ValueError("抖音带货批量任务至少需要一条视频")
+    payloads = [item_publish_payload(batch, item) for item in items]
+    task = create_pending_task(payloads, mode=mode)
+    now = _now()
+    with connect() as conn:
+        task_items = conn.execute(
+            "SELECT id FROM publish_task_items WHERE taskId = ? ORDER BY id", (task["id"],)
+        ).fetchall()
+        for index, (task_item, payload) in enumerate(zip(task_items, payloads), start=1):
+            poi = payload.get("locationPoi") if isinstance(payload.get("locationPoi"), dict) else {}
+            location_name = str(poi.get("name") or payload.get("locationKeyword") or "").strip()
+            location_address = str(poi.get("address") or "").strip()
+            location_summary = f"{location_name}（{location_address}）" if location_address else location_name
+            schedule_summary = (
+                f"北京时间定时 {payload['scheduleTime']}"
+                if payload.get("enableTimer") is True and payload.get("scheduleTime")
+                else "立即发布"
+            )
+            conn.execute(
+                """
+                UPDATE publish_task_items
+                SET batchItemIndex = ?, locationSummary = ?, scheduleSummary = ?
+                WHERE id = ?
+                """,
+                (index, location_summary, schedule_summary, task_item["id"]),
+            )
+        conn.execute(
+            "INSERT INTO publish_task_events (taskId, level, eventType, message, createdAt) VALUES (?, 'info', 'batch_created', ?, ?)",
+            (task["id"], "已创建抖音带货批量逐视频任务", now),
+        )
+        conn.commit()
+    return task
+
+
 def mark_task_running(task_id: int, message: str) -> None:
     """标记一键发本地预检开始执行。"""
 
@@ -486,5 +556,76 @@ def mark_platform_result(
         conn.execute(
             "INSERT INTO publish_task_events (taskId, level, eventType, message, createdAt) VALUES (?, ?, ?, ?, ?)",
             (int(task_id), "info" if ok else "error", str(event_type), message, now),
+        )
+        conn.commit()
+
+
+def mark_batch_item_result(
+    task_id: int,
+    item_id: int,
+    *,
+    ok: bool,
+    message: str,
+    event_type: str,
+    readback: dict | None,
+) -> None:
+    """按视频条目写入平台事件；只有最终平台回执可标记成功。"""
+
+    now = _now()
+    final_receipts = {"platform_publish_receipt", "platform_scheduled_receipt"}
+    status = "failed" if not ok else "success" if event_type in final_receipts else "running"
+    with connect() as conn:
+        item = conn.execute(
+            "SELECT id FROM publish_task_items WHERE id = ? AND taskId = ?", (int(item_id), int(task_id))
+        ).fetchone()
+        if not item:
+            raise ValueError("批量视频条目不属于该任务")
+        conn.execute(
+            """
+            UPDATE publish_task_items
+            SET status = ?, message = ?, attempts = attempts + 1,
+                startedAt = COALESCE(startedAt, ?),
+                finishedAt = CASE WHEN ? IN ('success', 'failed') THEN ? ELSE finishedAt END
+            WHERE id = ?
+            """,
+            (status, message, now, status, now, int(item_id)),
+        )
+        summary = conn.execute(
+            """
+            SELECT COUNT(*) AS total,
+                   SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS success,
+                   SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
+                   SUM(CASE WHEN status IN ('pending', 'running') THEN 1 ELSE 0 END) AS active
+            FROM publish_task_items WHERE taskId = ?
+            """,
+            (int(task_id),),
+        ).fetchone()
+        success, failed, active = (int(summary[key] or 0) for key in ("success", "failed", "active"))
+        task_status = "running" if active else "partial_failed" if failed and success else "failed" if failed else "success"
+        conn.execute(
+            """
+            UPDATE publish_tasks
+            SET status = ?, successCount = ?, failedCount = ?, skippedCount = 0,
+                startedAt = COALESCE(startedAt, ?),
+                lastError = CASE WHEN ? THEN ? ELSE lastError END,
+                finishedAt = CASE WHEN ? = 0 THEN ? ELSE finishedAt END
+            WHERE id = ?
+            """,
+            (task_status, success, failed, now, 1 if not ok else 0, message, active, now, int(task_id)),
+        )
+        conn.execute(
+            """
+            INSERT INTO publish_task_events (taskId, itemId, level, eventType, message, detailJson, createdAt)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(task_id),
+                int(item_id),
+                "info" if ok else "error",
+                str(event_type),
+                message,
+                json.dumps(readback or {}, ensure_ascii=False),
+                now,
+            ),
         )
         conn.commit()

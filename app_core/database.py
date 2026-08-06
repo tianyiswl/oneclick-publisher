@@ -256,6 +256,9 @@ def ensure_schema() -> None:
                 ("userName", "TEXT"),
                 ("accountRemark", "TEXT"),
                 ("contentType", "TEXT"),
+                ("batchItemIndex", "INTEGER"),
+                ("locationSummary", "TEXT"),
+                ("scheduleSummary", "TEXT"),
             ),
         )
         conn.execute(
