@@ -70,11 +70,41 @@ def _items(value: object) -> list[dict[str, object]]:
             {
                 "mediaPath": media_path,
                 "locationPresetId": _text(item.get("locationPresetId")),
-                "enableTimer": bool(item.get("enableTimer")),
+                # 旧草稿只保存每条 enableTimer。新草稿以批次 publishMode 为准；
+                # 这里仍保留兼容字段，不能用 bool("false") 把字符串误判为已定时。
+                "enableTimer": item.get("enableTimer") is True,
                 "scheduleTimeOverride": schedule_time,
             }
         )
     return result
+
+
+def _publish_mode(value: object) -> str:
+    mode = _text(value or "immediate")
+    if mode not in {"immediate", "interval-schedule"}:
+        raise DouyinCommerceBatchDraftError("批次草稿发布方式无效")
+    return mode
+
+
+def _schedule(value: object, *, publish_mode: str) -> dict[str, object]:
+    """保存本机排期控件值，不在草稿服务判断是否已到发布时间。"""
+
+    raw = value if isinstance(value, Mapping) else {}
+    timezone = _text(raw.get("timezone") or "Asia/Shanghai")
+    if timezone != "Asia/Shanghai":
+        raise DouyinCommerceBatchDraftError("批次草稿仅支持 Asia/Shanghai")
+    start_time = _text(raw.get("startTime"))
+    try:
+        interval = int(raw.get("intervalMinutes") or 0)
+    except (TypeError, ValueError) as exc:
+        raise DouyinCommerceBatchDraftError("批次草稿定时间隔无效") from exc
+    if publish_mode == "interval-schedule" and (not start_time or interval <= 0):
+        raise DouyinCommerceBatchDraftError("按间隔定时的草稿缺少起始时间或间隔")
+    return {
+        "timezone": "Asia/Shanghai",
+        "startTime": start_time if publish_mode == "interval-schedule" else "",
+        "intervalMinutes": interval if publish_mode == "interval-schedule" else 0,
+    }
 
 
 def normalize_batch_draft(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -85,12 +115,21 @@ def normalize_batch_draft(payload: Mapping[str, Any]) -> dict[str, Any]:
     account_file = _text(payload.get("accountFile"))
     if not account_file:
         raise DouyinCommerceBatchDraftError("批次草稿缺少账号文件")
+    # schemaVersion=1 的旧草稿没有 publishMode/schedule：保持其逐条
+    # enableTimer 的语义，恢复时会转成最接近的批次模式。
+    items = _items(payload.get("items"))
+    legacy_timer = any(item["enableTimer"] is True for item in items)
+    publish_mode = _publish_mode(
+        payload.get("publishMode") or ("interval-schedule" if legacy_timer else "immediate")
+    )
     return {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "accountId": _account_id(payload.get("accountId")),
         "accountFile": account_file,
         "shared": _shared(payload.get("shared")),
-        "items": _items(payload.get("items")),
+        "publishMode": publish_mode,
+        "schedule": _schedule(payload.get("schedule"), publish_mode=publish_mode),
+        "items": items,
     }
 
 

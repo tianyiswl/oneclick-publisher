@@ -54,6 +54,7 @@ from app_core import (
     douyin_commerce_draft_service,
     douyin_commerce_service,
     douyin_commerce_session,
+    douyin_favorite_music_cache,
     media_service,
     task_service,
 )
@@ -415,6 +416,8 @@ class DouyinCommercePage(QWidget):
         self._selected_video_indexes: list[int] = []
         self._batch_locations: dict[str, dict[str, object]] = {}
         self._batch_schedule_overrides: dict[str, str] = {}
+        # 批量任务和旧的单条任务必须分开保存；验证轮询会优先使用仍在运行的
+        # 批量任务号，确保原生短信/二维码对话框与当前视频保持同一会话。
         self._batch_task_id: int | None = None
         self._batch_preflight_fingerprint = ""
         self._batch_progress_text = ""
@@ -2364,6 +2367,30 @@ class DouyinCommercePage(QWidget):
             return "sync"
         return "none"
 
+    def _batch_content_change_kind(self) -> str:
+        """判断批量页是否仍持有可以复用的编辑会话。
+
+        批量预检/提交默认会逐条关闭会话，所以没有活会话时明确返回
+        ``reupload``。只有同一账号、同一首视频的会话仍在且共享文本变更时，
+        才允许调用 ``synchronize_content``；不会把关闭会话误报为无需上传。
+        """
+
+        if not self._session_id or not self._uploaded_editor_payload:
+            return "reupload"
+        try:
+            current = self.collect_upload_payload()
+        except (ValueError, douyin_commerce_service.DouyinCommerceError):
+            return "reupload"
+        if self._upload_identity(current) != self._upload_identity(
+            self._uploaded_editor_payload
+        ):
+            return "reupload"
+        if self._content_fields(current) != self._content_fields(
+            self._uploaded_editor_payload
+        ):
+            return "sync"
+        return "none"
+
     def _schedule_changed(self) -> None:
         self._preflight_fingerprint = ""
         self._sync_view()
@@ -2454,7 +2481,7 @@ class DouyinCommercePage(QWidget):
         if not isinstance(candidate, dict):
             self._load_favorite_music_candidates()
             return
-        if self.selected_video_count() > 1:
+        if self.selected_video_count() >= 1:
             # 批量选择只保留用户明确选择的音乐身份；真正平台写入和回读属于
             # 每条预检执行器，不能把本地选择冒充为已经写入。
             self._selected_music = dict(candidate)
@@ -2486,7 +2513,7 @@ class DouyinCommercePage(QWidget):
 
         if not checked or self._suppress_declaration_signal:
             return
-        if self.selected_video_count() > 1:
+        if self.selected_video_count() >= 1:
             self._confirmed_declaration = _normalized(declaration)
             self._batch_preflight_fingerprint = ""
             self.declaration_status.setText("已选择；预检时逐条写入并回读")
@@ -2517,7 +2544,7 @@ class DouyinCommercePage(QWidget):
         )
 
     def _go_to_step(self, step: int) -> None:
-        if self.selected_video_count() > 1:
+        if self.selected_video_count() >= 1:
             if step == 1 and not self._batch_content_is_valid():
                 QMessageBox.warning(self, "抖音带货", "请先选择账号、1 至 20 条视频并填写文案。")
                 return
@@ -2540,7 +2567,7 @@ class DouyinCommercePage(QWidget):
     def continue_to_review(self) -> None:
         """检查前先把客户端定时与同一编辑页实际状态对齐。"""
 
-        if self.selected_video_count() > 1:
+        if self.selected_video_count() >= 1:
             self._go_to_step(2)
             return
 
@@ -2805,7 +2832,9 @@ class DouyinCommercePage(QWidget):
         for key, value in self.summary_values.items():
             value.setText(summary.get(key) or "待完成")
         self._render_batch_review_rows()
-        batch_mode = self.selected_video_count() > 1
+        # 一条视频同样必须走批量工作台。这样单条和 1..20 条视频不会分裂为
+        # 两套上传/验证实现，也不会悄悄回退到旧单视频页面。
+        batch_mode = self.selected_video_count() >= 1
         if batch_mode:
             try:
                 batch_payload = self.collect_batch_payload()
@@ -2900,7 +2929,7 @@ class DouyinCommercePage(QWidget):
         """把当前会话投影到固定双栏；四项可独立填写，写入动作串行回读。"""
 
         busy = self._busy()
-        batch_mode = self.selected_video_count() > 1
+        batch_mode = self.selected_video_count() >= 1
         if hasattr(self, "batch_item_settings_stage"):
             self.batch_item_settings_stage.setVisible(batch_mode)
             self.location_stage.setVisible(not batch_mode)
@@ -2939,7 +2968,9 @@ class DouyinCommercePage(QWidget):
             else:
                 self.music_status.setText("暂无本地收藏音乐，可点击刷新")
         self.music_status.setVisible(
-            self._immediate_write_kind in {"music", "music_read", "music_cache", "music_refresh"}
+            batch_mode
+            or self._immediate_write_kind
+            in {"music", "music_read", "music_cache", "music_refresh"}
         )
         self.music_card.setVisible(False)
 
@@ -2989,7 +3020,9 @@ class DouyinCommercePage(QWidget):
                 self.declaration_status.setText("")
             else:
                 self.declaration_status.setText("选择后立即写入")
-        self.declaration_status.setVisible(self._immediate_write_kind == "declaration")
+        self.declaration_status.setVisible(
+            batch_mode or self._immediate_write_kind == "declaration"
+        )
         self.declaration_card.setVisible(False)
 
         can_configure_schedule = session_ready and not busy
@@ -3068,7 +3101,7 @@ class DouyinCommercePage(QWidget):
         )
 
     def _content_is_valid(self) -> bool:
-        if self.selected_video_count() > 1:
+        if self.selected_video_count() >= 1:
             return self._batch_content_is_valid()
         return bool(
             self._selected_account()
@@ -3193,6 +3226,18 @@ class DouyinCommercePage(QWidget):
                 "description": self.description_input.toPlainText(),
                 "tags": self._tags(),
             },
+            "publishMode": _normalized(self.batch_publish_mode.currentData() or "immediate"),
+            "schedule": {
+                "timezone": "Asia/Shanghai",
+                "startTime": datetime(
+                    self.batch_start_date.date().year(),
+                    self.batch_start_date.date().month(),
+                    self.batch_start_date.date().day(),
+                    self.batch_start_time.time().hour(),
+                    self.batch_start_time.time().minute(),
+                ).strftime("%Y-%m-%d %H:%M"),
+                "intervalMinutes": int(self.batch_interval_minutes.value()),
+            },
             "items": [
                 {
                     "mediaPath": _normalized(video.get("storedPath")),
@@ -3260,8 +3305,31 @@ class DouyinCommercePage(QWidget):
                 self._batch_locations[path] = dict(preset)
             if _normalized(item.get("scheduleTimeOverride")):
                 self._batch_schedule_overrides[path] = _normalized(item.get("scheduleTimeOverride"))
-        wants_timer = any(bool(item.get("enableTimer")) for item in payload.get("items") or [])
-        self.batch_publish_mode.setCurrentIndex(self.batch_publish_mode.findData("interval-schedule" if wants_timer else "immediate"))
+        publish_mode = _normalized(payload.get("publishMode") or "")
+        if publish_mode not in {"immediate", "interval-schedule"}:
+            publish_mode = (
+                "interval-schedule"
+                if any(item.get("enableTimer") is True for item in payload.get("items") or [])
+                else "immediate"
+            )
+        schedule = payload.get("schedule") if isinstance(payload.get("schedule"), dict) else {}
+        start_time = _normalized(schedule.get("startTime"))
+        if start_time:
+            try:
+                parsed = datetime.strptime(start_time, "%Y-%m-%d %H:%M")
+                self.batch_start_date.setDate(QDate(parsed.year, parsed.month, parsed.day))
+                self.batch_start_time.setTime(QTime(parsed.hour, parsed.minute))
+            except ValueError:
+                pass
+        try:
+            interval = int(schedule.get("intervalMinutes") or 0)
+        except (TypeError, ValueError):
+            interval = 0
+        if interval > 0:
+            self.batch_interval_minutes.setValue(interval)
+        self.batch_publish_mode.setCurrentIndex(
+            self.batch_publish_mode.findData(publish_mode)
+        )
         self._render_batch_item_rows()
         self._sync_view()
 
@@ -3285,7 +3353,7 @@ class DouyinCommercePage(QWidget):
             on_progress=self._batch_progress,
             on_success=lambda result: self._batch_preflight_succeeded(payload, result),
             on_error=self._batch_operation_failed,
-            on_finished=self._sync_view,
+            on_finished=self._batch_operation_finished,
         )
         self._sync_view()
 
@@ -3313,6 +3381,13 @@ class DouyinCommercePage(QWidget):
         self._batch_preflight_fingerprint = ""
         self.validation_label.setText("批量操作未完成，请检查任务记录后重试。")
         _LOGGER.warning("抖音带货批量操作未完成: %s", _normalized(message))
+
+    def _batch_operation_finished(self) -> None:
+        """批量预检/提交结束后收束验证内存与原生对话框。"""
+
+        self._cleanup_douyin_verification()
+        self._batch_task_id = None
+        self._sync_view()
 
     @staticmethod
     def _batch_fingerprint(payload: dict) -> str:
@@ -3349,7 +3424,7 @@ class DouyinCommercePage(QWidget):
             on_progress=self._batch_progress,
             on_success=lambda _result: self.validation_label.setText("批量任务已结束，请以任务记录中的逐条平台回执为准。"),
             on_error=self._batch_operation_failed,
-            on_finished=self._sync_view,
+            on_finished=self._batch_operation_finished,
         )
         self._start_douyin_verification_polling()
         self._sync_view()
@@ -3480,7 +3555,7 @@ class DouyinCommercePage(QWidget):
             widget = item.widget()
             if widget is not None:
                 widget.deleteLater()
-        is_batch = self.selected_video_count() > 1
+        is_batch = self.selected_video_count() >= 1
         self.batch_review_rows.setVisible(is_batch)
         self.summary_grid.setEnabled(not is_batch)
         if not is_batch:
@@ -3503,12 +3578,29 @@ class DouyinCommercePage(QWidget):
     def continue_after_content(self) -> None:
         """按内容差异决定无动作、内容同步或完整重新上传。"""
 
-        if self.selected_video_count() > 1:
+        if self.selected_video_count() >= 1:
             if not self._batch_content_is_valid():
                 QMessageBox.warning(self, "继续", "请选择账号、1 至 20 条视频并填写作品文案。")
                 return
+            change_kind = self._batch_content_change_kind()
+            if change_kind == "sync":
+                try:
+                    payload = self.collect_upload_payload()
+                except (ValueError, douyin_commerce_service.DouyinCommerceError) as exc:
+                    QMessageBox.warning(self, "同步内容", str(exc))
+                    return
+                self._start_content_sync(payload)
+                return
+            if change_kind == "reupload" and self._session_id:
+                # 账号或第一条视频变化会使现有会话失效；后续预检将为全部视频
+                # 重新建立会话。这里不暗中启动浏览器或上传。
+                self._session_id = ""
+                self._uploaded_editor_payload = None
+                self.content_notice.setText("账号或视频已变更；预检时会重新建立上传会话。")
+                self.content_notice.setVisible(True)
             # 批量模式不在“内容准备”阶段偷偷启动浏览器。进入设置页后由用户
-            # 选择共享音乐、声明和逐条地点，再显式执行发布前检查。
+            # 选择共享音乐、声明和逐条地点，再显式执行发布前检查。若当前
+            # 会话已关闭，预检会逐条重新上传，这不是“无需重传”的暗示。
             self._go_to_step(1)
             return
 
@@ -3727,7 +3819,13 @@ class DouyinCommercePage(QWidget):
         )
 
     def _load_favorite_music_candidates(self) -> None:
-        """只展开本机缓存；真实平台读取必须由用户点“刷新”触发。"""
+        """只展开账号本机缓存；批量草稿阶段绝不偷偷创建平台会话。"""
+
+        # 新批量工作台在上传前就需要选择共享音乐。此时只能读取当前账号已
+        # 同步到本机的安全缓存；缓存缺失时不创建浏览器、不上传，也不默认选歌。
+        if self.selected_video_count() >= 1 and not self._session_id:
+            self._load_batch_cached_favorite_music()
+            return
 
         if not self._session_id:
             QMessageBox.warning(self, "选择收藏音乐", "请先上传视频。")
@@ -3740,6 +3838,12 @@ class DouyinCommercePage(QWidget):
 
     def _refresh_favorite_music_candidates(self) -> None:
         """用户明确刷新时才打开当前抖音编辑页的收藏列表。"""
+
+        if self.selected_video_count() >= 1 and not self._session_id:
+            # 没有编辑会话时不能伪造“刷新成功”。引导用户保持在安全的本地
+            # 选择阶段，实际平台读取会在后续明确的预检会话内进行，且不提交。
+            self._load_batch_cached_favorite_music(refresh_requested=True)
+            return
 
         if not self._session_id:
             QMessageBox.warning(self, "刷新收藏音乐", "请先上传视频。")
@@ -3755,6 +3859,47 @@ class DouyinCommercePage(QWidget):
             lambda rows: self._show_music_candidates(rows, source="session"),
             self._music_load_failed,
         )
+
+    def _load_batch_cached_favorite_music(self, *, refresh_requested: bool = False) -> None:
+        """读取当前账号的本地收藏音乐缓存，不触碰抖音页面。
+
+        刷新按钮在未上传阶段只会重新读取本机缓存，避免把“刷新”误做成隐式
+        上传/打开浏览器。若缓存为空，用户必须先通过受控预检读取真实收藏列表
+        后再选择，页面不会提交任务。
+        """
+
+        account = self._selected_account() or {}
+        try:
+            account_id = int(account.get("id") or 0)
+        except (TypeError, ValueError):
+            account_id = 0
+        if account_id <= 0:
+            self.music_status.setText("请先选择抖音账号")
+            self.music_status.setVisible(True)
+            return
+        try:
+            rows = douyin_favorite_music_cache.list_cached_favorite_music(account_id)
+        except Exception:
+            rows = []
+        if rows:
+            self._show_music_candidates(rows, source="account-cache")
+            self.music_status.setText("从本机收藏音乐缓存选择")
+        else:
+            self._music_candidates = []
+            self.music_candidate_list.clear()
+            self.music_combo.blockSignals(True)
+            try:
+                self.music_combo.clear()
+                self.music_combo.addItem("暂无本地收藏音乐", None)
+            finally:
+                self.music_combo.blockSignals(False)
+            self.music_status.setText(
+                "当前账号暂无本地收藏音乐缓存；请先受控读取收藏列表，选择后再继续。"
+                if refresh_requested
+                else "当前账号暂无本地收藏音乐缓存。"
+            )
+        self.music_status.setVisible(True)
+        self._sync_view()
 
     def _show_music_candidates(
         self,
@@ -4000,7 +4145,7 @@ class DouyinCommercePage(QWidget):
         self._platform_action_error("declaration", message)
 
     def start_preflight(self) -> None:
-        if self.selected_video_count() > 1:
+        if self.selected_video_count() >= 1:
             self.start_batch_preflight()
             return
         try:
@@ -4065,7 +4210,7 @@ class DouyinCommercePage(QWidget):
         self._sync_view()
 
     def open_submit_confirmation(self) -> None:
-        if self.selected_video_count() > 1:
+        if self.selected_video_count() >= 1:
             self.open_batch_submit_confirmation()
             return
         action_label = "确认定时提交" if self.timer_enabled.isChecked() else "确认立即发表"
@@ -4110,7 +4255,7 @@ class DouyinCommercePage(QWidget):
     def _start_douyin_verification_polling(self) -> None:
         """只在最终提交运行时轮询 Broker 的本机内存请求。"""
 
-        if self._active_task_id is None:
+        if self._verification_task_id() is None:
             return
         if not self._douyin_verification_poll_timer.isActive():
             self._douyin_verification_poll_timer.start()
@@ -4119,9 +4264,10 @@ class DouyinCommercePage(QWidget):
     def _poll_douyin_verification(self) -> None:
         """按任务号打开唯一原生验证对话框，不执行浏览器操作。"""
 
-        if self._active_task_id is None:
+        task_id = self._verification_task_id()
+        if task_id is None:
             return
-        request_id = verification_broker.request_for_task(self._active_task_id)
+        request_id = verification_broker.request_for_task(task_id)
         if not request_id or request_id == self._douyin_verification_request_id:
             return
         if self._douyin_verification_dialog is not None:
@@ -4138,13 +4284,27 @@ class DouyinCommercePage(QWidget):
         self._douyin_verification_request_id = request_id
         dialog.show()
 
+    def _verification_task_id(self) -> int | None:
+        """返回仍在运行的验证任务号，批量任务优先于旧单条任务。"""
+
+        for value in (self._batch_task_id, self._active_task_id):
+            try:
+                task_id = int(value or 0)
+            except (TypeError, ValueError):
+                task_id = 0
+            if task_id > 0:
+                return task_id
+        return None
+
     def _cleanup_douyin_verification(self) -> None:
         """任务收束时停止轮询、关闭对话框并清空对应内存请求。"""
 
         self._douyin_verification_poll_timer.stop()
         request_id = self._douyin_verification_request_id
-        if not request_id and self._active_task_id is not None:
-            request_id = verification_broker.request_for_task(self._active_task_id) or ""
+        if not request_id:
+            task_id = self._verification_task_id()
+            if task_id is not None:
+                request_id = verification_broker.request_for_task(task_id) or ""
         if self._douyin_verification_dialog is not None:
             self._douyin_verification_dialog.accept()
         if request_id:

@@ -59,6 +59,42 @@ class DouyinCommerceBatchDraftTests(unittest.TestCase):
         )
         self.assertNotIn("token", normalized)
 
+    def test_roundtrip_keeps_batch_mode_shanghai_schedule_and_per_item_override(self) -> None:
+        """真实 SQLite 回读必须完整保留排期控件，而非只在内存规范化。"""
+
+        saved = save_batch_draft(
+            {
+                "accountId": 7,
+                "accountFile": "douyin.json",
+                "shared": {"title": "标题", "description": "文案", "tags": ["北海"]},
+                "publishMode": "interval-schedule",
+                "schedule": {
+                    "timezone": "Asia/Shanghai",
+                    "startTime": "2026-08-10 09:00",
+                    "intervalMinutes": 30,
+                },
+                "items": [
+                    {"mediaPath": "/tmp/a.mp4", "locationPresetId": "p1"},
+                    {
+                        "mediaPath": "/tmp/b.mp4",
+                        "locationPresetId": "p2",
+                        "scheduleTimeOverride": "2026-08-10 11:00",
+                    },
+                ],
+            }
+        )
+
+        restored = load_batch_draft()
+        self.assertEqual(restored, saved)
+        self.assertEqual(restored["payload"]["publishMode"], "interval-schedule")
+        self.assertEqual(restored["payload"]["schedule"]["timezone"], "Asia/Shanghai")
+        self.assertEqual(restored["payload"]["schedule"]["startTime"], "2026-08-10 09:00")
+        self.assertEqual(restored["payload"]["schedule"]["intervalMinutes"], 30)
+        self.assertEqual(
+            restored["payload"]["items"][1]["scheduleTimeOverride"],
+            "2026-08-10 11:00",
+        )
+
     def test_item_count_must_be_between_one_and_twenty(self) -> None:
         payload = {"accountId": 7, "accountFile": "douyin.json", "shared": {}, "items": []}
         with self.assertRaisesRegex(DouyinCommerceBatchDraftError, "1 至 20"):

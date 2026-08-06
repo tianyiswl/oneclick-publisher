@@ -20,6 +20,7 @@ from PyQt6.QtGui import QColor, QImage
 from PyQt6.QtWidgets import QApplication, QComboBox, QDialog, QFrame, QLabel, QPushButton
 
 from app_core import (
+    douyin_commerce_batch_draft_service,
     douyin_commerce_service,
     douyin_commerce_session,
     douyin_music_service,
@@ -4414,6 +4415,143 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.assertEqual(self.page.item_schedule_text(1), "09:30")
         self.page.set_item_schedule_override(2, "2026-08-07 15:00")
         self.assertEqual(self.page.item_schedule_text(2), "15:00")
+
+    def test_one_selected_video_uses_batch_preflight_instead_of_legacy_single_flow(self) -> None:
+        """1 条也必须走 1..20 批量入口，不能悄悄退回旧单视频发布。"""
+
+        with tempfile.TemporaryDirectory() as root:
+            video = Path(root) / "one.mp4"
+            video.write_bytes(b"offline-video")
+            account = {
+                "id": 72,
+                "type": 3,
+                "status": 1,
+                "filePath": "douyin-72.json",
+                "profileName": "主体",
+                "userName": "账号",
+            }
+            media = {
+                "id": 1,
+                "typeText": "视频",
+                "storedPath": str(video),
+                "filename": "one.mp4",
+            }
+            with patch("ui.douyin_commerce_page.account_service.list_accounts", return_value=[account]), patch(
+                "ui.douyin_commerce_page.media_service.list_media", return_value=[media]
+            ):
+                self.page.refresh()
+            self.page.account_combo.setCurrentIndex(1)
+            self.page.select_video_indexes([1])
+            with patch.object(self.page, "start_batch_preflight") as batch, patch.object(
+                self.page, "collect_payload"
+            ) as legacy:
+                self.page.start_preflight()
+
+            batch.assert_called_once()
+            legacy.assert_not_called()
+
+    def test_batch_draft_roundtrip_preserves_mode_schedule_and_item_overrides(self) -> None:
+        """本地草稿恢复不能丢失立即/间隔模式、北京时间起点或逐条覆盖。"""
+
+        normalized = douyin_commerce_batch_draft_service.normalize_batch_draft(
+            {
+                "accountId": 72,
+                "accountFile": "douyin-72.json",
+                "shared": {"title": "标题", "description": "文案", "tags": ["北海"]},
+                "publishMode": "interval-schedule",
+                "schedule": {
+                    "timezone": "Asia/Shanghai",
+                    "startTime": "2026-08-10 09:00",
+                    "intervalMinutes": 45,
+                },
+                "items": [
+                    {
+                        "mediaPath": "/tmp/a.mp4",
+                        "locationPresetId": "poi-a",
+                        "scheduleTimeOverride": "",
+                    },
+                    {
+                        "mediaPath": "/tmp/b.mp4",
+                        "locationPresetId": "poi-b",
+                        "scheduleTimeOverride": "2026-08-10 12:00",
+                    },
+                ],
+            }
+        )
+
+        self.assertEqual(normalized["publishMode"], "interval-schedule")
+        self.assertEqual(normalized["schedule"]["timezone"], "Asia/Shanghai")
+        self.assertEqual(normalized["schedule"]["startTime"], "2026-08-10 09:00")
+        self.assertEqual(normalized["schedule"]["intervalMinutes"], 45)
+        self.assertEqual(normalized["items"][1]["scheduleTimeOverride"], "2026-08-10 12:00")
+
+    def test_batch_music_reads_current_account_cache_without_opening_session(self) -> None:
+        account = {"id": 73, "type": 3, "status": 1, "filePath": "douyin-73.json", "profileName": "主体", "userName": "账号"}
+        self.page.account_combo.clear()
+        self.page.account_combo.addItem("请选择", None)
+        self.page.account_combo.addItem("账号", account)
+        self.page.account_combo.setCurrentIndex(1)
+        self.page._selected_video_indexes = [1]
+        self.page._session_id = ""
+        rows = [{"musicId": "m-1", "title": "收藏歌", "creator": "作者", "duration": "00:30", "syncedAt": "2026-08-06 10:00"}]
+
+        with patch(
+            "ui.douyin_commerce_page.douyin_favorite_music_cache.list_cached_favorite_music",
+            return_value=rows,
+        ) as cached, patch(
+            "ui.douyin_commerce_page.douyin_commerce_session.commerce_session_manager.start_upload"
+        ) as upload:
+            self.page._load_favorite_music_candidates()
+
+        cached.assert_called_once_with(73)
+        upload.assert_not_called()
+        self.assertEqual(self.page.music_combo.count(), 2)
+        self.assertEqual(self.page.music_combo.itemData(1)["musicId"], "m-1")
+
+    def test_batch_shared_content_uses_sync_only_for_live_matching_editor_session(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            video = Path(root) / "one.mp4"
+            video.write_bytes(b"offline-video")
+            account = {"id": 74, "type": 3, "status": 1, "filePath": "douyin-74.json", "profileName": "主体", "userName": "账号"}
+            media = {"id": 1, "typeText": "视频", "storedPath": str(video), "filename": "one.mp4"}
+            with patch("ui.douyin_commerce_page.account_service.list_accounts", return_value=[account]), patch(
+                "ui.douyin_commerce_page.media_service.list_media", return_value=[media]
+            ):
+                self.page.refresh()
+            self.page.account_combo.setCurrentIndex(1)
+            self.page.select_video_indexes([1])
+            self.page.description_input.setPlainText("原文案")
+            original = self.page.collect_upload_payload()
+            self.page._session_id = "live-session"
+            self.page._uploaded_editor_payload = dict(original)
+            self.page.title_input.setText("更新标题")
+
+            with patch.object(self.page, "_start_content_sync") as synchronize, patch.object(
+                self.page, "start_upload"
+            ) as upload:
+                self.page.continue_after_content()
+
+            synchronize.assert_called_once()
+            upload.assert_not_called()
+            self.page._session_id = ""
+            self.assertEqual(self.page._batch_content_change_kind(), "reupload")
+
+    def test_batch_verification_polls_batch_task_and_cleans_up_after_finish(self) -> None:
+        broker = DouyinVerificationBroker()
+        request_id = broker.create_sms(task_id=975, message="需要短信验证")
+        dialog = MagicMock()
+        self.page._batch_task_id = 975
+        with patch("ui.douyin_commerce_page.verification_broker", broker), patch(
+            "ui.douyin_commerce_page.DouyinVerificationDialog", return_value=dialog
+        ) as dialog_type:
+            self.page._start_douyin_verification_polling()
+            self.page._poll_douyin_verification()
+            dialog_type.assert_called_once_with(request_id, broker=broker, parent=self.page)
+            self.page._batch_operation_finished()
+
+        self.assertIsNone(broker.request_for_task(975))
+        self.assertIsNone(self.page._batch_task_id)
+        self.assertFalse(self.page._douyin_verification_poll_timer.isActive())
 
 
 class DouyinCommerceRoutingTests(unittest.TestCase):
