@@ -681,11 +681,8 @@ class DouYinVideo(object):
         if "/creator-micro/content/manage" in current_url:
             return None
 
-        markers = await self._visible_exact_text(
-            page,
-            self.PUBLISH_SECURITY_VERIFICATION_TEXTS,
-        )
-        if not markers:
+        verification_container = await self._unique_publish_verification_container(page)
+        if verification_container is None:
             if any(
                 fragment in current_url.lower()
                 for fragment in ("verification", "verify", "security")
@@ -693,8 +690,12 @@ class DouYinVideo(object):
                 raise RuntimeError("抖音验证页面状态无法识别，发布已安全停止")
             return None
 
-        inputs = await self._visible_enabled_items(page.get_by_role("textbox"))
-        buttons = await self._visible_enabled_items(page.get_by_role("button"))
+        inputs = await self._visible_enabled_items(
+            verification_container.get_by_role("textbox")
+        )
+        buttons = await self._visible_enabled_items(
+            verification_container.get_by_role("button")
+        )
         if inputs:
             if len(inputs) != 1:
                 raise RuntimeError("抖音验证输入框无法唯一确认，发布已安全停止")
@@ -704,7 +705,9 @@ class DouYinVideo(object):
 
             return VerificationChallenge(kind="sms", message="请在一键发客户端输入短信验证码")
 
-        images = await self._visible_enabled_items(page.get_by_role("img"))
+        images = await self._visible_enabled_items(
+            verification_container.get_by_role("img")
+        )
         if len(images) != 1:
             raise RuntimeError("抖音验证二维码无法唯一确认，发布已安全停止")
         try:
@@ -734,8 +737,15 @@ class DouYinVideo(object):
 
         if getattr(challenge, "kind", "") != "sms":
             raise RuntimeError("当前抖音验证不是短信验证码，发布已安全停止")
-        inputs = await self._visible_enabled_items(page.get_by_role("textbox"))
-        buttons = await self._visible_enabled_items(page.get_by_role("button"))
+        verification_container = await self._unique_publish_verification_container(page)
+        if verification_container is None:
+            raise RuntimeError("抖音验证容器无法唯一确认，发布已安全停止")
+        inputs = await self._visible_enabled_items(
+            verification_container.get_by_role("textbox")
+        )
+        buttons = await self._visible_enabled_items(
+            verification_container.get_by_role("button")
+        )
         if len(inputs) != 1:
             raise RuntimeError("抖音验证输入框无法唯一确认，发布已安全停止")
         if len(buttons) != 1:
@@ -798,6 +808,65 @@ class DouYinVideo(object):
             except Exception:
                 continue
         return items
+
+    async def _unique_publish_verification_container(self, page):
+        """由验证文案反查唯一可见弹层，避免把编辑页控件误作验证控件。"""
+
+        container_xpath = (
+            "xpath=ancestor-or-self::*["
+            "@role='dialog' or @aria-modal='true' or "
+            "contains(translate(string(@class), "
+            "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'modal') or "
+            "contains(translate(string(@class), "
+            "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'dialog') or "
+            "contains(translate(string(@class), "
+            "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'verification') or "
+            "contains(translate(string(@class), "
+            "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'verify') or "
+            "contains(translate(string(@class), "
+            "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'security')"
+            "][1]"
+        )
+        containers = {}
+        marker_seen = False
+        for text in self.PUBLISH_SECURITY_VERIFICATION_TEXTS:
+            markers = page.get_by_text(text, exact=True)
+            for index in range(await markers.count()):
+                marker = markers.nth(index)
+                try:
+                    if not await marker.is_visible():
+                        continue
+                except Exception:
+                    continue
+                marker_seen = True
+                try:
+                    candidates = marker.locator(container_xpath)
+                    if await candidates.count() != 1:
+                        raise RuntimeError("验证文案没有唯一可见弹层祖先")
+                    container = candidates.nth(0)
+                    if not await container.is_visible():
+                        raise RuntimeError("验证文案的弹层祖先不可见")
+                    identity = await container.evaluate(
+                        """
+                        node => {
+                          const path = [];
+                          for (let current = node; current; current = current.parentElement) {
+                            const parent = current.parentElement;
+                            const siblings = parent ? Array.from(parent.children) : [current];
+                            path.push(`${current.tagName}:${siblings.indexOf(current)}`);
+                          }
+                          return path.reverse().join('/');
+                        }
+                        """
+                    )
+                except Exception as exc:
+                    raise RuntimeError("抖音验证容器无法唯一确认，发布已安全停止") from exc
+                containers.setdefault(str(identity), container)
+        if not marker_seen:
+            return None
+        if len(containers) != 1:
+            raise RuntimeError("抖音验证容器无法唯一确认，发布已安全停止")
+        return next(iter(containers.values()))
 
     @staticmethod
     async def _visible_exact_text(page, values):

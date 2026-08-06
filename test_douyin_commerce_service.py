@@ -3617,10 +3617,6 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
             def nth(self, index: int):
                 return self.items[index]
 
-        class Marker:
-            async def is_visible(self) -> bool:
-                return True
-
         class Textbox:
             def __init__(self, page) -> None:
                 self.page = page
@@ -3654,6 +3650,33 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
                 await self.page.pause_for_external_race("click")
                 self.page.url = "https://creator.douyin.com/creator-micro/content/manage"
 
+        class VerificationContainer:
+            def __init__(self, page) -> None:
+                self.page = page
+
+            async def is_visible(self) -> bool:
+                return True
+
+            async def evaluate(self, _script: str) -> str:
+                return "atomic-sms-verification-container"
+
+            def get_by_role(self, role: str, **_kwargs):
+                if role == "textbox":
+                    return Controls([self.page.textbox])
+                if role == "button":
+                    return Controls([self.page.confirm])
+                return Controls([])
+
+        class Marker:
+            def __init__(self, container) -> None:
+                self.container = container
+
+            async def is_visible(self) -> bool:
+                return True
+
+            def locator(self, _selector: str):
+                return Controls([self.container])
+
         class Page:
             def __init__(self, broker) -> None:
                 self.broker = broker
@@ -3665,6 +3688,8 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
                 self.url = "https://creator.douyin.com/verification"
                 self.textbox = Textbox(self)
                 self.confirm = ConfirmButton(self)
+                self.container = VerificationContainer(self)
+                self.marker = Marker(self.container)
 
             async def pause_for_external_race(self, phase: str) -> None:
                 paused = threading.Event()
@@ -3707,7 +3732,7 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
 
             def get_by_text(self, text: str, *, exact: bool):
                 if self.url.endswith("/verification") and text == "接收短信验证码" and exact:
-                    return Controls([Marker()])
+                    return Controls([self.marker])
                 return Controls([])
 
             def get_by_role(self, role: str, **_kwargs):

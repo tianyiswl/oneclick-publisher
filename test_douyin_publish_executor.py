@@ -226,7 +226,8 @@ class DouyinPublishPayloadTests(unittest.TestCase):
                 return self.items[index]
 
         class Textbox:
-            def __init__(self) -> None:
+            def __init__(self, name: str) -> None:
+                self.name = name
                 self.value = ""
 
             async def is_visible(self) -> bool:
@@ -255,25 +256,78 @@ class DouyinPublishPayloadTests(unittest.TestCase):
                 self.page.url = "https://creator.douyin.com/creator-micro/content/manage"
 
         class Marker:
+            def __init__(self, container) -> None:
+                self.container = container
+
             async def is_visible(self) -> bool:
                 return True
+
+            def locator(self, _selector: str):
+                return Controls([self.container])
+
+        class ImageControl:
+            async def is_visible(self) -> bool:
+                return True
+
+            async def is_enabled(self) -> bool:
+                return True
+
+        class PublishButton:
+            def __init__(self) -> None:
+                self.click_count = 0
+
+            async def is_visible(self) -> bool:
+                return True
+
+            async def is_enabled(self) -> bool:
+                return True
+
+            async def click(self, *, timeout: int) -> None:
+                del timeout
+                self.click_count += 1
+
+        class VerificationContainer:
+            def __init__(self, page) -> None:
+                self.page = page
+
+            async def is_visible(self) -> bool:
+                return True
+
+            async def evaluate(self, _script: str) -> str:
+                return "sms-verification-container"
+
+            def get_by_role(self, role: str, **_kwargs):
+                if role == "textbox":
+                    return Controls([self.page.textbox])
+                if role == "button":
+                    return Controls([self.page.confirm])
+                return Controls([])
 
         class SmsChallengePage:
             def __init__(self) -> None:
                 self.url = "https://creator.douyin.com/verification"
-                self.textbox = Textbox()
+                self.title = Textbox("底层标题")
+                self.body = Textbox("底层正文")
+                self.textbox = Textbox("验证短信码")
                 self.confirm = ConfirmButton(self)
+                self.publish = PublishButton()
+                self.avatar = ImageControl()
+                self.video_preview = ImageControl()
+                self.container = VerificationContainer(self)
+                self.marker = Marker(self.container)
 
             def get_by_text(self, text: str, *, exact: bool):
                 if text == "接收短信验证码" and exact:
-                    return Controls([Marker()])
+                    return Controls([self.marker])
                 return Controls([])
 
             def get_by_role(self, role: str, **_kwargs):
                 if role == "textbox":
-                    return Controls([self.textbox])
+                    return Controls([self.title, self.body, self.textbox])
                 if role == "button":
-                    return Controls([self.confirm])
+                    return Controls([self.publish, self.confirm])
+                if role == "img":
+                    return Controls([self.avatar, self.video_preview])
                 return Controls([])
 
             async def wait_for_timeout(self, _milliseconds: int) -> None:
@@ -303,6 +357,9 @@ class DouyinPublishPayloadTests(unittest.TestCase):
         self.assertEqual(receipt["status"], "published")
         reveal.assert_not_called()
         self.assertEqual(page.textbox.value, "123456")
+        self.assertEqual(page.title.value, "")
+        self.assertEqual(page.body.value, "")
+        self.assertEqual(page.publish.click_count, 0)
 
     def test_multiple_visible_sms_inputs_stop_without_filling_any_value(self) -> None:
         """多个可见验证码输入框不能猜测目标控件。"""
@@ -330,19 +387,42 @@ class DouyinPublishPayloadTests(unittest.TestCase):
             async def fill(self, value: str) -> None:
                 self.value = value
 
-        class Marker:
+        class VerificationContainer:
+            def __init__(self, inputs) -> None:
+                self.inputs = inputs
+
             async def is_visible(self) -> bool:
                 return True
+
+            async def evaluate(self, _script: str) -> str:
+                return "ambiguous-input-container"
+
+            def get_by_role(self, role: str, **_kwargs):
+                if role == "textbox":
+                    return Controls(self.inputs)
+                return Controls([])
+
+        class Marker:
+            def __init__(self, container) -> None:
+                self.container = container
+
+            async def is_visible(self) -> bool:
+                return True
+
+            def locator(self, _selector: str):
+                return Controls([self.container])
 
         class AmbiguousPage:
             url = "https://creator.douyin.com/verification"
 
             def __init__(self) -> None:
                 self.inputs = [Textbox(), Textbox()]
+                self.container = VerificationContainer(self.inputs)
+                self.marker = Marker(self.container)
 
             def get_by_text(self, text: str, *, exact: bool):
                 if text == "接收短信验证码" and exact:
-                    return Controls([Marker()])
+                    return Controls([self.marker])
                 return Controls([])
 
             def get_by_role(self, role: str, **_kwargs):
@@ -363,6 +443,122 @@ class DouyinPublishPayloadTests(unittest.TestCase):
             asyncio.run(video.detect_publish_verification(page))
         self.assertEqual([item.value for item in page.inputs], ["", ""])
 
+    def test_multiple_verification_containers_stop_before_reading_controls(self) -> None:
+        """两个可见验证弹层时，不能任选其一读取短信或二维码控件。"""
+
+        class Controls:
+            def __init__(self, items) -> None:
+                self.items = list(items)
+
+            async def count(self) -> int:
+                return len(self.items)
+
+            def nth(self, index: int):
+                return self.items[index]
+
+        class Container:
+            def __init__(self, identity: str) -> None:
+                self.identity = identity
+
+            async def is_visible(self) -> bool:
+                return True
+
+            async def evaluate(self, _script: str) -> str:
+                return self.identity
+
+            def get_by_role(self, _role: str, **_kwargs):
+                raise AssertionError("容器不唯一时不应读取内部控件")
+
+        class Marker:
+            def __init__(self, container) -> None:
+                self.container = container
+
+            async def is_visible(self) -> bool:
+                return True
+
+            def locator(self, _selector: str):
+                return Controls([self.container])
+
+        class Page:
+            url = "https://creator.douyin.com/verification"
+
+            def __init__(self) -> None:
+                self.markers = [Marker(Container("dialog-a")), Marker(Container("dialog-b"))]
+
+            def get_by_text(self, text: str, *, exact: bool):
+                if text == "接收短信验证码" and exact:
+                    return Controls(self.markers)
+                return Controls([])
+
+            def get_by_role(self, _role: str, **_kwargs):
+                raise AssertionError("容器不唯一时不应读取全页控件")
+
+        video = DouYinVideo(
+            title="测试标题",
+            file_path="/tmp/demo.mp4",
+            tags=[],
+            publish_date=datetime.now(),
+            account_file="/tmp/account.json",
+            description="测试文案",
+        )
+        with self.assertRaisesRegex(RuntimeError, "验证容器无法唯一确认"):
+            asyncio.run(video.detect_publish_verification(Page()))
+
+    def test_unanchored_visible_verification_marker_stops_before_reading_controls(self) -> None:
+        """任一可见验证文案无法反查弹层时，不能忽略后继续使用另一弹层。"""
+
+        class Controls:
+            def __init__(self, items) -> None:
+                self.items = list(items)
+
+            async def count(self) -> int:
+                return len(self.items)
+
+            def nth(self, index: int):
+                return self.items[index]
+
+        class Container:
+            async def is_visible(self) -> bool:
+                return True
+
+            async def evaluate(self, _script: str) -> str:
+                return "only-valid-dialog"
+
+            def get_by_role(self, _role: str, **_kwargs):
+                raise AssertionError("验证文案存在未映射容器时不应读取任何控件")
+
+        class Marker:
+            def __init__(self, candidates) -> None:
+                self.candidates = candidates
+
+            async def is_visible(self) -> bool:
+                return True
+
+            def locator(self, _selector: str):
+                return Controls(self.candidates)
+
+        class Page:
+            url = "https://creator.douyin.com/verification"
+
+            def __init__(self) -> None:
+                self.markers = [Marker([Container()]), Marker([])]
+
+            def get_by_text(self, text: str, *, exact: bool):
+                if text == "接收短信验证码" and exact:
+                    return Controls(self.markers)
+                return Controls([])
+
+        video = DouYinVideo(
+            title="测试标题",
+            file_path="/tmp/demo.mp4",
+            tags=[],
+            publish_date=datetime.now(),
+            account_file="/tmp/account.json",
+            description="测试文案",
+        )
+        with self.assertRaisesRegex(RuntimeError, "验证容器无法唯一确认"):
+            asyncio.run(video.detect_publish_verification(Page()))
+
     def test_qr_challenge_requires_a_real_decoder_result(self) -> None:
         """有效二维码可经解码器确认，普通高对比方图绝不能仅凭形状通过。"""
 
@@ -376,9 +572,44 @@ class DouyinPublishPayloadTests(unittest.TestCase):
             def nth(self, index: int):
                 return self.items[index]
 
-        class Marker:
+        class BackgroundTextbox:
             async def is_visible(self) -> bool:
                 return True
+
+            async def is_enabled(self) -> bool:
+                return True
+
+        class BackgroundButton:
+            async def is_visible(self) -> bool:
+                return True
+
+            async def is_enabled(self) -> bool:
+                return True
+
+        class VerificationContainer:
+            def __init__(self, image) -> None:
+                self.image = image
+
+            async def is_visible(self) -> bool:
+                return True
+
+            async def evaluate(self, _script: str) -> str:
+                return "qr-verification-container"
+
+            def get_by_role(self, role: str, **_kwargs):
+                if role == "img":
+                    return Controls([self.image])
+                return Controls([])
+
+        class Marker:
+            def __init__(self, container) -> None:
+                self.container = container
+
+            async def is_visible(self) -> bool:
+                return True
+
+            def locator(self, _selector: str):
+                return Controls([self.container])
 
         class ImageControl:
             def __init__(self, payload: bytes) -> None:
@@ -398,15 +629,26 @@ class DouyinPublishPayloadTests(unittest.TestCase):
 
             def __init__(self, payload: bytes) -> None:
                 self.image = ImageControl(payload)
+                self.container = VerificationContainer(self.image)
+                self.marker = Marker(self.container)
+                self.title = BackgroundTextbox()
+                self.body = BackgroundTextbox()
+                self.publish = BackgroundButton()
+                self.avatar = ImageControl(payload)
+                self.video_preview = ImageControl(payload)
 
             def get_by_text(self, text: str, *, exact: bool):
                 if text == "使用原设备扫码" and exact:
-                    return Controls([Marker()])
+                    return Controls([self.marker])
                 return Controls([])
 
             def get_by_role(self, role: str, **_kwargs):
+                if role == "textbox":
+                    return Controls([self.title, self.body])
+                if role == "button":
+                    return Controls([self.publish])
                 if role == "img":
-                    return Controls([self.image])
+                    return Controls([self.avatar, self.video_preview, self.image])
                 return Controls([])
 
         qr = qrcode.make("offline-verification")
