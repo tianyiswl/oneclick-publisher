@@ -11,13 +11,13 @@ import subprocess
 import tempfile
 import threading
 import unittest
-from unittest.mock import AsyncMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 from zoneinfo import ZoneInfo
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtGui import QColor, QImage
-from PyQt6.QtWidgets import QApplication, QComboBox, QFrame, QLabel, QPushButton
+from PyQt6.QtWidgets import QApplication, QComboBox, QDialog, QFrame, QLabel, QPushButton
 
 from app_core import (
     douyin_commerce_service,
@@ -30,7 +30,7 @@ from app_core import (
 )
 from uploader.douyin_uploader.main import DouYinVideo
 from app_core import douyin_verification
-from app_core.douyin_verification import VerificationChallenge
+from app_core.douyin_verification import DouyinVerificationBroker, VerificationChallenge
 from ui.background_task import BackgroundTask
 from ui.douyin_commerce_page import DouyinCommercePage
 from ui.runtime_log import runtime_log_bus
@@ -2006,6 +2006,54 @@ class DouyinCommerceUiTests(unittest.TestCase):
         self.assertIsNone(
             self.page.findChild(QFrame, "douyinCommerceCommandBar")
         )
+
+    def test_submit_passes_created_task_id_to_the_same_editor_session(self) -> None:
+        """验证挑战必须能以最终任务号回到原生客户端，不能丢失任务关联。"""
+
+        payload = {"enableTimer": False, "runtimeMode": "publish", "debugDryRun": False}
+        self.page._session_id = "commerce-session"
+        self.page._preflight_fingerprint = "preflight-match"
+        confirmation = MagicMock()
+        confirmation.exec.return_value = QDialog.DialogCode.Accepted
+        task = {"id": 71, "taskNo": "T0806-0071"}
+        with patch.object(self.page, "collect_payload", return_value=payload), patch.object(
+            self.page, "_payload_fingerprint", return_value="preflight-match"
+        ), patch.object(self.page, "_summary", return_value={}), patch(
+            "ui.douyin_commerce_page.DouyinCommerceConfirmDialog",
+            return_value=confirmation,
+        ), patch(
+            "ui.douyin_commerce_page.task_service.create_pending_task", return_value=task
+        ), patch(
+            "ui.douyin_commerce_page.task_service.mark_task_running"
+        ), patch.object(self.page.runner, "run") as run, patch(
+            "ui.douyin_commerce_page.douyin_commerce_session.commerce_session_manager.submit",
+            return_value={"ok": True},
+        ) as submit:
+            self.page.open_submit_confirmation()
+            run.call_args.args[1]()
+
+        submit.assert_called_once_with("commerce-session", payload, 71)
+
+    def test_verification_polling_deduplicates_a_task_dialog_and_clears_its_request(self) -> None:
+        """重复轮询同一任务不得叠加对话框，任务结束必须清空内存请求。"""
+
+        broker = DouyinVerificationBroker()
+        request_id = broker.create_sms(task_id=72, message="需要短信验证")
+        self.page._active_task_id = 72
+        dialog = MagicMock()
+        with patch("ui.douyin_commerce_page.verification_broker", broker), patch(
+            "ui.douyin_commerce_page.DouyinVerificationDialog", return_value=dialog
+        ) as dialog_type:
+            self.page._start_douyin_verification_polling()
+            self.page._poll_douyin_verification()
+            self.page._poll_douyin_verification()
+
+            dialog_type.assert_called_once_with(request_id, broker=broker, parent=self.page)
+            self.page._submit_finished()
+
+        self.assertIsNone(broker.request_for_task(72))
+        self.assertFalse(self.page._douyin_verification_poll_timer.isActive())
+        dialog.accept.assert_called_once()
 
     def test_content_preparation_keeps_aligned_three_column_geometry(self) -> None:
         """防止内容准备页退化为高度不齐、底部操作被挤走的通用表单。"""

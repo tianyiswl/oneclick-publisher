@@ -54,10 +54,12 @@ from app_core import (
     media_service,
     task_service,
 )
+from app_core.douyin_verification import verification_broker
 from app_core.paths import AVATAR_DIR
 
 from .background_task import BackgroundTaskRunner
 from .common import button
+from .douyin_verification_dialog import DouyinVerificationDialog
 from .runtime_log import ExecutionLogPanel
 
 
@@ -319,6 +321,13 @@ class DouyinCommercePage(QWidget):
         self._suppress_declaration_signal = True
         self._preflight_fingerprint = ""
         self._active_task_id: int | None = None
+        self._douyin_verification_dialog: DouyinVerificationDialog | None = None
+        self._douyin_verification_request_id = ""
+        self._douyin_verification_poll_timer = QTimer(self)
+        self._douyin_verification_poll_timer.setInterval(250)
+        self._douyin_verification_poll_timer.timeout.connect(
+            self._poll_douyin_verification
+        )
         # 上传快照只用于区分“内容同步”和“重新上传”，不保存平台会话或凭据。
         self._uploaded_editor_payload: dict | None = None
         self._pending_upload_payload: dict | None = None
@@ -3207,14 +3216,60 @@ class DouyinCommercePage(QWidget):
         self.validation_label.setText(f"{mode_label}任务 {task.get('taskNo')} 正在等待平台回执…")
         self.runner.run(
             "douyin_commerce_submit",
-            lambda: douyin_commerce_session.commerce_session_manager.submit(self._session_id, payload),
+            lambda: douyin_commerce_session.commerce_session_manager.submit(
+                self._session_id, payload, self._active_task_id
+            ),
             on_success=lambda result: self._submit_succeeded(task, result),
             on_error=lambda message: self._submit_failed(task, message),
             on_finished=self._submit_finished,
         )
+        self._start_douyin_verification_polling()
         self._sync_view()
 
+    def _start_douyin_verification_polling(self) -> None:
+        """只在最终提交运行时轮询 Broker 的本机内存请求。"""
+
+        if self._active_task_id is None:
+            return
+        if not self._douyin_verification_poll_timer.isActive():
+            self._douyin_verification_poll_timer.start()
+        self._poll_douyin_verification()
+
+    def _poll_douyin_verification(self) -> None:
+        """按任务号打开唯一原生验证对话框，不执行浏览器操作。"""
+
+        if self._active_task_id is None:
+            return
+        request_id = verification_broker.request_for_task(self._active_task_id)
+        if not request_id or request_id == self._douyin_verification_request_id:
+            return
+        if self._douyin_verification_dialog is not None:
+            self._douyin_verification_dialog.accept()
+        dialog = DouyinVerificationDialog(
+            request_id,
+            broker=verification_broker,
+            parent=self,
+        )
+        self._douyin_verification_dialog = dialog
+        self._douyin_verification_request_id = request_id
+        dialog.show()
+
+    def _cleanup_douyin_verification(self) -> None:
+        """任务收束时停止轮询、关闭对话框并清空对应内存请求。"""
+
+        self._douyin_verification_poll_timer.stop()
+        request_id = self._douyin_verification_request_id
+        if not request_id and self._active_task_id is not None:
+            request_id = verification_broker.request_for_task(self._active_task_id) or ""
+        if self._douyin_verification_dialog is not None:
+            self._douyin_verification_dialog.accept()
+        if request_id:
+            verification_broker.clear(request_id)
+        self._douyin_verification_dialog = None
+        self._douyin_verification_request_id = ""
+
     def _submit_succeeded(self, task: dict, result: dict) -> None:
+        self._cleanup_douyin_verification()
         scheduled = result.get("scheduled") is True
         mode_label = "定时提交" if scheduled else "立即发表"
         task_service.record_task_event(
@@ -3235,6 +3290,7 @@ class DouyinCommercePage(QWidget):
         QMessageBox.information(self, f"{mode_label}完成", str(result.get("message") or "平台已回读发布结果"))
 
     def _submit_failed(self, task: dict, message: str) -> None:
+        self._cleanup_douyin_verification()
         task_service.mark_platform_result(
             int(task["id"]),
             3,
@@ -3252,6 +3308,7 @@ class DouyinCommercePage(QWidget):
         QMessageBox.warning(self, "最终提交未完成", message)
 
     def _submit_finished(self) -> None:
+        self._cleanup_douyin_verification()
         self._active_task_id = None
         self._sync_view()
 

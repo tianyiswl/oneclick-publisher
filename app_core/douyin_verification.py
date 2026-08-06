@@ -210,6 +210,23 @@ class DouyinVerificationBroker:
             raise DouyinVerificationError("抖音验证请求不存在或已清理")
         return request
 
+    def request_for_task(self, task_id: int) -> str | None:
+        """返回任务仍在进行的内存请求标识，不暴露任何验证内容。"""
+
+        try:
+            normalized_task_id = int(task_id)
+        except (TypeError, ValueError):
+            return None
+        with self._lock:
+            request_id = self._task_requests.get(normalized_task_id)
+            request = self._requests.get(request_id or "")
+        if request is None:
+            return None
+        with request.condition:
+            if self._state(request) in TERMINAL_STATES:
+                return None
+            return request.request_id
+
     def _state(self, request: VerificationRequest) -> str:
         if request.state == "waiting" and self._clock() >= request.expires_at:
             request.state = "expired"

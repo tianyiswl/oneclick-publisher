@@ -252,6 +252,22 @@ class DouyinVerificationBrokerTests(unittest.TestCase):
         retry_request_id = broker.create_sms(task_id=48, message="重新验证")
         self.assertNotEqual(retry_request_id, request_id)
 
+    def test_request_for_task_only_exposes_an_active_request_id(self):
+        """页面轮询只能按任务取得无敏感信息的活动请求标识。"""
+
+        broker = DouyinVerificationBroker()
+        request_id = broker.create_sms(
+            task_id=56,
+            message="Cookie=session-private; 手机号=13800138000",
+        )
+
+        self.assertEqual(broker.request_for_task(56), request_id)
+        self.assertNotIn("Cookie", str(broker.request_for_task(56)))
+        broker.cancel(request_id)
+        self.assertIsNone(broker.request_for_task(56))
+        broker.clear(request_id)
+        self.assertIsNone(broker.request_for_task(56))
+
 
 if __name__ == "__main__":
     unittest.main()
