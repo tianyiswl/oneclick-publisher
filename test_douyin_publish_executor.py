@@ -207,6 +207,45 @@ class DouyinPublishPayloadTests(unittest.TestCase):
         self.assertEqual(read_back.await_count, 4)
         self.assertEqual(page.keyboard.insert_text.await_count, 2)
 
+    def test_security_verification_reveals_hidden_browser_and_waits_for_receipt(self) -> None:
+        """出现验证码或扫码时，必须显示同一抖音后台窗口而非立即报失败。"""
+
+        class Page:
+            def __init__(self) -> None:
+                self.url = "https://creator.douyin.com/creator-micro/content/upload"
+                self.bring_to_front = AsyncMock()
+
+            async def wait_for_timeout(self, _milliseconds: int) -> None:
+                self.url = "https://creator.douyin.com/creator-micro/content/manage"
+
+        video = DouYinVideo(
+            title="测试标题",
+            file_path="/tmp/demo.mp4",
+            tags=[],
+            publish_date=datetime.now(),
+            account_file="/tmp/account.json",
+            description="测试文案",
+        )
+        page = Page()
+        with patch.object(
+            video,
+            "_visible_exact_text",
+            new_callable=AsyncMock,
+            return_value=["接收短信验证码"],
+        ), patch(
+            "uploader.douyin_uploader.main.is_publish_background_mode",
+            return_value=False,
+        ), patch(
+            "utils.base_social_media.reveal_page_window", new_callable=AsyncMock
+        ) as reveal:
+            import asyncio
+
+            result = asyncio.run(video._wait_formal_publish_result(page))
+
+        self.assertEqual(result["status"], "published")
+        reveal.assert_awaited_once_with(page)
+        page.bring_to_front.assert_awaited_once()
+
 
 @unittest.skipIf(publish_service is None, "当前离线环境未安装 Playwright，跳过桌面路由测试")
 class DouyinPublishRoutingTests(unittest.TestCase):

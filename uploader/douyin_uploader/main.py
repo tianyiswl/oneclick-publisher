@@ -675,9 +675,20 @@ class DouYinVideo(object):
                     )
                 if not security_verification_seen:
                     security_verification_seen = True
+                    try:
+                        # 带货会话平时保持最小化；验证码或扫码一旦出现，必须把
+                        # 同一抖音后台窗口恢复到前台，用户才能继续完成验证。
+                        from utils.base_social_media import reveal_page_window
+
+                        await reveal_page_window(page)
+                        await page.bring_to_front()
+                    except Exception as exc:
+                        douyin_logger.warning(
+                            f"抖音二次验证窗口前置失败，请从任务栏打开抖音后台：{exc}"
+                        )
                     douyin_logger.warning(
-                        "抖音要求二次安全验证，请在当前浏览器完成短信验证码"
-                        "或原设备扫码；验证完成后程序会继续确认发布结果"
+                        "抖音要求二次安全验证，已显示抖音后台窗口；请完成短信验证码"
+                        "或原设备扫码，验证完成后程序会继续确认发布结果"
                     )
 
             if attempt < self.PUBLISH_RESULT_WAIT_ATTEMPTS - 1:

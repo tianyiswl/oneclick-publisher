@@ -219,15 +219,15 @@ class DouyinCommerceSessionManager:
     def _commerce_browser_launch_options(cls, payload: Mapping[str, Any]) -> dict[str, bool]:
         """返回带货编辑会话的浏览器可见性策略。
 
-        默认后台模式必须直接使用真正无头浏览器，不能依赖最小化或离屏窗口。
-        登录失效会作为受控结果回到账号管理处理；显式关闭后台模式时才使用普通
-        有窗口浏览器，供开发诊断使用。
+        带货最终提交可能临时出现短信验证码或原设备扫码。默认后台模式因此使用
+        最小化的有窗口浏览器：平时不打扰用户，出现验证时又能恢复同一页面供
+        用户处理；真正无头浏览器无法在验证出现后再显示。
         """
 
         background_mode = cls._background_upload_mode(payload)
         return {
-            "headless": background_mode,
-            "hide_until_ready": False,
+            "headless": False,
+            "hide_until_ready": background_mode,
         }
 
     @staticmethod
@@ -508,6 +508,7 @@ class DouyinCommerceSessionManager:
         from playwright.async_api import async_playwright
         from uploader.douyin_uploader.main import DouYinVideo
         from utils.base_social_media import (
+            hide_page_window,
             launch_chromium_with_codecs,
             new_publish_context,
             set_init_script,
@@ -542,6 +543,10 @@ class DouyinCommerceSessionManager:
                 context = await new_publish_context(browser, storage_state=str(storage_state))
                 context = await set_init_script(context)
                 page = await context.new_page()
+                if background_mode and not await hide_page_window(page):
+                    raise DouyinCommerceSessionError(
+                        "后台编辑窗口未能安全隐藏，已停止上传以避免打扰当前操作"
+                    )
                 try:
                     actual_account = await douyin_publish_executor._readback_douyin_session_identity(
                         page,
@@ -974,7 +979,9 @@ class DouyinCommerceSessionManager:
 
             with publish_context(
                 mode="douyin_commerce_submit",
-                background_mode=background_mode,
+                # 浏览器仍在后台最小化；这里只允许上传器在检测到验证码或扫码
+                # 时恢复窗口，不能把无头会话中的人工验证误报为发布失败。
+                background_mode=False,
                 platform_type=3,
                 platform_name="抖音",
             ):
@@ -988,12 +995,6 @@ class DouyinCommerceSessionManager:
                         target_schedule.strftime("%Y-%m-%d %H:%M"),
                     ):
                         raise DouyinCommerceSessionError("抖音最终提交前定时时间回读不一致")
-                # 默认会话始终保持无头。显式关闭后台模式的开发诊断会话，才允许
-                # 在最终不可逆步骤前前置窗口。
-                if not background_mode:
-                    from utils.base_social_media import reveal_page_window
-
-                    await reveal_page_window(session.page)
                 publish_button = await session.uploader.wait_publish_button_ready(session.page)
                 await publish_button.click(timeout=10_000)
                 receipt = await session.uploader._wait_formal_publish_result(session.page)
@@ -1011,8 +1012,8 @@ class DouyinCommerceSessionManager:
                 f"抖音带货最终提交未能获得平台回执：{_normalized(str(exc))[:260]}"
             ) from exc
         finally:
-            # 成功或失败后都不把临时编辑会话留成可误复用状态。后台模式遇到
-            # 二次验证会立即安全停止，不会假定用户能在隐藏浏览器中处理。
+            # 成功或失败后都不把临时编辑会话留成可误复用状态。验证码/扫码出现时
+            # 上传器会先恢复同一后台窗口，等待用户完成平台验证或超时。
             await self._close(session_id)
         return {
             "ok": True,

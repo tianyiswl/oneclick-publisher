@@ -2766,8 +2766,8 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
         self.assertTrue(background_mode({"backgroundMode": True}))
         self.assertFalse(background_mode({"backgroundMode": False}))
 
-    def test_background_upload_uses_true_headless_browser(self) -> None:
-        """默认后台上传不创建可最小化或前置的浏览器窗口。"""
+    def test_background_upload_keeps_a_hidden_recoverable_browser_for_security_checks(self) -> None:
+        """后台上传平时隐藏窗口，以便验证码出现时恢复同一抖音后台页面。"""
 
         manager = douyin_commerce_session.DouyinCommerceSessionManager()
         options = getattr(manager, "_commerce_browser_launch_options", None)
@@ -2775,11 +2775,11 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
         self.assertTrue(callable(options))
         self.assertEqual(
             options({}),
-            {"headless": True, "hide_until_ready": False},
+            {"headless": False, "hide_until_ready": True},
         )
         self.assertEqual(
             options({"backgroundMode": True}),
-            {"headless": True, "hide_until_ready": False},
+            {"headless": False, "hide_until_ready": True},
         )
         self.assertEqual(
             options({"backgroundMode": False}),
@@ -3235,8 +3235,8 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
         self.assertIsNone(result["scheduledAt"])
         self.assertEqual(manager._session.schedule_time, "")
 
-    def test_headless_immediate_submit_does_not_reveal_browser_window(self) -> None:
-        """默认无头会话最终提交也不能把浏览器窗口带到用户前台。"""
+    def test_hidden_immediate_submit_does_not_reveal_browser_without_verification(self) -> None:
+        """最终提交保持隐藏；仅检测到平台验证时才由上传器恢复窗口。"""
         class OpenPage:
             def is_closed(self) -> bool:
                 return False
@@ -3315,7 +3315,7 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
             result = asyncio.run(manager._submit("session-demo", payload))
 
         reveal.assert_not_awaited()
-        self.assertTrue(uploader.background_mode_at_receipt)
+        self.assertFalse(uploader.background_mode_at_receipt)
         uploader.set_schedule_time_douyin.assert_not_awaited()
         publish_button.click.assert_awaited_once_with(timeout=10_000)
         scheduled_readback.assert_not_awaited()
