@@ -520,6 +520,13 @@ def _is_display_name(value: object) -> bool:
 async def _detect_display_name(page, platform_type: int) -> str | None:
     """从已登录官方后台提取昵称，失败时宁可保留旧名称也不猜测。"""
 
+    if int(platform_type) == 3:
+        # 抖音创作者中心的动态 ``name-*`` 节点不只用于当前账号。
+        # 页面异步渲染时会命中“在线客服”等功能入口；而登录流程已经监听
+        # 官方 ``media/user/info`` 身份回执。因此抖音昵称只能来自该回执，
+        # 绝不以页面文字兜底或覆盖已保存的官方昵称。
+        return None
+
     if int(platform_type) == 5:
         # B站创作中心的页面结构没有稳定的账号昵称节点；`[class*=name]`
         # 会命中播放量、弹幕等数据卡。只读取当前官方会话的 nav 身份接口，

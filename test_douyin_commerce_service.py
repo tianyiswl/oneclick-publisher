@@ -1308,13 +1308,15 @@ class DouyinCommerceUiTests(unittest.TestCase):
         self.assertIn("复制日志回归标识", copied)
         self.assertIn("已复制", self.page.content_execution_log.copy_button.text())
 
-    def test_execution_log_columns_keep_the_content_page_width_ratio(self) -> None:
-        """三个步骤的日志列保持相同的 27% 布局比例和最小宽度。"""
+    def test_platform_settings_prioritize_two_work_columns_over_logs(self) -> None:
+        """平台设置只保留共享设置与逐条地点两栏，日志不占主工作区。"""
 
         self.assertEqual(self.page.content_columns.columnStretch(2), 27)
         self.assertEqual(self.page.content_columns.columnMinimumWidth(2), 300)
-        self.assertEqual(self.page.platform_columns.columnStretch(2), 27)
-        self.assertEqual(self.page.platform_columns.columnMinimumWidth(2), 300)
+        self.assertEqual(self.page.platform_columns.columnStretch(0), 42)
+        self.assertEqual(self.page.platform_columns.columnStretch(1), 58)
+        self.assertEqual(self.page.platform_columns.columnStretch(2), 0)
+        self.assertTrue(self.page.platform_execution_log.isHidden())
         self.assertEqual(self.page.review_columns.columnStretch(1), 27)
         self.assertEqual(self.page.review_columns.columnMinimumWidth(1), 300)
 
@@ -1815,16 +1817,17 @@ class DouyinCommerceUiTests(unittest.TestCase):
 
         self.assertTrue(self.page.location_keyword.isEnabled())
 
-    def test_platform_workspace_orders_music_and_declaration_on_left(self) -> None:
-        """平台设置按“音乐、声明 / 定位、定时”组织，减少来回寻找。"""
+    def test_platform_workspace_orders_shared_settings_before_batch_locations(self) -> None:
+        """音乐、声明、发布方式在左栏；右栏专用于逐条地点。"""
 
         left_layout = self.page.platform_left_column.layout()
         right_layout = self.page.platform_right_column.layout()
 
         self.assertIs(left_layout.itemAt(0).widget(), self.page.music_stage)
         self.assertIs(left_layout.itemAt(1).widget(), self.page.declaration_stage)
+        self.assertIs(left_layout.itemAt(2).widget(), self.page.schedule_stage)
         self.assertIs(right_layout.itemAt(0).widget(), self.page.location_stage)
-        self.assertIs(right_layout.itemAt(1).widget(), self.page.schedule_stage)
+        self.assertIs(right_layout.itemAt(1).widget(), self.page.batch_item_settings_stage)
 
     def test_location_hint_does_not_imply_music_must_be_selected_first(self) -> None:
         """四项平台设置可独立操作，定位文案不能误导为串行步骤。"""
@@ -4672,6 +4675,78 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         upload.assert_not_called()
         self.assertEqual(self.page.music_combo.count(), 2)
         self.assertEqual(self.page.music_combo.itemData(1)["musicId"], "m-1")
+
+    def test_batch_content_preparation_starts_one_live_setup_session(self) -> None:
+        """批量平台设置必须先有一个真实编辑会话作为音乐和地点数据源。"""
+
+        self.page._selected_video_indexes = [1, 2]
+        self.page._session_id = ""
+        setup_payload = {
+            "accountList": ["douyin-setup.json"],
+            "fileList": ["/tmp/first.mp4"],
+            "title": "批量共享标题",
+            "description": "批量共享文案",
+            "tags": [],
+        }
+        with patch.object(self.page, "_batch_content_is_valid", return_value=True), patch.object(
+            self.page, "_batch_content_change_kind", return_value="reupload"
+        ), patch.object(
+            self.page, "collect_upload_payload", return_value=setup_payload
+        ), patch.object(self.page, "start_upload") as start_upload:
+            self.page.continue_after_content()
+
+        start_upload.assert_called_once_with(setup_payload)
+
+    def test_batch_default_declaration_and_schedule_share_the_left_platform_column(self) -> None:
+        """批量默认无需声明；发布方式与间隔位于声明下方的同一共享区。"""
+
+        self.page._selected_video_indexes = [1, 2]
+        self.assertEqual(self.page._selected_declaration(), "无需添加自主声明")
+        self.assertFalse(self.page.schedule_stage.isHidden())
+        self.page.timer_enabled.setChecked(True)
+        self.assertEqual(self.page.batch_publish_mode.currentData(), "interval-schedule")
+        self.assertFalse(self.page.batch_schedule_controls.isHidden())
+
+    def test_batch_location_candidates_are_bound_per_video_from_setup_session(self) -> None:
+        """地点候选属于对应视频，选择后保留完整 POI 与地址。"""
+
+        path = "/tmp/first.mp4"
+        candidate = {
+            "poiId": "poi-1",
+            "name": "北海银滩景区",
+            "address": "广西壮族自治区北海市银海区银滩大道中段",
+            "distance": "6km",
+        }
+        self.page._batch_location_search_succeeded(
+            path, "domestic", "北海", [candidate]
+        )
+        self.assertEqual(
+            self.page._batch_location_searches[path]["candidates"][0]["poiId"],
+            "poi-1",
+        )
+        account = {"id": 99, "type": 3, "status": 1, "filePath": "douyin-99.json"}
+        self.page.account_combo.clear()
+        self.page.account_combo.addItem("账号", account)
+        with patch(
+            "ui.douyin_commerce_page.save_location_preset",
+            return_value={**candidate, "scope": "domestic", "id": "preset-1"},
+        ) as save:
+            self.page._select_batch_location_candidate(path, "domestic", candidate)
+
+        save.assert_called_once_with(99, candidate, "domestic")
+        self.assertEqual(self.page._batch_locations[path]["address"], candidate["address"])
+
+    def test_batch_music_selection_with_setup_session_writes_current_editor(self) -> None:
+        """批量模式拿到设置会话后，音乐不能再只写本机草稿。"""
+
+        candidate = {"musicId": "music-1", "title": "收藏歌", "creator": "作者", "duration": "00:30"}
+        self.page._selected_video_indexes = [1, 2]
+        self.page._session_id = "setup-session"
+        self.page._show_music_candidates([candidate], source="session")
+        with patch.object(self.page, "_start_music_write") as write:
+            self.page._music_combo_activated(1)
+
+        write.assert_called_once_with(candidate)
 
     def test_batch_cached_music_candidate_click_selects_locally_without_editor_write(self) -> None:
         """未上传时点击本地收藏候选，只更新批量草稿，不访问编辑会话。"""
