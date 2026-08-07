@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import re
 import uuid
 from typing import Any
 
@@ -34,6 +35,16 @@ def _location(value: object) -> dict[str, str]:
     if not location or not location["poiId"] or not location["name"] or not location["address"]:
         raise DouyinLocationPresetError("地点预设需要 POI、名称和完整地址")
     return location
+
+
+def _address_match_key(value: object) -> str:
+    """仅消除平台回读中的排版差异，不抹去真实道路与门牌信息。"""
+
+    text = _text(value).casefold()
+    # 抖音地点列表偶尔只改变“市”“与”及标点/空格的展示方式；这些不是
+    # 地点身份差异。道路、门牌和其它中文内容仍全部保留，不能降级为店名匹配。
+    text = text.replace("市", "").replace("与", "")
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]", "", text)
 
 
 def save_location_preset(account_id: object, location: object, scope: object) -> dict[str, Any]:
@@ -101,24 +112,58 @@ def list_location_presets(account_id: object) -> list[dict[str, Any]]:
 
 
 def match_location_preset(preset: object, candidates: object) -> dict[str, str]:
-    """在当前候选中按 POI、名称、完整地址精确且唯一地复核预设。"""
+    """在当前候选中安全复核预设，优先使用官方 POI 身份。"""
 
     expected = _location(preset)
     if not isinstance(candidates, list):
         raise DouyinLocationPresetError("地点候选列表格式无效")
-    matches: list[dict[str, str]] = []
+    normalized_candidates: list[dict[str, str]] = []
     for candidate in candidates:
         normalized = normalize_location_candidate(candidate)
         if not normalized:
             continue
-        if (
-            normalized["poiId"] == expected["poiId"]
-            and normalized["name"] == expected["name"]
-            and normalized["address"] == expected["address"]
-        ):
-            matches.append(normalized)
-    if not matches:
-        raise DouyinLocationPresetError("当前地点候选未找到与预设完全一致的地点")
-    if len(matches) > 1:
-        raise DouyinLocationPresetError("当前地点候选存在多个与预设完全一致的地点")
-    return matches[0]
+        normalized_candidates.append(normalized)
+
+    def unique_match(rows: list[dict[str, str]], reason: str) -> dict[str, str] | None:
+        if len(rows) == 1:
+            return rows[0]
+        if len(rows) > 1:
+            raise DouyinLocationPresetError(f"当前地点候选存在多个{reason}的地点")
+        return None
+
+    # 普通地点结果包含稳定的官方 POI ID：地址文案有轻微变化时仍应认定为同一地点。
+    if not expected["poiId"].startswith("visible-poi:"):
+        matched = unique_match(
+            [row for row in normalized_candidates if row["poiId"] == expected["poiId"]],
+            "POI ID 一致",
+        )
+        if matched is not None:
+            return matched
+
+    matched = unique_match(
+        [
+            row
+            for row in normalized_candidates
+            if row["poiId"] == expected["poiId"]
+            and row["name"] == expected["name"]
+            and row["address"] == expected["address"]
+        ],
+        "完全一致",
+    )
+    if matched is not None:
+        return matched
+
+    # 新版带货页未暴露官方 POI ID 时，visible-poi 是由可见名称、地址生成的。
+    # 若地址仅是“上海市/上海”“路与路/路路”之类的排版变化，允许唯一候选恢复。
+    matched = unique_match(
+        [
+            row
+            for row in normalized_candidates
+            if row["name"] == expected["name"]
+            and _address_match_key(row["address"]) == _address_match_key(expected["address"])
+        ],
+        "名称与规范化地址一致",
+    )
+    if matched is not None:
+        return matched
+    raise DouyinLocationPresetError("当前地点候选未找到与预设完全一致的地点")

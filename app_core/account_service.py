@@ -398,9 +398,13 @@ def delete_account(account_id: int) -> None:
 def validate_accounts(
     account_ids: Iterable[int] | None = None,
     progress_callback: Callable[[dict], None] | None = None,
+    *,
+    invalid_status: int = 0,
 ) -> dict:
     """静默复核登录态；仅返回需用户介入的账号，不自行弹浏览器。"""
     from .oneclick_authorization import verify_saved_session
+    if int(invalid_status) not in {0, 2}:
+        raise ValueError("无效登录态只能标记为异常或待检测")
     accounts = list_accounts()
     wanted = {int(item) for item in account_ids or []}
     selected = [row for row in accounts if not wanted or row["id"] in wanted]
@@ -436,7 +440,7 @@ def validate_accounts(
         with connect() as conn:
             conn.execute(
                 "UPDATE user_info SET status = ?, lastCheckedAt = ? WHERE id = ?",
-                (1 if valid else 0, now, int(row["id"])),
+                (1 if valid else int(invalid_status), now, int(row["id"])),
             )
         report({**base_event, "phase": "checked", "valid": valid})
     refreshed_map = {row["id"]: row for row in list_accounts()}

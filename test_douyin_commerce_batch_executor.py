@@ -16,6 +16,7 @@ from app_core.douyin_commerce_batch_executor import (
     BatchProgressEvent,
     DouyinCommerceBatchExecutor,
     DouyinCommerceBatchExecutorError,
+    _location_search_keywords,
 )
 from app_core.douyin_commerce_batch_service import apply_interval_schedule, validate_batch_payload
 from app_core.douyin_location_service import normalize_location_candidate
@@ -46,6 +47,7 @@ class FakeCommerceSessionManager:
         self.verification_mode = verification_mode
         self.verification_broker = verification_broker
         self.location_candidates = location_candidates
+        self.location_searches: list[tuple[str, str]] = []
         self.scheduled_readback_time = scheduled_readback_time
         self.calls: list[str] = []
         self.open_sessions = 0
@@ -69,10 +71,6 @@ class FakeCommerceSessionManager:
         self.max_open_sessions = max(self.max_open_sessions, self.open_sessions)
         return {"sessionId": session_id}
 
-    def synchronize_content(self, session_id: str, _payload: dict, **_kwargs) -> dict:
-        self.calls.append(f"synchronize_content:{self._index_by_session[session_id]}")
-        return {}
-
     def select_cached_favorite_music(self, session_id: str, _music_id: str) -> dict:
         self.calls.append(f"select_music:{self._index_by_session[session_id]}")
         return {"musicId": "music-001", "title": "测试音乐", "creator": "测试", "duration": "01:08"}
@@ -83,6 +81,7 @@ class FakeCommerceSessionManager:
 
     def search_locations(self, session_id: str, _keyword: str, _scope: str) -> list[dict]:
         self.calls.append(f"search_locations:{self._index_by_session[session_id]}")
+        self.location_searches.append((_keyword, _scope))
         if self.location_candidates is not None:
             return self.location_candidates
         return [
@@ -95,7 +94,8 @@ class FakeCommerceSessionManager:
 
     def apply_location(self, session_id: str, location: dict) -> dict:
         self.calls.append(f"apply_location:{self._index_by_session[session_id]}")
-        return dict(location)
+        # 与真实会话管理器保持一致：地点回读嵌套在 location 字段中。
+        return {"location": dict(location)}
 
     def sync_schedule(self, session_id: str, _payload: dict) -> dict:
         self.calls.append(f"sync_schedule:{self._index_by_session[session_id]}")
@@ -262,12 +262,57 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
         )
 
         self.assertEqual([row["status"] for row in result], ["published", "failed", "published"])
+        self.assertEqual(result[1]["diagnostic"], "第 1 条平台回读失败")
         self.assertEqual(manager.max_open_sessions, 1)
         self.assertIn("submit:0", manager.calls)
         self.assertIn("submit:1", manager.calls)
         self.assertIn("submit:2", manager.calls)
+        self.assertEqual(
+            [call for call in manager.calls if call.startswith("start_upload:")],
+            ["start_upload:0", "start_upload:1", "start_upload:2"],
+        )
+        self.assertEqual(
+            manager.location_searches,
+            [
+                (item["locationPreset"]["address"], item["locationPreset"]["scope"])
+                for item in self.batch["items"]
+            ],
+        )
         self.assertEqual([item["status"] for item in task_service.get_task(self.task["id"])["items"]], ["success", "failed", "success"])
+        self.assertTrue(
+            any("第 1 条平台回读失败" in event.message for event in events)
+        )
         self.assertTrue(any(event.phase == "uploading" for event in events))
+
+    def test_manage_page_navigation_receipt_is_a_valid_immediate_publish_evidence(self) -> None:
+        """即时发表不暴露作品时间时，管理页最终跳转可作为可审计回执。"""
+
+        class NavigationReceiptManager(FakeCommerceSessionManager):
+            def submit(self, session_id: str, _payload: dict, task_id: int | None = None, **kwargs) -> dict:
+                del task_id, kwargs
+                index = self._index_by_session[session_id]
+                self.calls.append(f"submit:{index}")
+                return {
+                    "ok": True,
+                    "scheduled": False,
+                    "message": "抖音已进入作品管理页",
+                    "platformReceipt": {
+                        "status": "published",
+                        "url": "https://creator.douyin.com/creator-micro/content/manage",
+                    },
+                }
+
+        manager = NavigationReceiptManager()
+        result = DouyinCommerceBatchExecutor(manager).run_publish(
+            self.batch, task_id=self.task["id"], confirmed=True
+        )
+
+        self.assertEqual([row["status"] for row in result], ["published"] * 3)
+        events = task_service.get_task(self.task["id"])["events"]
+        receipts = [event for event in events if event["eventType"] == "platform_publish_receipt"]
+        self.assertEqual(len(receipts), 3)
+        self.assertIn("content/manage", receipts[0]["detailJson"])
+        self.assertIn("Asia/Shanghai", receipts[0]["detailJson"])
 
     def test_scheduled_item_only_succeeds_when_final_readback_exactly_matches_its_schedule(self) -> None:
         from datetime import datetime
@@ -427,7 +472,7 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
     def test_location_preset_must_exactly_match_current_editor_candidates(self) -> None:
         different_address = normalize_location_candidate(
             {
-                "poiId": "poi-001",
+                "poiId": "poi-other",
                 "name": "北海银滩景区",
                 "address": "广西壮族自治区北海市银海区不同道路 1 号",
             }
@@ -441,6 +486,59 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
         self.assertEqual(result[0]["status"], "failed")
         self.assertNotIn("apply_location:0", manager.calls)
         self.assertNotIn("submit:0", manager.calls)
+
+    def test_domestic_location_retries_city_and_name_after_address_search_miss(self) -> None:
+        """国内范围地址检索排序漂移时，必须仍按完整地址唯一筛选城市加店名结果。"""
+
+        location = {
+            "poiId": "visible-poi:shanghai-store",
+            "name": "夜南香北京烤鸭",
+            "address": "上海市静安区青云路与东宝兴路交叉口西100米",
+            "scope": "domestic",
+        }
+        batch = {**self.batch, "items": [{**self.batch["items"][0], "locationPreset": location}]}
+        task = task_service.create_douyin_batch_task(batch)
+
+        class SearchFallbackManager(FakeCommerceSessionManager):
+            def search_locations(self, session_id: str, keyword: str, scope: str) -> list[dict]:
+                self.calls.append(f"search_locations:{self._index_by_session[session_id]}")
+                self.location_searches.append((keyword, scope))
+                if keyword == location["address"]:
+                    return [
+                        {
+                            "poiId": "visible-poi:other",
+                            "name": "无关地点",
+                            "address": "上海市静安区青云路673号",
+                        }
+                    ]
+                return [dict(location)]
+
+        manager = SearchFallbackManager()
+        result = DouyinCommerceBatchExecutor(manager).run_preflight(batch, task_id=task["id"])
+
+        self.assertEqual(result[0]["status"], "preflighted")
+        self.assertEqual(
+            manager.location_searches,
+            [
+                (location["address"], "domestic"),
+                ("上海 夜南香北京烤鸭", "domestic"),
+            ],
+        )
+
+    def test_location_search_keywords_use_address_then_city_and_name(self) -> None:
+        self.assertEqual(
+            _location_search_keywords(
+                {
+                    "name": "夜南香北京烤鸭",
+                    "address": "广西壮族自治区北海市银海区银滩大道万泉城二区北门36栋0112号",
+                }
+            ),
+            [
+                "广西壮族自治区北海市银海区银滩大道万泉城二区北门36栋0112号",
+                "北海 夜南香北京烤鸭",
+                "夜南香北京烤鸭",
+            ],
+        )
 
     def test_preflight_never_submits_and_publish_requires_explicit_total_confirmation(self) -> None:
         manager = FakeCommerceSessionManager()

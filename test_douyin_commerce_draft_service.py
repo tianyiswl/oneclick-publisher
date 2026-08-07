@@ -76,6 +76,15 @@ class DouyinCommerceContentDraftTests(unittest.TestCase):
         self.assertEqual(len(second), len(set(second)))
         self.assertNotIn("cookie", " ".join(second).lower())
 
+    def test_remove_tag_history_only_deletes_the_requested_local_tag(self) -> None:
+        douyin_commerce_draft_service.remember_tag_history(["北海", "探店", "团购"])
+
+        remaining = douyin_commerce_draft_service.remove_tag_history("#探店")
+
+        self.assertNotIn("探店", remaining)
+        self.assertIn("北海", remaining)
+        self.assertIn("团购", remaining)
+
 
 if __name__ == "__main__":
     unittest.main()

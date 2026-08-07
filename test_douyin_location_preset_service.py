@@ -39,14 +39,41 @@ class DouyinLocationPresetTests(unittest.TestCase):
         with self.assertRaisesRegex(DouyinLocationPresetError, "完整地址"):
             save_location_preset(7, {"poiId": "p", "name": "银滩"}, "domestic")
 
-    def test_match_requires_one_exact_poi_name_and_address(self) -> None:
+    def test_match_uses_official_poi_id_when_platform_reformats_address(self) -> None:
         preset = save_location_preset(7, LOCATION, "domestic")
         matched = match_location_preset(preset, [{**LOCATION, "distance": "2km"}])
         self.assertEqual(matched["poiId"], "p")
+        reformatted = match_location_preset(
+            preset,
+            [{**LOCATION, "address": "广西北海银海区银滩大道"}],
+        )
+        self.assertEqual(reformatted["poiId"], "p")
         with self.assertRaisesRegex(DouyinLocationPresetError, "未找到"):
-            match_location_preset(preset, [{**LOCATION, "address": "其他地址"}])
+            match_location_preset(
+                preset,
+                [{**LOCATION, "poiId": "other", "address": "其他地址"}],
+            )
         with self.assertRaisesRegex(DouyinLocationPresetError, "多个"):
             match_location_preset(preset, [LOCATION, LOCATION])
+
+    def test_visible_poi_allows_only_unique_address_formatting_difference(self) -> None:
+        preset = {
+            "poiId": "visible-poi:old-format",
+            "name": "夜南香北京烤鸭",
+            "address": "上海市静安区青云路与东宝兴路交叉口西100米",
+        }
+        matched = match_location_preset(
+            preset,
+            [
+                {
+                    "poiId": "visible-poi:new-format",
+                    "name": "夜南香北京烤鸭",
+                    "address": "上海静安区青云路东宝兴路交叉口西100米",
+                }
+            ],
+        )
+        self.assertEqual(matched["poiId"], "visible-poi:new-format")
+
 
 
 if __name__ == "__main__":

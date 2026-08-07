@@ -19,6 +19,7 @@ from PyQt6.QtCore import QDate, QPoint, QSize, QTime, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QButtonGroup,
+    QApplication,
     QCheckBox,
     QComboBox,
     QDateEdit,
@@ -83,6 +84,7 @@ _VIDEO_PICKER_MAX_WIDTH = 440
 _VIDEO_PICKER_MAX_HEIGHT = 480
 _VIDEO_PICKER_ROW_HEIGHT = 68
 _BATCH_RUN_KEY = "douyin_commerce_batch_run"
+_BATCH_SHARED_LOCATION_SEARCH_KEY = "__shared_location_search__"
 
 
 def _account_avatar_path(account: dict) -> Path | None:
@@ -343,6 +345,7 @@ class DouyinCommercePage(QWidget):
     _PLATFORM_STAGE_ORDER = ("blocked", "music", "location", "declaration", "schedule")
     _IMMEDIATE_WRITE_KEY = "douyin_commerce_immediate_write"
     _DEFAULT_CONTENT_DECLARATION = "无需添加自主声明"
+    _DISABLED_CONTENT_DECLARATIONS = frozenset({"内容为转载信息"})
     _BATCH_EDITOR_SESSION_ENDED_HINT = "编辑会话已结束；预检将为每条视频重新建立上传会话"
     _UPLOAD_PROGRESS = {
         "checking_session": (1, "正在检查账号"),
@@ -421,12 +424,15 @@ class DouyinCommercePage(QWidget):
         self._selected_video_indexes: list[int] = []
         self._batch_locations: dict[str, dict[str, object]] = {}
         self._batch_location_searches: dict[str, dict[str, object]] = {}
+        self._batch_location_feedback = ""
+        self._batch_item_rows_signature: tuple[object, ...] | None = None
         self._batch_schedule_overrides: dict[str, str] = {}
         # 批量任务和旧的单条任务必须分开保存；验证轮询会优先使用仍在运行的
         # 批量任务号，确保原生短信/二维码对话框与当前视频保持同一会话。
         self._batch_task_id: int | None = None
         self._batch_preflight_fingerprint = ""
         self._batch_progress_text = ""
+        self._batch_result_feedback = ""
         # 批量执行器会在每条视频完成后主动关闭无头编辑会话。这个标记只用于
         # 向用户解释“为什么共享文字改完后要在下次预检重建会话”，不保存会话信息。
         self._batch_editor_session_ended = False
@@ -575,7 +581,8 @@ class DouyinCommercePage(QWidget):
         helper_label.setProperty("role", "caption")
         helper_label.setWordWrap(True)
         layout.addWidget(title)
-        layout.addWidget(helper_label)
+        if _normalized(helper):
+            layout.addWidget(helper_label)
         return panel, layout
 
     @staticmethod
@@ -606,10 +613,8 @@ class DouyinCommercePage(QWidget):
 
         dock = QFrame()
         dock.setObjectName("douyinCommerceReferenceFooter")
-        dock.setMinimumHeight(74)
         layout = QHBoxLayout(dock)
-        layout.setContentsMargins(22, 15, 20, 15)
-        layout.setSpacing(14)
+        self._configure_reference_footer(dock, layout)
         copy = QVBoxLayout()
         copy.setSpacing(4)
         title = QLabel("内容准备")
@@ -644,9 +649,18 @@ class DouyinCommercePage(QWidget):
         layout.addWidget(self.operation_dock_status)
         self.operation_dock_upload = button("上传视频并继续", variant="primary")
         self.operation_dock_upload.setObjectName("douyinCommerceUpload")
+        self.operation_dock_upload.setProperty("footerAction", True)
         self.operation_dock_upload.clicked.connect(self.continue_after_content)
         layout.addWidget(self.operation_dock_upload)
         return dock
+
+    @staticmethod
+    def _configure_reference_footer(dock: QFrame, layout: QHBoxLayout) -> None:
+        """统一三个阶段底部操作栏的尺寸与排版。"""
+
+        dock.setFixedHeight(82)
+        layout.setContentsMargins(22, 15, 20, 15)
+        layout.setSpacing(12)
 
     def _build_content_page(self) -> QWidget:
         body = QWidget()
@@ -863,23 +877,27 @@ class DouyinCommercePage(QWidget):
         content_layout.addWidget(self._stage_error_label("content"))
         columns.addWidget(content_panel, 0, 1)
 
-        # 右栏是批量视频选择器。保留运行日志作为折叠的诊断区，避免用户把
-        # 内部执行信息误读为当前需要填写的内容。
+        # 右栏沿用账号和内容卡片的同一视觉层级，专门承载批量视频选择。
         self.batch_video_panel, video_layout = self._reference_column(
-            "douyinCommerceBatchVideoColumn", "视频"
+            "douyinCommerceContentVideoColumn", "视频"
         )
         self.batch_video_panel.setProperty("douyinCommerceReferenceColumn", True)
-        # “账号 / 内容”仍是本页的两个主信息栏；右栏是素材选择器，不纳入
-        # 内容标题层级，避免三处同级大标题分散填写注意力。
-        heading = self.batch_video_panel.findChild(
-            QLabel, "douyinCommerceReferenceCardEyebrow"
-        )
-        if heading is not None:
-            heading.setObjectName("douyinCommerceBatchVideoEyebrow")
         video_layout.setContentsMargins(18, 0, 18, 18)
+        video_selection_actions = QHBoxLayout()
+        video_selection_actions.setSpacing(8)
         video_hint = QLabel("选择要使用的视频")
         video_hint.setObjectName("douyinCommerceFieldLabel")
-        video_layout.addWidget(video_hint)
+        video_selection_actions.addWidget(video_hint)
+        video_selection_actions.addStretch(1)
+        self.select_all_videos_button = button("全选", variant="secondary", compact=True)
+        self.select_all_videos_button.setObjectName("douyinCommerceSelectAllVideos")
+        self.select_all_videos_button.clicked.connect(self.select_all_batch_videos)
+        self.clear_video_selection_button = button("取消全选", variant="secondary", compact=True)
+        self.clear_video_selection_button.setObjectName("douyinCommerceClearVideoSelection")
+        self.clear_video_selection_button.clicked.connect(self.clear_batch_video_selection)
+        video_selection_actions.addWidget(self.select_all_videos_button)
+        video_selection_actions.addWidget(self.clear_video_selection_button)
+        video_layout.addLayout(video_selection_actions)
         self.batch_video_list = QListWidget()
         self.batch_video_list.setObjectName("douyinCommerceBatchVideoList")
         self.batch_video_list.setSelectionMode(QListWidget.SelectionMode.NoSelection)
@@ -898,6 +916,11 @@ class DouyinCommercePage(QWidget):
         self.batch_restore_content_button.setObjectName("douyinCommerceRestoreBatchContent")
         self.batch_restore_content_button.clicked.connect(self.restore_batch_content)
         video_layout.addWidget(self.batch_restore_content_button)
+        self.batch_clear_content_button = button("清空当前内容", variant="secondary", compact=True)
+        self.batch_clear_content_button.setObjectName("douyinCommerceClearBatchContent")
+        self.batch_clear_content_button.setToolTip("清空当前表单；不会删除已保存的本地内容")
+        self.batch_clear_content_button.clicked.connect(self.clear_current_content)
+        video_layout.addWidget(self.batch_clear_content_button)
         self.content_execution_log = ExecutionLogPanel()
         self.content_execution_log.setMinimumHeight(510)
         self.content_execution_log.setVisible(False)
@@ -1061,18 +1084,14 @@ class DouyinCommercePage(QWidget):
         layout.setSpacing(12)
         layout.setAlignment(Qt.AlignmentFlag.AlignTop)
 
-        session_bar = QFrame()
-        session_bar.setObjectName("douyinCommercePlatformProgress")
-        session_layout = QHBoxLayout(session_bar)
-        session_layout.setContentsMargins(14, 10, 14, 10)
-        session_layout.setSpacing(10)
-        self.platform_session_status = QLabel("等待上传视频")
+        # 平台状态统一投射到底部操作栏，避免在工作区顶部重复占用一条提示栏。
+        # 保留这个隐藏标签作为状态数据源，兼容现有流程与测试入口。
+        self.platform_session_status = QLabel("等待上传视频", body)
         self.platform_session_status.setObjectName("douyinCommercePlatformProgressText")
-        session_layout.addWidget(self.platform_session_status, 1)
+        self.platform_session_status.setVisible(False)
         self.platform_back_button = button("返回内容", variant="secondary", compact=True)
         self.platform_back_button.setObjectName("douyinCommerceBackToContent")
         self.platform_back_button.clicked.connect(lambda: self._go_to_step(0))
-        layout.addWidget(session_bar)
 
         workspace = QFrame()
         workspace.setObjectName("douyinCommercePlatformWorkspace")
@@ -1104,15 +1123,15 @@ class DouyinCommercePage(QWidget):
         self.location_stage = self._build_location_stage()
         self.batch_item_settings_stage = self._build_batch_item_settings_stage()
         right_layout.addWidget(self.location_stage)
-        right_layout.addWidget(self.batch_item_settings_stage)
-        right_layout.addStretch(1)
+        # 逐条地点设置填满右列，使其总高度与左侧音乐、声明和发布方式三块一致。
+        right_layout.addWidget(self.batch_item_settings_stage, 1)
         columns.addWidget(self.platform_right_column, 0, 1)
 
         self.platform_execution_log = ExecutionLogPanel()
         columns.addWidget(self.platform_execution_log, 0, 2)
 
-        columns.setColumnStretch(0, 42)
-        columns.setColumnStretch(1, 58)
+        columns.setColumnStretch(0, 3)
+        columns.setColumnStretch(1, 7)
         columns.setColumnStretch(2, 0)
         columns.setColumnMinimumWidth(0, 300)
         columns.setColumnMinimumWidth(1, 300)
@@ -1122,8 +1141,7 @@ class DouyinCommercePage(QWidget):
         self.platform_review_dock = QFrame()
         self.platform_review_dock.setObjectName("douyinCommercePlatformReviewDock")
         review_layout = QHBoxLayout(self.platform_review_dock)
-        review_layout.setContentsMargins(16, 12, 16, 12)
-        review_layout.setSpacing(12)
+        self._configure_reference_footer(self.platform_review_dock, review_layout)
         self.platform_review_status = QLabel("完成音乐、地点和声明后可检查")
         self.platform_review_status.setObjectName("douyinCommercePlatformReviewStatus")
         self.platform_review_status.setWordWrap(True)
@@ -1131,30 +1149,69 @@ class DouyinCommercePage(QWidget):
         review_layout.addWidget(self.platform_back_button)
         self.to_review_button = button("检查并继续", variant="primary")
         self.to_review_button.setObjectName("douyinCommerceToReview")
+        self.platform_back_button.setProperty("footerAction", True)
+        self.to_review_button.setProperty("footerAction", True)
         self.to_review_button.clicked.connect(self.continue_to_review)
         review_layout.addWidget(self.to_review_button)
         layout.addWidget(self.platform_review_dock)
         return self._scroll_page(body)
 
     def _build_batch_item_settings_stage(self) -> QFrame:
-        """批量模式逐条地点设置。"""
+        """批量模式统一搜索地点，再逐条选择。"""
 
-        panel, layout = self._section("逐条设置地点", "")
+        panel = QFrame()
+        panel.setProperty("subPanel", True)
         panel.setObjectName("douyinCommerceBatchItemSettings")
+        panel.setProperty("douyinCommerceWorkCard", True)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(18, 16, 18, 18)
+        layout.setSpacing(10)
+        title_row = QHBoxLayout()
+        title = QLabel("逐条设置地点")
+        title.setObjectName("sectionTitle")
+        title_row.addWidget(title)
+        title_row.addStretch(1)
+        self.batch_location_scope_combo = QComboBox()
+        self.batch_location_scope_combo.setObjectName("douyinCommerceBatchSharedLocationScope")
+        self.batch_location_scope_combo.addItem("本地", douyin_commerce_service.LOCATION_SCOPE_LOCAL)
+        self.batch_location_scope_combo.addItem("国内", douyin_commerce_service.LOCATION_SCOPE_DOMESTIC)
+        self.batch_location_scope_combo.setCurrentIndex(1)
+        self.batch_location_keyword = QLineEdit()
+        self.batch_location_keyword.setObjectName("douyinCommerceBatchSharedLocationKeyword")
+        self.batch_location_keyword.setPlaceholderText("输入地点或商户名称")
+        self.batch_location_search_button = button("搜索地点", variant="secondary", compact=True)
+        self.batch_location_search_button.setObjectName("douyinCommerceBatchSharedSearchLocation")
+        self.batch_location_search_button.clicked.connect(
+            lambda: self._search_batch_locations(
+                self.batch_location_scope_combo.currentData(),
+                self.batch_location_keyword.text(),
+            )
+        )
+        self.batch_location_keyword.returnPressed.connect(self.batch_location_search_button.click)
+        title_row.addWidget(self.batch_location_scope_combo)
+        title_row.addWidget(self.batch_location_keyword, 1)
+        title_row.addWidget(self.batch_location_search_button)
+        layout.addLayout(title_row)
         self.batch_item_rows = QScrollArea()
         self.batch_item_rows.setObjectName("douyinCommerceBatchItemRows")
         self.batch_item_rows.setWidgetResizable(True)
         self.batch_item_rows.setMinimumHeight(420)
+        self.batch_item_rows.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
         self.batch_item_rows.setFrameShape(QFrame.Shape.NoFrame)
         self.batch_item_rows_body = QWidget()
-        self.batch_item_rows_layout = QHBoxLayout(self.batch_item_rows_body)
+        self.batch_item_rows_layout = QGridLayout(self.batch_item_rows_body)
         self.batch_item_rows_layout.setContentsMargins(0, 0, 0, 0)
-        self.batch_item_rows_layout.setSpacing(10)
+        self.batch_item_rows_layout.setHorizontalSpacing(0)
+        self.batch_item_rows_layout.setVerticalSpacing(0)
+        self.batch_item_rows_layout.setColumnStretch(0, 1)
         self.batch_item_rows.setWidget(self.batch_item_rows_body)
         layout.addWidget(self.batch_item_rows)
         self.batch_item_settings_status = QLabel("内容准备完成后读取地点候选")
         self.batch_item_settings_status.setObjectName("douyinCommerceBatchItemSettingsStatus")
         self.batch_item_settings_status.setWordWrap(True)
+        self.batch_item_settings_status.setVisible(False)
         layout.addWidget(self.batch_item_settings_status)
         # 以下控件保留给既有本地草稿与测试入口；批量发布方式已移到左栏声明下方。
         self.batch_publish_mode = QComboBox(self)
@@ -1270,13 +1327,12 @@ class DouyinCommercePage(QWidget):
         self._render_batch_item_rows()
         self._sync_view()
 
-    def _batch_location_state(self, path: str) -> dict[str, object]:
-        """返回单条视频的临时地点搜索状态，不把候选 DOM 写入草稿。"""
+    def _batch_location_state(self) -> dict[str, object]:
+        """返回本次批量共用的地点搜索状态，不把候选 DOM 写入草稿。"""
 
-        existing = self._batch_location_searches.get(path)
-        selected = self._batch_locations.get(path) or {}
+        existing = self._batch_location_searches.get(_BATCH_SHARED_LOCATION_SEARCH_KEY)
         scope = _normalized(
-            (existing or {}).get("scope") or selected.get("scope")
+            (existing or {}).get("scope")
         ) or douyin_commerce_service.LOCATION_SCOPE_DOMESTIC
         return {
             "scope": scope,
@@ -1288,54 +1344,63 @@ class DouyinCommercePage(QWidget):
             ],
         }
 
-    def _search_batch_locations(self, path: str, scope: object, keyword: object) -> None:
-        """用一次设置会话读取指定视频要使用的官方地点候选。"""
+    def _search_batch_locations(self, scope: object, keyword: object) -> None:
+        """用一次设置会话读取所有视频共用的官方地点候选。"""
 
         if not self._session_id:
-            self.batch_item_settings_status.setText("请先完成内容准备并等待设置会话就绪")
+            self._set_batch_location_feedback("请先完成内容准备并等待设置会话就绪")
             return
         try:
             normalized_scope = douyin_commerce_service.normalize_commerce_location_scope(scope)
         except Exception:
-            self.batch_item_settings_status.setText("请选择地点范围：本地或国内")
+            self._set_batch_location_feedback("请选择地点范围：本地或国内")
             return
         normalized_keyword = _normalized(keyword)
         if not normalized_keyword:
-            self.batch_item_settings_status.setText("请输入地点或商户名称")
+            self._set_batch_location_feedback("请输入地点或商户名称")
             return
-        self._batch_location_searches[path] = {
+        self._batch_location_searches[_BATCH_SHARED_LOCATION_SEARCH_KEY] = {
             "scope": normalized_scope,
             "keyword": normalized_keyword,
             "candidates": [],
         }
-        self.batch_item_settings_status.setText("正在读取抖音地点候选…")
+        self._set_batch_location_feedback("正在读取抖音地点候选…")
         session_id = self._session_id
-        self._start_immediate_write(
+        started = self._start_immediate_write(
             "batch_location_search",
             lambda: douyin_commerce_session.commerce_session_manager.search_locations(
                 session_id, normalized_keyword, normalized_scope
             ),
             lambda rows: self._batch_location_search_succeeded(
-                path, normalized_scope, normalized_keyword, rows
+                normalized_scope, normalized_keyword, rows
             ),
-            lambda message: self._batch_location_search_failed(path, message),
+            self._batch_location_search_failed,
         )
+        if not started:
+            self._set_batch_location_feedback("地点搜索任务未启动，请等待当前操作结束后重试")
 
     def _batch_location_search_succeeded(
         self,
-        path: str,
         scope: str,
         keyword: str,
         rows: object,
     ) -> None:
         candidates = [dict(item) for item in rows if isinstance(item, dict)] if isinstance(rows, list) else []
-        self._batch_location_searches[path] = {
+        self._batch_location_searches[_BATCH_SHARED_LOCATION_SEARCH_KEY] = {
             "scope": scope,
             "keyword": keyword,
             "candidates": candidates,
         }
-        self.batch_item_settings_status.setText(
-            f"已读取 {len(candidates)} 个地点候选，请选择完整地址"
+        auto_filled, remaining = self._auto_fill_batch_location_candidates(
+            scope, candidates
+        )
+        self._set_batch_location_feedback(
+            (
+                f"已读取 {len(candidates)} 个地点候选，自动填充 {auto_filled} 条"
+                + (f"；还有 {remaining} 条待选择" if remaining else "")
+            )
+            if auto_filled
+            else f"已读取 {len(candidates)} 个地点候选，请选择完整地址"
             if candidates
             else "当前抖音编辑页未返回完整地点候选，请更换关键词"
         )
@@ -1343,11 +1408,15 @@ class DouyinCommercePage(QWidget):
         self._render_batch_item_rows()
         self._sync_view()
 
-    def _batch_location_search_failed(self, path: str, message: str) -> None:
-        state = self._batch_location_state(path)
+    def _batch_location_search_failed(self, message: str) -> None:
+        state = self._batch_location_state()
         state["candidates"] = []
-        self._batch_location_searches[path] = state
-        self.batch_item_settings_status.setText("地点候选读取失败，请重新搜索")
+        self._batch_location_searches[_BATCH_SHARED_LOCATION_SEARCH_KEY] = state
+        diagnostic = _normalized(message)
+        self._set_batch_location_feedback(
+            f"地点候选读取失败：{diagnostic[:180] or '请重新搜索'}"
+        )
+        _LOGGER.warning("抖音带货批量地点搜索失败：%s", diagnostic)
         self._platform_action_error("location", message)
         self._render_batch_item_rows()
 
@@ -1359,79 +1428,158 @@ class DouyinCommercePage(QWidget):
     ) -> None:
         """选择候选后保存完整 POI 预设，并绑定到当前视频。"""
 
-        if not isinstance(candidate, dict):
+        if not self._save_batch_location_candidate(path, scope, candidate):
+            self._set_batch_location_feedback("地点身份不完整，未保存")
             return
-        account = self._selected_account() or {}
-        try:
-            preset = save_location_preset(account.get("id"), candidate, scope)
-        except Exception as exc:
-            self.batch_item_settings_status.setText("地点身份不完整，未保存")
-            self._platform_action_error("location", exc)
-            return
-        self._batch_locations[path] = dict(preset)
-        self._batch_preflight_fingerprint = ""
-        self.batch_item_settings_status.setText("已绑定地点；其他视频可继续设置")
+        self._set_batch_location_feedback("已绑定地点；其他视频可继续设置")
         self._clear_stage_error("location")
         self._render_batch_item_rows()
         self._sync_view()
 
-    def _render_batch_item_rows(self) -> None:
-        if not hasattr(self, "batch_item_rows_layout"):
+    def _save_batch_location_candidate(
+        self,
+        path: str,
+        scope: object,
+        candidate: object,
+    ) -> bool:
+        """保存一条完整 POI 并绑定视频；全程只修改本地批次配置。"""
+
+        if not isinstance(candidate, dict):
+            return False
+        account = self._selected_account() or {}
+        try:
+            preset = save_location_preset(account.get("id"), candidate, scope)
+        except Exception as exc:
+            _LOGGER.warning("抖音带货批量地点保存失败：%s", _normalized(exc))
+            return False
+        self._batch_locations[path] = dict(preset)
+        self._batch_preflight_fingerprint = ""
+        return True
+
+    def _auto_fill_batch_location_candidates(
+        self,
+        scope: object,
+        candidates: list[dict[str, object]],
+    ) -> tuple[int, int]:
+        """按候选顺序填充未选择地点的视频，已有设置始终保持不变。"""
+
+        pending_paths = [
+            _normalized(video.get("storedPath"))
+            for video in self._selected_videos()
+            if _normalized(video.get("storedPath"))
+            and _normalized(video.get("storedPath")) not in self._batch_locations
+        ]
+        filled = 0
+        for path, candidate in zip(pending_paths, candidates):
+            if self._save_batch_location_candidate(path, scope, candidate):
+                filled += 1
+        return filled, max(0, len(pending_paths) - filled)
+
+    def _batch_item_rows_state_signature(self) -> tuple[object, ...]:
+        """生成地点卡片的稳定快照，避免普通状态刷新打断下拉框交互。"""
+
+        state = self._batch_location_state()
+        videos = self._selected_videos()
+        video_rows = tuple(
+            (
+                _normalized(video.get("storedPath")),
+                _normalized(video.get("filename")),
+                _normalized((self._batch_locations.get(_normalized(video.get("storedPath"))) or {}).get("poiId")),
+                _normalized((self._batch_locations.get(_normalized(video.get("storedPath"))) or {}).get("address")),
+            )
+            for video in videos
+        )
+        candidates = tuple(
+            (
+                _normalized(candidate.get("poiId")),
+                _normalized(candidate.get("name")),
+                _normalized(candidate.get("address")),
+            )
+            for candidate in state["candidates"]
+            if isinstance(candidate, dict)
+        )
+        return (
+            video_rows,
+            _normalized(state["scope"]),
+            _normalized(state["keyword"]),
+            candidates,
+        )
+
+    def _sync_batch_location_controls(self) -> None:
+        """只更新顶部搜索控件，不重建用户正展开的地点下拉框。"""
+
+        if not hasattr(self, "batch_location_scope_combo"):
             return
-        while self.batch_item_rows_layout.count():
-            item = self.batch_item_rows_layout.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.deleteLater()
+        can_search = bool(self._session_id) and not self._busy()
+        self.batch_location_scope_combo.setEnabled(can_search)
+        self.batch_location_keyword.setEnabled(can_search)
+        self.batch_location_search_button.setEnabled(can_search)
+
+    def _set_batch_location_feedback(self, message: object) -> None:
+        """保留地点搜索状态，避免重绘覆盖真实的成功或失败原因。"""
+
+        self._batch_location_feedback = _normalized(message)
+        if hasattr(self, "batch_item_settings_status"):
+            self.batch_item_settings_status.setText(self._batch_location_feedback)
+
+    def _render_batch_item_rows(self) -> None:
+        if not hasattr(self, "batch_item_rows"):
+            return
+        # 地点搜索回读会多次重绘。旧实现只从外层布局取走了嵌套列布局，
+        # 列中的卡片仍保留在旧 QWidget 上，Qt 延迟销毁时会造成新旧卡片叠加。
+        # 直接替换滚动区域的内容容器，确保每次仅保留当前一份地点卡片。
+        old_body = self.batch_item_rows.takeWidget()
+        if old_body is not None:
+            old_body.deleteLater()
+        self.batch_item_rows_body = QWidget()
+        self.batch_item_rows_layout = QGridLayout(self.batch_item_rows_body)
+        self.batch_item_rows_layout.setContentsMargins(0, 0, 0, 0)
+        self.batch_item_rows_layout.setHorizontalSpacing(0)
+        self.batch_item_rows_layout.setVerticalSpacing(0)
+        self.batch_item_rows_layout.setColumnStretch(0, 1)
+        self.batch_item_rows.setWidget(self.batch_item_rows_body)
         videos = self._selected_videos()
         if not videos:
-            self.batch_item_settings_status.setText("返回内容准备选择视频")
+            if not self._batch_location_feedback:
+                self._set_batch_location_feedback("返回内容准备选择视频")
+            self._batch_item_rows_signature = self._batch_item_rows_state_signature()
             return
-        columns = (QVBoxLayout(), QVBoxLayout())
-        for column in columns:
-            column.setContentsMargins(0, 0, 0, 0)
-            column.setSpacing(8)
-            self.batch_item_rows_layout.addLayout(column, 1)
-        split_index = (len(videos) + 1) // 2
+        state = self._batch_location_state()
+        self._sync_batch_location_controls()
+        scope_index = self.batch_location_scope_combo.findData(state["scope"])
+        if scope_index >= 0 and self.batch_location_scope_combo.currentIndex() != scope_index:
+            self.batch_location_scope_combo.blockSignals(True)
+            self.batch_location_scope_combo.setCurrentIndex(scope_index)
+            self.batch_location_scope_combo.blockSignals(False)
+        if self.batch_location_keyword.text() != str(state["keyword"]):
+            self.batch_location_keyword.blockSignals(True)
+            self.batch_location_keyword.setText(str(state["keyword"]))
+            self.batch_location_keyword.blockSignals(False)
         missing_location = 0
         for index, video in enumerate(videos):
             path = _normalized(video.get("storedPath"))
             row = QFrame()
             row.setObjectName("douyinCommerceBatchItemRow")
-            row_layout = QVBoxLayout(row)
-            row_layout.setContentsMargins(10, 9, 10, 9)
+            row.setFixedHeight(35)
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(8, 1, 8, 1)
             row_layout.setSpacing(8)
-            name = QLabel(f"{index + 1}. {self._video_picker_title(_normalized(video.get('filename')))}")
+            filename = _normalized(video.get("filename"))
+            compact_name = filename if len(filename) <= 20 else f"{filename[:19]}…"
+            name = QLabel(f"{index + 1}. {compact_name}")
             name.setToolTip(_normalized(video.get("filename")))
-            row_layout.addWidget(name)
+            name.setMinimumWidth(0)
+            name.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            row_layout.addWidget(name, 3)
             current = self._batch_locations.get(path) or {}
-            state = self._batch_location_state(path)
-            search_row = QHBoxLayout()
-            scope_combo = QComboBox()
-            scope_combo.setObjectName("douyinCommerceBatchLocationScope")
-            scope_combo.addItem("本地", douyin_commerce_service.LOCATION_SCOPE_LOCAL)
-            scope_combo.addItem("国内", douyin_commerce_service.LOCATION_SCOPE_DOMESTIC)
-            scope_index = scope_combo.findData(state["scope"])
-            scope_combo.setCurrentIndex(scope_index if scope_index >= 0 else 1)
-            keyword = QLineEdit(str(state["keyword"]))
-            keyword.setObjectName("douyinCommerceBatchLocationKeyword")
-            keyword.setPlaceholderText("地点或商户名称")
-            search_button = button("搜索", variant="secondary", compact=True)
-            search_button.setObjectName("douyinCommerceBatchSearchLocation")
-            search_button.setEnabled(bool(self._session_id) and not self._busy())
-            search_button.clicked.connect(
-                lambda _checked=False, item_path=path, scope_field=scope_combo, keyword_field=keyword: self._search_batch_locations(
-                    item_path, scope_field.currentData(), keyword_field.text()
-                )
-            )
-            keyword.returnPressed.connect(search_button.click)
-            search_row.addWidget(scope_combo)
-            search_row.addWidget(keyword, 1)
-            search_row.addWidget(search_button)
-            row_layout.addLayout(search_row)
             candidate_combo = QComboBox()
             candidate_combo.setObjectName("douyinCommerceBatchLocationCandidates")
-            candidate_combo.addItem("搜索后选择地点", None)
+            candidate_combo.setFixedHeight(30)
+            candidate_combo.setSizeAdjustPolicy(
+                QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+            )
+            candidate_combo.addItem("请选择地点", None)
+            current_index = 0
             for candidate in state["candidates"]:
                 label = f"{candidate.get('name') or ''} · {candidate.get('address') or ''}"
                 candidate_combo.addItem(label, dict(candidate))
@@ -1441,29 +1589,39 @@ class DouyinCommercePage(QWidget):
                     Qt.ItemDataRole.ToolTipRole,
                 )
                 if _normalized(candidate.get("poiId")) == _normalized(current.get("poiId")):
-                    candidate_combo.setCurrentIndex(candidate_combo.count() - 1)
-            candidate_combo.activated.connect(
-                lambda _value, item_path=path, scope_field=scope_combo, combo=candidate_combo: self._select_batch_location_candidate(
-                    item_path, scope_field.currentData(), combo.currentData()
+                    current_index = candidate_combo.count() - 1
+            # 顶部重新搜索其他关键词时，也要保留每条视频已经选中的地点并直接
+            # 显示在下拉框中；不再额外重复展示一块地址文本。
+            if current and current_index == 0:
+                label = f"{current.get('name') or ''} · {current.get('address') or ''}"
+                candidate_combo.addItem(label, dict(current))
+                candidate_combo.setItemData(
+                    candidate_combo.count() - 1,
+                    label,
+                    Qt.ItemDataRole.ToolTipRole,
+                )
+                current_index = candidate_combo.count() - 1
+            candidate_combo.setCurrentIndex(current_index)
+            candidate_combo.currentIndexChanged.connect(
+                lambda selected_index, item_path=path, combo=candidate_combo: selected_index > 0 and self._select_batch_location_candidate(
+                    item_path, state["scope"], combo.currentData()
                 )
             )
-            row_layout.addWidget(candidate_combo)
-            selected_label = QLabel(
-                f"{current.get('name') or ''}\n{current.get('address') or ''}"
-                if current
-                else "未选择地点"
-            )
-            selected_label.setObjectName("douyinCommerceBatchLocationSelected")
-            selected_label.setWordWrap(True)
-            row_layout.addWidget(selected_label)
+            # 选择地点只更新本地批次配置，不依赖搜索任务是否刚完成；否则
+            # 成功回调与线程清理的短暂间隙会让用户看到候选却无法选择。
+            candidate_combo.setEnabled(bool(state["candidates"]) or bool(current))
+            row_layout.addWidget(candidate_combo, 7)
             if not current:
                 missing_location += 1
-            columns[0 if index < split_index else 1].addWidget(row)
-        for column in columns:
-            column.addStretch(1)
-        self.batch_item_settings_status.setText(
-            "每条视频搜索并选择一个地点" if missing_location else "地点已填写；预检时会逐条重新搜索并精确回读"
-        )
+            self.batch_item_rows_layout.addWidget(row, index, 0)
+        self.batch_item_rows_layout.setRowStretch(len(videos), 1)
+        if not self._batch_location_feedback:
+            self._set_batch_location_feedback(
+                "在顶部搜索后，为每条视频选择一个地点"
+                if missing_location
+                else "地点已填写；预检时会逐条重新搜索并精确回读"
+            )
+        self._batch_item_rows_signature = self._batch_item_rows_state_signature()
 
     @staticmethod
     def _checklist_value(label_text: str) -> QLabel:
@@ -1489,7 +1647,7 @@ class DouyinCommercePage(QWidget):
     def _build_music_stage(self) -> QFrame:
         panel, panel_layout = self._section(
             "选择收藏音乐",
-            "直接选择后写入平台。",
+            "",
         )
         panel.setObjectName("douyinCommerceMusicStage")
         panel.setProperty("douyinCommerceWorkCard", True)
@@ -1638,7 +1796,7 @@ class DouyinCommercePage(QWidget):
     def _build_declaration_stage(self) -> QFrame:
         panel, panel_layout = self._section(
             "作品内容声明",
-            "选择后写入平台。",
+            "",
         )
         panel.setObjectName("douyinCommerceDeclarationStage")
         panel.setProperty("douyinCommerceWorkCard", True)
@@ -1649,6 +1807,9 @@ class DouyinCommercePage(QWidget):
             option = QRadioButton(declaration)
             option.setObjectName("douyinCommerceContentDeclarationOption")
             option.setAccessibleName(f"作品内容声明：{declaration}")
+            if declaration in self._DISABLED_CONTENT_DECLARATIONS:
+                option.setToolTip("当前发布流程不支持选择转载信息声明")
+                option.setEnabled(False)
             option.toggled.connect(
                 lambda checked, value=declaration: self._declaration_toggled(value, checked)
             )
@@ -1685,6 +1846,8 @@ class DouyinCommercePage(QWidget):
         self.timer_enabled.toggled.connect(self._timer_enabled_changed)
         panel_layout.addWidget(self.timer_enabled)
         schedule_row = QHBoxLayout()
+        schedule_row.setSpacing(8)
+        self.batch_schedule_row = schedule_row
         self.schedule_date = QDateEdit()
         self.schedule_date.setObjectName("douyinCommerceScheduleDate")
         self.schedule_date.setCalendarPopup(True)
@@ -1696,24 +1859,23 @@ class DouyinCommercePage(QWidget):
         self.schedule_time.setDisplayFormat("HH:mm")
         self.schedule_time.setTime(QTime(9, 0))
         self.schedule_time.timeChanged.connect(self._schedule_changed)
-        schedule_row.addWidget(QLabel("北京时间"))
         schedule_row.addWidget(self.schedule_date)
         schedule_row.addWidget(self.schedule_time)
-        panel_layout.addLayout(schedule_row)
-        self.batch_schedule_controls = QFrame()
+        self.batch_schedule_controls = QWidget()
         self.batch_schedule_controls.setObjectName("douyinCommerceBatchIntervalControls")
         interval_layout = QHBoxLayout(self.batch_schedule_controls)
         interval_layout.setContentsMargins(0, 0, 0, 0)
         interval_layout.setSpacing(8)
-        interval_layout.addWidget(QLabel("定时间隔"))
+        interval_layout.addWidget(QLabel("间隔"))
         self.batch_interval_minutes = QSpinBox()
         self.batch_interval_minutes.setRange(1, 1440)
         self.batch_interval_minutes.setValue(30)
         self.batch_interval_minutes.setSuffix(" 分钟")
         self.batch_interval_minutes.valueChanged.connect(self._batch_schedule_inputs_changed)
         interval_layout.addWidget(self.batch_interval_minutes)
-        interval_layout.addStretch(1)
-        panel_layout.addWidget(self.batch_schedule_controls)
+        schedule_row.addWidget(self.batch_schedule_controls)
+        schedule_row.addStretch(1)
+        panel_layout.addLayout(schedule_row)
         # 批量与单条共用同一组日期/时间，避免用户在两个区域重复填写。
         self.batch_start_date = self.schedule_date
         self.batch_start_time = self.schedule_time
@@ -1784,48 +1946,83 @@ class DouyinCommercePage(QWidget):
         self.summary_grid.setColumnStretch(0, 1)
         self.summary_grid.setColumnStretch(1, 1)
         panel_layout.addLayout(self.summary_grid)
+
+        self.review_submission_panel, submission_layout = self._section(
+            "逐条发布信息",
+            "核对每条视频的地点和发布时间后确认提交。",
+        )
+        self.review_submission_panel.setObjectName("douyinCommerceReviewSubmissionPanel")
+        self.review_submission_panel.setProperty("douyinCommerceWorkCard", True)
+        helper_item = submission_layout.takeAt(1)
+        self.review_submission_helper = helper_item.widget() if helper_item else QLabel()
+        helper_row = QHBoxLayout()
+        helper_row.setSpacing(8)
+        helper_row.addWidget(self.review_submission_helper)
+        helper_row.addStretch(1)
+        self.copy_batch_publish_info_button = button(
+            "复制发布信息", variant="secondary", compact=True
+        )
+        self.copy_batch_publish_info_button.setObjectName(
+            "douyinCommerceCopyBatchPublishInfo"
+        )
+        self.copy_batch_publish_info_button.clicked.connect(
+            self.copy_batch_publish_information
+        )
+        helper_row.addWidget(self.copy_batch_publish_info_button)
+        submission_layout.insertLayout(1, helper_row)
         self.batch_review_rows = QScrollArea()
         self.batch_review_rows.setObjectName("douyinCommerceBatchReviewRows")
         self.batch_review_rows.setWidgetResizable(True)
         self.batch_review_rows.setFrameShape(QFrame.Shape.NoFrame)
+        self.batch_review_rows.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
         self.batch_review_rows_body = QWidget()
         self.batch_review_rows_layout = QVBoxLayout(self.batch_review_rows_body)
         self.batch_review_rows_layout.setContentsMargins(0, 0, 0, 0)
         self.batch_review_rows_layout.setSpacing(8)
         self.batch_review_rows.setWidget(self.batch_review_rows_body)
         self.batch_review_rows.setVisible(False)
-        panel_layout.addWidget(self.batch_review_rows)
-        self.validation_label = QLabel("完成作品内容声明后可开始预检；如开启定时，还需设置未来时间")
+        self.batch_review_rows.setMinimumHeight(420)
+        submission_layout.addWidget(self.batch_review_rows, 1)
+        self.validation_label = QLabel("确认信息后提交发布。")
         self.validation_label.setObjectName("douyinCommerceReviewValidation")
         self.validation_label.setWordWrap(True)
-        panel_layout.addWidget(self.validation_label)
-        actions = QHBoxLayout()
         self.preflight_button = button("执行发布前检查", variant="primary")
         self.preflight_button.setObjectName("douyinCommercePreflight")
         self.preflight_button.clicked.connect(self.start_preflight)
+        # 发布前检查不再是用户流程的一步；保留对象仅兼容旧会话，界面始终隐藏。
+        self.preflight_button.setVisible(False)
         self.submit_button = button("确认立即发表", variant="secondary")
         self.submit_button.setObjectName("douyinCommerceSubmit")
         self.submit_button.clicked.connect(self.open_submit_confirmation)
-        actions.addWidget(self.preflight_button)
-        actions.addWidget(self.submit_button)
-        actions.addStretch()
-        panel_layout.addLayout(actions)
 
         review_columns.addWidget(panel, 0, 0, Qt.AlignmentFlag.AlignTop)
+        review_columns.addWidget(self.review_submission_panel, 0, 1)
         self.review_execution_log = ExecutionLogPanel()
-        review_columns.addWidget(self.review_execution_log, 0, 1)
-        review_columns.setColumnStretch(0, 73)
-        review_columns.setColumnStretch(1, 27)
-        review_columns.setColumnMinimumWidth(1, 300)
+        review_columns.addWidget(self.review_execution_log, 0, 2)
+        review_columns.setColumnStretch(0, 25)
+        review_columns.setColumnStretch(1, 50)
+        review_columns.setColumnStretch(2, 25)
+        review_columns.setColumnMinimumWidth(0, 270)
+        review_columns.setColumnMinimumWidth(2, 300)
         self.review_execution_log.setMinimumWidth(300)
         layout.addWidget(review_workspace)
 
-        navigation = QHBoxLayout()
+        self.review_action_dock = QFrame()
+        self.review_action_dock.setObjectName("douyinCommerceReferenceFooter")
+        navigation = QHBoxLayout(self.review_action_dock)
+        self._configure_reference_footer(self.review_action_dock, navigation)
+        navigation.addWidget(self.validation_label, 1)
         self.review_back_button = button("返回平台设置", variant="secondary")
+        self.review_back_button.setProperty("footerAction", True)
         self.review_back_button.clicked.connect(self.return_from_review)
+        self.preflight_button.setProperty("footerAction", True)
+        self.submit_button.setProperty("footerAction", True)
         navigation.addWidget(self.review_back_button)
-        navigation.addStretch()
-        layout.addLayout(navigation)
+        navigation.addWidget(self.preflight_button)
+        navigation.addWidget(self.submit_button)
+        layout.addWidget(self.review_action_dock)
         return self._scroll_page(body)
 
     @staticmethod
@@ -1972,6 +2169,35 @@ class DouyinCommercePage(QWidget):
         self._sync_batch_video_status()
         self._content_changed()
 
+    def select_all_batch_videos(self) -> None:
+        """选择当前素材列表中最多二十条视频，不访问平台。"""
+
+        if self._busy():
+            QMessageBox.warning(self, "全选视频", "当前正在处理，请等待操作完成后再修改视频。")
+            return
+        indexes = list(range(1, min(self.video_combo.count(), 21)))
+        if not indexes:
+            QMessageBox.information(self, "全选视频", "素材管理中暂未找到可选视频。")
+            return
+        self.select_video_indexes(indexes)
+
+    def clear_batch_video_selection(self) -> None:
+        """取消所有视频勾选，仅清空本地批次选择。"""
+
+        if self._busy():
+            QMessageBox.warning(self, "取消全选", "当前正在处理，请等待操作完成后再修改视频。")
+            return
+        self.batch_video_list.blockSignals(True)
+        for row in range(self.batch_video_list.count()):
+            self.batch_video_list.item(row).setCheckState(Qt.CheckState.Unchecked)
+        self.batch_video_list.blockSignals(False)
+        self._selected_video_indexes = []
+        self.video_combo.blockSignals(True)
+        self.video_combo.setCurrentIndex(0)
+        self.video_combo.blockSignals(False)
+        self._sync_batch_video_status()
+        self._content_changed()
+
     def selected_video_count(self) -> int:
         return len(self._selected_video_indexes)
 
@@ -2034,7 +2260,7 @@ class DouyinCommercePage(QWidget):
             self._suppress_declaration_signal = previous
 
     def _restore_music_combo(self, music: dict[str, str] | None) -> None:
-        """回到最近一次平台确认的音乐，避免失败后保留客户端暂选。"""
+        """回显当前音乐；批量模式的本地暂选也必须显示在选择框中。"""
 
         target_id = _normalized((music or {}).get("musicId"))
         self.music_combo.blockSignals(True)
@@ -2046,6 +2272,16 @@ class DouyinCommercePage(QWidget):
                     if isinstance(candidate, dict) and _normalized(candidate.get("musicId")) == target_id:
                         index = candidate_index
                         break
+                if index == 0 and isinstance(music, dict):
+                    title = _normalized(music.get("title")) or "未命名音乐"
+                    creator = _normalized(music.get("creator")) or "未知作者"
+                    duration = _normalized(music.get("duration"))
+                    suffix = f" · {duration}" if duration else ""
+                    self.music_combo.addItem(
+                        f"{title} · {creator}{suffix}",
+                        dict(music),
+                    )
+                    index = self.music_combo.count() - 1
             self.music_combo.setCurrentIndex(index)
         finally:
             self.music_combo.blockSignals(False)
@@ -2138,12 +2374,25 @@ class DouyinCommercePage(QWidget):
             self.tag_history_layout.addWidget(placeholder)
         else:
             for tag in self._tag_history:
-                chip = button(f"+ #{tag}", variant="ghost", compact=True)
+                chip = QFrame()
                 chip.setObjectName("douyinCommerceTagHistoryChip")
-                chip.setToolTip(f"添加历史标签 #{tag}")
-                chip.clicked.connect(
+                chip_layout = QHBoxLayout(chip)
+                chip_layout.setContentsMargins(6, 1, 3, 1)
+                chip_layout.setSpacing(1)
+                add_button = button(f"+ #{tag}", variant="ghost", compact=True)
+                add_button.setObjectName("douyinCommerceTagHistoryAdd")
+                add_button.setToolTip(f"添加历史标签 #{tag}")
+                add_button.clicked.connect(
                     lambda _checked=False, value=tag: self.add_history_tag(value)
                 )
+                remove_button = button("×", variant="ghost", compact=True)
+                remove_button.setObjectName("douyinCommerceTagHistoryRemove")
+                remove_button.setToolTip(f"删除历史标签 #{tag}")
+                remove_button.clicked.connect(
+                    lambda _checked=False, value=tag: self.remove_history_tag(value)
+                )
+                chip_layout.addWidget(add_button)
+                chip_layout.addWidget(remove_button, 0, Qt.AlignmentFlag.AlignTop)
                 self.tag_history_layout.addWidget(chip)
         self.tag_history_layout.addStretch(1)
 
@@ -2195,6 +2444,16 @@ class DouyinCommercePage(QWidget):
             self._tag_values = current
             self._render_selected_tags()
             self._content_changed()
+
+    def remove_history_tag(self, tag: str) -> None:
+        """删除一枚不再需要的本机历史标签，不影响当前内容或平台。"""
+
+        try:
+            self._tag_history = douyin_commerce_draft_service.remove_tag_history(tag)
+        except Exception as exc:
+            QMessageBox.warning(self, "删除最近标签", f"删除失败：{exc}")
+            return
+        self._render_tag_history()
 
     def remove_tag(self, tag: str) -> None:
         self._tag_values = [item for item in self._tag_values if item != tag]
@@ -2449,9 +2708,21 @@ class DouyinCommercePage(QWidget):
         self.tags_input.clear()
         self.tags_input.blockSignals(False)
         self._set_tags([])
+        # 批量工作台使用独立勾选列表；仅重置单选下拉框会留下旧的视频和地点。
+        self.batch_video_list.blockSignals(True)
+        for row in range(self.batch_video_list.count()):
+            self.batch_video_list.item(row).setCheckState(Qt.CheckState.Unchecked)
+        self.batch_video_list.blockSignals(False)
+        self._selected_video_indexes = []
+        self._batch_locations = {}
+        self._batch_location_searches = {}
+        self._batch_schedule_overrides = {}
+        self._batch_location_feedback = ""
+        self._sync_batch_video_status()
         self._uploaded_editor_payload = None
         self._pending_upload_payload = None
         self._preflight_fingerprint = ""
+        self._batch_preflight_fingerprint = ""
         self._clear_stage_error("content")
         self._sync_content_cards()
         self.content_notice.setText("当前信息已清空；已保存的本地内容仍可恢复。")
@@ -2630,7 +2901,7 @@ class DouyinCommercePage(QWidget):
         if not isinstance(candidate, dict):
             self._load_favorite_music_candidates()
             return
-        if self.selected_video_count() >= 1 and not self._session_id:
+        if self.selected_video_count() >= 1:
             self._select_batch_music_locally(candidate)
             return
         self._start_music_write(dict(candidate))
@@ -2641,7 +2912,8 @@ class DouyinCommercePage(QWidget):
         self._selected_music = dict(candidate)
         self._pending_music = None
         self._batch_preflight_fingerprint = ""
-        self.music_status.setText("已选择；预检时逐条写入并回读")
+        self._restore_music_combo(self._selected_music)
+        self.music_status.setText("")
         self._sync_view()
 
     def _toggle_music_candidate_list(self) -> None:
@@ -2659,20 +2931,21 @@ class DouyinCommercePage(QWidget):
         if not isinstance(data, dict):
             return
         self.music_candidate_list.setVisible(False)
-        if self.selected_video_count() >= 1 and not self._session_id:
+        if self.selected_video_count() >= 1:
             self._select_batch_music_locally(data)
             return
         self._start_music_write(dict(data))
 
     def _declaration_toggled(self, declaration: str, checked: bool) -> None:
-        """用户切换声明时立即写入；初始化与失败恢复不触发平台动作。"""
+        """批量仅保存声明；单视频仍在当前编辑会话即时写入。"""
 
         if not checked or self._suppress_declaration_signal:
             return
-        if self.selected_video_count() >= 1 and not self._session_id:
+        if self.selected_video_count() >= 1:
             self._confirmed_declaration = _normalized(declaration)
+            self._declaration_applied = False
             self._batch_preflight_fingerprint = ""
-            self.declaration_status.setText("已选择；预检时逐条写入并回读")
+            self.declaration_status.setText("")
             self._sync_view()
             return
         self._start_declaration_write(declaration)
@@ -2987,6 +3260,14 @@ class DouyinCommercePage(QWidget):
             self._saved_content_available and not self._session_id and not self._busy()
         )
         self.clear_content_button.setEnabled(not self._session_id and not self._busy())
+        can_edit_batch_content = not self._session_id and not self._busy()
+        self.select_all_videos_button.setEnabled(can_edit_batch_content)
+        self.clear_video_selection_button.setEnabled(can_edit_batch_content)
+        self.batch_save_content_button.setEnabled(not self._busy())
+        self.batch_restore_content_button.setEnabled(
+            self._saved_content_available and can_edit_batch_content
+        )
+        self.batch_clear_content_button.setEnabled(can_edit_batch_content)
 
         self._sync_platform_workspace()
         summary = self._summary()
@@ -2999,35 +3280,35 @@ class DouyinCommercePage(QWidget):
             try:
                 batch_payload = self.collect_batch_payload()
                 valid = self._can_batch_review()
-                validation = "可开始批量预检：逐条写入并回读，不会保存草稿或提交。" if valid else "请补齐音乐、声明和每条完整地点。"
+                if self._busy() and self._batch_progress_text:
+                    validation = self._batch_progress_text
+                elif self._batch_result_feedback:
+                    validation = self._batch_result_feedback
+                else:
+                    validation = "确认信息后提交发布。" if valid else "请补齐音乐、声明和每条完整地点。"
             except Exception as exc:
                 batch_payload = None
                 valid = False
                 validation = str(exc)
             self.validation_label.setText(validation)
-            preflight_ready = valid and not self._busy()
-            fingerprint = self._batch_fingerprint(batch_payload) if preflight_ready and batch_payload else ""
-            submit_ready = bool(preflight_ready and fingerprint and fingerprint == self._batch_preflight_fingerprint)
-            self.preflight_button.setEnabled(preflight_ready)
+            submit_ready = bool(valid and batch_payload and not self._busy())
+            self.preflight_button.setVisible(False)
+            self.preflight_button.setEnabled(False)
             self.submit_button.setEnabled(submit_ready)
-            self.submit_button.setText("确认批量提交")
-            self._set_button_variant(self.preflight_button, "primary" if preflight_ready and not submit_ready else "secondary")
+            self.submit_button.setText(f"确认提交 {self.selected_video_count()} 条视频")
             self._set_button_variant(self.submit_button, "primary" if submit_ready else "secondary")
             return
+        self.preflight_button.setVisible(False)
         try:
-            self.collect_payload("preflight")
+            self.collect_payload("publish")
             valid = self._can_review()
             if valid:
-                validation = (
-                    "可开始预检：仅回读当前编辑页字段与北京时间定时，不会保存草稿或提交发布。"
-                    if self.timer_enabled.isChecked()
-                    else "可开始预检：仅回读当前编辑页字段与立即发表状态，不会保存草稿或发表。"
-                )
+                validation = "确认信息后提交发布。"
             else:
                 validation = (
-                    "请先完成作品内容声明与未来定时。"
+                    "请先完成视频上传、作品内容声明与未来定时。"
                     if self.timer_enabled.isChecked()
-                    else "请先完成作品内容声明。"
+                    else "请先完成视频上传与作品内容声明。"
                 )
         except (ValueError, douyin_commerce_service.DouyinCommerceError) as exc:
             valid = False
@@ -3036,27 +3317,16 @@ class DouyinCommercePage(QWidget):
             valid = False
             validation = "内容已变更，请先同步内容或重新上传后再继续。"
         self.validation_label.setText(validation)
-        preflight_ready = valid and bool(self._session_id) and not self._busy()
-        fingerprint = self._payload_fingerprint("preflight") if preflight_ready else ""
-        submit_ready = bool(
-            preflight_ready
-            and fingerprint
-            and fingerprint == self._preflight_fingerprint
-            and not self._busy()
-        )
-        self.preflight_button.setEnabled(preflight_ready)
+        submit_ready = bool(valid and bool(self._session_id) and not self._busy())
+        self.preflight_button.setEnabled(False)
         self.submit_button.setEnabled(submit_ready)
         self.submit_button.setText("确认定时提交" if self.timer_enabled.isChecked() else "确认立即发表")
-        self._set_button_variant(
-            self.preflight_button,
-            "primary" if preflight_ready and not submit_ready else "secondary",
-        )
         self._set_button_variant(self.submit_button, "primary" if submit_ready else "secondary")
 
         if self._busy():
             self.status_badge.setText("正在处理")
         elif submit_ready:
-            self.status_badge.setText("预检已通过")
+            self.status_badge.setText("可以提交")
         elif self._session_id:
             self.status_badge.setText("继续配置")
         else:
@@ -3096,7 +3366,9 @@ class DouyinCommercePage(QWidget):
             self.schedule_stage.setVisible(True)
             self.platform_execution_log.setVisible(False)
             if batch_mode:
-                self._render_batch_item_rows()
+                self._sync_batch_location_controls()
+                if self._batch_item_rows_signature != self._batch_item_rows_state_signature():
+                    self._render_batch_item_rows()
         session_ready = bool(self._session_id) and self._content_change_kind() == "none"
         self.platform_back_button.setEnabled(not busy)
         if self._session_id and self._content_change_kind() == "sync":
@@ -3111,23 +3383,27 @@ class DouyinCommercePage(QWidget):
             self.platform_session_status.setText("编辑会话已就绪")
         else:
             self.platform_session_status.setText("等待上传视频")
-        self.platform_session_status.setVisible(
+        session_status_visible = (
             busy
             or (bool(self._session_id) and not session_ready)
             or (batch_mode and self._batch_editor_session_ended)
         )
+        self.platform_session_status.setVisible(False)
 
-        # 批量也必须从本次设置会话读取收藏音乐；不能把过期缓存伪装成当前平台数据。
-        can_choose_music = session_ready and not busy
+        # 批量中的“选择音乐”只保存本地批次配置；预检时才会逐条写入平台并回读。
+        # 批量已缓存的音乐可以在没有设置会话时直接选择；这一步完全不访问平台。
+        # “刷新收藏”仍需设置会话，因为它会主动读取一次当前抖音收藏抽屉。
+        can_choose_music = (
+            session_ready
+            or (batch_mode and bool(self._selected_account()))
+        ) and not busy
         self.music_combo.setEnabled(can_choose_music)
         self.music_refresh_button.setEnabled(can_choose_music)
         if not busy:
-            if not session_ready:
-                self.music_status.setText(
-                    "已选择音乐，等待设置会话回读"
-                    if batch_mode and self._selected_music
-                    else "上传后选择"
-                )
+            if batch_mode and self._selected_music:
+                self.music_status.setText("")
+            elif not session_ready:
+                self.music_status.setText("上传后选择")
             elif self._selected_music:
                 self.music_status.setText("")
             elif self._music_candidates:
@@ -3176,17 +3452,24 @@ class DouyinCommercePage(QWidget):
                 self.location_status.setText("搜索地点")
         self._sync_location_view()
 
-        can_choose_declaration = session_ready and not busy
-        for option in self.declaration_buttons.values():
-            option.setEnabled(can_choose_declaration)
-        if not busy:
+        can_choose_declaration = (session_ready or batch_mode) and not busy
+        for declaration, option in self.declaration_buttons.items():
+            option.setEnabled(
+                can_choose_declaration
+                and declaration not in self._DISABLED_CONTENT_DECLARATIONS
+            )
+        if batch_mode:
+            self.declaration_status.setText("")
+        elif not busy:
             if not can_choose_declaration:
                 self.declaration_status.setText("上传后选择")
             elif self._declaration_applied:
                 self.declaration_status.setText("")
             else:
                 self.declaration_status.setText("选择后立即写入")
-        self.declaration_status.setVisible(self._immediate_write_kind == "declaration")
+        self.declaration_status.setVisible(
+            not batch_mode and self._immediate_write_kind == "declaration"
+        )
         self.declaration_card.setVisible(False)
 
         # 定时仅是本地批次配置，不必等待音乐或地点；单条仍要求当前编辑会话存在。
@@ -3217,6 +3500,8 @@ class DouyinCommercePage(QWidget):
         self.to_review_button.setText("正在检查…" if checking_schedule else "检查并继续")
         if checking_schedule:
             self.platform_review_status.setText("正在检查发布时间…")
+        elif session_status_visible:
+            self.platform_review_status.setText(self.platform_session_status.text())
         elif review_ready:
             self.platform_review_status.setText("已完成，可检查")
         elif batch_mode:
@@ -3253,7 +3538,9 @@ class DouyinCommercePage(QWidget):
             return bool(self._session_id) and self._content_change_kind() == "none"
         if step == 1:
             return self._can_review()
-        return bool(self._preflight_fingerprint)
+        if self.selected_video_count() >= 1:
+            return self._can_batch_review()
+        return self._can_review()
 
     def _busy(self) -> bool:
         return bool(self._immediate_write_kind) or any(
@@ -3537,6 +3824,7 @@ class DouyinCommercePage(QWidget):
         total = int(event.get("total") or self.selected_video_count())
         self._batch_progress_text = f"正在处理 {index}/{total}：{_normalized(event.get('message'))}"
         self.validation_label.setText(self._batch_progress_text)
+        _LOGGER.info("抖音带货批量执行：%s", self._batch_progress_text)
         if _normalized(event.get("phase")) == "waiting_verification":
             videos = self._selected_videos()
             label = Path(_normalized(videos[index - 1].get("storedPath"))).name if 0 < index <= len(videos) else ""
@@ -3553,11 +3841,14 @@ class DouyinCommercePage(QWidget):
 
     def _batch_operation_failed(self, message: str) -> None:
         self._batch_preflight_fingerprint = ""
-        self.validation_label.setText("批量操作未完成，请检查任务记录后重试。")
-        _LOGGER.warning("抖音带货批量操作未完成: %s", _normalized(message))
+        diagnostic = _normalized(message) or "未知异常"
+        self._batch_result_feedback = f"批量任务未完成：{diagnostic}"
+        self.validation_label.setText(self._batch_result_feedback)
+        _LOGGER.warning("抖音带货批量操作未完成: %s", diagnostic)
+        QMessageBox.warning(self, "抖音带货批量提交失败", self._batch_result_feedback)
 
     def _batch_operation_finished(self) -> None:
-        """批量预检/提交结束后收束验证内存与原生对话框。"""
+        """批量提交结束后收束验证内存与原生对话框。"""
 
         self._cleanup_douyin_verification()
         self._batch_task_id = None
@@ -3569,17 +3860,12 @@ class DouyinCommercePage(QWidget):
         return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
     def open_batch_submit_confirmation(self) -> None:
+        """点击确认提交后直接启动批量发布，不再重复弹出二次确认。"""
+
         try:
             payload = self.collect_batch_payload()
         except Exception as exc:
             QMessageBox.warning(self, "确认批量提交", str(exc))
-            return
-        if self._batch_fingerprint(payload) != self._batch_preflight_fingerprint:
-            QMessageBox.warning(self, "需要重新预检", "内容、音乐、声明、地点或排期已变更，请先重新检查。")
-            return
-        rows = self._batch_summary_rows(payload)
-        dialog = DouyinCommerceBatchConfirmDialog(rows, parent=self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         task = task_service.create_douyin_batch_task(payload, mode="oneclick_publish")
         self.start_batch_publish(payload, task)
@@ -3590,18 +3876,61 @@ class DouyinCommercePage(QWidget):
         self._batch_task_id = int(task["id"])
         task_service.mark_task_running(self._batch_task_id, "抖音带货批量开始最终提交")
         self._batch_preflight_fingerprint = ""
-        self.runner.run(
+        self._batch_result_feedback = ""
+        self._batch_progress_text = f"已确认提交，正在启动 0/{len(payload.get('items') or [])} 条视频…"
+        self.validation_label.setText(self._batch_progress_text)
+        _LOGGER.info("抖音带货批量执行：%s", self._batch_progress_text)
+        started = self.runner.run(
             _BATCH_RUN_KEY,
             with_progress=lambda report: self._batch_executor.run_publish(
                 payload, task_id=self._batch_task_id or 0, confirmed=True, progress=lambda event: report(event.to_public_dict())
             ),
             on_progress=self._batch_progress,
-            on_success=lambda _result: self.validation_label.setText("批量任务已结束，请以任务记录中的逐条平台回执为准。"),
+            on_success=self._batch_publish_succeeded,
             on_error=self._batch_operation_failed,
             on_finished=self._batch_operation_finished,
         )
-        self._start_douyin_verification_polling()
+        if not started:
+            self._batch_operation_failed("提交任务未能启动，可能已有任务正在运行")
+        else:
+            self._start_douyin_verification_polling()
         self._sync_view()
+
+    def _batch_publish_succeeded(self, result: object) -> None:
+        """无论逐条结果成功或失败，都给出可见、可追溯的最终汇总。"""
+
+        rows = [dict(row) for row in result if isinstance(row, dict)] if isinstance(result, list) else []
+        published = [row for row in rows if _normalized(row.get("status")) == "published"]
+        failed = [
+            row
+            for row in rows
+            if _normalized(row.get("status")) in {"failed", "verification_failed"}
+        ]
+        waiting = [
+            row
+            for row in rows
+            if _normalized(row.get("status")) in {"waiting_login", "waiting_verification"}
+        ]
+        pending = [row for row in rows if _normalized(row.get("status")) == "pending"]
+        parts = [f"批量提交已结束：成功 {len(published)} 条，失败 {len(failed)} 条"]
+        if waiting:
+            parts.append(f"待人工处理 {len(waiting)} 条")
+        if pending:
+            parts.append(f"未开始 {len(pending)} 条")
+        diagnostics = [
+            _normalized(row.get("diagnostic"))
+            for row in failed
+            if _normalized(row.get("diagnostic"))
+        ]
+        if diagnostics:
+            parts.append(f"失败原因：{diagnostics[0]}")
+        self._batch_result_feedback = "；".join(parts) + "。"
+        self.validation_label.setText(self._batch_result_feedback)
+        _LOGGER.info("抖音带货批量结果：%s", self._batch_result_feedback)
+        if failed or waiting:
+            QMessageBox.warning(self, "抖音带货批量提交结果", self._batch_result_feedback)
+        else:
+            QMessageBox.information(self, "抖音带货批量提交成功", self._batch_result_feedback)
 
     def _batch_summary_rows(self, payload: dict) -> list[dict[str, str]]:
         scheduled = douyin_commerce_batch_service.apply_interval_schedule(
@@ -3731,7 +4060,8 @@ class DouyinCommercePage(QWidget):
                 widget.deleteLater()
         is_batch = self.selected_video_count() >= 1
         self.batch_review_rows.setVisible(is_batch)
-        self.summary_grid.setEnabled(not is_batch)
+        self.copy_batch_publish_info_button.setEnabled(is_batch)
+        self.summary_grid.setEnabled(True)
         if not is_batch:
             return
         for index, video in enumerate(self._selected_videos(), start=1):
@@ -3742,12 +4072,66 @@ class DouyinCommercePage(QWidget):
             card_layout = QVBoxLayout(card)
             card_layout.setContentsMargins(12, 9, 12, 9)
             card_layout.setSpacing(3)
-            card_layout.addWidget(QLabel(f"第 {index} 条 · {Path(path).name}"))
-            card_layout.addWidget(QLabel(f"地点：{location.get('name') or '待选择'} · {location.get('address') or ''}"))
+            video_label = QLabel(
+                f"视频名称：{self._batch_review_video_name(video, path)}"
+            )
+            location_label = QLabel(
+                f"地点：{location.get('name') or '待选择'} · {location.get('address') or ''}"
+            )
             schedule = self.item_schedule_text(index - 1)
-            card_layout.addWidget(QLabel(f"发布方式：{schedule}"))
+            schedule_label = QLabel(
+                "发布时间：直接发布"
+                if schedule == "立即发布"
+                else f"发布时间：定时：{schedule}"
+            )
+            for label in (video_label, location_label, schedule_label):
+                label.setWordWrap(True)
+                label.setTextInteractionFlags(
+                    Qt.TextInteractionFlag.TextSelectableByMouse
+                )
+                label.setSizePolicy(
+                    QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+                )
+                card_layout.addWidget(label)
             self.batch_review_rows_layout.addWidget(card)
         self.batch_review_rows_layout.addStretch(1)
+
+    @staticmethod
+    def _batch_review_video_name(video: dict, path: str) -> str:
+        """展示原始视频名，并去除素材库保存时附加的 UUID 前缀。"""
+
+        name = _normalized(video.get("filename")) or Path(path).name
+        return re.sub(
+            r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}_",
+            "",
+            name,
+            flags=re.IGNORECASE,
+        )
+
+    def copy_batch_publish_information(self) -> None:
+        """复制当前批量的逐条发布信息，方便用户留存或核对。"""
+
+        lines: list[str] = []
+        for index, video in enumerate(self._selected_videos()):
+            path = _normalized(video.get("storedPath"))
+            location = self._batch_locations.get(path) or {}
+            schedule = self.item_schedule_text(index)
+            lines.extend(
+                (
+                    f"视频名称：{self._batch_review_video_name(video, path)}",
+                    f"地点：{location.get('name') or '待选择'} · {location.get('address') or ''}",
+                    "发布时间：直接发布"
+                    if schedule == "立即发布"
+                    else f"发布时间：定时：{schedule}",
+                    "",
+                )
+            )
+        content = "\n".join(lines).strip()
+        if not content:
+            self.copy_batch_publish_info_button.setText("暂无发布信息")
+            return
+        QApplication.clipboard().setText(content)
+        self.copy_batch_publish_info_button.setText("已复制")
 
     def continue_after_content(self) -> None:
         """按内容差异决定无动作、内容同步或完整重新上传。"""
@@ -3903,6 +4287,7 @@ class DouyinCommercePage(QWidget):
         self.operation_progress_frame.setVisible(True)
         if self.pages.currentIndex() == 1:
             self.platform_session_status.setText(label)
+            self.platform_review_status.setText(label)
 
     def _clear_commerce_progress(self) -> None:
         self._commerce_progress_phase = ""
@@ -3998,7 +4383,7 @@ class DouyinCommercePage(QWidget):
 
         # 新批量工作台在上传前就需要选择共享音乐。此时只能读取当前账号已
         # 同步到本机的安全缓存；缓存缺失时不创建浏览器、不上传，也不默认选歌。
-        if self.selected_video_count() >= 1 and not self._session_id:
+        if self.selected_video_count() >= 1:
             self._load_batch_cached_favorite_music()
             return
 
@@ -4084,6 +4469,8 @@ class DouyinCommercePage(QWidget):
     ) -> None:
         self._music_candidates = [dict(item) for item in rows]
         self._music_candidate_source = source if self._music_candidates else ""
+        if self.selected_video_count() >= 1 and source == "session":
+            self._cache_batch_music_candidates(self._music_candidates)
         self._clear_stage_error("music")
         self.music_candidate_list.clear()
         self.music_combo.blockSignals(True)
@@ -4109,6 +4496,21 @@ class DouyinCommercePage(QWidget):
             else "暂无可用收藏音乐，请点击刷新。"
         )
         self._sync_view()
+
+    def _cache_batch_music_candidates(self, rows: list[dict[str, str]]) -> None:
+        """把用户已主动读取到的收藏音乐安全落盘，供下次批量直接选择。"""
+
+        account = self._selected_account() or {}
+        try:
+            account_id = int(account.get("id") or 0)
+        except (TypeError, ValueError):
+            account_id = 0
+        if account_id <= 0:
+            return
+        try:
+            douyin_favorite_music_cache.replace_cached_favorite_music(account_id, rows)
+        except Exception as exc:
+            _LOGGER.warning("保存抖音收藏音乐本地缓存失败：%s", _normalized(exc))
 
     def _music_cache_load_failed(self, message: str) -> None:
         self.music_status.setText("本地收藏音乐未读取完成，可点击刷新。")
@@ -4148,13 +4550,26 @@ class DouyinCommercePage(QWidget):
         )
 
     def _music_selected(self, music: dict[str, str]) -> None:
+        # 当前音乐抽屉的 DOM 标记会在选择完成后失效，但歌曲的公开身份仍可
+        # 继续作为“更换音乐”的列表展示。下次点击会重新打开当前官方抽屉并按
+        # musicId 精确核验，因此无需让用户手动刷新一次才能更换。
+        reusable_candidates = [
+            {
+                key: _normalized(candidate.get(key))
+                for key in ("musicId", "title", "creator", "duration")
+            }
+            for candidate in self._music_candidates
+            if isinstance(candidate, dict) and _normalized(candidate.get("musicId"))
+        ]
         self._selected_music = dict(music)
-        # musicId 对应的 marker 只在刚关闭的抖音弹窗中有效；保留会导致下次更换
-        # 时在客户端看似选中了新音乐，服务端却无法确认该条目。
-        self._discard_music_candidates_for_reload()
+        if reusable_candidates:
+            self._show_music_candidates(reusable_candidates, source="cache")
+            self.music_candidate_list.setVisible(False)
+            self.music_status.setText("当前音乐已确认；如需更换可直接选择，系统会重新核验平台收藏列表。")
+        else:
+            self._discard_music_candidates_for_reload()
         self._clear_stage_error("music")
         self.music_card.setText(self._music_display(self._selected_music))
-        self.music_status.setText("")
         self._preflight_fingerprint = ""
         self._sync_view()
 
@@ -4395,19 +4810,13 @@ class DouyinCommercePage(QWidget):
             QMessageBox.warning(self, action_label, str(exc))
             self._sync_view()
             return
-        if self._payload_fingerprint("preflight") != self._preflight_fingerprint:
+        if not self._can_review():
             QMessageBox.warning(
                 self,
-                "需要重新预检",
-                "账号、素材、内容、音乐、地点、作品内容声明或定时已变更，请先重新完成预检。",
+                action_label,
+                "请先完成视频上传、音乐、地点、作品内容声明及定时设置。",
             )
-            return
-        dialog = DouyinCommerceConfirmDialog(
-            self._summary(),
-            enable_timer=payload.get("enableTimer") is True,
-            parent=self,
-        )
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+            self._sync_view()
             return
         task = task_service.create_pending_task([payload], mode="oneclick_publish")
         self._active_task_id = int(task["id"])

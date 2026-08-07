@@ -1155,18 +1155,37 @@ async def _wait_for_fresh_commerce_location_results(
     *,
     baseline_signature: str,
     keyword: str,
+    allow_stable_baseline_match: bool = False,
 ) -> tuple[Any, list[dict[str, str]]]:
-    """等待本次关键词对应的候选结果，过滤范围切换前的陈旧下拉。"""
+    """等待本次关键词对应的候选结果，过滤范围切换前的陈旧下拉。
+
+    ``allow_stable_baseline_match`` 仅供已经完成“清空再填回关键词”的范围
+    切换流程使用。抖音会在范围切换时自动查询一次原关键词，此时最终的本地
+    结果可能与清空后的快照完全相同；连续两次回读一致且匹配关键词时，可将其
+    视为已稳定的当前范围结果，而不是误报为旧候选。
+    """
 
     last_signature = ""
+    stable_matching_baseline_reads = 0
     for _ in range(30):
         listbox, rows, signature = await _visible_commerce_location_result_snapshot(page)
         if listbox is not None and rows:
             last_signature = signature
+            matches_keyword = _location_rows_match_keyword(rows, keyword)
             # 新结果既应替换切换范围前的列表，也应至少与本次搜索词有关。
             # 若平台暂时仍返回旧本地候选，继续等待而不把错误地址展示给用户。
-            if signature != baseline_signature and _location_rows_match_keyword(rows, keyword):
+            if signature != baseline_signature and matches_keyword:
                 return listbox, rows
+            if (
+                allow_stable_baseline_match
+                and signature == baseline_signature
+                and matches_keyword
+            ):
+                stable_matching_baseline_reads += 1
+                if stable_matching_baseline_reads >= 2:
+                    return listbox, rows
+            else:
+                stable_matching_baseline_reads = 0
         await page.wait_for_timeout(200)
     if last_signature and last_signature == baseline_signature:
         raise DouyinCommerceError(
@@ -1202,9 +1221,16 @@ async def search_commerce_location_store_candidates(
     # 用户所选“本地/国内”，再填写关键词，避免客户端默认“国内”但平台仍以
     # 初始“本地”返回候选。
     await set_commerce_location_scope(page, scope)
-    # 输入框首次展开时，平台可能仍在回填初始“本地”推荐；先给范围切换的
-    # 已发请求一个受限的收敛时间，并保留快照。后续必须等待列表真正变化，
-    # 不能像此前那样只要看到 listbox 就立刻把旧结果返回客户端。
+    # 范围切换后若输入框保留着同一个关键词，fill(同样文本) 不会触发 input
+    # 事件，抖音便继续展示切换前的旧候选。先清空再重新填写，强制触发当前
+    # 范围的一次新检索；后续仍严格校验候选的完整地址和关键词匹配。
+    try:
+        await input_control.fill("", timeout=8_000)
+    except Exception as exc:
+        raise DouyinCommerceError("抖音带货位置输入框无法重置关键词，已安全停止") from exc
+    # 输入框首次展开或清空时，平台可能仍在回填初始“本地”推荐；先给范围切换
+    # 与清空关键词触发的请求一个受限的收敛时间，并保留快照。后续必须等待
+    # 列表真正变化，不能像此前那样只要看到 listbox 就立刻把旧结果返回客户端。
     await page.wait_for_timeout(450)
     _, _, baseline_signature = await _visible_commerce_location_result_snapshot(page)
     try:
@@ -1217,6 +1243,7 @@ async def search_commerce_location_store_candidates(
         page,
         baseline_signature=baseline_signature,
         keyword=normalized_keyword,
+        allow_stable_baseline_match=True,
     )
     candidates = normalize_commerce_location_candidates(rows)
     if not candidates:

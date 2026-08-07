@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from hashlib import sha256
 from typing import Any, Mapping
 
 from . import database, douyin_music_service
@@ -19,6 +20,20 @@ class DouyinFavoriteMusicCacheError(ValueError):
 
 _PUBLIC_KEYS = ("musicId", "title", "creator", "duration", "syncedAt")
 _UNSTABLE_ID_PREFIXES = ("visible:", "favorite-index:")
+
+
+def _metadata_music_id(value: Mapping[str, Any]) -> str:
+    """为无平台 ID 的收藏音乐生成本地稳定指纹。
+
+    指纹只由歌曲名、作者和时长组成。后续写入前仍会在当次收藏列表中按这三项
+    完整且唯一地重新定位，不能把该指纹当成抖音平台 ID 使用。
+    """
+
+    material = "\x1f".join(
+        str(value.get(key) or "").strip()
+        for key in ("title", "creator", "duration")
+    )
+    return f"metadata:{sha256(material.encode('utf-8')).hexdigest()}"
 
 
 def _account_id(value: object) -> int:
@@ -42,9 +57,7 @@ def _normalize_cache_row(value: object) -> dict[str, str] | None:
     music = douyin_music_service.normalize_music_readback(value)
     if not music:
         return None
-    music_id = _stable_music_id(music.get("musicId"))
-    if not music_id:
-        return None
+    music_id = _stable_music_id(music.get("musicId")) or _metadata_music_id(music)
     return {
         "musicId": music_id,
         "title": str(music["title"]),

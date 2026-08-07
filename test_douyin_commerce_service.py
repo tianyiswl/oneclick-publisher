@@ -16,13 +16,16 @@ from zoneinfo import ZoneInfo
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor, QImage
-from PyQt6.QtWidgets import QApplication, QComboBox, QDialog, QFrame, QLabel, QPushButton
+from PyQt6.QtWidgets import QApplication, QComboBox, QDialog, QFrame, QLabel, QLineEdit, QPushButton
 
 from app_core import (
+    database,
     douyin_commerce_batch_draft_service,
     douyin_commerce_service,
     douyin_commerce_session,
+    douyin_favorite_music_cache,
     douyin_music_service,
     douyin_publish_executor,
     media_service,
@@ -34,6 +37,7 @@ from app_core import douyin_verification
 from app_core.douyin_commerce_batch_executor import DouyinCommerceBatchExecutor
 from app_core.douyin_verification import DouyinVerificationBroker, VerificationChallenge
 from ui.background_task import BackgroundTask
+from ui.common import apply_style
 from ui.douyin_commerce_page import DouyinCommercePage
 from ui.runtime_log import runtime_log_bus
 from utils import base_social_media
@@ -388,7 +392,10 @@ class DouyinCommercePayloadTests(unittest.TestCase):
         mode.assert_awaited_once()
         open_search.assert_awaited_once_with(page, mode.return_value)
         set_scope.assert_awaited_once_with(page, "domestic")
-        field.fill.assert_awaited_once_with("北海夜南香", timeout=8_000)
+        self.assertEqual(
+            field.fill.await_args_list,
+            [call("", timeout=8_000), call("北海夜南香", timeout=8_000)],
+        )
         self.assertEqual(result[0]["name"], row["name"])
         self.assertNotIn("commerceStore", result[0])
 
@@ -503,7 +510,7 @@ class DouyinCommercePayloadTests(unittest.TestCase):
         self.assertEqual(result[0]["name"], "北海夜南香")
         self.assertEqual(
             events,
-            ["scroll", "click", "scope:domestic", "wait:450", "fill:北海夜南香"],
+            ["scroll", "click", "scope:domestic", "fill:", "wait:450", "fill:北海夜南香"],
         )
 
     def test_location_search_waits_past_stale_local_candidates(self) -> None:
@@ -550,8 +557,39 @@ class DouyinCommercePayloadTests(unittest.TestCase):
                     baseline_signature=stale_signature,
                     keyword="遂宁夜南香",
                 )
-            )
+        )
         self.assertEqual(rows, domestic_rows)
+
+    def test_location_search_accepts_stable_keyword_results_after_scope_switch(self) -> None:
+        """范围切换已触发检索时，同一组稳定匹配候选不应被误判为旧列表。"""
+
+        rows = [
+            {
+                "name": "夜南香北京烤鸭(万泉城店)",
+                "address": "广西壮族自治区北海市银海区银滩大道万泉城二区北门",
+            }
+        ]
+
+        class Page:
+            wait_for_timeout = AsyncMock()
+
+        signature = douyin_commerce_service._location_result_signature(rows)
+        with patch.object(
+            douyin_commerce_service,
+            "_visible_commerce_location_result_snapshot",
+            new_callable=AsyncMock,
+            side_effect=[(object(), rows, signature), (object(), rows, signature)],
+        ):
+            _listbox, result = asyncio.run(
+                douyin_commerce_service._wait_for_fresh_commerce_location_results(
+                    Page(),
+                    baseline_signature=signature,
+                    keyword="夜南香",
+                    allow_stable_baseline_match=True,
+                )
+            )
+
+        self.assertEqual(result, rows)
 
     def test_content_declaration_retries_only_after_known_cover_prompt_is_dismissed(self) -> None:
         """横封面提示可关闭后重试一次，并始终限定在声明弹层内。"""
@@ -1087,6 +1125,58 @@ class DouyinCommerceMusicRuleTests(unittest.TestCase):
                 [item, dict(item, marker="favorite-1")]
             )
 
+    def test_music_cache_uses_metadata_fingerprint_when_platform_id_is_missing(self) -> None:
+        """新版收藏页未暴露 ID 时，缓存仍可按完整公开元数据稳定复用。"""
+
+        visible = {
+            "musicId": "visible:测试歌|测试作者|01:08|favorite-index:1",
+            "title": "测试歌",
+            "creator": "测试作者",
+            "duration": "01:08",
+            "marker": "favorite-0",
+        }
+        cached = douyin_favorite_music_cache._normalize_cache_row(visible)
+
+        self.assertIsNotNone(cached)
+        self.assertTrue(cached["musicId"].startswith("metadata:"))
+        matched = douyin_music_service.find_favorite_music_by_id([visible], cached["musicId"])
+        self.assertEqual(matched["musicId"], visible["musicId"])
+
+    def test_music_metadata_fingerprint_is_persisted_and_reloaded(self) -> None:
+        """无平台 ID 的收藏音乐必须真实写入 SQLite，并可被下一次批量加载。"""
+
+        visible = {
+            "musicId": "visible:测试歌|测试作者|01:08|favorite-index:1",
+            "title": "测试歌",
+            "creator": "测试作者",
+            "duration": "01:08",
+        }
+        with tempfile.TemporaryDirectory() as root:
+            temporary_database = Path(root) / "cache.db"
+            with patch.object(database, "DB_PATH", temporary_database):
+                saved = douyin_favorite_music_cache.replace_cached_favorite_music(801, [visible])
+                loaded = douyin_favorite_music_cache.list_cached_favorite_music(801)
+
+        self.assertEqual(saved, loaded)
+        self.assertEqual(loaded[0]["title"], "测试歌")
+        self.assertTrue(loaded[0]["musicId"].startswith("metadata:"))
+
+    def test_music_metadata_cache_rejects_ambiguous_current_candidates(self) -> None:
+        """同名、同作者、同时长的多个当前候选不能猜测选择。"""
+
+        visible = {
+            "musicId": "visible:测试歌|测试作者|01:08|favorite-index:1",
+            "title": "测试歌",
+            "creator": "测试作者",
+            "duration": "01:08",
+        }
+        cached = douyin_favorite_music_cache._normalize_cache_row(visible)
+        with self.assertRaisesRegex(douyin_music_service.DouyinMusicError, "不唯一"):
+            douyin_music_service.find_favorite_music_by_id(
+                [visible, dict(visible, musicId="visible:测试歌|测试作者|01:08|favorite-index:2")],
+                cached["musicId"],
+            )
+
     def test_commerce_editor_skips_cover_and_requires_favorite_music(self) -> None:
         class App:
             pass
@@ -1182,6 +1272,46 @@ class DouyinCommerceMusicAsyncTests(unittest.IsolatedAsyncioTestCase):
                 await douyin_music_service._favorite_music_rows(
                     dialog, attempts=1, interval_seconds=0
                 )
+
+    async def test_cached_metadata_music_keeps_cache_identity_after_current_picker_readback(self) -> None:
+        """批量执行器比较缓存身份时，临时列表身份不能覆盖它。"""
+
+        class OpenPage:
+            def is_closed(self) -> bool:
+                return False
+
+        current = {
+            "musicId": "visible:测试歌|测试作者|01:08|favorite-index:1",
+            "title": "测试歌",
+            "creator": "测试作者",
+            "duration": "01:08",
+            "marker": "favorite-0",
+        }
+        cached = douyin_favorite_music_cache._normalize_cache_row(current)
+        manager = douyin_commerce_session.DouyinCommerceSessionManager()
+        manager._session = douyin_commerce_session._CommerceEditorSession(
+            session_id="metadata-session",
+            upload_payload={},
+            account_name="测试账号",
+            browser=None,
+            context=None,
+            page=OpenPage(),
+            playwright=None,
+            uploader=None,
+            music_dialog=object(),
+            music_candidates=[current],
+        )
+        with patch.object(
+            manager,
+            "_select_favorite_music",
+            new=AsyncMock(return_value=dict(current)),
+        ) as select:
+            selected = await manager._select_cached_favorite_music(
+                "metadata-session", cached["musicId"]
+            )
+
+        select.assert_awaited_once_with("metadata-session", current["musicId"])
+        self.assertEqual(selected["musicId"], cached["musicId"])
 
 
 class MediaServiceVideoMetadataTests(unittest.TestCase):
@@ -1285,6 +1415,30 @@ class DouyinCommerceUiTests(unittest.TestCase):
             "douyinCommerceExecutionLog",
         )
 
+    def test_tag_history_chip_exposes_a_local_remove_button(self) -> None:
+        """最近标签的删除按钮只删除本地历史，不修改当前已选标签。"""
+
+        self.page._tag_history = ["北海", "探店"]
+        self.page._render_tag_history()
+        remove_button = next(
+            button
+            for button in reversed(
+                self.page.tag_history_host.findChildren(
+                    QPushButton, "douyinCommerceTagHistoryRemove"
+                )
+            )
+            if button.toolTip() == "删除历史标签 #北海"
+        )
+        self.assertIsNotNone(remove_button)
+        with patch(
+            "ui.douyin_commerce_page.douyin_commerce_draft_service.remove_tag_history",
+            return_value=["探店"],
+        ) as remove_history:
+            remove_button.click()
+
+        remove_history.assert_called_once_with("北海")
+        self.assertEqual(self.page._tag_history, ["探店"])
+
     def test_execution_log_panel_receives_runtime_output(self) -> None:
         """三个日志面板均订阅同一运行日志总线。"""
 
@@ -1308,17 +1462,35 @@ class DouyinCommerceUiTests(unittest.TestCase):
         self.assertIn("复制日志回归标识", copied)
         self.assertIn("已复制", self.page.content_execution_log.copy_button.text())
 
+    def test_execution_log_panel_clears_shared_log_history(self) -> None:
+        """清空日志应同时清除所有步骤共享的运行记录。"""
+
+        runtime_log_bus().publish("清空日志回归标识")
+        self.app.processEvents()
+        self.page.content_execution_log.clear_execution_log()
+
+        self.assertEqual(runtime_log_bus().history(), [])
+        self.assertEqual(self.page.content_execution_log.output.toPlainText(), "")
+        self.assertEqual(self.page.review_execution_log.output.toPlainText(), "")
+        self.assertIn("已清空", self.page.content_execution_log.clear_button.text())
+
     def test_platform_settings_prioritize_two_work_columns_over_logs(self) -> None:
         """平台设置只保留共享设置与逐条地点两栏，日志不占主工作区。"""
 
         self.assertEqual(self.page.content_columns.columnStretch(2), 27)
         self.assertEqual(self.page.content_columns.columnMinimumWidth(2), 300)
-        self.assertEqual(self.page.platform_columns.columnStretch(0), 42)
-        self.assertEqual(self.page.platform_columns.columnStretch(1), 58)
+        self.assertEqual(self.page.platform_columns.columnStretch(0), 3)
+        self.assertEqual(self.page.platform_columns.columnStretch(1), 7)
         self.assertEqual(self.page.platform_columns.columnStretch(2), 0)
         self.assertTrue(self.page.platform_execution_log.isHidden())
-        self.assertEqual(self.page.review_columns.columnStretch(1), 27)
-        self.assertEqual(self.page.review_columns.columnMinimumWidth(1), 300)
+        self.assertEqual(self.page.review_columns.columnStretch(0), 25)
+        self.assertEqual(self.page.review_columns.columnStretch(1), 50)
+        self.assertEqual(self.page.review_columns.columnStretch(2), 25)
+        self.assertEqual(self.page.review_columns.columnMinimumWidth(2), 300)
+        self.assertIs(
+            self.page.review_submission_panel.parentWidget(),
+            self.page.review_execution_log.parentWidget(),
+        )
 
     def test_declaration_summary_card_is_not_rendered_in_platform_settings(self) -> None:
         """声明单选项已足够表达状态，不应再占用额外的长摘要框。"""
@@ -1397,6 +1569,10 @@ class DouyinCommerceUiTests(unittest.TestCase):
         self.assertTrue(
             self.page.declaration_buttons["无需添加自主声明"].isChecked()
         )
+        self.page._session_id = "session-demo"
+        self.page._sync_view()
+        self.assertFalse(self.page.declaration_buttons["内容为转载信息"].isEnabled())
+        self.assertTrue(self.page.declaration_buttons["内容由AI生成"].isEnabled())
         self.assertIsNone(self.page.findChild(QComboBox, "douyinCommerceStore"))
         self.assertIsNone(
             self.page.findChild(QComboBox, "douyinCommerceContentDeclaration")
@@ -1667,10 +1843,10 @@ class DouyinCommerceUiTests(unittest.TestCase):
         self.assertIsNone(self.page.music_combo.currentData())
         self.assertIn("当前音乐：旧音乐", self.page.music_combo.currentText())
 
-    def test_successful_music_write_discards_transient_candidates_before_change(
+    def test_successful_music_write_keeps_public_candidates_for_next_change(
         self,
     ) -> None:
-        """更换过一次音乐后，下次点击必须重新读取当前抖音弹窗。"""
+        """更换音乐无需手动刷新；下次写入会以当前平台抽屉重新核验。"""
 
         selected_music = {"musicId": "music-new", "title": "新音乐"}
         self.page._show_music_candidates(
@@ -1679,13 +1855,18 @@ class DouyinCommerceUiTests(unittest.TestCase):
 
         self.page._music_selected(selected_music)
 
-        self.assertEqual(self.page._music_candidates, [])
-        self.assertEqual(self.page.music_combo.count(), 1)
-        self.assertIsNone(self.page.music_combo.currentData())
-        self.assertIn("当前音乐：新音乐", self.page.music_combo.currentText())
-        with patch.object(self.page, "_load_favorite_music_candidates") as load:
-            self.page._music_combo_activated(0)
-        load.assert_called_once_with()
+        self.assertEqual(
+            self.page._music_candidates,
+            [
+                {"musicId": "music-old", "title": "旧音乐", "creator": "", "duration": ""},
+                {"musicId": "music-new", "title": "新音乐", "creator": "", "duration": ""},
+            ],
+        )
+        self.assertEqual(self.page._music_candidate_source, "cache")
+        self.assertEqual(self.page.music_combo.count(), 3)
+        with patch.object(self.page, "_start_music_write") as write:
+            self.page._music_combo_activated(1)
+        write.assert_called_once_with(self.page._music_candidates[0])
 
     def test_location_click_immediately_starts_platform_write(self) -> None:
         """地点候选点击后直接进入同一编辑会话回读，不再要求二次确认。"""
@@ -2000,14 +2181,14 @@ class DouyinCommerceUiTests(unittest.TestCase):
         self.assertIs(self.page.operation_dock_upload.parent(), self.page.operation_dock)
         self.assertFalse(self.page.operation_dock.isHidden())
 
-    def test_content_cards_keep_only_primary_section_titles(self) -> None:
-        """内容准备的输入栏只保留账号、内容两个主标题。"""
+    def test_content_cards_keep_uniform_primary_section_titles(self) -> None:
+        """内容准备的账号、内容和视频栏必须使用同一套主标题样式。"""
 
         headings = self.page.findChildren(
             QLabel, "douyinCommerceReferenceCardEyebrow"
         )
 
-        self.assertEqual([heading.text() for heading in headings], ["账号", "内容"])
+        self.assertEqual([heading.text() for heading in headings], ["账号", "内容", "视频"])
         self.assertIsNone(
             self.page.findChild(QLabel, "douyinCommerceReferenceCardTitle")
         )
@@ -2084,15 +2265,10 @@ class DouyinCommerceUiTests(unittest.TestCase):
 
         payload = {"enableTimer": False, "runtimeMode": "publish", "debugDryRun": False}
         self.page._session_id = "commerce-session"
-        self.page._preflight_fingerprint = "preflight-match"
-        confirmation = MagicMock()
-        confirmation.exec.return_value = QDialog.DialogCode.Accepted
+        self.page._preflight_fingerprint = ""
         task = {"id": 71, "taskNo": "T0806-0071"}
         with patch.object(self.page, "collect_payload", return_value=payload), patch.object(
-            self.page, "_payload_fingerprint", return_value="preflight-match"
-        ), patch.object(self.page, "_summary", return_value={}), patch(
-            "ui.douyin_commerce_page.DouyinCommerceConfirmDialog",
-            return_value=confirmation,
+            self.page, "_can_review", return_value=True
         ), patch(
             "ui.douyin_commerce_page.task_service.create_pending_task", return_value=task
         ), patch(
@@ -2105,6 +2281,19 @@ class DouyinCommerceUiTests(unittest.TestCase):
             run.call_args.args[1]()
 
         submit.assert_called_once_with("commerce-session", payload, 71)
+
+    def test_batch_submit_starts_directly_without_a_second_confirmation_dialog(self) -> None:
+        """点击批量确认提交后应直接创建任务，汇总信息已在检查页展示。"""
+
+        payload = {"items": [{"mediaPath": "C:/demo.mp4"}]}
+        task = {"id": 72, "taskNo": "T0806-0072"}
+        with patch.object(self.page, "collect_batch_payload", return_value=payload), patch(
+            "ui.douyin_commerce_page.task_service.create_douyin_batch_task",
+            return_value=task,
+        ), patch.object(self.page, "start_batch_publish") as start:
+            self.page.open_batch_submit_confirmation()
+
+        start.assert_called_once_with(payload, task)
 
     def test_verification_polling_deduplicates_a_task_dialog_and_clears_its_request(self) -> None:
         """重复轮询同一任务不得叠加对话框，任务结束必须清空内存请求。"""
@@ -2592,6 +2781,67 @@ class DouyinCommerceUiTests(unittest.TestCase):
         self.assertIs(layout.itemAt(0).widget(), self.page.platform_review_status)
         self.assertIs(layout.itemAt(1).widget(), self.page.platform_back_button)
         self.assertIs(layout.itemAt(2).widget(), self.page.to_review_button)
+
+    def test_platform_progress_is_rendered_in_bottom_action_dock(self) -> None:
+        """平台处理状态不能额外占用工作区顶部，应显示在底部操作栏。"""
+
+        self.page._immediate_write_kind = "music"
+        self.page._sync_platform_workspace()
+
+        self.assertIsNone(
+            self.page.findChild(QFrame, "douyinCommercePlatformProgress")
+        )
+        self.assertTrue(self.page.platform_session_status.isHidden())
+        self.assertEqual(self.page.platform_review_status.text(), "正在处理，请稍候")
+
+    def test_review_footer_places_back_and_submit_on_the_right(self) -> None:
+        """检查页的返回和确认提交必须归入统一底部操作栏右侧。"""
+
+        layout = self.page.review_action_dock.layout()
+
+        self.assertIs(layout.itemAt(0).widget(), self.page.validation_label)
+        self.assertIs(layout.itemAt(1).widget(), self.page.review_back_button)
+        self.assertIs(layout.itemAt(3).widget(), self.page.submit_button)
+        self.assertIsNot(self.page.review_back_button.parentWidget(), self.page.review_submission_panel)
+        self.assertIsNot(self.page.submit_button.parentWidget(), self.page.review_submission_panel)
+
+    def test_review_footer_uses_concise_publish_hint(self) -> None:
+        """检查页底部仅保留简洁的提交提示，避免冗长重复说明。"""
+
+        self.page._selected_video_indexes = [1]
+        with patch.object(
+            self.page, "collect_batch_payload", return_value={"items": [{}]}
+        ), patch.object(self.page, "_can_batch_review", return_value=True):
+            self.page._sync_workbench()
+
+        self.assertEqual(self.page.validation_label.text(), "确认信息后提交发布。")
+
+    def test_all_stage_footers_share_height_layout_and_action_button_spec(self) -> None:
+        """三个阶段的底部操作栏必须使用同一高度、内边距与按钮规格。"""
+
+        footers = (
+            self.page.operation_dock,
+            self.page.platform_review_dock,
+            self.page.review_action_dock,
+        )
+        for footer in footers:
+            layout = footer.layout()
+            self.assertEqual(footer.minimumHeight(), 82)
+            self.assertEqual(footer.maximumHeight(), 82)
+            self.assertEqual(layout.contentsMargins().left(), 22)
+            self.assertEqual(layout.contentsMargins().top(), 15)
+            self.assertEqual(layout.contentsMargins().right(), 20)
+            self.assertEqual(layout.contentsMargins().bottom(), 15)
+            self.assertEqual(layout.spacing(), 12)
+
+        for action in (
+            self.page.operation_dock_upload,
+            self.page.platform_back_button,
+            self.page.to_review_button,
+            self.page.review_back_button,
+            self.page.submit_button,
+        ):
+            self.assertTrue(action.property("footerAction"))
 
     def test_continue_to_review_syncs_schedule_before_navigation(self) -> None:
         """检查页前必须先核对编辑页定时；仅在回读成功后才进入下一步。"""
@@ -4541,6 +4791,159 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             self.assertIn("主体", self.page.account_card.text())
             self.assertEqual(self.page.batch_video_list.count(), 3)
 
+    def test_batch_location_rerender_replaces_old_scroll_body_without_overlapping_cards(self) -> None:
+        """地点搜索回读后重绘只能保留一套卡片，不能累积旧的嵌套列布局。"""
+
+        for index in range(3):
+            self.page.video_combo.addItem(
+                f"视频 {index + 1}.mp4",
+                {
+                    "id": index + 1,
+                    "storedPath": f"/tmp/batch-{index + 1}.mp4",
+                    "filename": f"视频 {index + 1}.mp4",
+                },
+            )
+        self.page._selected_video_indexes = [1, 2, 3]
+        self.page._render_batch_item_rows()
+        first_body = self.page.batch_item_rows.widget()
+        self.page._render_batch_item_rows()
+        second_body = self.page.batch_item_rows.widget()
+
+        self.assertIsNot(first_body, second_body)
+        self.assertEqual(
+            len(second_body.findChildren(QFrame, "douyinCommerceBatchItemRow")),
+            3,
+        )
+        self.assertIsNotNone(second_body.layout().itemAtPosition(0, 0))
+        self.assertIsNotNone(second_body.layout().itemAtPosition(1, 0))
+        self.assertIsNone(second_body.layout().itemAtPosition(0, 1))
+
+    def test_batch_location_rows_keep_three_to_seven_width_and_fixed_control_heights(self) -> None:
+        """地点行须保持视频 3、地点 7 的宽度比例，避免下拉框被裁切。"""
+
+        apply_style(self.app)
+        self.page.video_combo.clear()
+        self.page.video_combo.addItem("请选择视频", None)
+        self.page.video_combo.addItem(
+            "超长视频标题用于测试布局.mp4",
+            {
+                "storedPath": "/tmp/location-ratio.mp4",
+                "filename": "超长视频标题用于测试布局.mp4",
+            },
+        )
+        self.page._selected_video_indexes = [1]
+        self.page._render_batch_item_rows()
+        row = self.page.batch_item_rows.widget().findChild(
+            QFrame, "douyinCommerceBatchItemRow"
+        )
+        combo = row.findChild(QComboBox, "douyinCommerceBatchLocationCandidates")
+
+        self.assertEqual(row.minimumHeight(), 35)
+        self.assertEqual(row.maximumHeight(), 35)
+        self.assertEqual(row.layout().stretch(0), 3)
+        self.assertEqual(row.layout().stretch(1), 7)
+        self.assertEqual(combo.minimumHeight(), 30)
+        self.assertEqual(combo.maximumHeight(), 30)
+        self.assertEqual(self.page.batch_item_rows.widget().layout().verticalSpacing(), 0)
+        self.page.show()
+        self.app.processEvents()
+        self.assertEqual(combo.height(), 30)
+
+    def test_batch_review_rows_wrap_text_without_horizontal_scrollbar(self) -> None:
+        """逐条发布信息应自动换行，不能出现横向滚动条。"""
+
+        self.page.video_combo.clear()
+        self.page.video_combo.addItem("请选择视频", None)
+        self.page.video_combo.addItem(
+            "非常长的视频标题用于检查自动换行.mp4",
+            {
+                "storedPath": "/tmp/review-wrap.mp4",
+                "filename": "非常长的视频标题用于检查自动换行.mp4",
+            },
+        )
+        self.page._selected_video_indexes = [1]
+        self.page._batch_locations["/tmp/review-wrap.mp4"] = {
+            "name": "非常长的地点名称",
+            "address": "这是用于验证检查提交区域自动换行行为的一段很长很长的完整地址信息",
+        }
+        self.page._render_batch_review_rows()
+        labels = self.page.batch_review_rows.widget().findChildren(QLabel)
+
+        self.assertEqual(
+            self.page.batch_review_rows.horizontalScrollBarPolicy(),
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
+        )
+        self.assertTrue(all(label.wordWrap() for label in labels))
+
+    def test_batch_review_uses_original_filename_and_copies_selectable_information(self) -> None:
+        """逐条发布信息只能展示原始文件名，且可选择、可一键复制。"""
+
+        path = "/tmp/2e5f2bc0-9216-11f1-b29f-1831bfcc9866_北海探店.mp4"
+        self.page.video_combo.clear()
+        self.page.video_combo.addItem("请选择视频", None)
+        self.page.video_combo.addItem(
+            "2e5f2bc0-9216-11f1-b29f-1831bfcc9866_北海探店.mp4",
+            {"storedPath": path, "filename": Path(path).name},
+        )
+        self.page._selected_video_indexes = [1]
+        self.page._batch_locations[path] = {
+            "name": "北海银滩",
+            "address": "广西壮族自治区北海市银海区银滩大道",
+        }
+        self.page._render_batch_review_rows()
+        labels = self.page.batch_review_rows.widget().findChildren(QLabel)
+
+        self.assertTrue(any("视频名称：北海探店.mp4" == label.text() for label in labels))
+        self.assertFalse(any("2e5f2bc0-9216-11f1-b29f-1831bfcc9866" in label.text() for label in labels))
+        self.assertTrue(
+            all(
+                label.textInteractionFlags() & Qt.TextInteractionFlag.TextSelectableByMouse
+                for label in labels
+            )
+        )
+        with patch("ui.douyin_commerce_page.QApplication.clipboard") as clipboard:
+            self.page.copy_batch_publish_information()
+
+        copied = clipboard.return_value.setText.call_args.args[0]
+        self.assertIn("视频名称：北海探店.mp4", copied)
+        self.assertIn("地点：北海银滩", copied)
+        self.assertIn("发布时间：直接发布", copied)
+
+    def test_batch_location_search_auto_fills_only_unassigned_videos_in_order(self) -> None:
+        """地点搜索成功后，应跳过已有地点并按候选顺序填充其余视频。"""
+
+        self.page.video_combo.clear()
+        self.page.video_combo.addItem("请选择视频", None)
+        paths = []
+        for index in range(3):
+            path = f"/tmp/auto-location-{index + 1}.mp4"
+            paths.append(path)
+            self.page.video_combo.addItem(
+                f"视频 {index + 1}.mp4",
+                {"id": index + 1, "storedPath": path, "filename": f"视频 {index + 1}.mp4"},
+            )
+        self.page._selected_video_indexes = [1, 2, 3]
+        self.page._batch_locations[paths[1]] = {
+            "poiId": "existing", "name": "已选择地点", "address": "原有地址", "scope": "domestic",
+        }
+        candidates = [
+            {"poiId": "poi-1", "name": "候选一", "address": "地址一"},
+            {"poiId": "poi-2", "name": "候选二", "address": "地址二"},
+            {"poiId": "poi-3", "name": "候选三", "address": "地址三"},
+        ]
+
+        with patch(
+            "ui.douyin_commerce_page.save_location_preset",
+            side_effect=lambda _account_id, candidate, scope: {**candidate, "scope": scope},
+        ) as save_preset:
+            self.page._batch_location_search_succeeded("domestic", "测试", candidates)
+
+        self.assertEqual(self.page._batch_locations[paths[0]]["poiId"], "poi-1")
+        self.assertEqual(self.page._batch_locations[paths[1]]["poiId"], "existing")
+        self.assertEqual(self.page._batch_locations[paths[2]]["poiId"], "poi-2")
+        self.assertEqual(save_preset.call_count, 2)
+        self.assertIn("自动填充 2 条", self.page.batch_item_settings_status.text())
+
     def test_batch_defaults_to_immediate_and_only_generates_interval_when_enabled(self) -> None:
         self.page.video_combo.clear()
         self.page.video_combo.addItem("请选择视频", None)
@@ -4556,6 +4959,36 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.assertEqual(self.page.item_schedule_text(1), "09:30")
         self.page.set_item_schedule_override(2, "2026-08-07 15:00")
         self.assertEqual(self.page.item_schedule_text(2), "15:00")
+
+    def test_batch_declaration_change_stays_local_until_final_submission(self) -> None:
+        """批量修改声明不可重复访问编辑页，最终提交才逐条写入并回读。"""
+
+        self.page.video_combo.clear()
+        self.page.video_combo.addItem("请选择视频", None)
+        self.page.video_combo.addItem(
+            "视频 1.mp4",
+            {"storedPath": "/tmp/declaration-local.mp4", "filename": "视频 1.mp4"},
+        )
+        self.page._selected_video_indexes = [1]
+        self.page._session_id = "session-demo"
+        self.page._sync_view()
+
+        with patch.object(self.page, "_start_declaration_write") as write:
+            self.page.declaration_buttons["内容由AI生成"].click()
+
+        write.assert_not_called()
+        self.assertEqual(self.page._selected_declaration(), "内容由AI生成")
+        self.assertEqual(self.page._confirmed_declaration, "内容由AI生成")
+        self.assertFalse(self.page.declaration_status.isVisible())
+
+    def test_batch_schedule_date_time_and_interval_share_one_row(self) -> None:
+        """批量定时的日期、时间与间隔应并列显示，避免间隔被拆到下一行。"""
+
+        schedule_row = self.page.batch_schedule_row
+
+        self.assertGreaterEqual(schedule_row.indexOf(self.page.schedule_date), 0)
+        self.assertGreaterEqual(schedule_row.indexOf(self.page.schedule_time), 0)
+        self.assertGreaterEqual(schedule_row.indexOf(self.page.batch_schedule_controls), 0)
 
     def test_collect_batch_payload_generates_explicit_item_timer_fields_before_ui_task_creation(self) -> None:
         with tempfile.TemporaryDirectory() as root:
@@ -4616,7 +5049,50 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
                 self.page.start_preflight()
 
             batch.assert_called_once()
-            legacy.assert_not_called()
+        legacy.assert_not_called()
+
+    def test_batch_review_directly_enables_submit_without_preflight(self) -> None:
+        """批量第三阶段不应要求先上传一轮预检，确认提交只执行一次正式上传。"""
+
+        video_path = "/tmp/direct-submit.mp4"
+        self.page.account_combo.addItem(
+            "账号 · 主体",
+            {
+                "id": 1,
+                "type": 3,
+                "status": 1,
+                "filePath": "douyin-1.json",
+                "userName": "账号",
+                "profileName": "主体",
+            },
+        )
+        self.page.account_combo.setCurrentIndex(1)
+        self.page.video_combo.addItem(
+            "direct-submit.mp4",
+            {"id": 1, "storedPath": video_path, "filename": "direct-submit.mp4"},
+        )
+        self.page._selected_video_indexes = [1]
+        self.page.description_input.setPlainText("批量直接提交测试文案")
+        self.page._selected_music = {
+            "musicId": "music-1",
+            "title": "收藏歌",
+            "creator": "作者",
+            "duration": "00:30",
+        }
+        self.page._set_selected_declaration("无需添加自主声明")
+        video = self.page._selected_videos()[0]
+        self.page._batch_locations[str(video.get("storedPath") or "")] = {
+            "poiId": "poi-1",
+            "name": "北海银滩景区",
+            "address": "广西壮族自治区北海市银海区银滩大道中段",
+            "scope": "domestic",
+        }
+        self.page.pages.setCurrentIndex(2)
+        self.page._sync_view()
+
+        self.assertTrue(self.page.preflight_button.isHidden())
+        self.assertTrue(self.page.submit_button.isEnabled())
+        self.assertIn("确认提交 1 条视频", self.page.submit_button.text())
 
     def test_batch_draft_roundtrip_preserves_mode_schedule_and_item_overrides(self) -> None:
         """本地草稿恢复不能丢失立即/间隔模式、北京时间起点或逐条覆盖。"""
@@ -4707,8 +5183,8 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.assertEqual(self.page.batch_publish_mode.currentData(), "interval-schedule")
         self.assertFalse(self.page.batch_schedule_controls.isHidden())
 
-    def test_batch_location_candidates_are_bound_per_video_from_setup_session(self) -> None:
-        """地点候选属于对应视频，选择后保留完整 POI 与地址。"""
+    def test_batch_location_candidates_are_shared_then_bound_per_video(self) -> None:
+        """顶部统一搜索的候选可分别绑定到每条视频。"""
 
         path = "/tmp/first.mp4"
         candidate = {
@@ -4717,11 +5193,9 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             "address": "广西壮族自治区北海市银海区银滩大道中段",
             "distance": "6km",
         }
-        self.page._batch_location_search_succeeded(
-            path, "domestic", "北海", [candidate]
-        )
+        self.page._batch_location_search_succeeded("domestic", "北海", [candidate])
         self.assertEqual(
-            self.page._batch_location_searches[path]["candidates"][0]["poiId"],
+            self.page._batch_location_searches["__shared_location_search__"]["candidates"][0]["poiId"],
             "poi-1",
         )
         account = {"id": 99, "type": 3, "status": 1, "filePath": "douyin-99.json"}
@@ -4736,8 +5210,141 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         save.assert_called_once_with(99, candidate, "domestic")
         self.assertEqual(self.page._batch_locations[path]["address"], candidate["address"])
 
-    def test_batch_music_selection_with_setup_session_writes_current_editor(self) -> None:
-        """批量模式拿到设置会话后，音乐不能再只写本机草稿。"""
+    def test_batch_location_search_results_are_available_to_every_video_dropdown(self) -> None:
+        """所有视频行复用顶部搜索结果，界面不再各自创建搜索框。"""
+
+        for index in range(2):
+            self.page.video_combo.addItem(
+                f"视频 {index + 1}.mp4",
+                {
+                    "id": index + 1,
+                    "storedPath": f"/tmp/shared-location-{index + 1}.mp4",
+                    "filename": f"视频 {index + 1}.mp4",
+                },
+            )
+        self.page._selected_video_indexes = [1, 2]
+        candidate = {
+            "poiId": "poi-shared",
+            "name": "北海银滩景区",
+            "address": "广西壮族自治区北海市银海区银滩大道中段",
+        }
+
+        self.page._batch_location_search_succeeded("domestic", "北海", [candidate])
+        body = self.page.batch_item_rows.widget()
+        dropdowns = body.findChildren(QComboBox, "douyinCommerceBatchLocationCandidates")
+
+        self.assertEqual(len(dropdowns), 2)
+        self.assertTrue(all(dropdown.count() == 2 for dropdown in dropdowns))
+        self.assertTrue(all(dropdown.isEnabled() for dropdown in dropdowns))
+        self.assertTrue(
+            all(dropdown.itemData(1)["poiId"] == "poi-shared" for dropdown in dropdowns)
+        )
+        self.assertEqual(
+            len(body.findChildren(QLineEdit, "douyinCommerceBatchLocationKeyword")),
+            0,
+        )
+
+    def test_batch_location_search_error_remains_visible_after_rerender(self) -> None:
+        """平台搜索失败时必须保留诊断，不能被通用提示覆盖。"""
+
+        self.page._batch_location_search_failed("当前编辑页未返回与关键词相符的地点")
+
+        self.assertIn("地点候选读取失败", self.page.batch_item_settings_status.text())
+        self.assertIn("关键词", self.page.batch_item_settings_status.text())
+
+    def test_batch_location_dropdown_survives_unrelated_platform_state_sync(self) -> None:
+        """状态刷新不能替换用户正准备点击的地点下拉框。"""
+
+        self.page.video_combo.addItem(
+            "视频 1.mp4",
+            {
+                "id": 1,
+                "storedPath": "/tmp/location-stable.mp4",
+                "filename": "视频 1.mp4",
+            },
+        )
+        self.page._selected_video_indexes = [1]
+        candidate = {
+            "poiId": "poi-stable",
+            "name": "北海银滩景区",
+            "address": "广西壮族自治区北海市银海区银滩大道中段",
+        }
+        self.page._batch_location_search_succeeded("domestic", "北海", [candidate])
+        body = self.page.batch_item_rows.widget()
+        dropdown = body.findChild(QComboBox, "douyinCommerceBatchLocationCandidates")
+
+        self.page._sync_platform_workspace()
+
+        self.assertIs(self.page.batch_item_rows.widget(), body)
+        self.assertIs(
+            body.findChild(QComboBox, "douyinCommerceBatchLocationCandidates"),
+            dropdown,
+        )
+        self.assertTrue(dropdown.isEnabled())
+
+    def test_batch_location_search_auto_binds_first_unassigned_candidate(self) -> None:
+        """地点搜索成功后应自动把候选绑定到首条未设置视频。"""
+
+        path = "/tmp/location-clickable.mp4"
+        self.page.video_combo.clear()
+        self.page.video_combo.addItem("请选择视频", None)
+        self.page.video_combo.addItem(
+            "视频 1.mp4",
+            {"id": 1, "storedPath": path, "filename": "视频 1.mp4"},
+        )
+        self.page._selected_video_indexes = [1]
+        account = {"id": 97, "type": 3, "status": 1, "filePath": "douyin-97.json"}
+        self.page.account_combo.clear()
+        self.page.account_combo.addItem("账号", account)
+        candidate = {
+            "poiId": "poi-clickable",
+            "name": "北海银滩景区",
+            "address": "广西壮族自治区北海市银海区银滩大道中段",
+        }
+        with patch(
+            "ui.douyin_commerce_page.save_location_preset",
+            return_value={**candidate, "scope": "domestic", "id": "preset-clickable"},
+        ) as save:
+            self.page._batch_location_search_succeeded("domestic", "北海", [candidate])
+
+        save.assert_called_once_with(97, candidate, "domestic")
+        self.assertEqual(self.page._batch_locations[path]["poiId"], "poi-clickable")
+        dropdown = self.page.batch_item_rows.widget().findChild(
+            QComboBox, "douyinCommerceBatchLocationCandidates"
+        )
+        self.assertEqual(dropdown.currentIndex(), 1)
+
+    def test_batch_location_selected_value_is_only_shown_in_dropdown(self) -> None:
+        """已选地点只保留在下拉框中，避免视频卡片重复显示完整地址。"""
+
+        path = "/tmp/location-selected.mp4"
+        self.page.video_combo.clear()
+        self.page.video_combo.addItem("请选择视频", None)
+        self.page.video_combo.addItem(
+            "视频 1.mp4",
+            {"id": 1, "storedPath": path, "filename": "视频 1.mp4"},
+        )
+        self.page._selected_video_indexes = [1]
+        selected = {
+            "poiId": "poi-selected",
+            "name": "北海银滩景区",
+            "address": "广西壮族自治区北海市银海区银滩大道中段",
+            "scope": "domestic",
+        }
+        self.page._batch_locations[path] = selected
+        self.page._batch_location_search_succeeded("domestic", "北海", [])
+        body = self.page.batch_item_rows.widget()
+        dropdown = body.findChild(QComboBox, "douyinCommerceBatchLocationCandidates")
+
+        self.assertTrue(dropdown.isEnabled())
+        self.assertGreater(dropdown.currentIndex(), 0)
+        self.assertIn("北海银滩景区", dropdown.currentText())
+        self.assertEqual(
+            body.findChildren(QLabel, "douyinCommerceBatchLocationSelected"), []
+        )
+
+    def test_batch_music_selection_with_setup_session_stays_local_until_preflight(self) -> None:
+        """批量选择音乐只更新本地配置，预检时才逐条写入平台。"""
 
         candidate = {"musicId": "music-1", "title": "收藏歌", "creator": "作者", "duration": "00:30"}
         self.page._selected_video_indexes = [1, 2]
@@ -4746,7 +5353,28 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         with patch.object(self.page, "_start_music_write") as write:
             self.page._music_combo_activated(1)
 
-        write.assert_called_once_with(candidate)
+        write.assert_not_called()
+        self.assertEqual(self.page._selected_music, candidate)
+        self.assertEqual(self.page.music_combo.currentData(), candidate)
+        self.assertIn("收藏歌", self.page.music_combo.currentText())
+        self.assertFalse(self.page.music_status.isVisible())
+
+    def test_batch_platform_read_writes_favorite_music_to_local_cache(self) -> None:
+        """已读取的收藏音乐须落盘，下一批无需再次刷新才能加载。"""
+
+        account = {"id": 96, "type": 3, "status": 1, "filePath": "douyin-96.json"}
+        candidate = {"musicId": "music-96", "title": "本地缓存歌", "creator": "作者", "duration": "00:30"}
+        self.page.account_combo.clear()
+        self.page.account_combo.addItem("账号", account)
+        self.page.account_combo.setCurrentIndex(0)
+        self.page._selected_video_indexes = [1]
+
+        with patch(
+            "ui.douyin_commerce_page.douyin_favorite_music_cache.replace_cached_favorite_music"
+        ) as replace:
+            self.page._show_music_candidates([candidate], source="session")
+
+        replace.assert_called_once_with(96, [candidate])
 
     def test_batch_cached_music_candidate_click_selects_locally_without_editor_write(self) -> None:
         """未上传时点击本地收藏候选，只更新批量草稿，不访问编辑会话。"""
@@ -4771,7 +5399,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         write.assert_not_called()
         self.assertEqual(self.page._selected_music, candidate)
         self.assertEqual(self.page._batch_preflight_fingerprint, "")
-        self.assertIn("已选择", self.page.music_status.text())
+        self.assertFalse(self.page.music_status.isVisible())
 
     def test_batch_editor_session_end_explains_rebuild_for_shared_content_changes(self) -> None:
         """批量会话关闭后只改共享字段，页面必须说明下次预检会重建会话。"""
@@ -4786,8 +5414,8 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         expected = "编辑会话已结束；预检将为每条视频重新建立上传会话"
         self.assertFalse(self.page.content_notice.isHidden())
         self.assertIn(expected, self.page.content_notice.text())
-        self.assertFalse(self.page.platform_session_status.isHidden())
-        self.assertIn(expected, self.page.platform_session_status.text())
+        self.assertTrue(self.page.platform_session_status.isHidden())
+        self.assertIn(expected, self.page.platform_review_status.text())
         self.assertEqual(self.page._batch_content_change_kind(), "reupload")
 
     def test_batch_preflight_reuploads_every_video_after_real_title_edit_and_session_close(self) -> None:

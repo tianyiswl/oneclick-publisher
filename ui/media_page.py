@@ -145,6 +145,9 @@ class MediaPage(QWidget):
         self.refresh_categories()
         rows = self.filtered_rows()
         self.table.clearSpans()
+        # 空态行会合并整行并在首列写入“暂无素材”。首个素材导入后若不清理
+        # 旧单元格，勾选框所在列可能残留该文本。
+        self.table.clearContents()
         self.table.setRowCount(len(rows))
         self.select_all.blockSignals(True)
         self.select_all.setChecked(False)

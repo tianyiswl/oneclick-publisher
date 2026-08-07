@@ -7,6 +7,7 @@ from functools import lru_cache
 import json
 import shutil
 import subprocess
+import sys
 import uuid
 from pathlib import Path
 
@@ -17,6 +18,14 @@ from .paths import COVER_DIR, ROOT_DIR, VIDEO_DIR
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".avi", ".wmv", ".flv", ".webm"}
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+
+def _hidden_process_options() -> dict[str, object]:
+    """在 Windows 静默运行本地媒体工具，避免素材导入时闪出控制台窗口。"""
+
+    if sys.platform.startswith("win"):
+        return {"creationflags": subprocess.CREATE_NO_WINDOW}
+    return {}
 
 
 def media_type(filename: str) -> str:
@@ -121,6 +130,7 @@ def _probe_local_video_metadata(stored_path: str) -> dict[str, str]:
             text=True,
             timeout=8,
             check=False,
+            **_hidden_process_options(),
         )
     except (OSError, subprocess.SubprocessError):
         return {}
@@ -186,7 +196,13 @@ def generate_video_cover(video_path: Path, media_id: int) -> str:
             str(cover_path),
         ]
         try:
-            subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
+            subprocess.run(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=20,
+                **_hidden_process_options(),
+            )
         except Exception:
             pass
     if not cover_path.exists():

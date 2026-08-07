@@ -25,6 +25,7 @@ class RuntimeLogBus(QObject):
     """跨线程汇总标准输出和 logging 记录，最多保留最近 300 条。"""
 
     line_added = pyqtSignal(str)
+    cleared = pyqtSignal()
 
     def __init__(self, parent: QObject) -> None:
         super().__init__(parent)
@@ -40,6 +41,12 @@ class RuntimeLogBus(QObject):
 
     def history(self) -> list[str]:
         return list(self._lines)
+
+    def clear(self) -> None:
+        """清空客户端当前运行日志；后续新日志仍会正常追加。"""
+
+        self._lines.clear()
+        self.cleared.emit()
 
 
 class _RuntimeLogStream:
@@ -141,6 +148,11 @@ class ExecutionLogPanel(QFrame):
         self.copy_button.setAccessibleName("复制全部执行日志")
         self.copy_button.clicked.connect(self.copy_execution_log)
         header.addWidget(self.copy_button)
+        self.clear_button = QPushButton("清空日志")
+        self.clear_button.setObjectName("douyinCommerceClearExecutionLog")
+        self.clear_button.setAccessibleName("清空全部执行日志")
+        self.clear_button.clicked.connect(self.clear_execution_log)
+        header.addWidget(self.clear_button)
         hint = QLabel("实时")
         hint.setObjectName("douyinCommerceExecutionLogHint")
         header.addWidget(hint)
@@ -158,6 +170,7 @@ class ExecutionLogPanel(QFrame):
             self.output.setPlainText("\n".join(history))
             self.output.moveCursor(QTextCursor.MoveOperation.End)
         bus.line_added.connect(self._append_line)
+        bus.cleared.connect(self.output.clear)
 
     def _append_line(self, line: str) -> None:
         self.output.appendPlainText(line)
@@ -172,3 +185,9 @@ class ExecutionLogPanel(QFrame):
             return
         QApplication.clipboard().setText(content)
         self.copy_button.setText(f"已复制 {len(content.splitlines())} 条")
+
+    def clear_execution_log(self) -> None:
+        """清空所有步骤共用的客户端日志记录。"""
+
+        runtime_log_bus().clear()
+        self.clear_button.setText("已清空")

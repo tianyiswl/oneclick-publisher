@@ -82,7 +82,11 @@ def _validated_receipt(
     else:
         if not (safe_readback.get("platformPostId") or safe_readback.get("postUrl")):
             raise ValueError("批量发布回执缺少 platformPostId 或 postUrl")
-        _validate_beijing_datetime("publishedAt")
+        # 抖音即时发表会先返回“已进入作品管理页”的 URL，而不一定暴露作品
+        # 级发布时间。真实管理页 URL 已能证明最终跳转；此时不能用客户端时间
+        # 伪造 publishedAt。若平台给出发布时间，仍必须按北京时间严格校验。
+        if "publishedAt" in safe_readback:
+            _validate_beijing_datetime("publishedAt")
 
     return normalized_event, safe_readback
 

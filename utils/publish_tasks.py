@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -39,10 +41,17 @@ def _as_bool(value: Any) -> bool:
     return value in (1, "1", True, "true", "True", "yes", "on")
 
 
-def _connect() -> sqlite3.Connection:
+@contextmanager
+def _connect() -> Iterator[sqlite3.Connection]:
+    """打开旧任务库连接，并在上下文退出时关闭 Windows 文件句柄。"""
+
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 def _is_douyin_commerce_batch_task(conn: sqlite3.Connection, task_id: int) -> bool:

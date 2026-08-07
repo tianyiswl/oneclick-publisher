@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+from hashlib import sha256
 import re
 from typing import Any, Mapping
 
@@ -86,9 +87,10 @@ def find_favorite_music_by_id(
 ) -> dict[str, str]:
     """从本次已打开的收藏抽屉中精确找回一条可点击音乐。
 
-    本地缓存只保存稳定的平台音乐 ID；真正写入前仍必须在当前编辑会话的
-    收藏抽屉中找到同一个 ID，拿到瞬态 ``marker`` 后才允许点击。缺失 ID、
-    过期缓存项或重复条目都不能退化为标题模糊匹配或“第一首”。
+    本地缓存优先保存稳定的平台音乐 ID；新版页面未暴露该 ID 时，缓存保存
+    歌曲名、作者、时长生成的稳定指纹。真正写入前仍必须在当前编辑会话的
+    收藏抽屉中精确匹配同一 ID 或完整三字段唯一候选，拿到瞬态 ``marker``
+    后才允许点击。缺失、过期或歧义项都不能退化为模糊匹配或“第一首”。
     """
 
     expected = _normalized(music_id)
@@ -96,14 +98,28 @@ def find_favorite_music_by_id(
         raise DouyinMusicError("抖音收藏音乐缺少可复用的平台身份，无法安全选择")
     if not isinstance(candidates, list):
         raise DouyinMusicError("抖音收藏音乐当前候选不可用，请刷新后重新选择")
-    matches = [
-        dict(item)
-        for item in candidates
-        if isinstance(item, Mapping)
-        and _normalized(item.get("musicId")) == expected
-    ]
+    if expected.startswith("metadata:"):
+        def metadata_identity(item: Mapping[str, str]) -> str:
+            material = "\x1f".join(
+                _normalized(item.get(key))
+                for key in ("title", "creator", "duration")
+            )
+            return f"metadata:{sha256(material.encode('utf-8')).hexdigest()}"
+
+        matches = [
+            dict(item)
+            for item in candidates
+            if isinstance(item, Mapping) and metadata_identity(item) == expected
+        ]
+    else:
+        matches = [
+            dict(item)
+            for item in candidates
+            if isinstance(item, Mapping)
+            and _normalized(item.get("musicId")) == expected
+        ]
     if len(matches) != 1:
-        raise DouyinMusicError("抖音收藏音乐缓存项不在当前收藏列表，请刷新后重新选择")
+        raise DouyinMusicError("抖音收藏音乐缓存项在当前收藏列表中不唯一或已失效，请刷新后重新选择")
     return matches[0]
 
 

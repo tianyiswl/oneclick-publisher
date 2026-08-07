@@ -10,7 +10,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtWidgets import QApplication, QMessageBox, QPushButton
 
-from app_core import account_browser_service
+from app_core import account_browser_service, account_service
 from ui.account_page import AccountPage
 from ui.main_window import MainWindow
 from ui.publish_page import PublishPage
@@ -43,6 +43,18 @@ class AccountDetectionUiTests(unittest.TestCase):
         self.assertIn("绑定账号", labels)
         self.assertFalse(any("API" in label for label in labels))
         self.assertFalse(any("开发者配置" in label for label in labels))
+        page.close()
+
+    def test_expired_account_cookie_is_checked_before_being_marked_pending(self) -> None:
+        """超过 24 小时先静默复核 Cookie，复核失败才进入待检测状态。"""
+
+        page = AccountPage()
+        with patch.object(
+            account_service, "accounts_requiring_check", return_value=[7, 8]
+        ), patch.object(page, "start_validation") as start:
+            page.auto_check_stale_accounts()
+
+        start.assert_called_once_with([7, 8], silent=True, invalid_status=2)
         page.close()
 
     def test_removed_authorization_modules_are_not_importable(self) -> None:

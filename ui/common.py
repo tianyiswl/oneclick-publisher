@@ -797,12 +797,13 @@ def apply_style(app: QApplication) -> None:
             font-weight: 650;
         }
         QLabel#douyinCommerceReviewValidation {
-            color: #526174;
-            background: #F7FAFC;
-            border-left: 3px solid #89B9B3;
-            border-radius: 6px;
-            padding: 8px 10px;
-            font-size: 12px;
+            color: #657D91;
+            background: transparent;
+            border: 0;
+            border-radius: 0;
+            padding: 0;
+            font-size: 13px;
+            font-weight: 500;
         }
         QFrame#douyinCommerceContentAccountColumn,
         QFrame#douyinCommerceContentBodyColumn,
@@ -952,18 +953,38 @@ def apply_style(app: QApplication) -> None:
             background: #D7EEE9;
             border-color: #7FC9BB;
         }
-        QPushButton#douyinCommerceTagHistoryChip {
+        QFrame#douyinCommerceTagHistoryChip {
             background: #FFFFFF;
-            color: #526174;
             border: 1px solid #D8E1E8;
             border-radius: 12px;
-            padding: 3px 8px;
+        }
+        QPushButton#douyinCommerceTagHistoryAdd {
+            color: #526174;
+            background: transparent;
+            border: 0;
+            padding: 2px 1px;
             font-size: 11px;
         }
-        QPushButton#douyinCommerceTagHistoryChip:hover {
+        QPushButton#douyinCommerceTagHistoryAdd:hover {
             color: #075F59;
-            border-color: #8ED3CB;
-            background: #F0FAF8;
+            background: transparent;
+        }
+        QPushButton#douyinCommerceTagHistoryRemove {
+            min-width: 14px;
+            max-width: 14px;
+            min-height: 14px;
+            max-height: 14px;
+            color: #98A6B5;
+            background: transparent;
+            border: 0;
+            border-radius: 7px;
+            padding: 0;
+            font-size: 14px;
+            font-weight: 700;
+        }
+        QPushButton#douyinCommerceTagHistoryRemove:hover {
+            color: #FFFFFF;
+            background: #E05A47;
         }
         QListWidget#douyinCommerceMusicCandidates,
         QListWidget#douyinCommerceLocationResults {
@@ -1313,6 +1334,21 @@ def apply_style(app: QApplication) -> None:
             background: #E8F7F5;
             border-color: #9ED8CF;
         }
+        QPushButton#douyinCommerceClearExecutionLog {
+            min-height: 26px;
+            color: #8A5B35;
+            background: #FFF8EF;
+            border: 1px solid #F2D7B3;
+            border-radius: 7px;
+            padding: 1px 8px;
+            font-size: 11px;
+            font-weight: 700;
+        }
+        QPushButton#douyinCommerceClearExecutionLog:hover {
+            color: #7A2E0E;
+            background: #FFF0DB;
+            border-color: #EAB977;
+        }
         QPlainTextEdit#douyinCommerceExecutionLogOutput {
             color: #C7E9E3;
             background: #17243A;
@@ -1501,11 +1537,52 @@ def apply_style(app: QApplication) -> None:
             font-size: 12px;
             font-weight: 650;
         }
-        QFrame#douyinCommerceReferenceFooter {
+        QFrame#douyinCommerceReferenceFooter,
+        QFrame#douyinCommercePlatformReviewDock {
             background: #FBFFFE;
             border: 1px solid #C7E8E1;
             border-top: 3px solid #0B8A85;
             border-radius: 14px;
+        }
+        QFrame#douyinCommerceReferenceFooter QLabel#douyinCommerceOperationTitle,
+        QFrame#douyinCommerceReferenceFooter QLabel#douyinCommerceOperationDetail,
+        QFrame#douyinCommerceReferenceFooter QLabel#douyinCommerceOperationStatus,
+        QFrame#douyinCommerceReferenceFooter QLabel#douyinCommerceReviewValidation,
+        QFrame#douyinCommercePlatformReviewDock QLabel#douyinCommercePlatformReviewStatus {
+            font-size: 13px;
+        }
+        QFrame#douyinCommerceReferenceFooter QPushButton[footerAction="true"],
+        QFrame#douyinCommercePlatformReviewDock QPushButton[footerAction="true"] {
+            min-height: 46px;
+            max-height: 46px;
+            min-width: 178px;
+            padding: 0 18px;
+            font-size: 15px;
+            font-weight: 750;
+        }
+        QFrame#douyinCommerceBatchItemRow {
+            background: #F7FBFD;
+            border: 1px solid #E0EBF1;
+            border-radius: 7px;
+        }
+        QComboBox#douyinCommerceBatchLocationCandidates {
+            /* Qt 样式表高度作用于内容区；加上上下内边距和边框后总高正好 30px。 */
+            min-height: 24px;
+            max-height: 24px;
+            color: #263B50;
+            background: #FFFFFF;
+            border: 1px solid #C9DAE5;
+            border-radius: 7px;
+            padding: 2px 30px 2px 9px;
+        }
+        QComboBox#douyinCommerceBatchLocationCandidates:hover,
+        QComboBox#douyinCommerceBatchLocationCandidates:focus {
+            border-color: #74B9C6;
+        }
+        QFrame#douyinCommerceBatchReviewRow {
+            background: #F4FCFA;
+            border: 1px solid #CBEAE4;
+            border-radius: 9px;
         }
         QLabel#douyinCommerceOperationTitle {
             color: #29465C;

@@ -468,14 +468,22 @@ class AccountPage(QWidget):
         self.start_validation([row["id"]])
 
     def auto_check_stale_accounts(self) -> None:
-        # 平台复核会打开官方页面，只允许用户明确点击“检测登录”后执行。
-        return
+        """超过可信时限后先静默检测 Cookie，失败才标记为待检测。"""
+
+        stale_ids = account_service.accounts_requiring_check()
+        if stale_ids:
+            self.start_validation(
+                stale_ids,
+                silent=True,
+                invalid_status=2,
+            )
 
     def start_validation(
         self,
         account_ids: list[int] | None,
         *,
         silent: bool = False,
+        invalid_status: int = 0,
     ) -> None:
         if self.tasks.is_running("account_validation"):
             if not silent:
@@ -487,6 +495,7 @@ class AccountPage(QWidget):
             lambda: account_service.validate_accounts(
                 account_ids,
                 progress_callback=self.validation_progress_changed.emit,
+                invalid_status=invalid_status,
             ),
             on_started=lambda: self._set_validation_running(True),
             on_success=lambda payload: self._finish_validation(payload, silent=silent),

@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
+import re
 from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo
 
@@ -71,6 +72,26 @@ def _text(value: object) -> str:
 def _safe_item_label(item: Mapping[str, Any], index: int) -> str:
     name = Path(_text(item.get("mediaPath"))).name
     return name or f"第 {index + 1} 条视频"
+
+
+def _location_search_keywords(location: Mapping[str, Any]) -> list[str]:
+    """返回地点恢复时的有序检索词：地址优先，国内排序漂移时补充城市和店名。"""
+
+    address = _text(location.get("address"))
+    name = _text(location.get("name"))
+    result = [address] if address else []
+    city_source = address
+    if "自治区" in city_source:
+        city_source = city_source.split("自治区", 1)[1]
+    elif "省" in city_source:
+        city_source = city_source.split("省", 1)[1]
+    city_match = re.search(r"([\u4e00-\u9fff]{2,}市)", city_source)
+    city = _text(city_match.group(1)[:-1]) if city_match else ""
+    if city and name:
+        result.append(f"{city} {name}")
+    if name:
+        result.append(name)
+    return list(dict.fromkeys(keyword for keyword in result if keyword))
 
 
 def _is_intervention_error(error: Exception) -> bool:
@@ -143,9 +164,16 @@ def _final_receipt_from_submit_result(
     if not isinstance(readback, Mapping):
         raise DouyinCommerceBatchExecutorError("抖音发表缺少平台最终回读")
     receipt = {
-        key: _text(readback.get(key))
-        for key in ("platformPostId", "postUrl", "publishedAt", "timezone")
-        if _text(readback.get(key))
+        key: value
+        for key, value in (
+            ("platformPostId", _text(readback.get("platformPostId"))),
+            # 抖音即时发表回执会返回管理页 url；它是平台最终跳转的真实证据，
+            # 不把它伪造为作品 ID 或发布时间。
+            ("postUrl", _text(readback.get("postUrl") or readback.get("url"))),
+            ("publishedAt", _text(readback.get("publishedAt"))),
+            ("timezone", _text(readback.get("timezone")) or SHANGHAI_TIMEZONE),
+        )
+        if value
     }
     return "platform_publish_receipt", receipt, message
 
@@ -437,8 +465,10 @@ class DouyinCommerceBatchExecutor:
         label = _safe_item_label(item, index)
         session_id = ""
         retain_session = False
-        # 上传、内容写入、地点和预检都必须留在 dry-run 会话；只有通过同一
-        # 会话的最终 submit 才可显式切换为 publish。
+        # 上传、地点和预检都必须留在 dry-run 会话；上传阶段已完成标题、文案
+        # 与话题的页面回读，不能在同一编辑页重复同步一次内容。重复清空富文本
+        # 编辑器会在 Windows 端偶发残留旧文案，且没有任何业务收益。
+        # 只有通过同一会话的最终 submit 才可显式切换为 publish。
         payload = _runtime_payload(batch, item, mode="preflight")
         publish_payload = dict(payload)
         publish_payload["runtimeMode"] = "publish"
@@ -460,7 +490,6 @@ class DouyinCommerceBatchExecutor:
                 raise DouyinCommerceBatchExecutorError("抖音上传会话未返回唯一会话标识")
             session_id = _text(upload.get("sessionId"))
 
-            self._manager.synchronize_content(session_id, payload)
             selected = self._manager.select_cached_favorite_music(
                 session_id, _text(payload["selectedMusic"].get("musicId"))
             )
@@ -472,18 +501,32 @@ class DouyinCommerceBatchExecutor:
             if _text(declared) != _text(payload["contentDeclaration"]):
                 raise DouyinCommerceBatchExecutorError("抖音作品内容声明回读不一致")
 
-            candidates = self._manager.search_locations(
-                session_id,
-                _text(payload["locationKeyword"]),
-                _text(payload["locationScope"]),
-            )
-            try:
-                matched = match_location_preset(payload["locationPoi"], candidates)
-            except DouyinLocationPresetError as exc:
-                raise DouyinCommerceBatchExecutorError(str(exc)) from exc
+            location = payload["locationPoi"]
+            scope = _text(payload["locationScope"])
+            matched: dict[str, str] | None = None
+            last_location_error: Exception | None = None
+            for keyword in _location_search_keywords(location):
+                try:
+                    candidates = self._manager.search_locations(session_id, keyword, scope)
+                    matched = match_location_preset(location, candidates)
+                    break
+                except Exception as exc:
+                    last_location_error = exc
+            if matched is None:
+                diagnostic = _text(last_location_error) or "未返回可用候选"
+                raise DouyinCommerceBatchExecutorError(
+                    f"抖音在“{scope}”范围内未找到已保存的完整地点：{diagnostic}"
+                )
             applied = self._manager.apply_location(session_id, matched)
-            if not isinstance(applied, Mapping) or any(
-                _text(applied.get(field)) != _text(matched.get(field))
+            # 会话管理器的真实回读格式为 {"location": {...}}。离线替身可能
+            # 直接返回地点对象，二者都只接受名称、完整地址与 POI 三项一致。
+            applied_location = (
+                applied.get("location")
+                if isinstance(applied, Mapping) and isinstance(applied.get("location"), Mapping)
+                else applied
+            )
+            if not isinstance(applied_location, Mapping) or any(
+                _text(applied_location.get(field)) != _text(matched.get(field))
                 for field in ("poiId", "name", "address")
             ):
                 raise DouyinCommerceBatchExecutorError("抖音发布定位写入后回读不一致")
@@ -521,6 +564,7 @@ class DouyinCommerceBatchExecutor:
             self._emit(progress, index=index, total=total, phase="published", message=f"第 {index + 1} 条视频已取得平台回读")
             return {"index": index, "label": label, "status": "published"}
         except Exception as exc:
+            diagnostic = _text(exc)[:240] or "未取得可用的平台回执"
             if self._has_active_verification(task_id):
                 # 仅 broker 仍持有同一 active 请求时才保留会话。真实 manager 在
                 # 该会话内等待用户输入并从当前 submit 调用继续，因此不会重复提交。
@@ -532,7 +576,7 @@ class DouyinCommerceBatchExecutor:
                     total=total,
                     progress=progress,
                 )
-                return {**waiting, "label": label}
+                return {**waiting, "label": label, "diagnostic": diagnostic}
             if _is_intervention_error(exc):
                 self._record_progress(
                     task_id,
@@ -548,13 +592,29 @@ class DouyinCommerceBatchExecutor:
                     phase="verification_failed",
                     message=f"第 {index + 1} 条视频验证失败或已取消，批量已停止",
                 )
-                return {"index": index, "label": label, "status": "verification_failed"}
+                return {
+                    "index": index,
+                    "label": label,
+                    "status": "verification_failed",
+                    "diagnostic": diagnostic,
+                }
             self._record_progress(
                 task_id, item_id, ok=False, event_type="batch_item_failed",
-                message=f"第 {index + 1} 条视频未完成平台回读，已跳过继续下一条",
+                message=f"第 {index + 1} 条视频未完成平台回读：{diagnostic}",
             )
-            self._emit(progress, index=index, total=total, phase="failed", message=f"第 {index + 1} 条视频未完成，继续下一条")
-            return {"index": index, "label": label, "status": "failed"}
+            self._emit(
+                progress,
+                index=index,
+                total=total,
+                phase="failed",
+                message=f"第 {index + 1} 条视频失败：{diagnostic}；继续下一条",
+            )
+            return {
+                "index": index,
+                "label": label,
+                "status": "failed",
+                "diagnostic": diagnostic,
+            }
         finally:
             if session_id and not retain_session:
                 self._manager.close(session_id)

@@ -758,7 +758,16 @@ class DouyinCommerceSessionManager:
             raise DouyinCommerceSessionError(
                 "抖音收藏音乐缓存已过期，请刷新后重新选择"
             ) from exc
-        return await self._select_favorite_music(session_id, candidate["musicId"])
+        selected = await self._select_favorite_music(session_id, candidate["musicId"])
+        # 无平台 musicId 时，本地缓存使用歌曲名、作者和时长的稳定指纹。平台
+        # 当前抽屉仍通过完整三字段唯一匹配并回读；对批量执行器则回传原缓存
+        # 身份，避免把瞬态 visible/favorite-index 标识写入下一步任务校验。
+        requested_id = _normalized(music_id)
+        if requested_id.startswith("metadata:"):
+            selected["musicId"] = requested_id
+            if isinstance(session.selected_music, dict):
+                session.selected_music["musicId"] = requested_id
+        return selected
 
     async def _search_locations(
         self,

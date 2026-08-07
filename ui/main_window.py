@@ -373,7 +373,8 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self._build_shell())
         self._set_current_page(0)
         self.menuBar().setVisible(False)
-        # 启动时不自动检测账号，避免在用户未发起操作时触发平台访问。
+        # 仅检测超过可信时限的已登录 Cookie；正常账号不会重复访问平台。
+        self.accounts.start_auto_checking()
 
     def _apply_initial_window_geometry(self) -> None:
         """Windows 使用大屏自适应尺寸，其他平台保留原始窗口大小。"""
@@ -496,7 +497,7 @@ class MainWindow(QMainWindow):
         )
         feedback_copy.setObjectName("feedbackCopy")
         feedback_copy.setWordWrap(True)
-        feedback_wechat = QLabel("微信：tianyiswl")
+        feedback_wechat = QLabel("微信：sj1337622")
         feedback_wechat.setObjectName("feedbackContact")
         feedback_store = QLabel("淘宝店铺：逆浪风")
         feedback_store.setObjectName("feedbackContact")

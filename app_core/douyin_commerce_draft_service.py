@@ -137,3 +137,14 @@ def remember_tag_history(tags: object) -> list[str]:
                 (tag, updated_at),
             )
     return list_tag_history()
+
+
+def remove_tag_history(tag: object) -> list[str]:
+    """删除一枚本机历史标签；当前内容和平台状态均不受影响。"""
+
+    normalized = _text(tag).lstrip("#")
+    if not normalized:
+        return list_tag_history()
+    with database.connect() as conn:
+        conn.execute("DELETE FROM tag_history WHERE tag = ?", (normalized,))
+    return list_tag_history()
