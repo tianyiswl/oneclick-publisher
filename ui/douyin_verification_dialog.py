@@ -179,7 +179,13 @@ class DouyinVerificationDialog(QDialog):
             "cancelled": "验证已取消，提交已安全停止。",
             "expired": "验证已过期，提交已安全停止。",
         }
-        self.status_label.setText(state_labels.get(state, "验证状态异常，提交已安全停止。"))
+        default_status = state_labels.get(state, "验证状态异常，提交已安全停止。")
+        # Broker 仅会提供固定、非敏感的状态文案；只有错误验证码回到 waiting
+        # 时需要覆盖默认提示，其余终态仍统一使用客户端的标准状态文案。
+        waiting_message = str(snapshot.get("message") or "")
+        self.status_label.setText(
+            waiting_message if state == "waiting" and waiting_message else default_status
+        )
         processing = state == "processing"
         self.cancel_button.setEnabled(state not in TERMINAL_STATES and not processing)
         if kind == "sms" and hasattr(self, "submit_button"):
@@ -200,10 +206,19 @@ class DouyinVerificationDialog(QDialog):
         if state == "success":
             self._terminal = True
             self.timer.stop()
-            QTimer.singleShot(250, self.accept)
+            QTimer.singleShot(250, self._close_after_success)
         elif state in TERMINAL_STATES:
             self._terminal = True
             self.timer.stop()
+
+    def _close_after_success(self) -> None:
+        """短暂展示成功后关闭窗口并擦除本机内存验证请求。"""
+
+        self.accept()
+        try:
+            self.broker.clear(self.request_id)
+        except DouyinVerificationError:
+            pass
 
     def submit_code(self) -> None:
         if not hasattr(self, "code_input"):

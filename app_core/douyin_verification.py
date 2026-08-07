@@ -256,7 +256,10 @@ class DouyinVerificationBroker:
                 "taskId": request.task_id,
                 "kind": request.kind,
                 "state": state,
-                "message": _snapshot_message(request.kind, state),
+                # 该字段只允许本模块写入固定中文提示，绝不回传平台页面、手机号、
+                # Cookie 或验证码。它使客户端可在“验证码错误后重新输入”时显示
+                # 正确的下一步，而不是笼统显示等待中。
+                "message": request.message or _snapshot_message(request.kind, state),
                 "expiresInSeconds": max(0, round(request.expires_at - self._clock())),
                 "hasQrImage": bool(request.qr_image),
             }
@@ -349,6 +352,7 @@ class DouyinVerificationBroker:
             if self._state(request) != "waiting" or request.kind != "sms":
                 raise DouyinVerificationError("当前抖音验证不能接收短信验证码")
             request.pending_code = value
+            request.message = "验证码已提交，正在验证。"
             request.condition.notify_all()
 
     def consume_code(self, request_id: str) -> str | None:
@@ -401,6 +405,22 @@ class DouyinVerificationBroker:
             request.state = "success"
             request.message = _snapshot_message(request.kind, "success")
             request.pending_code = ""
+            request.condition.notify_all()
+
+    def retry_sms_input(self, request_id: str) -> None:
+        """平台明确拒绝验证码后回到同一短信挑战，允许用户重新输入。
+
+        不重新发送短信、不新建验证请求，也不改动 60 秒重发冷却；只清空已领取的
+        内存验证码并恢复同一页面会话的输入机会。
+        """
+
+        request = self._get(request_id)
+        with request.condition:
+            if request.kind != "sms" or self._state(request) != "processing":
+                raise DouyinVerificationError("当前抖音验证不能重新输入验证码")
+            request.state = "waiting"
+            request.pending_code = ""
+            request.message = "验证码未通过或已过期，请检查后重新输入。"
             request.condition.notify_all()
 
     def fail(

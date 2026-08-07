@@ -708,7 +708,7 @@ class DouYinVideo(object):
                 except Exception:
                     panel_text = ""
                 if any(marker in panel_text for marker in ("验证码错误", "验证码不正确", "验证失败", "验证已过期")):
-                    raise RuntimeError("抖音短信验证未通过，发布已安全停止")
+                    raise RuntimeError("抖音页面明确提示验证码错误或已过期，发布未继续")
                 # 已提交验证码后，平台可能短时间保留短信弹层或异步跳转。
                 # 这不是新的挑战，交给外层等待明确成功回执。
                 return None
@@ -807,6 +807,17 @@ class DouYinVideo(object):
         await inputs[0].fill(str(code))
         if await inputs[0].input_value() != str(code):
             raise RuntimeError("抖音验证码填写后未能回读，发布已安全停止")
+        for _ in range(20):
+            try:
+                if await buttons[0].is_enabled():
+                    break
+            except Exception:
+                pass
+            await page.wait_for_timeout(250)
+        else:
+            raise RuntimeError(
+                "抖音验证码已写入，但验证按钮未启用；无法判断验证码是否正确，发布已安全停止"
+            )
         if callable(before_submit):
             before_submit()
         await buttons[0].click(timeout=10_000)
@@ -824,7 +835,7 @@ class DouYinVideo(object):
             if "/creator-micro/content/manage" in current_url:
                 return
             if any(marker in panel_text for marker in ("验证码错误", "验证码不正确", "验证失败", "验证已过期")):
-                raise RuntimeError("抖音短信验证未通过，发布已安全停止")
+                raise RuntimeError("抖音页面明确提示验证码错误或已过期，发布未继续")
             await page.wait_for_timeout(250)
         # 平台仍可能在异步校验中；外层只会等待管理页，不会再次发送短信或误判二维码。
         return
@@ -918,6 +929,20 @@ class DouYinVideo(object):
                 continue
         return items
 
+    @staticmethod
+    async def _visible_items(locator):
+        """返回可见节点，不把验证码按钮的初始禁用态误判为控件不存在。"""
+
+        items = []
+        for index in range(await locator.count()):
+            item = locator.nth(index)
+            try:
+                if await item.is_visible():
+                    items.append(item)
+            except Exception:
+                continue
+        return items
+
     async def _unique_publish_verification_container(self, page):
         """由验证文案反查唯一可见弹层，避免把编辑页控件误作验证控件。"""
 
@@ -991,20 +1016,24 @@ class DouYinVideo(object):
         return next(iter(containers.values()))
 
     async def _sms_verification_controls(self, container):
-        """只在已锁定的验证面板内定位验证码输入与“验证”动作。"""
+        """只在已锁定的验证面板内定位验证码输入与“验证”动作。
+
+        短信验证的“验证”按钮通常会在验证码填满前保持禁用，因此此处仅要求
+        节点可见；真正点击前再显式等待其启用。
+        """
 
         try:
-            inputs = await self._visible_enabled_items(container.locator("input"))
+            inputs = await self._visible_items(container.locator("input"))
         except AttributeError:
             inputs = []
         if not inputs:
-            inputs = await self._visible_enabled_items(container.get_by_role("textbox"))
+            inputs = await self._visible_items(container.get_by_role("textbox"))
         try:
-            confirms = await self._visible_enabled_items(container.get_by_text("验证", exact=True))
+            confirms = await self._visible_items(container.get_by_text("验证", exact=True))
         except AttributeError:
             confirms = []
         if not confirms:
-            confirms = await self._visible_enabled_items(container.get_by_role("button", name="验证", exact=True))
+            confirms = await self._visible_items(container.get_by_role("button", name="验证", exact=True))
         return inputs, confirms
 
     @staticmethod

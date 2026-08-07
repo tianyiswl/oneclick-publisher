@@ -250,7 +250,9 @@ class DouyinPublishPayloadTests(unittest.TestCase):
                 return True
 
             async def is_enabled(self) -> bool:
-                return True
+                # 真实抖音“验证”按钮会在验证码写入前禁用；回归用例要求
+                # 执行器先定位可见按钮，填写并回读后才等待它启用。
+                return bool(self.page.textbox.value)
 
             async def click(self, *, timeout: int) -> None:
                 self.page.url = "https://creator.douyin.com/creator-micro/content/manage"

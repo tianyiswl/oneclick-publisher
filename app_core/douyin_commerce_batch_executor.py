@@ -578,19 +578,20 @@ class DouyinCommerceBatchExecutor:
                 )
                 return {**waiting, "label": label, "diagnostic": diagnostic}
             if _is_intervention_error(exc):
+                verification_message = f"第 {index + 1} 条视频：{diagnostic}"
                 self._record_progress(
                     task_id,
                     item_id,
                     ok=False,
                     event_type="verification_failed",
-                    message=f"第 {index + 1} 条视频的抖音验证未完成，批量已安全停止",
+                    message=verification_message,
                 )
                 self._emit(
                     progress,
                     index=index,
                     total=total,
                     phase="verification_failed",
-                    message=f"第 {index + 1} 条视频验证失败或已取消，批量已停止",
+                    message=verification_message,
                 )
                 return {
                     "index": index,

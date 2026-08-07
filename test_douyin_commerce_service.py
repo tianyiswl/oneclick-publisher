@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QColor, QImage
+from PyQt6.QtGui import QColor, QImage, QInputMethodEvent
 from PyQt6.QtWidgets import QApplication, QComboBox, QDialog, QFrame, QLabel, QLineEdit, QPushButton
 
 from app_core import (
@@ -38,10 +38,49 @@ from app_core.douyin_commerce_batch_executor import DouyinCommerceBatchExecutor
 from app_core.douyin_verification import DouyinVerificationBroker, VerificationChallenge
 from ui.background_task import BackgroundTask
 from ui.common import apply_style
-from ui.douyin_commerce_page import DouyinCommercePage
+from ui.douyin_commerce_page import DouyinCommercePage, _ImeAwarePlainTextEdit
 from ui.runtime_log import runtime_log_bus
 from utils import base_social_media
 from test_douyin_commerce_batch_executor import FakeCommerceSessionManager
+
+
+class DouyinImePlaceholderTests(unittest.TestCase):
+    """中文输入法预编辑期间，文案提示不得与候选文字重叠。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        self.editor = _ImeAwarePlainTextEdit()
+        self.editor.setPlaceholderText("填写视频发布文案")
+
+    def test_hides_placeholder_during_ime_preedit(self) -> None:
+        event = QInputMethodEvent("chi", [])
+
+        QApplication.sendEvent(self.editor, event)
+
+        self.assertEqual(self.editor.placeholderText(), "")
+        self.assertEqual(self.editor.toPlainText(), "")
+
+    def test_restores_placeholder_after_cancelled_preedit_when_empty(self) -> None:
+        QApplication.sendEvent(self.editor, QInputMethodEvent("chi", []))
+        QApplication.sendEvent(self.editor, QInputMethodEvent("", []))
+
+        self.assertEqual(self.editor.placeholderText(), "填写视频发布文案")
+
+    def test_keeps_placeholder_hidden_after_ime_commit(self) -> None:
+        event = QInputMethodEvent("", [])
+        event.setCommitString("测试")
+
+        QApplication.sendEvent(self.editor, event)
+
+        self.assertEqual(self.editor.toPlainText(), "测试")
+        self.assertEqual(self.editor.placeholderText(), "")
+
+        self.editor.clear()
+
+        self.assertEqual(self.editor.placeholderText(), "填写视频发布文案")
 
 
 class DouyinCommercePayloadTests(unittest.TestCase):
@@ -1387,6 +1426,30 @@ class DouyinCommerceUiTests(unittest.TestCase):
 
         self.assertEqual(events[0]["phase"], "uploading_video")
 
+    def test_batch_progress_shows_completed_success_and_failure_counts(self) -> None:
+        """逐条发布期间底部必须实时展示累计结果，而非只显示当前序号。"""
+
+        self.page._batch_task_id = 601
+        with patch(
+            "ui.douyin_commerce_page.task_service.get_task",
+            return_value={
+                "items": [
+                    {"status": "success"},
+                    {"status": "failed"},
+                    {"status": "running"},
+                    {"status": "pending"},
+                ]
+            },
+        ):
+            self.page._batch_progress(
+                {"index": 2, "total": 4, "phase": "uploading", "message": "正在上传视频"}
+            )
+
+        self.assertEqual(
+            self.page.validation_label.text(),
+            "已完成 2/4 · 成功 1 · 失败 1 · 正在处理 3/4：正在上传视频",
+        )
+
     def test_content_layout_moves_video_tags_and_local_content_to_requested_areas(self) -> None:
         """内容页必须以账号含视频、内容含标签历史和本地内容、右侧日志呈现。"""
 
@@ -2467,6 +2530,19 @@ class DouyinCommerceUiTests(unittest.TestCase):
         self.assertTrue(self.page._saved_content_available)
         self.assertTrue(self.page.restore_content_button.isEnabled())
         run.assert_not_called()
+
+    def test_clear_current_content_keeps_batch_saved_content_recoverable(self) -> None:
+        """批量草稿独立保存；清空当前表单后仍必须能点击批量恢复。"""
+
+        self.page._saved_content_available = False
+        self.page._batch_saved_content_available = True
+        self.page._selected_video_indexes = [0]
+
+        self.page.clear_current_content()
+
+        self.assertFalse(self.page._saved_content_available)
+        self.assertTrue(self.page._batch_saved_content_available)
+        self.assertTrue(self.page.batch_restore_content_button.isEnabled())
 
     def test_video_card_shows_compact_material_metadata(self) -> None:
         """素材卡只保留文件名、时长和尺寸，避免把素材库内部状态暴露给用户。"""
@@ -3986,8 +4062,8 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
             )
         session.uploader.apply_sms_verification_code.assert_not_awaited()
 
-    def test_rejected_sms_code_stops_without_success_receipt(self) -> None:
-        """平台拒绝已填写的验证码时，不得伪造验证或发布成功。"""
+    def test_rejected_sms_code_returns_to_same_request_for_reentry(self) -> None:
+        """平台明确拒绝验证码时，应保留同一会话并允许重新输入一次。"""
 
         class Page:
             async def wait_for_timeout(self, _milliseconds: int) -> None:
@@ -3995,26 +4071,42 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
 
         class Uploader:
             apply_sms_verification_code = AsyncMock(
-                side_effect=RuntimeError("验证码被平台拒绝")
+                side_effect=[RuntimeError("验证码被平台拒绝"), None]
             )
 
         class Broker:
-            failed = []
+            def __init__(self) -> None:
+                self.state = "waiting"
+                self.codes = ["123456", "654321"]
+                self.retried = []
+                self.succeeded = []
+                self.failed = []
 
             def create_sms(self, **_kwargs) -> str:
                 return "request-rejected"
 
             def snapshot(self, _request_id: str) -> dict:
-                return {"state": "waiting"}
+                return {"state": self.state}
 
             def claim_code(self, _request_id: str) -> str:
-                return "123456"
+                if self.state != "waiting" or not self.codes:
+                    return ""
+                self.state = "processing"
+                return self.codes.pop(0)
 
             def ensure_processing(self, _request_id: str) -> None:
                 return None
 
             def fail(self, request_id: str) -> None:
                 self.failed.append(request_id)
+
+            def retry_sms_input(self, request_id: str) -> None:
+                self.retried.append(request_id)
+                self.state = "waiting"
+
+            def succeed(self, request_id: str) -> None:
+                self.succeeded.append(request_id)
+                self.state = "success"
 
             def clear(self, _request_id: str) -> None:
                 return None
@@ -4032,23 +4124,42 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
         )
         broker = Broker()
         with patch.object(douyin_commerce_session, "verification_broker", broker):
-            with self.assertRaisesRegex(
-                douyin_commerce_session.DouyinCommerceSessionError,
-                "短信验证",
-            ):
-                asyncio.run(
-                    douyin_commerce_session.DouyinCommerceSessionManager()._handle_publish_verification(
-                        session,
-                        VerificationChallenge(
-                            kind="sms",
-                            message="请在一键发客户端输入短信验证码",
-                        ),
-                        task_id=79,
-                    )
+            asyncio.run(
+                douyin_commerce_session.DouyinCommerceSessionManager()._handle_publish_verification(
+                    session,
+                    VerificationChallenge(
+                        kind="sms",
+                        message="请在一键发客户端输入短信验证码",
+                    ),
+                    task_id=79,
                 )
+            )
 
-        uploader.apply_sms_verification_code.assert_awaited_once()
-        self.assertEqual(broker.failed, ["request-rejected"])
+        self.assertEqual(uploader.apply_sms_verification_code.await_count, 2)
+        self.assertEqual(broker.retried, ["request-rejected"])
+        self.assertEqual(broker.succeeded, ["request-rejected"])
+        self.assertEqual(broker.failed, [])
+
+    def test_sms_failure_message_distinguishes_write_control_and_platform_results(self) -> None:
+        """客户端提示必须回答“平台明确拒绝”还是“尚不能确认”。"""
+
+        message_for = douyin_commerce_session._sms_verification_failure_message
+        self.assertEqual(
+            message_for(RuntimeError("抖音页面明确提示验证码错误或已过期，发布未继续")),
+            "抖音页面明确提示验证码错误或已过期，发布未继续。",
+        )
+        self.assertEqual(
+            message_for(RuntimeError("抖音验证码填写后未能回读，发布已安全停止")),
+            "验证码未能写入抖音验证输入框，发布未继续。",
+        )
+        self.assertEqual(
+            message_for(RuntimeError("抖音验证码已写入，但验证按钮未启用；无法判断验证码是否正确，发布已安全停止")),
+            "验证码已写入，但验证按钮未启用；无法判断验证码是否正确，发布未继续。",
+        )
+        self.assertEqual(
+            message_for(RuntimeError("请求超时")),
+            "验证码已提交，但抖音未返回可确认结果；无法判断验证码是否正确，发布未继续。",
+        )
 
     def test_sms_resend_returns_to_the_same_running_editor_session(self) -> None:
         """60 秒后重发必须回到同一 Playwright 会话，不能新建验证码请求。"""

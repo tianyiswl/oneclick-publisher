@@ -82,6 +82,21 @@ def _normalized(value: object) -> str:
     return " ".join(str(value or "").replace("\u200b", " ").split())
 
 
+def _sms_verification_failure_message(error: Exception) -> str:
+    """将验证码失败归因收束为可行动且不泄露页面细节的提示。"""
+
+    detail = _normalized(error).casefold()
+    if "明确提示验证码错误或已过期" in detail or "验证码被平台拒绝" in detail:
+        return "抖音页面明确提示验证码错误或已过期，发布未继续。"
+    if "填写后未能回读" in detail:
+        return "验证码未能写入抖音验证输入框，发布未继续。"
+    if "验证按钮未启用" in detail:
+        return "验证码已写入，但验证按钮未启用；无法判断验证码是否正确，发布未继续。"
+    if any(marker in detail for marker in ("容器无法唯一", "输入框无法唯一", "确认按钮无法唯一")):
+        return "验证码验证控件无法唯一确认，无法判断验证码是否正确，发布未继续。"
+    return "验证码已提交，但抖音未返回可确认结果；无法判断验证码是否正确，发布未继续。"
+
+
 def _public_music(value: Mapping[str, Any]) -> dict[str, str]:
     music = douyin_music_service.normalize_music_readback(value)
     if not music:
@@ -1137,11 +1152,27 @@ class DouyinCommerceSessionManager:
                                 ),
                             )
                         except Exception as exc:
+                            message = _sms_verification_failure_message(exc)
+                            if message.startswith("抖音页面明确提示验证码错误或已过期"):
+                                # 平台已明确拒绝本次验证码时，不终止整个批量任务。
+                                # 保持同一无头页面、同一验证码请求和原有重发冷却，
+                                # 让原生窗口提示用户重新输入。
+                                try:
+                                    verification_broker.retry_sms_input(request_id)
+                                except Exception as retry_exc:
+                                    verification_broker.fail(request_id)
+                                    raise DouyinCommerceSessionError(
+                                        "验证码被平台拒绝后无法恢复输入状态，发布未继续。"
+                                    ) from retry_exc
+                                continue
                             verification_broker.fail(request_id)
                             raise DouyinCommerceSessionError(
-                                "抖音短信验证未通过或页面状态无法确认，发布已安全停止"
+                                message
                             ) from exc
                         verification_broker.succeed(request_id)
+                        # 给原生窗口一个轮询周期显示“验证成功、正在继续”，再由
+                        # finally 清理内存请求；不延长浏览器会话，也不持久化验证码。
+                        await asyncio.sleep(0.35)
                         return
                 else:
                     try:
@@ -1157,6 +1188,7 @@ class DouyinCommerceSessionManager:
                         if "/creator-micro/content/manage" in str(session.page.url or ""):
                             verification_broker.begin_processing(request_id)
                             verification_broker.succeed(request_id)
+                            await asyncio.sleep(0.35)
                             return
                         await session.page.wait_for_timeout(250)
                         continue
@@ -1167,6 +1199,8 @@ class DouyinCommerceSessionManager:
                         )
                 await session.page.wait_for_timeout(250)
         finally:
+            # 会话收束即擦除验证码/二维码。成功路径已保留一个极短轮询窗口，
+            # 让原生窗口先显示成功并自行关闭，随后仍按既有安全契约立即清理。
             verification_broker.clear(request_id)
 
     async def _submit(

@@ -87,6 +87,36 @@ _BATCH_RUN_KEY = "douyin_commerce_batch_run"
 _BATCH_SHARED_LOCATION_SEARCH_KEY = "__shared_location_search__"
 
 
+class _ImeAwarePlainTextEdit(QPlainTextEdit):
+    """让多行文案框在中文输入法预编辑时也隐藏占位提示。"""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._configured_placeholder = ""
+        self._ime_preedit_active = False
+        self.textChanged.connect(self._sync_placeholder_visibility)
+
+    def setPlaceholderText(self, text: str) -> None:
+        self._configured_placeholder = str(text)
+        self._sync_placeholder_visibility()
+
+    def inputMethodEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        # QPlainTextEdit 的文档在拼音候选阶段仍为空，默认占位文字会与
+        # 预编辑文本重叠。预编辑开始就先隐藏；取消且文档仍为空时再恢复。
+        self._ime_preedit_active = bool(event.preeditString())
+        self._sync_placeholder_visibility()
+        super().inputMethodEvent(event)
+        self._ime_preedit_active = bool(event.preeditString())
+        self._sync_placeholder_visibility()
+
+    def _sync_placeholder_visibility(self) -> None:
+        visible_text = ""
+        if not self._ime_preedit_active and not self.toPlainText():
+            visible_text = self._configured_placeholder
+        if super().placeholderText() != visible_text:
+            super().setPlaceholderText(visible_text)
+
+
 def _account_avatar_path(account: dict) -> Path | None:
     """兼容账号记录中的头像绝对路径与本机头像目录。"""
 
@@ -416,6 +446,9 @@ class DouyinCommercePage(QWidget):
         self._uploaded_editor_payload: dict | None = None
         self._pending_upload_payload: dict | None = None
         self._saved_content_available = False
+        # 单条与批量内容分别保存到不同的本地草稿表；两者的恢复入口不能共用
+        # 一个可用状态，否则清空表单或重启后会把批量草稿误判为不存在。
+        self._batch_saved_content_available = False
         self._tag_values: list[str] = []
         self._tag_history: list[str] = []
         # 批量工作台在内容准备后保留一个无头“设置会话”：它只用于读取当前
@@ -795,7 +828,7 @@ class DouyinCommercePage(QWidget):
         desc_label = QLabel("作品文案")
         desc_label.setObjectName("douyinCommerceFieldLabel")
         content_layout.addWidget(desc_label)
-        self.description_input = QPlainTextEdit()
+        self.description_input = _ImeAwarePlainTextEdit()
         self.description_input.setObjectName("douyinCommerceDescription")
         self.description_input.setPlaceholderText("填写视频发布文案。上传后会由平台编辑页回读。")
         self.description_input.setFixedHeight(154)
@@ -2073,6 +2106,7 @@ class DouyinCommercePage(QWidget):
         self.video_combo.blockSignals(False)
         self._refresh_batch_video_list()
         self._refresh_saved_content_status()
+        self._refresh_batch_saved_content_status()
         self._load_tag_history()
         self._render_selected_tags()
         self._sync_content_cards()
@@ -2554,6 +2588,16 @@ class DouyinCommercePage(QWidget):
             )
         else:
             self.content_save_status.setText("尚未保存本地内容")
+
+    def _refresh_batch_saved_content_status(self) -> None:
+        """只读取批量草稿的本机状态，不触发平台、上传或恢复动作。"""
+
+        try:
+            saved = douyin_commerce_batch_draft_service.load_batch_draft()
+        except Exception:
+            self._batch_saved_content_available = False
+            return
+        self._batch_saved_content_available = bool(saved)
 
     @staticmethod
     def _restore_saved_combo(combo: QComboBox, *, identity: object, path: object) -> bool:
@@ -3265,7 +3309,7 @@ class DouyinCommercePage(QWidget):
         self.clear_video_selection_button.setEnabled(can_edit_batch_content)
         self.batch_save_content_button.setEnabled(not self._busy())
         self.batch_restore_content_button.setEnabled(
-            self._saved_content_available and can_edit_batch_content
+            self._batch_saved_content_available and can_edit_batch_content
         )
         self.batch_clear_content_button.setEnabled(can_edit_batch_content)
 
@@ -3718,7 +3762,7 @@ class DouyinCommercePage(QWidget):
             QMessageBox.warning(self, "保存本地内容", str(exc))
             return
         self.reference_save_badge.setText(f"本地内容已保存 · {saved.get('updatedAt') or '刚刚'}")
-        self._saved_content_available = True
+        self._batch_saved_content_available = True
         self._sync_view()
 
     def restore_batch_content(self) -> None:
@@ -3730,6 +3774,8 @@ class DouyinCommercePage(QWidget):
             QMessageBox.warning(self, "恢复已保存内容", str(exc))
             return
         if not saved:
+            self._refresh_batch_saved_content_status()
+            self._sync_view()
             return
         payload = dict(saved.get("payload") or {})
         self.account_combo.blockSignals(True)
@@ -3789,6 +3835,7 @@ class DouyinCommercePage(QWidget):
         self.batch_publish_mode.setCurrentIndex(
             self.batch_publish_mode.findData(publish_mode)
         )
+        self._refresh_batch_saved_content_status()
         self._render_batch_item_rows()
         self._sync_view()
 
@@ -3822,13 +3869,34 @@ class DouyinCommercePage(QWidget):
             return
         index = int(event.get("index") or 0) + 1
         total = int(event.get("total") or self.selected_video_count())
-        self._batch_progress_text = f"正在处理 {index}/{total}：{_normalized(event.get('message'))}"
+        completed, succeeded, failed = self._batch_execution_counts(total)
+        self._batch_progress_text = (
+            f"已完成 {completed}/{total} · 成功 {succeeded} · 失败 {failed}"
+            f" · 正在处理 {index}/{total}：{_normalized(event.get('message'))}"
+        )
         self.validation_label.setText(self._batch_progress_text)
         _LOGGER.info("抖音带货批量执行：%s", self._batch_progress_text)
         if _normalized(event.get("phase")) == "waiting_verification":
             videos = self._selected_videos()
             label = Path(_normalized(videos[index - 1].get("storedPath"))).name if 0 < index <= len(videos) else ""
             self._verification_item_context = {"index": index, "total": total, "label": label}
+
+    def _batch_execution_counts(self, total: int) -> tuple[int, int, int]:
+        """从当前任务记录读取逐条结果，只用于底部实时进度摘要。"""
+
+        task_id = int(self._batch_task_id or 0)
+        if task_id <= 0:
+            return 0, 0, 0
+        try:
+            task = task_service.get_task(task_id)
+            rows = task.get("items") if isinstance(task, dict) else []
+        except Exception:
+            return 0, 0, 0
+        statuses = [_normalized(row.get("status")) for row in rows if isinstance(row, dict)]
+        succeeded = sum(status == "success" for status in statuses)
+        failed = sum(status == "failed" for status in statuses)
+        completed = min(max(0, int(total)), succeeded + failed)
+        return completed, succeeded, failed
 
     def _batch_preflight_succeeded(self, payload: dict, result: object) -> None:
         rows = result if isinstance(result, list) else []
@@ -3877,7 +3945,8 @@ class DouyinCommercePage(QWidget):
         task_service.mark_task_running(self._batch_task_id, "抖音带货批量开始最终提交")
         self._batch_preflight_fingerprint = ""
         self._batch_result_feedback = ""
-        self._batch_progress_text = f"已确认提交，正在启动 0/{len(payload.get('items') or [])} 条视频…"
+        total = len(payload.get("items") or [])
+        self._batch_progress_text = f"已完成 0/{total} · 成功 0 · 失败 0 · 正在启动…"
         self.validation_label.setText(self._batch_progress_text)
         _LOGGER.info("抖音带货批量执行：%s", self._batch_progress_text)
         started = self.runner.run(

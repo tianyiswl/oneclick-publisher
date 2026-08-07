@@ -466,8 +466,10 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
                     ["published", "verification_failed", "pending"],
                 )
                 self.assertIsNone(broker.request_for_task(task["id"]))
-                event_types = [event["eventType"] for event in task_service.get_task(task["id"])["events"]]
+                events = task_service.get_task(task["id"])["events"]
+                event_types = [event["eventType"] for event in events]
                 self.assertEqual(event_types[-1], "verification_failed")
+                self.assertIn(result[1]["diagnostic"], events[-1]["message"])
 
     def test_location_preset_must_exactly_match_current_editor_candidates(self) -> None:
         different_address = normalize_location_candidate(

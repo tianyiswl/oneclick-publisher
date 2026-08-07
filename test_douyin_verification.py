@@ -189,6 +189,23 @@ class DouyinVerificationBrokerTests(unittest.TestCase):
             broker.submit_code(request_id, "invalid")
         self.assertIsNone(broker.claim_code(request_id))
 
+    def test_platform_rejected_sms_returns_to_same_request_for_reentry(self):
+        """重输不创建第二个请求，也不绕过原短信重发冷却。"""
+
+        broker = DouyinVerificationBroker()
+        request_id = broker.create_sms(task_id=154, message="需要短信验证")
+        broker.submit_code(request_id, "123456")
+        self.assertEqual(broker.claim_code(request_id), "123456")
+
+        broker.retry_sms_input(request_id)
+
+        snapshot = broker.snapshot(request_id)
+        self.assertEqual(snapshot["state"], "waiting")
+        self.assertEqual(snapshot["message"], "验证码未通过或已过期，请检查后重新输入。")
+        self.assertFalse(snapshot["canResend"])
+        broker.submit_code(request_id, "654321")
+        self.assertEqual(broker.claim_code(request_id), "654321")
+
     def test_sms_resend_uses_same_active_request_and_enforces_monotonic_60_second_cooldown(self):
         now = [100.0]
         calls: list[str] = []

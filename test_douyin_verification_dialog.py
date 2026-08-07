@@ -140,6 +140,25 @@ class DouyinVerificationDialogTests(unittest.TestCase):
         self.assertEqual(dialog.result(), 0)
         dialog.accept()
 
+    def test_rejected_sms_keeps_dialog_open_for_reentry_and_success_closes_it(self):
+        request_id = self.broker.create_sms(task_id=153, message="需要短信验证")
+        dialog = DouyinVerificationDialog(request_id, broker=self.broker)
+        self.broker.submit_code(request_id, "123456")
+        self.assertEqual(self.broker.claim_code(request_id), "123456")
+        self.broker.retry_sms_input(request_id)
+
+        dialog.poll_state()
+
+        self.assertTrue(dialog.code_input.isEnabled())
+        self.assertIn("重新输入", dialog.status_label.text())
+        self.broker.begin_processing(request_id)
+        self.broker.succeed(request_id)
+        dialog.poll_state()
+        QTest.qWait(300)
+        self.assertTrue(dialog._terminal)
+        with self.assertRaises(Exception):
+            self.broker.snapshot(request_id)
+
     def test_batch_verification_context_shows_only_index_and_file_name(self):
         request_id = self.broker.create_sms(task_id=59, message="需要短信验证")
         dialog = DouyinVerificationDialog(
