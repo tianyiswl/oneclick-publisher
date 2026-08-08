@@ -13,6 +13,22 @@ from .account_service import PLATFORMS
 from .database import connect
 
 
+PAUSE_REASON_USER_REQUEST = "user_request"
+PAUSE_REASON_WAITING_LOGIN = "waiting_login"
+PAUSE_REASON_WAITING_VERIFICATION = "waiting_verification"
+PAUSE_REASON_RECEIPT_AMBIGUOUS = "receipt_ambiguous"
+PAUSE_REASON_AUTO_FAILURE = "auto_failure"
+DOUYIN_BATCH_PAUSE_REASONS = frozenset(
+    {
+        PAUSE_REASON_USER_REQUEST,
+        PAUSE_REASON_WAITING_LOGIN,
+        PAUSE_REASON_WAITING_VERIFICATION,
+        PAUSE_REASON_RECEIPT_AMBIGUOUS,
+        PAUSE_REASON_AUTO_FAILURE,
+    }
+)
+
+
 CONTENT_TYPE_LABELS = {
     "video": "视频",
     "article": "图文",
@@ -322,7 +338,12 @@ def delete_tasks(task_ids: list[int]) -> int:
     return int(cursor.rowcount)
 
 
-def create_pending_task(payloads: list[dict], mode: str = "desktop") -> dict:
+def create_pending_task(
+    payloads: list[dict],
+    mode: str = "desktop",
+    *,
+    resume_source_task_id: int | None = None,
+) -> dict:
     account_files = sorted({a for payload in payloads for a in payload.get("accountList", [])})
     with connect() as conn:
         account_meta = {}
@@ -380,9 +401,9 @@ def create_pending_task(payloads: list[dict], mode: str = "desktop") -> dict:
             """
             INSERT INTO publish_tasks (
                 taskNo, mode, title, status, dryRun, platformCount, itemCount, contentType,
-                payloadJson, accountSummary, platformSummary, createdAt
+                payloadJson, accountSummary, platformSummary, resumeSourceTaskId, createdAt
             )
-            VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 task_no,
@@ -395,6 +416,7 @@ def create_pending_task(payloads: list[dict], mode: str = "desktop") -> dict:
                 json.dumps(payloads, ensure_ascii=False),
                 account_summary,
                 platform_summary,
+                resume_source_task_id,
                 _now(),
             ),
         )
@@ -436,6 +458,8 @@ def create_douyin_batch_task(
     mode: str = "oneclick_publish",
     *,
     schedule_now=None,
+    resume_source_task_id: int | None = None,
+    batch_item_indexes: list[int] | None = None,
 ) -> dict:
     """为批量信封中的每条视频创建独立、可审计的发布项。"""
 
@@ -462,14 +486,26 @@ def create_douyin_batch_task(
     items = prepared_batch.get("items") if isinstance(prepared_batch, dict) else None
     if not isinstance(items, list) or not items:
         raise ValueError("抖音带货批量任务至少需要一条视频")
+    if batch_item_indexes is None:
+        resolved_item_indexes = list(range(1, len(items) + 1))
+    else:
+        resolved_item_indexes = [int(index) for index in batch_item_indexes]
+        if len(resolved_item_indexes) != len(items):
+            raise ValueError("抖音带货续发视频序号数量不匹配")
+        if any(index <= 0 for index in resolved_item_indexes) or len(set(resolved_item_indexes)) != len(resolved_item_indexes):
+            raise ValueError("抖音带货续发视频序号必须为互异正整数")
     payloads = [item_publish_payload(prepared_batch, item) for item in items]
-    task = create_pending_task(payloads, mode=mode)
+    task = create_pending_task(
+        payloads,
+        mode=mode,
+        resume_source_task_id=resume_source_task_id,
+    )
     now = _now()
     with connect() as conn:
         task_items = conn.execute(
             "SELECT id FROM publish_task_items WHERE taskId = ? ORDER BY id", (task["id"],)
         ).fetchall()
-        for index, (task_item, payload) in enumerate(zip(task_items, payloads), start=1):
+        for index, (task_item, payload) in enumerate(zip(task_items, payloads)):
             poi = payload.get("locationPoi") if isinstance(payload.get("locationPoi"), dict) else {}
             location_name = str(poi.get("name") or payload.get("locationKeyword") or "").strip()
             location_address = str(poi.get("address") or "").strip()
@@ -485,7 +521,7 @@ def create_douyin_batch_task(
                 SET batchItemIndex = ?, locationSummary = ?, scheduleSummary = ?
                 WHERE id = ?
                 """,
-                (index, location_summary, schedule_summary, task_item["id"]),
+                (resolved_item_indexes[index], location_summary, schedule_summary, task_item["id"]),
             )
         conn.execute(
             "INSERT INTO publish_task_events (taskId, level, eventType, message, createdAt) VALUES (?, 'info', 'batch_created', ?, ?)",
@@ -493,6 +529,261 @@ def create_douyin_batch_task(
         )
         conn.commit()
     return task
+
+
+def _resume_blocked(
+    task_id: int,
+    reason: str,
+    *,
+    source_task: dict | None = None,
+    pending_count: int = 0,
+) -> dict[str, object]:
+    """返回不带平台副作用的续发拒绝结果。"""
+
+    return {
+        "resumeAllowed": False,
+        "blockedReason": reason,
+        "pendingCount": int(pending_count),
+        "sourceTaskId": int(task_id),
+        "sourceTaskNo": str((source_task or {}).get("taskNo") or ""),
+        "itemIndexes": [],
+    }
+
+
+def _load_douyin_batch_resume_source(task_id: int) -> tuple[dict, list[tuple[dict, dict]]]:
+    """读取来源任务及其按原批次序号关联的逐视频快照。"""
+
+    source = get_task(task_id)
+    if not source:
+        raise ValueError("任务记录不存在或已被删除")
+    if source.get("workflow") != "douyin-commerce-batch":
+        raise ValueError("仅支持抖音带货批量任务继续发布")
+    if source.get("status") != "paused":
+        raise ValueError("仅已暂停的抖音带货批量任务可以继续发布")
+    if source.get("pauseReasonCode") != PAUSE_REASON_USER_REQUEST:
+        raise ValueError("仅支持用户主动暂停的批次继续发布")
+    try:
+        payloads = json.loads(source.get("payloadJson") or "")
+    except json.JSONDecodeError as exc:
+        raise ValueError("来源批次保存的逐视频数据无法读取") from exc
+    if not isinstance(payloads, list) or not payloads:
+        raise ValueError("来源批次缺少逐视频保存数据")
+    items = source.get("items")
+    if not isinstance(items, list) or len(items) != len(payloads):
+        raise ValueError("来源批次的视频明细与保存数据不一致")
+
+    snapshots: list[tuple[dict, dict]] = []
+    for position, (item, payload) in enumerate(zip(items, payloads), start=1):
+        if not isinstance(item, dict) or not isinstance(payload, dict):
+            raise ValueError("来源批次的视频快照格式无效")
+        batch_index = item.get("batchItemIndex")
+        if not isinstance(batch_index, int) or batch_index <= 0:
+            batch_index = position
+            item = {**item, "batchItemIndex": batch_index}
+        snapshots.append((item, payload))
+    return source, snapshots
+
+
+def _build_douyin_batch_from_pending_payloads(
+    pending_snapshots: list[tuple[dict, dict]],
+    *,
+    now: datetime,
+) -> tuple[dict, list[int]]:
+    """将待续发的逐视频快照重建为受现有契约校验的批次信封。"""
+
+    from .douyin_commerce_batch_service import prepare_batch_for_execution
+    from .douyin_music_service import validate_favorite_music_mode
+
+    if not pending_snapshots:
+        raise ValueError("来源批次没有未开始的视频")
+    first_payload = pending_snapshots[0][1]
+    account_files = first_payload.get("accountList")
+    if not isinstance(account_files, list) or len(account_files) != 1:
+        raise ValueError("来源批次账号信息不完整")
+    account_file = str(account_files[0] or "").strip()
+    if not account_file:
+        raise ValueError("来源批次账号信息不完整")
+    with connect() as conn:
+        account = conn.execute(
+            """
+            SELECT 1
+            FROM user_info
+            WHERE type = 3 AND status = 1 AND filePath = ?
+            LIMIT 1
+            """,
+            (account_file,),
+        ).fetchone()
+    if not account:
+        raise ValueError("来源批次的抖音账号当前不可用，请重新登录后新建批次")
+
+    scheduled = first_payload.get("enableTimer") is True
+    items: list[dict] = []
+    item_indexes: list[int] = []
+    for source_item, payload in pending_snapshots:
+        if payload.get("batchWorkflow") != "douyin-commerce-batch":
+            raise ValueError("来源批次保存的数据不属于抖音带货批量任务")
+        if payload.get("accountList") != [account_file]:
+            raise ValueError("来源批次待续发视频的账号不一致")
+        file_list = payload.get("fileList")
+        if not isinstance(file_list, list) or len(file_list) != 1:
+            raise ValueError("来源批次视频文件信息不完整")
+        media_path = str(file_list[0] or "").strip()
+        if not media_path or not Path(media_path).is_file():
+            raise ValueError(f"原批次第 {source_item['batchItemIndex']} 条视频素材不存在")
+        location = payload.get("locationPoi")
+        if not isinstance(location, dict) or not str(location.get("name") or "").strip():
+            raise ValueError(f"原批次第 {source_item['batchItemIndex']} 条视频地点信息不完整")
+        if not payload.get("selectedMusic"):
+            raise ValueError(f"原批次第 {source_item['batchItemIndex']} 条视频收藏音乐信息不完整")
+        if not str(payload.get("contentDeclaration") or "").strip():
+            raise ValueError(f"原批次第 {source_item['batchItemIndex']} 条视频自主声明信息不完整")
+        try:
+            validate_favorite_music_mode(payload.get("musicMode"))
+        except Exception as exc:
+            raise ValueError(f"原批次第 {source_item['batchItemIndex']} 条视频收藏音乐模式无效") from exc
+        item_scheduled = payload.get("enableTimer") is True
+        if item_scheduled != scheduled:
+            raise ValueError("来源批次待续发视频的发布方式不一致")
+        schedule_time = str(payload.get("scheduleTime") or "").strip() if item_scheduled else ""
+        if item_scheduled and not schedule_time:
+            raise ValueError(f"原批次第 {source_item['batchItemIndex']} 条视频缺少原定时时间")
+        items.append(
+            {
+                "mediaPath": media_path,
+                "locationPreset": dict(location),
+                "scheduleTimeOverride": schedule_time,
+            }
+        )
+        item_indexes.append(int(source_item["batchItemIndex"]))
+
+    publish_mode = "interval-schedule" if scheduled else "immediate"
+    batch = {
+        "type": 3,
+        "workflow": "douyin-commerce-batch",
+        "commerceMode": "local-group-buy",
+        "contentType": "video",
+        "accountFile": account_file,
+        "shared": {
+            "title": first_payload.get("title"),
+            "description": first_payload.get("description"),
+            "tags": first_payload.get("tags"),
+            "selectedMusic": first_payload.get("selectedMusic"),
+            "contentDeclaration": first_payload.get("contentDeclaration"),
+        },
+        "publishMode": publish_mode,
+        "schedule": {
+            "timezone": "Asia/Shanghai",
+            "startTime": items[0]["scheduleTimeOverride"] if scheduled else "",
+            "intervalMinutes": 1 if scheduled else 0,
+        },
+        "items": items,
+    }
+    try:
+        prepared_batch = prepare_batch_for_execution(batch, now=now)
+    except Exception as exc:
+        raise ValueError(f"来源批次无法安全续发：{exc}") from exc
+    return prepared_batch, item_indexes
+
+
+def prepare_douyin_batch_resume(task_id: int, *, now: datetime) -> dict[str, object]:
+    """只读校验来源任务，返回可供用户确认的受控续发批次。"""
+
+    try:
+        source, snapshots = _load_douyin_batch_resume_source(int(task_id))
+    except ValueError as exc:
+        return _resume_blocked(int(task_id), str(exc))
+    pending_snapshots = [
+        (item, payload)
+        for item, payload in snapshots
+        if item.get("status") == "pending"
+    ]
+    if not pending_snapshots:
+        return _resume_blocked(
+            int(task_id),
+            "来源批次没有未开始的视频",
+            source_task=source,
+        )
+    with connect() as conn:
+        existing_child = conn.execute(
+            "SELECT taskNo FROM publish_tasks WHERE resumeSourceTaskId = ? LIMIT 1",
+            (int(task_id),),
+        ).fetchone()
+    if existing_child:
+        return _resume_blocked(
+            int(task_id),
+            f"该来源任务已创建续发子任务：{existing_child['taskNo']}",
+            source_task=source,
+            pending_count=len(pending_snapshots),
+        )
+    try:
+        batch, item_indexes = _build_douyin_batch_from_pending_payloads(
+            pending_snapshots,
+            now=now,
+        )
+    except ValueError as exc:
+        return _resume_blocked(
+            int(task_id),
+            str(exc),
+            source_task=source,
+            pending_count=len(pending_snapshots),
+        )
+    return {
+        "resumeAllowed": True,
+        "blockedReason": "",
+        "pendingCount": len(pending_snapshots),
+        "sourceTaskId": int(task_id),
+        "sourceTaskNo": str(source.get("taskNo") or ""),
+        "itemIndexes": item_indexes,
+        "batch": batch,
+    }
+
+
+def create_douyin_batch_resume(task_id: int, *, now: datetime) -> dict[str, object]:
+    """重新校验后创建独立续发子任务，绝不改写来源任务。"""
+
+    prepared = prepare_douyin_batch_resume(int(task_id), now=now)
+    if prepared.get("resumeAllowed") is not True:
+        raise ValueError(str(prepared.get("blockedReason") or "当前任务不可继续发布"))
+    child = create_douyin_batch_task(
+        dict(prepared["batch"]),
+        mode="oneclick_resume",
+        schedule_now=now,
+        resume_source_task_id=int(prepared["sourceTaskId"]),
+        batch_item_indexes=list(prepared["itemIndexes"]),
+    )
+    source_task_no = str(prepared["sourceTaskNo"])
+    item_indexes = list(prepared["itemIndexes"])
+    now_text = _now()
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO publish_task_events (taskId, level, eventType, message, createdAt)
+            VALUES (?, 'info', 'batch_resume_created', ?, ?)
+            """,
+            (
+                int(task_id),
+                f"已创建续发子任务 {child['taskNo']}，包含原批次第 {'、'.join(map(str, item_indexes))} 条视频",
+                now_text,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO publish_task_events (taskId, level, eventType, message, createdAt)
+            VALUES (?, 'info', 'batch_resume_created', ?, ?)
+            """,
+            (
+                int(child["id"]),
+                f"来源任务 {source_task_no}，续发原批次第 {'、'.join(map(str, item_indexes))} 条视频",
+                now_text,
+            ),
+        )
+        conn.commit()
+    return {
+        "task": child,
+        "batch": prepared["batch"],
+        "sourceTaskNo": source_task_no,
+        "itemIndexes": item_indexes,
+    }
 
 
 def mark_task_running(task_id: int, message: str) -> None:
@@ -511,14 +802,16 @@ def mark_task_running(task_id: int, message: str) -> None:
         conn.commit()
 
 
-def mark_task_paused(task_id: int, message: str) -> None:
+def mark_task_paused(task_id: int, message: str, *, pause_reason_code: str) -> None:
     """标记批量任务已受控暂停，未开始的条目必须保持 pending。"""
 
+    if pause_reason_code not in DOUYIN_BATCH_PAUSE_REASONS:
+        raise ValueError("未知的批量暂停原因")
     now = _now()
     with connect() as conn:
         conn.execute(
-            "UPDATE publish_tasks SET status = 'paused' WHERE id = ?",
-            (int(task_id),),
+            "UPDATE publish_tasks SET status = 'paused', pauseReasonCode = ? WHERE id = ?",
+            (pause_reason_code, int(task_id)),
         )
         conn.execute(
             "INSERT INTO publish_task_events (taskId, level, eventType, message, createdAt) VALUES (?, 'warning', 'batch_paused', ?, ?)",

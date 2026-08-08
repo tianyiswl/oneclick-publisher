@@ -212,6 +212,8 @@ def ensure_schema() -> None:
                 contentType TEXT,
                 payloadJson TEXT,
                 lastError TEXT,
+                pauseReasonCode TEXT,
+                resumeSourceTaskId INTEGER,
                 createdAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 startedAt TEXT,
                 finishedAt TEXT
@@ -225,7 +227,16 @@ def ensure_schema() -> None:
                 ("accountSummary", "TEXT"),
                 ("platformSummary", "TEXT"),
                 ("contentType", "TEXT"),
+                ("pauseReasonCode", "TEXT"),
+                ("resumeSourceTaskId", "INTEGER"),
             ),
+        )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_publish_tasks_resume_source
+            ON publish_tasks(resumeSourceTaskId)
+            WHERE resumeSourceTaskId IS NOT NULL
+            """
         )
         conn.execute(
             """

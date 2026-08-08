@@ -6,10 +6,13 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 from app_core import (
+    account_service,
     database,
     douyin_commerce_batch_executor,
     publish_service,
@@ -34,7 +37,13 @@ class DouyinCommerceBatchTaskTests(unittest.TestCase):
                 "title": "北海团购",
                 "description": "三条本地团购视频",
                 "tags": ["北海", "团购"],
-                "selectedMusic": {"musicId": "music-001", "title": "收藏音乐"},
+                "selectedMusic": {
+                    "musicId": "music-001",
+                    "title": "收藏音乐",
+                    "creator": "测试作者",
+                    "duration": "00:30",
+                    "source": "douyin-favorite-visible",
+                },
                 "contentDeclaration": "内容由AI生成",
             },
             "items": [
@@ -57,6 +66,82 @@ class DouyinCommerceBatchTaskTests(unittest.TestCase):
         self.db_patch.stop()
         self.tempdir.cleanup()
 
+    def _create_paused_douyin_batch_source(self) -> dict:
+        """创建一条用户主动暂停、仅后两条待续发的本地来源任务。"""
+
+        account_service.save_oneclick_authorized_account(
+            3,
+            "续发测试主体",
+            "resume-account.json",
+            display_name="续发测试账号",
+        )
+        self.resume_media_paths = []
+        for index in range(1, 4):
+            media_path = Path(self.tempdir.name) / f"resume-{index}.mp4"
+            media_path.write_bytes(b"resume-test-media")
+            self.resume_media_paths.append(str(media_path))
+        batch = {
+            "type": 3,
+            "workflow": "douyin-commerce-batch",
+            "commerceMode": "local-group-buy",
+            "contentType": "video",
+            "accountFile": "resume-account.json",
+            "shared": {
+                "title": "受控续发测试",
+                "description": "只续发未开始的视频",
+                "tags": ["北海", "团购"],
+                "selectedMusic": {
+                    "musicId": "music-001",
+                    "title": "收藏音乐",
+                    "creator": "测试作者",
+                    "duration": "00:30",
+                    "source": "douyin-favorite-visible",
+                },
+                "contentDeclaration": "内容由AI生成",
+            },
+            "publishMode": "interval-schedule",
+            "schedule": {
+                "timezone": "Asia/Shanghai",
+                "startTime": "2026-08-09 16:00",
+                "intervalMinutes": 30,
+            },
+            "items": [
+                {
+                    "mediaPath": media_path,
+                    "locationPreset": {
+                        "poiId": f"resume-poi-{index}",
+                        "name": f"续发地点{index}",
+                        "address": f"北京市朝阳区续发路{index}号",
+                        "scope": "domestic",
+                    },
+                    "scheduleTimeOverride": "",
+                }
+                for index, media_path in enumerate(self.resume_media_paths, start=1)
+            ],
+        }
+        source = task_service.create_douyin_batch_task(
+            batch,
+            schedule_now=datetime(2026, 8, 8, 21, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+        first_item_id = task_service.get_task(source["id"])["items"][0]["id"]
+        self._write_final_receipt(
+            source["id"],
+            first_item_id,
+            event_type="platform_scheduled_receipt",
+            readback={
+                "scheduleTime": "2026-08-09 16:00",
+                "timezone": "Asia/Shanghai",
+            },
+            timezone="Asia/Shanghai",
+            message="第一条已获得平台定时回执",
+        )
+        task_service.mark_task_paused(
+            source["id"],
+            "用户主动暂停，后续视频未开始",
+            pause_reason_code=task_service.PAUSE_REASON_USER_REQUEST,
+        )
+        return source
+
     @staticmethod
     def _write_final_receipt(*args, **kwargs) -> None:
         """通过未来批量执行器唯一允许导入的内部写入模块执行。"""
@@ -75,6 +160,119 @@ class DouyinCommerceBatchTaskTests(unittest.TestCase):
         self.assertEqual(len(detail["items"]), 3)
         self.assertIn("北海银滩景区", detail["commerceSummary"])
         self.assertIn("立即发布", detail["commerceSummary"])
+
+    def test_prepare_douyin_batch_resume_only_includes_pending_source_items(self) -> None:
+        """若错误复制成功项或丢失原排期，该测试必须失败。"""
+
+        source = self._create_paused_douyin_batch_source()
+
+        prepared = task_service.prepare_douyin_batch_resume(
+            source["id"],
+            now=datetime(2026, 8, 8, 21, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+
+        self.assertTrue(prepared["resumeAllowed"])
+        self.assertEqual(prepared["itemIndexes"], [2, 3])
+        self.assertEqual(
+            [item["mediaPath"] for item in prepared["batch"]["items"]],
+            self.resume_media_paths[1:],
+        )
+        self.assertEqual(
+            [item["scheduleTime"] for item in prepared["batch"]["items"]],
+            ["2026-08-09 16:30", "2026-08-09 17:00"],
+        )
+
+    def test_create_douyin_batch_resume_keeps_source_unchanged_and_preserves_indexes(self) -> None:
+        """若续发覆盖来源条目或重排原视频序号，该测试必须失败。"""
+
+        source = self._create_paused_douyin_batch_source()
+        source_before = task_service.get_task(source["id"])
+
+        created = task_service.create_douyin_batch_resume(
+            source["id"],
+            now=datetime(2026, 8, 8, 21, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+
+        child = task_service.get_task(created["task"]["id"])
+        source_after = task_service.get_task(source["id"])
+        self.assertEqual(child["mode"], "oneclick_resume")
+        self.assertEqual(child["resumeSourceTaskId"], source["id"])
+        self.assertEqual([item["batchItemIndex"] for item in child["items"]], [2, 3])
+        self.assertEqual(source_after["status"], source_before["status"])
+        self.assertEqual(source_after["successCount"], source_before["successCount"])
+        self.assertEqual(source_after["failedCount"], source_before["failedCount"])
+        self.assertEqual(source_after["items"], source_before["items"])
+
+    def test_prepare_douyin_batch_resume_rejects_nonmanual_and_historical_pauses(self) -> None:
+        """若登录、验证、回执、自动暂停或历史任务可续发，该测试必须失败。"""
+
+        for reason in (
+            task_service.PAUSE_REASON_WAITING_LOGIN,
+            task_service.PAUSE_REASON_WAITING_VERIFICATION,
+            task_service.PAUSE_REASON_RECEIPT_AMBIGUOUS,
+            task_service.PAUSE_REASON_AUTO_FAILURE,
+            None,
+        ):
+            with self.subTest(reason=reason):
+                source = self._create_paused_douyin_batch_source()
+                if reason is None:
+                    with database.connect() as conn:
+                        conn.execute(
+                            "UPDATE publish_tasks SET pauseReasonCode = NULL WHERE id = ?",
+                            (source["id"],),
+                        )
+                        conn.commit()
+                else:
+                    task_service.mark_task_paused(
+                        source["id"],
+                        "非用户主动暂停",
+                        pause_reason_code=reason,
+                    )
+                before_count = len(task_service.list_tasks())
+                prepared = task_service.prepare_douyin_batch_resume(
+                    source["id"],
+                    now=datetime(2026, 8, 8, 21, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+                )
+                self.assertFalse(prepared["resumeAllowed"])
+                with self.assertRaises(ValueError):
+                    task_service.create_douyin_batch_resume(
+                        source["id"],
+                        now=datetime(2026, 8, 8, 21, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+                    )
+                self.assertEqual(len(task_service.list_tasks()), before_count)
+
+    def test_prepare_douyin_batch_resume_rejects_expired_schedule_and_missing_media(self) -> None:
+        """若续发自动改期或忽略缺失素材，该测试必须失败。"""
+
+        source = self._create_paused_douyin_batch_source()
+        expired = task_service.prepare_douyin_batch_resume(
+            source["id"],
+            now=datetime(2026, 8, 10, 0, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+        self.assertFalse(expired["resumeAllowed"])
+        self.assertIn("发布时间", expired["blockedReason"])
+
+        source = self._create_paused_douyin_batch_source()
+        Path(self.resume_media_paths[1]).unlink()
+        missing_media = task_service.prepare_douyin_batch_resume(
+            source["id"],
+            now=datetime(2026, 8, 8, 21, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+        self.assertFalse(missing_media["resumeAllowed"])
+        self.assertIn("素材不存在", missing_media["blockedReason"])
+
+    def test_prepare_douyin_batch_resume_rejects_duplicate_child_creation(self) -> None:
+        """若同一来源可重复创建子任务导致重复发布，该测试必须失败。"""
+
+        source = self._create_paused_douyin_batch_source()
+        now = datetime(2026, 8, 8, 21, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        task_service.create_douyin_batch_resume(source["id"], now=now)
+
+        prepared = task_service.prepare_douyin_batch_resume(source["id"], now=now)
+        self.assertFalse(prepared["resumeAllowed"])
+        self.assertIn("已创建续发子任务", prepared["blockedReason"])
+        with self.assertRaisesRegex(ValueError, "已创建续发子任务"):
+            task_service.create_douyin_batch_resume(source["id"], now=now)
 
     def test_public_platform_receipt_keeps_a_batch_item_running(self) -> None:
         task = task_service.create_douyin_batch_task(self.batch)
