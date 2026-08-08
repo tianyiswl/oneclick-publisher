@@ -360,6 +360,14 @@ class DouYinVideo(object):
                 f"抖音独立标题输入框数量异常：{len(title_inputs)}，已停止填写"
             )
         title = (self.title or "").strip()
+        # 批量复用浏览器上下文时，平台可能保留上一条编辑器的标题。必须先
+        # 清空并回读为空，再写入当前目标值，不能依赖 fill(新值) 隐式覆盖。
+        await title_inputs[0].fill("")
+        actual_after_clear = (await title_inputs[0].input_value()).strip()
+        if actual_after_clear:
+            raise RuntimeError(
+                f"抖音标题未能清空旧值，已停止填写：{actual_after_clear}"
+            )
         await title_inputs[0].fill(title)
         actual_title = (await title_inputs[0].input_value()).strip()
         if actual_title != title:

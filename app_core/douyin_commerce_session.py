@@ -35,6 +35,7 @@ from . import (
 )
 from .oneclick_preflight import _account_for_payload, _storage_state
 from .douyin_verification import verification_broker
+from utils.log import douyin_logger
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -699,18 +700,36 @@ class DouyinCommerceSessionManager:
         return douyin_favorite_music_cache.list_cached_favorite_music(session.account_id)
 
     async def _refresh_favorite_music(self, session_id: str) -> list[dict[str, str]]:
-        """显式刷新当前账号的收藏音乐，并仅持久化稳定、非敏感元数据。"""
+        """显式刷新当前账号的收藏音乐，并恢复编辑页可操作状态。
+
+        “刷新”只用于同步候选，不等于已选择音乐。读取完成后必须关闭真实音乐
+        抽屉；用户之后从客户端下拉框选歌时，再打开当次抽屉并做精确回读。这样
+        音乐、地点、声明与定时可以按任意顺序设置，而不会遗留遮罩阻断地点搜索。
+        """
 
         session = await self._current(session_id)
         current = await self._load_favorite_music(session_id)
+        picker_page = session.music_picker_page
+        dialog = session.music_dialog
+        if picker_page is None or dialog is None:
+            raise DouyinCommerceSessionError("抖音收藏音乐读取后未保留可关闭的选择器")
+        try:
+            await douyin_music_service.close_favorite_music_choices(picker_page, dialog)
+        except douyin_music_service.DouyinMusicError as exc:
+            raise DouyinCommerceSessionError(
+                f"抖音收藏音乐读取后未能安全关闭选择器：{exc}"
+            ) from exc
+        # 抽屉关闭后，行 marker 已经失效，不能继续将它们作为可点击候选留在
+        # 会话中。客户端只展示稳定缓存；真正选歌时会重新打开当前列表精确匹配。
+        session.music_picker_page = None
+        session.music_dialog = None
+        session.music_candidates = []
+        self._refresh_editor_stage(session)
         if session.account_id <= 0:
             return current
-        douyin_favorite_music_cache.replace_cached_favorite_music(
-            session.account_id, session.music_candidates
+        return douyin_favorite_music_cache.replace_cached_favorite_music(
+            session.account_id, current
         )
-        # 刷新后的本次列表仍可能含只能在当前弹层使用的临时身份。它们不会
-        # 入库，但用户仍可在本次打开的真实抽屉中手动选择并完成回读。
-        return current
 
     async def _select_favorite_music(
         self,
@@ -1117,6 +1136,13 @@ class DouyinCommerceSessionManager:
         else:
             raise DouyinCommerceSessionError("抖音返回了无法处理的验证类型，发布已安全停止")
 
+        verification_label = "短信验证码" if kind == "sms" else "扫码验证"
+        verification_message = (
+            f"抖音最终提交触发{verification_label}，"
+            "正在等待用户处理；当前编辑会话保持不变"
+        )
+        douyin_logger.warning(verification_message)
+
         # 只把瞬态挑战对象交给当前进程内的客户端；回调不得写二维码、验证码或
         # 原始页面信息。回调失败不影响浏览器会话的安全等待和后续清理。
         if on_verification is not None:
@@ -1172,6 +1198,8 @@ class DouyinCommerceSessionManager:
                         verification_broker.succeed(request_id)
                         # 给原生窗口一个轮询周期显示“验证成功、正在继续”，再由
                         # finally 清理内存请求；不延长浏览器会话，也不持久化验证码。
+                        success_message = "抖音短信验证码已通过，继续等待平台回执"
+                        douyin_logger.success(success_message)
                         await asyncio.sleep(0.35)
                         return
                 else:
@@ -1188,6 +1216,8 @@ class DouyinCommerceSessionManager:
                         if "/creator-micro/content/manage" in str(session.page.url or ""):
                             verification_broker.begin_processing(request_id)
                             verification_broker.succeed(request_id)
+                            success_message = "抖音扫码验证已通过，继续等待平台回执"
+                            douyin_logger.success(success_message)
                             await asyncio.sleep(0.35)
                             return
                         await session.page.wait_for_timeout(250)

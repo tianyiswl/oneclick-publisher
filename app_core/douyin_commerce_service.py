@@ -9,7 +9,10 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import hashlib
+import json
+import os
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -41,7 +44,17 @@ CONTENT_DECLARATION_OPTIONS = (
 )
 _COMMERCE_MODE_TEXT = "带货模式"
 _CHECKIN_MODE_TEXT = "打卡模式"
+_UNSELECTED_MODE_VALUE = "__oneclick_unselected_commerce_mode__"
 _ANCHOR_ROOT_ID = "douyin_creator_pc_anchor_jump"
+_LOCATION_DIAGNOSTIC_ENV = "ONECLICK_LOCATION_DIAGNOSTIC_DIR"
+_LOCATION_DIAGNOSTIC_LABELS = (
+    "添加标签",
+    "位置",
+    "带货模式",
+    "打卡模式",
+    "本地",
+    "国内",
+)
 
 
 class DouyinCommerceError(RuntimeError):
@@ -481,11 +494,12 @@ def _is_location_linked_store(
 
 
 async def _anchor_controls(page):
-    """定位新版“带货模式 + 关联地点”这一组两个选择控件。
+    """定位页面实际可见的带货位置操作面。
 
-    新版抖音不再提供复选框：左侧下拉决定“带货模式/打卡模式”，右侧下拉
-    展示可关联的带货地点。仅依赖官方页面稳定的锚点根 ID、可见性和两个
-    直接子选择控件的结构；不按页面中泛化的“带货模式”文本猜测。
+    抖音现存两种界面：旧版依赖固定锚点中的两个 ``semi-select``；新版则在
+    同一“添加标签”行直接呈现“位置 + 带货模式 + 地点输入框”。后者没有可点
+    的“添加标签”按钮，不能把静态标签误当作入口。两种结构都必须由同一行内
+    的完整组合唯一确认；全页出现的孤立“位置”或“带货模式”文本一律不采用。
     """
 
     result = await page.evaluate(
@@ -499,24 +513,179 @@ async def _anchor_controls(page):
             }};
             const normalize = value => String(value || '')
                 .replace(/[\\u200b\\u00a0]/g, ' ').replace(/\\s+/g, ' ').trim();
-            const anchor = document.getElementById('{_ANCHOR_ROOT_ID}');
-            if (!anchor || !visible(anchor)) return {{ count: 0 }};
-            const groups = Array.from(anchor.querySelectorAll('[class*="anchor-item"]'))
+            const clearMarkers = () => document.querySelectorAll(
+                '[data-oneclick-commerce-mode], [data-oneclick-commerce-store]'
+            ).forEach(node => {{
+                node.removeAttribute('data-oneclick-commerce-mode');
+                node.removeAttribute('data-oneclick-commerce-store');
+            }});
+            const text = node => normalize(node.innerText || node.textContent);
+            const leafText = (root, label) => Array.from(root.querySelectorAll('*'))
                 .filter(visible)
-                .map(group => Array.from(group.children)
-                    .filter(node => node.classList?.contains('semi-select') && visible(node)));
-            const matched = groups.filter(items => items.length === 2
-                && ['{_COMMERCE_MODE_TEXT}', '{_CHECKIN_MODE_TEXT}']
-                    .includes(normalize(items[0].innerText || items[0].textContent)));
-            if (matched.length !== 1) return {{ count: matched.length }};
-            const [mode, store] = matched[0];
-            mode.dataset.oneclickCommerceMode = 'active';
-            store.dataset.oneclickCommerceStore = 'active';
-            return {{
-                count: 1,
-                mode: normalize(mode.innerText || mode.textContent),
-                store: normalize(store.innerText || store.textContent),
+                .filter(node => text(node) === label)
+                .filter(node => !Array.from(node.children)
+                    .some(child => visible(child) && text(child) === label));
+            const editable = node => visible(node) && !node.disabled && !node.readOnly
+                && String(node.type || '').toLowerCase() !== 'hidden';
+            const interactive = node => {{
+                for (let current = node, depth = 0;
+                    current && current !== document.body && depth < 6;
+                    current = current.parentElement, depth += 1) {{
+                    const role = String(current.getAttribute?.('role') || '').toLowerCase();
+                    const className = String(current.className || '');
+                    if (current.classList?.contains('semi-select') || role === 'button'
+                        || current.tagName === 'BUTTON' || Number(current.tabIndex) >= 0
+                        || /(?:^|[-_\\s])(?:select|dropdown|item|option)(?:$|[-_\\s])/i.test(className)) {{
+                        return current;
+                    }}
+                }}
+                return null;
             }};
+            const lowestCommonAncestor = (left, right) => {{
+                const ancestors = new Set();
+                for (let current = left; current && current !== document.body; current = current.parentElement) {{
+                    ancestors.add(current);
+                }}
+                for (let current = right; current && current !== document.body; current = current.parentElement) {{
+                    if (ancestors.has(current)) return current;
+                }}
+                return null;
+            }};
+            const mark = (mode, store, surface) => {{
+                clearMarkers();
+                mode.dataset.oneclickCommerceMode = 'active';
+                store.dataset.oneclickCommerceStore = 'active';
+                return {{
+                    count: 1,
+                    mode: text(mode),
+                    store: normalize(store.value || store.innerText || store.textContent),
+                    surface,
+                }};
+            }};
+
+            // 旧版：固定锚点内的“模式 + 门店”双下拉。
+            const anchor = document.getElementById('{_ANCHOR_ROOT_ID}');
+            if (anchor && visible(anchor)) {{
+                const groups = Array.from(anchor.querySelectorAll('[class*="anchor-item"]'))
+                    .filter(visible)
+                    .map(group => Array.from(group.children)
+                        .filter(node => node.classList?.contains('semi-select') && visible(node)));
+                const matched = groups.filter(items => items.length === 2
+                    && ['{_COMMERCE_MODE_TEXT}', '{_CHECKIN_MODE_TEXT}']
+                        .includes(text(items[0])));
+                if (matched.length === 1) {{
+                    const [mode, store] = matched[0];
+                    return mark(mode, store, 'legacy-anchor');
+                }}
+                if (matched.length > 1) return {{ count: matched.length, surface: 'legacy-anchor' }};
+            }}
+
+            // 新版：位置、带货模式和地点输入框必须属于同一个可见行。这里不把
+            // “添加标签”静态标题当作按钮；只接受完整三元组，避免误点共创或话题。
+            const positionLeaves = leafText(document, '位置');
+            const modeLeaves = leafText(document, '{_COMMERCE_MODE_TEXT}');
+            const modern = [];
+            for (const position of positionLeaves) {{
+                for (const modeLeaf of modeLeaves) {{
+                    const row = lowestCommonAncestor(position, modeLeaf);
+                    if (!row || !visible(row)) continue;
+                    const positionsInRow = leafText(row, '位置');
+                    const modesInRow = leafText(row, '{_COMMERCE_MODE_TEXT}');
+                    const fields = Array.from(row.querySelectorAll(
+                        'input, textarea, [contenteditable="true"][role="textbox"]'
+                    )).filter(editable);
+                    const mode = interactive(modeLeaf);
+                    if (positionsInRow.length === 1 && modesInRow.length === 1
+                        && fields.length === 1 && mode && !modern.some(item => item.row === row)) {{
+                        modern.push({{ row, mode, store: fields[0] }});
+                    }}
+                }}
+            }}
+            if (modern.length === 1) {{
+                return mark(modern[0].mode, modern[0].store, 'modern-position-mode-input');
+            }}
+            if (modern.length > 1) {{
+                return {{ count: modern.length, surface: 'modern-position-mode-input' }};
+            }}
+
+            // 部分账号在首次选择“位置”后只用 CSS/data-code 展示位置类型，
+            // “带货模式”则位于紧邻的独立行。只在唯一“添加标签”小节内接受：
+            // 当前行恰有“位置类型下拉 + 可搜索地点输入”，后续兄弟行恰有一个
+            // “单下拉且无输入框”的模式候选；共创行含两个下拉和输入框，会被
+            // 排除。不能把当前位置类型下拉误标成带货模式。
+            const structural = [];
+            for (const addLeaf of leafText(document, '添加标签')) {{
+                for (let row = addLeaf.parentElement, depth = 0;
+                    row && row !== document.body && depth < 6;
+                    row = row.parentElement, depth += 1) {{
+                    const rowClass = String(row.className || '');
+                    if (!/(?:^|[-_\\s])new-layout(?:$|[-_\\s])/i.test(rowClass)) {{
+                        continue;
+                    }}
+                    const contentChildren = Array.from(row.children)
+                        .filter(visible)
+                        .filter(node => /(?:^|[-_\\s])content-child(?:$|[-_\\s])/i
+                            .test(String(node.className || '')));
+                    if (contentChildren.length !== 1) break;
+                    const content = contentChildren[0];
+                    const selects = Array.from(content.querySelectorAll('.semi-select'))
+                        .filter(visible)
+                        .filter(node => !node.parentElement?.closest('.semi-select'));
+                    const fields = Array.from(content.querySelectorAll(
+                        'input, textarea, [contenteditable="true"][role="textbox"]'
+                    )).filter(editable);
+                    const positionTypeCandidates = selects.filter(node =>
+                        !node.classList.contains('semi-select-filterable')
+                        && !node.querySelector('input, textarea, [contenteditable="true"]'));
+                    const searchSelects = selects.filter(node =>
+                        node.classList.contains('semi-select-filterable')
+                        && fields.some(field => node.contains(field)));
+                    if (positionTypeCandidates.length !== 1 || searchSelects.length !== 1
+                        || fields.length !== 1) {{
+                        break;
+                    }}
+                    const adjacentModeCandidates = [];
+                    for (let sibling = row.nextElementSibling;
+                        sibling; sibling = sibling.nextElementSibling) {{
+                        if (!visible(sibling)) continue;
+                        const siblingClass = String(sibling.className || '');
+                        if (!/(?:^|[-_\\s])new-layout(?:$|[-_\\s])/i.test(siblingClass)) {{
+                            continue;
+                        }}
+                        const siblingSelects = Array.from(
+                            sibling.querySelectorAll('.semi-select')
+                        ).filter(visible).filter(node =>
+                            !node.parentElement?.closest('.semi-select'));
+                        const siblingFields = Array.from(sibling.querySelectorAll(
+                            'input, textarea, [contenteditable="true"][role="textbox"]'
+                        )).filter(editable);
+                        if (siblingSelects.length === 1 && siblingFields.length === 0) {{
+                            adjacentModeCandidates.push(siblingSelects[0]);
+                        }}
+                    }}
+                    if (adjacentModeCandidates.length === 1) {{
+                        structural.push({{
+                            row,
+                            mode: adjacentModeCandidates[0],
+                            store: fields[0],
+                        }});
+                    }}
+                    break;
+                }}
+            }}
+            if (structural.length === 1) {{
+                const matched = mark(
+                    structural[0].mode,
+                    structural[0].store,
+                    'modern-add-tag-structure'
+                );
+                if (!matched.mode) matched.mode = '{_UNSELECTED_MODE_VALUE}';
+                return matched;
+            }}
+            if (structural.length > 1) {{
+                return {{ count: structural.length, surface: 'modern-add-tag-structure' }};
+            }}
+            return {{ count: modern.length, surface: 'modern-position-mode-input' }};
         }}"""
     )
     if not isinstance(result, Mapping) or int(result.get("count") or 0) != 1:
@@ -533,10 +702,12 @@ async def _anchor_controls(page):
 
 
 async def _mark_unique_position_tag_select(page) -> Any | None:
-    """标记“添加标签”行中唯一显示为“位置”的选择控件。
+    """标记“添加标签”行中唯一的“位置”入口。
 
     只在带货控件组尚未出现时使用。这个控件的当前文案、可见性和唯一性都由
-    页面回读；若页面上存在多个“位置”控件，宁可停下也不按序号猜测。
+    页面回读；新版不保证入口根节点的全文恰好等于“位置”，因此从精确文字
+    叶节点向上收敛到可点击控件，并要求同一行内同时有唯一“带货模式”。若
+    页面上存在多个候选，宁可停下也不按序号猜测。
     """
 
     result = await page.evaluate(
@@ -550,9 +721,43 @@ async def _mark_unique_position_tag_select(page) -> Any | None:
             };
             const normalize = value => String(value || '')
                 .replace(/[\u200b\u00a0]/g, ' ').replace(/\\s+/g, ' ').trim();
-            const controls = Array.from(document.querySelectorAll('.semi-select'))
+            const text = node => normalize(node.innerText || node.textContent);
+            const leaves = (root, label) => Array.from(root.querySelectorAll('*'))
                 .filter(visible)
-                .filter(node => normalize(node.innerText || node.textContent) === '位置');
+                .filter(node => text(node) === label)
+                .filter(node => !Array.from(node.children)
+                    .some(child => visible(child) && text(child) === label));
+            const interactive = node => {
+                for (let current = node, depth = 0;
+                    current && current !== document.body && depth < 6;
+                    current = current.parentElement, depth += 1) {
+                    const role = String(current.getAttribute?.('role') || '').toLowerCase();
+                    const className = String(current.className || '');
+                    if (current.classList?.contains('semi-select') || role === 'button'
+                        || current.tagName === 'BUTTON' || Number(current.tabIndex) >= 0
+                        || /(?:^|[-_\\s])(?:select|dropdown|item|option)(?:$|[-_\\s])/i.test(className)) {
+                        return current;
+                    }
+                }
+                return null;
+            };
+            const candidates = [];
+            for (const leaf of leaves(document, '位置')) {
+                const control = interactive(leaf);
+                if (!control || candidates.includes(control)) continue;
+                let row = control.parentElement;
+                let supported = false;
+                for (let depth = 0; row && row !== document.body && depth < 5;
+                    row = row.parentElement, depth += 1) {
+                    if (leaves(row, '位置').length === 1
+                        && leaves(row, '带货模式').length === 1) {
+                        supported = true;
+                        break;
+                    }
+                }
+                if (supported) candidates.push(control);
+            }
+            const controls = candidates;
             if (controls.length !== 1) return { count: controls.length };
             controls[0].dataset.oneclickCommercePositionTag = 'active';
             return { count: 1 };
@@ -564,7 +769,12 @@ async def _mark_unique_position_tag_select(page) -> Any | None:
 
 
 async def _open_unique_add_tag(page) -> bool:
-    """仅在页面存在唯一可见“添加标签”入口时打开其菜单。"""
+    """仅在页面存在唯一可见“添加标签”入口时打开其菜单。
+
+    页面存在两种结构：精确文字位于可点击祖先内，或“添加标签”只是左侧
+    静态标题、真正下拉位于同一行右侧兄弟区域。两条路径都必须收敛为唯一
+    可见控件；不能因容器类名包含笼统的 ``item`` 就把整行误判为入口。
+    """
 
     result = await page.evaluate(
         """() => {
@@ -577,10 +787,106 @@ async def _open_unique_add_tag(page) -> bool:
             };
             const normalize = value => String(value || '')
                 .replace(/[\u200b\u00a0]/g, ' ').replace(/\\s+/g, ' ').trim();
-            const nodes = Array.from(document.querySelectorAll('button, [role="button"], .semi-select'))
+            const text = node => normalize(node.innerText || node.textContent);
+            const leaves = Array.from(document.querySelectorAll('*'))
                 .filter(visible)
-                .filter(node => normalize(node.innerText || node.textContent) === '添加标签');
-            if (nodes.length !== 1) return { count: nodes.length };
+                .filter(node => text(node) === '添加标签')
+                .filter(node => !Array.from(node.children)
+                    .some(child => visible(child) && text(child) === '添加标签'));
+            const interactive = node => {
+                for (let current = node, depth = 0;
+                    current && current !== document.body && depth < 6;
+                    current = current.parentElement, depth += 1) {
+                    const role = String(current.getAttribute?.('role') || '').toLowerCase();
+                    const className = String(current.className || '');
+                    if (current.classList?.contains('semi-select') || role === 'button'
+                        || current.tagName === 'BUTTON' || Number(current.tabIndex) >= 0
+                        || /(?:^|[-_\\s])(?:select|dropdown|trigger)(?:$|[-_\\s])/i
+                            .test(className)) {
+                        return current;
+                    }
+                }
+                return null;
+            };
+            const nodes = [];
+            for (const leaf of leaves) {
+                const control = interactive(leaf);
+                if (control && !nodes.includes(control)) nodes.push(control);
+            }
+            if (nodes.length > 1) {
+                return { count: nodes.length, leaves: leaves.length, route: 'ancestor' };
+            }
+            if (nodes.length === 0) {
+                const siblingNodes = [];
+                const add = node => {
+                    if (node && visible(node) && !siblingNodes.includes(node)) {
+                        siblingNodes.push(node);
+                    }
+                };
+                // 2026-08 新版在选择音乐后会重渲染并移除原位置标签。此时
+                // “添加标签”右侧入口退化为无 role/tabindex 的 content-child
+                // 容器。只接受精确标题所在 new-layout 行的唯一右侧直属容器；
+                // 不在全页搜索 content-child，也不按同类节点序号猜测。该精确
+                // 结构必须优先于旧版向后查找，否则后续声明区按钮会形成假歧义。
+                const modernNodes = [];
+                for (const leaf of leaves) {
+                    for (let row = leaf.parentElement, depth = 0;
+                        row && row !== document.body && depth < 6;
+                        row = row.parentElement, depth += 1) {
+                        const rowClass = String(row.className || '');
+                        if (!/(?:^|[-_\\s])new-layout(?:$|[-_\\s])/i.test(rowClass)) {
+                            continue;
+                        }
+                        const children = Array.from(row.children).filter(visible);
+                        const titleBranch = children.find(child => child.contains(leaf));
+                        if (!titleBranch) continue;
+                        const titleRect = titleBranch.getBoundingClientRect();
+                        const matches = children.filter(child => {
+                            if (child === titleBranch) return false;
+                            const className = String(child.className || '');
+                            const rect = child.getBoundingClientRect();
+                            const verticalOverlap = Math.min(titleRect.bottom, rect.bottom)
+                                - Math.max(titleRect.top, rect.top);
+                            return /(?:^|[-_\\s])content-child(?:$|[-_\\s])/i.test(className)
+                                && rect.left >= titleRect.right
+                                && verticalOverlap > 0;
+                        });
+                        matches.forEach(node => {
+                            if (!modernNodes.includes(node)) modernNodes.push(node);
+                        });
+                        break;
+                    }
+                }
+                if (modernNodes.length > 0) {
+                    modernNodes.forEach(add);
+                } else {
+                    for (const leaf of leaves) {
+                        for (let branch = leaf, depth = 0;
+                            branch && branch !== document.body && depth < 5;
+                            branch = branch.parentElement, depth += 1) {
+                            for (let sibling = branch.nextElementSibling;
+                                sibling; sibling = sibling.nextElementSibling) {
+                                if (sibling.matches?.(
+                                    '.semi-select-single, .semi-select, button, [role="button"], [tabindex]'
+                                )) add(sibling);
+                                sibling.querySelectorAll?.(
+                                    '.semi-select-single, .semi-select, button, [role="button"], [tabindex]'
+                                ).forEach(add);
+                            }
+                        }
+                    }
+                }
+                if (siblingNodes.length !== 1) {
+                    return {
+                        count: siblingNodes.length,
+                        leaves: leaves.length,
+                        route: 'following-sibling',
+                    };
+                }
+                nodes.push(siblingNodes[0]);
+            }
+            document.querySelectorAll('[data-oneclick-commerce-add-tag]')
+                .forEach(node => node.removeAttribute('data-oneclick-commerce-add-tag'));
             nodes[0].dataset.oneclickCommerceAddTag = 'active';
             return { count: 1 };
         }"""
@@ -625,6 +931,325 @@ async def _wait_position_tag_option(page) -> Any:
     raise DouyinCommerceError("抖音“位置”标签选项未能唯一显示，已安全停止")
 
 
+async def _wait_unique_position_tag_select(
+    page,
+    *,
+    attempts: int = 4,
+    interval_ms: int = 150,
+) -> Any | None:
+    """短时等待动态位置入口，只返回页面唯一确认的控件。"""
+
+    max_attempts = max(1, attempts)
+    for attempt in range(max_attempts):
+        tag_select = await _mark_unique_position_tag_select(page)
+        if tag_select is not None:
+            return tag_select
+        if attempt + 1 < max_attempts:
+            await page.wait_for_timeout(interval_ms)
+    return None
+
+
+def _diagnostic_text(value: object, *, limit: int = 160) -> str:
+    """收敛诊断元数据；禁止把长正文或控件值混入快照。"""
+
+    return _normalized(value)[:limit]
+
+
+def _sanitize_location_diagnostic_node(value: object) -> dict[str, Any]:
+    """只保留控件结构白名单，不接受页面返回的任意附加字段。"""
+
+    if not isinstance(value, Mapping):
+        return {}
+    classes = [
+        _diagnostic_text(item, limit=96)
+        for item in value.get("classes", [])
+        if _diagnostic_text(item, limit=96)
+    ][:16]
+    data_attributes = [
+        _diagnostic_text(item, limit=80)
+        for item in value.get("dataAttributes", [])
+        if _diagnostic_text(item, limit=80).startswith("data-")
+    ][:24]
+    rect_raw = value.get("rect") if isinstance(value.get("rect"), Mapping) else {}
+    rect: dict[str, float] = {}
+    for key in ("x", "y", "width", "height"):
+        try:
+            rect[key] = round(float(rect_raw.get(key) or 0), 2)
+        except (TypeError, ValueError):
+            rect[key] = 0.0
+    state_raw = value.get("state") if isinstance(value.get("state"), Mapping) else {}
+    state = {
+        key: _diagnostic_text(state_raw.get(key), limit=24)
+        for key in (
+            "ariaExpanded",
+            "ariaSelected",
+            "ariaChecked",
+            "ariaCurrent",
+            "dataState",
+        )
+        if _diagnostic_text(state_raw.get(key), limit=24)
+    }
+    try:
+        tab_index = int(value.get("tabIndex", -1))
+    except (TypeError, ValueError):
+        tab_index = -1
+    return {
+        "tag": _diagnostic_text(value.get("tag"), limit=24).lower(),
+        "role": _diagnostic_text(value.get("role"), limit=48).lower(),
+        "classes": classes,
+        "ariaLabel": _diagnostic_text(value.get("ariaLabel"), limit=120),
+        "placeholder": _diagnostic_text(value.get("placeholder"), limit=120),
+        "rect": rect,
+        "tabIndex": tab_index,
+        "disabled": bool(value.get("disabled")),
+        "readOnly": bool(value.get("readOnly")),
+        "contentEditable": bool(value.get("contentEditable")),
+        "dataAttributes": data_attributes,
+        "state": state,
+    }
+
+
+def _sanitize_location_entry_diagnostic(value: object) -> dict[str, Any]:
+    """对浏览器返回结果做第二层白名单过滤，敏感字段即使出现也不落盘。"""
+
+    raw = value if isinstance(value, Mapping) else {}
+    allowed_labels = set(_LOCATION_DIAGNOSTIC_LABELS)
+    counts_raw = raw.get("labelCounts") if isinstance(raw.get("labelCounts"), Mapping) else {}
+    label_counts: dict[str, int] = {}
+    for label in _LOCATION_DIAGNOSTIC_LABELS:
+        try:
+            count = max(0, int(counts_raw.get(label) or 0))
+        except (TypeError, ValueError):
+            count = 0
+        if count:
+            label_counts[label] = count
+
+    landmarks: list[dict[str, Any]] = []
+    for item in raw.get("landmarks", []):
+        if not isinstance(item, Mapping):
+            continue
+        label = _diagnostic_text(item.get("label"), limit=24)
+        if label not in allowed_labels:
+            continue
+        leaf = _sanitize_location_diagnostic_node(item.get("leaf"))
+        ancestors = [
+            cleaned
+            for node in item.get("ancestors", [])
+            if (cleaned := _sanitize_location_diagnostic_node(node))
+        ][:8]
+        siblings = [
+            cleaned
+            for node in item.get("siblings", [])
+            if (cleaned := _sanitize_location_diagnostic_node(node))
+        ][:48]
+        landmarks.append(
+            {
+                "label": label,
+                "leaf": leaf,
+                "ancestors": ancestors,
+                "siblings": siblings,
+            }
+        )
+
+    editable_nodes = [
+        cleaned
+        for node in raw.get("editableNodes", [])
+        if (cleaned := _sanitize_location_diagnostic_node(node))
+    ][:32]
+    marked_entry_descendants = [
+        cleaned
+        for node in raw.get("markedEntryDescendants", [])
+        if (cleaned := _sanitize_location_diagnostic_node(node))
+    ][:48]
+    overlay_nodes = [
+        cleaned
+        for node in raw.get("overlayNodes", [])
+        if (cleaned := _sanitize_location_diagnostic_node(node))
+    ][:64]
+    modern_row_nodes = [
+        cleaned
+        for node in raw.get("modernRowNodes", [])
+        if (cleaned := _sanitize_location_diagnostic_node(node))
+    ][:96]
+    location_section_nodes = [
+        cleaned
+        for node in raw.get("locationSectionNodes", [])
+        if (cleaned := _sanitize_location_diagnostic_node(node))
+    ][:160]
+    return {
+        "schemaVersion": 1,
+        "kind": "douyin-location-entry-structure",
+        "capturedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "labelCounts": label_counts,
+        "landmarks": landmarks[:32],
+        "editableNodes": editable_nodes,
+        "markedEntryDescendants": marked_entry_descendants,
+        "overlayNodes": overlay_nodes,
+        "modernRowNodes": modern_row_nodes,
+        "locationSectionNodes": location_section_nodes,
+    }
+
+
+async def _capture_location_entry_diagnostic(page, output_dir: Path) -> Path:
+    """保存最小脱敏 DOM 结构；不读取正文、输入值、Cookie、HTML 或请求。"""
+
+    raw = await page.evaluate(
+        f"""() => {{
+            const labels = {json.dumps(list(_LOCATION_DIAGNOSTIC_LABELS), ensure_ascii=False)};
+            const visible = node => {{
+                if (!(node instanceof HTMLElement)) return false;
+                const rect = node.getBoundingClientRect();
+                const style = getComputedStyle(node);
+                return rect.width > 0 && rect.height > 0
+                    && style.display !== 'none' && style.visibility !== 'hidden';
+            }};
+            const normalize = value => String(value || '')
+                .replace(/[\\u200b\\u00a0]/g, ' ').replace(/\\s+/g, ' ').trim();
+            const nodeText = node => normalize(node.innerText || node.textContent);
+            const descriptor = node => {{
+                const rect = node.getBoundingClientRect();
+                const classText = typeof node.className === 'string' ? node.className : '';
+                return {{
+                    tag: String(node.tagName || '').toLowerCase(),
+                    role: String(node.getAttribute?.('role') || ''),
+                    classes: classText.split(/\\s+/).filter(Boolean).slice(0, 16),
+                    ariaLabel: String(node.getAttribute?.('aria-label') || ''),
+                    placeholder: String(node.getAttribute?.('placeholder') || ''),
+                    rect: {{ x: rect.x, y: rect.y, width: rect.width, height: rect.height }},
+                    tabIndex: Number(node.tabIndex ?? -1),
+                    disabled: Boolean(node.disabled),
+                    readOnly: Boolean(node.readOnly),
+                    contentEditable: node.getAttribute?.('contenteditable') === 'true',
+                    dataAttributes: Array.from(node.attributes || [])
+                        .map(attribute => attribute.name)
+                        .filter(name => name.startsWith('data-')).slice(0, 24),
+                    state: {{
+                        ariaExpanded: String(node.getAttribute?.('aria-expanded') || ''),
+                        ariaSelected: String(node.getAttribute?.('aria-selected') || ''),
+                        ariaChecked: String(node.getAttribute?.('aria-checked') || ''),
+                        ariaCurrent: String(node.getAttribute?.('aria-current') || ''),
+                        dataState: String(node.getAttribute?.('data-state') || ''),
+                    }},
+                }};
+            }};
+            const leaves = label => Array.from(document.querySelectorAll('*'))
+                .filter(visible)
+                .filter(node => nodeText(node) === label)
+                .filter(node => !Array.from(node.children)
+                    .some(child => visible(child) && nodeText(child) === label));
+            const labelCounts = Object.fromEntries(labels.map(label => [label, leaves(label).length]));
+            const landmarks = [];
+            const neighborhoods = new Set();
+            for (const label of labels) {{
+                for (const leaf of leaves(label).slice(0, 8)) {{
+                    const ancestors = [];
+                    const siblings = [];
+                    for (let current = leaf.parentElement, depth = 0;
+                        current && current !== document.body && depth < 7;
+                        current = current.parentElement, depth += 1) {{
+                        neighborhoods.add(current);
+                        ancestors.push(descriptor(current));
+                        Array.from(current.children).filter(visible).slice(0, 12)
+                            .forEach(node => siblings.push(descriptor(node)));
+                    }}
+                    landmarks.push({{
+                        label,
+                        leaf: descriptor(leaf),
+                        ancestors,
+                        siblings: siblings.slice(0, 48),
+                    }});
+                }}
+            }}
+            const editableSelector = 'input, textarea, [contenteditable="true"]';
+            const editableNodes = Array.from(document.querySelectorAll(editableSelector))
+                .filter(visible)
+                .filter(node => {{
+                    const placeholder = normalize(node.getAttribute?.('placeholder'));
+                    if (/(?:位置|地点|商户)/.test(placeholder)) return true;
+                    for (let current = node.parentElement, depth = 0;
+                        current && current !== document.body && depth < 7;
+                        current = current.parentElement, depth += 1) {{
+                        if (neighborhoods.has(current)) return true;
+                    }}
+                    return false;
+                }})
+                .slice(0, 32).map(descriptor);
+            const markedEntry = document.querySelector(
+                '[data-oneclick-commerce-add-tag="active"]'
+            );
+            const markedEntryDescendants = markedEntry
+                ? [markedEntry, ...Array.from(markedEntry.querySelectorAll('*'))]
+                    .filter(visible).slice(0, 48).map(descriptor)
+                : [];
+            const overlayNodes = Array.from(document.querySelectorAll('*'))
+                .filter(visible)
+                .filter(node => {{
+                    const role = String(node.getAttribute?.('role') || '').toLowerCase();
+                    const classText = typeof node.className === 'string' ? node.className : '';
+                    return ['listbox', 'menu', 'option', 'menuitem'].includes(role)
+                        || node.getAttribute?.('aria-expanded') === 'true'
+                        || /(?:dropdown|popover|popup|select-option|menu)/i.test(classText);
+                }})
+                .slice(0, 64).map(descriptor);
+            const modernRowNodes = Array.from(document.querySelectorAll('*'))
+                .filter(visible)
+                .filter(node => /(?:^|[-_\\s])new-layout(?:$|[-_\\s])/i
+                    .test(typeof node.className === 'string' ? node.className : ''))
+                .flatMap(row => [row, ...Array.from(row.querySelectorAll('*')).filter(visible)])
+                .slice(0, 96).map(descriptor);
+            const locationSectionNodes = [];
+            for (const addLeaf of leaves('添加标签').slice(0, 2)) {{
+                let addRow = addLeaf.parentElement;
+                for (let depth = 0;
+                    addRow && addRow !== document.body && depth < 6;
+                    addRow = addRow.parentElement, depth += 1) {{
+                    if (/(?:^|[-_\\s])new-layout(?:$|[-_\\s])/i
+                        .test(typeof addRow.className === 'string' ? addRow.className : '')) {{
+                        break;
+                    }}
+                }}
+                const section = addRow?.parentElement;
+                if (!section) continue;
+                [section, ...Array.from(section.querySelectorAll('*')).filter(visible)]
+                    .slice(0, 160).forEach(node => locationSectionNodes.push(descriptor(node)));
+            }}
+            return {{
+                schemaVersion: 1,
+                kind: 'douyin-location-entry-structure',
+                labelCounts,
+                landmarks,
+                editableNodes,
+                markedEntryDescendants,
+                overlayNodes,
+                modernRowNodes,
+                locationSectionNodes,
+            }};
+        }}"""
+    )
+    payload = _sanitize_location_entry_diagnostic(raw)
+    target_dir = Path(output_dir).expanduser().resolve()
+    target_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    target = target_dir / f"douyin-location-entry-{timestamp}.json"
+    target.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return target
+
+
+async def _capture_configured_location_entry_diagnostic(page) -> Path | None:
+    """仅在开发者显式设置目录时取证；失败不得掩盖原平台安全停止原因。"""
+
+    output_dir = _normalized(os.environ.get(_LOCATION_DIAGNOSTIC_ENV))
+    if not output_dir:
+        return None
+    try:
+        return await _capture_location_entry_diagnostic(page, Path(output_dir))
+    except Exception:
+        return None
+
+
 async def _ensure_position_tag(page) -> None:
     """确保进入视频中实际的“位置 → 带货模式 → 输入地点”控件组。"""
 
@@ -636,17 +1261,40 @@ async def _ensure_position_tag(page) -> None:
         if "实际 0 个" not in str(exc):
             raise
 
-    tag_select = await _mark_unique_position_tag_select(page)
+    tag_select = await _wait_unique_position_tag_select(page)
     if tag_select is None:
         opened = await _open_unique_add_tag(page)
         if not opened:
+            diagnostic = await _capture_configured_location_entry_diagnostic(page)
+            suffix = f"；脱敏诊断已保存：{diagnostic.name}" if diagnostic else ""
             raise DouyinCommerceError(
-                "抖音页面未找到唯一可用的“位置”标签入口，已安全停止"
+                f"抖音页面未找到唯一可用的“位置”标签入口，已安全停止{suffix}"
             )
-        await page.wait_for_timeout(250)
-        tag_select = await _mark_unique_position_tag_select(page)
+
+        # 部分账号点击“添加标签”后不会再弹出“位置”选项，而是直接把位置
+        # 类型和可搜索输入框渲染到同一行。先短时回读完整控件组；只有结构仍
+        # 为 0 个才继续兼容旧菜单，多个候选仍立即安全停止。
+        for attempt in range(5):
+            try:
+                await _anchor_controls(page)
+                return
+            except DouyinCommerceError as exc:
+                if "实际 0 个" not in str(exc):
+                    raise
+            if attempt < 4:
+                await page.wait_for_timeout(200)
+
+        tag_select = await _wait_unique_position_tag_select(
+            page,
+            attempts=5,
+            interval_ms=200,
+        )
     if tag_select is None:
-        raise DouyinCommerceError("抖音“添加标签”后未出现唯一“位置”控件，已安全停止")
+        diagnostic = await _capture_configured_location_entry_diagnostic(page)
+        suffix = f"；脱敏诊断已保存：{diagnostic.name}" if diagnostic else ""
+        raise DouyinCommerceError(
+            f"抖音“添加标签”后未出现唯一“位置”控件，已安全停止{suffix}"
+        )
 
     await _open_exact_select(page, tag_select, "位置标签")
     position_option = await _wait_position_tag_option(page)
@@ -663,6 +1311,14 @@ async def _open_exact_select(page, control, purpose: str) -> None:
     说明并遮住下拉；只有错误中同时出现该精确说明和 pointer interception 时，
     才对同一个已确认元素派发原生鼠标事件。该回退只打开下拉，绝不选择选项。
     """
+
+    if await _is_direct_location_entry(control):
+        try:
+            await control.scroll_into_view_if_needed(timeout=5_000)
+            await control.click(timeout=3_000)
+            return
+        except Exception as exc:
+            raise DouyinCommerceError(f"抖音{purpose}控件无法安全打开") from exc
 
     selection = control.locator("> .semi-select-selection")
     if await selection.count() != 1:
@@ -688,6 +1344,19 @@ async def _open_exact_select(page, control, purpose: str) -> None:
         await selection.dispatch_event("click")
     except Exception as exc:
         raise DouyinCommerceError(f"抖音{purpose}被共创说明遮挡且无法安全打开") from exc
+
+
+async def _is_direct_location_entry(control) -> bool:
+    """判断已唯一标记控件是否为新版原生地点输入入口。"""
+
+    try:
+        return bool(
+            await control.evaluate(
+                "node => node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement"
+            )
+        )
+    except Exception:
+        return False
 
 
 async def _wait_mode_options(page) -> list[Any]:
@@ -741,8 +1410,10 @@ async def _ensure_local_group_buy_mode(page):
     mode_control, store_control, mode_value, _ = await _anchor_controls(page)
     if mode_value == _COMMERCE_MODE_TEXT:
         return store_control
-    if mode_value != _CHECKIN_MODE_TEXT:
-        raise DouyinCommerceError("抖音带货模式当前值无法识别，已安全停止")
+    if mode_value not in {_CHECKIN_MODE_TEXT, _UNSELECTED_MODE_VALUE}:
+        diagnostic = await _capture_configured_location_entry_diagnostic(page)
+        suffix = f"；脱敏诊断已保存：{diagnostic.name}" if diagnostic else ""
+        raise DouyinCommerceError(f"抖音带货模式当前值无法识别，已安全停止{suffix}")
 
     await _open_exact_select(page, mode_control, "带货模式")
     options = await _wait_mode_options(page)
@@ -830,6 +1501,22 @@ async def _open_store_selector(page, store_control) -> Any:
     existing = await _visible_store_listbox(page)
     if existing is not None:
         return existing
+    # 新版位置控件本身就是可编辑输入框。它不是 semi-select，若继续按旧结构
+    # 查找 ``.semi-select-selection`` 会造成“无法安全打开”的假失败。
+    try:
+        is_direct_input = bool(
+            await store_control.evaluate(
+                "node => node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement"
+            )
+        )
+    except Exception:
+        is_direct_input = False
+    if is_direct_input:
+        try:
+            await store_control.click(timeout=5_000)
+        except Exception as exc:
+            raise DouyinCommerceError("抖音带货位置输入框无法安全打开，已停止") from exc
+        return await _wait_store_listbox(page)
     await _open_exact_select(page, store_control, "可绑定门店")
     return await _wait_store_listbox(page)
 
@@ -852,28 +1539,115 @@ async def _visible_commerce_search_input(page) -> Any:
                 return rect.width > 0 && rect.height > 0
                     && style.display !== 'none' && style.visibility !== 'hidden';
             };
+            const normalize = value => String(value || '')
+                .replace(/[\\u200b\\u00a0]/g, ' ').replace(/\\s+/g, ' ').trim();
+            const text = node => normalize(node.innerText || node.textContent);
+            const editable = node => visible(node)
+                && !node.disabled
+                && !node.readOnly
+                && String(node.type || '').toLowerCase() !== 'hidden';
+            const labelLeaves = (root, label) => Array.from(root.querySelectorAll('*'))
+                .filter(visible)
+                .filter(node => text(node) === label)
+                .filter(node => !Array.from(node.children)
+                    .some(child => visible(child) && text(child) === label));
             const root = document.querySelector('[data-oneclick-commerce-store="active"]');
             if (!root || !visible(root)) return { count: 0 };
-            // 平台升级后实际 input 可能是该 .semi-select 的后代，也可能是
-            // 同一 anchor-item 中紧邻的动态节点；两种情况都严格限制在已唯一
-            // 标记的带货控件组内，绝不退化为全页搜索。
-            const group = root.closest('[class*="anchor-item"]') || root.parentElement;
-            const scopes = [root];
-            if (group && group !== root) scopes.push(group);
-            const seen = new Set();
-            const fields = scopes.flatMap(scope => Array.from(
-                scope.querySelectorAll('input, textarea, [contenteditable="true"][role="textbox"]')
-            )).filter(node => {
-                if (seen.has(node)) return false;
-                seen.add(node);
-                return visible(node)
-                    && !node.disabled
-                    && !node.readOnly
-                    && String(node.type || '').toLowerCase() !== 'hidden';
-            });
-            if (fields.length !== 1) return { count: fields.length };
-            fields[0].dataset.oneclickCommerceSearchInput = 'active';
-            return { count: 1 };
+
+            const editableSelector =
+                'input, textarea, [contenteditable="true"][role="textbox"]';
+            const fieldsWithin = panel => Array.from(
+                panel.querySelectorAll(editableSelector)
+            ).filter(editable);
+            const lowestCommonAncestor = (left, right) => {
+                const ancestors = new Set();
+                for (let current = left;
+                    current && current !== document.body;
+                    current = current.parentElement) {
+                    ancestors.add(current);
+                }
+                for (let current = right;
+                    current && current !== document.body;
+                    current = current.parentElement) {
+                    if (ancestors.has(current)) return current;
+                }
+                return null;
+            };
+            const clearMarkers = () => {
+                document.querySelectorAll('[data-oneclick-commerce-search-input]')
+                    .forEach(node => node.removeAttribute(
+                        'data-oneclick-commerce-search-input'
+                    ));
+                document.querySelectorAll('[data-oneclick-commerce-location-panel]')
+                    .forEach(node => node.removeAttribute(
+                        'data-oneclick-commerce-location-panel'
+                    ));
+            };
+            clearMarkers();
+
+            // 现代页面有时已把唯一地点控件直接标记为输入框，无需再搜索 portal。
+            if (root.matches(editableSelector) && editable(root)) {
+                root.dataset.oneclickCommerceSearchInput = 'active';
+                return { count: 1, source: 'direct' };
+            }
+
+            // 新版抖音把“输入地理位置”渲染在 dy-creator-content-portal 一类的
+            // 独立浮层，已不再是带货 .semi-select 的子节点。不能为了兼容 portal
+            // 退化为全页任意 input。先从“本地/国内”标签对确定最小地点面板，
+            // 再要求该面板内只有一个输入字段，避免共享大祖先时把整页字段算入。
+            const portalMatches = [];
+            let observedPortalFieldCount = 0;
+            for (const local of labelLeaves(document, '本地')) {
+                for (const domestic of labelLeaves(document, '国内')) {
+                    let panel = lowestCommonAncestor(local, domestic);
+                    for (let depth = 0;
+                        panel && panel !== document.body && depth < 8;
+                        panel = panel.parentElement, depth += 1) {
+                        if (labelLeaves(panel, '本地').length !== 1
+                            || labelLeaves(panel, '国内').length !== 1) {
+                            continue;
+                        }
+                        const fields = fieldsWithin(panel);
+                        if (fields.length > 0 && observedPortalFieldCount === 0) {
+                            observedPortalFieldCount = fields.length;
+                        }
+                        if (fields.length === 1) {
+                            if (!portalMatches.some(item => item.field === fields[0])) {
+                                portalMatches.push({ field: fields[0], panel });
+                            }
+                            break;
+                        }
+                        if (fields.length > 1) break;
+                    }
+                }
+            }
+            if (portalMatches.length > 1) return { count: portalMatches.length };
+            let matches = portalMatches;
+            if (matches.length === 0 && observedPortalFieldCount > 0) {
+                return { count: observedPortalFieldCount };
+            }
+
+            // 保留旧版同组结构作为后备：少数账号仍把输入框渲染在 anchor-item 内，
+            // 但它没有 portal 面板时才使用此分支，避免与当前浮层重复计数。
+            if (matches.length === 0) {
+                const group = root.closest('[class*="anchor-item"]') || root.parentElement;
+                const scopes = [root];
+                if (group && group !== root) scopes.push(group);
+                const seen = new Set();
+                matches = scopes.flatMap(scope => Array.from(
+                    scope.querySelectorAll('input, textarea, [contenteditable="true"][role="textbox"]')
+                )).filter(field => {
+                    if (seen.has(field) || !editable(field)) return false;
+                    seen.add(field);
+                    return true;
+                }).map(field => ({ field, panel: null }));
+            }
+            if (matches.length !== 1) return { count: matches.length };
+            matches[0].field.dataset.oneclickCommerceSearchInput = 'active';
+            if (matches[0].panel) {
+                matches[0].panel.dataset.oneclickCommerceLocationPanel = 'active';
+            }
+            return { count: 1, source: matches[0].panel ? 'portal' : 'anchor' };
         }"""
     )
     if not isinstance(result, Mapping) or int(result.get("count") or 0) != 1:
@@ -1228,6 +2002,17 @@ async def search_commerce_location_store_candidates(
         await input_control.fill("", timeout=8_000)
     except Exception as exc:
         raise DouyinCommerceError("抖音带货位置输入框无法重置关键词，已安全停止") from exc
+    try:
+        cleared_keyword = _normalized(
+            await input_control.evaluate(
+                """node => node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement
+                    ? node.value : (node.innerText || node.textContent || '')"""
+            )
+        )
+    except Exception as exc:
+        raise DouyinCommerceError("抖音带货位置输入框清空后无法回读，已安全停止") from exc
+    if cleared_keyword:
+        raise DouyinCommerceError("抖音带货位置输入框未能清空旧关键词，已安全停止")
     # 输入框首次展开或清空时，平台可能仍在回填初始“本地”推荐；先给范围切换
     # 与清空关键词触发的请求一个受限的收敛时间，并保留快照。后续必须等待
     # 列表真正变化，不能像此前那样只要看到 listbox 就立刻把旧结果返回客户端。
@@ -1237,6 +2022,17 @@ async def search_commerce_location_store_candidates(
         await input_control.fill(normalized_keyword, timeout=8_000)
     except Exception as exc:
         raise DouyinCommerceError("抖音带货位置输入框无法填写关键词，已安全停止") from exc
+    try:
+        written_keyword = _normalized(
+            await input_control.evaluate(
+                """node => node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement
+                    ? node.value : (node.innerText || node.textContent || '')"""
+            )
+        )
+    except Exception as exc:
+        raise DouyinCommerceError("抖音带货位置关键词写入后无法回读，已安全停止") from exc
+    if written_keyword != normalized_keyword:
+        raise DouyinCommerceError("抖音带货位置关键词写入后回读不一致，已安全停止")
     # 不使用固定“成功等待”。只接受本次关键词触发、且相对于输入前已变化的
     # 结构化候选列表。
     listbox, rows = await _wait_for_fresh_commerce_location_results(

@@ -466,6 +466,9 @@ class DouyinCommercePage(QWidget):
         self._batch_preflight_fingerprint = ""
         self._batch_progress_text = ""
         self._batch_result_feedback = ""
+        self._batch_pause_requested = False
+        # 只自动维护“系统默认”日期；用户手动选择的未来日期绝不覆盖。
+        self._schedule_date_auto_default = True
         # 批量执行器会在每条视频完成后主动关闭无头编辑会话。这个标记只用于
         # 向用户解释“为什么共享文字改完后要在下次预检重建会话”，不保存会话信息。
         self._batch_editor_session_ended = False
@@ -1554,6 +1557,12 @@ class DouyinCommercePage(QWidget):
         self._batch_location_feedback = _normalized(message)
         if hasattr(self, "batch_item_settings_status"):
             self.batch_item_settings_status.setText(self._batch_location_feedback)
+            # 这块状态标签此前只在创建时被隐藏，后续虽然写入了“候选读取
+            # 失败”等真实回读，用户却始终看不到，页面只剩空下拉框。每次
+            # 搜索、选择或失败回调均应立即显示当前结果；空内容才隐藏。
+            self.batch_item_settings_status.setVisible(
+                bool(self._batch_location_feedback)
+            )
 
     def _render_batch_item_rows(self) -> None:
         if not hasattr(self, "batch_item_rows"):
@@ -1884,13 +1893,22 @@ class DouyinCommercePage(QWidget):
         self.schedule_date = QDateEdit()
         self.schedule_date.setObjectName("douyinCommerceScheduleDate")
         self.schedule_date.setCalendarPopup(True)
-        tomorrow = datetime.now(_SHANGHAI_TZ).date() + timedelta(days=1)
-        self.schedule_date.setDate(QDate(tomorrow.year, tomorrow.month, tomorrow.day))
+        default_schedule = self._default_schedule_datetime()
+        self.schedule_date.setMinimumDate(
+            QDate.currentDate()
+        )
+        self.schedule_date.setDate(
+            QDate(
+                default_schedule.year,
+                default_schedule.month,
+                default_schedule.day,
+            )
+        )
         self.schedule_date.dateChanged.connect(self._schedule_changed)
         self.schedule_time = QTimeEdit()
         self.schedule_time.setObjectName("douyinCommerceScheduleTime")
         self.schedule_time.setDisplayFormat("HH:mm")
-        self.schedule_time.setTime(QTime(9, 0))
+        self.schedule_time.setTime(QTime(16, 0))
         self.schedule_time.timeChanged.connect(self._schedule_changed)
         schedule_row.addWidget(self.schedule_date)
         schedule_row.addWidget(self.schedule_time)
@@ -2029,6 +2047,10 @@ class DouyinCommercePage(QWidget):
         self.submit_button = button("确认立即发表", variant="secondary")
         self.submit_button.setObjectName("douyinCommerceSubmit")
         self.submit_button.clicked.connect(self.open_submit_confirmation)
+        self.pause_batch_button = button("暂停发布", variant="secondary")
+        self.pause_batch_button.setObjectName("douyinCommercePauseBatchPublish")
+        self.pause_batch_button.setVisible(False)
+        self.pause_batch_button.clicked.connect(self.pause_batch_publish)
 
         review_columns.addWidget(panel, 0, 0, Qt.AlignmentFlag.AlignTop)
         review_columns.addWidget(self.review_submission_panel, 0, 1)
@@ -2052,9 +2074,11 @@ class DouyinCommercePage(QWidget):
         self.review_back_button.clicked.connect(self.return_from_review)
         self.preflight_button.setProperty("footerAction", True)
         self.submit_button.setProperty("footerAction", True)
+        self.pause_batch_button.setProperty("footerAction", True)
         navigation.addWidget(self.review_back_button)
         navigation.addWidget(self.preflight_button)
         navigation.addWidget(self.submit_button)
+        navigation.addWidget(self.pause_batch_button)
         layout.addWidget(self.review_action_dock)
         return self._scroll_page(body)
 
@@ -2762,6 +2786,50 @@ class DouyinCommercePage(QWidget):
         self._batch_location_searches = {}
         self._batch_schedule_overrides = {}
         self._batch_location_feedback = ""
+        # “清空当前内容”必须覆盖完整发布意图，不能只清标题/文案后继续沿用
+        # 上一批的音乐、地点、声明或定时。候选与平台会话状态同样全部丢弃。
+        self._clear_music_candidates()
+        self._selected_music = None
+        self.music_card.setText("尚未选择收藏音乐")
+        self._locations = []
+        self._selected_location_data = None
+        self._pending_location = None
+        self._location_applied = False
+        self.location_result_list.clear()
+        self.location_keyword.blockSignals(True)
+        self.location_keyword.clear()
+        self.location_keyword.blockSignals(False)
+        self.location_scope_combo.blockSignals(True)
+        self.location_scope_combo.setCurrentIndex(
+            self.location_scope_combo.findData(
+                douyin_commerce_service.LOCATION_SCOPE_DOMESTIC
+            )
+        )
+        self.location_scope_combo.blockSignals(False)
+        self.location_candidate_card.setText("尚未选择发布定位")
+        self.location_applied_card.setText("尚未选择发布定位")
+        self._clear_declaration("请选择作品内容声明")
+        self.batch_location_scope_combo.blockSignals(True)
+        self.batch_location_scope_combo.setCurrentIndex(
+            self.batch_location_scope_combo.findData(
+                douyin_commerce_service.LOCATION_SCOPE_DOMESTIC
+            )
+        )
+        self.batch_location_scope_combo.blockSignals(False)
+        self.batch_location_keyword.blockSignals(True)
+        self.batch_location_keyword.clear()
+        self.batch_location_keyword.blockSignals(False)
+        self.batch_publish_mode.blockSignals(True)
+        self.batch_publish_mode.setCurrentIndex(
+            self.batch_publish_mode.findData("immediate")
+        )
+        self.batch_publish_mode.blockSignals(False)
+        self.batch_timer_enabled.blockSignals(True)
+        self.batch_timer_enabled.setChecked(False)
+        self.batch_timer_enabled.blockSignals(False)
+        self.timer_enabled.blockSignals(True)
+        self.timer_enabled.setChecked(False)
+        self.timer_enabled.blockSignals(False)
         self._sync_batch_video_status()
         self._uploaded_editor_payload = None
         self._pending_upload_payload = None
@@ -2852,11 +2920,53 @@ class DouyinCommercePage(QWidget):
             self._render_batch_item_rows()
         self._sync_view()
 
+    @staticmethod
+    def _default_schedule_datetime(now: datetime | None = None) -> datetime:
+        """返回北京时间次日 16:00 的默认定时点。"""
+
+        current = now or datetime.now(_SHANGHAI_TZ)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=_SHANGHAI_TZ)
+        else:
+            current = current.astimezone(_SHANGHAI_TZ)
+        return (current + timedelta(days=1)).replace(
+            hour=16,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+
+    def _refresh_schedule_default(self) -> None:
+        """保持默认日期不落后当前北京时间，不覆盖今天或未来的手选日期。"""
+
+        today = datetime.now(_SHANGHAI_TZ).date()
+        minimum = QDate(today.year, today.month, today.day)
+        default_at = self._default_schedule_datetime()
+        default = QDate(default_at.year, default_at.month, default_at.day)
+        is_stale_default = self.schedule_date.date() < minimum
+        self.schedule_date.setMinimumDate(minimum)
+        if self._schedule_date_auto_default and is_stale_default:
+            blocked = self.schedule_date.blockSignals(True)
+            self.schedule_date.setDate(default)
+            self.schedule_date.blockSignals(blocked)
+
+    def pause_batch_publish(self) -> None:
+        """请求批量在当前视频完成后停下，未开始视频保持未开始。"""
+
+        if not self.runner.is_running(_BATCH_RUN_KEY):
+            return
+        if self._batch_executor.request_pause():
+            self._batch_pause_requested = True
+            self._sync_view()
+            self.validation_label.setText("已请求暂停；当前视频完成后不会再提交后续视频。")
+
     def _timer_enabled_changed(self, _checked: bool) -> None:
         """切换发布方式只影响本次预检指纹，不触发任何平台动作。"""
 
         self._preflight_fingerprint = ""
         self._batch_preflight_fingerprint = ""
+        if self.timer_enabled.isChecked():
+            self._refresh_schedule_default()
         if self.selected_video_count() >= 1 and hasattr(self, "batch_publish_mode"):
             target = "interval-schedule" if self.timer_enabled.isChecked() else "immediate"
             if self.batch_publish_mode.currentData() != target:
@@ -3222,6 +3332,7 @@ class DouyinCommercePage(QWidget):
 
     def _sync_workbench(self) -> None:
         current_step = self.pages.currentIndex()
+        self._refresh_schedule_default()
         batch_mode = self.selected_video_count() >= 1
         for index, label in enumerate(self.step_labels):
             if index == current_step:
@@ -3239,6 +3350,17 @@ class DouyinCommercePage(QWidget):
                 "返回平台设置" if has_editor_session else "开始新内容"
             )
             self.review_back_button.setEnabled(not self._busy())
+        if hasattr(self, "pause_batch_button"):
+            batch_running = bool(self._batch_task_id) and self.runner.is_running(
+                _BATCH_RUN_KEY
+            )
+            self.pause_batch_button.setVisible(batch_running)
+            self.pause_batch_button.setEnabled(
+                batch_running and not self._batch_pause_requested
+            )
+            self.pause_batch_button.setText(
+                "将在当前视频后暂停" if self._batch_pause_requested else "暂停发布"
+            )
         self._sync_content_cards()
 
         if batch_mode and self._batch_editor_session_ended and not self._session_id:
@@ -3721,6 +3843,7 @@ class DouyinCommercePage(QWidget):
 
     def _batch_draft_payload(self) -> dict:
         account = self._selected_account() or {}
+        location_search = self._batch_location_state()
         return {
             "accountId": account.get("id"),
             "accountFile": account.get("filePath"),
@@ -3728,6 +3851,13 @@ class DouyinCommercePage(QWidget):
                 "title": self.title_input.text(),
                 "description": self.description_input.toPlainText(),
                 "tags": self._tags(),
+                "selectedMusic": dict(self._selected_music or {}),
+                "contentDeclaration": self._selected_declaration(),
+            },
+            # 只保存用户最后的搜索意图；平台候选必须在新会话中重新读取。
+            "lastLocationSearch": {
+                "scope": location_search["scope"],
+                "keyword": location_search["keyword"],
             },
             "publishMode": _normalized(self.batch_publish_mode.currentData() or "immediate"),
             "schedule": {
@@ -3745,6 +3875,12 @@ class DouyinCommercePage(QWidget):
                 {
                     "mediaPath": _normalized(video.get("storedPath")),
                     "locationPresetId": _normalized(self._batch_locations.get(_normalized(video.get("storedPath")), {}).get("id")),
+                    "locationPreset": dict(
+                        self._batch_locations.get(
+                            _normalized(video.get("storedPath")),
+                            {},
+                        )
+                    ),
                     "enableTimer": self.batch_publish_mode.currentData() == "interval-schedule",
                     "scheduleTimeOverride": _normalized(self._batch_schedule_overrides.get(_normalized(video.get("storedPath")))),
                 }
@@ -3800,12 +3936,53 @@ class DouyinCommercePage(QWidget):
         self.title_input.setText(str(shared.get("title") or ""))
         self.description_input.setPlainText(str(shared.get("description") or ""))
         self._set_tags(shared.get("tags") or [])
+        restored_music = shared.get("selectedMusic")
+        self._selected_music = (
+            dict(restored_music)
+            if isinstance(restored_music, dict) and restored_music
+            else None
+        )
+        self._pending_music = None
+        self._discard_music_candidates_for_reload()
+        declaration = _normalized(shared.get("contentDeclaration"))
+        if declaration not in self.declaration_buttons:
+            declaration = self._DEFAULT_CONTENT_DECLARATION
+        self._set_selected_declaration(declaration)
+        self._confirmed_declaration = declaration
+        self._declaration_applied = False
+        self._pending_declaration = ""
+        location_search = (
+            payload.get("lastLocationSearch")
+            if isinstance(payload.get("lastLocationSearch"), dict)
+            else {}
+        )
+        search_scope = _normalized(location_search.get("scope"))
+        if search_scope not in {
+            douyin_commerce_service.LOCATION_SCOPE_LOCAL,
+            douyin_commerce_service.LOCATION_SCOPE_DOMESTIC,
+        }:
+            search_scope = douyin_commerce_service.LOCATION_SCOPE_DOMESTIC
+        self._batch_location_searches = {
+            _BATCH_SHARED_LOCATION_SEARCH_KEY: {
+                "scope": search_scope,
+                "keyword": _normalized(location_search.get("keyword")),
+                "candidates": [],
+            }
+        }
         presets = {str(item.get("id")): item for item in self._current_location_presets()}
         self._batch_locations = {}
         self._batch_schedule_overrides = {}
         for item in payload.get("items") or []:
             path = _normalized(item.get("mediaPath"))
-            preset = presets.get(_normalized(item.get("locationPresetId")))
+            snapshot = item.get("locationPreset")
+            preset = (
+                dict(snapshot)
+                if isinstance(snapshot, dict)
+                and _normalized(snapshot.get("poiId"))
+                and _normalized(snapshot.get("name"))
+                and _normalized(snapshot.get("address"))
+                else presets.get(_normalized(item.get("locationPresetId")))
+            )
             if preset:
                 self._batch_locations[path] = dict(preset)
             if _normalized(item.get("scheduleTimeOverride")):
@@ -3822,6 +3999,11 @@ class DouyinCommercePage(QWidget):
         if start_time:
             try:
                 parsed = datetime.strptime(start_time, "%Y-%m-%d %H:%M")
+                now = datetime.now(_SHANGHAI_TZ)
+                # 草稿只保留更远的未来排期；今天或过去的旧日期
+                # 不得覆盖“北京时间次日 16:00”的当前默认规则。
+                if parsed.date() <= now.date():
+                    parsed = self._default_schedule_datetime(now)
                 self.batch_start_date.setDate(QDate(parsed.year, parsed.month, parsed.day))
                 self.batch_start_time.setTime(QTime(parsed.hour, parsed.minute))
             except ValueError:
@@ -3849,6 +4031,7 @@ class DouyinCommercePage(QWidget):
             return
         task = task_service.create_douyin_batch_task(payload, mode="oneclick_preflight")
         self._batch_task_id = int(task["id"])
+        self._batch_pause_requested = False
         self._batch_editor_session_ended = False
         task_service.mark_task_running(self._batch_task_id, "抖音带货批量开始逐条发布前检查")
         self.validation_label.setText(f"正在检查 0/{len(payload['items'])} 条视频…")
@@ -3920,6 +4103,7 @@ class DouyinCommercePage(QWidget):
 
         self._cleanup_douyin_verification()
         self._batch_task_id = None
+        self._batch_pause_requested = False
         self._sync_view()
 
     @staticmethod
@@ -3942,6 +4126,7 @@ class DouyinCommercePage(QWidget):
         """确认后启动批量最终提交；只由平台逐条回执决定已发布状态。"""
 
         self._batch_task_id = int(task["id"])
+        self._batch_pause_requested = False
         task_service.mark_task_running(self._batch_task_id, "抖音带货批量开始最终提交")
         self._batch_preflight_fingerprint = ""
         self._batch_result_feedback = ""
@@ -3980,12 +4165,25 @@ class DouyinCommercePage(QWidget):
             for row in rows
             if _normalized(row.get("status")) in {"waiting_login", "waiting_verification"}
         ]
+        ambiguous = [
+            row
+            for row in rows
+            if _normalized(row.get("status")) == "receipt_ambiguous"
+        ]
         pending = [row for row in rows if _normalized(row.get("status")) == "pending"]
-        parts = [f"批量提交已结束：成功 {len(published)} 条，失败 {len(failed)} 条"]
+        paused = [row for row in rows if _normalized(row.get("status")) == "paused"]
+        if paused or ambiguous:
+            parts = [f"批量提交已暂停：成功 {len(published)} 条，失败 {len(failed)} 条"]
+        else:
+            parts = [f"批量提交已结束：成功 {len(published)} 条，失败 {len(failed)} 条"]
         if waiting:
             parts.append(f"待人工处理 {len(waiting)} 条")
+        if ambiguous:
+            parts.append(f"平台状态待核对 {len(ambiguous)} 条")
         if pending:
             parts.append(f"未开始 {len(pending)} 条")
+        if paused:
+            parts.append(f"已暂停 {len(paused)} 条")
         diagnostics = [
             _normalized(row.get("diagnostic"))
             for row in failed
@@ -3993,10 +4191,17 @@ class DouyinCommercePage(QWidget):
         ]
         if diagnostics:
             parts.append(f"失败原因：{diagnostics[0]}")
+        ambiguous_diagnostics = [
+            _normalized(row.get("diagnostic"))
+            for row in ambiguous
+            if _normalized(row.get("diagnostic"))
+        ]
+        if ambiguous_diagnostics:
+            parts.append(f"待核对原因：{ambiguous_diagnostics[0]}")
         self._batch_result_feedback = "；".join(parts) + "。"
         self.validation_label.setText(self._batch_result_feedback)
         _LOGGER.info("抖音带货批量结果：%s", self._batch_result_feedback)
-        if failed or waiting:
+        if failed or waiting or paused or ambiguous:
             QMessageBox.warning(self, "抖音带货批量提交结果", self._batch_result_feedback)
         else:
             QMessageBox.information(self, "抖音带货批量提交成功", self._batch_result_feedback)
@@ -4485,7 +4690,9 @@ class DouyinCommercePage(QWidget):
             lambda: douyin_commerce_session.commerce_session_manager.refresh_favorite_music(
                 session_id
             ),
-            lambda rows: self._show_music_candidates(rows, source="session"),
+            # 刷新完成后平台音乐抽屉已关闭，候选只能作为本地缓存展示；用户
+            # 真正选择时会重新打开当前抽屉精确匹配，不能复用失效的 DOM marker。
+            lambda rows: self._show_music_candidates(rows, source="cache"),
             self._music_load_failed,
         )
 

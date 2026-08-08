@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 from . import account_service, douyin_commerce_service, douyin_music_service, task_service
 from .douyin_location_service import normalize_location_candidate
 from .oneclick_preflight import _account_for_payload, _storage_state
+from utils.log import douyin_logger
 
 
 _DOUYIN_EDITOR_URL = (
@@ -103,43 +104,225 @@ def _schedule_text_matches(text: object, target: datetime) -> bool:
     return target.date() == today and "今天" in normalized
 
 
+_SCHEDULED_CARD_SCAN_SCRIPT = r"""
+({ title, timeText, dateVariants }) => {
+    // oneclick-scheduled-card-scan
+    const normalize = (value) => String(value || "").replace(/\u200b/g, " ").replace(/\s+/g, " ").trim();
+    const expectedTitle = normalize(title);
+    const dates = (dateVariants || []).map(normalize).filter(Boolean);
+    const containsSchedule = (value) => {
+        const text = normalize(value);
+        return text.includes(timeText) && dates.some((date) => text.includes(date));
+    };
+    const visible = (element) => {
+        if (!(element instanceof HTMLElement)) return false;
+        const style = window.getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+    };
+
+    const scheduleLeaves = [];
+    for (const element of document.body.querySelectorAll("*")) {
+        if (!visible(element) || !containsSchedule(element.innerText)) continue;
+        const childContainsSchedule = Array.from(element.children).some(
+            (child) => visible(child) && containsSchedule(child.innerText)
+        );
+        if (!childContainsSchedule) scheduleLeaves.push(element);
+    }
+
+    const matches = [];
+    const seen = new Set();
+    for (const leaf of scheduleLeaves) {
+        let node = leaf;
+        for (let depth = 0; node && depth < 10; depth += 1, node = node.parentElement) {
+            if (!visible(node)) continue;
+            const text = normalize(node.innerText);
+            // 内层定时控件行也有“定时发布中/修改定时”，但不包含标题，
+            // 不能把它误当整张作品卡。只在平台作品卡容器停止上溯，
+            // 同时保留 article/listitem 作为离线与旧版结构的语义兼容边界。
+            const classes = Array.from(node.classList || []);
+            const isCardBoundary =
+                node.tagName === "ARTICLE" ||
+                node.getAttribute("role") === "listitem" ||
+                classes.some((value) =>
+                    value.startsWith("video-card-info-") ||
+                    value.startsWith("video-card-content-")
+                );
+            if (!isCardBoundary) continue;
+            const isScheduledCard =
+                text.includes("定时发布中") &&
+                (text.includes("修改定时") || text.includes("继续编辑"));
+            if (expectedTitle && text.includes(expectedTitle) && containsSchedule(text) && !seen.has(text)) {
+                if (isScheduledCard) {
+                    seen.add(text);
+                    matches.push(text);
+                }
+            }
+            break;
+        }
+    }
+    return matches;
+}
+"""
+
+
+_SCHEDULED_LIST_SCROLL_SCRIPT = r"""
+() => {
+    // oneclick-scheduled-list-scroll
+    const step = Math.max(Math.floor(window.innerHeight * 0.82), 600);
+    const beforeWindow = window.scrollY;
+    window.scrollBy(0, step);
+    if (window.scrollY > beforeWindow) return true;
+
+    const visibleScrollable = Array.from(document.querySelectorAll("body *"))
+        .filter((element) => {
+            if (!(element instanceof HTMLElement)) return false;
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return (
+                rect.width > 300 &&
+                rect.height > 240 &&
+                element.scrollHeight > element.clientHeight + 40 &&
+                (style.overflowY === "auto" || style.overflowY === "scroll")
+            );
+        })
+        .sort((left, right) => {
+            const leftRect = left.getBoundingClientRect();
+            const rightRect = right.getBoundingClientRect();
+            return rightRect.width * rightRect.height - leftRect.width * leftRect.height;
+        });
+    for (const element of visibleScrollable) {
+        const before = element.scrollTop;
+        element.scrollTop += step;
+        if (element.scrollTop > before) return true;
+    }
+    return false;
+}
+"""
+
+
+async def _scheduled_card_texts(page, *, title: str, target: datetime) -> list[str]:
+    """只返回同一张定时作品卡内同时匹配标题和时间的文本。"""
+
+    date_variants = [
+        target.strftime("%Y-%m-%d"),
+        target.strftime("%Y/%m/%d"),
+        target.strftime("%Y年%m月%d日"),
+        target.strftime("%m-%d"),
+        target.strftime("%m/%d"),
+    ]
+    if target.date() == datetime.now(_SHANGHAI_TZ).date():
+        date_variants.append("今天")
+    result = await page.evaluate(
+        _SCHEDULED_CARD_SCAN_SCRIPT,
+        {
+            "title": _normalized(title),
+            "timeText": target.strftime("%H:%M"),
+            "dateVariants": date_variants,
+        },
+    )
+    if not isinstance(result, list):
+        return []
+    return [_normalized(item) for item in result if _normalized(item)]
+
+
 async def _scheduled_submission_readback(
     page,
     *,
     title: str,
     target: datetime,
-    attempts: int = 90,
+    attempts: int = 300,
 ) -> dict[str, str]:
     """在最终提交后从抖音管理页回读该作品与定时时间。"""
 
     expected_title = _normalized(title)
-    for attempt in range(attempts):
+    normalized_attempts = max(1, int(attempts))
+    target_text = target.strftime("%Y-%m-%d %H:%M")
+    douyin_logger.info(
+        f"抖音已完成最终提交动作，开始等待平台回执："
+        f"标题={expected_title}，定时={target_text}，最长等待 {normalized_attempts} 秒"
+    )
+    last_match_count = 0
+    for attempt in range(normalized_attempts):
         if page.is_closed():
             break
         try:
-            body = await page.locator("body").inner_text(timeout=1_500)
+            cards = await _scheduled_card_texts(
+                page,
+                title=expected_title,
+                target=target,
+            )
         except Exception:
-            body = ""
-        if expected_title and expected_title in _normalized(body) and _schedule_text_matches(
-            body, target
+            cards = []
+        last_match_count = len(cards)
+        if any(
+            expected_title in card and _schedule_text_matches(card, target)
+            for card in cards
         ):
+            douyin_logger.success(
+                f"抖音作品管理页已读到定时回执："
+                f"标题={expected_title}，定时={target_text}，"
+                f"第 {attempt + 1} 次检查命中"
+            )
             return {
                 "title": expected_title,
-                "scheduledAt": target.strftime("%Y-%m-%d %H:%M"),
+                "scheduledAt": target_text,
                 "timezone": "Asia/Shanghai",
                 "url": str(page.url or ""),
             }
-        # 最终提交后的管理页会先进入空壳，再异步刷新作品卡片。每十秒仅
-        # 刷新一次只读管理页，避免把“跳转成功但列表尚未同步”误判为失败。
-        if attempt and attempt % 10 == 0:
-            try:
-                await page.reload(wait_until="domcontentloaded", timeout=20_000)
-            except Exception:
-                pass
+
+        # 作品管理页按定时时间倒序且懒加载。重复执行较早时段时，
+        # 本次已提交作品会排在首屏之外；必须向下触发懒加载。平台还可能让
+        # 提交跳转后的 SPA 列表长期停留在旧快照，因此每 30 次未命中时刷新
+        # 一次管理页，不能只延长等待或只滚动旧列表。
+        if attempt < normalized_attempts - 1:
+            if (attempt + 1) % 15 == 0:
+                douyin_logger.info(
+                    f"抖音仍在等待作品管理页回执："
+                    f"已检查 {attempt + 1} 次，定时={target_text}，"
+                    f"当前匹配卡片 {last_match_count} 张"
+                )
+            refreshed = False
+            reload_page = getattr(page, "reload", None)
+            if (
+                (attempt + 1) % 30 == 0
+                and "/creator-micro/content/manage" in str(getattr(page, "url", "") or "")
+                and callable(reload_page)
+            ):
+                douyin_logger.info(
+                    f"抖音作品管理页列表可能仍是旧快照，正在刷新后继续回读："
+                    f"已检查 {attempt + 1} 次，定时={target_text}"
+                )
+                try:
+                    await reload_page(wait_until="domcontentloaded", timeout=60_000)
+                    refreshed = True
+                    douyin_logger.info(
+                        f"抖音作品管理页已刷新，继续等待定时回执：定时={target_text}"
+                    )
+                except Exception as exc:
+                    douyin_logger.warning(
+                        f"抖音作品管理页刷新失败，继续按当前页面安全检查："
+                        f"{_normalized(exc)[:160]}"
+                    )
+            if not refreshed:
+                try:
+                    await page.evaluate(_SCHEDULED_LIST_SCROLL_SCRIPT)
+                except Exception:
+                    pass
         await page.wait_for_timeout(1_000)
-    raise DouyinPublishError(
-        "抖音定时提交后未能从作品管理页回读标题和指定时间，未记录为定时成功"
+    page_state = (
+        "作品管理页"
+        if "/creator-micro/content/manage" in str(getattr(page, "url", "") or "")
+        else "非作品管理页"
     )
+    diagnostic = (
+        "抖音定时提交后未能从作品管理页回读标题和指定时间："
+        f"已检查 {normalized_attempts} 次，最长等待 {normalized_attempts} 秒，"
+        f"当前页面={page_state}，匹配卡片 {last_match_count} 张；"
+        "未记录为定时成功"
+    )
+    douyin_logger.error(f"抖音平台回执等待超时：{diagnostic}")
+    raise DouyinPublishError(diagnostic)
 
 
 def validate_douyin_publish_payload(payload: Mapping[str, Any]) -> dict[str, Any]:

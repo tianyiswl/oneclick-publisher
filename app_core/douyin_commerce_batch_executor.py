@@ -12,6 +12,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 import re
+import threading
 from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo
 
@@ -41,6 +42,12 @@ _LOGIN_PAUSE_STATUSES = frozenset(
     {"needs_login", "login_required", "requires_login", "login_expired"}
 )
 _ACTIVE_VERIFICATION_STATES = frozenset({"waiting", "processing"})
+_AMBIGUOUS_SUBMIT_MARKERS = (
+    "最终提交未能获得平台回执",
+    "定时提交后未能从作品管理页回读",
+    "点击发布后未确认跳转",
+    "点击发布后 5 分钟内未进入作品管理页",
+)
 
 
 class DouyinCommerceBatchExecutorError(RuntimeError):
@@ -108,6 +115,13 @@ def _controlled_upload_pause_status(upload: object) -> str:
         return ""
     status = _text(upload.get("status")).casefold().replace("-", "_").replace(" ", "_")
     return "waiting_login" if status in _LOGIN_PAUSE_STATUSES else ""
+
+
+def _is_ambiguous_submit_error(error: Exception) -> bool:
+    """最终点击已发生但缺回执时，只能暂停核对，不得继续提交。"""
+
+    message = _text(error)
+    return any(marker in message for marker in _AMBIGUOUS_SUBMIT_MARKERS)
 
 
 def _runtime_payload(
@@ -198,6 +212,18 @@ class DouyinCommerceBatchExecutor:
         self._task_store = task_store
         self._now = now or (lambda: datetime.now(_SHANGHAI))
         self._verification_broker = verification_broker
+        self._pause_requested = threading.Event()
+
+    def request_pause(self) -> bool:
+        """请求在当前视频安全收束后暂停，绝不在中途打断平台写入。"""
+
+        if self._pause_requested.is_set():
+            return False
+        self._pause_requested.set()
+        return True
+
+    def _reset_pause_request(self) -> None:
+        self._pause_requested.clear()
 
     def run_preflight(
         self,
@@ -208,6 +234,7 @@ class DouyinCommerceBatchExecutor:
     ) -> list[dict[str, object]]:
         """逐条写入并回读编辑器字段；绝不调用 submit。"""
 
+        self._reset_pause_request()
         return self._run(
             self._prepare_batch(batch),
             task_id=task_id,
@@ -227,6 +254,7 @@ class DouyinCommerceBatchExecutor:
 
         if confirmed is not True:
             raise DouyinCommerceBatchExecutorError("抖音带货批量发布必须先完成总确认")
+        self._reset_pause_request()
         return self._run(
             self._prepare_batch(batch),
             task_id=task_id,
@@ -425,11 +453,30 @@ class DouyinCommerceBatchExecutor:
         total = len(items)
         results: list[dict[str, object]] = []
         paused = False
+        paused_result_status = "pending"
+        consecutive_failures = 0
+        pause_reason = ""
 
         for index, (item, item_id) in enumerate(zip(items, task_items)):
             label = _safe_item_label(item, index)
             if paused:
-                results.append({"index": index, "label": label, "status": "pending"})
+                results.append(
+                    {"index": index, "label": label, "status": paused_result_status}
+                )
+                continue
+            if self._pause_requested.is_set():
+                paused = True
+                paused_result_status = "paused"
+                pause_reason = "已按用户请求暂停，未开始后续视频"
+                self._task_store.mark_task_paused(task_id, pause_reason)
+                self._emit(
+                    progress,
+                    index=index,
+                    total=total,
+                    phase="paused",
+                    message=pause_reason,
+                )
+                results.append({"index": index, "label": label, "status": "paused"})
                 continue
             result = self._run_item(
                 batch,
@@ -448,6 +495,31 @@ class DouyinCommerceBatchExecutor:
                 "verification_failed",
             }:
                 paused = True
+                paused_result_status = "pending"
+                pause_reason = "等待用户处理验证或登录，未开始后续视频"
+                continue
+            if result["status"] == "receipt_ambiguous":
+                paused = True
+                paused_result_status = "pending"
+                pause_reason = "平台最终提交状态待核对，已暂停且未开始后续视频"
+                self._task_store.mark_task_paused(task_id, pause_reason)
+                continue
+            if result["status"] == "failed":
+                consecutive_failures += 1
+            else:
+                consecutive_failures = 0
+            if consecutive_failures >= 5:
+                paused = True
+                paused_result_status = "paused"
+                pause_reason = "连续失败 5 条，已自动暂停，未开始后续视频"
+                self._task_store.mark_task_paused(task_id, pause_reason)
+                self._emit(
+                    progress,
+                    index=index,
+                    total=total,
+                    phase="auto_paused",
+                    message=pause_reason,
+                )
         return results
 
     def _run_item(
@@ -577,6 +649,31 @@ class DouyinCommerceBatchExecutor:
                     progress=progress,
                 )
                 return {**waiting, "label": label, "diagnostic": diagnostic}
+            if _is_ambiguous_submit_error(exc):
+                message = (
+                    f"第 {index + 1} 条视频已触发最终提交，但平台状态待核对："
+                    f"{diagnostic}"
+                )
+                self._record_progress(
+                    task_id,
+                    item_id,
+                    ok=False,
+                    event_type="platform_receipt_ambiguous",
+                    message=message,
+                )
+                self._emit(
+                    progress,
+                    index=index,
+                    total=total,
+                    phase="receipt_ambiguous",
+                    message=message,
+                )
+                return {
+                    "index": index,
+                    "label": label,
+                    "status": "receipt_ambiguous",
+                    "diagnostic": diagnostic,
+                }
             if _is_intervention_error(exc):
                 verification_message = f"第 {index + 1} 条视频：{diagnostic}"
                 self._record_progress(

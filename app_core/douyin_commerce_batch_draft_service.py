@@ -12,6 +12,13 @@ import json
 from typing import Any, Mapping
 
 from . import database
+from .douyin_commerce_service import (
+    LOCATION_SCOPE_DOMESTIC,
+    normalize_commerce_location_scope,
+    normalize_content_declaration,
+)
+from .douyin_location_service import normalize_location_candidate
+from .douyin_music_service import normalize_music_readback
 
 
 class DouyinCommerceBatchDraftError(ValueError):
@@ -48,11 +55,61 @@ def _tags(value: object) -> list[str]:
 def _shared(value: object) -> dict[str, object]:
     if not isinstance(value, Mapping):
         raise DouyinCommerceBatchDraftError("批次草稿缺少共享内容")
+    raw_music = value.get("selectedMusic")
+    music: dict[str, str] = {}
+    if isinstance(raw_music, Mapping) and raw_music:
+        normalized_music = normalize_music_readback(raw_music)
+        if not normalized_music:
+            raise DouyinCommerceBatchDraftError("批次草稿收藏音乐身份无效")
+        music = normalized_music
+    declaration = _text(value.get("contentDeclaration"))
+    if declaration:
+        try:
+            declaration = normalize_content_declaration(declaration)
+        except Exception as exc:
+            raise DouyinCommerceBatchDraftError(str(exc)) from exc
     return {
         "title": _text(value.get("title")),
         "description": str(value.get("description") or "").strip(),
         "tags": _tags(value.get("tags")),
+        "selectedMusic": music,
+        "contentDeclaration": declaration,
     }
+
+
+def _location_preset(value: object) -> dict[str, object]:
+    """只保存恢复发布意图所需的地点身份，不保留候选或 DOM 状态。"""
+
+    if not isinstance(value, Mapping) or not value:
+        return {}
+    location = normalize_location_candidate(dict(value))
+    if not location or not location.get("address"):
+        raise DouyinCommerceBatchDraftError("批次草稿地点快照缺少 POI、名称或完整地址")
+    try:
+        scope = normalize_commerce_location_scope(value.get("scope"))
+    except Exception as exc:
+        raise DouyinCommerceBatchDraftError(str(exc)) from exc
+    return {
+        "id": _text(value.get("id")),
+        "poiId": location["poiId"],
+        "name": location["name"],
+        "address": location["address"],
+        "scope": scope,
+        "verifiedAt": _text(value.get("verifiedAt")),
+    }
+
+
+def _last_location_search(value: object) -> dict[str, str]:
+    """保存最后一次搜索意图；候选列表必须在新平台会话中重新读取。"""
+
+    raw = value if isinstance(value, Mapping) else {}
+    try:
+        scope = normalize_commerce_location_scope(
+            raw.get("scope") or LOCATION_SCOPE_DOMESTIC
+        )
+    except Exception as exc:
+        raise DouyinCommerceBatchDraftError(str(exc)) from exc
+    return {"scope": scope, "keyword": _text(raw.get("keyword"))}
 
 
 def _items(value: object) -> list[dict[str, object]]:
@@ -66,10 +123,17 @@ def _items(value: object) -> list[dict[str, object]]:
         if not media_path:
             raise DouyinCommerceBatchDraftError(f"第 {index} 个批次条目缺少本地媒体路径")
         schedule_time = _text(item.get("scheduleTimeOverride"))
+        location_preset_id = _text(item.get("locationPresetId"))
+        location_preset = _location_preset(item.get("locationPreset"))
+        if location_preset:
+            if not location_preset.get("id") and location_preset_id:
+                location_preset["id"] = location_preset_id
+            location_preset_id = _text(location_preset.get("id")) or location_preset_id
         result.append(
             {
                 "mediaPath": media_path,
-                "locationPresetId": _text(item.get("locationPresetId")),
+                "locationPresetId": location_preset_id,
+                "locationPreset": location_preset,
                 # 旧草稿只保存每条 enableTimer。新草稿以批次 publishMode 为准；
                 # 这里仍保留兼容字段，不能用 bool("false") 把字符串误判为已定时。
                 "enableTimer": item.get("enableTimer") is True,
@@ -123,10 +187,11 @@ def normalize_batch_draft(payload: Mapping[str, Any]) -> dict[str, Any]:
         payload.get("publishMode") or ("interval-schedule" if legacy_timer else "immediate")
     )
     return {
-        "schemaVersion": 2,
+        "schemaVersion": 3,
         "accountId": _account_id(payload.get("accountId")),
         "accountFile": account_file,
         "shared": _shared(payload.get("shared")),
+        "lastLocationSearch": _last_location_search(payload.get("lastLocationSearch")),
         "publishMode": publish_mode,
         "schedule": _schedule(payload.get("schedule"), publish_mode=publish_mode),
         "items": items,

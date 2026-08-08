@@ -687,7 +687,25 @@ async def _close_selected_music_picker(page, dialog) -> None:
     文案，避免误点编辑器其它控件。
     """
 
-    controls = dialog.locator("button.semi-sidesheet-close")
+    # 当前平台的“使用”有两种正常收束方式：旧版保留抽屉等待关闭，
+    # 新版会在写入音乐后自动关闭抽屉。后一种情况下不存在 close 节点，
+    # 不能把“已关闭”误判为失败，更不能继续点编辑器上的泛化关闭按钮。
+    try:
+        if not await dialog.is_visible():
+            return
+    except Exception:
+        # 抽屉节点已被平台移除也等同于遮罩已消失。
+        return
+
+    # 抖音近期同时存在 sidesheet 与 modal 两种容器。优先旧版 class，并只在
+    # 已知音乐弹层内部回退到带明确“关闭”无障碍语义的控件；不扫描编辑页，也
+    # 不点击泛化的“×”。
+    controls = dialog.locator(
+        "button.semi-sidesheet-close, "
+        "button.semi-modal-close, "
+        "button[aria-label='关闭'], button[title='关闭'], "
+        "[role='button'][aria-label='关闭'], [role='button'][title='关闭']"
+    )
     visible = []
     for index in range(await controls.count()):
         node = controls.nth(index)
@@ -698,7 +716,7 @@ async def _close_selected_music_picker(page, dialog) -> None:
             continue
     if len(visible) != 1:
         raise DouyinMusicError(
-            f"抖音收藏音乐已选中，但音乐抽屉关闭控件不唯一（实际 {len(visible)} 个）"
+            f"抖音收藏音乐已选中，但可见音乐弹层关闭控件不唯一（实际 {len(visible)} 个）"
         )
     try:
         await visible[0].click(timeout=8_000)
@@ -715,6 +733,17 @@ async def _close_selected_music_picker(page, dialog) -> None:
     raise DouyinMusicError(
         "抖音收藏音乐已选中，但关闭抽屉后遮罩仍存在，未继续后续字段"
     )
+
+
+async def close_favorite_music_choices(page, dialog) -> None:
+    """关闭仅用于读取收藏列表的音乐抽屉，并确认编辑页已恢复可操作。
+
+    刷新收藏音乐的目的只是同步候选，不能把平台抽屉留在编辑页上。否则地点、
+    声明和定时虽然在客户端可点，但会被同一会话中的遮罩安全拦截。这里复用已
+    验证的唯一关闭控件及遮罩消失回读，不会选择音乐，也不会写入或提交作品。
+    """
+
+    await _close_selected_music_picker(page, dialog)
 
 
 async def open_favorite_music_choices(page) -> tuple[Any, Any, list[dict[str, str]]]:

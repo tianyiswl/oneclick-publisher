@@ -511,6 +511,22 @@ def mark_task_running(task_id: int, message: str) -> None:
         conn.commit()
 
 
+def mark_task_paused(task_id: int, message: str) -> None:
+    """标记批量任务已受控暂停，未开始的条目必须保持 pending。"""
+
+    now = _now()
+    with connect() as conn:
+        conn.execute(
+            "UPDATE publish_tasks SET status = 'paused' WHERE id = ?",
+            (int(task_id),),
+        )
+        conn.execute(
+            "INSERT INTO publish_task_events (taskId, level, eventType, message, createdAt) VALUES (?, 'warning', 'batch_paused', ?, ?)",
+            (int(task_id), message, now),
+        )
+        conn.commit()
+
+
 def record_task_event(task_id: int, event_type: str, message: str, *, level: str = "info") -> None:
     """追加不含会话凭据的平台预检事件。"""
 

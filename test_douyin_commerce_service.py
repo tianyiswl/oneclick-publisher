@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -16,9 +17,11 @@ from zoneinfo import ZoneInfo
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QDate, Qt
 from PyQt6.QtGui import QColor, QImage, QInputMethodEvent
 from PyQt6.QtWidgets import QApplication, QComboBox, QDialog, QFrame, QLabel, QLineEdit, QPushButton
+from loguru import logger
+from playwright.async_api import async_playwright
 
 from app_core import (
     database,
@@ -389,6 +392,7 @@ class DouyinCommercePayloadTests(unittest.TestCase):
                 self.scroll_into_view_if_needed = AsyncMock()
                 self.click = AsyncMock()
                 self.fill = AsyncMock()
+                self.evaluate = AsyncMock(side_effect=["", "北海夜南香"])
 
         field = SearchInput()
 
@@ -437,6 +441,58 @@ class DouyinCommercePayloadTests(unittest.TestCase):
         )
         self.assertEqual(result[0]["name"], row["name"])
         self.assertNotIn("commerceStore", result[0])
+
+    def test_location_search_stops_when_old_keyword_cannot_be_cleared(self) -> None:
+        """平台仍回读旧关键词时，禁止继续输入新词或读取旧候选。"""
+
+        class SearchInput:
+            scroll_into_view_if_needed = AsyncMock()
+            click = AsyncMock()
+            fill = AsyncMock()
+            evaluate = AsyncMock(return_value="上一次关键词")
+
+        field = SearchInput()
+
+        class Page:
+            wait_for_timeout = AsyncMock()
+
+        with patch.object(
+            douyin_commerce_service,
+            "_ensure_position_tag",
+            new_callable=AsyncMock,
+        ), patch.object(
+            douyin_commerce_service,
+            "_ensure_local_group_buy_mode",
+            new_callable=AsyncMock,
+            return_value=object(),
+        ), patch.object(
+            douyin_commerce_service,
+            "_open_commerce_search_input",
+            new_callable=AsyncMock,
+            return_value=field,
+        ), patch.object(
+            douyin_commerce_service,
+            "set_commerce_location_scope",
+            new_callable=AsyncMock,
+        ), patch.object(
+            douyin_commerce_service,
+            "_wait_for_fresh_commerce_location_results",
+            new_callable=AsyncMock,
+        ) as wait_results:
+            with self.assertRaisesRegex(
+                douyin_commerce_service.DouyinCommerceError,
+                "未能清空旧关键词",
+            ):
+                asyncio.run(
+                    douyin_commerce_service.search_commerce_location_store_candidates(
+                        Page(),
+                        "夜心数码",
+                        scope="local",
+                    )
+                )
+
+        self.assertEqual(field.fill.await_args_list, [call("", timeout=8_000)])
+        wait_results.assert_not_awaited()
 
     def test_location_scope_anchors_leaf_labels_inside_current_search_panel(self) -> None:
         """范围标签不能提升到包含“本地国内”全文的父节点后再做文字相等判断。"""
@@ -493,6 +549,9 @@ class DouyinCommercePayloadTests(unittest.TestCase):
         events: list[str] = []
 
         class SearchInput:
+            def __init__(self) -> None:
+                self.value = ""
+
             async def scroll_into_view_if_needed(self, **_kwargs) -> None:
                 events.append("scroll")
 
@@ -500,7 +559,11 @@ class DouyinCommercePayloadTests(unittest.TestCase):
                 events.append("click")
 
             async def fill(self, value: str, **_kwargs) -> None:
+                self.value = value
                 events.append(f"fill:{value}")
+
+            async def evaluate(self, _script: str) -> str:
+                return self.value
 
         field = SearchInput()
 
@@ -915,6 +978,88 @@ class DouyinCommercePayloadTests(unittest.TestCase):
         ):
             asyncio.run(douyin_commerce_service.set_commerce_location_scope(Page(), "国内"))
 
+    def test_position_tag_waits_for_unique_dynamic_entry_before_opening_add_tag(self) -> None:
+        page = MagicMock()
+        page.wait_for_timeout = AsyncMock()
+        tag_select = MagicMock()
+        position_option = MagicMock()
+        position_option.click = AsyncMock()
+        missing_anchor = douyin_commerce_service.DouyinCommerceError(
+            "抖音页面未找到唯一可用的带货模式控件组（实际 0 个），已安全停止"
+        )
+        with patch.object(
+            douyin_commerce_service,
+            "_anchor_controls",
+            new_callable=AsyncMock,
+            side_effect=[
+                missing_anchor,
+                (object(), object(), "带货模式", ""),
+            ],
+        ), patch.object(
+            douyin_commerce_service,
+            "_mark_unique_position_tag_select",
+            new_callable=AsyncMock,
+            side_effect=[None, None, tag_select],
+        ), patch.object(
+            douyin_commerce_service,
+            "_open_unique_add_tag",
+            new_callable=AsyncMock,
+        ) as open_add_tag, patch.object(
+            douyin_commerce_service,
+            "_open_exact_select",
+            new_callable=AsyncMock,
+        ), patch.object(
+            douyin_commerce_service,
+            "_wait_position_tag_option",
+            new_callable=AsyncMock,
+            return_value=position_option,
+        ):
+            asyncio.run(douyin_commerce_service._ensure_position_tag(page))
+
+        open_add_tag.assert_not_awaited()
+        self.assertEqual(
+            page.wait_for_timeout.await_args_list[:2],
+            [call(150), call(150)],
+        )
+        position_option.click.assert_awaited_once_with(timeout=8_000)
+
+    def test_add_tag_may_directly_render_css_position_row_without_option_menu(self) -> None:
+        """平台直接渲染位置输入行时，应立即回读成功而不是继续等菜单项。"""
+
+        page = MagicMock()
+        page.wait_for_timeout = AsyncMock()
+        missing_anchor = douyin_commerce_service.DouyinCommerceError(
+            "抖音页面未找到唯一可用的带货模式控件组（实际 0 个），已安全停止"
+        )
+        with patch.object(
+            douyin_commerce_service,
+            "_anchor_controls",
+            new_callable=AsyncMock,
+            side_effect=[missing_anchor, (object(), object(), "", "")],
+        ), patch.object(
+            douyin_commerce_service,
+            "_wait_unique_position_tag_select",
+            new_callable=AsyncMock,
+            return_value=None,
+        ), patch.object(
+            douyin_commerce_service,
+            "_open_unique_add_tag",
+            new_callable=AsyncMock,
+            return_value=True,
+        ), patch.object(
+            douyin_commerce_service,
+            "_open_exact_select",
+            new_callable=AsyncMock,
+        ) as open_select, patch.object(
+            douyin_commerce_service,
+            "_wait_position_tag_option",
+            new_callable=AsyncMock,
+        ) as wait_option:
+            asyncio.run(douyin_commerce_service._ensure_position_tag(page))
+
+        open_select.assert_not_awaited()
+        wait_option.assert_not_awaited()
+
     def test_location_search_opens_dynamic_input_before_waiting(self) -> None:
         """新版页面必须先打开“输入地理位置”，不能在初始 DOM 猜 input。"""
 
@@ -946,6 +1091,77 @@ class DouyinCommercePayloadTests(unittest.TestCase):
         open_select.assert_awaited_once_with(page, store_control, "带货位置")
         page.wait_for_timeout.assert_awaited_once_with(200)
 
+    def test_location_entry_diagnostic_writes_only_allowlisted_structure(self) -> None:
+        """诊断快照不得落盘输入值、正文、Cookie、HTML 或请求数据。"""
+
+        class Page:
+            def __init__(self) -> None:
+                self.evaluate = AsyncMock(
+                    return_value={
+                        "schemaVersion": 1,
+                        "kind": "douyin-location-entry-structure",
+                        "labelCounts": {"位置": 1, "带货模式": 1, "正文": 99},
+                        "landmarks": [
+                            {
+                                "label": "位置",
+                                "leaf": {
+                                    "tag": "span",
+                                    "role": "",
+                                    "classes": ["position-label"],
+                                    "ariaLabel": "位置",
+                                    "placeholder": "",
+                                    "rect": {"x": 10, "y": 20, "width": 30, "height": 40},
+                                    "tabIndex": -1,
+                                    "disabled": False,
+                                    "readOnly": False,
+                                    "contentEditable": False,
+                                    "dataAttributes": ["data-state"],
+                                    "state": {"ariaExpanded": "false"},
+                                    "value": "不允许保存",
+                                    "outerHTML": "<span>页面正文</span>",
+                                },
+                                "ancestors": [],
+                                "siblings": [],
+                                "text": "页面正文",
+                            }
+                        ],
+                        "editableNodes": [
+                            {
+                                "tag": "input",
+                                "role": "textbox",
+                                "classes": ["location-input"],
+                                "ariaLabel": "",
+                                "placeholder": "输入地理位置",
+                                "rect": {"x": 50, "y": 60, "width": 200, "height": 32},
+                                "tabIndex": 0,
+                                "disabled": False,
+                                "readOnly": False,
+                                "contentEditable": False,
+                                "dataAttributes": [],
+                                "state": {},
+                                "value": "夜心数码",
+                            }
+                        ],
+                        "cookie": "secret",
+                        "request": {"url": "secret"},
+                    }
+                )
+
+        with tempfile.TemporaryDirectory() as root:
+            path = asyncio.run(
+                douyin_commerce_service._capture_location_entry_diagnostic(
+                    Page(), Path(root)
+                )
+            )
+            payload = json.loads(path.read_text(encoding="utf-8"))
+
+        rendered = json.dumps(payload, ensure_ascii=False)
+        self.assertEqual(payload["labelCounts"], {"位置": 1, "带货模式": 1})
+        self.assertEqual(payload["landmarks"][0]["label"], "位置")
+        self.assertEqual(payload["editableNodes"][0]["placeholder"], "输入地理位置")
+        for forbidden in ("夜心数码", "页面正文", "secret", "outerHTML", "cookie", "request", "value"):
+            self.assertNotIn(forbidden, rendered)
+
     def test_location_search_reuses_existing_dynamic_input_without_clicking(self) -> None:
         class Page:
             pass
@@ -966,6 +1182,98 @@ class DouyinCommercePayloadTests(unittest.TestCase):
 
         self.assertIs(result, field)
         open_select.assert_not_awaited()
+
+    def test_anchor_controls_accept_modern_position_mode_and_input_surface(self) -> None:
+        """新版“位置 + 带货模式 + 输入框”不应退回旧的添加标签入口。"""
+
+        class Page:
+            def __init__(self) -> None:
+                self.evaluate = AsyncMock(
+                    return_value={
+                        "count": 1,
+                        "mode": "带货模式",
+                        "store": "",
+                        "surface": "modern-position-mode-input",
+                    }
+                )
+                self.locator = MagicMock(side_effect=lambda selector: selector)
+
+        page = Page()
+        mode, store, mode_value, store_value = asyncio.run(
+            douyin_commerce_service._anchor_controls(page)
+        )
+
+        self.assertEqual(mode, '[data-oneclick-commerce-mode="active"]')
+        self.assertEqual(store, '[data-oneclick-commerce-store="active"]')
+        self.assertEqual(mode_value, "带货模式")
+        self.assertEqual(store_value, "")
+        script = page.evaluate.await_args.args[0]
+        self.assertIn("modern-position-mode-input", script)
+        self.assertIn("modeLeaves", script)
+        self.assertIn("'input, textarea", script)
+
+    def test_native_location_input_opens_without_requiring_semi_select_markup(self) -> None:
+        """现代位置输入框本身就是入口，不能再按旧 semi-select 结构打开。"""
+
+        class InputControl:
+            def __init__(self) -> None:
+                self.click = AsyncMock()
+                self.evaluate = AsyncMock(return_value=True)
+
+        class Page:
+            pass
+
+        control = InputControl()
+        listbox = object()
+        with patch.object(
+            douyin_commerce_service,
+            "_visible_store_listbox",
+            new_callable=AsyncMock,
+            side_effect=[None, listbox],
+        ), patch.object(
+            douyin_commerce_service,
+            "_open_exact_select",
+            new_callable=AsyncMock,
+        ) as open_select:
+            result = asyncio.run(
+                douyin_commerce_service._open_store_selector(Page(), control)
+            )
+
+        self.assertIs(result, listbox)
+        control.click.assert_awaited_once_with(timeout=5_000)
+        open_select.assert_not_awaited()
+
+    def test_position_tag_can_open_a_uniquely_marked_modern_control_without_semi_markup(self) -> None:
+        """新版位置入口不是 semi-select 时，仍只点击已经唯一确认的入口。"""
+
+        class EmptyChildren:
+            async def count(self) -> int:
+                return 0
+
+        class Control:
+            def __init__(self) -> None:
+                self.click = AsyncMock()
+
+            def locator(self, _selector: str):
+                return EmptyChildren()
+
+            async def scroll_into_view_if_needed(self, **_kwargs) -> None:
+                return None
+
+        control = Control()
+        with patch.object(
+            douyin_commerce_service,
+            "_is_direct_location_entry",
+            new_callable=AsyncMock,
+            return_value=True,
+        ):
+            asyncio.run(
+                douyin_commerce_service._open_exact_select(
+                    object(), control, "位置标签"
+                )
+            )
+
+        control.click.assert_awaited_once_with(timeout=3_000)
 
     def test_store_dom_scripts_keep_newline_regex_escaped(self) -> None:
         """页面脚本中的 ``\\n`` 必须交给浏览器解析，不能被 Python 展开。"""
@@ -1082,6 +1390,367 @@ class DouyinCommercePayloadTests(unittest.TestCase):
         bind_store.assert_not_awaited()
         self.assertEqual(result["location"]["name"], row["name"])
         self.assertNotIn("commerceStore", result)
+
+
+class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
+    """用真实 DOM 约束地点 portal，避免把整张发布页的输入框算进来。"""
+
+    async def test_anchor_controls_pairs_css_position_input_with_adjacent_mode_row(self) -> None:
+        """位置文案由 CSS 渲染时，不能把同一行的位置类型下拉当成带货模式。"""
+
+        html = """
+        <main>
+          <div id="location-section">
+            <section class="content-obt4oA new-layout-sLYOT6" style="display:flex;width:646px;height:32px">
+              <div><span>添加标签</span></div>
+              <div class="content-child-V0CB7w" style="display:flex;width:552px;height:32px">
+                <div id="position-type" class="semi-select semi-select-single" style="width:104px;height:32px">
+                  <div class="select-dropdown-option-video" data-code="poi"></div>
+                </div>
+                <div class="anchor-component-Shp3mT" style="width:440px;height:32px">
+                  <div class="semi-select semi-select-single semi-select-filterable" style="width:440px;height:32px">
+                    <input id="location-input">
+                  </div>
+                </div>
+              </div>
+            </section>
+            <section class="content-obt4oA new-layout-sLYOT6" style="display:flex;width:646px;height:32px">
+              <div style="width:74px;height:32px"></div>
+              <div id="commerce-mode" class="semi-select semi-select-single semi-select-filterable" style="width:552px;height:32px">
+                <div class="semi-select-selection"><span class="semi-select-selection-placeholder"></span></div>
+              </div>
+            </section>
+            <section class="content-obt4oA new-layout-sLYOT6" style="display:flex;width:646px;height:32px">
+              <div style="width:74px;height:32px"></div>
+              <div style="display:flex;width:552px;height:32px">
+                <div class="semi-select semi-select-single" style="width:128px;height:32px"></div>
+                <div class="semi-select semi-select-multiple semi-select-filterable" style="width:412px;height:32px">
+                  <input style="width:2px">
+                </div>
+              </div>
+            </section>
+          </div>
+        </main>
+        """
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+
+                mode, store, _, store_text = (
+                    await douyin_commerce_service._anchor_controls(page)
+                )
+
+                self.assertEqual(await mode.get_attribute("id"), "commerce-mode")
+                self.assertEqual(await store.get_attribute("id"), "location-input")
+                self.assertEqual(store_text, "")
+            finally:
+                await browser.close()
+
+    async def test_blank_adjacent_mode_selects_official_commerce_mode(self) -> None:
+        """批量态模式为空时，必须从官方两项中选择并回读“带货模式”。"""
+
+        html = """
+        <main>
+          <div id="location-section">
+            <section class="content-obt4oA new-layout-sLYOT6" style="display:flex;width:646px;height:32px">
+              <div><span>添加标签</span></div>
+              <div class="content-child-V0CB7w" style="display:flex;width:552px;height:32px">
+                <div id="position-type" class="semi-select semi-select-single" style="width:104px;height:32px"></div>
+                <div style="width:440px;height:32px">
+                  <div class="semi-select semi-select-single semi-select-filterable" style="width:440px;height:32px">
+                    <input id="location-input">
+                  </div>
+                </div>
+              </div>
+            </section>
+            <section class="content-obt4oA new-layout-sLYOT6" style="display:flex;width:646px;height:32px">
+              <div style="width:74px;height:32px"></div>
+              <div id="commerce-mode" class="semi-select semi-select-single semi-select-filterable" style="width:552px;height:32px">
+                <div id="mode-selection" class="semi-select-selection" style="width:506px;height:30px">
+                  <span id="mode-value" class="semi-select-selection-placeholder"></span>
+                </div>
+              </div>
+            </section>
+          </div>
+          <div id="mode-list" role="listbox" style="display:none;width:200px;height:80px">
+            <div id="commerce-option" role="option" style="height:32px">带货模式</div>
+            <div role="option" style="height:32px">打卡模式</div>
+          </div>
+          <script>
+            document.querySelector('#mode-selection').addEventListener('click', () => {
+              document.querySelector('#mode-list').style.display = 'block';
+            });
+            document.querySelector('#commerce-option').addEventListener('click', () => {
+              const value = document.querySelector('#mode-value');
+              value.textContent = '带货模式';
+              value.className = 'semi-select-selection-text';
+              document.querySelector('#mode-list').style.display = 'none';
+            });
+          </script>
+        </main>
+        """
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+
+                store = await douyin_commerce_service._ensure_local_group_buy_mode(page)
+
+                self.assertEqual(await store.get_attribute("id"), "location-input")
+                self.assertEqual(
+                    await page.locator("#mode-value").inner_text(),
+                    "带货模式",
+                )
+            finally:
+                await browser.close()
+
+    async def test_add_tag_opens_unique_focusable_ancestor_from_exact_text_leaf(self) -> None:
+        html = """
+        <main>
+          <div id="add-tag" tabindex="0"><span>添加标签</span></div>
+          <script>
+            document.querySelector('#add-tag').addEventListener('click', () => {
+              document.body.dataset.addTagOpened = 'yes';
+            });
+          </script>
+        </main>
+        """
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+
+                opened = await douyin_commerce_service._open_unique_add_tag(page)
+
+                self.assertTrue(opened)
+                self.assertEqual(
+                    await page.locator("body").get_attribute("data-add-tag-opened"),
+                    "yes",
+                )
+            finally:
+                await browser.close()
+
+    async def test_add_tag_opens_unique_select_in_following_sibling_area(self) -> None:
+        """旧版标题是静态文字，真正入口位于同一行右侧兄弟区域。"""
+
+        html = """
+        <main>
+          <section class="anchor-item">
+            <div class="anchor-item-label"><span>添加标签</span></div>
+            <div class="anchor-item-content">
+              <div id="add-tag-select" class="semi-select-single" tabindex="0">
+                请选择
+              </div>
+            </div>
+          </section>
+          <script>
+            document.querySelector('#add-tag-select').addEventListener('click', () => {
+              document.body.dataset.addTagOpened = 'yes';
+            });
+          </script>
+        </main>
+        """
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+
+                opened = await douyin_commerce_service._open_unique_add_tag(page)
+
+                self.assertTrue(opened)
+                self.assertEqual(
+                    await page.locator("body").get_attribute("data-add-tag-opened"),
+                    "yes",
+                )
+            finally:
+                await browser.close()
+
+    async def test_add_tag_opens_unique_modern_content_child_after_music_reset(self) -> None:
+        """选音乐重渲染后，入口是同一行右侧无 role/tabindex 的唯一容器。"""
+
+        html = """
+        <main>
+          <section class="content-obt4oA new-layout-sLYOT6" style="display:flex;width:646px;height:32px">
+            <div>
+              <div class="title-dS7kae"><span class="title-content-oaqcSp">添加标签</span></div>
+            </div>
+            <div id="modern-add-tag" class="content-child-V0CB7w content-limit-width-zybqBW" style="width:552px;height:32px"></div>
+          </section>
+          <script>
+            document.querySelector('#modern-add-tag').addEventListener('click', () => {
+              document.body.dataset.addTagOpened = 'yes';
+            });
+          </script>
+        </main>
+        """
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+
+                opened = await douyin_commerce_service._open_unique_add_tag(page)
+
+                self.assertTrue(opened)
+                self.assertEqual(
+                    await page.locator("body").get_attribute("data-add-tag-opened"),
+                    "yes",
+                )
+            finally:
+                await browser.close()
+
+    async def test_modern_add_tag_ignores_unrelated_focusable_controls_below_row(self) -> None:
+        """新版精确行存在时，不得被后续声明区等可聚焦控件干扰。"""
+
+        html = """
+        <main>
+          <section class="container-EMGgQp">
+            <section class="content-obt4oA new-layout-sLYOT6" style="display:flex;width:646px;height:32px">
+              <div>
+                <div class="title-dS7kae"><span class="title-content-oaqcSp">添加标签</span></div>
+              </div>
+              <div id="modern-add-tag" class="content-child-V0CB7w content-limit-width-zybqBW" style="width:552px;height:32px"></div>
+            </section>
+          </section>
+          <section class="container-EMGgQp">
+            <button id="unrelated">后续声明区按钮</button>
+          </section>
+          <script>
+            document.querySelector('#modern-add-tag').addEventListener('click', () => {
+              document.body.dataset.addTagOpened = 'yes';
+            });
+          </script>
+        </main>
+        """
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+
+                opened = await douyin_commerce_service._open_unique_add_tag(page)
+
+                self.assertTrue(opened)
+                self.assertEqual(
+                    await page.locator("body").get_attribute("data-add-tag-opened"),
+                    "yes",
+                )
+            finally:
+                await browser.close()
+
+    async def test_add_tag_rejects_multiple_modern_content_children(self) -> None:
+        """右侧候选不唯一时仍应安全停止，不能按位置猜测。"""
+
+        html = """
+        <main>
+          <section class="content-obt4oA new-layout-sLYOT6" style="display:flex;width:646px;height:32px">
+            <div><div class="title-dS7kae"><span>添加标签</span></div></div>
+            <div class="content-child-first" style="width:276px;height:32px"></div>
+            <div class="content-child-second" style="width:276px;height:32px"></div>
+          </section>
+        </main>
+        """
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+
+                opened = await douyin_commerce_service._open_unique_add_tag(page)
+
+                self.assertFalse(opened)
+            finally:
+                await browser.close()
+
+    async def test_add_tag_rejects_ambiguous_following_sibling_selects(self) -> None:
+        html = """
+        <main>
+          <section>
+            <div><span>添加标签</span></div>
+            <div>
+              <div class="semi-select-single" tabindex="0">请选择 A</div>
+              <div class="semi-select-single" tabindex="0">请选择 B</div>
+            </div>
+          </section>
+        </main>
+        """
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+
+                opened = await douyin_commerce_service._open_unique_add_tag(page)
+
+                self.assertFalse(opened)
+                self.assertEqual(
+                    await page.locator(
+                        '[data-oneclick-commerce-add-tag="active"]'
+                    ).count(),
+                    0,
+                )
+            finally:
+                await browser.close()
+
+    async def test_location_portal_ignores_eight_other_editor_fields(self) -> None:
+        html = """
+        <main id="editor-root">
+          <input id="title"><textarea id="description"></textarea>
+          <input id="tag"><input id="schedule-date"><input id="schedule-time">
+          <input id="collaboration"><input id="cover"><input id="other">
+          <div data-oneclick-commerce-store="active">输入地理位置</div>
+          <section id="location-portal">
+            <nav><button>本地</button><button>国内</button></nav>
+            <input id="location-input">
+          </section>
+        </main>
+        """
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+
+                locator = await douyin_commerce_service._visible_commerce_search_input(page)
+
+                self.assertEqual(await locator.get_attribute("id"), "location-input")
+                self.assertEqual(
+                    await page.locator(
+                        '[data-oneclick-commerce-search-input="active"]'
+                    ).count(),
+                    1,
+                )
+            finally:
+                await browser.close()
+
+    async def test_location_portal_rejects_two_editable_fields(self) -> None:
+        html = """
+        <main id="editor-root">
+          <div data-oneclick-commerce-store="active">输入地理位置</div>
+          <section id="location-portal">
+            <nav><button>本地</button><button>国内</button></nav>
+            <input id="location-input"><input id="ambiguous-input">
+          </section>
+        </main>
+        """
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+
+                with self.assertRaisesRegex(
+                    douyin_commerce_service.DouyinCommerceError,
+                    "实际 2 个",
+                ):
+                    await douyin_commerce_service._visible_commerce_search_input(page)
+            finally:
+                await browser.close()
 
 
 class DouyinCommerceMusicRuleTests(unittest.TestCase):
@@ -1450,6 +2119,33 @@ class DouyinCommerceUiTests(unittest.TestCase):
             "已完成 2/4 · 成功 1 · 失败 1 · 正在处理 3/4：正在上传视频",
         )
 
+    def test_ambiguous_platform_receipt_summary_reports_paused_and_pending_review(self) -> None:
+        """最终提交回执不明时，弹窗不得误报整批已结束或漏计当前视频。"""
+
+        result = [
+            {
+                "index": 0,
+                "status": "receipt_ambiguous",
+                "diagnostic": "定时提交后未能从作品管理页回读标题和指定时间",
+            },
+            *[
+                {"index": index, "status": "pending"}
+                for index in range(1, 19)
+            ],
+        ]
+
+        with patch("ui.douyin_commerce_page.QMessageBox.warning"), patch(
+            "ui.douyin_commerce_page.QMessageBox.information"
+        ):
+            self.page._batch_publish_succeeded(result)
+
+        self.assertEqual(
+            self.page.validation_label.text(),
+            "批量提交已暂停：成功 0 条，失败 0 条；"
+            "平台状态待核对 1 条；未开始 18 条；"
+            "待核对原因：定时提交后未能从作品管理页回读标题和指定时间。",
+        )
+
     def test_content_layout_moves_video_tags_and_local_content_to_requested_areas(self) -> None:
         """内容页必须以账号含视频、内容含标签历史和本地内容、右侧日志呈现。"""
 
@@ -1794,8 +2490,8 @@ class DouyinCommerceUiTests(unittest.TestCase):
         refresh.assert_not_called()
         self.assertIn("点击刷新", self.page.music_status.text())
 
-    def test_refresh_music_is_explicit_and_candidates_remain_selectable(self) -> None:
-        """刷新才读取当前抖音页；刷新结果保留为当前会话候选。"""
+    def test_refresh_music_returns_closed_picker_candidates_as_cache(self) -> None:
+        """刷新只同步候选；不能让音乐抽屉阻塞后续地点设置。"""
 
         self.page._session_id = "session-demo"
         with patch.object(
@@ -1804,18 +2500,16 @@ class DouyinCommerceUiTests(unittest.TestCase):
             self.page._refresh_favorite_music_candidates()
         self.assertEqual(start.call_args.args[0], "music_refresh")
 
-        self.page._show_music_candidates(
-            [
-                {
-                    "musicId": "music-001",
-                    "title": "出埃及记",
-                    "creator": "石Yuchi",
-                    "duration": "01:08",
-                }
-            ],
-            source="session",
-        )
-        self.assertEqual(self.page._music_candidate_source, "session")
+        candidate = {
+            "musicId": "music-001",
+            "title": "出埃及记",
+            "creator": "石Yuchi",
+            "duration": "01:08",
+        }
+        on_success = start.call_args.args[2]
+        with patch.object(self.page, "_show_music_candidates") as show:
+            on_success([candidate])
+        show.assert_called_once_with([candidate], source="cache")
 
     def test_cached_music_selection_uses_exact_current_editor_recheck(self) -> None:
         """缓存候选点击后必须走受控重识别入口，不能直接复用本地数据。"""
@@ -2515,6 +3209,29 @@ class DouyinCommerceUiTests(unittest.TestCase):
         self.page._pending_upload_payload = {"title": "旧标题"}
         self.page._preflight_fingerprint = "旧预检"
         self.page._saved_content_available = True
+        self.page._selected_music = {
+            "musicId": "old-music",
+            "title": "旧音乐",
+            "creator": "旧作者",
+            "duration": "00:30",
+        }
+        self.page._locations = [{"poiId": "old-poi"}]
+        self.page._selected_location_data = {
+            "poiId": "old-poi",
+            "name": "旧地点",
+            "address": "旧地址1号",
+        }
+        self.page._location_applied = True
+        self.page._set_selected_declaration("内容由AI生成")
+        self.page._confirmed_declaration = "内容由AI生成"
+        self.page._batch_location_searches["__shared_location_search__"] = {
+            "scope": "local",
+            "keyword": "旧关键词",
+            "candidates": [{"poiId": "old-poi"}],
+        }
+        self.page.batch_publish_mode.setCurrentIndex(
+            self.page.batch_publish_mode.findData("interval-schedule")
+        )
 
         with patch.object(self.page.runner, "run") as run:
             self.page.clear_current_content()
@@ -2527,6 +3244,20 @@ class DouyinCommerceUiTests(unittest.TestCase):
         self.assertIsNone(self.page._uploaded_editor_payload)
         self.assertIsNone(self.page._pending_upload_payload)
         self.assertEqual(self.page._preflight_fingerprint, "")
+        self.assertIsNone(self.page._selected_music)
+        self.assertEqual(self.page._locations, [])
+        self.assertIsNone(self.page._selected_location_data)
+        self.assertFalse(self.page._location_applied)
+        self.assertEqual(
+            self.page._selected_declaration(),
+            self.page._DEFAULT_CONTENT_DECLARATION,
+        )
+        self.assertEqual(self.page._confirmed_declaration, "")
+        self.assertEqual(
+            self.page._batch_location_state(),
+            {"scope": "domestic", "keyword": "", "candidates": []},
+        )
+        self.assertEqual(self.page.batch_publish_mode.currentData(), "immediate")
         self.assertTrue(self.page._saved_content_available)
         self.assertTrue(self.page.restore_content_button.isEnabled())
         run.assert_not_called()
@@ -3219,8 +3950,8 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
         self.assertEqual(manager._session.music_candidates, [current_candidate])
         self.assertIsNotNone(manager._session.music_dialog)
 
-    def test_manual_refresh_updates_only_current_account_cache(self) -> None:
-        """刷新读取当前抽屉一次，并将稳定候选交给当前账号缓存服务。"""
+    def test_manual_refresh_closes_picker_and_returns_current_account_cache(self) -> None:
+        """刷新后必须关闭抽屉，地点等独立设置才可继续。"""
 
         class OpenPage:
             def is_closed(self) -> bool:
@@ -3247,20 +3978,111 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
                 "marker": "row-current",
             }
         ]
+        cached = [
+            {
+                "musicId": "music-current",
+                "title": "当前收藏歌曲",
+                "creator": "当前作者",
+                "duration": "03:21",
+            }
+        ]
+        picker_page = object()
+        dialog = object()
         with patch.object(
             douyin_commerce_session.douyin_music_service,
             "open_favorite_music_choices",
             new_callable=AsyncMock,
-            return_value=(object(), object(), current),
-        ) as open_choices, patch(
+            return_value=(picker_page, dialog, current),
+        ) as open_choices, patch.object(
+            douyin_commerce_session.douyin_music_service,
+            "close_favorite_music_choices",
+            new_callable=AsyncMock,
+        ) as close_picker, patch(
             "app_core.douyin_favorite_music_cache.replace_cached_favorite_music",
-            return_value=[],
+            return_value=cached,
         ) as replace:
             result = asyncio.run(manager._refresh_favorite_music("session-demo"))
 
         self.assertEqual(result[0]["musicId"], "music-current")
         open_choices.assert_awaited_once_with(manager._session.page)
-        replace.assert_called_once_with(31, manager._session.music_candidates)
+        close_picker.assert_awaited_once_with(
+            picker_page, dialog
+        )
+        replace.assert_called_once_with(
+            31,
+            [
+                {
+                    "musicId": "music-current",
+                    "title": "当前收藏歌曲",
+                    "creator": "当前作者",
+                    "duration": "03:21",
+                    "source": "douyin-favorite-visible",
+                }
+            ],
+        )
+        self.assertIsNone(manager._session.music_picker_page)
+        self.assertIsNone(manager._session.music_dialog)
+
+    def test_location_search_remains_available_after_music_refresh_closes_picker(self) -> None:
+        """音乐刷新关闭抽屉后，同一编辑会话必须立即允许地点读取。"""
+
+        class OpenPage:
+            def is_closed(self) -> bool:
+                return False
+
+        manager = douyin_commerce_session.DouyinCommerceSessionManager()
+        manager._session = douyin_commerce_session._CommerceEditorSession(
+            session_id="session-demo",
+            upload_payload={},
+            account_name="测试账号",
+            browser=None,
+            context=None,
+            page=OpenPage(),
+            playwright=None,
+            uploader=None,
+            account_id=31,
+        )
+        music = {
+            "musicId": "music-001",
+            "title": "收藏歌曲",
+            "creator": "作者",
+            "duration": "03:21",
+        }
+        locations = [{
+            "name": "北海夜南香",
+            "address": "广西壮族自治区北海市银海区银滩大道 1 号",
+            "poiId": "visible-poi:test",
+        }]
+        with patch.object(
+            douyin_commerce_session.douyin_music_service,
+            "open_favorite_music_choices",
+            new_callable=AsyncMock,
+            return_value=(object(), object(), [music]),
+        ), patch.object(
+            douyin_commerce_session.douyin_music_service,
+            "close_favorite_music_choices",
+            new_callable=AsyncMock,
+        ), patch(
+            "app_core.douyin_favorite_music_cache.replace_cached_favorite_music",
+            return_value=[music],
+        ), patch.object(
+            douyin_commerce_session.douyin_commerce_service,
+            "search_commerce_location_store_candidates",
+            new_callable=AsyncMock,
+            return_value=locations,
+        ) as search:
+            asyncio.run(manager._refresh_favorite_music("session-demo"))
+            result = asyncio.run(
+                manager._search_locations("session-demo", "北海夜南香", "domestic")
+            )
+
+        self.assertEqual(result, locations)
+        self.assertIsNone(manager._session.music_dialog)
+        self.assertIsNone(manager._session.music_picker_page)
+        search.assert_awaited_once_with(
+            manager._session.page, "北海夜南香", scope="domestic"
+        )
+        self.assertEqual(manager._session.music_candidates, [])
 
     def test_progress_event_only_exposes_phase_label_and_state(self) -> None:
         event = douyin_commerce_session.CommerceProgressEvent(
@@ -3402,6 +4224,79 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
         self.assertNotIn("marker", selected)
         self.assertEqual(selected["musicId"], "music-new")
 
+    def test_selected_music_picker_accepts_platform_auto_close(self) -> None:
+        """平台点击“使用”后已自动关闭抽屉时，不应再误报关闭控件缺失。"""
+
+        class AutoClosedDialog:
+            async def is_visible(self) -> bool:
+                return False
+
+        class PickerPage:
+            async def wait_for_timeout(self, _milliseconds: int) -> None:
+                return None
+
+        asyncio.run(
+            douyin_music_service._close_selected_music_picker(
+                PickerPage(), AutoClosedDialog()
+            )
+        )
+
+    def test_selected_music_picker_uses_unique_accessible_modal_close_fallback(self) -> None:
+        """新版弹层没有旧 sidesheet class 时，只接受弹层内唯一的明确关闭控件。"""
+
+        class EmptyControls:
+            async def count(self) -> int:
+                return 0
+
+        class Control:
+            def __init__(self, dialog) -> None:
+                self.dialog = dialog
+                self.clicked = False
+
+            async def is_visible(self) -> bool:
+                return True
+
+            async def is_enabled(self) -> bool:
+                return True
+
+            async def click(self, **_kwargs) -> None:
+                self.clicked = True
+                self.dialog.visible = False
+
+        class Controls:
+            def __init__(self, control) -> None:
+                self.control = control
+
+            async def count(self) -> int:
+                return 1
+
+            def nth(self, _index: int):
+                return self.control
+
+        class Dialog:
+            def __init__(self) -> None:
+                self.visible = True
+                self.control = Control(self)
+
+            async def is_visible(self) -> bool:
+                return self.visible
+
+            def locator(self, selector: str):
+                if "semi-modal-close" in selector:
+                    return Controls(self.control)
+                return EmptyControls()
+
+        class PickerPage:
+            async def wait_for_timeout(self, _milliseconds: int) -> None:
+                return None
+
+        dialog = Dialog()
+        asyncio.run(
+            douyin_music_service._close_selected_music_picker(PickerPage(), dialog)
+        )
+
+        self.assertTrue(dialog.control.clicked)
+
     def test_selected_music_keeps_same_session_available_for_location_search(self) -> None:
         """首次刷新并选歌后，地点搜索继续复用同一编辑会话。"""
 
@@ -3467,6 +4362,70 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
         search.assert_awaited_once_with(editor_page, "北海", scope="domestic")
         self.assertEqual(selected["musicId"], "music-new")
         self.assertEqual(result, [location])
+
+    def test_music_replace_after_refresh_leaves_no_picker_before_location_search(self) -> None:
+        """覆盖真实顺序：选音乐 A → 刷新 → 选音乐 B → 搜索地点。"""
+
+        class OpenPage:
+            def is_closed(self) -> bool:
+                return False
+
+        manager = douyin_commerce_session.DouyinCommerceSessionManager()
+        manager._session = douyin_commerce_session._CommerceEditorSession(
+            session_id="session-demo",
+            upload_payload={},
+            account_name="测试账号",
+            browser=None,
+            context=None,
+            page=OpenPage(),
+            playwright=None,
+            uploader=None,
+            account_id=31,
+        )
+        music_a = {"musicId": "music-a", "title": "音乐 A", "creator": "作者", "duration": "03:21", "marker": "a"}
+        music_b = {"musicId": "music-b", "title": "音乐 B", "creator": "作者", "duration": "03:22", "marker": "b"}
+        location = {"poiId": "poi-1", "name": "北海夜南香", "address": "广西壮族自治区北海市银海区银滩大道 1 号"}
+        pickers = [(object(), object(), [music_a, music_b]) for _ in range(3)]
+
+        async def select(_page, _picker, _dialog, candidate):
+            return {key: value for key, value in candidate.items() if key != "marker"}
+
+        with patch.object(
+            douyin_commerce_session.douyin_music_service,
+            "open_favorite_music_choices",
+            new_callable=AsyncMock,
+            side_effect=pickers,
+        ) as open_picker, patch.object(
+            douyin_commerce_session.douyin_music_service,
+            "select_favorite_music_choice",
+            new_callable=AsyncMock,
+            side_effect=select,
+        ) as select_picker, patch.object(
+            douyin_commerce_session.douyin_music_service,
+            "close_favorite_music_choices",
+            new_callable=AsyncMock,
+        ) as close_picker, patch(
+            "app_core.douyin_favorite_music_cache.replace_cached_favorite_music",
+            return_value=[music_a, music_b],
+        ), patch.object(
+            douyin_commerce_session.douyin_commerce_service,
+            "search_commerce_location_store_candidates",
+            new_callable=AsyncMock,
+            return_value=[location],
+        ) as search:
+            asyncio.run(manager._select_cached_favorite_music("session-demo", "music-a"))
+            asyncio.run(manager._refresh_favorite_music("session-demo"))
+            asyncio.run(manager._select_cached_favorite_music("session-demo", "music-b"))
+            result = asyncio.run(manager._search_locations("session-demo", "北海夜南香", "domestic"))
+
+        self.assertEqual(result, [location])
+        self.assertEqual(open_picker.await_count, 3)
+        self.assertEqual(select_picker.await_count, 2)
+        self.assertEqual(close_picker.await_count, 1)
+        self.assertIsNone(manager._session.music_picker_page)
+        self.assertIsNone(manager._session.music_dialog)
+        self.assertEqual(manager._session.selected_music["musicId"], "music-b")
+        search.assert_awaited_once_with(manager._session.page, "北海夜南香", scope="domestic")
 
     def test_session_manager_defaults_upload_context_to_background(self) -> None:
         """上传会话默认后台；显式 false 才允许兼容旧调用。"""
@@ -4087,6 +5046,66 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
         self.assertEqual(broker.succeeded, ["request-demo"])
         self.assertEqual(broker.cleared, ["request-demo"])
         self.assertIsNone(manager._session)
+
+    def test_publish_verification_writes_explicit_runtime_log(self) -> None:
+        """最终提交若出现短信验证，运行日志必须明确记录触发与通过。"""
+
+        class Page:
+            async def wait_for_timeout(self, _milliseconds: int) -> None:
+                return None
+
+        class Uploader:
+            def __init__(self) -> None:
+                self.apply_sms_verification_code = AsyncMock()
+
+        class Broker:
+            def create_sms(self, **_kwargs) -> str:
+                return "request-log"
+
+            def snapshot(self, _request_id: str) -> dict:
+                return {"state": "waiting"}
+
+            def claim_code(self, _request_id: str) -> str:
+                return "123456"
+
+            def ensure_processing(self, _request_id: str) -> None:
+                return None
+
+            def succeed(self, _request_id: str) -> None:
+                return None
+
+            def clear(self, _request_id: str) -> None:
+                return None
+
+        session = douyin_commerce_session._CommerceEditorSession(
+            session_id="session-log",
+            upload_payload={},
+            account_name="测试账号",
+            browser=None,
+            context=None,
+            page=Page(),
+            playwright=None,
+            uploader=Uploader(),
+        )
+        messages: list[str] = []
+        sink_id = logger.add(lambda message: messages.append(message.record["message"]))
+        try:
+            with patch.object(douyin_commerce_session, "verification_broker", Broker()):
+                asyncio.run(
+                    douyin_commerce_session.DouyinCommerceSessionManager()._handle_publish_verification(
+                        session,
+                        VerificationChallenge(
+                            kind="sms",
+                            message="请在一键发客户端输入短信验证码",
+                        ),
+                        task_id=81,
+                    )
+                )
+        finally:
+            logger.remove(sink_id)
+
+        self.assertTrue(any("触发短信验证码" in message for message in messages))
+        self.assertTrue(any("短信验证码已通过" in message for message in messages))
 
     def test_cancelled_or_expired_sms_claim_stops_before_page_write_or_receipt(self) -> None:
         """验证码被领取后若已取消或超时，不能再填写、点击或返回成功回执。"""
@@ -5193,6 +6212,9 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.assertEqual(self.page._batch_locations[paths[2]]["poiId"], "poi-2")
         self.assertEqual(save_preset.call_count, 2)
         self.assertIn("自动填充 2 条", self.page.batch_item_settings_status.text())
+        # 测试页未 show()，isVisible() 会受父窗口影响；isHidden() 才能验证
+        # 组件是否被本次搜索回读显式展示。
+        self.assertFalse(self.page.batch_item_settings_status.isHidden())
 
     def test_batch_defaults_to_immediate_and_only_generates_interval_when_enabled(self) -> None:
         self.page.video_combo.clear()
@@ -5206,7 +6228,14 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.assertEqual(self.page.item_schedule_text(1), "立即发布")
         self.page.batch_timer_enabled.setChecked(True)
         self.page.batch_interval_minutes.setValue(30)
-        self.assertEqual(self.page.item_schedule_text(1), "09:30")
+        selected = datetime.fromisoformat(
+            f"{self.page.schedule_date.date().toString('yyyy-MM-dd')} "
+            f"{self.page.schedule_time.time().toString('HH:mm')}"
+        )
+        self.assertEqual(
+            self.page.item_schedule_text(1),
+            (selected + timedelta(minutes=30)).strftime("%H:%M"),
+        )
         self.page.set_item_schedule_override(2, "2026-08-07 15:00")
         self.assertEqual(self.page.item_schedule_text(2), "15:00")
 
@@ -5239,6 +6268,106 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.assertGreaterEqual(schedule_row.indexOf(self.page.schedule_date), 0)
         self.assertGreaterEqual(schedule_row.indexOf(self.page.schedule_time), 0)
         self.assertGreaterEqual(schedule_row.indexOf(self.page.batch_schedule_controls), 0)
+
+    def test_auto_schedule_date_rolls_forward_when_default_has_expired(self) -> None:
+        """默认日期跨日后应刷新为下一个北京时间，而非保留过期日期。"""
+
+        self.page._schedule_date_auto_default = True
+        today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+        yesterday = QDate(today.year, today.month, today.day).addDays(-1)
+        blocked = self.page.schedule_date.blockSignals(True)
+        self.page.schedule_date.setMinimumDate(yesterday)
+        self.page.schedule_date.setDate(yesterday)
+        self.page.schedule_date.blockSignals(blocked)
+
+        self.page._refresh_schedule_default()
+
+        self.assertEqual(
+            self.page.schedule_date.date().toString("yyyy-MM-dd"),
+            self.page._default_schedule_datetime().date().isoformat(),
+        )
+
+    def test_default_schedule_is_always_next_beijing_day_at_1600(self) -> None:
+        """无论当前几点，自动默认日期都必须是北京时间次日。"""
+
+        before = datetime(2026, 8, 8, 15, 59, tzinfo=ZoneInfo("Asia/Shanghai"))
+        after = datetime(2026, 8, 8, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+        self.assertEqual(
+            self.page._default_schedule_datetime(before).strftime("%Y-%m-%d %H:%M"),
+            "2026-08-09 16:00",
+        )
+        self.assertEqual(
+            self.page._default_schedule_datetime(after).strftime("%Y-%m-%d %H:%M"),
+            "2026-08-09 16:00",
+        )
+
+    def test_restoring_today_schedule_uses_next_beijing_day_default(self) -> None:
+        """恢复草稿不得用今天的旧排期覆盖“次日 16:00”默认值。"""
+
+        today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+        saved = {
+            "updatedAt": "2026-08-08 14:46",
+            "payload": {
+                "schemaVersion": 3,
+                "accountId": 72,
+                "accountFile": "douyin-72.json",
+                "shared": {
+                    "title": "标题",
+                    "description": "文案",
+                    "tags": ["测试"],
+                    "selectedMusic": {},
+                    "contentDeclaration": "无需添加自主声明",
+                },
+                "lastLocationSearch": {"scope": "domestic", "keyword": ""},
+                "publishMode": "interval-schedule",
+                "schedule": {
+                    "timezone": "Asia/Shanghai",
+                    "startTime": f"{today.isoformat()} 09:00",
+                    "intervalMinutes": 30,
+                },
+                "items": [
+                    {
+                        "mediaPath": "/tmp/saved-schedule.mp4",
+                        "locationPresetId": "",
+                        "locationPreset": {},
+                        "enableTimer": True,
+                        "scheduleTimeOverride": "",
+                    }
+                ],
+            },
+        }
+
+        with patch(
+            "ui.douyin_commerce_page.douyin_commerce_batch_draft_service.load_batch_draft",
+            return_value=saved,
+        ), patch.object(self.page, "_current_location_presets", return_value=[]):
+            self.page.restore_batch_content()
+
+        expected_date = today + timedelta(days=1)
+        self.assertEqual(
+            self.page.batch_start_date.date().toString("yyyy-MM-dd"),
+            expected_date.isoformat(),
+        )
+        self.assertEqual(
+            self.page.batch_start_time.time().toString("HH:mm"),
+            "16:00",
+        )
+
+    def test_pause_button_is_placed_after_submit_and_requests_safe_pause(self) -> None:
+        """用户暂停只影响下一条视频，当前视频先安全收束。"""
+
+        layout = self.page.review_action_dock.layout()
+        self.assertIs(layout.itemAt(4).widget(), self.page.pause_batch_button)
+        self.page._batch_task_id = 9
+        with patch.object(self.page.runner, "is_running", return_value=True):
+            self.page._sync_view()
+            self.assertFalse(self.page.pause_batch_button.isHidden())
+            with patch.object(self.page._batch_executor, "request_pause", return_value=True) as pause:
+                self.page.pause_batch_publish()
+
+        pause.assert_called_once_with()
+        self.assertIn("当前视频", self.page.validation_label.text())
 
     def test_collect_batch_payload_generates_explicit_item_timer_fields_before_ui_task_creation(self) -> None:
         with tempfile.TemporaryDirectory() as root:
@@ -5379,6 +6508,169 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.assertEqual(normalized["schedule"]["intervalMinutes"], 45)
         self.assertEqual(normalized["items"][1]["scheduleTimeOverride"], "2026-08-10 12:00")
 
+    def test_batch_draft_payload_includes_stable_platform_intent(self) -> None:
+        """保存本地内容必须包含音乐、声明、地点快照和最后搜索意图。"""
+
+        video_file = tempfile.NamedTemporaryFile(suffix=".mp4")
+        self.addCleanup(video_file.close)
+        video_path = video_file.name
+        account = {
+            "id": 72,
+            "type": 3,
+            "status": 1,
+            "filePath": "douyin-72.json",
+            "profileName": "主体",
+            "userName": "账号",
+        }
+        media = {
+            "id": 1,
+            "typeText": "视频",
+            "storedPath": video_path,
+            "filename": "a.mp4",
+        }
+        with patch(
+            "ui.douyin_commerce_page.account_service.list_accounts",
+            return_value=[account],
+        ), patch(
+            "ui.douyin_commerce_page.media_service.list_media",
+            return_value=[media],
+        ):
+            self.page.refresh()
+        self.page.account_combo.setCurrentIndex(1)
+        self.page.select_video_indexes([1])
+        self.page._selected_music = {
+            "musicId": "music-1",
+            "title": "收藏歌",
+            "creator": "作者",
+            "duration": "00:30",
+        }
+        self.page._set_selected_declaration("无需添加自主声明")
+        self.page._batch_locations[video_path] = {
+            "id": "preset-1",
+            "poiId": "poi-1",
+            "name": "夜南香北京烤鸭",
+            "address": "陕西省安康市汉滨区江北办富民街2号",
+            "scope": "domestic",
+            "verifiedAt": "2026-08-08 15:00",
+        }
+        self.page._batch_location_searches["__shared_location_search__"] = {
+            "scope": "domestic",
+            "keyword": "夜南香北京烤鸭",
+            "candidates": [{"poiId": "temporary"}],
+        }
+
+        payload = self.page._batch_draft_payload()
+
+        self.assertEqual(payload["shared"]["selectedMusic"]["musicId"], "music-1")
+        self.assertEqual(
+            payload["shared"]["contentDeclaration"],
+            "无需添加自主声明",
+        )
+        self.assertEqual(
+            payload["lastLocationSearch"],
+            {"scope": "domestic", "keyword": "夜南香北京烤鸭"},
+        )
+        self.assertEqual(
+            payload["items"][0]["locationPreset"]["address"],
+            "陕西省安康市汉滨区江北办富民街2号",
+        )
+
+    def test_restore_batch_content_uses_snapshot_and_drops_saved_candidates(self) -> None:
+        """预设表缺失时仍恢复完整地点，但候选必须等待新会话重新读取。"""
+
+        video_file = tempfile.NamedTemporaryFile(suffix=".mp4")
+        self.addCleanup(video_file.close)
+        video_path = video_file.name
+        account = {
+            "id": 72,
+            "type": 3,
+            "status": 1,
+            "filePath": "douyin-72.json",
+            "profileName": "主体",
+            "userName": "账号",
+        }
+        media = {
+            "id": 1,
+            "typeText": "视频",
+            "storedPath": video_path,
+            "filename": "a.mp4",
+        }
+        snapshot = {
+            "id": "preset-1",
+            "poiId": "poi-1",
+            "name": "夜心数码",
+            "address": "广西壮族自治区北海市海城区测试路1号",
+            "scope": "local",
+            "verifiedAt": "2026-08-08 15:00",
+        }
+        saved = {
+            "updatedAt": "2026-08-08 17:00",
+            "payload": {
+                "schemaVersion": 3,
+                "accountId": 72,
+                "accountFile": "douyin-72.json",
+                "shared": {
+                    "title": "标题",
+                    "description": "文案",
+                    "tags": ["测试"],
+                    "selectedMusic": {
+                        "musicId": "music-1",
+                        "title": "收藏歌",
+                        "creator": "作者",
+                        "duration": "00:30",
+                        "source": "douyin-favorite-visible",
+                    },
+                    "contentDeclaration": "无需添加自主声明",
+                },
+                "lastLocationSearch": {
+                    "scope": "local",
+                    "keyword": "夜心数码",
+                    "candidates": [{"poiId": "must-not-restore"}],
+                },
+                "publishMode": "immediate",
+                "schedule": {
+                    "timezone": "Asia/Shanghai",
+                    "startTime": "",
+                    "intervalMinutes": 0,
+                },
+                "items": [
+                    {
+                        "mediaPath": video_path,
+                        "locationPresetId": "preset-1",
+                        "locationPreset": snapshot,
+                        "enableTimer": False,
+                        "scheduleTimeOverride": "",
+                    }
+                ],
+            },
+        }
+        with patch(
+            "ui.douyin_commerce_page.account_service.list_accounts",
+            return_value=[account],
+        ), patch(
+            "ui.douyin_commerce_page.media_service.list_media",
+            return_value=[media],
+        ):
+            self.page.refresh()
+        with patch(
+            "ui.douyin_commerce_page.douyin_commerce_batch_draft_service.load_batch_draft",
+            return_value=saved,
+        ), patch.object(self.page, "_current_location_presets", return_value=[]):
+            self.page.restore_batch_content()
+
+        self.assertEqual(self.page._selected_music["musicId"], "music-1")
+        self.assertEqual(self.page._selected_declaration(), "无需添加自主声明")
+        self.assertEqual(
+            self.page._batch_locations[video_path]["address"],
+            snapshot["address"],
+        )
+        state = self.page._batch_location_state()
+        self.assertEqual(state["scope"], "local")
+        self.assertEqual(state["keyword"], "夜心数码")
+        self.assertEqual(state["candidates"], [])
+        self.assertEqual(self.page.batch_location_scope_combo.currentData(), "local")
+        self.assertEqual(self.page.batch_location_keyword.text(), "夜心数码")
+
     def test_batch_music_reads_current_account_cache_without_opening_session(self) -> None:
         account = {"id": 73, "type": 3, "status": 1, "filePath": "douyin-73.json", "profileName": "主体", "userName": "账号"}
         self.page.account_combo.clear()
@@ -5501,6 +6793,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
 
         self.assertIn("地点候选读取失败", self.page.batch_item_settings_status.text())
         self.assertIn("关键词", self.page.batch_item_settings_status.text())
+        self.assertFalse(self.page.batch_item_settings_status.isHidden())
 
     def test_batch_location_dropdown_survives_unrelated_platform_state_sync(self) -> None:
         """状态刷新不能替换用户正准备点击的地点下拉框。"""

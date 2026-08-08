@@ -284,6 +284,98 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
         )
         self.assertTrue(any(event.phase == "uploading" for event in events))
 
+    def test_ambiguous_post_submit_readback_pauses_before_next_video(self) -> None:
+        """点击最终提交后无法回读时，不能当成普通失败继续提交后续视频。"""
+
+        class AmbiguousReceiptManager(FakeCommerceSessionManager):
+            def submit(
+                self,
+                session_id: str,
+                _payload: dict,
+                task_id: int | None = None,
+                **kwargs,
+            ) -> dict:
+                del task_id, kwargs
+                index = self._index_by_session[session_id]
+                self.calls.append(f"submit:{index}")
+                if index == 1:
+                    raise RuntimeError(
+                        "抖音带货最终提交未能获得平台回执："
+                        "抖音定时提交后未能从作品管理页回读标题和指定时间"
+                    )
+                return super().submit(session_id, _payload)
+
+        manager = AmbiguousReceiptManager()
+        events: list[BatchProgressEvent] = []
+
+        result = DouyinCommerceBatchExecutor(manager).run_publish(
+            self.batch,
+            task_id=self.task["id"],
+            confirmed=True,
+            progress=events.append,
+        )
+
+        self.assertEqual(
+            [row["status"] for row in result],
+            ["published", "receipt_ambiguous", "pending"],
+        )
+        self.assertNotIn("start_upload:2", manager.calls)
+        self.assertTrue(any(event.phase == "receipt_ambiguous" for event in events))
+        saved = task_service.get_task(self.task["id"])
+        self.assertEqual(saved["status"], "paused")
+        self.assertEqual(
+            [item["status"] for item in saved["items"]],
+            ["success", "failed", "pending"],
+        )
+        self.assertEqual(saved["events"][-1]["eventType"], "batch_paused")
+
+    def test_five_consecutive_failures_pause_batch_and_leave_later_items_unstarted(self) -> None:
+        """同一根因连续失败五条后，绝不能继续上传第六条。"""
+
+        extra_paths: list[str] = []
+        for name in ("d.mp4", "e.mp4", "f.mp4"):
+            path = Path(self.directory.name) / name
+            path.write_bytes(b"offline-video")
+            extra_paths.append(str(path))
+        batch = dict(self.batch)
+        batch["items"] = [
+            *[dict(item) for item in self.batch["items"]],
+            *[
+                {
+                    "mediaPath": path,
+                    "locationPreset": {
+                        "poiId": "poi-001",
+                        "name": "北海银滩景区",
+                        "address": "广西壮族自治区北海市银海区银滩大道中段",
+                        "scope": "domestic",
+                    },
+                }
+                for path in extra_paths
+            ],
+        ]
+        task = task_service.create_douyin_batch_task(batch)
+        events: list[BatchProgressEvent] = []
+
+        result = DouyinCommerceBatchExecutor(
+            FakeCommerceSessionManager(fail_item_indexes={0, 1, 2, 3, 4})
+        ).run_publish(batch, task_id=task["id"], confirmed=True, progress=events.append)
+
+        self.assertEqual(
+            [row["status"] for row in result],
+            ["failed", "failed", "failed", "failed", "failed", "paused"],
+        )
+        self.assertEqual(
+            [event.phase for event in events if event.phase == "uploading"],
+            ["uploading"] * 5,
+        )
+        self.assertTrue(any(event.phase == "auto_paused" for event in events))
+        saved = task_service.get_task(task["id"])
+        self.assertEqual(saved["status"], "paused")
+        self.assertEqual(
+            [item["status"] for item in saved["items"]],
+            ["failed", "failed", "failed", "failed", "failed", "pending"],
+        )
+
     def test_manage_page_navigation_receipt_is_a_valid_immediate_publish_evidence(self) -> None:
         """即时发表不暴露作品时间时，管理页最终跳转可作为可审计回执。"""
 

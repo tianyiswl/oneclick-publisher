@@ -12,6 +12,7 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
+from loguru import logger
 import qrcode
 from PIL import Image
 
@@ -119,6 +120,346 @@ class DouyinPublishPayloadTests(unittest.TestCase):
             )
         )
 
+    def test_scheduled_readback_scrolls_lazy_list_until_same_card_matches(self) -> None:
+        """管理页按定时时间排序且懒加载时，首屏之外的真实作品也必须能回读。"""
+
+        target = datetime(2026, 8, 9, 10, 0)
+
+        class Body:
+            async def inner_text(self, *, timeout: int) -> str:
+                del timeout
+                return "作品管理 首屏只有其他作品"
+
+        class Page:
+            url = "https://creator.douyin.com/creator-micro/content/manage"
+
+            def __init__(self) -> None:
+                self.scan_count = 0
+                self.scroll_count = 0
+
+            def is_closed(self) -> bool:
+                return False
+
+            def locator(self, selector: str):
+                self.assert_selector = selector
+                return Body()
+
+            async def evaluate(self, script: str, payload=None):
+                if "oneclick-scheduled-card-scan" in script:
+                    self.scan_count += 1
+                    if self.scroll_count:
+                        return [
+                            "测试 测试#测试 定时发布中 "
+                            "定时: 2026年08月09日 10:00 修改定时"
+                        ]
+                    return []
+                if "oneclick-scheduled-list-scroll" in script:
+                    self.scroll_count += 1
+                    return True
+                raise AssertionError(f"未知脚本：{script[:80]}")
+
+            async def wait_for_timeout(self, milliseconds: int) -> None:
+                del milliseconds
+
+            async def reload(self, **_kwargs) -> None:
+                raise AssertionError("两次内可回读时不应刷新管理页")
+
+        page = Page()
+        result = asyncio.run(
+            douyin_publish_executor._scheduled_submission_readback(
+                page,
+                title="测试",
+                target=target,
+                attempts=2,
+            )
+        )
+
+        self.assertEqual(result["scheduledAt"], "2026-08-09 10:00")
+        self.assertEqual(page.scan_count, 2)
+        self.assertEqual(page.scroll_count, 1)
+
+    def test_scheduled_readback_allows_platform_card_to_appear_after_three_minutes(self) -> None:
+        """抖音卡片延迟超过 90 秒时，不得过早把已提交作品判为待核对。"""
+
+        target = datetime(2026, 8, 9, 16, 30)
+
+        class Page:
+            url = "https://creator.douyin.com/creator-micro/content/manage"
+
+            def __init__(self) -> None:
+                self.scan_count = 0
+
+            def is_closed(self) -> bool:
+                return False
+
+            async def evaluate(self, script: str, payload=None):
+                del payload
+                if "oneclick-scheduled-card-scan" in script:
+                    self.scan_count += 1
+                    if self.scan_count >= 181:
+                        return [
+                            "测试 定时发布中 "
+                            "定时: 2026年08月09日 16:30 修改定时"
+                        ]
+                    return []
+                if "oneclick-scheduled-list-scroll" in script:
+                    return False
+                raise AssertionError(f"未知脚本：{script[:80]}")
+
+            async def wait_for_timeout(self, _milliseconds: int) -> None:
+                return None
+
+        page = Page()
+        result = asyncio.run(
+            douyin_publish_executor._scheduled_submission_readback(
+                page,
+                title="测试",
+                target=target,
+            )
+        )
+
+        self.assertEqual(result["scheduledAt"], "2026-08-09 16:30")
+        self.assertEqual(page.scan_count, 181)
+
+    def test_scheduled_readback_refreshes_stale_manage_page_before_timeout(self) -> None:
+        """提交跳转后的管理页列表不更新时，刷新后出现的卡片必须能够回读。"""
+
+        target = datetime(2026, 8, 9, 16, 0)
+
+        class Page:
+            url = "https://creator.douyin.com/creator-micro/content/manage"
+
+            def __init__(self) -> None:
+                self.scan_count = 0
+                self.reload_count = 0
+
+            def is_closed(self) -> bool:
+                return False
+
+            async def evaluate(self, script: str, payload=None):
+                del payload
+                if "oneclick-scheduled-card-scan" in script:
+                    self.scan_count += 1
+                    if self.reload_count:
+                        return [
+                            "测试 定时发布中 "
+                            "定时: 2026年08月09日 16:00 修改定时"
+                        ]
+                    return []
+                if "oneclick-scheduled-list-scroll" in script:
+                    return False
+                raise AssertionError(f"未知脚本：{script[:80]}")
+
+            async def reload(self, **kwargs) -> None:
+                self.assert_reload_options = kwargs
+                self.reload_count += 1
+
+            async def wait_for_timeout(self, _milliseconds: int) -> None:
+                return None
+
+        page = Page()
+        result = asyncio.run(
+            douyin_publish_executor._scheduled_submission_readback(
+                page,
+                title="测试",
+                target=target,
+                attempts=31,
+            )
+        )
+
+        self.assertEqual(result["scheduledAt"], "2026-08-09 16:00")
+        self.assertEqual(page.reload_count, 1)
+        self.assertEqual(
+            page.assert_reload_options,
+            {"wait_until": "domcontentloaded", "timeout": 60_000},
+        )
+
+    def test_scheduled_readback_timeout_logs_wait_stage_and_reports_page_state(self) -> None:
+        """回执超时时，客户端日志和异常必须说明等待时长与当前页面。"""
+
+        target = datetime(2026, 8, 9, 16, 30)
+
+        class Page:
+            url = "https://creator.douyin.com/creator-micro/content/manage"
+
+            def is_closed(self) -> bool:
+                return False
+
+            async def evaluate(self, script: str, payload=None):
+                del payload
+                if "oneclick-scheduled-card-scan" in script:
+                    return []
+                if "oneclick-scheduled-list-scroll" in script:
+                    return False
+                raise AssertionError(f"未知脚本：{script[:80]}")
+
+            async def wait_for_timeout(self, _milliseconds: int) -> None:
+                return None
+
+        messages: list[str] = []
+        sink_id = logger.add(lambda message: messages.append(message.record["message"]))
+        try:
+            with self.assertRaisesRegex(
+                douyin_publish_executor.DouyinPublishError,
+                "已检查 2 次.*最长等待 2 秒.*作品管理页.*匹配卡片 0 张",
+            ):
+                asyncio.run(
+                    douyin_publish_executor._scheduled_submission_readback(
+                        Page(),
+                        title="测试",
+                        target=target,
+                        attempts=2,
+                    )
+                )
+        finally:
+            logger.remove(sink_id)
+
+        self.assertTrue(any("开始等待平台回执" in message for message in messages))
+        self.assertTrue(any("平台回执等待超时" in message for message in messages))
+
+    def test_scheduled_readback_never_cross_matches_title_and_time_between_cards(self) -> None:
+        """标题和时间分别位于两张作品卡时，不得用全页文本拼成成功回执。"""
+
+        target = datetime(2026, 8, 9, 10, 0)
+
+        class Body:
+            async def inner_text(self, *, timeout: int) -> str:
+                del timeout
+                return (
+                    "卡片A 测试 定时: 2026年08月09日 11:00 "
+                    "卡片B 其他标题 定时: 2026年08月09日 10:00"
+                )
+
+        class Page:
+            url = "https://creator.douyin.com/creator-micro/content/manage"
+
+            def is_closed(self) -> bool:
+                return False
+
+            def locator(self, _selector: str):
+                return Body()
+
+            async def evaluate(self, script: str, payload=None):
+                del payload
+                if "oneclick-scheduled-card-scan" in script:
+                    return []
+                if "oneclick-scheduled-list-scroll" in script:
+                    return False
+                raise AssertionError(f"未知脚本：{script[:80]}")
+
+            async def wait_for_timeout(self, milliseconds: int) -> None:
+                del milliseconds
+
+            async def reload(self, **_kwargs) -> None:
+                return None
+
+        with self.assertRaisesRegex(
+            douyin_publish_executor.DouyinPublishError,
+            "未能从作品管理页回读",
+        ):
+            asyncio.run(
+                douyin_publish_executor._scheduled_submission_readback(
+                    Page(),
+                    title="测试",
+                    target=target,
+                    attempts=1,
+                )
+            )
+
+    def test_scheduled_card_dom_scan_requires_title_and_time_in_one_visible_card(self) -> None:
+        """真实 DOM 扫描不得跨卡片匹配，也不接受隐藏卡片。"""
+
+        async def scenario() -> None:
+            from playwright.async_api import async_playwright
+
+            target = datetime(2026, 8, 9, 10, 0)
+            async with async_playwright() as playwright:
+                browser = await playwright.chromium.launch(headless=True)
+                page = await browser.new_page()
+                await page.set_content(
+                    """
+                    <section class="works-list">
+                      <article class="work-card">
+                        <h3>测试</h3><span>定时发布中</span>
+                        <span>定时: 2026年08月09日 11:00</span><button>修改定时</button>
+                      </article>
+                      <article class="work-card">
+                        <h3>其他标题</h3><span>定时发布中</span>
+                        <span>定时: 2026年08月09日 10:00</span><button>修改定时</button>
+                      </article>
+                      <article class="work-card" style="display:none">
+                        <h3>测试</h3><span>定时发布中</span>
+                        <span>定时: 2026年08月09日 10:00</span><button>修改定时</button>
+                      </article>
+                    </section>
+                    """
+                )
+                self.assertEqual(
+                    await douyin_publish_executor._scheduled_card_texts(
+                        page,
+                        title="测试",
+                        target=target,
+                    ),
+                    [],
+                )
+                await page.locator(".works-list").evaluate(
+                    """list => list.insertAdjacentHTML('beforeend', `
+                    <article class="work-card">
+                      <h3>测试</h3><span>定时发布中</span>
+                      <span>定时: 2026年08月09日 10:00</span><button>修改定时</button>
+                    </article>`);"""
+                )
+                cards = await douyin_publish_executor._scheduled_card_texts(
+                    page,
+                    title="测试",
+                    target=target,
+                )
+                self.assertEqual(len(cards), 1)
+                self.assertIn("2026年08月09日 10:00", cards[0])
+                await browser.close()
+
+        asyncio.run(scenario())
+
+    def test_scheduled_card_dom_scan_reaches_card_title_above_nested_schedule_controls(self) -> None:
+        """定时控件行不是作品卡边界，必须继续上溯到同卡标题。"""
+
+        async def scenario() -> None:
+            from playwright.async_api import async_playwright
+
+            target = datetime(2026, 8, 9, 16, 0)
+            async with async_playwright() as playwright:
+                browser = await playwright.chromium.launch(headless=True)
+                page = await browser.new_page()
+                await page.set_content(
+                    """
+                    <section class="works-list">
+                      <article class="video-card-info">
+                        <h3>测试</h3>
+                        <div class="info-row">
+                          <div class="schedule-controls">
+                            <span>定时发布中</span>
+                            <span>定时: 2026年08月09日 16:00</span>
+                            <button>修改定时</button>
+                          </div>
+                        </div>
+                      </article>
+                    </section>
+                    """
+                )
+
+                cards = await douyin_publish_executor._scheduled_card_texts(
+                    page,
+                    title="测试",
+                    target=target,
+                )
+
+                self.assertEqual(len(cards), 1)
+                self.assertIn("测试", cards[0])
+                self.assertIn("2026年08月09日 16:00", cards[0])
+                await browser.close()
+
+        asyncio.run(scenario())
+
     def test_official_identity_must_exactly_match_selected_account(self) -> None:
         self.assertEqual(
             douyin_publish_executor._verified_douyin_identity("知言", " 知言 "),
@@ -211,6 +552,32 @@ class DouyinPublishPayloadTests(unittest.TestCase):
         self.assertEqual(editor.fill.await_count, 2)
         self.assertEqual(read_back.await_count, 4)
         self.assertEqual(page.keyboard.insert_text.await_count, 2)
+
+    def test_title_is_cleared_and_read_back_before_new_value_is_written(self) -> None:
+        """独立标题必须先确认旧值已清空，再写入新标题并二次回读。"""
+
+        video = DouYinVideo(
+            title="新标题",
+            file_path="/tmp/demo.mp4",
+            tags=[],
+            publish_date=datetime.now(),
+            account_file="/tmp/account.json",
+            description="测试",
+        )
+        title_input = MagicMock()
+        title_input.fill = AsyncMock()
+        title_input.input_value = AsyncMock(side_effect=["", "新标题"])
+        with patch.object(
+            video,
+            "_visible_title_inputs",
+            new_callable=AsyncMock,
+            return_value=[title_input],
+        ):
+            asyncio.run(video.clear_platform_title(MagicMock()))
+
+        self.assertEqual(title_input.fill.await_args_list[0].args, ("",))
+        self.assertEqual(title_input.fill.await_args_list[1].args, ("新标题",))
+        self.assertEqual(title_input.input_value.await_count, 2)
 
     def test_headless_sms_challenge_waits_for_native_code_without_revealing_page(self) -> None:
         """验证码应只在同一无头页面填写，不能转为前台浏览器。"""

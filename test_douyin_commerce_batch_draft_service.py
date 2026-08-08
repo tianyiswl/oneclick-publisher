@@ -29,19 +29,90 @@ class DouyinCommerceBatchDraftTests(unittest.TestCase):
         self.database_patch.stop()
         self.temporary_directory.cleanup()
 
-    def test_batch_draft_keeps_shared_fields_and_item_specific_location_only(self) -> None:
+    def test_batch_draft_v3_keeps_stable_platform_intent_without_session_cache(self) -> None:
         saved = save_batch_draft(
             {
                 "accountId": 7,
                 "accountFile": "douyin.json",
-                "shared": {"title": "统一标题", "description": "统一文案", "tags": ["北海"]},
-                "items": [{"mediaPath": "/tmp/a.mp4", "locationPresetId": "p1", "enableTimer": False}],
+                "shared": {
+                    "title": "统一标题",
+                    "description": "统一文案",
+                    "tags": ["北海"],
+                    "selectedMusic": {
+                        "musicId": "music-1",
+                        "title": "收藏音乐",
+                        "creator": "作者",
+                        "duration": "00:30",
+                        "sessionMarker": "must-not-persist",
+                    },
+                    "contentDeclaration": "无需添加自主声明",
+                },
+                "lastLocationSearch": {
+                    "scope": "domestic",
+                    "keyword": "夜南香北京烤鸭",
+                    "candidates": [{"poiId": "must-not-persist"}],
+                },
+                "items": [
+                    {
+                        "mediaPath": "/tmp/a.mp4",
+                        "locationPresetId": "p1",
+                        "locationPreset": {
+                            "id": "p1",
+                            "accountId": 7,
+                            "poiId": "poi-1",
+                            "name": "夜南香北京烤鸭",
+                            "address": "陕西省安康市汉滨区江北办富民街2号",
+                            "scope": "domestic",
+                            "verifiedAt": "2026-08-08 15:00",
+                            "domMarker": "must-not-persist",
+                        },
+                        "enableTimer": False,
+                    }
+                ],
                 "cookie": "must-not-persist",
             }
         )
+        self.assertEqual(saved["payload"]["schemaVersion"], 3)
+        self.assertEqual(saved["payload"]["shared"]["selectedMusic"]["musicId"], "music-1")
+        self.assertNotIn("sessionMarker", saved["payload"]["shared"]["selectedMusic"])
+        self.assertEqual(
+            saved["payload"]["shared"]["contentDeclaration"],
+            "无需添加自主声明",
+        )
+        self.assertEqual(
+            saved["payload"]["lastLocationSearch"],
+            {"scope": "domestic", "keyword": "夜南香北京烤鸭"},
+        )
         self.assertEqual(saved["payload"]["items"][0]["locationPresetId"], "p1")
+        self.assertEqual(
+            saved["payload"]["items"][0]["locationPreset"]["address"],
+            "陕西省安康市汉滨区江北办富民街2号",
+        )
+        self.assertNotIn("domMarker", saved["payload"]["items"][0]["locationPreset"])
         self.assertNotIn("cookie", saved["payload"])
         self.assertEqual(load_batch_draft(), saved)
+
+    def test_schema_v2_draft_upgrades_with_empty_optional_platform_intent(self) -> None:
+        normalized = normalize_batch_draft(
+            {
+                "schemaVersion": 2,
+                "accountId": 7,
+                "accountFile": "douyin.json",
+                "shared": {"title": "标题", "description": "文案", "tags": []},
+                "items": [
+                    {
+                        "mediaPath": "/tmp/a.mp4",
+                        "locationPresetId": "p1",
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(normalized["schemaVersion"], 3)
+        self.assertEqual(normalized["shared"]["selectedMusic"], {})
+        self.assertEqual(normalized["shared"]["contentDeclaration"], "")
+        self.assertEqual(normalized["lastLocationSearch"], {"scope": "domestic", "keyword": ""})
+        self.assertEqual(normalized["items"][0]["locationPreset"], {})
 
     def test_unknown_and_sensitive_item_fields_are_not_persisted(self) -> None:
         normalized = normalize_batch_draft(
@@ -55,7 +126,15 @@ class DouyinCommerceBatchDraftTests(unittest.TestCase):
         )
         self.assertEqual(
             normalized["items"],
-            [{"mediaPath": "/tmp/a.mp4", "locationPresetId": "", "enableTimer": False, "scheduleTimeOverride": ""}],
+            [
+                {
+                    "mediaPath": "/tmp/a.mp4",
+                    "locationPresetId": "",
+                    "locationPreset": {},
+                    "enableTimer": False,
+                    "scheduleTimeOverride": "",
+                }
+            ],
         )
         self.assertNotIn("token", normalized)
 

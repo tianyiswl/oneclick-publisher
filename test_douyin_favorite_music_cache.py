@@ -64,7 +64,7 @@ class DouyinFavoriteMusicCacheTests(unittest.TestCase):
         self.assertNotIn("marker", first[0])
         self.assertNotIn("cookie", first[0])
 
-    def test_replace_ignores_rows_without_stable_platform_music_id(self) -> None:
+    def test_replace_converts_unstable_row_id_to_metadata_fingerprint(self) -> None:
         saved = douyin_favorite_music_cache.replace_cached_favorite_music(
             3,
             [
@@ -78,8 +78,13 @@ class DouyinFavoriteMusicCacheTests(unittest.TestCase):
             ],
         )
 
-        self.assertEqual(saved, [])
-        self.assertEqual(douyin_favorite_music_cache.list_cached_favorite_music(3), [])
+        self.assertEqual(len(saved), 1)
+        self.assertTrue(saved[0]["musicId"].startswith("metadata:"))
+        self.assertEqual(saved[0]["title"], "临时行")
+        self.assertEqual(saved[0]["creator"], "作者")
+        self.assertEqual(saved[0]["duration"], "00:31")
+        self.assertNotIn("marker", saved[0])
+        self.assertEqual(douyin_favorite_music_cache.list_cached_favorite_music(3), saved)
 
     def test_replace_rejects_duplicate_stable_music_identity(self) -> None:
         with self.assertRaisesRegex(ValueError, "重复"):
