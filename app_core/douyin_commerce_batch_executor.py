@@ -468,7 +468,11 @@ class DouyinCommerceBatchExecutor:
                 paused = True
                 paused_result_status = "paused"
                 pause_reason = "已按用户请求暂停，未开始后续视频"
-                self._task_store.mark_task_paused(task_id, pause_reason)
+                self._task_store.mark_task_paused(
+                    task_id,
+                    pause_reason,
+                    pause_reason_code=task_service.PAUSE_REASON_USER_REQUEST,
+                )
                 self._emit(
                     progress,
                     index=index,
@@ -497,12 +501,26 @@ class DouyinCommerceBatchExecutor:
                 paused = True
                 paused_result_status = "pending"
                 pause_reason = "等待用户处理验证或登录，未开始后续视频"
+                pause_reason_code = (
+                    task_service.PAUSE_REASON_WAITING_LOGIN
+                    if result["status"] == "waiting_login"
+                    else task_service.PAUSE_REASON_WAITING_VERIFICATION
+                )
+                self._task_store.mark_task_paused(
+                    task_id,
+                    pause_reason,
+                    pause_reason_code=pause_reason_code,
+                )
                 continue
             if result["status"] == "receipt_ambiguous":
                 paused = True
                 paused_result_status = "pending"
                 pause_reason = "平台最终提交状态待核对，已暂停且未开始后续视频"
-                self._task_store.mark_task_paused(task_id, pause_reason)
+                self._task_store.mark_task_paused(
+                    task_id,
+                    pause_reason,
+                    pause_reason_code=task_service.PAUSE_REASON_RECEIPT_AMBIGUOUS,
+                )
                 continue
             if result["status"] == "failed":
                 consecutive_failures += 1
@@ -512,7 +530,11 @@ class DouyinCommerceBatchExecutor:
                 paused = True
                 paused_result_status = "paused"
                 pause_reason = "连续失败 5 条，已自动暂停，未开始后续视频"
-                self._task_store.mark_task_paused(task_id, pause_reason)
+                self._task_store.mark_task_paused(
+                    task_id,
+                    pause_reason,
+                    pause_reason_code=task_service.PAUSE_REASON_AUTO_FAILURE,
+                )
                 self._emit(
                     progress,
                     index=index,

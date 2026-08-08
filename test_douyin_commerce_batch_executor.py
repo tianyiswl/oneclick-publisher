@@ -324,6 +324,10 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
         saved = task_service.get_task(self.task["id"])
         self.assertEqual(saved["status"], "paused")
         self.assertEqual(
+            saved["pauseReasonCode"],
+            task_service.PAUSE_REASON_RECEIPT_AMBIGUOUS,
+        )
+        self.assertEqual(
             [item["status"] for item in saved["items"]],
             ["success", "failed", "pending"],
         )
@@ -371,6 +375,10 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
         self.assertTrue(any(event.phase == "auto_paused" for event in events))
         saved = task_service.get_task(task["id"])
         self.assertEqual(saved["status"], "paused")
+        self.assertEqual(
+            saved["pauseReasonCode"],
+            task_service.PAUSE_REASON_AUTO_FAILURE,
+        )
         self.assertEqual(
             [item["status"] for item in saved["items"]],
             ["failed", "failed", "failed", "failed", "failed", "pending"],
@@ -465,7 +473,13 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
         self.assertNotIn("submit:2", manager.calls)
         self.assertNotIn("close:1", manager.calls)
         self.assertEqual(manager.open_sessions, 1)
-        self.assertEqual(task_service.get_task(self.task["id"])["items"][1]["status"], "running")
+        saved = task_service.get_task(self.task["id"])
+        self.assertEqual(saved["status"], "paused")
+        self.assertEqual(
+            saved["pauseReasonCode"],
+            task_service.PAUSE_REASON_WAITING_VERIFICATION,
+        )
+        self.assertEqual(saved["items"][1]["status"], "running")
 
     def test_needs_login_controlled_status_pauses_whole_batch_without_marking_item_failed(self) -> None:
         manager = FakeCommerceSessionManager(login_on_index=1)
@@ -480,8 +494,14 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
         )
         self.assertNotIn("submit:1", manager.calls)
         self.assertNotIn("start_upload:2", manager.calls)
+        saved = task_service.get_task(self.task["id"])
+        self.assertEqual(saved["status"], "paused")
         self.assertEqual(
-            [item["status"] for item in task_service.get_task(self.task["id"])["items"]],
+            saved["pauseReasonCode"],
+            task_service.PAUSE_REASON_WAITING_LOGIN,
+        )
+        self.assertEqual(
+            [item["status"] for item in saved["items"]],
             ["success", "running", "pending"],
         )
 
@@ -558,10 +578,42 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
                     ["published", "verification_failed", "pending"],
                 )
                 self.assertIsNone(broker.request_for_task(task["id"]))
-                events = task_service.get_task(task["id"])["events"]
+                saved = task_service.get_task(task["id"])
+                self.assertEqual(saved["status"], "paused")
+                self.assertEqual(
+                    saved["pauseReasonCode"],
+                    task_service.PAUSE_REASON_WAITING_VERIFICATION,
+                )
+                events = saved["events"]
                 event_types = [event["eventType"] for event in events]
-                self.assertEqual(event_types[-1], "verification_failed")
-                self.assertIn(result[1]["diagnostic"], events[-1]["message"])
+                self.assertEqual(event_types[-2:], ["verification_failed", "batch_paused"])
+                self.assertIn(result[1]["diagnostic"], events[-2]["message"])
+
+    def test_user_requested_pause_records_manual_reason_after_current_video(self) -> None:
+        """若用户暂停被误分类或后续视频已启动，该测试必须失败。"""
+
+        executor: DouyinCommerceBatchExecutor
+
+        class PauseAfterFirstSubmitManager(FakeCommerceSessionManager):
+            def submit(self, session_id: str, payload: dict, **kwargs) -> dict:
+                index = self._index_by_session[session_id]
+                result = super().submit(session_id, payload, **kwargs)
+                if index == 0:
+                    executor.request_pause()
+                return result
+
+        manager = PauseAfterFirstSubmitManager()
+        executor = DouyinCommerceBatchExecutor(manager)
+        result = executor.run_publish(self.batch, task_id=self.task["id"], confirmed=True)
+
+        self.assertEqual([row["status"] for row in result], ["published", "paused", "paused"])
+        self.assertNotIn("start_upload:1", manager.calls)
+        saved = task_service.get_task(self.task["id"])
+        self.assertEqual(saved["status"], "paused")
+        self.assertEqual(
+            saved["pauseReasonCode"],
+            task_service.PAUSE_REASON_USER_REQUEST,
+        )
 
     def test_location_preset_must_exactly_match_current_editor_candidates(self) -> None:
         different_address = normalize_location_candidate(
