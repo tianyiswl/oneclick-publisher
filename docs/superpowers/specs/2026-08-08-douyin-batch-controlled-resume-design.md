@@ -54,7 +54,7 @@
 2. 任务状态为 `paused`；
 3. `pauseReasonCode == "user_request"`；
 4. 至少有一条 `publish_task_items.status == "pending"`；
-5. 来源批次 payload 和所有待续发素材仍可通过本地契约校验；
+5. 来源任务保存的逐视频 payload 快照可重建为批次信封，且所有待续发素材仍可通过本地契约校验；
 6. 所有待续发的定时时间仍晚于当前北京时间。
 
 缺少任一条件时，任务详情不显示续发按钮；服务层也必须拒绝调用，不能仅依靠前端隐藏按钮。
@@ -74,7 +74,7 @@
 
 ## 服务边界
 
-新增 `task_service.prepare_douyin_batch_resume(task_id, now)`，只做本地读取与校验，返回：
+新增 `task_service.prepare_douyin_batch_resume(task_id, now)`，只做本地读取与校验。它从来源任务保存的逐视频 payload 快照重建批次共享字段和仅含 pending 项的批次信封，返回：
 
 - 来源任务基本信息；
 - 仅包含 `pending` 视频的受控批次 payload；
