@@ -106,6 +106,7 @@ class TaskDetailDialogTests(unittest.TestCase):
 
         table = dialog.findChild(QTableWidget, "batchResultTable")
         self.assertEqual(table.currentRow(), 1)
+        self.assertEqual(table.selectedItems(), [])
         self.assertEqual(table.item(1, 4).foreground().color().name().upper(), "#B42318")
         self.assertEqual(table.item(1, 4).background().color().name().upper(), "#FEF3F2")
 

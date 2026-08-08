@@ -241,6 +241,7 @@ class TaskDetailDialog(QDialog):
             0,
         )
         table.setCurrentCell(failed_row, 0)
+        table.clearSelection()
         table.scrollToItem(table.item(failed_row, 0))
 
     def _render_batch_items(self, rows: list[dict]) -> None:
