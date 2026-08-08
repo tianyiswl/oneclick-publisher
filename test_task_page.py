@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -143,6 +144,26 @@ class TaskDetailDialogTests(unittest.TestCase):
         ]
         self.assertEqual(len(generic_tables), 1)
         self.assertIsNone(dialog.findChild(QComboBox, "batchStatusFilter"))
+
+    def test_resume_button_is_visible_only_for_allowed_batch_and_only_emits_task_id(self) -> None:
+        """若详情页绕过资格判断创建任务，或不可续发任务仍显示按钮，该测试必须失败。"""
+
+        task = {**self._batch_task(), "id": 41, "status": "paused", "pauseReasonCode": "user_request"}
+        with patch("ui.task_page.task_service.prepare_douyin_batch_resume") as prepared:
+            prepared.return_value = {"resumeAllowed": True, "pendingCount": 2}
+            dialog = TaskDetailDialog(task)
+            self.addCleanup(dialog.close)
+            emitted: list[int] = []
+            dialog.resume_douyin_batch_requested.connect(emitted.append)
+            self.assertFalse(dialog.resume_batch_button.isHidden())
+            self.assertEqual(dialog.resume_batch_button.text(), "继续未开始的 2 条")
+            dialog.resume_batch_button.click()
+            self.assertEqual(emitted, [41])
+        with patch("ui.task_page.task_service.prepare_douyin_batch_resume") as prepared:
+            prepared.return_value = {"resumeAllowed": False, "pendingCount": 0}
+            dialog = TaskDetailDialog(task)
+            self.addCleanup(dialog.close)
+            self.assertTrue(dialog.resume_batch_button.isHidden())
 
 
 if __name__ == "__main__":

@@ -351,6 +351,7 @@ class MainWindow(QMainWindow):
             lambda: self._set_current_page(1)
         )
         self.tasks = TaskPage()
+        self.tasks.resume_douyin_batch_requested.connect(self._open_douyin_batch_resume)
         self.page_definitions = (
             ("工作台", self.dashboard, "ui/assets/nav-dashboard.svg"),
             ("账号管理", self.accounts, "ui/assets/nav-accounts.svg"),
@@ -393,6 +394,17 @@ class MainWindow(QMainWindow):
                 available.height(),
             )
         )
+
+    def _open_douyin_batch_resume(self, task_id: int) -> None:
+        """把任务详情的续发请求交给抖音带货页确认，不在列表页执行。"""
+
+        douyin_index = next(
+            index
+            for index, (label, _page, _icon) in enumerate(self.page_definitions)
+            if label == "抖音带货"
+        )
+        self._set_current_page(douyin_index)
+        self.douyin_commerce.open_batch_resume(int(task_id))
 
     def _build_shell(self) -> QWidget:
         shell = QWidget()

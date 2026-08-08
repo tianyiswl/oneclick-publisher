@@ -6,11 +6,12 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import QCheckBox, QComboBox, QDialog, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox, QTableWidget, QTableWidgetItem, QTabWidget, QTextEdit, QVBoxLayout, QWidget
 
 from app_core import task_service
+from app_core.douyin_commerce_batch_service import current_shanghai_time
 
 from .common import button, table_item
 
@@ -50,6 +51,8 @@ BATCH_FAILED_BACKGROUND_COLOR = "#FEF3F2"
 
 class TaskDetailDialog(QDialog):
     """任务记录明细弹窗。"""
+
+    resume_douyin_batch_requested = pyqtSignal(int)
 
     def __init__(self, task: dict, parent=None) -> None:
         super().__init__(parent)
@@ -115,6 +118,30 @@ class TaskDetailDialog(QDialog):
         tabs.addTab(self._events_tab(), "事件日志")
         tabs.addTab(self._payload_tab(), "发布参数")
         layout.addWidget(tabs)
+
+        actions = QHBoxLayout()
+        actions.addStretch()
+        self.resume_batch_button = button("继续未开始的视频", variant="primary")
+        self.resume_batch_button.setObjectName("douyinCommerceResumeBatch")
+        self.resume_batch_button.setVisible(False)
+        self.resume_batch_button.clicked.connect(self._request_batch_resume)
+        if self._is_batch_task():
+            plan = task_service.prepare_douyin_batch_resume(
+                int(task.get("id") or 0), now=current_shanghai_time()
+            )
+            if plan.get("resumeAllowed") is True and int(plan.get("pendingCount") or 0) > 0:
+                self.resume_batch_button.setText(f"继续未开始的 {int(plan['pendingCount'])} 条")
+                self.resume_batch_button.setVisible(True)
+        actions.addWidget(self.resume_batch_button)
+        close_button = button("关闭", variant="secondary")
+        close_button.clicked.connect(self.accept)
+        actions.addWidget(close_button)
+        layout.addLayout(actions)
+
+    def _request_batch_resume(self) -> None:
+        """详情页只转交来源任务 ID，不创建任务或启动执行器。"""
+
+        self.resume_douyin_batch_requested.emit(int(self.task["id"]))
 
     def _is_batch_task(self) -> bool:
         return self.task.get("workflow") == "douyin-commerce-batch"
@@ -323,6 +350,8 @@ class TaskDetailDialog(QDialog):
 
 
 class TaskPage(QWidget):
+    resume_douyin_batch_requested = pyqtSignal(int)
+
     def __init__(self) -> None:
         super().__init__()
         self.setObjectName("pageRoot")
@@ -661,4 +690,6 @@ class TaskPage(QWidget):
         if not task:
             QMessageBox.warning(self, "任务明细", "任务记录不存在或已被删除。")
             return
-        TaskDetailDialog(task, self).exec()
+        dialog = TaskDetailDialog(task, self)
+        dialog.resume_douyin_batch_requested.connect(self.resume_douyin_batch_requested.emit)
+        dialog.exec()
