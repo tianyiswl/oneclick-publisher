@@ -41,7 +41,11 @@ from app_core.douyin_commerce_batch_executor import DouyinCommerceBatchExecutor
 from app_core.douyin_verification import DouyinVerificationBroker, VerificationChallenge
 from ui.background_task import BackgroundTask
 from ui.common import apply_style
-from ui.douyin_commerce_page import DouyinCommercePage, _ImeAwarePlainTextEdit
+from ui.douyin_commerce_page import (
+    DouyinCommerceBatchResumeConfirmDialog,
+    DouyinCommercePage,
+    _ImeAwarePlainTextEdit,
+)
 from ui.runtime_log import runtime_log_bus
 from utils import base_social_media
 from test_douyin_commerce_batch_executor import FakeCommerceSessionManager
@@ -6059,6 +6063,45 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             self.assertFalse(self.page.account_avatar.pixmap().isNull())
             self.assertIn("主体", self.page.account_card.text())
             self.assertEqual(self.page.batch_video_list.count(), 3)
+
+    def test_resume_cancel_does_not_create_or_start_batch(self) -> None:
+        """若取消确认仍创建任务或启动执行器，该测试必须失败。"""
+
+        plan = {
+            "resumeAllowed": True,
+            "pendingCount": 2,
+            "sourceTaskNo": "T0808-0041",
+            "itemIndexes": [2, 3],
+            "batch": {"items": [{"mediaPath": "/tmp/a.mp4", "scheduleTime": "2026-08-09 16:30"}, {"mediaPath": "/tmp/b.mp4", "scheduleTime": "2026-08-09 17:00"}]},
+        }
+        with patch("ui.douyin_commerce_page.task_service.prepare_douyin_batch_resume", return_value=plan), patch(
+            "ui.douyin_commerce_page.DouyinCommerceBatchResumeConfirmDialog.exec", return_value=QDialog.DialogCode.Rejected
+        ), patch("ui.douyin_commerce_page.task_service.create_douyin_batch_resume") as create_resume, patch.object(
+            self.page, "start_batch_publish"
+        ) as start:
+            self.page.open_batch_resume(41)
+        create_resume.assert_not_called()
+        start.assert_not_called()
+
+    def test_resume_confirmation_creates_child_then_starts_existing_batch_executor_path(self) -> None:
+        """若确认后未创建子任务或跳过既有启动路径，该测试必须失败。"""
+
+        plan = {
+            "resumeAllowed": True,
+            "pendingCount": 1,
+            "sourceTaskNo": "T0808-0041",
+            "itemIndexes": [2],
+            "batch": {"items": [{"mediaPath": "/tmp/a.mp4", "scheduleTime": "2026-08-09 16:30"}]},
+        }
+        created = {"task": {"id": 99, "mode": "oneclick_resume"}, "batch": plan["batch"]}
+        with patch("ui.douyin_commerce_page.task_service.prepare_douyin_batch_resume", return_value=plan), patch(
+            "ui.douyin_commerce_page.DouyinCommerceBatchResumeConfirmDialog.exec", return_value=QDialog.DialogCode.Accepted
+        ), patch("ui.douyin_commerce_page.task_service.create_douyin_batch_resume", return_value=created) as create_resume, patch.object(
+            self.page, "start_batch_publish"
+        ) as start:
+            self.page.open_batch_resume(41)
+        create_resume.assert_called_once()
+        start.assert_called_once_with(plan["batch"], created["task"])
 
     def test_batch_location_rerender_replaces_old_scroll_body_without_overlapping_cards(self) -> None:
         """地点搜索回读后重绘只能保留一套卡片，不能累积旧的嵌套列布局。"""

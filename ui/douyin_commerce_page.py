@@ -358,6 +358,56 @@ class DouyinCommerceBatchConfirmDialog(QDialog):
         layout.addWidget(actions)
 
 
+class DouyinCommerceBatchResumeConfirmDialog(QDialog):
+    """续发前的独立最终确认，明确排除已失败与已完成视频。"""
+
+    def __init__(self, plan: dict, *, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("确认继续发布")
+        self.resize(720, 500)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 22, 24, 22)
+        layout.setSpacing(12)
+        count = int(plan.get("pendingCount") or 0)
+        layout.addWidget(QLabel(f"继续发布 {count} 条抖音带货视频"))
+        source = QLabel(f"来源任务：{plan.get('sourceTaskNo') or '—'}")
+        source.setProperty("role", "caption")
+        layout.addWidget(source)
+        indexes = "、".join(str(value) for value in plan.get("itemIndexes") or [])
+        layout.addWidget(QLabel(f"仅继续原批次第 {indexes} 条；已成功和失败视频不会重试。"))
+        note = QLabel("将重新打开浏览器并重新校验音乐、地点、声明和定时。原定时时间过期会安全停止，不会自动改期。")
+        note.setWordWrap(True)
+        note.setProperty("role", "caption")
+        layout.addWidget(note)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        body = QWidget()
+        rows = QVBoxLayout(body)
+        for index, item in zip(plan.get("itemIndexes") or [], plan.get("batch", {}).get("items") or []):
+            card = QFrame()
+            card.setProperty("subPanel", True)
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(14, 10, 14, 10)
+            card_layout.addWidget(QLabel(f"第 {index} 条 · {Path(str(item.get('mediaPath') or '')).name}"))
+            schedule = str(item.get("scheduleTime") or "").strip()
+            card_layout.addWidget(QLabel(f"发布方式：北京时间定时 {schedule}" if schedule else "发布方式：立即发布"))
+            rows.addWidget(card)
+        rows.addStretch(1)
+        scroll.setWidget(body)
+        layout.addWidget(scroll, 1)
+        self.confirm_checkbox = QCheckBox("我已核对待续发视频及原定时时间")
+        layout.addWidget(self.confirm_checkbox)
+        actions = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok)
+        actions.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        actions.button(QDialogButtonBox.StandardButton.Ok).setText(f"确认继续发布 {count} 条")
+        self.confirm_button = actions.button(QDialogButtonBox.StandardButton.Ok)
+        self.confirm_button.setEnabled(False)
+        self.confirm_checkbox.toggled.connect(self.confirm_button.setEnabled)
+        actions.accepted.connect(self.accept)
+        actions.rejected.connect(self.reject)
+        layout.addWidget(actions)
+
+
 class DouyinCommercePage(QWidget):
     """单账号、单视频的抖音带货分步向导。"""
 
@@ -4121,6 +4171,24 @@ class DouyinCommercePage(QWidget):
             return
         task = task_service.create_douyin_batch_task(payload, mode="oneclick_publish")
         self.start_batch_publish(payload, task)
+
+    def open_batch_resume(self, task_id: int) -> None:
+        """确认前只读取资格；用户确认后才创建子任务并进入既有执行链路。"""
+
+        resume_now = douyin_commerce_batch_service.current_shanghai_time()
+        plan = task_service.prepare_douyin_batch_resume(int(task_id), now=resume_now)
+        if plan.get("resumeAllowed") is not True:
+            QMessageBox.warning(self, "继续发布", str(plan.get("blockedReason") or "当前任务不可继续发布"))
+            return
+        dialog = DouyinCommerceBatchResumeConfirmDialog(plan, parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            created = task_service.create_douyin_batch_resume(int(task_id), now=resume_now)
+        except Exception as exc:
+            QMessageBox.warning(self, "继续发布", str(exc))
+            return
+        self.start_batch_publish(dict(created["batch"]), dict(created["task"]))
 
     def start_batch_publish(self, payload: dict, task: dict) -> None:
         """确认后启动批量最终提交；只由平台逐条回执决定已发布状态。"""
