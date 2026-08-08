@@ -73,8 +73,8 @@ jobs:
         with:
           name: 一键发-Windows-x64-${{ github.run_number }}
           path: |
-            release/Fashetai_*_Windows_x64_*.zip
-            release/Fashetai_*_Windows_x64_*.zip.sha256
+            release/YiJianFa_*_Windows_x64_*.zip
+            release/YiJianFa_*_Windows_x64_*.zip.sha256
           if-no-files-found: error
           retention-days: 30
 
@@ -82,7 +82,7 @@ jobs:
         if: success()
         shell: pwsh
         run: |
-          $zip = Get-ChildItem release/Fashetai_*_Windows_x64_*.zip | Select-Object -First 1
+          $zip = Get-ChildItem release/YiJianFa_*_Windows_x64_*.zip | Select-Object -First 1
           $sha = Get-Content "$($zip.FullName).sha256"
           Add-Content $env:GITHUB_STEP_SUMMARY "## 一键发 Windows x64 构建"
           Add-Content $env:GITHUB_STEP_SUMMARY ""

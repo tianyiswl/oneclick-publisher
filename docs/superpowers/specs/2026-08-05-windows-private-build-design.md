@@ -9,7 +9,7 @@
 - 平台：Windows x64，构建环境为 `windows-latest`。
 - 分发：仅 GitHub Actions Artifact，保留 30 天；不创建公开 Release。
 - 触发：仅 `workflow_dispatch` 手动触发，避免每次源码提交自动消耗构建额度。
-- 打包：PyInstaller `one-dir`，可执行文件采用现有 ASCII 标识 `Fashetai.exe`；应用窗口与 Artifact 显示名仍使用“一键发”。
+- 打包：PyInstaller `one-dir`，可执行文件采用独立项目 ASCII 标识 `YiJianFa.exe`；应用窗口与 Artifact 显示名均使用“一键发”。
 - 浏览器：随包携带 Playwright Chromium、headless shell 与 ffmpeg；发布执行仍使用一键发自己的本地运行目录。
 - 签名：首版不伪造 Authenticode 签名。没有 Windows 代码签名证书时，产物会明确标记为未签名测试包。
 
@@ -19,9 +19,9 @@
 
 新增 `tools/build_windows.py`，只允许在 Windows 上执行。脚本读取 `app_core.branding.APP_VERSION`，从 Playwright 的 `browsers.json` 解析当前依赖的 Chromium、headless shell 与 ffmpeg 修订号，并从 Windows 缓存复制对应目录。
 
-PyInstaller 生成目录型应用 `release/windows-YYYYMMDD-v<版本>/Fashetai/`。脚本将浏览器资源放在 PyInstaller 的 `_internal/runtime/playwright-browsers/` 下；运行时 `_MEIPASS` 正是 `_internal`，因此现有 `utils.base_social_media._configure_bundled_playwright_browsers()` 能找到该目录，无需读取系统浏览器、Cookie 或开发机路径。
+PyInstaller 生成目录型应用 `release/windows-YYYYMMDD-v<版本>/YiJianFa/`。脚本将浏览器资源放在 PyInstaller 的 `_internal/runtime/playwright-browsers/` 下；运行时 `_MEIPASS` 正是 `_internal`，因此现有 `utils.base_social_media._configure_bundled_playwright_browsers()` 能找到该目录，无需读取系统浏览器、Cookie 或开发机路径。
 
-脚本随后执行 `Fashetai.exe --ui-test` 和 `Fashetai.exe --browser-self-test`，将通过的目录打包为 ASCII 文件名 ZIP，并以标准库 `zipfile` 扫描禁止项。ZIP 内不得出现 `demo-runtime/`、Cookie、storage state、数据库、OAuth token 或媒体素材目录。脚本输出 ZIP 绝对路径、SHA-256 和 `WINDOWS_BUILD_OK`。
+脚本随后执行 `YiJianFa.exe --ui-test` 和 `YiJianFa.exe --browser-self-test`，将通过的目录打包为 ASCII 文件名 ZIP，并以标准库 `zipfile` 扫描禁止项。ZIP 内不得出现 `demo-runtime/`、Cookie、storage state、数据库、OAuth token 或媒体素材目录。脚本输出 ZIP 绝对路径、SHA-256 和 `WINDOWS_BUILD_OK`。
 
 ### GitHub Actions
 

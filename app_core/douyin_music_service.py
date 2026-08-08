@@ -802,6 +802,10 @@ async def select_favorite_music_choice(
         if await _selection_is_readable(
             picker_page, dialog, sanitized, marker=marker
         ):
+            # 已由抽屉回读到所选音乐后，必须主动关闭它。否则编辑页仍被
+            # 抽屉遮罩拦截，后续地点、声明等独立设置会在同一会话中被误判
+            # 为不可操作，迫使用户取消并重新上传视频。
+            await _close_selected_music_picker(picker_page, dialog)
             return sanitized
         await picker_page.wait_for_timeout(200)
     raise DouyinMusicError("抖音收藏所选音乐选择后未能由页面回读确认，已安全停止")

@@ -12,10 +12,11 @@ APP_ICON_RELATIVE_PATH = "ui/assets/fashetai-app-icon.png"
 TRIAL_DAYS = 7
 UPGRADE_STORE = "逆浪风"
 
-# 构建产物使用 ASCII 名称，避免 Windows 打包和解压路径兼容问题。
-APP_EXECUTABLE_NAME = "Fashetai"
+# 构建产物使用独立项目的 ASCII 名称，避免 Windows 打包和解压路径兼容问题。
+# 用户可见名称始终为“一键发”；此名称同时决定 Windows ZIP 顶层目录和 exe 名称。
+APP_EXECUTABLE_NAME = "YiJianFa"
 ACTIVATION_PRODUCT_ID = "fashetai_desktop"
 
-# 旧标识只用于升级和服务端兼容，不再用于新构建产物。
-LEGACY_APP_EXECUTABLE_NAMES = ("MatrixArk", "zimeiti_desktop")
+# 发射台等旧标识只用于本地升级识别和服务端兼容，不再用于新构建产物。
+LEGACY_APP_EXECUTABLE_NAMES = ("Fashetai", "MatrixArk", "zimeiti_desktop")
 LEGACY_ACTIVATION_PRODUCT_IDS = ("matrixark_desktop", "zimeiti_desktop")

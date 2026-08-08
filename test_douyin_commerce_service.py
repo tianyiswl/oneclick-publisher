@@ -3329,6 +3329,145 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
         self.assertEqual(manager._session.selected_music, old_music)
         self.assertEqual(manager._session.stage, "music_selected")
 
+    def test_favorite_music_selection_closes_picker_after_readback(self) -> None:
+        """音乐仅在选中态回读后关闭抽屉，避免遮罩阻断其它编辑项。"""
+
+        class ApplyButton:
+            async def is_visible(self) -> bool:
+                return True
+
+            async def is_enabled(self) -> bool:
+                return True
+
+            async def inner_text(self) -> str:
+                return "使用"
+
+            async def scroll_into_view_if_needed(self, **_kwargs) -> None:
+                return None
+
+            async def click(self, **_kwargs) -> None:
+                return None
+
+        class ApplyButtons:
+            async def count(self) -> int:
+                return 1
+
+            def nth(self, _index: int) -> ApplyButton:
+                return ApplyButton()
+
+        class Row:
+            async def scroll_into_view_if_needed(self, **_kwargs) -> None:
+                return None
+
+            async def hover(self, **_kwargs) -> None:
+                return None
+
+            def locator(self, _selector: str) -> ApplyButtons:
+                return ApplyButtons()
+
+        class PickerPage:
+            def locator(self, _selector: str) -> Row:
+                return Row()
+
+            async def wait_for_timeout(self, _milliseconds: int) -> None:
+                return None
+
+        picker_page = PickerPage()
+        dialog = object()
+        candidate = {
+            "musicId": "music-new",
+            "title": "新音乐",
+            "creator": "测试作者",
+            "duration": "01:08",
+            "marker": "row-1",
+        }
+        with patch.object(
+            douyin_music_service,
+            "_selection_is_readable",
+            new_callable=AsyncMock,
+            return_value=True,
+        ), patch.object(
+            douyin_music_service,
+            "_close_selected_music_picker",
+            new_callable=AsyncMock,
+            return_value=None,
+        ) as close_picker:
+            selected = asyncio.run(
+                douyin_music_service.select_favorite_music_choice(
+                    object(), picker_page, dialog, candidate
+                )
+            )
+
+        close_picker.assert_awaited_once_with(picker_page, dialog)
+        self.assertNotIn("marker", selected)
+        self.assertEqual(selected["musicId"], "music-new")
+
+    def test_selected_music_keeps_same_session_available_for_location_search(self) -> None:
+        """首次刷新并选歌后，地点搜索继续复用同一编辑会话。"""
+
+        class OpenPage:
+            def is_closed(self) -> bool:
+                return False
+
+        editor_page = OpenPage()
+        picker_page = object()
+        dialog = object()
+        candidate = {
+            "musicId": "music-new",
+            "title": "新音乐",
+            "creator": "测试作者",
+            "duration": "01:08",
+            "marker": "row-1",
+        }
+        location = {
+            "poiId": "poi-1",
+            "name": "北海银滩景区",
+            "address": "广西壮族自治区北海市银海区银滩大道中段",
+            "distance": "6.0km",
+        }
+        manager = douyin_commerce_session.DouyinCommerceSessionManager()
+        manager._session = douyin_commerce_session._CommerceEditorSession(
+            session_id="session-demo",
+            upload_payload={},
+            account_name="测试账号",
+            browser=None,
+            context=None,
+            page=editor_page,
+            playwright=None,
+            uploader=None,
+            music_picker_page=picker_page,
+            music_dialog=dialog,
+            music_candidates=[candidate],
+        )
+        with patch.object(
+            douyin_commerce_session.douyin_music_service,
+            "select_favorite_music_choice",
+            new_callable=AsyncMock,
+            return_value={
+                "musicId": "music-new",
+                "title": "新音乐",
+                "creator": "测试作者",
+                "duration": "01:08",
+            },
+        ) as select, patch.object(
+            douyin_commerce_session.douyin_commerce_service,
+            "search_commerce_location_store_candidates",
+            new_callable=AsyncMock,
+            return_value=[location],
+        ) as search:
+            # session 层在真实音乐服务关闭抽屉并回读后清理抽屉状态；此处验证
+            # 该清理不会阻断同一 sessionId 的地点搜索。
+            selected = asyncio.run(manager._select_favorite_music("session-demo", "music-new"))
+            result = asyncio.run(manager._search_locations("session-demo", "北海", "domestic"))
+
+        select.assert_awaited_once_with(editor_page, picker_page, dialog, candidate)
+        # 音乐服务关闭抽屉后，session 不得遗留抽屉状态。
+        self.assertIsNone(manager._session.music_picker_page)
+        self.assertIsNone(manager._session.music_dialog)
+        search.assert_awaited_once_with(editor_page, "北海", scope="domestic")
+        self.assertEqual(selected["musicId"], "music-new")
+        self.assertEqual(result, [location])
+
     def test_session_manager_defaults_upload_context_to_background(self) -> None:
         """上传会话默认后台；显式 false 才允许兼容旧调用。"""
 

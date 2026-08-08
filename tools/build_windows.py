@@ -46,7 +46,7 @@ def archive_filename(build_date: str, version: str) -> str:
         raise ValueError("构建日期必须为 YYYYMMDD")
     if not re.fullmatch(r"\d+(?:\.\d+)*", version):
         raise ValueError("版本号只能包含数字和点")
-    return f"Fashetai_{version}_Windows_x64_{build_date}.zip"
+    return f"{APP_EXECUTABLE_NAME}_{version}_Windows_x64_{build_date}.zip"
 
 
 def resolve_playwright_browser_dirs(

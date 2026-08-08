@@ -91,11 +91,11 @@ async def _run_browser_self_test() -> None:
     async with async_playwright() as playwright:
         browser = await launch_chromium_with_codecs(playwright, headless=True)
         page = await browser.new_page()
-        await page.set_content("<title>Fashetai Browser Test</title><main id='status'>ready</main>")
+        await page.set_content("<title>YiJianFa Browser Test</title><main id='status'>ready</main>")
         title = await page.title()
         status = await page.locator("#status").inner_text()
         await browser.close()
-    if title != "Fashetai Browser Test" or status != "ready":
+    if title != "YiJianFa Browser Test" or status != "ready":
         raise RuntimeError("浏览器自检页面回读失败")
 
 
@@ -115,7 +115,7 @@ def run_release_verification(
         Path(signature_path),
     )
     print(
-        "FASHETAI_RELEASE_VERIFIED "
+        "YIJIANFA_RELEASE_VERIFIED "
         f"version={manifest['version']} build={manifest.get('buildId') or '-'}"
     )
 

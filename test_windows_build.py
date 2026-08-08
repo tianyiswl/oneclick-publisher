@@ -18,6 +18,7 @@ from tools.build_windows import (
     render_spec,
     resolve_playwright_browser_dirs,
 )
+from app_core.branding import APP_EXECUTABLE_NAME
 
 
 class WindowsBuildTests(unittest.TestCase):
@@ -41,7 +42,7 @@ class WindowsBuildTests(unittest.TestCase):
     def test_archive_filename_is_ascii_and_versioned(self) -> None:
         self.assertEqual(
             archive_filename("20260805", "0.4.1"),
-            "Fashetai_0.4.1_Windows_x64_20260805.zip",
+            "YiJianFa_0.4.1_Windows_x64_20260805.zip",
         )
 
     def test_resolve_required_playwright_browser_dirs(self) -> None:
@@ -104,7 +105,7 @@ class WindowsBuildTests(unittest.TestCase):
     def test_bundle_browser_resources_uses_pyinstaller_internal_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            dist_root = root / "Fashetai"
+            dist_root = root / APP_EXECUTABLE_NAME
             browser = root / "chromium-1223"
             executable = browser / "chrome-win" / "chrome.exe"
             executable.parent.mkdir(parents=True)
@@ -125,11 +126,11 @@ class WindowsBuildTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             archive = Path(temp_dir) / "unsafe.zip"
             with zipfile.ZipFile(archive, "w") as handle:
-                handle.writestr("Fashetai/cookiesFile/account.json", "secret")
+                handle.writestr(f"{APP_EXECUTABLE_NAME}/cookiesFile/account.json", "secret")
 
             with self.assertRaisesRegex(
                 RuntimeError,
-                "fashetai/cookiesfile/<redacted>",
+                "yijianfa/cookiesfile/<redacted>",
             ):
                 assert_archive_safe(archive)
 
@@ -137,7 +138,7 @@ class WindowsBuildTests(unittest.TestCase):
         spec = render_spec(Path(r"C:\work\oneclick"))
 
         self.assertIn("desktop_native_app.py", spec)
-        self.assertIn("name='Fashetai'", spec)
+        self.assertIn("name='YiJianFa'", spec)
         self.assertIn('"tzdata"', spec)
         self.assertIn("COLLECT(", spec)
         self.assertNotIn("BUNDLE(", spec)
