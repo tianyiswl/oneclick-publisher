@@ -7,6 +7,7 @@ import re
 from pathlib import Path
 
 from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import QCheckBox, QComboBox, QDialog, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox, QTableWidget, QTableWidgetItem, QTabWidget, QTextEdit, QVBoxLayout, QWidget
 
 from app_core import task_service
@@ -42,6 +43,9 @@ BATCH_STATUS_LABELS = {
 UUID_FILE_PREFIX = re.compile(
     r"^[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}_"
 )
+
+BATCH_FAILED_TEXT_COLOR = "#B42318"
+BATCH_FAILED_BACKGROUND_COLOR = "#FEF3F2"
 
 
 class TaskDetailDialog(QDialog):
@@ -160,6 +164,18 @@ class TaskDetailDialog(QDialog):
         panel = QWidget()
         panel_layout = QVBoxLayout(panel)
         panel_layout.setContentsMargins(0, 8, 0, 0)
+
+        filter_row = QHBoxLayout()
+        filter_label = QLabel("状态")
+        filter_label.setProperty("role", "caption")
+        filter_row.addWidget(filter_label)
+        status_filter = QComboBox()
+        status_filter.setObjectName("batchStatusFilter")
+        status_filter.setMinimumWidth(132)
+        filter_row.addWidget(status_filter)
+        filter_row.addStretch()
+        panel_layout.addLayout(filter_row)
+
         table = QTableWidget(0, 6)
         table.setObjectName("batchResultTable")
         table.setHorizontalHeaderLabels(["序号", "视频", "地点", "定时时间", "状态", "结果说明"])
@@ -168,9 +184,64 @@ class TaskDetailDialog(QDialog):
         table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         table.verticalHeader().setVisible(False)
         panel_layout.addWidget(table)
+        self.batch_items = self._ordered_batch_items()
+        self.batch_status_filter = status_filter
         self.batch_result_table = table
-        self._render_batch_items(self._ordered_batch_items())
+        self._populate_batch_status_filter(status_filter)
+        status_filter.currentIndexChanged.connect(self._apply_batch_status_filter)
+        self._render_batch_items(self.batch_items)
+        self._focus_first_failed()
         return panel
+
+    def _batch_status_counts(self) -> dict[str, int]:
+        return {
+            "all": len(self.batch_items),
+            "success": sum(row.get("status") == "success" for row in self.batch_items),
+            "failed": sum(row.get("status") == "failed" for row in self.batch_items),
+            "running": sum(row.get("status") == "running" for row in self.batch_items),
+            "pending": sum(row.get("status") == "pending" for row in self.batch_items),
+        }
+
+    def _populate_batch_status_filter(self, combo: QComboBox) -> None:
+        counts = self._batch_status_counts()
+        options = [
+            ("全部", None, counts["all"]),
+            ("成功", "success", counts["success"]),
+            ("失败", "failed", counts["failed"]),
+            ("执行中", "running", counts["running"]),
+            ("未开始", "pending", counts["pending"]),
+        ]
+        combo.blockSignals(True)
+        combo.clear()
+        for label, status, count in options:
+            combo.addItem(f"{label}（{count}）", status)
+        combo.blockSignals(False)
+
+    def _apply_batch_status_filter(self) -> None:
+        selected_status = self.batch_status_filter.currentData()
+        rows = [
+            row
+            for row in self.batch_items
+            if selected_status is None or row.get("status") == selected_status
+        ]
+        self._render_batch_items(rows)
+        self._focus_first_failed()
+
+    def _focus_first_failed(self) -> None:
+        table = self.batch_result_table
+        if table.rowCount() == 0:
+            table.clearSelection()
+            return
+        failed_row = next(
+            (
+                row_index
+                for row_index in range(table.rowCount())
+                if table.item(row_index, 4).text() == "失败"
+            ),
+            0,
+        )
+        table.setCurrentCell(failed_row, 0)
+        table.scrollToItem(table.item(failed_row, 0))
 
     def _render_batch_items(self, rows: list[dict]) -> None:
         table = self.batch_result_table
@@ -194,6 +265,10 @@ class TaskDetailDialog(QDialog):
                     item.setToolTip(str(value))
                 elif column == 5:
                     item.setToolTip(str(row.get("message") or value))
+                if row.get("status") == "failed":
+                    item.setBackground(QColor(BATCH_FAILED_BACKGROUND_COLOR))
+                    if column in (4, 5):
+                        item.setForeground(QColor(BATCH_FAILED_TEXT_COLOR))
                 table.setItem(row_idx, column, item)
 
     def _items_tab(self) -> QTableWidget:

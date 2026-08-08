@@ -8,7 +8,7 @@ import unittest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtWidgets import QApplication, QLabel, QTableWidget
+from PyQt6.QtWidgets import QApplication, QComboBox, QLabel, QTableWidget, QTabWidget
 
 from ui.task_page import TaskDetailDialog
 
@@ -90,6 +90,58 @@ class TaskDetailDialogTests(unittest.TestCase):
         self.assertEqual(table.item(1, 0).text(), "12")
         self.assertEqual(table.item(1, 1).text(), "测试13.mp4")
         self.assertIn("抖音带货位置搜索失败", table.item(1, 5).text())
+
+    def test_batch_task_filters_and_focuses_the_first_failed_video(self) -> None:
+        """缺少失败定位或状态筛选时，应捕获失败视频仍难查找的回归。"""
+        dialog = TaskDetailDialog(self._batch_task())
+        self.addCleanup(dialog.close)
+
+        status_filter = dialog.findChild(QComboBox, "batchStatusFilter")
+        self.assertIsNotNone(status_filter)
+        self.assertEqual(status_filter.itemText(0), "全部（2）")
+        self.assertIn(
+            "失败（1）",
+            [status_filter.itemText(index) for index in range(status_filter.count())],
+        )
+
+        table = dialog.findChild(QTableWidget, "batchResultTable")
+        self.assertEqual(table.currentRow(), 1)
+        self.assertEqual(table.item(1, 4).foreground().color().name().upper(), "#B42318")
+        self.assertEqual(table.item(1, 4).background().color().name().upper(), "#FEF3F2")
+
+        status_filter.setCurrentText("失败（1）")
+        self.assertEqual(table.rowCount(), 1)
+        self.assertEqual(table.item(0, 1).text(), "测试13.mp4")
+
+    def test_non_batch_task_keeps_the_generic_items_table(self) -> None:
+        """批量专用表格不得改变普通任务的十列执行项明细。"""
+        task = {
+            **self._batch_task(),
+            "workflow": "domestic-video",
+            "workflowLabel": "国内视频",
+            "commerceSummary": "普通任务带货信息",
+            "items": [
+                {
+                    "platformName": "抖音",
+                    "accountLabel": "逆浪风",
+                    "fileName": "测试.mp4",
+                    "status": "success",
+                    "message": "完成",
+                }
+            ],
+        }
+        dialog = TaskDetailDialog(task)
+        self.addCleanup(dialog.close)
+
+        tabs = dialog.findChild(QTabWidget, "taskDetailTabs")
+        self.assertEqual(tabs.tabText(0), "执行项")
+        generic_tables = [
+            table
+            for table in dialog.findChildren(QTableWidget)
+            if table.columnCount() == 10
+        ]
+        self.assertEqual(len(generic_tables), 1)
+        self.assertIsNone(dialog.findChild(QComboBox, "batchStatusFilter"))
 
 
 if __name__ == "__main__":
