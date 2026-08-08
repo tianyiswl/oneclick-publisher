@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QCheckBox, QComboBox, QDialog, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox, QTableWidget, QTableWidgetItem, QTabWidget, QTextEdit, QVBoxLayout, QWidget
 
@@ -28,6 +31,17 @@ STATUS_COLORS = {
     "failed": "#dc2626",
     "cancelled": "#64748b",
 }
+
+BATCH_STATUS_LABELS = {
+    "pending": "未开始",
+    "running": "执行中",
+    "success": "成功",
+    "failed": "失败",
+}
+
+UUID_FILE_PREFIX = re.compile(
+    r"^[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}_"
+)
 
 
 class TaskDetailDialog(QDialog):
@@ -69,14 +83,19 @@ class TaskDetailDialog(QDialog):
             ("创建时间", task.get("createdAt"), 4, 0, 1),
             ("完成时间", task.get("finishedAt"), 4, 2, 1),
         ]
-        if task.get("commerceSummary"):
+        if self._is_batch_task():
+            summary_values.append(("批量结果", self._batch_result_summary(), 5, 0, 5))
+        elif task.get("commerceSummary"):
             summary_values.append(("带货信息", task.get("commerceSummary"), 5, 0, 5))
-        summary_values.append(("失败原因", task.get("lastError"), 6, 0, 5))
+        if not self._is_batch_task() or task.get("lastError"):
+            summary_values.append(("失败原因", task.get("lastError"), 6, 0, 5))
         for label_text, value, row, column, span in summary_values:
             label = QLabel(label_text)
             label.setProperty("role", "caption")
             value_label = QLabel(str(value or ""))
             value_label.setWordWrap(True)
+            if label_text == "批量结果":
+                value_label.setObjectName("batchResultSummary")
             summary.addWidget(label, row, column)
             summary.addWidget(value_label, row, column + 1, 1, span)
         summary.setColumnStretch(1, 1)
@@ -84,10 +103,98 @@ class TaskDetailDialog(QDialog):
         layout.addWidget(summary_panel)
 
         tabs = QTabWidget()
-        tabs.addTab(self._items_tab(), "执行项")
+        tabs.setObjectName("taskDetailTabs")
+        if self._is_batch_task():
+            tabs.addTab(self._batch_items_tab(), f"视频结果（{len(self._ordered_batch_items())}）")
+        else:
+            tabs.addTab(self._items_tab(), "执行项")
         tabs.addTab(self._events_tab(), "事件日志")
         tabs.addTab(self._payload_tab(), "发布参数")
         layout.addWidget(tabs)
+
+    def _is_batch_task(self) -> bool:
+        return self.task.get("workflow") == "douyin-commerce-batch"
+
+    def _ordered_batch_items(self) -> list[dict]:
+        rows = self.task.get("items") or []
+
+        def sort_key(indexed_row: tuple[int, dict]) -> tuple[int, int]:
+            fallback, row = indexed_row
+            try:
+                item_index = int(row.get("batchItemIndex"))
+            except (TypeError, ValueError):
+                item_index = fallback + 1
+            return item_index, fallback
+
+        return [row for _, row in sorted(enumerate(rows), key=sort_key)]
+
+    def _batch_result_summary(self) -> str:
+        rows = self._ordered_batch_items()
+        success_count = sum(row.get("status") == "success" for row in rows)
+        failed_count = sum(row.get("status") == "failed" for row in rows)
+        unfinished_count = len(rows) - success_count - failed_count
+        return (
+            f"共 {len(rows)} 条 · 成功 {success_count} · "
+            f"失败 {failed_count} · 未完成 {unfinished_count}"
+        )
+
+    def _batch_video_name(self, row: dict) -> str:
+        raw_name = row.get("fileName") or row.get("filePath") or ""
+        file_name = Path(str(raw_name)).name
+        return UUID_FILE_PREFIX.sub("", file_name) or "—"
+
+    def _batch_result_text(self, row: dict) -> str:
+        status = row.get("status")
+        message = str(row.get("message") or "").strip()
+        if status == "success":
+            return "平台已回读"
+        if status == "failed":
+            return message or "未记录具体失败原因"
+        if status == "running":
+            return message or "正在执行"
+        if status == "pending":
+            return "尚未开始"
+        return message or "—"
+
+    def _batch_items_tab(self) -> QWidget:
+        panel = QWidget()
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(0, 8, 0, 0)
+        table = QTableWidget(0, 6)
+        table.setObjectName("batchResultTable")
+        table.setHorizontalHeaderLabels(["序号", "视频", "地点", "定时时间", "状态", "结果说明"])
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.verticalHeader().setVisible(False)
+        panel_layout.addWidget(table)
+        self.batch_result_table = table
+        self._render_batch_items(self._ordered_batch_items())
+        return panel
+
+    def _render_batch_items(self, rows: list[dict]) -> None:
+        table = self.batch_result_table
+        table.setRowCount(len(rows))
+        for row_idx, row in enumerate(rows):
+            batch_index = row.get("batchItemIndex") or row_idx + 1
+            values = [
+                batch_index,
+                self._batch_video_name(row),
+                row.get("locationSummary") or "—",
+                row.get("scheduleSummary") or "—",
+                BATCH_STATUS_LABELS.get(row.get("status"), row.get("status") or "—"),
+                self._batch_result_text(row),
+            ]
+            for column, value in enumerate(values):
+                color = STATUS_COLORS.get(row.get("status")) if column == 4 else None
+                item = table_item(value, color)
+                if column == 1:
+                    item.setToolTip(str(row.get("filePath") or row.get("fileName") or ""))
+                elif column in (2, 3):
+                    item.setToolTip(str(value))
+                elif column == 5:
+                    item.setToolTip(str(row.get("message") or value))
+                table.setItem(row_idx, column, item)
 
     def _items_tab(self) -> QTableWidget:
         rows = self.task.get("items") or []
