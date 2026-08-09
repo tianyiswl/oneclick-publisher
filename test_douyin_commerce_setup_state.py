@@ -70,6 +70,24 @@ class SetupGenerationTest(unittest.TestCase):
             )
         )
 
+    def test_ready_generation_accepts_active_matching_collector_result(self):
+        generation = new_setup_generation(account_id=31)
+        generation.transition(SetupGenerationState.COLLECTING)
+        generation.activate_collector(
+            CollectorType.DOMESTIC_LOCATION,
+            instance_id="domestic-1",
+            session_id="session-a",
+        )
+        generation.transition(SetupGenerationState.READY)
+
+        self.assertTrue(
+            generation.accepts_result(
+                generation.generation_id,
+                CollectorType.DOMESTIC_LOCATION,
+                "domestic-1",
+            )
+        )
+
     def test_non_active_collectors_reject_results(self):
         generation = new_setup_generation(account_id=31)
         generation.transition(SetupGenerationState.COLLECTING)

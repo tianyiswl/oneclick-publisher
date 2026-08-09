@@ -125,7 +125,10 @@ class SetupGeneration:
         collector_type: CollectorType,
         instance_id: str,
     ) -> bool:
-        if self.state is not SetupGenerationState.COLLECTING:
+        if self.state not in {
+            SetupGenerationState.COLLECTING,
+            SetupGenerationState.READY,
+        }:
             return False
         slot = self.collectors[collector_type]
         return (
