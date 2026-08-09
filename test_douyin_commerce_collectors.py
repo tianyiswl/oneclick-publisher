@@ -439,6 +439,56 @@ class DouyinCommerceCollectorManagerTests(unittest.TestCase):
                     self.assertNotIn(forbidden, combined)
                 self.assertIn("collector_unknown", combined)
 
+    def test_sensitive_search_keywords_are_redacted_at_both_public_event_exits(self):
+        generation_id = self.manager.begin_generation(self.upload_payload)[
+            "setupGenerationId"
+        ]
+        payloads = (
+            (
+                "/Users/andy/private/account.json",
+                ("/users", "andy", "private", "account.json"),
+            ),
+            (
+                "/tmp/browser-profile/state.json",
+                ("/tmp", "browser-profile", "state.json"),
+            ),
+            (
+                'selector=<div data-secret="abc">private</div>',
+                ("selector", "<div", "data-secret", "private"),
+            ),
+            (
+                "access_token=top-secret",
+                ("access_token", "top-secret"),
+            ),
+            (
+                "cookie_value=top-secret",
+                ("cookie_value", "top-secret"),
+            ),
+        )
+
+        for payload, forbidden_parts in payloads:
+            self.manager.search_locations(generation_id, payload, "domestic")
+            public_events = (
+                (
+                    "recent_diagnostics",
+                    self.manager.recent_diagnostics(generation_id)[-1],
+                ),
+                ("event_sink", self.events[-1]),
+            )
+            for outlet, event in public_events:
+                with self.subTest(payload=payload, outlet=outlet):
+                    public_keyword = event["keyword"].casefold()
+                    self.assertNotEqual(public_keyword, payload.casefold())
+                    for forbidden in forbidden_parts:
+                        self.assertNotIn(forbidden, public_keyword)
+
+        self.manager.search_locations(generation_id, "夜南香", "domestic")
+        self.assertEqual(
+            self.manager.recent_diagnostics(generation_id)[-1]["keyword"],
+            "夜南香",
+        )
+        self.assertEqual(self.events[-1]["keyword"], "夜南香")
+
     def test_local_retry_records_attempt_and_cleanup_result(self):
         generation_id = self.manager.begin_generation(self.upload_payload)[
             "setupGenerationId"

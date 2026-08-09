@@ -1943,7 +1943,11 @@ class DouyinCommerceCollectorManager:
             phase=phase,
             action=action,
             scope=scope,
-            keyword=keyword,
+            keyword=(
+                _redact_diagnostic_text(keyword, limit=80)
+                if keyword
+                else ""
+            ),
             attempt=attempt,
             candidate_count=candidate_count,
             duration_ms=duration_ms,
