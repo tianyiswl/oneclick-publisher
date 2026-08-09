@@ -1759,6 +1759,92 @@ class DouyinCommerceCollectorManagerTests(unittest.TestCase):
         )
         self.assertEqual(strict_manager.close_calls, [])
 
+    def test_keyboard_interrupt_close_completes_owner_and_retries(self):
+        self._assert_process_control_close_completes_owner_and_retries(
+            KeyboardInterrupt
+        )
+
+    def test_system_exit_close_completes_owner_and_retries(self):
+        self._assert_process_control_close_completes_owner_and_retries(
+            SystemExit
+        )
+
+    def _assert_process_control_close_completes_owner_and_retries(
+        self,
+        interruption_type: type[BaseException],
+    ) -> None:
+        class InterruptedStrictSessionManager(FakeSessionManager):
+            def __init__(self) -> None:
+                super().__init__(1)
+                self.strict_close_calls: list[str | None] = []
+                self.interruptions_remaining = 1
+
+            def close_strict(self, session_id: str | None = None) -> None:
+                self.strict_close_calls.append(session_id)
+                if self.interruptions_remaining:
+                    self.interruptions_remaining -= 1
+                    raise interruption_type(
+                        "Cookie=secret 验证码123456 DOM=<html>private</html>"
+                    )
+
+        strict_manager = InterruptedStrictSessionManager()
+        self.manager._manager_factory = lambda: strict_manager
+        self.manager._close_wait_seconds = 0.2
+        generation_id = self.manager.begin_generation(self.upload_payload)[
+            "setupGenerationId"
+        ]
+
+        first = self.manager.close_generation(generation_id, reason="cancelled")
+
+        self.assertFalse(first["closed"])
+        self.assertEqual(first["aliveCollectorCount"], 1)
+        self.assertEqual(
+            first["cleanupResults"]["domestic_location"],
+            "cleanup_interrupted",
+        )
+        self.assertNotIn("secret", str(first))
+        self.assertNotIn("123456", str(first))
+        self.assertNotIn("<html>", str(first))
+        with self.manager._state_lock:
+            runtime = self.manager._runtime
+            self.assertIsNotNone(runtime)
+            collector = runtime.collectors[CollectorType.DOMESTIC_LOCATION]
+            first_owner = collector.close_owner
+            self.assertIsNotNone(first_owner)
+            self.assertTrue(first_owner.done.is_set())
+            self.assertEqual(first_owner.result, "cleanup_interrupted")
+            self.assertNotIn(
+                id(strict_manager), self.manager._manager_close_owners
+            )
+
+        continued = self.manager._action_queue.submit(
+            generation_id,
+            "queue-after-interruption",
+            CollectorType.DOMESTIC_LOCATION,
+            lambda: "queue_continues",
+            is_cleanup=True,
+        )
+        self.assertEqual(
+            self.manager._action_queue.wait(continued),
+            "queue_continues",
+        )
+
+        second = self.manager.close_generation(generation_id, reason="cancelled")
+
+        self.assertTrue(second["closed"])
+        self.assertEqual(second["aliveCollectorCount"], 0)
+        self.assertEqual(
+            second["cleanupResults"]["domestic_location"],
+            "closed",
+        )
+        self.assertEqual(
+            strict_manager.strict_close_calls,
+            ["session-1", "session-1"],
+        )
+        self.assertIsNot(collector.close_owner, first_owner)
+        self.assertTrue(collector.close_owner.done.is_set())
+        self.assertEqual(strict_manager.close_calls, [])
+
     def test_close_reports_unstarted_collectors_without_constructing_them(self):
         generation_id = self.manager.begin_generation(self.upload_payload)[
             "setupGenerationId"

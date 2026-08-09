@@ -669,6 +669,17 @@ class DouyinCommerceCollectorManager:
                     collector.manager,
                     collector.session_id or None,
                 )
+        except (KeyboardInterrupt, SystemExit):
+            with self._state_lock:
+                self._complete_collector_close_locked(
+                    runtime,
+                    collector_type,
+                    collector,
+                    owner,
+                    "cleanup_interrupted",
+                    mark_failed=True,
+                )
+            raise
         except Exception:
             cleanup_result = "cleanup_incomplete"
 
