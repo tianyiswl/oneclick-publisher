@@ -1840,6 +1840,259 @@ class DouyinCommercePayloadTests(unittest.TestCase):
         self.assertEqual(result["location"]["name"], row["name"])
         self.assertNotIn("commerceStore", result)
 
+    def test_saved_location_is_clicked_in_the_same_open_panel(self) -> None:
+        """搜索已匹配时必须直接使用当前 listbox，不得重开面板丢失候选快照。"""
+
+        page = object()
+        listbox = object()
+        row = {
+            "poiId": "visible-poi:target",
+            "name": "夜南香北京烤鸭",
+            "address": "陕西省安康市汉滨区江北办富民街2号",
+        }
+        events: list[str] = []
+
+        async def search(*_args, **_kwargs):
+            events.append("search")
+            return [dict(row)]
+
+        async def current_listbox(_page):
+            events.append("listbox")
+            return listbox
+
+        async def apply_open(_page, actual_listbox, candidate):
+            self.assertIs(actual_listbox, listbox)
+            self.assertEqual(
+                {key: candidate.get(key) for key in ("poiId", "name", "address")},
+                row,
+            )
+            events.append("click")
+            return {"location": dict(row)}
+
+        with patch.object(
+            douyin_commerce_service,
+            "search_commerce_location_store_candidates",
+            side_effect=search,
+        ), patch.object(
+            douyin_commerce_service,
+            "_visible_store_listbox",
+            side_effect=current_listbox,
+        ), patch.object(
+            douyin_commerce_service,
+            "_apply_open_commerce_location_to_page",
+            side_effect=apply_open,
+            create=True,
+        ), patch.object(
+            douyin_commerce_service,
+            "close_commerce_store_selector",
+            new_callable=AsyncMock,
+        ), patch.object(
+            douyin_commerce_service,
+            "_open_store_selector",
+            new_callable=AsyncMock,
+        ) as reopen:
+            result = asyncio.run(
+                douyin_commerce_service.apply_saved_commerce_location_to_page(
+                    page, row, "domestic", [row["address"]]
+                )
+            )
+
+        self.assertEqual(events, ["search", "listbox", "click"])
+        self.assertEqual(result["matchedKeyword"], row["address"])
+        reopen.assert_not_awaited()
+
+    def test_saved_location_closes_first_search_before_keyword_fallback(self) -> None:
+        """第一关键词未匹配时必须收口该面板，第二关键词才能使用新候选。"""
+
+        page = object()
+        listbox = object()
+        target = {
+            "poiId": "visible-poi:target",
+            "name": "夜南香北京烤鸭",
+            "address": "陕西省安康市汉滨区江北办富民街2号",
+        }
+        other = {
+            "poiId": "visible-poi:other",
+            "name": "其他地点",
+            "address": "广西壮族自治区北海市海城区其他路1号",
+        }
+        events: list[str] = []
+
+        async def search(_page, keyword, **_kwargs):
+            events.append(f"search:{keyword}")
+            return [dict(other)] if keyword == "店名" else [dict(target)]
+
+        async def close(_page):
+            events.append("close")
+
+        async def apply_open(_page, actual_listbox, candidate):
+            self.assertIs(actual_listbox, listbox)
+            self.assertEqual(
+                {key: candidate.get(key) for key in ("poiId", "name", "address")},
+                target,
+            )
+            events.append("click")
+            return {"location": dict(target)}
+
+        with patch.object(
+            douyin_commerce_service,
+            "search_commerce_location_store_candidates",
+            side_effect=search,
+        ), patch.object(
+            douyin_commerce_service,
+            "close_commerce_store_selector",
+            side_effect=close,
+        ), patch.object(
+            douyin_commerce_service,
+            "_visible_store_listbox",
+            new_callable=AsyncMock,
+            return_value=listbox,
+        ), patch.object(
+            douyin_commerce_service,
+            "_apply_open_commerce_location_to_page",
+            side_effect=apply_open,
+            create=True,
+        ):
+            result = asyncio.run(
+                douyin_commerce_service.apply_saved_commerce_location_to_page(
+                    page, target, "domestic", ["店名", target["address"]]
+                )
+            )
+
+        first_search = events.index("search:店名")
+        second_search = events.index(f"search:{target['address']}")
+        self.assertIn("close", events[first_search + 1 : second_search])
+        self.assertEqual(events[-2:], ["click", "close"])
+        self.assertEqual(result["matchedKeyword"], target["address"])
+
+    def test_saved_location_rejects_ambiguous_current_candidates(self) -> None:
+        """当次面板出现两个同身份候选时必须安全停止，不得默认点第一条。"""
+
+        target = {
+            "poiId": "visible-poi:target",
+            "name": "夜南香北京烤鸭",
+            "address": "陕西省安康市汉滨区江北办富民街2号",
+        }
+        with patch.object(
+            douyin_commerce_service,
+            "search_commerce_location_store_candidates",
+            new_callable=AsyncMock,
+            return_value=[dict(target), dict(target)],
+        ), patch.object(
+            douyin_commerce_service,
+            "close_commerce_store_selector",
+            new_callable=AsyncMock,
+        ):
+            with self.assertRaisesRegex(
+                douyin_commerce_service.DouyinCommerceError,
+                "publish_location_candidate_ambiguous",
+            ):
+                asyncio.run(
+                    douyin_commerce_service.apply_saved_commerce_location_to_page(
+                        object(), target, "domestic", [target["address"]]
+                    )
+                )
+
+    def test_saved_location_projects_selector_cleanup_failure(self) -> None:
+        """旧面板无法收口时只允许固定错误码，不能继续搜索或泄露底层原文。"""
+
+        with patch.object(
+            douyin_commerce_service,
+            "close_commerce_store_selector",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("sensitive-selector-detail"),
+        ), patch.object(
+            douyin_commerce_service,
+            "search_commerce_location_store_candidates",
+            new_callable=AsyncMock,
+        ) as search:
+            with self.assertRaisesRegex(
+                douyin_commerce_service.DouyinCommerceError,
+                "^publish_location_cleanup_incomplete$",
+            ) as raised:
+                asyncio.run(
+                    douyin_commerce_service.apply_saved_commerce_location_to_page(
+                        object(), self.location, "domestic", [self.location["address"]]
+                    )
+                )
+
+        self.assertIsNone(raised.exception.__cause__)
+        search.assert_not_awaited()
+
+    def test_open_location_click_failure_uses_fixed_error_code(self) -> None:
+        """唯一候选节点点击失败时不得把 Playwright 原文投影到任务。"""
+
+        row = {
+            "poiId": "visible-poi:target",
+            "name": "夜南香北京烤鸭",
+            "address": "陕西省安康市汉滨区江北办富民街2号",
+        }
+        target = MagicMock()
+        target.scroll_into_view_if_needed = AsyncMock()
+        target.click = AsyncMock(side_effect=RuntimeError("sensitive-dom-detail"))
+        with patch.object(
+            douyin_commerce_service,
+            "_store_option_descriptors",
+            new_callable=AsyncMock,
+            return_value=[dict(row)],
+        ), patch.object(
+            douyin_commerce_service,
+            "_location_option_targets",
+            new_callable=AsyncMock,
+            return_value=[target],
+        ):
+            with self.assertRaisesRegex(
+                douyin_commerce_service.DouyinCommerceError,
+                "^publish_location_click_failed$",
+            ) as raised:
+                asyncio.run(
+                    douyin_commerce_service._apply_open_commerce_location_to_page(
+                        object(), object(), row
+                    )
+                )
+
+        self.assertIsNone(raised.exception.__cause__)
+
+    def test_open_location_readback_mismatch_uses_fixed_error_code(self) -> None:
+        """点击后带货模式或地点名不一致时不得返回应用成功。"""
+
+        class Page:
+            wait_for_timeout = AsyncMock()
+
+        row = {
+            "poiId": "visible-poi:target",
+            "name": "夜南香北京烤鸭",
+            "address": "陕西省安康市汉滨区江北办富民街2号",
+        }
+        target = MagicMock()
+        target.scroll_into_view_if_needed = AsyncMock()
+        target.click = AsyncMock()
+        with patch.object(
+            douyin_commerce_service,
+            "_store_option_descriptors",
+            new_callable=AsyncMock,
+            return_value=[dict(row)],
+        ), patch.object(
+            douyin_commerce_service,
+            "_location_option_targets",
+            new_callable=AsyncMock,
+            return_value=[target],
+        ), patch.object(
+            douyin_commerce_service,
+            "_anchor_controls",
+            new_callable=AsyncMock,
+            return_value=(None, None, "带货模式", "其他地点"),
+        ):
+            with self.assertRaisesRegex(
+                douyin_commerce_service.DouyinCommerceError,
+                "^publish_location_readback_mismatch$",
+            ):
+                asyncio.run(
+                    douyin_commerce_service._apply_open_commerce_location_to_page(
+                        Page(), object(), row
+                    )
+                )
+
 
 class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
     """用真实 DOM 约束地点 portal，避免把整张发布页的输入框算进来。"""

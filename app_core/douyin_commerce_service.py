@@ -17,6 +17,10 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .douyin_location_service import normalize_location_candidate, normalize_location_keyword
+from .douyin_location_preset_service import (
+    DouyinLocationPresetError,
+    match_location_preset,
+)
 from .douyin_music_service import (
     FAVORITE_FIRST_MUSIC_MODE,
     FAVORITE_MANUAL_MUSIC_MODE,
@@ -2298,28 +2302,20 @@ async def _location_option_targets(listbox, location: Mapping[str, Any]) -> list
     return targets
 
 
-async def apply_commerce_location_to_page(
+async def _apply_open_commerce_location_to_page(
     page,
+    listbox,
     candidate: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """只选择并回读发布定位，不读取或绑定团购门店。
-
-    平台把候选展示在“带货模式”控件中，因此选择一次候选后页面可能显示商品
-    摘要；一键发在本步骤不会把该摘要当作门店绑定成功，也不会重新展开下拉去
-    检查门店选中态。当前流程不读取、选择或验证任何团购门店。
-    """
+    """从当前已打开的地点面板点击唯一候选并回读。"""
 
     normalized = normalize_commerce_location_candidate(candidate)
     if not normalized:
-        raise DouyinCommerceError("待选择的发布定位缺少完整地址或稳定身份")
+        raise DouyinCommerceError("publish_location_candidate_missing")
     location = {
         key: _normalized(normalized.get(key))
         for key in ("poiId", "name", "address", "distance")
     }
-    store_control = await _ensure_local_group_buy_mode(page)
-    listbox = await _open_store_selector(page, store_control)
-    # 先读取当前可见结果，确保平台列表中的这个完整地点不是重复项；随后才
-    # 对唯一节点点击。此处不使用或验证任何门店身份。
     visible_locations = normalize_commerce_location_candidates(
         await _store_option_descriptors(listbox)
     )
@@ -2331,17 +2327,111 @@ async def apply_commerce_location_to_page(
         and _normalized(row.get("address")) == location["address"]
     ]
     if len(matched_locations) != 1:
-        raise DouyinCommerceError("抖音页面未找到唯一匹配的发布定位，已安全停止")
+        code = (
+            "publish_location_candidate_ambiguous"
+            if len(matched_locations) > 1
+            else "publish_location_candidate_missing"
+        )
+        raise DouyinCommerceError(code)
     targets = await _location_option_targets(listbox, location)
     if len(targets) != 1:
-        raise DouyinCommerceError("发布定位在当前页面不是唯一可点击项，已安全停止")
-    await targets[0].scroll_into_view_if_needed(timeout=5_000)
-    await targets[0].click(timeout=8_000)
-    await page.wait_for_timeout(450)
-    _, _, mode_value, selected_name = await _anchor_controls(page)
+        raise DouyinCommerceError("publish_location_click_failed")
+    try:
+        await targets[0].scroll_into_view_if_needed(timeout=5_000)
+        await targets[0].click(timeout=8_000)
+    except Exception:
+        raise DouyinCommerceError("publish_location_click_failed") from None
+    try:
+        await page.wait_for_timeout(450)
+        _, _, mode_value, selected_name = await _anchor_controls(page)
+    except Exception:
+        raise DouyinCommerceError("publish_location_readback_mismatch") from None
     if mode_value != _COMMERCE_MODE_TEXT or selected_name != location["name"]:
-        raise DouyinCommerceError("抖音发布定位选择后未能回读带货模式和地点名称，已安全停止")
+        raise DouyinCommerceError("publish_location_readback_mismatch")
     return {"location": location}
+
+
+async def apply_commerce_location_to_page(
+    page,
+    candidate: Mapping[str, Any],
+) -> dict[str, Any]:
+    """只选择并回读发布定位，不读取或绑定团购门店。"""
+
+    normalized = normalize_commerce_location_candidate(candidate)
+    if not normalized:
+        raise DouyinCommerceError("publish_location_candidate_missing")
+    store_control = await _ensure_local_group_buy_mode(page)
+    listbox = await _open_store_selector(page, store_control)
+    return await _apply_open_commerce_location_to_page(page, listbox, normalized)
+
+
+async def _close_commerce_store_selector_strict(page) -> None:
+    """收口地点面板；失败时只暴露固定公开错误码。"""
+
+    try:
+        await close_commerce_store_selector(page)
+    except Exception:
+        raise DouyinCommerceError("publish_location_cleanup_incomplete") from None
+
+
+async def apply_saved_commerce_location_to_page(
+    page,
+    preset: Mapping[str, Any],
+    scope: object,
+    keywords: list[str],
+) -> dict[str, Any]:
+    """在同一地点面板中完成搜索、唯一匹配、点击和回读。"""
+
+    selected_scope = normalize_commerce_location_scope(scope)
+    bounded_keywords = list(
+        dict.fromkeys(
+            normalized
+            for value in keywords
+            if (normalized := _normalized(value))
+        )
+    )[:3]
+    if not bounded_keywords:
+        raise DouyinCommerceError("publish_location_candidate_missing")
+
+    for keyword in bounded_keywords:
+        await _close_commerce_store_selector_strict(page)
+        panel_may_be_open = False
+        try:
+            panel_may_be_open = True
+            try:
+                candidates = await search_commerce_location_store_candidates(
+                    page,
+                    keyword,
+                    scope=selected_scope,
+                )
+            except DouyinCommerceError:
+                continue
+            try:
+                matched = match_location_preset(preset, candidates)
+            except DouyinLocationPresetError as exc:
+                if "存在多个" in str(exc):
+                    raise DouyinCommerceError(
+                        "publish_location_candidate_ambiguous"
+                    ) from None
+                continue
+            listbox = await _visible_store_listbox(page)
+            if listbox is None:
+                raise DouyinCommerceError("publish_location_click_failed")
+            result = await _apply_open_commerce_location_to_page(
+                page,
+                listbox,
+                matched,
+            )
+            return {**result, "matchedKeyword": keyword}
+        except DouyinCommerceError:
+            raise
+        except Exception:
+            raise DouyinCommerceError("publish_location_click_failed") from None
+        finally:
+            if panel_may_be_open:
+                await _close_commerce_store_selector_strict(page)
+
+    raise DouyinCommerceError("publish_location_candidate_missing")
 
 
 async def apply_commerce_location_store_to_page(
