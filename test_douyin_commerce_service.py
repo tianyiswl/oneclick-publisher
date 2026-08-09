@@ -7403,7 +7403,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         def close_current(generation_id: str, *, reason: str) -> dict:
             self.assertEqual(self.page._setup_generation_id, "generation-a")
             self.assertEqual(generation_id, "generation-a")
-            self.assertEqual(reason, "abandoned")
+            self.assertEqual(reason, "user_abandon")
             return {
                 "closed": True,
                 "setupGenerationId": generation_id,
@@ -7419,7 +7419,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         ):
             self.page._abandon_session(silent=True)
 
-        close_generation.assert_called_once_with("generation-a", reason="abandoned")
+        close_generation.assert_called_once_with("generation-a", reason="user_abandon")
         self.assertEqual(self.page._setup_generation_id, "")
         self.assertIsNone(self.page._selected_music)
         self.assertEqual(self.page._batch_locations, {})
@@ -7428,6 +7428,262 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.assertFalse(self.page._staged_location_confirmed)
         self.assertFalse(self.page._staged_declaration_confirmed)
         self.assertEqual(self.page.title_input.text(), "仍需保留的标题")
+
+    def test_login_required_closes_setup_generation_before_reset(self) -> None:
+        """登录失效必须统一关闭当前代际，不得只清理 UI 句柄。"""
+
+        self.page.runner = self._InlineRunner()
+        self.page._setup_generation_id = "generation-a"
+        self.page._selected_music = {"musicId": "music-1", "title": "收藏歌"}
+
+        with patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.close_generation",
+            return_value={"closed": True, "aliveCollectorCount": 0},
+        ) as close_generation:
+            self.page._handle_login_required()
+
+        close_generation.assert_called_once_with(
+            "generation-a", reason="login_required"
+        )
+        self.assertEqual(self.page._setup_generation_id, "")
+        self.assertIsNone(self.page._selected_music)
+        self.assertFalse(self.page.login_required_frame.isHidden())
+
+    def test_new_setup_generation_closes_previous_generation_with_fixed_reason(self) -> None:
+        """账号或内容变化创建新代际前，先以固定原因关闭旧代际。"""
+
+        self.page.runner = self._InlineRunner()
+        self.page._setup_generation_id = "generation-a"
+        order: list[tuple[str, str]] = []
+        started = self._collector_status()
+        started["setupGenerationId"] = "generation-b"
+
+        def close_generation(generation_id: str, *, reason: str) -> dict:
+            order.append(("close", reason))
+            self.assertEqual(generation_id, "generation-a")
+            return {"closed": True, "aliveCollectorCount": 0}
+
+        def begin_generation(_payload: dict, *, on_progress=None) -> dict:
+            del on_progress
+            order.append(("begin", "generation-b"))
+            return started
+
+        with patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.close_generation",
+            side_effect=close_generation,
+        ), patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.begin_generation",
+            side_effect=begin_generation,
+        ), patch.object(self.page, "_go_to_step"):
+            self.page._start_setup_generation({"accountId": 31})
+
+        self.assertEqual(
+            order,
+            [("close", "generation_replaced"), ("begin", "generation-b")],
+        )
+        self.assertEqual(self.page._setup_generation_id, "generation-b")
+
+    def test_failed_generation_start_closes_partial_generation(self) -> None:
+        """代际已有公开 ID 但国内采集器未就绪时，必须收口故障会话。"""
+
+        self.page.runner = self._InlineRunner()
+        failed = self._collector_status(domestic="failed")
+        with patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.close_generation",
+            return_value={"closed": True, "aliveCollectorCount": 0},
+        ) as close_generation:
+            self.page._setup_generation_succeeded(failed)
+
+        close_generation.assert_called_once_with(
+            "generation-a", reason="operation_failed"
+        )
+        self.assertEqual(self.page._setup_generation_id, "")
+        self.assertIn("collector_start_failed", self.page.platform_review_status.text())
+
+    def test_generation_start_exception_closes_runtime_without_public_id(self) -> None:
+        """启动内部已建 runtime 却未返回 ID 时，异常路径仍须统一取消关闭。"""
+
+        self.page.runner = self._InlineRunner()
+        with patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.begin_generation",
+            side_effect=RuntimeError("collector_start_failed"),
+        ), patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.close_generation",
+            return_value={"closed": True, "aliveCollectorCount": 0},
+        ) as close_generation:
+            self.page._start_setup_generation({"accountId": 31})
+
+        close_generation.assert_called_once_with(None, reason="operation_failed")
+        self.assertEqual(self.page._setup_generation_id, "")
+        self.assertIn("collector_start_failed", self.page.platform_review_status.text())
+
+    def test_close_setup_generation_without_active_generation_is_already_closed(self) -> None:
+        """无活动代际时关闭是幂等成功，不应调用平台协调器。"""
+
+        with patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.close_generation"
+        ) as close_generation:
+            result = self.page._close_setup_generation("user_abandon")
+
+        close_generation.assert_not_called()
+        self.assertEqual(result["closed"], True)
+        self.assertEqual(result["aliveCollectorCount"], 0)
+
+    def test_shutdown_closes_collectors_and_legacy_publish_session_without_dialog(self) -> None:
+        """客户端退出时必须尽力关闭代际和旧正式会话，且不弹窗。"""
+
+        self.page._setup_generation_id = "generation-a"
+        self.page._session_id = "session-legacy"
+        with patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.close_generation",
+            return_value={"closed": True, "aliveCollectorCount": 0},
+        ) as close_generation, patch.object(
+            douyin_commerce_session.commerce_session_manager, "close"
+        ) as close_session, patch(
+            "ui.douyin_commerce_page.QMessageBox.information"
+        ) as information, patch(
+            "ui.douyin_commerce_page.QMessageBox.warning"
+        ) as warning:
+            self.page.shutdown()
+
+        close_generation.assert_called_once_with(
+            "generation-a", reason="client_shutdown"
+        )
+        close_session.assert_called_once_with("session-legacy")
+        self.assertEqual(self.page._setup_generation_id, "")
+        self.assertEqual(self.page._session_id, "")
+        information.assert_not_called()
+        warning.assert_not_called()
+
+    def test_batch_preflight_stops_before_executor_when_collector_remains_alive(self) -> None:
+        """预检关闭屏障未取得零存活时，不得创建任何正式编辑会话。"""
+
+        self.page.runner = self._InlineRunner()
+        self.page._setup_generation_id = "generation-a"
+        self.page._selected_video_indexes = [1]
+        payload = {"items": [{"mediaPath": "/tmp/video-1.mp4"}]}
+        with patch.object(
+            self.page, "collect_batch_payload", return_value=payload
+        ), patch(
+            "ui.douyin_commerce_page.task_service.create_douyin_batch_task",
+            return_value={"id": 71},
+        ), patch(
+            "ui.douyin_commerce_page.task_service.mark_task_running"
+        ), patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.close_generation",
+            return_value={"closed": False, "aliveCollectorCount": 1},
+        ) as close_generation, patch.object(
+            self.page._batch_executor, "run_preflight"
+        ) as run_preflight, patch(
+            "ui.douyin_commerce_page.QMessageBox.warning"
+        ):
+            self.page.start_batch_preflight()
+
+        close_generation.assert_called_once_with(
+            "generation-a", reason="preflight_started"
+        )
+        run_preflight.assert_not_called()
+        self.assertEqual(self.page._setup_generation_id, "generation-a")
+        self.assertIn(
+            "平台设置临时会话未完全关闭，已安全停止",
+            self.page.validation_label.text(),
+        )
+
+    def test_batch_publish_stops_before_executor_when_collector_remains_alive(self) -> None:
+        """正式发布关闭屏障失败时，不得上传第一条视频。"""
+
+        self.page.runner = self._InlineRunner()
+        self.page._setup_generation_id = "generation-a"
+        self.page._selected_video_indexes = [1]
+        payload = {"items": [{"mediaPath": "/tmp/video-1.mp4"}]}
+        with patch.object(
+            self.page, "collect_batch_payload", return_value=payload
+        ), patch(
+            "ui.douyin_commerce_page.task_service.mark_task_running"
+        ), patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.close_generation",
+            return_value={"closed": False, "aliveCollectorCount": 1},
+        ) as close_generation, patch.object(
+            self.page._batch_executor, "run_publish"
+        ) as run_publish, patch(
+            "ui.douyin_commerce_page.QMessageBox.warning"
+        ), patch(
+            "ui.douyin_commerce_page.QMessageBox.information"
+        ):
+            self.page.start_batch_publish(payload, {"id": 72})
+
+        close_generation.assert_called_once_with(
+            "generation-a", reason="publish_started"
+        )
+        run_publish.assert_not_called()
+        self.assertEqual(self.page._setup_generation_id, "generation-a")
+        self.assertIn(
+            "平台设置临时会话未完全关闭，已安全停止",
+            self.page.validation_label.text(),
+        )
+
+    def test_batch_preflight_runs_only_after_zero_alive_barrier(self) -> None:
+        """零存活回读必须先清除代际句柄，再进入执行器。"""
+
+        self.page.runner = self._InlineRunner()
+        self.page._setup_generation_id = "generation-a"
+        self.page._selected_video_indexes = [1]
+        payload = {"items": [{"mediaPath": "/tmp/video-1.mp4"}]}
+
+        def run_preflight(*_args, **_kwargs):
+            self.assertEqual(self.page._setup_generation_id, "")
+            return [{"index": 0, "status": "preflighted"}]
+
+        with patch.object(
+            self.page, "collect_batch_payload", return_value=payload
+        ), patch(
+            "ui.douyin_commerce_page.task_service.create_douyin_batch_task",
+            return_value={"id": 73},
+        ), patch(
+            "ui.douyin_commerce_page.task_service.mark_task_running"
+        ), patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.close_generation",
+            return_value={"closed": True, "aliveCollectorCount": 0},
+        ), patch.object(
+            self.page._batch_executor,
+            "run_preflight",
+            side_effect=run_preflight,
+        ) as executor, patch(
+            "ui.douyin_commerce_page.QMessageBox.warning"
+        ):
+            self.page.start_batch_preflight()
+
+        executor.assert_called_once()
+        self.assertEqual(self.page._setup_generation_id, "")
+
+    def test_batch_publish_runs_only_after_zero_alive_barrier(self) -> None:
+        """正式发布执行器也只能在零存活回读后启动。"""
+
+        self.page.runner = self._InlineRunner()
+        self.page._setup_generation_id = "generation-a"
+        self.page._selected_video_indexes = [1]
+        payload = {"items": [{"mediaPath": "/tmp/video-1.mp4"}]}
+
+        def run_publish(*_args, **_kwargs):
+            self.assertEqual(self.page._setup_generation_id, "")
+            return [{"index": 0, "status": "failed", "diagnostic": "离线测试"}]
+
+        with patch(
+            "ui.douyin_commerce_page.task_service.mark_task_running"
+        ), patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.close_generation",
+            return_value={"closed": True, "aliveCollectorCount": 0},
+        ), patch.object(
+            self.page._batch_executor,
+            "run_publish",
+            side_effect=run_publish,
+        ) as executor, patch(
+            "ui.douyin_commerce_page.QMessageBox.warning"
+        ):
+            self.page.start_batch_publish(payload, {"id": 74})
+
+        executor.assert_called_once()
+        self.assertEqual(self.page._setup_generation_id, "")
 
     def test_abandon_cleanup_incomplete_retains_generation_and_choices(self) -> None:
         """放弃关闭不完整时保留安全重试所需句柄与本批选择。"""

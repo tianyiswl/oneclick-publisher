@@ -663,6 +663,7 @@ class MainWindow(QMainWindow):
         )
 
     def closeEvent(self, event) -> None:
+        self.douyin_commerce.shutdown()
         self.accounts.stop_auto_checking()
         account_browser_service.close_all_backend_sessions(wait=True)
         super().closeEvent(event)

@@ -584,6 +584,17 @@ class DouyinCommerceBatchExecutor:
                 raise DouyinCommerceBatchExecutorError("抖音上传会话未返回唯一会话标识")
             session_id = _text(upload.get("sessionId"))
 
+            baseline = self._manager.prepare_publish_settings(session_id)
+            if (
+                not isinstance(baseline, Mapping)
+                or baseline.get("status") != "clean"
+                or type(baseline.get("openLayerCount")) is not int
+                or baseline.get("openLayerCount") != 0
+            ):
+                raise DouyinCommerceBatchExecutorError(
+                    "抖音正式发布页未取得干净设置基线"
+                )
+
             selected = self._manager.select_cached_favorite_music(
                 session_id, _text(payload["selectedMusic"].get("musicId"))
             )

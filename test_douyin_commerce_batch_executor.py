@@ -40,6 +40,7 @@ class FakeCommerceSessionManager:
         verification_broker: DouyinVerificationBroker | None = None,
         location_candidates: list[dict] | None = None,
         scheduled_readback_time: str = "",
+        baseline_fail_indexes: set[int] | None = None,
     ) -> None:
         self.fail_item_indexes = fail_item_indexes or set()
         self.challenge_on_index = challenge_on_index
@@ -49,7 +50,11 @@ class FakeCommerceSessionManager:
         self.location_candidates = location_candidates
         self.location_searches: list[tuple[str, str]] = []
         self.scheduled_readback_time = scheduled_readback_time
+        self.baseline_fail_indexes = baseline_fail_indexes or set()
         self.calls: list[str] = []
+        self.ordered_calls: list[tuple[str, str]] = []
+        self.started_session_ids: list[str] = []
+        self.closed_session_ids: list[str] = []
         self.open_sessions = 0
         self.max_open_sessions = 0
         self._index_by_session: dict[str, int] = {}
@@ -59,28 +64,46 @@ class FakeCommerceSessionManager:
         if payload.get("runtimeMode") != "preflight" or payload.get("debugDryRun") is not True:
             raise AssertionError("上传必须保持预检模式")
         index = len([call for call in self.calls if call.startswith("start_upload:")])
-        session_id = f"session-{index}"
+        session_id = f"session-{index + 1}"
         self.calls.append(f"start_upload:{index}")
+        self.ordered_calls.append(
+            ("start_upload", Path(str(payload["fileList"][0])).name)
+        )
         if self.login_on_index == index:
             return {
                 "status": "needs_login",
                 "message": "登录已失效，请到账号管理重新登录",
             }
         self._index_by_session[session_id] = index
+        self.started_session_ids.append(session_id)
         self.open_sessions += 1
         self.max_open_sessions = max(self.max_open_sessions, self.open_sessions)
         return {"sessionId": session_id}
 
+    def prepare_publish_settings(self, session_id: str) -> dict:
+        index = self._index_by_session[session_id]
+        self.ordered_calls.append(("prepare_publish_settings", session_id))
+        if index in self.baseline_fail_indexes:
+            raise RuntimeError("正式发布页旧浮层未能清理")
+        return {
+            "status": "clean",
+            "sessionId": session_id,
+            "openLayerCount": 0,
+        }
+
     def select_cached_favorite_music(self, session_id: str, _music_id: str) -> dict:
         self.calls.append(f"select_music:{self._index_by_session[session_id]}")
+        self.ordered_calls.append(("select_cached_favorite_music", session_id))
         return {"musicId": "music-001", "title": "测试音乐", "creator": "测试", "duration": "01:08"}
 
     def select_content_declaration(self, session_id: str, declaration: str) -> str:
         self.calls.append(f"select_declaration:{self._index_by_session[session_id]}")
+        self.ordered_calls.append(("select_content_declaration", session_id))
         return declaration
 
     def search_locations(self, session_id: str, _keyword: str, _scope: str) -> list[dict]:
         self.calls.append(f"search_locations:{self._index_by_session[session_id]}")
+        self.ordered_calls.append(("search_locations", session_id))
         self.location_searches.append((_keyword, _scope))
         if self.location_candidates is not None:
             return self.location_candidates
@@ -94,17 +117,20 @@ class FakeCommerceSessionManager:
 
     def apply_location(self, session_id: str, location: dict) -> dict:
         self.calls.append(f"apply_location:{self._index_by_session[session_id]}")
+        self.ordered_calls.append(("apply_location", session_id))
         # 与真实会话管理器保持一致：地点回读嵌套在 location 字段中。
         return {"location": dict(location)}
 
     def sync_schedule(self, session_id: str, _payload: dict) -> dict:
         self.calls.append(f"sync_schedule:{self._index_by_session[session_id]}")
+        self.ordered_calls.append(("sync_schedule", session_id))
         return {"scheduled": False}
 
     def preflight(self, session_id: str, _payload: dict) -> dict:
         if _payload.get("runtimeMode") != "preflight" or _payload.get("debugDryRun") is not True:
             raise AssertionError("预检必须保持 dry-run")
         self.calls.append(f"preflight:{self._index_by_session[session_id]}")
+        self.ordered_calls.append(("preflight", session_id))
         return {"ok": True}
 
     def submit(
@@ -118,6 +144,7 @@ class FakeCommerceSessionManager:
             raise AssertionError("最终提交必须明确发布模式")
         index = self._index_by_session[session_id]
         self.calls.append(f"submit:{index}")
+        self.ordered_calls.append(("submit", session_id))
         if index in self.fail_item_indexes:
             raise RuntimeError(f"第 {index} 条平台回读失败")
         if self.challenge_on_index == index and not self._challenge_seen:
@@ -184,6 +211,8 @@ class FakeCommerceSessionManager:
     def close(self, session_id: str | None = None) -> None:
         if session_id is not None and session_id in self._index_by_session:
             self.calls.append(f"close:{self._index_by_session[session_id]}")
+            self.ordered_calls.append(("close", session_id))
+            self.closed_session_ids.append(session_id)
             self.open_sessions -= 1
 
     def status(self) -> dict[str, str]:
@@ -283,6 +312,89 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
             any("第 1 条平台回读失败" in event.message for event in events)
         )
         self.assertTrue(any(event.phase == "uploading" for event in events))
+
+    def test_each_video_uses_fresh_session_and_clean_baseline_before_settings(self) -> None:
+        """每条视频上传后必须先清理正式页，再按计划顺序写入设置。"""
+
+        manager = FakeCommerceSessionManager()
+
+        result = DouyinCommerceBatchExecutor(manager).run_publish(
+            self.batch, task_id=self.task["id"], confirmed=True
+        )
+
+        self.assertEqual([row["status"] for row in result], ["published"] * 3)
+        self.assertEqual(
+            manager.ordered_calls[:5],
+            [
+                ("start_upload", "a.mp4"),
+                ("prepare_publish_settings", "session-1"),
+                ("select_cached_favorite_music", "session-1"),
+                ("select_content_declaration", "session-1"),
+                ("search_locations", "session-1"),
+            ],
+        )
+        self.assertEqual(
+            manager.started_session_ids,
+            ["session-1", "session-2", "session-3"],
+        )
+        self.assertEqual(
+            manager.closed_session_ids,
+            ["session-1", "session-2", "session-3"],
+        )
+
+    def test_baseline_cleanup_failure_closes_item_without_applying_settings(self) -> None:
+        """基线清理异常只能将本条记为失败，关闭会话后按既有策略继续。"""
+
+        manager = FakeCommerceSessionManager(baseline_fail_indexes={0})
+
+        result = DouyinCommerceBatchExecutor(manager).run_publish(
+            self.batch, task_id=self.task["id"], confirmed=True
+        )
+
+        self.assertEqual(
+            [row["status"] for row in result],
+            ["failed", "published", "published"],
+        )
+        self.assertEqual(result[0]["diagnostic"], "正式发布页旧浮层未能清理")
+        self.assertEqual(
+            [
+                call
+                for call in manager.ordered_calls
+                if call[1] == "session-1"
+            ],
+            [
+                ("prepare_publish_settings", "session-1"),
+                ("close", "session-1"),
+            ],
+        )
+        self.assertEqual(manager.started_session_ids[:2], ["session-1", "session-2"])
+        self.assertEqual(manager.closed_session_ids[:2], ["session-1", "session-2"])
+
+    def test_clean_status_with_open_layer_is_rejected_as_dirty_baseline(self) -> None:
+        """status=clean 不足以放行，仍有浮层时不得写入或记 published。"""
+
+        class OpenLayerBaselineManager(FakeCommerceSessionManager):
+            def prepare_publish_settings(self, session_id: str) -> dict:
+                result = super().prepare_publish_settings(session_id)
+                if session_id == "session-1":
+                    result["openLayerCount"] = 1
+                return result
+
+        manager = OpenLayerBaselineManager()
+
+        result = DouyinCommerceBatchExecutor(manager).run_publish(
+            self.batch, task_id=self.task["id"], confirmed=True
+        )
+
+        self.assertEqual(result[0]["status"], "failed")
+        self.assertEqual(
+            result[0]["diagnostic"], "抖音正式发布页未取得干净设置基线"
+        )
+        self.assertNotIn(
+            ("select_cached_favorite_music", "session-1"), manager.ordered_calls
+        )
+        self.assertIn(("close", "session-1"), manager.ordered_calls)
+        self.assertNotIn(("submit", "session-1"), manager.ordered_calls)
 
     def test_ambiguous_post_submit_readback_pauses_before_next_video(self) -> None:
         """点击最终提交后无法回读时，不能当成普通失败继续提交后续视频。"""
