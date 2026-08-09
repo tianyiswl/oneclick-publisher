@@ -1132,7 +1132,10 @@ class DouyinCommerceCollectorManager:
                         "cleanup_incomplete"
                     )
                     raise DouyinCommerceCollectorError(
-                        "cleanup_incomplete"
+                        "cleanup_incomplete",
+                        generation_id=generation_id,
+                        collector_type=collector_type.value,
+                        collector_instance_id=expected_instance_id,
                     ) from None
                 if not still_owns_current_slot:
                     if (
@@ -1538,7 +1541,9 @@ class DouyinCommerceCollectorManager:
             event_emitted=error.event_emitted,
             generation_id=generation_id,
             collector_type=collector_type.value,
-            collector_instance_id=action_instance_id,
+            collector_instance_id=(
+                error.collector_instance_id or action_instance_id
+            ),
         )
 
     def _mark_failed(

@@ -5011,6 +5011,11 @@ class DouyinCommercePage(QWidget):
             return
         if _normalized(status.get("setupGenerationId")) != generation_id:
             return
+        if _normalized(status.get("generationState")) not in {
+            "collecting",
+            "ready",
+        }:
+            return
         current_instance = _normalized(
             self._collector_detail(status, collector_type).get("instanceId")
         )
@@ -5049,6 +5054,11 @@ class DouyinCommercePage(QWidget):
         except Exception:
             return
         if _normalized(status.get("setupGenerationId")) != generation_id:
+            return
+        if _normalized(status.get("generationState")) not in {
+            "collecting",
+            "ready",
+        }:
             return
         current_instance = _normalized(
             self._collector_detail(status, collector_type).get("instanceId")

@@ -871,6 +871,98 @@ class DouyinCommerceCollectorManagerTests(unittest.TestCase):
         close_thread.join(timeout=1)
         self.assertTrue(outcome["closed"]["closed"])
 
+    def test_music_login_error_arriving_after_cancel_keeps_same_action_instance(self):
+        """音乐懒启动阻塞后取消代际，迟到登录错误仍携带原动作实例。"""
+
+        self._assert_late_login_after_generation_close(
+            collector_type="favorite_music",
+            close_reason="abandoned",
+            expected_generation_state="cancelling",
+        )
+
+    def test_local_login_error_arriving_after_publish_close_keeps_same_action_instance(self):
+        """本地点懒启动阻塞后发布关闭，迟到登录错误仍携带原动作实例。"""
+
+        self._assert_late_login_after_generation_close(
+            collector_type="local_location",
+            close_reason="publish_completed",
+            expected_generation_state="closing_collectors",
+        )
+
+    def _assert_late_login_after_generation_close(
+        self,
+        *,
+        collector_type: str,
+        close_reason: str,
+        expected_generation_state: str,
+    ) -> None:
+        generation_id = self.manager.begin_generation(self.upload_payload)[
+            "setupGenerationId"
+        ]
+        self.factory.block_start_ids.add(2)
+        self.factory.start_result_overrides[2] = {
+            "status": "needs_login",
+            "message": "登录已失效，请到账号管理重新登录",
+        }
+        outcome: dict[str, object] = {}
+        action = (
+            (lambda: self.manager.refresh_favorite_music(generation_id))
+            if collector_type == "favorite_music"
+            else (
+                lambda: self.manager.search_locations(
+                    generation_id, "夜南香", "local"
+                )
+            )
+        )
+        action_thread = threading.Thread(
+            target=lambda: self._capture_call(outcome, "action", action)
+        )
+        action_thread.start()
+        for _ in range(100):
+            if len(self.factory.instances) >= 2:
+                break
+            time.sleep(0.01)
+        blocked_manager = self.factory.instances[1]
+        self.assertTrue(blocked_manager.start_started.wait(timeout=1))
+        expected_instance_id = self.manager.status(generation_id)[
+            "collectorInstanceIds"
+        ][collector_type]
+
+        close_thread = threading.Thread(
+            target=lambda: self._capture_call(
+                outcome,
+                "close",
+                lambda: self.manager.close_generation(
+                    generation_id, reason=close_reason
+                ),
+            )
+        )
+        close_thread.start()
+        for _ in range(100):
+            status = self.manager.status(generation_id)
+            if status["generationState"] == expected_generation_state:
+                break
+            time.sleep(0.01)
+        self.assertEqual(status["generationState"], expected_generation_state)
+        self.assertEqual(
+            status["collectorInstanceIds"][collector_type],
+            expected_instance_id,
+        )
+
+        blocked_manager.release_start.set()
+        action_thread.join(timeout=1)
+        close_thread.join(timeout=1)
+
+        self.assertFalse(action_thread.is_alive())
+        self.assertFalse(close_thread.is_alive())
+        error = outcome["action_error"]
+        self.assertEqual(str(error), "login_required")
+        self.assertEqual(
+            error.to_public_action_result()["collectorInstanceId"],
+            expected_instance_id,
+        )
+        self.assertTrue(outcome["close"]["closed"])
+
     @staticmethod
     def _capture_call(
         outcome: dict[str, object],
@@ -1216,6 +1308,56 @@ class DouyinCommerceCollectorManagerTests(unittest.TestCase):
         self.assertEqual(after["local_location"], before["local_location"])
         self.assertEqual(self.factory.instances[1].close_calls, ["session-2"])
         self.assertEqual(len(self.factory.instances), 3)
+
+    def test_retry_old_cleanup_failure_envelope_uses_expected_old_instance(self):
+        """retry 旧实例清理失败必须匹配仍存活的旧槽，不能绑定预留新实例。"""
+
+        generation_id = self.manager.begin_generation(self.upload_payload)[
+            "setupGenerationId"
+        ]
+        before = self.manager.status(generation_id)
+        old_instance_id = before["collectorInstanceIds"]["domestic_location"]
+        self.factory.instances[0].close_failures_remaining = 1
+
+        with self.assertRaises(DouyinCommerceCollectorError) as raised:
+            self.manager.retry_collector(generation_id, "domestic_location")
+
+        result = raised.exception.to_public_action_result()
+        self.assertEqual(result["errorCode"], "cleanup_incomplete")
+        self.assertEqual(result["collectorInstanceId"], old_instance_id)
+        status = self.manager.status(generation_id)
+        self.assertEqual(
+            status["collectorInstanceIds"]["domestic_location"],
+            old_instance_id,
+        )
+        self.assertEqual(status["collectors"]["domestic_location"], "failed")
+
+    def test_retry_new_start_failure_envelope_uses_reserved_new_instance(self):
+        """旧实例全关后，新启动失败必须绑定已进入启动阶段的预留新实例。"""
+
+        generation_id = self.manager.begin_generation(self.upload_payload)[
+            "setupGenerationId"
+        ]
+        old_instance_id = self.manager.status(generation_id)[
+            "collectorInstanceIds"
+        ]["domestic_location"]
+        self.factory.errors_by_id[2] = RuntimeError(
+            "Cookie=secret DOM=<html>private</html>"
+        )
+
+        with self.assertRaises(DouyinCommerceCollectorError) as raised:
+            self.manager.retry_collector(generation_id, "domestic_location")
+
+        result = raised.exception.to_public_action_result()
+        self.assertEqual(result["errorCode"], "collector_start_failed")
+        self.assertTrue(result["collectorInstanceId"])
+        self.assertNotEqual(result["collectorInstanceId"], old_instance_id)
+        status = self.manager.status(generation_id)
+        self.assertEqual(
+            status["collectorInstanceIds"]["domestic_location"],
+            result["collectorInstanceId"],
+        )
+        self.assertEqual(status["collectors"]["domestic_location"], "failed")
 
     def test_generation_close_reuses_retry_owned_blocking_close(self):
         generation_id = self.manager.begin_generation(self.upload_payload)[

@@ -7724,6 +7724,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.page._setup_generation_id = "generation-a"
         self.page._collector_action_tokens["local_location"] = 7
         current = self._collector_status(local="active")
+        current["generationState"] = "ready"
         self.page._render_collector_status(current)
         login_required = {
             "ok": False,
@@ -7773,6 +7774,95 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         handle_login.assert_not_called()
         self.assertEqual(self.page.music_collector_status.text(), "收藏音乐：可用")
         self.assertTrue(self.page.retry_collector_button.isHidden())
+
+    def test_music_login_required_during_cancelling_generation_is_discarded(self) -> None:
+        """音乐登录错误到达时若代际已取消，不得清选择或切到账号管理。"""
+
+        self.page._setup_generation_id = "generation-a"
+        self.page._collector_action_tokens["favorite_music"] = 4
+        self.page._selected_music = {"musicId": "music-1", "title": "收藏歌"}
+        self.page._batch_locations = {"/tmp/a.mp4": {"poiId": "poi-1"}}
+        self.page.pages.setCurrentIndex(1)
+        closing = self._collector_status(music="active")
+        closing["generationState"] = "cancelling"
+        login_required = {
+            "ok": False,
+            "errorCode": "login_required",
+            "setupGenerationId": "generation-a",
+            "collectorType": "favorite_music",
+            "collectorInstanceId": "music-a",
+        }
+
+        with patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.status",
+            return_value=closing,
+        ), patch.object(self.page, "_handle_login_required") as handle_login:
+            self.page._collector_action_failed(
+                "generation-a", "favorite_music", 4, login_required
+            )
+
+        handle_login.assert_not_called()
+        self.assertEqual(self.page._selected_music["musicId"], "music-1")
+        self.assertEqual(self.page._batch_locations["/tmp/a.mp4"]["poiId"], "poi-1")
+        self.assertEqual(self.page.pages.currentIndex(), 1)
+
+    def test_local_login_required_during_closing_collectors_is_discarded(self) -> None:
+        """本地点登录错误到达时若采集器正在关闭，不得清选择或切页。"""
+
+        self.page._setup_generation_id = "generation-a"
+        self.page._collector_action_tokens["local_location"] = 7
+        self.page._selected_music = {"musicId": "music-1", "title": "收藏歌"}
+        self.page._batch_locations = {"/tmp/a.mp4": {"poiId": "poi-1"}}
+        self.page.pages.setCurrentIndex(1)
+        closing = self._collector_status(local="active")
+        closing["generationState"] = "closing_collectors"
+        login_required = {
+            "ok": False,
+            "errorCode": "login_required",
+            "setupGenerationId": "generation-a",
+            "collectorType": "local_location",
+            "collectorInstanceId": "local-a",
+        }
+
+        with patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.status",
+            return_value=closing,
+        ), patch.object(self.page, "_handle_login_required") as handle_login:
+            self.page._collector_action_failed(
+                "generation-a", "local_location", 7, login_required
+            )
+
+        handle_login.assert_not_called()
+        self.assertEqual(self.page._selected_music["musicId"], "music-1")
+        self.assertEqual(self.page._batch_locations["/tmp/a.mp4"]["poiId"], "poi-1")
+        self.assertEqual(self.page.pages.currentIndex(), 1)
+
+    def test_retry_cleanup_failure_for_current_old_instance_is_visible(self) -> None:
+        """retry 旧实例关闭失败应显示固定失败并保留单槽重试入口。"""
+
+        self.page._setup_generation_id = "generation-a"
+        self.page._collector_action_tokens["domestic_location"] = 3
+        current = self._collector_status(domestic="failed")
+        self.page._render_collector_status(current)
+        cleanup_failed = {
+            "ok": False,
+            "errorCode": "cleanup_incomplete",
+            "setupGenerationId": "generation-a",
+            "collectorType": "domestic_location",
+            "collectorInstanceId": "domestic-a",
+        }
+
+        with patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.status",
+            return_value=current,
+        ):
+            self.page._collector_action_failed(
+                "generation-a", "domestic_location", 3, cleanup_failed
+            )
+
+        self.assertIn("cleanup_incomplete", self.page.domestic_collector_status.text())
+        self.assertFalse(self.page.retry_collector_button.isHidden())
+        self.assertEqual(self.page.retry_collector_button.text(), "重试国内地点")
 
     def test_setup_generation_login_required_routes_to_account_management(self) -> None:
         """真实 manager 固定登录错误必须进入既有账号管理流程。"""
