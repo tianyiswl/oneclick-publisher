@@ -69,10 +69,29 @@ _ERROR_CODES = frozenset(
         "challenge_required",
     }
 )
-_SHORT_HASH = re.compile(r"[0-9a-f]{12}")
+_DIAGNOSTIC_PHASES = frozenset({"result", "queue", "cleanup"})
+_DIAGNOSTIC_ACTIONS = frozenset(
+    {
+        "refresh_favorite_music",
+        "search_locations",
+        "retry_collector",
+        "close_generation",
+    }
+)
+_DIAGNOSTIC_OUTCOMES = frozenset({"success", "failed", "discarded"})
 _ACCOUNT_MASK = re.compile(r"account-\d+")
 _ABSOLUTE_PATH = re.compile(
     r"(?i)(?:[a-z]:[\\/]|/)(?:[^\s,;|\"'<>]+[\\/]?)+"
+)
+_UUID = re.compile(
+    r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+    r"[0-9a-f]{4}-[0-9a-f]{12}\b"
+)
+_HTML_TAG = re.compile(r"<[^<>]+>")
+_COOKIE_KEY_VALUE = re.compile(
+    r"(?i)(?:^|[;\s])(?:ttwid|passport_csrf(?:_token)?|"
+    r"(?:session|sid|uid|odin|ms)[a-z0-9_-]*|"
+    r"[a-z0-9_-]*(?:token|cookie|csrf)[a-z0-9_-]*)\s*="
 )
 _SENSITIVE_TEXT = re.compile(
     r"(?i)(?:access[_-]?token|cookie|token|html|dom|selector|"
@@ -193,20 +212,28 @@ def _short_hash(value: object) -> str:
 
 
 def _safe_short_hash(value: object) -> str:
-    if type(value) is not str or not value:
-        return ""
-    if _SHORT_HASH.fullmatch(value):
-        return value
     return _short_hash(value)
 
 
 def _safe_report_text(value: object, *, limit: int = 80) -> str:
     if type(value) is not str:
         return ""
-    text = value[:limit]
-    if _ABSOLUTE_PATH.search(text) or _SENSITIVE_TEXT.search(text):
+    if (
+        _ABSOLUTE_PATH.search(value)
+        or _UUID.search(value)
+        or _HTML_TAG.search(value)
+        or _COOKIE_KEY_VALUE.search(value)
+        or _SENSITIVE_TEXT.search(value)
+    ):
         return "<redacted>"
-    return text
+    return value[:limit]
+
+
+def _safe_structural_value(
+    value: object,
+    allowed: frozenset[str],
+) -> str:
+    return value if type(value) is str and value in allowed else "unknown"
 
 
 def _safe_cleanup_result(value: object) -> str:
@@ -266,8 +293,12 @@ def _sanitize_diagnostics(rows: object) -> list[dict[str, object]]:
                     and _ACCOUNT_MASK.fullmatch(row.get("accountMaskedId"))
                     else "account-redacted"
                 ),
-                "phase": _safe_report_text(row.get("phase"), limit=40),
-                "action": _safe_report_text(row.get("action"), limit=60),
+                "phase": _safe_structural_value(
+                    row.get("phase"), _DIAGNOSTIC_PHASES
+                ),
+                "action": _safe_structural_value(
+                    row.get("action"), _DIAGNOSTIC_ACTIONS
+                ),
                 "scope": (
                     row.get("scope")
                     if row.get("scope") in {"", "domestic", "local"}
@@ -287,7 +318,9 @@ def _sanitize_diagnostics(rows: object) -> list[dict[str, object]]:
                     if type(row.get("durationMs")) is int
                     else 0
                 ),
-                "outcome": _safe_report_text(row.get("outcome"), limit=20),
+                "outcome": _safe_structural_value(
+                    row.get("outcome"), _DIAGNOSTIC_OUTCOMES
+                ),
                 "errorCode": _safe_error_code(row.get("errorCode")),
                 "cleanupResult": _safe_cleanup_result(row.get("cleanupResult")),
             }

@@ -3385,6 +3385,144 @@ class DouyinCommerceCollectorVerifierTests(unittest.TestCase):
         "filePath": "private-account-state.json",
     }
 
+    def _persist_diagnostic_report(
+        self,
+        diagnostic: dict[str, object],
+        *,
+        generation_id: str = "generation-safe",
+        instance_id: str = "instance-safe",
+    ) -> tuple[str, dict[str, object]]:
+        report = {
+            "accountMaskedId": "account-31",
+            "actionIntervalMs": 800,
+            "generations": [
+                {
+                    "generation": "A",
+                    "order": "music-domestic-local",
+                    "ending": "normal",
+                    "outcome": "completed",
+                    "stopReason": "",
+                    "generationIdHash": generation_id,
+                    "collectorInstanceHashes": {
+                        "domestic_location": instance_id,
+                    },
+                    "candidateCounts": {},
+                    "diagnostics": [diagnostic],
+                    "closeResult": {
+                        "closed": True,
+                        "aliveCollectorCount": 0,
+                        "cleanupResults": {},
+                    },
+                }
+            ],
+            "stopReason": "",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report_path = Path(temp_dir) / "diagnostic-report.json"
+            _write_report(report_path, report)
+            report_text = report_path.read_text(encoding="utf-8")
+        return report_text, json.loads(report_text)
+
+    def test_report_writer_rejects_uuid_in_structural_phase_field(self):
+        secret_uuid = "123e4567-e89b-12d3-a456-426614174000"
+
+        report_text, report = self._persist_diagnostic_report(
+            {
+                "phase": secret_uuid,
+                "action": "search_locations",
+                "outcome": "private-outcome-secret",
+            }
+        )
+
+        diagnostic = report["generations"][0]["diagnostics"][0]
+        self.assertNotIn(secret_uuid, report_text)
+        self.assertNotIn("private-outcome-secret", report_text)
+        self.assertEqual(diagnostic["phase"], "unknown")
+        self.assertEqual(diagnostic["outcome"], "unknown")
+
+    def test_report_writer_redacts_unlabelled_cookie_key_values(self):
+        cookie_secret = "ttwid=private-ttwid; passport_csrf=private-csrf"
+
+        report_text, report = self._persist_diagnostic_report(
+            {
+                "phase": "result",
+                "action": "search_locations",
+                "keyword": cookie_secret,
+                "outcome": "success",
+            }
+        )
+
+        diagnostic = report["generations"][0]["diagnostics"][0]
+        self.assertNotIn("private-ttwid", report_text)
+        self.assertNotIn("private-csrf", report_text)
+        self.assertEqual(diagnostic["keyword"], "<redacted>")
+
+    def test_report_writer_redacts_uuid_in_readable_keyword(self):
+        secret_uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+        report_text, report = self._persist_diagnostic_report(
+            {
+                "phase": "result",
+                "action": "search_locations",
+                "keyword": secret_uuid,
+                "outcome": "success",
+            }
+        )
+
+        diagnostic = report["generations"][0]["diagnostics"][0]
+        self.assertNotIn(secret_uuid, report_text)
+        self.assertEqual(diagnostic["keyword"], "<redacted>")
+
+    def test_report_writer_rejects_html_tag_in_structural_action_field(self):
+        html_secret = '<input value="private-node-secret">'
+
+        report_text, report = self._persist_diagnostic_report(
+            {
+                "phase": "result",
+                "action": html_secret,
+                "outcome": "success",
+            }
+        )
+
+        diagnostic = report["generations"][0]["diagnostics"][0]
+        self.assertNotIn("private-node-secret", report_text)
+        self.assertEqual(diagnostic["action"], "unknown")
+
+    def test_report_writer_rehashes_twelve_hex_character_ids(self):
+        report_text, report = self._persist_diagnostic_report(
+            {
+                "requestIdHash": "111111111111",
+                "setupGenerationIdHash": "222222222222",
+                "collectorInstanceIdHash": "333333333333",
+                "phase": "result",
+                "action": "search_locations",
+                "outcome": "success",
+            },
+            generation_id="0123456789ab",
+            instance_id="abcdef123456",
+        )
+
+        for raw_id in (
+            "0123456789ab",
+            "abcdef123456",
+            "111111111111",
+            "222222222222",
+            "333333333333",
+        ):
+            self.assertNotIn(raw_id, report_text)
+        generation = report["generations"][0]
+        diagnostic = generation["diagnostics"][0]
+        self.assertEqual(generation["generationIdHash"], "d407ad901895")
+        self.assertEqual(
+            generation["collectorInstanceHashes"]["domestic_location"],
+            "da4ec3358a10",
+        )
+        self.assertEqual(diagnostic["requestIdHash"], "a18ac4e6fbd3")
+        self.assertEqual(diagnostic["setupGenerationIdHash"], "76eb17a8fb17")
+        self.assertEqual(
+            diagnostic["collectorInstanceIdHash"], "5080b6ee794e"
+        )
+
     def test_execute_rejects_duplicate_three_field_accounts_before_file_path_validation(self):
         manager = FakeVerificationManager()
         duplicate_accounts = [
