@@ -143,6 +143,12 @@ class WindowsBuildTests(unittest.TestCase):
         self.assertIn("COLLECT(", spec)
         self.assertNotIn("BUNDLE(", spec)
 
+    def test_windows_spec_bundles_assets_including_probe_not_demo_runtime(self) -> None:
+        spec = render_spec(Path(r"C:\\work\\oneclick"))
+
+        self.assertIn('"ui/assets"', spec)
+        self.assertNotIn("demo-runtime", spec)
+
     def test_windows_build_requirements_include_timezone_database(self) -> None:
         requirements = (
             Path(__file__).resolve().parent / "requirements-oneclick.txt"

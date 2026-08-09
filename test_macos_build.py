@@ -8,7 +8,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tools.build_macos import bundle_playwright_browsers, resolve_playwright_browser_dirs
+from tools.build_macos import (
+    bundle_playwright_browsers,
+    resolve_playwright_browser_dirs,
+    write_spec,
+)
 
 
 class MacOSBuildTests(unittest.TestCase):
@@ -77,6 +81,15 @@ class MacOSBuildTests(unittest.TestCase):
 
             copied = target_root / "chromium-1223" / "chrome-mac-arm64" / "chrome"
             self.assertEqual(copied.read_bytes(), b"browser")
+
+    def test_macos_spec_bundles_assets_including_probe_not_demo_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            spec_path = Path(temp_dir) / "YiJianFa.spec"
+            write_spec(spec_path, Path(temp_dir) / "app.icns")
+            spec = spec_path.read_text(encoding="utf-8")
+
+        self.assertIn('"ui/assets"', spec)
+        self.assertNotIn("demo-runtime", spec)
 
 
 if __name__ == "__main__":

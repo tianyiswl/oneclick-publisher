@@ -39,6 +39,22 @@ def poster(path: Path, title: str, subtitle: str, accent: str) -> None:
     image.save(path, quality=95)
 
 
+def create_douyin_commerce_probe() -> Path:
+    """生成打包使用的固定无声探针视频，不含任何用户业务信息。"""
+
+    probe = ROOT / "ui" / "assets" / "douyin-commerce-probe.mp4"
+    probe.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        "ffmpeg", "-y",
+        "-f", "lavfi", "-i", "color=c=0x17304d:s=360x640:r=15",
+        "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+        "-t", "1", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-shortest", "-movflags", "+faststart", str(probe),
+    ]
+    subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return probe
+
+
 def main() -> None:
     OUTPUT.mkdir(parents=True, exist_ok=True)
     posters = {
@@ -57,6 +73,7 @@ def main() -> None:
         "-c:v", "libx264", "-c:a", "aac", "-shortest", str(video),
     ]
     subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    create_douyin_commerce_probe()
     print(OUTPUT)
 
 
