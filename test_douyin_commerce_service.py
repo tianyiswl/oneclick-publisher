@@ -1898,6 +1898,52 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await browser.close()
 
+    async def test_local_location_list_keeps_complete_results_beside_helper_option(self) -> None:
+        """本地列表含无地址辅助项时，仍应读取同面板内的完整官方地点。"""
+
+        html = """
+        <main id="editor-root">
+          <div data-oneclick-commerce-store="active">输入地理位置</div>
+          <section id="location-portal">
+            <nav><button>本地</button><button>国内</button></nav>
+            <input id="location-input" value="夜南香">
+            <div id="local-results" role="listbox">
+              <div role="option">不展示地理位置</div>
+              <div role="option">
+                <div class="name-local">夜南香北京烤鸭（万泉城店）</div>
+                <div class="address-local">广西壮族自治区北海市银海区银滩大道 1 号</div>
+              </div>
+            </div>
+          </section>
+        </main>
+        """
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+                await douyin_commerce_service._visible_commerce_search_input(page)
+
+                listbox = await douyin_commerce_service._visible_store_listbox(page)
+
+                self.assertIsNotNone(listbox)
+                self.assertEqual(await listbox.get_attribute("id"), "local-results")
+                rows = await douyin_commerce_service._store_option_descriptors(listbox)
+                candidates = douyin_commerce_service.normalize_commerce_location_candidates(
+                    rows
+                )
+                self.assertEqual(len(candidates), 1)
+                self.assertEqual(
+                    candidates[0]["name"],
+                    "夜南香北京烤鸭（万泉城店）",
+                )
+                self.assertEqual(
+                    candidates[0]["address"],
+                    "广西壮族自治区北海市银海区银滩大道 1 号",
+                )
+            finally:
+                await browser.close()
+
 
 class DouyinCommerceMusicRuleTests(unittest.TestCase):
     def test_only_visible_favorite_modes_are_accepted(self) -> None:

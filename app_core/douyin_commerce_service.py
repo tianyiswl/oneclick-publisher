@@ -1436,8 +1436,9 @@ async def _visible_store_listbox(page) -> Any | None:
     """只读定位当前已展开的唯一带货位置/门店候选列表。
 
     新版页面会把“名称、完整地址、商品/返佣摘要”直接放在同一个结果项中，
-    不保证 class 名称稳定。因此除了已有的结构化 data/class 标识外，也只接受
-    至少包含完整地址特征的可见 option；标签菜单等只有短文本的下拉不会匹配。
+    不保证 class 名称稳定。本地范围还可能在同一列表中附带“无地理位置”等
+    无地址辅助项，因此只要求列表至少存在一个完整地点；后续逐项规范化仍会
+    丢弃无地址项。标签菜单等只有短文本的下拉仍不会匹配。
     """
 
     result = await page.evaluate(
@@ -1469,7 +1470,7 @@ async def _visible_store_listbox(page) -> Any | None:
                     .filter(list => {
                         const options = Array.from(list.querySelectorAll(':scope > [role="option"]'))
                             .filter(visible);
-                        return options.length > 0 && options.every(option => {
+                        return options.length > 0 && options.some(option => {
                             const row = descriptor(option);
                             return row.name && row.address && looksAddress(row.address);
                         });
