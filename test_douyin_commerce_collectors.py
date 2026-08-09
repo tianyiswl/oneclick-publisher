@@ -40,6 +40,7 @@ class FakeSessionManager:
         self.location_started = threading.Event()
         self.release_refresh: threading.Event | None = None
         self.release_location: threading.Event | None = None
+        self.refresh_error: Exception | None = None
         self.search_error: Exception | None = None
         self.location_result_override: object | None = None
         self.close_failures_remaining = 0
@@ -66,6 +67,8 @@ class FakeSessionManager:
         self.refresh_started.set()
         if self.release_refresh is not None:
             self.release_refresh.wait(timeout=2)
+        if self.refresh_error is not None:
+            raise self.refresh_error
         return [
             {
                 "musicId": f"music-{self.manager_id}",
@@ -168,6 +171,25 @@ class ExitGateLock:
 
 
 class DouyinCommerceCollectorManagerTests(unittest.TestCase):
+    _DIAGNOSTIC_FIELDS = {
+        "timestamp",
+        "requestId",
+        "setupGenerationId",
+        "collectorType",
+        "collectorInstanceId",
+        "accountMaskedId",
+        "phase",
+        "action",
+        "scope",
+        "keyword",
+        "attempt",
+        "candidateCount",
+        "durationMs",
+        "outcome",
+        "errorCode",
+        "cleanupResult",
+    }
+
     def setUp(self) -> None:
         self.factory = FakeManagerFactory()
         self.events: list[dict[str, object]] = []
@@ -196,6 +218,214 @@ class DouyinCommerceCollectorManagerTests(unittest.TestCase):
             self.manager.close_generation(reason="test_cleanup")
         except Exception:
             pass
+
+    def assert_complete_diagnostic(self, event: Mapping[str, object]) -> None:
+        self.assertEqual(set(event), self._DIAGNOSTIC_FIELDS)
+        self.assertTrue(event["timestamp"])
+        self.assertTrue(event["requestId"])
+        self.assertTrue(event["setupGenerationId"])
+        self.assertTrue(event["collectorInstanceId"])
+        self.assertEqual(event["accountMaskedId"], "account-31")
+        self.assertIs(type(event["attempt"]), int)
+        self.assertIs(type(event["candidateCount"]), int)
+        self.assertIs(type(event["durationMs"]), int)
+
+    def test_recent_diagnostics_records_successful_domestic_search(self):
+        generation_id = self.manager.begin_generation(self.upload_payload)[
+            "setupGenerationId"
+        ]
+
+        self.manager.search_locations(generation_id, "侨港风情街", "domestic")
+
+        event = self.manager.recent_diagnostics(generation_id)[-1]
+        self.assert_complete_diagnostic(event)
+        self.assertEqual(event["collectorType"], "domestic_location")
+        self.assertEqual(event["action"], "search_locations")
+        self.assertEqual(event["scope"], "domestic")
+        self.assertEqual(event["keyword"], "侨港风情街")
+        self.assertEqual(event["attempt"], 1)
+        self.assertEqual(event["candidateCount"], 1)
+        self.assertEqual(event["outcome"], "success")
+        self.assertEqual(event["errorCode"], "collector_unknown")
+
+    def test_empty_location_candidates_use_fixed_error_and_diagnostic(self):
+        generation_id = self.manager.begin_generation(self.upload_payload)[
+            "setupGenerationId"
+        ]
+        self.factory.instances[0].location_result_override = []
+
+        with self.assertRaises(DouyinCommerceCollectorError) as raised:
+            self.manager.search_locations(generation_id, "夜南香", "domestic")
+
+        self.assertEqual(str(raised.exception), "candidate_empty")
+        event = self.manager.recent_diagnostics(generation_id)[-1]
+        self.assert_complete_diagnostic(event)
+        self.assertEqual(event["candidateCount"], 0)
+        self.assertEqual(event["outcome"], "failed")
+        self.assertEqual(event["errorCode"], "candidate_empty")
+
+    def test_music_failure_is_classified_and_only_safe_detail_reaches_log(self):
+        generation_id = self.manager.begin_generation(self.upload_payload)[
+            "setupGenerationId"
+        ]
+        self.manager.refresh_favorite_music(generation_id)
+        self.factory.instances[1].refresh_error = RuntimeError(
+            "candidate panel missing cookiesFile/account.json "
+            "验证码123456 Cookie=secret DOM=<html>" + "private" * 80
+        )
+
+        with self.assertLogs(
+            "app_core.douyin_commerce_collectors", level="WARNING"
+        ) as captured, self.assertRaises(DouyinCommerceCollectorError) as raised:
+            self.manager.refresh_favorite_music(generation_id)
+
+        self.assertEqual(str(raised.exception), "candidate_panel_missing")
+        self.assertIsNone(raised.exception.__cause__)
+        event = self.manager.recent_diagnostics(generation_id)[-1]
+        self.assert_complete_diagnostic(event)
+        self.assertEqual(event["collectorType"], "favorite_music")
+        self.assertEqual(event["action"], "refresh_favorite_music")
+        self.assertEqual(event["outcome"], "failed")
+        self.assertEqual(event["errorCode"], "candidate_panel_missing")
+        combined = "\n".join(captured.output) + repr(
+            self.manager.recent_diagnostics(generation_id)
+        )
+        for secret in (
+            "cookiesFile/account.json",
+            "123456",
+            "secret",
+            "<html>",
+            "privateprivate",
+        ):
+            self.assertNotIn(secret, combined)
+        lowered = combined.casefold()
+        for marker in ("cookie=", "token=", "dom=", "<html"):
+            self.assertNotIn(marker, lowered)
+        self.assertIn("candidate_panel_missing", combined)
+        safe_detail = self.manager._safe_diagnostic_detail(
+            "/Users/andy/private/cookiesFile/account.json 验证码123456 "
+            "Token=private DOM=<html> SessionId=session-secret " + "x" * 400
+        )
+        self.assertLessEqual(len(safe_detail), 180)
+        self.assertNotIn("/Users/andy/private", safe_detail)
+        self.assertNotIn("123456", safe_detail)
+        self.assertNotIn("验证码", safe_detail)
+        self.assertNotIn("token=", safe_detail.casefold())
+        self.assertNotIn("dom=", safe_detail.casefold())
+        self.assertNotIn("session", safe_detail.casefold())
+
+    def test_local_retry_records_attempt_and_cleanup_result(self):
+        generation_id = self.manager.begin_generation(self.upload_payload)[
+            "setupGenerationId"
+        ]
+        self.manager.search_locations(generation_id, "夜南香", "local")
+
+        self.manager.retry_collector(generation_id, "local_location")
+
+        event = self.manager.recent_diagnostics(generation_id)[-1]
+        self.assert_complete_diagnostic(event)
+        self.assertEqual(event["collectorType"], "local_location")
+        self.assertEqual(event["action"], "retry_collector")
+        self.assertEqual(event["scope"], "local")
+        self.assertEqual(event["attempt"], 2)
+        self.assertEqual(event["outcome"], "success")
+        self.assertEqual(event["cleanupResult"], "closed")
+
+    def test_stale_result_and_incomplete_close_are_diagnosed(self):
+        generation_id = self.manager.begin_generation(self.upload_payload)[
+            "setupGenerationId"
+        ]
+        self.manager.refresh_favorite_music(generation_id)
+        domestic = self.factory.instances[0]
+        domestic.location_result_override = []
+        domestic.release_location = threading.Event()
+        outcome: dict[str, object] = {}
+        search_thread = threading.Thread(
+            target=lambda: self._capture_call(
+                outcome,
+                "search",
+                lambda: self.manager.search_locations(
+                    generation_id, "侨港风情街", "domestic"
+                ),
+            )
+        )
+        search_thread.start()
+        self.assertTrue(domestic.location_started.wait(timeout=1))
+        with self.manager._state_lock:
+            self.manager._runtime.generation.collectors[
+                CollectorType.DOMESTIC_LOCATION
+            ].instance_id = "replacement-instance"
+        domestic.release_location.set()
+        search_thread.join(timeout=1)
+
+        stale = self.manager.recent_diagnostics(generation_id)[-1]
+        self.assert_complete_diagnostic(stale)
+        self.assertEqual(stale["outcome"], "discarded")
+        self.assertEqual(stale["errorCode"], "stale_result_discarded")
+
+        self.factory.instances[1].close_failures_remaining = 1
+        closed = self.manager.close_generation(generation_id, reason="cancelled")
+
+        self.assertFalse(closed["closed"])
+        cleanup = [
+            event
+            for event in self.manager.recent_diagnostics(generation_id, limit=200)
+            if event["action"] == "close_generation"
+            and event["collectorType"] == "favorite_music"
+        ][-1]
+        self.assert_complete_diagnostic(cleanup)
+        self.assertEqual(cleanup["phase"], "cleanup")
+        self.assertEqual(cleanup["outcome"], "failed")
+        self.assertEqual(cleanup["errorCode"], "cleanup_incomplete")
+        self.assertEqual(cleanup["cleanupResult"], "cleanup_incomplete")
+
+    def test_recent_diagnostics_keeps_only_current_generation_last_200(self):
+        first_generation = self.manager.begin_generation(self.upload_payload)[
+            "setupGenerationId"
+        ]
+        for index in range(205):
+            self.manager.search_locations(
+                first_generation, f"国内地点{index}", "domestic"
+            )
+
+        retained = self.manager.recent_diagnostics(first_generation, limit=999)
+        self.assertEqual(len(retained), 200)
+        self.assertEqual(retained[0]["keyword"], "国内地点5")
+
+        second_generation = self.manager.begin_generation(self.upload_payload)[
+            "setupGenerationId"
+        ]
+
+        self.assertEqual(self.manager.recent_diagnostics(first_generation), [])
+        self.assertEqual(self.manager.recent_diagnostics(second_generation), [])
+
+    def test_error_classification_uses_fixed_priority_and_codes(self):
+        cases = (
+            ("login required; multiple targets", "login_required"),
+            ("scope not confirmed; multiple targets", "scope_not_confirmed"),
+            (
+                "抖音位置搜索范围本地未能确认，已安全停止",
+                "scope_not_confirmed",
+            ),
+            ("candidate panel missing", "candidate_panel_missing"),
+            ("multiple candidate panels", "candidate_ambiguous"),
+            ("抖音可带货地点列表未能唯一显示", "candidate_ambiguous"),
+            ("no candidates returned", "candidate_empty"),
+            (
+                "抖音未返回与夜南香相符的最新完整发布定位",
+                "candidate_empty",
+            ),
+            ("HTTP 429 rate limited", "rate_limited_or_degraded"),
+            ("browser close failed", "cleanup_incomplete"),
+            ("unexpected automation fault", "collector_unknown"),
+        )
+
+        for detail, expected in cases:
+            with self.subTest(detail=detail):
+                self.assertEqual(
+                    self.manager._classify_diagnostic_error(RuntimeError(detail)),
+                    expected,
+                )
 
     def test_begin_starts_only_domestic_then_music_and_local_start_lazily(self):
         begun = self.manager.begin_generation(self.upload_payload)
@@ -762,7 +992,12 @@ class DouyinCommerceCollectorManagerTests(unittest.TestCase):
         self.assertIsInstance(outcome.get("error"), DouyinCommerceCollectorError)
         self.assertEqual(str(outcome["error"]), "stale_result_discarded")
         self.assertTrue(outcome["closed"]["closed"])
-        self.assertEqual(self.events[-1]["errorCode"], "stale_result_discarded")
+        stale_events = [
+            event
+            for event in self.events
+            if event["errorCode"] == "stale_result_discarded"
+        ]
+        self.assertEqual(stale_events[-1]["errorCode"], "stale_result_discarded")
         self.assertEqual(
             sum(
                 event["errorCode"] == "stale_result_discarded"

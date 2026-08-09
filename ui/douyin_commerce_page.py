@@ -88,6 +88,20 @@ _VIDEO_PICKER_ROW_HEIGHT = 68
 _BATCH_RUN_KEY = "douyin_commerce_batch_run"
 _BATCH_SHARED_LOCATION_SEARCH_KEY = "__shared_location_search__"
 
+COLLECTOR_ERROR_COPY = {
+    "collector_start_failed": "采集器启动失败",
+    "login_required": "账号需要重新登录",
+    "scope_not_confirmed": "地点范围未确认",
+    "candidate_panel_missing": "未找到候选面板",
+    "candidate_ambiguous": "候选目标不唯一",
+    "candidate_empty": "没有读取到候选",
+    "rate_limited_or_degraded": "平台可能频控或服务降级",
+    "stale_result_discarded": "旧批次结果已丢弃",
+    "cleanup_incomplete": "采集器关闭不完整",
+    "publish_apply_mismatch": "正式页设置回读不一致",
+    "collector_unknown": "采集器发生未知错误",
+}
+
 
 class _ImeAwarePlainTextEdit(QPlainTextEdit):
     """让多行文案框在中文输入法预编辑时也隐藏占位提示。"""
@@ -1225,6 +1239,16 @@ class DouyinCommercePage(QWidget):
         self.retry_collector_button.setVisible(False)
         self.retry_collector_button.clicked.connect(self._retry_last_failed_collector)
         collector_status_layout.addWidget(self.retry_collector_button)
+        self.copy_collector_diagnostics_button = button(
+            "复制诊断摘要", variant="secondary", compact=True
+        )
+        self.copy_collector_diagnostics_button.setObjectName(
+            "douyinCommerceCopyCollectorDiagnostics"
+        )
+        self.copy_collector_diagnostics_button.clicked.connect(
+            self._copy_collector_diagnostics
+        )
+        collector_status_layout.addWidget(self.copy_collector_diagnostics_button)
         layout.addWidget(collector_status_bar)
 
         workspace = QFrame()
@@ -4682,25 +4706,108 @@ class DouyinCommercePage(QWidget):
         QApplication.clipboard().setText(content)
         self.copy_batch_publish_info_button.setText("已复制")
 
+    def _copy_collector_diagnostics(self) -> None:
+        """复制当前代际的公开诊断摘要，不弹出阻塞对话框。"""
+
+        generation_id = _normalized(self._setup_generation_id)
+        events: list[dict[str, object]] = []
+        if generation_id:
+            try:
+                public_events = (
+                    douyin_commerce_collectors.commerce_collector_manager
+                    .recent_diagnostics(generation_id)
+                )
+            except Exception:
+                public_events = []
+            if isinstance(public_events, list):
+                events = [
+                    dict(event)
+                    for event in public_events
+                    if isinstance(event, Mapping)
+                    and _normalized(event.get("setupGenerationId")) == generation_id
+                ]
+
+        collector_copy = {
+            "domestic_location": "国内地点",
+            "favorite_music": "收藏音乐",
+            "local_location": "本地点",
+        }
+        allowed_actions = {
+            "begin_generation",
+            "refresh_favorite_music",
+            "search_locations",
+            "retry_collector",
+            "close_generation",
+        }
+        allowed_cleanup = {
+            "closed",
+            "not_started",
+            "cleanup_incomplete",
+            "cleanup_interrupted",
+        }
+        lines: list[str] = []
+        for event in sorted(
+            events,
+            key=lambda item: _normalized(item.get("timestamp")),
+        ):
+            collector_type = _normalized(event.get("collectorType"))
+            collector_name = collector_copy.get(collector_type, "未知采集器")
+            action = _normalized(event.get("action"))
+            if action not in allowed_actions:
+                action = "collector_action"
+            keyword = _normalized(event.get("keyword")).replace("\n", " ")[:80]
+            candidate_count = event.get("candidateCount")
+            if type(candidate_count) is not int or candidate_count < 0:
+                candidate_count = 0
+            duration_ms = event.get("durationMs")
+            if type(duration_ms) is not int or duration_ms < 0:
+                duration_ms = 0
+            raw_error_code = _normalized(event.get("errorCode"))
+            error_code = (
+                "ok"
+                if _normalized(event.get("outcome")) == "success"
+                else self._public_collector_error_code(raw_error_code)
+            )
+            cleanup_result = _normalized(event.get("cleanupResult"))
+            if cleanup_result not in allowed_cleanup:
+                cleanup_result = "-"
+            timestamp = self._collector_diagnostic_time(event.get("timestamp"))
+            lines.append(
+                f"{timestamp} | 批次 {generation_id[:6]} | {collector_name} | "
+                f"{action} | 关键词={keyword} | 候选={candidate_count} | "
+                f"{duration_ms}ms | {error_code} | cleanup={cleanup_result}"
+            )
+
+        QApplication.clipboard().setText(
+            "\n".join(lines) if lines else "当前批次暂无采集诊断"
+        )
+        self.copy_collector_diagnostics_button.setText("诊断已复制")
+        QTimer.singleShot(1500, self._restore_collector_diagnostics_button)
+
+    @staticmethod
+    def _collector_diagnostic_time(value: object) -> str:
+        raw = _normalized(value)
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone(_SHANGHAI_TZ)
+            return parsed.strftime("%H:%M:%S")
+        except (TypeError, ValueError):
+            return "--:--:--"
+
+    def _restore_collector_diagnostics_button(self) -> None:
+        try:
+            self.copy_collector_diagnostics_button.setText("复制诊断摘要")
+        except RuntimeError:
+            # 页面已销毁时，延迟回调无需再更新按钮。
+            return
+
     @staticmethod
     def _public_collector_error_code(value: object) -> str:
         """只允许固定错误码进入 UI，底层异常全文仅留本机日志。"""
 
         code = _normalized(value)
-        allowed = {
-            "collector_start_failed",
-            "login_required",
-            "scope_not_confirmed",
-            "candidate_panel_missing",
-            "candidate_ambiguous",
-            "candidate_empty",
-            "rate_limited_or_degraded",
-            "stale_result_discarded",
-            "cleanup_incomplete",
-            "publish_apply_mismatch",
-            "collector_unknown",
-        }
-        return code if code in allowed else "collector_unknown"
+        return code if code in COLLECTOR_ERROR_COPY else "collector_unknown"
 
     @staticmethod
     def _collector_detail(status: Mapping[str, Any], collector_type: str) -> dict[str, Any]:
@@ -4753,7 +4860,10 @@ class DouyinCommercePage(QWidget):
                 body = defaults[collector_type]
             elif state == "failed":
                 error_code = self._public_collector_error_code(detail.get("errorCode"))
-                body = f"失败 · 错误码 {error_code}"
+                body = (
+                    f"失败 · {COLLECTOR_ERROR_COPY[error_code]} · "
+                    f"错误码 {error_code}"
+                )
                 failed_types.append(collector_type)
             else:
                 body = state_copy.get(state, "状态未知")

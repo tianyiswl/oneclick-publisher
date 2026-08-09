@@ -7,8 +7,11 @@
 
 from __future__ import annotations
 
+from collections import deque
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
+import logging
+import re
 import threading
 from time import monotonic
 from typing import Any, Callable, Mapping
@@ -24,6 +27,9 @@ from .douyin_commerce_setup_state import (
     SetupGenerationState,
     new_setup_generation,
 )
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class DouyinCommerceCollectorError(RuntimeError):
@@ -277,6 +283,79 @@ _CONTROLLED_SCALAR_TYPES = frozenset(
     {type(None), bool, int, float, str}
 )
 
+_DIAGNOSTIC_LIMIT = 200
+_ACCOUNT_STATE_PATH = re.compile(
+    r"(?i)(?:(?:[a-z]:)?(?:[/\\][^/\\\s,;|]+)*)?[/\\]?"
+    r"(?:cookies?file|account(?:s|_state)?)(?:[/\\][^\s,;|]+)+"
+    r"|\baccount(?:_state)?\.(?:json|txt)\b"
+)
+_LONG_NUMBER = re.compile(r"\d{4,}")
+_SENSITIVE_DETAIL = re.compile(
+    r"(?i)(?:\b(?:cookie|token|html|dom|session(?:[_ -]?id)?|"
+    r"verification(?:[_ -]?code)?)\b|验证码|二维码)"
+    r"\s*[:=：]?\s*[^,;|\n]*"
+)
+
+_LOGIN_MARKERS = (
+    "login required",
+    "login_required",
+    "needs_login",
+    "not logged in",
+    "登录",
+    "扫码",
+    "账号失效",
+)
+_SCOPE_MARKERS = (
+    "scope not confirmed",
+    "scope_not_confirmed",
+    "scope is ambiguous",
+    "范围不唯一",
+    "范围未确认",
+    "范围无法识别",
+)
+_PANEL_MISSING_MARKERS = (
+    "candidate panel missing",
+    "candidate_panel_missing",
+    "listbox missing",
+    "候选面板缺失",
+    "未找到候选面板",
+)
+_AMBIGUOUS_MARKERS = (
+    "multiple candidate panels",
+    "multiple panels",
+    "multiple targets",
+    "candidate_ambiguous",
+    "多面板",
+    "多目标",
+    "多个候选面板",
+)
+_EMPTY_MARKERS = (
+    "no candidates",
+    "0 candidates",
+    "candidate_empty",
+    "empty candidates",
+    "空候选",
+    "候选为空",
+    "未返回候选",
+)
+_RATE_LIMIT_MARKERS = (
+    "rate limited",
+    "rate limit",
+    "too many requests",
+    "service degraded",
+    "degraded",
+    "http 429",
+    "频控",
+    "服务降级",
+)
+_CLEANUP_MARKERS = (
+    "cleanup_incomplete",
+    "close failed",
+    "cleanup failed",
+    "关闭失败",
+    "清理失败",
+)
+
 
 class DouyinCommerceCollectorManager:
     """以代际隔离三个独立抖音平台设置采集会话。"""
@@ -300,6 +379,10 @@ class DouyinCommerceCollectorManager:
             int, tuple[Any, _CollectorCloseOwner]
         ] = {}
         self._close_wait_seconds = 15.0
+        self._diagnostic_generation_id = ""
+        self._diagnostics: deque[dict[str, object]] = deque(
+            maxlen=_DIAGNOSTIC_LIMIT
+        )
 
     def begin_generation(
         self,
@@ -380,6 +463,8 @@ class DouyinCommerceCollectorManager:
         with self._state_lock:
             self._require_current_begin_flight_locked(begin_flight)
             self._runtime = runtime
+            self._diagnostic_generation_id = generation.generation_id
+            self._diagnostics.clear()
             action = self._action_queue.reserve(
                 runtime.generation.generation_id,
                 str(uuid4()),
@@ -613,6 +698,7 @@ class DouyinCommerceCollectorManager:
             if existing.result is not None:
                 return self._copy_close_result(existing.result)
             raise DouyinCommerceCollectorError("cleanup_incomplete")
+        close_started_at = monotonic()
         try:
             result = self._close_generation(
                 generation_id, reason=normalized_reason
@@ -622,6 +708,7 @@ class DouyinCommerceCollectorManager:
             raise
         owner.result = self._copy_close_result(result)
         owner.done.set()
+        self._record_close_diagnostics(result, close_started_at)
         return result
 
     def _close_generation(
@@ -737,7 +824,8 @@ class DouyinCommerceCollectorManager:
                     mark_failed=True,
                 )
             raise
-        except Exception:
+        except Exception as error:
+            self._log_diagnostic_failure("cleanup_incomplete", error)
             cleanup_result = "cleanup_incomplete"
 
         with self._state_lock:
@@ -864,6 +952,54 @@ class DouyinCommerceCollectorManager:
             runtime.closed_result = self._copy_close_result(result)
         return result
 
+    def _record_close_diagnostics(
+        self,
+        result: Mapping[str, object],
+        started_at: float,
+    ) -> None:
+        generation_id = str(result.get("setupGenerationId") or "")
+        cleanup_results = result.get("cleanupResults")
+        if not generation_id or not isinstance(cleanup_results, Mapping):
+            return
+        with self._state_lock:
+            runtime = self._runtime
+            if (
+                runtime is None
+                or runtime.generation.generation_id != generation_id
+            ):
+                return
+            instances = {
+                collector_type: (
+                    runtime.generation.collectors[collector_type].instance_id or ""
+                )
+                for collector_type in _COLLECTOR_ORDER
+            }
+        request_id = str(uuid4())
+        duration_ms = self._elapsed_ms(started_at)
+        for collector_type in _COLLECTOR_ORDER:
+            instance_id = instances[collector_type]
+            if not instance_id:
+                continue
+            cleanup_result = str(
+                cleanup_results.get(collector_type.value) or "cleanup_incomplete"
+            )
+            succeeded = cleanup_result in {"closed", "not_started"}
+            self._emit_event(
+                request_id=request_id,
+                generation_id=generation_id,
+                collector=None,
+                collector_type=collector_type,
+                collector_instance_id=instance_id,
+                phase="cleanup",
+                action="close_generation",
+                scope=_FIXED_SCOPES[collector_type],
+                keyword="",
+                duration_ms=duration_ms,
+                outcome="success" if succeeded else "failed",
+                error_code="" if succeeded else "cleanup_incomplete",
+                cleanup_result=cleanup_result,
+            )
+
     def _finalize_closed_runtime_locked(self, runtime: _GenerationRuntime) -> None:
         if runtime.collectors:
             return
@@ -943,12 +1079,34 @@ class DouyinCommerceCollectorManager:
                 "aliveCollectorCount": len(runtime.collectors),
             }
 
+    def recent_diagnostics(
+        self,
+        generation_id: str,
+        limit: int = 50,
+    ) -> list[dict[str, object]]:
+        """返回当前代际最近的公开诊断，旧代际固定为空。"""
+
+        normalized_generation_id = self._normalize_public_text(
+            generation_id, error_code="stale_result_discarded"
+        )
+        if type(limit) is not int:
+            raise DouyinCommerceCollectorError("collector_unknown") from None
+        bounded_limit = max(0, min(limit, _DIAGNOSTIC_LIMIT))
+        if not normalized_generation_id or bounded_limit == 0:
+            return []
+        with self._state_lock:
+            if normalized_generation_id != self._diagnostic_generation_id:
+                return []
+            retained = list(self._diagnostics)[-bounded_limit:]
+            return [dict(event) for event in retained]
+
     def _refresh_music_action(
         self,
         generation_id: str,
         request_id: str,
         action_instance_id: str,
     ) -> dict[str, object]:
+        started_at = monotonic()
         collector = self._ensure_collector(
             generation_id,
             CollectorType.FAVORITE_MUSIC,
@@ -957,7 +1115,7 @@ class DouyinCommerceCollectorManager:
         self._validate_active_collector(generation_id, collector)
         try:
             result = collector.manager.refresh_favorite_music(collector.session_id)
-        except Exception:
+        except Exception as error:
             if not self._mark_failed(generation_id, collector):
                 self._emit_event(
                     request_id=request_id,
@@ -969,19 +1127,52 @@ class DouyinCommerceCollectorManager:
                     keyword="",
                     outcome="discarded",
                     error_code="stale_result_discarded",
+                    duration_ms=self._elapsed_ms(started_at),
                 )
                 raise DouyinCommerceCollectorError(
                     "stale_result_discarded", event_emitted=True
                 ) from None
-            raise DouyinCommerceCollectorError("collector_unknown") from None
+            error_code = self._classify_diagnostic_error(error)
+            self._log_diagnostic_failure(error_code, error)
+            self._emit_event(
+                request_id=request_id,
+                generation_id=generation_id,
+                collector=collector,
+                phase="result",
+                action="refresh_favorite_music",
+                scope="",
+                keyword="",
+                duration_ms=self._elapsed_ms(started_at),
+                outcome="failed",
+                error_code=error_code,
+            )
+            raise DouyinCommerceCollectorError(
+                error_code, event_emitted=True
+            ) from None
         try:
             public_result = [dict(item) for item in result]
-        except Exception:
+        except Exception as error:
             if not self._mark_failed(generation_id, collector):
                 raise DouyinCommerceCollectorError(
                     "stale_result_discarded"
                 ) from None
-            raise DouyinCommerceCollectorError("collector_unknown") from None
+            error_code = self._classify_diagnostic_error(error)
+            self._log_diagnostic_failure(error_code, error)
+            self._emit_event(
+                request_id=request_id,
+                generation_id=generation_id,
+                collector=collector,
+                phase="result",
+                action="refresh_favorite_music",
+                scope="",
+                keyword="",
+                duration_ms=self._elapsed_ms(started_at),
+                outcome="failed",
+                error_code=error_code,
+            )
+            raise DouyinCommerceCollectorError(
+                error_code, event_emitted=True
+            ) from None
         self._accept_or_discard(
             generation_id,
             collector,
@@ -1004,6 +1195,7 @@ class DouyinCommerceCollectorManager:
         scope: str,
         action_instance_id: str,
     ) -> dict[str, object]:
+        started_at = monotonic()
         collector = self._ensure_collector(
             generation_id,
             collector_type,
@@ -1018,7 +1210,7 @@ class DouyinCommerceCollectorManager:
                 keyword,
                 scope,
             )
-        except Exception:
+        except Exception as error:
             if not self._mark_failed(generation_id, collector):
                 self._emit_event(
                     request_id=request_id,
@@ -1030,19 +1222,58 @@ class DouyinCommerceCollectorManager:
                     keyword=keyword,
                     outcome="discarded",
                     error_code="stale_result_discarded",
+                    duration_ms=self._elapsed_ms(started_at),
                 )
                 raise DouyinCommerceCollectorError(
                     "stale_result_discarded", event_emitted=True
                 ) from None
-            raise DouyinCommerceCollectorError("collector_unknown") from None
+            error_code = self._classify_diagnostic_error(error)
+            self._log_diagnostic_failure(error_code, error)
+            self._emit_event(
+                request_id=request_id,
+                generation_id=generation_id,
+                collector=collector,
+                phase="result",
+                action="search_locations",
+                scope=scope,
+                keyword=keyword,
+                duration_ms=self._elapsed_ms(started_at),
+                outcome="failed",
+                error_code=error_code,
+            )
+            raise DouyinCommerceCollectorError(
+                error_code, event_emitted=True
+            ) from None
         try:
             public_result = [dict(item) for item in result]
-        except Exception:
+        except Exception as error:
             if not self._mark_failed(generation_id, collector):
                 raise DouyinCommerceCollectorError(
                     "stale_result_discarded"
                 ) from None
-            raise DouyinCommerceCollectorError("collector_unknown") from None
+            error_code = self._classify_diagnostic_error(error)
+            self._log_diagnostic_failure(error_code, error)
+            self._emit_event(
+                request_id=request_id,
+                generation_id=generation_id,
+                collector=collector,
+                phase="result",
+                action="search_locations",
+                scope=scope,
+                keyword=keyword,
+                duration_ms=self._elapsed_ms(started_at),
+                outcome="failed",
+                error_code=error_code,
+            )
+            raise DouyinCommerceCollectorError(
+                error_code, event_emitted=True
+            ) from None
+        if not public_result:
+            if not self._mark_failed(generation_id, collector):
+                raise DouyinCommerceCollectorError(
+                    "stale_result_discarded"
+                ) from None
+            raise DouyinCommerceCollectorError("candidate_empty") from None
         self._accept_or_discard(
             generation_id,
             collector,
@@ -1103,7 +1334,8 @@ class DouyinCommerceCollectorManager:
                         old.manager,
                         old.session_id or None,
                     )
-            except Exception:
+            except Exception as error:
+                self._log_diagnostic_failure("cleanup_incomplete", error)
                 cleanup_result = "cleanup_incomplete"
             with self._state_lock:
                 owner.result = cleanup_result
@@ -1467,10 +1699,11 @@ class DouyinCommerceCollectorManager:
         scope: str = "",
         keyword: str = "",
     ) -> Any:
+        started_at = monotonic()
         try:
-            return self._action_queue.wait(queued_action)
+            result = self._action_queue.wait(queued_action)
         except DouyinCommerceCollectorError as error:
-            if error.code == "stale_result_discarded":
+            if not error.event_emitted:
                 with self._state_lock:
                     runtime = self._runtime
                     collector = (
@@ -1479,19 +1712,69 @@ class DouyinCommerceCollectorManager:
                         and runtime.generation.generation_id == generation_id
                         else None
                     )
-                if collector is not None and not error.event_emitted:
-                    self._emit_event(
-                        request_id=request_id,
-                        generation_id=generation_id,
-                        collector=collector,
-                        phase="queue",
-                        action=action_name,
-                        scope=scope,
-                        keyword=keyword,
-                        outcome="discarded",
-                        error_code=error.code,
-                    )
+                self._emit_event(
+                    request_id=request_id,
+                    generation_id=generation_id,
+                    collector=collector,
+                    collector_type=collector_type,
+                    collector_instance_id=(
+                        error.collector_instance_id
+                        or (collector.instance_id if collector is not None else "")
+                    ),
+                    phase=(
+                        "queue"
+                        if error.code == "stale_result_discarded"
+                        else "result"
+                    ),
+                    action=action_name,
+                    scope=scope,
+                    keyword=keyword,
+                    attempt=2 if action_name == "retry_collector" else 1,
+                    duration_ms=self._elapsed_ms(started_at),
+                    outcome=(
+                        "discarded"
+                        if error.code == "stale_result_discarded"
+                        else "failed"
+                    ),
+                    error_code=error.code,
+                    cleanup_result=(
+                        "cleanup_incomplete"
+                        if error.code == "cleanup_incomplete"
+                        else ""
+                    ),
+                )
             raise
+        candidate_count = 0
+        if isinstance(result, Mapping):
+            candidates = result.get("candidates")
+            if isinstance(candidates, list):
+                candidate_count = len(candidates)
+        with self._state_lock:
+            runtime = self._runtime
+            collector = (
+                runtime.collectors.get(collector_type)
+                if runtime
+                and runtime.generation.generation_id == generation_id
+                else None
+            )
+        self._emit_event(
+            request_id=request_id,
+            generation_id=generation_id,
+            collector=collector,
+            collector_type=collector_type,
+            collector_instance_id=(collector.instance_id if collector else ""),
+            phase="result",
+            action=action_name,
+            scope=scope,
+            keyword=keyword,
+            attempt=2 if action_name == "retry_collector" else 1,
+            candidate_count=candidate_count,
+            duration_ms=self._elapsed_ms(started_at),
+            outcome="success",
+            error_code="",
+            cleanup_result="closed" if action_name == "retry_collector" else "",
+        )
+        return result
 
     def _public_action_result(
         self,
@@ -1590,17 +1873,26 @@ class DouyinCommerceCollectorManager:
         *,
         request_id: str,
         generation_id: str,
-        collector: _CollectorRuntime,
+        collector: _CollectorRuntime | None,
+        collector_type: CollectorType | None = None,
+        collector_instance_id: str = "",
         phase: str,
         action: str,
         scope: str,
         keyword: str,
+        attempt: int = 1,
+        candidate_count: int = 0,
+        duration_ms: int = 0,
         outcome: str,
         error_code: str,
+        cleanup_result: str = "",
     ) -> None:
-        sink = self._event_sink
-        if sink is None:
+        effective_type = collector.collector_type if collector else collector_type
+        if effective_type is None:
             return
+        effective_instance_id = (
+            collector.instance_id if collector else collector_instance_id
+        )
         with self._state_lock:
             runtime = self._runtime
             account_id = (
@@ -1611,25 +1903,105 @@ class DouyinCommerceCollectorManager:
         event = CollectorDiagnosticEvent(
             request_id=request_id,
             setup_generation_id=generation_id,
-            collector_type=collector.collector_type,
-            collector_instance_id=collector.instance_id,
+            collector_type=effective_type,
+            collector_instance_id=effective_instance_id,
             account_masked_id=f"account-{account_id}",
             phase=phase,
             action=action,
             scope=scope,
             keyword=keyword,
-            attempt=1,
-            candidate_count=0,
-            duration_ms=0,
+            attempt=attempt,
+            candidate_count=candidate_count,
+            duration_ms=duration_ms,
             outcome=outcome,
             error_code=error_code,
-            cleanup_result="",
+            cleanup_result=cleanup_result,
         ).to_public_dict()
+        with self._state_lock:
+            if generation_id == self._diagnostic_generation_id:
+                self._diagnostics.append(dict(event))
+        sink = self._event_sink
+        if sink is None:
+            return
         try:
-            sink(event)
+            sink(dict(event))
         except Exception:
             # 诊断消费方不得打断受控采集流程。
             return
+
+    @staticmethod
+    def _elapsed_ms(started_at: float) -> int:
+        return max(0, int((monotonic() - started_at) * 1000))
+
+    @staticmethod
+    def _exception_text(error: object) -> str:
+        try:
+            return str(error)
+        except Exception:
+            return ""
+
+    @classmethod
+    def _classify_diagnostic_error(cls, error: object) -> str:
+        """按固定优先级将底层异常收敛为公开错误码。"""
+
+        detail = cls._exception_text(error).strip().casefold()
+        if any(marker in detail for marker in _LOGIN_MARKERS):
+            return "login_required"
+        if any(marker in detail for marker in _SCOPE_MARKERS) or (
+            "范围" in detail
+            and any(marker in detail for marker in ("未能确认", "无法识别", "不唯一"))
+        ):
+            return "scope_not_confirmed"
+        if any(marker in detail for marker in _PANEL_MISSING_MARKERS):
+            return "candidate_panel_missing"
+        if any(marker in detail for marker in _AMBIGUOUS_MARKERS) or any(
+            marker in detail
+            for marker in ("未能唯一显示", "不是唯一", "重复可见身份", "重复完整地址")
+        ):
+            return "candidate_ambiguous"
+        if any(marker in detail for marker in _EMPTY_MARKERS) or (
+            "未返回" in detail
+            and any(marker in detail for marker in ("候选", "地点", "发布定位"))
+        ):
+            return "candidate_empty"
+        if any(marker in detail for marker in _RATE_LIMIT_MARKERS):
+            return "rate_limited_or_degraded"
+        if any(marker in detail for marker in _CLEANUP_MARKERS):
+            return "cleanup_incomplete"
+        return "collector_unknown"
+
+    @classmethod
+    def _safe_diagnostic_detail(cls, error: object) -> str:
+        """生成最多 180 字的本机开发摘要，不保留账号态或页面原文。"""
+
+        detail = cls._exception_text(error).replace("\r", " ").replace("\n", " ")
+        detail = _ACCOUNT_STATE_PATH.sub("<account-state>", detail)
+        detail = _LONG_NUMBER.sub("<redacted-number>", detail)
+        detail = _SENSITIVE_DETAIL.sub("<redacted>", detail)
+        return (detail.strip() or "<unavailable>")[:180]
+
+    @classmethod
+    def _log_diagnostic_failure(cls, error_code: str, error: object) -> None:
+        safe_code = (
+            error_code
+            if error_code
+            in {
+                "login_required",
+                "scope_not_confirmed",
+                "candidate_panel_missing",
+                "candidate_ambiguous",
+                "candidate_empty",
+                "rate_limited_or_degraded",
+                "cleanup_incomplete",
+                "collector_unknown",
+            }
+            else "collector_unknown"
+        )
+        _LOGGER.warning(
+            "抖音采集诊断失败 errorCode=%s detail=%s",
+            safe_code,
+            cls._safe_diagnostic_detail(error),
+        )
 
     @staticmethod
     def _collector_type(value: object) -> CollectorType:

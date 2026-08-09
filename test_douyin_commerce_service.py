@@ -2810,6 +2810,99 @@ class DouyinCommerceUiTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.page.close()
 
+    def test_copy_collector_diagnostics_is_non_blocking_and_whitelisted(self) -> None:
+        """主 UI 专项也必须覆盖诊断复制入口与非阻塞约束。"""
+
+        self.page._setup_generation_id = "8f31c9ab-generation"
+        event = {
+            "timestamp": "2026-08-09T13:42:10+08:00",
+            "requestId": "request-a",
+            "setupGenerationId": "8f31c9ab-generation",
+            "collectorType": "local_location",
+            "collectorInstanceId": "local-a",
+            "accountMaskedId": "account-31",
+            "phase": "result",
+            "action": "search_locations",
+            "scope": "local",
+            "keyword": "夜南香",
+            "attempt": 1,
+            "candidateCount": 0,
+            "durationMs": 1200,
+            "outcome": "failed",
+            "errorCode": "candidate_panel_missing",
+            "cleanupResult": "closed",
+            "sessionId": "session-secret",
+            "rawDetail": "cookiesFile/account.json Cookie=secret DOM=<html> 123456",
+        }
+        success_event = {
+            **event,
+            "timestamp": "2026-08-09T13:42:11+08:00",
+            "requestId": "request-b",
+            "collectorType": "favorite_music",
+            "collectorInstanceId": "music-a",
+            "action": "refresh_favorite_music",
+            "keyword": "",
+            "candidateCount": 3,
+            "durationMs": 37,
+            "outcome": "success",
+            "errorCode": "collector_unknown",
+            "cleanupResult": "",
+        }
+
+        with patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.recent_diagnostics",
+            return_value=[event, success_event],
+        ), patch(
+            "ui.douyin_commerce_page.QApplication.clipboard"
+        ) as clipboard, patch(
+            "ui.douyin_commerce_page.QTimer.singleShot"
+        ), patch(
+            "ui.douyin_commerce_page.QMessageBox.information"
+        ) as information, patch(
+            "ui.douyin_commerce_page.QMessageBox.warning"
+        ) as warning, patch(
+            "ui.douyin_commerce_page.QMessageBox.critical"
+        ) as critical:
+            self.page._copy_collector_diagnostics()
+
+        copied = clipboard.return_value.setText.call_args.args[0]
+        self.assertIn(
+            "13:42:10 | 批次 8f31c9 | 本地点 | search_locations", copied
+        )
+        self.assertIn("关键词=夜南香 | 候选=0 | 1200ms", copied)
+        self.assertIn("candidate_panel_missing | cleanup=closed", copied)
+        self.assertIn("收藏音乐 | refresh_favorite_music", copied)
+        self.assertIn("候选=3 | 37ms | ok | cleanup=-", copied)
+        for secret in (
+            "session-secret",
+            "cookiesFile/account.json",
+            "Cookie",
+            "DOM",
+            "<html>",
+            "123456",
+        ):
+            self.assertNotIn(secret, copied)
+        information.assert_not_called()
+        warning.assert_not_called()
+        critical.assert_not_called()
+
+    def test_copy_collector_diagnostics_uses_fixed_empty_copy(self) -> None:
+        self.page._setup_generation_id = "generation-empty"
+        with patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.recent_diagnostics",
+            return_value=[],
+        ), patch(
+            "ui.douyin_commerce_page.QApplication.clipboard"
+        ) as clipboard, patch(
+            "ui.douyin_commerce_page.QMessageBox.information"
+        ) as information:
+            self.page._copy_collector_diagnostics()
+
+        clipboard.return_value.setText.assert_called_once_with(
+            "当前批次暂无采集诊断"
+        )
+        information.assert_not_called()
+
     def test_background_task_forwards_progress_before_success(self) -> None:
         events: list[dict[str, str]] = []
         task = BackgroundTask(
