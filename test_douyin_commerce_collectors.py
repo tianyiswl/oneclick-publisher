@@ -3,6 +3,11 @@
 
 from __future__ import annotations
 
+from contextlib import redirect_stdout
+import io
+import json
+from pathlib import Path
+import tempfile
 import threading
 import time
 import unittest
@@ -14,6 +19,10 @@ from app_core.douyin_commerce_collectors import (
     DouyinCommerceCollectorManager,
 )
 from app_core.douyin_commerce_setup_state import CollectorType
+from tools.verify_douyin_commerce_collectors import (
+    build_verification_sequences,
+    main as verification_main,
+)
 
 
 class FakeSessionManager:
@@ -145,6 +154,107 @@ class FakeManagerFactory:
             instance.release_start = threading.Event()
         self.instances.append(instance)
         return instance
+
+
+class FakeVerificationManager:
+    """仅实现验证器允许使用的协调器公开边界。"""
+
+    def __init__(self) -> None:
+        self.begin_payloads: list[dict[str, object]] = []
+        self.actions: list[tuple[str, str, str]] = []
+        self.close_calls: list[tuple[str | None, str]] = []
+        self.current_generation_id = ""
+        self.instance_ids: dict[str, str] = {}
+        self.action_error_codes: dict[tuple[int, str], str] = {}
+
+    def begin_generation(self, payload: Mapping[str, object]) -> dict[str, object]:
+        self.begin_payloads.append(dict(payload))
+        generation_number = len(self.begin_payloads)
+        self.current_generation_id = f"generation-full-secret-{generation_number}"
+        self.instance_ids = {
+            "domestic_location": f"domestic-full-secret-{generation_number}",
+            "favorite_music": f"music-full-secret-{generation_number}",
+            "local_location": f"local-full-secret-{generation_number}",
+        }
+        return self.status(self.current_generation_id)
+
+    def refresh_favorite_music(self, generation_id: str) -> dict[str, object]:
+        self._raise_configured("music")
+        self.actions.append((generation_id, "music", ""))
+        return {"ok": True, "candidates": [{"title": "收藏音乐"}]}
+
+    def search_locations(
+        self,
+        generation_id: str,
+        keyword: object,
+        scope: object,
+    ) -> dict[str, object]:
+        normalized_scope = str(scope)
+        self._raise_configured(normalized_scope)
+        self.actions.append((generation_id, normalized_scope, str(keyword)))
+        return {
+            "ok": True,
+            "candidates": [
+                {"poiId": f"poi-{normalized_scope}", "name": "夜南香", "address": "北海"}
+            ],
+        }
+
+    def close_generation(
+        self,
+        generation_id: str | None = None,
+        *,
+        reason: str,
+    ) -> dict[str, object]:
+        self.close_calls.append((generation_id, reason))
+        return {
+            "closed": True,
+            "setupGenerationId": generation_id or "",
+            "aliveCollectorCount": 0,
+            "cleanupResults": {
+                "domestic_location": "closed",
+                "favorite_music": "closed",
+                "local_location": "closed",
+            },
+        }
+
+    def status(self, generation_id: str | None = None) -> dict[str, object]:
+        return {
+            "setupGenerationId": generation_id or self.current_generation_id,
+            "generationState": "collecting",
+            "collectorInstanceIds": dict(self.instance_ids),
+            "aliveCollectorCount": 3,
+        }
+
+    def recent_diagnostics(
+        self,
+        generation_id: str,
+        limit: int = 50,
+    ) -> list[dict[str, object]]:
+        del limit
+        was_closed = any(
+            closed_generation_id == generation_id
+            for closed_generation_id, _reason in self.close_calls
+        )
+        return [
+            {
+                "timestamp": "2026-08-09T12:00:00+08:00",
+                "setupGenerationId": generation_id,
+                "collectorType": "domestic_location",
+                "action": "close_generation" if was_closed else "search_locations",
+                "candidateCount": 1,
+                "outcome": "success",
+                "errorCode": "",
+                "cleanupResult": "closed" if was_closed else "",
+            }
+        ]
+
+    def _raise_configured(self, action: str) -> None:
+        generation_number = len(self.begin_payloads)
+        code = self.action_error_codes.get((generation_number, action))
+        if code:
+            error = RuntimeError(code)
+            error.code = code
+            raise error
 
 
 class ExitGateLock:
@@ -3260,6 +3370,177 @@ class DouyinCommerceCollectorManagerTests(unittest.TestCase):
             str(outcome["stale_close_error"]), "stale_result_discarded"
         )
         self.assertNotIn("stale_close", outcome)
+
+
+class DouyinCommerceCollectorVerifierTests(unittest.TestCase):
+    """验证器只允许采集公开候选并关闭临时代际。"""
+
+    _ACCOUNT = {
+        "id": 31,
+        "type": 3,
+        "status": 1,
+        "filePath": "private-account-state.json",
+    }
+
+    def test_verifier_default_mode_only_prints_plan(self):
+        output = io.StringIO()
+        with mock.patch(
+            "tools.verify_douyin_commerce_collectors.commerce_collector_manager"
+        ) as manager, mock.patch(
+            "tools.verify_douyin_commerce_collectors.account_service.list_accounts"
+        ) as list_accounts, redirect_stdout(output):
+            result = verification_main(
+                ["--account-id", "31", "--keyword", "夜南香"]
+            )
+
+        self.assertEqual(result, 0)
+        manager.begin_generation.assert_not_called()
+        list_accounts.assert_not_called()
+        printed = json.loads(output.getvalue())
+        self.assertEqual(printed[0]["generation"], "A")
+        self.assertEqual(len(printed), 3)
+
+    def test_verification_sequences_cover_three_generations_and_three_orders(self):
+        sequences = build_verification_sequences("夜南香", domestic_count=20)
+
+        self.assertEqual([row["generation"] for row in sequences], ["A", "B", "C"])
+        self.assertEqual(
+            [row["order"] for row in sequences],
+            [
+                "music-domestic-local",
+                "domestic-music-local",
+                "local-domestic-music",
+            ],
+        )
+        self.assertEqual(
+            [row["domesticSearchCount"] for row in sequences],
+            [20, 20, 1],
+        )
+        self.assertEqual(
+            [row["localSearchCount"] for row in sequences],
+            [2, 1, 1],
+        )
+        self.assertEqual(
+            [row["ending"] for row in sequences],
+            ["normal", "abandon", "normal"],
+        )
+        self.assertEqual(
+            [action["type"] for action in sequences[0]["actions"][:2]],
+            ["music", "domestic"],
+        )
+        self.assertEqual(
+            [action["type"] for action in sequences[1]["actions"][-2:]],
+            ["music", "local"],
+        )
+        self.assertEqual(
+            [action["type"] for action in sequences[2]["actions"]],
+            ["local", "domestic", "music"],
+        )
+
+    def test_fake_execute_closes_every_generation_and_writes_redacted_zero_submit_report(self):
+        manager = FakeVerificationManager()
+        sleep_intervals: list[float] = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report_path = Path(temp_dir) / "collector-verification.json"
+            with mock.patch(
+                "tools.verify_douyin_commerce_collectors.commerce_collector_manager",
+                manager,
+            ), mock.patch(
+                "tools.verify_douyin_commerce_collectors.account_service.list_accounts",
+                return_value=[dict(self._ACCOUNT)],
+            ), mock.patch(
+                "tools.verify_douyin_commerce_collectors.time.sleep",
+                side_effect=sleep_intervals.append,
+            ):
+                result = verification_main(
+                    [
+                        "--account-id",
+                        "31",
+                        "--keyword",
+                        "夜南香",
+                        "--execute",
+                        "--output",
+                        str(report_path),
+                    ]
+                )
+            report_text = report_path.read_text(encoding="utf-8")
+            report = json.loads(report_text)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(len(manager.begin_payloads), 3)
+        self.assertEqual(
+            [payload["accountList"] for payload in manager.begin_payloads],
+            [["private-account-state.json"]] * 3,
+        )
+        self.assertEqual(
+            manager.close_calls,
+            [
+                ("generation-full-secret-1", "verification_normal"),
+                ("generation-full-secret-2", "verification_abandon"),
+                ("generation-full-secret-3", "verification_normal"),
+            ],
+        )
+        self.assertTrue(sleep_intervals)
+        self.assertTrue(all(interval >= 0.8 for interval in sleep_intervals))
+        self.assertEqual(report["finalSubmitCount"], 0)
+        self.assertEqual(report["draftSaveCount"], 0)
+        self.assertEqual(report["publicPublishCount"], 0)
+        self.assertEqual([item["generation"] for item in report["generations"]], ["A", "B", "C"])
+        self.assertTrue(
+            all(
+                item["diagnostics"][-1]["action"] == "close_generation"
+                for item in report["generations"]
+            )
+        )
+        self.assertNotIn("private-account-state.json", report_text)
+        self.assertNotIn("generation-full-secret", report_text)
+        self.assertNotIn("domestic-full-secret", report_text)
+        self.assertNotIn("music-full-secret", report_text)
+        self.assertNotIn("local-full-secret", report_text)
+
+    def test_execute_stops_immediately_and_closes_current_generation_on_safety_signal(self):
+        for error_code in (
+            "login_required",
+            "rate_limited_or_degraded",
+            "account_verification_required",
+        ):
+            with self.subTest(error_code=error_code):
+                manager = FakeVerificationManager()
+                manager.action_error_codes[(1, "music")] = error_code
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    report_path = Path(temp_dir) / "stopped.json"
+                    with mock.patch(
+                        "tools.verify_douyin_commerce_collectors.commerce_collector_manager",
+                        manager,
+                    ), mock.patch(
+                        "tools.verify_douyin_commerce_collectors.account_service.list_accounts",
+                        return_value=[dict(self._ACCOUNT)],
+                    ), mock.patch(
+                        "tools.verify_douyin_commerce_collectors.time.sleep"
+                    ):
+                        result = verification_main(
+                            [
+                                "--account-id",
+                                "31",
+                                "--keyword",
+                                "夜南香",
+                                "--execute",
+                                "--output",
+                                str(report_path),
+                            ]
+                        )
+                    report = json.loads(report_path.read_text(encoding="utf-8"))
+
+                self.assertEqual(result, 3)
+                self.assertEqual(len(manager.begin_payloads), 1)
+                self.assertEqual(
+                    manager.close_calls,
+                    [("generation-full-secret-1", "verification_stopped")],
+                )
+                self.assertEqual(report["stopReason"], error_code)
+                self.assertEqual(report["finalSubmitCount"], 0)
+                self.assertEqual(report["draftSaveCount"], 0)
+                self.assertEqual(report["publicPublishCount"], 0)
 
 
 if __name__ == "__main__":
