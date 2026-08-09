@@ -248,6 +248,72 @@ class DouyinCommerceCollectorManagerTests(unittest.TestCase):
         self.assertEqual(event["outcome"], "success")
         self.assertEqual(event["errorCode"], "collector_unknown")
 
+    def test_untrusted_exception_string_methods_are_never_called_by_diagnostics(self):
+        class SideEffectStringError(RuntimeError):
+            def __init__(self) -> None:
+                super().__init__("candidate panel missing")
+                self.calls = 0
+
+            def __str__(self) -> str:
+                self.calls += 1
+                return "candidate panel missing"
+
+        class RaisingStringError(RuntimeError):
+            def __init__(self) -> None:
+                super().__init__("candidate panel missing")
+                self.calls = 0
+
+            def __str__(self) -> str:
+                self.calls += 1
+                raise RuntimeError("diagnostic string conversion must not run")
+
+        class BlockingStringError(RuntimeError):
+            def __init__(self) -> None:
+                super().__init__("candidate panel missing")
+                self.calls = 0
+                self.entered = threading.Event()
+                self.release = threading.Event()
+
+            def __str__(self) -> str:
+                self.calls += 1
+                self.entered.set()
+                self.release.wait(timeout=0.2)
+                return "candidate panel missing"
+
+        for error_type in (
+            SideEffectStringError,
+            RaisingStringError,
+            BlockingStringError,
+        ):
+            with self.subTest(error_type=error_type.__name__):
+                factory = FakeManagerFactory()
+                manager = DouyinCommerceCollectorManager(
+                    manager_factory=factory,
+                    probe_payload_builder=lambda payload: {
+                        **payload,
+                        "fileList": ["probe.mp4"],
+                        "runtimeMode": "preflight",
+                        "debugDryRun": True,
+                    },
+                )
+                try:
+                    generation_id = manager.begin_generation(self.upload_payload)[
+                        "setupGenerationId"
+                    ]
+                    manager.refresh_favorite_music(generation_id)
+                    untrusted_error = error_type()
+                    factory.instances[1].refresh_error = untrusted_error
+
+                    with self.assertLogs(
+                        "app_core.douyin_commerce_collectors", level="WARNING"
+                    ), self.assertRaises(DouyinCommerceCollectorError) as raised:
+                        manager.refresh_favorite_music(generation_id)
+
+                    self.assertEqual(raised.exception.code, "collector_unknown")
+                    self.assertEqual(untrusted_error.calls, 0)
+                finally:
+                    manager.close_generation(reason="test-cleanup")
+
     def test_empty_location_candidates_use_fixed_error_and_diagnostic(self):
         generation_id = self.manager.begin_generation(self.upload_payload)[
             "setupGenerationId"
@@ -314,6 +380,65 @@ class DouyinCommerceCollectorManagerTests(unittest.TestCase):
         self.assertNotIn("dom=", safe_detail.casefold())
         self.assertNotIn("session", safe_detail.casefold())
 
+    def test_reviewer_payloads_are_absent_from_safe_log_and_public_events(self):
+        generation_id = self.manager.begin_generation(self.upload_payload)[
+            "setupGenerationId"
+        ]
+        payloads = (
+            (
+                "/Users/andy/private/account.json",
+                ("/users", "andy", "private", "account.json"),
+            ),
+            (
+                "/tmp/browser-profile/state.json",
+                ("/tmp", "browser-profile", "state.json"),
+            ),
+            (
+                'selector=<div data-secret="abc">private</div>',
+                ("selector", "<div", "data-secret", "private"),
+            ),
+            (
+                "access_token=top-secret",
+                ("access_token", "top-secret"),
+            ),
+            (
+                "cookie_value=top-secret",
+                ("cookie_value", "top-secret"),
+            ),
+        )
+
+        for payload, forbidden_parts in payloads:
+            with self.subTest(payload=payload):
+                current_manager = self.factory.instances[-1]
+                current_manager.search_error = RuntimeError(payload)
+                with self.assertLogs(
+                    "app_core.douyin_commerce_collectors", level="WARNING"
+                ) as captured, self.assertRaises(DouyinCommerceCollectorError):
+                    self.manager.search_locations(
+                        generation_id, "审查关键词", "domestic"
+                    )
+
+                event = self.manager.recent_diagnostics(generation_id)[-1]
+                safe_detail = self.manager._safe_diagnostic_detail(
+                    RuntimeError(payload)
+                )
+                combined = (
+                    safe_detail
+                    + "\n"
+                    + "\n".join(captured.output)
+                    + "\n"
+                    + repr(event)
+                ).casefold()
+                current_manager.search_error = None
+                self.manager.retry_collector(
+                    generation_id, "domestic_location"
+                )
+
+                self.assertLessEqual(len(safe_detail), 180)
+                for forbidden in forbidden_parts:
+                    self.assertNotIn(forbidden, combined)
+                self.assertIn("collector_unknown", combined)
+
     def test_local_retry_records_attempt_and_cleanup_result(self):
         generation_id = self.manager.begin_generation(self.upload_payload)[
             "setupGenerationId"
@@ -330,6 +455,122 @@ class DouyinCommerceCollectorManagerTests(unittest.TestCase):
         self.assertEqual(event["attempt"], 2)
         self.assertEqual(event["outcome"], "success")
         self.assertEqual(event["cleanupResult"], "closed")
+
+    def test_completed_old_action_event_keeps_dispatched_instance_after_retry(self):
+        generation_id = self.manager.begin_generation(self.upload_payload)[
+            "setupGenerationId"
+        ]
+        old_instance_id = self.manager.status(generation_id)[
+            "collectorInstanceIds"
+        ]["domestic_location"]
+        old_wait_returned = threading.Event()
+        release_old_wait = threading.Event()
+        outcome: dict[str, object] = {}
+        original_wait = self.manager._action_queue.wait
+        search_thread: threading.Thread | None = None
+
+        def gate_old_wait(action):
+            result = original_wait(action)
+            if threading.current_thread() is search_thread:
+                old_wait_returned.set()
+                release_old_wait.wait(timeout=1)
+            return result
+
+        with mock.patch.object(
+            self.manager._action_queue,
+            "wait",
+            side_effect=gate_old_wait,
+        ):
+            search_thread = threading.Thread(
+                target=lambda: self._capture_call(
+                    outcome,
+                    "search",
+                    lambda: self.manager.search_locations(
+                        generation_id, "侨港风情街", "domestic"
+                    ),
+                )
+            )
+            search_thread.start()
+            self.assertTrue(old_wait_returned.wait(timeout=1))
+
+            retried = self.manager.retry_collector(
+                generation_id, "domestic_location"
+            )
+            new_instance_id = retried["collectorInstanceId"]
+            release_old_wait.set()
+            search_thread.join(timeout=1)
+
+        self.assertFalse(search_thread.is_alive())
+        self.assertNotEqual(new_instance_id, old_instance_id)
+        self.assertEqual(
+            outcome["search"]["collectorInstanceId"], old_instance_id
+        )
+        search_event = [
+            event
+            for event in self.manager.recent_diagnostics(
+                generation_id, limit=200
+            )
+            if event["action"] == "search_locations"
+            and event["keyword"] == "侨港风情街"
+            and event["outcome"] == "success"
+        ][-1]
+        self.assertEqual(search_event["collectorInstanceId"], old_instance_id)
+
+    def test_cancelled_unstarted_local_action_event_keeps_reserved_instance(self):
+        generation_id = self.manager.begin_generation(self.upload_payload)[
+            "setupGenerationId"
+        ]
+        local_action_reserved = threading.Event()
+        outcome: dict[str, object] = {}
+        original_start = self.manager._action_queue.start
+
+        def hold_local_action(action):
+            if (
+                action.collector_type is CollectorType.LOCAL_LOCATION
+                and not action.is_cleanup
+            ):
+                local_action_reserved.set()
+                return None
+            return original_start(action)
+
+        with mock.patch.object(
+            self.manager._action_queue,
+            "start",
+            side_effect=hold_local_action,
+        ):
+            search_thread = threading.Thread(
+                target=lambda: self._capture_call(
+                    outcome,
+                    "search",
+                    lambda: self.manager.search_locations(
+                        generation_id, "夜南香", "local"
+                    ),
+                )
+            )
+            search_thread.start()
+            self.assertTrue(local_action_reserved.wait(timeout=1))
+            outcome["close"] = self.manager.close_generation(
+                generation_id, reason="cancelled"
+            )
+            search_thread.join(timeout=1)
+
+        self.assertFalse(search_thread.is_alive())
+        error_result = outcome["search_error"].to_public_action_result()
+        self.assertEqual(error_result["errorCode"], "stale_result_discarded")
+        self.assertTrue(error_result["collectorInstanceId"])
+        cancelled_event = [
+            event
+            for event in self.manager.recent_diagnostics(
+                generation_id, limit=200
+            )
+            if event["action"] == "search_locations"
+            and event["keyword"] == "夜南香"
+        ][-1]
+        self.assertEqual(cancelled_event["outcome"], "discarded")
+        self.assertEqual(
+            cancelled_event["collectorInstanceId"],
+            error_result["collectorInstanceId"],
+        )
 
     def test_stale_result_and_incomplete_close_are_diagnosed(self):
         generation_id = self.manager.begin_generation(self.upload_payload)[

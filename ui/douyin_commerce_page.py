@@ -4755,7 +4755,14 @@ class DouyinCommercePage(QWidget):
             action = _normalized(event.get("action"))
             if action not in allowed_actions:
                 action = "collector_action"
-            keyword = _normalized(event.get("keyword")).replace("\n", " ")[:80]
+            raw_keyword = event.get("keyword")
+            keyword = (
+                douyin_commerce_collectors._redact_diagnostic_text(
+                    raw_keyword, limit=80
+                )
+                if type(raw_keyword) is str and raw_keyword
+                else ""
+            )
             candidate_count = event.get("candidateCount")
             if type(candidate_count) is not int or candidate_count < 0:
                 candidate_count = 0

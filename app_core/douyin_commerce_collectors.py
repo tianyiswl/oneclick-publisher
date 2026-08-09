@@ -284,17 +284,26 @@ _CONTROLLED_SCALAR_TYPES = frozenset(
 )
 
 _DIAGNOSTIC_LIMIT = 200
-_ACCOUNT_STATE_PATH = re.compile(
-    r"(?i)(?:(?:[a-z]:)?(?:[/\\][^/\\\s,;|]+)*)?[/\\]?"
-    r"(?:cookies?file|account(?:s|_state)?)(?:[/\\][^\s,;|]+)+"
-    r"|\baccount(?:_state)?\.(?:json|txt)\b"
+_ABSOLUTE_PATH = re.compile(
+    r"(?i)(?:[a-z]:[\\/]|/)(?:[^\s,;|\"'<>]+[\\/]?)+"
+)
+_ACCOUNT_STATE_FILE = re.compile(
+    r"(?i)(?:cookies?(?:file)?|accounts?|account[_-]?state|state)"
+    r"\.(?:json|txt)\b"
+)
+_ACCOUNT_STATE_RELATIVE_PATH = re.compile(
+    r"(?i)(?:[^\s,;|\"'<>]+[\\/])*"
+    r"(?:cookies?(?:file)?|accounts?|account[_-]?state|state)"
+    r"\.(?:json|txt)\b"
 )
 _LONG_NUMBER = re.compile(r"\d{4,}")
 _SENSITIVE_DETAIL = re.compile(
-    r"(?i)(?:\b(?:cookie|token|html|dom|session(?:[_ -]?id)?|"
-    r"verification(?:[_ -]?code)?)\b|验证码|二维码)"
-    r"\s*[:=：]?\s*[^,;|\n]*"
+    r"(?i)(?:(?:access[_-]?token|cookie(?:[_-]?(?:value|data|header))?|"
+    r"token|html|dom|selector|session(?:[_ -]?id)?|"
+    r"verification(?:[_ -]?code)?)|验证码|二维码)"
+    r"\s*[:=：]?\s*(?:<[^>\n]*>.*?</[^>\n]*>|[^,;|\n]*)"
 )
+_HTML_FRAGMENT = re.compile(r"<[^>\n]+>(?:.*?</[^>\n]+>)?")
 
 _LOGIN_MARKERS = (
     "login required",
@@ -355,6 +364,46 @@ _CLEANUP_MARKERS = (
     "关闭失败",
     "清理失败",
 )
+_TRUSTED_DIAGNOSTIC_EXCEPTION_TYPES = (
+    RuntimeError,
+    ValueError,
+    TypeError,
+    TimeoutError,
+    ConnectionError,
+    OSError,
+)
+
+
+def _trusted_diagnostic_text(value: object) -> str:
+    """只读取不会执行自定义代码的内建字符串。"""
+
+    if type(value) is str:
+        return value
+    if type(value) in _TRUSTED_DIAGNOSTIC_EXCEPTION_TYPES:
+        arguments = value.args
+        if len(arguments) == 1 and type(arguments[0]) is str:
+            return arguments[0]
+    return ""
+
+
+def _redact_diagnostic_text(value: object, *, limit: int = 180) -> str:
+    """将可信内建字符串投影为有限、无路径的诊断摘要。"""
+
+    detail = _trusted_diagnostic_text(value).replace("\r", " ").replace("\n", " ")
+
+    def replace_absolute_path(match: re.Match[str]) -> str:
+        return (
+            "<account-state>"
+            if _ACCOUNT_STATE_FILE.search(match.group(0))
+            else "<path>"
+        )
+
+    detail = _ABSOLUTE_PATH.sub(replace_absolute_path, detail)
+    detail = _ACCOUNT_STATE_RELATIVE_PATH.sub("<account-state>", detail)
+    detail = _SENSITIVE_DETAIL.sub("<redacted>", detail)
+    detail = _HTML_FRAGMENT.sub("<redacted>", detail)
+    detail = _LONG_NUMBER.sub("<redacted-number>", detail)
+    return (detail.strip() or "<unavailable>")[: max(0, limit)]
 
 
 class DouyinCommerceCollectorManager:
@@ -537,6 +586,7 @@ class DouyinCommerceCollectorManager:
                 collector_type=CollectorType.FAVORITE_MUSIC,
                 request_id=request_id,
                 action_name="refresh_favorite_music",
+                action_instance_id=action_instance_id,
             )
         except DouyinCommerceCollectorError as error:
             raise self._contextual_action_error(
@@ -594,6 +644,7 @@ class DouyinCommerceCollectorManager:
                 collector_type=collector_type,
                 request_id=request_id,
                 action_name="search_locations",
+                action_instance_id=action_instance_id,
                 scope=normalized_scope,
                 keyword=normalized_keyword,
             )
@@ -638,6 +689,7 @@ class DouyinCommerceCollectorManager:
                 collector_type=normalized_type,
                 request_id=request_id,
                 action_name="retry_collector",
+                action_instance_id=action_instance_id,
                 scope=_FIXED_SCOPES[normalized_type],
             )
         except DouyinCommerceCollectorError as error:
@@ -1696,6 +1748,7 @@ class DouyinCommerceCollectorManager:
         collector_type: CollectorType,
         request_id: str,
         action_name: str,
+        action_instance_id: str,
         scope: str = "",
         keyword: str = "",
     ) -> Any:
@@ -1704,23 +1757,12 @@ class DouyinCommerceCollectorManager:
             result = self._action_queue.wait(queued_action)
         except DouyinCommerceCollectorError as error:
             if not error.event_emitted:
-                with self._state_lock:
-                    runtime = self._runtime
-                    collector = (
-                        runtime.collectors.get(collector_type)
-                        if runtime
-                        and runtime.generation.generation_id == generation_id
-                        else None
-                    )
                 self._emit_event(
                     request_id=request_id,
                     generation_id=generation_id,
-                    collector=collector,
+                    collector=None,
                     collector_type=collector_type,
-                    collector_instance_id=(
-                        error.collector_instance_id
-                        or (collector.instance_id if collector is not None else "")
-                    ),
+                    collector_instance_id=action_instance_id,
                     phase=(
                         "queue"
                         if error.code == "stale_result_discarded"
@@ -1749,20 +1791,12 @@ class DouyinCommerceCollectorManager:
             candidates = result.get("candidates")
             if isinstance(candidates, list):
                 candidate_count = len(candidates)
-        with self._state_lock:
-            runtime = self._runtime
-            collector = (
-                runtime.collectors.get(collector_type)
-                if runtime
-                and runtime.generation.generation_id == generation_id
-                else None
-            )
         self._emit_event(
             request_id=request_id,
             generation_id=generation_id,
-            collector=collector,
+            collector=None,
             collector_type=collector_type,
-            collector_instance_id=(collector.instance_id if collector else ""),
+            collector_instance_id=action_instance_id,
             phase="result",
             action=action_name,
             scope=scope,
@@ -1934,17 +1968,14 @@ class DouyinCommerceCollectorManager:
         return max(0, int((monotonic() - started_at) * 1000))
 
     @staticmethod
-    def _exception_text(error: object) -> str:
-        try:
-            return str(error)
-        except Exception:
-            return ""
+    def _trusted_diagnostic_text(value: object) -> str:
+        return _trusted_diagnostic_text(value)
 
     @classmethod
     def _classify_diagnostic_error(cls, error: object) -> str:
         """按固定优先级将底层异常收敛为公开错误码。"""
 
-        detail = cls._exception_text(error).strip().casefold()
+        detail = cls._trusted_diagnostic_text(error).strip().casefold()
         if any(marker in detail for marker in _LOGIN_MARKERS):
             return "login_required"
         if any(marker in detail for marker in _SCOPE_MARKERS) or (
@@ -1974,11 +2005,7 @@ class DouyinCommerceCollectorManager:
     def _safe_diagnostic_detail(cls, error: object) -> str:
         """生成最多 180 字的本机开发摘要，不保留账号态或页面原文。"""
 
-        detail = cls._exception_text(error).replace("\r", " ").replace("\n", " ")
-        detail = _ACCOUNT_STATE_PATH.sub("<account-state>", detail)
-        detail = _LONG_NUMBER.sub("<redacted-number>", detail)
-        detail = _SENSITIVE_DETAIL.sub("<redacted>", detail)
-        return (detail.strip() or "<unavailable>")[:180]
+        return _redact_diagnostic_text(error)
 
     @classmethod
     def _log_diagnostic_failure(cls, error_code: str, error: object) -> None:

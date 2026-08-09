@@ -2903,6 +2903,63 @@ class DouyinCommerceUiTests(unittest.TestCase):
         )
         information.assert_not_called()
 
+    def test_copy_collector_diagnostics_redacts_reviewer_payloads(self) -> None:
+        self.page._setup_generation_id = "generation-redaction"
+        payloads = (
+            "/Users/andy/private/account.json",
+            "/tmp/browser-profile/state.json",
+            'selector=<div data-secret="abc">private</div>',
+            "access_token=top-secret",
+            "cookie_value=top-secret",
+        )
+        events = [
+            {
+                "timestamp": f"2026-08-09T13:42:1{index}+08:00",
+                "requestId": f"request-{index}",
+                "setupGenerationId": "generation-redaction",
+                "collectorType": "domestic_location",
+                "collectorInstanceId": f"domestic-{index}",
+                "accountMaskedId": "account-31",
+                "phase": "result",
+                "action": "search_locations",
+                "scope": "domestic",
+                "keyword": payload,
+                "attempt": 1,
+                "candidateCount": 0,
+                "durationMs": 10,
+                "outcome": "failed",
+                "errorCode": "collector_unknown",
+                "cleanupResult": "",
+            }
+            for index, payload in enumerate(payloads)
+        ]
+
+        with patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.recent_diagnostics",
+            return_value=events,
+        ), patch(
+            "ui.douyin_commerce_page.QApplication.clipboard"
+        ) as clipboard:
+            self.page._copy_collector_diagnostics()
+
+        copied = clipboard.return_value.setText.call_args.args[0].casefold()
+        for forbidden in (
+            "/users",
+            "andy",
+            "private",
+            "account.json",
+            "/tmp",
+            "browser-profile",
+            "state.json",
+            "selector",
+            "<div",
+            "data-secret",
+            "access_token",
+            "cookie_value",
+            "top-secret",
+        ):
+            self.assertNotIn(forbidden, copied)
+
     def test_background_task_forwards_progress_before_success(self) -> None:
         events: list[dict[str, str]] = []
         task = BackgroundTask(
