@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 import logging
 from pathlib import Path
 import re
+import threading
 from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo
 
@@ -428,6 +429,7 @@ class DouyinCommercePage(QWidget):
     _SETUP_GENERATION_TASK_KEY = "douyin_commerce_setup_generation"
     _SETUP_GENERATION_CLOSE_TASK_KEY = "douyin_commerce_setup_generation_close"
     _COLLECTOR_BARRIER_ERROR = "平台设置临时会话未完全关闭，已安全停止"
+    _SHUTDOWN_WAIT_SECONDS = 5.0
     _DEFAULT_CONTENT_DECLARATION = "无需添加自主声明"
     _DISABLED_CONTENT_DECLARATIONS = frozenset({"内容为转载信息"})
     _BATCH_EDITOR_SESSION_ENDED_HINT = "编辑会话已结束；预检将为每条视频重新建立上传会话"
@@ -474,6 +476,7 @@ class DouyinCommercePage(QWidget):
         # 采集器内部的 sessionId，只保留协调器公开的代际和实例状态。
         self._setup_generation_id = ""
         self._setup_generation_cleanup_required = False
+        self._shutdown_requested = threading.Event()
         self._collector_status: dict[str, object] = {}
         self._last_failed_collector_type = ""
         self._staged_music_confirmed = False
@@ -4245,20 +4248,30 @@ class DouyinCommercePage(QWidget):
             return
         task = task_service.create_douyin_batch_task(payload, mode="oneclick_preflight")
         self._batch_task_id = int(task["id"])
+        task_id = self._batch_task_id
         self._batch_pause_requested = False
         self._batch_editor_session_ended = False
-        task_service.mark_task_running(self._batch_task_id, "抖音带货批量开始逐条发布前检查")
         self.validation_label.setText(f"正在检查 0/{len(payload['items'])} 条视频…")
+
+        def run_preflight(report) -> object:
+            def execute() -> object:
+                task_service.mark_task_running(
+                    task_id, "抖音带货批量开始逐条发布前检查"
+                )
+                return self._batch_executor.run_preflight(
+                    payload,
+                    task_id=task_id,
+                    progress=lambda event: report(event.to_public_dict()),
+                )
+
+            return self._run_after_collector_barrier(
+                execute,
+                reason="preflight_started",
+            )
+
         self.runner.run(
             _BATCH_RUN_KEY,
-            with_progress=lambda report: self._run_after_collector_barrier(
-                lambda: self._batch_executor.run_preflight(
-                    payload,
-                    task_id=self._batch_task_id or 0,
-                    progress=lambda event: report(event.to_public_dict()),
-                ),
-                reason="preflight_started",
-            ),
+            with_progress=run_preflight,
             on_progress=self._batch_progress,
             on_success=lambda result: self._batch_preflight_succeeded(payload, result),
             on_error=self._batch_operation_failed,
@@ -4363,25 +4376,35 @@ class DouyinCommercePage(QWidget):
         """确认后启动批量最终提交；只由平台逐条回执决定已发布状态。"""
 
         self._batch_task_id = int(task["id"])
+        task_id = self._batch_task_id
         self._batch_pause_requested = False
-        task_service.mark_task_running(self._batch_task_id, "抖音带货批量开始最终提交")
         self._batch_preflight_fingerprint = ""
         self._batch_result_feedback = ""
         total = len(payload.get("items") or [])
         self._batch_progress_text = f"已完成 0/{total} · 成功 0 · 失败 0 · 正在启动…"
         self.validation_label.setText(self._batch_progress_text)
         _LOGGER.info("抖音带货批量执行：%s", self._batch_progress_text)
-        started = self.runner.run(
-            _BATCH_RUN_KEY,
-            with_progress=lambda report: self._run_after_collector_barrier(
-                lambda: self._batch_executor.run_publish(
+
+        def run_publish(report) -> object:
+            def execute() -> object:
+                task_service.mark_task_running(
+                    task_id, "抖音带货批量开始最终提交"
+                )
+                return self._batch_executor.run_publish(
                     payload,
-                    task_id=self._batch_task_id or 0,
+                    task_id=task_id,
                     confirmed=True,
                     progress=lambda event: report(event.to_public_dict()),
-                ),
+                )
+
+            return self._run_after_collector_barrier(
+                execute,
                 reason="publish_started",
-            ),
+            )
+
+        started = self.runner.run(
+            _BATCH_RUN_KEY,
+            with_progress=run_publish,
             on_progress=self._batch_progress,
             on_success=self._batch_publish_succeeded,
             on_error=self._batch_operation_failed,
@@ -4768,7 +4791,9 @@ class DouyinCommercePage(QWidget):
     def _start_setup_generation(self, payload: dict) -> None:
         """关闭旧代际并建立本次平台设置代际；不创建正式发布会话。"""
 
-        if self.runner.is_running(self._SETUP_GENERATION_TASK_KEY):
+        if self._shutdown_requested.is_set() or self.runner.is_running(
+            self._SETUP_GENERATION_TASK_KEY
+        ):
             return
         old_generation_id = self._setup_generation_id
         self._setup_start_token += 1
@@ -4782,12 +4807,40 @@ class DouyinCommercePage(QWidget):
 
         def begin(report):
             def operation() -> object:
+                if self._shutdown_requested.is_set():
+                    raise RuntimeError("client_shutdown")
                 # 内部 runtime 可能在公开 ID 返回前失败；先登记清理义务，
                 # 让异常回调仍能通过 close_generation(None) 统一收口。
                 self._setup_generation_cleanup_required = True
-                return douyin_commerce_collectors.commerce_collector_manager.begin_generation(
+                if self._shutdown_requested.is_set():
+                    raise RuntimeError("client_shutdown")
+                result = douyin_commerce_collectors.commerce_collector_manager.begin_generation(
                     dict(payload), on_progress=report
                 )
+                if self._shutdown_requested.is_set():
+                    generation_id = (
+                        _normalized(result.get("setupGenerationId"))
+                        if isinstance(result, Mapping)
+                        else ""
+                    )
+                    try:
+                        close_result = (
+                            douyin_commerce_collectors.commerce_collector_manager.close_generation(
+                                generation_id or None,
+                                reason="client_shutdown",
+                            )
+                        )
+                    except Exception:
+                        close_result = {
+                            "closed": False,
+                            "aliveCollectorCount": 1,
+                        }
+                    if self._collector_close_is_complete(close_result):
+                        self._setup_generation_cleanup_required = False
+                    elif generation_id:
+                        self._setup_generation_id = generation_id
+                    raise RuntimeError("client_shutdown")
+                return result
 
             if old_generation_id:
                 return self._run_after_collector_barrier(
@@ -4812,7 +4865,7 @@ class DouyinCommercePage(QWidget):
     def _accept_setup_generation_result(
         self, start_token: int, payload: Mapping[str, Any], result: object
     ) -> None:
-        if start_token != self._setup_start_token:
+        if self._shutdown_requested.is_set() or start_token != self._setup_start_token:
             return
         self._setup_generation_succeeded(result)
         result_generation_id = (
@@ -4856,7 +4909,7 @@ class DouyinCommercePage(QWidget):
         self._go_to_step(1)
 
     def _setup_generation_failed(self, start_token: int, message: object) -> None:
-        if start_token != self._setup_start_token:
+        if self._shutdown_requested.is_set() or start_token != self._setup_start_token:
             return
         self._clear_commerce_progress()
         code = (
@@ -4884,10 +4937,8 @@ class DouyinCommercePage(QWidget):
     def _collector_close_is_complete(result: object) -> bool:
         if not isinstance(result, Mapping) or result.get("closed") is not True:
             return False
-        try:
-            return int(result.get("aliveCollectorCount") or 0) == 0
-        except (TypeError, ValueError):
-            return False
+        alive_count = result.get("aliveCollectorCount")
+        return type(alive_count) is int and alive_count == 0
 
     def _close_setup_generation(self, reason: str) -> dict[str, object]:
         """同步执行统一 cancel-and-close；调用方负责将它放入后台任务。"""
@@ -4976,11 +5027,7 @@ class DouyinCommercePage(QWidget):
                 result,
             ),
             on_error=lambda _message: self._setup_generation_close_failed(close_token),
-            on_finished=(
-                (lambda: None)
-                if completion == "operation_failed"
-                else self._sync_view
-            ),
+            on_finished=self._sync_view,
         )
         if not started:
             self._setup_generation_close_failed(close_token)
@@ -6133,21 +6180,43 @@ class DouyinCommercePage(QWidget):
         if not silent:
             QMessageBox.information(self, "抖音带货", "已关闭临时编辑页，未保存草稿或发布。")
 
-    def shutdown(self) -> None:
-        """客户端退出收口：不弹窗，尽力关闭采集代际与旧正式会话。"""
+    def shutdown(self) -> bool:
+        """客户端退出收口；只有启动任务已停且采集器严格归零才返回成功。"""
 
-        result = self._close_setup_generation("client_shutdown")
-        if not self._collector_close_is_complete(result) and (
-            self._setup_generation_id or self._setup_generation_cleanup_required
-        ):
-            self._close_setup_generation("client_shutdown")
+        self._shutdown_requested.set()
+        setup_finished = True
+        if self.runner.is_running(self._SETUP_GENERATION_TASK_KEY):
+            cancel_pending = getattr(self.runner, "cancel_pending", None)
+            cancelled = bool(
+                callable(cancel_pending)
+                and cancel_pending(self._SETUP_GENERATION_TASK_KEY)
+            )
+            if not cancelled:
+                wait_for_finished = getattr(self.runner, "wait_for_finished", None)
+                setup_finished = bool(
+                    callable(wait_for_finished)
+                    and wait_for_finished(
+                        self._SETUP_GENERATION_TASK_KEY,
+                        self._SHUTDOWN_WAIT_SECONDS,
+                    )
+                )
+
+        collectors_closed = False
+        if setup_finished:
+            result = self._close_setup_generation("client_shutdown")
+            if not self._collector_close_is_complete(result):
+                result = self._close_setup_generation("client_shutdown")
+            collectors_closed = self._collector_close_is_complete(result)
+
+        legacy_session_closed = True
         session_id = self._session_id
         self._session_id = ""
         if session_id:
             try:
                 douyin_commerce_session.commerce_session_manager.close(session_id)
             except Exception:
-                pass
+                legacy_session_closed = False
+        return setup_finished and collectors_closed and legacy_session_closed
 
     def _reset_platform_settings_after_abandon(self) -> None:
         """将平台设置恢复为一次全新上传的默认状态。

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import threading
 from typing import Any
 
 from PyQt6.QtCore import QObject, QRunnable, QThreadPool, pyqtSignal, pyqtSlot
@@ -27,15 +28,51 @@ class BackgroundTask(QRunnable):
         self.fn = fn
         self.signals = TaskSignals()
         self.setAutoDelete(False)
+        self._state_lock = threading.Lock()
+        self._state = "queued"
+        self._finished = threading.Event()
+
+    def cancel_pending(self) -> bool:
+        """只取消尚未进入 worker 的任务；与 ``run`` 的抢占由同一把锁裁决。"""
+
+        with self._state_lock:
+            if self._state != "queued":
+                return False
+            self._state = "cancelled"
+            self._finished.set()
+            return True
+
+    def wait_for_finished(self, timeout_seconds: float) -> bool:
+        """等待 worker 结束；事件在线程信号送回 UI 前置位，避免退出死锁。"""
+
+        return self._finished.wait(max(0.0, float(timeout_seconds)))
+
+    def _claim_run(self) -> bool:
+        with self._state_lock:
+            if self._state == "cancelled":
+                return False
+            if self._state != "queued":
+                return False
+            self._state = "running"
+            return True
+
+    def _mark_finished(self) -> None:
+        with self._state_lock:
+            self._state = "finished"
+            self._finished.set()
 
     @pyqtSlot()
     def run(self) -> None:
+        if not self._claim_run():
+            self.signals.finished.emit()
+            return
         self.signals.started.emit()
         try:
             self.signals.succeeded.emit(self.fn(self.signals.progressed.emit))
         except Exception as exc:
             self.signals.failed.emit(str(exc) or exc.__class__.__name__)
         finally:
+            self._mark_finished()
             self.signals.finished.emit()
 
 
@@ -46,9 +83,30 @@ class BackgroundTaskRunner(QObject):
         super().__init__(parent)
         self.pool = QThreadPool.globalInstance()
         self.active: dict[str, BackgroundTask] = {}
+        self._active_lock = threading.RLock()
 
     def is_running(self, key: str) -> bool:
-        return key in self.active
+        with self._active_lock:
+            return key in self.active
+
+    def cancel_pending(self, key: str) -> bool:
+        """原子取消尚未开跑的指定任务，并立即撤销其 active 投影。"""
+
+        with self._active_lock:
+            task = self.active.get(key)
+            if task is None or not task.cancel_pending():
+                return False
+            self.active.pop(key, None)
+            return True
+
+    def wait_for_finished(self, key: str, timeout_seconds: float) -> bool:
+        """有界等待指定 worker；active 清理由 Qt finished 回调稍后完成。"""
+
+        with self._active_lock:
+            task = self.active.get(key)
+        if task is None:
+            return True
+        return task.wait_for_finished(timeout_seconds)
 
     def run(
         self,
@@ -62,8 +120,6 @@ class BackgroundTaskRunner(QObject):
         on_error: Callable[[str], None] | None = None,
         on_finished: Callable[[], None] | None = None,
     ) -> bool:
-        if key in self.active:
-            return False
         if fn is None and with_progress is None:
             raise ValueError("后台任务必须提供执行函数")
 
@@ -76,7 +132,10 @@ class BackgroundTaskRunner(QObject):
                 return fn()
 
         task = BackgroundTask(worker)
-        self.active[key] = task
+        with self._active_lock:
+            if key in self.active:
+                return False
+            self.active[key] = task
 
         if on_started:
             task.signals.started.connect(on_started)
@@ -88,7 +147,9 @@ class BackgroundTaskRunner(QObject):
             task.signals.failed.connect(on_error)
 
         def cleanup() -> None:
-            self.active.pop(key, None)
+            with self._active_lock:
+                if self.active.get(key) is task:
+                    self.active.pop(key, None)
             if on_finished:
                 on_finished()
 

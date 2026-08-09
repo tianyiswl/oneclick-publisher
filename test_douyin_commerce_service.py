@@ -40,7 +40,7 @@ from uploader.douyin_uploader.main import DouYinVideo
 from app_core import douyin_verification
 from app_core.douyin_commerce_batch_executor import DouyinCommerceBatchExecutor
 from app_core.douyin_verification import DouyinVerificationBroker, VerificationChallenge
-from ui.background_task import BackgroundTask
+from ui.background_task import BackgroundTask, BackgroundTaskRunner
 from ui.common import apply_style
 from ui.douyin_commerce_page import (
     DouyinCommerceBatchResumeConfirmDialog,
@@ -7228,6 +7228,69 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
                     on_finished()
             return True
 
+    class _ControlledLifecycleRunner:
+        """确定性复现真实 runner：回调期间 active，finished 前先移除 key。"""
+
+        def __init__(self) -> None:
+            self.active: dict[str, dict[str, object]] = {}
+
+        def is_running(self, key: str) -> bool:
+            return key in self.active
+
+        def run(
+            self,
+            key: str,
+            fn=None,
+            *,
+            with_progress=None,
+            on_started=None,
+            on_progress=None,
+            on_success=None,
+            on_error=None,
+            on_finished=None,
+        ) -> bool:
+            if key in self.active:
+                return False
+            if with_progress is None:
+                if fn is None:
+                    raise ValueError("测试任务必须提供执行函数")
+                with_progress = lambda _report: fn()
+            self.active[key] = {
+                "worker": with_progress,
+                "on_started": on_started,
+                "on_progress": on_progress,
+                "on_success": on_success,
+                "on_error": on_error,
+                "on_finished": on_finished,
+            }
+            return True
+
+        def execute(self, key: str) -> None:
+            job = self.active[key]
+            on_started = job["on_started"]
+            if callable(on_started):
+                on_started()
+            on_progress = job["on_progress"]
+            report = lambda event: on_progress(event) if callable(on_progress) else None
+            try:
+                result = job["worker"](report)
+            except Exception as exc:
+                on_error = job["on_error"]
+                if callable(on_error):
+                    on_error(str(exc))
+                else:
+                    raise
+            else:
+                on_success = job["on_success"]
+                if callable(on_success):
+                    on_success(result)
+
+        def finish(self, key: str) -> None:
+            job = self.active.pop(key)
+            on_finished = job["on_finished"]
+            if callable(on_finished):
+                on_finished()
+
     @staticmethod
     def _collector_status(
         *,
@@ -7544,7 +7607,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         ) as information, patch(
             "ui.douyin_commerce_page.QMessageBox.warning"
         ) as warning:
-            self.page.shutdown()
+            shutdown_succeeded = self.page.shutdown()
 
         close_generation.assert_called_once_with(
             "generation-a", reason="client_shutdown"
@@ -7552,8 +7615,277 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         close_session.assert_called_once_with("session-legacy")
         self.assertEqual(self.page._setup_generation_id, "")
         self.assertEqual(self.page._session_id, "")
+        self.assertIs(shutdown_succeeded, True)
         information.assert_not_called()
         warning.assert_not_called()
+
+    def test_shutdown_cancels_queued_setup_before_worker_can_begin_generation(self) -> None:
+        """已入线程池但尚未执行的 setup 必须在退出返回前不可逆取消。"""
+
+        class QueuedPool:
+            def __init__(self) -> None:
+                self.tasks: list[BackgroundTask] = []
+
+            def start(self, task: BackgroundTask) -> None:
+                self.tasks.append(task)
+
+        queued_pool = QueuedPool()
+        runner = BackgroundTaskRunner(self.page)
+        runner.pool = queued_pool
+        self.page.runner = runner
+        started = self._collector_status()
+
+        with patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.begin_generation",
+            return_value=started,
+        ) as begin_generation, patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.close_generation",
+            return_value={
+                "closed": True,
+                "setupGenerationId": "",
+                "aliveCollectorCount": 0,
+            },
+        ), patch("ui.douyin_commerce_page.QMessageBox.warning"):
+            self.page._start_setup_generation({"accountId": 31})
+            self.assertEqual(len(queued_pool.tasks), 1)
+
+            shutdown_succeeded = self.page.shutdown()
+            queued_pool.tasks[0].run()
+            QApplication.processEvents()
+
+        begin_generation.assert_not_called()
+        self.assertIs(shutdown_succeeded, True)
+        self.assertFalse(runner.is_running(self.page._SETUP_GENERATION_TASK_KEY))
+        self.assertEqual(self.page._setup_generation_id, "")
+
+    def test_shutdown_reports_failure_when_running_setup_misses_bounded_deadline(self) -> None:
+        """运行中的 setup 未在截止内收束时，退出必须返回失败而非假报零存活。"""
+
+        class TimedOutRunner:
+            def is_running(self, key: str) -> bool:
+                return key == self.page._SETUP_GENERATION_TASK_KEY
+
+            def cancel_pending(self, _key: str) -> bool:
+                return False
+
+            def wait_for_finished(self, _key: str, _timeout_seconds: float) -> bool:
+                return False
+
+        runner = TimedOutRunner()
+        runner.page = self.page
+        self.page.runner = runner
+        with patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.close_generation",
+            return_value={"closed": True, "aliveCollectorCount": 0},
+        ):
+            shutdown_succeeded = self.page.shutdown()
+
+        self.assertIs(shutdown_succeeded, False)
+
+    def test_timed_out_setup_closes_generation_when_worker_returns_late(self) -> None:
+        """退出已被阻止后，迟到的 begin 结果仍须在 worker 内 client_shutdown。"""
+
+        class RunningPool:
+            def __init__(self) -> None:
+                self.thread: threading.Thread | None = None
+
+            def start(self, task: BackgroundTask) -> None:
+                self.thread = threading.Thread(target=task.run, daemon=True)
+                self.thread.start()
+
+        begin_entered = threading.Event()
+        allow_return = threading.Event()
+        running_pool = RunningPool()
+        runner = BackgroundTaskRunner(self.page)
+        runner.pool = running_pool
+        self.page.runner = runner
+        self.page._SHUTDOWN_WAIT_SECONDS = 0.001
+        started = self._collector_status()
+
+        def blocked_begin(_payload: dict, *, on_progress=None) -> dict:
+            del on_progress
+            begin_entered.set()
+            if not allow_return.wait(2):
+                raise AssertionError("测试未释放 begin_generation")
+            return started
+
+        with patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.begin_generation",
+            side_effect=blocked_begin,
+        ), patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.close_generation",
+            return_value={
+                "closed": True,
+                "setupGenerationId": "generation-a",
+                "aliveCollectorCount": 0,
+            },
+        ) as close_generation:
+            self.page._start_setup_generation({"accountId": 31})
+            self.assertTrue(begin_entered.wait(1))
+            shutdown_succeeded = self.page.shutdown()
+            try:
+                self.assertIs(shutdown_succeeded, False)
+            finally:
+                allow_return.set()
+                self.assertIsNotNone(running_pool.thread)
+                running_pool.thread.join(2)
+                QApplication.processEvents()
+
+        close_generation.assert_called_with(
+            "generation-a", reason="client_shutdown"
+        )
+        self.assertFalse(self.page._setup_generation_cleanup_required)
+        self.assertEqual(self.page._setup_generation_id, "")
+
+    def test_collector_barrier_rejects_non_strict_zero_alive_proofs(self) -> None:
+        """缺字段或可强转为零的值都不是全部采集器已关闭的证据。"""
+
+        invalid_results = (
+            [],
+            {"closed": True},
+            {"closed": True, "aliveCollectorCount": False},
+            {"closed": True, "aliveCollectorCount": 0.0},
+            {"closed": True, "aliveCollectorCount": "0"},
+            {"closed": False, "aliveCollectorCount": 0},
+        )
+        for close_result in invalid_results:
+            with self.subTest(close_result=close_result):
+                self.page._setup_generation_id = "generation-a"
+                operation = MagicMock()
+                with patch(
+                    "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.close_generation",
+                    return_value=close_result,
+                ), self.assertRaisesRegex(
+                    RuntimeError,
+                    "平台设置临时会话未完全关闭，已安全停止",
+                ):
+                    self.page._run_after_collector_barrier(
+                        operation,
+                        reason="preflight_started",
+                    )
+                operation.assert_not_called()
+
+    def test_operation_failed_close_refreshes_only_after_runner_removes_active_key(self) -> None:
+        """异常关闭的 finished 刷新必须发生在 key 删除后，恢复被 busy 禁用的控件。"""
+
+        runner = self._ControlledLifecycleRunner()
+        self.page.runner = runner
+        failed = self._collector_status(domestic="failed")
+        with patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.begin_generation",
+            return_value=failed,
+        ), patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.close_generation",
+            return_value={"closed": True, "aliveCollectorCount": 0},
+        ):
+            self.page._start_setup_generation({"accountId": 31})
+            runner.execute(self.page._SETUP_GENERATION_TASK_KEY)
+            runner.finish(self.page._SETUP_GENERATION_TASK_KEY)
+            runner.execute(self.page._SETUP_GENERATION_CLOSE_TASK_KEY)
+
+            self.assertTrue(self.page._busy())
+            self.assertFalse(self.page.save_content_button.isEnabled())
+            runner.finish(self.page._SETUP_GENERATION_CLOSE_TASK_KEY)
+
+        self.assertFalse(self.page._busy())
+        self.assertTrue(self.page.save_content_button.isEnabled())
+
+    @staticmethod
+    def _create_offline_pending_task(*, mode: str) -> dict:
+        return task_service.create_pending_task(
+            [
+                {
+                    "type": 3,
+                    "accountList": ["oneclick_3_offline.json"],
+                    "fileList": ["/tmp/offline-video.mp4"],
+                    "contentType": "video",
+                    "title": "关闭屏障离线测试",
+                    "debugDryRun": mode == "oneclick_preflight",
+                }
+            ],
+            mode=mode,
+        )
+
+    def test_preflight_barrier_failure_keeps_ledger_non_running_until_finished(self) -> None:
+        """预检屏障失败时台账不得 running，且 finished 前保留 taskId 和固定原因。"""
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            database, "DB_PATH", Path(directory) / "database.db"
+        ):
+            database.ensure_schema()
+            task = self._create_offline_pending_task(mode="oneclick_preflight")
+            runner = self._ControlledLifecycleRunner()
+            self.page.runner = runner
+            self.page._setup_generation_id = "generation-a"
+            self.page._selected_video_indexes = [1]
+            payload = {"items": [{"mediaPath": "/tmp/offline-video.mp4"}]}
+            with patch.object(
+                self.page, "collect_batch_payload", return_value=payload
+            ), patch(
+                "ui.douyin_commerce_page.task_service.create_douyin_batch_task",
+                return_value=task,
+            ), patch(
+                "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.close_generation",
+                return_value={"closed": False, "aliveCollectorCount": 1},
+            ), patch.object(
+                self.page._batch_executor, "run_preflight"
+            ) as run_preflight, patch(
+                "ui.douyin_commerce_page.QMessageBox.warning"
+            ):
+                self.page.start_batch_preflight()
+                runner.execute("douyin_commerce_batch_run")
+                try:
+                    stored = task_service.get_task(task["id"])
+                    self.assertIsNotNone(stored)
+                    self.assertNotEqual(stored["status"], "running")
+                    self.assertEqual(self.page._batch_task_id, task["id"])
+                    self.assertEqual(
+                        self.page._batch_result_feedback,
+                        "批量任务未完成：平台设置临时会话未完全关闭，已安全停止",
+                    )
+                    run_preflight.assert_not_called()
+                finally:
+                    runner.finish("douyin_commerce_batch_run")
+            self.assertIsNone(self.page._batch_task_id)
+
+    def test_publish_barrier_failure_keeps_ledger_non_running_until_finished(self) -> None:
+        """发布屏障失败时台账不得 running，且 executor 未启动、固定归因仍可见。"""
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            database, "DB_PATH", Path(directory) / "database.db"
+        ):
+            database.ensure_schema()
+            task = self._create_offline_pending_task(mode="oneclick_publish")
+            runner = self._ControlledLifecycleRunner()
+            self.page.runner = runner
+            self.page._setup_generation_id = "generation-a"
+            self.page._selected_video_indexes = [1]
+            payload = {"items": [{"mediaPath": "/tmp/offline-video.mp4"}]}
+            with patch(
+                "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.close_generation",
+                return_value={"closed": False, "aliveCollectorCount": 1},
+            ), patch.object(
+                self.page._batch_executor, "run_publish"
+            ) as run_publish, patch.object(
+                self.page, "_start_douyin_verification_polling"
+            ), patch(
+                "ui.douyin_commerce_page.QMessageBox.warning"
+            ):
+                self.page.start_batch_publish(payload, task)
+                runner.execute("douyin_commerce_batch_run")
+                try:
+                    stored = task_service.get_task(task["id"])
+                    self.assertIsNotNone(stored)
+                    self.assertNotEqual(stored["status"], "running")
+                    self.assertEqual(self.page._batch_task_id, task["id"])
+                    self.assertEqual(
+                        self.page._batch_result_feedback,
+                        "批量任务未完成：平台设置临时会话未完全关闭，已安全停止",
+                    )
+                    run_publish.assert_not_called()
+                finally:
+                    runner.finish("douyin_commerce_batch_run")
+            self.assertIsNone(self.page._batch_task_id)
 
     def test_batch_preflight_stops_before_executor_when_collector_remains_alive(self) -> None:
         """预检关闭屏障未取得零存活时，不得创建任何正式编辑会话。"""
