@@ -13,6 +13,7 @@ import logging
 from pathlib import Path
 import re
 import threading
+import time
 from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo
 
@@ -505,6 +506,14 @@ class DouyinCommercePage(QWidget):
             "favorite_music": 0,
             "local_location": 0,
         }
+        self._platform_collector_progress_owner: tuple[str, str, int] | None = None
+        self._platform_collector_progress_label_text = ""
+        self._platform_collector_progress_started = 0.0
+        self._platform_collector_progress_timer = QTimer(self)
+        self._platform_collector_progress_timer.setInterval(1_000)
+        self._platform_collector_progress_timer.timeout.connect(
+            self._update_platform_collector_progress
+        )
         self._music_candidates: list[dict[str, str]] = []
         self._music_candidate_source = ""
         self._selected_music: dict[str, str] | None = None
@@ -1304,6 +1313,30 @@ class DouyinCommercePage(QWidget):
         self.platform_review_status.setObjectName("douyinCommercePlatformReviewStatus")
         self.platform_review_status.setWordWrap(True)
         review_layout.addWidget(self.platform_review_status, 1)
+        self.platform_collector_progress_frame = QFrame()
+        self.platform_collector_progress_frame.setObjectName(
+            "douyinCommercePlatformCollectorProgress"
+        )
+        platform_progress_layout = QVBoxLayout(
+            self.platform_collector_progress_frame
+        )
+        platform_progress_layout.setContentsMargins(10, 7, 10, 7)
+        platform_progress_layout.setSpacing(4)
+        self.platform_collector_progress_label = QLabel("")
+        self.platform_collector_progress_label.setObjectName(
+            "douyinCommercePlatformCollectorProgressLabel"
+        )
+        self.platform_collector_progress = QProgressBar()
+        self.platform_collector_progress.setObjectName(
+            "douyinCommercePlatformCollectorProgressBar"
+        )
+        self.platform_collector_progress.setRange(0, 0)
+        self.platform_collector_progress.setTextVisible(False)
+        self.platform_collector_progress.setFixedWidth(180)
+        platform_progress_layout.addWidget(self.platform_collector_progress_label)
+        platform_progress_layout.addWidget(self.platform_collector_progress)
+        self.platform_collector_progress_frame.setVisible(False)
+        review_layout.addWidget(self.platform_collector_progress_frame)
         review_layout.addWidget(self.platform_back_button)
         self.to_review_button = button("检查并继续", variant="primary")
         self.to_review_button.setObjectName("douyinCommerceToReview")
@@ -1562,6 +1595,11 @@ class DouyinCommercePage(QWidget):
                     normalized_scope,
                     normalized_keyword,
                     rows if isinstance(rows, list) else [],
+                ),
+                action_label=(
+                    "正在搜索国内地点"
+                    if collector_type == "domestic_location"
+                    else "正在搜索本地地点"
                 ),
             )
             if not started:
@@ -4939,6 +4977,13 @@ class DouyinCommercePage(QWidget):
         old_generation_id = self._setup_generation_id
         self._setup_start_token += 1
         start_token = self._setup_start_token
+        self._reset_platform_collector_progress()
+        self._start_platform_collector_progress(
+            "",
+            "domestic_location",
+            start_token,
+            "正在准备国内地点采集",
+        )
         self._collector_status = {}
         self._last_failed_collector_type = ""
         self._setup_start_error_code = ""
@@ -4998,10 +5043,19 @@ class DouyinCommercePage(QWidget):
                 start_token, payload, result
             ),
             on_error=lambda message: self._setup_generation_failed(start_token, message),
-            on_finished=self._sync_view,
+            on_finished=lambda: self._setup_generation_finished(start_token),
         )
         if not started:
             self._setup_generation_failed(start_token, "collector_start_failed")
+            self._setup_generation_finished(start_token)
+
+    def _setup_generation_finished(self, start_token: int) -> None:
+        self._finish_platform_collector_progress(
+            "",
+            "domestic_location",
+            start_token,
+        )
+        self._sync_view()
 
     def _accept_setup_generation_result(
         self, start_token: int, payload: Mapping[str, Any], result: object
@@ -5186,6 +5240,7 @@ class DouyinCommercePage(QWidget):
         if not self._collector_close_is_complete(result):
             self._setup_generation_close_failed(close_token)
             return
+        self._reset_platform_collector_progress()
         self._collector_status = {}
         self._last_failed_collector_type = ""
         self._setup_close_error_code = ""
@@ -5231,12 +5286,20 @@ class DouyinCommercePage(QWidget):
         collector_type: str,
         work,
         on_success,
+        *,
+        action_label: str,
     ) -> bool:
         generation_id = self._setup_generation_id
         if not generation_id or self.runner.is_running(self._COLLECTOR_TASK_KEY):
             return False
         self._collector_action_tokens[collector_type] += 1
         action_token = self._collector_action_tokens[collector_type]
+        self._start_platform_collector_progress(
+            generation_id,
+            collector_type,
+            action_token,
+            action_label,
+        )
 
         def controlled_work() -> object:
             try:
@@ -5257,13 +5320,35 @@ class DouyinCommercePage(QWidget):
             on_error=lambda message: self._collector_action_failed(
                 generation_id, collector_type, action_token, message
             ),
-            on_finished=self._sync_view,
+            on_finished=lambda: self._collector_action_finished(
+                generation_id,
+                collector_type,
+                action_token,
+            ),
         )
         if not started:
             self._collector_action_failed(
                 generation_id, collector_type, action_token, "collector_start_failed"
             )
+            self._collector_action_finished(
+                generation_id,
+                collector_type,
+                action_token,
+            )
         return started
+
+    def _collector_action_finished(
+        self,
+        generation_id: str,
+        collector_type: str,
+        action_token: int,
+    ) -> None:
+        self._finish_platform_collector_progress(
+            generation_id,
+            collector_type,
+            action_token,
+        )
+        self._sync_view()
 
     def _collector_action_succeeded(
         self,
@@ -5405,6 +5490,11 @@ class DouyinCommercePage(QWidget):
                 generation_id, collector_type
             ),
             retry_succeeded,
+            action_label={
+                "domestic_location": "正在重试国内地点",
+                "favorite_music": "正在重试收藏音乐",
+                "local_location": "正在重试本地地点",
+            }[collector_type],
         )
 
     def continue_after_content(self) -> None:
@@ -5553,6 +5643,62 @@ class DouyinCommercePage(QWidget):
         self.operation_progress.setValue(0)
         self.operation_progress_frame.setVisible(False)
 
+    def _start_platform_collector_progress(
+        self,
+        generation_id: str,
+        collector_type: str,
+        action_token: int,
+        label: str,
+    ) -> None:
+        """显示当前单队列采集动作的不确定进度。"""
+
+        self._platform_collector_progress_owner = (
+            _normalized(generation_id),
+            _normalized(collector_type),
+            int(action_token),
+        )
+        self._platform_collector_progress_label_text = _normalized(label)
+        self._platform_collector_progress_started = time.monotonic()
+        self.platform_collector_progress.setRange(0, 0)
+        self.platform_collector_progress_frame.setVisible(True)
+        self._update_platform_collector_progress()
+        self._platform_collector_progress_timer.start()
+
+    def _update_platform_collector_progress(self) -> None:
+        if self._platform_collector_progress_owner is None:
+            return
+        elapsed = max(
+            0,
+            int(time.monotonic() - self._platform_collector_progress_started),
+        )
+        self.platform_collector_progress_label.setText(
+            f"{self._platform_collector_progress_label_text} · 已等待 {elapsed} 秒"
+        )
+
+    def _finish_platform_collector_progress(
+        self,
+        generation_id: str,
+        collector_type: str,
+        action_token: int,
+    ) -> None:
+        owner = (
+            _normalized(generation_id),
+            _normalized(collector_type),
+            int(action_token),
+        )
+        if owner != self._platform_collector_progress_owner:
+            return
+        self._reset_platform_collector_progress()
+
+    def _reset_platform_collector_progress(self) -> None:
+        self._platform_collector_progress_timer.stop()
+        self._platform_collector_progress_owner = None
+        self._platform_collector_progress_label_text = ""
+        self._platform_collector_progress_started = 0.0
+        if hasattr(self, "platform_collector_progress_label"):
+            self.platform_collector_progress_label.clear()
+            self.platform_collector_progress_frame.setVisible(False)
+
     def _handle_upload_result(self, result: object) -> None:
         if isinstance(result, dict) and result.get("status") == "needs_login":
             self._handle_login_required()
@@ -5574,6 +5720,7 @@ class DouyinCommercePage(QWidget):
     def _handle_login_required(self) -> None:
         """登录失效时只给出账号管理入口，绝不在当前发布页接管登录。"""
 
+        self._reset_platform_collector_progress()
         if (
             self._setup_generation_id
             or self._setup_generation_cleanup_required
@@ -5686,6 +5833,7 @@ class DouyinCommercePage(QWidget):
                 lambda rows: self._show_music_candidates(
                     rows if isinstance(rows, list) else [], source="collector"
                 ),
+                action_label="正在刷新收藏音乐",
             )
             return
         if self.selected_video_count() >= 1 and not self._session_id:
@@ -5896,6 +6044,11 @@ class DouyinCommercePage(QWidget):
                 ),
                 lambda rows: self._show_locations(
                     rows if isinstance(rows, list) else []
+                ),
+                action_label=(
+                    "正在搜索国内地点"
+                    if collector_type == "domestic_location"
+                    else "正在搜索本地地点"
                 ),
             )
             return
@@ -6324,6 +6477,7 @@ class DouyinCommercePage(QWidget):
     def shutdown(self) -> bool:
         """客户端退出收口；只有启动任务已停且采集器严格归零才返回成功。"""
 
+        self._reset_platform_collector_progress()
         self._shutdown_requested.set()
         setup_finished = True
         if self.runner.is_running(self._SETUP_GENERATION_TASK_KEY):
@@ -6366,6 +6520,7 @@ class DouyinCommercePage(QWidget):
         声明与定时属于已放弃会话的发布意图，必须全部丢弃。
         """
 
+        self._reset_platform_collector_progress()
         self._clear_music_candidates()
         self._selected_music = None
         self._collector_status = {}
@@ -6450,6 +6605,7 @@ class DouyinCommercePage(QWidget):
     def _clear_current_batch_platform_choices(self) -> None:
         """明确完成后清除本批发布意图，账号候选缓存仍保留在独立缓存层。"""
 
+        self._reset_platform_collector_progress()
         self._clear_music_candidates()
         self._selected_music = None
         self._pending_music = None

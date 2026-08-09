@@ -4754,13 +4754,17 @@ class DouyinCommerceUiTests(unittest.TestCase):
         self.assertTrue(self.page._can_review())
 
     def test_platform_review_dock_places_return_before_check_action(self) -> None:
-        """平台设置底部应先给返回内容，再给继续检查。"""
+        """平台进度位于状态与“返回内容/检查”按钮之间。"""
 
         layout = self.page.platform_review_dock.layout()
 
         self.assertIs(layout.itemAt(0).widget(), self.page.platform_review_status)
-        self.assertIs(layout.itemAt(1).widget(), self.page.platform_back_button)
-        self.assertIs(layout.itemAt(2).widget(), self.page.to_review_button)
+        self.assertIs(
+            layout.itemAt(1).widget(),
+            self.page.platform_collector_progress_frame,
+        )
+        self.assertIs(layout.itemAt(2).widget(), self.page.platform_back_button)
+        self.assertIs(layout.itemAt(3).widget(), self.page.to_review_button)
 
     def test_platform_progress_is_rendered_in_bottom_action_dock(self) -> None:
         """平台处理状态不能额外占用工作区顶部，应显示在底部操作栏。"""
@@ -7944,6 +7948,201 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
                 }
             }
         return status
+
+    def test_platform_collector_progress_is_indeterminate_and_shows_elapsed_seconds(self) -> None:
+        """平台采集只能显示真实等待时间，不得伪造完成百分比。"""
+
+        with patch(
+            "ui.douyin_commerce_page.time.monotonic",
+            side_effect=[100.0, 100.0, 107.4],
+        ):
+            self.page._start_platform_collector_progress(
+                "generation-a",
+                "favorite_music",
+                1,
+                "正在刷新收藏音乐",
+            )
+            self.page._update_platform_collector_progress()
+
+        self.assertFalse(self.page.platform_collector_progress_frame.isHidden())
+        self.assertEqual(self.page.platform_collector_progress.minimum(), 0)
+        self.assertEqual(self.page.platform_collector_progress.maximum(), 0)
+        self.assertEqual(
+            self.page.platform_collector_progress_label.text(),
+            "正在刷新收藏音乐 · 已等待 7 秒",
+        )
+
+    def test_stale_collector_finish_cannot_hide_current_progress(self) -> None:
+        """旧代际或旧 action token 的 finished 不得收口当前进度。"""
+
+        self.page._start_platform_collector_progress(
+            "generation-new",
+            "local_location",
+            3,
+            "正在搜索本地地点",
+        )
+
+        self.page._finish_platform_collector_progress(
+            "generation-old",
+            "local_location",
+            2,
+        )
+
+        self.assertFalse(self.page.platform_collector_progress_frame.isHidden())
+        self.assertEqual(
+            self.page._platform_collector_progress_owner,
+            ("generation-new", "local_location", 3),
+        )
+
+    def test_collector_entry_points_show_fixed_progress_labels(self) -> None:
+        """音乐、国内/本地搜索和受控重试必须各自显示固定动作。"""
+
+        runner = self._ControlledLifecycleRunner()
+        self.page.runner = runner
+        self.page._setup_generation_id = "generation-a"
+
+        self.page._refresh_favorite_music_candidates()
+        self.assertTrue(
+            self.page.platform_collector_progress_label.text().startswith(
+                "正在刷新收藏音乐"
+            )
+        )
+        runner.finish(self.page._COLLECTOR_TASK_KEY)
+
+        self.page._search_batch_locations("domestic", "夜南香")
+        self.assertTrue(
+            self.page.platform_collector_progress_label.text().startswith(
+                "正在搜索国内地点"
+            )
+        )
+        runner.finish(self.page._COLLECTOR_TASK_KEY)
+
+        self.page._search_batch_locations("local", "夜南香")
+        self.assertTrue(
+            self.page.platform_collector_progress_label.text().startswith(
+                "正在搜索本地地点"
+            )
+        )
+        runner.finish(self.page._COLLECTOR_TASK_KEY)
+
+        self.page._last_failed_collector_type = "local_location"
+        self.page._retry_last_failed_collector()
+        self.assertTrue(
+            self.page.platform_collector_progress_label.text().startswith(
+                "正在重试本地地点"
+            )
+        )
+        runner.finish(self.page._COLLECTOR_TASK_KEY)
+
+        self.assertTrue(self.page.platform_collector_progress_frame.isHidden())
+
+    def test_abandon_reset_stops_and_hides_platform_collector_progress(self) -> None:
+        """放弃或代际重置时必须停止计时器并清除进度所有者。"""
+
+        self.page._start_platform_collector_progress(
+            "generation-a",
+            "domestic_location",
+            1,
+            "正在准备国内地点采集",
+        )
+
+        self.page._reset_platform_settings_after_abandon()
+
+        self.assertIsNone(self.page._platform_collector_progress_owner)
+        self.assertFalse(self.page._platform_collector_progress_timer.isActive())
+        self.assertTrue(self.page.platform_collector_progress_frame.isHidden())
+        self.assertEqual(self.page.platform_collector_progress_label.text(), "")
+
+    def test_setup_generation_progress_stays_visible_until_runner_finished(self) -> None:
+        """国内初始采集在 worker 运行期间持续显示，不得被 success 提前隐藏。"""
+
+        runner = self._ControlledLifecycleRunner()
+        self.page.runner = runner
+        with patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.begin_generation",
+            return_value=self._collector_status(),
+        ), patch.object(self.page, "_go_to_step"):
+            self.page._start_setup_generation({"accountId": 31})
+            self.assertTrue(
+                self.page.platform_collector_progress_label.text().startswith(
+                    "正在准备国内地点采集"
+                )
+            )
+            runner.execute(self.page._SETUP_GENERATION_TASK_KEY)
+            self.assertFalse(
+                self.page.platform_collector_progress_frame.isHidden()
+            )
+            runner.finish(self.page._SETUP_GENERATION_TASK_KEY)
+
+        self.assertTrue(self.page.platform_collector_progress_frame.isHidden())
+
+    def test_login_required_resets_platform_collector_progress(self) -> None:
+        """登录失效时不得留下仍在计时的旧采集动作。"""
+
+        self.page._start_platform_collector_progress(
+            "generation-a",
+            "favorite_music",
+            1,
+            "正在刷新收藏音乐",
+        )
+
+        self.page._handle_login_required()
+
+        self.assertIsNone(self.page._platform_collector_progress_owner)
+        self.assertFalse(self.page._platform_collector_progress_timer.isActive())
+        self.assertTrue(self.page.platform_collector_progress_frame.isHidden())
+
+    def test_successful_generation_close_resets_platform_collector_progress(self) -> None:
+        """采集代际严格归零后必须收口任何未完成进度。"""
+
+        self.page._start_platform_collector_progress(
+            "generation-a",
+            "local_location",
+            1,
+            "正在搜索本地地点",
+        )
+        self.page._setup_close_token = 8
+
+        self.page._setup_generation_close_succeeded(
+            8,
+            "preflight_started",
+            True,
+            {"closed": True, "aliveCollectorCount": 0},
+        )
+
+        self.assertIsNone(self.page._platform_collector_progress_owner)
+        self.assertTrue(self.page.platform_collector_progress_frame.isHidden())
+
+    def test_shutdown_resets_platform_collector_progress(self) -> None:
+        """客户端退出路径必须停止 Qt 计时器，不得让其跨越窗口生命周期。"""
+
+        self.page._start_platform_collector_progress(
+            "generation-a",
+            "domestic_location",
+            1,
+            "正在搜索国内地点",
+        )
+
+        self.assertTrue(self.page.shutdown())
+
+        self.assertIsNone(self.page._platform_collector_progress_owner)
+        self.assertFalse(self.page._platform_collector_progress_timer.isActive())
+        self.assertTrue(self.page.platform_collector_progress_frame.isHidden())
+
+    def test_completed_batch_clears_platform_collector_progress(self) -> None:
+        """整批明确完成并清除选择时，不得保留上一批的进度所有者。"""
+
+        self.page._start_platform_collector_progress(
+            "generation-a",
+            "favorite_music",
+            1,
+            "正在刷新收藏音乐",
+        )
+
+        self.page._clear_current_batch_platform_choices()
+
+        self.assertIsNone(self.page._platform_collector_progress_owner)
+        self.assertTrue(self.page.platform_collector_progress_frame.isHidden())
 
     def test_enter_platform_settings_starts_isolated_generation_without_publish_upload(self) -> None:
         """进入设置页只建立采集代际，不能把用户视频变成共享发布会话。"""

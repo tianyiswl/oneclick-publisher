@@ -920,6 +920,27 @@ def apply_style(app: QApplication) -> None:
             background: #0B8A80;
             border-radius: 3px;
         }
+        QFrame#douyinCommercePlatformCollectorProgress {
+            background: #F8FAFC;
+            border: 1px solid #DCE7EF;
+            border-radius: 8px;
+        }
+        QLabel#douyinCommercePlatformCollectorProgressLabel {
+            color: #344054;
+            font-size: 11px;
+            font-weight: 700;
+        }
+        QProgressBar#douyinCommercePlatformCollectorProgressBar {
+            background: #E7EEF3;
+            border: 0;
+            border-radius: 3px;
+            min-height: 6px;
+            max-height: 6px;
+        }
+        QProgressBar#douyinCommercePlatformCollectorProgressBar::chunk {
+            background: #0B8A80;
+            border-radius: 3px;
+        }
         QFrame#douyinCommerceLoginRequired {
             background: #FFFAEB;
             border: 1px solid #FEDF89;
