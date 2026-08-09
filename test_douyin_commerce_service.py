@@ -7347,45 +7347,48 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
     def test_batch_review_directly_enables_submit_without_preflight(self) -> None:
         """批量第三阶段不应要求先上传一轮预检，确认提交只执行一次正式上传。"""
 
-        video_path = "/tmp/direct-submit.mp4"
-        self.page.account_combo.addItem(
-            "账号 · 主体",
-            {
-                "id": 1,
-                "type": 3,
-                "status": 1,
-                "filePath": "douyin-1.json",
-                "userName": "账号",
-                "profileName": "主体",
-            },
-        )
-        self.page.account_combo.setCurrentIndex(1)
-        self.page.video_combo.addItem(
-            "direct-submit.mp4",
-            {"id": 1, "storedPath": video_path, "filename": "direct-submit.mp4"},
-        )
-        self.page._selected_video_indexes = [1]
-        self.page.description_input.setPlainText("批量直接提交测试文案")
-        self.page._selected_music = {
-            "musicId": "music-1",
-            "title": "收藏歌",
-            "creator": "作者",
-            "duration": "00:30",
-        }
-        self.page._set_selected_declaration("无需添加自主声明")
-        video = self.page._selected_videos()[0]
-        self.page._batch_locations[str(video.get("storedPath") or "")] = {
-            "poiId": "poi-1",
-            "name": "北海银滩景区",
-            "address": "广西壮族自治区北海市银海区银滩大道中段",
-            "scope": "domestic",
-        }
-        self.page.pages.setCurrentIndex(2)
-        self.page._sync_view()
+        with tempfile.TemporaryDirectory() as root:
+            video_path = Path(root) / "direct-submit.mp4"
+            video_path.write_bytes(b"offline-video")
+            self.page.account_combo.addItem(
+                "账号 · 主体",
+                {
+                    "id": 1,
+                    "type": 3,
+                    "status": 1,
+                    "filePath": "douyin-1.json",
+                    "userName": "账号",
+                    "profileName": "主体",
+                },
+            )
+            self.page.account_combo.setCurrentIndex(1)
+            self.page.video_combo.addItem(
+                video_path.name,
+                {"id": 1, "storedPath": str(video_path), "filename": video_path.name},
+            )
+            video_index = self.page.video_combo.count() - 1
+            self.page._selected_video_indexes = [video_index]
+            self.page.description_input.setPlainText("批量直接提交测试文案")
+            self.page._selected_music = {
+                "musicId": "music-1",
+                "title": "收藏歌",
+                "creator": "作者",
+                "duration": "00:30",
+            }
+            self.page._set_selected_declaration("无需添加自主声明")
+            video = self.page._selected_videos()[0]
+            self.page._batch_locations[str(video.get("storedPath") or "")] = {
+                "poiId": "poi-1",
+                "name": "北海银滩景区",
+                "address": "广西壮族自治区北海市银海区银滩大道中段",
+                "scope": "domestic",
+            }
+            self.page.pages.setCurrentIndex(2)
+            self.page._sync_view()
 
-        self.assertTrue(self.page.preflight_button.isHidden())
-        self.assertTrue(self.page.submit_button.isEnabled())
-        self.assertIn("确认提交 1 条视频", self.page.submit_button.text())
+            self.assertTrue(self.page.preflight_button.isHidden())
+            self.assertTrue(self.page.submit_button.isEnabled())
+            self.assertIn("确认提交 1 条视频", self.page.submit_button.text())
 
     def test_batch_draft_roundtrip_preserves_mode_schedule_and_item_overrides(self) -> None:
         """本地草稿恢复不能丢失立即/间隔模式、北京时间起点或逐条覆盖。"""
