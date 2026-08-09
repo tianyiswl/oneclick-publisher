@@ -1477,6 +1477,8 @@ class DouyinCommerceSessionManager:
             else:
                 try:
                     await session.context.close()
+                except asyncio.CancelledError:
+                    failed = True
                 except Exception:
                     failed = True
                 else:
@@ -1487,6 +1489,8 @@ class DouyinCommerceSessionManager:
             else:
                 try:
                     await session.browser.close()
+                except asyncio.CancelledError:
+                    failed = True
                 except Exception:
                     failed = True
                 else:
@@ -1497,6 +1501,8 @@ class DouyinCommerceSessionManager:
             else:
                 try:
                     await session.playwright.stop()
+                except asyncio.CancelledError:
+                    failed = True
                 except Exception:
                     failed = True
                 else:

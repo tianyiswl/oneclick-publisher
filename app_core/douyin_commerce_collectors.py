@@ -8,7 +8,6 @@
 from __future__ import annotations
 
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
-from copy import deepcopy
 from dataclasses import dataclass, field
 import threading
 from time import monotonic
@@ -56,6 +55,7 @@ class _CollectorCloseOwner:
 class _LifecycleFlight:
     done: threading.Event = field(default_factory=threading.Event)
     result: dict[str, object] | None = None
+    cancelled: bool = False
 
 
 @dataclass
@@ -251,6 +251,10 @@ _PROBE_PAYLOAD_KEYS = (
     "debugDryRun",
 )
 
+_CONTROLLED_SCALAR_TYPES = frozenset(
+    {type(None), bool, int, float, str}
+)
+
 
 class DouyinCommerceCollectorManager:
     """以代际隔离三个独立抖音平台设置采集会话。"""
@@ -292,7 +296,11 @@ class DouyinCommerceCollectorManager:
                     break
             preceding.done.wait()
         try:
-            return self._begin_generation(payload, on_progress=on_progress)
+            return self._begin_generation(
+                payload,
+                begin_flight=owner,
+                on_progress=on_progress,
+            )
         finally:
             with self._state_lock:
                 if self._begin_flight is owner:
@@ -303,9 +311,11 @@ class DouyinCommerceCollectorManager:
         self,
         payload: Mapping[str, Any],
         *,
+        begin_flight: _LifecycleFlight,
         on_progress=None,
     ) -> dict[str, object]:
 
+        self._require_current_begin_flight(begin_flight)
         if not isinstance(payload, Mapping):
             raise DouyinCommerceCollectorError("collector_start_failed")
 
@@ -321,6 +331,7 @@ class DouyinCommerceCollectorManager:
             )
         if needs_close:
             cleanup = self.close_generation(previous_id, reason="replaced")
+            self._require_current_begin_flight(begin_flight)
             if cleanup.get("closed") is not True or int(
                 cleanup.get("aliveCollectorCount") or 0
             ):
@@ -328,13 +339,16 @@ class DouyinCommerceCollectorManager:
 
         try:
             built_payload = self._probe_payload_builder(payload)
+            self._require_current_begin_flight(begin_flight)
             probe_payload = self._snapshot_probe_payload(built_payload)
+            self._require_current_begin_flight(begin_flight)
         except Exception:
+            self._require_current_begin_flight(begin_flight)
             raise DouyinCommerceCollectorError("collector_start_failed") from None
 
-        generation = new_setup_generation(
-            account_id=self._account_id(probe_payload)
-        )
+        account_id = self._account_id(probe_payload)
+        self._require_current_begin_flight(begin_flight)
+        generation = new_setup_generation(account_id=account_id)
         generation.transition(SetupGenerationState.COLLECTING)
         runtime = _GenerationRuntime(
             generation=generation,
@@ -342,6 +356,7 @@ class DouyinCommerceCollectorManager:
             collectors={},
         )
         with self._state_lock:
+            self._require_current_begin_flight_locked(begin_flight)
             self._runtime = runtime
             action = self._action_queue.reserve(
                 runtime.generation.generation_id,
@@ -353,14 +368,36 @@ class DouyinCommerceCollectorManager:
                     on_progress=on_progress,
                 ),
             )
+        self._require_current_begin_flight(begin_flight)
         self._action_queue.start(action)
         try:
             self._action_queue.wait(action)
+            self._require_current_begin_flight(begin_flight)
         except DouyinCommerceCollectorError:
+            self._require_current_begin_flight(begin_flight)
             raise
         except Exception:
+            self._require_current_begin_flight(begin_flight)
             raise DouyinCommerceCollectorError("collector_start_failed") from None
-        return self.status(generation.generation_id)
+        with self._state_lock:
+            self._require_current_begin_flight_locked(begin_flight)
+            return self.status(generation.generation_id)
+
+    def _require_current_begin_flight(
+        self,
+        begin_flight: _LifecycleFlight,
+    ) -> None:
+        with self._state_lock:
+            self._require_current_begin_flight_locked(begin_flight)
+
+    def _require_current_begin_flight_locked(
+        self,
+        begin_flight: _LifecycleFlight,
+    ) -> None:
+        if begin_flight.cancelled or self._begin_flight is not begin_flight:
+            raise DouyinCommerceCollectorError(
+                "stale_result_discarded"
+            ) from None
 
     def refresh_favorite_music(
         self, generation_id: str
@@ -492,6 +529,13 @@ class DouyinCommerceCollectorManager:
             reason, error_code="collector_unknown"
         )
         with self._state_lock:
+            if generation_id is None:
+                begin_flight = self._begin_flight
+                if begin_flight is not None and not begin_flight.done.is_set():
+                    begin_flight.cancelled = True
+                    if self._begin_flight is begin_flight:
+                        self._begin_flight = None
+                    begin_flight.done.set()
             runtime = self._runtime
             if runtime is None:
                 return self._empty_close_result(generation_id)
@@ -1055,7 +1099,9 @@ class DouyinCommerceCollectorManager:
             stored_probe_payload = runtime.probe_payload
 
         try:
-            probe_payload = deepcopy(stored_probe_payload)
+            probe_payload = self._rebuild_controlled_value(stored_probe_payload)
+            if type(probe_payload) is not dict:
+                raise TypeError("probe payload snapshot is invalid")
         except Exception:
             if not self._mark_failed(generation_id, collector):
                 raise DouyinCommerceCollectorError(
@@ -1450,17 +1496,83 @@ class DouyinCommerceCollectorManager:
             return
         manager.close(session_id)
 
-    @staticmethod
-    def _snapshot_probe_payload(payload: object) -> dict[str, Any]:
-        if not isinstance(payload, Mapping):
-            raise TypeError("probe payload must be a mapping")
-        outer = dict(payload)
+    @classmethod
+    def _snapshot_probe_payload(cls, payload: object) -> dict[str, Any]:
+        if type(payload) is not dict:
+            raise TypeError("probe payload must be a controlled mapping")
+        outer = payload
         whitelisted = {
             key: outer[key]
             for key in _PROBE_PAYLOAD_KEYS
             if key in outer
         }
-        return deepcopy(whitelisted)
+        snapshot = cls._rebuild_controlled_value(whitelisted)
+        if type(snapshot) is not dict:
+            raise TypeError("probe payload snapshot is invalid")
+        return snapshot
+
+    @classmethod
+    def _rebuild_controlled_value(
+        cls,
+        value: object,
+        active_containers: set[int] | None = None,
+    ) -> object:
+        value_type = type(value)
+        if value_type in _CONTROLLED_SCALAR_TYPES:
+            return value
+        if value_type not in {list, tuple, dict}:
+            raise TypeError("probe payload value is not controlled")
+
+        active = active_containers if active_containers is not None else set()
+        marker = id(value)
+        if marker in active:
+            raise TypeError("probe payload contains a cycle")
+        active.add(marker)
+        try:
+            if value_type is list:
+                return [
+                    cls._rebuild_controlled_value(item, active)
+                    for item in value
+                ]
+            if value_type is tuple:
+                return tuple(
+                    cls._rebuild_controlled_value(item, active)
+                    for item in value
+                )
+
+            rebuilt: dict[object, object] = {}
+            for key, item in value.items():
+                rebuilt_key = cls._rebuild_controlled_key(key, active)
+                rebuilt[rebuilt_key] = cls._rebuild_controlled_value(
+                    item, active
+                )
+            return rebuilt
+        finally:
+            active.remove(marker)
+
+    @classmethod
+    def _rebuild_controlled_key(
+        cls,
+        key: object,
+        active_containers: set[int],
+    ) -> object:
+        key_type = type(key)
+        if key_type in _CONTROLLED_SCALAR_TYPES:
+            return key
+        if key_type is not tuple:
+            raise TypeError("probe payload key is not controlled")
+
+        marker = id(key)
+        if marker in active_containers:
+            raise TypeError("probe payload key contains a cycle")
+        active_containers.add(marker)
+        try:
+            return tuple(
+                cls._rebuild_controlled_key(item, active_containers)
+                for item in key
+            )
+        finally:
+            active_containers.remove(marker)
 
     @staticmethod
     def _account_id(payload: Mapping[str, Any]) -> int:
@@ -1476,7 +1588,9 @@ class DouyinCommerceCollectorManager:
                     value = accounts[0].get("id", 0)
             return int(value)
         except Exception:
-            raise DouyinCommerceCollectorError("collector_unknown") from None
+            raise DouyinCommerceCollectorError(
+                "collector_start_failed"
+            ) from None
 
     @staticmethod
     def _empty_close_result(generation_id: str | None) -> dict[str, object]:

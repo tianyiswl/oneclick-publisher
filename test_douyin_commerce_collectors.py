@@ -247,6 +247,82 @@ class DouyinCommerceCollectorManagerTests(unittest.TestCase):
         self.assertEqual(begun["collectors"]["domestic_location"], "active")
         self.assertEqual(self.factory.instances[0].close_calls, [])
 
+    def test_close_cancels_blocked_builder_before_runtime_or_upload_and_next_begin_starts(self):
+        builder_started = threading.Event()
+        release_builder = threading.Event()
+        outcome: dict[str, object] = {}
+
+        def blocked_builder(payload: Mapping[str, Any]) -> dict[str, Any]:
+            builder_started.set()
+            release_builder.wait(timeout=2)
+            return {
+                **dict(payload),
+                "fileList": ["probe.mp4"],
+                "runtimeMode": "preflight",
+                "debugDryRun": True,
+            }
+
+        self.manager._probe_payload_builder = blocked_builder
+        begin_thread = threading.Thread(
+            target=lambda: self._capture_call(
+                outcome,
+                "begin",
+                lambda: self.manager.begin_generation(self.upload_payload),
+            )
+        )
+        begin_thread.start()
+        self.assertTrue(builder_started.wait(timeout=1))
+
+        next_thread: threading.Thread | None = None
+        try:
+            closed = self.manager.close_generation(reason="cancelled")
+            self.assertTrue(closed["closed"])
+            self.assertEqual(closed["aliveCollectorCount"], 0)
+            self.assertIsNone(self.manager._runtime)
+
+            self.manager._probe_payload_builder = lambda payload: {
+                **dict(payload),
+                "fileList": ["probe.mp4"],
+                "runtimeMode": "preflight",
+                "debugDryRun": True,
+            }
+            next_thread = threading.Thread(
+                target=lambda: self._capture_call(
+                    outcome,
+                    "next_begin",
+                    lambda: self.manager.begin_generation(self.upload_payload),
+                )
+            )
+            next_thread.start()
+            next_thread.join(timeout=0.3)
+            self.assertFalse(next_thread.is_alive())
+        finally:
+            release_builder.set()
+            begin_thread.join(timeout=1)
+            if next_thread is not None:
+                next_thread.join(timeout=1)
+
+        self.assertFalse(begin_thread.is_alive())
+        self.assertNotIn("begin", outcome)
+        self.assertEqual(str(outcome["begin_error"]), "stale_result_discarded")
+        self.assertIsNone(outcome["begin_error"].__cause__)
+        with self.manager._action_queue._lock:
+            self.assertEqual(self.manager._action_queue._actions, [])
+
+        self.assertNotIn("next_begin_error", outcome)
+        next_generation = outcome["next_begin"]
+
+        self.assertEqual(next_generation["generationState"], "collecting")
+        self.assertEqual(
+            next_generation["collectors"]["domestic_location"], "active"
+        )
+        self.assertEqual(len(self.factory.instances), 1)
+        self.assertEqual(len(self.factory.instances[0].start_payloads), 1)
+        self.assertEqual(
+            self.manager.status()["setupGenerationId"],
+            next_generation["setupGenerationId"],
+        )
+
     def test_begin_deep_snapshots_nested_accounts_for_lazy_collectors(self):
         accounts = [{"id": 31, "path": "account-a.json"}]
         payload = {
@@ -301,6 +377,49 @@ class DouyinCommerceCollectorManagerTests(unittest.TestCase):
         self.assertNotIn("secret", str(raised.exception))
         self.assertEqual(self.factory.instances, [])
 
+    def test_begin_snapshot_rejects_self_aliasing_custom_container(self):
+        class SelfAliasingAccountList(list):
+            def __deepcopy__(self, memo):
+                del memo
+                return self
+
+        unsafe_accounts = SelfAliasingAccountList(
+            [{"id": 31, "path": "account-a.json"}]
+        )
+        self.manager._probe_payload_builder = lambda payload: {
+            **dict(payload),
+            "accountId": 0,
+            "accountList": unsafe_accounts,
+            "fileList": ["probe.mp4"],
+        }
+
+        with self.assertRaises(DouyinCommerceCollectorError) as raised:
+            self.manager.begin_generation(self.upload_payload)
+
+        self.assertEqual(str(raised.exception), "collector_start_failed")
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertEqual(self.factory.instances, [])
+
+    def test_begin_snapshot_rejects_self_aliasing_custom_outer_mapping(self):
+        class SelfAliasingPayload(dict):
+            def __deepcopy__(self, memo):
+                del memo
+                return self
+
+        self.manager._probe_payload_builder = lambda payload: SelfAliasingPayload(
+            {
+                **dict(payload),
+                "fileList": ["probe.mp4"],
+            }
+        )
+
+        with self.assertRaises(DouyinCommerceCollectorError) as raised:
+            self.manager.begin_generation(self.upload_payload)
+
+        self.assertEqual(str(raised.exception), "collector_start_failed")
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertEqual(self.factory.instances, [])
+
     def test_builder_account_conversion_failure_is_sanitized(self):
         class SensitiveAccountId:
             def __bool__(self):
@@ -323,9 +442,23 @@ class DouyinCommerceCollectorManagerTests(unittest.TestCase):
             self.manager.begin_generation(self.upload_payload)
 
         self.assertIsInstance(raised.exception, DouyinCommerceCollectorError)
-        self.assertEqual(str(raised.exception), "collector_unknown")
+        self.assertEqual(str(raised.exception), "collector_start_failed")
         self.assertIsNone(raised.exception.__cause__)
         self.assertNotIn("secret", str(raised.exception))
+
+    def test_builtin_account_conversion_failure_uses_start_error(self):
+        self.manager._probe_payload_builder = lambda payload: {
+            **dict(payload),
+            "accountId": [],
+            "fileList": ["probe.mp4"],
+        }
+
+        with self.assertRaises(DouyinCommerceCollectorError) as raised:
+            self.manager.begin_generation(self.upload_payload)
+
+        self.assertEqual(str(raised.exception), "collector_start_failed")
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertEqual(self.factory.instances, [])
 
     def test_domestic_and_local_keywords_never_share_a_session(self):
         generation_id = self.manager.begin_generation(self.upload_payload)[

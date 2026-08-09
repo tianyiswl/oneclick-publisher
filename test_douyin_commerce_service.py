@@ -4587,6 +4587,76 @@ class DouyinCommerceTaskPresentationTests(unittest.TestCase):
 
 
 class DouyinCommerceSessionContractTests(unittest.TestCase):
+    def test_strict_close_records_cancelled_step_and_continues_later_resources(self):
+        context = MagicMock()
+        context.close = AsyncMock(side_effect=asyncio.CancelledError())
+        browser = MagicMock()
+        browser.close = AsyncMock()
+        playwright = MagicMock()
+        playwright.stop = AsyncMock()
+        manager = douyin_commerce_session.DouyinCommerceSessionManager()
+        session = douyin_commerce_session._CommerceEditorSession(
+            session_id="session-demo",
+            upload_payload={},
+            account_name="测试账号",
+            browser=browser,
+            context=context,
+            page=object(),
+            playwright=playwright,
+            uploader=None,
+        )
+        manager._session = session
+
+        with self.assertRaises(
+            douyin_commerce_session.DouyinCommerceSessionError
+        ) as raised:
+            manager.close_strict("session-demo")
+
+        self.assertEqual(str(raised.exception), "commerce_session_close_failed")
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertIs(manager._session, session)
+        context.close.assert_awaited_once_with()
+        browser.close.assert_awaited_once_with()
+        playwright.stop.assert_awaited_once_with()
+
+        context.close.side_effect = None
+        manager.close_strict("session-demo")
+
+        self.assertIsNone(manager._session)
+        self.assertEqual(context.close.await_count, 2)
+        self.assertEqual(browser.close.await_count, 1)
+        self.assertEqual(playwright.stop.await_count, 1)
+
+    def test_strict_close_does_not_swallow_process_control_exceptions(self):
+        for process_error in (KeyboardInterrupt(), SystemExit()):
+            with self.subTest(error_type=type(process_error).__name__):
+                context = MagicMock()
+                context.close = AsyncMock(side_effect=process_error)
+                browser = MagicMock()
+                browser.close = AsyncMock()
+                playwright = MagicMock()
+                playwright.stop = AsyncMock()
+                session = douyin_commerce_session._CommerceEditorSession(
+                    session_id="session-demo",
+                    upload_payload={},
+                    account_name="测试账号",
+                    browser=browser,
+                    context=context,
+                    page=object(),
+                    playwright=playwright,
+                    uploader=None,
+                )
+
+                with self.assertRaises(type(process_error)):
+                    asyncio.run(
+                        douyin_commerce_session.DouyinCommerceSessionManager._close_resources_strict(
+                            session
+                        )
+                    )
+
+                browser.close.assert_not_awaited()
+                playwright.stop.assert_not_awaited()
+
     def test_strict_close_attempts_every_resource_and_keeps_failure_retryable(self):
         """严格关闭不得吞错，也不得因前项失败跳过后续资源。"""
 
