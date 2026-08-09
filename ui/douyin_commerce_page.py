@@ -5338,22 +5338,7 @@ class DouyinCommercePage(QWidget):
         self._session_id = ""
         if session_id:
             douyin_commerce_session.commerce_session_manager.close(session_id)
-        self._clear_music_candidates()
-        self._selected_music = None
-        self.music_card.setText("尚未选择收藏音乐")
-        self.music_status.setText("本次上传会话已结束")
-        self._locations = []
-        self._selected_location_data = None
-        self._pending_location = None
-        self.location_result_list.clear()
-        self.location_candidate_card.setText("尚未选择发布定位")
-        self.location_applied_card.setText("尚未选择发布定位")
-        self._location_applied = False
-        self.location_scope_combo.blockSignals(True)
-        self.location_scope_combo.setCurrentIndex(2)
-        self.location_scope_combo.blockSignals(False)
-        self._clear_declaration("请重新上传视频后选择地点与作品内容声明")
-        self._preflight_fingerprint = ""
+        self._reset_platform_settings_after_abandon()
         self._uploaded_editor_payload = None
         self._pending_upload_payload = None
         # 放弃只影响临时会话；从本机重新读取保存状态，确保恢复入口立即回到正确状态。
@@ -5361,6 +5346,83 @@ class DouyinCommercePage(QWidget):
         self._sync_view()
         if not silent:
             QMessageBox.information(self, "抖音带货", "已关闭临时编辑页，未保存草稿或发布。")
+
+    def _reset_platform_settings_after_abandon(self) -> None:
+        """将平台设置恢复为一次全新上传的默认状态。
+
+        内容准备中的账号、视频、标题、文案和话题保留；音乐、地点、
+        声明与定时属于已放弃会话的发布意图，必须全部丢弃。
+        """
+
+        self._clear_music_candidates()
+        self._selected_music = None
+        self.music_card.setText("尚未选择收藏音乐")
+        self.music_status.setText("本次上传会话已结束")
+        self._batch_locations = {}
+        self._batch_location_searches = {}
+        self._batch_schedule_overrides = {}
+        self._batch_location_feedback = ""
+        self._batch_item_rows_signature = None
+        self._locations = []
+        self._selected_location_data = None
+        self._pending_location = None
+        self.location_result_list.clear()
+        self.location_keyword.blockSignals(True)
+        self.location_keyword.clear()
+        self.location_keyword.blockSignals(False)
+        self.location_candidate_card.setText("尚未选择发布定位")
+        self.location_applied_card.setText("尚未选择发布定位")
+        self._location_applied = False
+        self.location_scope_combo.blockSignals(True)
+        self.location_scope_combo.setCurrentIndex(
+            self.location_scope_combo.findData(
+                douyin_commerce_service.LOCATION_SCOPE_DOMESTIC
+            )
+        )
+        self.location_scope_combo.blockSignals(False)
+        self.batch_location_scope_combo.blockSignals(True)
+        self.batch_location_scope_combo.setCurrentIndex(
+            self.batch_location_scope_combo.findData(
+                douyin_commerce_service.LOCATION_SCOPE_DOMESTIC
+            )
+        )
+        self.batch_location_scope_combo.blockSignals(False)
+        self.batch_location_keyword.blockSignals(True)
+        self.batch_location_keyword.clear()
+        self.batch_location_keyword.blockSignals(False)
+        self._clear_declaration("请重新上传视频后选择地点与作品内容声明")
+        self.batch_publish_mode.blockSignals(True)
+        self.batch_publish_mode.setCurrentIndex(
+            self.batch_publish_mode.findData("immediate")
+        )
+        self.batch_publish_mode.blockSignals(False)
+        self.batch_timer_enabled.blockSignals(True)
+        self.batch_timer_enabled.setChecked(False)
+        self.batch_timer_enabled.blockSignals(False)
+        self.timer_enabled.blockSignals(True)
+        self.timer_enabled.setChecked(False)
+        self.timer_enabled.blockSignals(False)
+        self.batch_interval_minutes.blockSignals(True)
+        self.batch_interval_minutes.setValue(30)
+        self.batch_interval_minutes.blockSignals(False)
+        default_schedule = self._default_schedule_datetime()
+        self.schedule_date.blockSignals(True)
+        self.schedule_date.setDate(
+            QDate(default_schedule.year, default_schedule.month, default_schedule.day)
+        )
+        self.schedule_date.blockSignals(False)
+        self.schedule_time.blockSignals(True)
+        self.schedule_time.setTime(QTime(16, 0))
+        self.schedule_time.blockSignals(False)
+        self._schedule_date_auto_default = True
+        self._preflight_fingerprint = ""
+        self._batch_preflight_fingerprint = ""
+        self._batch_progress_text = ""
+        self._batch_result_feedback = ""
+        self._batch_pause_requested = False
+        self._batch_editor_session_ended = False
+        for stage in ("music", "location", "declaration", "schedule"):
+            self._clear_stage_error(stage)
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt 固定事件名
         if self._session_id and not self._busy():

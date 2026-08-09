@@ -436,8 +436,11 @@ class DouyinCommercePayloadTests(unittest.TestCase):
             )
 
         position.assert_awaited_once()
-        mode.assert_awaited_once()
-        open_search.assert_awaited_once_with(page, mode.return_value)
+        self.assertEqual(mode.await_count, 2)
+        self.assertEqual(
+            open_search.await_args_list,
+            [call(page, mode.return_value), call(page, mode.return_value)],
+        )
         set_scope.assert_awaited_once_with(page, "domestic")
         self.assertEqual(
             field.fill.await_args_list,
@@ -522,9 +525,15 @@ class DouyinCommercePayloadTests(unittest.TestCase):
                 return self.control
 
         page = Page()
-        result = asyncio.run(
-            douyin_commerce_service.set_commerce_location_scope(page, "国内")
-        )
+        with patch.object(
+            douyin_commerce_service,
+            "_visible_commerce_search_input",
+            new_callable=AsyncMock,
+            return_value=object(),
+        ):
+            result = asyncio.run(
+                douyin_commerce_service.set_commerce_location_scope(page, "国内")
+            )
 
         self.assertEqual(result, "国内")
         self.assertEqual(
@@ -546,6 +555,125 @@ class DouyinCommercePayloadTests(unittest.TestCase):
         self.assertIn("current && current !== boundary", browser_script)
         self.assertIn("scope-selection-not-exclusive", browser_script)
         self.assertNotIn(".map(interactive)", browser_script)
+
+    def test_location_scope_reacquires_search_input_after_platform_rerender(self) -> None:
+        """切换本地/国内会重绘地点面板，必须重新标记新输入框后再回读选中态。"""
+
+        class Control:
+            def __init__(self, page) -> None:
+                self.page = page
+
+            async def click(self, **_kwargs) -> None:
+                self.page.scope_selected = True
+                # 真实页面在切换范围后会替换输入框节点，旧 marker 随之消失。
+                self.page.input_marked = False
+
+        class Page:
+            def __init__(self) -> None:
+                self.input_marked = False
+                self.scope_selected = False
+                self.selected_reads = 0
+                self.control = Control(self)
+                self.wait_for_timeout = AsyncMock()
+
+            async def evaluate(self, script: str):
+                if "const editableSelector" in script:
+                    self.input_marked = True
+                    return {"count": 1, "source": "portal"}
+                if "scope-selection-not-exclusive" in script:
+                    if not self.input_marked:
+                        return {
+                            "state": "ambiguous",
+                            "reason": "search-input-not-visible",
+                            "local": 0,
+                            "domestic": 0,
+                        }
+                    if not self.scope_selected:
+                        return {"state": "ready", "local": 1, "domestic": 1}
+                    self.selected_reads += 1
+                    return {"state": "selected", "local": 1, "domestic": 1}
+                raise AssertionError("测试未覆盖的页面脚本")
+
+            def locator(self, _selector: str):
+                return self.control
+
+        page = Page()
+
+        result = asyncio.run(
+            douyin_commerce_service.set_commerce_location_scope(page, "local")
+        )
+
+        self.assertEqual(result, "本地")
+        self.assertEqual(page.selected_reads, 2)
+
+    def test_location_search_uses_recreated_input_after_scope_switch(self) -> None:
+        """范围切换后只能清空并填写重绘后的新输入框。"""
+
+        class SearchInput:
+            def __init__(self, name: str) -> None:
+                self.name = name
+                self.value = ""
+                self.scroll_into_view_if_needed = AsyncMock()
+                self.click = AsyncMock()
+                self.filled: list[str] = []
+
+            async def fill(self, value: str, **_kwargs) -> None:
+                self.value = value
+                self.filled.append(value)
+
+            async def evaluate(self, _script: str) -> str:
+                return self.value
+
+        old_field = SearchInput("old")
+        new_field = SearchInput("new")
+
+        class Page:
+            wait_for_timeout = AsyncMock()
+
+        row = {
+            "name": "北海夜南香",
+            "address": "广西壮族自治区北海市银海区银滩大道 1 号",
+        }
+        mode_controls = [object(), object()]
+        with patch.object(
+            douyin_commerce_service, "_ensure_position_tag", new_callable=AsyncMock
+        ), patch.object(
+            douyin_commerce_service,
+            "_ensure_local_group_buy_mode",
+            new_callable=AsyncMock,
+            side_effect=mode_controls,
+        ) as mode, patch.object(
+            douyin_commerce_service,
+            "_open_commerce_search_input",
+            new_callable=AsyncMock,
+            side_effect=[old_field, new_field],
+        ) as open_search, patch.object(
+            douyin_commerce_service,
+            "set_commerce_location_scope",
+            new_callable=AsyncMock,
+            return_value="本地",
+        ), patch.object(
+            douyin_commerce_service,
+            "_visible_commerce_location_result_snapshot",
+            new_callable=AsyncMock,
+            return_value=(None, [], ""),
+        ), patch.object(
+            douyin_commerce_service,
+            "_wait_for_fresh_commerce_location_results",
+            new_callable=AsyncMock,
+            return_value=(object(), [row]),
+        ):
+            result = asyncio.run(
+                douyin_commerce_service.search_commerce_location_store_candidates(
+                    Page(), "北海夜南香", scope="local"
+                )
+            )
+
+        self.assertEqual(result[0]["name"], "北海夜南香")
+        self.assertEqual(mode.await_count, 2)
+        self.assertEqual(open_search.await_count, 2)
+        self.assertEqual(old_field.filled, [])
+        self.assertEqual(new_field.filled, ["", "北海夜南香"])
 
     def test_location_search_switches_page_scope_before_entering_keyword(self) -> None:
         """平台在输入关键词后立刻检索，因此范围切换必须先于 fill。"""
@@ -612,11 +740,20 @@ class DouyinCommercePayloadTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(mode.await_count, 1)
+        self.assertEqual(mode.await_count, 2)
         self.assertEqual(result[0]["name"], "北海夜南香")
         self.assertEqual(
             events,
-            ["scroll", "click", "scope:domestic", "fill:", "wait:450", "fill:北海夜南香"],
+            [
+                "scroll",
+                "click",
+                "scope:domestic",
+                "scroll",
+                "click",
+                "fill:",
+                "wait:450",
+                "fill:北海夜南香",
+            ],
         )
 
     def test_location_search_waits_past_stale_local_candidates(self) -> None:
@@ -976,7 +1113,12 @@ class DouyinCommercePayloadTests(unittest.TestCase):
                     }
                 )
 
-        with self.assertRaisesRegex(
+        with patch.object(
+            douyin_commerce_service,
+            "_visible_commerce_search_input",
+            new_callable=AsyncMock,
+            return_value=object(),
+        ), self.assertRaisesRegex(
             douyin_commerce_service.DouyinCommerceError,
             "当前地点面板内本地 2 个、国内 1 个；pair-not-in-search-panel",
         ):
@@ -3734,6 +3876,72 @@ class DouyinCommerceUiTests(unittest.TestCase):
         self.assertEqual(self.page._session_id, "")
         self.assertTrue(self.page._saved_content_available)
         self.assertTrue(self.page.restore_content_button.isEnabled())
+
+    def test_abandon_session_resets_all_platform_settings_but_keeps_content(self) -> None:
+        """放弃上传后重新开始时，不得沿用上一批的音乐、地点、声明或定时。"""
+
+        self.page._session_id = "session-demo"
+        self.page.title_input.setText("保留的标题")
+        self.page.description_input.setPlainText("保留的文案")
+        self.page._selected_video_indexes = [1, 2]
+        self.page._selected_music = {
+            "musicId": "music-old",
+            "title": "上一批音乐",
+            "creator": "作者",
+            "duration": "00:30",
+        }
+        self.page._batch_locations = {
+            "/tmp/one.mp4": {
+                "poiId": "poi-old",
+                "name": "上一批地点",
+                "address": "上一批完整地址 1 号",
+                "scope": "local",
+            }
+        }
+        self.page._batch_location_searches = {
+            "__shared_location_search__": {
+                "scope": "local",
+                "keyword": "上一批关键词",
+                "candidates": [{"poiId": "poi-old"}],
+            }
+        }
+        self.page._batch_schedule_overrides = {
+            "/tmp/one.mp4": "2026-08-12 18:00"
+        }
+        self.page.batch_location_scope_combo.setCurrentIndex(
+            self.page.batch_location_scope_combo.findData("local")
+        )
+        self.page.batch_location_keyword.setText("上一批关键词")
+        self.page._set_selected_declaration("内容由AI生成")
+        self.page._confirmed_declaration = "内容由AI生成"
+        self.page.timer_enabled.setChecked(True)
+        self.page.batch_interval_minutes.setValue(45)
+
+        with patch(
+            "ui.douyin_commerce_page.douyin_commerce_session.commerce_session_manager.close"
+        ):
+            self.page._abandon_session(silent=True)
+
+        self.assertEqual(self.page.title_input.text(), "保留的标题")
+        self.assertEqual(self.page.description_input.toPlainText(), "保留的文案")
+        self.assertEqual(self.page._selected_video_indexes, [1, 2])
+        self.assertIsNone(self.page._selected_music)
+        self.assertEqual(self.page._batch_locations, {})
+        self.assertEqual(self.page._batch_schedule_overrides, {})
+        self.assertEqual(
+            self.page._batch_location_state(),
+            {"scope": "domestic", "keyword": "", "candidates": []},
+        )
+        self.assertEqual(self.page.batch_location_scope_combo.currentData(), "domestic")
+        self.assertEqual(self.page.batch_location_keyword.text(), "")
+        self.assertEqual(
+            self.page._selected_declaration(),
+            self.page._DEFAULT_CONTENT_DECLARATION,
+        )
+        self.assertEqual(self.page._confirmed_declaration, "")
+        self.assertFalse(self.page.timer_enabled.isChecked())
+        self.assertEqual(self.page.batch_publish_mode.currentData(), "immediate")
+        self.assertEqual(self.page.batch_interval_minutes.value(), 30)
 
     def test_location_candidate_keeps_independent_declaration_controls_after_location_readback(self) -> None:
         candidate = douyin_commerce_service.normalize_commerce_location_candidates(

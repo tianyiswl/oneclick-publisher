@@ -1704,6 +1704,16 @@ async def set_commerce_location_scope(page, scope: object) -> str:
     # 未选”才算切换完成，避免刚点击就把旧的“本地”请求结果当成“国内”。
     stable_selected_reads = 0
     for _ in range(12):
+        # 范围点击会替换整个 portal，旧输入框上的临时 marker
+        # 会随 DOM 一起消失。每次回读前都重新限定当前地点面板；
+        # 短暂的 0 个是重绘中，多个仍然立即安全停止。
+        try:
+            await _visible_commerce_search_input(page)
+        except DouyinCommerceError as exc:
+            if "实际 0 个" in str(exc):
+                await page.wait_for_timeout(200)
+                continue
+            raise
         result = await page.evaluate(
             """() => {
                 const visible = node => {
@@ -1995,6 +2005,18 @@ async def search_commerce_location_store_candidates(
     # 用户所选“本地/国内”，再填写关键词，避免客户端默认“国内”但平台仍以
     # 初始“本地”返回候选。
     await set_commerce_location_scope(page, scope)
+    # 切换范围会重绘输入框和候选面板，不能继续使用切换前
+    # 取得的 locator。重新回读带货模式与唯一输入框，同时兼容
+    # 平台在切换后直接收起浮层的情况。
+    store_control = await _ensure_local_group_buy_mode(page)
+    input_control = await _open_commerce_search_input(page, store_control)
+    try:
+        await input_control.scroll_into_view_if_needed(timeout=5_000)
+        await input_control.click(timeout=5_000)
+    except Exception as exc:
+        raise DouyinCommerceError(
+            "抖音范围切换后的位置输入框无法安全打开，已停止"
+        ) from exc
     # 范围切换后若输入框保留着同一个关键词，fill(同样文本) 不会触发 input
     # 事件，抖音便继续展示切换前的旧候选。先清空再重新填写，强制触发当前
     # 范围的一次新检索；后续仍严格校验候选的完整地址和关键词匹配。
