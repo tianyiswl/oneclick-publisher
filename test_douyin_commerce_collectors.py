@@ -247,6 +247,60 @@ class DouyinCommerceCollectorManagerTests(unittest.TestCase):
         self.assertEqual(begun["collectors"]["domestic_location"], "active")
         self.assertEqual(self.factory.instances[0].close_calls, [])
 
+    def test_begin_deep_snapshots_nested_accounts_for_lazy_collectors(self):
+        accounts = [{"id": 31, "path": "account-a.json"}]
+        payload = {
+            **self.upload_payload,
+            "accountId": 0,
+            "accountList": accounts,
+        }
+
+        generation_id = self.manager.begin_generation(payload)[
+            "setupGenerationId"
+        ]
+        accounts[0]["id"] = 99
+        accounts[0]["path"] = "account-mutated.json"
+        accounts.append({"id": 100, "path": "account-b.json"})
+
+        self.manager.refresh_favorite_music(generation_id)
+        self.manager.search_locations(generation_id, "夜南香", "local")
+
+        expected_accounts = [{"id": 31, "path": "account-a.json"}]
+        self.assertEqual(
+            self.factory.instances[1].start_payloads[0]["accountList"],
+            expected_accounts,
+        )
+        self.assertEqual(
+            self.factory.instances[2].start_payloads[0]["accountList"],
+            expected_accounts,
+        )
+        self.assertIsNot(
+            self.factory.instances[1].start_payloads[0]["accountList"],
+            accounts,
+        )
+
+    def test_begin_snapshot_conversion_failure_is_fixed_and_sanitized(self):
+        class SensitiveUncopyableAccount:
+            def __deepcopy__(self, memo):
+                del memo
+                raise DouyinCommerceCollectorError(
+                    "Cookie=secret 验证码123456 DOM=<html>private</html>"
+                )
+
+        self.manager._probe_payload_builder = lambda payload: {
+            **dict(payload),
+            "accountList": [SensitiveUncopyableAccount()],
+            "fileList": ["probe.mp4"],
+        }
+
+        with self.assertRaises(DouyinCommerceCollectorError) as raised:
+            self.manager.begin_generation(self.upload_payload)
+
+        self.assertEqual(str(raised.exception), "collector_start_failed")
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertNotIn("secret", str(raised.exception))
+        self.assertEqual(self.factory.instances, [])
+
     def test_builder_account_conversion_failure_is_sanitized(self):
         class SensitiveAccountId:
             def __bool__(self):
@@ -936,6 +990,90 @@ class DouyinCommerceCollectorManagerTests(unittest.TestCase):
         self.assertNotIn("123456", str(raised.exception))
         self.assertNotIn("<html>", str(raised.exception))
 
+    def test_all_untrusted_start_result_failures_use_fixed_start_error(self):
+        sensitive = "Cookie=secret 验证码123456 DOM=<html>private</html>"
+
+        class BoolFailureMapping(Mapping[str, object]):
+            def __getitem__(self, key: str) -> object:
+                if key == "sessionId":
+                    return "session-safe"
+                raise KeyError(key)
+
+            def __iter__(self):
+                return iter(("sessionId",))
+
+            def __len__(self) -> int:
+                return 1
+
+            def __bool__(self) -> bool:
+                raise DouyinCommerceCollectorError(sensitive)
+
+        class GetFailureMapping(Mapping[str, object]):
+            def __getitem__(self, key: str) -> object:
+                raise KeyError(key)
+
+            def __iter__(self):
+                return iter(("sessionId",))
+
+            def __len__(self) -> int:
+                return 1
+
+            def get(self, key: str, default=None):
+                del key, default
+                raise DouyinCommerceCollectorError(sensitive)
+
+        class SessionIdBoolFailure:
+            def __bool__(self) -> bool:
+                raise DouyinCommerceCollectorError(sensitive)
+
+            def __str__(self) -> str:
+                return "session-safe"
+
+        class SessionIdStringFailure:
+            def __bool__(self) -> bool:
+                return True
+
+            def __str__(self) -> str:
+                raise DouyinCommerceCollectorError(sensitive)
+
+        cases = {
+            "manager_start": DouyinCommerceCollectorError(sensitive),
+            "result_truthiness": BoolFailureMapping(),
+            "result_get": GetFailureMapping(),
+            "session_truthiness": {"sessionId": SessionIdBoolFailure()},
+            "session_string": {"sessionId": SessionIdStringFailure()},
+        }
+        for name, unsafe_result in cases.items():
+            with self.subTest(boundary=name):
+                unsafe_manager = FakeSessionManager(1)
+
+                def unsafe_start(payload, *, on_progress=None, result=unsafe_result):
+                    del payload, on_progress
+                    if isinstance(result, Exception):
+                        raise result
+                    return result
+
+                unsafe_manager.start_upload = unsafe_start
+                manager = DouyinCommerceCollectorManager(
+                    manager_factory=lambda item=unsafe_manager: item,
+                    probe_payload_builder=lambda payload: {
+                        **payload,
+                        "fileList": ["probe.mp4"],
+                    },
+                )
+                try:
+                    with self.assertRaises(DouyinCommerceCollectorError) as raised:
+                        manager.begin_generation(self.upload_payload)
+                    self.assertEqual(
+                        str(raised.exception), "collector_start_failed"
+                    )
+                    self.assertIsNone(raised.exception.__cause__)
+                    self.assertNotIn("secret", str(raised.exception))
+                    self.assertNotIn("123456", str(raised.exception))
+                    self.assertNotIn("<html>", str(raised.exception))
+                finally:
+                    manager.close_generation(reason="test_cleanup")
+
     def test_shared_manager_collision_removes_failed_slot_without_closing_owner(self):
         generation_id = self.manager.begin_generation(self.upload_payload)[
             "setupGenerationId"
@@ -954,6 +1092,76 @@ class DouyinCommerceCollectorManagerTests(unittest.TestCase):
         self.assertEqual(domestic.close_calls, [])
         closed = self.manager.close_generation(generation_id, reason="cancelled")
         self.assertTrue(closed["closed"])
+        self.assertEqual(domestic.close_calls, ["session-1"])
+
+    def test_shared_manager_collision_cannot_gain_a_second_close_owner(self):
+        """共用 manager 在碰撞检出后不得进入第二运行时或被关闭两次。"""
+
+        generation_id = self.manager.begin_generation(self.upload_payload)[
+            "setupGenerationId"
+        ]
+        domestic = self.factory.instances[0]
+        factory_entered = threading.Event()
+        release_factory = threading.Event()
+        outcome: dict[str, object] = {}
+
+        def return_shared_manager() -> FakeSessionManager:
+            factory_entered.set()
+            release_factory.wait(timeout=2)
+            return domestic
+
+        self.manager._manager_factory = return_shared_manager
+        refresh_thread = threading.Thread(
+            target=lambda: self._capture_call(
+                outcome,
+                "refresh",
+                lambda: self.manager.refresh_favorite_music(generation_id),
+            )
+        )
+        refresh_thread.start()
+        self.assertTrue(factory_entered.wait(timeout=1))
+
+        gate = ExitGateLock(self.manager._state_lock, domestic.start_thread_ident)
+        self.manager._state_lock = gate
+        release_factory.set()
+        self.assertTrue(gate.exited.wait(timeout=1))
+        with self.manager._state_lock:
+            collision = self.manager._runtime.collectors[
+                CollectorType.FAVORITE_MUSIC
+            ]
+            shared_manager_entered_second_runtime = collision.manager is domestic
+
+        close_thread = threading.Thread(
+            target=lambda: self._capture_call(
+                outcome,
+                "close",
+                lambda: self.manager.close_generation(
+                    generation_id, reason="cancelled"
+                ),
+            )
+        )
+        close_thread.start()
+        try:
+            for _ in range(100):
+                with self.manager._state_lock:
+                    owner = self.manager._runtime.collectors[
+                        CollectorType.DOMESTIC_LOCATION
+                    ].close_owner
+                if owner is not None:
+                    break
+                time.sleep(0.01)
+            self.assertIsNotNone(owner)
+        finally:
+            gate.release.set()
+            refresh_thread.join(timeout=1)
+            close_thread.join(timeout=1)
+
+        self.assertFalse(refresh_thread.is_alive())
+        self.assertFalse(close_thread.is_alive())
+        self.assertEqual(str(outcome["refresh_error"]), "collector_start_failed")
+        self.assertNotIn("close_error", outcome)
+        self.assertTrue(outcome["close"]["closed"])
+        self.assertFalse(shared_manager_entered_second_runtime)
         self.assertEqual(domestic.close_calls, ["session-1"])
 
     def test_shared_session_collision_closes_only_rejected_distinct_manager(self):
@@ -978,6 +1186,86 @@ class DouyinCommerceCollectorManagerTests(unittest.TestCase):
         self.assertTrue(closed["closed"])
         self.assertEqual(domestic.close_calls, ["session-1"])
         self.assertEqual(rejected.close_calls, [None])
+
+    def test_shared_session_collision_does_not_complete_generation_owner_early(self):
+        """碰撞分支必须等待 generation owner 真实关闭，失败后仍可重试。"""
+
+        generation_id = self.manager.begin_generation(self.upload_payload)[
+            "setupGenerationId"
+        ]
+        domestic = self.factory.instances[0]
+        self.factory.start_session_overrides[2] = "session-1"
+        self.factory.block_start_ids.add(2)
+        outcome: dict[str, object] = {}
+        refresh_thread = threading.Thread(
+            target=lambda: self._capture_call(
+                outcome,
+                "refresh",
+                lambda: self.manager.refresh_favorite_music(generation_id),
+            )
+        )
+        refresh_thread.start()
+        for _ in range(100):
+            if len(self.factory.instances) >= 2:
+                break
+            time.sleep(0.01)
+        rejected = self.factory.instances[1]
+        self.assertTrue(rejected.start_started.wait(timeout=1))
+        rejected.close_failures_remaining = 1
+        rejected.release_close = threading.Event()
+
+        gate = ExitGateLock(self.manager._state_lock, rejected.start_thread_ident)
+        self.manager._state_lock = gate
+        rejected.release_start.set()
+        self.assertTrue(gate.exited.wait(timeout=1))
+
+        close_thread = threading.Thread(
+            target=lambda: self._capture_call(
+                outcome,
+                "first_close",
+                lambda: self.manager.close_generation(
+                    generation_id, reason="cancelled"
+                ),
+            )
+        )
+        close_thread.start()
+        try:
+            for _ in range(100):
+                with self.manager._state_lock:
+                    owner = self.manager._runtime.collectors[
+                        CollectorType.FAVORITE_MUSIC
+                    ].close_owner
+                if owner is not None:
+                    break
+                time.sleep(0.01)
+            self.assertIsNotNone(owner)
+        finally:
+            gate.release.set()
+
+        self.assertTrue(rejected.close_started.wait(timeout=1))
+        rejected.release_close.set()
+        refresh_thread.join(timeout=1)
+        close_thread.join(timeout=1)
+        for _ in range(100):
+            with self.manager._action_queue._lock:
+                queue_empty = not self.manager._action_queue._actions
+            if queue_empty:
+                break
+            time.sleep(0.01)
+
+        self.assertFalse(refresh_thread.is_alive())
+        self.assertFalse(close_thread.is_alive())
+        self.assertEqual(str(outcome["refresh_error"]), "collector_start_failed")
+        self.assertNotIn("first_close_error", outcome)
+        self.assertFalse(outcome["first_close"]["closed"])
+        self.assertEqual(outcome["first_close"]["aliveCollectorCount"], 1)
+        self.assertEqual(rejected.close_calls, ["session-1"])
+
+        second = self.manager.close_generation(generation_id, reason="cancelled")
+
+        self.assertTrue(second["closed"])
+        self.assertEqual(second["aliveCollectorCount"], 0)
+        self.assertEqual(rejected.close_calls, ["session-1", "session-1"])
 
     def test_late_factory_failure_after_close_is_reported_as_stale(self):
         generation_id = self.manager.begin_generation(self.upload_payload)[
@@ -1130,6 +1418,49 @@ class DouyinCommerceCollectorManagerTests(unittest.TestCase):
         self.assertEqual(str(reason_error.exception), "collector_unknown")
         self.assertIsNone(reason_error.exception.__cause__)
 
+    def test_empty_generation_id_cannot_close_the_current_generation(self):
+        generation_id = self.manager.begin_generation(self.upload_payload)[
+            "setupGenerationId"
+        ]
+
+        with self.assertRaises(DouyinCommerceCollectorError) as raised:
+            self.manager.close_generation("", reason="cancelled")
+
+        self.assertEqual(str(raised.exception), "stale_result_discarded")
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertEqual(self.factory.instances[0].close_calls, [])
+        self.assertEqual(
+            self.manager.status(generation_id)["generationState"], "collecting"
+        )
+
+    def test_empty_generation_id_without_runtime_is_stale_for_close(self):
+        with self.assertRaises(DouyinCommerceCollectorError) as raised:
+            self.manager.close_generation("", reason="cancelled")
+
+        self.assertEqual(str(raised.exception), "stale_result_discarded")
+        self.assertIsNone(raised.exception.__cause__)
+
+    def test_empty_generation_id_cannot_read_the_current_generation_status(self):
+        generation_id = self.manager.begin_generation(self.upload_payload)[
+            "setupGenerationId"
+        ]
+
+        with self.assertRaises(DouyinCommerceCollectorError) as raised:
+            self.manager.status("")
+
+        self.assertEqual(str(raised.exception), "stale_result_discarded")
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertEqual(
+            self.manager.status(generation_id)["generationState"], "collecting"
+        )
+
+    def test_empty_generation_id_without_runtime_is_stale_for_status(self):
+        with self.assertRaises(DouyinCommerceCollectorError) as raised:
+            self.manager.status("")
+
+        self.assertEqual(str(raised.exception), "stale_result_discarded")
+        self.assertIsNone(raised.exception.__cause__)
+
     def test_late_diagnostic_reuses_normalized_keyword_without_second_conversion(self):
         class ConvertOnceKeyword:
             def __init__(self) -> None:
@@ -1250,6 +1581,50 @@ class DouyinCommerceCollectorManagerTests(unittest.TestCase):
             "closed",
         )
         self.assertEqual(domestic.close_calls, ["session-1", "session-1"])
+
+    def test_generation_close_prefers_strict_close_and_retries_its_failure(self):
+        class StrictSessionManager(FakeSessionManager):
+            def __init__(self) -> None:
+                super().__init__(1)
+                self.strict_close_calls: list[str | None] = []
+                self.strict_failures_remaining = 1
+
+            def close_strict(self, session_id: str | None = None) -> None:
+                self.strict_close_calls.append(session_id)
+                if self.strict_failures_remaining:
+                    self.strict_failures_remaining -= 1
+                    raise RuntimeError(
+                        "Cookie=secret 验证码123456 DOM=<html>private</html>"
+                    )
+
+        strict_manager = StrictSessionManager()
+        self.manager._manager_factory = lambda: strict_manager
+        generation_id = self.manager.begin_generation(self.upload_payload)[
+            "setupGenerationId"
+        ]
+
+        first = self.manager.close_generation(generation_id, reason="cancelled")
+
+        self.assertFalse(first["closed"])
+        self.assertEqual(first["aliveCollectorCount"], 1)
+        self.assertEqual(
+            first["cleanupResults"]["domestic_location"],
+            "cleanup_incomplete",
+        )
+        self.assertEqual(strict_manager.strict_close_calls, ["session-1"])
+        self.assertEqual(strict_manager.close_calls, [])
+        self.assertNotIn("secret", str(first))
+        self.assertNotIn("<html>", str(first))
+
+        second = self.manager.close_generation(generation_id, reason="cancelled")
+
+        self.assertTrue(second["closed"])
+        self.assertEqual(second["aliveCollectorCount"], 0)
+        self.assertEqual(
+            strict_manager.strict_close_calls,
+            ["session-1", "session-1"],
+        )
+        self.assertEqual(strict_manager.close_calls, [])
 
     def test_close_reports_unstarted_collectors_without_constructing_them(self):
         generation_id = self.manager.begin_generation(self.upload_payload)[

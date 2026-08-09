@@ -4587,6 +4587,57 @@ class DouyinCommerceTaskPresentationTests(unittest.TestCase):
 
 
 class DouyinCommerceSessionContractTests(unittest.TestCase):
+    def test_strict_close_attempts_every_resource_and_keeps_failure_retryable(self):
+        """严格关闭不得吞错，也不得因前项失败跳过后续资源。"""
+
+        sensitive = "Cookie=secret 验证码123456 DOM=<html>private</html>"
+        context = MagicMock()
+        context.close = AsyncMock(side_effect=RuntimeError(sensitive))
+        browser = MagicMock()
+        browser.close = AsyncMock(
+            side_effect=douyin_commerce_session.DouyinCommerceSessionError(
+                sensitive
+            )
+        )
+        playwright = MagicMock()
+        playwright.stop = AsyncMock()
+        manager = douyin_commerce_session.DouyinCommerceSessionManager()
+        session = douyin_commerce_session._CommerceEditorSession(
+            session_id="session-demo",
+            upload_payload={},
+            account_name="测试账号",
+            browser=browser,
+            context=context,
+            page=object(),
+            playwright=playwright,
+            uploader=None,
+        )
+        manager._session = session
+        strict_close = getattr(manager, "close_strict", None)
+        self.assertTrue(callable(strict_close))
+
+        with self.assertRaises(
+            douyin_commerce_session.DouyinCommerceSessionError
+        ) as raised:
+            strict_close("session-demo")
+
+        self.assertEqual(str(raised.exception), "commerce_session_close_failed")
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertNotIn("secret", str(raised.exception))
+        self.assertIs(manager._session, session)
+        context.close.assert_awaited_once_with()
+        browser.close.assert_awaited_once_with()
+        playwright.stop.assert_awaited_once_with()
+
+        context.close.side_effect = None
+        browser.close.side_effect = None
+        strict_close("session-demo")
+
+        self.assertIsNone(manager._session)
+        self.assertEqual(context.close.await_count, 2)
+        self.assertEqual(browser.close.await_count, 2)
+        self.assertEqual(playwright.stop.await_count, 1)
+
     def test_cached_music_is_read_only_and_scoped_to_current_account(self) -> None:
         """缓存读取不打开平台页面，只按当前已上传账号读取安全字段。"""
 

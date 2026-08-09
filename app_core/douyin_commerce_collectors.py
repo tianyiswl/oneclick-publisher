@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
+from copy import deepcopy
 from dataclasses import dataclass, field
 import threading
 from time import monotonic
@@ -235,6 +236,21 @@ _LOCATION_COLLECTORS = {
     "local": CollectorType.LOCAL_LOCATION,
 }
 
+_PROBE_PAYLOAD_KEYS = (
+    "type",
+    "workflow",
+    "commerceMode",
+    "contentType",
+    "accountId",
+    "accountList",
+    "fileList",
+    "title",
+    "description",
+    "tags",
+    "runtimeMode",
+    "debugDryRun",
+)
+
 
 class DouyinCommerceCollectorManager:
     """以代际隔离三个独立抖音平台设置采集会话。"""
@@ -254,6 +270,9 @@ class DouyinCommerceCollectorManager:
         self._action_queue = _CollectorActionQueue()
         self._runtime: _GenerationRuntime | None = None
         self._begin_flight: _LifecycleFlight | None = None
+        self._manager_close_owners: dict[
+            int, tuple[Any, _CollectorCloseOwner]
+        ] = {}
         self._close_wait_seconds = 15.0
 
     def begin_generation(
@@ -308,7 +327,8 @@ class DouyinCommerceCollectorManager:
                 raise DouyinCommerceCollectorError("cleanup_incomplete")
 
         try:
-            probe_payload = dict(self._probe_payload_builder(payload))
+            built_payload = self._probe_payload_builder(payload)
+            probe_payload = self._snapshot_probe_payload(built_payload)
         except Exception:
             raise DouyinCommerceCollectorError("collector_start_failed") from None
 
@@ -466,6 +486,8 @@ class DouyinCommerceCollectorManager:
                 generation_id, error_code="stale_result_discarded"
             )
         )
+        if generation_id == "":
+            raise DouyinCommerceCollectorError("stale_result_discarded")
         normalized_reason = self._normalize_public_text(
             reason, error_code="collector_unknown"
         )
@@ -474,7 +496,7 @@ class DouyinCommerceCollectorManager:
             if runtime is None:
                 return self._empty_close_result(generation_id)
             if (
-                generation_id
+                generation_id is not None
                 and generation_id != runtime.generation.generation_id
             ):
                 raise DouyinCommerceCollectorError("stale_result_discarded")
@@ -522,7 +544,7 @@ class DouyinCommerceCollectorManager:
             if runtime is None:
                 return self._empty_close_result(generation_id)
             current_id = runtime.generation.generation_id
-            if generation_id and generation_id != current_id:
+            if generation_id is not None and generation_id != current_id:
                 raise DouyinCommerceCollectorError("stale_result_discarded")
             if runtime.closed_result is not None and not runtime.collectors:
                 return self._copy_close_result(runtime.closed_result)
@@ -599,7 +621,10 @@ class DouyinCommerceCollectorManager:
         cleanup_result = "closed"
         try:
             if collector.manager is not None:
-                collector.manager.close(collector.session_id or None)
+                self._close_collector_manager(
+                    collector.manager,
+                    collector.session_id or None,
+                )
         except Exception:
             cleanup_result = "cleanup_incomplete"
 
@@ -613,16 +638,64 @@ class DouyinCommerceCollectorManager:
                 mark_failed=True,
             )
 
-    @staticmethod
     def _claim_collector_close_locked(
+        self,
         collector: _CollectorRuntime,
     ) -> tuple[_CollectorCloseOwner, bool]:
         existing = collector.close_owner
         if existing is not None and not existing.done.is_set():
             return existing, False
+        manager = collector.manager
+        if manager is not None:
+            registered = self._manager_close_owners.get(id(manager))
+            if (
+                registered is not None
+                and registered[0] is manager
+                and not registered[1].done.is_set()
+            ):
+                collector.close_owner = registered[1]
+                return registered[1], False
         owner = _CollectorCloseOwner()
         collector.close_owner = owner
+        if manager is not None:
+            self._manager_close_owners[id(manager)] = (manager, owner)
         return owner, True
+
+    def _bind_manager_close_owner_locked(
+        self,
+        collector: _CollectorRuntime,
+    ) -> None:
+        """将占位期已声明的 close owner 绑定到后到的 manager 身份。"""
+
+        manager = collector.manager
+        owner = collector.close_owner
+        if manager is None or owner is None or owner.done.is_set():
+            return
+        registered = self._manager_close_owners.get(id(manager))
+        if (
+            registered is not None
+            and registered[0] is manager
+            and not registered[1].done.is_set()
+            and registered[1] is not owner
+        ):
+            return
+        self._manager_close_owners[id(manager)] = (manager, owner)
+
+    def _release_manager_close_owner_locked(
+        self,
+        collector: _CollectorRuntime,
+        owner: _CollectorCloseOwner,
+    ) -> None:
+        manager = collector.manager
+        if manager is None:
+            return
+        registered = self._manager_close_owners.get(id(manager))
+        if (
+            registered is not None
+            and registered[0] is manager
+            and registered[1] is owner
+        ):
+            self._manager_close_owners.pop(id(manager), None)
 
     def _complete_collector_close_locked(
         self,
@@ -649,6 +722,7 @@ class DouyinCommerceCollectorManager:
             and runtime.collectors.get(collector_type) is collector
         ):
             runtime.collectors.pop(collector_type, None)
+        self._release_manager_close_owner_locked(collector, owner)
         owner.done.set()
         self._finalize_closed_runtime_locked(runtime)
 
@@ -714,11 +788,15 @@ class DouyinCommerceCollectorManager:
                 generation_id, error_code="stale_result_discarded"
             )
         )
+        if generation_id == "":
+            raise DouyinCommerceCollectorError("stale_result_discarded")
         with self._state_lock:
             runtime = self._runtime
             if runtime is None:
                 return {
-                    "setupGenerationId": generation_id or "",
+                    "setupGenerationId": (
+                        generation_id if generation_id is not None else ""
+                    ),
                     "generationState": SetupGenerationState.CLOSED.value,
                     "collectors": {
                         collector_type.value: CollectorState.NOT_STARTED.value
@@ -729,7 +807,10 @@ class DouyinCommerceCollectorManager:
                     },
                     "aliveCollectorCount": 0,
                 }
-            if generation_id and generation_id != runtime.generation.generation_id:
+            if (
+                generation_id is not None
+                and generation_id != runtime.generation.generation_id
+            ):
                 raise DouyinCommerceCollectorError("stale_result_discarded")
             generation = runtime.generation
             return {
@@ -887,11 +968,15 @@ class DouyinCommerceCollectorManager:
             cleanup_result = "closed"
             try:
                 if old.manager is not None:
-                    old.manager.close(old.session_id or None)
+                    self._close_collector_manager(
+                        old.manager,
+                        old.session_id or None,
+                    )
             except Exception:
                 cleanup_result = "cleanup_incomplete"
             with self._state_lock:
                 owner.result = cleanup_result
+                self._release_manager_close_owner_locked(old, owner)
                 owner.done.set()
                 slot = runtime.generation.collectors[collector_type]
                 still_owns_current_slot = bool(
@@ -967,7 +1052,16 @@ class DouyinCommerceCollectorManager:
             slot.state = CollectorState.STARTING
             slot.instance_id = collector.instance_id
             slot.session_id = None
-            probe_payload = dict(runtime.probe_payload)
+            stored_probe_payload = runtime.probe_payload
+
+        try:
+            probe_payload = deepcopy(stored_probe_payload)
+        except Exception:
+            if not self._mark_failed(generation_id, collector):
+                raise DouyinCommerceCollectorError(
+                    "stale_result_discarded"
+                ) from None
+            raise DouyinCommerceCollectorError("collector_start_failed") from None
 
         try:
             manager = self._manager_factory()
@@ -979,7 +1073,6 @@ class DouyinCommerceCollectorManager:
             raise DouyinCommerceCollectorError("collector_start_failed") from None
 
         with self._state_lock:
-            collector.manager = manager
             current = self._runtime
             slot = runtime.generation.collectors[collector_type]
             can_start = bool(
@@ -991,37 +1084,41 @@ class DouyinCommerceCollectorManager:
                 and slot.instance_id == collector.instance_id
                 and slot.state is CollectorState.STARTING
             )
-            has_close_owner = bool(
-                collector.close_owner is not None
-                and not collector.close_owner.done.is_set()
-            )
             manager_is_shared = any(
                 item is not collector and item.manager is manager
                 for item in runtime.collectors.values()
             )
-        if not can_start:
-            if not has_close_owner:
-                self._discard_unaccepted_start(runtime, collector)
-            raise DouyinCommerceCollectorError("stale_result_discarded")
+            if not manager_is_shared:
+                collector.manager = manager
+                self._bind_manager_close_owner_locked(collector)
+            has_close_owner = bool(
+                collector.close_owner is not None
+                and not collector.close_owner.done.is_set()
+            )
         if manager_is_shared:
             self._reject_collector_collision(
                 runtime,
                 collector,
                 close_rejected_manager=False,
             )
-            raise DouyinCommerceCollectorError("collector_start_failed")
+            raise DouyinCommerceCollectorError(
+                "collector_start_failed" if can_start else "stale_result_discarded"
+            ) from None
+        if not can_start:
+            if not has_close_owner:
+                self._discard_unaccepted_start(runtime, collector)
+            raise DouyinCommerceCollectorError("stale_result_discarded")
 
         try:
             started = manager.start_upload(probe_payload, on_progress=on_progress)
-            session_id = str((started or {}).get("sessionId") or "").strip()
+            if not isinstance(started, Mapping) or not started:
+                raise TypeError("collector start result is invalid")
+            raw_session_id = started.get("sessionId")
+            if not raw_session_id:
+                raise TypeError("collector session id is missing")
+            session_id = str(raw_session_id).strip()
             if not session_id:
-                raise DouyinCommerceCollectorError("collector_start_failed")
-        except DouyinCommerceCollectorError as error:
-            if not self._mark_failed(generation_id, collector):
-                raise DouyinCommerceCollectorError(
-                    "stale_result_discarded"
-                ) from None
-            raise error from None
+                raise TypeError("collector session id is empty")
         except Exception:
             if not self._mark_failed(generation_id, collector):
                 raise DouyinCommerceCollectorError(
@@ -1091,15 +1188,20 @@ class DouyinCommerceCollectorManager:
 
         with self._state_lock:
             owner, claimed = self._claim_collector_close_locked(collector)
+        if not claimed:
+            # generation close 已拥有该 manager；其 cleanup action 排在
+            # 当前碰撞动作之后。此处不得伪造完成或移除 runtime。
+            return
         cleanup_result = "closed"
         try:
-            if claimed and collector.manager is not None:
-                collector.manager.close(None)
+            if collector.manager is not None:
+                self._close_collector_manager(collector.manager, None)
         except Exception:
             cleanup_result = "cleanup_incomplete"
         with self._state_lock:
+            if collector.close_owner is not owner:
+                return
             owner.result = cleanup_result
-            owner.done.set()
             runtime.cleanup_results[collector_type] = cleanup_result
             slot = runtime.generation.collectors[collector_type]
             if cleanup_result == "closed":
@@ -1112,6 +1214,9 @@ class DouyinCommerceCollectorManager:
                     slot.session_id = None
             elif slot.instance_id == collector.instance_id:
                 slot.state = CollectorState.FAILED
+            self._release_manager_close_owner_locked(collector, owner)
+            owner.done.set()
+            self._finalize_closed_runtime_locked(runtime)
 
     def _discard_unaccepted_start(
         self,
@@ -1125,7 +1230,10 @@ class DouyinCommerceCollectorManager:
         cleanup_result = "closed"
         try:
             if collector.manager is not None:
-                collector.manager.close(collector.session_id or None)
+                self._close_collector_manager(
+                    collector.manager,
+                    collector.session_id or None,
+                )
         except Exception:
             cleanup_result = "cleanup_incomplete"
         with self._state_lock:
@@ -1332,6 +1440,29 @@ class DouyinCommerceCollectorManager:
             raise DouyinCommerceCollectorError(error_code) from None
 
     @staticmethod
+    def _close_collector_manager(
+        manager: Any,
+        session_id: str | None,
+    ) -> None:
+        strict_close = getattr(manager, "close_strict", None)
+        if callable(strict_close):
+            strict_close(session_id)
+            return
+        manager.close(session_id)
+
+    @staticmethod
+    def _snapshot_probe_payload(payload: object) -> dict[str, Any]:
+        if not isinstance(payload, Mapping):
+            raise TypeError("probe payload must be a mapping")
+        outer = dict(payload)
+        whitelisted = {
+            key: outer[key]
+            for key in _PROBE_PAYLOAD_KEYS
+            if key in outer
+        }
+        return deepcopy(whitelisted)
+
+    @staticmethod
     def _account_id(payload: Mapping[str, Any]) -> int:
         try:
             value: object = payload.get("accountId", 0)
@@ -1351,7 +1482,7 @@ class DouyinCommerceCollectorManager:
     def _empty_close_result(generation_id: str | None) -> dict[str, object]:
         return {
             "closed": True,
-            "setupGenerationId": generation_id or "",
+            "setupGenerationId": generation_id if generation_id is not None else "",
             "aliveCollectorCount": 0,
             "cleanupResults": {
                 collector_type.value: "not_started"

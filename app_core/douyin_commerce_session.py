@@ -156,6 +156,9 @@ class _CommerceEditorSession:
     # 抖音新版的地点范围组件会在收藏音乐抽屉完成一次只读开合后才稳定
     # 初始化。仅真实新上传会话需要预热；测试构造和旧会话默认不触发。
     platform_dom_needs_music_warmup: bool = False
+    strict_context_closed: bool = False
+    strict_browser_closed: bool = False
+    strict_playwright_stopped: bool = False
 
 
 class DouyinCommerceSessionManager:
@@ -416,6 +419,16 @@ class DouyinCommerceSessionManager:
         except DouyinCommerceSessionError:
             # 页面销毁或应用退出时的重复关闭无需打断 UI。
             return
+
+    def close_strict(self, session_id: str | None = None) -> None:
+        """严格关闭会话；任一资源失败都向关闭屏障返回固定信号。"""
+
+        try:
+            self._call(self._close_strict(session_id))
+        except Exception:
+            raise DouyinCommerceSessionError(
+                "commerce_session_close_failed"
+            ) from None
 
     def status(self) -> dict[str, str]:
         return self._call(self._status())
@@ -1437,6 +1450,62 @@ class DouyinCommerceSessionManager:
             context=session.context,
             browser=session.browser,
             playwright=session.playwright,
+        )
+
+    async def _close_strict(self, session_id: str | None) -> None:
+        session = self._session
+        if session is None:
+            return
+        if session_id and _normalized(session_id) != session.session_id:
+            raise DouyinCommerceSessionError(
+                "commerce_session_close_failed"
+            ) from None
+        complete = await self._close_resources_strict(session)
+        if not complete:
+            raise DouyinCommerceSessionError(
+                "commerce_session_close_failed"
+            ) from None
+        if self._session is session:
+            self._session = None
+
+    @staticmethod
+    async def _close_resources_strict(session: _CommerceEditorSession) -> bool:
+        failed = False
+        if not session.strict_context_closed:
+            if session.context is None:
+                session.strict_context_closed = True
+            else:
+                try:
+                    await session.context.close()
+                except Exception:
+                    failed = True
+                else:
+                    session.strict_context_closed = True
+        if not session.strict_browser_closed:
+            if session.browser is None:
+                session.strict_browser_closed = True
+            else:
+                try:
+                    await session.browser.close()
+                except Exception:
+                    failed = True
+                else:
+                    session.strict_browser_closed = True
+        if not session.strict_playwright_stopped:
+            if session.playwright is None:
+                session.strict_playwright_stopped = True
+            else:
+                try:
+                    await session.playwright.stop()
+                except Exception:
+                    failed = True
+                else:
+                    session.strict_playwright_stopped = True
+        return bool(
+            not failed
+            and session.strict_context_closed
+            and session.strict_browser_closed
+            and session.strict_playwright_stopped
         )
 
     @staticmethod
