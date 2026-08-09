@@ -23,15 +23,21 @@ class FakeSessionManager:
         self.manager_id = manager_id
         self.session_id = ""
         self.start_payloads: list[dict[str, Any]] = []
+        self.start_started = threading.Event()
+        self.release_start: threading.Event | None = None
         self.refresh_calls: list[str] = []
         self.location_calls: list[tuple[str, object, object]] = []
         self.location_scopes: list[object] = []
         self.close_calls: list[str | None] = []
+        self.close_started = threading.Event()
+        self.release_close: threading.Event | None = None
+        self.close_during_location = False
         self.refresh_started = threading.Event()
         self.location_started = threading.Event()
         self.release_refresh: threading.Event | None = None
         self.release_location: threading.Event | None = None
         self.search_error: Exception | None = None
+        self.location_result_override: object | None = None
         self.close_failures_remaining = 0
 
     def start_upload(
@@ -42,6 +48,9 @@ class FakeSessionManager:
     ) -> dict[str, str]:
         del on_progress
         self.start_payloads.append(dict(payload))
+        self.start_started.set()
+        if self.release_start is not None:
+            self.release_start.wait(timeout=2)
         self.session_id = f"session-{self.manager_id}"
         return {"sessionId": self.session_id}
 
@@ -72,6 +81,8 @@ class FakeSessionManager:
             self.release_location.wait(timeout=2)
         if self.search_error is not None:
             raise self.search_error
+        if self.location_result_override is not None:
+            return self.location_result_override
         return [
             {
                 "poiId": f"poi-{self.manager_id}",
@@ -81,7 +92,16 @@ class FakeSessionManager:
         ]
 
     def close(self, session_id: str | None = None) -> None:
+        self.close_started.set()
+        if (
+            self.location_started.is_set()
+            and self.release_location is not None
+            and not self.release_location.is_set()
+        ):
+            self.close_during_location = True
         self.close_calls.append(session_id)
+        if self.release_close is not None:
+            self.release_close.wait(timeout=2)
         if self.close_failures_remaining:
             self.close_failures_remaining -= 1
             raise RuntimeError("Cookie=secret DOM=<html>")
@@ -90,9 +110,16 @@ class FakeSessionManager:
 class FakeManagerFactory:
     def __init__(self) -> None:
         self.instances: list[FakeSessionManager] = []
+        self.block_start_ids: set[int] = set()
+        self.errors_by_id: dict[int, Exception] = {}
 
     def __call__(self) -> FakeSessionManager:
-        instance = FakeSessionManager(len(self.instances) + 1)
+        manager_id = len(self.instances) + 1
+        if manager_id in self.errors_by_id:
+            raise self.errors_by_id[manager_id]
+        instance = FakeSessionManager(manager_id)
+        if instance.manager_id in self.block_start_ids:
+            instance.release_start = threading.Event()
         self.instances.append(instance)
         return instance
 
@@ -427,6 +454,100 @@ class DouyinCommerceCollectorManagerTests(unittest.TestCase):
             "replacement-instance",
         )
 
+    def test_late_failure_from_retry_replaced_instance_does_not_fail_new_slot(self):
+        generation_id = self.manager.begin_generation(self.upload_payload)[
+            "setupGenerationId"
+        ]
+        old_manager = self.factory.instances[0]
+        old_manager.release_location = threading.Event()
+        old_manager.search_error = RuntimeError("Cookie=old DOM=<html>old</html>")
+        outcome: dict[str, object] = {}
+        thread = threading.Thread(
+            target=lambda: self._capture_call(
+                outcome,
+                "search",
+                lambda: self.manager.search_locations(
+                    generation_id, "侨港风情街", "domestic"
+                ),
+            )
+        )
+        thread.start()
+        self.assertTrue(old_manager.location_started.wait(timeout=1))
+
+        with self.manager._state_lock:
+            runtime = self.manager._runtime
+            old_runtime = runtime.collectors[CollectorType.DOMESTIC_LOCATION]
+            replacement_manager = self.factory()
+            replacement_manager.start_upload(self.upload_payload)
+            replacement = type(old_runtime)(
+                collector_type=CollectorType.DOMESTIC_LOCATION,
+                manager=replacement_manager,
+                instance_id="retry-replacement",
+                session_id=replacement_manager.session_id,
+                fixed_scope="domestic",
+            )
+            runtime.collectors[CollectorType.DOMESTIC_LOCATION] = replacement
+            runtime.generation.activate_collector(
+                CollectorType.DOMESTIC_LOCATION,
+                instance_id=replacement.instance_id,
+                session_id=replacement.session_id,
+            )
+
+        old_manager.release_location.set()
+        thread.join(timeout=1)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(str(outcome["search_error"]), "stale_result_discarded")
+        status = self.manager.status(generation_id)
+        self.assertEqual(status["collectors"]["domestic_location"], "active")
+        self.assertEqual(
+            status["collectorInstanceIds"]["domestic_location"],
+            "retry-replacement",
+        )
+
+    def test_start_activation_instance_mismatch_discards_and_closes_own_session(self):
+        self.factory.block_start_ids.add(1)
+        outcome: dict[str, object] = {}
+        thread = threading.Thread(
+            target=lambda: self._capture_call(
+                outcome,
+                "begin",
+                lambda: self.manager.begin_generation(self.upload_payload),
+            )
+        )
+        thread.start()
+        for _ in range(100):
+            if self.factory.instances:
+                break
+            time.sleep(0.01)
+        created = self.factory.instances[0]
+        self.assertTrue(created.start_started.wait(timeout=1))
+        with self.manager._state_lock:
+            runtime = self.manager._runtime
+            slot = runtime.generation.collectors[
+                CollectorType.DOMESTIC_LOCATION
+            ]
+            slot.instance_id = "replacement-before-activation"
+
+        created.release_start.set()
+        thread.join(timeout=1)
+
+        self.assertFalse(thread.is_alive())
+        self.assertNotIn("begin", outcome)
+        self.assertIn("begin_error", outcome)
+        self.assertEqual(str(outcome["begin_error"]), "stale_result_discarded")
+        self.assertEqual(created.close_calls, ["session-1"])
+        with self.manager._state_lock:
+            runtime = self.manager._runtime
+            slot = runtime.generation.collectors[
+                CollectorType.DOMESTIC_LOCATION
+            ]
+            self.assertEqual(slot.instance_id, "replacement-before-activation")
+            self.assertNotIn(
+                CollectorType.DOMESTIC_LOCATION,
+                runtime.collectors,
+            )
+
     def test_retry_replaces_only_requested_collector(self):
         generation_id = self.manager.begin_generation(self.upload_payload)[
             "setupGenerationId"
@@ -462,6 +583,50 @@ class DouyinCommerceCollectorManagerTests(unittest.TestCase):
         self.assertNotIn("secret", public_text)
         self.assertNotIn("123456", public_text)
         self.assertNotIn("<html>", public_text)
+
+    def test_lazy_manager_factory_exception_is_replaced_by_fixed_public_error(self):
+        generation_id = self.manager.begin_generation(self.upload_payload)[
+            "setupGenerationId"
+        ]
+        self.factory.errors_by_id[2] = RuntimeError(
+            "Cookie=secret 验证码123456 DOM=<html>private</html>"
+        )
+
+        with self.assertRaises(Exception) as raised:
+            self.manager.refresh_favorite_music(generation_id)
+
+        self.assertIsInstance(raised.exception, DouyinCommerceCollectorError)
+        self.assertEqual(str(raised.exception), "collector_start_failed")
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertNotIn("secret", str(raised.exception))
+        self.assertNotIn("123456", str(raised.exception))
+        self.assertNotIn("<html>", str(raised.exception))
+
+    def test_malformed_collector_result_is_replaced_by_fixed_public_error(self):
+        class SensitiveMalformedResult:
+            def __iter__(self):
+                raise RuntimeError(
+                    "Cookie=secret 验证码123456 DOM=<html>private</html>"
+                )
+
+        generation_id = self.manager.begin_generation(self.upload_payload)[
+            "setupGenerationId"
+        ]
+        self.factory.instances[0].location_result_override = [
+            SensitiveMalformedResult()
+        ]
+
+        with self.assertRaises(Exception) as raised:
+            self.manager.search_locations(
+                generation_id, "侨港风情街", "domestic"
+            )
+
+        self.assertIsInstance(raised.exception, DouyinCommerceCollectorError)
+        self.assertEqual(str(raised.exception), "collector_unknown")
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertNotIn("secret", str(raised.exception))
+        self.assertNotIn("123456", str(raised.exception))
+        self.assertNotIn("<html>", str(raised.exception))
 
     def test_close_continues_after_one_failure_and_retry_is_idempotent(self):
         generation_id = self.manager.begin_generation(self.upload_payload)[
@@ -523,29 +688,214 @@ class DouyinCommerceCollectorManagerTests(unittest.TestCase):
         )
         self.assertEqual(len(self.factory.instances), 1)
 
-    def test_running_action_timeout_is_reported_as_cleanup_incomplete(self):
+    def test_timeout_defers_running_slot_close_to_the_serial_queue(self):
         generation_id = self.manager.begin_generation(self.upload_payload)[
             "setupGenerationId"
         ]
+        self.manager.refresh_favorite_music(generation_id)
+        self.manager.search_locations(generation_id, "夜南香", "local")
+        domestic, music, local = self.factory.instances
+        domestic.release_location = threading.Event()
+        outcome: dict[str, object] = {}
+        search_thread = threading.Thread(
+            target=lambda: self._capture_call(
+                outcome,
+                "search",
+                lambda: self.manager.search_locations(
+                    generation_id, "侨港风情街", "domestic"
+                ),
+            )
+        )
+        search_thread.start()
+        self.assertTrue(domestic.location_started.wait(timeout=1))
+        original_wait_running = self.manager._action_queue.wait_running
 
+        try:
+            with mock.patch.object(
+                self.manager._action_queue,
+                "wait_running",
+                side_effect=lambda target_id, timeout: original_wait_running(
+                    target_id, timeout=0.05
+                ),
+            ):
+                closed = self.manager.close_generation(
+                    generation_id, reason="cancelled"
+                )
+
+            self.assertFalse(closed["closed"])
+            self.assertEqual(closed["aliveCollectorCount"], 1)
+            self.assertEqual(
+                closed["cleanupResults"]["domestic_location"],
+                "cleanup_incomplete",
+            )
+            self.assertEqual(domestic.close_calls, [])
+            self.assertFalse(domestic.close_during_location)
+            self.assertEqual(music.close_calls, ["session-2"])
+            self.assertEqual(local.close_calls, ["session-3"])
+        finally:
+            domestic.release_location.set()
+            search_thread.join(timeout=1)
+
+        self.assertFalse(search_thread.is_alive())
+        self.assertTrue(domestic.close_started.wait(timeout=1))
+        self.assertEqual(domestic.close_calls, ["session-1"])
+        self.assertFalse(domestic.close_during_location)
+        for _ in range(100):
+            if self.manager.status(generation_id)["generationState"] == "closed":
+                break
+            time.sleep(0.01)
+        final_status = self.manager.status(generation_id)
+        self.assertEqual(final_status["generationState"], "closed")
+        self.assertEqual(final_status["aliveCollectorCount"], 0)
+
+    def test_second_close_reuses_pending_deferred_cleanup_without_duplicate_close(self):
+        generation_id = self.manager.begin_generation(self.upload_payload)[
+            "setupGenerationId"
+        ]
+        domestic = self.factory.instances[0]
+        domestic.release_location = threading.Event()
+        outcome: dict[str, object] = {}
+        search_thread = threading.Thread(
+            target=lambda: self._capture_call(
+                outcome,
+                "search",
+                lambda: self.manager.search_locations(
+                    generation_id, "侨港风情街", "domestic"
+                ),
+            )
+        )
+        search_thread.start()
+        self.assertTrue(domestic.location_started.wait(timeout=1))
+        original_wait_running = self.manager._action_queue.wait_running
         with mock.patch.object(
             self.manager._action_queue,
-            "running_collector_type",
-            return_value=CollectorType.DOMESTIC_LOCATION,
-        ), mock.patch.object(
-            self.manager._action_queue,
             "wait_running",
-            return_value=False,
+            side_effect=lambda target_id, timeout: original_wait_running(
+                target_id, timeout=0.05
+            ),
         ):
-            result = self.manager.close_generation(
+            first_close = self.manager.close_generation(
                 generation_id, reason="cancelled"
             )
+        self.assertFalse(first_close["closed"])
+        domestic.release_close = threading.Event()
+        second_thread = threading.Thread(
+            target=lambda: self._capture_call(
+                outcome,
+                "second_close",
+                lambda: self.manager.close_generation(
+                    generation_id, reason="cancelled"
+                ),
+            )
+        )
+        second_thread.start()
 
-        self.assertFalse(result["closed"])
-        self.assertEqual(result["aliveCollectorCount"], 1)
+        domestic.release_location.set()
+        search_thread.join(timeout=1)
+        self.assertTrue(domestic.close_started.wait(timeout=1))
+        time.sleep(0.05)
+        try:
+            self.assertEqual(domestic.close_calls, ["session-1"])
+        finally:
+            domestic.release_close.set()
+            second_thread.join(timeout=1)
+
+        self.assertFalse(second_thread.is_alive())
+        self.assertNotIn("second_close_error", outcome)
+        self.assertTrue(outcome["second_close"]["closed"])
+        self.assertEqual(domestic.close_calls, ["session-1"])
+
+    def test_concurrent_begin_calls_are_single_flight_without_leaking_first_session(self):
+        self.factory.block_start_ids.add(1)
+        outcome: dict[str, object] = {}
+        first_thread = threading.Thread(
+            target=lambda: self._capture_call(
+                outcome,
+                "first_begin",
+                lambda: self.manager.begin_generation(self.upload_payload),
+            )
+        )
+        first_thread.start()
+        for _ in range(100):
+            if self.factory.instances:
+                break
+            time.sleep(0.01)
+        first = self.factory.instances[0]
+        self.assertTrue(first.start_started.wait(timeout=1))
+
+        second_thread = threading.Thread(
+            target=lambda: self._capture_call(
+                outcome,
+                "second_begin",
+                lambda: self.manager.begin_generation(self.upload_payload),
+            )
+        )
+        second_thread.start()
+        time.sleep(0.05)
+        self.assertEqual(len(self.factory.instances), 1)
+
+        first.release_start.set()
+        first_thread.join(timeout=1)
+        second_thread.join(timeout=1)
+
+        self.assertFalse(first_thread.is_alive())
+        self.assertFalse(second_thread.is_alive())
+        self.assertNotIn("first_begin_error", outcome)
+        self.assertNotIn("second_begin_error", outcome)
+        first_generation = outcome["first_begin"]["setupGenerationId"]
+        second_generation = outcome["second_begin"]["setupGenerationId"]
+        self.assertNotEqual(first_generation, second_generation)
+        self.assertEqual(first.close_calls, ["session-1"])
+        self.assertEqual(len(self.factory.instances), 2)
         self.assertEqual(
-            result["cleanupResults"]["domestic_location"],
-            "cleanup_incomplete",
+            self.manager.status()["setupGenerationId"], second_generation
+        )
+
+    def test_concurrent_close_calls_wait_for_one_idempotent_cleanup(self):
+        generation_id = self.manager.begin_generation(self.upload_payload)[
+            "setupGenerationId"
+        ]
+        self.manager.refresh_favorite_music(generation_id)
+        self.manager.search_locations(generation_id, "夜南香", "local")
+        domestic = self.factory.instances[0]
+        domestic.release_close = threading.Event()
+        outcome: dict[str, object] = {}
+        first_thread = threading.Thread(
+            target=lambda: self._capture_call(
+                outcome,
+                "first_close",
+                lambda: self.manager.close_generation(
+                    generation_id, reason="cancelled"
+                ),
+            )
+        )
+        first_thread.start()
+        self.assertTrue(domestic.close_started.wait(timeout=1))
+        second_thread = threading.Thread(
+            target=lambda: self._capture_call(
+                outcome,
+                "second_close",
+                lambda: self.manager.close_generation(
+                    generation_id, reason="cancelled"
+                ),
+            )
+        )
+        second_thread.start()
+        time.sleep(0.05)
+
+        domestic.release_close.set()
+        first_thread.join(timeout=1)
+        second_thread.join(timeout=1)
+
+        self.assertFalse(first_thread.is_alive())
+        self.assertFalse(second_thread.is_alive())
+        self.assertNotIn("first_close_error", outcome)
+        self.assertNotIn("second_close_error", outcome)
+        self.assertEqual(outcome["first_close"], outcome["second_close"])
+        self.assertTrue(outcome["first_close"]["closed"])
+        self.assertEqual(
+            [item.close_calls for item in self.factory.instances],
+            [["session-1"], ["session-2"], ["session-3"]],
         )
 
 
