@@ -773,9 +773,25 @@ class DouyinCommerceSessionManager:
             )
         except douyin_music_service.DouyinMusicError as exc:
             # 收藏列表的 marker 依附于当前音乐弹窗。写入失败后不复用它，下一次
-            # 选择必须重新打开并读取，避免将已重绘的条目误认成同一首音乐。
-            session.music_picker_page = None
-            session.music_dialog = None
+            # 选择必须重新打开并读取。但若失败发生在选中回读后的抽屉关闭
+            # 阶段，不能先丢弃弹层引用；只有当限定于该弹层的关闭能力成功后
+            # 才清引用，否则留给正式页基线再次严格清理。
+            picker_page = session.music_picker_page
+            dialog = session.music_dialog
+            picker_closed = picker_page is None and dialog is None
+            if picker_page is not None and dialog is not None:
+                try:
+                    await douyin_music_service.close_favorite_music_choices(
+                        picker_page,
+                        dialog,
+                    )
+                except Exception:
+                    picker_closed = False
+                else:
+                    picker_closed = True
+            if picker_closed:
+                session.music_picker_page = None
+                session.music_dialog = None
             session.music_candidates = []
             self._refresh_editor_stage(session)
             raise DouyinCommerceSessionError(f"抖音收藏音乐未能选择并回读：{exc}") from exc

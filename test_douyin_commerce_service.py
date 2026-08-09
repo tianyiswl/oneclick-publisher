@@ -4994,6 +4994,88 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
         self.assertEqual(manager._session.selected_music, old_music)
         self.assertEqual(manager._session.stage, "music_selected")
 
+    def test_music_close_failure_keeps_layer_for_publish_baseline_retry(self) -> None:
+        """音乐已回读但抽屉未关闭时，基线不得跳过真实浮层返回 clean。"""
+
+        class OpenPage:
+            def is_closed(self) -> bool:
+                return False
+
+        class EmptyControls:
+            async def count(self) -> int:
+                return 0
+
+        class VisibleDialog:
+            def __init__(self) -> None:
+                self.close_lookups = 0
+
+            async def is_visible(self) -> bool:
+                return True
+
+            def locator(self, _selector: str) -> EmptyControls:
+                self.close_lookups += 1
+                return EmptyControls()
+
+        manager = douyin_commerce_session.DouyinCommerceSessionManager()
+        page = OpenPage()
+        picker_page = object()
+        dialog = VisibleDialog()
+        old_music = {"musicId": "music-old", "title": "旧音乐"}
+        candidate = {
+            "musicId": "music-new",
+            "title": "新音乐",
+            "creator": "测试作者",
+            "duration": "01:08",
+            "marker": "row-1",
+        }
+        session = douyin_commerce_session._CommerceEditorSession(
+            session_id="session-demo",
+            upload_payload={},
+            account_name="测试账号",
+            browser=None,
+            context=None,
+            page=page,
+            playwright=None,
+            uploader=None,
+            music_picker_page=picker_page,
+            music_dialog=dialog,
+            music_candidates=[candidate],
+            selected_music=dict(old_music),
+        )
+        manager._session = session
+        close_error = douyin_music_service.DouyinMusicError(
+            "抖音收藏音乐已选中，但音乐抽屉无法安全关闭"
+        )
+        with patch.object(
+            douyin_commerce_session.douyin_music_service,
+            "select_favorite_music_choice",
+            new_callable=AsyncMock,
+            side_effect=close_error,
+        ), patch.object(
+            douyin_commerce_session.douyin_commerce_service,
+            "close_commerce_store_selector",
+            new_callable=AsyncMock,
+        ) as close_location_selector:
+            with self.assertRaisesRegex(
+                douyin_commerce_session.DouyinCommerceSessionError,
+                "未能选择并回读",
+            ):
+                asyncio.run(
+                    manager._select_favorite_music("session-demo", "music-new")
+                )
+            with self.assertRaises(
+                douyin_commerce_session.DouyinCommerceSessionError
+            ) as raised:
+                manager.prepare_publish_settings("session-demo")
+
+        self.assertEqual(str(raised.exception), "正式发布页旧浮层未能清理")
+        self.assertEqual(dialog.close_lookups, 2)
+        close_location_selector.assert_not_awaited()
+        self.assertIs(session.music_picker_page, picker_page)
+        self.assertIs(session.music_dialog, dialog)
+        self.assertEqual(session.music_candidates, [])
+        self.assertEqual(session.selected_music, old_music)
+
     def test_favorite_music_selection_closes_picker_after_readback(self) -> None:
         """音乐仅在选中态回读后关闭抽屉，避免遮罩阻断其它编辑项。"""
 
