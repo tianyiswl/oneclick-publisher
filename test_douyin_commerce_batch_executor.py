@@ -49,6 +49,9 @@ class FakeCommerceSessionManager:
         self.verification_broker = verification_broker
         self.location_candidates = location_candidates
         self.location_searches: list[tuple[str, str]] = []
+        self.atomic_location_requests: list[
+            tuple[str, dict, str, list[str]]
+        ] = []
         self.scheduled_readback_time = scheduled_readback_time
         self.baseline_fail_indexes = baseline_fail_indexes or set()
         self.calls: list[str] = []
@@ -120,6 +123,27 @@ class FakeCommerceSessionManager:
         self.ordered_calls.append(("apply_location", session_id))
         # 与真实会话管理器保持一致：地点回读嵌套在 location 字段中。
         return {"location": dict(location)}
+
+    def apply_saved_location(
+        self,
+        session_id: str,
+        preset: dict,
+        scope: str,
+        keywords: list[str],
+    ) -> dict:
+        self.calls.append(
+            f"apply_saved_location:{self._index_by_session[session_id]}"
+        )
+        self.ordered_calls.append(("apply_saved_location", session_id))
+        self.atomic_location_requests.append(
+            (session_id, dict(preset), scope, list(keywords))
+        )
+        location = (
+            dict(self.location_candidates[0])
+            if self.location_candidates
+            else dict(preset)
+        )
+        return {"location": location, "matchedKeyword": keywords[0]}
 
     def sync_schedule(self, session_id: str, _payload: dict) -> dict:
         self.calls.append(f"sync_schedule:{self._index_by_session[session_id]}")
@@ -301,7 +325,11 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
             ["start_upload:0", "start_upload:1", "start_upload:2"],
         )
         self.assertEqual(
-            manager.location_searches,
+            [
+                (keywords[0], scope)
+                for _session_id, _preset, scope, keywords
+                in manager.atomic_location_requests
+            ],
             [
                 (item["locationPreset"]["address"], item["locationPreset"]["scope"])
                 for item in self.batch["items"]
@@ -330,7 +358,7 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
                 ("prepare_publish_settings", "session-1"),
                 ("select_cached_favorite_music", "session-1"),
                 ("select_content_declaration", "session-1"),
-                ("search_locations", "session-1"),
+                ("apply_saved_location", "session-1"),
             ],
         )
         self.assertEqual(
@@ -340,6 +368,83 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
         self.assertEqual(
             manager.closed_session_ids,
             ["session-1", "session-2", "session-3"],
+        )
+
+    def test_executor_uses_one_atomic_location_action_before_schedule(self) -> None:
+        """正式执行器不得再把搜索与点击拆成两次面板动作。"""
+
+        manager = FakeCommerceSessionManager()
+
+        result = DouyinCommerceBatchExecutor(manager).run_preflight(
+            self.batch,
+            task_id=self.task["id"],
+        )
+
+        self.assertEqual([row["status"] for row in result], ["preflighted"] * 3)
+        first_session_calls = [
+            name
+            for name, session_id in manager.ordered_calls
+            if session_id == "session-1"
+        ]
+        self.assertEqual(
+            first_session_calls,
+            [
+                "prepare_publish_settings",
+                "select_cached_favorite_music",
+                "select_content_declaration",
+                "apply_saved_location",
+                "sync_schedule",
+                "preflight",
+                "close",
+            ],
+        )
+        self.assertNotIn("search_locations:0", manager.calls)
+        self.assertNotIn("apply_location:0", manager.calls)
+        self.assertEqual(
+            manager.atomic_location_requests[0][3],
+            _location_search_keywords(self.batch["items"][0]["locationPreset"]),
+        )
+
+    def test_atomic_location_failure_blocks_schedule_preflight_and_submit(self) -> None:
+        """地点原子应用失败后本条只能关闭会话，不得继续排期或提交。"""
+
+        class FailingAtomicLocationManager(FakeCommerceSessionManager):
+            def apply_saved_location(
+                self,
+                session_id: str,
+                preset: dict,
+                scope: str,
+                keywords: list[str],
+            ) -> dict:
+                del preset, scope, keywords
+                self.ordered_calls.append(("apply_saved_location", session_id))
+                raise RuntimeError("publish_location_click_failed")
+
+        batch = {**self.batch, "items": [dict(self.batch["items"][0])]}
+        task = task_service.create_douyin_batch_task(batch)
+        manager = FailingAtomicLocationManager()
+
+        result = DouyinCommerceBatchExecutor(manager).run_publish(
+            batch,
+            task_id=task["id"],
+            confirmed=True,
+        )
+
+        self.assertEqual(result[0]["status"], "failed")
+        self.assertEqual(result[0]["diagnostic"], "publish_location_click_failed")
+        self.assertEqual(
+            [
+                name
+                for name, session_id in manager.ordered_calls
+                if session_id == "session-1"
+            ],
+            [
+                "prepare_publish_settings",
+                "select_cached_favorite_music",
+                "select_content_declaration",
+                "apply_saved_location",
+                "close",
+            ],
         )
 
     def test_baseline_cleanup_failure_closes_item_without_applying_settings(self) -> None:
@@ -745,8 +850,8 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
         self.assertNotIn("apply_location:0", manager.calls)
         self.assertNotIn("submit:0", manager.calls)
 
-    def test_domestic_location_retries_city_and_name_after_address_search_miss(self) -> None:
-        """国内范围地址检索排序漂移时，必须仍按完整地址唯一筛选城市加店名结果。"""
+    def test_domestic_location_passes_bounded_address_city_and_name_keywords(self) -> None:
+        """执行器一次传入地址、城市加店名和店名，由同面板原子动作内部回退。"""
 
         location = {
             "poiId": "visible-poi:shanghai-store",
@@ -757,29 +862,16 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
         batch = {**self.batch, "items": [{**self.batch["items"][0], "locationPreset": location}]}
         task = task_service.create_douyin_batch_task(batch)
 
-        class SearchFallbackManager(FakeCommerceSessionManager):
-            def search_locations(self, session_id: str, keyword: str, scope: str) -> list[dict]:
-                self.calls.append(f"search_locations:{self._index_by_session[session_id]}")
-                self.location_searches.append((keyword, scope))
-                if keyword == location["address"]:
-                    return [
-                        {
-                            "poiId": "visible-poi:other",
-                            "name": "无关地点",
-                            "address": "上海市静安区青云路673号",
-                        }
-                    ]
-                return [dict(location)]
-
-        manager = SearchFallbackManager()
+        manager = FakeCommerceSessionManager()
         result = DouyinCommerceBatchExecutor(manager).run_preflight(batch, task_id=task["id"])
 
         self.assertEqual(result[0]["status"], "preflighted")
         self.assertEqual(
-            manager.location_searches,
+            manager.atomic_location_requests[0][3],
             [
-                (location["address"], "domestic"),
-                ("上海 夜南香北京烤鸭", "domestic"),
+                location["address"],
+                "上海 夜南香北京烤鸭",
+                "夜南香北京烤鸭",
             ],
         )
 

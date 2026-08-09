@@ -356,6 +356,48 @@ class DouyinCommerceSessionManager:
             raise DouyinCommerceSessionError("请选择一键发返回的完整发布定位候选")
         return self._call(self._apply_location(session_id, dict(normalized)))
 
+    def apply_saved_location(
+        self,
+        session_id: str,
+        preset: Mapping[str, Any],
+        scope: object,
+        keywords: list[str],
+    ) -> dict[str, Any]:
+        """在当前正式发布页原子搜索、应用并回读已存地点。"""
+
+        normalized = douyin_commerce_service.normalize_commerce_location_candidate(
+            preset
+        )
+        if not normalized:
+            raise DouyinCommerceSessionError("publish_location_candidate_missing")
+        try:
+            selected_scope = douyin_commerce_service.normalize_commerce_location_scope(
+                scope
+            )
+        except Exception:
+            raise DouyinCommerceSessionError(
+                "publish_location_candidate_missing"
+            ) from None
+        if not isinstance(keywords, list):
+            raise DouyinCommerceSessionError("publish_location_candidate_missing")
+        bounded_keywords = list(
+            dict.fromkeys(
+                normalized_keyword
+                for value in keywords
+                if (normalized_keyword := _normalized(value))
+            )
+        )[:3]
+        if not bounded_keywords:
+            raise DouyinCommerceSessionError("publish_location_candidate_missing")
+        return self._call(
+            self._apply_saved_location(
+                session_id,
+                dict(normalized),
+                selected_scope,
+                bounded_keywords,
+            )
+        )
+
     def select_content_declaration(self, session_id: str, declaration: object) -> str:
         """选择用户明确指定的作品内容声明，并从当前编辑页回读。"""
 
@@ -998,6 +1040,67 @@ class DouyinCommerceSessionManager:
         session.schedule_time = ""
         self._refresh_editor_stage(session)
         return {"location": dict(session.location)}
+
+    async def _apply_saved_location(
+        self,
+        session_id: str,
+        preset: dict[str, Any],
+        scope: str,
+        keywords: list[str],
+    ) -> dict[str, Any]:
+        session = await self._current(session_id)
+        self._ensure_editor_not_blocked_by_music_picker(session)
+        try:
+            result = (
+                await douyin_commerce_service.apply_saved_commerce_location_to_page(
+                    session.page,
+                    preset,
+                    scope,
+                    keywords,
+                )
+            )
+        except douyin_commerce_service.DouyinCommerceError as exc:
+            code = _normalized(exc)
+            allowed = {
+                "publish_location_candidate_missing",
+                "publish_location_candidate_ambiguous",
+                "publish_location_click_failed",
+                "publish_location_readback_mismatch",
+                "publish_location_cleanup_incomplete",
+            }
+            raise DouyinCommerceSessionError(
+                code if code in allowed else "publish_location_click_failed"
+            ) from None
+        except Exception:
+            raise DouyinCommerceSessionError("publish_location_click_failed") from None
+        location = result.get("location") if isinstance(result, Mapping) else None
+        normalized = douyin_commerce_service.normalize_commerce_location_candidate(
+            location
+        )
+        if not normalized or not _same_location(normalized, preset):
+            raise DouyinCommerceSessionError("publish_location_readback_mismatch")
+        matched_keyword = (
+            _normalized(result.get("matchedKeyword"))
+            if isinstance(result, Mapping)
+            else ""
+        )
+        if matched_keyword not in keywords:
+            raise DouyinCommerceSessionError("publish_location_readback_mismatch")
+
+        session.commerce_location_candidates = [dict(normalized)]
+        session.location = dict(normalized)
+        session.location_scope = scope
+        session.stores = []
+        session.selected_store = None
+        if session.uploader is not None:
+            session.uploader.location_verification = session.location["name"]
+        session.preflight_fingerprint = ""
+        session.schedule_time = ""
+        self._refresh_editor_stage(session)
+        return {
+            "location": dict(session.location),
+            "matchedKeyword": matched_keyword,
+        }
 
     async def _select_content_declaration(
         self,

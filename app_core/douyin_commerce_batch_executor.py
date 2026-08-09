@@ -608,33 +608,36 @@ class DouyinCommerceBatchExecutor:
 
             location = payload["locationPoi"]
             scope = _text(payload["locationScope"])
-            matched: dict[str, str] | None = None
-            last_location_error: Exception | None = None
-            for keyword in _location_search_keywords(location):
-                try:
-                    candidates = self._manager.search_locations(session_id, keyword, scope)
-                    matched = match_location_preset(location, candidates)
-                    break
-                except Exception as exc:
-                    last_location_error = exc
-            if matched is None:
-                diagnostic = _text(last_location_error) or "未返回可用候选"
-                raise DouyinCommerceBatchExecutorError(
-                    f"抖音在“{scope}”范围内未找到已保存的完整地点：{diagnostic}"
-                )
-            applied = self._manager.apply_location(session_id, matched)
-            # 会话管理器的真实回读格式为 {"location": {...}}。离线替身可能
-            # 直接返回地点对象，二者都只接受名称、完整地址与 POI 三项一致。
+            applied = self._manager.apply_saved_location(
+                session_id,
+                location,
+                scope,
+                _location_search_keywords(location),
+            )
             applied_location = (
                 applied.get("location")
                 if isinstance(applied, Mapping) and isinstance(applied.get("location"), Mapping)
-                else applied
+                else None
             )
+            try:
+                confirmed_location = match_location_preset(
+                    location,
+                    [dict(applied_location)]
+                    if isinstance(applied_location, Mapping)
+                    else [],
+                )
+            except Exception:
+                raise DouyinCommerceBatchExecutorError(
+                    "publish_location_readback_mismatch"
+                ) from None
             if not isinstance(applied_location, Mapping) or any(
-                _text(applied_location.get(field)) != _text(matched.get(field))
+                _text(applied_location.get(field))
+                != _text(confirmed_location.get(field))
                 for field in ("poiId", "name", "address")
             ):
-                raise DouyinCommerceBatchExecutorError("抖音发布定位写入后回读不一致")
+                raise DouyinCommerceBatchExecutorError(
+                    "publish_location_readback_mismatch"
+                )
 
             self._manager.sync_schedule(session_id, payload)
             preflight = self._manager.preflight(session_id, payload)

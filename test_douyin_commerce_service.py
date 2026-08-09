@@ -7209,6 +7209,105 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
         self.assertIsNone(manager._session.location)
         self.assertEqual(manager._session.location_scope, "domestic")
 
+    def test_apply_saved_location_updates_session_only_after_atomic_readback(self) -> None:
+        """会话层必须把预设和有界关键词一次交给 DOM 原子动作。"""
+
+        class OpenPage:
+            def is_closed(self) -> bool:
+                return False
+
+        class Uploader:
+            location_verification = ""
+
+        location = {
+            "poiId": "poi-001",
+            "name": "北海银滩景区",
+            "address": "广西壮族自治区北海市银海区银滩大道中段",
+        }
+        manager = douyin_commerce_session.DouyinCommerceSessionManager()
+        manager._session = douyin_commerce_session._CommerceEditorSession(
+            session_id="session-demo",
+            upload_payload={},
+            account_name="测试账号",
+            browser=None,
+            context=None,
+            page=OpenPage(),
+            playwright=None,
+            uploader=Uploader(),
+            stage="declaration_selected",
+            selected_declaration="无需添加自主声明",
+            stores=[{"storeId": "stale"}],
+            selected_store={"storeId": "stale"},
+            preflight_fingerprint="stale",
+            schedule_time="2026-08-11 09:00",
+        )
+        keywords = [location["address"], "北海 北海银滩景区"]
+        with patch.object(
+            douyin_commerce_session.douyin_commerce_service,
+            "apply_saved_commerce_location_to_page",
+            new_callable=AsyncMock,
+            return_value={
+                "location": {**location, "distance": ""},
+                "matchedKeyword": keywords[1],
+            },
+        ) as apply_atomic:
+            result = manager.apply_saved_location(
+                "session-demo",
+                location,
+                "domestic",
+                keywords,
+            )
+
+        self.assertEqual(apply_atomic.await_count, 1)
+        actual_page, actual_preset, actual_scope, actual_keywords = (
+            apply_atomic.await_args.args
+        )
+        self.assertIs(actual_page, manager._session.page)
+        self.assertEqual(actual_preset["name"], location["name"])
+        self.assertEqual(actual_preset["address"], location["address"])
+        self.assertTrue(actual_preset["poiId"].startswith("visible-poi:"))
+        self.assertEqual(actual_scope, "domestic")
+        self.assertEqual(actual_keywords, keywords)
+        self.assertTrue(result["location"]["poiId"].startswith("visible-poi:"))
+        self.assertEqual(result["matchedKeyword"], keywords[1])
+        self.assertEqual(manager._session.location_scope, "domestic")
+        self.assertEqual(
+            manager._session.commerce_location_candidates,
+            [result["location"]],
+        )
+        self.assertEqual(manager._session.stores, [])
+        self.assertIsNone(manager._session.selected_store)
+        self.assertEqual(manager._session.preflight_fingerprint, "")
+        self.assertEqual(manager._session.schedule_time, "")
+        self.assertEqual(manager._session.uploader.location_verification, location["name"])
+
+    def test_apply_saved_location_rejects_missing_keywords_before_dom_action(self) -> None:
+        """空关键词不得打开正式发布页的地点面板。"""
+
+        manager = douyin_commerce_session.DouyinCommerceSessionManager()
+        location = {
+            "poiId": "poi-001",
+            "name": "北海银滩景区",
+            "address": "广西壮族自治区北海市银海区银滩大道中段",
+        }
+        with patch.object(
+            douyin_commerce_session.douyin_commerce_service,
+            "apply_saved_commerce_location_to_page",
+            new_callable=AsyncMock,
+        ) as apply_atomic:
+            with self.assertRaisesRegex(
+                douyin_commerce_session.DouyinCommerceSessionError,
+                "publish_location_candidate_missing",
+            ):
+                manager.apply_saved_location(
+                    "session-demo",
+                    location,
+                    "domestic",
+                    ["", "  "],
+                )
+
+        apply_atomic.assert_not_awaited()
+
     def test_location_search_failure_still_closes_candidate_selector(self) -> None:
         """读取失败也必须收口地点浮层，避免下一次搜索继承残留菜单。"""
 
