@@ -153,9 +153,6 @@ class _CommerceEditorSession:
     selected_store: dict[str, str] | None = None
     preflight_fingerprint: str = ""
     schedule_time: str = ""
-    # 抖音新版的地点范围组件会在收藏音乐抽屉完成一次只读开合后才稳定
-    # 初始化。仅真实新上传会话需要预热；测试构造和旧会话默认不触发。
-    platform_dom_needs_music_warmup: bool = False
     strict_context_closed: bool = False
     strict_browser_closed: bool = False
     strict_playwright_stopped: bool = False
@@ -341,6 +338,11 @@ class DouyinCommerceSessionManager:
         """在当前已上传编辑页搜索发布定位候选，不另开浏览器或使用私有请求。"""
 
         return self._call(self._search_locations(session_id, keyword, scope))
+
+    def prepare_publish_settings(self, session_id: str) -> dict[str, object]:
+        """在正式发布页应用设置前建立可验证的干净基线。"""
+
+        return self._call(self._prepare_publish_settings(session_id))
 
     def apply_location(
         self,
@@ -658,7 +660,6 @@ class DouyinCommerceSessionManager:
                 playwright=playwright,
                 uploader=uploader,
                 account_id=int(account.get("id") or 0),
-                platform_dom_needs_music_warmup=True,
             )
             self._session = session
             success = True
@@ -741,7 +742,6 @@ class DouyinCommerceSessionManager:
         session.music_picker_page = None
         session.music_dialog = None
         session.music_candidates = []
-        session.platform_dom_needs_music_warmup = False
         self._refresh_editor_stage(session)
         if session.account_id <= 0:
             return current
@@ -821,6 +821,52 @@ class DouyinCommerceSessionManager:
                 session.selected_music["musicId"] = requested_id
         return selected
 
+    async def _prepare_publish_settings(
+        self,
+        session_id: str,
+    ) -> dict[str, object]:
+        """关闭当前正式页浮层后，丢弃仅存于内存的旧设置。"""
+
+        session = await self._current(session_id)
+        if session.music_picker_page is not None or session.music_dialog is not None:
+            if session.music_picker_page is None or session.music_dialog is None:
+                raise DouyinCommerceSessionError("正式发布页旧浮层未能清理")
+            try:
+                await douyin_music_service.close_favorite_music_choices(
+                    session.music_picker_page,
+                    session.music_dialog,
+                )
+            except Exception as exc:
+                raise DouyinCommerceSessionError(
+                    "正式发布页旧浮层未能清理"
+                ) from exc
+            session.music_picker_page = None
+            session.music_dialog = None
+
+        try:
+            await douyin_commerce_service.close_commerce_store_selector(session.page)
+        except Exception as exc:
+            raise DouyinCommerceSessionError(
+                "正式发布页旧浮层未能清理"
+            ) from exc
+
+        session.music_candidates = []
+        session.selected_music = None
+        session.commerce_location_candidates = []
+        session.location = None
+        session.location_scope = ""
+        session.selected_declaration = ""
+        session.stores = []
+        session.selected_store = None
+        session.preflight_fingerprint = ""
+        session.schedule_time = ""
+        self._refresh_editor_stage(session)
+        return {
+            "status": "clean",
+            "sessionId": session.session_id,
+            "openLayerCount": 0,
+        }
+
     async def _search_locations(
         self,
         session_id: str,
@@ -838,20 +884,6 @@ class DouyinCommerceSessionManager:
 
         candidates: list[dict[str, Any]] = []
         for attempt in range(2):
-            if session.platform_dom_needs_music_warmup:
-                # 用户无需记住“必须先刷新音乐再搜地址”的隐含顺序。这里只读收藏
-                # 候选并安全关闭抽屉，不选择音乐、不写地点，也不进入提交阶段。
-                try:
-                    await self._refresh_favorite_music(session_id)
-                except DouyinCommerceSessionError as exc:
-                    raise DouyinCommerceSessionError(
-                        f"抖音平台设置初始化失败，暂不能搜索地点：{exc}"
-                    ) from exc
-                # 抽屉关闭会触发发布页位置组件异步重绘；等待其完成后再定位输入
-                # 和范围，避免偶发读到“本地 0 个、国内 0 个”的中间态。
-                await session.page.wait_for_timeout(4_500)
-                session.platform_dom_needs_music_warmup = False
-
             # 每次检索前先收口上一轮候选。地点候选与当前上传会话复用同一页面，
             # 若旧 listbox 仍展开，带货模式回读可能把菜单项误作当前值。
             try:
@@ -870,7 +902,6 @@ class DouyinCommerceSessionManager:
             except Exception as exc:
                 # 搜索中途失败也尽量收口本次已展开的地点候选；清理失败不得覆盖
                 # 原始平台错误，下一次搜索仍会在入口处再次严格清理。
-                session.platform_dom_needs_music_warmup = True
                 try:
                     await douyin_commerce_service.close_commerce_store_selector(session.page)
                 except Exception:
@@ -881,7 +912,8 @@ class DouyinCommerceSessionManager:
                     and "本地 0 个、国内 0 个" in error_text
                 )
                 if attempt == 0 and transient_scope_failure:
-                    _LOGGER.info("抖音地点范围面板尚未挂载，刷新平台设置组件后自动重试一次")
+                    _LOGGER.info("抖音地点范围面板尚未挂载，有界等待后自动重试一次")
+                    await session.page.wait_for_timeout(1_500)
                     continue
                 raise DouyinCommerceSessionError(
                     f"抖音带货位置搜索失败：{error_text[:260]}"
@@ -892,9 +924,6 @@ class DouyinCommerceSessionManager:
             raise DouyinCommerceSessionError(
                 f"抖音地点候选读取后未能安全关闭：{_normalized(str(exc))[:220]}"
             ) from exc
-        # 抖音每次地点检索都会重绘范围和候选组件。下一轮搜索重新做一次
-        # 只读音乐抽屉开合，以换取稳定、可重复的国内/本地切换。
-        session.platform_dom_needs_music_warmup = True
         # 新搜索结果会改变发布定位。任何此前的门店选择、预检或定时回读都
         # 必须失效，避免误把旧门店用于新地点。
         session.commerce_location_candidates = [dict(item) for item in candidates]

@@ -6644,8 +6644,8 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
 
         self.assertEqual(close_selector.await_count, 2)
 
-    def test_first_location_search_warms_up_platform_dom_via_music_refresh(self) -> None:
-        """真实新上传页第一次搜地址前先完成只读音乐初始化，解除组件顺序依赖。"""
+    def test_location_search_never_refreshes_music(self) -> None:
+        """地点采集不得因任何历史标记触发收藏音乐刷新。"""
 
         class OpenPage:
             wait_for_timeout = AsyncMock()
@@ -6655,7 +6655,7 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
 
         manager = douyin_commerce_session.DouyinCommerceSessionManager()
         page = OpenPage()
-        manager._session = douyin_commerce_session._CommerceEditorSession(
+        session = douyin_commerce_session._CommerceEditorSession(
             session_id="session-demo",
             upload_payload={},
             account_name="测试账号",
@@ -6664,15 +6664,24 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
             page=page,
             playwright=None,
             uploader=None,
-            platform_dom_needs_music_warmup=True,
         )
-        expected = [{"name": "北海夜南香", "address": "广西北海市银海区示例路1号"}]
+        # 覆盖旧进程可能残留的动态属性；新实现不得读取它。
+        session.platform_dom_needs_music_warmup = True
+        manager._session = session
+        expected = [
+            {
+                "poiId": "poi-night-south",
+                "name": "夜南香北京烤鸭",
+                "address": "广西壮族自治区北海市银海区银滩大道 1 号",
+                "distance": "1.2km",
+            }
+        ]
         with patch.object(
             manager,
             "_refresh_favorite_music",
             new_callable=AsyncMock,
             return_value=[],
-        ) as warmup, patch.object(
+        ) as refresh_music, patch.object(
             douyin_commerce_session.douyin_commerce_service,
             "close_commerce_store_selector",
             new_callable=AsyncMock,
@@ -6686,13 +6695,12 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
                 manager._search_locations("session-demo", "北海夜南香", "domestic")
             )
 
-        warmup.assert_awaited_once_with("session-demo")
-        page.wait_for_timeout.assert_awaited_once_with(4_500)
-        self.assertTrue(manager._session.platform_dom_needs_music_warmup)
-        self.assertEqual(result, expected)
+        self.assertEqual(result[0]["name"], "夜南香北京烤鸭")
+        refresh_music.assert_not_awaited()
+        page.wait_for_timeout.assert_not_awaited()
 
-    def test_transient_missing_scope_panel_rewarms_and_retries_once(self) -> None:
-        """范围面板短暂未挂载时，同一次搜索应刷新页面组件后自动恢复一次。"""
+    def test_transient_missing_scope_panel_waits_then_retries_without_music(self) -> None:
+        """范围面板短暂未挂载时只允许有界等待并重试地点。"""
 
         class OpenPage:
             wait_for_timeout = AsyncMock()
@@ -6722,7 +6730,7 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
             "_refresh_favorite_music",
             new_callable=AsyncMock,
             return_value=[],
-        ) as warmup, patch.object(
+        ) as refresh_music, patch.object(
             douyin_commerce_session.douyin_commerce_service,
             "close_commerce_store_selector",
             new_callable=AsyncMock,
@@ -6737,10 +6745,142 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
             )
 
         self.assertEqual(search.await_count, 2)
-        warmup.assert_awaited_once_with("session-demo")
-        page.wait_for_timeout.assert_awaited_once_with(4_500)
+        refresh_music.assert_not_awaited()
+        page.wait_for_timeout.assert_awaited_once_with(1_500)
         self.assertEqual(close_selector.await_count, 4)
         self.assertEqual(result, expected)
+
+    def test_prepare_publish_settings_closes_layers_before_clearing_state(self) -> None:
+        """正式页基线必须先关闭真实浮层，再清理内存旧值。"""
+
+        class OpenPage:
+            def is_closed(self) -> bool:
+                return False
+
+        manager = douyin_commerce_session.DouyinCommerceSessionManager()
+        page = OpenPage()
+        picker_page = object()
+        dialog = object()
+        session = douyin_commerce_session._CommerceEditorSession(
+            session_id="session-demo",
+            upload_payload={},
+            account_name="测试账号",
+            browser=None,
+            context=None,
+            page=page,
+            playwright=None,
+            uploader=None,
+            stage="preflighted",
+            music_picker_page=picker_page,
+            music_dialog=dialog,
+            music_candidates=[{"musicId": "music-old", "title": "旧音乐"}],
+            selected_music={"musicId": "music-old", "title": "旧音乐"},
+            commerce_location_candidates=[
+                {
+                    "poiId": "poi-old",
+                    "name": "旧地点",
+                    "address": "广西壮族自治区北海市银海区旧路 1 号",
+                }
+            ],
+            location={
+                "poiId": "poi-old",
+                "name": "旧地点",
+                "address": "广西壮族自治区北海市银海区旧路 1 号",
+            },
+            location_scope="local",
+            selected_declaration="内容由AI生成",
+            stores=[{"storeId": "store-old", "name": "旧门店"}],
+            selected_store={"storeId": "store-old", "name": "旧门店"},
+            preflight_fingerprint="old-fingerprint",
+            schedule_time="2026-08-10 16:00",
+        )
+        manager._session = session
+        close_order: list[str] = []
+
+        async def close_music(*_args) -> None:
+            close_order.append("music")
+
+        async def close_location(*_args) -> None:
+            close_order.append("location")
+
+        with patch.object(
+            douyin_commerce_session.douyin_music_service,
+            "close_favorite_music_choices",
+            new_callable=AsyncMock,
+            side_effect=close_music,
+        ) as close_music_picker, patch.object(
+            douyin_commerce_session.douyin_commerce_service,
+            "close_commerce_store_selector",
+            new_callable=AsyncMock,
+            side_effect=close_location,
+        ) as close_location_selector:
+            result = manager.prepare_publish_settings("session-demo")
+
+        self.assertEqual(
+            result,
+            {"status": "clean", "sessionId": "session-demo", "openLayerCount": 0},
+        )
+        self.assertEqual(close_order, ["music", "location"])
+        close_music_picker.assert_awaited_once_with(picker_page, dialog)
+        close_location_selector.assert_awaited_once_with(page)
+        self.assertIsNone(session.music_picker_page)
+        self.assertIsNone(session.music_dialog)
+        self.assertEqual(session.music_candidates, [])
+        self.assertIsNone(session.selected_music)
+        self.assertEqual(session.commerce_location_candidates, [])
+        self.assertIsNone(session.location)
+        self.assertEqual(session.location_scope, "")
+        self.assertEqual(session.selected_declaration, "")
+        self.assertEqual(session.stores, [])
+        self.assertIsNone(session.selected_store)
+        self.assertEqual(session.preflight_fingerprint, "")
+        self.assertEqual(session.schedule_time, "")
+        self.assertEqual(session.stage, "uploaded")
+
+    def test_prepare_publish_settings_stops_when_music_layer_cannot_close(self) -> None:
+        """音乐浮层无法唯一清理时必须精确归因，且不能继续清状态。"""
+
+        class OpenPage:
+            def is_closed(self) -> bool:
+                return False
+
+        manager = douyin_commerce_session.DouyinCommerceSessionManager()
+        page = OpenPage()
+        old_music = {"musicId": "music-old", "title": "旧音乐"}
+        session = douyin_commerce_session._CommerceEditorSession(
+            session_id="session-demo",
+            upload_payload={},
+            account_name="测试账号",
+            browser=None,
+            context=None,
+            page=page,
+            playwright=None,
+            uploader=None,
+            music_picker_page=object(),
+            music_dialog=object(),
+            music_candidates=[dict(old_music)],
+            selected_music=dict(old_music),
+        )
+        manager._session = session
+        with patch.object(
+            douyin_commerce_session.douyin_music_service,
+            "close_favorite_music_choices",
+            new_callable=AsyncMock,
+            side_effect=douyin_music_service.DouyinMusicError("关闭控件不唯一"),
+        ), patch.object(
+            douyin_commerce_session.douyin_commerce_service,
+            "close_commerce_store_selector",
+            new_callable=AsyncMock,
+        ) as close_location_selector:
+            with self.assertRaises(
+                douyin_commerce_session.DouyinCommerceSessionError
+            ) as raised:
+                manager.prepare_publish_settings("session-demo")
+
+        self.assertEqual(str(raised.exception), "正式发布页旧浮层未能清理")
+        close_location_selector.assert_not_awaited()
+        self.assertEqual(session.music_candidates, [old_music])
+        self.assertEqual(session.selected_music, old_music)
 
     def test_location_selection_does_not_bind_store_without_explicit_store_step(self) -> None:
         class OpenPage:
