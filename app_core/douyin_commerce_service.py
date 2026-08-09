@@ -567,13 +567,21 @@ async def _anchor_controls(page):
                 const selectedMode = mode.querySelector(
                     '.semi-select-selection-text, [aria-selected="true"]'
                 );
+                const selectedModeIsPlaceholder = Boolean(
+                    selectedMode?.classList?.contains('semi-select-selection-placeholder')
+                    || selectedMode?.classList?.contains('semi-select-selection-text-inactive')
+                );
                 return {{
                     count: 1,
                     // 控件展开时 innerText 会连同所有菜单项一起返回；这里只读
-                    // 已选值，缺少标准选中节点时才兼容旧版控件全文。
-                    mode: normalize(
-                        selectedMode && (selectedMode.innerText || selectedMode.textContent)
-                    ) || text(mode),
+                    // 已选值。新版会给空值渲染“请选择带货模式”等非空提示
+                    // 文案，必须依据 placeholder 状态识别为空，不能把它当成
+                    // 未知模式而阻断首次地点搜索。
+                    mode: selectedModeIsPlaceholder
+                        ? '{_UNSELECTED_MODE_VALUE}'
+                        : normalize(
+                            selectedMode && (selectedMode.innerText || selectedMode.textContent)
+                        ) || text(mode),
                     store: normalize(store.value || store.innerText || store.textContent),
                     surface,
                 }};
@@ -1417,13 +1425,21 @@ async def _wait_mode_options(page) -> list[Any]:
             if len(visible) == 2:
                 return visible
         await page.wait_for_timeout(200)
-    raise DouyinCommerceError("抖音带货模式菜单未能唯一显示，已安全停止")
+    diagnostic = await _capture_configured_location_entry_diagnostic(page)
+    suffix = f"；脱敏诊断已保存：{diagnostic.name}" if diagnostic else ""
+    raise DouyinCommerceError(f"抖音带货模式菜单未能唯一显示，已安全停止{suffix}")
 
 
 async def _ensure_local_group_buy_mode(page):
     """确认或切换到页面实际回读的“带货模式”，并返回关联地点下拉。"""
 
     mode_control, store_control, mode_value, _ = await _anchor_controls(page)
+    # 当前新版页面会在“添加标签”的位置行直接提供原生地点输入框，同时在
+    # 相邻行保留另一个空的筛选下拉。该相邻下拉展开后可能包含大量业务候选，
+    # 并不是旧版只有“带货模式/打卡模式”两项的模式菜单。已有唯一原生地点
+    # 输入时直接复用它，避免误开相邻下拉并污染后续国内/本地搜索。
+    if await _is_direct_location_entry(store_control):
+        return store_control
     if mode_value == _COMMERCE_MODE_TEXT:
         return store_control
     if mode_value not in {_CHECKIN_MODE_TEXT, _UNSELECTED_MODE_VALUE}:
@@ -1468,7 +1484,12 @@ async def _visible_store_listbox(page) -> Any | None:
                 };
                 const normalize = value => String(value || '')
                     .replace(/[\u200b\u00a0]/g, ' ').replace(/\\s+/g, ' ').trim();
-                const looksAddress = value => /(?:自治区|省|市|区|县|镇|乡|街|路|大道|巷|号|楼|村)/.test(value);
+                const looksAddress = value => {
+                    const text = normalize(value);
+                    return text.length >= 6
+                        && !/(?:商品|返佣|佣金|团购|套餐|券|专区)/.test(text)
+                        && /(?:自治区|省|市|区|县|镇|乡|街|路|大道|巷|号|楼|村)/.test(text);
+                };
                 const descriptor = option => {
                     const rawText = String(option.innerText || option.textContent || '')
                         .replace(/[\u200b\u00a0]/g, ' ');
@@ -1510,6 +1531,77 @@ async def _wait_store_listbox(page) -> Any:
             return listbox
         await page.wait_for_timeout(200)
     raise DouyinCommerceError("抖音可带货地点列表未能唯一显示，已安全停止")
+
+
+async def _visible_commerce_location_overlay(page) -> Any | None:
+    """定位当前地点输入面板内的候选浮层，包括空结果和辅助项列表。
+
+    读取地点候选仍只接受含完整地址的列表；关闭动作则必须识别同一面板内
+    的所有结果列表，否则“未找到相关地点”等辅助列表会残留到下一次搜索。
+    """
+
+    result = await page.evaluate(
+        """() => {
+            const visible = node => {
+                if (!(node instanceof HTMLElement)) return false;
+                const rect = node.getBoundingClientRect();
+                const style = getComputedStyle(node);
+                return rect.width > 0 && rect.height > 0
+                    && style.display !== 'none' && style.visibility !== 'hidden';
+            };
+            const normalize = value => String(value || '')
+                .replace(/[\u200b\u00a0]/g, ' ').replace(/\\s+/g, ' ').trim();
+            const text = node => normalize(node.innerText || node.textContent);
+            const labelLeaves = (root, label) => Array.from(root.querySelectorAll('*'))
+                .filter(visible)
+                .filter(node => text(node) === label)
+                .filter(node => !Array.from(node.children)
+                    .some(child => visible(child) && text(child) === label));
+            document.querySelectorAll('[data-oneclick-commerce-location-overlay]')
+                .forEach(node => node.removeAttribute(
+                    'data-oneclick-commerce-location-overlay'
+                ));
+            const input = document.querySelector(
+                '[data-oneclick-commerce-search-input="active"], '
+                + '[data-oneclick-commerce-store="active"]'
+            );
+            if (!input || !visible(input)) return { count: 0 };
+            let panel = null;
+            for (let current = input.parentElement, depth = 0;
+                current && current !== document.body && depth < 10;
+                current = current.parentElement, depth += 1) {
+                if (labelLeaves(current, '本地').length === 1
+                    && labelLeaves(current, '国内').length === 1) {
+                    panel = current;
+                    break;
+                }
+            }
+            if (!panel) return { count: 0 };
+            const lists = Array.from(panel.querySelectorAll('[role="listbox"]'))
+                .filter(visible)
+                .filter(list => {
+                    const options = Array.from(
+                        list.querySelectorAll(':scope > [role="option"]')
+                    ).filter(visible);
+                    if (options.length === 0) return false;
+                    const values = options.map(text);
+                    return !(values.length === 2
+                        && values.includes('带货模式')
+                        && values.includes('打卡模式'));
+                });
+            if (lists.length !== 1) return { count: lists.length };
+            lists[0].dataset.oneclickCommerceLocationOverlay = 'active';
+            return { count: 1 };
+        }"""
+    )
+    count = int(result.get("count") or 0) if isinstance(result, Mapping) else 0
+    if count > 1:
+        raise DouyinCommerceError(
+            f"抖音当前地点面板出现 {count} 个候选浮层，无法安全关闭"
+        )
+    if count == 1:
+        return page.locator('[data-oneclick-commerce-location-overlay="active"]')
+    return None
 
 
 async def _open_store_selector(page, store_control) -> Any:
@@ -1720,7 +1812,11 @@ async def set_commerce_location_scope(page, scope: object) -> str:
     # 抖音切换标签后会异步更新下拉结果。至少连续两次看到“目标已选、另一项
     # 未选”才算切换完成，避免刚点击就把旧的“本地”请求结果当成“国内”。
     stable_selected_reads = 0
-    for _ in range(12):
+    last_missing_scope_pair = False
+    # 连续切换或平台侧限速时，这组标签实测可能在输入后的 3 秒以后才挂载。
+    # 以控件真实出现为完成条件，最多等待约 6 秒；不使用固定成功休眠，也不
+    # 放宽唯一性和选中态回读要求。
+    for _ in range(30):
         # 范围点击会替换整个 portal，旧输入框上的临时 marker
         # 会随 DOM 一起消失。每次回读前都重新限定当前地点面板；
         # 短暂的 0 个是重绘中，多个仍然立即安全停止。
@@ -1860,10 +1956,25 @@ async def set_commerce_location_scope(page, scope: object) -> str:
             local_count = int(result.get("local") or 0)
             domestic_count = int(result.get("domestic") or 0)
             reason = _normalized(result.get("reason"))
+            if (
+                local_count == 0
+                and domestic_count == 0
+                and reason == "pair-not-in-search-panel"
+            ):
+                # 输入或范围切换后 portal 会先替换输入框，再补上范围标签；
+                # 这一小段 0/0 是已知重绘过渡态，给页面受限时间收敛。
+                last_missing_scope_pair = True
+                await page.wait_for_timeout(200)
+                continue
             suffix = f"；{reason}" if reason else ""
+            diagnostic = await _capture_configured_location_entry_diagnostic(page)
+            diagnostic_suffix = (
+                f"；脱敏诊断已保存：{diagnostic.name}" if diagnostic else ""
+            )
             raise DouyinCommerceError(
                 "抖音位置搜索范围“本地/国内”控件未能唯一显示"
                 f"（当前地点面板内本地 {local_count} 个、国内 {domestic_count} 个{suffix}），已安全停止"
+                f"{diagnostic_suffix}"
             )
         if state == "selected":
             stable_selected_reads += 1
@@ -1881,6 +1992,16 @@ async def set_commerce_location_scope(page, scope: object) -> str:
             await page.wait_for_timeout(250)
             continue
         await page.wait_for_timeout(200)
+    if last_missing_scope_pair:
+        diagnostic = await _capture_configured_location_entry_diagnostic(page)
+        diagnostic_suffix = (
+            f"；脱敏诊断已保存：{diagnostic.name}" if diagnostic else ""
+        )
+        raise DouyinCommerceError(
+            "抖音位置搜索范围“本地/国内”控件未能唯一显示"
+            "（当前地点面板内本地 0 个、国内 0 个；pair-not-in-search-panel），已安全停止"
+            f"{diagnostic_suffix}"
+        )
     raise DouyinCommerceError(
         f"抖音位置搜索范围“本地/国内”未能确认“{expected_label}”，已安全停止"
     )
@@ -2021,7 +2142,33 @@ async def search_commerce_location_store_candidates(
     # 抖音会在关键词输入后立即按当前范围请求候选；必须先把页面实际范围切成
     # 用户所选“本地/国内”，再填写关键词，避免客户端默认“国内”但平台仍以
     # 初始“本地”返回候选。
-    await set_commerce_location_scope(page, scope)
+    try:
+        await set_commerce_location_scope(page, scope)
+    except DouyinCommerceError as exc:
+        message = str(exc)
+        delayed_scope_panel = (
+            "本地 0 个、国内 0 个" in message
+            and "pair-not-in-search-panel" in message
+        )
+        if not delayed_scope_panel:
+            raise
+        # 当前新版在空输入框获得焦点时仍不渲染“本地/国内”，只有本次关键
+        # 词触发首轮候选后才创建范围标签。该首轮结果只负责唤起面板，不会
+        # 返回客户端；随后仍会切换目标范围、清空旧词并重新检索与回读。
+        try:
+            # 重复同词搜索时输入框仍保留旧值；直接 fill 同样文字不会触发
+            # input 事件，也就不会重新创建范围面板。先清空再写回，确保每次
+            # 都产生一轮新的、可验证的页面请求。
+            await input_control.fill("", timeout=8_000)
+            await page.wait_for_timeout(120)
+            await input_control.click(timeout=5_000)
+            await input_control.fill(normalized_keyword, timeout=8_000)
+        except Exception as fill_exc:
+            raise DouyinCommerceError(
+                "抖音地点范围面板未显示且无法用本次关键词安全唤起"
+            ) from fill_exc
+        await page.wait_for_timeout(900)
+        await set_commerce_location_scope(page, scope)
     # 切换范围会重绘输入框和候选面板，不能继续使用切换前
     # 取得的 locator。重新回读带货模式与唯一输入框，同时兼容
     # 平台在切换后直接收起浮层的情况。
@@ -2057,6 +2204,18 @@ async def search_commerce_location_store_candidates(
     # 列表真正变化，不能像此前那样只要看到 listbox 就立刻把旧结果返回客户端。
     await page.wait_for_timeout(450)
     _, _, baseline_signature = await _visible_commerce_location_result_snapshot(page)
+    # 清空关键词本身也可能让抖音替换整个搜索组件。上面的 locator 即使刚刚
+    # 成功清空，也可能在 450ms 收敛期间失效；重新从唯一“添加标签”行定位
+    # 当前输入框，再执行本次真正检索，避免向已分离节点写词。
+    store_control = await _ensure_local_group_buy_mode(page)
+    input_control = await _open_commerce_search_input(page, store_control)
+    try:
+        await input_control.scroll_into_view_if_needed(timeout=5_000)
+        await input_control.click(timeout=5_000)
+    except Exception as exc:
+        raise DouyinCommerceError(
+            "抖音关键词重置后的位置输入框无法安全打开，已停止"
+        ) from exc
     try:
         await input_control.fill(normalized_keyword, timeout=8_000)
     except Exception as exc:
@@ -2113,7 +2272,12 @@ async def _location_option_targets(listbox, location: Mapping[str, Any]) -> list
                     const rawText = String(node.innerText || node.textContent || '')
                         .replace(/[\u200b\u00a0]/g, ' ');
                     const lines = rawText.split(/\\n+/).map(normalize).filter(Boolean);
-                    const looksAddress = value => /(?:自治区|省|市|区|县|镇|乡|街|路|大道|巷|号|楼|村)/.test(value);
+                    const looksAddress = value => {
+                        const text = normalize(value);
+                        return text.length >= 6
+                            && !/(?:商品|返佣|佣金|团购|套餐|券|专区)/.test(text)
+                            && /(?:自治区|省|市|区|县|镇|乡|街|路|大道|巷|号|楼|村)/.test(text);
+                    };
                     const nameNode = node.querySelector('[data-store-name], [class*="name-"], [class*="name_"], [class*="title-"]');
                     const addressNode = node.querySelector('[data-store-address], [class*="address-"], [class*="address_"], [class*="addr"]');
                     const name = normalize(nameNode && (nameNode.innerText || nameNode.textContent)) || lines[0] || '';
@@ -2207,7 +2371,30 @@ async def apply_commerce_location_store_to_page(
 
 
 async def close_commerce_store_selector(page) -> None:
-    """只关闭已确认的带货门店下拉，不选择任何门店。"""
+    """关闭当前地点候选浮层，不选择地点或门店。"""
+
+    try:
+        input_control = await _visible_commerce_search_input(page)
+    except DouyinCommerceError as exc:
+        if "实际 0 个" not in str(exc):
+            raise
+        input_control = None
+    if input_control is not None:
+        overlay = await _visible_commerce_location_overlay(page)
+        if overlay is not None:
+            try:
+                await input_control.press("Escape", timeout=5_000)
+            except Exception as exc:
+                raise DouyinCommerceError(
+                    "抖音地点候选浮层无法安全关闭，已停止后续设置"
+                ) from exc
+            for _ in range(10):
+                if await _visible_commerce_location_overlay(page) is None:
+                    return
+                await page.wait_for_timeout(150)
+            raise DouyinCommerceError(
+                "抖音地点候选浮层无法安全关闭，已停止后续设置"
+            )
 
     listbox = await _visible_store_listbox(page)
     if listbox is None:
@@ -2240,7 +2427,12 @@ async def _store_option_descriptors(listbox) -> list[dict[str, str]]:
                         .replace(/[\u200b\u00a0]/g, ' ');
                     const text = normalize(rawText);
                     const lines = rawText.split(/\\n+/).map(normalize).filter(Boolean);
-                    const looksAddress = value => /(?:自治区|省|市|区|县|镇|乡|街|路|大道|巷|号|楼|村)/.test(value);
+                    const looksAddress = value => {
+                        const text = normalize(value);
+                        return text.length >= 6
+                            && !/(?:商品|返佣|佣金|团购|套餐|券|专区)/.test(text)
+                            && /(?:自治区|省|市|区|县|镇|乡|街|路|大道|巷|号|楼|村)/.test(text);
+                    };
                     const looksCommerce = value => /(?:商品|返佣|佣金|团购|套餐|券)/.test(value);
                     const nameNode = node.querySelector('[data-store-name], [class*="name-"], [class*="name_"], [class*="title-"]');
                     const addressNode = node.querySelector('[data-store-address], [class*="address-"], [class*="address_"], [class*="addr"]');
@@ -2351,7 +2543,12 @@ async def apply_commerce_store_to_page(
                     const normalize = value => String(value || '').replace(/\\u200b/g, ' ').replace(/\\s+/g, ' ').trim();
                     const rawText = String(node.innerText || node.textContent || '').replace(/[\\u200b\\u00a0]/g, ' ');
                     const lines = rawText.split(/\\n+/).map(normalize).filter(Boolean);
-                    const looksAddress = value => /(?:自治区|省|市|区|县|镇|乡|街|路|大道|巷|号|楼|村)/.test(value);
+                    const looksAddress = value => {
+                        const text = normalize(value);
+                        return text.length >= 6
+                            && !/(?:商品|返佣|佣金|团购|套餐|券|专区)/.test(text)
+                            && /(?:自治区|省|市|区|县|镇|乡|街|路|大道|巷|号|楼|村)/.test(text);
+                    };
                     const nameNode = node.querySelector('[data-store-name], [class*="name-"], [class*="name_"], [class*="title-"]');
                     const addressNode = node.querySelector('[data-store-address], [class*="address-"], [class*="address_"], [class*="addr"]');
                     const name = normalize(nameNode?.innerText || nameNode?.textContent) || lines[0] || '';

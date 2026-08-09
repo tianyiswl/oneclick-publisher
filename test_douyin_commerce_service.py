@@ -436,10 +436,14 @@ class DouyinCommercePayloadTests(unittest.TestCase):
             )
 
         position.assert_awaited_once()
-        self.assertEqual(mode.await_count, 2)
+        self.assertEqual(mode.await_count, 3)
         self.assertEqual(
             open_search.await_args_list,
-            [call(page, mode.return_value), call(page, mode.return_value)],
+            [
+                call(page, mode.return_value),
+                call(page, mode.return_value),
+                call(page, mode.return_value),
+            ],
         )
         set_scope.assert_awaited_once_with(page, "domestic")
         self.assertEqual(
@@ -556,6 +560,74 @@ class DouyinCommercePayloadTests(unittest.TestCase):
         self.assertIn("scope-selection-not-exclusive", browser_script)
         self.assertNotIn(".map(interactive)", browser_script)
 
+    def test_location_scope_waits_through_transient_missing_pair_after_reopen(self) -> None:
+        """重复或切换搜索重开面板时，短暂 0/0 不是永久结构错误。"""
+
+        class Page:
+            def __init__(self) -> None:
+                self.wait_for_timeout = AsyncMock()
+                self.evaluate = AsyncMock(
+                    side_effect=[
+                        {
+                            "state": "ambiguous",
+                            "reason": "pair-not-in-search-panel",
+                            "local": 0,
+                            "domestic": 0,
+                        },
+                        {"state": "selected", "local": 1, "domestic": 1},
+                        {"state": "selected", "local": 1, "domestic": 1},
+                    ]
+                )
+
+        page = Page()
+        with patch.object(
+            douyin_commerce_service,
+            "_visible_commerce_search_input",
+            new_callable=AsyncMock,
+            return_value=object(),
+        ):
+            result = asyncio.run(
+                douyin_commerce_service.set_commerce_location_scope(page, "domestic")
+            )
+
+        self.assertEqual(result, "国内")
+        page.wait_for_timeout.assert_any_await(200)
+
+    def test_location_scope_allows_slow_platform_panel_to_materialize(self) -> None:
+        """连续搜索被平台限速时，范围标签可在约三秒后才重新挂载。"""
+
+        missing = {
+            "state": "ambiguous",
+            "reason": "pair-not-in-search-panel",
+            "local": 0,
+            "domestic": 0,
+        }
+
+        class Page:
+            def __init__(self) -> None:
+                self.wait_for_timeout = AsyncMock()
+                self.evaluate = AsyncMock(
+                    side_effect=[missing] * 15
+                    + [
+                        {"state": "selected", "local": 1, "domestic": 1},
+                        {"state": "selected", "local": 1, "domestic": 1},
+                    ]
+                )
+
+        page = Page()
+        with patch.object(
+            douyin_commerce_service,
+            "_visible_commerce_search_input",
+            new_callable=AsyncMock,
+            return_value=object(),
+        ):
+            result = asyncio.run(
+                douyin_commerce_service.set_commerce_location_scope(page, "domestic")
+            )
+
+        self.assertEqual(result, "国内")
+        self.assertEqual(page.evaluate.await_count, 17)
+
     def test_location_scope_reacquires_search_input_after_platform_rerender(self) -> None:
         """切换本地/国内会重绘地点面板，必须重新标记新输入框后再回读选中态。"""
 
@@ -634,7 +706,7 @@ class DouyinCommercePayloadTests(unittest.TestCase):
             "name": "北海夜南香",
             "address": "广西壮族自治区北海市银海区银滩大道 1 号",
         }
-        mode_controls = [object(), object()]
+        mode_controls = [object(), object(), object()]
         with patch.object(
             douyin_commerce_service, "_ensure_position_tag", new_callable=AsyncMock
         ), patch.object(
@@ -646,7 +718,7 @@ class DouyinCommercePayloadTests(unittest.TestCase):
             douyin_commerce_service,
             "_open_commerce_search_input",
             new_callable=AsyncMock,
-            side_effect=[old_field, new_field],
+            side_effect=[old_field, new_field, new_field],
         ) as open_search, patch.object(
             douyin_commerce_service,
             "set_commerce_location_scope",
@@ -670,8 +742,8 @@ class DouyinCommercePayloadTests(unittest.TestCase):
             )
 
         self.assertEqual(result[0]["name"], "北海夜南香")
-        self.assertEqual(mode.await_count, 2)
-        self.assertEqual(open_search.await_count, 2)
+        self.assertEqual(mode.await_count, 3)
+        self.assertEqual(open_search.await_count, 3)
         self.assertEqual(old_field.filled, [])
         self.assertEqual(new_field.filled, ["", "北海夜南香"])
 
@@ -740,7 +812,7 @@ class DouyinCommercePayloadTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(mode.await_count, 2)
+        self.assertEqual(mode.await_count, 3)
         self.assertEqual(result[0]["name"], "北海夜南香")
         self.assertEqual(
             events,
@@ -752,9 +824,157 @@ class DouyinCommercePayloadTests(unittest.TestCase):
                 "click",
                 "fill:",
                 "wait:450",
+                "scroll",
+                "click",
                 "fill:北海夜南香",
             ],
         )
+
+    def test_location_search_materializes_scope_panel_when_tabs_are_initially_absent(self) -> None:
+        """新版范围标签延迟渲染时，先用本次关键词唤起面板再切换并重搜。"""
+
+        class SearchInput:
+            def __init__(self) -> None:
+                self.value = ""
+                self.fill = AsyncMock(side_effect=self._fill)
+                self.scroll_into_view_if_needed = AsyncMock()
+                self.click = AsyncMock()
+
+            async def _fill(self, value: str, **_kwargs) -> None:
+                self.value = value
+
+            async def evaluate(self, _script: str) -> str:
+                return self.value
+
+        field = SearchInput()
+
+        class Page:
+            wait_for_timeout = AsyncMock()
+
+        missing_scope = douyin_commerce_service.DouyinCommerceError(
+            "抖音位置搜索范围“本地/国内”控件未能唯一显示"
+            "（当前地点面板内本地 0 个、国内 0 个；pair-not-in-search-panel），已安全停止"
+        )
+        row = {
+            "name": "北海夜南香",
+            "address": "广西壮族自治区北海市银海区银滩大道 1 号",
+        }
+        with patch.object(
+            douyin_commerce_service, "_ensure_position_tag", new_callable=AsyncMock
+        ), patch.object(
+            douyin_commerce_service,
+            "_ensure_local_group_buy_mode",
+            new_callable=AsyncMock,
+            return_value=object(),
+        ), patch.object(
+            douyin_commerce_service,
+            "_open_commerce_search_input",
+            new_callable=AsyncMock,
+            return_value=field,
+        ), patch.object(
+            douyin_commerce_service,
+            "set_commerce_location_scope",
+            new_callable=AsyncMock,
+            side_effect=[missing_scope, "国内"],
+        ) as set_scope, patch.object(
+            douyin_commerce_service,
+            "_visible_commerce_location_result_snapshot",
+            new_callable=AsyncMock,
+            return_value=(None, [], ""),
+        ), patch.object(
+            douyin_commerce_service,
+            "_wait_for_fresh_commerce_location_results",
+            new_callable=AsyncMock,
+            return_value=(object(), [row]),
+        ):
+            result = asyncio.run(
+                douyin_commerce_service.search_commerce_location_store_candidates(
+                    Page(), "北海夜南香", scope="domestic"
+                )
+            )
+
+        self.assertEqual(set_scope.await_count, 2)
+        self.assertEqual(field.click.await_count, 4)
+        self.assertEqual(
+            field.fill.await_args_list,
+            [
+                call("", timeout=8_000),
+                call("北海夜南香", timeout=8_000),
+                call("", timeout=8_000),
+                call("北海夜南香", timeout=8_000),
+            ],
+        )
+        self.assertEqual(result[0]["name"], "北海夜南香")
+
+    def test_location_search_reacquires_input_after_clear_triggers_rerender(self) -> None:
+        """清空关键词触发输入框替换后，必须重新定位新节点再填写。"""
+
+        class SearchInput:
+            def __init__(self, *, reject_nonempty: bool = False) -> None:
+                self.value = ""
+                self.reject_nonempty = reject_nonempty
+                self.fill = AsyncMock(side_effect=self._fill)
+                self.scroll_into_view_if_needed = AsyncMock()
+                self.click = AsyncMock()
+
+            async def _fill(self, value: str, **_kwargs) -> None:
+                if value and self.reject_nonempty:
+                    raise RuntimeError("detached input")
+                self.value = value
+
+            async def evaluate(self, _script: str) -> str:
+                return self.value
+
+        initial = SearchInput()
+        stale_after_scope = SearchInput(reject_nonempty=True)
+        fresh_after_clear = SearchInput()
+
+        class Page:
+            wait_for_timeout = AsyncMock()
+
+        row = {
+            "name": "北海夜南香",
+            "address": "广西壮族自治区北海市银海区银滩大道 1 号",
+        }
+        with patch.object(
+            douyin_commerce_service, "_ensure_position_tag", new_callable=AsyncMock
+        ), patch.object(
+            douyin_commerce_service,
+            "_ensure_local_group_buy_mode",
+            new_callable=AsyncMock,
+            return_value=object(),
+        ) as mode, patch.object(
+            douyin_commerce_service,
+            "_open_commerce_search_input",
+            new_callable=AsyncMock,
+            side_effect=[initial, stale_after_scope, fresh_after_clear],
+        ) as open_input, patch.object(
+            douyin_commerce_service,
+            "set_commerce_location_scope",
+            new_callable=AsyncMock,
+            return_value="国内",
+        ), patch.object(
+            douyin_commerce_service,
+            "_visible_commerce_location_result_snapshot",
+            new_callable=AsyncMock,
+            return_value=(None, [], ""),
+        ), patch.object(
+            douyin_commerce_service,
+            "_wait_for_fresh_commerce_location_results",
+            new_callable=AsyncMock,
+            return_value=(object(), [row]),
+        ):
+            result = asyncio.run(
+                douyin_commerce_service.search_commerce_location_store_candidates(
+                    Page(), "北海夜南香", scope="domestic"
+                )
+            )
+
+        self.assertEqual(mode.await_count, 3)
+        self.assertEqual(open_input.await_count, 3)
+        stale_after_scope.fill.assert_awaited_once_with("", timeout=8_000)
+        fresh_after_clear.fill.assert_awaited_once_with("北海夜南香", timeout=8_000)
+        self.assertEqual(result[0]["name"], "北海夜南香")
 
     def test_location_search_waits_past_stale_local_candidates(self) -> None:
         """首次搜索不能因旧本地推荐列表已存在而立即返回。"""
@@ -1630,8 +1850,8 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await browser.close()
 
-    async def test_blank_adjacent_mode_selects_official_commerce_mode(self) -> None:
-        """批量态模式为空时，必须从官方两项中选择并回读“带货模式”。"""
+    async def test_blank_adjacent_select_does_not_override_direct_location_input(self) -> None:
+        """存在原生地点输入时，相邻空下拉不再按旧版模式菜单处理。"""
 
         html = """
         <main>
@@ -1684,7 +1904,91 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await store.get_attribute("id"), "location-input")
                 self.assertEqual(
                     await page.locator("#mode-value").inner_text(),
-                    "带货模式",
+                    "",
+                )
+                self.assertEqual(
+                    await page.locator("#mode-list").evaluate(
+                        "node => getComputedStyle(node).display"
+                    ),
+                    "none",
+                )
+            finally:
+                await browser.close()
+
+    async def test_direct_location_input_bypasses_unrelated_empty_adjacent_select(self) -> None:
+        """新版已有原生地点输入时，不得再打开相邻的其他筛选下拉。"""
+
+        mode_control = object()
+        location_input = object()
+        with patch.object(
+            douyin_commerce_service,
+            "_anchor_controls",
+            new_callable=AsyncMock,
+            return_value=(
+                mode_control,
+                location_input,
+                douyin_commerce_service._UNSELECTED_MODE_VALUE,
+                "",
+            ),
+        ), patch.object(
+            douyin_commerce_service,
+            "_is_direct_location_entry",
+            new_callable=AsyncMock,
+            return_value=True,
+        ), patch.object(
+            douyin_commerce_service,
+            "_open_exact_select",
+            new_callable=AsyncMock,
+        ) as open_select, patch.object(
+            douyin_commerce_service,
+            "_wait_mode_options",
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
+            result = await douyin_commerce_service._ensure_local_group_buy_mode(object())
+
+        self.assertIs(result, location_input)
+        open_select.assert_not_awaited()
+
+    async def test_nonempty_mode_placeholder_is_treated_as_unselected(self) -> None:
+        """抖音新版会给空模式渲染提示文案，不能把提示文案当成未知模式。"""
+
+        html = """
+        <main>
+          <div id="location-section">
+            <section class="content-obt4oA new-layout-sLYOT6" style="display:flex;width:646px;height:32px">
+              <div><span>添加标签</span></div>
+              <div class="content-child-V0CB7w" style="display:flex;width:552px;height:32px">
+                <div class="semi-select semi-select-single" style="width:104px;height:32px"></div>
+                <div style="width:440px;height:32px">
+                  <div class="semi-select semi-select-single semi-select-filterable" style="width:440px;height:32px">
+                    <input id="location-input">
+                  </div>
+                </div>
+              </div>
+            </section>
+            <section class="content-obt4oA new-layout-sLYOT6" style="display:flex;width:646px;height:32px">
+              <div style="width:74px;height:32px"></div>
+              <div id="commerce-mode" class="semi-select semi-select-single semi-select-filterable" style="width:552px;height:32px">
+                <div class="semi-select-selection">
+                  <span class="semi-select-selection-text semi-select-selection-placeholder">请选择带货模式</span>
+                </div>
+              </div>
+            </section>
+          </div>
+        </main>
+        """
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+
+                _, _, mode_value, _ = await douyin_commerce_service._anchor_controls(page)
+
+                self.assertEqual(
+                    mode_value,
+                    douyin_commerce_service._UNSELECTED_MODE_VALUE,
                 )
             finally:
                 await browser.close()
@@ -1946,6 +2250,11 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
             <div id="local-results" role="listbox">
               <div role="option">不展示地理位置</div>
               <div role="option">
+                <div class="name-local">夜南香北京烤鸭团购信息</div>
+                <div>团购专区</div>
+                <div>15 件商品 · 15 件返佣</div>
+              </div>
+              <div role="option">
                 <div class="name-local">夜南香北京烤鸭（万泉城店）</div>
                 <div class="address-local">广西壮族自治区北海市银海区银滩大道 1 号</div>
               </div>
@@ -1977,6 +2286,121 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
                     candidates[0]["address"],
                     "广西壮族自治区北海市银海区银滩大道 1 号",
                 )
+            finally:
+                await browser.close()
+
+    async def test_commerce_summary_with_district_word_is_not_a_complete_address(self) -> None:
+        """“团购专区”含“区”字也不能冒充平台返回的完整地址。"""
+
+        html = """
+        <main id="editor-root">
+          <input data-oneclick-commerce-store="active" id="location-input">
+          <section id="location-portal">
+            <nav><button>本地</button><button>国内</button></nav>
+            <div id="commerce-only-results" role="listbox">
+              <div role="option">
+                <div class="name-local">夜南香北京烤鸭</div>
+                <div>团购专区</div>
+                <div>15 件商品 · 15 件返佣</div>
+              </div>
+            </div>
+          </section>
+        </main>
+        """
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+
+                listbox = await douyin_commerce_service._visible_store_listbox(page)
+
+                self.assertIsNone(listbox)
+            finally:
+                await browser.close()
+
+    async def test_close_location_selector_detects_helper_only_result_panel(self) -> None:
+        """空结果辅助列表也必须按 Escape 收口，不能残留到下一次搜索。"""
+
+        html = """
+        <main id="editor-root">
+          <section id="location-row">
+            <span>位置</span>
+            <div class="semi-select" tabindex="0">
+              <span class="semi-select-selection-text">带货模式</span>
+              <div id="mode-results" role="listbox">
+                <div role="option">带货模式</div>
+                <div role="option">打卡模式</div>
+              </div>
+            </div>
+            <section id="location-portal">
+              <nav><button>本地</button><button>国内</button></nav>
+              <input data-oneclick-commerce-store="active" id="location-input">
+              <div id="helper-results" role="listbox">
+                <div role="option">未找到相关地点</div>
+              </div>
+            </section>
+          </section>
+          <script>
+            document.querySelector('#location-input').addEventListener('keydown', event => {
+              if (event.key === 'Escape') {
+                document.querySelector('#helper-results').style.display = 'none';
+              }
+            });
+          </script>
+        </main>
+        """
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+
+                await douyin_commerce_service.close_commerce_store_selector(page)
+
+                self.assertFalse(await page.locator("#helper-results").is_visible())
+            finally:
+                await browser.close()
+
+    async def test_close_location_selector_uses_escape_for_direct_input_results(self) -> None:
+        """新版输入框的完整候选列表不能靠再次点击输入框关闭。"""
+
+        html = """
+        <main id="editor-root">
+          <section id="location-row">
+            <span>位置</span>
+            <div class="semi-select" tabindex="0">
+              <span class="semi-select-selection-text">带货模式</span>
+            </div>
+            <section id="location-portal">
+              <nav><button>本地</button><button>国内</button></nav>
+              <input data-oneclick-commerce-store="active" id="location-input">
+              <div id="complete-results" role="listbox">
+                <div role="option">
+                  <div class="name-local">夜南香北京烤鸭（万泉城店）</div>
+                  <div class="address-local">广西壮族自治区北海市银海区银滩大道 1 号</div>
+                </div>
+              </div>
+            </section>
+          </section>
+          <script>
+            document.querySelector('#location-input').addEventListener('keydown', event => {
+              if (event.key === 'Escape') {
+                document.querySelector('#complete-results').style.display = 'none';
+              }
+            });
+          </script>
+        </main>
+        """
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+
+                await douyin_commerce_service.close_commerce_store_selector(page)
+
+                self.assertFalse(await page.locator("#complete-results").is_visible())
             finally:
                 await browser.close()
 
@@ -6098,6 +6522,104 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
                 )
 
         self.assertEqual(close_selector.await_count, 2)
+
+    def test_first_location_search_warms_up_platform_dom_via_music_refresh(self) -> None:
+        """真实新上传页第一次搜地址前先完成只读音乐初始化，解除组件顺序依赖。"""
+
+        class OpenPage:
+            wait_for_timeout = AsyncMock()
+
+            def is_closed(self) -> bool:
+                return False
+
+        manager = douyin_commerce_session.DouyinCommerceSessionManager()
+        page = OpenPage()
+        manager._session = douyin_commerce_session._CommerceEditorSession(
+            session_id="session-demo",
+            upload_payload={},
+            account_name="测试账号",
+            browser=None,
+            context=None,
+            page=page,
+            playwright=None,
+            uploader=None,
+            platform_dom_needs_music_warmup=True,
+        )
+        expected = [{"name": "北海夜南香", "address": "广西北海市银海区示例路1号"}]
+        with patch.object(
+            manager,
+            "_refresh_favorite_music",
+            new_callable=AsyncMock,
+            return_value=[],
+        ) as warmup, patch.object(
+            douyin_commerce_session.douyin_commerce_service,
+            "close_commerce_store_selector",
+            new_callable=AsyncMock,
+        ), patch.object(
+            douyin_commerce_session.douyin_commerce_service,
+            "search_commerce_location_store_candidates",
+            new_callable=AsyncMock,
+            return_value=expected,
+        ):
+            result = asyncio.run(
+                manager._search_locations("session-demo", "北海夜南香", "domestic")
+            )
+
+        warmup.assert_awaited_once_with("session-demo")
+        page.wait_for_timeout.assert_awaited_once_with(4_500)
+        self.assertTrue(manager._session.platform_dom_needs_music_warmup)
+        self.assertEqual(result, expected)
+
+    def test_transient_missing_scope_panel_rewarms_and_retries_once(self) -> None:
+        """范围面板短暂未挂载时，同一次搜索应刷新页面组件后自动恢复一次。"""
+
+        class OpenPage:
+            wait_for_timeout = AsyncMock()
+
+            def is_closed(self) -> bool:
+                return False
+
+        manager = douyin_commerce_session.DouyinCommerceSessionManager()
+        page = OpenPage()
+        manager._session = douyin_commerce_session._CommerceEditorSession(
+            session_id="session-demo",
+            upload_payload={},
+            account_name="测试账号",
+            browser=None,
+            context=None,
+            page=page,
+            playwright=None,
+            uploader=None,
+        )
+        expected = [{"name": "北海夜南香", "address": "广西北海市银海区示例路1号"}]
+        transient_error = douyin_commerce_service.DouyinCommerceError(
+            "抖音位置搜索范围‘本地/国内’控件未能唯一显示"
+            "（当前地点面板内本地 0 个、国内 0 个；pair-not-in-search-panel），已安全停止"
+        )
+        with patch.object(
+            manager,
+            "_refresh_favorite_music",
+            new_callable=AsyncMock,
+            return_value=[],
+        ) as warmup, patch.object(
+            douyin_commerce_session.douyin_commerce_service,
+            "close_commerce_store_selector",
+            new_callable=AsyncMock,
+        ) as close_selector, patch.object(
+            douyin_commerce_session.douyin_commerce_service,
+            "search_commerce_location_store_candidates",
+            new_callable=AsyncMock,
+            side_effect=[transient_error, expected],
+        ) as search:
+            result = asyncio.run(
+                manager._search_locations("session-demo", "北海夜南香", "domestic")
+            )
+
+        self.assertEqual(search.await_count, 2)
+        warmup.assert_awaited_once_with("session-demo")
+        page.wait_for_timeout.assert_awaited_once_with(4_500)
+        self.assertEqual(close_selector.await_count, 4)
+        self.assertEqual(result, expected)
 
     def test_location_selection_does_not_bind_store_without_explicit_store_step(self) -> None:
         class OpenPage:
