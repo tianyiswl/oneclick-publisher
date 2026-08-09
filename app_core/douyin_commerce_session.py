@@ -811,6 +811,14 @@ class DouyinCommerceSessionManager:
     ) -> list[dict[str, Any]]:
         session = await self._current(session_id)
         self._ensure_editor_not_blocked_by_music_picker(session)
+        # 每次检索前先收口上一轮候选。地点候选与当前上传会话复用同一页面，
+        # 若旧 listbox 仍展开，带货模式回读可能把菜单项误作当前值。
+        try:
+            await douyin_commerce_service.close_commerce_store_selector(session.page)
+        except Exception as exc:
+            raise DouyinCommerceSessionError(
+                f"抖音上一次地点候选未能安全关闭：{_normalized(str(exc))[:220]}"
+            ) from exc
         try:
             selected_scope = douyin_commerce_service.normalize_commerce_location_scope(scope)
             candidates = await douyin_commerce_service.search_commerce_location_store_candidates(
@@ -819,8 +827,20 @@ class DouyinCommerceSessionManager:
                 scope=selected_scope,
             )
         except Exception as exc:
+            # 搜索中途失败也尽量收口本次已展开的地点候选；清理失败不得覆盖
+            # 原始平台错误，下一次搜索仍会在入口处再次严格清理。
+            try:
+                await douyin_commerce_service.close_commerce_store_selector(session.page)
+            except Exception:
+                _LOGGER.warning("抖音地点搜索失败后候选浮层未能关闭", exc_info=True)
             raise DouyinCommerceSessionError(
                 f"抖音带货位置搜索失败：{_normalized(str(exc))[:260]}"
+            ) from exc
+        try:
+            await douyin_commerce_service.close_commerce_store_selector(session.page)
+        except Exception as exc:
+            raise DouyinCommerceSessionError(
+                f"抖音地点候选读取后未能安全关闭：{_normalized(str(exc))[:220]}"
             ) from exc
         # 新搜索结果会改变发布定位。任何此前的门店选择、预检或定时回读都
         # 必须失效，避免误把旧门店用于新地点。

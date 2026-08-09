@@ -523,11 +523,20 @@ async def _anchor_controls(page):
             const leafText = (root, label) => Array.from(root.querySelectorAll('*'))
                 .filter(visible)
                 .filter(node => text(node) === label)
+                // 展开的下拉菜单会重复渲染“带货模式/打卡模式”等选项；
+                // 它们不是表单当前值，不能参与控件组唯一性判断。
+                .filter(node => !node.closest(
+                    '[role="listbox"], [role="option"], [role="menu"], [role="menuitem"]'
+                ))
                 .filter(node => !Array.from(node.children)
                     .some(child => visible(child) && text(child) === label));
             const editable = node => visible(node) && !node.disabled && !node.readOnly
                 && String(node.type || '').toLowerCase() !== 'hidden';
             const interactive = node => {{
+                // Semi Select 的已选文案节点本身也含有 ``select`` 类名片段，
+                // 必须先返回完整控件，否则后续只能标记到内部文字节点。
+                const owningSelect = node.closest?.('.semi-select');
+                if (owningSelect && visible(owningSelect)) return owningSelect;
                 for (let current = node, depth = 0;
                     current && current !== document.body && depth < 6;
                     current = current.parentElement, depth += 1) {{
@@ -555,9 +564,16 @@ async def _anchor_controls(page):
                 clearMarkers();
                 mode.dataset.oneclickCommerceMode = 'active';
                 store.dataset.oneclickCommerceStore = 'active';
+                const selectedMode = mode.querySelector(
+                    '.semi-select-selection-text, [aria-selected="true"]'
+                );
                 return {{
                     count: 1,
-                    mode: text(mode),
+                    // 控件展开时 innerText 会连同所有菜单项一起返回；这里只读
+                    // 已选值，缺少标准选中节点时才兼容旧版控件全文。
+                    mode: normalize(
+                        selectedMode && (selectedMode.innerText || selectedMode.textContent)
+                    ) || text(mode),
                     store: normalize(store.value || store.innerText || store.textContent),
                     surface,
                 }};

@@ -1541,6 +1541,42 @@ class DouyinCommercePayloadTests(unittest.TestCase):
 class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
     """用真实 DOM 约束地点 portal，避免把整张发布页的输入框算进来。"""
 
+    async def test_anchor_controls_reads_selected_mode_without_open_menu_text(self) -> None:
+        """模式菜单展开时只能回读已选值，不能把菜单全文当成当前模式。"""
+
+        html = """
+        <main>
+          <section id="location-row">
+            <span>位置</span>
+            <div id="commerce-mode" class="semi-select" tabindex="0">
+              <div class="semi-select-selection">
+                <span class="semi-select-selection-text">带货模式</span>
+              </div>
+              <div role="listbox">
+                <div role="option">带货模式</div>
+                <div role="option">打卡模式</div>
+              </div>
+            </div>
+            <input id="location-input">
+          </section>
+        </main>
+        """
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+
+                mode, store, mode_value, _ = (
+                    await douyin_commerce_service._anchor_controls(page)
+                )
+
+                self.assertEqual(await mode.get_attribute("id"), "commerce-mode")
+                self.assertEqual(await store.get_attribute("id"), "location-input")
+                self.assertEqual(mode_value, "带货模式")
+            finally:
+                await browser.close()
+
     async def test_anchor_controls_pairs_css_position_input_with_adjacent_mode_row(self) -> None:
         """位置文案由 CSS 渲染时，不能把同一行的位置类型下拉当成带货模式。"""
 
@@ -4328,7 +4364,11 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
             "search_commerce_location_store_candidates",
             new_callable=AsyncMock,
             return_value=locations,
-        ) as search:
+        ) as search, patch.object(
+            douyin_commerce_session.douyin_commerce_service,
+            "close_commerce_store_selector",
+            new_callable=AsyncMock,
+        ):
             asyncio.run(manager._refresh_favorite_music("session-demo"))
             result = asyncio.run(
                 manager._search_locations("session-demo", "北海夜南香", "domestic")
@@ -4607,7 +4647,11 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
             "search_commerce_location_store_candidates",
             new_callable=AsyncMock,
             return_value=[location],
-        ) as search:
+        ) as search, patch.object(
+            douyin_commerce_session.douyin_commerce_service,
+            "close_commerce_store_selector",
+            new_callable=AsyncMock,
+        ):
             # session 层在真实音乐服务关闭抽屉并回读后清理抽屉状态；此处验证
             # 该清理不会阻断同一 sessionId 的地点搜索。
             selected = asyncio.run(manager._select_favorite_music("session-demo", "music-new"))
@@ -4670,7 +4714,11 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
             "search_commerce_location_store_candidates",
             new_callable=AsyncMock,
             return_value=[location],
-        ) as search:
+        ) as search, patch.object(
+            douyin_commerce_session.douyin_commerce_service,
+            "close_commerce_store_selector",
+            new_callable=AsyncMock,
+        ):
             asyncio.run(manager._select_cached_favorite_music("session-demo", "music-a"))
             asyncio.run(manager._refresh_favorite_music("session-demo"))
             asyncio.run(manager._select_cached_favorite_music("session-demo", "music-b"))
@@ -5069,7 +5117,11 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
             "search_commerce_location_store_candidates",
             new_callable=AsyncMock,
             return_value=expected,
-        ) as search:
+        ) as search, patch.object(
+            douyin_commerce_session.douyin_commerce_service,
+            "close_commerce_store_selector",
+            new_callable=AsyncMock,
+        ):
             result = asyncio.run(
                 manager._search_locations("session-demo", "北海", "domestic")
             )
@@ -5993,16 +6045,59 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
             "search_commerce_location_store_candidates",
             new_callable=AsyncMock,
             return_value=expected,
-        ) as search:
+        ) as search, patch.object(
+            douyin_commerce_session.douyin_commerce_service,
+            "close_commerce_store_selector",
+            new_callable=AsyncMock,
+        ) as close_selector:
             result = asyncio.run(
                 manager._search_locations("session-demo", "北海", "domestic")
             )
 
         search.assert_awaited_once_with(manager._session.page, "北海", scope="domestic")
+        self.assertEqual(close_selector.await_count, 2)
         self.assertEqual(result, expected)
         self.assertEqual(manager._session.commerce_location_candidates, expected)
         self.assertIsNone(manager._session.location)
         self.assertEqual(manager._session.location_scope, "domestic")
+
+    def test_location_search_failure_still_closes_candidate_selector(self) -> None:
+        """读取失败也必须收口地点浮层，避免下一次搜索继承残留菜单。"""
+
+        class OpenPage:
+            def is_closed(self) -> bool:
+                return False
+
+        manager = douyin_commerce_session.DouyinCommerceSessionManager()
+        manager._session = douyin_commerce_session._CommerceEditorSession(
+            session_id="session-demo",
+            upload_payload={},
+            account_name="测试账号",
+            browser=None,
+            context=None,
+            page=OpenPage(),
+            playwright=None,
+            uploader=None,
+        )
+        with patch.object(
+            douyin_commerce_session.douyin_commerce_service,
+            "search_commerce_location_store_candidates",
+            new_callable=AsyncMock,
+            side_effect=douyin_commerce_service.DouyinCommerceError("候选读取失败"),
+        ), patch.object(
+            douyin_commerce_session.douyin_commerce_service,
+            "close_commerce_store_selector",
+            new_callable=AsyncMock,
+        ) as close_selector:
+            with self.assertRaisesRegex(
+                douyin_commerce_session.DouyinCommerceSessionError,
+                "候选读取失败",
+            ):
+                asyncio.run(
+                    manager._search_locations("session-demo", "北海", "domestic")
+                )
+
+        self.assertEqual(close_selector.await_count, 2)
 
     def test_location_selection_does_not_bind_store_without_explicit_store_step(self) -> None:
         class OpenPage:
