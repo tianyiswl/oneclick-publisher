@@ -37,10 +37,23 @@ class DouyinCommerceCollectorError(RuntimeError):
 @dataclass
 class _CollectorRuntime:
     collector_type: CollectorType
-    manager: Any
+    manager: Any | None
     instance_id: str
     session_id: str = ""
     fixed_scope: str = ""
+    close_owner: _CollectorCloseOwner | None = None
+
+
+@dataclass
+class _CollectorCloseOwner:
+    done: threading.Event = field(default_factory=threading.Event)
+    result: str = "cleanup_incomplete"
+
+
+@dataclass
+class _LifecycleFlight:
+    done: threading.Event = field(default_factory=threading.Event)
+    result: dict[str, object] | None = None
 
 
 @dataclass
@@ -49,8 +62,8 @@ class _GenerationRuntime:
     probe_payload: dict[str, Any]
     collectors: dict[CollectorType, _CollectorRuntime]
     cleanup_results: dict[CollectorType, str] = field(default_factory=dict)
-    cleanup_actions: dict[CollectorType, _QueuedAction] = field(default_factory=dict)
     closed_result: dict[str, object] | None = None
+    close_flight: _LifecycleFlight | None = None
 
 
 @dataclass
@@ -222,10 +235,10 @@ class DouyinCommerceCollectorManager:
         self._manager_factory = manager_factory
         self._probe_payload_builder = probe_payload_builder
         self._event_sink = event_sink
-        self._lifecycle_lock = threading.RLock()
         self._state_lock = threading.RLock()
         self._action_queue = _CollectorActionQueue()
         self._runtime: _GenerationRuntime | None = None
+        self._begin_flight: _LifecycleFlight | None = None
 
     def begin_generation(
         self,
@@ -235,8 +248,21 @@ class DouyinCommerceCollectorManager:
     ) -> dict[str, object]:
         """关闭旧代际，建立新代际并只自动启动国内地点采集器。"""
 
-        with self._lifecycle_lock:
+        while True:
+            with self._state_lock:
+                preceding = self._begin_flight
+                if preceding is None:
+                    owner = _LifecycleFlight()
+                    self._begin_flight = owner
+                    break
+            preceding.done.wait()
+        try:
             return self._begin_generation(payload, on_progress=on_progress)
+        finally:
+            with self._state_lock:
+                if self._begin_flight is owner:
+                    self._begin_flight = None
+            owner.done.set()
 
     def _begin_generation(
         self,
@@ -279,15 +305,16 @@ class DouyinCommerceCollectorManager:
         )
         with self._state_lock:
             self._runtime = runtime
-            action = self._enqueue_locked(
-                runtime,
+        action = self._action_queue.submit(
+            runtime.generation.generation_id,
+            str(uuid4()),
+            CollectorType.DOMESTIC_LOCATION,
+            lambda: self._ensure_collector(
+                generation.generation_id,
                 CollectorType.DOMESTIC_LOCATION,
-                lambda: self._ensure_collector(
-                    generation.generation_id,
-                    CollectorType.DOMESTIC_LOCATION,
-                    on_progress=on_progress,
-                ),
-            )
+                on_progress=on_progress,
+            ),
+        )
         try:
             self._action_queue.wait(action)
         except DouyinCommerceCollectorError:
@@ -301,15 +328,18 @@ class DouyinCommerceCollectorManager:
     ) -> list[dict[str, str]]:
         """在独立音乐会话中懒启动并刷新收藏音乐。"""
 
+        generation_id = self._normalize_public_text(
+            generation_id, error_code="stale_result_discarded"
+        )
         request_id = str(uuid4())
         with self._state_lock:
-            runtime = self._require_collecting_runtime(generation_id)
-            action = self._action_queue.submit(
-                generation_id,
-                request_id,
-                CollectorType.FAVORITE_MUSIC,
-                lambda: self._refresh_music_action(generation_id, request_id),
-            )
+            self._require_collecting_runtime(generation_id)
+        action = self._action_queue.submit(
+            generation_id,
+            request_id,
+            CollectorType.FAVORITE_MUSIC,
+            lambda: self._refresh_music_action(generation_id, request_id),
+        )
         return self._wait_public_action(
             action,
             generation_id=generation_id,
@@ -326,25 +356,33 @@ class DouyinCommerceCollectorManager:
     ) -> list[dict[str, Any]]:
         """按固定范围将地点搜索路由到独立会话。"""
 
-        normalized_scope = str(scope or "").strip().casefold()
+        normalized_scope = self._normalize_public_text(
+            scope, error_code="collector_scope_mismatch"
+        ).strip().casefold()
+        generation_id = self._normalize_public_text(
+            generation_id, error_code="stale_result_discarded"
+        )
+        normalized_keyword = self._normalize_public_text(
+            keyword, error_code="collector_unknown"
+        )
         collector_type = _LOCATION_COLLECTORS.get(normalized_scope)
         if collector_type is None:
             raise DouyinCommerceCollectorError("collector_scope_mismatch")
         request_id = str(uuid4())
         with self._state_lock:
             self._require_collecting_runtime(generation_id)
-            action = self._action_queue.submit(
+        action = self._action_queue.submit(
+            generation_id,
+            request_id,
+            collector_type,
+            lambda: self._search_locations_action(
                 generation_id,
-                request_id,
                 collector_type,
-                lambda: self._search_locations_action(
-                    generation_id,
-                    collector_type,
-                    request_id,
-                    keyword,
-                    normalized_scope,
-                ),
-            )
+                request_id,
+                normalized_keyword,
+                normalized_scope,
+            ),
+        )
         return self._wait_public_action(
             action,
             generation_id=generation_id,
@@ -352,7 +390,7 @@ class DouyinCommerceCollectorManager:
             request_id=request_id,
             action_name="search_locations",
             scope=normalized_scope,
-            keyword=keyword,
+            keyword=normalized_keyword,
         )
 
     def retry_collector(
@@ -362,22 +400,25 @@ class DouyinCommerceCollectorManager:
     ) -> dict[str, object]:
         """在一个队列动作中只替换指定采集器。"""
 
+        generation_id = self._normalize_public_text(
+            generation_id, error_code="stale_result_discarded"
+        )
         normalized_type = self._collector_type(collector_type)
         request_id = str(uuid4())
         with self._state_lock:
             runtime = self._require_collecting_runtime(generation_id)
             current = runtime.collectors.get(normalized_type)
             expected_instance_id = current.instance_id if current else ""
-            action = self._action_queue.submit(
+        action = self._action_queue.submit(
+            generation_id,
+            request_id,
+            normalized_type,
+            lambda: self._retry_collector_action(
                 generation_id,
-                request_id,
                 normalized_type,
-                lambda: self._retry_collector_action(
-                    generation_id,
-                    normalized_type,
-                    expected_instance_id,
-                ),
-            )
+                expected_instance_id,
+            ),
+        )
         self._wait_public_action(
             action,
             generation_id=generation_id,
@@ -396,8 +437,40 @@ class DouyinCommerceCollectorManager:
     ) -> dict[str, object]:
         """幂等取消队列并尽力关闭当前代际的所有会话。"""
 
-        with self._lifecycle_lock:
-            return self._close_generation(generation_id, reason=reason)
+        generation_id = (
+            None
+            if generation_id is None
+            else self._normalize_public_text(
+                generation_id, error_code="stale_result_discarded"
+            )
+        )
+        normalized_reason = self._normalize_public_text(
+            reason, error_code="collector_unknown"
+        )
+        with self._state_lock:
+            runtime = self._runtime
+            if runtime is None:
+                return self._empty_close_result(generation_id)
+            existing = runtime.close_flight
+            if existing is None or existing.done.is_set():
+                owner = _LifecycleFlight()
+                runtime.close_flight = owner
+                existing = None
+        if existing is not None:
+            existing.done.wait()
+            if existing.result is not None:
+                return self._copy_close_result(existing.result)
+            raise DouyinCommerceCollectorError("cleanup_incomplete")
+        try:
+            result = self._close_generation(
+                generation_id, reason=normalized_reason
+            )
+        except Exception:
+            owner.done.set()
+            raise
+        owner.result = self._copy_close_result(result)
+        owner.done.set()
+        return result
 
     def _close_generation(
         self,
@@ -406,7 +479,7 @@ class DouyinCommerceCollectorManager:
         reason: str,
     ) -> dict[str, object]:
 
-        normalized_reason = str(reason or "").strip().casefold()
+        normalized_reason = reason.strip().casefold()
         is_publish_barrier = any(
             marker in normalized_reason
             for marker in ("publish", "preflight", "continue", "check")
@@ -444,44 +517,69 @@ class DouyinCommerceCollectorManager:
             with self._state_lock:
                 collector = runtime.collectors.get(collector_type)
                 previous_result = runtime.cleanup_results.get(collector_type)
-                existing_cleanup = runtime.cleanup_actions.get(collector_type)
-            if existing_cleanup is not None:
-                self._action_queue.wait_action(existing_cleanup, timeout=15)
-                continue
+                existing_owner = collector.close_owner if collector else None
             if collector is None:
-                if previous_result is None:
-                    runtime.cleanup_results[collector_type] = "not_started"
+                with self._state_lock:
+                    if previous_result is None:
+                        runtime.cleanup_results[collector_type] = "not_started"
                 continue
 
             if not running_finished and collector_type is running_type:
                 with self._state_lock:
                     runtime.cleanup_results[collector_type] = "cleanup_incomplete"
-                    self._defer_collector_close_locked(
-                        runtime,
+                    owner, claimed = self._claim_collector_close_locked(collector)
+                if claimed:
+                    def finish_deferred_close(
+                        runtime=runtime,
+                        collector_type=collector_type,
+                        collector=collector,
+                        owner=owner,
+                    ) -> None:
+                        self._finish_deferred_collector_close(
+                            runtime,
+                            collector_type,
+                            collector,
+                            owner,
+                        )
+
+                    self._action_queue.submit(
+                        runtime.generation.generation_id,
+                        str(uuid4()),
                         collector_type,
-                        collector,
+                        finish_deferred_close,
+                        is_cleanup=True,
                     )
                 continue
 
+            if existing_owner is not None and not existing_owner.done.is_set():
+                existing_owner.done.wait(timeout=15)
+                continue
+
             cleanup_result = "closed"
+            with self._state_lock:
+                owner, claimed = self._claim_collector_close_locked(collector)
+            if not claimed:
+                owner.done.wait(timeout=15)
+                continue
             try:
-                collector.manager.close(collector.session_id or None)
+                if collector.manager is not None:
+                    collector.manager.close(collector.session_id or None)
             except Exception:
                 cleanup_result = "cleanup_incomplete"
             with self._state_lock:
-                slot = generation.collectors[collector_type]
-                slot.state = CollectorState.CLOSED
-                slot.session_id = None
-                runtime.cleanup_results[collector_type] = cleanup_result
-                if cleanup_result == "closed":
-                    if runtime.collectors.get(collector_type) is collector:
-                        runtime.collectors.pop(collector_type, None)
+                self._complete_collector_close_locked(
+                    runtime,
+                    collector_type,
+                    collector,
+                    owner,
+                    cleanup_result,
+                )
 
         with self._state_lock:
             for collector_type in _COLLECTOR_ORDER:
                 runtime.cleanup_results.setdefault(collector_type, "not_started")
             alive_count = len(runtime.collectors)
-            closed = running_finished and alive_count == 0 and all(
+            closed = alive_count == 0 and all(
                 result != "cleanup_incomplete"
                 for result in runtime.cleanup_results.values()
             )
@@ -500,56 +598,71 @@ class DouyinCommerceCollectorManager:
                 runtime.closed_result = self._copy_close_result(result)
             return result
 
-    def _defer_collector_close_locked(
-        self,
-        runtime: _GenerationRuntime,
-        collector_type: CollectorType,
-        collector: _CollectorRuntime,
-    ) -> None:
-        existing = runtime.cleanup_actions.get(collector_type)
-        if existing is not None and existing.future is not None and not existing.future.done():
-            return
-        action = self._action_queue.submit(
-            runtime.generation.generation_id,
-            str(uuid4()),
-            collector_type,
-            lambda: self._finish_deferred_collector_close(
-                runtime,
-                collector_type,
-                collector,
-            ),
-            is_cleanup=True,
-        )
-        runtime.cleanup_actions[collector_type] = action
-
     def _finish_deferred_collector_close(
         self,
         runtime: _GenerationRuntime,
         collector_type: CollectorType,
         collector: _CollectorRuntime,
+        owner: _CollectorCloseOwner,
     ) -> None:
         cleanup_result = "closed"
         try:
-            collector.manager.close(collector.session_id or None)
+            if collector.manager is not None:
+                collector.manager.close(collector.session_id or None)
         except Exception:
             cleanup_result = "cleanup_incomplete"
 
         with self._state_lock:
-            runtime.cleanup_actions.pop(collector_type, None)
-            runtime.cleanup_results[collector_type] = cleanup_result
-            slot = runtime.generation.collectors[collector_type]
-            if slot.instance_id == collector.instance_id:
-                slot.state = CollectorState.CLOSED
-                slot.session_id = None
-            if (
-                cleanup_result == "closed"
-                and runtime.collectors.get(collector_type) is collector
-            ):
-                runtime.collectors.pop(collector_type, None)
-            self._finalize_closed_runtime_locked(runtime)
+            self._complete_collector_close_locked(
+                runtime,
+                collector_type,
+                collector,
+                owner,
+                cleanup_result,
+            )
+
+    @staticmethod
+    def _claim_collector_close_locked(
+        collector: _CollectorRuntime,
+    ) -> tuple[_CollectorCloseOwner, bool]:
+        existing = collector.close_owner
+        if existing is not None and not existing.done.is_set():
+            return existing, False
+        owner = _CollectorCloseOwner()
+        collector.close_owner = owner
+        return owner, True
+
+    def _complete_collector_close_locked(
+        self,
+        runtime: _GenerationRuntime,
+        collector_type: CollectorType,
+        collector: _CollectorRuntime,
+        owner: _CollectorCloseOwner,
+        cleanup_result: str,
+    ) -> None:
+        if collector.close_owner is not owner:
+            return
+        owner.result = cleanup_result
+        runtime.cleanup_results[collector_type] = cleanup_result
+        slot = runtime.generation.collectors[collector_type]
+        if slot.instance_id == collector.instance_id:
+            slot.state = CollectorState.CLOSED
+            slot.session_id = None
+        if (
+            cleanup_result == "closed"
+            and runtime.collectors.get(collector_type) is collector
+        ):
+            runtime.collectors.pop(collector_type, None)
+        owner.done.set()
+        self._finalize_closed_runtime_locked(runtime)
 
     def _finalize_closed_runtime_locked(self, runtime: _GenerationRuntime) -> None:
-        if runtime.collectors or runtime.cleanup_actions:
+        if runtime.collectors:
+            return
+        if runtime.generation.state not in {
+            SetupGenerationState.CANCELLING,
+            SetupGenerationState.CLOSING_COLLECTORS,
+        }:
             return
         if any(
             result == "cleanup_incomplete"
@@ -572,6 +685,13 @@ class DouyinCommerceCollectorManager:
     def status(self, generation_id: str | None = None) -> dict[str, object]:
         """返回不包含底层 Session ID 的公开状态。"""
 
+        generation_id = (
+            None
+            if generation_id is None
+            else self._normalize_public_text(
+                generation_id, error_code="stale_result_discarded"
+            )
+        )
         with self._state_lock:
             runtime = self._runtime
             if runtime is None:
@@ -607,20 +727,6 @@ class DouyinCommerceCollectorManager:
                 },
                 "aliveCollectorCount": len(runtime.collectors),
             }
-
-    def _enqueue_locked(
-        self,
-        runtime: _GenerationRuntime,
-        collector_type: CollectorType,
-        callback: Callable[[], Any],
-    ) -> _QueuedAction:
-        self._require_collecting_runtime(runtime.generation.generation_id)
-        return self._action_queue.submit(
-            runtime.generation.generation_id,
-            str(uuid4()),
-            collector_type,
-            callback,
-        )
 
     def _refresh_music_action(
         self,
@@ -735,16 +841,42 @@ class DouyinCommerceCollectorManager:
             slot.state = CollectorState.RETRYING
 
         if old is not None:
+            with self._state_lock:
+                owner, claimed = self._claim_collector_close_locked(old)
+            if not claimed:
+                owner.done.wait(timeout=15)
+                if owner.result != "closed":
+                    raise DouyinCommerceCollectorError("cleanup_incomplete")
+            cleanup_result = "closed"
             try:
-                old.manager.close(old.session_id or None)
+                if claimed and old.manager is not None:
+                    old.manager.close(old.session_id or None)
             except Exception:
-                with self._state_lock:
+                cleanup_result = "cleanup_incomplete"
+            with self._state_lock:
+                if claimed:
+                    owner.result = cleanup_result
+                    owner.done.set()
+                if cleanup_result != "closed":
                     slot.state = CollectorState.FAILED
                     runtime.cleanup_results[collector_type] = "cleanup_incomplete"
-                raise DouyinCommerceCollectorError("cleanup_incomplete") from None
-            with self._state_lock:
+                    raise DouyinCommerceCollectorError(
+                        "cleanup_incomplete"
+                    ) from None
                 if runtime.collectors.get(collector_type) is not old:
                     raise DouyinCommerceCollectorError("stale_result_discarded")
+                if runtime.generation.state not in {
+                    SetupGenerationState.COLLECTING,
+                    SetupGenerationState.READY,
+                }:
+                    runtime.cleanup_results[collector_type] = "closed"
+                    slot.state = CollectorState.CLOSED
+                    slot.session_id = None
+                    runtime.collectors.pop(collector_type, None)
+                    self._finalize_closed_runtime_locked(runtime)
+                    raise DouyinCommerceCollectorError(
+                        "stale_result_discarded"
+                    ) from None
                 runtime.collectors.pop(collector_type, None)
                 runtime.cleanup_results.pop(collector_type, None)
                 slot.instance_id = None
@@ -769,20 +901,9 @@ class DouyinCommerceCollectorManager:
                 self._validate_active_collector(generation_id, existing)
                 return existing
 
-            try:
-                manager = self._manager_factory()
-            except Exception:
-                runtime.generation.collectors[
-                    collector_type
-                ].state = CollectorState.FAILED
-                raise DouyinCommerceCollectorError(
-                    "collector_start_failed"
-                ) from None
-            if any(item.manager is manager for item in runtime.collectors.values()):
-                raise DouyinCommerceCollectorError("collector_start_failed")
             collector = _CollectorRuntime(
                 collector_type=collector_type,
-                manager=manager,
+                manager=None,
                 instance_id=str(uuid4()),
                 fixed_scope=_FIXED_SCOPES[collector_type],
             )
@@ -794,15 +915,59 @@ class DouyinCommerceCollectorManager:
             probe_payload = dict(runtime.probe_payload)
 
         try:
+            manager = self._manager_factory()
+        except Exception:
+            if not self._mark_failed(generation_id, collector):
+                raise DouyinCommerceCollectorError(
+                    "stale_result_discarded"
+                ) from None
+            raise DouyinCommerceCollectorError("collector_start_failed") from None
+
+        with self._state_lock:
+            collector.manager = manager
+            current = self._runtime
+            slot = runtime.generation.collectors[collector_type]
+            can_start = bool(
+                current is runtime
+                and current.generation.generation_id == generation_id
+                and current.generation.state
+                in {SetupGenerationState.COLLECTING, SetupGenerationState.READY}
+                and current.collectors.get(collector_type) is collector
+                and slot.instance_id == collector.instance_id
+                and slot.state is CollectorState.STARTING
+            )
+            has_close_owner = bool(
+                collector.close_owner is not None
+                and not collector.close_owner.done.is_set()
+            )
+            manager_is_shared = any(
+                item is not collector and item.manager is manager
+                for item in runtime.collectors.values()
+            )
+        if not can_start:
+            if not has_close_owner:
+                self._discard_unaccepted_start(runtime, collector)
+            raise DouyinCommerceCollectorError("stale_result_discarded")
+        if manager_is_shared:
+            self._mark_failed(generation_id, collector)
+            raise DouyinCommerceCollectorError("collector_start_failed")
+
+        try:
             started = manager.start_upload(probe_payload, on_progress=on_progress)
             session_id = str((started or {}).get("sessionId") or "").strip()
             if not session_id:
                 raise DouyinCommerceCollectorError("collector_start_failed")
-        except DouyinCommerceCollectorError:
-            self._mark_failed(generation_id, collector)
-            raise
+        except DouyinCommerceCollectorError as error:
+            if not self._mark_failed(generation_id, collector):
+                raise DouyinCommerceCollectorError(
+                    "stale_result_discarded"
+                ) from None
+            raise error from None
         except Exception:
-            self._mark_failed(generation_id, collector)
+            if not self._mark_failed(generation_id, collector):
+                raise DouyinCommerceCollectorError(
+                    "stale_result_discarded"
+                ) from None
             raise DouyinCommerceCollectorError("collector_start_failed") from None
 
         with self._state_lock:
@@ -818,43 +983,52 @@ class DouyinCommerceCollectorManager:
                 and slot.instance_id == collector.instance_id
                 and slot.state is CollectorState.STARTING
             )
-            has_deferred_cleanup = collector_type in runtime.cleanup_actions
-        if not can_activate:
-            if not has_deferred_cleanup:
-                self._discard_unaccepted_start(runtime, collector)
-            raise DouyinCommerceCollectorError("stale_result_discarded")
-
-        with self._state_lock:
-            if any(
+            has_close_owner = bool(
+                collector.close_owner is not None
+                and not collector.close_owner.done.is_set()
+            )
+            session_is_shared = any(
                 item is not collector and item.session_id == session_id
                 for item in runtime.collectors.values()
-            ):
-                slot.state = CollectorState.FAILED
-                raise DouyinCommerceCollectorError("collector_start_failed")
-            runtime.generation.activate_collector(
-                collector_type,
-                instance_id=collector.instance_id,
-                session_id=session_id,
             )
-            return collector
+            if can_activate and not session_is_shared:
+                runtime.generation.activate_collector(
+                    collector_type,
+                    instance_id=collector.instance_id,
+                    session_id=session_id,
+                )
+                return collector
+            if can_activate:
+                slot.state = CollectorState.FAILED
+        if not can_activate:
+            if not has_close_owner:
+                self._discard_unaccepted_start(runtime, collector)
+            raise DouyinCommerceCollectorError("stale_result_discarded")
+        raise DouyinCommerceCollectorError("collector_start_failed")
 
     def _discard_unaccepted_start(
         self,
         runtime: _GenerationRuntime,
         collector: _CollectorRuntime,
     ) -> None:
+        with self._state_lock:
+            owner, claimed = self._claim_collector_close_locked(collector)
+        if not claimed:
+            return
         cleanup_result = "closed"
         try:
-            collector.manager.close(collector.session_id or None)
+            if collector.manager is not None:
+                collector.manager.close(collector.session_id or None)
         except Exception:
             cleanup_result = "cleanup_incomplete"
         with self._state_lock:
-            runtime.cleanup_results[collector.collector_type] = cleanup_result
-            if (
-                cleanup_result == "closed"
-                and runtime.collectors.get(collector.collector_type) is collector
-            ):
-                runtime.collectors.pop(collector.collector_type, None)
+            self._complete_collector_close_locked(
+                runtime,
+                collector.collector_type,
+                collector,
+                owner,
+                cleanup_result,
+            )
 
     def _validate_active_collector(
         self,
@@ -880,7 +1054,7 @@ class DouyinCommerceCollectorManager:
         request_id: str,
         action: str,
         scope: str = "",
-        keyword: object = "",
+        keyword: str = "",
     ) -> None:
         with self._state_lock:
             runtime = self._runtime
@@ -920,7 +1094,7 @@ class DouyinCommerceCollectorManager:
         request_id: str,
         action_name: str,
         scope: str = "",
-        keyword: object = "",
+        keyword: str = "",
     ) -> Any:
         try:
             return self._action_queue.wait(queued_action)
@@ -980,7 +1154,7 @@ class DouyinCommerceCollectorManager:
         runtime = self._runtime
         if (
             runtime is None
-            or runtime.generation.generation_id != str(generation_id or "")
+            or runtime.generation.generation_id != generation_id
             or runtime.generation.state
             not in {SetupGenerationState.COLLECTING, SetupGenerationState.READY}
         ):
@@ -996,7 +1170,7 @@ class DouyinCommerceCollectorManager:
         phase: str,
         action: str,
         scope: str,
-        keyword: object,
+        keyword: str,
         outcome: str,
         error_code: str,
     ) -> None:
@@ -1019,7 +1193,7 @@ class DouyinCommerceCollectorManager:
             phase=phase,
             action=action,
             scope=scope,
-            keyword=str(keyword or ""),
+            keyword=keyword,
             attempt=1,
             candidate_count=0,
             duration_ms=0,
@@ -1038,9 +1212,17 @@ class DouyinCommerceCollectorManager:
         if isinstance(value, CollectorType):
             return value
         try:
-            return CollectorType(str(value or "").strip().casefold())
-        except ValueError:
+            normalized = "" if value is None else str(value).strip().casefold()
+            return CollectorType(normalized)
+        except Exception:
             raise DouyinCommerceCollectorError("collector_unknown") from None
+
+    @staticmethod
+    def _normalize_public_text(value: object, *, error_code: str) -> str:
+        try:
+            return "" if value is None else str(value)
+        except Exception:
+            raise DouyinCommerceCollectorError(error_code) from None
 
     @staticmethod
     def _account_id(payload: Mapping[str, Any]) -> int:
