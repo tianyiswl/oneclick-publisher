@@ -434,7 +434,7 @@ class DouyinCommercePage(QWidget):
     _STEPS = ("内容准备", "平台设置", "检查与提交")
     _STEP_HINTS = (
         "选择账号、视频并完成本地内容准备。",
-        "在同一抖音编辑页选择音乐、定位、作品声明与发布方式。",
+        "在独立临时采集会话读取候选；本页仅本机暂存，正式发布时逐条重新核验。",
         "只读预检通过后，再进行一次独立提交确认。",
     )
     _PLATFORM_STAGE_ORDER = ("blocked", "music", "location", "declaration", "schedule")
@@ -4533,6 +4533,7 @@ class DouyinCommercePage(QWidget):
             "workflow": douyin_commerce_service.DOUYIN_COMMERCE_WORKFLOW,
             "commerceMode": douyin_commerce_service.LOCAL_GROUP_BUY_MODE,
             "contentType": "video",
+            "accountId": account.get("id"),
             "title": self.title_input.text().strip(),
             "description": self.description_input.toPlainText().strip(),
             "tags": self._tags(),

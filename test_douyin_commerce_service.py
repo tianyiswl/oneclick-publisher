@@ -3322,6 +3322,29 @@ class DouyinCommerceUiTests(unittest.TestCase):
 
         self.assertTrue(payload["backgroundMode"])
 
+    def test_upload_payload_includes_selected_builtin_account_id(self) -> None:
+        """平台设置探针源载荷必须携带当前账号的本机整数 ID。"""
+
+        with tempfile.TemporaryDirectory() as root:
+            video = Path(root) / "commerce.mp4"
+            video.write_bytes(b"video")
+            account = {
+                "id": 73,
+                "type": 3,
+                "status": 1,
+                "filePath": "oneclick_3_demo.json",
+            }
+            media = {"storedPath": str(video), "filename": "commerce.mp4"}
+            self.page.title_input.setText("抖音带货测试")
+            self.page.description_input.setPlainText("仅验证账号 ID 载荷。")
+            with patch.object(
+                self.page, "_selected_account", return_value=account
+            ), patch.object(self.page, "_selected_video", return_value=media):
+                payload = self.page.collect_upload_payload()
+
+        self.assertIs(type(payload["accountId"]), int)
+        self.assertEqual(payload["accountId"], 73)
+
     def test_music_candidates_are_not_auto_selected(self) -> None:
         self.page._session_id = "session-demo"
         self.page._show_music_candidates(
@@ -3639,6 +3662,18 @@ class DouyinCommerceUiTests(unittest.TestCase):
         self.page._sync_view()
 
         self.assertTrue(self.page.location_keyword.isEnabled())
+
+    def test_platform_step_hint_explains_isolated_local_staging(self) -> None:
+        """平台设置提示不得把三个采集器误说成同一编辑页。"""
+
+        self.page.pages.setCurrentIndex(1)
+        self.page._sync_view()
+
+        hint = self.page.progress_context_label.text()
+        self.assertIn("独立临时采集会话", hint)
+        self.assertIn("本机暂存", hint)
+        self.assertIn("正式发布时逐条重新核验", hint)
+        self.assertNotIn("同一抖音编辑页", hint)
 
     def test_platform_workspace_orders_shared_settings_before_batch_locations(self) -> None:
         """音乐、声明、发布方式在左栏；右栏专用于逐条地点。"""

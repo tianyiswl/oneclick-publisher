@@ -47,7 +47,14 @@ _COLLECTOR_KEYS = (
     "local_location",
 )
 _CLEANUP_RESULTS = frozenset(
-    {"", "closed", "not_started", "cleanup_incomplete", "cleanup_unknown"}
+    {
+        "",
+        "closed",
+        "not_started",
+        "cleanup_incomplete",
+        "cleanup_interrupted",
+        "cleanup_unknown",
+    }
 )
 _ERROR_CODES = frozenset(
     {

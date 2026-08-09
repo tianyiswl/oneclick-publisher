@@ -43,7 +43,12 @@ def build_probe_upload_payload(
     """构造只携带账号和工作流身份的预检上传参数。"""
 
     probe = resolve_douyin_commerce_probe(resource_dir)
-    return {
+    account_id = source.get("accountId")
+    if account_id is not None and (
+        type(account_id) is not int or account_id < 0
+    ):
+        raise DouyinCommerceProbeError("探针账号 ID 无效")
+    payload = {
         "type": source.get("type", 3),
         "workflow": source.get("workflow", "douyin-commerce"),
         "commerceMode": source.get("commerceMode", "local-group-buy"),
@@ -56,3 +61,6 @@ def build_probe_upload_payload(
         "runtimeMode": "preflight",
         "debugDryRun": True,
     }
+    if account_id is not None:
+        payload["accountId"] = account_id
+    return payload

@@ -20,8 +20,10 @@ from app_core.douyin_commerce_collectors import (
     DouyinCommerceCollectorError,
     DouyinCommerceCollectorManager,
 )
+from app_core.douyin_commerce_probe import build_probe_upload_payload
 from app_core.douyin_commerce_setup_state import CollectorType
 from tools.verify_douyin_commerce_collectors import (
+    _public_close_result,
     _write_report,
     build_verification_sequences,
     main as verification_main,
@@ -360,6 +362,28 @@ class DouyinCommerceCollectorManagerTests(unittest.TestCase):
         self.assertEqual(event["candidateCount"], 1)
         self.assertEqual(event["outcome"], "success")
         self.assertEqual(event["errorCode"], "collector_unknown")
+
+    def test_real_probe_builder_preserves_account_id_for_runtime_and_diagnostics(self):
+        """真实探针白名单必须把 UI 的整数账号 ID 交给协调器。"""
+
+        factory = FakeManagerFactory()
+        manager = DouyinCommerceCollectorManager(
+            manager_factory=factory,
+            probe_payload_builder=build_probe_upload_payload,
+        )
+        try:
+            begun = manager.begin_generation(self.upload_payload)
+            generation_id = begun["setupGenerationId"]
+            with manager._state_lock:
+                self.assertEqual(manager._runtime.generation.account_id, 31)
+
+            manager.search_locations(generation_id, "侨港风情街", "domestic")
+
+            event = manager.recent_diagnostics(generation_id)[-1]
+            self.assertEqual(event["accountMaskedId"], "account-31")
+            self.assertNotIn("account.json", str(event))
+        finally:
+            manager.close_generation(reason="test_cleanup")
 
     def test_untrusted_exception_string_methods_are_never_called_by_diagnostics(self):
         class SideEffectStringError(RuntimeError):
@@ -1998,6 +2022,93 @@ class DouyinCommerceCollectorManagerTests(unittest.TestCase):
         )
         self.assertEqual(status["collectors"]["domestic_location"], "failed")
 
+    def test_retry_keyboard_interrupt_completes_owner_and_allows_close_retry(self):
+        self._assert_retry_process_control_interruption_completes_owner(
+            KeyboardInterrupt
+        )
+
+    def test_retry_system_exit_completes_owner_and_allows_close_retry(self):
+        self._assert_retry_process_control_interruption_completes_owner(
+            SystemExit
+        )
+
+    def _assert_retry_process_control_interruption_completes_owner(
+        self,
+        interruption_type: type[BaseException],
+    ) -> None:
+        class InterruptedRetrySessionManager(FakeSessionManager):
+            def __init__(self) -> None:
+                super().__init__(1)
+                self.strict_close_calls: list[str | None] = []
+                self.interruptions_remaining = 1
+
+            def close_strict(self, session_id: str | None = None) -> None:
+                self.strict_close_calls.append(session_id)
+                if self.interruptions_remaining:
+                    self.interruptions_remaining -= 1
+                    raise interruption_type(
+                        "Cookie=secret 验证码123456 DOM=<html>private</html>"
+                    )
+
+        strict_manager = InterruptedRetrySessionManager()
+        self.manager._manager_factory = lambda: strict_manager
+        self.manager._close_wait_seconds = 0.2
+        generation_id = self.manager.begin_generation(self.upload_payload)[
+            "setupGenerationId"
+        ]
+
+        with self.assertRaises(interruption_type):
+            self.manager.retry_collector(generation_id, "domestic_location")
+
+        with self.manager._state_lock:
+            runtime = self.manager._runtime
+            self.assertIsNotNone(runtime)
+            collector = runtime.collectors[CollectorType.DOMESTIC_LOCATION]
+            first_owner = collector.close_owner
+            self.assertIsNotNone(first_owner)
+            self.assertTrue(first_owner.done.is_set())
+            self.assertEqual(first_owner.result, "cleanup_interrupted")
+            self.assertEqual(
+                runtime.cleanup_results[CollectorType.DOMESTIC_LOCATION],
+                "cleanup_interrupted",
+            )
+            self.assertEqual(
+                runtime.generation.collectors[
+                    CollectorType.DOMESTIC_LOCATION
+                ].state.value,
+                "failed",
+            )
+            self.assertNotIn(
+                id(strict_manager), self.manager._manager_close_owners
+            )
+
+        continued = self.manager._action_queue.submit(
+            generation_id,
+            "queue-after-retry-interruption",
+            CollectorType.DOMESTIC_LOCATION,
+            lambda: "queue_continues",
+            is_cleanup=True,
+        )
+        self.assertEqual(
+            self.manager._action_queue.wait(continued),
+            "queue_continues",
+        )
+
+        closed = self.manager.close_generation(generation_id, reason="cancelled")
+
+        self.assertTrue(closed["closed"])
+        self.assertEqual(closed["aliveCollectorCount"], 0)
+        self.assertEqual(
+            closed["cleanupResults"]["domestic_location"], "closed"
+        )
+        self.assertEqual(
+            strict_manager.strict_close_calls,
+            ["session-1", "session-1"],
+        )
+        self.assertIsNot(collector.close_owner, first_owner)
+        self.assertTrue(collector.close_owner.done.is_set())
+        self.assertEqual(strict_manager.close_calls, [])
+
     def test_generation_close_reuses_retry_owned_blocking_close(self):
         generation_id = self.manager.begin_generation(self.upload_payload)[
             "setupGenerationId"
@@ -3391,6 +3502,7 @@ class DouyinCommerceCollectorVerifierTests(unittest.TestCase):
         *,
         generation_id: str = "generation-safe",
         instance_id: str = "instance-safe",
+        close_result: dict[str, object] | None = None,
     ) -> tuple[str, dict[str, object]]:
         report = {
             "accountMaskedId": "account-31",
@@ -3408,7 +3520,8 @@ class DouyinCommerceCollectorVerifierTests(unittest.TestCase):
                     },
                     "candidateCounts": {},
                     "diagnostics": [diagnostic],
-                    "closeResult": {
+                    "closeResult": close_result
+                    or {
                         "closed": True,
                         "aliveCollectorCount": 0,
                         "cleanupResults": {},
@@ -3422,6 +3535,42 @@ class DouyinCommerceCollectorVerifierTests(unittest.TestCase):
             _write_report(report_path, report)
             report_text = report_path.read_text(encoding="utf-8")
         return report_text, json.loads(report_text)
+
+    def test_cleanup_interrupted_survives_public_close_and_final_json(self):
+        raw_close = {
+            "closed": False,
+            "aliveCollectorCount": 1,
+            "cleanupResults": {
+                "domestic_location": "cleanup_interrupted",
+            },
+        }
+
+        public_close = _public_close_result(raw_close)
+
+        self.assertEqual(
+            public_close["cleanupResults"]["domestic_location"],
+            "cleanup_interrupted",
+        )
+        _report_text, report = self._persist_diagnostic_report(
+            {
+                "phase": "cleanup",
+                "action": "close_generation",
+                "outcome": "failed",
+                "cleanupResult": "cleanup_interrupted",
+            },
+            close_result=raw_close,
+        )
+        generation = report["generations"][0]
+        self.assertEqual(
+            generation["diagnostics"][0]["cleanupResult"],
+            "cleanup_interrupted",
+        )
+        self.assertEqual(
+            generation["closeResult"]["cleanupResults"][
+                "domestic_location"
+            ],
+            "cleanup_interrupted",
+        )
 
     def test_report_writer_rejects_uuid_in_structural_phase_field(self):
         secret_uuid = "123e4567-e89b-12d3-a456-426614174000"

@@ -34,6 +34,7 @@ class DouyinCommerceProbeTests(unittest.TestCase):
                     "workflow": "douyin-commerce",
                     "commerceMode": "local-group-buy",
                     "contentType": "video",
+                    "accountId": 31,
                     "accountList": ["account.json"],
                     "fileList": ["/private/user-video.mp4"],
                     "title": "用户标题",
@@ -58,14 +59,37 @@ class DouyinCommerceProbeTests(unittest.TestCase):
         self.assertEqual(payload["tags"], [])
         self.assertEqual(payload["runtimeMode"], "preflight")
         self.assertTrue(payload["debugDryRun"])
+        self.assertEqual(payload["accountId"], 31)
         self.assertEqual(payload["accountList"], ["account.json"])
         self.assertEqual(
             set(payload),
             {
-                "type", "workflow", "commerceMode", "contentType", "accountList",
-                "fileList", "title", "description", "tags", "runtimeMode", "debugDryRun",
+                "type", "workflow", "commerceMode", "contentType", "accountId",
+                "accountList", "fileList", "title", "description", "tags",
+                "runtimeMode", "debugDryRun",
             },
         )
+
+    def test_probe_payload_rejects_non_builtin_or_negative_account_ids(self) -> None:
+        class ConvertibleAccountId:
+            def __int__(self) -> int:
+                raise AssertionError("不得执行自定义 accountId 转换")
+
+        invalid_values = (True, -1, "31", ConvertibleAccountId())
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._write_probe(root)
+            for invalid in invalid_values:
+                with self.subTest(invalid=type(invalid).__name__), self.assertRaises(
+                    DouyinCommerceProbeError
+                ):
+                    build_probe_upload_payload(
+                        {
+                            "accountId": invalid,
+                            "accountList": ["account.json"],
+                        },
+                        resource_dir=root,
+                    )
 
     def test_resolve_probe_enforces_one_kib_to_512_kib_size_limits(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
