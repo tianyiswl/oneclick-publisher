@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import subprocess
 from pathlib import Path
 
@@ -55,7 +56,15 @@ def create_douyin_commerce_probe() -> Path:
     return probe
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--douyin-commerce-probe-only", action="store_true")
+    args = parser.parse_args(argv)
+
+    if args.douyin_commerce_probe_only:
+        print(create_douyin_commerce_probe())
+        return 0
+
     OUTPUT.mkdir(parents=True, exist_ok=True)
     posters = {
         "xhs-image-01.png": ("小红书图文测试", "图片序列 · 标题 · 正文", "#E94362"),
@@ -75,7 +84,8 @@ def main() -> None:
     subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     create_douyin_commerce_probe()
     print(OUTPUT)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

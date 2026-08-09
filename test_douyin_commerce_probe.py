@@ -67,7 +67,7 @@ class DouyinCommerceProbeTests(unittest.TestCase):
             },
         )
 
-    def test_resolve_probe_rejects_missing_empty_or_oversized_file(self) -> None:
+    def test_resolve_probe_enforces_one_kib_to_512_kib_size_limits(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             with self.assertRaises(DouyinCommerceProbeError):
@@ -77,7 +77,18 @@ class DouyinCommerceProbeTests(unittest.TestCase):
             with self.assertRaises(DouyinCommerceProbeError):
                 resolve_douyin_commerce_probe(root)
 
-            probe.write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"x" * (512 * 1024))
+            header = b"\x00\x00\x00\x18ftypmp42"
+            probe.write_bytes(header + b"x" * (1_023 - len(header)))
+            with self.assertRaises(DouyinCommerceProbeError):
+                resolve_douyin_commerce_probe(root)
+
+            probe.write_bytes(header + b"x" * (1_024 - len(header)))
+            self.assertEqual(resolve_douyin_commerce_probe(root), probe)
+
+            probe.write_bytes(header + b"x" * (512 * 1024 - len(header)))
+            self.assertEqual(resolve_douyin_commerce_probe(root), probe)
+
+            probe.write_bytes(header + b"x" * (512 * 1024 + 1 - len(header)))
             with self.assertRaises(DouyinCommerceProbeError):
                 resolve_douyin_commerce_probe(root)
 

@@ -10,6 +10,7 @@ from conf import RESOURCE_DIR
 
 
 DOUYIN_COMMERCE_PROBE_RELATIVE_PATH = Path("ui/assets/douyin-commerce-probe.mp4")
+_MIN_PROBE_SIZE_BYTES = 1_024
 _MAX_PROBE_SIZE_BYTES = 512 * 1024
 
 
@@ -28,7 +29,7 @@ def resolve_douyin_commerce_probe(resource_dir: Path | None = None) -> Path:
         raise DouyinCommerceProbeError("内置抖音带货探针不存在")
 
     size = probe.stat().st_size
-    if size <= 0 or size > _MAX_PROBE_SIZE_BYTES:
+    if size < _MIN_PROBE_SIZE_BYTES or size > _MAX_PROBE_SIZE_BYTES:
         raise DouyinCommerceProbeError("内置抖音带货探针大小无效")
     with probe.open("rb") as handle:
         if b"ftyp" not in handle.read(32):
