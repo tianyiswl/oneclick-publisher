@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import re
 import sys
 import time
 from typing import Any, Mapping
@@ -40,23 +41,42 @@ _SAFETY_STOP_CODES = frozenset(
         "challenge_required",
     }
 )
-_DIAGNOSTIC_FIELDS = (
-    "timestamp",
-    "requestId",
-    "setupGenerationId",
-    "collectorType",
-    "collectorInstanceId",
-    "accountMaskedId",
-    "phase",
-    "action",
-    "scope",
-    "keyword",
-    "attempt",
-    "candidateCount",
-    "durationMs",
-    "outcome",
-    "errorCode",
-    "cleanupResult",
+_COLLECTOR_KEYS = (
+    "domestic_location",
+    "favorite_music",
+    "local_location",
+)
+_CLEANUP_RESULTS = frozenset(
+    {"", "closed", "not_started", "cleanup_incomplete", "cleanup_unknown"}
+)
+_ERROR_CODES = frozenset(
+    {
+        "",
+        "login_required",
+        "scope_not_confirmed",
+        "candidate_panel_missing",
+        "candidate_ambiguous",
+        "candidate_empty",
+        "rate_limited_or_degraded",
+        "cleanup_incomplete",
+        "collector_start_failed",
+        "collector_unknown",
+        "stale_result_discarded",
+        "account_verification_required",
+        "verification_required",
+        "sms_verification_required",
+        "qr_verification_required",
+        "challenge_required",
+    }
+)
+_SHORT_HASH = re.compile(r"[0-9a-f]{12}")
+_ACCOUNT_MASK = re.compile(r"account-\d+")
+_ABSOLUTE_PATH = re.compile(
+    r"(?i)(?:[a-z]:[\\/]|/)(?:[^\s,;|\"'<>]+[\\/]?)+"
+)
+_SENSITIVE_TEXT = re.compile(
+    r"(?i)(?:access[_-]?token|cookie|token|html|dom|selector|"
+    r"session(?:[_ -]?id)?|verification(?:[_ -]?code)?|验证码|二维码)"
 )
 
 
@@ -138,7 +158,7 @@ def _resolve_manager() -> Any:
 
 
 def _select_account_file(account_id: int) -> str:
-    matches: list[str] = []
+    matches: list[Mapping[str, object]] = []
     for account in account_service.list_accounts():
         if not isinstance(account, Mapping):
             continue
@@ -151,20 +171,50 @@ def _select_account_file(account_id: int) -> str:
                 and type(account.get("status")) is int
                 and account.get("status") == 1
             )
-            file_path = account.get("filePath")
         except Exception:
             continue
-        if matched and type(file_path) is str and file_path.strip():
-            matches.append(file_path.strip())
+        if matched:
+            matches.append(account)
     if len(matches) != 1:
         raise CollectorVerificationError("account_not_available")
-    return matches[0]
+    try:
+        file_path = matches[0].get("filePath")
+    except Exception:
+        raise CollectorVerificationError("account_not_available") from None
+    if type(file_path) is not str or not file_path.strip():
+        raise CollectorVerificationError("account_not_available")
+    return file_path.strip()
 
 
 def _short_hash(value: object) -> str:
     if type(value) is not str or not value:
         return ""
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+
+
+def _safe_short_hash(value: object) -> str:
+    if type(value) is not str or not value:
+        return ""
+    if _SHORT_HASH.fullmatch(value):
+        return value
+    return _short_hash(value)
+
+
+def _safe_report_text(value: object, *, limit: int = 80) -> str:
+    if type(value) is not str:
+        return ""
+    text = value[:limit]
+    if _ABSOLUTE_PATH.search(text) or _SENSITIVE_TEXT.search(text):
+        return "<redacted>"
+    return text
+
+
+def _safe_cleanup_result(value: object) -> str:
+    return value if type(value) is str and value in _CLEANUP_RESULTS else "cleanup_unknown"
+
+
+def _safe_error_code(value: object) -> str:
+    return value if type(value) is str and value in _ERROR_CODES else "collector_unknown"
 
 
 def _candidate_count(result: object) -> int:
@@ -189,14 +239,59 @@ def _sanitize_diagnostics(rows: object) -> list[dict[str, object]]:
     for row in rows:
         if not isinstance(row, Mapping):
             continue
-        safe: dict[str, object] = {}
-        for field in _DIAGNOSTIC_FIELDS:
-            value = row.get(field)
-            if field in {"setupGenerationId", "collectorInstanceId"}:
-                safe[f"{field}Hash"] = _short_hash(value)
-            elif type(value) in {type(None), bool, int, float, str}:
-                safe[field] = value
-        safe_rows.append(safe)
+        collector_type = row.get("collectorType")
+        safe_rows.append(
+            {
+                "timestamp": _safe_report_text(row.get("timestamp"), limit=40),
+                "requestIdHash": _safe_short_hash(
+                    row.get("requestIdHash") or row.get("requestId")
+                ),
+                "setupGenerationIdHash": _safe_short_hash(
+                    row.get("setupGenerationIdHash")
+                    or row.get("setupGenerationId")
+                ),
+                "collectorType": (
+                    collector_type
+                    if type(collector_type) is str
+                    and collector_type in _COLLECTOR_KEYS
+                    else "collector_unknown"
+                ),
+                "collectorInstanceIdHash": _safe_short_hash(
+                    row.get("collectorInstanceIdHash")
+                    or row.get("collectorInstanceId")
+                ),
+                "accountMaskedId": (
+                    row.get("accountMaskedId")
+                    if type(row.get("accountMaskedId")) is str
+                    and _ACCOUNT_MASK.fullmatch(row.get("accountMaskedId"))
+                    else "account-redacted"
+                ),
+                "phase": _safe_report_text(row.get("phase"), limit=40),
+                "action": _safe_report_text(row.get("action"), limit=60),
+                "scope": (
+                    row.get("scope")
+                    if row.get("scope") in {"", "domestic", "local"}
+                    else "unknown"
+                ),
+                "keyword": _safe_report_text(row.get("keyword"), limit=80),
+                "attempt": (
+                    row.get("attempt") if type(row.get("attempt")) is int else 0
+                ),
+                "candidateCount": (
+                    row.get("candidateCount")
+                    if type(row.get("candidateCount")) is int
+                    else 0
+                ),
+                "durationMs": (
+                    row.get("durationMs")
+                    if type(row.get("durationMs")) is int
+                    else 0
+                ),
+                "outcome": _safe_report_text(row.get("outcome"), limit=20),
+                "errorCode": _safe_error_code(row.get("errorCode")),
+                "cleanupResult": _safe_cleanup_result(row.get("cleanupResult")),
+            }
+        )
     return safe_rows
 
 
@@ -208,11 +303,15 @@ def _public_close_result(result: object) -> dict[str, object]:
             "cleanupResults": {},
         }
     cleanup = result.get("cleanupResults")
-    safe_cleanup = {
-        key: value
-        for key, value in dict(cleanup).items()
-        if type(key) is str and type(value) is str
-    } if isinstance(cleanup, Mapping) else {}
+    safe_cleanup = (
+        {
+            key: _safe_cleanup_result(cleanup.get(key))
+            for key in _COLLECTOR_KEYS
+            if key in cleanup
+        }
+        if isinstance(cleanup, Mapping)
+        else {}
+    )
     return {
         "closed": result.get("closed") is True,
         "aliveCollectorCount": (
@@ -231,13 +330,9 @@ def _instance_hashes(status: object) -> dict[str, str]:
     if not isinstance(instances, Mapping):
         return {}
     return {
-        key: _short_hash(value)
+        key: _safe_short_hash(value)
         for key, value in instances.items()
-        if type(key) is str and key in {
-            "domestic_location",
-            "favorite_music",
-            "local_location",
-        }
+        if type(key) is str and key in _COLLECTOR_KEYS
     }
 
 
@@ -255,9 +350,106 @@ def _build_probe_source(account_id: int, account_file: str) -> dict[str, object]
 def _write_report(path: Path, report: Mapping[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        json.dumps(
+            _sanitize_report_for_persistence(report),
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
         encoding="utf-8",
     )
+
+
+def _sanitize_report_for_persistence(report: object) -> dict[str, object]:
+    """在写盘前重建报告白名单，不信任上游已脱敏结果。"""
+
+    source = report if isinstance(report, Mapping) else {}
+    raw_generations = source.get("generations")
+    generations: list[dict[str, object]] = []
+    if type(raw_generations) is list:
+        for raw in raw_generations:
+            if not isinstance(raw, Mapping):
+                continue
+            raw_hashes = raw.get("collectorInstanceHashes")
+            hashes = (
+                {
+                    key: _safe_short_hash(raw_hashes.get(key))
+                    for key in _COLLECTOR_KEYS
+                    if key in raw_hashes
+                }
+                if isinstance(raw_hashes, Mapping)
+                else {}
+            )
+            raw_counts = raw.get("candidateCounts")
+            counts: dict[str, list[int]] = {}
+            if isinstance(raw_counts, Mapping):
+                for key in ("favoriteMusic", "domestic", "local"):
+                    values = raw_counts.get(key)
+                    counts[key] = (
+                        [
+                            value
+                            for value in values
+                            if type(value) is int and value >= 0
+                        ]
+                        if type(values) is list
+                        else []
+                    )
+            generations.append(
+                {
+                    "generation": (
+                        raw.get("generation")
+                        if raw.get("generation") in {"A", "B", "C"}
+                        else "unknown"
+                    ),
+                    "order": (
+                        raw.get("order")
+                        if raw.get("order")
+                        in {
+                            "music-domestic-local",
+                            "domestic-music-local",
+                            "local-domestic-music",
+                        }
+                        else "unknown"
+                    ),
+                    "ending": (
+                        raw.get("ending")
+                        if raw.get("ending") in {"normal", "abandon"}
+                        else "unknown"
+                    ),
+                    "outcome": (
+                        raw.get("outcome")
+                        if raw.get("outcome") in {"completed", "stopped"}
+                        else "stopped"
+                    ),
+                    "stopReason": _safe_error_code(raw.get("stopReason")),
+                    "generationIdHash": _safe_short_hash(
+                        raw.get("generationIdHash") or raw.get("generationId")
+                    ),
+                    "collectorInstanceHashes": hashes,
+                    "candidateCounts": counts,
+                    "diagnostics": _sanitize_diagnostics(raw.get("diagnostics")),
+                    "closeResult": _public_close_result(raw.get("closeResult")),
+                }
+            )
+    account_mask = source.get("accountMaskedId")
+    interval = source.get("actionIntervalMs")
+    return {
+        "schemaVersion": "douyin-commerce-collector-verification/v1",
+        "accountMaskedId": (
+            account_mask
+            if type(account_mask) is str and _ACCOUNT_MASK.fullmatch(account_mask)
+            else "account-redacted"
+        ),
+        "actionIntervalMs": (
+            max(800, interval) if type(interval) is int else 800
+        ),
+        "generations": generations,
+        "stopReason": _safe_error_code(source.get("stopReason")),
+        "finalSubmitCount": 0,
+        "draftSaveCount": 0,
+        "publicPublishCount": 0,
+    }
 
 
 def _execute_sequences(

@@ -7,6 +7,8 @@ from contextlib import redirect_stdout
 import io
 import json
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -20,6 +22,7 @@ from app_core.douyin_commerce_collectors import (
 )
 from app_core.douyin_commerce_setup_state import CollectorType
 from tools.verify_douyin_commerce_collectors import (
+    _write_report,
     build_verification_sequences,
     main as verification_main,
 )
@@ -3381,6 +3384,179 @@ class DouyinCommerceCollectorVerifierTests(unittest.TestCase):
         "status": 1,
         "filePath": "private-account-state.json",
     }
+
+    def test_execute_rejects_duplicate_three_field_accounts_before_file_path_validation(self):
+        manager = FakeVerificationManager()
+        duplicate_accounts = [
+            {**self._ACCOUNT, "filePath": ""},
+            {**self._ACCOUNT, "filePath": "valid-account-state.json"},
+        ]
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report_path = Path(temp_dir) / "must-not-exist.json"
+            with mock.patch(
+                "tools.verify_douyin_commerce_collectors.commerce_collector_manager",
+                manager,
+            ), mock.patch(
+                "tools.verify_douyin_commerce_collectors.account_service.list_accounts",
+                return_value=duplicate_accounts,
+            ), mock.patch(
+                "tools.verify_douyin_commerce_collectors.time.sleep"
+            ), redirect_stdout(output):
+                result = verification_main(
+                    [
+                        "--account-id",
+                        "31",
+                        "--keyword",
+                        "夜南香",
+                        "--execute",
+                        "--output",
+                        str(report_path),
+                    ]
+                )
+
+            self.assertEqual(result, 2)
+            self.assertFalse(report_path.exists())
+        self.assertEqual(manager.begin_payloads, [])
+        self.assertEqual(
+            json.loads(output.getvalue())["errorCode"],
+            "account_not_available",
+        )
+
+    def test_report_writer_independently_redacts_ids_text_and_cleanup_values(self):
+        malicious_report = {
+            "schemaVersion": "douyin-commerce-collector-verification/v1",
+            "accountMaskedId": "account-31",
+            "actionIntervalMs": 800,
+            "generations": [
+                {
+                    "generation": "A",
+                    "order": "music-domestic-local",
+                    "ending": "normal",
+                    "outcome": "completed",
+                    "stopReason": "",
+                    "generationIdHash": "raw-generation-secret",
+                    "collectorInstanceHashes": {
+                        "domestic_location": "raw-instance-secret",
+                    },
+                    "candidateCounts": {
+                        "favoriteMusic": [1],
+                        "domestic": [1],
+                        "local": [1],
+                    },
+                    "diagnostics": [
+                        {
+                            "timestamp": "2026-08-09T12:00:00+08:00",
+                            "requestId": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                            "setupGenerationId": "raw-generation-secret",
+                            "collectorInstanceId": "raw-instance-secret",
+                            "collectorType": "domestic_location",
+                            "accountMaskedId": "account-31",
+                            "phase": "result",
+                            "action": "search_locations",
+                            "scope": "domestic",
+                            "keyword": (
+                                "/Users/andy/private/account.json "
+                                "Cookie=top-secret-cookie "
+                                "HTML=<html>private</html> DOM=private-dom"
+                            ),
+                            "attempt": 1,
+                            "candidateCount": 1,
+                            "durationMs": 12,
+                            "outcome": "success",
+                            "errorCode": "",
+                            "cleanupResult": "DOM=private-dom",
+                        }
+                    ],
+                    "closeResult": {
+                        "closed": True,
+                        "aliveCollectorCount": 0,
+                        "cleanupResults": {
+                            "domestic_location": "Cookie=top-secret-cookie",
+                            "favorite_music": "closed",
+                            "local_location": "not_started",
+                            "unknown-cleanup-key": "HTML=<html>private</html>",
+                        },
+                    },
+                }
+            ],
+            "stopReason": "",
+            "finalSubmitCount": 99,
+            "draftSaveCount": 98,
+            "publicPublishCount": 97,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report_path = Path(temp_dir) / "security-boundary.json"
+            _write_report(report_path, malicious_report)
+            report_text = report_path.read_text(encoding="utf-8")
+            report = json.loads(report_text)
+
+        for secret in (
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "raw-generation-secret",
+            "raw-instance-secret",
+            "/Users/andy/private/account.json",
+            "top-secret-cookie",
+            "<html>private</html>",
+            "private-dom",
+            "unknown-cleanup-key",
+        ):
+            self.assertNotIn(secret, report_text)
+        generation = report["generations"][0]
+        diagnostic = generation["diagnostics"][0]
+        self.assertEqual(diagnostic["requestIdHash"], "9af645a8fef3")
+        self.assertEqual(diagnostic["cleanupResult"], "cleanup_unknown")
+        self.assertEqual(
+            generation["closeResult"]["cleanupResults"],
+            {
+                "domestic_location": "cleanup_unknown",
+                "favorite_music": "closed",
+                "local_location": "not_started",
+            },
+        )
+        self.assertEqual(report["finalSubmitCount"], 0)
+        self.assertEqual(report["draftSaveCount"], 0)
+        self.assertEqual(report["publicPublishCount"], 0)
+
+    def test_default_mode_independent_process_never_imports_collector_module(self):
+        verifier = Path(__file__).resolve().parent / "tools" / "verify_douyin_commerce_collectors.py"
+        guard_script = """
+import builtins
+import runpy
+import sys
+
+verifier = sys.argv[1]
+original_import = builtins.__import__
+
+def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+    if name == "app_core.douyin_commerce_collectors":
+        raise RuntimeError("collector module imported in default mode")
+    return original_import(name, globals, locals, fromlist, level)
+
+builtins.__import__ = guarded_import
+sys.argv = [verifier, "--account-id", "31", "--keyword", "夜南香"]
+try:
+    runpy.run_path(verifier, run_name="__main__")
+except SystemExit as error:
+    if error.code not in (None, 0):
+        raise
+if "app_core.douyin_commerce_collectors" in sys.modules:
+    raise RuntimeError("collector module retained in default mode")
+print("DEFAULT_MODE_NO_COLLECTOR_IMPORT")
+"""
+
+        completed = subprocess.run(
+            [sys.executable, "-c", guard_script, str(verifier)],
+            cwd=Path(__file__).resolve().parent,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("DEFAULT_MODE_NO_COLLECTOR_IMPORT", completed.stdout)
+        self.assertNotIn("collector module imported", completed.stderr)
 
     def test_verifier_default_mode_only_prints_plan(self):
         output = io.StringIO()
