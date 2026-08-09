@@ -431,12 +431,18 @@ class DouyinCommerceCollectorManager:
         )
         request_id = str(uuid4())
         with self._state_lock:
-            self._require_collecting_runtime(generation_id)
+            runtime = self._require_collecting_runtime(generation_id)
+            current = runtime.collectors.get(CollectorType.FAVORITE_MUSIC)
+            action_instance_id = (
+                current.instance_id if current is not None else str(uuid4())
+            )
             action = self._action_queue.reserve(
                 generation_id,
                 request_id,
                 CollectorType.FAVORITE_MUSIC,
-                lambda: self._refresh_music_action(generation_id, request_id),
+                lambda: self._refresh_music_action(
+                    generation_id, request_id, action_instance_id
+                ),
             )
         self._action_queue.start(action)
         try:
@@ -449,7 +455,10 @@ class DouyinCommerceCollectorManager:
             )
         except DouyinCommerceCollectorError as error:
             raise self._contextual_action_error(
-                error, generation_id, CollectorType.FAVORITE_MUSIC
+                error,
+                generation_id,
+                CollectorType.FAVORITE_MUSIC,
+                action_instance_id,
             ) from None
 
     def search_locations(
@@ -474,7 +483,11 @@ class DouyinCommerceCollectorManager:
             raise DouyinCommerceCollectorError("collector_scope_mismatch")
         request_id = str(uuid4())
         with self._state_lock:
-            self._require_collecting_runtime(generation_id)
+            runtime = self._require_collecting_runtime(generation_id)
+            current = runtime.collectors.get(collector_type)
+            action_instance_id = (
+                current.instance_id if current is not None else str(uuid4())
+            )
             action = self._action_queue.reserve(
                 generation_id,
                 request_id,
@@ -485,6 +498,7 @@ class DouyinCommerceCollectorManager:
                     request_id,
                     normalized_keyword,
                     normalized_scope,
+                    action_instance_id,
                 ),
             )
         self._action_queue.start(action)
@@ -500,7 +514,7 @@ class DouyinCommerceCollectorManager:
             )
         except DouyinCommerceCollectorError as error:
             raise self._contextual_action_error(
-                error, generation_id, collector_type
+                error, generation_id, collector_type, action_instance_id
             ) from None
 
     def retry_collector(
@@ -519,6 +533,7 @@ class DouyinCommerceCollectorManager:
             runtime = self._require_collecting_runtime(generation_id)
             current = runtime.collectors.get(normalized_type)
             expected_instance_id = current.instance_id if current else ""
+            action_instance_id = str(uuid4())
             action = self._action_queue.reserve(
                 generation_id,
                 request_id,
@@ -527,6 +542,7 @@ class DouyinCommerceCollectorManager:
                     generation_id,
                     normalized_type,
                     expected_instance_id,
+                    action_instance_id,
                 ),
             )
         self._action_queue.start(action)
@@ -541,7 +557,7 @@ class DouyinCommerceCollectorManager:
             )
         except DouyinCommerceCollectorError as error:
             raise self._contextual_action_error(
-                error, generation_id, normalized_type
+                error, generation_id, normalized_type, action_instance_id
             ) from None
         return self._public_action_result(
             generation_id,
@@ -931,9 +947,12 @@ class DouyinCommerceCollectorManager:
         self,
         generation_id: str,
         request_id: str,
+        action_instance_id: str,
     ) -> dict[str, object]:
         collector = self._ensure_collector(
-            generation_id, CollectorType.FAVORITE_MUSIC
+            generation_id,
+            CollectorType.FAVORITE_MUSIC,
+            action_instance_id=action_instance_id,
         )
         self._validate_active_collector(generation_id, collector)
         try:
@@ -983,8 +1002,13 @@ class DouyinCommerceCollectorManager:
         request_id: str,
         keyword: object,
         scope: str,
+        action_instance_id: str,
     ) -> dict[str, object]:
-        collector = self._ensure_collector(generation_id, collector_type)
+        collector = self._ensure_collector(
+            generation_id,
+            collector_type,
+            action_instance_id=action_instance_id,
+        )
         if collector.fixed_scope != scope:
             raise DouyinCommerceCollectorError("collector_scope_mismatch")
         self._validate_active_collector(generation_id, collector)
@@ -1039,6 +1063,7 @@ class DouyinCommerceCollectorManager:
         generation_id: str,
         collector_type: CollectorType,
         expected_instance_id: str,
+        action_instance_id: str,
     ) -> _CollectorRuntime:
         with self._state_lock:
             runtime = self._require_collecting_runtime(generation_id)
@@ -1129,7 +1154,11 @@ class DouyinCommerceCollectorManager:
                 slot.session_id = None
                 slot.state = CollectorState.RETRYING
 
-        return self._ensure_collector(generation_id, collector_type)
+        return self._ensure_collector(
+            generation_id,
+            collector_type,
+            action_instance_id=action_instance_id,
+        )
 
     def _ensure_collector(
         self,
@@ -1137,11 +1166,19 @@ class DouyinCommerceCollectorManager:
         collector_type: CollectorType,
         *,
         on_progress=None,
+        action_instance_id: str = "",
     ) -> _CollectorRuntime:
         with self._state_lock:
             runtime = self._require_collecting_runtime(generation_id)
             existing = runtime.collectors.get(collector_type)
             if existing is not None:
+                if (
+                    action_instance_id
+                    and existing.instance_id != action_instance_id
+                ):
+                    raise DouyinCommerceCollectorError(
+                        "stale_result_discarded"
+                    )
                 if existing.fixed_scope != _FIXED_SCOPES[collector_type]:
                     raise DouyinCommerceCollectorError("collector_scope_mismatch")
                 self._validate_active_collector(generation_id, existing)
@@ -1150,7 +1187,7 @@ class DouyinCommerceCollectorManager:
             collector = _CollectorRuntime(
                 collector_type=collector_type,
                 manager=None,
-                instance_id=str(uuid4()),
+                instance_id=action_instance_id or str(uuid4()),
                 fixed_scope=_FIXED_SCOPES[collector_type],
             )
             runtime.collectors[collector_type] = collector
@@ -1230,15 +1267,16 @@ class DouyinCommerceCollectorManager:
             if not session_id:
                 raise TypeError("collector session id is empty")
         except Exception as error:
-            if not self._mark_failed(generation_id, collector):
-                raise DouyinCommerceCollectorError(
-                    "stale_result_discarded"
-                ) from None
             if (
                 isinstance(error, DouyinCommerceCollectorError)
                 and error.code == "login_required"
             ):
+                self._mark_failed(generation_id, collector)
                 raise DouyinCommerceCollectorError("login_required") from None
+            if not self._mark_failed(generation_id, collector):
+                raise DouyinCommerceCollectorError(
+                    "stale_result_discarded"
+                ) from None
             raise DouyinCommerceCollectorError("collector_start_failed") from None
 
         with self._state_lock:
@@ -1491,27 +1529,16 @@ class DouyinCommerceCollectorManager:
         error: DouyinCommerceCollectorError,
         generation_id: str,
         collector_type: CollectorType,
+        action_instance_id: str,
     ) -> DouyinCommerceCollectorError:
-        """为固定错误补齐 UI 丢弃迟到回调所需的公开门禁。"""
+        """使用动作派发时捕获的不可变实例上下文投影固定错误。"""
 
-        instance_id = error.collector_instance_id
-        if not instance_id:
-            with self._state_lock:
-                runtime = self._runtime
-                collector = (
-                    runtime.collectors.get(collector_type)
-                    if runtime
-                    and runtime.generation.generation_id == generation_id
-                    else None
-                )
-                if collector is not None:
-                    instance_id = collector.instance_id
         return DouyinCommerceCollectorError(
             error.code,
             event_emitted=error.event_emitted,
             generation_id=generation_id,
             collector_type=collector_type.value,
-            collector_instance_id=instance_id,
+            collector_instance_id=action_instance_id,
         )
 
     def _mark_failed(

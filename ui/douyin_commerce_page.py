@@ -5056,6 +5056,9 @@ class DouyinCommercePage(QWidget):
         if not current_instance or result_instance != current_instance:
             return
         code = self._public_collector_error_code(message.get("errorCode"))
+        if code == "login_required":
+            self._handle_login_required()
+            return
         collectors = dict(status.get("collectors") or {})
         collectors[collector_type] = "failed"
         details = dict(status.get("collectorDetails") or {})

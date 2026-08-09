@@ -7691,6 +7691,89 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.assertEqual(self.page.music_collector_status.text(), "收藏音乐：可用")
         self.assertTrue(self.page.retry_collector_button.isHidden())
 
+    def test_current_music_login_required_routes_to_account_management(self) -> None:
+        """收藏音乐懒启动的当前实例登录失效必须进入账号管理。"""
+
+        self.page._setup_generation_id = "generation-a"
+        self.page._collector_action_tokens["favorite_music"] = 4
+        current = self._collector_status(music="active")
+        self.page._render_collector_status(current)
+        login_required = {
+            "ok": False,
+            "errorCode": "login_required",
+            "setupGenerationId": "generation-a",
+            "collectorType": "favorite_music",
+            "collectorInstanceId": "music-a",
+        }
+
+        with patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.status",
+            return_value=current,
+        ), patch.object(self.page, "_handle_login_required") as handle_login:
+            self.page._collector_action_failed(
+                "generation-a", "favorite_music", 4, login_required
+            )
+
+        handle_login.assert_called_once_with()
+        self.assertEqual(self.page.music_collector_status.text(), "收藏音乐：可用")
+        self.assertTrue(self.page.retry_collector_button.isHidden())
+
+    def test_current_local_login_required_routes_to_account_management(self) -> None:
+        """本地点懒启动的当前实例登录失效必须进入账号管理。"""
+
+        self.page._setup_generation_id = "generation-a"
+        self.page._collector_action_tokens["local_location"] = 7
+        current = self._collector_status(local="active")
+        self.page._render_collector_status(current)
+        login_required = {
+            "ok": False,
+            "errorCode": "login_required",
+            "setupGenerationId": "generation-a",
+            "collectorType": "local_location",
+            "collectorInstanceId": "local-a",
+        }
+
+        with patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.status",
+            return_value=current,
+        ), patch.object(self.page, "_handle_login_required") as handle_login:
+            self.page._collector_action_failed(
+                "generation-a", "local_location", 7, login_required
+            )
+
+        handle_login.assert_called_once_with()
+        self.assertIn("本地点：可用", self.page.local_collector_status.text())
+        self.assertNotIn("失败", self.page.local_collector_status.text())
+        self.assertTrue(self.page.retry_collector_button.isHidden())
+
+    def test_late_music_login_required_does_not_route_to_account_management(self) -> None:
+        """旧音乐实例的迟到登录错误不得打断当前新实例。"""
+
+        self.page._setup_generation_id = "generation-a"
+        self.page._collector_action_tokens["favorite_music"] = 4
+        current = self._collector_status(music="active")
+        current["collectorInstanceIds"]["favorite_music"] = "music-new"
+        self.page._render_collector_status(current)
+        stale_login = {
+            "ok": False,
+            "errorCode": "login_required",
+            "setupGenerationId": "generation-a",
+            "collectorType": "favorite_music",
+            "collectorInstanceId": "music-old",
+        }
+
+        with patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.status",
+            return_value=current,
+        ), patch.object(self.page, "_handle_login_required") as handle_login:
+            self.page._collector_action_failed(
+                "generation-a", "favorite_music", 4, stale_login
+            )
+
+        handle_login.assert_not_called()
+        self.assertEqual(self.page.music_collector_status.text(), "收藏音乐：可用")
+        self.assertTrue(self.page.retry_collector_button.isHidden())
+
     def test_setup_generation_login_required_routes_to_account_management(self) -> None:
         """真实 manager 固定登录错误必须进入既有账号管理流程。"""
 

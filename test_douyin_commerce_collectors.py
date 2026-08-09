@@ -941,6 +941,7 @@ class DouyinCommerceCollectorManagerTests(unittest.TestCase):
         with self.manager._state_lock:
             runtime = self.manager._runtime
             old_runtime = runtime.collectors[CollectorType.DOMESTIC_LOCATION]
+            old_instance_id = old_runtime.instance_id
             replacement_manager = self.factory()
             replacement_manager.start_upload(self.upload_payload)
             replacement = type(old_runtime)(
@@ -962,11 +963,145 @@ class DouyinCommerceCollectorManagerTests(unittest.TestCase):
 
         self.assertFalse(thread.is_alive())
         self.assertEqual(str(outcome["search_error"]), "stale_result_discarded")
+        self.assertEqual(
+            outcome["search_error"].to_public_action_result()[
+                "collectorInstanceId"
+            ],
+            old_instance_id,
+        )
         status = self.manager.status(generation_id)
         self.assertEqual(status["collectors"]["domestic_location"], "active")
         self.assertEqual(
             status["collectorInstanceIds"]["domestic_location"],
             "retry-replacement",
+        )
+
+    def test_replaced_lazy_music_login_error_keeps_old_action_instance(self):
+        """懒启动音乐实例被替换后，登录错误仍绑定旧动作且保留固定码。"""
+
+        generation_id = self.manager.begin_generation(self.upload_payload)[
+            "setupGenerationId"
+        ]
+        self.factory.block_start_ids.add(2)
+        self.factory.start_result_overrides[2] = {
+            "status": "needs_login",
+            "message": "登录已失效，请到账号管理重新登录",
+        }
+        outcome: dict[str, object] = {}
+        thread = threading.Thread(
+            target=lambda: self._capture_call(
+                outcome,
+                "music",
+                lambda: self.manager.refresh_favorite_music(generation_id),
+            )
+        )
+        thread.start()
+        for _ in range(100):
+            if len(self.factory.instances) >= 2:
+                break
+            time.sleep(0.01)
+        old_manager = self.factory.instances[1]
+        self.assertTrue(old_manager.start_started.wait(timeout=1))
+
+        with self.manager._state_lock:
+            runtime = self.manager._runtime
+            old_runtime = runtime.collectors[CollectorType.FAVORITE_MUSIC]
+            old_instance_id = old_runtime.instance_id
+            replacement_manager = self.factory()
+            replacement_manager.start_upload(self.upload_payload)
+            replacement = type(old_runtime)(
+                collector_type=CollectorType.FAVORITE_MUSIC,
+                manager=replacement_manager,
+                instance_id="music-replacement",
+                session_id=replacement_manager.session_id,
+                fixed_scope="",
+            )
+            runtime.collectors[CollectorType.FAVORITE_MUSIC] = replacement
+            runtime.generation.activate_collector(
+                CollectorType.FAVORITE_MUSIC,
+                instance_id=replacement.instance_id,
+                session_id=replacement.session_id,
+            )
+
+        old_manager.release_start.set()
+        thread.join(timeout=1)
+
+        self.assertFalse(thread.is_alive())
+        error = outcome["music_error"]
+        self.assertEqual(str(error), "login_required")
+        self.assertEqual(
+            error.to_public_action_result()["collectorInstanceId"],
+            old_instance_id,
+        )
+        status = self.manager.status(generation_id)
+        self.assertEqual(status["collectors"]["favorite_music"], "active")
+        self.assertEqual(
+            status["collectorInstanceIds"]["favorite_music"],
+            "music-replacement",
+        )
+
+    def test_replaced_instance_candidate_normalization_error_keeps_old_instance(self):
+        """候选规范化发生在替换后时，失败 envelope 仍绑定动作旧实例。"""
+
+        class InvalidCandidate:
+            def __iter__(self):
+                raise RuntimeError("Cookie=secret DOM=<html>private</html>")
+
+        generation_id = self.manager.begin_generation(self.upload_payload)[
+            "setupGenerationId"
+        ]
+        old_manager = self.factory.instances[0]
+        old_manager.release_location = threading.Event()
+        old_manager.location_result_override = [InvalidCandidate()]
+        outcome: dict[str, object] = {}
+        thread = threading.Thread(
+            target=lambda: self._capture_call(
+                outcome,
+                "search",
+                lambda: self.manager.search_locations(
+                    generation_id, "侨港风情街", "domestic"
+                ),
+            )
+        )
+        thread.start()
+        self.assertTrue(old_manager.location_started.wait(timeout=1))
+
+        with self.manager._state_lock:
+            runtime = self.manager._runtime
+            old_runtime = runtime.collectors[CollectorType.DOMESTIC_LOCATION]
+            old_instance_id = old_runtime.instance_id
+            replacement_manager = self.factory()
+            replacement_manager.start_upload(self.upload_payload)
+            replacement = type(old_runtime)(
+                collector_type=CollectorType.DOMESTIC_LOCATION,
+                manager=replacement_manager,
+                instance_id="normalization-replacement",
+                session_id=replacement_manager.session_id,
+                fixed_scope="domestic",
+            )
+            runtime.collectors[CollectorType.DOMESTIC_LOCATION] = replacement
+            runtime.generation.activate_collector(
+                CollectorType.DOMESTIC_LOCATION,
+                instance_id=replacement.instance_id,
+                session_id=replacement.session_id,
+            )
+
+        old_manager.release_location.set()
+        thread.join(timeout=1)
+
+        self.assertFalse(thread.is_alive())
+        error = outcome["search_error"]
+        self.assertEqual(str(error), "stale_result_discarded")
+        self.assertEqual(
+            error.to_public_action_result()["collectorInstanceId"],
+            old_instance_id,
+        )
+        self.assertNotIn("secret", str(error.to_public_action_result()))
+        status = self.manager.status(generation_id)
+        self.assertEqual(status["collectors"]["domestic_location"], "active")
+        self.assertEqual(
+            status["collectorInstanceIds"]["domestic_location"],
+            "normalization-replacement",
         )
 
     def test_start_activation_instance_mismatch_discards_and_closes_own_session(self):
