@@ -7227,6 +7227,277 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
                     on_finished()
             return True
 
+    @staticmethod
+    def _collector_status(
+        *,
+        domestic: str = "active",
+        music: str = "not_started",
+        local: str = "not_started",
+        error_code: str = "",
+    ) -> dict:
+        """构造不含底层会话标识的完整 UI 采集状态。"""
+
+        status = {
+            "setupGenerationId": "generation-a",
+            "generationState": "collecting",
+            "collectors": {
+                "domestic_location": domestic,
+                "favorite_music": music,
+                "local_location": local,
+            },
+            "collectorInstanceIds": {
+                "domestic_location": "domestic-a" if domestic != "not_started" else "",
+                "favorite_music": "music-a" if music != "not_started" else "",
+                "local_location": "local-a" if local != "not_started" else "",
+            },
+        }
+        if local != "not_started" or error_code:
+            status["collectorDetails"] = {
+                "local_location": {
+                    "state": local,
+                    "candidateCount": 0,
+                    "durationMs": 37,
+                    "errorCode": error_code,
+                }
+            }
+        return status
+
+    def test_enter_platform_settings_starts_isolated_generation_without_publish_upload(self) -> None:
+        """进入设置页只建立采集代际，不能把用户视频变成共享发布会话。"""
+
+        self.page._selected_video_indexes = [1, 2]
+        payload = {
+            "accountList": ["douyin-setup.json"],
+            "fileList": ["/tmp/user-first.mp4"],
+            "title": "批量共享标题",
+            "description": "批量共享文案",
+            "tags": [],
+        }
+        self.page.runner = self._InlineRunner()
+        with patch.object(self.page, "_batch_content_is_valid", return_value=True), patch.object(
+            self.page, "collect_upload_payload", return_value=payload
+        ), patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.begin_generation",
+            return_value=self._collector_status(),
+        ) as begin, patch(
+            "ui.douyin_commerce_page.douyin_commerce_session.commerce_session_manager.start_upload"
+        ) as legacy_upload:
+            self.page.continue_after_content()
+
+        begin.assert_called_once()
+        legacy_upload.assert_not_called()
+        self.assertEqual(self.page._setup_generation_id, "generation-a")
+        self.assertEqual(self.page._session_id, "")
+        self.assertEqual(self.page.pages.currentIndex(), 1)
+        self.assertEqual(self.page.domestic_collector_status.text(), "国内地点：可用")
+        self.assertEqual(self.page.music_collector_status.text(), "收藏音乐：点击刷新后启动")
+        self.assertEqual(self.page.local_collector_status.text(), "本地点：首次搜索时启动")
+
+    def test_music_location_and_declaration_are_staged_without_legacy_platform_writes(self) -> None:
+        """采集页选择只更新本批公开字段，最终执行器才重新核验并写入。"""
+
+        self.page._selected_video_indexes = [1]
+        self.page._setup_generation_id = "generation-a"
+        music = {
+            "musicId": "music-1",
+            "title": "收藏歌",
+            "creator": "作者",
+            "duration": "00:30",
+            "privateMarker": "不得进入本地载荷",
+        }
+        location = {
+            "poiId": "poi-1",
+            "name": "夜南香北京烤鸭",
+            "address": "陕西省安康市汉滨区江北办富民街2号",
+            "distance": "2km",
+            "privateMarker": "不得进入本地载荷",
+        }
+
+        with patch.object(
+            douyin_commerce_session.commerce_session_manager,
+            "select_favorite_music",
+        ) as select_music, patch.object(
+            douyin_commerce_session.commerce_session_manager,
+            "select_cached_favorite_music",
+        ) as select_cached, patch.object(
+            douyin_commerce_session.commerce_session_manager,
+            "apply_location",
+        ) as apply_location, patch.object(
+            douyin_commerce_session.commerce_session_manager,
+            "select_content_declaration",
+        ) as select_declaration:
+            self.page._stage_music_selection(music)
+            self.page._stage_location_selection(location)
+            self.page._stage_declaration_selection("内容由AI生成")
+
+        select_music.assert_not_called()
+        select_cached.assert_not_called()
+        apply_location.assert_not_called()
+        select_declaration.assert_not_called()
+        self.assertNotIn("privateMarker", self.page._selected_music)
+        self.assertNotIn("privateMarker", self.page._selected_location_data)
+        self.assertEqual(self.page._selected_location_data["locationScope"], "domestic")
+        self.assertEqual(self.page._confirmed_declaration, "内容由AI生成")
+        self.assertTrue(self.page._staged_music_confirmed)
+        self.assertTrue(self.page._staged_location_confirmed)
+        self.assertTrue(self.page._staged_declaration_confirmed)
+        self.assertIn("发布时重新核验", self.page.music_status.text())
+
+    def test_failed_local_collector_has_one_retry_slot_and_rejects_stale_result(self) -> None:
+        """只重试失败采集器；旧代际回调不得覆盖当前 UI。"""
+
+        self.page.runner = self._InlineRunner()
+        self.page._setup_generation_id = "generation-a"
+        self.page._selected_music = {"musicId": "music-1", "title": "收藏歌"}
+        self.page._batch_location_searches["__shared_location_search__"] = {
+            "scope": "domestic",
+            "keyword": "夜南香",
+            "candidates": [{"poiId": "poi-domestic", "name": "国内候选", "address": "完整地址"}],
+        }
+        failed = self._collector_status(local="failed", error_code="candidate_empty")
+        self.page._render_collector_status(failed)
+
+        retried = self._collector_status(local="active")
+        with patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.retry_collector",
+            return_value=retried,
+        ) as retry:
+            self.page._retry_last_failed_collector()
+
+        retry.assert_called_once_with("generation-a", "local_location")
+        self.assertEqual(self.page._selected_music["musicId"], "music-1")
+        self.assertEqual(
+            self.page._batch_location_searches["__shared_location_search__"]["candidates"][0]["poiId"],
+            "poi-domestic",
+        )
+        self.assertTrue(self.page.retry_collector_button.isHidden())
+
+        self.page._setup_generation_id = "generation-b"
+        self.page._setup_generation_succeeded(self._collector_status())
+        self.assertEqual(self.page._setup_generation_id, "generation-b")
+
+    def test_abandon_setup_generation_clears_only_current_batch_platform_choices(self) -> None:
+        """放弃代际关闭采集器并清本批选择，但保留内容输入和本地缓存。"""
+
+        self.page._setup_generation_id = "generation-a"
+        self.page._selected_music = {"musicId": "music-1", "title": "收藏歌"}
+        self.page._batch_locations = {"/tmp/a.mp4": {"poiId": "poi-1"}}
+        self.page._confirmed_declaration = "内容由AI生成"
+        self.page._staged_music_confirmed = True
+        self.page._staged_location_confirmed = True
+        self.page._staged_declaration_confirmed = True
+        self.page.title_input.setText("仍需保留的标题")
+
+        with patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.close_generation"
+        ) as close_generation, patch(
+            "ui.douyin_commerce_page.douyin_commerce_draft_service.load_content_draft",
+            return_value=None,
+        ):
+            self.page._abandon_session(silent=True)
+
+        close_generation.assert_called_once_with("generation-a", reason="abandoned")
+        self.assertEqual(self.page._setup_generation_id, "")
+        self.assertIsNone(self.page._selected_music)
+        self.assertEqual(self.page._batch_locations, {})
+        self.assertEqual(self.page._confirmed_declaration, "")
+        self.assertFalse(self.page._staged_music_confirmed)
+        self.assertFalse(self.page._staged_location_confirmed)
+        self.assertFalse(self.page._staged_declaration_confirmed)
+        self.assertEqual(self.page.title_input.text(), "仍需保留的标题")
+
+    def test_fully_published_batch_clears_current_platform_choices(self) -> None:
+        """整批有明确发布回执后，当前批选择不得自动沿用到下一批。"""
+
+        self.page._selected_music = {"musicId": "music-1", "title": "收藏歌"}
+        self.page._batch_locations = {"/tmp/a.mp4": {"poiId": "poi-1"}}
+        self.page._confirmed_declaration = "内容由AI生成"
+        self.page._staged_music_confirmed = True
+        self.page._staged_location_confirmed = True
+        self.page._staged_declaration_confirmed = True
+
+        with patch("ui.douyin_commerce_page.QMessageBox.information"):
+            self.page._batch_publish_succeeded([{"index": 0, "status": "published"}])
+
+        self.assertIsNone(self.page._selected_music)
+        self.assertEqual(self.page._batch_locations, {})
+        self.assertEqual(self.page._confirmed_declaration, "")
+        self.assertFalse(self.page._staged_music_confirmed)
+        self.assertFalse(self.page._staged_location_confirmed)
+        self.assertFalse(self.page._staged_declaration_confirmed)
+
+    def test_music_domestic_and_local_collectors_accept_any_order_in_one_generation(self) -> None:
+        """三种操作顺序都复用同一代际，且不会清空已暂存的独立选择。"""
+
+        candidate = {"musicId": "music-1", "title": "收藏歌", "creator": "作者", "duration": "00:30"}
+        location = {"poiId": "poi-1", "name": "夜南香", "address": "陕西省安康市完整地址"}
+        active = self._collector_status(music="active", local="active")
+        orders = (
+            ("music", "domestic", "local"),
+            ("domestic", "music", "local"),
+            ("local", "domestic", "music"),
+        )
+
+        for order in orders:
+            with self.subTest(order=order):
+                self.page.runner = self._InlineRunner()
+                self.page._setup_generation_id = "generation-a"
+                self.page._stage_declaration_selection("内容由AI生成")
+                with patch(
+                    "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.refresh_favorite_music",
+                    return_value=[candidate],
+                ) as refresh_music, patch(
+                    "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.search_locations",
+                    return_value=[location],
+                ) as search_locations, patch(
+                    "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.status",
+                    return_value=active,
+                ):
+                    for action in order:
+                        if action == "music":
+                            self.page._refresh_favorite_music_candidates()
+                            self.page._stage_music_selection(candidate)
+                        else:
+                            self.page._search_batch_locations(action, "夜南香")
+
+                if "music" in order:
+                    refresh_music.assert_called_once_with("generation-a")
+                self.assertEqual(
+                    [item.args for item in search_locations.call_args_list],
+                    [
+                        ("generation-a", "夜南香", action)
+                        for action in order
+                        if action in {"domestic", "local"}
+                    ],
+                )
+                self.assertEqual(self.page._selected_music["musicId"], "music-1")
+                self.assertEqual(self.page._confirmed_declaration, "内容由AI生成")
+
+    def test_late_collector_instance_callback_cannot_write_current_candidates(self) -> None:
+        """同代际旧实例回调也必须丢弃，不能只检查 generationId。"""
+
+        self.page._setup_generation_id = "generation-a"
+        self.page._collector_action_tokens["favorite_music"] = 4
+        accepted: list[object] = []
+        current = self._collector_status(music="active")
+        current["collectorInstanceIds"]["favorite_music"] = "music-new"
+        stale = {
+            "setupGenerationId": "generation-a",
+            "collectorInstanceId": "music-old",
+            "candidates": [{"musicId": "stale"}],
+        }
+
+        with patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.status",
+            return_value=current,
+        ):
+            self.page._collector_action_succeeded(
+                "generation-a", "favorite_music", 4, stale, accepted.append
+            )
+
+        self.assertEqual(accepted, [])
+        self.assertEqual(self.page._music_candidates, [])
+
     class _BatchTaskStore:
         """批量执行器所需的最小内存任务存储，不触碰本机任务库。"""
 
@@ -7954,8 +8225,8 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.assertEqual(self.page.music_combo.count(), 2)
         self.assertEqual(self.page.music_combo.itemData(1)["musicId"], "m-1")
 
-    def test_batch_content_preparation_starts_one_live_setup_session(self) -> None:
-        """批量平台设置必须先有一个真实编辑会话作为音乐和地点数据源。"""
+    def test_batch_content_preparation_starts_one_isolated_setup_generation(self) -> None:
+        """批量平台设置只建立采集代际，不复用正式发布编辑会话。"""
 
         self.page._selected_video_indexes = [1, 2]
         self.page._session_id = ""
@@ -7970,10 +8241,13 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             self.page, "_batch_content_change_kind", return_value="reupload"
         ), patch.object(
             self.page, "collect_upload_payload", return_value=setup_payload
-        ), patch.object(self.page, "start_upload") as start_upload:
+        ), patch.object(self.page, "_start_setup_generation") as start_generation, patch.object(
+            self.page, "start_upload"
+        ) as start_upload:
             self.page.continue_after_content()
 
-        start_upload.assert_called_once_with(setup_payload)
+        start_generation.assert_called_once_with(setup_payload)
+        start_upload.assert_not_called()
 
     def test_batch_default_declaration_and_schedule_share_the_left_platform_column(self) -> None:
         """批量默认无需声明；发布方式与间隔位于声明下方的同一共享区。"""
@@ -8313,7 +8587,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             )
             self.assertTrue(self.page._batch_preflight_fingerprint)
 
-    def test_batch_shared_content_uses_sync_only_for_live_matching_editor_session(self) -> None:
+    def test_batch_shared_content_replaces_setup_generation_without_legacy_sync(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             video = Path(root) / "one.mp4"
             video.write_bytes(b"offline-video")
@@ -8333,10 +8607,13 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
 
             with patch.object(self.page, "_start_content_sync") as synchronize, patch.object(
                 self.page, "start_upload"
-            ) as upload:
+            ) as upload, patch.object(
+                self.page, "_start_setup_generation"
+            ) as start_generation:
                 self.page.continue_after_content()
 
-            synchronize.assert_called_once()
+            start_generation.assert_called_once()
+            synchronize.assert_not_called()
             upload.assert_not_called()
             self.page._session_id = ""
             self.assertEqual(self.page._batch_content_change_kind(), "reupload")

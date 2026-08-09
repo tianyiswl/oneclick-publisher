@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
 """抖音带货的分步桌面工作流。
 
-抖音的音乐、位置和作品内容声明只能在视频上传后的编辑页完成。本页因此不是
-把所有字段堆在一个表单，而是明确分为：内容准备 → 同一编辑会话中的音乐、定位、
-作品声明与定时 → 预检与提交。一次上传对应
-一个仅内存中的受控编辑会话；不保存草稿，也不会在没有最终确认时点击发表。
+抖音的音乐与位置候选由三个隔离采集器读取；采集页只保存公开候选和用户选择，
+不把采集器会话当作正式发布会话，也不即时写入音乐、地点或作品声明。最终执行器
+会为每条视频重新进入正式页核验并应用；没有最终确认时不会点击发表。
 """
 
 from __future__ import annotations
@@ -13,6 +12,7 @@ from datetime import datetime, timedelta
 import logging
 from pathlib import Path
 import re
+from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
 from PyQt6.QtCore import QDate, QPoint, QSize, QTime, QTimer, Qt, pyqtSignal
@@ -52,6 +52,7 @@ from app_core import (
     account_service,
     douyin_commerce_batch_draft_service,
     douyin_commerce_batch_service,
+    douyin_commerce_collectors,
     douyin_commerce_draft_service,
     douyin_commerce_service,
     douyin_commerce_session,
@@ -413,9 +414,8 @@ class DouyinCommercePage(QWidget):
 
     request_account_management = pyqtSignal()
 
-    # 用户看到的是两个配置阶段：先在本机准备内容，视频上传后再进入同一编辑会话
-    # 完成平台设置。音乐、定位、声明可任意先后选择；每次平台写入仍会串行回读，
-    # 只是不用四张割裂的表单页强制用户按界面顺序完成。
+    # 用户先在本机准备内容，再进入隔离采集页。音乐、定位、声明可任意先后选择；
+    # 本页仅本地暂存，正式发布时才逐条重新核验并应用。
     _STEPS = ("内容准备", "平台设置", "检查与提交")
     _STEP_HINTS = (
         "选择账号、视频并完成本地内容准备。",
@@ -424,6 +424,8 @@ class DouyinCommercePage(QWidget):
     )
     _PLATFORM_STAGE_ORDER = ("blocked", "music", "location", "declaration", "schedule")
     _IMMEDIATE_WRITE_KEY = "douyin_commerce_immediate_write"
+    _COLLECTOR_TASK_KEY = "douyin_commerce_collector_action"
+    _SETUP_GENERATION_TASK_KEY = "douyin_commerce_setup_generation"
     _DEFAULT_CONTENT_DECLARATION = "无需添加自主声明"
     _DISABLED_CONTENT_DECLARATIONS = frozenset({"内容为转载信息"})
     _BATCH_EDITOR_SESSION_ENDED_HINT = "编辑会话已结束；预检将为每条视频重新建立上传会话"
@@ -466,6 +468,20 @@ class DouyinCommercePage(QWidget):
         self.setObjectName("pageRoot")
         self.runner = BackgroundTaskRunner(self)
         self._session_id = ""
+        # 平台设置采集代际与正式发布会话严格分离。这里永远不保存三个
+        # 采集器内部的 sessionId，只保留协调器公开的代际和实例状态。
+        self._setup_generation_id = ""
+        self._collector_status: dict[str, object] = {}
+        self._last_failed_collector_type = ""
+        self._staged_music_confirmed = False
+        self._staged_location_confirmed = False
+        self._staged_declaration_confirmed = False
+        self._setup_start_token = 0
+        self._collector_action_tokens = {
+            "domestic_location": 0,
+            "favorite_music": 0,
+            "local_location": 0,
+        }
         self._music_candidates: list[dict[str, str]] = []
         self._music_candidate_source = ""
         self._selected_music: dict[str, str] | None = None
@@ -1179,6 +1195,29 @@ class DouyinCommercePage(QWidget):
         self.platform_back_button.setObjectName("douyinCommerceBackToContent")
         self.platform_back_button.clicked.connect(lambda: self._go_to_step(0))
 
+        collector_status_bar = QFrame()
+        collector_status_bar.setObjectName("douyinCommerceCollectorStatusBar")
+        collector_status_layout = QHBoxLayout(collector_status_bar)
+        collector_status_layout.setContentsMargins(14, 9, 14, 9)
+        collector_status_layout.setSpacing(14)
+        self.domestic_collector_status = QLabel("国内地点：等待进入设置")
+        self.music_collector_status = QLabel("收藏音乐：点击刷新后启动")
+        self.local_collector_status = QLabel("本地点：首次搜索时启动")
+        for status_label in (
+            self.domestic_collector_status,
+            self.music_collector_status,
+            self.local_collector_status,
+        ):
+            status_label.setObjectName("douyinCommerceCollectorStatus")
+            status_label.setWordWrap(True)
+            collector_status_layout.addWidget(status_label, 1)
+        self.retry_collector_button = button("重试采集器", variant="secondary", compact=True)
+        self.retry_collector_button.setObjectName("douyinCommerceRetryCollector")
+        self.retry_collector_button.setVisible(False)
+        self.retry_collector_button.clicked.connect(self._retry_last_failed_collector)
+        collector_status_layout.addWidget(self.retry_collector_button)
+        layout.addWidget(collector_status_bar)
+
         workspace = QFrame()
         workspace.setObjectName("douyinCommercePlatformWorkspace")
         columns = QGridLayout(workspace)
@@ -1433,7 +1472,7 @@ class DouyinCommercePage(QWidget):
     def _search_batch_locations(self, scope: object, keyword: object) -> None:
         """用一次设置会话读取所有视频共用的官方地点候选。"""
 
-        if not self._session_id:
+        if not self._setup_generation_id and not self._session_id:
             self._set_batch_location_feedback("请先完成内容准备并等待设置会话就绪")
             return
         try:
@@ -1451,6 +1490,29 @@ class DouyinCommercePage(QWidget):
             "candidates": [],
         }
         self._set_batch_location_feedback("正在读取抖音地点候选…")
+        if self._setup_generation_id:
+            generation_id = self._setup_generation_id
+            collector_type = (
+                "domestic_location"
+                if normalized_scope == douyin_commerce_service.LOCATION_SCOPE_DOMESTIC
+                else "local_location"
+            )
+            started = self._run_collector_action(
+                collector_type,
+                lambda: douyin_commerce_collectors.commerce_collector_manager.search_locations(
+                    generation_id, normalized_keyword, normalized_scope
+                ),
+                lambda rows: self._batch_location_search_succeeded(
+                    normalized_scope,
+                    normalized_keyword,
+                    rows if isinstance(rows, list) else [],
+                ),
+            )
+            if not started:
+                self._set_batch_location_feedback(
+                    "地点搜索任务未启动，请等待当前操作结束后重试"
+                )
+            return
         session_id = self._session_id
         started = self._start_immediate_write(
             "batch_location_search",
@@ -1517,6 +1579,7 @@ class DouyinCommercePage(QWidget):
         if not self._save_batch_location_candidate(path, scope, candidate):
             self._set_batch_location_feedback("地点身份不完整，未保存")
             return
+        self._staged_location_confirmed = bool(self._batch_locations)
         self._set_batch_location_feedback("已绑定地点；其他视频可继续设置")
         self._clear_stage_error("location")
         self._render_batch_item_rows()
@@ -1596,7 +1659,7 @@ class DouyinCommercePage(QWidget):
 
         if not hasattr(self, "batch_location_scope_combo"):
             return
-        can_search = bool(self._session_id) and not self._busy()
+        can_search = bool(self._setup_generation_id or self._session_id) and not self._busy()
         self.batch_location_scope_combo.setEnabled(can_search)
         self.batch_location_keyword.setEnabled(can_search)
         self.batch_location_search_button.setEnabled(can_search)
@@ -3076,7 +3139,10 @@ class DouyinCommercePage(QWidget):
         self._preflight_fingerprint = ""
         self._sync_view()
         if location:
-            self._start_location_write(location)
+            if self._setup_generation_id:
+                self._stage_location_selection(location)
+            else:
+                self._start_location_write(location)
 
     def change_location_selection(self) -> None:
         """放弃已选地点，要求从当前编辑页重新读取候选。"""
@@ -3105,6 +3171,9 @@ class DouyinCommercePage(QWidget):
         if not isinstance(candidate, dict):
             self._load_favorite_music_candidates()
             return
+        if self._setup_generation_id:
+            self._stage_music_selection(candidate)
+            return
         if self.selected_video_count() >= 1:
             self._select_batch_music_locally(candidate)
             return
@@ -3113,11 +3182,54 @@ class DouyinCommercePage(QWidget):
     def _select_batch_music_locally(self, candidate: dict[str, str]) -> None:
         """保存批量共享音乐选择，不在内容准备阶段创建或写入编辑会话。"""
 
-        self._selected_music = dict(candidate)
+        self._stage_music_selection(candidate)
+
+    def _stage_music_selection(self, candidate: dict[str, str]) -> None:
+        """仅保存音乐公开身份，发布执行时再进入正式页核验。"""
+
+        if not isinstance(candidate, dict):
+            return
+        staged = {
+            key: _normalized(candidate.get(key))
+            for key in ("musicId", "title", "creator", "duration")
+        }
+        if not staged["musicId"] and not staged["title"]:
+            return
+        self._selected_music = staged
         self._pending_music = None
+        self._staged_music_confirmed = True
         self._batch_preflight_fingerprint = ""
+        self._preflight_fingerprint = ""
         self._restore_music_combo(self._selected_music)
-        self.music_status.setText("")
+        self.music_status.setText("本地已选择，发布时重新核验")
+        self.music_status.setVisible(True)
+        self._sync_view()
+
+    def _stage_location_selection(self, candidate: dict[str, str]) -> None:
+        """只暂存完整 POI 公开字段，不在采集页调用 apply_location。"""
+
+        if not isinstance(candidate, dict):
+            return
+        scope = _normalized(candidate.get("locationScope")) or self._selected_location_scope()
+        if scope not in {
+            douyin_commerce_service.LOCATION_SCOPE_DOMESTIC,
+            douyin_commerce_service.LOCATION_SCOPE_LOCAL,
+        }:
+            return
+        staged = {
+            key: _normalized(candidate.get(key))
+            for key in ("poiId", "name", "address", "distance")
+        }
+        if not staged["poiId"] or not staged["name"] or not staged["address"]:
+            return
+        staged["locationScope"] = scope
+        self._selected_location_data = staged
+        self._pending_location = None
+        self._location_applied = False
+        self._staged_location_confirmed = True
+        self.location_candidate_card.setText(self._location_display(staged))
+        self.location_status.setText("本地已选择，发布时重新核验")
+        self._preflight_fingerprint = ""
         self._sync_view()
 
     def _toggle_music_candidate_list(self) -> None:
@@ -3135,6 +3247,9 @@ class DouyinCommercePage(QWidget):
         if not isinstance(data, dict):
             return
         self.music_candidate_list.setVisible(False)
+        if self._setup_generation_id:
+            self._stage_music_selection(data)
+            return
         if self.selected_video_count() >= 1:
             self._select_batch_music_locally(data)
             return
@@ -3145,14 +3260,29 @@ class DouyinCommercePage(QWidget):
 
         if not checked or self._suppress_declaration_signal:
             return
+        if self._setup_generation_id:
+            self._stage_declaration_selection(declaration)
+            return
         if self.selected_video_count() >= 1:
-            self._confirmed_declaration = _normalized(declaration)
-            self._declaration_applied = False
-            self._batch_preflight_fingerprint = ""
-            self.declaration_status.setText("")
-            self._sync_view()
+            self._stage_declaration_selection(declaration)
             return
         self._start_declaration_write(declaration)
+
+    def _stage_declaration_selection(self, value: str) -> None:
+        """规范化并保存本批声明，不调用旧编辑会话写入接口。"""
+
+        declaration = _normalized(value)
+        if declaration not in self.declaration_buttons:
+            return
+        self._set_selected_declaration(declaration)
+        self._confirmed_declaration = declaration
+        self._pending_declaration = ""
+        self._declaration_applied = False
+        self._staged_declaration_confirmed = True
+        self._batch_preflight_fingerprint = ""
+        self._preflight_fingerprint = ""
+        self.declaration_status.setText("本地已选择，发布时重新核验")
+        self._sync_view()
 
     def _clear_declaration(self, message: str) -> None:
         self._set_selected_declaration(self._DEFAULT_CONTENT_DECLARATION)
@@ -3395,7 +3525,7 @@ class DouyinCommercePage(QWidget):
             self._set_widget_property(self.step_cards[index], "stepState", state)
         self.progress_context_label.setText(self._STEP_HINTS[current_step])
         if hasattr(self, "review_back_button"):
-            has_editor_session = bool(self._session_id)
+            has_editor_session = bool(self._session_id or self._setup_generation_id)
             self.review_back_button.setText(
                 "返回平台设置" if has_editor_session else "开始新内容"
             )
@@ -3438,7 +3568,9 @@ class DouyinCommercePage(QWidget):
             "primary" if current_step == 1 else "secondary",
         )
         self.content_stage_button.setEnabled(not self._busy())
-        self.platform_stage_button.setEnabled(bool(self._session_id) and not self._busy())
+        self.platform_stage_button.setEnabled(
+            bool(self._session_id or self._setup_generation_id) and not self._busy()
+        )
         if current_step == 0:
             if self._busy():
                 dock_state = "running"
@@ -3469,8 +3601,10 @@ class DouyinCommercePage(QWidget):
             self._set_widget_property(
                 self.operation_dock_status, "operationState", dock_state
             )
-        self.abandon_button.setEnabled(bool(self._session_id) and not self._busy())
-        self.abandon_button.setVisible(bool(self._session_id))
+        self.abandon_button.setEnabled(
+            bool(self._session_id or self._setup_generation_id) and not self._busy()
+        )
+        self.abandon_button.setVisible(bool(self._session_id or self._setup_generation_id))
         self.save_content_button.setEnabled(not self._busy())
         self.restore_content_button.setEnabled(
             self._saved_content_available and not self._session_id and not self._busy()
@@ -3576,6 +3710,8 @@ class DouyinCommercePage(QWidget):
 
         busy = self._busy()
         batch_mode = self.selected_video_count() >= 1
+        if self.retry_collector_button.isVisible():
+            self.retry_collector_button.setEnabled(not busy)
         if hasattr(self, "batch_item_settings_stage"):
             self.batch_item_settings_stage.setVisible(batch_mode)
             self.location_stage.setVisible(not batch_mode)
@@ -3585,7 +3721,9 @@ class DouyinCommercePage(QWidget):
                 self._sync_batch_location_controls()
                 if self._batch_item_rows_signature != self._batch_item_rows_state_signature():
                     self._render_batch_item_rows()
-        session_ready = bool(self._session_id) and self._content_change_kind() == "none"
+        session_ready = bool(self._setup_generation_id) or (
+            bool(self._session_id) and self._content_change_kind() == "none"
+        )
         self.platform_back_button.setEnabled(not busy)
         if self._session_id and self._content_change_kind() == "sync":
             self.platform_session_status.setText("内容已修改，请返回内容同步")
@@ -3617,7 +3755,11 @@ class DouyinCommercePage(QWidget):
         self.music_refresh_button.setEnabled(can_choose_music)
         if not busy:
             if batch_mode and self._selected_music:
-                self.music_status.setText("")
+                self.music_status.setText(
+                    "本地已选择，发布时重新核验"
+                    if self._staged_music_confirmed
+                    else ""
+                )
             elif not session_ready:
                 self.music_status.setText("上传后选择")
             elif self._selected_music:
@@ -3627,7 +3769,8 @@ class DouyinCommercePage(QWidget):
             else:
                 self.music_status.setText("暂无本地收藏音乐，可点击刷新")
         self.music_status.setVisible(
-            self._immediate_write_kind
+            self._staged_music_confirmed
+            or self._immediate_write_kind
             in {"music", "music_read", "music_cache", "music_refresh"}
         )
         self.music_card.setVisible(False)
@@ -3751,6 +3894,8 @@ class DouyinCommercePage(QWidget):
 
     def _step_complete(self, step: int) -> bool:
         if step == 0:
+            if self.selected_video_count() >= 1:
+                return bool(self._setup_generation_id)
             return bool(self._session_id) and self._content_change_kind() == "none"
         if step == 1:
             return self._can_review()
@@ -3764,6 +3909,8 @@ class DouyinCommercePage(QWidget):
             for key in (
                 "douyin_commerce_upload",
                 "douyin_commerce_sync_content",
+                self._SETUP_GENERATION_TASK_KEY,
+                self._COLLECTOR_TASK_KEY,
                 self._IMMEDIATE_WRITE_KEY,
                 "douyin_commerce_preflight",
                 "douyin_commerce_submit",
@@ -4269,6 +4416,8 @@ class DouyinCommercePage(QWidget):
         self._batch_result_feedback = "；".join(parts) + "。"
         self.validation_label.setText(self._batch_result_feedback)
         _LOGGER.info("抖音带货批量结果：%s", self._batch_result_feedback)
+        if rows and len(published) == len(rows):
+            self._clear_current_batch_platform_choices()
         if failed or waiting or paused or ambiguous:
             QMessageBox.warning(self, "抖音带货批量提交结果", self._batch_result_feedback)
         else:
@@ -4475,34 +4624,356 @@ class DouyinCommercePage(QWidget):
         QApplication.clipboard().setText(content)
         self.copy_batch_publish_info_button.setText("已复制")
 
+    @staticmethod
+    def _public_collector_error_code(value: object) -> str:
+        """只允许固定错误码进入 UI，底层异常全文仅留本机日志。"""
+
+        code = _normalized(value)
+        allowed = {
+            "collector_start_failed",
+            "login_required",
+            "scope_not_confirmed",
+            "candidate_panel_missing",
+            "candidate_ambiguous",
+            "candidate_empty",
+            "rate_limited_or_degraded",
+            "stale_result_discarded",
+            "cleanup_incomplete",
+            "publish_apply_mismatch",
+            "collector_unknown",
+        }
+        return code if code in allowed else "collector_unknown"
+
+    @staticmethod
+    def _collector_detail(status: Mapping[str, Any], collector_type: str) -> dict[str, Any]:
+        collectors = status.get("collectors")
+        raw_state = collectors.get(collector_type) if isinstance(collectors, Mapping) else None
+        detail: dict[str, Any] = (
+            dict(raw_state) if isinstance(raw_state, Mapping) else {"state": raw_state}
+        )
+        details = status.get("collectorDetails")
+        if isinstance(details, Mapping) and isinstance(details.get(collector_type), Mapping):
+            detail.update(dict(details[collector_type]))
+        instances = status.get("collectorInstanceIds")
+        if isinstance(instances, Mapping) and not detail.get("instanceId"):
+            detail["instanceId"] = instances.get(collector_type)
+        return detail
+
+    def _render_collector_status(self, status: Mapping[str, Any]) -> None:
+        """投影三采集器公开状态，不显示代际、实例或底层会话标识。"""
+
+        if not isinstance(status, Mapping):
+            return
+        generation_id = _normalized(status.get("setupGenerationId"))
+        if self._setup_generation_id and generation_id != self._setup_generation_id:
+            return
+        if not generation_id:
+            return
+        self._collector_status = dict(status)
+        labels = {
+            "domestic_location": (self.domestic_collector_status, "国内地点"),
+            "favorite_music": (self.music_collector_status, "收藏音乐"),
+            "local_location": (self.local_collector_status, "本地点"),
+        }
+        defaults = {
+            "domestic_location": "等待进入设置",
+            "favorite_music": "点击刷新后启动",
+            "local_location": "首次搜索时启动",
+        }
+        state_copy = {
+            "starting": "启动中",
+            "active": "可用",
+            "retrying": "重试中",
+            "closing": "正在关闭",
+            "closed": "已关闭",
+        }
+        failed_types: list[str] = []
+        for collector_type, (label, title) in labels.items():
+            detail = self._collector_detail(status, collector_type)
+            state = _normalized(detail.get("state")) or "not_started"
+            if state == "not_started":
+                body = defaults[collector_type]
+            elif state == "failed":
+                error_code = self._public_collector_error_code(detail.get("errorCode"))
+                body = f"失败 · 错误码 {error_code}"
+                failed_types.append(collector_type)
+            else:
+                body = state_copy.get(state, "状态未知")
+            candidate_count = detail.get("candidateCount")
+            duration_ms = detail.get("durationMs")
+            suffixes: list[str] = []
+            if type(candidate_count) is int and candidate_count >= 0:
+                suffixes.append(f"候选 {candidate_count}")
+            if type(duration_ms) is int and duration_ms >= 0:
+                suffixes.append(f"耗时 {duration_ms}ms")
+            if suffixes:
+                body = f"{body} · " + " · ".join(suffixes)
+            label.setText(f"{title}：{body}")
+
+        # 单槽重试：同一时刻只暴露一个明确失败项，不批量重启其他采集器。
+        if failed_types:
+            preferred = self._last_failed_collector_type
+            self._last_failed_collector_type = (
+                preferred if preferred in failed_types else failed_types[0]
+            )
+            retry_copy = {
+                "domestic_location": "重试国内地点",
+                "favorite_music": "重试收藏音乐",
+                "local_location": "重试本地点",
+            }
+            self.retry_collector_button.setText(
+                retry_copy[self._last_failed_collector_type]
+            )
+            self.retry_collector_button.setVisible(True)
+            self.retry_collector_button.setEnabled(not self._busy())
+        else:
+            self._last_failed_collector_type = ""
+            self.retry_collector_button.setVisible(False)
+
+    def _start_setup_generation(self, payload: dict) -> None:
+        """关闭旧代际并建立本次平台设置代际；不创建正式发布会话。"""
+
+        if self.runner.is_running(self._SETUP_GENERATION_TASK_KEY):
+            return
+        old_generation_id = self._setup_generation_id
+        self._setup_start_token += 1
+        start_token = self._setup_start_token
+        self._setup_generation_id = ""
+        self._collector_status = {}
+        self._last_failed_collector_type = ""
+        self.retry_collector_button.setVisible(False)
+        self.platform_review_status.setText("正在准备平台设置采集器…")
+
+        def begin(report):
+            if old_generation_id:
+                douyin_commerce_collectors.commerce_collector_manager.close_generation(
+                    old_generation_id, reason="replaced"
+                )
+            return douyin_commerce_collectors.commerce_collector_manager.begin_generation(
+                dict(payload), on_progress=report
+            )
+
+        started = self.runner.run(
+            self._SETUP_GENERATION_TASK_KEY,
+            with_progress=begin,
+            on_progress=self._set_commerce_progress,
+            on_success=lambda result: self._accept_setup_generation_result(
+                start_token, payload, result
+            ),
+            on_error=lambda message: self._setup_generation_failed(start_token, message),
+            on_finished=self._sync_view,
+        )
+        if not started:
+            self._setup_generation_failed(start_token, "collector_start_failed")
+
+    def _accept_setup_generation_result(
+        self, start_token: int, payload: Mapping[str, Any], result: object
+    ) -> None:
+        if start_token != self._setup_start_token:
+            return
+        self._setup_generation_succeeded(result)
+        result_generation_id = (
+            _normalized(result.get("setupGenerationId"))
+            if isinstance(result, Mapping)
+            else ""
+        )
+        if result_generation_id and result_generation_id == self._setup_generation_id:
+            self._uploaded_editor_payload = dict(payload)
+
+    def _setup_generation_succeeded(self, result: object) -> None:
+        """仅接纳当前、非空且国内采集器已就绪的代际结果。"""
+
+        if not isinstance(result, Mapping):
+            return
+        if _normalized(result.get("status")) == "needs_login" or _normalized(
+            result.get("generationState")
+        ) == "paused_for_login":
+            self._handle_login_required()
+            return
+        generation_id = _normalized(result.get("setupGenerationId"))
+        if not generation_id:
+            self._setup_generation_failed(self._setup_start_token, "collector_start_failed")
+            return
+        if self._setup_generation_id and generation_id != self._setup_generation_id:
+            return
+        domestic = self._collector_detail(result, "domestic_location")
+        if _normalized(domestic.get("state")) != "active":
+            self._setup_generation_failed(self._setup_start_token, "collector_start_failed")
+            return
+        self._clear_commerce_progress()
+        self._setup_generation_id = generation_id
+        self._session_id = ""
+        self._render_collector_status(result)
+        self._clear_stage_error("content")
+        self.content_notice.setVisible(False)
+        self._go_to_step(1)
+
+    def _setup_generation_failed(self, start_token: int, message: object) -> None:
+        if start_token != self._setup_start_token:
+            return
+        self._clear_commerce_progress()
+        code = self._public_collector_error_code(message)
+        if code == "login_required":
+            self._handle_login_required()
+            return
+        self.platform_review_status.setText(f"平台设置采集器未就绪 · 错误码 {code}")
+        self._set_stage_error("content", code)
+        self._sync_view()
+
+    def _run_collector_action(
+        self,
+        collector_type: str,
+        work,
+        on_success,
+    ) -> bool:
+        generation_id = self._setup_generation_id
+        if not generation_id or self.runner.is_running(self._COLLECTOR_TASK_KEY):
+            return False
+        self._collector_action_tokens[collector_type] += 1
+        action_token = self._collector_action_tokens[collector_type]
+        started = self.runner.run(
+            self._COLLECTOR_TASK_KEY,
+            with_progress=lambda _report: work(),
+            on_success=lambda result: self._collector_action_succeeded(
+                generation_id,
+                collector_type,
+                action_token,
+                result,
+                on_success,
+            ),
+            on_error=lambda message: self._collector_action_failed(
+                generation_id, collector_type, action_token, message
+            ),
+            on_finished=self._sync_view,
+        )
+        if not started:
+            self._collector_action_failed(
+                generation_id, collector_type, action_token, "collector_start_failed"
+            )
+        return started
+
+    def _collector_action_succeeded(
+        self,
+        generation_id: str,
+        collector_type: str,
+        action_token: int,
+        result: object,
+        on_success,
+    ) -> None:
+        if (
+            generation_id != self._setup_generation_id
+            or action_token != self._collector_action_tokens.get(collector_type)
+        ):
+            return
+        payload = result
+        result_status: Mapping[str, Any] | None = None
+        if isinstance(result, Mapping) and "setupGenerationId" in result:
+            if _normalized(result.get("setupGenerationId")) != generation_id:
+                return
+            if isinstance(result.get("collectors"), Mapping):
+                result_status = result
+            payload = result.get("candidates", result.get("result", result))
+        if result_status is not None:
+            status = result_status
+        else:
+            try:
+                status = douyin_commerce_collectors.commerce_collector_manager.status(
+                    generation_id
+                )
+            except Exception:
+                return
+        if _normalized(status.get("setupGenerationId")) != generation_id:
+            return
+        result_instance = (
+            _normalized(result.get("collectorInstanceId"))
+            if isinstance(result, Mapping)
+            else ""
+        )
+        current_instance = _normalized(
+            self._collector_detail(status, collector_type).get("instanceId")
+        )
+        if result_instance and result_instance != current_instance:
+            return
+        self._render_collector_status(status)
+        on_success(payload)
+
+    def _collector_action_failed(
+        self,
+        generation_id: str,
+        collector_type: str,
+        action_token: int,
+        message: object,
+    ) -> None:
+        if (
+            generation_id != self._setup_generation_id
+            or action_token != self._collector_action_tokens.get(collector_type)
+        ):
+            return
+        code = self._public_collector_error_code(message)
+        try:
+            status = douyin_commerce_collectors.commerce_collector_manager.status(
+                generation_id
+            )
+        except Exception:
+            status = dict(self._collector_status)
+        collectors = dict(status.get("collectors") or {})
+        collectors[collector_type] = "failed"
+        details = dict(status.get("collectorDetails") or {})
+        detail = dict(details.get(collector_type) or {})
+        detail.update({"state": "failed", "errorCode": code})
+        details[collector_type] = detail
+        status = {**status, "setupGenerationId": generation_id, "collectors": collectors, "collectorDetails": details}
+        self._last_failed_collector_type = collector_type
+        self._render_collector_status(status)
+        _LOGGER.warning(
+            "抖音设置采集失败 collector=%s errorCode=%s", collector_type, code
+        )
+
+    def _retry_last_failed_collector(self) -> None:
+        collector_type = self._last_failed_collector_type
+        generation_id = self._setup_generation_id
+        if not collector_type or not generation_id:
+            return
+
+        def retry_succeeded(status: object) -> None:
+            if not isinstance(status, Mapping):
+                return
+            if collector_type == "favorite_music":
+                self._clear_music_candidates()
+            elif collector_type in {"domestic_location", "local_location"}:
+                target_scope = (
+                    douyin_commerce_service.LOCATION_SCOPE_DOMESTIC
+                    if collector_type == "domestic_location"
+                    else douyin_commerce_service.LOCATION_SCOPE_LOCAL
+                )
+                current = self._batch_location_state()
+                if _normalized(current.get("scope")) == target_scope:
+                    current["candidates"] = []
+                    self._batch_location_searches[_BATCH_SHARED_LOCATION_SEARCH_KEY] = current
+                    self._render_batch_item_rows()
+            self._render_collector_status(status)
+
+        self._run_collector_action(
+            collector_type,
+            lambda: douyin_commerce_collectors.commerce_collector_manager.retry_collector(
+                generation_id, collector_type
+            ),
+            retry_succeeded,
+        )
+
     def continue_after_content(self) -> None:
-        """按内容差异决定无动作、内容同步或完整重新上传。"""
+        """为 1 至 20 条视频统一建立隔离的平台设置采集代际。"""
 
         if self.selected_video_count() >= 1:
             if not self._batch_content_is_valid():
                 QMessageBox.warning(self, "继续", "请选择账号、1 至 20 条视频并填写作品文案。")
                 return
-            change_kind = self._batch_content_change_kind()
-            if change_kind == "sync":
-                try:
-                    payload = self.collect_upload_payload()
-                except (ValueError, douyin_commerce_service.DouyinCommerceError) as exc:
-                    QMessageBox.warning(self, "同步内容", str(exc))
-                    return
-                self._start_content_sync(payload)
-                return
-            if change_kind == "none":
-                self._go_to_step(1)
-                return
-            # 批量平台设置也需要真实数据源：以第一条视频建立一次无头设置
-            # 会话，读取收藏音乐和地点候选。该会话不保存草稿、不提交；最终
-            # 预检/提交仍会为每条视频重新建立并逐条回读编辑页。
             try:
                 payload = self.collect_upload_payload()
             except (ValueError, douyin_commerce_service.DouyinCommerceError) as exc:
                 QMessageBox.warning(self, "继续", str(exc))
                 return
-            self.start_upload(payload)
+            self._start_setup_generation(payload)
             return
 
         try:
@@ -4741,6 +5212,20 @@ class DouyinCommercePage(QWidget):
     def _refresh_favorite_music_candidates(self) -> None:
         """用户明确刷新时才打开当前抖音编辑页的收藏列表。"""
 
+        if self._setup_generation_id:
+            generation_id = self._setup_generation_id
+            self.music_status.setText("正在刷新收藏音乐…")
+            self.music_status.setVisible(True)
+            self._run_collector_action(
+                "favorite_music",
+                lambda: douyin_commerce_collectors.commerce_collector_manager.refresh_favorite_music(
+                    generation_id
+                ),
+                lambda rows: self._show_music_candidates(
+                    rows if isinstance(rows, list) else [], source="collector"
+                ),
+            )
+            return
         if self.selected_video_count() >= 1 and not self._session_id:
             # 没有编辑会话时不能伪造“刷新成功”。引导用户保持在安全的本地
             # 选择阶段，实际平台读取会在后续明确的预检会话内进行，且不提交。
@@ -4813,7 +5298,7 @@ class DouyinCommercePage(QWidget):
     ) -> None:
         self._music_candidates = [dict(item) for item in rows]
         self._music_candidate_source = source if self._music_candidates else ""
-        if self.selected_video_count() >= 1 and source == "session":
+        if self.selected_video_count() >= 1 and source in {"session", "collector"}:
             self._cache_batch_music_candidates(self._music_candidates)
         self._clear_stage_error("music")
         self.music_candidate_list.clear()
@@ -4926,7 +5411,7 @@ class DouyinCommercePage(QWidget):
     def search_locations(self) -> None:
         keyword = self.location_keyword.text()
         scope = self._selected_location_scope()
-        if not self._session_id:
+        if not self._setup_generation_id and not self._session_id:
             QMessageBox.warning(self, "搜索发布定位", "请先完成视频上传。")
             return
         if not scope:
@@ -4935,6 +5420,23 @@ class DouyinCommercePage(QWidget):
         self.location_status.setText(
             f"正在按“{douyin_commerce_service.location_scope_label(scope)}”范围，从当前抖音编辑页读取候选…"
         )
+        if self._setup_generation_id:
+            generation_id = self._setup_generation_id
+            collector_type = (
+                "domestic_location"
+                if scope == douyin_commerce_service.LOCATION_SCOPE_DOMESTIC
+                else "local_location"
+            )
+            self._run_collector_action(
+                collector_type,
+                lambda: douyin_commerce_collectors.commerce_collector_manager.search_locations(
+                    generation_id, keyword, scope
+                ),
+                lambda rows: self._show_locations(
+                    rows if isinstance(rows, list) else []
+                ),
+            )
+            return
         session_id = self._session_id
         self._start_immediate_write(
             "location_search",
@@ -5301,7 +5803,7 @@ class DouyinCommercePage(QWidget):
         self._sync_view()
 
     def abandon_session(self) -> None:
-        if not self._session_id:
+        if not self._session_id and not self._setup_generation_id:
             return
         answer = QMessageBox.question(
             self,
@@ -5335,9 +5837,15 @@ class DouyinCommercePage(QWidget):
 
     def _abandon_session(self, *, silent: bool) -> None:
         session_id = self._session_id
+        generation_id = self._setup_generation_id
         self._session_id = ""
+        self._setup_generation_id = ""
         if session_id:
             douyin_commerce_session.commerce_session_manager.close(session_id)
+        if generation_id:
+            douyin_commerce_collectors.commerce_collector_manager.close_generation(
+                generation_id, reason="abandoned"
+            )
         self._reset_platform_settings_after_abandon()
         self._uploaded_editor_payload = None
         self._pending_upload_payload = None
@@ -5356,6 +5864,15 @@ class DouyinCommercePage(QWidget):
 
         self._clear_music_candidates()
         self._selected_music = None
+        self._collector_status = {}
+        self._last_failed_collector_type = ""
+        self._staged_music_confirmed = False
+        self._staged_location_confirmed = False
+        self._staged_declaration_confirmed = False
+        self.retry_collector_button.setVisible(False)
+        self.domestic_collector_status.setText("国内地点：等待进入设置")
+        self.music_collector_status.setText("收藏音乐：点击刷新后启动")
+        self.local_collector_status.setText("本地点：首次搜索时启动")
         self.music_card.setText("尚未选择收藏音乐")
         self.music_status.setText("本次上传会话已结束")
         self._batch_locations = {}
@@ -5423,6 +5940,30 @@ class DouyinCommercePage(QWidget):
         self._batch_editor_session_ended = False
         for stage in ("music", "location", "declaration", "schedule"):
             self._clear_stage_error(stage)
+
+    def _clear_current_batch_platform_choices(self) -> None:
+        """明确完成后清除本批发布意图，账号候选缓存仍保留在独立缓存层。"""
+
+        self._clear_music_candidates()
+        self._selected_music = None
+        self._pending_music = None
+        self._batch_locations = {}
+        self._batch_location_searches = {}
+        self._batch_schedule_overrides = {}
+        self._locations = []
+        self._selected_location_data = None
+        self._pending_location = None
+        self.location_result_list.clear()
+        self._location_applied = False
+        self._set_selected_declaration(self._DEFAULT_CONTENT_DECLARATION)
+        self._confirmed_declaration = ""
+        self._pending_declaration = ""
+        self._declaration_applied = False
+        self._staged_music_confirmed = False
+        self._staged_location_confirmed = False
+        self._staged_declaration_confirmed = False
+        self._batch_preflight_fingerprint = ""
+        self._preflight_fingerprint = ""
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt 固定事件名
         if self._session_id and not self._busy():
