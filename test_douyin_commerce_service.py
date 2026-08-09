@@ -9629,6 +9629,66 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         )
         self.assertEqual(dropdown.currentIndex(), 1)
 
+    def test_batch_location_placeholder_clears_old_binding_then_next_search_refills(self) -> None:
+        """用户改回“请选择地点”后，旧绑定必须真正清除并允许新搜索重新自动填入。"""
+
+        path = "/tmp/location-reselect.mp4"
+        self.page.video_combo.clear()
+        self.page.video_combo.addItem("请选择视频", None)
+        self.page.video_combo.addItem(
+            "视频 1.mp4",
+            {"id": 1, "storedPath": path, "filename": "视频 1.mp4"},
+        )
+        self.page._selected_video_indexes = [1]
+        account = {"id": 98, "type": 3, "status": 1, "filePath": "douyin-98.json"}
+        self.page.account_combo.clear()
+        self.page.account_combo.addItem("账号", account)
+        old_candidate = {
+            "poiId": "poi-old",
+            "name": "旧地点",
+            "address": "旧地点完整地址",
+        }
+        new_candidate = {
+            "poiId": "poi-new",
+            "name": "新地点",
+            "address": "新地点完整地址",
+        }
+
+        def save_candidate(_account_id, candidate, scope):
+            return {**candidate, "scope": scope, "id": f"preset-{candidate['poiId']}"}
+
+        with patch(
+            "ui.douyin_commerce_page.save_location_preset",
+            side_effect=save_candidate,
+        ) as save:
+            self.page._batch_location_search_succeeded(
+                "domestic", "旧关键词", [old_candidate]
+            )
+            dropdown = self.page.batch_item_rows.widget().findChild(
+                QComboBox, "douyinCommerceBatchLocationCandidates"
+            )
+            self.assertEqual(dropdown.currentData()["poiId"], "poi-old")
+
+            dropdown.setCurrentIndex(0)
+
+            self.assertNotIn(path, self.page._batch_locations)
+            rerendered_dropdown = self.page.batch_item_rows.widget().findChild(
+                QComboBox, "douyinCommerceBatchLocationCandidates"
+            )
+            self.assertEqual(rerendered_dropdown.currentIndex(), 0)
+            self.assertEqual(rerendered_dropdown.currentText(), "请选择地点")
+
+            self.page._batch_location_search_succeeded(
+                "domestic", "新关键词", [new_candidate]
+            )
+
+        self.assertEqual(save.call_count, 2)
+        self.assertEqual(self.page._batch_locations[path]["poiId"], "poi-new")
+        final_dropdown = self.page.batch_item_rows.widget().findChild(
+            QComboBox, "douyinCommerceBatchLocationCandidates"
+        )
+        self.assertEqual(final_dropdown.currentData()["poiId"], "poi-new")
+
     def test_batch_location_selected_value_is_only_shown_in_dropdown(self) -> None:
         """已选地点只保留在下拉框中，避免视频卡片重复显示完整地址。"""
 

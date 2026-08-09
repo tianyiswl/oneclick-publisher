@@ -1481,9 +1481,32 @@ class DouyinCommercePage(QWidget):
             self._batch_locations[path] = dict(preset)
         else:
             self._batch_locations.pop(path, None)
+        self._staged_location_confirmed = bool(self._batch_locations)
         self._batch_preflight_fingerprint = ""
         self._render_batch_item_rows()
         self._sync_view()
+
+    def _batch_location_selection_changed(
+        self,
+        path: str,
+        scope: object,
+        combo: QComboBox,
+        selected_index: int,
+    ) -> None:
+        """同步地点下拉框与本批次绑定。
+
+        “请选择地点”不只是展示占位项；用户主动选回该项时，
+        必须清除数据模型中的旧绑定，让下一次搜索能把该视频
+        重新视为“未选地点”并自动填入新候选。
+        """
+
+        if selected_index <= 0:
+            self._set_batch_location(path, None)
+            self._set_batch_location_feedback(
+                "已清除该视频的地点；再次搜索后会自动填入新地点"
+            )
+            return
+        self._select_batch_location_candidate(path, scope, combo.currentData())
 
     def _batch_location_state(self) -> dict[str, object]:
         """返回本次批量共用的地点搜索状态，不把候选 DOM 写入草稿。"""
@@ -1791,8 +1814,8 @@ class DouyinCommercePage(QWidget):
                 current_index = candidate_combo.count() - 1
             candidate_combo.setCurrentIndex(current_index)
             candidate_combo.currentIndexChanged.connect(
-                lambda selected_index, item_path=path, combo=candidate_combo: selected_index > 0 and self._select_batch_location_candidate(
-                    item_path, state["scope"], combo.currentData()
+                lambda selected_index, item_path=path, combo=candidate_combo: self._batch_location_selection_changed(
+                    item_path, state["scope"], combo, selected_index
                 )
             )
             # 选择地点只更新本地批次配置，不依赖搜索任务是否刚完成；否则
