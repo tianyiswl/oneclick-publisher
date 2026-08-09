@@ -29,10 +29,32 @@ from .douyin_commerce_setup_state import (
 class DouyinCommerceCollectorError(RuntimeError):
     """采集协调器的固定、可公开错误码。"""
 
-    def __init__(self, code: str, *, event_emitted: bool = False) -> None:
+    def __init__(
+        self,
+        code: str,
+        *,
+        event_emitted: bool = False,
+        generation_id: str = "",
+        collector_type: str = "",
+        collector_instance_id: str = "",
+    ) -> None:
         self.code = str(code or "collector_unknown")
         self.event_emitted = event_emitted
+        self.generation_id = str(generation_id or "")
+        self.collector_type = str(collector_type or "")
+        self.collector_instance_id = str(collector_instance_id or "")
         super().__init__(self.code)
+
+    def to_public_action_result(self) -> dict[str, object]:
+        """将动作失败投影为不含底层会话与异常原文的受控结果。"""
+
+        return {
+            "ok": False,
+            "errorCode": self.code,
+            "setupGenerationId": self.generation_id,
+            "collectorType": self.collector_type,
+            "collectorInstanceId": self.collector_instance_id,
+        }
 
 
 @dataclass
@@ -401,7 +423,7 @@ class DouyinCommerceCollectorManager:
 
     def refresh_favorite_music(
         self, generation_id: str
-    ) -> list[dict[str, str]]:
+    ) -> dict[str, object]:
         """在独立音乐会话中懒启动并刷新收藏音乐。"""
 
         generation_id = self._normalize_public_text(
@@ -417,20 +439,25 @@ class DouyinCommerceCollectorManager:
                 lambda: self._refresh_music_action(generation_id, request_id),
             )
         self._action_queue.start(action)
-        return self._wait_public_action(
-            action,
-            generation_id=generation_id,
-            collector_type=CollectorType.FAVORITE_MUSIC,
-            request_id=request_id,
-            action_name="refresh_favorite_music",
-        )
+        try:
+            return self._wait_public_action(
+                action,
+                generation_id=generation_id,
+                collector_type=CollectorType.FAVORITE_MUSIC,
+                request_id=request_id,
+                action_name="refresh_favorite_music",
+            )
+        except DouyinCommerceCollectorError as error:
+            raise self._contextual_action_error(
+                error, generation_id, CollectorType.FAVORITE_MUSIC
+            ) from None
 
     def search_locations(
         self,
         generation_id: str,
         keyword: object,
         scope: object,
-    ) -> list[dict[str, Any]]:
+    ) -> dict[str, object]:
         """按固定范围将地点搜索路由到独立会话。"""
 
         normalized_scope = self._normalize_public_text(
@@ -461,15 +488,20 @@ class DouyinCommerceCollectorManager:
                 ),
             )
         self._action_queue.start(action)
-        return self._wait_public_action(
-            action,
-            generation_id=generation_id,
-            collector_type=collector_type,
-            request_id=request_id,
-            action_name="search_locations",
-            scope=normalized_scope,
-            keyword=normalized_keyword,
-        )
+        try:
+            return self._wait_public_action(
+                action,
+                generation_id=generation_id,
+                collector_type=collector_type,
+                request_id=request_id,
+                action_name="search_locations",
+                scope=normalized_scope,
+                keyword=normalized_keyword,
+            )
+        except DouyinCommerceCollectorError as error:
+            raise self._contextual_action_error(
+                error, generation_id, collector_type
+            ) from None
 
     def retry_collector(
         self,
@@ -498,15 +530,24 @@ class DouyinCommerceCollectorManager:
                 ),
             )
         self._action_queue.start(action)
-        self._wait_public_action(
-            action,
-            generation_id=generation_id,
-            collector_type=normalized_type,
-            request_id=request_id,
-            action_name="retry_collector",
-            scope=_FIXED_SCOPES[normalized_type],
+        try:
+            collector = self._wait_public_action(
+                action,
+                generation_id=generation_id,
+                collector_type=normalized_type,
+                request_id=request_id,
+                action_name="retry_collector",
+                scope=_FIXED_SCOPES[normalized_type],
+            )
+        except DouyinCommerceCollectorError as error:
+            raise self._contextual_action_error(
+                error, generation_id, normalized_type
+            ) from None
+        return self._public_action_result(
+            generation_id,
+            normalized_type,
+            collector.instance_id,
         )
-        return self.status(generation_id)
 
     def close_generation(
         self,
@@ -890,7 +931,7 @@ class DouyinCommerceCollectorManager:
         self,
         generation_id: str,
         request_id: str,
-    ) -> list[dict[str, str]]:
+    ) -> dict[str, object]:
         collector = self._ensure_collector(
             generation_id, CollectorType.FAVORITE_MUSIC
         )
@@ -928,7 +969,12 @@ class DouyinCommerceCollectorManager:
             request_id=request_id,
             action="refresh_favorite_music",
         )
-        return public_result
+        return self._public_action_result(
+            generation_id,
+            CollectorType.FAVORITE_MUSIC,
+            collector.instance_id,
+            candidates=public_result,
+        )
 
     def _search_locations_action(
         self,
@@ -937,7 +983,7 @@ class DouyinCommerceCollectorManager:
         request_id: str,
         keyword: object,
         scope: str,
-    ) -> list[dict[str, Any]]:
+    ) -> dict[str, object]:
         collector = self._ensure_collector(generation_id, collector_type)
         if collector.fixed_scope != scope:
             raise DouyinCommerceCollectorError("collector_scope_mismatch")
@@ -981,7 +1027,12 @@ class DouyinCommerceCollectorManager:
             scope=scope,
             keyword=keyword,
         )
-        return public_result
+        return self._public_action_result(
+            generation_id,
+            collector_type,
+            collector.instance_id,
+            candidates=public_result,
+        )
 
     def _retry_collector_action(
         self,
@@ -1170,17 +1221,24 @@ class DouyinCommerceCollectorManager:
             started = manager.start_upload(probe_payload, on_progress=on_progress)
             if not isinstance(started, Mapping) or not started:
                 raise TypeError("collector start result is invalid")
+            if str(started.get("status") or "").strip().casefold() == "needs_login":
+                raise DouyinCommerceCollectorError("login_required")
             raw_session_id = started.get("sessionId")
             if not raw_session_id:
                 raise TypeError("collector session id is missing")
             session_id = str(raw_session_id).strip()
             if not session_id:
                 raise TypeError("collector session id is empty")
-        except Exception:
+        except Exception as error:
             if not self._mark_failed(generation_id, collector):
                 raise DouyinCommerceCollectorError(
                     "stale_result_discarded"
                 ) from None
+            if (
+                isinstance(error, DouyinCommerceCollectorError)
+                and error.code == "login_required"
+            ):
+                raise DouyinCommerceCollectorError("login_required") from None
             raise DouyinCommerceCollectorError("collector_start_failed") from None
 
         with self._state_lock:
@@ -1393,6 +1451,68 @@ class DouyinCommerceCollectorManager:
                         error_code=error.code,
                     )
             raise
+
+    def _public_action_result(
+        self,
+        generation_id: str,
+        collector_type: CollectorType,
+        collector_instance_id: str,
+        *,
+        candidates: list[dict[str, Any]] | None = None,
+    ) -> dict[str, object]:
+        """返回带代际、类型、实例三重门禁的统一动作结果。"""
+
+        status = self.status(generation_id)
+        instances = status.get("collectorInstanceIds")
+        current_instance_id = (
+            str(instances.get(collector_type.value) or "")
+            if isinstance(instances, Mapping)
+            else ""
+        )
+        if not collector_instance_id or current_instance_id != collector_instance_id:
+            raise DouyinCommerceCollectorError(
+                "stale_result_discarded",
+                generation_id=generation_id,
+                collector_type=collector_type.value,
+                collector_instance_id=collector_instance_id,
+            ) from None
+        result: dict[str, object] = {
+            **status,
+            "ok": True,
+            "collectorType": collector_type.value,
+            "collectorInstanceId": collector_instance_id,
+        }
+        if candidates is not None:
+            result["candidates"] = [dict(item) for item in candidates]
+        return result
+
+    def _contextual_action_error(
+        self,
+        error: DouyinCommerceCollectorError,
+        generation_id: str,
+        collector_type: CollectorType,
+    ) -> DouyinCommerceCollectorError:
+        """为固定错误补齐 UI 丢弃迟到回调所需的公开门禁。"""
+
+        instance_id = error.collector_instance_id
+        if not instance_id:
+            with self._state_lock:
+                runtime = self._runtime
+                collector = (
+                    runtime.collectors.get(collector_type)
+                    if runtime
+                    and runtime.generation.generation_id == generation_id
+                    else None
+                )
+                if collector is not None:
+                    instance_id = collector.instance_id
+        return DouyinCommerceCollectorError(
+            error.code,
+            event_emitted=error.event_emitted,
+            generation_id=generation_id,
+            collector_type=collector_type.value,
+            collector_instance_id=instance_id,
+        )
 
     def _mark_failed(
         self,

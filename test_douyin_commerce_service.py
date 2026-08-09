@@ -26,6 +26,7 @@ from playwright.async_api import async_playwright
 from app_core import (
     database,
     douyin_commerce_batch_draft_service,
+    douyin_commerce_collectors,
     douyin_commerce_service,
     douyin_commerce_session,
     douyin_favorite_music_cache,
@@ -7358,10 +7359,20 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.page._render_collector_status(failed)
 
         retried = self._collector_status(local="active")
+        retried.update(
+            {
+                "ok": True,
+                "collectorType": "local_location",
+                "collectorInstanceId": "local-a",
+            }
+        )
         with patch(
             "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.retry_collector",
             return_value=retried,
-        ) as retry:
+        ) as retry, patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.status",
+            return_value=retried,
+        ):
             self.page._retry_last_failed_collector()
 
         retry.assert_called_once_with("generation-a", "local_location")
@@ -7379,6 +7390,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
     def test_abandon_setup_generation_clears_only_current_batch_platform_choices(self) -> None:
         """放弃代际关闭采集器并清本批选择，但保留内容输入和本地缓存。"""
 
+        self.page.runner = self._InlineRunner()
         self.page._setup_generation_id = "generation-a"
         self.page._selected_music = {"musicId": "music-1", "title": "收藏歌"}
         self.page._batch_locations = {"/tmp/a.mp4": {"poiId": "poi-1"}}
@@ -7388,8 +7400,19 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.page._staged_declaration_confirmed = True
         self.page.title_input.setText("仍需保留的标题")
 
+        def close_current(generation_id: str, *, reason: str) -> dict:
+            self.assertEqual(self.page._setup_generation_id, "generation-a")
+            self.assertEqual(generation_id, "generation-a")
+            self.assertEqual(reason, "abandoned")
+            return {
+                "closed": True,
+                "setupGenerationId": generation_id,
+                "aliveCollectorCount": 0,
+            }
+
         with patch(
-            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.close_generation"
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.close_generation",
+            side_effect=close_current,
         ) as close_generation, patch(
             "ui.douyin_commerce_page.douyin_commerce_draft_service.load_content_draft",
             return_value=None,
@@ -7406,9 +7429,78 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.assertFalse(self.page._staged_declaration_confirmed)
         self.assertEqual(self.page.title_input.text(), "仍需保留的标题")
 
+    def test_abandon_cleanup_incomplete_retains_generation_and_choices(self) -> None:
+        """放弃关闭不完整时保留安全重试所需句柄与本批选择。"""
+
+        self.page.runner = self._InlineRunner()
+        self.page._setup_generation_id = "generation-a"
+        self.page._selected_music = {"musicId": "music-1", "title": "收藏歌"}
+        self.page._batch_locations = {"/tmp/a.mp4": {"poiId": "poi-1"}}
+        self.page._confirmed_declaration = "内容由AI生成"
+
+        with patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.close_generation",
+            return_value={
+                "closed": False,
+                "setupGenerationId": "generation-a",
+                "aliveCollectorCount": 1,
+            },
+        ), patch(
+            "ui.douyin_commerce_page.douyin_commerce_draft_service.load_content_draft",
+            return_value=None,
+        ):
+            self.page._abandon_session(silent=True)
+
+        self.assertEqual(self.page._setup_generation_id, "generation-a")
+        self.assertEqual(self.page._selected_music["musicId"], "music-1")
+        self.assertEqual(self.page._batch_locations["/tmp/a.mp4"]["poiId"], "poi-1")
+        self.assertEqual(self.page._confirmed_declaration, "内容由AI生成")
+        self.assertIn("cleanup_incomplete", self.page.platform_review_status.text())
+
+    def test_abandon_generation_close_is_dispatched_without_blocking_ui(self) -> None:
+        """放弃只派发后台关闭；调用返回前不得同步进入可能阻塞的 close。"""
+
+        self.page._setup_generation_id = "generation-a"
+        self.page._selected_music = {"musicId": "music-1", "title": "收藏歌"}
+        self.page.runner = MagicMock()
+        self.page.runner.is_running.return_value = False
+        self.page.runner.run.return_value = True
+
+        with patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.close_generation"
+        ) as close_generation:
+            self.page._abandon_session(silent=True)
+
+        close_generation.assert_not_called()
+        self.page.runner.run.assert_called_once()
+        self.assertEqual(self.page._setup_generation_id, "generation-a")
+        self.assertEqual(self.page._selected_music["musicId"], "music-1")
+
+    def test_abandon_close_exception_uses_fixed_error_without_leaking_raw_text(self) -> None:
+        """后台关闭异常只显示固定码，并保留后续安全重试所需状态。"""
+
+        self.page.runner = self._InlineRunner()
+        self.page._setup_generation_id = "generation-a"
+        self.page._selected_music = {"musicId": "music-1", "title": "收藏歌"}
+
+        with patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.close_generation",
+            side_effect=RuntimeError("Cookie=secret DOM=<html>private</html>"),
+        ):
+            self.page._abandon_session(silent=True)
+
+        visible = self.page.platform_review_status.text()
+        self.assertEqual(self.page._setup_generation_id, "generation-a")
+        self.assertEqual(self.page._selected_music["musicId"], "music-1")
+        self.assertIn("cleanup_incomplete", visible)
+        self.assertNotIn("secret", visible)
+        self.assertNotIn("<html>", visible)
+
     def test_fully_published_batch_clears_current_platform_choices(self) -> None:
         """整批有明确发布回执后，当前批选择不得自动沿用到下一批。"""
 
+        self.page.runner = self._InlineRunner()
+        self.page._setup_generation_id = "generation-a"
         self.page._selected_music = {"musicId": "music-1", "title": "收藏歌"}
         self.page._batch_locations = {"/tmp/a.mp4": {"poiId": "poi-1"}}
         self.page._confirmed_declaration = "内容由AI生成"
@@ -7416,15 +7508,53 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.page._staged_location_confirmed = True
         self.page._staged_declaration_confirmed = True
 
-        with patch("ui.douyin_commerce_page.QMessageBox.information"):
+        with patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.close_generation",
+            return_value={
+                "closed": True,
+                "setupGenerationId": "generation-a",
+                "aliveCollectorCount": 0,
+            },
+        ) as close_generation, patch("ui.douyin_commerce_page.QMessageBox.information"):
             self.page._batch_publish_succeeded([{"index": 0, "status": "published"}])
 
+        close_generation.assert_called_once_with(
+            "generation-a", reason="publish_completed"
+        )
+        self.assertEqual(self.page._setup_generation_id, "")
         self.assertIsNone(self.page._selected_music)
         self.assertEqual(self.page._batch_locations, {})
         self.assertEqual(self.page._confirmed_declaration, "")
         self.assertFalse(self.page._staged_music_confirmed)
         self.assertFalse(self.page._staged_location_confirmed)
         self.assertFalse(self.page._staged_declaration_confirmed)
+
+    def test_fully_published_batch_retains_generation_when_close_is_incomplete(self) -> None:
+        """明确发布完成仍须等采集器全部关闭后才能撤销句柄和选择。"""
+
+        self.page.runner = self._InlineRunner()
+        self.page._setup_generation_id = "generation-a"
+        self.page._selected_music = {"musicId": "music-1", "title": "收藏歌"}
+        self.page._batch_locations = {"/tmp/a.mp4": {"poiId": "poi-1"}}
+        self.page._confirmed_declaration = "内容由AI生成"
+
+        with patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.close_generation",
+            return_value={
+                "closed": False,
+                "setupGenerationId": "generation-a",
+                "aliveCollectorCount": 1,
+            },
+        ), patch(
+            "ui.douyin_commerce_page.QMessageBox.information"
+        ):
+            self.page._batch_publish_succeeded([{"index": 0, "status": "published"}])
+
+        self.assertEqual(self.page._setup_generation_id, "generation-a")
+        self.assertEqual(self.page._selected_music["musicId"], "music-1")
+        self.assertEqual(self.page._batch_locations["/tmp/a.mp4"]["poiId"], "poi-1")
+        self.assertEqual(self.page._confirmed_declaration, "内容由AI生成")
+        self.assertIn("cleanup_incomplete", self.page.platform_review_status.text())
 
     def test_music_domestic_and_local_collectors_accept_any_order_in_one_generation(self) -> None:
         """三种操作顺序都复用同一代际，且不会清空已暂存的独立选择。"""
@@ -7443,12 +7573,36 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
                 self.page.runner = self._InlineRunner()
                 self.page._setup_generation_id = "generation-a"
                 self.page._stage_declaration_selection("内容由AI生成")
+
+                def music_result(_generation_id: str) -> dict:
+                    return {
+                        **active,
+                        "ok": True,
+                        "collectorType": "favorite_music",
+                        "collectorInstanceId": "music-a",
+                        "candidates": [candidate],
+                    }
+
+                def location_result(
+                    _generation_id: str, _keyword: str, scope: str
+                ) -> dict:
+                    collector_type = f"{scope}_location"
+                    return {
+                        **active,
+                        "ok": True,
+                        "collectorType": collector_type,
+                        "collectorInstanceId": active["collectorInstanceIds"][
+                            collector_type
+                        ],
+                        "candidates": [location],
+                    }
+
                 with patch(
                     "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.refresh_favorite_music",
-                    return_value=[candidate],
+                    side_effect=music_result,
                 ) as refresh_music, patch(
                     "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.search_locations",
-                    return_value=[location],
+                    side_effect=location_result,
                 ) as search_locations, patch(
                     "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.status",
                     return_value=active,
@@ -7482,9 +7636,21 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         current = self._collector_status(music="active")
         current["collectorInstanceIds"]["favorite_music"] = "music-new"
         stale = {
+            "ok": True,
             "setupGenerationId": "generation-a",
+            "collectorType": "favorite_music",
             "collectorInstanceId": "music-old",
             "candidates": [{"musicId": "stale"}],
+            "collectors": {
+                "domestic_location": "active",
+                "favorite_music": "active",
+                "local_location": "not_started",
+            },
+            "collectorInstanceIds": {
+                "domestic_location": "domestic-a",
+                "favorite_music": "music-old",
+                "local_location": "",
+            },
         }
 
         with patch(
@@ -7497,6 +7663,50 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
 
         self.assertEqual(accepted, [])
         self.assertEqual(self.page._music_candidates, [])
+
+    def test_late_collector_instance_failure_cannot_replace_current_status(self) -> None:
+        """旧实例失败回调不得把当前新实例标记为失败或暴露重试入口。"""
+
+        self.page._setup_generation_id = "generation-a"
+        self.page._collector_action_tokens["favorite_music"] = 4
+        current = self._collector_status(music="active")
+        current["collectorInstanceIds"]["favorite_music"] = "music-new"
+        self.page._render_collector_status(current)
+        stale_failure = {
+            "ok": False,
+            "errorCode": "collector_unknown",
+            "setupGenerationId": "generation-a",
+            "collectorType": "favorite_music",
+            "collectorInstanceId": "music-old",
+        }
+
+        with patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.status",
+            return_value=current,
+        ):
+            self.page._collector_action_failed(
+                "generation-a", "favorite_music", 4, stale_failure
+            )
+
+        self.assertEqual(self.page.music_collector_status.text(), "收藏音乐：可用")
+        self.assertTrue(self.page.retry_collector_button.isHidden())
+
+    def test_setup_generation_login_required_routes_to_account_management(self) -> None:
+        """真实 manager 固定登录错误必须进入既有账号管理流程。"""
+
+        self.page.runner = self._InlineRunner()
+        with patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.begin_generation",
+            side_effect=douyin_commerce_collectors.DouyinCommerceCollectorError(
+                "login_required"
+            ),
+        ), patch.object(self.page, "_handle_login_required") as handle_login:
+            self.page._start_setup_generation({"accountId": 31})
+
+        handle_login.assert_called_once_with()
+        self.assertNotIn(
+            "collector_start_failed", self.page.platform_review_status.text()
+        )
 
     class _BatchTaskStore:
         """批量执行器所需的最小内存任务存储，不触碰本机任务库。"""

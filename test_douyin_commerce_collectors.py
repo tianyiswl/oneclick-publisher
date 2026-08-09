@@ -27,6 +27,7 @@ class FakeSessionManager:
         self.start_thread_ident: int | None = None
         self.release_start: threading.Event | None = None
         self.start_session_override: str | None = None
+        self.start_result_override: dict[str, str] | None = None
         self.refresh_calls: list[str] = []
         self.location_calls: list[tuple[str, object, object]] = []
         self.location_scopes: list[object] = []
@@ -55,8 +56,10 @@ class FakeSessionManager:
         self.start_started.set()
         if self.release_start is not None:
             self.release_start.wait(timeout=2)
+        if self.start_result_override is not None:
+            return dict(self.start_result_override)
         self.session_id = self.start_session_override or f"session-{self.manager_id}"
-        return {"sessionId": self.session_id}
+        return {"status": "ready", "sessionId": self.session_id}
 
     def refresh_favorite_music(self, session_id: str) -> list[dict[str, str]]:
         self.refresh_calls.append(session_id)
@@ -120,6 +123,7 @@ class FakeManagerFactory:
         self.factory_started: dict[int, threading.Event] = {}
         self.release_factory: dict[int, threading.Event] = {}
         self.start_session_overrides: dict[int, str] = {}
+        self.start_result_overrides: dict[int, dict[str, str]] = {}
         self.errors_by_id: dict[int, Exception] = {}
 
     def __call__(self) -> FakeSessionManager:
@@ -133,6 +137,7 @@ class FakeManagerFactory:
             raise self.errors_by_id[manager_id]
         instance = FakeSessionManager(manager_id)
         instance.start_session_override = self.start_session_overrides.get(manager_id)
+        instance.start_result_override = self.start_result_overrides.get(manager_id)
         if instance.manager_id in self.block_start_ids:
             instance.release_start = threading.Event()
         self.instances.append(instance)
@@ -215,6 +220,81 @@ class DouyinCommerceCollectorManagerTests(unittest.TestCase):
         )
         self.assertEqual(self.factory.instances[0].location_scopes, [])
         self.assertEqual(self.factory.instances[2].location_scopes, ["local"])
+
+    def test_public_actions_return_controlled_instance_envelopes(self):
+        """真实 manager 的三类动作都必须携带本次实例门禁信息。"""
+
+        generation_id = self.manager.begin_generation(self.upload_payload)[
+            "setupGenerationId"
+        ]
+
+        music = self.manager.refresh_favorite_music(generation_id)
+        domestic = self.manager.search_locations(
+            generation_id, "侨港风情街", "domestic"
+        )
+        retried = self.manager.retry_collector(generation_id, "favorite_music")
+
+        self.assertEqual(music["setupGenerationId"], generation_id)
+        self.assertEqual(music["collectorType"], "favorite_music")
+        self.assertTrue(music["collectorInstanceId"])
+        self.assertEqual(music["candidates"][0]["musicId"], "music-2")
+        self.assertEqual(domestic["setupGenerationId"], generation_id)
+        self.assertEqual(domestic["collectorType"], "domestic_location")
+        self.assertTrue(domestic["collectorInstanceId"])
+        self.assertEqual(domestic["candidates"][0]["name"], "侨港风情街")
+        self.assertEqual(retried["setupGenerationId"], generation_id)
+        self.assertEqual(retried["collectorType"], "favorite_music")
+        self.assertTrue(retried["collectorInstanceId"])
+        self.assertNotEqual(
+            retried["collectorInstanceId"], music["collectorInstanceId"]
+        )
+
+    def test_needs_login_start_is_preserved_as_fixed_login_required_error(self):
+        """底层登录失效结果不得降级为普通启动失败或泄露原始字段。"""
+
+        self.factory.start_result_overrides[1] = {
+            "status": "needs_login",
+            "message": "登录已失效，请到账号管理重新登录",
+        }
+
+        with self.assertRaises(DouyinCommerceCollectorError) as raised:
+            self.manager.begin_generation(self.upload_payload)
+
+        self.assertEqual(str(raised.exception), "login_required")
+        self.assertNotIn("登录已失效", str(raised.exception))
+        self.assertNotIn("session", str(raised.exception).casefold())
+
+    def test_public_action_error_carries_fixed_instance_envelope(self):
+        """真实 manager 失败也必须携带门禁，且不暴露浏览器异常原文。"""
+
+        generation_id = self.manager.begin_generation(self.upload_payload)[
+            "setupGenerationId"
+        ]
+        expected_instance = self.manager.status(generation_id)[
+            "collectorInstanceIds"
+        ]["domestic_location"]
+        self.factory.instances[0].search_error = RuntimeError(
+            "Cookie=secret DOM=<html>private</html>"
+        )
+
+        with self.assertRaises(DouyinCommerceCollectorError) as raised:
+            self.manager.search_locations(
+                generation_id, "侨港风情街", "domestic"
+            )
+
+        result = raised.exception.to_public_action_result()
+        self.assertEqual(
+            result,
+            {
+                "ok": False,
+                "errorCode": "collector_unknown",
+                "setupGenerationId": generation_id,
+                "collectorType": "domestic_location",
+                "collectorInstanceId": expected_instance,
+            },
+        )
+        self.assertNotIn("secret", str(result))
+        self.assertNotIn("<html>", str(result))
 
     def test_begin_never_reads_original_mapping_after_builder_snapshot(self):
         class GetRaisesMapping(Mapping[str, object]):
@@ -470,8 +550,8 @@ class DouyinCommerceCollectorManagerTests(unittest.TestCase):
         )
         local = self.manager.search_locations(generation_id, "夜南香", "local")
 
-        self.assertEqual(domestic[0]["name"], "侨港风情街")
-        self.assertEqual(local[0]["name"], "夜南香")
+        self.assertEqual(domestic["candidates"][0]["name"], "侨港风情街")
+        self.assertEqual(local["candidates"][0]["name"], "夜南香")
         self.assertEqual(self.factory.instances[0].location_scopes, ["domestic"])
         self.assertEqual(self.factory.instances[1].location_scopes, ["local"])
         self.assertNotEqual(
