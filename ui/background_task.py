@@ -148,8 +148,9 @@ class BackgroundTaskRunner(QObject):
 
         def cleanup() -> None:
             with self._active_lock:
-                if self.active.get(key) is task:
-                    self.active.pop(key, None)
+                if self.active.get(key) is not task:
+                    return
+                self.active.pop(key, None)
             if on_finished:
                 on_finished()
 

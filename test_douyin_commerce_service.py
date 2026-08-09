@@ -52,6 +52,88 @@ from utils import base_social_media
 from test_douyin_commerce_batch_executor import FakeCommerceSessionManager
 
 
+class BackgroundTaskRunnerLifecycleTests(unittest.TestCase):
+    """同键任务替换时，取消的旧 worker 不得回调新 UI 世代。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    class _QueuedPool:
+        """保留真实 BackgroundTask，由测试确定性控制运行顺序。"""
+
+        def __init__(self) -> None:
+            self.tasks: list[BackgroundTask] = []
+
+        def start(self, task: BackgroundTask) -> None:
+            self.tasks.append(task)
+
+    def setUp(self) -> None:
+        self.pool = self._QueuedPool()
+        self.runner = BackgroundTaskRunner()
+        self.runner.pool = self.pool
+
+    def test_cancelled_old_task_cannot_finish_replacement_with_same_key(self) -> None:
+        """旧 worker 迟到 finished 不得触发旧业务回调或清理同键新任务。"""
+
+        old_finished: list[str] = []
+        new_finished: list[str] = []
+        self.assertTrue(
+            self.runner.run(
+                "shared-key",
+                fn=lambda: "old",
+                on_finished=lambda: old_finished.append("old"),
+            )
+        )
+        old_task = self.pool.tasks[-1]
+
+        self.assertTrue(self.runner.cancel_pending("shared-key"))
+        self.assertTrue(
+            self.runner.run(
+                "shared-key",
+                fn=lambda: "new",
+                on_finished=lambda: new_finished.append("new"),
+            )
+        )
+        new_task = self.pool.tasks[-1]
+
+        old_task.run()
+        QApplication.processEvents()
+
+        self.assertEqual(old_finished, [])
+        self.assertEqual(new_finished, [])
+        self.assertIs(self.runner.active.get("shared-key"), new_task)
+
+        new_task.run()
+        QApplication.processEvents()
+
+        self.assertEqual(old_finished, [])
+        self.assertEqual(new_finished, ["new"])
+        self.assertFalse(self.runner.is_running("shared-key"))
+
+    def test_cancelled_task_finishes_internally_without_business_callback(self) -> None:
+        """无替换任务时，取消的 worker 仍终态可等待，但不执行旧 UI 回调。"""
+
+        business_finished: list[str] = []
+        self.assertTrue(
+            self.runner.run(
+                "cancelled-key",
+                fn=lambda: "unused",
+                on_finished=lambda: business_finished.append("finished"),
+            )
+        )
+        old_task = self.pool.tasks[-1]
+
+        self.assertTrue(self.runner.cancel_pending("cancelled-key"))
+        old_task.run()
+        QApplication.processEvents()
+
+        self.assertTrue(old_task.wait_for_finished(0))
+        self.assertTrue(self.runner.wait_for_finished("cancelled-key", 0))
+        self.assertEqual(business_finished, [])
+        self.assertFalse(self.runner.is_running("cancelled-key"))
+
+
 class DouyinImePlaceholderTests(unittest.TestCase):
     """中文输入法预编辑期间，文案提示不得与候选文字重叠。"""
 
