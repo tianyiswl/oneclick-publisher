@@ -3699,6 +3699,59 @@ class DouyinCommerceUiTests(unittest.TestCase):
         refresh.assert_not_called()
         self.assertIn("点击刷新", self.page.music_status.text())
 
+    def test_first_batch_music_click_loads_cache_and_opens_candidate_list(self) -> None:
+        """批量模式首次点击候选框后，应直接显示已缓存音乐而非要求再点一次。"""
+
+        candidate = {
+            "musicId": "music-local-001",
+            "title": "本地缓存音乐",
+            "creator": "作者",
+            "duration": "00:30",
+        }
+        self.page._selected_video_indexes = [1]
+        self.page.account_combo.clear()
+        self.page.account_combo.addItem(
+            "抖音账号",
+            {"id": 96, "type": 3, "status": 1, "filePath": "douyin-96.json"},
+        )
+        self.page.account_combo.setCurrentIndex(0)
+        self.page.music_combo.setEnabled(True)
+        with patch(
+            "ui.douyin_commerce_page.douyin_favorite_music_cache.list_cached_favorite_music",
+            return_value=[candidate],
+        ):
+            self.page._load_favorite_music_candidates()
+            self.app.processEvents()
+
+        self.assertEqual(self.page.music_candidate_list.count(), 1)
+        self.assertFalse(self.page.music_candidate_list.isHidden())
+
+    def test_platform_collector_diagnostics_are_hidden_from_workspace(self) -> None:
+        """采集状态保留给内部恢复逻辑，不应显示在平台设置工作区。"""
+
+        self.assertTrue(self.page.domestic_collector_status.parentWidget().isHidden())
+        self.assertTrue(self.page.copy_collector_diagnostics_button.parentWidget().isHidden())
+
+    def test_review_copy_action_shares_publish_information_title_row(self) -> None:
+        """检查页不显示冗余说明，复制操作与逐条发布信息标题保持同一行。"""
+
+        visible_copy = [
+            label.text()
+            for label in self.page.review_panel.findChildren(QLabel)
+            if not label.isHidden()
+        ]
+        self.assertNotIn("先做只填写与回读的预检。预检通过不代表已定时或已发布；只有最终提交后收到平台管理页回执，任务才会记录为已定时或已发布。", visible_copy)
+        self.assertTrue(self.page.review_submission_helper.isHidden())
+        self.assertFalse(self.page.copy_batch_publish_info_button.isHidden())
+        self.assertIs(
+            self.page.copy_batch_publish_info_button.parentWidget(),
+            self.page.review_submission_header,
+        )
+        self.assertIs(
+            self.page.review_submission_title.parentWidget(),
+            self.page.review_submission_header,
+        )
+
     def test_refresh_music_returns_closed_picker_candidates_as_cache(self) -> None:
         """刷新只同步候选；不能让音乐抽屉阻塞后续地点设置。"""
 

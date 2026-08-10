@@ -1258,6 +1258,9 @@ class DouyinCommercePage(QWidget):
             self._copy_collector_diagnostics
         )
         collector_status_layout.addWidget(self.copy_collector_diagnostics_button)
+        # 采集器状态仍作为内部状态源保留，供底部提示和故障恢复逻辑使用；
+        # 不再把国内地点、收藏音乐和本地点的诊断文本占用平台设置工作区。
+        collector_status_bar.setVisible(False)
         layout.addWidget(collector_status_bar)
 
         workspace = QFrame()
@@ -2158,8 +2161,7 @@ class DouyinCommercePage(QWidget):
 
         panel, panel_layout = self._section(
             "检查并提交",
-            "先做只填写与回读的预检。预检通过不代表已定时或已发布；"
-            "只有最终提交后收到平台管理页回执，任务才会记录为已定时或已发布。",
+            "",
         )
         panel.setObjectName("douyinCommerceReviewPanel")
         panel.setProperty("douyinCommerceWorkCard", True)
@@ -2207,16 +2209,22 @@ class DouyinCommercePage(QWidget):
 
         self.review_submission_panel, submission_layout = self._section(
             "逐条发布信息",
-            "核对每条视频的地点和发布时间后确认提交。",
+            "",
         )
         self.review_submission_panel.setObjectName("douyinCommerceReviewSubmissionPanel")
         self.review_submission_panel.setProperty("douyinCommerceWorkCard", True)
-        helper_item = submission_layout.takeAt(1)
-        self.review_submission_helper = helper_item.widget() if helper_item else QLabel()
-        helper_row = QHBoxLayout()
-        helper_row.setSpacing(8)
-        helper_row.addWidget(self.review_submission_helper)
-        helper_row.addStretch(1)
+        title_item = submission_layout.takeAt(0)
+        self.review_submission_title = title_item.widget() if title_item else QLabel()
+        self.review_submission_header = QFrame()
+        self.review_submission_header.setObjectName("douyinCommerceReviewSubmissionHeader")
+        header_layout = QHBoxLayout(self.review_submission_header)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(8)
+        header_layout.addWidget(self.review_submission_title)
+        header_layout.addStretch(1)
+        # 保留旧属性供既有状态同步使用，但不再创建或显示重复的说明文本。
+        self.review_submission_helper = QLabel()
+        self.review_submission_helper.setVisible(False)
         self.copy_batch_publish_info_button = button(
             "复制发布信息", variant="secondary", compact=True
         )
@@ -2226,8 +2234,8 @@ class DouyinCommercePage(QWidget):
         self.copy_batch_publish_info_button.clicked.connect(
             self.copy_batch_publish_information
         )
-        helper_row.addWidget(self.copy_batch_publish_info_button)
-        submission_layout.insertLayout(1, helper_row)
+        header_layout.addWidget(self.copy_batch_publish_info_button)
+        submission_layout.insertWidget(0, self.review_submission_header)
         self.batch_review_rows = QScrollArea()
         self.batch_review_rows.setObjectName("douyinCommerceBatchReviewRows")
         self.batch_review_rows.setWidgetResizable(True)
@@ -5863,7 +5871,8 @@ class DouyinCommercePage(QWidget):
         # 新批量工作台在上传前就需要选择共享音乐。此时只能读取当前账号已
         # 同步到本机的安全缓存；缓存缺失时不创建浏览器、不上传，也不默认选歌。
         if self.selected_video_count() >= 1:
-            self._load_batch_cached_favorite_music()
+            # 首次点击同步到本地缓存后应直接展开卡片内候选，不能要求用户再点一次。
+            self._load_batch_cached_favorite_music(open_candidate_list=True)
             return
 
         if not self._session_id:
@@ -5916,7 +5925,12 @@ class DouyinCommercePage(QWidget):
             self._music_load_failed,
         )
 
-    def _load_batch_cached_favorite_music(self, *, refresh_requested: bool = False) -> None:
+    def _load_batch_cached_favorite_music(
+        self,
+        *,
+        refresh_requested: bool = False,
+        open_candidate_list: bool = False,
+    ) -> None:
         """读取当前账号的本地收藏音乐缓存，不触碰抖音页面。
 
         刷新按钮在未上传阶段只会重新读取本机缓存，避免把“刷新”误做成隐式
@@ -5940,6 +5954,10 @@ class DouyinCommercePage(QWidget):
         if rows:
             self._show_music_candidates(rows, source="account-cache")
             self.music_status.setText("从本机收藏音乐缓存选择")
+            if open_candidate_list:
+                # _show_music_candidates 会先重建列表并同步控件状态；延迟到本轮
+                # Qt 事件结束后再展开，避免首次点击被组合框原始鼠标事件吞掉。
+                QTimer.singleShot(0, self._open_music_picker_if_ready)
         else:
             self._music_candidates = []
             self.music_candidate_list.clear()
