@@ -103,7 +103,9 @@ class DouyinVerificationDialog(QDialog):
             if widget is not None:
                 widget.deleteLater()
         if kind == "sms":
-            self.description_label.setText("需要短信验证，请输入收到的数字验证码。")
+            self.description_label.setText(
+                "需要短信验证，请输入收到的数字验证码。验证码会明文显示，仅在本机内存中临时处理。"
+            )
             self.code_input = QLineEdit()
             self.code_input.setObjectName("douyinVerificationCode")
             self.code_input.setInputMethodHints(
@@ -114,7 +116,7 @@ class DouyinVerificationDialog(QDialog):
             )
             self.code_input.setMaxLength(8)
             self.code_input.setPlaceholderText("输入 4 至 8 位数字验证码")
-            self.code_input.setEchoMode(QLineEdit.EchoMode.Password)
+            self.code_input.setEchoMode(QLineEdit.EchoMode.Normal)
             self.code_input.returnPressed.connect(self.submit_code)
             self.content_layout.addWidget(self.code_input)
             self.submit_button = button("提交验证码", variant="primary")

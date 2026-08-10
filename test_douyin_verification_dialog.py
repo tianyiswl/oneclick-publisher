@@ -51,6 +51,18 @@ class DouyinVerificationDialogTests(unittest.TestCase):
         self.assertNotIn("13800138000", dialog.status_label.text())
         dialog.close()
 
+    def test_sms_code_is_plaintext_visible_but_never_copied_to_status(self) -> None:
+        request_id = self.broker.create_sms(task_id=60, message="需要短信验证")
+        dialog = DouyinVerificationDialog(request_id, broker=self.broker)
+        dialog.code_input.setText("123456")
+
+        self.assertEqual(dialog.code_input.echoMode(), QLineEdit.EchoMode.Normal)
+        self.assertEqual(dialog.code_input.displayText(), "123456")
+        self.assertIn("明文显示", dialog.description_label.text())
+        self.assertNotIn("123456", dialog.status_label.text())
+        self.assertNotIn("123456", repr(dialog))
+        dialog.close()
+
     def test_sms_dialog_accepts_typed_and_pasted_digits_but_rejects_non_digits(self):
         """真实输入事件必须可提交数字，验证器不能把数字当作字面量拒绝。"""
 
