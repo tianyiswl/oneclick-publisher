@@ -225,6 +225,7 @@ class DouyinCommerceBatchExecutor:
         self._shutdown_requested = threading.Event()
         self._run_lock = threading.RLock()
         self._run_generation = 0
+        self._claimed_submit_items: set[tuple[int, int, int]] = set()
 
     def request_pause(self, *, source: str = "") -> bool:
         """只接受客户端明确确认的暂停请求，不把验证事件误当成人工暂停。"""
@@ -245,6 +246,7 @@ class DouyinCommerceBatchExecutor:
         with self._run_lock:
             self._run_generation += 1
             self._shutdown_requested.clear()
+            self._claimed_submit_items.clear()
             return self._run_generation
 
     def request_shutdown(self, source: str = "") -> bool:
@@ -264,6 +266,25 @@ class DouyinCommerceBatchExecutor:
                 self._shutdown_requested.is_set()
                 or run_generation != self._run_generation
             )
+
+    def _claim_submit_permission(
+        self,
+        run_generation: int,
+        task_id: int,
+        item_id: int,
+    ) -> bool:
+        """在退出与代际共用锁上线性化每条唯一最终提交许可。"""
+
+        key = (run_generation, int(task_id), int(item_id))
+        with self._run_lock:
+            if (
+                self._shutdown_requested.is_set()
+                or run_generation != self._run_generation
+                or key in self._claimed_submit_items
+            ):
+                return False
+            self._claimed_submit_items.add(key)
+            return True
 
     def run_preflight(
         self,
@@ -304,7 +325,7 @@ class DouyinCommerceBatchExecutor:
                 task_id, now_utc=self._utc_now()
             )
             self._cooldown_gate.restore_remaining(account_key, remaining)
-        except (DouyinSmsCooldownError, TypeError, ValueError):
+        except Exception:
             raise DouyinCommerceBatchExecutorError(
                 "verification_cooldown_state_invalid"
             ) from None
@@ -408,8 +429,8 @@ class DouyinCommerceBatchExecutor:
         except ValueError as exc:
             raise DouyinCommerceBatchExecutorError(str(exc)) from exc
 
-    def _has_active_verification(self, task_id: int) -> bool:
-        """仅信任仍由同一进程 broker 持有的 active 验证请求。
+    def _active_verification_request_id(self, task_id: int) -> str:
+        """返回仍由同一进程 broker 持有的 active 请求标识。
 
         验证被取消、过期或失败后，broker 不会再返回 active 请求。此时绝不能
         用异常文本把失败伪装成可恢复的 ``waiting_verification``。
@@ -418,11 +439,16 @@ class DouyinCommerceBatchExecutor:
         try:
             request_id = self._verification_broker.request_for_task(int(task_id))
             if not request_id:
-                return False
+                return ""
             snapshot = self._verification_broker.snapshot(request_id)
         except Exception:
-            return False
-        return _text(snapshot.get("state")) in _ACTIVE_VERIFICATION_STATES
+            return ""
+        if _text(snapshot.get("state")) not in _ACTIVE_VERIFICATION_STATES:
+            return ""
+        return _text(request_id)
+
+    def _has_active_verification(self, task_id: int) -> bool:
+        return bool(self._active_verification_request_id(task_id))
 
     def _record_login_waiting(
         self,
@@ -483,41 +509,68 @@ class DouyinCommerceBatchExecutor:
         total: int,
         label: str,
         account_key: str,
+        run_generation: int,
         progress: Callable[[BatchProgressEvent], None] | None,
     ) -> Callable[[object], object]:
         """为原生验证弹窗附上内存条目上下文，不把挑战对象写入任务记录。"""
 
+        first_request_id = ""
+        handled = False
+
         def _callback(challenge: object) -> object:
+            nonlocal first_request_id, handled
             if isinstance(challenge, VerificationChallenge):
                 # 这份副本只存在回调栈中；二维码字节仍由 broker 在内存托管。
                 challenge = replace(challenge, item_index=index, item_label=label)
+            else:
+                return challenge
             # session manager 仅会在 broker 请求已经创建后调用回调。没有 active
             # 请求时不落 waiting 事件，以免已取消/过期的验证码留下可恢复假象。
-            active = self._has_active_verification(task_id)
+            with self._run_lock:
+                if (
+                    self._shutdown_requested.is_set()
+                    or run_generation != self._run_generation
+                ):
+                    return challenge
+                active_request_id = self._active_verification_request_id(task_id)
+                if not active_request_id:
+                    return challenge
+                if not first_request_id:
+                    first_request_id = active_request_id
+                if (
+                    handled
+                    or active_request_id != first_request_id
+                ):
+                    return challenge
+                handled = True
             if (
-                isinstance(challenge, VerificationChallenge)
-                and challenge.kind == "sms"
-                and active
+                challenge.kind == "sms"
             ):
                 try:
                     self._cooldown_gate.record_trigger(account_key)
+                except DouyinSmsCooldownError as exc:
+                    raise DouyinCommerceBatchExecutorError(_text(exc)) from None
+                except Exception:
+                    raise DouyinCommerceBatchExecutorError(
+                        "verification_cooldown_failed"
+                    ) from None
+                try:
                     self._task_store.record_douyin_sms_cooldown(
                         task_id,
                         item_id,
                         triggered_at_utc=self._utc_now(),
                     )
-                except (DouyinSmsCooldownError, TypeError, ValueError):
+                except Exception:
                     raise DouyinCommerceBatchExecutorError(
-                        "verification_cooldown_state_invalid"
+                        "verification_cooldown_failed"
                     ) from None
-            if active:
-                self._record_active_verification_waiting(
-                    task_id,
-                    item_id,
-                    index=index,
-                    total=total,
-                    progress=progress,
-                )
+            self._record_active_verification_waiting(
+                task_id,
+                item_id,
+                index=index,
+                total=total,
+                progress=progress,
+            )
             return challenge
 
         return _callback
@@ -539,13 +592,18 @@ class DouyinCommerceBatchExecutor:
                 return False
             if self._cooldown_gate.remaining_seconds(account_key) <= 0:
                 return True
-            self._record_progress(
-                task_id,
-                item_id,
-                ok=True,
-                event_type="verification_cooldown_wait_started",
-                message=f"第 {index + 1} 条视频已预检，正在等待短信验证冷却",
-            )
+            try:
+                self._record_progress(
+                    task_id,
+                    item_id,
+                    ok=True,
+                    event_type="verification_cooldown_wait_started",
+                    message=f"第 {index + 1} 条视频已预检，正在等待短信验证冷却",
+                )
+            except Exception:
+                raise DouyinCommerceBatchExecutorError(
+                    "verification_cooldown_failed"
+                ) from None
 
             def on_tick(remaining_seconds: int) -> None:
                 self._emit(
@@ -563,13 +621,18 @@ class DouyinCommerceBatchExecutor:
                 cancelled=cancelled,
             )
             if ready:
-                self._record_progress(
-                    task_id,
-                    item_id,
-                    ok=True,
-                    event_type="verification_cooldown_wait_finished",
-                    message=f"第 {index + 1} 条视频短信验证冷却已结束",
-                )
+                try:
+                    self._record_progress(
+                        task_id,
+                        item_id,
+                        ok=True,
+                        event_type="verification_cooldown_wait_finished",
+                        message=f"第 {index + 1} 条视频短信验证冷却已结束",
+                    )
+                except Exception:
+                    raise DouyinCommerceBatchExecutorError(
+                        "verification_cooldown_failed"
+                    ) from None
             return ready
         except DouyinSmsCooldownError as exc:
             raise DouyinCommerceBatchExecutorError(_text(exc)) from None
@@ -713,6 +776,8 @@ class DouyinCommerceBatchExecutor:
         label = _safe_item_label(item, index)
         session_id = ""
         retain_session = False
+        submit_permission_claimed = False
+        final_receipt_recorded = False
         # 上传、地点和预检都必须留在 dry-run 会话；上传阶段已完成标题、文案
         # 与话题的页面回读，不能在同一编辑页重复同步一次内容。重复清空富文本
         # 编辑器会在 Windows 端偶发残留旧文案，且没有任何业务收益。
@@ -825,6 +890,23 @@ class DouyinCommerceBatchExecutor:
                 }
 
             self._emit(progress, index=index, total=total, phase="submitting", message=f"正在提交第 {index + 1} 条视频")
+            if not self._claim_submit_permission(
+                run_generation,
+                task_id,
+                item_id,
+            ):
+                message = "客户端已退出，当前视频未执行最终提交"
+                self._task_store.pause_douyin_batch_before_submit(
+                    task_id,
+                    item_id,
+                    message,
+                )
+                return {
+                    "index": index,
+                    "label": label,
+                    "status": "client_shutdown",
+                }
+            submit_permission_claimed = True
             submitted = self._manager.submit(
                 session_id,
                 publish_payload,
@@ -836,6 +918,7 @@ class DouyinCommerceBatchExecutor:
                     total=total,
                     label=label,
                     account_key=_text(batch.get("accountFile")),
+                    run_generation=run_generation,
                     progress=progress,
                 ),
             )
@@ -845,8 +928,31 @@ class DouyinCommerceBatchExecutor:
                 submitted,
                 expected_schedule_time=_text(publish_payload.get("scheduleTime")),
             )
+            final_receipt_recorded = True
             self._emit(progress, index=index, total=total, phase="published", message=f"第 {index + 1} 条视频已取得平台回读")
             return {"index": index, "label": label, "status": "published"}
+        except (KeyboardInterrupt, SystemExit):
+            if not submit_permission_claimed:
+                self._task_store.pause_douyin_batch_before_submit(
+                    task_id,
+                    item_id,
+                    "客户端已退出，当前视频未执行最终提交",
+                )
+            elif not final_receipt_recorded:
+                message = "最终提交已开始，但平台回执状态待人工核对"
+                self._record_progress(
+                    task_id,
+                    item_id,
+                    ok=False,
+                    event_type="platform_receipt_ambiguous",
+                    message=message,
+                )
+                self._task_store.mark_task_paused(
+                    task_id,
+                    message,
+                    pause_reason_code=task_service.PAUSE_REASON_RECEIPT_AMBIGUOUS,
+                )
+            raise
         except Exception as exc:
             diagnostic = _text(exc)[:240] or "未取得可用的平台回执"
             if self._has_active_verification(task_id):

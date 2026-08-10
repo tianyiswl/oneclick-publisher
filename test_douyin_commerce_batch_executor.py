@@ -760,7 +760,27 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
     def test_sms_cooldown_waits_after_next_preflight_then_auto_submits_once(self) -> None:
         now = [100.0]
         broker = DouyinVerificationBroker()
-        manager = FakeCommerceSessionManager(
+        timeline: list[str] = []
+
+        class TimelineManager(FakeCommerceSessionManager):
+            def start_upload(self, payload: dict, **kwargs) -> dict:
+                index = len(
+                    [call for call in self.calls if call.startswith("start_upload:")]
+                )
+                timeline.append(f"upload:{index}")
+                return super().start_upload(payload, **kwargs)
+
+            def preflight(self, session_id: str, payload: dict) -> dict:
+                index = self._index_by_session[session_id]
+                timeline.append(f"preflight:{index}")
+                return super().preflight(session_id, payload)
+
+            def submit(self, session_id: str, payload: dict, **kwargs) -> dict:
+                index = self._index_by_session[session_id]
+                timeline.append(f"submit:{index}")
+                return super().submit(session_id, payload, **kwargs)
+
+        manager = TimelineManager(
             challenge_on_index=0,
             verification_mode="active_success",
             verification_broker=broker,
@@ -770,6 +790,14 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
             waiter=lambda seconds: now.__setitem__(0, now[0] + seconds),
         )
         events: list[BatchProgressEvent] = []
+
+        def progress(event: BatchProgressEvent) -> None:
+            events.append(event)
+            if event.phase == "verification_cooldown":
+                timeline.append(f"cooldown:{event.remaining_seconds}")
+            elif event.phase == "submitting":
+                timeline.append(f"submitting:{event.index}")
+
         executor = DouyinCommerceBatchExecutor(
             manager,
             verification_broker=broker,
@@ -781,16 +809,13 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
             self.batch,
             task_id=self.task["id"],
             confirmed=True,
-            progress=events.append,
+            progress=progress,
         )
 
         self.assertEqual([row["status"] for row in result], ["published"] * 3)
-        self.assertEqual(manager.calls.count("submit:0"), 1)
-        self.assertEqual(manager.calls.count("submit:1"), 1)
-        self.assertLess(
-            manager.ordered_calls.index(("preflight", "session-2")),
-            manager.ordered_calls.index(("submit", "session-2")),
-        )
+        for index in range(3):
+            self.assertEqual(manager.calls.count(f"start_upload:{index}"), 1)
+            self.assertEqual(manager.calls.count(f"submit:{index}"), 1)
         cooldown = [row for row in events if row.phase == "verification_cooldown"]
         self.assertEqual(
             (cooldown[0].remaining_seconds, cooldown[-1].remaining_seconds),
@@ -814,6 +839,90 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
             stored_event_types.count("verification_cooldown_wait_finished"),
             1,
         )
+        self.assertLess(timeline.index("preflight:1"), timeline.index("cooldown:60"))
+        self.assertLess(timeline.index("cooldown:60"), timeline.index("cooldown:1"))
+        self.assertLess(timeline.index("cooldown:1"), timeline.index("submitting:1"))
+        self.assertLess(timeline.index("submitting:1"), timeline.index("submit:1"))
+
+    def test_shutdown_from_submitting_progress_never_claims_submit(self) -> None:
+        now = [100.0]
+        broker = DouyinVerificationBroker()
+        manager = FakeCommerceSessionManager(
+            challenge_on_index=0,
+            verification_mode="active_success",
+            verification_broker=broker,
+        )
+        executor: DouyinCommerceBatchExecutor
+
+        def progress(event: BatchProgressEvent) -> None:
+            if event.phase == "submitting" and event.index == 1:
+                executor.request_shutdown("client_shutdown")
+
+        executor = DouyinCommerceBatchExecutor(
+            manager,
+            verification_broker=broker,
+            cooldown_gate=DouyinSmsCooldownGate(
+                clock=lambda: now[0],
+                waiter=lambda seconds: now.__setitem__(0, now[0] + seconds),
+            ),
+            utc_now=lambda: datetime(2026, 8, 10, 1, 0, tzinfo=timezone.utc),
+        )
+
+        result = executor.run_publish(
+            self.batch,
+            task_id=self.task["id"],
+            confirmed=True,
+            progress=progress,
+        )
+
+        self.assertEqual(
+            [row["status"] for row in result],
+            ["published", "client_shutdown", "pending"],
+        )
+        self.assertNotIn("submit:1", manager.calls)
+        self.assertIn("close:1", manager.calls)
+        saved = task_service.get_task(self.task["id"])
+        self.assertEqual(saved["items"][1]["status"], "pending")
+
+    def test_generation_replacement_from_submitting_progress_never_claims_submit(self) -> None:
+        now = [100.0]
+        broker = DouyinVerificationBroker()
+        manager = FakeCommerceSessionManager(
+            challenge_on_index=0,
+            verification_mode="active_success",
+            verification_broker=broker,
+        )
+        executor: DouyinCommerceBatchExecutor
+
+        def progress(event: BatchProgressEvent) -> None:
+            if event.phase == "submitting" and event.index == 1:
+                executor.reset_shutdown()
+
+        executor = DouyinCommerceBatchExecutor(
+            manager,
+            verification_broker=broker,
+            cooldown_gate=DouyinSmsCooldownGate(
+                clock=lambda: now[0],
+                waiter=lambda seconds: now.__setitem__(0, now[0] + seconds),
+            ),
+            utc_now=lambda: datetime(2026, 8, 10, 1, 0, tzinfo=timezone.utc),
+        )
+
+        result = executor.run_publish(
+            self.batch,
+            task_id=self.task["id"],
+            confirmed=True,
+            progress=progress,
+        )
+
+        self.assertEqual(
+            [row["status"] for row in result],
+            ["published", "client_shutdown", "pending"],
+        )
+        self.assertNotIn("submit:1", manager.calls)
+        self.assertIn("close:1", manager.calls)
+        saved = task_service.get_task(self.task["id"])
+        self.assertEqual(saved["items"][1]["status"], "pending")
 
     def test_shutdown_interface_accepts_source_positionally_and_generations_increase(self) -> None:
         executor = DouyinCommerceBatchExecutor(FakeCommerceSessionManager())
@@ -854,6 +963,7 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
             total=3,
             label="a.mp4",
             account_key=self.batch["accountFile"],
+            run_generation=0,
             progress=None,
         )
 
@@ -879,10 +989,119 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
             total=3,
             label="a.mp4",
             account_key=self.batch["accountFile"],
+            run_generation=0,
             progress=None,
         )
         inactive_callback(VerificationChallenge(kind="sms", message="需要短信验证"))
         self.assertEqual(gate.remaining_seconds(self.batch["accountFile"]), 0)
+
+    def test_duplicate_sms_callback_records_first_active_request_only_once(self) -> None:
+        now = [100.0]
+        broker = DouyinVerificationBroker()
+
+        class DuplicateCallbackManager(FakeCommerceSessionManager):
+            def submit(self, session_id: str, payload: dict, **kwargs) -> dict:
+                callback = kwargs.get("on_verification")
+
+                def duplicate_callback(challenge: object) -> object:
+                    first = callback(challenge)
+                    now[0] += 10
+                    callback(challenge)
+                    return first
+
+                kwargs["on_verification"] = duplicate_callback
+                return super().submit(session_id, payload, **kwargs)
+
+        manager = DuplicateCallbackManager(
+            challenge_on_index=0,
+            verification_mode="active_success",
+            verification_broker=broker,
+        )
+        events: list[BatchProgressEvent] = []
+        executor = DouyinCommerceBatchExecutor(
+            manager,
+            verification_broker=broker,
+            cooldown_gate=DouyinSmsCooldownGate(
+                clock=lambda: now[0],
+                waiter=lambda seconds: now.__setitem__(0, now[0] + seconds),
+            ),
+            utc_now=lambda: datetime(2026, 8, 10, 1, 0, tzinfo=timezone.utc),
+        )
+
+        result = executor.run_publish(
+            self.batch,
+            task_id=self.task["id"],
+            confirmed=True,
+            progress=events.append,
+        )
+
+        self.assertEqual([row["status"] for row in result], ["published"] * 3)
+        cooldown = [event for event in events if event.phase == "verification_cooldown"]
+        self.assertEqual(cooldown[0].remaining_seconds, 50)
+        self.assertEqual(
+            len([event for event in events if event.phase == "waiting_verification"]),
+            1,
+        )
+        event_types = [
+            event["eventType"]
+            for event in task_service.get_task(self.task["id"])["events"]
+        ]
+        self.assertEqual(event_types.count("douyin_sms_cooldown_started"), 1)
+        self.assertEqual(event_types.count("verification_waiting"), 1)
+
+    def test_old_generation_sms_callback_cannot_bind_new_active_request(self) -> None:
+        now = [100.0]
+        broker = DouyinVerificationBroker()
+        captured_callbacks: list = []
+
+        class CaptureCallbackManager(FakeCommerceSessionManager):
+            def submit(self, session_id: str, payload: dict, **kwargs) -> dict:
+                if self._index_by_session[session_id] == 0:
+                    captured_callbacks.append(kwargs.get("on_verification"))
+                return super().submit(session_id, payload, **kwargs)
+
+        manager = CaptureCallbackManager()
+        gate = DouyinSmsCooldownGate(
+            clock=lambda: now[0],
+            waiter=lambda seconds: now.__setitem__(0, now[0] + seconds),
+        )
+        events: list[BatchProgressEvent] = []
+        executor = DouyinCommerceBatchExecutor(
+            manager,
+            verification_broker=broker,
+            cooldown_gate=gate,
+            utc_now=lambda: datetime(2026, 8, 10, 1, 0, tzinfo=timezone.utc),
+        )
+        result = executor.run_publish(
+            self.batch,
+            task_id=self.task["id"],
+            confirmed=True,
+            progress=events.append,
+        )
+        self.assertEqual([row["status"] for row in result], ["published"] * 3)
+        event_count = len(task_service.get_task(self.task["id"])["events"])
+        waiting_count = len(
+            [event for event in events if event.phase == "waiting_verification"]
+        )
+
+        executor.reset_shutdown()
+        broker.create_sms(
+            task_id=self.task["id"],
+            message="新代际的短信验证",
+        )
+        captured_callbacks[0](
+            VerificationChallenge(kind="sms", message="旧提交迟到回调")
+        )
+
+        self.assertEqual(gate.remaining_seconds(self.batch["accountFile"]), 0)
+        self.assertEqual(
+            len(task_service.get_task(self.task["id"])["events"]),
+            event_count,
+        )
+        self.assertEqual(
+            len([event for event in events if event.phase == "waiting_verification"]),
+            waiting_count,
+        )
 
     def test_persisted_sms_cooldown_is_restored_before_first_submit(self) -> None:
         monotonic_now = [100.0]
@@ -943,6 +1162,139 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
         self.assertEqual(str(caught.exception), "verification_cooldown_state_invalid")
         self.assertIsNone(caught.exception.__cause__)
 
+    def test_load_cooldown_runtime_errors_are_fixed_and_sanitized(self) -> None:
+        for storage_error in (
+            AttributeError("Cookie=session-secret"),
+            RuntimeError("<html>private platform page</html>"),
+        ):
+            with self.subTest(error_type=type(storage_error).__name__):
+                with patch.object(
+                    task_service,
+                    "load_douyin_sms_cooldown_remaining",
+                    side_effect=storage_error,
+                ):
+                    actual: Exception | None = None
+                    try:
+                        DouyinCommerceBatchExecutor(
+                            FakeCommerceSessionManager()
+                        ).run_publish(
+                            self.batch,
+                            task_id=self.task["id"],
+                            confirmed=True,
+                        )
+                    except Exception as exc:
+                        actual = exc
+
+                self.assertIs(type(actual), DouyinCommerceBatchExecutorError)
+                self.assertEqual(
+                    str(actual),
+                    "verification_cooldown_state_invalid",
+                )
+                self.assertIsNone(actual.__cause__)
+                saved = task_service.get_task(self.task["id"])
+                self.assertNotIn("session-secret", repr(saved["events"]))
+                self.assertNotIn("private platform page", repr(saved["events"]))
+
+    def test_record_cooldown_runtime_error_is_fixed_and_sanitized(self) -> None:
+        now = [100.0]
+        broker = DouyinVerificationBroker()
+        manager = FakeCommerceSessionManager(
+            challenge_on_index=0,
+            verification_mode="active_success",
+            verification_broker=broker,
+        )
+        executor = DouyinCommerceBatchExecutor(
+            manager,
+            verification_broker=broker,
+            cooldown_gate=DouyinSmsCooldownGate(
+                clock=lambda: now[0],
+                waiter=lambda seconds: now.__setitem__(0, now[0] + seconds),
+            ),
+            utc_now=lambda: datetime(2026, 8, 10, 1, 0, tzinfo=timezone.utc),
+        )
+
+        with patch.object(
+            task_service,
+            "record_douyin_sms_cooldown",
+            side_effect=AttributeError("Cookie=record-secret"),
+        ):
+            result = executor.run_publish(
+                self.batch,
+                task_id=self.task["id"],
+                confirmed=True,
+            )
+
+        self.assertEqual(result[0]["diagnostic"], "verification_cooldown_failed")
+        self.assertNotIn("record-secret", repr(result))
+        saved = task_service.get_task(self.task["id"])
+        self.assertNotIn("record-secret", repr(saved["events"]))
+
+    def test_cooldown_wait_start_runtime_error_is_fixed_and_sanitized(self) -> None:
+        now = [100.0]
+        gate = DouyinSmsCooldownGate(
+            clock=lambda: now[0],
+            waiter=lambda seconds: now.__setitem__(0, now[0] + seconds),
+        )
+        gate.record_trigger(self.batch["accountFile"])
+        original_record = task_service.mark_batch_item_result
+
+        def malicious_start(*args, **kwargs) -> None:
+            if kwargs.get("event_type") == "verification_cooldown_wait_started":
+                raise RuntimeError("<html>cooldown-start-secret</html>")
+            original_record(*args, **kwargs)
+
+        with patch.object(
+            task_service,
+            "mark_batch_item_result",
+            side_effect=malicious_start,
+        ):
+            result = DouyinCommerceBatchExecutor(
+                FakeCommerceSessionManager(),
+                cooldown_gate=gate,
+            ).run_publish(
+                self.batch,
+                task_id=self.task["id"],
+                confirmed=True,
+            )
+
+        self.assertEqual(result[0]["diagnostic"], "verification_cooldown_failed")
+        self.assertNotIn("cooldown-start-secret", repr(result))
+        saved = task_service.get_task(self.task["id"])
+        self.assertNotIn("cooldown-start-secret", repr(saved["events"]))
+
+    def test_cooldown_wait_end_runtime_error_is_fixed_and_sanitized(self) -> None:
+        now = [100.0]
+        gate = DouyinSmsCooldownGate(
+            clock=lambda: now[0],
+            waiter=lambda seconds: now.__setitem__(0, now[0] + seconds),
+        )
+        gate.record_trigger(self.batch["accountFile"])
+        original_record = task_service.mark_batch_item_result
+
+        def malicious_end(*args, **kwargs) -> None:
+            if kwargs.get("event_type") == "verification_cooldown_wait_finished":
+                raise RuntimeError("Cookie=cooldown-end-secret")
+            original_record(*args, **kwargs)
+
+        with patch.object(
+            task_service,
+            "mark_batch_item_result",
+            side_effect=malicious_end,
+        ):
+            result = DouyinCommerceBatchExecutor(
+                FakeCommerceSessionManager(),
+                cooldown_gate=gate,
+            ).run_publish(
+                self.batch,
+                task_id=self.task["id"],
+                confirmed=True,
+            )
+
+        self.assertEqual(result[0]["diagnostic"], "verification_cooldown_failed")
+        self.assertNotIn("cooldown-end-secret", repr(result))
+        saved = task_service.get_task(self.task["id"])
+        self.assertNotIn("cooldown-end-secret", repr(saved["events"]))
+
     def test_gate_failure_uses_fixed_error_without_leaking_waiter_exception(self) -> None:
         now = [100.0]
 
@@ -970,6 +1322,103 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
 
         self.assertEqual(str(caught.exception), "verification_cooldown_failed")
         self.assertIsNone(caught.exception.__cause__)
+
+    def test_process_control_exit_before_submit_claim_rolls_item_back(self) -> None:
+        for error_type in (KeyboardInterrupt, SystemExit):
+            with self.subTest(error_type=error_type.__name__):
+                task = task_service.create_douyin_batch_task(self.batch)
+                now = [100.0]
+                original = error_type("不应泄露的预提交中断")
+
+                def interrupted_waiter(_seconds: float) -> None:
+                    raise original
+
+                gate = DouyinSmsCooldownGate(
+                    clock=lambda: now[0],
+                    waiter=interrupted_waiter,
+                )
+                gate.record_trigger(self.batch["accountFile"])
+                manager = FakeCommerceSessionManager()
+                executor = DouyinCommerceBatchExecutor(
+                    manager,
+                    cooldown_gate=gate,
+                )
+
+                with self.assertRaises(error_type) as caught:
+                    executor.run_publish(
+                        self.batch,
+                        task_id=task["id"],
+                        confirmed=True,
+                    )
+
+                self.assertIs(caught.exception, original)
+                self.assertNotIn("submit:0", manager.calls)
+                self.assertIn("close:0", manager.calls)
+                saved = task_service.get_task(task["id"])
+                self.assertEqual(
+                    (saved["status"], saved["pauseReasonCode"]),
+                    ("paused", "client_shutdown"),
+                )
+                self.assertEqual(saved["items"][0]["status"], "pending")
+                self.assertIn(
+                    "batch_paused_client_shutdown",
+                    [event["eventType"] for event in saved["events"]],
+                )
+                self.assertNotIn(
+                    "不应泄露",
+                    repr(saved["events"]),
+                )
+
+    def test_process_control_exit_after_submit_claim_records_ambiguous_receipt(self) -> None:
+        for error_type in (KeyboardInterrupt, SystemExit):
+            with self.subTest(error_type=error_type.__name__):
+                task = task_service.create_douyin_batch_task(self.batch)
+                original = error_type("不应泄露的提交中断")
+
+                class InterruptedSubmitManager(FakeCommerceSessionManager):
+                    def submit(
+                        self,
+                        session_id: str,
+                        payload: dict,
+                        **_kwargs,
+                    ) -> dict:
+                        if (
+                            payload.get("runtimeMode") != "publish"
+                            or payload.get("debugDryRun") is not False
+                        ):
+                            raise AssertionError("最终提交必须明确发布模式")
+                        index = self._index_by_session[session_id]
+                        self.calls.append(f"submit:{index}")
+                        self.ordered_calls.append(("submit", session_id))
+                        raise original
+
+                manager = InterruptedSubmitManager()
+                executor = DouyinCommerceBatchExecutor(manager)
+
+                with self.assertRaises(error_type) as caught:
+                    executor.run_publish(
+                        self.batch,
+                        task_id=task["id"],
+                        confirmed=True,
+                    )
+
+                self.assertIs(caught.exception, original)
+                self.assertEqual(manager.calls.count("submit:0"), 1)
+                self.assertIn("close:0", manager.calls)
+                saved = task_service.get_task(task["id"])
+                self.assertEqual(
+                    (saved["status"], saved["pauseReasonCode"]),
+                    ("paused", "receipt_ambiguous"),
+                )
+                self.assertEqual(saved["items"][0]["status"], "failed")
+                self.assertEqual(
+                    [event["eventType"] for event in saved["events"]][-2:],
+                    ["platform_receipt_ambiguous", "batch_paused"],
+                )
+                self.assertNotIn(
+                    "不应泄露",
+                    repr(saved["events"]),
+                )
 
     def test_user_pause_during_cooldown_finishes_current_item_then_stops_next(self) -> None:
         now = [100.0]
