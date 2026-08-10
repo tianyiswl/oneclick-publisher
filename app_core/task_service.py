@@ -8,6 +8,7 @@ import re
 import uuid
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from .account_service import PLATFORMS
 from .database import connect
@@ -18,6 +19,7 @@ PAUSE_REASON_WAITING_LOGIN = "waiting_login"
 PAUSE_REASON_WAITING_VERIFICATION = "waiting_verification"
 PAUSE_REASON_RECEIPT_AMBIGUOUS = "receipt_ambiguous"
 PAUSE_REASON_AUTO_FAILURE = "auto_failure"
+PAUSE_REASON_CLIENT_SHUTDOWN = "client_shutdown"
 DOUYIN_BATCH_PAUSE_REASONS = frozenset(
     {
         PAUSE_REASON_USER_REQUEST,
@@ -25,6 +27,7 @@ DOUYIN_BATCH_PAUSE_REASONS = frozenset(
         PAUSE_REASON_WAITING_VERIFICATION,
         PAUSE_REASON_RECEIPT_AMBIGUOUS,
         PAUSE_REASON_AUTO_FAILURE,
+        PAUSE_REASON_CLIENT_SHUTDOWN,
     }
 )
 
@@ -47,6 +50,8 @@ _BATCH_READBACK_FIELDS = {
     "publishedAt",
     "scheduleTime",
     "timezone",
+    "cooldownStartedAt",
+    "cooldownSeconds",
 }
 
 
@@ -298,6 +303,52 @@ def get_task(task_id: int) -> dict | None:
     data["items"] = [dict(item) for item in items]
     data["events"] = [dict(event) for event in events]
     return data
+
+
+def _latest_sms_cooldown_event(task_ids: list[int]) -> dict | None:
+    normalized = [int(value) for value in task_ids if int(value) > 0]
+    placeholders = ",".join("?" for _ in normalized)
+    with connect() as conn:
+        row = conn.execute(
+            f"SELECT * FROM publish_task_events WHERE taskId IN ({placeholders}) AND eventType = 'douyin_sms_cooldown_started' ORDER BY id DESC LIMIT 1",
+            tuple(normalized),
+        ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def load_douyin_sms_cooldown_remaining(
+    task_id: int, *, now_utc: datetime
+) -> float:
+    if now_utc.tzinfo is None:
+        raise ValueError("verification_cooldown_state_invalid")
+    task = get_task(int(task_id))
+    if not isinstance(task, dict):
+        raise ValueError("verification_cooldown_state_invalid")
+    task_ids = [int(task_id)]
+    source_id = task.get("resumeSourceTaskId")
+    if type(source_id) is int and source_id > 0:
+        task_ids.append(source_id)
+    event = _latest_sms_cooldown_event(task_ids)
+    if event is None:
+        return 0.0
+    try:
+        detail = json.loads(str(event["detailJson"]))
+        if not isinstance(detail, dict):
+            raise ValueError
+        if detail.get("cooldownSeconds") != "60":
+            raise ValueError
+        started = datetime.fromisoformat(detail["cooldownStartedAt"])
+        if started.tzinfo is None:
+            raise ValueError
+        elapsed = (
+            now_utc.astimezone(ZoneInfo("UTC"))
+            - started.astimezone(ZoneInfo("UTC"))
+        ).total_seconds()
+        if elapsed < 0:
+            raise ValueError
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        raise ValueError("verification_cooldown_state_invalid") from None
+    return max(0.0, 60.0 - elapsed)
 
 
 def delete_tasks(task_ids: list[int]) -> int:
@@ -560,8 +611,11 @@ def _load_douyin_batch_resume_source(task_id: int) -> tuple[dict, list[tuple[dic
         raise ValueError("仅支持抖音带货批量任务继续发布")
     if source.get("status") != "paused":
         raise ValueError("仅已暂停的抖音带货批量任务可以继续发布")
-    if source.get("pauseReasonCode") != PAUSE_REASON_USER_REQUEST:
-        raise ValueError("仅支持用户主动暂停的批次继续发布")
+    if source.get("pauseReasonCode") not in {
+        PAUSE_REASON_USER_REQUEST,
+        PAUSE_REASON_CLIENT_SHUTDOWN,
+    }:
+        raise ValueError("仅支持用户主动暂停或客户端退出的批次继续发布")
     try:
         payloads = json.loads(source.get("payloadJson") or "")
     except json.JSONDecodeError as exc:
@@ -820,6 +874,34 @@ def mark_task_paused(task_id: int, message: str, *, pause_reason_code: str) -> N
         conn.commit()
 
 
+def pause_douyin_batch_before_submit(
+    task_id: int, item_id: int, message: str
+) -> None:
+    """客户端退出前，原子回退尚未获得最终成功回执的当前条目。"""
+
+    now = _now()
+    with connect() as conn:
+        item = conn.execute(
+            "SELECT status FROM publish_task_items WHERE id = ? AND taskId = ?",
+            (int(item_id), int(task_id)),
+        ).fetchone()
+        if item is None or item["status"] == "success":
+            raise ValueError("最终提交前条目状态无法安全回退")
+        conn.execute(
+            "UPDATE publish_task_items SET status = 'pending', message = ?, finishedAt = NULL WHERE id = ?",
+            (message, int(item_id)),
+        )
+        conn.execute(
+            "UPDATE publish_tasks SET status = 'paused', pauseReasonCode = ? WHERE id = ?",
+            (PAUSE_REASON_CLIENT_SHUTDOWN, int(task_id)),
+        )
+        conn.execute(
+            "INSERT INTO publish_task_events (taskId, itemId, level, eventType, message, createdAt) VALUES (?, ?, 'warning', 'batch_paused_client_shutdown', ?, ?)",
+            (int(task_id), int(item_id), message, now),
+        )
+        conn.commit()
+
+
 def record_task_event(task_id: int, event_type: str, message: str, *, level: str = "info") -> None:
     """追加不含会话凭据的平台预检事件。"""
 
@@ -1019,4 +1101,22 @@ def mark_batch_item_result(
     _write_batch_progress_or_failure(
         task_id, item_id, ok=ok, message=message, event_type=event_type,
         readback=readback,
+    )
+
+
+def record_douyin_sms_cooldown(
+    task_id: int, item_id: int, *, triggered_at_utc: datetime
+) -> None:
+    """仅保存冷却计时所需的非敏感审计信息。"""
+
+    mark_batch_item_result(
+        task_id,
+        item_id,
+        ok=True,
+        event_type="douyin_sms_cooldown_started",
+        message="本条已实际触发短信验证，后续最终提交遵守 60 秒冷却",
+        readback={
+            "cooldownStartedAt": triggered_at_utc.astimezone(ZoneInfo("UTC")).isoformat(),
+            "cooldownSeconds": "60",
+        },
     )

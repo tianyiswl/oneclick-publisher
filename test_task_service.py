@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
@@ -202,6 +202,99 @@ class DouyinCommerceBatchTaskTests(unittest.TestCase):
         self.assertEqual(source_after["successCount"], source_before["successCount"])
         self.assertEqual(source_after["failedCount"], source_before["failedCount"])
         self.assertEqual(source_after["items"], source_before["items"])
+
+    def test_sms_cooldown_restores_for_source_and_resume_child(self) -> None:
+        """若来源/续发子任务丢失冷却，或损坏状态被放行，该测试必须失败。"""
+
+        source = task_service.create_douyin_batch_task(self.batch)
+        item_id = task_service.get_task(source["id"])["items"][0]["id"]
+        triggered = datetime(2026, 8, 10, 1, 0, tzinfo=ZoneInfo("UTC"))
+        task_service.record_douyin_sms_cooldown(
+            source["id"], item_id, triggered_at_utc=triggered
+        )
+        child = task_service.create_douyin_batch_task(
+            self.batch, resume_source_task_id=source["id"]
+        )
+        now = triggered + timedelta(seconds=33)
+
+        self.assertEqual(
+            task_service.load_douyin_sms_cooldown_remaining(source["id"], now_utc=now),
+            27.0,
+        )
+        self.assertEqual(
+            task_service.load_douyin_sms_cooldown_remaining(child["id"], now_utc=now),
+            27.0,
+        )
+        rendered = str(task_service.get_task(source["id"])["events"])
+        self.assertNotIn("oneclick_3_offline.json", rendered)
+        self.assertNotIn("123456", rendered)
+
+        with database.connect() as conn:
+            event = conn.execute(
+                """
+                SELECT id FROM publish_task_events
+                WHERE taskId = ? AND eventType = 'douyin_sms_cooldown_started'
+                ORDER BY id DESC LIMIT 1
+                """,
+                (source["id"],),
+            ).fetchone()
+            conn.execute(
+                "UPDATE publish_task_events SET detailJson = ? WHERE id = ?",
+                ('{"cooldownSeconds":"bad"}', event["id"]),
+            )
+            conn.commit()
+        with self.assertRaisesRegex(ValueError, "^verification_cooldown_state_invalid$"):
+            task_service.load_douyin_sms_cooldown_remaining(source["id"], now_utc=now)
+
+        task_service.record_douyin_sms_cooldown(
+            source["id"], item_id, triggered_at_utc=triggered
+        )
+        self.assertEqual(
+            task_service.load_douyin_sms_cooldown_remaining(
+                source["id"], now_utc=triggered + timedelta(seconds=60)
+            ),
+            0.0,
+        )
+
+    def test_client_shutdown_before_submit_returns_current_item_to_pending(self) -> None:
+        """若退出前提交过的当前条目不能安全回退，该测试必须失败。"""
+
+        source = task_service.create_douyin_batch_task(self.batch)
+        item_id = task_service.get_task(source["id"])["items"][0]["id"]
+        task_service.mark_batch_item_result(
+            source["id"], item_id, ok=True,
+            message="预检完成", event_type="preflight_readback", readback={},
+        )
+        task_service.pause_douyin_batch_before_submit(
+            source["id"], item_id, "客户端退出，最终提交尚未发生"
+        )
+
+        saved = task_service.get_task(source["id"])
+        self.assertEqual(saved["status"], "paused")
+        self.assertEqual(saved["pauseReasonCode"], "client_shutdown")
+        self.assertEqual(saved["items"][0]["status"], "pending")
+
+    def test_sms_cooldown_rejects_non_object_event_detail(self) -> None:
+        """若损坏的冷却事件详情泄漏底层异常，该测试必须失败。"""
+
+        task = task_service.create_douyin_batch_task(self.batch)
+        item_id = task_service.get_task(task["id"])["items"][0]["id"]
+        triggered = datetime(2026, 8, 10, 1, 0, tzinfo=ZoneInfo("UTC"))
+        task_service.record_douyin_sms_cooldown(
+            task["id"], item_id, triggered_at_utc=triggered
+        )
+        with database.connect() as conn:
+            conn.execute(
+                """
+                UPDATE publish_task_events SET detailJson = '[]'
+                WHERE taskId = ? AND eventType = 'douyin_sms_cooldown_started'
+                """,
+                (task["id"],),
+            )
+            conn.commit()
+
+        with self.assertRaisesRegex(ValueError, "^verification_cooldown_state_invalid$"):
+            task_service.load_douyin_sms_cooldown_remaining(task["id"], now_utc=triggered)
 
     def test_prepare_douyin_batch_resume_rejects_nonmanual_and_historical_pauses(self) -> None:
         """若登录、验证、回执、自动暂停或历史任务可续发，该测试必须失败。"""
