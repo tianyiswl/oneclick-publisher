@@ -9,6 +9,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -764,10 +765,9 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
 
         class TimelineManager(FakeCommerceSessionManager):
             def start_upload(self, payload: dict, **kwargs) -> dict:
-                index = len(
-                    [call for call in self.calls if call.startswith("start_upload:")]
+                timeline.append(
+                    f"upload:{Path(str(payload['fileList'][0])).name}"
                 )
-                timeline.append(f"upload:{index}")
                 return super().start_upload(payload, **kwargs)
 
             def preflight(self, session_id: str, payload: dict) -> dict:
@@ -776,8 +776,7 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
                 return super().preflight(session_id, payload)
 
             def submit(self, session_id: str, payload: dict, **kwargs) -> dict:
-                index = self._index_by_session[session_id]
-                timeline.append(f"submit:{index}")
+                timeline.append(f"submit:{session_id}")
                 return super().submit(session_id, payload, **kwargs)
 
         manager = TimelineManager(
@@ -813,9 +812,25 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
         )
 
         self.assertEqual([row["status"] for row in result], ["published"] * 3)
-        for index in range(3):
-            self.assertEqual(manager.calls.count(f"start_upload:{index}"), 1)
-            self.assertEqual(manager.calls.count(f"submit:{index}"), 1)
+        self.assertEqual(
+            [call for call in manager.calls if call.startswith("start_upload:")],
+            ["start_upload:0", "start_upload:1", "start_upload:2"],
+        )
+        self.assertEqual(
+            [call for call in manager.calls if call.startswith("submit:")],
+            ["submit:0", "submit:1", "submit:2"],
+        )
+        self.assertEqual(
+            [entry for entry in timeline if entry.startswith("upload:")],
+            [
+                f"upload:{Path(media_path).name}"
+                for media_path in self.media_paths
+            ],
+        )
+        self.assertEqual(
+            [entry for entry in timeline if entry.startswith("submit:session-")],
+            ["submit:session-1", "submit:session-2", "submit:session-3"],
+        )
         cooldown = [row for row in events if row.phase == "verification_cooldown"]
         self.assertEqual(
             (cooldown[0].remaining_seconds, cooldown[-1].remaining_seconds),
@@ -842,7 +857,10 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
         self.assertLess(timeline.index("preflight:1"), timeline.index("cooldown:60"))
         self.assertLess(timeline.index("cooldown:60"), timeline.index("cooldown:1"))
         self.assertLess(timeline.index("cooldown:1"), timeline.index("submitting:1"))
-        self.assertLess(timeline.index("submitting:1"), timeline.index("submit:1"))
+        self.assertLess(
+            timeline.index("submitting:1"),
+            timeline.index("submit:session-2"),
+        )
 
     def test_shutdown_from_submitting_progress_never_claims_submit(self) -> None:
         now = [100.0]
@@ -923,6 +941,66 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
         self.assertIn("close:1", manager.calls)
         saved = task_service.get_task(self.task["id"])
         self.assertEqual(saved["items"][1]["status"], "pending")
+
+    def test_reset_waits_until_actual_submit_leaves_linearization_boundary(self) -> None:
+        submit_entered = threading.Event()
+        release_submit = threading.Event()
+        reset_started = threading.Event()
+        reset_finished = threading.Event()
+
+        class BarrierSubmitManager(FakeCommerceSessionManager):
+            def submit(self, session_id: str, payload: dict, **kwargs) -> dict:
+                submit_entered.set()
+                if not release_submit.wait(2):
+                    raise AssertionError("提交 barrier 未被释放")
+                return super().submit(session_id, payload, **kwargs)
+
+        batch = {**self.batch, "items": [self.batch["items"][0]]}
+        task = task_service.create_douyin_batch_task(batch)
+        manager = BarrierSubmitManager()
+        executor = DouyinCommerceBatchExecutor(manager)
+        worker_result: list[list[dict[str, object]]] = []
+        worker_errors: list[BaseException] = []
+        reset_generations: list[int] = []
+
+        def run_worker() -> None:
+            try:
+                worker_result.append(
+                    executor.run_publish(
+                        batch,
+                        task_id=task["id"],
+                        confirmed=True,
+                    )
+                )
+            except BaseException as exc:
+                worker_errors.append(exc)
+
+        def reset_worker() -> None:
+            reset_started.set()
+            reset_generations.append(executor.reset_shutdown())
+            reset_finished.set()
+
+        publish_thread = threading.Thread(target=run_worker)
+        publish_thread.start()
+        self.assertTrue(submit_entered.wait(1))
+        reset_thread = threading.Thread(target=reset_worker)
+        reset_thread.start()
+        self.assertTrue(reset_started.wait(1))
+        reset_completed_inside_submit = reset_finished.wait(0.1)
+        release_submit.set()
+        publish_thread.join(2)
+        reset_thread.join(2)
+
+        self.assertFalse(reset_completed_inside_submit)
+        self.assertFalse(publish_thread.is_alive())
+        self.assertFalse(reset_thread.is_alive())
+        self.assertEqual(worker_errors, [])
+        self.assertEqual(
+            [row["status"] for row in worker_result[0]],
+            ["published"],
+        )
+        self.assertEqual(reset_generations, [1])
+        self.assertEqual(manager.calls.count("submit:0"), 1)
 
     def test_shutdown_interface_accepts_source_positionally_and_generations_increase(self) -> None:
         executor = DouyinCommerceBatchExecutor(FakeCommerceSessionManager())
@@ -1228,6 +1306,112 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
         self.assertNotIn("record-secret", repr(result))
         saved = task_service.get_task(self.task["id"])
         self.assertNotIn("record-secret", repr(saved["events"]))
+
+    def test_swallowed_callback_error_overrides_submit_return_or_exception(self) -> None:
+        for submit_outcome in ("return_success", "raise_error"):
+            with self.subTest(submit_outcome=submit_outcome):
+                task = task_service.create_douyin_batch_task(self.batch)
+                broker = DouyinVerificationBroker()
+                now = [100.0]
+
+                class SwallowingCallbackManager(FakeCommerceSessionManager):
+                    def submit(
+                        self,
+                        session_id: str,
+                        payload: dict,
+                        task_id: int | None = None,
+                        **kwargs,
+                    ) -> dict:
+                        index = self._index_by_session[session_id]
+                        if index != 0:
+                            return super().submit(
+                                session_id,
+                                payload,
+                                task_id=task_id,
+                                **kwargs,
+                            )
+                        if (
+                            payload.get("runtimeMode") != "publish"
+                            or payload.get("debugDryRun") is not False
+                        ):
+                            raise AssertionError("最终提交必须明确发布模式")
+                        self.calls.append("submit:0")
+                        self.ordered_calls.append(("submit", session_id))
+                        request_id = broker.create_sms(
+                            task_id=int(task_id or 0),
+                            message="请输入短信验证码",
+                        )
+                        try:
+                            kwargs["on_verification"](
+                                VerificationChallenge(
+                                    kind="sms",
+                                    message="需要短信验证",
+                                )
+                            )
+                        except Exception:
+                            pass
+                        broker.submit_code(request_id, "123456")
+                        broker.claim_code(request_id)
+                        broker.succeed(request_id)
+                        if submit_outcome == "raise_error":
+                            raise RuntimeError("<html>manager-private-page</html>")
+                        return {
+                            "ok": True,
+                            "scheduled": False,
+                            "message": "平台管理页返回成功",
+                            "platformReceipt": {
+                                "platformPostId": "must-not-be-written",
+                                "publishedAt": "2026-08-10 10:00",
+                                "timezone": "Asia/Shanghai",
+                            },
+                        }
+
+                manager = SwallowingCallbackManager()
+                executor = DouyinCommerceBatchExecutor(
+                    manager,
+                    verification_broker=broker,
+                    cooldown_gate=DouyinSmsCooldownGate(
+                        clock=lambda: now[0],
+                        waiter=lambda seconds: now.__setitem__(
+                            0, now[0] + seconds
+                        ),
+                    ),
+                    utc_now=lambda: datetime(
+                        2026, 8, 10, 1, 0, tzinfo=timezone.utc
+                    ),
+                )
+                with patch.object(
+                    task_service,
+                    "record_douyin_sms_cooldown",
+                    side_effect=RuntimeError("Cookie=callback-secret"),
+                ):
+                    result = executor.run_publish(
+                        self.batch,
+                        task_id=task["id"],
+                        confirmed=True,
+                    )
+
+                self.assertEqual(
+                    [row["status"] for row in result],
+                    ["receipt_ambiguous", "pending", "pending"],
+                )
+                self.assertEqual(
+                    result[0]["diagnostic"],
+                    "verification_cooldown_failed",
+                )
+                self.assertEqual(manager.calls.count("submit:0"), 1)
+                self.assertNotIn("submit:1", manager.calls)
+                self.assertNotIn("submit:2", manager.calls)
+                saved = task_service.get_task(task["id"])
+                self.assertEqual(
+                    (saved["status"], saved["pauseReasonCode"]),
+                    ("paused", "receipt_ambiguous"),
+                )
+                self.assertEqual(saved["items"][0]["status"], "failed")
+                self.assertNotIn("must-not-be-written", repr(saved))
+                combined = repr(result) + repr(saved["events"])
+                self.assertNotIn("callback-secret", combined)
+                self.assertNotIn("manager-private-page", combined)
 
     def test_cooldown_wait_start_runtime_error_is_fixed_and_sanitized(self) -> None:
         now = [100.0]

@@ -267,25 +267,6 @@ class DouyinCommerceBatchExecutor:
                 or run_generation != self._run_generation
             )
 
-    def _claim_submit_permission(
-        self,
-        run_generation: int,
-        task_id: int,
-        item_id: int,
-    ) -> bool:
-        """在退出与代际共用锁上线性化每条唯一最终提交许可。"""
-
-        key = (run_generation, int(task_id), int(item_id))
-        with self._run_lock:
-            if (
-                self._shutdown_requested.is_set()
-                or run_generation != self._run_generation
-                or key in self._claimed_submit_items
-            ):
-                return False
-            self._claimed_submit_items.add(key)
-            return True
-
     def run_preflight(
         self,
         batch: Mapping[str, Any],
@@ -511,11 +492,17 @@ class DouyinCommerceBatchExecutor:
         account_key: str,
         run_generation: int,
         progress: Callable[[BatchProgressEvent], None] | None,
+        error_sentinel: list[str] | None = None,
     ) -> Callable[[object], object]:
         """为原生验证弹窗附上内存条目上下文，不把挑战对象写入任务记录。"""
 
         first_request_id = ""
         handled = False
+        sentinel = error_sentinel if error_sentinel is not None else []
+
+        def _remember_error(code: str) -> None:
+            if not sentinel:
+                sentinel.append(code)
 
         def _callback(challenge: object) -> object:
             nonlocal first_request_id, handled
@@ -549,11 +536,11 @@ class DouyinCommerceBatchExecutor:
                 try:
                     self._cooldown_gate.record_trigger(account_key)
                 except DouyinSmsCooldownError as exc:
-                    raise DouyinCommerceBatchExecutorError(_text(exc)) from None
+                    _remember_error(_text(exc))
+                    return challenge
                 except Exception:
-                    raise DouyinCommerceBatchExecutorError(
-                        "verification_cooldown_failed"
-                    ) from None
+                    _remember_error("verification_cooldown_failed")
+                    return challenge
                 try:
                     self._task_store.record_douyin_sms_cooldown(
                         task_id,
@@ -561,16 +548,18 @@ class DouyinCommerceBatchExecutor:
                         triggered_at_utc=self._utc_now(),
                     )
                 except Exception:
-                    raise DouyinCommerceBatchExecutorError(
-                        "verification_cooldown_failed"
-                    ) from None
-            self._record_active_verification_waiting(
-                task_id,
-                item_id,
-                index=index,
-                total=total,
-                progress=progress,
-            )
+                    _remember_error("verification_cooldown_failed")
+                    return challenge
+            try:
+                self._record_active_verification_waiting(
+                    task_id,
+                    item_id,
+                    index=index,
+                    total=total,
+                    progress=progress,
+                )
+            except Exception:
+                _remember_error("verification_cooldown_failed")
             return challenge
 
         return _callback
@@ -890,11 +879,43 @@ class DouyinCommerceBatchExecutor:
                 }
 
             self._emit(progress, index=index, total=total, phase="submitting", message=f"正在提交第 {index + 1} 条视频")
-            if not self._claim_submit_permission(
-                run_generation,
-                task_id,
-                item_id,
-            ):
+            verification_error_sentinel: list[str] = []
+            verification_callback = self._verification_progress_callback(
+                task_id=task_id,
+                item_id=item_id,
+                index=index,
+                total=total,
+                label=label,
+                account_key=_text(batch.get("accountFile")),
+                run_generation=run_generation,
+                progress=progress,
+                error_sentinel=verification_error_sentinel,
+            )
+            submit_error: Exception | None = None
+            submit_key = (run_generation, int(task_id), int(item_id))
+            with self._run_lock:
+                if (
+                    self._shutdown_requested.is_set()
+                    or run_generation != self._run_generation
+                    or submit_key in self._claimed_submit_items
+                ):
+                    submitted = None
+                else:
+                    self._claimed_submit_items.add(submit_key)
+                    submit_permission_claimed = True
+                    try:
+                        submitted = self._manager.submit(
+                            session_id,
+                            publish_payload,
+                            task_id=task_id,
+                            on_verification=verification_callback,
+                        )
+                    except (KeyboardInterrupt, SystemExit):
+                        raise
+                    except Exception as exc:
+                        submit_error = exc
+                        submitted = None
+            if not submit_permission_claimed:
                 message = "客户端已退出，当前视频未执行最终提交"
                 self._task_store.pause_douyin_batch_before_submit(
                     task_id,
@@ -906,22 +927,34 @@ class DouyinCommerceBatchExecutor:
                     "label": label,
                     "status": "client_shutdown",
                 }
-            submit_permission_claimed = True
-            submitted = self._manager.submit(
-                session_id,
-                publish_payload,
-                task_id=task_id,
-                on_verification=self._verification_progress_callback(
-                    task_id=task_id,
-                    item_id=item_id,
+            if verification_error_sentinel:
+                diagnostic = verification_error_sentinel[0]
+                message = (
+                    f"第 {index + 1} 条视频已进入最终提交，"
+                    f"但冷却状态异常：{diagnostic}"
+                )
+                self._record_progress(
+                    task_id,
+                    item_id,
+                    ok=False,
+                    event_type="platform_receipt_ambiguous",
+                    message=message,
+                )
+                self._emit(
+                    progress,
                     index=index,
                     total=total,
-                    label=label,
-                    account_key=_text(batch.get("accountFile")),
-                    run_generation=run_generation,
-                    progress=progress,
-                ),
-            )
+                    phase="receipt_ambiguous",
+                    message=message,
+                )
+                return {
+                    "index": index,
+                    "label": label,
+                    "status": "receipt_ambiguous",
+                    "diagnostic": diagnostic,
+                }
+            if submit_error is not None:
+                raise submit_error
             self._record_final_submit_result(
                 task_id,
                 item_id,
