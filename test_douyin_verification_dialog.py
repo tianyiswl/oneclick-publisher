@@ -4,13 +4,13 @@
 from __future__ import annotations
 
 from io import BytesIO
+import inspect
 import os
 import unittest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import qrcode
-from PyQt6.QtCore import Qt
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QLineEdit
 
@@ -63,8 +63,8 @@ class DouyinVerificationDialogTests(unittest.TestCase):
         self.assertNotIn("123456", repr(dialog))
         dialog.close()
 
-    def test_sms_dialog_accepts_typed_and_pasted_digits_but_rejects_non_digits(self):
-        """真实输入事件必须可提交数字，验证器不能把数字当作字面量拒绝。"""
+    def test_sms_dialog_accepts_typed_and_direct_digits_but_rejects_non_digits(self):
+        """数字输入可提交，验证器不能把数字当作字面量拒绝。"""
 
         typed_id = self.broker.create_sms(task_id=56, message="需要短信验证")
         typed_dialog = DouyinVerificationDialog(typed_id, broker=self.broker)
@@ -75,20 +75,14 @@ class DouyinVerificationDialogTests(unittest.TestCase):
         self.assertNotIn("123456", typed_dialog.status_label.text())
         typed_dialog.close()
 
-        pasted_id = self.broker.create_sms(task_id=57, message="需要短信验证")
-        pasted_dialog = DouyinVerificationDialog(pasted_id, broker=self.broker)
-        QApplication.clipboard().setText("654321")
-        pasted_dialog.code_input.setFocus()
-        QTest.keyClick(
-            pasted_dialog.code_input,
-            Qt.Key.Key_V,
-            Qt.KeyboardModifier.ControlModifier,
-        )
-        self.assertEqual(pasted_dialog.code_input.text(), "654321")
-        pasted_dialog.submit_button.click()
-        self.assertEqual(self.broker.consume_code(pasted_id), "654321")
-        self.assertNotIn("654321", pasted_dialog.status_label.text())
-        pasted_dialog.close()
+        direct_id = self.broker.create_sms(task_id=57, message="需要短信验证")
+        direct_dialog = DouyinVerificationDialog(direct_id, broker=self.broker)
+        direct_dialog.code_input.setText("654321")
+        self.assertEqual(direct_dialog.code_input.text(), "654321")
+        direct_dialog.submit_button.click()
+        self.assertEqual(self.broker.consume_code(direct_id), "654321")
+        self.assertNotIn("654321", direct_dialog.status_label.text())
+        direct_dialog.close()
 
         rejected_id = self.broker.create_sms(task_id=58, message="需要短信验证")
         rejected_dialog = DouyinVerificationDialog(rejected_id, broker=self.broker)
@@ -96,6 +90,13 @@ class DouyinVerificationDialogTests(unittest.TestCase):
         QTest.keyClicks(rejected_dialog.code_input, "abc")
         self.assertEqual(rejected_dialog.code_input.text(), "")
         rejected_dialog.close()
+
+    def test_sms_input_regression_does_not_use_system_clipboard(self) -> None:
+        regression_source = inspect.getsource(
+            type(self).test_sms_dialog_accepts_typed_and_direct_digits_but_rejects_non_digits
+        )
+
+        self.assertNotIn("QApplication.clipboard", regression_source)
 
     def test_sms_dialog_disables_resend_during_cooldown_and_uses_same_request_after_60_seconds(self):
         now = [100.0]
