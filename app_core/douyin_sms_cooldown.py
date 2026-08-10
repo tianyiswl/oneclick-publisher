@@ -48,9 +48,9 @@ class DouyinSmsCooldownGate:
 
     def record_trigger(self, account_key: str) -> None:
         key = self._validated_key(account_key)
-        deadline = self._safe_now() + SMS_COOLDOWN_SECONDS
         with self._lock:
-            self._deadlines[key] = deadline
+            deadline = self._safe_now() + SMS_COOLDOWN_SECONDS
+            self._deadlines[key] = max(self._deadlines.get(key, deadline), deadline)
 
     def restore_remaining(self, account_key: str, remaining_seconds: float) -> None:
         key = self._validated_key(account_key)
@@ -78,6 +78,8 @@ class DouyinSmsCooldownGate:
                 if cancelled():
                     return False
                 on_tick(math.ceil(remaining))
+                if cancelled():
+                    return False
                 self._waiter(min(1.0, remaining))
         except DouyinSmsCooldownError:
             raise
