@@ -4481,6 +4481,13 @@ class DouyinCommercePage(QWidget):
         dialog = DouyinCommerceBatchResumeConfirmDialog(plan, parent=self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
+        if self.runner.is_running(_BATCH_RUN_KEY):
+            QMessageBox.warning(
+                self,
+                "继续发布",
+                "当前已有批量发布任务正在运行，请等待结束后再继续。",
+            )
+            return
         try:
             created = task_service.create_douyin_batch_resume(int(task_id), now=resume_now)
         except Exception as exc:
@@ -4490,6 +4497,25 @@ class DouyinCommercePage(QWidget):
 
     def start_batch_publish(self, payload: dict, task: dict) -> None:
         """确认后启动批量最终提交；只由平台逐条回执决定已发布状态。"""
+
+        if self.runner.is_running(_BATCH_RUN_KEY):
+            QMessageBox.warning(
+                self,
+                "批量发布",
+                "当前已有批量发布任务正在运行，请等待结束后再继续。",
+            )
+            return
+        try:
+            self._batch_executor.reset_shutdown()
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            QMessageBox.warning(
+                self,
+                "批量发布",
+                "批量发布执行器未能启动，已安全停止",
+            )
+            return
 
         self._batch_task_id = int(task["id"])
         task_id = self._batch_task_id
@@ -4518,7 +4544,6 @@ class DouyinCommercePage(QWidget):
                 reason="publish_started",
             )
 
-        self._batch_executor.reset_shutdown()
         started = self.runner.run(
             _BATCH_RUN_KEY,
             with_progress=run_publish,

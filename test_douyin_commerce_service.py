@@ -9505,6 +9505,100 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         create_resume.assert_called_once()
         start.assert_called_once_with(plan["batch"], created["task"])
 
+    def test_resume_rejects_real_active_batch_before_creating_child_or_resetting(self) -> None:
+        """真实同键 worker 活跃时，继续发布不能创建子任务或破坏旧代际。"""
+
+        class QueuedPool:
+            def __init__(self) -> None:
+                self.tasks: list[BackgroundTask] = []
+
+            def start(self, task: BackgroundTask) -> None:
+                self.tasks.append(task)
+
+        pool = QueuedPool()
+        runner = BackgroundTaskRunner(self.page)
+        runner.pool = pool
+        self.page.runner = runner
+        self.page._batch_task_id = 77
+        self.assertTrue(
+            runner.run("douyin_commerce_batch_run", lambda: "旧批次")
+        )
+        plan = {
+            "resumeAllowed": True,
+            "pendingCount": 1,
+            "sourceTaskNo": "T0808-0041",
+            "itemIndexes": [2],
+            "batch": {"items": [{"mediaPath": "/tmp/a.mp4"}]},
+        }
+        created = {"task": {"id": 99}, "batch": plan["batch"]}
+        try:
+            with patch(
+                "ui.douyin_commerce_page.task_service.prepare_douyin_batch_resume",
+                return_value=plan,
+            ), patch(
+                "ui.douyin_commerce_page.DouyinCommerceBatchResumeConfirmDialog.exec",
+                return_value=QDialog.DialogCode.Accepted,
+            ), patch(
+                "ui.douyin_commerce_page.task_service.create_douyin_batch_resume",
+                return_value=created,
+            ) as create_resume, patch.object(
+                self.page._batch_executor, "reset_shutdown"
+            ) as reset_shutdown, patch(
+                "ui.douyin_commerce_page.QMessageBox.warning"
+            ):
+                self.page.open_batch_resume(41)
+
+            create_resume.assert_not_called()
+            reset_shutdown.assert_not_called()
+            self.assertEqual(self.page._batch_task_id, 77)
+            self.assertTrue(runner.is_running("douyin_commerce_batch_run"))
+            self.assertEqual(pool.tasks, [runner.active["douyin_commerce_batch_run"]])
+        finally:
+            runner.cancel_pending("douyin_commerce_batch_run")
+
+    def test_start_batch_publish_reset_error_keeps_old_context_and_never_enqueues(self) -> None:
+        """代际重置普通异常须脱敏停下，不能覆盖旧上下文或加入 worker。"""
+
+        class QueuedPool:
+            def __init__(self) -> None:
+                self.tasks: list[BackgroundTask] = []
+
+            def start(self, task: BackgroundTask) -> None:
+                self.tasks.append(task)
+
+        pool = QueuedPool()
+        runner = BackgroundTaskRunner(self.page)
+        runner.pool = pool
+        self.page.runner = runner
+        self.page._batch_task_id = 77
+        self.page._batch_result_feedback = "旧批次反馈"
+        self.page.validation_label.setText("旧批次进度")
+        unexpected: Exception | None = None
+        with patch.object(
+            self.page._batch_executor,
+            "reset_shutdown",
+            side_effect=RuntimeError("COOKIE=private-selector"),
+        ), patch("ui.douyin_commerce_page.QMessageBox.warning") as warning:
+            try:
+                self.page.start_batch_publish(
+                    {"items": [{"mediaPath": "/tmp/video-1.mp4"}]},
+                    {"id": 99},
+                )
+            except Exception as exc:
+                unexpected = exc
+
+        self.assertIsNone(unexpected)
+        self.assertEqual(self.page._batch_task_id, 77)
+        self.assertEqual(self.page._batch_result_feedback, "旧批次反馈")
+        self.assertEqual(self.page.validation_label.text(), "旧批次进度")
+        self.assertFalse(runner.is_running("douyin_commerce_batch_run"))
+        self.assertEqual(pool.tasks, [])
+        warning.assert_called_once_with(
+            self.page,
+            "批量发布",
+            "批量发布执行器未能启动，已安全停止",
+        )
+
     def test_batch_location_rerender_replaces_old_scroll_body_without_overlapping_cards(self) -> None:
         """地点搜索回读后重绘只能保留一套卡片，不能累积旧的嵌套列布局。"""
 
