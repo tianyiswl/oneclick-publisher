@@ -19,7 +19,16 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtCore import QDate, Qt
 from PyQt6.QtGui import QColor, QImage, QInputMethodEvent
-from PyQt6.QtWidgets import QApplication, QComboBox, QDialog, QFrame, QLabel, QLineEdit, QPushButton
+from PyQt6.QtWidgets import (
+    QApplication,
+    QComboBox,
+    QDialog,
+    QFrame,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
+)
 from loguru import logger
 from playwright.async_api import async_playwright
 
@@ -9671,19 +9680,61 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             "16:00",
         )
 
-    def test_pause_button_is_placed_after_submit_and_requests_safe_pause(self) -> None:
-        """用户暂停只影响下一条视频，当前视频先安全收束。"""
+    def test_pause_button_requires_explicit_confirmation_before_requesting_pause(self) -> None:
+        """验证成功默认继续；单次误触暂停按钮不得停止后续视频。"""
 
         layout = self.page.review_action_dock.layout()
         self.assertIs(layout.itemAt(4).widget(), self.page.pause_batch_button)
         self.page._batch_task_id = 9
-        with patch.object(self.page.runner, "is_running", return_value=True):
+        with patch.object(
+            self.page.runner,
+            "is_running",
+            return_value=True,
+        ), patch(
+            "ui.douyin_commerce_page.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.No,
+        ), patch.object(
+            self.page._batch_executor,
+            "request_pause",
+            return_value=True,
+        ) as pause:
             self.page._sync_view()
             self.assertFalse(self.page.pause_batch_button.isHidden())
-            with patch.object(self.page._batch_executor, "request_pause", return_value=True) as pause:
-                self.page.pause_batch_publish()
+            self.page.pause_batch_publish()
 
-        pause.assert_called_once_with()
+        pause.assert_not_called()
+        self.assertFalse(self.page._batch_pause_requested)
+
+    def test_confirmed_pause_records_client_source_and_requests_safe_pause(self) -> None:
+        """只有用户在客户端明确确认，才允许当前视频后暂停。"""
+
+        self.page._batch_task_id = 9
+        with patch.object(
+            self.page.runner,
+            "is_running",
+            return_value=True,
+        ), patch(
+            "ui.douyin_commerce_page.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ) as question, patch.object(
+            self.page._batch_executor,
+            "request_pause",
+            return_value=True,
+        ) as pause, patch(
+            "ui.douyin_commerce_page.task_service.record_task_event"
+        ) as record_event:
+            self.page._sync_view()
+            self.page.pause_batch_publish()
+
+        question.assert_called_once()
+        pause.assert_called_once_with(source="user_confirmed")
+        record_event.assert_called_once_with(
+            9,
+            "batch_pause_requested",
+            "用户已在客户端确认：当前视频完成后暂停后续发布",
+            level="warning",
+        )
+        self.assertTrue(self.page._batch_pause_requested)
         self.assertIn("当前视频", self.page.validation_label.text())
 
     def test_collect_batch_payload_generates_explicit_item_timer_fields_before_ui_task_creation(self) -> None:

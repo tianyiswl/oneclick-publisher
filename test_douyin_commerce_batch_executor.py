@@ -816,7 +816,7 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
                 index = self._index_by_session[session_id]
                 result = super().submit(session_id, payload, **kwargs)
                 if index == 0:
-                    executor.request_pause()
+                    executor.request_pause(source="user_confirmed")
                 return result
 
         manager = PauseAfterFirstSubmitManager()
@@ -831,6 +831,14 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
             saved["pauseReasonCode"],
             task_service.PAUSE_REASON_USER_REQUEST,
         )
+
+    def test_pause_request_requires_explicit_user_confirmation_source(self) -> None:
+        """验证回调或无来源调用不得伪装成用户手动暂停。"""
+
+        executor = DouyinCommerceBatchExecutor(FakeCommerceSessionManager())
+
+        self.assertFalse(executor.request_pause())
+        self.assertTrue(executor.request_pause(source="user_confirmed"))
 
     def test_location_preset_must_exactly_match_current_editor_candidates(self) -> None:
         different_address = normalize_location_candidate(

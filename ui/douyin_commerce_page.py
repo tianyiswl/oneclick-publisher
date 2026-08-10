@@ -3162,8 +3162,28 @@ class DouyinCommercePage(QWidget):
 
         if not self.runner.is_running(_BATCH_RUN_KEY):
             return
-        if self._batch_executor.request_pause():
+        answer = QMessageBox.question(
+            self,
+            "确认暂停发布",
+            "抖音验证成功后会自动继续发布。是否仍要在当前视频完成后暂停剩余视频？",
+            QMessageBox.StandardButton.No | QMessageBox.StandardButton.Yes,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        if self._batch_executor.request_pause(source="user_confirmed"):
             self._batch_pause_requested = True
+            task_id = int(self._batch_task_id or 0)
+            if task_id > 0:
+                try:
+                    task_service.record_task_event(
+                        task_id,
+                        "batch_pause_requested",
+                        "用户已在客户端确认：当前视频完成后暂停后续发布",
+                        level="warning",
+                    )
+                except Exception:
+                    _LOGGER.warning("抖音带货暂停请求已生效，但审计事件未能写入")
             self._sync_view()
             self.validation_label.setText("已请求暂停；当前视频完成后不会再提交后续视频。")
 

@@ -214,9 +214,11 @@ class DouyinCommerceBatchExecutor:
         self._verification_broker = verification_broker
         self._pause_requested = threading.Event()
 
-    def request_pause(self) -> bool:
-        """请求在当前视频安全收束后暂停，绝不在中途打断平台写入。"""
+    def request_pause(self, *, source: str = "") -> bool:
+        """只接受客户端明确确认的暂停请求，不把验证事件误当成人工暂停。"""
 
+        if _text(source) != "user_confirmed":
+            return False
         if self._pause_requested.is_set():
             return False
         self._pause_requested.set()
