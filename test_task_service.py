@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
@@ -290,6 +291,145 @@ class DouyinCommerceBatchTaskTests(unittest.TestCase):
                 WHERE taskId = ? AND eventType = 'douyin_sms_cooldown_started'
                 """,
                 (task["id"],),
+            )
+            conn.commit()
+
+        with self.assertRaisesRegex(ValueError, "^verification_cooldown_state_invalid$"):
+            task_service.load_douyin_sms_cooldown_remaining(task["id"], now_utc=triggered)
+
+    def test_sms_cooldown_current_task_event_takes_precedence_over_later_source_write(self) -> None:
+        """若来源任务较晚写入的旧事件覆盖当前任务冷却，该测试必须失败。"""
+
+        source = task_service.create_douyin_batch_task(self.batch)
+        source_item_id = task_service.get_task(source["id"])["items"][0]["id"]
+        child = task_service.create_douyin_batch_task(
+            self.batch, resume_source_task_id=source["id"]
+        )
+        child_item_id = task_service.get_task(child["id"])["items"][0]["id"]
+        base = datetime(2026, 8, 10, 1, 0, tzinfo=ZoneInfo("UTC"))
+
+        task_service.record_douyin_sms_cooldown(
+            child["id"], child_item_id, triggered_at_utc=base + timedelta(seconds=40)
+        )
+        task_service.record_douyin_sms_cooldown(
+            source["id"], source_item_id, triggered_at_utc=base
+        )
+
+        self.assertEqual(
+            task_service.load_douyin_sms_cooldown_remaining(
+                child["id"], now_utc=base + timedelta(seconds=50)
+            ),
+            50.0,
+        )
+
+    def test_client_shutdown_does_not_roll_back_success_created_before_conditional_update(self) -> None:
+        """若条件更新前的成功条目仍被回退或写暂停事件，该测试必须失败。"""
+
+        task = task_service.create_douyin_batch_task(self.batch)
+        item_id = task_service.get_task(task["id"])["items"][0]["id"]
+
+        class RacingConnection:
+            def __init__(self, connection) -> None:
+                self.connection = connection
+                self.raced = False
+
+            def execute(self, sql, parameters=()):
+                if (
+                    not self.raced
+                    and "UPDATE publish_task_items SET status = 'pending'" in sql
+                ):
+                    with database.connect() as concurrent:
+                        concurrent.execute(
+                            "UPDATE publish_task_items SET status = 'success' WHERE id = ?",
+                            (item_id,),
+                        )
+                        concurrent.commit()
+                    self.raced = True
+                return self.connection.execute(sql, parameters)
+
+            def commit(self) -> None:
+                self.connection.commit()
+
+        @contextmanager
+        def racing_connect():
+            with database.connect() as connection:
+                yield RacingConnection(connection)
+
+        with patch.object(task_service, "connect", new=racing_connect):
+            with self.assertRaisesRegex(ValueError, "^最终提交前条目状态无法安全回退$"):
+                task_service.pause_douyin_batch_before_submit(
+                    task["id"], item_id, "客户端退出，最终提交尚未发生"
+                )
+
+        saved = task_service.get_task(task["id"])
+        self.assertEqual(saved["status"], "pending")
+        self.assertEqual(saved["items"][0]["status"], "success")
+        self.assertNotIn(
+            "batch_paused_client_shutdown",
+            [event["eventType"] for event in saved["events"]],
+        )
+
+    def test_record_sms_cooldown_rejects_naive_timestamp(self) -> None:
+        """若 naive 冷却时间按本机时区解释，该测试必须失败。"""
+
+        task = task_service.create_douyin_batch_task(self.batch)
+        item_id = task_service.get_task(task["id"])["items"][0]["id"]
+
+        with self.assertRaisesRegex(ValueError, "^verification_cooldown_state_invalid$"):
+            task_service.record_douyin_sms_cooldown(
+                task["id"], item_id, triggered_at_utc=datetime(2026, 8, 10, 1, 0)
+            )
+
+    def test_record_sms_cooldown_rejects_non_utc_offset(self) -> None:
+        """若 +08:00 冷却起点被写入，该测试必须失败。"""
+
+        task = task_service.create_douyin_batch_task(self.batch)
+        item_id = task_service.get_task(task["id"])["items"][0]["id"]
+
+        with self.assertRaisesRegex(ValueError, "^verification_cooldown_state_invalid$"):
+            task_service.record_douyin_sms_cooldown(
+                task["id"],
+                item_id,
+                triggered_at_utc=datetime(
+                    2026, 8, 10, 9, 0, tzinfo=ZoneInfo("Asia/Shanghai")
+                ),
+            )
+
+    def test_load_sms_cooldown_rejects_non_utc_now(self) -> None:
+        """若读取时接受 +08:00 当前时间，该测试必须失败。"""
+
+        task = task_service.create_douyin_batch_task(self.batch)
+        item_id = task_service.get_task(task["id"])["items"][0]["id"]
+        triggered = datetime(2026, 8, 10, 1, 0, tzinfo=ZoneInfo("UTC"))
+        task_service.record_douyin_sms_cooldown(
+            task["id"], item_id, triggered_at_utc=triggered
+        )
+
+        with self.assertRaisesRegex(ValueError, "^verification_cooldown_state_invalid$"):
+            task_service.load_douyin_sms_cooldown_remaining(
+                task["id"],
+                now_utc=datetime(2026, 8, 10, 9, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+            )
+
+    def test_load_sms_cooldown_rejects_non_utc_event_start(self) -> None:
+        """若已保存的 +08:00 冷却起点被接受，该测试必须失败。"""
+
+        task = task_service.create_douyin_batch_task(self.batch)
+        item_id = task_service.get_task(task["id"])["items"][0]["id"]
+        triggered = datetime(2026, 8, 10, 1, 0, tzinfo=ZoneInfo("UTC"))
+        task_service.record_douyin_sms_cooldown(
+            task["id"], item_id, triggered_at_utc=triggered
+        )
+        with database.connect() as conn:
+            conn.execute(
+                """
+                UPDATE publish_task_events SET detailJson = ?
+                WHERE taskId = ? AND eventType = 'douyin_sms_cooldown_started'
+                """,
+                (
+                    '{"cooldownStartedAt":"2026-08-10T09:00:00+08:00","cooldownSeconds":"60"}',
+                    task["id"],
+                ),
             )
             conn.commit()
 

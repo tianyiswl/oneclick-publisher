@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -305,30 +305,37 @@ def get_task(task_id: int) -> dict | None:
     return data
 
 
-def _latest_sms_cooldown_event(task_ids: list[int]) -> dict | None:
-    normalized = [int(value) for value in task_ids if int(value) > 0]
-    placeholders = ",".join("?" for _ in normalized)
+def _latest_sms_cooldown_event(task_id: int) -> dict | None:
     with connect() as conn:
         row = conn.execute(
-            f"SELECT * FROM publish_task_events WHERE taskId IN ({placeholders}) AND eventType = 'douyin_sms_cooldown_started' ORDER BY id DESC LIMIT 1",
-            tuple(normalized),
+            "SELECT * FROM publish_task_events WHERE taskId = ? AND eventType = 'douyin_sms_cooldown_started' ORDER BY id DESC LIMIT 1",
+            (int(task_id),),
         ).fetchone()
     return dict(row) if row is not None else None
+
+
+def _require_utc_datetime(value: object) -> datetime:
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        raise ValueError("verification_cooldown_state_invalid")
+    try:
+        if value.utcoffset() != timedelta(0):
+            raise ValueError("verification_cooldown_state_invalid")
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("verification_cooldown_state_invalid") from None
+    return value
 
 
 def load_douyin_sms_cooldown_remaining(
     task_id: int, *, now_utc: datetime
 ) -> float:
-    if now_utc.tzinfo is None:
-        raise ValueError("verification_cooldown_state_invalid")
+    now_utc = _require_utc_datetime(now_utc)
     task = get_task(int(task_id))
     if not isinstance(task, dict):
         raise ValueError("verification_cooldown_state_invalid")
-    task_ids = [int(task_id)]
+    event = _latest_sms_cooldown_event(int(task_id))
     source_id = task.get("resumeSourceTaskId")
-    if type(source_id) is int and source_id > 0:
-        task_ids.append(source_id)
-    event = _latest_sms_cooldown_event(task_ids)
+    if event is None and type(source_id) is int and source_id > 0:
+        event = _latest_sms_cooldown_event(source_id)
     if event is None:
         return 0.0
     try:
@@ -338,8 +345,7 @@ def load_douyin_sms_cooldown_remaining(
         if detail.get("cooldownSeconds") != "60":
             raise ValueError
         started = datetime.fromisoformat(detail["cooldownStartedAt"])
-        if started.tzinfo is None:
-            raise ValueError
+        started = _require_utc_datetime(started)
         elapsed = (
             now_utc.astimezone(ZoneInfo("UTC"))
             - started.astimezone(ZoneInfo("UTC"))
@@ -881,16 +887,12 @@ def pause_douyin_batch_before_submit(
 
     now = _now()
     with connect() as conn:
-        item = conn.execute(
-            "SELECT status FROM publish_task_items WHERE id = ? AND taskId = ?",
-            (int(item_id), int(task_id)),
-        ).fetchone()
-        if item is None or item["status"] == "success":
-            raise ValueError("最终提交前条目状态无法安全回退")
-        conn.execute(
-            "UPDATE publish_task_items SET status = 'pending', message = ?, finishedAt = NULL WHERE id = ?",
-            (message, int(item_id)),
+        updated = conn.execute(
+            "UPDATE publish_task_items SET status = 'pending', message = ?, finishedAt = NULL WHERE id = ? AND taskId = ? AND status <> 'success'",
+            (message, int(item_id), int(task_id)),
         )
+        if updated.rowcount != 1:
+            raise ValueError("最终提交前条目状态无法安全回退")
         conn.execute(
             "UPDATE publish_tasks SET status = 'paused', pauseReasonCode = ? WHERE id = ?",
             (PAUSE_REASON_CLIENT_SHUTDOWN, int(task_id)),
@@ -1109,6 +1111,7 @@ def record_douyin_sms_cooldown(
 ) -> None:
     """仅保存冷却计时所需的非敏感审计信息。"""
 
+    triggered_at_utc = _require_utc_datetime(triggered_at_utc)
     mark_batch_item_result(
         task_id,
         item_id,
