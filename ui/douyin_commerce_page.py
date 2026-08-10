@@ -4389,6 +4389,17 @@ class DouyinCommercePage(QWidget):
             return
         index = int(event.get("index") or 0) + 1
         total = int(event.get("total") or self.selected_video_count())
+        phase = _normalized(event.get("phase"))
+        remaining_seconds = event.get("remainingSeconds")
+        if phase == "verification_cooldown":
+            if type(remaining_seconds) is not int or remaining_seconds < 0:
+                return
+            self._batch_progress_text = (
+                f"短信验证码冷却中，剩余 {remaining_seconds} 秒；"
+                f"到点自动继续第 {index}/{total} 条"
+            )
+            self.validation_label.setText(self._batch_progress_text)
+            return
         completed, succeeded, failed = self._batch_execution_counts(total)
         self._batch_progress_text = (
             f"已完成 {completed}/{total} · 成功 {succeeded} · 失败 {failed}"
@@ -4396,7 +4407,7 @@ class DouyinCommercePage(QWidget):
         )
         self.validation_label.setText(self._batch_progress_text)
         _LOGGER.info("抖音带货批量执行：%s", self._batch_progress_text)
-        if _normalized(event.get("phase")) == "waiting_verification":
+        if phase == "waiting_verification":
             videos = self._selected_videos()
             label = Path(_normalized(videos[index - 1].get("storedPath"))).name if 0 < index <= len(videos) else ""
             self._verification_item_context = {"index": index, "total": total, "label": label}
@@ -4507,6 +4518,7 @@ class DouyinCommercePage(QWidget):
                 reason="publish_started",
             )
 
+        self._batch_executor.reset_shutdown()
         started = self.runner.run(
             _BATCH_RUN_KEY,
             with_progress=run_publish,
@@ -6499,6 +6511,25 @@ class DouyinCommercePage(QWidget):
 
         self._reset_platform_collector_progress()
         self._shutdown_requested.set()
+        self._batch_executor.request_shutdown(source="client_shutdown")
+        batch_finished = True
+        if self.runner.is_running(_BATCH_RUN_KEY):
+            cancel_pending = getattr(self.runner, "cancel_pending", None)
+            cancelled = bool(
+                callable(cancel_pending) and cancel_pending(_BATCH_RUN_KEY)
+            )
+            if not cancelled:
+                wait_for_finished = getattr(self.runner, "wait_for_finished", None)
+                batch_finished = bool(
+                    callable(wait_for_finished)
+                    and wait_for_finished(
+                        _BATCH_RUN_KEY,
+                        self._SHUTDOWN_WAIT_SECONDS,
+                    )
+                )
+        if not batch_finished:
+            return False
+
         setup_finished = True
         if self.runner.is_running(self._SETUP_GENERATION_TASK_KEY):
             cancel_pending = getattr(self.runner, "cancel_pending", None)

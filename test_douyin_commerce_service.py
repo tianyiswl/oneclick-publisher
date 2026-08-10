@@ -3266,6 +3266,45 @@ class DouyinCommerceUiTests(unittest.TestCase):
             "已完成 2/4 · 成功 1 · 失败 1 · 正在处理 3/4：正在上传视频",
         )
 
+    def test_batch_sms_cooldown_updates_countdown_without_per_second_log(self) -> None:
+        """冷却每秒只更新受控界面文案，不把倒计时逐秒写入运行日志。"""
+
+        with patch("ui.douyin_commerce_page._LOGGER.info") as info:
+            for remaining in (27, 26):
+                self.page._batch_progress(
+                    {
+                        "index": 2,
+                        "total": 20,
+                        "phase": "verification_cooldown",
+                        "message": "不应投影的外部文案",
+                        "remainingSeconds": remaining,
+                    }
+                )
+
+        self.assertEqual(
+            self.page.validation_label.text(),
+            "短信验证码冷却中，剩余 26 秒；到点自动继续第 3/20 条",
+        )
+        self.assertEqual(info.call_count, 0)
+
+    def test_batch_sms_cooldown_ignores_non_builtin_integer_seconds(self) -> None:
+        """布尔值不是合法秒数，不能借由 int 子类关系污染界面或日志。"""
+
+        self.page.validation_label.setText("保留上一条可信进度")
+        with patch("ui.douyin_commerce_page._LOGGER.info") as info:
+            self.page._batch_progress(
+                {
+                    "index": 2,
+                    "total": 20,
+                    "phase": "verification_cooldown",
+                    "message": "不应投影的外部文案",
+                    "remainingSeconds": True,
+                }
+            )
+
+        self.assertEqual(self.page.validation_label.text(), "保留上一条可信进度")
+        self.assertEqual(info.call_count, 0)
+
     def test_ambiguous_platform_receipt_summary_reports_paused_and_pending_review(self) -> None:
         """最终提交回执不明时，弹窗不得误报整批已结束或漏计当前视频。"""
 
@@ -8446,6 +8485,65 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         information.assert_not_called()
         warning.assert_not_called()
 
+    def test_shutdown_requests_batch_stop_and_refuses_exit_until_worker_finishes(self) -> None:
+        """批 worker 未收束时必须拒绝退出，且不得越过它关闭后续资源。"""
+
+        self.page._session_id = "session-legacy"
+        with patch.object(
+            self.page.runner,
+            "is_running",
+            side_effect=lambda key: key == "douyin_commerce_batch_run",
+        ), patch.object(
+            self.page.runner, "cancel_pending", return_value=False
+        ) as cancel_pending, patch.object(
+            self.page.runner, "wait_for_finished", return_value=False
+        ) as wait_for_finished, patch.object(
+            self.page._batch_executor, "request_shutdown", return_value=True
+        ) as request_shutdown, patch.object(
+            self.page, "_close_setup_generation"
+        ) as close_generation, patch.object(
+            douyin_commerce_session.commerce_session_manager, "close"
+        ) as close_session:
+            result = self.page.shutdown()
+
+        self.assertFalse(result)
+        request_shutdown.assert_called_once_with(source="client_shutdown")
+        cancel_pending.assert_called_once_with("douyin_commerce_batch_run")
+        wait_for_finished.assert_called_once_with(
+            "douyin_commerce_batch_run",
+            self.page._SHUTDOWN_WAIT_SECONDS,
+        )
+        close_generation.assert_not_called()
+        close_session.assert_not_called()
+
+    def test_shutdown_closes_collectors_after_batch_worker_finishes(self) -> None:
+        """批 worker 已收束后才复用既有采集器零存活关闭屏障。"""
+
+        with patch.object(
+            self.page.runner,
+            "is_running",
+            side_effect=lambda key: key == "douyin_commerce_batch_run",
+        ), patch.object(
+            self.page.runner, "cancel_pending", return_value=False
+        ), patch.object(
+            self.page.runner, "wait_for_finished", return_value=True
+        ) as wait_for_finished, patch.object(
+            self.page._batch_executor, "request_shutdown", return_value=True
+        ) as request_shutdown, patch.object(
+            self.page,
+            "_close_setup_generation",
+            return_value={"closed": True, "aliveCollectorCount": 0},
+        ) as close_generation:
+            result = self.page.shutdown()
+
+        self.assertTrue(result)
+        request_shutdown.assert_called_once_with(source="client_shutdown")
+        wait_for_finished.assert_called_once_with(
+            "douyin_commerce_batch_run",
+            self.page._SHUTDOWN_WAIT_SECONDS,
+        )
+        close_generation.assert_called_once_with("client_shutdown")
+
     def test_shutdown_cancels_queued_setup_before_worker_can_begin_generation(self) -> None:
         """已入线程池但尚未执行的 setup 必须在退出返回前不可逆取消。"""
 
@@ -8843,6 +8941,27 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
 
         executor.assert_called_once()
         self.assertEqual(self.page._setup_generation_id, "")
+
+    def test_start_batch_publish_resets_shutdown_before_worker_is_enqueued(self) -> None:
+        """重新发布必须先建立新执行代际，再把 worker 加入后台队列。"""
+
+        order: list[str] = []
+        payload = {"items": [{"mediaPath": "/tmp/video-1.mp4"}]}
+        with patch.object(
+            self.page._batch_executor,
+            "reset_shutdown",
+            side_effect=lambda: order.append("reset") or 2,
+        ) as reset_shutdown, patch.object(
+            self.page.runner,
+            "run",
+            side_effect=lambda *_args, **_kwargs: order.append("run") or True,
+        ), patch.object(
+            self.page, "_start_douyin_verification_polling"
+        ):
+            self.page.start_batch_publish(payload, {"id": 75})
+
+        reset_shutdown.assert_called_once_with()
+        self.assertEqual(order, ["reset", "run"])
 
     def test_abandon_cleanup_incomplete_retains_generation_and_choices(self) -> None:
         """放弃关闭不完整时保留安全重试所需句柄与本批选择。"""
