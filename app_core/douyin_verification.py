@@ -56,6 +56,10 @@ class VerificationRequest:
     # 重新发送只允许由仍持有同一编辑器会话的执行器注册；回调绝不写入快照、
     # 任务事件或日志，避免被 UI 用新建验证请求绕过平台的 60 秒限制。
     resend_handler: Callable[[], object] | None = field(default=None, repr=False)
+    resend_confirmed_observers: list[Callable[[str], object]] = field(
+        default_factory=list,
+        repr=False,
+    )
     resend_available_at: float = field(default=0.0, repr=False)
     resend_in_flight: bool = field(default=False, repr=False)
     state: str = "waiting"
@@ -332,7 +336,30 @@ class DouyinVerificationBroker:
                 raise DouyinVerificationError("抖音验证已取消、失败或超时，不能重新发送验证码")
             request.pending_code = ""
             request.resend_available_at = self._clock() + 60.0
+            observers = tuple(request.resend_confirmed_observers)
             request.condition.notify_all()
+        for observer in observers:
+            observer(request.request_id)
+
+    def register_sms_resend_confirmed_observer(
+        self,
+        request_id: str,
+        observer: Callable[[str], object],
+    ) -> None:
+        """为同一活跃短信请求登记平台重发确认观察者。
+
+        观察者只收到不可变的内存 request id；不包含验证码、手机号或
+        平台页面内容，并随请求 ``clear`` 一并擦除。
+        """
+
+        if not callable(observer):
+            raise DouyinVerificationError("抖音验证重发观察者无效")
+        request = self._get(request_id)
+        with request.condition:
+            if request.kind != "sms" or self._state(request) != "waiting":
+                raise DouyinVerificationError("当前抖音验证不能登记重发确认")
+            if observer not in request.resend_confirmed_observers:
+                request.resend_confirmed_observers.append(observer)
 
     def qr_image(self, request_id: str) -> bytes:
         """供原生二维码对话框从同一进程内存读取图像。"""
@@ -488,6 +515,7 @@ class DouyinVerificationBroker:
                 request.pending_code = ""
                 request.qr_image = b""
                 request.resend_handler = None
+                request.resend_confirmed_observers.clear()
                 request.resend_in_flight = False
                 request.condition.notify_all()
             if self._task_requests.get(request.task_id) == request.request_id:

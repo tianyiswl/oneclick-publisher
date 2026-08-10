@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import tempfile
 import threading
@@ -862,6 +862,200 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
             timeline.index("submit:session-2"),
         )
 
+    def test_confirmed_sms_resend_renews_next_item_cooldown_from_confirmation(self) -> None:
+        """同一验证请求的平台重发确认必须把跨视频冷却重新计满 60 秒。"""
+
+        now = [100.0]
+        utc_origin = datetime(2026, 8, 10, 1, 0, tzinfo=timezone.utc)
+        broker = DouyinVerificationBroker(clock=lambda: now[0])
+        events: list[BatchProgressEvent] = []
+        request_ids: list[str] = []
+        resend_confirmations: list[str] = []
+
+        class ConfirmedResendManager(FakeCommerceSessionManager):
+            def submit(
+                self,
+                session_id: str,
+                payload: dict,
+                task_id: int | None = None,
+                **kwargs,
+            ) -> dict:
+                index = self._index_by_session[session_id]
+                if index != 0:
+                    return super().submit(
+                        session_id,
+                        payload,
+                        task_id=task_id,
+                        **kwargs,
+                    )
+                self.calls.append("submit:0")
+                self.ordered_calls.append(("submit", session_id))
+                request_id = broker.create_sms(
+                    task_id=int(task_id or 0),
+                    message="请输入短信验证码",
+                    resend_handler=lambda: resend_confirmations.append(request_id)
+                    or True,
+                )
+                request_ids.append(request_id)
+                kwargs["on_verification"](
+                    VerificationChallenge(kind="sms", message="需要短信验证")
+                )
+                # 首次短信的 60 秒已过，平台此刻确认重新发送。
+                now[0] = 160.0
+                broker.request_sms_resend(request_id)
+                broker.submit_code(request_id, "123456")
+                self.assert_active_request(request_id)
+                if broker.claim_code(request_id) != "123456":
+                    raise AssertionError("验证码必须在同一 active 请求中被领取")
+                broker.succeed(request_id)
+                return {
+                    "ok": True,
+                    "scheduled": False,
+                    "message": "第 0 条作品已由平台管理页回读",
+                    "platformReceipt": {
+                        "platformPostId": "post-0",
+                        "publishedAt": "2026-08-10 10:00",
+                        "timezone": "Asia/Shanghai",
+                    },
+                }
+
+        manager = ConfirmedResendManager(verification_broker=broker)
+        executor = DouyinCommerceBatchExecutor(
+            manager,
+            verification_broker=broker,
+            cooldown_gate=DouyinSmsCooldownGate(
+                clock=lambda: now[0],
+                waiter=lambda seconds: now.__setitem__(0, now[0] + seconds),
+            ),
+            utc_now=lambda: utc_origin + timedelta(seconds=now[0] - 100.0),
+        )
+
+        result = executor.run_publish(
+            self.batch,
+            task_id=self.task["id"],
+            confirmed=True,
+            progress=events.append,
+        )
+
+        self.assertEqual([row["status"] for row in result], ["published"] * 3)
+        self.assertEqual(resend_confirmations, request_ids)
+        self.assertEqual(
+            [
+                event.remaining_seconds
+                for event in events
+                if event.phase == "verification_cooldown"
+            ],
+            list(range(60, 0, -1)),
+        )
+        self.assertEqual(
+            [call for call in manager.calls if call.startswith("submit:")],
+            ["submit:0", "submit:1", "submit:2"],
+        )
+        stored_event_types = [
+            event["eventType"]
+            for event in task_service.get_task(self.task["id"])["events"]
+        ]
+        self.assertEqual(stored_event_types.count("douyin_sms_cooldown_started"), 2)
+
+    def test_resend_cooldown_persistence_error_pauses_even_when_submit_swallows_it(self) -> None:
+        """重发确认的冷却写入失败必须由执行器哨兵收束，不得继续后续条。"""
+
+        now = [100.0]
+        broker = DouyinVerificationBroker(clock=lambda: now[0])
+        original_record = task_service.record_douyin_sms_cooldown
+        record_calls = [0]
+
+        def fail_only_resend_record(*args, **kwargs) -> None:
+            record_calls[0] += 1
+            if record_calls[0] == 2:
+                raise RuntimeError("Cookie=resend-persistence-secret")
+            original_record(*args, **kwargs)
+
+        class SwallowingResendManager(FakeCommerceSessionManager):
+            def submit(
+                self,
+                session_id: str,
+                payload: dict,
+                task_id: int | None = None,
+                **kwargs,
+            ) -> dict:
+                index = self._index_by_session[session_id]
+                if index != 0:
+                    return super().submit(
+                        session_id,
+                        payload,
+                        task_id=task_id,
+                        **kwargs,
+                    )
+                self.calls.append("submit:0")
+                self.ordered_calls.append(("submit", session_id))
+                request_id = broker.create_sms(
+                    task_id=int(task_id or 0),
+                    message="请输入短信验证码",
+                    resend_handler=lambda: True,
+                )
+                kwargs["on_verification"](
+                    VerificationChallenge(kind="sms", message="需要短信验证")
+                )
+                now[0] = 160.0
+                try:
+                    broker.request_sms_resend(request_id)
+                except Exception:
+                    # 模拟真实会话层吞掉普通 callback 异常后继续等平台回执。
+                    pass
+                broker.submit_code(request_id, "123456")
+                broker.claim_code(request_id)
+                broker.succeed(request_id)
+                return {
+                    "ok": True,
+                    "scheduled": False,
+                    "message": "平台管理页返回成功",
+                    "platformReceipt": {
+                        "platformPostId": "must-not-be-written",
+                        "publishedAt": "2026-08-10 10:00",
+                        "timezone": "Asia/Shanghai",
+                    },
+                }
+
+        manager = SwallowingResendManager(verification_broker=broker)
+        executor = DouyinCommerceBatchExecutor(
+            manager,
+            verification_broker=broker,
+            cooldown_gate=DouyinSmsCooldownGate(
+                clock=lambda: now[0],
+                waiter=lambda seconds: now.__setitem__(0, now[0] + seconds),
+            ),
+            utc_now=lambda: datetime(2026, 8, 10, 1, 0, tzinfo=timezone.utc),
+        )
+        with patch.object(
+            task_service,
+            "record_douyin_sms_cooldown",
+            side_effect=fail_only_resend_record,
+        ):
+            result = executor.run_publish(
+                self.batch,
+                task_id=self.task["id"],
+                confirmed=True,
+            )
+
+        self.assertEqual(
+            [row["status"] for row in result],
+            ["receipt_ambiguous", "pending", "pending"],
+        )
+        self.assertEqual(result[0]["diagnostic"], "verification_cooldown_failed")
+        self.assertEqual(
+            [call for call in manager.calls if call.startswith("submit:")],
+            ["submit:0"],
+        )
+        saved = task_service.get_task(self.task["id"])
+        self.assertEqual(
+            (saved["status"], saved["pauseReasonCode"]),
+            ("paused", "receipt_ambiguous"),
+        )
+        combined = repr(result) + repr(saved["events"])
+        self.assertNotIn("resend-persistence-secret", combined)
+        self.assertNotIn("must-not-be-written", repr(saved))
+
     def test_shutdown_from_submitting_progress_never_claims_submit(self) -> None:
         now = [100.0]
         broker = DouyinVerificationBroker()
@@ -1184,6 +1378,51 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
         self.assertEqual(
             len([event for event in events if event.phase == "waiting_verification"]),
             waiting_count,
+        )
+
+    def test_late_resend_confirmation_from_old_generation_does_not_renew_cooldown(self) -> None:
+        """旧 run 已被替换后，同 request 的迟到平台确认不得污染新代际。"""
+
+        now = [100.0]
+        broker = DouyinVerificationBroker(clock=lambda: now[0])
+        gate = DouyinSmsCooldownGate(
+            clock=lambda: now[0],
+            waiter=lambda seconds: now.__setitem__(0, now[0] + seconds),
+        )
+        executor = DouyinCommerceBatchExecutor(
+            FakeCommerceSessionManager(),
+            verification_broker=broker,
+            cooldown_gate=gate,
+            utc_now=lambda: datetime(2026, 8, 10, 1, 0, tzinfo=timezone.utc),
+        )
+        item_id = task_service.get_task(self.task["id"])["items"][0]["id"]
+        request_id = broker.create_sms(
+            task_id=self.task["id"],
+            message="请输入短信验证码",
+            resend_handler=lambda: True,
+        )
+        callback = executor._verification_progress_callback(
+            task_id=self.task["id"],
+            item_id=item_id,
+            index=0,
+            total=3,
+            label="a.mp4",
+            account_key=self.batch["accountFile"],
+            run_generation=0,
+            progress=None,
+        )
+        callback(VerificationChallenge(kind="sms", message="需要短信验证"))
+        initial_event_count = len(task_service.get_task(self.task["id"])["events"])
+
+        now[0] = 160.0
+        self.assertEqual(gate.remaining_seconds(self.batch["accountFile"]), 0)
+        executor.reset_shutdown()
+        broker.request_sms_resend(request_id)
+
+        self.assertEqual(gate.remaining_seconds(self.batch["accountFile"]), 0)
+        self.assertEqual(
+            len(task_service.get_task(self.task["id"])["events"]),
+            initial_event_count,
         )
 
     def test_persisted_sms_cooldown_is_restored_before_first_submit(self) -> None:

@@ -508,6 +508,36 @@ class DouyinCommerceBatchExecutor:
             if not sentinel:
                 sentinel.append(code)
 
+        def _record_sms_trigger() -> None:
+            try:
+                self._cooldown_gate.record_trigger(account_key)
+            except DouyinSmsCooldownError as exc:
+                _remember_error(_text(exc))
+                return
+            except Exception:
+                _remember_error("verification_cooldown_failed")
+                return
+            try:
+                self._task_store.record_douyin_sms_cooldown(
+                    task_id,
+                    item_id,
+                    triggered_at_utc=self._utc_now(),
+                )
+            except Exception:
+                _remember_error("verification_cooldown_failed")
+
+        def _resend_confirmed(confirmed_request_id: str) -> None:
+            with self._run_lock:
+                if (
+                    self._shutdown_requested.is_set()
+                    or run_generation != self._run_generation
+                    or _text(confirmed_request_id) != first_request_id
+                    or self._active_verification_request_id(task_id)
+                    != first_request_id
+                ):
+                    return
+            _record_sms_trigger()
+
         def _callback(challenge: object) -> object:
             nonlocal first_request_id, handled
             if isinstance(challenge, VerificationChallenge):
@@ -538,21 +568,18 @@ class DouyinCommerceBatchExecutor:
                 challenge.kind == "sms"
             ):
                 try:
-                    self._cooldown_gate.record_trigger(account_key)
-                except DouyinSmsCooldownError as exc:
-                    _remember_error(_text(exc))
-                    return challenge
-                except Exception:
-                    _remember_error("verification_cooldown_failed")
-                    return challenge
-                try:
-                    self._task_store.record_douyin_sms_cooldown(
-                        task_id,
-                        item_id,
-                        triggered_at_utc=self._utc_now(),
+                    register_observer = getattr(
+                        self._verification_broker,
+                        "register_sms_resend_confirmed_observer",
+                        None,
                     )
+                    if callable(register_observer):
+                        register_observer(first_request_id, _resend_confirmed)
                 except Exception:
                     _remember_error("verification_cooldown_failed")
+                    return challenge
+                _record_sms_trigger()
+                if sentinel:
                     return challenge
             try:
                 self._record_active_verification_waiting(

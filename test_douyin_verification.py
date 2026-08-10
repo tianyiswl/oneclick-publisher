@@ -209,11 +209,16 @@ class DouyinVerificationBrokerTests(unittest.TestCase):
     def test_sms_resend_uses_same_active_request_and_enforces_monotonic_60_second_cooldown(self):
         now = [100.0]
         calls: list[str] = []
+        confirmations: list[str] = []
         broker = DouyinVerificationBroker(clock=lambda: now[0])
         request_id = broker.create_sms(
             task_id=88,
             message="需要短信验证",
             resend_handler=lambda: calls.append("resend") or True,
+        )
+        broker.register_sms_resend_confirmed_observer(
+            request_id,
+            confirmations.append,
         )
 
         first = broker.snapshot(request_id)
@@ -221,30 +226,44 @@ class DouyinVerificationBrokerTests(unittest.TestCase):
         self.assertEqual(first["resendInSeconds"], 60)
         with self.assertRaisesRegex(DouyinVerificationError, "60 秒后"):
             broker.request_sms_resend(request_id)
+        self.assertEqual(confirmations, [])
 
         now[0] = 160.0
         broker.request_sms_resend(request_id)
         second = broker.snapshot(request_id)
         self.assertEqual(calls, ["resend"])
+        self.assertEqual(confirmations, [request_id])
         self.assertFalse(second["canResend"])
         self.assertEqual(second["resendInSeconds"], 60)
         # 重新发送不创建新的 request，也不能用第二次点击绕过新的冷却期。
         self.assertEqual(second["requestId"], request_id)
         with self.assertRaisesRegex(DouyinVerificationError, "60 秒后"):
             broker.request_sms_resend(request_id)
+        self.assertEqual(confirmations, [request_id])
+
+        now[0] = 220.0
+        broker.request_sms_resend(request_id)
+        self.assertEqual(calls, ["resend", "resend"])
+        self.assertEqual(confirmations, [request_id, request_id])
 
     def test_sms_resend_rejects_terminal_request_and_handler_failure_stops_safely(self):
         now = [200.0]
+        confirmations: list[str] = []
         broker = DouyinVerificationBroker(clock=lambda: now[0])
         request_id = broker.create_sms(
             task_id=89,
             message="需要短信验证",
             resend_handler=lambda: False,
         )
+        broker.register_sms_resend_confirmed_observer(
+            request_id,
+            confirmations.append,
+        )
         now[0] = 260.0
         with self.assertRaisesRegex(DouyinVerificationError, "未确认"):
             broker.request_sms_resend(request_id)
         self.assertEqual(broker.snapshot(request_id)["state"], "failed")
+        self.assertEqual(confirmations, [])
         with self.assertRaisesRegex(DouyinVerificationError, "不能重新发送"):
             broker.request_sms_resend(request_id)
 
