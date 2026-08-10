@@ -1425,6 +1425,171 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
             initial_event_count,
         )
 
+    def test_resend_observer_and_reset_are_linearized_in_both_orders(self) -> None:
+        """reset 与重发确认必须只有一方先取得可观测的线性化权。"""
+
+        with self.subTest(order="reset_first"):
+            now = [100.0]
+            observer_arrived = threading.Event()
+            release_observer = threading.Event()
+            resend_errors: list[BaseException] = []
+
+            class DelayedObserverBroker(DouyinVerificationBroker):
+                def register_sms_resend_confirmed_observer(
+                    self,
+                    request_id: str,
+                    observer,
+                ) -> None:
+                    def delayed_observer(confirmed_request_id: str) -> None:
+                        observer_arrived.set()
+                        if not release_observer.wait(1):
+                            raise AssertionError("重发 observer 未获准继续")
+                        observer(confirmed_request_id)
+
+                    super().register_sms_resend_confirmed_observer(
+                        request_id,
+                        delayed_observer,
+                    )
+
+            broker = DelayedObserverBroker(clock=lambda: now[0])
+            gate = DouyinSmsCooldownGate(
+                clock=lambda: now[0],
+                waiter=lambda seconds: now.__setitem__(0, now[0] + seconds),
+            )
+            task = task_service.create_douyin_batch_task(self.batch)
+            item_id = task_service.get_task(task["id"])["items"][0]["id"]
+            executor = DouyinCommerceBatchExecutor(
+                FakeCommerceSessionManager(),
+                verification_broker=broker,
+                cooldown_gate=gate,
+                utc_now=lambda: datetime(2026, 8, 10, 1, 0, tzinfo=timezone.utc),
+            )
+            request_id = broker.create_sms(
+                task_id=task["id"],
+                message="请输入短信验证码",
+                resend_handler=lambda: True,
+            )
+            callback = executor._verification_progress_callback(
+                task_id=task["id"],
+                item_id=item_id,
+                index=0,
+                total=3,
+                label="a.mp4",
+                account_key=self.batch["accountFile"],
+                run_generation=0,
+                progress=None,
+            )
+            callback(VerificationChallenge(kind="sms", message="需要短信验证"))
+            initial_event_count = len(task_service.get_task(task["id"])["events"])
+            now[0] = 160.0
+
+            def request_resend() -> None:
+                try:
+                    broker.request_sms_resend(request_id)
+                except BaseException as exc:
+                    resend_errors.append(exc)
+
+            resend_thread = threading.Thread(target=request_resend)
+            resend_thread.start()
+            self.assertTrue(observer_arrived.wait(1))
+            self.assertEqual(executor.reset_shutdown(), 1)
+            release_observer.set()
+            resend_thread.join(1)
+
+            self.assertFalse(resend_thread.is_alive())
+            self.assertEqual(resend_errors, [])
+            self.assertEqual(gate.remaining_seconds(self.batch["accountFile"]), 0)
+            self.assertEqual(
+                len(task_service.get_task(task["id"])["events"]),
+                initial_event_count,
+            )
+
+        with self.subTest(order="observer_first"):
+            now = [200.0]
+            effect_arrived = threading.Event()
+            release_effect = threading.Event()
+            reset_started = threading.Event()
+            reset_completed = threading.Event()
+            resend_errors: list[BaseException] = []
+
+            class BlockingSecondTriggerGate(DouyinSmsCooldownGate):
+                def __init__(self) -> None:
+                    super().__init__(
+                        clock=lambda: now[0],
+                        waiter=lambda seconds: now.__setitem__(0, now[0] + seconds),
+                    )
+                    self.trigger_count = 0
+
+                def record_trigger(self, account_key: str) -> None:
+                    self.trigger_count += 1
+                    if self.trigger_count == 2:
+                        effect_arrived.set()
+                        if not release_effect.wait(1):
+                            raise AssertionError("重发续期未获准继续")
+                    super().record_trigger(account_key)
+
+            broker = DouyinVerificationBroker(clock=lambda: now[0])
+            gate = BlockingSecondTriggerGate()
+            task = task_service.create_douyin_batch_task(self.batch)
+            item_id = task_service.get_task(task["id"])["items"][0]["id"]
+            executor = DouyinCommerceBatchExecutor(
+                FakeCommerceSessionManager(),
+                verification_broker=broker,
+                cooldown_gate=gate,
+                utc_now=lambda: datetime(2026, 8, 10, 1, 0, tzinfo=timezone.utc),
+            )
+            request_id = broker.create_sms(
+                task_id=task["id"],
+                message="请输入短信验证码",
+                resend_handler=lambda: True,
+            )
+            callback = executor._verification_progress_callback(
+                task_id=task["id"],
+                item_id=item_id,
+                index=0,
+                total=3,
+                label="a.mp4",
+                account_key=self.batch["accountFile"],
+                run_generation=0,
+                progress=None,
+            )
+            callback(VerificationChallenge(kind="sms", message="需要短信验证"))
+            initial_event_count = len(task_service.get_task(task["id"])["events"])
+            now[0] = 260.0
+
+            def request_resend() -> None:
+                try:
+                    broker.request_sms_resend(request_id)
+                except BaseException as exc:
+                    resend_errors.append(exc)
+
+            def reset_executor() -> None:
+                reset_started.set()
+                executor.reset_shutdown()
+                reset_completed.set()
+
+            resend_thread = threading.Thread(target=request_resend)
+            reset_thread = threading.Thread(target=reset_executor)
+            resend_thread.start()
+            self.assertTrue(effect_arrived.wait(1))
+            reset_thread.start()
+            self.assertTrue(reset_started.wait(1))
+            completed_before_effect = reset_completed.wait(0.1)
+            release_effect.set()
+            resend_thread.join(1)
+            reset_thread.join(1)
+
+            self.assertFalse(completed_before_effect)
+            self.assertFalse(resend_thread.is_alive())
+            self.assertFalse(reset_thread.is_alive())
+            self.assertTrue(reset_completed.is_set())
+            self.assertEqual(resend_errors, [])
+            self.assertEqual(gate.remaining_seconds(self.batch["accountFile"]), 60)
+            self.assertEqual(
+                len(task_service.get_task(task["id"])["events"]),
+                initial_event_count + 1,
+            )
+
     def test_persisted_sms_cooldown_is_restored_before_first_submit(self) -> None:
         monotonic_now = [100.0]
         triggered_at = datetime(2026, 8, 10, 1, 0, tzinfo=timezone.utc)

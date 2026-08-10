@@ -228,6 +228,7 @@ class DouyinCommerceBatchExecutor:
         self._run_generation = 0
         self._claimed_submit_items: set[tuple[int, int, int]] = set()
         self._active_submit_leases: set[tuple[int, int, int]] = set()
+        self._active_resend_observer_leases = 0
 
     def request_pause(self, *, source: str = "") -> bool:
         """只接受客户端明确确认的暂停请求，不把验证事件误当成人工暂停。"""
@@ -246,7 +247,10 @@ class DouyinCommerceBatchExecutor:
         """为新 worker 建立唯一运行代际，并清除之前的客户端退出标记。"""
 
         with self._run_condition:
-            while self._active_submit_leases:
+            while (
+                self._active_submit_leases
+                or self._active_resend_observer_leases
+            ):
                 self._run_condition.wait()
             self._run_generation += 1
             self._shutdown_requested.clear()
@@ -527,16 +531,20 @@ class DouyinCommerceBatchExecutor:
                 _remember_error("verification_cooldown_failed")
 
         def _resend_confirmed(confirmed_request_id: str) -> None:
-            with self._run_lock:
+            with self._run_condition:
                 if (
                     self._shutdown_requested.is_set()
                     or run_generation != self._run_generation
                     or _text(confirmed_request_id) != first_request_id
-                    or self._active_verification_request_id(task_id)
-                    != first_request_id
                 ):
                     return
-            _record_sms_trigger()
+                self._active_resend_observer_leases += 1
+            try:
+                _record_sms_trigger()
+            finally:
+                with self._run_condition:
+                    self._active_resend_observer_leases -= 1
+                    self._run_condition.notify_all()
 
         def _callback(challenge: object) -> object:
             nonlocal first_request_id, handled
