@@ -224,8 +224,10 @@ class DouyinCommerceBatchExecutor:
         self._pause_requested = threading.Event()
         self._shutdown_requested = threading.Event()
         self._run_lock = threading.RLock()
+        self._run_condition = threading.Condition(self._run_lock)
         self._run_generation = 0
         self._claimed_submit_items: set[tuple[int, int, int]] = set()
+        self._active_submit_leases: set[tuple[int, int, int]] = set()
 
     def request_pause(self, *, source: str = "") -> bool:
         """只接受客户端明确确认的暂停请求，不把验证事件误当成人工暂停。"""
@@ -243,7 +245,9 @@ class DouyinCommerceBatchExecutor:
     def reset_shutdown(self) -> int:
         """为新 worker 建立唯一运行代际，并清除之前的客户端退出标记。"""
 
-        with self._run_lock:
+        with self._run_condition:
+            while self._active_submit_leases:
+                self._run_condition.wait()
             self._run_generation += 1
             self._shutdown_requested.clear()
             self._claimed_submit_items.clear()
@@ -893,16 +897,18 @@ class DouyinCommerceBatchExecutor:
             )
             submit_error: Exception | None = None
             submit_key = (run_generation, int(task_id), int(item_id))
-            with self._run_lock:
-                if (
+            submitted = None
+            with self._run_condition:
+                if not (
                     self._shutdown_requested.is_set()
                     or run_generation != self._run_generation
                     or submit_key in self._claimed_submit_items
                 ):
-                    submitted = None
-                else:
                     self._claimed_submit_items.add(submit_key)
+                    self._active_submit_leases.add(submit_key)
                     submit_permission_claimed = True
+            if submit_permission_claimed:
+                try:
                     try:
                         submitted = self._manager.submit(
                             session_id,
@@ -915,6 +921,10 @@ class DouyinCommerceBatchExecutor:
                     except Exception as exc:
                         submit_error = exc
                         submitted = None
+                finally:
+                    with self._run_condition:
+                        self._active_submit_leases.discard(submit_key)
+                        self._run_condition.notify_all()
             if not submit_permission_claimed:
                 message = "客户端已退出，当前视频未执行最终提交"
                 self._task_store.pause_douyin_batch_before_submit(

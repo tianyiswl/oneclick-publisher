@@ -961,6 +961,7 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
         executor = DouyinCommerceBatchExecutor(manager)
         worker_result: list[list[dict[str, object]]] = []
         worker_errors: list[BaseException] = []
+        shutdown_results: list[bool] = []
         reset_generations: list[int] = []
 
         def run_worker() -> None:
@@ -976,6 +977,9 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
                 worker_errors.append(exc)
 
         def reset_worker() -> None:
+            shutdown_results.append(
+                executor.request_shutdown("client_shutdown")
+            )
             reset_started.set()
             reset_generations.append(executor.reset_shutdown())
             reset_finished.set()
@@ -999,6 +1003,7 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
             [row["status"] for row in worker_result[0]],
             ["published"],
         )
+        self.assertEqual(shutdown_results, [True])
         self.assertEqual(reset_generations, [1])
         self.assertEqual(manager.calls.count("submit:0"), 1)
 
@@ -1412,6 +1417,121 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
                 combined = repr(result) + repr(saved["events"])
                 self.assertNotIn("callback-secret", combined)
                 self.assertNotIn("manager-private-page", combined)
+
+    def test_async_callback_thread_records_sentinel_without_submit_lock_deadlock(self) -> None:
+        """submit 等待 Future 时，独立回调线程仍必须能写入错误哨兵。"""
+
+        broker = DouyinVerificationBroker()
+        now = [100.0]
+        callback_done = threading.Event()
+        callback_threads: list[threading.Thread] = []
+
+        class AsyncCallbackManager(FakeCommerceSessionManager):
+            callback_completed_inside_submit = False
+
+            def submit(
+                self,
+                session_id: str,
+                payload: dict,
+                task_id: int | None = None,
+                **kwargs,
+            ) -> dict:
+                index = self._index_by_session[session_id]
+                if index != 0:
+                    return super().submit(
+                        session_id,
+                        payload,
+                        task_id=task_id,
+                        **kwargs,
+                    )
+                if (
+                    payload.get("runtimeMode") != "publish"
+                    or payload.get("debugDryRun") is not False
+                ):
+                    raise AssertionError("最终提交必须明确发布模式")
+                self.calls.append("submit:0")
+                self.ordered_calls.append(("submit", session_id))
+                request_id = broker.create_sms(
+                    task_id=int(task_id or 0),
+                    message="请输入短信验证码",
+                )
+
+                def invoke_callback() -> None:
+                    try:
+                        kwargs["on_verification"](
+                            VerificationChallenge(
+                                kind="sms",
+                                message="需要短信验证",
+                            )
+                        )
+                    finally:
+                        callback_done.set()
+
+                callback_thread = threading.Thread(target=invoke_callback)
+                callback_threads.append(callback_thread)
+                callback_thread.start()
+                self.callback_completed_inside_submit = callback_done.wait(0.5)
+                if not self.callback_completed_inside_submit:
+                    broker.cancel(request_id)
+                else:
+                    broker.submit_code(request_id, "123456")
+                    broker.claim_code(request_id)
+                    broker.succeed(request_id)
+                return {
+                    "ok": True,
+                    "scheduled": False,
+                    "message": "平台管理页返回成功",
+                    "platformReceipt": {
+                        "platformPostId": "must-not-be-written",
+                        "publishedAt": "2026-08-10 10:00",
+                        "timezone": "Asia/Shanghai",
+                    },
+                }
+
+        manager = AsyncCallbackManager()
+        executor = DouyinCommerceBatchExecutor(
+            manager,
+            verification_broker=broker,
+            cooldown_gate=DouyinSmsCooldownGate(
+                clock=lambda: now[0],
+                waiter=lambda seconds: now.__setitem__(0, now[0] + seconds),
+            ),
+            utc_now=lambda: datetime(2026, 8, 10, 1, 0, tzinfo=timezone.utc),
+        )
+        with patch.object(
+            task_service,
+            "record_douyin_sms_cooldown",
+            side_effect=RuntimeError("Cookie=async-callback-secret"),
+        ):
+            result = executor.run_publish(
+                self.batch,
+                task_id=self.task["id"],
+                confirmed=True,
+            )
+
+        for callback_thread in callback_threads:
+            callback_thread.join(1)
+
+        self.assertTrue(manager.callback_completed_inside_submit)
+        self.assertTrue(callback_done.is_set())
+        self.assertEqual(
+            [row["status"] for row in result],
+            ["receipt_ambiguous", "pending", "pending"],
+        )
+        self.assertEqual(result[0]["diagnostic"], "verification_cooldown_failed")
+        self.assertEqual(manager.calls.count("submit:0"), 1)
+        self.assertNotIn("submit:1", manager.calls)
+        self.assertNotIn("submit:2", manager.calls)
+        self.assertIn("close:0", manager.calls)
+        saved = task_service.get_task(self.task["id"])
+        self.assertEqual(
+            (saved["status"], saved["pauseReasonCode"]),
+            ("paused", "receipt_ambiguous"),
+        )
+        self.assertEqual(saved["items"][0]["status"], "failed")
+        combined = repr(result) + repr(saved["events"])
+        self.assertNotIn("async-callback-secret", combined)
+        self.assertNotIn("must-not-be-written", repr(saved))
 
     def test_cooldown_wait_start_runtime_error_is_fixed_and_sanitized(self) -> None:
         now = [100.0]
