@@ -144,11 +144,11 @@ CAPABILITIES: dict[tuple[str, str], PlatformCapability] = {
     ),
     ("TikTok", ContentType.VIDEO.value): _capability(
         "TikTok", ContentType.VIDEO, "video", requires_assets=True,
-        notes="使用已恢复的 TikTok Studio 视频通道，预检会停在 Post 之前。",
+        notes="使用 TikTok Studio 视频通道；支持停在 Post 前预检和确认后的立即发布。",
     ),
     ("YouTube", ContentType.VIDEO.value): _capability(
         "YouTube", ContentType.VIDEO, "video", requires_assets=True,
-        notes="使用已恢复的 YouTube Studio 视频通道，预检会停在 Done 之前。",
+        notes="使用 YouTube Studio 视频通道；支持停在 SAVE 前预检和确认后的立即发布。",
     ),
     ("Instagram Reels", ContentType.VIDEO.value): _capability(
         "Instagram Reels", ContentType.VIDEO, "video", requires_assets=True,

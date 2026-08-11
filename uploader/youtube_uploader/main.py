@@ -17,10 +17,21 @@ from utils.base_social_media import (
     set_init_script,
 )
 from utils.log import youtube_logger
+from utils.publish_observer import publish_event
 
 
 UPLOAD_URL = "https://www.youtube.com/upload"
-FORMAL_LOCK_MESSAGE = "YouTube 正式发布尚未解锁；当前只允许停在最终发布前"
+FORMAL_LOCK_MESSAGE = "YouTube 正式发布缺少桌面端确认"
+MANUAL_INTERVENTION_TIMEOUT_SECONDS = 600
+PUBLISH_RESULT_TIMEOUT_SECONDS = 120
+
+
+class YouTubeManualInterventionRequired(RuntimeError):
+    """YouTube 要求登录、验证码或其他真人安全确认。"""
+
+
+class YouTubePublishResultUnverified(RuntimeError):
+    """最终保存按钮已点击，但平台没有返回足够的成功证据。"""
 
 
 async def _click_if_present(page, selector: str, timeout: int = 5000) -> bool:
@@ -31,6 +42,89 @@ async def _click_if_present(page, selector: str, timeout: int = 5000) -> bool:
         return True
     except Exception:
         return False
+
+
+async def _body_text(page) -> str:
+    try:
+        return (await page.locator("body").inner_text(timeout=3000)).lower()
+    except Exception:
+        return ""
+
+
+async def _feedback_text(page) -> str:
+    parts = []
+    for selector in ('[role="alert"]', '[role="status"]', 'ytcp-toast'):
+        locator = page.locator(selector)
+        try:
+            count = min(await locator.count(), 12)
+        except Exception:
+            continue
+        for index in range(count):
+            try:
+                value = (await locator.nth(index).inner_text(timeout=1000)).strip()
+            except Exception:
+                continue
+            if value:
+                parts.append(value)
+    return "\n".join(parts)
+
+
+def youtube_security_intervention_reason(url: str, body_text: str) -> str | None:
+    """识别 Google/YouTube 登录与安全验证页面。"""
+
+    normalized_url = str(url or "").lower()
+    text = str(body_text or "").lower()
+    if "accounts.google.com" in normalized_url or "/signin" in normalized_url:
+        return "YouTube 登录状态已失效，请重新登录"
+    if any(marker in normalized_url for marker in ("/challenge/", "signin/v2/challenge")):
+        return "Google 要求完成账号安全验证"
+    markers = (
+        "verify it's you",
+        "2-step verification",
+        "enter the code",
+        "check your phone",
+        "confirm your recovery",
+        "验证您的身份",
+        "两步验证",
+        "输入验证码",
+        "查看您的手机",
+        "确认恢复",
+    )
+    if any(marker in text for marker in markers):
+        return "Google 要求完成验证码或安全确认"
+    return None
+
+
+def youtube_publish_success_signal(
+    *,
+    url: str,
+    feedback_text: str,
+    upload_dialog_visible: bool,
+    final_button_visible: bool,
+    visibility: str,
+) -> str | None:
+    """接受平台明确提示，或 Studio 上传对话框在最终保存后关闭。"""
+
+    text = str(feedback_text or "").lower()
+    markers = (
+        "video published",
+        "published successfully",
+        "video saved",
+        "视频已发布",
+        "发布成功",
+        "视频已保存",
+    )
+    matched = next((marker for marker in markers if marker in text), None)
+    if matched:
+        return f"platform_feedback:{matched}"
+    normalized_url = str(url or "").lower()
+    if (
+        "studio.youtube.com" in normalized_url
+        and not upload_dialog_visible
+        and not final_button_visible
+    ):
+        return f"studio_upload_dialog_closed:{visibility}"
+    return None
 
 
 async def _fill_editable(page, selector: str, text: str) -> None:
@@ -48,6 +142,12 @@ async def _fill_editable(page, selector: str, text: str) -> None:
         await page.evaluate("() => document.activeElement && document.activeElement.blur()")
     except Exception:
         pass
+    try:
+        actual = await box.input_value()
+    except Exception:
+        actual = await box.inner_text()
+    if " ".join(str(actual or "").split()) != " ".join(str(text or "").split()):
+        raise RuntimeError("YouTube 字段写入后回读不一致，已停止在最终保存前")
 
 
 async def _wait_upload_complete(page, max_polls: int = 240) -> None:
@@ -102,6 +202,7 @@ class YouTubeVideo:
         self.visibility = visibility if visibility in {"public", "private", "unlisted"} else "private"
         self.dry_run = bool(dry_run)
         self.dry_run_hold_browser = bool(dry_run_hold_browser)
+        self.publish_confirmed = False
         self.external_page = None
         self.external_context = None
         self.external_browser = None
@@ -131,7 +232,7 @@ class YouTubeVideo:
         except Exception as exc:
             raise RuntimeError(f"YouTube 未找到播放列表“{collection_name}”") from exc
 
-    async def set_ai_generated_declaration(self, page) -> None:
+    async def set_ai_generated_declaration(self, page) -> bool:
         ai_generated = bool(getattr(self, "ai_generated", False))
         await _click_if_present(page, "#toggle-button", 5000)
         selector = (
@@ -143,7 +244,7 @@ class YouTubeVideo:
             youtube_logger.info(
                 f"[youtube] AI/合成内容声明已设置：{'包含' if ai_generated else '不包含'}"
             )
-            return
+            return True
         text_selector = (
             "tp-yt-paper-radio-button:has-text('Yes'), tp-yt-paper-radio-button:has-text('是')"
             if ai_generated
@@ -151,6 +252,8 @@ class YouTubeVideo:
         )
         if not await _click_if_present(page, text_selector, 3000):
             youtube_logger.warning("[youtube] 未识别到 AI/合成内容声明控件，请在预发布页人工确认")
+            return False
+        return True
 
     async def set_audience(self, page) -> None:
         """按一键发设置选择 YouTube 受众，并从真实控件回读。"""
@@ -196,8 +299,157 @@ class YouTubeVideo:
             "YouTube 受众设置后无法回读确认，已停止在最终保存前"
         )
 
-    async def upload(self, playwright: Playwright) -> None:
-        if not self.dry_run:
+    async def set_visibility(self, page) -> None:
+        """选择可见性并回读选中状态。"""
+
+        visibility_name = {
+            "public": "PUBLIC",
+            "unlisted": "UNLISTED",
+            "private": "PRIVATE",
+        }[self.visibility]
+        target = page.locator(
+            f"tp-yt-paper-radio-button[name='{visibility_name}']"
+        ).first
+        try:
+            await target.wait_for(state="visible", timeout=10000)
+            await target.click()
+            await page.wait_for_timeout(250)
+            checked = await target.evaluate(
+                """element =>
+                  element.getAttribute('aria-checked') === 'true'
+                  || element.getAttribute('aria-selected') === 'true'
+                  || element.hasAttribute('checked')
+                  || element.checked === true
+                """
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"YouTube 未能设置{self.visibility}可见性，已停止在发布前"
+            ) from exc
+        if not checked:
+            raise RuntimeError(
+                f"YouTube {self.visibility}可见性设置后无法回读，已停止在发布前"
+            )
+        youtube_logger.info(f"[youtube] 可见性已设置并回读：{self.visibility}")
+
+    async def _wait_for_manual_intervention(self, page) -> None:
+        reason = youtube_security_intervention_reason(page.url, await _body_text(page))
+        if not reason:
+            return
+        await reveal_page_window(page)
+        publish_event(
+            "youtube_manual_intervention",
+            f"{reason}；请在当前浏览器完成，程序会自动继续",
+            level="warning",
+        )
+        youtube_logger.warning(f"[youtube] {reason}；等待用户在可见浏览器完成")
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + MANUAL_INTERVENTION_TIMEOUT_SECONDS
+        while loop.time() < deadline:
+            await asyncio.sleep(1)
+            reason = youtube_security_intervention_reason(
+                page.url,
+                await _body_text(page),
+            )
+            if not reason:
+                publish_event(
+                    "youtube_manual_intervention_resolved",
+                    "YouTube 真人安全确认已完成，自动发布继续执行",
+                )
+                return
+        raise YouTubeManualInterventionRequired(
+            "YouTube 真人安全确认等待超时；登录态已保留，请重新启动前台发布"
+        )
+
+    async def _final_button(self, page):
+        selectors = (
+            "#done-button",
+            "ytcp-button#done-button",
+            "ytcp-button:has-text('Save')",
+            "ytcp-button:has-text('Publish')",
+            "ytcp-button:has-text('保存')",
+            "ytcp-button:has-text('发布')",
+        )
+        for selector in selectors:
+            button = page.locator(selector).first
+            try:
+                if await button.count() and await button.is_visible() and await button.is_enabled():
+                    return button
+            except Exception:
+                continue
+        return None
+
+    async def _upload_dialog_visible(self, page) -> bool:
+        for selector in (
+            "ytcp-video-upload-dialog",
+            "ytcp-uploads-dialog",
+            "ytcp-dialog[aria-label*='upload' i]",
+        ):
+            locator = page.locator(selector).first
+            try:
+                if await locator.count() and await locator.is_visible():
+                    return True
+            except Exception:
+                continue
+        return False
+
+    async def _final_button_visible(self, page) -> bool:
+        return await self._final_button(page) is not None
+
+    async def _wait_for_publish_result(self, page) -> str:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + PUBLISH_RESULT_TIMEOUT_SECONDS
+        while loop.time() < deadline:
+            await self._wait_for_manual_intervention(page)
+            feedback = await _feedback_text(page)
+            signal = youtube_publish_success_signal(
+                url=page.url,
+                feedback_text=feedback,
+                upload_dialog_visible=await self._upload_dialog_visible(page),
+                final_button_visible=await self._final_button_visible(page),
+                visibility=self.visibility,
+            )
+            if signal:
+                return signal
+            combined = f"{feedback}\n{await _body_text(page)}".lower()
+            if any(
+                marker in combined
+                for marker in (
+                    "couldn't save",
+                    "could not save",
+                    "upload failed",
+                    "processing abandoned",
+                    "无法保存",
+                    "上传失败",
+                    "处理已中止",
+                )
+            ):
+                raise RuntimeError("YouTube 页面提示最终保存失败")
+            await asyncio.sleep(2)
+        raise YouTubePublishResultUnverified(
+            "YouTube 未返回可验证的保存或发布结果；本次不会记为成功，请到内容列表人工核对"
+        )
+
+    async def _publish_formally(self, page) -> dict[str, str]:
+        if not self.publish_confirmed:
+            raise RuntimeError(FORMAL_LOCK_MESSAGE)
+        await self._wait_for_manual_intervention(page)
+        button = await self._final_button(page)
+        if button is None:
+            raise RuntimeError("YouTube 最终 SAVE 按钮不可用，未执行发布")
+        publish_event("youtube_final_click", "YouTube 已确认，正在点击 SAVE")
+        await button.click()
+        signal = await self._wait_for_publish_result(page)
+        publish_event(
+            "youtube_publish_verified",
+            "YouTube 保存或发布结果已回读",
+            reference=signal,
+            visibility=self.visibility,
+        )
+        return {"status": "published", "evidence": signal}
+
+    async def upload(self, playwright: Playwright) -> dict[str, str] | None:
+        if not self.dry_run and not self.publish_confirmed:
             raise RuntimeError(FORMAL_LOCK_MESSAGE)
         if not Path(self.file_path).is_file():
             raise RuntimeError(f"YouTube 视频文件不存在：{self.file_path}")
@@ -221,7 +473,8 @@ class YouTubeVideo:
             if "accounts.google.com" in url or "/signin" in url:
                 raise RuntimeError("YouTube 登录已失效，请先在账号管理中重新登录")
 
-            youtube_logger.info(f"[youtube] 开始预发布上传：{Path(self.file_path).name}")
+            mode_text = "预发布" if self.dry_run else "正式发布"
+            youtube_logger.info(f"[youtube] 开始{mode_text}上传：{Path(self.file_path).name}")
             file_input = page.locator('input[type="file"]').first
             await file_input.wait_for(state="attached", timeout=60000)
             await file_input.set_input_files(self.file_path)
@@ -239,7 +492,10 @@ class YouTubeVideo:
                     await thumb.wait_for(state="attached", timeout=20000)
                     await thumb.set_input_files(self.thumbnail_path)
                 except Exception as exc:
-                    youtube_logger.warning(f"[youtube] 封面暂未自动填入，可在预发布页手动确认：{exc}")
+                    if self.dry_run:
+                        youtube_logger.warning(f"[youtube] 封面暂未自动填入，可在预发布页手动确认：{exc}")
+                    else:
+                        raise RuntimeError(f"YouTube 封面写入失败：{exc}") from exc
 
             await self.set_audience(page)
 
@@ -252,8 +508,13 @@ class YouTubeVideo:
                     await tag_input.wait_for(state="visible", timeout=8000)
                     await tag_input.fill(",".join(self.tags)[:490])
                 except Exception as exc:
-                    youtube_logger.warning(f"[youtube] 标签暂未自动填入，可在预发布页手动确认：{exc}")
-            await self.set_ai_generated_declaration(page)
+                    if self.dry_run:
+                        youtube_logger.warning(f"[youtube] 标签暂未自动填入，可在预发布页手动确认：{exc}")
+                    else:
+                        raise RuntimeError(f"YouTube 标签写入失败：{exc}") from exc
+            ai_declaration_set = await self.set_ai_generated_declaration(page)
+            if bool(getattr(self, "ai_generated", False)) and not ai_declaration_set and not self.dry_run:
+                raise RuntimeError("YouTube 未能设置 AI/合成内容声明，未执行最终发布")
 
             for _ in range(5):
                 visibility = page.locator("tp-yt-paper-radio-button[name='PRIVATE']").first
@@ -261,33 +522,34 @@ class YouTubeVideo:
                     break
                 await _click_if_present(page, "#next-button", 8000)
                 await page.wait_for_timeout(800)
-            visibility_name = {
-                "public": "PUBLIC",
-                "unlisted": "UNLISTED",
-                "private": "PRIVATE",
-            }[self.visibility]
-            if not await _click_if_present(
-                page,
-                f"tp-yt-paper-radio-button[name='{visibility_name}']",
-                10000,
-            ):
-                raise RuntimeError(f"YouTube 未能设置{self.visibility}可见性，已停止在发布前")
+            await self.set_visibility(page)
 
             await _wait_upload_complete(page)
+            result = None
+            if not self.dry_run:
+                result = await self._publish_formally(page)
             await save_context_storage_state(context, self.account_file, include_indexed_db=True)
-            youtube_logger.success(f"[youtube] 已设置为{self.visibility}并停在最终保存前，未点击 Done")
+            if self.dry_run:
+                youtube_logger.success(f"[youtube] 已设置为{self.visibility}并停在最终保存前，未点击 SAVE")
+            else:
+                youtube_logger.success(f"[youtube] 已获得平台结果：{self.visibility}")
 
             if owns_browser:
-                await keep_browser_open_for_dry_run(
-                    page,
-                    context,
-                    browser,
-                    account_file=self.account_file,
-                    logger=youtube_logger,
-                    platform_name="YouTube",
-                    block_until_close=self.dry_run_hold_browser,
-                    include_indexed_db=True,
-                )
+                if self.dry_run:
+                    await keep_browser_open_for_dry_run(
+                        page,
+                        context,
+                        browser,
+                        account_file=self.account_file,
+                        logger=youtube_logger,
+                        platform_name="YouTube",
+                        block_until_close=self.dry_run_hold_browser,
+                        include_indexed_db=True,
+                    )
+                else:
+                    await context.close()
+                    await browser.close()
+            return result
         except Exception:
             if owns_browser:
                 try:
@@ -302,4 +564,4 @@ class YouTubeVideo:
 
     async def main(self):
         async with async_playwright() as playwright:
-            await self.upload(playwright)
+            return await self.upload(playwright)

@@ -202,6 +202,10 @@ def _attach_publish_options(app, data, publish_datetime):
     )
     app.sync_to_toutiao = _option_bool(data.get("syncToToutiao"))
     app.visibility = str(data.get("visibility") or "public")
+    app.publish_confirmed = _option_bool(
+        data.get("overseasVideoPublishConfirmed")
+        or data.get("metaBrowserPublishConfirmed")
+    )
     app.publish_date = 0 if _option_bool(data.get("saveDraftOnly")) else publish_datetime
     return app
 
@@ -823,6 +827,7 @@ def _post_video_overseas(
     made_for_kids=False,
     notify_subscribers=True,
     share_to_feed=True,
+    browser_publish_confirmed=False,
 ):
     tags = normalize_publish_tags(tags, max_count=get_publish_tag_limit(platform_type))
     account_files = [Path(BASE_DIR / "cookiesFile" / file) for file in account_file]
@@ -849,6 +854,7 @@ def _post_video_overseas(
         "madeForKids": made_for_kids,
         "notifySubscribers": notify_subscribers,
         "shareToFeed": share_to_feed,
+        "overseasVideoPublishConfirmed": browser_publish_confirmed,
         "metaBrowserPublishConfirmed": publish_confirmed,
         "metaBrowserAutomationAcknowledged": automation_acknowledged,
     }

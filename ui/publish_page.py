@@ -1131,6 +1131,11 @@ class PublishPage(QWidget):
         collection_row_layout.addWidget(collection_status)
         self.platform_collection_rows[platform_type] = collection_row
         publish_settings_layout.addRow("合集/播放列表", collection_row)
+        if platform_type == 6:
+            collection.setEnabled(False)
+            collection_sync.setEnabled(False)
+            collection_status.setText("首版不设置")
+            collection_row.setToolTip("TikTok 合集尚未接入可靠回读，首版不会写入。")
 
         schedule_enabled = QCheckBox("单独设置")
         schedule_date = QDateEdit()
@@ -1146,6 +1151,11 @@ class PublishPage(QWidget):
         schedule_time.setEnabled(False)
         schedule_enabled.toggled.connect(schedule_date.setEnabled)
         schedule_enabled.toggled.connect(schedule_time.setEnabled)
+        if platform_type in {6, 7}:
+            schedule_enabled.setEnabled(False)
+            schedule_enabled.setToolTip(
+                f"{name} 首版只开放立即发布，定时发布将在真实账号回读验收后开放。"
+            )
         self.platform_schedule_enabled[platform_type] = schedule_enabled
         self.platform_schedule_dates[platform_type] = schedule_date
         self.platform_schedule_times[platform_type] = schedule_time
@@ -1261,6 +1271,22 @@ class PublishPage(QWidget):
             body_layout.addWidget(settings)
             self.bili_title = title
             self.bili_desc = text
+        elif platform_type == 6:
+            settings = QFrame()
+            settings.setProperty("subPanel", True)
+            settings_layout = QFormLayout(settings)
+            settings_layout.setContentsMargins(12, 10, 12, 10)
+            visibility = QComboBox()
+            visibility.addItem("公开（首版固定）", "public")
+            visibility.setEnabled(False)
+            visibility.setToolTip("TikTok 首版只开放可验证的公开立即发布。")
+            self.platform_visibility[platform_type] = visibility
+            settings_layout.addRow("可见性", visibility)
+            boundary = QLabel("暂不设置定时、合集、AI 内容声明或本地自定义封面")
+            boundary.setProperty("role", "muted")
+            boundary.setWordWrap(True)
+            settings_layout.addRow("首版范围", boundary)
+            body_layout.addWidget(settings)
         elif platform_type == 7:
             settings = QFrame()
             settings.setProperty("subPanel", True)
@@ -1281,7 +1307,7 @@ class PublishPage(QWidget):
             self.youtube_notify_subscribers = QCheckBox("通知订阅者")
             self.youtube_notify_subscribers.setChecked(True)
             self.youtube_notify_subscribers.setToolTip(
-                "YouTube 默认会通知订阅者；取消勾选时明确传递 notifySubscribers=false。"
+                "首版必须保持开启；关闭通知尚未接入可靠回读，提交时会安全阻断。"
             )
             settings_layout.addRow("通知", self.youtube_notify_subscribers)
             body_layout.addWidget(settings)
@@ -3021,6 +3047,9 @@ class PublishPage(QWidget):
             platform_name = account_service.PLATFORMS[platform_type]
             has_platform_schedule = self.platform_schedule_enabled[platform_type].isChecked()
             cover_paths = self._platform_cover_paths(platform_type)
+            if platform_type == 6:
+                # TikTok 网页端首版不承诺本地自定义封面；平台卡片已明确展示该边界。
+                cover_paths = {}
             schedule_time = (
                 self._validated_schedule_time(
                     self._platform_schedule_time(platform_type),
@@ -3184,6 +3213,12 @@ class PublishPage(QWidget):
         if PublishConfirmDialog(summary, self).exec() != QDialog.DialogCode.Accepted:
             self.task_status_label.setText("发布任务：已返回修改")
             return
+        if runtime_mode == "publish":
+            for payload in payloads:
+                if int(payload.get("type") or 0) in {6, 7}:
+                    payload["overseasVideoPublishConfirmed"] = True
+                    # TikTok/YouTube 的登录验证与风控必须在可见窗口处理。
+                    payload["backgroundMode"] = False
         meta_browser_payloads = [
             payload
             for payload in payloads
@@ -3221,7 +3256,7 @@ class PublishPage(QWidget):
                 if int(payload.get("type", 0))
                 in account_service.OVERSEAS_PLATFORM_TYPES
             ]
-            contains_locked_overseas = any(
+            contains_tiktok_youtube = any(
                 int(payload.get("type", 0)) in {6, 7}
                 for payload in overseas_payloads
             )
@@ -3233,8 +3268,8 @@ class PublishPage(QWidget):
                 message = "任务已开始。上传和表单检查将在无窗口后台完成，预检结束后自动关闭会话。"
             else:
                 message = "任务已开始。程序会显示发布页面并停在最终发布前，检查完成后请关闭自动化浏览器。"
-            if contains_locked_overseas:
-                message += "任务包含仍保持正式发布锁定的海外目标。"
+            if contains_tiktok_youtube:
+                message += "完成后可选择 TikTok/YouTube 可见浏览器正式发布。"
             elif contains_meta_browser:
                 message += "完成后可选择 Meta 可见浏览器确认式发布。"
             else:
@@ -3884,10 +3919,17 @@ class PublishPage(QWidget):
             for payload in overseas_payloads
             if int(payload.get("type") or 0) in {8, 9}
         ]
-        meta_browser_ready = bool(overseas_payloads) and (
+        tiktok_youtube = [
+            payload
+            for payload in overseas_payloads
+            if int(payload.get("type") or 0) in {6, 7}
+        ]
+        formal_overseas_ready = bool(overseas_payloads) and (
+            len(browser_meta) + len(tiktok_youtube) == len(overseas_payloads)
+        )
+        meta_browser_ready = bool(browser_meta) and (
             len(browser_meta) == len(overseas_payloads)
         )
-        formal_overseas_ready = meta_browser_ready
         box = QMessageBox(self)
         box.setWindowTitle("预发布检查完成")
         box.setIcon(QMessageBox.Icon.Information)
@@ -3900,8 +3942,7 @@ class PublishPage(QWidget):
         if contains_overseas and not formal_overseas_ready:
             box.setInformativeText(
                 f"{self._finish_message(task, status_text)}\n\n"
-                "TikTok 与 YouTube 当前只开放浏览器预发布检查，"
-                "正式发布保持锁定。\n"
+                "所选海外平台尚未全部接入受控正式发布。\n"
                 f"{session_note}"
             )
             manual_btn = box.addButton("我已了解", QMessageBox.ButtonRole.AcceptRole)
@@ -3912,7 +3953,7 @@ class PublishPage(QWidget):
             "继续 Meta 确认式发布：将再显示一次独立确认，"
             "并在可见浏览器中执行。\n"
             if meta_browser_ready
-            else "继续一键发布：使用同一配置重新上传并执行正式发布。\n"
+            else "继续海外平台正式发布：使用同一配置重新上传，在可见浏览器中执行并回读结果。\n"
         )
         box.setInformativeText(
             f"{self._finish_message(task, status_text)}\n\n"
@@ -3923,7 +3964,7 @@ class PublishPage(QWidget):
         formal_btn = box.addButton(
             "继续 Meta 确认式发布"
             if meta_browser_ready
-            else "继续一键发布",
+            else "继续海外平台正式发布",
             QMessageBox.ButtonRole.AcceptRole,
         )
         manual_btn = box.addButton("暂不发布", QMessageBox.ButtonRole.DestructiveRole)
@@ -3938,6 +3979,9 @@ class PublishPage(QWidget):
                 payload["runtimeMode"] = "publish"
                 payload["debugDryRun"] = False
                 payload["debugDryRunHoldBrowser"] = False
+                if int(payload.get("type") or 0) in {6, 7}:
+                    payload["overseasVideoPublishConfirmed"] = True
+                    payload["backgroundMode"] = False
             meta_browser_payloads = [
                 payload
                 for payload in payloads

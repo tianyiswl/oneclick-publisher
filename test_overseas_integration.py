@@ -263,11 +263,11 @@ class OverseasPreflightTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertTrue(any("定时时间" in item for item in result["errors"]))
 
-    def test_formal_publish_remains_closed_for_unverified_browser_channels(self) -> None:
+    def test_formal_publish_requires_explicit_confirmation(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             video = Path(raw) / "video.mp4"
             video.write_bytes(b"video")
-            with self.assertRaisesRegex(ValueError, "Meta 浏览器通道"):
+            with self.assertRaisesRegex(ValueError, "正式发布确认"):
                 publish_service._validate_payloads(
                     [
                         {

@@ -25,6 +25,7 @@ from . import (
     oneclick_capabilities,
     oneclick_preflight,
     overseas_browser_publish,
+    overseas_video_publish,
     overseas_preflight,
     task_service,
     wechat_publish_executor,
@@ -209,9 +210,9 @@ def _validate_payloads(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
             if payload.get("debugDryRun") is not True:
                 raise ValueError("预发布检查必须保持 debugDryRun=true")
         elif runtime_mode == "publish":
-            if platform_type not in {1, 3, 8, 9, 10}:
+            if platform_type not in {1, 3, 6, 7, 8, 9, 10}:
                 raise ValueError(
-                    "当前正式发布执行器只开放小红书、抖音、公众号和 Meta 浏览器通道"
+                    "当前正式发布执行器只开放小红书、抖音、公众号、TikTok、YouTube 和 Meta 浏览器通道"
                 )
             if payload.get("debugDryRun") is not False:
                 raise ValueError("正式发布必须明确 debugDryRun=false")
@@ -221,6 +222,14 @@ def _validate_payloads(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 payload.update(
                     douyin_publish_executor.validate_douyin_publish_payload(payload)
                 )
+            elif platform_type in {6, 7}:
+                checked = overseas_video_publish.validate_overseas_video_publish_payload(
+                    payload
+                )
+                if not checked["ok"]:
+                    raise ValueError("；".join(checked["errors"]))
+                # 海外账号风控与二次验证必须能在前台由用户处理。
+                payload["backgroundMode"] = False
             elif platform_type in {8, 9}:
                 checked = overseas_browser_publish.validate_meta_browser_publish_payload(
                     payload
@@ -451,6 +460,10 @@ def _run_publish(task: dict, payloads: list[dict[str, Any]]) -> None:
                     result = wechat_publish_executor.run_wechat_publish_sync(
                         payload,
                         task_id=int(task["id"]),
+                    )
+                elif platform_type in {6, 7}:
+                    result = overseas_video_publish.run_overseas_video_publish_sync(
+                        payload
                     )
                 elif platform_type in {8, 9}:
                     result = overseas_browser_publish.run_meta_browser_publish_sync(
