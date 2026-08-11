@@ -77,6 +77,7 @@ from .background_task import BackgroundTaskRunner
 from .common import button
 from .douyin_verification_dialog import DouyinVerificationDialog
 from .runtime_log import ExecutionLogPanel
+from .topic_tag_editor import FlowLayout, history_tag_box_height
 
 
 _SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
@@ -936,7 +937,7 @@ class DouyinCommercePage(QWidget):
         self.description_input.textChanged.connect(self._content_changed)
         content_layout.addWidget(self.description_input)
         tag_title_row = QHBoxLayout()
-        tag_title = QLabel("话题标签（选填）")
+        tag_title = QLabel("话题标签")
         tag_title.setObjectName("douyinCommerceFieldLabel")
         tag_title_row.addWidget(tag_title)
         tag_title_row.addStretch()
@@ -963,14 +964,18 @@ class DouyinCommercePage(QWidget):
         self.selected_tags_layout.setContentsMargins(8, 6, 8, 6)
         self.selected_tags_layout.setSpacing(6)
         content_layout.addWidget(self.selected_tags_host)
-        history_title = QLabel("最近使用标签")
+        history_title = QLabel("历史标签")
         history_title.setObjectName("douyinCommerceFieldLabel")
         content_layout.addWidget(history_title)
         self.tag_history_host = QFrame()
         self.tag_history_host.setObjectName("douyinCommerceTagHistoryHost")
-        self.tag_history_layout = QHBoxLayout(self.tag_history_host)
-        self.tag_history_layout.setContentsMargins(8, 6, 8, 6)
-        self.tag_history_layout.setSpacing(6)
+        self.tag_history_host.setFixedHeight(history_tag_box_height(3))
+        self.tag_history_layout = FlowLayout(
+            self.tag_history_host,
+            contents_margins=(8, 5, 8, 5),
+            horizontal_spacing=6,
+            vertical_spacing=4,
+        )
         content_layout.addWidget(self.tag_history_host)
         self.content_notice = QLabel("保存后再上传；上传后设置音乐、地点、声明和定时。")
         self.content_notice.setObjectName("douyinCommerceInlineNotice")
@@ -2667,7 +2672,6 @@ class DouyinCommercePage(QWidget):
                 chip_layout.addWidget(add_button)
                 chip_layout.addWidget(remove_button, 0, Qt.AlignmentFlag.AlignTop)
                 self.tag_history_layout.addWidget(chip)
-        self.tag_history_layout.addStretch(1)
 
     def _load_tag_history(self) -> None:
         try:

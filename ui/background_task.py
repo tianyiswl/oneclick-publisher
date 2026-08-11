@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import threading
+import traceback
 from typing import Any
 
 from PyQt6.QtCore import QObject, QRunnable, QThreadPool, pyqtSignal, pyqtSlot
@@ -142,7 +143,22 @@ class BackgroundTaskRunner(QObject):
         if on_progress:
             task.signals.progressed.connect(on_progress)
         if on_success:
-            task.signals.succeeded.connect(on_success)
+            def deliver_success(value: object) -> None:
+                try:
+                    on_success(value)
+                except Exception as exc:
+                    # PyQt6 信号槽中的未捕获异常可能直接终止整个进程。后台任务
+                    # 的结果处理也必须进入错误通道，不能让单个功能拖垮客户端。
+                    message = f"处理后台任务结果失败：{str(exc) or exc.__class__.__name__}"
+                    if on_error:
+                        try:
+                            on_error(message)
+                        except Exception:
+                            traceback.print_exc()
+                    else:
+                        traceback.print_exc()
+
+            task.signals.succeeded.connect(deliver_success)
         if on_error:
             task.signals.failed.connect(on_error)
 

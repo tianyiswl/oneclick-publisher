@@ -670,10 +670,10 @@ def apply_style(app: QApplication) -> None:
             border-radius: 9px;
         }
         QTabBar#contentTabBar::tab {
-            min-width: 108px;
+            min-width: 88px;
             min-height: 34px;
-            margin: 3px;
-            padding: 0 16px;
+            margin: 3px 2px;
+            padding: 0 12px;
             background: transparent;
             color: #475467;
             border: 1px solid transparent;
@@ -691,7 +691,7 @@ def apply_style(app: QApplication) -> None:
             font-weight: 700;
         }
         QTabBar#contentTabBar::tab:selected:focus {
-            border: 2px solid #5EEAD4;
+            border: 1px solid #5EEAD4;
         }
 
         /* 抖音带货：任务型桌面工作台。进度、当前动作和平台回读分层展示，
@@ -1694,7 +1694,7 @@ def apply_style(app: QApplication) -> None:
             color: #DCE5EF;
             border: 1px solid #25344C;
             font-family: "SFMono-Regular", "Cascadia Mono", "Consolas";
-            font-size: 11px;
+            font-size: 13px;
         }
         QPlainTextEdit#diagnosticOutput {
             background: #162033;

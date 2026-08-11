@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 
 from . import account_service, douyin_commerce_service, douyin_music_service, task_service
 from .douyin_location_service import normalize_location_candidate
+from .douyin_verification import verification_broker
 from .oneclick_preflight import _account_for_payload, _storage_state
 from utils.log import douyin_logger
 
@@ -373,6 +374,10 @@ def validate_douyin_publish_payload(payload: Mapping[str, Any]) -> dict[str, Any
         checked["locationKeyword"] = ""
         checked["locationPoi"] = {}
 
+    # 公共内容页只把用户明确勾选视为 AI 声明；字符串、数字等历史脏值
+    # 不得被隐式转换为 True，避免误替用户作内容声明。
+    checked["aiGenerated"] = checked.get("aiGenerated") is True
+
     # 正式发布必须以前台浏览器执行，二维码、验证码和未知提示才有机会被用户处理。
     checked["backgroundMode"] = False
     schedule_time = _scheduled_time(checked)
@@ -569,6 +574,143 @@ async def _hold_frontend_for_user(
         await asyncio.sleep(0.5)
 
 
+def _sms_verification_failure_message(error: Exception) -> str:
+    """把验证码失败收束为可操作提示，不把页面内容带入客户端。"""
+
+    detail = _normalized(error).casefold()
+    if "明确提示验证码错误或已过期" in detail or "验证码被平台拒绝" in detail:
+        return "抖音页面明确提示验证码错误或已过期，发布未继续。"
+    if "填写后未能回读" in detail:
+        return "验证码未能写入抖音验证输入框，发布未继续。"
+    if "验证按钮未启用" in detail:
+        return "验证码已写入，但验证按钮未启用；发布未继续。"
+    if any(marker in detail for marker in ("容器无法唯一", "输入框无法唯一", "确认按钮无法唯一")):
+        return "验证码控件无法唯一确认，发布未继续。"
+    return "验证码已提交，但抖音未返回可确认结果；发布未继续。"
+
+
+async def _handle_publish_verification(
+    uploader,
+    page,
+    challenge,
+    *,
+    task_id: int,
+) -> None:
+    """在标准发布的原会话中等待客户端短信或扫码验证。"""
+
+    normalized_task_id = int(task_id)
+    if normalized_task_id <= 0:
+        raise DouyinPublishError("抖音验证缺少任务号，发布已安全停止")
+    kind = getattr(challenge, "kind", "")
+    if kind == "sms":
+        loop = asyncio.get_running_loop()
+
+        def resend_same_request() -> bool:
+            async def resend() -> bool:
+                await uploader.resend_sms_verification_code(page, challenge)
+                return True
+
+            try:
+                future = asyncio.run_coroutine_threadsafe(resend(), loop)
+                return future.result(timeout=15) is True
+            except Exception:
+                douyin_logger.warning("抖音短信验证码重新发送未获平台确认")
+                return False
+
+        request_id = verification_broker.create_sms(
+            task_id=normalized_task_id,
+            message="请在一键发客户端输入短信验证码",
+            resend_handler=resend_same_request,
+        )
+        label = "短信验证码"
+    elif kind == "qr":
+        request_id = verification_broker.create_qr(
+            task_id=normalized_task_id,
+            qr_image=bytes(getattr(challenge, "qr_image", b"")),
+            expires_in_seconds=600,
+        )
+        label = "扫码验证"
+    else:
+        raise DouyinPublishError("抖音返回了无法处理的验证类型，发布已安全停止")
+
+    task_service.record_task_event(
+        normalized_task_id,
+        "douyin_verification_required",
+        f"抖音最终提交触发{label}，请在一键发客户端完成验证；当前发布会话保持不变。",
+        level="warning",
+    )
+    douyin_logger.warning(f"抖音最终提交触发{label}，正在等待客户端处理")
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 600
+    try:
+        while True:
+            snapshot = verification_broker.snapshot(request_id)
+            state = snapshot.get("state")
+            if state != "waiting":
+                state_messages = {
+                    "cancelled": "用户已取消抖音验证，发布已安全停止",
+                    "expired": "等待抖音验证超时，发布已安全停止",
+                    "failed": "抖音验证失败，发布已安全停止",
+                }
+                raise DouyinPublishError(
+                    state_messages.get(str(state), "抖音验证状态异常，发布已安全停止")
+                )
+            if loop.time() >= deadline:
+                verification_broker.fail(request_id)
+                raise DouyinPublishError("等待抖音验证超时，发布已安全停止")
+
+            if kind == "sms":
+                code = verification_broker.claim_code(request_id)
+                if code:
+                    try:
+                        verification_broker.ensure_processing(request_id)
+                        await uploader.apply_sms_verification_code(
+                            page,
+                            challenge,
+                            code,
+                            before_submit=lambda: verification_broker.ensure_processing(
+                                request_id
+                            ),
+                        )
+                    except Exception as exc:
+                        message = _sms_verification_failure_message(exc)
+                        if message.startswith("抖音页面明确提示验证码错误或已过期"):
+                            verification_broker.retry_sms_input(request_id)
+                            continue
+                        verification_broker.fail(request_id)
+                        raise DouyinPublishError(message) from exc
+                    verification_broker.succeed(request_id)
+                    douyin_logger.success("抖音短信验证码已通过，继续等待平台回执")
+                    await asyncio.sleep(0.35)
+                    return
+            else:
+                try:
+                    current = await uploader.detect_publish_verification(page)
+                except Exception as exc:
+                    verification_broker.fail(request_id)
+                    raise DouyinPublishError(
+                        "抖音扫码验证页面状态无法确认，发布已安全停止"
+                    ) from exc
+                if current is None:
+                    if "/creator-micro/content/manage" in str(page.url or ""):
+                        verification_broker.begin_processing(request_id)
+                        verification_broker.succeed(request_id)
+                        douyin_logger.success("抖音扫码验证已通过，继续等待平台回执")
+                        await asyncio.sleep(0.35)
+                        return
+                    await page.wait_for_timeout(250)
+                    continue
+                if getattr(current, "kind", "") != "qr":
+                    verification_broker.fail(request_id)
+                    raise DouyinPublishError(
+                        "抖音扫码验证页面状态已变化，发布已安全停止"
+                    )
+            await page.wait_for_timeout(250)
+    finally:
+        verification_broker.clear(request_id)
+
+
 async def run_douyin_publish(payload: Mapping[str, Any], *, task_id: int) -> dict[str, Any]:
     """在一键发受控会话内完成抖音视频发布并要求平台管理页回执。"""
 
@@ -597,6 +739,7 @@ async def run_douyin_publish(payload: Mapping[str, Any], *, task_id: int) -> dic
     browser = None
     context = None
     page = None
+    verification_requested = False
     try:
         browser = await launch_publish_browser(playwright)
         context = await new_publish_context(browser, storage_state=str(storage_state))
@@ -637,8 +780,14 @@ async def run_douyin_publish(payload: Mapping[str, Any], *, task_id: int) -> dic
             save_draft_only=False,
             description=str(checked["description"]),
         )
-        app.ai_generated = False
-        app.content_declaration = str(checked.get("contentDeclaration") or "")
+        app.ai_generated = (
+            False if is_commerce_workflow else checked.get("aiGenerated") is True
+        )
+        app.content_declaration = (
+            str(checked.get("contentDeclaration") or "")
+            if is_commerce_workflow
+            else ""
+        )
         app.sync_to_toutiao = checked.get("syncToToutiao") is True
         app.location_payload = {
             "locationKeyword": checked["locationKeyword"],
@@ -649,6 +798,18 @@ async def run_douyin_publish(payload: Mapping[str, Any], *, task_id: int) -> dic
         app.external_page = page
         app.external_context = context
         app.external_browser = browser
+
+        async def handle_verification(challenge) -> None:
+            nonlocal verification_requested
+            verification_requested = True
+            await _handle_publish_verification(
+                app,
+                page,
+                challenge,
+                task_id=int(task_id),
+            )
+
+        app.verification_callback = handle_verification
 
         with publish_context(
             task_id=int(task_id),
@@ -684,6 +845,19 @@ async def run_douyin_publish(payload: Mapping[str, Any], *, task_id: int) -> dic
                 int(task_id),
                 "douyin_commerce_declaration_readback",
                 f"抖音作品内容声明已由编辑页回读：{content_declaration}",
+            )
+        elif checked.get("aiGenerated") is True:
+            content_declaration = _normalized(
+                getattr(app, "content_declaration_verification", "")
+            )
+            if content_declaration != "内容由AI生成":
+                raise DouyinPublishError(
+                    "抖音 AI 生成内容声明最终回读不一致，未记录为发布成功"
+                )
+            task_service.record_task_event(
+                int(task_id),
+                "douyin_ai_declaration_readback",
+                "抖音 AI 生成内容声明已由编辑页回读：内容由AI生成",
             )
 
         scheduled_readback = None
@@ -727,7 +901,12 @@ async def run_douyin_publish(payload: Mapping[str, Any], *, task_id: int) -> dic
             "platformReceipt": dict(receipt),
         }
     except Exception as exc:
-        if page is not None and browser is not None and _requires_foreground_hold(str(exc)):
+        if (
+            not verification_requested
+            and page is not None
+            and browser is not None
+            and _requires_foreground_hold(str(exc))
+        ):
             await _hold_frontend_for_user(
                 page,
                 browser,

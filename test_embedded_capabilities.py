@@ -42,7 +42,7 @@ class EmbeddedCapabilitiesTests(unittest.TestCase):
             candidates = base_social_media._runtime_base_dirs()
 
         self.assertIn(
-            Path("/Applications/一键发.app/Contents/Resources"),
+            executable.resolve().parent.parent / "Resources",
             candidates,
         )
 

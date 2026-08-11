@@ -36,11 +36,9 @@ from PyQt6.QtWidgets import (
     QSizePolicy,
     QSplitter,
     QStackedWidget,
-    QStyle,
     QTabBar,
     QTextEdit,
     QTimeEdit,
-    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -50,6 +48,7 @@ from app_core import (
     account_service,
     collection_service,
     content_bundle,
+    douyin_commerce_draft_service,
     douyin_location_service,
     media_service,
     mobai_release_importer,
@@ -65,7 +64,12 @@ from app_core.meta_browser_policy import (
     META_BROWSER_AUTOMATION_ACKNOWLEDGED,
     META_BROWSER_PUBLISH_CONFIRMED,
 )
-from app_core.wechat_verification import verification_broker
+from app_core.douyin_verification import (
+    verification_broker as douyin_verification_broker,
+)
+from app_core.wechat_verification import (
+    verification_broker as wechat_verification_broker,
+)
 
 from .common import ROOT_DIR, button
 from .background_task import BackgroundTaskRunner
@@ -73,6 +77,8 @@ from .login_dialog import LoginDialog
 from .media_context_menu import build_media_context_menu
 from .platform_open import open_path, reveal_in_folder
 from .timer_dialog import TimerDialog
+from .topic_tag_editor import TopicTagEditor
+from .douyin_verification_dialog import DouyinVerificationDialog
 from .wechat_verification_dialog import WechatVerificationDialog
 
 
@@ -110,12 +116,8 @@ BILI_PARTITIONS = [
 ]
 
 PLATFORM_TARGET_ROLE = int(Qt.ItemDataRole.UserRole) + 1
-HISTORY_DEFAULT_HEIGHT = 144
-HISTORY_MIN_HEIGHT = 56
-PLATFORM_TEXT_HEIGHT = 166
-PLATFORM_TAGS_HEIGHT = 72
-COMMON_TEXT_HEIGHT = 100
-COMMON_TAGS_HEIGHT = 48
+PLATFORM_TEXT_LINES = 5
+COMMON_TEXT_LINES = 8
 PLATFORM_COVER_PANEL_MIN_WIDTH = 190
 PLATFORM_COVER_PANEL_MAX_WIDTH = 206
 PLATFORM_NAV_WIDTH = 136
@@ -126,6 +128,20 @@ WINDOWS_PUBLISH_TARGET_MIN_WIDTH = 300
 COMPACT_PUBLISH_ACTIVITY_WIDTH = 228
 COMPACT_PUBLISH_ACTIVITY_MIN_WIDTH = 196
 PUBLISH_CONTENT_INITIAL_WIDTH = 700
+
+
+def _text_edit_height_for_lines(editor: QTextEdit, lines: int) -> int:
+    """按当前字体与主题内边距计算指定文本行数的完整高度。"""
+
+    editor.ensurePolished()
+    margins = editor.contentsMargins()
+    document_padding = int(round(editor.document().documentMargin() * 2))
+    return (
+        editor.fontMetrics().lineSpacing() * max(1, int(lines))
+        + margins.top()
+        + margins.bottom()
+        + document_padding
+    )
 
 def publish_target_widths(platform_name: str) -> tuple[int, int]:
     """返回当前桌面平台的发布对象初始宽度和最小宽度。"""
@@ -152,7 +168,18 @@ class HeaderTabStack(QStackedWidget):
         self._tab_bar.setObjectName("contentTabBar")
         self._tab_bar.setAccessibleName("发布内容类型切换")
         self._tab_bar.setDrawBase(False)
-        self._tab_bar.setExpanding(False)
+        # 只有两个固定入口，不应出现 Qt 默认的左右滚动按钮。让标签等宽
+        # 填满分段控件，并在标题区变窄时共同收缩，避免右侧箭头和边框截断。
+        self._tab_bar.setUsesScrollButtons(False)
+        self._tab_bar.setExpanding(True)
+        self._tab_bar.setElideMode(Qt.TextElideMode.ElideNone)
+        # 当前主题下两个标签的最小尺寸各为 118px；容器至少保留 236px，
+        # 避免禁用滚动按钮后第二个标签被静默裁切。
+        self._tab_bar.setMinimumWidth(236)
+        self._tab_bar.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Fixed,
+        )
         self._tab_bar.currentChanged.connect(super().setCurrentIndex)
         self.currentChanged.connect(self._sync_tab_bar)
 
@@ -412,11 +439,13 @@ class PublishPage(QWidget):
         self._cover_rows_signature: tuple | None = None
         self._cover_pixmap_cache: dict[str, tuple[int, int, QPixmap]] = {}
         self._wechat_verification_dialog: WechatVerificationDialog | None = None
+        self._douyin_verification_dialog: DouyinVerificationDialog | None = None
         self.collection_tasks = BackgroundTaskRunner(self)
         self.location_tasks = BackgroundTaskRunner(self)
         self.account_health_tasks = BackgroundTaskRunner(self)
         self._douyin_selected_location: dict[str, object] = {}
         self._douyin_location_query = ""
+        self._topic_tag_editors: list[TopicTagEditor] = []
         self._douyin_location_search_timer = QTimer(self)
         self._douyin_location_search_timer.setSingleShot(True)
         self._douyin_location_search_timer.setInterval(450)
@@ -819,44 +848,21 @@ class PublishPage(QWidget):
         content_form.addRow("通用标题", self.common_title_input)
         self.title_input = QTextEdit()
         self.title_input.setPlaceholderText("各平台文案留空时使用这里的正文")
-        self.title_input.setFixedHeight(COMMON_TEXT_HEIGHT)
-        content_form.addRow("通用文案", self.title_input)
-        self.tags_input = QTextEdit()
-        self.tags_input.setPlaceholderText("#AI编程 #程序员 #效率工具")
-        self.tags_input.setAcceptRichText(False)
-        self.tags_input.setTabChangesFocus(True)
-        self.tags_input.setFixedHeight(COMMON_TAGS_HEIGHT)
-        content_form.addRow("通用话题", self.tags_input)
-        left_layout.addLayout(content_form)
-
-        history_header = QHBoxLayout()
-        history_header.setContentsMargins(0, 0, 0, 0)
-        history_header.setSpacing(8)
-        history_title = QLabel("历史话题")
-        history_title.setProperty("role", "sectionTitle")
-        history_header.addWidget(history_title)
-        history_header.addStretch()
-        history_hint = QLabel("点击添加 · × 删除")
-        history_hint.setProperty("role", "caption")
-        history_header.addWidget(history_hint)
-        left_layout.addLayout(history_header)
-        self.tag_history = QListWidget()
-        self.tag_history.setObjectName("historyTagList")
-        self.tag_history.setFlow(QListWidget.Flow.LeftToRight)
-        self.tag_history.setWrapping(True)
-        self.tag_history.setResizeMode(QListWidget.ResizeMode.Adjust)
-        self.tag_history.setMovement(QListWidget.Movement.Static)
-        self.tag_history.setSpacing(2)
-        self.tag_history.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.tag_history.setVerticalScrollMode(QListWidget.ScrollMode.ScrollPerPixel)
-        self.tag_history.verticalScrollBar().setSingleStep(34)
-        self.tag_history.setMinimumHeight(HISTORY_MIN_HEIGHT)
-        self.tag_history.setMaximumHeight(HISTORY_DEFAULT_HEIGHT)
-        self.tag_history.setSizePolicy(
-            QSizePolicy.Policy.Expanding,
-            QSizePolicy.Policy.Expanding,
+        self.title_input.setFixedHeight(
+            _text_edit_height_for_lines(self.title_input, COMMON_TEXT_LINES)
         )
-        left_layout.addWidget(self.tag_history, 1)
+        content_form.addRow("通用文案", self.title_input)
+        self.tags_input = TopicTagEditor(
+            placeholder="例如：AI编程、程序员、效率工具",
+            history_rows=3,
+            history_changed=self._refresh_topic_histories,
+        )
+        self._topic_tag_editors.append(self.tags_input)
+        content_form.addRow(self.tags_input)
+        left_layout.addLayout(content_form)
+        # 兼容旧调用方；最近标签现在由结构化话题编辑器统一管理。
+        self.tag_history = None
+        left_layout.addStretch(1)
 
         cover_header = QHBoxLayout()
         self.cover_section_title = QLabel("通用封面")
@@ -1000,7 +1006,7 @@ class PublishPage(QWidget):
         self.platform_editor_stack.addWidget(self.platform_empty_page)
         self.platform_titles: dict[int, QLineEdit] = {}
         self.platform_texts: dict[int, QTextEdit] = {}
-        self.platform_tags: dict[int, QTextEdit] = {}
+        self.platform_tags: dict[int, TopicTagEditor] = {}
         self.platform_editors: dict[int, QWidget] = {}
         self.platform_categories: dict[int, QComboBox] = {}
         self.platform_visibility: dict[int, QComboBox] = {}
@@ -1020,6 +1026,8 @@ class PublishPage(QWidget):
         self.youtube_notify_subscribers: QCheckBox | None = None
         self.instagram_share_to_feed: QCheckBox | None = None
         self.douyin_sync_toutiao: QCheckBox | None = None
+        # 普通抖音发布页只提供账号本地地点；本地/国内范围仅属于抖音带货。
+        self.douyin_location_scope: QComboBox | None = None
         self.douyin_location_keyword: QLineEdit | None = None
         self.douyin_location_search_button: QPushButton | None = None
         self.douyin_location_results_title: QLabel | None = None
@@ -1073,14 +1081,17 @@ class PublishPage(QWidget):
         content_form.addRow("平台标题", title)
         text = QTextEdit()
         text.setPlaceholderText("留空时使用通用文案")
-        text.setFixedHeight(PLATFORM_TEXT_HEIGHT)
+        text.setFixedHeight(
+            _text_edit_height_for_lines(text, PLATFORM_TEXT_LINES)
+        )
         content_form.addRow("平台文案", text)
-        tags = QTextEdit()
-        tags.setPlaceholderText(f"{name} 专属话题，留空使用通用话题")
-        tags.setAcceptRichText(False)
-        tags.setTabChangesFocus(True)
-        tags.setFixedHeight(PLATFORM_TAGS_HEIGHT)
-        content_form.addRow("平台话题", tags)
+        tags = TopicTagEditor(
+            placeholder=f"输入{name}专属话题；留空使用通用话题",
+            history_rows=2,
+            history_changed=self._refresh_topic_histories,
+        )
+        self._topic_tag_editors.append(tags)
+        content_form.addRow(tags)
         body_layout.addLayout(content_form)
 
         self.platform_titles[platform_type] = title
@@ -1158,11 +1169,13 @@ class PublishPage(QWidget):
             self.douyin_sync_toutiao = QCheckBox("同步发布到今日头条")
             self.douyin_sync_toutiao.setChecked(False)
             self.douyin_location_keyword = QLineEdit()
-            self.douyin_location_keyword.setPlaceholderText("输入地点名称；留空不添加")
+            self.douyin_location_keyword.setPlaceholderText(
+                "搜索账号所在地的地点；留空不添加"
+            )
             self.douyin_location_keyword.setClearButtonEnabled(True)
             self.douyin_location_keyword.setMaxLength(80)
             self.douyin_location_keyword.setToolTip(
-                "输入至少 2 个字后，使用当前抖音会话在后台搜索官方地点。"
+                "普通抖音发布仅支持账号本地地点；输入至少 2 个字后搜索。"
             )
             self.douyin_location_keyword.textEdited.connect(
                 self._douyin_location_text_edited
@@ -1221,7 +1234,7 @@ class PublishPage(QWidget):
             settings_layout.addRow(self.douyin_location_results)
 
             self.douyin_location_status = QLabel(
-                "输入至少 2 个字，一键发会在后台读取抖音官方地点"
+                "仅搜索当前抖音账号所在地的官方地点"
             )
             self.douyin_location_status.setProperty("role", "muted")
             self.douyin_location_status.setWordWrap(True)
@@ -1498,7 +1511,14 @@ class PublishPage(QWidget):
             self._set_collection_status(platform_type, f"正在读取 {len(accounts)} 个账号的合集…")
 
         def on_success(result: dict) -> None:
-            names = list(result.get("collections") or [])
+            if not isinstance(result, dict):
+                on_error("合集同步服务返回了无效数据，请重试")
+                return
+            raw_names = result.get("collections")
+            if not isinstance(raw_names, (list, tuple)):
+                on_error("合集同步服务返回了无效数据，请重试")
+                return
+            names = collection_service.normalize_collection_names(raw_names)
             self._set_collection_options(platform_type, names, preserve_current=True)
             if names:
                 account_text = f"{len(accounts)} 个账号共同" if len(accounts) > 1 else "当前账号"
@@ -1594,6 +1614,7 @@ class PublishPage(QWidget):
 
         account = dict(accounts[0])
         source_account_id = int(account.get("id") or 0)
+        scope = "local"
         self._douyin_location_query = keyword
         search_button = self.douyin_location_search_button
 
@@ -1602,7 +1623,7 @@ class PublishPage(QWidget):
                 search_button.setEnabled(False)
                 search_button.setText("搜索中")
             self._set_douyin_location_status(
-                f"正在后台读取“{keyword}”的抖音官方地点…"
+                f"正在本地范围搜索“{keyword}”…"
             )
 
         def on_success(rows: object) -> None:
@@ -1611,7 +1632,10 @@ class PublishPage(QWidget):
                 int(item.get("id") or 0)
                 for item in self._platform_accounts(3)
             }
-            if current != keyword or source_account_id not in current_accounts:
+            if (
+                current != keyword
+                or source_account_id not in current_accounts
+            ):
                 return
             self._show_douyin_location_results(
                 rows if isinstance(rows, list) else [],
@@ -1645,6 +1669,7 @@ class PublishPage(QWidget):
             lambda: douyin_location_service.search_douyin_locations(
                 account,
                 keyword,
+                scope,
             ),
             on_started=on_started,
             on_success=on_success,
@@ -1749,6 +1774,7 @@ class PublishPage(QWidget):
             return
         raw = item.data(Qt.ItemDataRole.UserRole) or {}
         candidate["sourceAccountId"] = int(raw.get("sourceAccountId") or 0)
+        candidate["scope"] = "local"
         self._douyin_selected_location = candidate
         self.douyin_location_keyword.blockSignals(True)
         self.douyin_location_keyword.setText(candidate["name"])
@@ -1863,10 +1889,14 @@ class PublishPage(QWidget):
         media_actions.setContentsMargins(0, 0, 0, 0)
         media_actions.setSpacing(4)
         media_actions.addStretch()
-        select_media = button("全选", variant="ghost", compact=True)
-        select_media.clicked.connect(lambda: self._set_list_checked(self.media_list, True))
-        media_actions.addWidget(select_media)
+        self.select_all_media_btn = button("全选", variant="ghost", compact=True)
+        self.select_all_media_btn.setToolTip("选择当前列表中的全部图片")
+        self.select_all_media_btn.clicked.connect(
+            lambda: self._set_list_checked(self.media_list, True)
+        )
+        media_actions.addWidget(self.select_all_media_btn)
         self.deselect_all_media_btn = button("取消全选", variant="ghost", compact=True)
+        self.deselect_all_media_btn.setToolTip("取消选择当前列表中的全部图片")
         self.deselect_all_media_btn.clicked.connect(
             lambda: self._set_list_checked(self.media_list, False)
         )
@@ -1926,6 +1956,9 @@ class PublishPage(QWidget):
         self.log.setObjectName("executionLog")
         self.log.setReadOnly(True)
         self.log.setPlaceholderText("暂无执行记录")
+        log_font = self.log.font()
+        log_font.setPixelSize(13)
+        self.log.setFont(log_font)
         layout.addWidget(self.log, 2)
         return panel
 
@@ -1958,59 +1991,20 @@ class PublishPage(QWidget):
             self.template_combo.addItem(item["name"], item["id"])
 
     def refresh_tags(self) -> None:
-        self.tag_history.clear()
-        for tag in publish_config_service.list_tags():
-            self._append_history_tag(tag)
+        self._refresh_topic_histories()
 
-    def _append_history_tag(self, tag: str) -> None:
-        item = QListWidgetItem(tag)
-        chip = QFrame()
-        chip.setObjectName("historyTagChip")
-        chip_layout = QHBoxLayout(chip)
-        chip_layout.setContentsMargins(7, 3, 4, 3)
-        chip_layout.setSpacing(3)
-
-        tag_button = QToolButton()
-        tag_button.setObjectName("historyTagText")
-        display_text = f"#{tag}"
-        tag_button.setText(display_text)
-        tag_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
-        tag_button.setAutoRaise(True)
-        tag_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        tag_button.setToolTip(f"添加 #{tag}")
-        tag_button.setAccessibleName(f"添加历史话题 #{tag}")
-        tag_button.clicked.connect(lambda _checked=False, value=tag: self.add_tag(value))
-        tag_button.ensurePolished()
-        tag_text_width = tag_button.fontMetrics().horizontalAdvance(display_text)
-        # Windows 原生 QToolButton 的 sizeHint 会为纯文字按钮预留过多空间；
-        # 使用实际文字宽度加安全留白，既不省略文字，也能让常用话题紧凑换行。
-        tag_button_width = tag_text_width + 14
-        tag_button.setFixedWidth(tag_button_width)
-        chip_layout.addWidget(tag_button)
-
-        delete_button = QToolButton()
-        delete_button.setObjectName("historyTagDelete")
-        delete_button.setIcon(
-            self.style().standardIcon(QStyle.StandardPixmap.SP_TitleBarCloseButton)
-        )
-        delete_button.setIconSize(QSize(7, 7))
-        delete_button.setAutoRaise(True)
-        delete_button.setFixedSize(12, 12)
-        delete_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        delete_button.setToolTip(f"删除 #{tag}")
-        delete_button.setAccessibleName(f"删除历史话题 #{tag}")
-        delete_button.clicked.connect(lambda _checked=False, value=tag: self.delete_history_tag(value))
-        chip_layout.addWidget(delete_button, 0, Qt.AlignmentFlag.AlignVCenter)
-
-        chip_width = max(70, tag_button_width + 26)
-        chip.setFixedSize(chip_width, 30)
-        item.setSizeHint(QSize(chip_width, 30))
-        self.tag_history.addItem(item)
-        self.tag_history.setItemWidget(item, chip)
+    def _refresh_topic_histories(self, history: list[str] | None = None) -> None:
+        if history is None:
+            try:
+                history = douyin_commerce_draft_service.list_tag_history()
+            except Exception:
+                history = []
+        for editor in self._topic_tag_editors:
+            editor.refresh_history(history)
 
     def delete_history_tag(self, tag: str) -> None:
-        publish_config_service.delete_tag(tag)
-        self.refresh_tags()
+        history = douyin_commerce_draft_service.remove_tag_history(tag)
+        self._refresh_topic_histories(history)
 
     def refresh_accounts(self) -> None:
         accounts = account_service.list_accounts()
@@ -2211,6 +2205,15 @@ class PublishPage(QWidget):
         )
         valid_ids = {int(item["id"]) for item in self._media_rows}
         self._selected_media_ids.intersection_update(valid_ids)
+        if self.content_type == "video" and len(self._selected_media_ids) > 1:
+            # 兼容旧版保存内容：历史草稿可能记录了多条视频，恢复时只采用
+            # 素材列表中的第一条，避免重新呈现已经废止的多选状态。
+            first_selected_id = next(
+                int(item["id"])
+                for item in self._media_rows
+                if int(item["id"]) in self._selected_media_ids
+            )
+            self._selected_media_ids = {first_selected_id}
         self.media_list.blockSignals(True)
         self.media_list.clear()
         for media in self._media_rows:
@@ -2547,12 +2550,40 @@ class PublishPage(QWidget):
         if not media_id:
             return
         if item.checkState() == Qt.CheckState.Checked:
+            if self.content_type == "video":
+                # 视频内容包一次只能包含一个视频。切换勾选项时直接替换旧选择，
+                # 避免把多条视频误当成同账号批量发布任务。
+                self.media_list.blockSignals(True)
+                for index in range(self.media_list.count()):
+                    other = self.media_list.item(index)
+                    if other is not item:
+                        other.setCheckState(Qt.CheckState.Unchecked)
+                self.media_list.blockSignals(False)
+                self._selected_media_ids.clear()
             self._selected_media_ids.add(media_id)
         else:
             self._selected_media_ids.discard(media_id)
         self.update_selected_labels()
 
     def _set_list_checked(self, widget: QListWidget, checked: bool) -> None:
+        if widget is self.media_list and self.content_type == "video":
+            # 视频模式不提供批量选择；即使旧调用仍触发该方法，也只能保留一条。
+            widget.blockSignals(True)
+            self._selected_media_ids.clear()
+            for index in range(widget.count()):
+                item = widget.item(index)
+                selected = checked and index == 0
+                item.setCheckState(
+                    Qt.CheckState.Checked if selected else Qt.CheckState.Unchecked
+                )
+                if selected:
+                    row = item.data(Qt.ItemDataRole.UserRole) or {}
+                    media_id = int(row.get("id") or 0)
+                    if media_id:
+                        self._selected_media_ids.add(media_id)
+            widget.blockSignals(False)
+            self.update_selected_labels()
+            return
         state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
         widget.blockSignals(True)
         for index in range(widget.count()):
@@ -2749,20 +2780,10 @@ class PublishPage(QWidget):
         self.refresh(force=True)
 
     def add_tag(self, tag: str) -> None:
-        tags = publish_config_service.parse_tags(self.tags_input.toPlainText())
-        if tag not in tags:
-            tags.append(tag)
-        self.tags_input.setPlainText(" ".join(f"#{item}" for item in tags))
+        self.tags_input.add_history_tag(tag)
 
     def delete_selected_tag(self) -> None:
-        item = self.tag_history.currentItem()
-        if not item:
-            QMessageBox.information(self, "历史话题", "请先选择要删除的话题。")
-            return
-        tag = item.text()
-        if QMessageBox.question(self, "删除历史话题", f"确定删除 #{tag}？") != QMessageBox.StandardButton.Yes:
-            return
-        self.delete_history_tag(tag)
+        QMessageBox.information(self, "历史标签", "请点击标签右侧的 × 删除。")
 
     def open_timer(self) -> None:
         dialog = TimerDialog(self, self.timer_values)
@@ -2925,7 +2946,8 @@ class PublishPage(QWidget):
         self.media_title.setText(current["title"])
         self.media_search.setPlaceholderText(current["search"])
         self.media_search.setVisible(self.content_type != "text")
-        self.media_actions_widget.setVisible(self.content_type != "text")
+        # 全选仅适用于一篇图文中的多张图片；视频发布始终是一条视频。
+        self.media_actions_widget.setVisible(self.content_type == "article")
         self.media_list.setVisible(self.content_type != "text")
         self.text_material_hint.setVisible(self.content_type == "text")
         self.media_list.setToolTip(current["empty"])
@@ -2968,6 +2990,8 @@ class PublishPage(QWidget):
         if self.content_type != "text" and not media:
             material_label = "图片素材" if self.content_type == "article" else "视频素材"
             raise ValueError(f"请至少选择一个{material_label}")
+        if self.content_type == "video" and len(media) != 1:
+            raise ValueError("视频发布一次只能选择一个视频素材")
         common_tags = publish_config_service.parse_tags(self.tags_input.toPlainText())
         publish_config_service.save_tags(common_tags)
         file_list = [item["file_path"] for item in media]
@@ -3130,9 +3154,11 @@ class PublishPage(QWidget):
                         raise ValueError("抖音账号已变更，请重新搜索并选择发布定位")
                     payload["locationKeyword"] = location["name"]
                     payload["locationPoi"] = location
+                    payload["locationScope"] = "local"
                 else:
                     payload["locationKeyword"] = ""
                     payload["locationPoi"] = {}
+                    payload["locationScope"] = "local"
             if platform_type in self.platform_categories:
                 payload["category"] = self.platform_categories[platform_type].currentData() or None
             if platform_type in self.platform_visibility:
@@ -3730,6 +3756,10 @@ class PublishPage(QWidget):
         task = task_service.get_task(self.active_task_id)
         if not task:
             return
+        # 任务事件与桌面轮询可能在同一周期交错。先直接检查进程内请求，
+        # 避免验证已经等待却因事件刷新延迟而没有弹出原生窗口。
+        if douyin_verification_broker.request_for_task(self.active_task_id):
+            self._show_douyin_verification()
         status = task.get("status")
         self._update_task_progress(task)
         for event in task.get("events", []):
@@ -3743,6 +3773,11 @@ class PublishPage(QWidget):
             self.log.append(f"[{created}] [{level}] {message}")
             if event.get("eventType") == "wechat_verification_required":
                 self._show_wechat_verification()
+            if (
+                event.get("eventType") == "douyin_verification_required"
+                and douyin_verification_broker.request_for_task(self.active_task_id)
+            ):
+                self._show_douyin_verification()
         if task.get("status") not in ("pending", "running"):
             self.task_timer.stop()
             status_text = self._status_text(status)
@@ -3789,7 +3824,7 @@ class PublishPage(QWidget):
 
         if not self.active_task_id:
             return
-        request_id = verification_broker.request_for_task(self.active_task_id)
+        request_id = wechat_verification_broker.request_for_task(self.active_task_id)
         if not request_id:
             self.log.append("[error] 微信验证请求不存在，发布已保持暂停")
             return
@@ -3803,6 +3838,29 @@ class PublishPage(QWidget):
             dialog.exec()
         finally:
             self._wechat_verification_dialog = None
+
+    def _show_douyin_verification(self) -> None:
+        """在发布中心显示标准抖音短信或扫码验证窗口。"""
+
+        if not self.active_task_id:
+            return
+        request_id = douyin_verification_broker.request_for_task(self.active_task_id)
+        if not request_id:
+            return
+        if self._douyin_verification_dialog:
+            self._douyin_verification_dialog.raise_()
+            self._douyin_verification_dialog.activateWindow()
+            return
+        dialog = DouyinVerificationDialog(
+            request_id,
+            self,
+            broker=douyin_verification_broker,
+        )
+        self._douyin_verification_dialog = dialog
+        try:
+            dialog.exec()
+        finally:
+            self._douyin_verification_dialog = None
 
     def preflight_complete_choice(self, task: dict, status_text: str) -> str:
         try:
@@ -4226,6 +4284,7 @@ class PublishPage(QWidget):
                 )
                 or {}
             ),
+            "douyinLocationScope": "local",
             "wechatGroupNotification": bool(
                 self.wechat_group_notification
                 and self.wechat_group_notification.isChecked()
@@ -4265,8 +4324,31 @@ class PublishPage(QWidget):
         }
 
     def save_publish_content(self) -> None:
-        publish_config_service.save_publish_draft(self.payload_for_saved_content())
-        saved_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+        try:
+            saved = publish_config_service.save_publish_draft(
+                self.payload_for_saved_content()
+            )
+        except publish_config_service.PublishConfigError as exc:
+            self.content_save_status.setText("保存失败")
+            self.content_save_status.setProperty("role", "danger")
+            self.content_save_status.style().unpolish(self.content_save_status)
+            self.content_save_status.style().polish(self.content_save_status)
+            QMessageBox.warning(self, "保存填写内容", str(exc))
+            return
+        remembered_tags: list[str] = []
+        for editor in self._topic_tag_editors:
+            for tag in editor.tags():
+                if tag not in remembered_tags:
+                    remembered_tags.append(tag)
+        try:
+            history = douyin_commerce_draft_service.remember_tag_history(
+                remembered_tags
+            )
+            self._refresh_topic_histories(history)
+        except Exception:
+            # 主草稿已经可靠落盘时，标签历史失败不能反向误报保存失败。
+            pass
+        saved_at = str(saved.get("updatedAt") or "")
         self.content_save_status.setText(f"已保存 {saved_at}")
         self.content_save_status.setProperty("role", "success")
         self.content_save_status.style().unpolish(self.content_save_status)
@@ -4279,7 +4361,13 @@ class PublishPage(QWidget):
         )
 
     def refresh_saved_content_status(self) -> None:
-        draft = publish_config_service.load_publish_draft()
+        try:
+            draft = publish_config_service.load_publish_draft()
+        except publish_config_service.PublishConfigError as exc:
+            self.content_save_status.setText(str(exc))
+            self.content_save_status.setProperty("role", "danger")
+            self.restore_content_btn.setEnabled(False)
+            return
         if not draft:
             self.content_save_status.setText("尚未保存")
             self.restore_content_btn.setEnabled(False)
@@ -4340,7 +4428,13 @@ class PublishPage(QWidget):
             self.cover_43.setCurrentIndex(best_index)
 
     def restore_publish_content(self, *, show_message: bool = True) -> None:
-        draft = publish_config_service.load_publish_draft()
+        try:
+            draft = publish_config_service.load_publish_draft()
+        except publish_config_service.PublishConfigError as exc:
+            if show_message:
+                QMessageBox.warning(self, "恢复内容", str(exc))
+            self.refresh_saved_content_status()
+            return
         if not draft:
             if show_message:
                 QMessageBox.information(self, "恢复内容", "当前没有已保存的发布内容。")
@@ -4495,10 +4589,13 @@ class PublishPage(QWidget):
             location = douyin_location_service.normalize_location_candidate(
                 payload.get("douyinLocation")
             )
+            saved_scope = str(payload.get("douyinLocationScope") or "").strip()
+            if location and saved_scope != "local":
+                location = None
             keyword = str(payload.get("douyinLocationKeyword") or "").strip()
             self.douyin_location_keyword.blockSignals(True)
             self.douyin_location_keyword.setText(
-                location["name"] if location else keyword
+                location["name"] if location else ""
             )
             self.douyin_location_keyword.blockSignals(False)
             self._douyin_selected_location = {}
@@ -4517,7 +4614,7 @@ class PublishPage(QWidget):
                 )
             elif keyword:
                 self._set_douyin_location_status(
-                    "旧模板只保存了地点关键词，请重新搜索并选择官方地点",
+                    "历史定位未确认本地范围，请重新搜索并选择本地官方地点",
                     "warning",
                 )
             else:

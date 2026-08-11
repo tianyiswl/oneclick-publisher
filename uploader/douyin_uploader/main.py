@@ -167,6 +167,9 @@ class DouYinVideo(object):
         self._sms_verification_submitted = False
         # 仅由抖音带货临时会话注入；普通发布保持没有客户端进度回调的旧行为。
         self.progress_callback = None
+        # 正式发布执行器可注入原生客户端验证协调器。回调只接收当前进程内的
+        # 挑战对象，验证码与二维码不会写入任务、日志或 Cookie 文件。
+        self.verification_callback = None
         if self.save_draft_only and self.dry_run:
             raise ValueError("保存草稿模式与 dry_run 预发布检查不能同时开启")
 
@@ -1482,7 +1485,10 @@ class DouYinVideo(object):
         try:
             self._assert_formal_publish_allowed()
             await publish_button.click(timeout=10000)
-            self.publish_result = await self._wait_formal_publish_result(page)
+            self.publish_result = await self._wait_formal_publish_result(
+                page,
+                on_verification=getattr(self, "verification_callback", None),
+            )
             douyin_logger.success("  [-]视频发布成功")
         except Exception as e:
             screenshot_path = os.path.join(DOUYIN_SCREENSHOT_DIR, f"douyin_publish_timeout_{int(asyncio.get_event_loop().time()*1000)}.png")

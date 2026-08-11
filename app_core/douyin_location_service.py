@@ -23,10 +23,14 @@ DOUYIN_LOCATION_SEARCH_ENDPOINT = "/aweme/v1/life/video_api/search/poi/"
 MIN_KEYWORD_LENGTH = 2
 MAX_KEYWORD_LENGTH = 50
 MAX_RESULTS = 12
+LOCATION_SEARCH_SCOPES = {
+    "local": {"label": "本地", "searchType": 0},
+    "domestic": {"label": "国内", "searchType": 2},
+}
 _CACHE_TTL_SECONDS = 60.0
 _CACHE_MAX_ITEMS = 60
 _cache_lock = threading.Lock()
-_cache: dict[tuple[int, str], tuple[float, list[dict[str, str]]]] = {}
+_cache: dict[tuple[int, str, str], tuple[float, list[dict[str, str]]]] = {}
 
 
 class DouyinLocationSearchError(RuntimeError):
@@ -44,6 +48,33 @@ def normalize_location_keyword(value: object) -> str:
     if len(keyword) > MAX_KEYWORD_LENGTH:
         raise DouyinLocationSearchError(f"地点搜索词不能超过 {MAX_KEYWORD_LENGTH} 个字")
     return keyword
+
+
+def normalize_location_scope(value: object) -> str:
+    scope = _normalized(value).lower() or "domestic"
+    if scope not in LOCATION_SEARCH_SCOPES:
+        raise DouyinLocationSearchError("地点搜索范围无效")
+    return scope
+
+
+def location_search_params(keyword: object, scope: object = "domestic") -> dict[str, str]:
+    """构造与抖音创作页一致的 POI 搜索参数。"""
+
+    normalized_keyword = normalize_location_keyword(keyword)
+    normalized_scope = normalize_location_scope(scope)
+    return {
+        # 平台字段是复数 keywords；旧实现误用 keyword，接口会忽略搜索词。
+        "keywords": normalized_keyword,
+        "count": str(MAX_RESULTS),
+        "from_webapp": "1",
+        "get_current_loc": "1",
+        "is_image_album_style": "1",
+        "search_type": str(
+            LOCATION_SEARCH_SCOPES[normalized_scope]["searchType"]
+        ),
+        "poi_anchor_tab": "2",
+        "page": "0",
+    }
 
 
 def _distance_text(value: object) -> str:
@@ -99,17 +130,26 @@ def normalize_location_response(value: object) -> list[dict[str, str]]:
         raise DouyinLocationSearchError(f"抖音地点搜索失败：{message}")
 
     rows = []
-    for key in ("current_locs", "poi_list"):
+    # 有关键词时平台自身只展示 poi_list；当前位置推荐只能作为兜底，否则
+    # 固定推荐会排在真正的搜索结果前面，让不同关键词看起来完全相同。
+    for key in ("poi_list", "current_locs"):
         items = value.get(key)
         if isinstance(items, list):
             rows.extend(items)
     result: list[dict[str, str]] = []
-    seen: set[str] = set()
+    by_poi_id: dict[str, dict[str, str]] = {}
     for row in rows:
         candidate = normalize_location_candidate(row)
-        if not candidate or candidate["poiId"] in seen:
+        if not candidate:
             continue
-        seen.add(candidate["poiId"])
+        existing = by_poi_id.get(candidate["poiId"])
+        if existing is not None:
+            # 搜索结果优先决定名称和顺序，当前位置数据只补齐缺失的地址/距离。
+            for field in ("address", "distance"):
+                if not existing.get(field) and candidate.get(field):
+                    existing[field] = candidate[field]
+            continue
+        by_poi_id[candidate["poiId"]] = candidate
         result.append(candidate)
         if len(result) >= MAX_RESULTS:
             break
@@ -134,27 +174,40 @@ def _storage_state(account: dict) -> Path:
     return state
 
 
-def _cached(account_id: int, keyword: str) -> list[dict[str, str]] | None:
+def _cached(
+    account_id: int,
+    keyword: str,
+    scope: str,
+) -> list[dict[str, str]] | None:
     with _cache_lock:
-        value = _cache.get((account_id, keyword))
+        value = _cache.get((account_id, scope, keyword))
         if not value:
             return None
         stored_at, rows = value
         if time.monotonic() - stored_at > _CACHE_TTL_SECONDS:
-            _cache.pop((account_id, keyword), None)
+            _cache.pop((account_id, scope, keyword), None)
             return None
         return deepcopy(rows)
 
 
-def _store_cache(account_id: int, keyword: str, rows: list[dict[str, str]]) -> None:
+def _store_cache(
+    account_id: int,
+    keyword: str,
+    scope: str,
+    rows: list[dict[str, str]],
+) -> None:
     with _cache_lock:
         if len(_cache) >= _CACHE_MAX_ITEMS:
             oldest = min(_cache, key=lambda key: _cache[key][0])
             _cache.pop(oldest, None)
-        _cache[(account_id, keyword)] = (time.monotonic(), deepcopy(rows))
+        _cache[(account_id, scope, keyword)] = (time.monotonic(), deepcopy(rows))
 
 
-async def _search(account: dict, keyword: str) -> list[dict[str, str]]:
+async def _search(
+    account: dict,
+    keyword: str,
+    scope: str,
+) -> list[dict[str, str]]:
     state = _storage_state(account)
     from playwright.async_api import async_playwright
 
@@ -172,16 +225,12 @@ async def _search(account: dict, keyword: str) -> list[dict[str, str]]:
             if "creator.douyin.com" not in page.url:
                 raise DouyinLocationSearchError("抖音会话已失效，请先在账号管理中重新登录")
             response = await page.evaluate(
-                """async ({ endpoint, keyword, count }) => {
+                """async ({ endpoint, params }) => {
                     const controller = new AbortController();
                     const timeout = setTimeout(() => controller.abort(), 12000);
                     try {
-                        const params = new URLSearchParams({
-                            keyword,
-                            count: String(count),
-                            from_webapp: '1',
-                        });
-                        const result = await fetch(`${endpoint}?${params.toString()}`, {
+                        const query = new URLSearchParams(params);
+                        const result = await fetch(`${endpoint}?${query.toString()}`, {
                             credentials: 'include',
                             headers: { Accept: 'application/json, text/plain, */*' },
                             signal: controller.signal,
@@ -194,8 +243,7 @@ async def _search(account: dict, keyword: str) -> list[dict[str, str]]:
                 }""",
                 {
                     "endpoint": DOUYIN_LOCATION_SEARCH_ENDPOINT,
-                    "keyword": keyword,
-                    "count": MAX_RESULTS,
+                    "params": location_search_params(keyword, scope),
                 },
             )
             if not isinstance(response, dict) or int(response.get("httpStatus") or 0) != 200:
@@ -214,16 +262,21 @@ async def _search(account: dict, keyword: str) -> list[dict[str, str]]:
             await browser.close()
 
 
-def search_douyin_locations(account: dict, keyword: object) -> list[dict[str, str]]:
+def search_douyin_locations(
+    account: dict,
+    keyword: object,
+    scope: object = "domestic",
+) -> list[dict[str, str]]:
     """同步入口：供 PyQt 后台线程读取抖音地点候选。"""
 
     normalized_keyword = normalize_location_keyword(keyword)
+    normalized_scope = normalize_location_scope(scope)
     account_id = _account_identity(account)
-    cached = _cached(account_id, normalized_keyword)
+    cached = _cached(account_id, normalized_keyword, normalized_scope)
     if cached is not None:
         return cached
-    rows = asyncio.run(_search(dict(account), normalized_keyword))
-    _store_cache(account_id, normalized_keyword, rows)
+    rows = asyncio.run(_search(dict(account), normalized_keyword, normalized_scope))
+    _store_cache(account_id, normalized_keyword, normalized_scope, rows)
     return deepcopy(rows)
 
 

@@ -181,8 +181,20 @@ def _validate_payloads(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     raise ValueError(
                         "抖音发布定位必须来自一键发官方地点候选，不能只传关键词"
                     )
+                if (
+                    str(payload.get("workflow") or "").strip()
+                    != "douyin-commerce"
+                    and str(payload.get("locationScope") or "").strip()
+                    != "local"
+                ):
+                    raise ValueError(
+                        "普通抖音发布定位仅支持账号本地地点，"
+                        "请返回平台适配重新搜索并选择本地地点"
+                    )
                 payload["locationKeyword"] = location["name"]
                 payload["locationPoi"] = location
+                if str(payload.get("workflow") or "").strip() != "douyin-commerce":
+                    payload["locationScope"] = "local"
             else:
                 payload["locationKeyword"] = ""
                 payload["locationPoi"] = {}

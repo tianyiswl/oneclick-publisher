@@ -1895,16 +1895,36 @@ async def _douyin_fill_title_and_description(
 
     title_input = page.locator(f'input[placeholder="{title_placeholder}"]').first
     await title_input.wait_for(state="visible", timeout=15_000)
-    await _set_dom_value(title_input, title)
+    # 抖音新版标题框是 React 受控输入框。直接改 DOM value 会被组件状态
+    # 回写覆盖；必须模拟真实用户先清空、确认旧值消失，再用 fill 写入。
+    await title_input.fill("", timeout=10_000)
+    cleared_title = _normalized_page_text(await title_input.input_value())
+    if cleared_title:
+        raise PreflightError(
+            f"抖音{label}标题旧值未能清空：{cleared_title[:80]}"
+        )
+    await title_input.fill(title, timeout=10_000)
     editor = page.locator('[contenteditable="true"]').first
     await editor.wait_for(state="visible", timeout=10_000)
     await editor.fill(description, timeout=10_000)
     await page.wait_for_timeout(300)
-    title_ok = _normalized_page_text(await title_input.input_value()) == _normalized_page_text(title)
-    description_ok = _normalized_page_text(await editor.inner_text()) == _normalized_page_text(description)
+    actual_title = _normalized_page_text(await title_input.input_value())
+    expected_title = _normalized_page_text(title)
+    actual_description = _normalized_page_text(await editor.inner_text())
+    expected_description = _normalized_page_text(description)
+    title_ok = actual_title == expected_title
+    description_ok = actual_description == expected_description
     if not title_ok or not description_ok:
-        missing = "标题" if not title_ok else "描述"
-        raise PreflightError(f"抖音{label}{missing}字段未能回读测试值")
+        if not title_ok:
+            raise PreflightError(
+                f"抖音{label}标题字段回读不一致："
+                f"期望“{expected_title[:80]}”，实际“{actual_title[:80] or '空'}”"
+            )
+        raise PreflightError(
+            f"抖音{label}描述字段回读不一致："
+            f"期望“{expected_description[:120]}”，"
+            f"实际“{actual_description[:120] or '空'}”"
+        )
 
 
 async def _douyin_first_visible_nodes(root, selectors: tuple[str, ...]) -> list:
@@ -2347,9 +2367,39 @@ async def _douyin_video_preflight(page, payload: dict) -> str:
         title_placeholder="填写作品标题，为作品获得更多流量", label="视频",
     )
     location_name = await _douyin_set_location(page, payload)
+    declaration_note = ""
+    if payload.get("aiGenerated") is True:
+        # 复用正式发布上传器已经过回归验证的自主声明选择逻辑。这里仅在
+        # 编辑页选择并回读，不定位或点击发布、暂存、预览等结果性控件。
+        from uploader.douyin_uploader.main import DouYinVideo
+
+        declarer = DouYinVideo(
+            title=title,
+            file_path=str(files[0]),
+            tags=[],
+            publish_date=0,
+            account_file="",
+            dry_run=True,
+            dry_run_hold_browser=False,
+            description=description,
+        )
+        declarer.ai_generated = True
+        declarer.content_declaration = ""
+        try:
+            declaration = await declarer.set_ai_generated_declaration(page)
+        except Exception as exc:
+            raise PreflightError(
+                f"抖音 AI 生成内容声明未能写入并回读：{_normalized_page_text(exc)[:160]}"
+            ) from exc
+        if _normalized_page_text(declaration) != "内容由AI生成":
+            raise PreflightError("抖音 AI 生成内容声明回读不一致")
+        declaration_note = "，AI 生成内容声明已回读"
     # 安全边界：绝不定位或点击“发布”“发布暂存离开”“预览”等按钮。
     location_note = f"，定位“{location_name}”已回读" if location_name else "，未添加定位"
-    return f"抖音视频素材已上传，标题和描述已回读{location_note}；未保存草稿、未预览、未发布"
+    return (
+        f"抖音视频素材已上传，标题和描述已回读{location_note}"
+        f"{declaration_note}；未保存草稿、未预览、未发布"
+    )
 
 
 async def _douyin_graphic_preflight(page, payload: dict) -> str:

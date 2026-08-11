@@ -17,6 +17,7 @@ import qrcode
 from PIL import Image
 
 from app_core import douyin_publish_executor
+from app_core.douyin_verification import VerificationChallenge, verification_broker
 from uploader.douyin_uploader.main import DouYinVideo
 
 try:
@@ -66,6 +67,188 @@ class DouyinPublishPayloadTests(unittest.TestCase):
         self.assertEqual(checked["locationPoi"]["poiId"], "6601124346666682376")
         self.assertEqual(checked["locationKeyword"], "北海银滩景区")
         self.assertIsNone(checked["scheduleTime"])
+
+    def test_normalizes_only_explicit_ai_generated_boolean(self) -> None:
+        payload = dict(self.payload)
+        payload["aiGenerated"] = True
+        checked = douyin_publish_executor.validate_douyin_publish_payload(payload)
+        self.assertTrue(checked["aiGenerated"])
+
+        payload["aiGenerated"] = "true"
+        checked = douyin_publish_executor.validate_douyin_publish_payload(payload)
+        self.assertFalse(checked["aiGenerated"])
+
+    def test_standard_publish_sms_verification_uses_native_broker(self) -> None:
+        """标准发布应在原会话等待客户端验证码，不要求用户操作浏览器。"""
+
+        class Page:
+            url = "https://creator.douyin.com/verification"
+
+            async def wait_for_timeout(self, _milliseconds: int) -> None:
+                await asyncio.sleep(0)
+
+        class Uploader:
+            def __init__(self) -> None:
+                self.codes: list[str] = []
+
+            async def apply_sms_verification_code(
+                self,
+                _page,
+                _challenge,
+                code: str,
+                before_submit=None,
+            ) -> None:
+                if before_submit:
+                    before_submit()
+                self.codes.append(code)
+
+            async def resend_sms_verification_code(self, _page, _challenge) -> None:
+                return None
+
+        async def scenario() -> Uploader:
+            uploader = Uploader()
+            task = asyncio.create_task(
+                douyin_publish_executor._handle_publish_verification(
+                    uploader,
+                    Page(),
+                    VerificationChallenge(kind="sms", message=""),
+                    task_id=90210,
+                )
+            )
+            request_id = None
+            for _ in range(20):
+                await asyncio.sleep(0)
+                request_id = verification_broker.request_for_task(90210)
+                if request_id:
+                    break
+            self.assertIsNotNone(request_id)
+            verification_broker.submit_code(str(request_id), "123456")
+            await task
+            self.assertIsNone(verification_broker.request_for_task(90210))
+            return uploader
+
+        with patch.object(
+            douyin_publish_executor.task_service,
+            "record_task_event",
+        ) as record:
+            uploader = asyncio.run(scenario())
+
+        self.assertEqual(uploader.codes, ["123456"])
+        self.assertEqual(record.call_args.args[1], "douyin_verification_required")
+
+    def test_standard_publish_qr_verification_waits_for_management_receipt(self) -> None:
+        """扫码完成后只有进入作品管理页才可继续，不能凭弹层消失猜成功。"""
+
+        qr_output = BytesIO()
+        qrcode.make("standard-publish-verification").save(qr_output, format="PNG")
+
+        class Page:
+            url = "https://creator.douyin.com/verification"
+
+            async def wait_for_timeout(self, _milliseconds: int) -> None:
+                await asyncio.sleep(0)
+
+        class Uploader:
+            async def detect_publish_verification(self, page):
+                if "/creator-micro/content/manage" in page.url:
+                    return None
+                return VerificationChallenge(
+                    kind="qr",
+                    message="",
+                    qr_image=qr_output.getvalue(),
+                )
+
+        async def scenario() -> None:
+            page = Page()
+            task = asyncio.create_task(
+                douyin_publish_executor._handle_publish_verification(
+                    Uploader(),
+                    page,
+                    VerificationChallenge(
+                        kind="qr",
+                        message="",
+                        qr_image=qr_output.getvalue(),
+                    ),
+                    task_id=90212,
+                )
+            )
+            request_id = None
+            for _ in range(20):
+                await asyncio.sleep(0)
+                request_id = verification_broker.request_for_task(90212)
+                if request_id:
+                    break
+            self.assertIsNotNone(request_id)
+            page.url = "https://creator.douyin.com/creator-micro/content/manage"
+            await task
+            self.assertIsNone(verification_broker.request_for_task(90212))
+
+        with patch.object(
+            douyin_publish_executor.task_service,
+            "record_task_event",
+        ) as record:
+            asyncio.run(scenario())
+
+        self.assertEqual(record.call_args.args[1], "douyin_verification_required")
+
+    def test_uploader_forwards_injected_verification_callback(self) -> None:
+        """上传器点击发布后必须把标准发布协调器交给验证等待器。"""
+
+        video = DouYinVideo(
+            title="测试",
+            file_path=str(self.video),
+            tags=[],
+            publish_date=0,
+            account_file="offline.json",
+            description="测试",
+        )
+        callback = AsyncMock()
+        video.verification_callback = callback
+        video.external_page = MagicMock()
+        video.external_context = MagicMock()
+        video.external_browser = MagicMock()
+        publish_button = MagicMock()
+        publish_button.click = AsyncMock()
+
+        async_methods = (
+            "prepare_uploaded_video_editor",
+            "set_favorite_music",
+            "set_collection",
+            "set_structured_location",
+            "set_commerce_store",
+            "set_ai_generated_declaration",
+        )
+        patches = [
+            patch.object(video, name, new_callable=AsyncMock)
+            for name in async_methods
+        ]
+        started = [item.start() for item in patches]
+        del started
+        try:
+            with patch.object(
+                video,
+                "wait_publish_button_ready",
+                new_callable=AsyncMock,
+                return_value=publish_button,
+            ), patch.object(
+                video,
+                "_wait_formal_publish_result",
+                new_callable=AsyncMock,
+                return_value={"status": "published"},
+            ) as wait_result, patch(
+                "uploader.douyin_uploader.main.save_context_storage_state",
+                new_callable=AsyncMock,
+            ):
+                receipt = asyncio.run(video.upload(MagicMock()))
+        finally:
+            for item in reversed(patches):
+                item.stop()
+
+        self.assertEqual(receipt["status"], "published")
+        self.assertIs(
+            wait_result.await_args.kwargs["on_verification"],
+            callback,
+        )
 
     def test_rejects_plain_location_keyword(self) -> None:
         payload = dict(self.payload)

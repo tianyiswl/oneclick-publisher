@@ -18,6 +18,51 @@ from ui.publish_page import PublishPage
 
 
 class DouyinLocationMatchingTests(unittest.TestCase):
+    def test_douyin_preflight_title_uses_controlled_input_fill(self) -> None:
+        state = {"title": "旧标题", "description": ""}
+
+        async def fill_title(value: str, **_kwargs) -> None:
+            state["title"] = value
+
+        async def fill_description(value: str, **_kwargs) -> None:
+            state["description"] = value
+
+        title_input = MagicMock()
+        title_input.wait_for = AsyncMock()
+        title_input.fill = AsyncMock(side_effect=fill_title)
+        title_input.input_value = AsyncMock(side_effect=lambda: state["title"])
+        title_query = MagicMock()
+        title_query.first = title_input
+
+        editor = MagicMock()
+        editor.wait_for = AsyncMock()
+        editor.fill = AsyncMock(side_effect=fill_description)
+        editor.inner_text = AsyncMock(side_effect=lambda: state["description"])
+        editor_query = MagicMock()
+        editor_query.first = editor
+
+        page = MagicMock()
+        page.locator.side_effect = lambda selector: (
+            title_query if selector.startswith("input[") else editor_query
+        )
+        page.wait_for_timeout = AsyncMock()
+
+        asyncio.run(
+            oneclick_preflight._douyin_fill_title_and_description(
+                page,
+                "测试",
+                "测试文案",
+                title_placeholder="填写作品标题，为作品获得更多流量",
+                label="视频",
+            )
+        )
+
+        self.assertEqual(
+            [call.args[0] for call in title_input.fill.await_args_list],
+            ["", "测试"],
+        )
+        editor.fill.assert_awaited_once_with("测试文案", timeout=10_000)
+
     def test_candidate_name_uses_primary_line_not_address(self) -> None:
         self.assertEqual(
             oneclick_preflight._douyin_location_candidate_name(
@@ -259,6 +304,7 @@ class DouyinLocationUiTests(unittest.TestCase):
     def test_location_has_independent_full_width_search_and_enters_payload(self) -> None:
         page = PublishPage()
         self.assertIsNotNone(page.douyin_sync_toutiao)
+        self.assertIsNone(page.douyin_location_scope)
         self.assertIsNotNone(page.douyin_location_keyword)
         self.assertIsNot(
             page.douyin_sync_toutiao.parentWidget(),
@@ -309,6 +355,7 @@ class DouyinLocationUiTests(unittest.TestCase):
         self.assertEqual(len(payloads), 1)
         self.assertTrue(payloads[0]["syncToToutiao"])
         self.assertEqual(payloads[0]["locationKeyword"], "北海银滩景区")
+        self.assertEqual(payloads[0]["locationScope"], "local")
         self.assertEqual(
             payloads[0]["locationPoi"],
             {
@@ -324,6 +371,49 @@ class DouyinLocationUiTests(unittest.TestCase):
             template["douyinLocation"]["poiId"],
             "6601124346666682376",
         )
+        self.assertEqual(template["douyinLocationScope"], "local")
+        page.close()
+
+    def test_standard_douyin_location_search_is_local_only(self) -> None:
+        page = PublishPage()
+        account = {
+            "id": 3,
+            "type": 3,
+            "platformName": "抖音",
+            "filePath": "oneclick_3_offline.json",
+        }
+        page.douyin_location_keyword.setText("北海银滩")
+        with patch.object(page, "_platform_accounts", return_value=[account]), patch.object(
+            page.location_tasks,
+            "run",
+            return_value=True,
+        ) as run:
+            page.search_douyin_locations()
+
+        work = run.call_args.args[1]
+        with patch(
+            "ui.publish_page.douyin_location_service.search_douyin_locations",
+            return_value=[],
+        ) as search:
+            work()
+        search.assert_called_once_with(account, "北海银滩", "local")
+        page.close()
+
+    def test_legacy_location_without_local_scope_is_not_restored(self) -> None:
+        page = PublishPage()
+        page._apply_content_payload(
+            {
+                "douyinLocationKeyword": "延安北巷七号社区公园",
+                "douyinLocation": {
+                    "poiId": "6601153104370993165",
+                    "name": "延安北巷七号社区公园",
+                    "address": "贵州省贵阳市云岩区延安巷27号",
+                },
+            }
+        )
+        self.assertEqual(page.douyin_location_keyword.text(), "")
+        self.assertEqual(page._douyin_selected_location, {})
+        self.assertIn("重新搜索", page.douyin_location_status.text())
         page.close()
 
     def test_plain_keyword_cannot_enter_publish_payload(self) -> None:
@@ -347,6 +437,21 @@ class DouyinLocationUiTests(unittest.TestCase):
 
 
 class DouyinLocationServiceTests(unittest.TestCase):
+    def test_search_params_use_official_keywords_and_scope_values(self) -> None:
+        domestic = douyin_location_service.location_search_params(
+            "北京故宫",
+            "domestic",
+        )
+        local = douyin_location_service.location_search_params(
+            "北京故宫",
+            "local",
+        )
+
+        self.assertEqual(domestic["keywords"], "北京故宫")
+        self.assertNotIn("keyword", domestic)
+        self.assertEqual(domestic["search_type"], "2")
+        self.assertEqual(local["search_type"], "0")
+
     def test_commerce_editor_search_reuses_current_editor_without_raw_request(self) -> None:
         page = object()
         expected = [
@@ -419,6 +524,7 @@ class DouyinLocationServiceTests(unittest.TestCase):
                 "runtimeMode": "preflight",
                 "debugDryRun": True,
                 "locationKeyword": "北海银滩景区",
+                "locationScope": "local",
                 "locationPoi": {
                     "poiId": "poi-1",
                     "name": "北海银滩景区",
@@ -428,6 +534,31 @@ class DouyinLocationServiceTests(unittest.TestCase):
             validated = _validate_payloads([payload])[0]
             self.assertEqual(validated["locationPoi"]["poiId"], "poi-1")
             self.assertEqual(validated["locationPoi"]["address"], "北海市银海区")
+
+    def test_standard_task_rejects_location_without_local_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            video = Path(temporary_directory) / "offline.mp4"
+            video.write_bytes(b"offline")
+            with self.assertRaisesRegex(ValueError, "仅支持账号本地地点"):
+                _validate_payloads(
+                    [
+                        {
+                            "type": 3,
+                            "contentType": "video",
+                            "title": "离线测试",
+                            "description": "离线测试",
+                            "fileList": [str(video)],
+                            "runtimeMode": "preflight",
+                            "debugDryRun": True,
+                            "locationKeyword": "延安北巷七号社区公园",
+                            "locationPoi": {
+                                "poiId": "6601153104370993165",
+                                "name": "延安北巷七号社区公园",
+                                "address": "贵州省贵阳市云岩区延安巷27号",
+                            },
+                        }
+                    ]
+                )
 
     def test_task_validation_rejects_keyword_without_poi(self) -> None:
         with self.assertRaisesRegex(ValueError, "不能只传关键词"):

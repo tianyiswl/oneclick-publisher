@@ -102,15 +102,41 @@ def wechat_home_session_confirms(
     并且页面账号名与本地账号记录一致；不能只凭 URL 判定登录成功。
     """
 
+    return bool(
+        wechat_authorization_page_confirms(
+            current_url,
+            home_visible=home_visible,
+            login_visible=login_visible,
+            detected_name=detected_name,
+        )
+        and saved_identity_matches(account, detected_name)
+    )
+
+
+def wechat_authorization_page_confirms(
+    current_url: object,
+    *,
+    home_visible: bool,
+    login_visible: bool,
+    detected_name: object,
+) -> bool:
+    """确认公众号授权页已经从登录态进入可用后台首页。
+
+    首次绑定还没有本地账号名可供比对，因此必须组合官方域名、后台首页、
+    可见首页导航、登录控件消失和有效公众号名称五项证据。任何单项都不能
+    触发自动保存，避免把二维码页或跳转中间页误判为登录成功。
+    """
+
     parsed = urlsplit(str(current_url or ""))
     if parsed.scheme != "https" or parsed.hostname != "mp.weixin.qq.com":
         return False
     if parsed.path.rstrip("/") != "/cgi-bin/home":
         return False
+    display_name = " ".join(str(detected_name or "").split())
     return bool(
         home_visible
         and not login_visible
-        and saved_identity_matches(account, detected_name)
+        and account_service._is_display_name(display_name)
     )
 
 
@@ -250,7 +276,16 @@ class AuthorizationSession:
                 # B站扫码完成后不一定再次请求 cookie/info 接口，导致单靠网络
                 # 回执无法收尾。仅对已知的创作中心身份区做第二道确认：必须
                 # 读到有效账号昵称，绝不以“页面已打开”作为已登录判断。
-                await self._detect_logged_in_page(page)
+                # 扫码确认可能在原标签页跳转，也可能打开同一持久化会话中的
+                # 新标签页。逐页检查严格身份证据，避免只盯首个登录页而漏掉
+                # 已经进入后台首页的公众号会话。
+                for candidate_page in reversed(context.pages):
+                    if candidate_page.is_closed():
+                        continue
+                    await self._detect_logged_in_page(candidate_page)
+                    if self._login_detected:
+                        page = candidate_page
+                        break
                 await asyncio.sleep(0.25)
 
             if self._cancel_requested.is_set():
@@ -321,10 +356,52 @@ class AuthorizationSession:
         又不会将登录页、二维码页或普通导航文字误存为账号。
         """
 
-        if self._login_detected or int(self.platform_type) != 5:
+        platform_type = int(self.platform_type)
+        if self._login_detected or platform_type not in {5, 10}:
+            return
+        if platform_type == 10:
+            try:
+                display_name = await account_service._detect_display_name(
+                    page,
+                    platform_type,
+                )
+                home_markers = page.locator(
+                    'a[href*="/cgi-bin/home"], '
+                    '.weui-desktop-menu__link:has-text("首页"), '
+                    '.weui-desktop-menu__name:has-text("首页")'
+                )
+                login_controls = page.locator(
+                    '.login__type__container__scan, .login_qrcode, .qrcode, '
+                    'button:has-text("登录"), a:has-text("登录")'
+                )
+                home_visible = False
+                for index in range(min(await home_markers.count(), 8)):
+                    if await home_markers.nth(index).is_visible(timeout=250):
+                        home_visible = True
+                        break
+                login_visible = False
+                for index in range(min(await login_controls.count(), 8)):
+                    if await login_controls.nth(index).is_visible(timeout=200):
+                        login_visible = True
+                        break
+            except Exception:
+                return
+            if not wechat_authorization_page_confirms(
+                page.url,
+                home_visible=home_visible,
+                login_visible=login_visible,
+                detected_name=display_name,
+            ):
+                return
+            self._detected_display_name = display_name
+            self._login_detected = True
+            self.queue.put("LOGIN_DETECTED")
+            # 首页已经稳定渲染，但仍为 Cookie / localStorage 留出最终落盘时间。
+            await asyncio.sleep(1.5)
+            self._save_requested.set()
             return
         try:
-            display_name = await account_service._detect_display_name(page, self.platform_type)
+            display_name = await account_service._detect_display_name(page, platform_type)
         except Exception:
             return
         if not display_name:

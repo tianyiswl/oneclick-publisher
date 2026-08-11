@@ -45,7 +45,8 @@ class XhsContentBundleTests(unittest.TestCase):
 
     def test_rejects_absolute_image_path(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            manifest = self._bundle(Path(temporary), images=["/tmp/elsewhere.png"])
+            absolute = Path(temporary).anchor + "elsewhere.png"
+            manifest = self._bundle(Path(temporary), images=[absolute])
             with self.assertRaisesRegex(XhsContentBundleError, "相对路径"):
                 load_xhs_content_bundle(manifest)
 

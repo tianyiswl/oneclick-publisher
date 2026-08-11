@@ -6075,6 +6075,13 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
     def test_schedule_sync_updates_editor_only_when_platform_time_changed(self) -> None:
         """进入检查前先读平台定时；不一致时写入并二次回读。"""
 
+        target_time = (
+            datetime.now(ZoneInfo("Asia/Shanghai")) + timedelta(days=2)
+        ).replace(hour=10, minute=0, second=0, microsecond=0)
+        previous_time = target_time - timedelta(days=1, hours=1)
+        target = target_time.strftime("%Y-%m-%d %H:%M")
+        previous = previous_time.strftime("%Y-%m-%d %H:%M")
+
         class OpenPage:
             def is_closed(self) -> bool:
                 return False
@@ -6084,10 +6091,10 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
 
             def __init__(self) -> None:
                 self.read_schedule_time_douyin = AsyncMock(
-                    side_effect=["2026-08-10 09:00", "2026-08-11 10:00"]
+                    side_effect=[previous, target]
                 )
                 self.set_schedule_time_douyin = AsyncMock(
-                    return_value="2026-08-11 10:00"
+                    return_value=target
                 )
 
         upload_payload = {
@@ -6108,7 +6115,6 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
             "name": "北海银滩景区",
             "address": "广西壮族自治区北海市银海区银滩大道中段",
         }
-        target = "2026-08-11 10:00"
         payload = {
             **upload_payload,
             "selectedMusic": music,
