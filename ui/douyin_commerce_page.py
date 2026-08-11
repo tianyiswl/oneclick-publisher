@@ -76,7 +76,7 @@ from app_core.paths import AVATAR_DIR
 from .background_task import BackgroundTaskRunner
 from .common import button
 from .douyin_verification_dialog import DouyinVerificationDialog
-from .runtime_log import ExecutionLogPanel
+from .runtime_log import ExecutionLogPanel, runtime_log_bus
 from .topic_tag_editor import FlowLayout, history_tag_box_height
 
 
@@ -565,6 +565,9 @@ class DouyinCommercePage(QWidget):
         self._batch_preflight_fingerprint = ""
         self._batch_progress_text = ""
         self._batch_result_feedback = ""
+        # 批次结果仍需留在当前页面供复制；只有用户真正进入下一批平台设置时
+        # 才清空共享执行日志，避免多批记录混在一起。
+        self._clear_runtime_log_on_next_task = False
         self._batch_pause_requested = False
         # 只自动维护“系统默认”日期；用户手动选择的未来日期绝不覆盖。
         self._schedule_date_auto_default = True
@@ -1703,6 +1706,13 @@ class DouyinCommercePage(QWidget):
         except Exception as exc:
             _LOGGER.warning("抖音带货批量地点保存失败：%s", _normalized(exc))
             return False
+        search_state = self._batch_location_state()
+        if _normalized(search_state.get("scope")) == _normalized(scope):
+            search_keyword = _normalized(search_state.get("keyword"))
+            if search_keyword:
+                # 原始搜索词属于本批次的恢复意图，不写入账号级地点数据库；
+                # 它随视频地点快照进入草稿和正式发布载荷。
+                preset["searchKeyword"] = search_keyword
         self._batch_locations[path] = dict(preset)
         self._batch_preflight_fingerprint = ""
         return True
@@ -2289,6 +2299,16 @@ class DouyinCommercePage(QWidget):
         navigation = QHBoxLayout(self.review_action_dock)
         self._configure_reference_footer(self.review_action_dock, navigation)
         navigation.addWidget(self.validation_label, 1)
+        self.background_mode_checkbox = QCheckBox("后台运行")
+        self.background_mode_checkbox.setObjectName(
+            "douyinCommerceBackgroundMode"
+        )
+        self.background_mode_checkbox.setChecked(True)
+        self.background_mode_checkbox.setToolTip(
+            "默认使用后台浏览器发布；取消勾选后会显示正式发布浏览器，"
+            "用于观察地点、声明或平台风控失败。"
+        )
+        navigation.addWidget(self.background_mode_checkbox)
         self.review_back_button = button("返回平台设置", variant="secondary")
         self.review_back_button.setProperty("footerAction", True)
         self.review_back_button.clicked.connect(self.return_from_review)
@@ -4157,6 +4177,7 @@ class DouyinCommercePage(QWidget):
             "commerceMode": "local-group-buy",
             "contentType": "video",
             "accountList": [str(account.get("filePath") or "")],
+            "backgroundMode": self.background_mode_checkbox.isChecked(),
             "shared": {
                 "title": self.title_input.text().strip(),
                 "description": self.description_input.toPlainText().strip(),
@@ -4574,6 +4595,10 @@ class DouyinCommercePage(QWidget):
         """无论逐条结果成功或失败，都给出可见、可追溯的最终汇总。"""
 
         rows = [dict(row) for row in result if isinstance(row, dict)] if isinstance(result, list) else []
+        if rows:
+            # 结果页仍要保留本批日志供复制和排障；等用户真正进入下一批平台
+            # 设置时再清空，直接重试当前批次不会丢失上下文。
+            self._clear_runtime_log_on_next_task = True
         published = [row for row in rows if _normalized(row.get("status")) == "published"]
         failed = [
             row
@@ -4673,7 +4698,7 @@ class DouyinCommercePage(QWidget):
             "enableTimer": False,
             "runtimeMode": "preflight",
             "debugDryRun": True,
-            "backgroundMode": True,
+            "backgroundMode": self.background_mode_checkbox.isChecked(),
             "syncToToutiao": False,
         }
         return douyin_commerce_service.validate_douyin_commerce_upload_payload(payload)
@@ -4693,7 +4718,7 @@ class DouyinCommercePage(QWidget):
             "scheduleTime": self._schedule_text() if timer_enabled else "",
             "runtimeMode": runtime_mode,
             "debugDryRun": runtime_mode == "preflight",
-            "backgroundMode": True,
+            "backgroundMode": self.background_mode_checkbox.isChecked(),
         }
         return douyin_commerce_service.validate_douyin_commerce_payload(payload)
 
@@ -5036,6 +5061,16 @@ class DouyinCommercePage(QWidget):
             self._last_failed_collector_type = ""
             self.retry_collector_button.setVisible(False)
 
+    def _clear_runtime_log_for_new_task_if_needed(self) -> None:
+        """在上一批已结束且下一批真正开始时建立新的日志段。"""
+
+        if not self._clear_runtime_log_on_next_task:
+            return
+        bus = runtime_log_bus()
+        bus.clear()
+        self._clear_runtime_log_on_next_task = False
+        bus.publish("新的抖音带货任务已开始，上一批客户端执行日志已清空")
+
     def _start_setup_generation(self, payload: dict) -> None:
         """关闭旧代际并建立本次平台设置代际；不创建正式发布会话。"""
 
@@ -5043,6 +5078,7 @@ class DouyinCommercePage(QWidget):
             self._SETUP_GENERATION_TASK_KEY
         ):
             return
+        self._clear_runtime_log_for_new_task_if_needed()
         old_generation_id = self._setup_generation_id
         self._setup_start_token += 1
         start_token = self._setup_start_token

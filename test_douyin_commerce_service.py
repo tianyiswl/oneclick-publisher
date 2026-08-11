@@ -35,6 +35,8 @@ from playwright.async_api import async_playwright
 from app_core import (
     database,
     douyin_commerce_batch_draft_service,
+    douyin_commerce_batch_executor,
+    douyin_commerce_batch_service,
     douyin_commerce_collectors,
     douyin_commerce_service,
     douyin_commerce_session,
@@ -238,6 +240,7 @@ class DouyinCommercePayloadTests(unittest.TestCase):
             douyin_publish_executor._scheduled_time(checked).strftime("%Y-%m-%d %H:%M"),
             self.payload["scheduleTime"],
         )
+        self.assertFalse(checked["backgroundMode"])
 
         multiple = dict(self.payload, accountList=["a.json", "b.json"])
         with self.assertRaisesRegex(douyin_commerce_service.DouyinCommerceError, "一个"):
@@ -248,6 +251,85 @@ class DouyinCommercePayloadTests(unittest.TestCase):
         stale = dict(self.payload, scheduleTime="2020-01-01 09:00")
         with self.assertRaisesRegex(douyin_publish_executor.DouyinPublishError, "晚于"):
             douyin_publish_executor._scheduled_time(stale)
+
+    def test_full_payload_preserves_the_original_location_search_keyword(self) -> None:
+        """正式发布必须保留用户实际找到该地点的原始搜索词。"""
+
+        checked = douyin_commerce_service.validate_douyin_commerce_payload(
+            dict(self.payload, locationSearchKeyword="joymark")
+        )
+
+        self.assertEqual(checked["locationSearchKeyword"], "joymark")
+
+    def test_location_keyword_recovery_prefers_original_query_and_brand_fallback(self) -> None:
+        """英文混排店名不能只依赖长地址和完整名称重新检索。"""
+
+        location = {
+            "poiId": "poi-joymark",
+            "name": "JOYMARK(株洲王府星mall店)",
+            "address": "湖南省株洲市芦淞区王府·星Mall负一楼F-11号铺",
+        }
+
+        with_original = douyin_commerce_batch_executor._location_search_keywords(
+            location,
+            original_keyword="joymark",
+        )
+        legacy = douyin_commerce_batch_executor._location_search_keywords(location)
+
+        self.assertEqual(with_original[0], "joymark")
+        self.assertIn("JOYMARK", legacy)
+        self.assertLess(legacy.index("JOYMARK"), legacy.index(location["address"]))
+
+    def test_batch_contract_preserves_location_query_and_background_mode(self) -> None:
+        """批次白名单不能丢弃地点原始词或用户选择的可见运行模式。"""
+
+        raw = {
+            "type": 3,
+            "workflow": "douyin-commerce-batch",
+            "commerceMode": "local-group-buy",
+            "contentType": "video",
+            "accountList": ["oneclick_3_offline.json"],
+            "shared": {
+                "title": "",
+                "description": "批次契约测试",
+                "tags": [],
+                "selectedMusic": {
+                    "musicId": "music-001",
+                    "title": "测试音乐",
+                    "creator": "作者",
+                    "duration": "00:30",
+                },
+                "contentDeclaration": "无需添加自主声明",
+            },
+            "backgroundMode": False,
+            "publishMode": "immediate",
+            "schedule": {},
+            "items": [
+                {
+                    "mediaPath": str(self.video),
+                    "locationPreset": {
+                        **self.location,
+                        "scope": "domestic",
+                        "searchKeyword": "joymark",
+                    },
+                    "scheduleTimeOverride": "",
+                }
+            ],
+        }
+
+        checked = douyin_commerce_batch_service.prepare_batch_for_execution(raw)
+        item_payload = douyin_commerce_batch_service.item_publish_payload(
+            checked,
+            checked["items"][0],
+        )
+
+        self.assertFalse(checked["backgroundMode"])
+        self.assertEqual(
+            checked["items"][0]["locationPreset"]["searchKeyword"],
+            "joymark",
+        )
+        self.assertFalse(item_payload["backgroundMode"])
+        self.assertEqual(item_payload["locationSearchKeyword"], "joymark")
 
     def test_immediate_publish_is_allowed_without_a_schedule_time(self) -> None:
         immediate = dict(self.payload, enableTimer=False, scheduleTime="")
@@ -1961,7 +2043,10 @@ class DouyinCommercePayloadTests(unittest.TestCase):
             "_apply_open_commerce_location_to_page",
             side_effect=apply_open,
             create=True,
-        ):
+        ), patch.object(
+            douyin_commerce_service,
+            "douyin_logger",
+        ) as location_log:
             result = asyncio.run(
                 douyin_commerce_service.apply_saved_commerce_location_to_page(
                     page, target, "domestic", ["店名", target["address"]]
@@ -1973,6 +2058,15 @@ class DouyinCommercePayloadTests(unittest.TestCase):
         self.assertIn("close", events[first_search + 1 : second_search])
         self.assertEqual(events[-2:], ["click", "close"])
         self.assertEqual(result["matchedKeyword"], target["address"])
+        info_text = "\n".join(
+            str(call.args[0]) for call in location_log.info.call_args_list
+        )
+        warning_text = "\n".join(
+            str(call.args[0]) for call in location_log.warning.call_args_list
+        )
+        self.assertIn("关键词=店名", info_text)
+        self.assertIn("返回 1 个完整候选", info_text)
+        self.assertIn("均未匹配目标", warning_text)
 
     def test_saved_location_rejects_ambiguous_current_candidates(self) -> None:
         """当次面板出现两个同身份候选时必须安全停止，不得默认点第一条。"""
@@ -3419,6 +3513,34 @@ class DouyinCommerceUiTests(unittest.TestCase):
         self.assertEqual(self.page.review_execution_log.output.toPlainText(), "")
         self.assertIn("已清空", self.page.content_execution_log.clear_button.text())
 
+    def test_finished_batch_clears_runtime_log_only_when_the_next_task_starts(self) -> None:
+        """结果页应保留本批日志，下一批开始时才建立新的日志段。"""
+
+        runtime_log_bus().clear()
+        runtime_log_bus().publish("上一批定位失败诊断")
+        with patch("ui.douyin_commerce_page.QMessageBox.warning"):
+            self.page._batch_publish_succeeded(
+                [
+                    {
+                        "index": 0,
+                        "status": "failed",
+                        "diagnostic": "publish_location_candidate_missing",
+                    }
+                ]
+            )
+
+        self.assertTrue(self.page._clear_runtime_log_on_next_task)
+        self.assertTrue(
+            any("上一批定位失败诊断" in line for line in runtime_log_bus().history())
+        )
+
+        self.page._clear_runtime_log_for_new_task_if_needed()
+
+        history = runtime_log_bus().history()
+        self.assertFalse(self.page._clear_runtime_log_on_next_task)
+        self.assertFalse(any("上一批定位失败诊断" in line for line in history))
+        self.assertTrue(any("新的抖音带货任务" in line for line in history))
+
     def test_platform_settings_prioritize_two_work_columns_over_logs(self) -> None:
         """平台设置只保留共享设置与逐条地点两栏，日志不占主工作区。"""
 
@@ -3622,6 +3744,23 @@ class DouyinCommerceUiTests(unittest.TestCase):
                 payload = self.page.collect_upload_payload()
 
         self.assertTrue(payload["backgroundMode"])
+
+    def test_upload_payload_honors_visible_diagnostic_mode(self) -> None:
+        """取消后台运行后，当前任务的上传载荷必须明确为前台模式。"""
+
+        with tempfile.TemporaryDirectory() as root:
+            video = Path(root) / "commerce.mp4"
+            video.write_bytes(b"video")
+            account = {"type": 3, "status": 1, "filePath": "oneclick_3_demo.json"}
+            media = {"storedPath": str(video), "filename": "commerce.mp4"}
+            self.page.description_input.setPlainText("前台诊断模式。")
+            self.page.background_mode_checkbox.setChecked(False)
+            with patch.object(self.page, "_selected_account", return_value=account), patch.object(
+                self.page, "_selected_video", return_value=media
+            ):
+                payload = self.page.collect_upload_payload()
+
+        self.assertFalse(payload["backgroundMode"])
 
     def test_upload_payload_includes_selected_builtin_account_id(self) -> None:
         """平台设置探针源载荷必须携带当前账号的本机整数 ID。"""
@@ -4885,8 +5024,9 @@ class DouyinCommerceUiTests(unittest.TestCase):
         layout = self.page.review_action_dock.layout()
 
         self.assertIs(layout.itemAt(0).widget(), self.page.validation_label)
-        self.assertIs(layout.itemAt(1).widget(), self.page.review_back_button)
-        self.assertIs(layout.itemAt(3).widget(), self.page.submit_button)
+        self.assertIs(layout.itemAt(1).widget(), self.page.background_mode_checkbox)
+        self.assertIs(layout.itemAt(2).widget(), self.page.review_back_button)
+        self.assertIs(layout.itemAt(4).widget(), self.page.submit_button)
         self.assertIsNot(self.page.review_back_button.parentWidget(), self.page.review_submission_panel)
         self.assertIsNot(self.page.submit_button.parentWidget(), self.page.review_submission_panel)
 
@@ -5997,7 +6137,7 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
         self.assertFalse(background_mode({"backgroundMode": False}))
 
     def test_background_upload_uses_true_headless_browser(self) -> None:
-        """默认后台上传不创建可最小化或前置的浏览器窗口。"""
+        """默认后台使用无头浏览器；诊断模式创建可见窗口。"""
 
         manager = douyin_commerce_session.DouyinCommerceSessionManager()
         options = getattr(manager, "_commerce_browser_launch_options", None)
@@ -6013,7 +6153,7 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
         )
         self.assertEqual(
             options({"backgroundMode": False}),
-            {"headless": True, "hide_until_ready": False},
+            {"headless": False, "hide_until_ready": False},
         )
 
     def test_background_upload_minimizes_the_window_after_page_creation(self) -> None:
@@ -9956,7 +10096,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         """验证成功默认继续；单次误触暂停按钮不得停止后续视频。"""
 
         layout = self.page.review_action_dock.layout()
-        self.assertIs(layout.itemAt(4).widget(), self.page.pause_batch_button)
+        self.assertIs(layout.itemAt(5).widget(), self.page.pause_batch_button)
         self.page._batch_task_id = 9
         with patch.object(
             self.page.runner,
@@ -10371,6 +10511,50 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.assertEqual(self.page.batch_publish_mode.currentData(), "interval-schedule")
         self.assertFalse(self.page.batch_schedule_controls.isHidden())
 
+    def test_review_defaults_to_background_mode_and_allows_visible_diagnostics(self) -> None:
+        """检查页默认后台运行，用户取消后载荷必须明确传递前台模式。"""
+
+        self.assertTrue(self.page.background_mode_checkbox.isChecked())
+        self.assertEqual(
+            self.page.background_mode_checkbox.parentWidget().objectName(),
+            "douyinCommerceReferenceFooter",
+        )
+        self.page.background_mode_checkbox.setChecked(False)
+
+        with tempfile.TemporaryDirectory() as root:
+            video_path = Path(root) / "visible.mp4"
+            video_path.write_bytes(b"video")
+            account = {
+                "id": 73,
+                "type": 3,
+                "status": 1,
+                "filePath": "oneclick_3_demo.json",
+            }
+            media = {"storedPath": str(video_path), "filename": "visible.mp4"}
+            self.page.title_input.setText("")
+            self.page.description_input.setPlainText("前台诊断模式")
+            self.page._selected_music = {
+                "musicId": "music-1",
+                "title": "收藏音乐",
+                "creator": "作者",
+                "duration": "00:30",
+            }
+            self.page._batch_locations = {
+                str(video_path): {
+                    "poiId": "poi-1",
+                    "name": "JOYMARK",
+                    "address": "湖南省株洲市完整地址1号",
+                    "scope": "domestic",
+                    "searchKeyword": "joymark",
+                }
+            }
+            with patch.object(self.page, "_selected_account", return_value=account), patch.object(
+                self.page, "_selected_videos", return_value=[media]
+            ):
+                payload = self.page.collect_batch_payload()
+
+        self.assertFalse(payload["backgroundMode"])
+
     def test_batch_location_candidates_are_shared_then_bound_per_video(self) -> None:
         """顶部统一搜索的候选可分别绑定到每条视频。"""
 
@@ -10397,6 +10581,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
 
         save.assert_called_once_with(99, candidate, "domestic")
         self.assertEqual(self.page._batch_locations[path]["address"], candidate["address"])
+        self.assertEqual(self.page._batch_locations[path]["searchKeyword"], "北海")
 
     def test_batch_location_search_results_are_available_to_every_video_dropdown(self) -> None:
         """所有视频行复用顶部搜索结果，界面不再各自创建搜索框。"""

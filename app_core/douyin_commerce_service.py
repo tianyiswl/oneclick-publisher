@@ -28,6 +28,7 @@ from .douyin_music_service import (
     normalize_music_readback,
     validate_favorite_music_mode,
 )
+from utils.log import douyin_logger
 
 
 DOUYIN_COMMERCE_WORKFLOW = "douyin-commerce"
@@ -359,6 +360,7 @@ def _validate_douyin_commerce_content(
 
     if not _normalized(checked.get("description")):
         raise DouyinCommerceError(f"{action}缺少作品描述")
+    checked["backgroundMode"] = checked.get("backgroundMode") is not False
     return checked
 
 
@@ -404,6 +406,16 @@ def validate_douyin_commerce_payload(payload: Mapping[str, Any]) -> dict[str, An
     checked["locationScope"] = normalize_commerce_location_scope(
         checked.get("locationScope")
     )
+    original_search_keyword = _normalized(checked.get("locationSearchKeyword"))
+    if original_search_keyword:
+        try:
+            checked["locationSearchKeyword"] = normalize_location_keyword(
+                original_search_keyword
+            )
+        except Exception as exc:
+            raise DouyinCommerceError(f"抖音带货地点原始搜索词无效：{exc}") from exc
+    else:
+        checked.pop("locationSearchKeyword", None)
     # 抖音新版带货模式在地点项中显示关联商品信息，但首版不再维护或绑定
     # 独立门店身份。清理旧字段，避免历史任务/候选被误当成当前已绑定门店。
     checked.pop("commerceStore", None)
@@ -2393,7 +2405,16 @@ async def apply_saved_commerce_location_to_page(
     if not bounded_keywords:
         raise DouyinCommerceError("publish_location_candidate_missing")
 
-    for keyword in bounded_keywords:
+    scope_label = location_scope_label(selected_scope)
+    expected = normalize_commerce_location_candidate(preset) or {}
+    target_text = (
+        f"{_normalized(expected.get('name'))} · {_normalized(expected.get('address'))}"
+    ).strip(" ·")
+    for attempt, keyword in enumerate(bounded_keywords, start=1):
+        douyin_logger.info(
+            f"抖音发布定位第 {attempt}/{len(bounded_keywords)} 次搜索："
+            f"范围={scope_label}，关键词={keyword}，目标={target_text}"
+        )
         await _close_commerce_store_selector_strict(page)
         panel_may_be_open = False
         try:
@@ -2404,23 +2425,54 @@ async def apply_saved_commerce_location_to_page(
                     keyword,
                     scope=selected_scope,
                 )
-            except DouyinCommerceError:
+            except DouyinCommerceError as exc:
+                douyin_logger.warning(
+                    f"抖音发布定位关键词“{keyword}”搜索失败："
+                    f"{_normalized(str(exc))[:220] or type(exc).__name__}；"
+                    "将尝试下一关键词"
+                )
                 continue
+            candidate_summary = [
+                (
+                    f"{_normalized(row.get('name'))} · "
+                    f"{_normalized(row.get('address'))}"
+                ).strip(" ·")
+                for row in candidates[:5]
+                if isinstance(row, Mapping)
+            ]
+            douyin_logger.info(
+                f"抖音发布定位关键词“{keyword}”返回 {len(candidates)} 个完整候选："
+                f"{candidate_summary or ['无']}"
+            )
             try:
                 matched = match_location_preset(preset, candidates)
             except DouyinLocationPresetError as exc:
                 if "存在多个" in str(exc):
+                    douyin_logger.warning(
+                        f"抖音发布定位关键词“{keyword}”返回多个同身份候选，"
+                        "无法唯一确认"
+                    )
                     raise DouyinCommerceError(
                         "publish_location_candidate_ambiguous"
                     ) from None
+                douyin_logger.warning(
+                    f"抖音发布定位关键词“{keyword}”的 {len(candidates)} 个候选"
+                    f"均未匹配目标“{target_text}”；将尝试下一关键词"
+                )
                 continue
             listbox = await _visible_store_listbox(page)
             if listbox is None:
+                douyin_logger.warning(
+                    f"抖音发布定位关键词“{keyword}”已匹配目标，但候选面板已消失"
+                )
                 raise DouyinCommerceError("publish_location_click_failed")
             result = await _apply_open_commerce_location_to_page(
                 page,
                 listbox,
                 matched,
+            )
+            douyin_logger.success(
+                f"抖音发布定位关键词“{keyword}”已命中并回读目标：{target_text}"
             )
             return {**result, "matchedKeyword": keyword}
         except DouyinCommerceError:
@@ -2431,6 +2483,10 @@ async def apply_saved_commerce_location_to_page(
             if panel_may_be_open:
                 await _close_commerce_store_selector_strict(page)
 
+    douyin_logger.warning(
+        f"抖音发布定位恢复结束：范围={scope_label}，目标={target_text}，"
+        f"全部关键词均未返回唯一匹配，已尝试={bounded_keywords}"
+    )
     raise DouyinCommerceError("publish_location_candidate_missing")
 
 

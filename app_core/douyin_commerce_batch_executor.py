@@ -35,6 +35,7 @@ from .douyin_verification import (
     VerificationChallenge,
     verification_broker as _default_verification_broker,
 )
+from utils.log import douyin_logger
 
 
 _SHANGHAI = ZoneInfo(SHANGHAI_TIMEZONE)
@@ -86,12 +87,34 @@ def _safe_item_label(item: Mapping[str, Any], index: int) -> str:
     return name or f"第 {index + 1} 条视频"
 
 
-def _location_search_keywords(location: Mapping[str, Any]) -> list[str]:
-    """返回地点恢复时的有序检索词：地址优先，国内排序漂移时补充城市和店名。"""
+def _location_search_keywords(
+    location: Mapping[str, Any],
+    *,
+    original_keyword: object = "",
+) -> list[str]:
+    """返回地点恢复时的有序检索词，并优先复用用户的真实搜索意图。"""
 
     address = _text(location.get("address"))
     name = _text(location.get("name"))
-    result = [address] if address else []
+    original = _text(original_keyword)
+    result: list[str] = []
+
+    def append(value: object) -> None:
+        normalized = _text(value)
+        if normalized and normalized not in result:
+            result.append(normalized)
+
+    append(original)
+    # 旧任务没有 searchKeyword。对于 JOYMARK(株洲王府星mall店) 这类
+    # 中英文混排名称，平台通常只接受短品牌词，完整名称和长地址均可能无结果。
+    brand_tokens = [
+        token
+        for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9._-]{1,}", name)
+        if token.casefold() not in {"mall", "store", "shop"}
+    ]
+    brand = brand_tokens[0] if brand_tokens else ""
+    append(brand)
+
     city_source = address
     if "自治区" in city_source:
         city_source = city_source.split("自治区", 1)[1]
@@ -99,11 +122,45 @@ def _location_search_keywords(location: Mapping[str, Any]) -> list[str]:
         city_source = city_source.split("省", 1)[1]
     city_match = re.search(r"([\u4e00-\u9fff]{2,}市)", city_source)
     city = _text(city_match.group(1)[:-1]) if city_match else ""
-    if city and name:
-        result.append(f"{city} {name}")
-    if name:
-        result.append(name)
-    return list(dict.fromkeys(keyword for keyword in result if keyword))
+    if original or brand:
+        append(name)
+        append(address)
+        append(f"{city} {name}" if city and name else "")
+    else:
+        append(address)
+        append(f"{city} {name}" if city and name else "")
+        append(name)
+    return result
+
+
+_PUBLIC_BATCH_DIAGNOSTICS = {
+    "publish_location_candidate_missing": (
+        "发布定位恢复失败：正式发布页按已保存范围和搜索词重新搜索后，"
+        "没有找到与预设 POI 完全一致的地点"
+        "（错误码 publish_location_candidate_missing；请查看执行日志中的逐关键词结果）"
+    ),
+    "publish_location_candidate_ambiguous": (
+        "发布定位恢复失败：正式发布页返回了多个无法唯一确认的同名地点"
+        "（错误码 publish_location_candidate_ambiguous）"
+    ),
+    "publish_location_click_failed": (
+        "发布定位恢复失败：已找到目标地点，但平台候选无法安全点击"
+        "（错误码 publish_location_click_failed）"
+    ),
+    "publish_location_readback_mismatch": (
+        "发布定位恢复失败：点击地点后，平台回读与已保存地点不一致"
+        "（错误码 publish_location_readback_mismatch）"
+    ),
+    "publish_location_cleanup_incomplete": (
+        "发布定位恢复失败：地点候选面板未能安全关闭"
+        "（错误码 publish_location_cleanup_incomplete）"
+    ),
+}
+
+
+def _public_batch_diagnostic(value: object) -> str:
+    diagnostic = _text(value)
+    return _PUBLIC_BATCH_DIAGNOSTICS.get(diagnostic, diagnostic)
 
 
 def _is_intervention_error(error: Exception) -> bool:
@@ -855,12 +912,37 @@ class DouyinCommerceBatchExecutor:
 
             location = payload["locationPoi"]
             scope = _text(payload["locationScope"])
-            applied = self._manager.apply_saved_location(
-                session_id,
+            location_keywords = _location_search_keywords(
                 location,
-                scope,
-                _location_search_keywords(location),
+                original_keyword=payload.get("locationSearchKeyword"),
             )
+            scope_label = {"local": "本地", "domestic": "国内"}.get(
+                scope,
+                scope or "未确认",
+            )
+            target_location = (
+                f"{_text(location.get('name'))} · {_text(location.get('address'))}"
+            ).strip(" ·")
+            douyin_logger.info(
+                f"抖音带货第 {index + 1}/{total} 条开始恢复发布定位："
+                f"视频={label}，范围={scope_label}，目标={target_location}，"
+                f"原始搜索词={_text(payload.get('locationSearchKeyword')) or '旧任务未保存'}，"
+                f"依次尝试={location_keywords}"
+            )
+            try:
+                applied = self._manager.apply_saved_location(
+                    session_id,
+                    location,
+                    scope,
+                    location_keywords,
+                )
+            except Exception as exc:
+                douyin_logger.warning(
+                    f"抖音带货第 {index + 1}/{total} 条发布定位恢复失败："
+                    f"视频={label}，范围={scope_label}，目标={target_location}，"
+                    f"已尝试={location_keywords}，错误={_text(exc) or type(exc).__name__}"
+                )
+                raise
             applied_location = (
                 applied.get("location")
                 if isinstance(applied, Mapping) and isinstance(applied.get("location"), Mapping)
@@ -885,6 +967,10 @@ class DouyinCommerceBatchExecutor:
                 raise DouyinCommerceBatchExecutorError(
                     "publish_location_readback_mismatch"
                 )
+            douyin_logger.success(
+                f"抖音带货第 {index + 1}/{total} 条发布定位已恢复并回读确认："
+                f"{target_location}"
+            )
 
             self._manager.sync_schedule(session_id, payload)
             preflight = self._manager.preflight(session_id, payload)
@@ -1094,20 +1180,24 @@ class DouyinCommerceBatchExecutor:
                 }
             self._record_progress(
                 task_id, item_id, ok=False, event_type="batch_item_failed",
-                message=f"第 {index + 1} 条视频未完成平台回读：{diagnostic}",
+                message=(
+                    f"第 {index + 1} 条视频未完成平台回读："
+                    f"{_public_batch_diagnostic(diagnostic)}"
+                ),
             )
+            public_diagnostic = _public_batch_diagnostic(diagnostic)
             self._emit(
                 progress,
                 index=index,
                 total=total,
                 phase="failed",
-                message=f"第 {index + 1} 条视频失败：{diagnostic}；继续下一条",
+                message=f"第 {index + 1} 条视频失败：{public_diagnostic}；继续下一条",
             )
             return {
                 "index": index,
                 "label": label,
                 "status": "failed",
-                "diagnostic": diagnostic,
+                "diagnostic": public_diagnostic,
             }
         finally:
             if session_id and not retain_session:

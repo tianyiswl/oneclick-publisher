@@ -241,13 +241,13 @@ class DouyinCommerceSessionManager:
     def _commerce_browser_launch_options(cls, payload: Mapping[str, Any]) -> dict[str, bool]:
         """返回带货编辑会话的浏览器可见性策略。
 
-        带货编辑与最终提交一律使用真正无头浏览器，不能依赖最小化或离屏窗口。
-        登录失效会作为受控结果回到账号管理处理，不为验证或诊断打开前台浏览器。
+        默认使用真正无头浏览器；仅桌面端明确取消“后台运行”时创建可见的
+        受控窗口，供用户观察地点、声明或风控页面。两种模式不改变提交判定。
         """
 
-        del payload
+        background_mode = cls._background_upload_mode(payload)
         return {
-            "headless": True,
+            "headless": background_mode,
             "hide_until_ready": False,
         }
 
@@ -638,7 +638,7 @@ class DouyinCommerceSessionManager:
         success = False
         try:
             browser_options = self._commerce_browser_launch_options(payload)
-            background_mode = True
+            background_mode = self._background_upload_mode(payload)
             with publish_context(
                 mode="douyin_commerce_upload",
                 background_mode=background_mode,
@@ -1471,7 +1471,7 @@ class DouyinCommerceSessionManager:
             raise DouyinCommerceSessionError(
                 "当前编辑页仍保留已回读的定时；不能安全改为立即发表，请重新上传并预检"
             )
-        background_mode = True
+        background_mode = self._background_upload_mode(payload)
         try:
             from utils.publish_observer import publish_context
 

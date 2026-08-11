@@ -19,7 +19,11 @@ from .douyin_commerce_service import (
     normalize_commerce_location_scope,
     normalize_content_declaration,
 )
-from .douyin_location_service import normalize_location_candidate
+from .douyin_location_service import (
+    DouyinLocationSearchError,
+    normalize_location_candidate,
+    normalize_location_keyword,
+)
 from .douyin_music_service import FAVORITE_MANUAL_MUSIC_MODE, normalize_music_readback
 
 
@@ -134,7 +138,18 @@ def _location_preset(value: object, *, index: int) -> dict[str, str]:
         )
     except Exception as exc:
         raise DouyinCommerceBatchError(f"第 {index} 条视频地点预设范围无效：{exc}") from exc
-    return {**location, "scope": scope}
+    result = {**location, "scope": scope}
+    search_keyword = _text(
+        value.get("searchKeyword") if isinstance(value, Mapping) else None
+    )
+    if search_keyword:
+        try:
+            result["searchKeyword"] = normalize_location_keyword(search_keyword)
+        except DouyinLocationSearchError as exc:
+            raise DouyinCommerceBatchError(
+                f"第 {index} 条视频地点原始搜索词无效：{exc}"
+            ) from exc
+    return result
 
 
 def _items(value: object) -> list[dict[str, Any]]:
@@ -230,6 +245,9 @@ def validate_batch_payload(
         "commerceMode": LOCAL_GROUP_BUY_MODE,
         "contentType": "video",
         "accountFile": _account_file(payload),
+        # 后台运行默认开启；只有桌面端明确传入 false 才显示受控浏览器，
+        # 方便用户观察平台 DOM 与风控页面。
+        "backgroundMode": payload.get("backgroundMode") is not False,
         "shared": _shared(payload.get("shared")),
         "publishMode": publish_mode,
         "schedule": _schedule(payload.get("schedule"), publish_mode=publish_mode),
@@ -300,7 +318,11 @@ def item_publish_payload(batch: Mapping[str, Any], item: Mapping[str, Any]) -> d
         "contentDeclaration": batch["shared"]["contentDeclaration"],
         "locationPoi": dict(item["locationPreset"]),
         "locationKeyword": item["locationPreset"]["name"],
+        "locationSearchKeyword": _text(
+            item["locationPreset"].get("searchKeyword")
+        ),
         "locationScope": item["locationPreset"]["scope"],
+        "backgroundMode": batch.get("backgroundMode") is not False,
         "enableTimer": item["enableTimer"] is True,
         "scheduleTime": schedule_time,
     }

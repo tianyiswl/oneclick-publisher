@@ -434,7 +434,8 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
         )
 
         self.assertEqual(result[0]["status"], "failed")
-        self.assertEqual(result[0]["diagnostic"], "publish_location_click_failed")
+        self.assertIn("发布定位恢复失败", result[0]["diagnostic"])
+        self.assertIn("publish_location_click_failed", result[0]["diagnostic"])
         self.assertEqual(
             [
                 name
