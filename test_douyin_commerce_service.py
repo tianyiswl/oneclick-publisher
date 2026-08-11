@@ -1186,6 +1186,8 @@ class DouyinCommercePayloadTests(unittest.TestCase):
                 (object(), local_rows, stale_signature),
                 (object(), local_rows, stale_signature),
                 (object(), domestic_rows, fresh_signature),
+                (object(), domestic_rows, fresh_signature),
+                (object(), domestic_rows, fresh_signature),
             ],
         ):
             _listbox, rows = asyncio.run(
@@ -1215,7 +1217,11 @@ class DouyinCommercePayloadTests(unittest.TestCase):
             douyin_commerce_service,
             "_visible_commerce_location_result_snapshot",
             new_callable=AsyncMock,
-            side_effect=[(object(), rows, signature), (object(), rows, signature)],
+            side_effect=[
+                (object(), rows, signature),
+                (object(), rows, signature),
+                (object(), rows, signature),
+            ],
         ):
             _listbox, result = asyncio.run(
                 douyin_commerce_service._wait_for_fresh_commerce_location_results(
@@ -1227,6 +1233,98 @@ class DouyinCommercePayloadTests(unittest.TestCase):
             )
 
         self.assertEqual(result, rows)
+
+    def test_location_search_waits_for_slow_target_before_returning(self) -> None:
+        """慢网络下不得把空列表或先到达的非目标候选当成检索完成。"""
+
+        other_rows = [
+            {
+                "poiId": "poi-other",
+                "name": "JOYMARK 其他门店",
+                "address": "湖南省株洲市天元区其他路1号",
+            }
+        ]
+        target = {
+            "poiId": "poi-target",
+            "name": "JOYMARK(株洲王府星mall店)",
+            "address": "湖南省株洲市芦淞区王府·星Mall负一楼F-11号铺",
+        }
+        target_rows = [dict(target)]
+        other_signature = douyin_commerce_service._location_result_signature(other_rows)
+        target_signature = douyin_commerce_service._location_result_signature(target_rows)
+
+        class Page:
+            wait_for_timeout = AsyncMock()
+
+        snapshots = [
+            (None, [], ""),
+            (object(), other_rows, other_signature),
+            (object(), other_rows, other_signature),
+            (object(), target_rows, target_signature),
+            (object(), target_rows, target_signature),
+            (object(), target_rows, target_signature),
+        ]
+        with patch.object(
+            douyin_commerce_service,
+            "_visible_commerce_location_result_snapshot",
+            new_callable=AsyncMock,
+            side_effect=snapshots,
+        ) as snapshot, patch.object(
+            douyin_commerce_service,
+            "douyin_logger",
+        ) as location_log:
+            _listbox, result = asyncio.run(
+                douyin_commerce_service._wait_for_fresh_commerce_location_results(
+                    Page(),
+                    baseline_signature="",
+                    keyword="joymark",
+                    allow_stable_baseline_match=True,
+                    expected_location=target,
+                )
+            )
+
+        self.assertEqual(result, target_rows)
+        self.assertEqual(snapshot.await_count, len(snapshots))
+        info_text = "\n".join(
+            str(call.args[0]) for call in location_log.info.call_args_list
+        )
+        self.assertIn("目标候选已出现", info_text)
+        self.assertIn("候选已稳定", info_text)
+
+    def test_location_search_never_returns_an_empty_click_target(self) -> None:
+        """候选在等待窗口内始终为空时必须超时停止，不能继续点击。"""
+
+        class Page:
+            wait_for_timeout = AsyncMock()
+
+        with patch.object(
+            douyin_commerce_service,
+            "_visible_commerce_location_result_snapshot",
+            new_callable=AsyncMock,
+            return_value=(object(), [], ""),
+        ) as snapshot, patch.object(
+            douyin_commerce_service,
+            "douyin_logger",
+        ) as location_log:
+            with self.assertRaisesRegex(
+                douyin_commerce_service.DouyinCommerceError,
+                "未返回.*最新完整发布定位",
+            ):
+                asyncio.run(
+                    douyin_commerce_service._wait_for_fresh_commerce_location_results(
+                        Page(),
+                        baseline_signature="",
+                        keyword="joymark",
+                        allow_stable_baseline_match=True,
+                        timeout_ms=700,
+                    )
+                )
+
+        self.assertGreaterEqual(snapshot.await_count, 2)
+        warning_text = "\n".join(
+            str(call.args[0]) for call in location_log.warning.call_args_list
+        )
+        self.assertIn("是否出现完整候选=否", warning_text)
 
     def test_content_declaration_retries_only_after_known_cover_prompt_is_dismissed(self) -> None:
         """横封面提示可关闭后重试一次，并始终限定在声明弹层内。"""
@@ -1522,8 +1620,6 @@ class DouyinCommercePayloadTests(unittest.TestCase):
         page = MagicMock()
         page.wait_for_timeout = AsyncMock()
         tag_select = MagicMock()
-        position_option = MagicMock()
-        position_option.click = AsyncMock()
         missing_anchor = douyin_commerce_service.DouyinCommerceError(
             "抖音页面未找到唯一可用的带货模式控件组（实际 0 个），已安全停止"
         )
@@ -1550,10 +1646,9 @@ class DouyinCommercePayloadTests(unittest.TestCase):
             new_callable=AsyncMock,
         ), patch.object(
             douyin_commerce_service,
-            "_wait_position_tag_option",
+            "_select_unique_position_tag_option",
             new_callable=AsyncMock,
-            return_value=position_option,
-        ):
+        ) as select_position:
             asyncio.run(douyin_commerce_service._ensure_position_tag(page))
 
         open_add_tag.assert_not_awaited()
@@ -1561,7 +1656,7 @@ class DouyinCommercePayloadTests(unittest.TestCase):
             page.wait_for_timeout.await_args_list[:2],
             [call(150), call(150)],
         )
-        position_option.click.assert_awaited_once_with(timeout=8_000)
+        select_position.assert_awaited_once_with(page)
 
     def test_add_tag_may_directly_render_css_position_row_without_option_menu(self) -> None:
         """平台直接渲染位置输入行时，应立即回读成功而不是继续等菜单项。"""
@@ -1592,13 +1687,13 @@ class DouyinCommercePayloadTests(unittest.TestCase):
             new_callable=AsyncMock,
         ) as open_select, patch.object(
             douyin_commerce_service,
-            "_wait_position_tag_option",
+            "_select_unique_position_tag_option",
             new_callable=AsyncMock,
-        ) as wait_option:
+        ) as select_position:
             asyncio.run(douyin_commerce_service._ensure_position_tag(page))
 
         open_select.assert_not_awaited()
-        wait_option.assert_not_awaited()
+        select_position.assert_not_awaited()
 
     def test_location_search_opens_dynamic_input_before_waiting(self) -> None:
         """新版页面必须先打开“输入地理位置”，不能在初始 DOM 猜 input。"""
@@ -1942,9 +2037,11 @@ class DouyinCommercePayloadTests(unittest.TestCase):
             "address": "陕西省安康市汉滨区江北办富民街2号",
         }
         events: list[str] = []
+        search_kwargs: list[dict[str, object]] = []
 
-        async def search(*_args, **_kwargs):
+        async def search(*_args, **kwargs):
             events.append("search")
+            search_kwargs.append(dict(kwargs))
             return [dict(row)]
 
         async def current_listbox(_page):
@@ -1990,6 +2087,10 @@ class DouyinCommercePayloadTests(unittest.TestCase):
 
         self.assertEqual(events, ["search", "listbox", "click"])
         self.assertEqual(result["matchedKeyword"], row["address"])
+        expected_location = search_kwargs[0]["expected_location"]
+        self.assertIsInstance(expected_location, dict)
+        self.assertEqual(expected_location["name"], row["name"])
+        self.assertEqual(expected_location["address"], row["address"])
         reopen.assert_not_awaited()
 
     def test_saved_location_closes_first_search_before_keyword_fallback(self) -> None:
@@ -2525,6 +2626,114 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(
                     await page.locator("body").get_attribute("data-add-tag-opened"),
                     "yes",
+                )
+            finally:
+                await browser.close()
+
+    async def test_game_controller_tag_type_is_recoverable_as_position_select(self) -> None:
+        """音乐重绘误留“游戏手柄”时，应识别标签类型下拉并允许改回位置。"""
+
+        html = """
+        <main>
+          <section class="content-obt4oA new-layout-sLYOT6" style="display:flex;width:646px;height:32px">
+            <div>
+              <div class="title-dS7kae"><span class="title-content-oaqcSp">添加标签</span></div>
+            </div>
+            <div class="content-child-V0CB7w" style="display:flex;width:552px;height:32px">
+              <div id="tag-type" class="semi-select semi-select-single" tabindex="0">
+                <span class="semi-select-selection-text">游戏手柄</span>
+              </div>
+              <input placeholder="添加作品同款游戏">
+            </div>
+          </section>
+        </main>
+        """
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+
+                control = await douyin_commerce_service._mark_unique_position_tag_select(page)
+
+                self.assertIsNotNone(control)
+                self.assertEqual(
+                    await page.locator("#tag-type").get_attribute(
+                        "data-oneclick-commerce-position-tag"
+                    ),
+                    "active",
+                )
+            finally:
+                await browser.close()
+
+    async def test_position_option_is_validated_and_clicked_in_one_dom_turn(self) -> None:
+        """位置菜单不得先标记节点再异步点击，避免 React 复用节点后误点游戏。"""
+
+        html = """
+        <main>
+          <div role="listbox" style="width:240px;height:80px">
+            <div role="option" style="width:220px;height:30px">游戏手柄</div>
+            <div id="position-option" role="option" style="width:220px;height:30px">位置</div>
+          </div>
+          <script>
+            document.querySelectorAll('[role="option"]').forEach(node => {
+              node.addEventListener('click', () => {
+                document.body.dataset.selectedTag = node.textContent.trim();
+              });
+            });
+          </script>
+        </main>
+        """
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+
+                await douyin_commerce_service._select_unique_position_tag_option(
+                    page,
+                    attempts=1,
+                )
+
+                self.assertEqual(
+                    await page.locator("body").get_attribute("data-selected-tag"),
+                    "位置",
+                )
+            finally:
+                await browser.close()
+
+    async def test_position_option_never_falls_back_to_game_controller(self) -> None:
+        """菜单只有游戏手柄时必须停止，不能选择第一项。"""
+
+        html = """
+        <main>
+          <div role="listbox" style="width:240px;height:40px">
+            <div role="option" style="width:220px;height:30px">游戏手柄</div>
+          </div>
+          <script>
+            document.querySelector('[role="option"]').addEventListener('click', () => {
+              document.body.dataset.selectedTag = '游戏手柄';
+            });
+          </script>
+        </main>
+        """
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+
+                with self.assertRaisesRegex(
+                    douyin_commerce_service.DouyinCommerceError,
+                    "位置.*唯一显示",
+                ):
+                    await douyin_commerce_service._select_unique_position_tag_option(
+                        page,
+                        attempts=1,
+                    )
+
+                self.assertIsNone(
+                    await page.locator("body").get_attribute("data-selected-tag")
                 )
             finally:
                 await browser.close()

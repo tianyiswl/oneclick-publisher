@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from time import monotonic
 from typing import Any, Mapping
 
 from .douyin_location_service import normalize_location_candidate, normalize_location_keyword
@@ -60,6 +61,9 @@ _LOCATION_DIAGNOSTIC_LABELS = (
     "本地",
     "国内",
 )
+_LOCATION_RESULT_WAIT_TIMEOUT_MS = 30_000
+_LOCATION_RESULT_POLL_INTERVAL_MS = 350
+_LOCATION_RESULT_STABLE_READS = 3
 
 
 class DouyinCommerceError(RuntimeError):
@@ -797,13 +801,56 @@ async def _mark_unique_position_tag_select(page) -> Any | None:
                 }
                 if (supported) candidates.push(control);
             }
+            // 选择音乐后 React 可能重建“添加标签”行，并把标签类型错误保留为
+            // “游戏手柄”。此时不能再依赖当前文案必须是“位置”；只在唯一
+            // “添加标签”new-layout 行的右侧 content-child 内，接受唯一一个
+            // 非筛选型标签类型下拉。地点搜索下拉含输入框，会被明确排除。
+            if (candidates.length === 0) {
+                const structural = [];
+                for (const addLeaf of leaves(document, '添加标签')) {
+                    for (let row = addLeaf.parentElement, depth = 0;
+                        row && row !== document.body && depth < 6;
+                        row = row.parentElement, depth += 1) {
+                        const rowClass = String(row.className || '');
+                        if (!/(?:^|[-_\\s])new-layout(?:$|[-_\\s])/i.test(rowClass)) {
+                            continue;
+                        }
+                        const contentChildren = Array.from(row.children)
+                            .filter(visible)
+                            .filter(node => /(?:^|[-_\\s])content-child(?:$|[-_\\s])/i
+                                .test(String(node.className || '')));
+                        if (contentChildren.length !== 1) break;
+                        const content = contentChildren[0];
+                        const selector = '.semi-select, [role="combobox"], '
+                            + '[aria-haspopup="listbox"], [aria-haspopup="menu"]';
+                        const typeSelects = Array.from(content.querySelectorAll(selector))
+                            .filter(visible)
+                            .filter(node => !node.parentElement?.closest(selector))
+                            .filter(node => !node.classList?.contains('semi-select-filterable'))
+                            .filter(node => !node.querySelector(
+                                'input, textarea, [contenteditable="true"]'
+                            ));
+                        if (typeSelects.length === 1
+                            && !structural.includes(typeSelects[0])) {
+                            structural.push(typeSelects[0]);
+                        }
+                        break;
+                    }
+                }
+                structural.forEach(node => candidates.push(node));
+            }
             const controls = candidates;
             if (controls.length !== 1) return { count: controls.length };
             controls[0].dataset.oneclickCommercePositionTag = 'active';
-            return { count: 1 };
+            return { count: 1, current: text(controls[0]) };
         }"""
     )
     if isinstance(result, Mapping) and int(result.get("count") or 0) == 1:
+        current = _normalized(result.get("current"))
+        if current and current != "位置":
+            douyin_logger.warning(
+                f"抖音添加标签当前显示“{current}”，将只通过精确菜单项改回“位置”"
+            )
         return page.locator('[data-oneclick-commerce-position-tag="active"]')
     return None
 
@@ -942,10 +989,21 @@ async def _open_unique_add_tag(page) -> bool:
     return True
 
 
-async def _wait_position_tag_option(page) -> Any:
-    """等待唯一可见的“位置”标签选项；只选择这个精确文案。"""
+async def _select_unique_position_tag_option(
+    page,
+    *,
+    attempts: int = 20,
+    interval_ms: int = 200,
+) -> None:
+    """在同一 DOM 回合中校验并点击唯一“位置”选项。
 
-    for _ in range(20):
+    不能先给菜单项写标记、再通过异步 Locator 点击：React 可能在两步之间
+    复用该节点并把文案改成“游戏手柄”。这里的精确文本回读与 ``click()``
+    在同一个浏览器脚本中完成，节点一旦不是“位置”就不会发生点击。
+    """
+
+    max_attempts = max(1, int(attempts))
+    for attempt in range(max_attempts):
         result = await page.evaluate(
             """() => {
                 const visible = node => {
@@ -957,17 +1015,34 @@ async def _wait_position_tag_option(page) -> Any:
                 };
                 const normalize = value => String(value || '')
                     .replace(/[\u200b\u00a0]/g, ' ').replace(/\\s+/g, ' ').trim();
-                const options = Array.from(document.querySelectorAll('[role="option"]'))
+                const options = Array.from(document.querySelectorAll(
+                    '[role="option"], [role="menuitem"], .semi-select-option'
+                ))
                     .filter(visible)
                     .filter(node => normalize(node.innerText || node.textContent) === '位置');
-                if (options.length !== 1) return { count: options.length };
-                options[0].dataset.oneclickCommercePositionOption = 'active';
-                return { count: 1 };
+                if (options.length !== 1) {
+                    return { count: options.length, clicked: false };
+                }
+                const option = options[0];
+                // 最后一刻再次读取同一节点；若框架同步重绘或复用了节点，
+                // 此处不再满足精确文案，也就绝不会退化成点击第一项。
+                if (!visible(option)
+                    || normalize(option.innerText || option.textContent) !== '位置') {
+                    return { count: 0, clicked: false };
+                }
+                option.click();
+                return { count: 1, clicked: true };
             }"""
         )
-        if isinstance(result, Mapping) and int(result.get("count") or 0) == 1:
-            return page.locator('[data-oneclick-commerce-position-option="active"]')
-        await page.wait_for_timeout(200)
+        if isinstance(result, Mapping) and result.get("clicked") is True:
+            return
+        count = int(result.get("count") or 0) if isinstance(result, Mapping) else 0
+        if count > 1:
+            raise DouyinCommerceError(
+                f"抖音“位置”标签选项出现多个（实际 {count} 个），已安全停止"
+            )
+        if attempt + 1 < max_attempts:
+            await page.wait_for_timeout(interval_ms)
     raise DouyinCommerceError("抖音“位置”标签选项未能唯一显示，已安全停止")
 
 
@@ -1337,8 +1412,7 @@ async def _ensure_position_tag(page) -> None:
         )
 
     await _open_exact_select(page, tag_select, "位置标签")
-    position_option = await _wait_position_tag_option(page)
-    await position_option.click(timeout=8_000)
+    await _select_unique_position_tag_option(page)
     await page.wait_for_timeout(350)
     # 只有锚点结构明确出现，才允许进入后续带货模式和搜索输入。
     await _anchor_controls(page)
@@ -2094,37 +2168,106 @@ async def _wait_for_fresh_commerce_location_results(
     baseline_signature: str,
     keyword: str,
     allow_stable_baseline_match: bool = False,
+    expected_location: Mapping[str, Any] | None = None,
+    timeout_ms: int = _LOCATION_RESULT_WAIT_TIMEOUT_MS,
+    stable_reads_required: int = _LOCATION_RESULT_STABLE_READS,
 ) -> tuple[Any, list[dict[str, str]]]:
-    """等待本次关键词对应的候选结果，过滤范围切换前的陈旧下拉。
+    """等待本次关键词对应的完整稳定候选，过滤空列表与陈旧下拉。
 
     ``allow_stable_baseline_match`` 仅供已经完成“清空再填回关键词”的范围
     切换流程使用。抖音会在范围切换时自动查询一次原关键词，此时最终的本地
     结果可能与清空后的快照完全相同；连续两次回读一致且匹配关键词时，可将其
     视为已稳定的当前范围结果，而不是误报为旧候选。
+
+    正式发布可传入 ``expected_location``。慢网络下即使先出现空列表、非目标
+    候选或分批渲染的候选，也必须等目标 POI 出现且列表连续稳定后才返回。
     """
 
+    normalized_timeout_ms = max(
+        _LOCATION_RESULT_POLL_INTERVAL_MS,
+        int(timeout_ms),
+    )
+    required_reads = max(2, int(stable_reads_required))
+    max_reads = max(
+        required_reads,
+        normalized_timeout_ms // _LOCATION_RESULT_POLL_INTERVAL_MS + 1,
+    )
+    expected = (
+        normalize_commerce_location_candidate(expected_location)
+        if isinstance(expected_location, Mapping)
+        else None
+    )
+    started_at = monotonic()
     last_signature = ""
-    stable_matching_baseline_reads = 0
-    for _ in range(30):
+    stable_signature = ""
+    stable_reads = 0
+    first_complete_logged = False
+    target_seen_logged = False
+    douyin_logger.info(
+        f"抖音地点候选开始等待：关键词={keyword}，最长等待="
+        f"{normalized_timeout_ms / 1000:.1f} 秒，稳定要求={required_reads} 次"
+    )
+    for _ in range(max_reads):
         listbox, rows, signature = await _visible_commerce_location_result_snapshot(page)
-        if listbox is not None and rows:
+        candidates = normalize_commerce_location_candidates(rows)
+        if listbox is not None and candidates:
             last_signature = signature
-            matches_keyword = _location_rows_match_keyword(rows, keyword)
-            # 新结果既应替换切换范围前的列表，也应至少与本次搜索词有关。
-            # 若平台暂时仍返回旧本地候选，继续等待而不把错误地址展示给用户。
-            if signature != baseline_signature and matches_keyword:
-                return listbox, rows
-            if (
-                allow_stable_baseline_match
-                and signature == baseline_signature
-                and matches_keyword
-            ):
-                stable_matching_baseline_reads += 1
-                if stable_matching_baseline_reads >= 2:
+            if not first_complete_logged:
+                first_complete_logged = True
+                douyin_logger.info(
+                    f"抖音地点候选首次返回完整数据：关键词={keyword}，"
+                    f"候选数={len(candidates)}，继续等待目标和列表稳定"
+                )
+            matches_keyword = _location_rows_match_keyword(candidates, keyword)
+            is_fresh = (
+                signature != baseline_signature
+                or allow_stable_baseline_match
+            )
+            target_ready = expected is None
+            if expected is not None:
+                try:
+                    match_location_preset(expected, candidates)
+                    target_ready = True
+                except DouyinLocationPresetError as exc:
+                    # 多个同身份候选也要先等列表稳定，再由调用方以明确的
+                    # ambiguous 错误安全停止；目标尚未出现时则继续等待。
+                    target_ready = "存在多个" in str(exc)
+            eligible = matches_keyword and is_fresh and target_ready
+            if eligible:
+                if expected is not None and not target_seen_logged:
+                    target_seen_logged = True
+                    douyin_logger.info(
+                        f"抖音地点目标候选已出现：关键词={keyword}，"
+                        "继续确认候选列表稳定"
+                    )
+                if signature == stable_signature:
+                    stable_reads += 1
+                else:
+                    stable_signature = signature
+                    stable_reads = 1
+                if stable_reads >= required_reads:
+                    elapsed = monotonic() - started_at
+                    douyin_logger.info(
+                        f"抖音地点候选已稳定：关键词={keyword}，"
+                        f"候选数={len(candidates)}，耗时={elapsed:.1f} 秒"
+                    )
+                    # 保持既有内部契约：等待器返回页面原始描述，统一由搜索
+                    # 出口归一化；这里只用归一化候选判断完整性与目标身份。
                     return listbox, rows
             else:
-                stable_matching_baseline_reads = 0
-        await page.wait_for_timeout(200)
+                stable_signature = ""
+                stable_reads = 0
+        else:
+            # 空列表只表示平台仍在加载，不能作为搜索完成或可点击状态。
+            stable_signature = ""
+            stable_reads = 0
+        await page.wait_for_timeout(_LOCATION_RESULT_POLL_INTERVAL_MS)
+    elapsed = monotonic() - started_at
+    douyin_logger.warning(
+        f"抖音地点候选等待超时：关键词={keyword}，耗时={elapsed:.1f} 秒，"
+        f"是否出现完整候选={'是' if first_complete_logged else '否'}，"
+        f"是否出现目标={'是' if target_seen_logged else '否'}"
+    )
     if last_signature and last_signature == baseline_signature:
         raise DouyinCommerceError(
             f"抖音“{keyword}”地点结果仍是切换范围前的旧候选，未展示错误地址，请重试"
@@ -2139,6 +2282,7 @@ async def search_commerce_location_store_candidates(
     keyword: object,
     *,
     scope: object,
+    expected_location: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """按用户选择的“本地/国内”范围读取发布定位候选。
 
@@ -2254,6 +2398,7 @@ async def search_commerce_location_store_candidates(
         baseline_signature=baseline_signature,
         keyword=normalized_keyword,
         allow_stable_baseline_match=True,
+        expected_location=expected_location,
     )
     candidates = normalize_commerce_location_candidates(rows)
     if not candidates:
@@ -2424,6 +2569,7 @@ async def apply_saved_commerce_location_to_page(
                     page,
                     keyword,
                     scope=selected_scope,
+                    expected_location=expected,
                 )
             except DouyinCommerceError as exc:
                 douyin_logger.warning(
