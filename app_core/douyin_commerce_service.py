@@ -2257,7 +2257,12 @@ async def _wait_for_fresh_commerce_location_results(
             if unfiltered_target_ready and not filtered_target_ready:
                 commission_mismatch_seen = True
         stable_candidates = candidates
-        if allow_filtered_empty and expected is None and unfiltered_candidates:
+        if (
+            allow_filtered_empty
+            and not candidates
+            and expected is None
+            and unfiltered_candidates
+        ):
             stable_candidates = unfiltered_candidates
         if listbox is not None and stable_candidates:
             last_signature = signature

@@ -1522,6 +1522,48 @@ class DouyinCommercePayloadTests(unittest.TestCase):
         )
         self.assertIn("是否出现完整候选=否", warning_text)
 
+    def test_filtered_candidates_cannot_borrow_keyword_match_from_other_commission_type(self) -> None:
+        """筛选后非空时，关键词匹配必须只依据筛选后候选。"""
+
+        rows = [
+            {
+                "name": "北海无佣地点",
+                "address": "广西北海市测试路 1 号",
+                "commerceInfo": "1件商品 · 0件返佣",
+            },
+            {
+                "name": "上海返佣地点",
+                "address": "上海市测试路 2 号",
+                "commerceInfo": "1件商品 · 1件返佣",
+            },
+        ]
+
+        class Page:
+            wait_for_timeout = AsyncMock()
+
+        with patch.object(
+            douyin_commerce_service,
+            "_visible_commerce_location_result_snapshot",
+            new_callable=AsyncMock,
+            return_value=(object(), rows, "fresh-mixed-commission"),
+        ):
+            with self.assertRaisesRegex(
+                douyin_commerce_service.DouyinCommerceError,
+                "未返回.*最新完整发布定位",
+            ):
+                asyncio.run(
+                    douyin_commerce_service._wait_for_fresh_commerce_location_results(
+                        Page(),
+                        baseline_signature="",
+                        keyword="北海",
+                        allow_stable_baseline_match=True,
+                        commission_filter="commission",
+                        allow_filtered_empty=True,
+                        timeout_ms=700,
+                        stable_reads_required=2,
+                    )
+                )
+
     def test_content_declaration_retries_only_after_known_cover_prompt_is_dismissed(self) -> None:
         """横封面提示可关闭后重试一次，并始终限定在声明弹层内。"""
 
