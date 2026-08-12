@@ -2708,6 +2708,109 @@ class DouyinCommercePayloadTests(unittest.TestCase):
 class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
     """用真实 DOM 约束地点 portal，避免把整张发布页的输入框算进来。"""
 
+    async def test_visibility_override_and_hidden_portal_obey_effective_visibility(
+        self,
+    ) -> None:
+        """CSS 可覆盖 visibility，但透明或隐藏 portal 下的 option 必须整体排除。"""
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(
+                    """
+                    <div id="location-results" role="listbox">
+                      <div id="override-option" role="option">
+                        <span data-store-name>可见返佣店</span>
+                        <span data-store-address>广西北海市海景大道1号</span>
+                        <div style="visibility: hidden">
+                          <span data-commerce-info style="visibility: visible">
+                            15件商品 · 15件返佣
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                    """
+                )
+
+                with self.subTest(case="visibility_override"):
+                    badge = page.locator("[data-commerce-info]")
+                    self.assertTrue(await badge.is_visible())
+                    listbox = await douyin_commerce_service._visible_store_listbox(page)
+                    self.assertIsNotNone(listbox)
+                    rows = await douyin_commerce_service._store_option_descriptors(
+                        listbox
+                    )
+                    self.assertEqual(len(rows), 1)
+                    self.assertEqual(rows[0]["commerceInfo"], "15件商品 · 15件返佣")
+                    self.assertEqual(
+                        douyin_commerce_service.normalize_commerce_location_candidate(
+                            rows[0]
+                        )["commissionType"],
+                        "commission",
+                    )
+                    targets = await douyin_commerce_service._location_option_targets(
+                        listbox,
+                        {
+                            "name": "可见返佣店",
+                            "address": "广西北海市海景大道1号",
+                        },
+                        commission_filter="commission",
+                    )
+                    self.assertEqual(len(targets), 1)
+                    self.assertEqual(
+                        await targets[0].get_attribute("id"), "override-option"
+                    )
+
+                hidden_portals = (
+                    ("opacity", 'style="opacity: 0"', True),
+                    ("display", 'style="display: none"', False),
+                    ("aria_hidden", 'aria-hidden="true"', True),
+                    ("hidden", "hidden", False),
+                )
+                for case, portal_attributes, playwright_visible in hidden_portals:
+                    with self.subTest(case=case):
+                        await page.set_content(
+                            f"""
+                            <div id="portal" {portal_attributes}>
+                              <div id="hidden-results" role="listbox">
+                                <div id="hidden-option" role="option">
+                                  <span data-store-name>不可读返佣店</span>
+                                  <span data-store-address>广西北海市海景大道2号</span>
+                                  <span data-commerce-info>8件商品 · 8件返佣</span>
+                                </div>
+                              </div>
+                            </div>
+                            """
+                        )
+                        option = page.locator("#hidden-option")
+                        self.assertEqual(
+                            await option.is_visible(), playwright_visible
+                        )
+                        self.assertIsNone(
+                            await douyin_commerce_service._visible_store_listbox(page)
+                        )
+                        direct_listbox = page.locator("#hidden-results")
+                        self.assertEqual(
+                            await douyin_commerce_service._store_option_descriptors(
+                                direct_listbox
+                            ),
+                            [],
+                        )
+                        self.assertEqual(
+                            await douyin_commerce_service._location_option_targets(
+                                direct_listbox,
+                                {
+                                    "name": "不可读返佣店",
+                                    "address": "广西北海市海景大道2号",
+                                },
+                                commission_filter="all",
+                            ),
+                            [],
+                        )
+            finally:
+                await browser.close()
+
     async def test_hidden_descendant_commission_text_is_excluded_in_both_dom_entries(
         self,
     ) -> None:

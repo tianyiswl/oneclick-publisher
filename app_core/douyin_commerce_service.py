@@ -70,6 +70,25 @@ _LOCATION_DIAGNOSTIC_LABELS = (
 _LOCATION_RESULT_WAIT_TIMEOUT_MS = 30_000
 _LOCATION_RESULT_POLL_INTERVAL_MS = 350
 _LOCATION_RESULT_STABLE_READS = 3
+_STORE_EFFECTIVE_VISIBILITY_JS = r"""
+                const isEffectivelyVisible = node => {
+                    if (!(node instanceof HTMLElement)) return false;
+                    if (node.closest?.('[hidden], [aria-hidden="true"]')) return false;
+                    const view = node.ownerDocument?.defaultView;
+                    const targetStyle = view?.getComputedStyle(node);
+                    if (!targetStyle
+                        || targetStyle.visibility === 'hidden'
+                        || targetStyle.visibility === 'collapse') return false;
+                    for (let current = node; current; current = current.parentElement) {
+                        const style = view?.getComputedStyle(current);
+                        if (!style || style.display === 'none'
+                            || Number.parseFloat(style.opacity) === 0
+                            || style.contentVisibility === 'hidden') return false;
+                    }
+                    const rect = node.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                };
+"""
 
 
 class DouyinCommerceError(RuntimeError):
@@ -1583,13 +1602,9 @@ async def _visible_store_listbox(page) -> Any | None:
 
     result = await page.evaluate(
         """() => {
-                const visible = node => {
-                    if (!(node instanceof HTMLElement)) return false;
-                    const rect = node.getBoundingClientRect();
-                    const style = getComputedStyle(node);
-                    return rect.width > 0 && rect.height > 0
-                        && style.display !== 'none' && style.visibility !== 'hidden';
-                };
+"""
+        + _STORE_EFFECTIVE_VISIBILITY_JS
+        + """
                 const normalize = value => String(value || '')
                     .replace(/[\u200b\u00a0]/g, ' ').replace(/\\s+/g, ' ').trim();
                 const looksAddress = value => {
@@ -1611,10 +1626,10 @@ async def _visible_store_listbox(page) -> Any | None:
                     return { name, address };
                 };
                 const lists = Array.from(document.querySelectorAll('[role="listbox"]'))
-                    .filter(visible)
+                    .filter(isEffectivelyVisible)
                     .filter(list => {
                         const options = Array.from(list.querySelectorAll(':scope > [role="option"]'))
-                            .filter(visible);
+                            .filter(isEffectivelyVisible);
                         return options.length > 0 && options.some(option => {
                             const row = descriptor(option);
                             return row.name && row.address && looksAddress(row.address);
@@ -2534,6 +2549,10 @@ async def _location_option_targets(
                 continue
             actual = await node.evaluate(
                 """node => {
+"""
+                + _STORE_EFFECTIVE_VISIBILITY_JS
+                + """
+                    if (!isEffectivelyVisible(node)) return null;
                     const normalize = value => String(value || '')
                         .replace(/[\u200b\u00a0]/g, ' ').replace(/\\s+/g, ' ').trim();
                     const rawText = String(node.innerText || node.textContent || '')
@@ -2561,19 +2580,7 @@ async def _location_option_targets(
                         || nameNode?.contains(candidate) || addressNode?.contains(candidate)
                         || candidate.contains?.(nameNode) || candidate.contains?.(addressNode)
                     ));
-                    const isVisibleCommerceNode = candidate => {
-                        if (!candidate || candidate.closest?.('[hidden], [aria-hidden="true"]')) return false;
-                        const view = candidate.ownerDocument?.defaultView;
-                        for (let current = candidate; current; current = current.parentElement) {
-                            const style = view?.getComputedStyle(current);
-                            if (!style || style.display === 'none'
-                                || style.visibility === 'hidden' || style.visibility === 'collapse'
-                                || Number.parseFloat(style.opacity) === 0
-                                || style.contentVisibility === 'hidden') return false;
-                            if (current === node) break;
-                        }
-                        return candidate.getClientRects().length > 0;
-                    };
+                    const isVisibleCommerceNode = isEffectivelyVisible;
                     const visibleCommerceText = candidate => {
                         if (!isVisibleCommerceNode(candidate)) return '';
                         const clone = candidate.cloneNode(true);
@@ -2943,6 +2950,10 @@ async def _store_option_descriptors(listbox) -> list[dict[str, str]]:
                 continue
             descriptor = await node.evaluate(
                 """node => {
+"""
+                + _STORE_EFFECTIVE_VISIBILITY_JS
+                + """
+                    if (!isEffectivelyVisible(node)) return null;
                     const normalize = value => String(value || '').replace(/\\u200b/g, ' ').replace(/\\s+/g, ' ').trim();
                     const attr = name => normalize(node.getAttribute(name));
                     const rawText = String(node.innerText || node.textContent || '')
@@ -2971,19 +2982,7 @@ async def _store_option_descriptors(listbox) -> list[dict[str, str]]:
                         || nameNode?.contains(candidate) || addressNode?.contains(candidate)
                         || candidate.contains?.(nameNode) || candidate.contains?.(addressNode)
                     ));
-                    const isVisibleCommerceNode = candidate => {
-                        if (!candidate || candidate.closest?.('[hidden], [aria-hidden="true"]')) return false;
-                        const view = candidate.ownerDocument?.defaultView;
-                        for (let current = candidate; current; current = current.parentElement) {
-                            const style = view?.getComputedStyle(current);
-                            if (!style || style.display === 'none'
-                                || style.visibility === 'hidden' || style.visibility === 'collapse'
-                                || Number.parseFloat(style.opacity) === 0
-                                || style.contentVisibility === 'hidden') return false;
-                            if (current === node) break;
-                        }
-                        return candidate.getClientRects().length > 0;
-                    };
+                    const isVisibleCommerceNode = isEffectivelyVisible;
                     const visibleCommerceText = candidate => {
                         if (!isVisibleCommerceNode(candidate)) return '';
                         const clone = candidate.cloneNode(true);

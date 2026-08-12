@@ -149,6 +149,7 @@
 
 ### I2：可见 wrapper 不得重新带入隐藏后代文本
 
+- 本节为 Round 2 历史证据；当时把祖先 `visibility:hidden` 当作不可覆盖条件，已被 Round 3 的 CSS 子节点覆盖反例推翻并替换。
 - RED 用例：`DouyinCommerceLocationDomTests.test_hidden_descendant_commission_text_is_excluded_in_both_dom_entries`。本地隔离 DOM 同时覆盖可见 wrapper 内嵌 `aria-hidden=true` 与 `opacity:0` 的“15件商品 · 15件返佣”，以及真正可见的嵌套徽标。结果：`Ran 1 test in 0.670s` / `FAILED (failures=1)`；两个隐藏场景均被父 wrapper 的 `innerText` 重新读成返佣。
 - GREEN：两个 DOM 入口使用同一逻辑，沿节点至 option 的祖先链验证 `hidden/aria-hidden/display/visibility/opacity/content-visibility` 及布局矩形；然后克隆候选节点，剔除不可见后代，只从剩余 `textContent` 构建摘要。隐藏两项均为 `no_commission`，可见嵌套徽标仍为 `commission`。`Ran 1 test in 0.334s` / `OK`。
 
@@ -157,6 +158,13 @@
 - 新用例不再断言 mock 自己追加的 `ok`；mock 只返回完整结构化 envelope。测试使用生产 `BackgroundTaskRunner` 和受控队列池，真实执行 worker、Qt signal、`_collector_action_succeeded` 及地点成功 handler。
 - RED：新用例在未改生产时已直接通过，说明本项是旧测试证据缺口，不伪造生产缺陷。按回归测试 mutation 校验，临时切断生产 `on_success(payload)` 后，三种操作顺序全部因 UI `platformResultCount` 仍为 `0` 而失败：`Ran 1 test in 0.149s` / `FAILED (failures=3)`。
 - GREEN：恢复生产成功回调后，逐顺序验证 domestic/local 的 `_batch_location_state()` 范围、关键词、返佣筛选、平台计数 `1`、候选数 `1`、返佣类型及无失败/错误状态；同时保留 `commission_filter='commission'` 和 `include_metadata=True` 参数断言。`Ran 1 test in 0.137s` / `OK`。
+
+## Scoped re-review round 3/5
+
+### I2：CSS visibility 覆盖与透明 portal
+
+- RED 用例：`DouyinCommerceLocationDomTests.test_visibility_override_and_hidden_portal_obey_effective_visibility`。A 场景中，父 wrapper 是 `visibility:hidden`，子返佣徽标显式 `visibility:visible`，Playwright `is_visible()` 为 true，旧逻辑却把返佣摘要读成空。B 场景中，外层 portal 分别为 `opacity:0`、`display:none`、`aria-hidden=true` 或 `hidden`，旧列表入口仍把透明和 aria-hidden portal 识别为候选列表。`Ran 1 test in 0.524s` / `FAILED (failures=3)`。
+- GREEN：新增单一当前页 JS helper，由目标节点的 computed `visibility` 判定可覆盖语义；祖先链仅持续否决 `display:none`、`hidden`、`aria-hidden=true`、`content-visibility:hidden`、任一层 `opacity:0` 以及无正尺寸布局矩形等不可逆条件。listbox 识别、option 候选入口和两个 DOM 摘要入口共用该 helper；不可见 option 直接不产出描述。A 正确识别 `commission`，B 四种 portal 均无列表、无描述、无点击目标。`Ran 1 test in 0.329s` / `OK`。
 
 ## 终审后组合与全量证据
 
@@ -175,29 +183,30 @@
 - 范围：Service Payload + DOM + SessionContract、collectors、BatchUi、batch executor、draft/batch draft/batch service、task service/page。
 - 首次组合暴露旧测试替身未模拟点击后 `selected` 状态，以及旧 BatchUi fixture 手工注入 generation 却未绑内容指纹；分别单项修复并转绿。Qt 段一度因这些失效代际真实派发后台关闭而 `SIGSEGV`，用 `PYTHONFAULTHANDLER` 定位后将“有效测试代际”统一绑定当前内容指纹，崩溃定位单测 `1/1 OK`。
 - 随后两个兼容失败严格按“单项修复→单项 GREEN→重跑相关组合”收口：草稿旧断言改为验证当前顶部意图；隔离 generation 测试的 mock 启动指纹与当前页面保持一致。
-- Round 2 复审发现 I2 wrapper 隐藏后代和 M3 证据缺口，因此 `Ran 451 tests in 15.628s` / `OK` 已降级为历史证据。Round 2 新鲜相关组合：`Ran 452 tests in 16.203s` / `OK`，退出码 `0`。
+- Round 2 的 `Ran 452 tests in 16.203s` / `OK` 已被 Round 3 CSS 可见性反例推翻，降级为历史证据。Round 3 新相关组合：`Ran 453 tests in 21.673s` / `OK`，退出码 `0`。
 
 ### 完整离线回归
 
 - 命令：`QT_QPA_PLATFORM=offscreen ../../.venv/bin/python -m unittest discover -v`。
-- Round 2 复审发现上述两项未闭环，因此 `Ran 913 tests in 30.004s` / `OK` 已降级为历史证据。Round 2 新鲜最终全量：`Ran 914 tests in 31.071s` / `OK`，退出码 `0`。
-- 证据链说明：旧 `901`、`449/911`、首轮 `451/913` 及上轮最终 `451/913` 均已被后续终审或 scoped re-review 推翻，仅作历史证据。
+- Round 2 的 `Ran 914 tests in 31.071s` / `OK` 已被 Round 3 CSS 可见性反例推翻，降级为历史证据。Round 3 新最终全量：`Ran 915 tests in 32.549s` / `OK`，退出码 `0`。
+- 证据链说明：旧 `901`、`449/911`、历次 `451/913` 及 Round 2 `452/914` 均已被后续终审或 scoped re-review 推翻，仅作历史证据。
 
 ## Finding 收口
 
 | Finding | 状态 | 离线证据边界 |
 | --- | --- | --- |
 | C1 | 已修复 | 无效点击不能复用点击前候选伪造回读；无法证明完整身份固定码停止 |
-| I1–I2 | 已修复 | 数量 token／千分位／冲突与 DOM 摘要边界已回归；隐藏后代不得经可见 wrapper 泄入 |
+| I1–I2 | 已修复 | 隐藏后代、CSS visibility 覆盖与透明／隐藏 portal 已由 Round 3 相关组合 `453/453` 与最终全量 `915/915` 回归 |
 | I3–I5 | 已修复 | 内容指纹、搜索意图与结果、同 POI 异佣型快照已隔离 |
 | I6–I7 | 已修复 | DOM 重复 option 过滤后判重；批处理只在严格零存活回读后继续 |
 | M1–M3 | 已修复 | 幂等归一化、稳定签名、关键字参数与真实 runner/UI 回调接纳均已回归 |
 
-当前结论：Round 2 两个 scoped finding 已完成单项 RED/GREEN，新相关组合 `452/452` 和新最终全量 `914/914` 均通过，本地离线契约验收通过。这不是真实抖音 DOM、真实账号、上传、预检、草稿或发布成功证据。
+当前结论：Round 3 I2 已完成单项 RED/GREEN，新相关组合 `453/453` 与新最终全量 `915/915` 均通过；当前离线实现验收通过。这不是真实抖音 DOM、真实账号、上传、预检、草稿或发布成功证据。
 
 ## 最终离线收尾审计
 
-- Round 2 独立只读 diff 复审：I2 两个 DOM 入口的祖先可见性与 clone 剔除逻辑一致，可见嵌套徽标仍保留；M3 走生产 `BackgroundTaskRunner`、Qt signals、生产成功 handler 并断言最终 UI 状态；无 blocker。
+- Round 2 独立只读 diff 复审当时记录“无 blocker”，但随后被 Round 3 CSS visibility 覆盖反例推翻；只作历史审计证据。
+- Round 3 独立只读 diff 复审：无 blocker。确认目标节点 computed `visibility` 可覆盖祖先 hidden；`hidden/aria-hidden`、祖先 `display:none`、累计 `opacity:0`、`content-visibility:hidden` 与无正尺寸仍安全排除；listbox、option 和两个摘要入口共用单一 helper，报告计数与历史证据口径一致。复审未修改、未测试、未访问平台。
 - `py_compile`：9 个指定生产文件 + 2 个相关测试文件通过，退出码 `0`。
 - AST：9 个指定生产文件可解析，`AST_OK=9`。
 - `git diff --check`：通过，无输出。
