@@ -155,6 +155,10 @@ _PUBLIC_BATCH_DIAGNOSTICS = {
         "发布定位恢复失败：地点候选面板未能安全关闭"
         "（错误码 publish_location_cleanup_incomplete）"
     ),
+    "publish_location_commission_mismatch": (
+        "发布定位恢复失败：地点存在，但当前返佣状态与设置时不一致"
+        "（错误码 publish_location_commission_mismatch）"
+    ),
 }
 
 
@@ -935,6 +939,7 @@ class DouyinCommerceBatchExecutor:
                     location,
                     scope,
                     location_keywords,
+                    payload.get("locationCommissionFilter", "all"),
                 )
             except Exception as exc:
                 douyin_logger.warning(

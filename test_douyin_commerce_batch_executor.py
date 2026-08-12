@@ -53,7 +53,7 @@ class FakeCommerceSessionManager:
         self.location_candidates = location_candidates
         self.location_searches: list[tuple[str, str]] = []
         self.atomic_location_requests: list[
-            tuple[str, dict, str, list[str]]
+            tuple[str, dict, str, list[str], str]
         ] = []
         self.scheduled_readback_time = scheduled_readback_time
         self.baseline_fail_indexes = baseline_fail_indexes or set()
@@ -133,13 +133,20 @@ class FakeCommerceSessionManager:
         preset: dict,
         scope: str,
         keywords: list[str],
+        commission_filter: str,
     ) -> dict:
         self.calls.append(
             f"apply_saved_location:{self._index_by_session[session_id]}"
         )
         self.ordered_calls.append(("apply_saved_location", session_id))
         self.atomic_location_requests.append(
-            (session_id, dict(preset), scope, list(keywords))
+            (
+                session_id,
+                dict(preset),
+                scope,
+                list(keywords),
+                commission_filter,
+            )
         )
         location = (
             dict(self.location_candidates[0])
@@ -330,7 +337,7 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
         self.assertEqual(
             [
                 (keywords[0], scope)
-                for _session_id, _preset, scope, keywords
+                for _session_id, _preset, scope, keywords, _commission_filter
                 in manager.atomic_location_requests
             ],
             [
@@ -418,8 +425,9 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
                 preset: dict,
                 scope: str,
                 keywords: list[str],
+                commission_filter: str,
             ) -> dict:
-                del preset, scope, keywords
+                del preset, scope, keywords, commission_filter
                 self.ordered_calls.append(("apply_saved_location", session_id))
                 raise RuntimeError("publish_location_click_failed")
 
@@ -450,6 +458,101 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
                 "close",
             ],
         )
+
+    def test_commission_mismatch_fails_only_current_video_and_continues_next(self) -> None:
+        """返佣复核失败必须关闭本条会话，下一条仍按自身筛选继续提交。"""
+
+        class CommissionMismatchManager(FakeCommerceSessionManager):
+            def apply_saved_location(
+                self,
+                session_id: str,
+                preset: dict,
+                scope: str,
+                keywords: list[str],
+                commission_filter: str,
+            ) -> dict:
+                result = super().apply_saved_location(
+                    session_id,
+                    preset,
+                    scope,
+                    keywords,
+                    commission_filter,
+                )
+                if session_id == "session-1":
+                    raise RuntimeError("publish_location_commission_mismatch")
+                return result
+
+        items = [dict(item) for item in self.batch["items"][:2]]
+        items[0]["locationPreset"] = {
+            **items[0]["locationPreset"],
+            "commissionFilter": "commission",
+        }
+        items[1]["locationPreset"] = {
+            **items[1]["locationPreset"],
+            "commissionFilter": "no_commission",
+        }
+        batch = {**self.batch, "items": items}
+        task = task_service.create_douyin_batch_task(batch)
+        manager = CommissionMismatchManager()
+
+        result = DouyinCommerceBatchExecutor(manager).run_publish(
+            batch,
+            task_id=task["id"],
+            confirmed=True,
+        )
+
+        self.assertEqual(
+            [row["status"] for row in result],
+            ["failed", "published"],
+        )
+        self.assertEqual(
+            result[0]["diagnostic"],
+            "发布定位恢复失败：地点存在，但当前返佣状态与设置时不一致"
+            "（错误码 publish_location_commission_mismatch）",
+        )
+        self.assertEqual(
+            [request[4] for request in manager.atomic_location_requests],
+            ["commission", "no_commission"],
+        )
+        self.assertEqual(
+            [
+                name
+                for name, session_id in manager.ordered_calls
+                if session_id == "session-1"
+            ],
+            [
+                "prepare_publish_settings",
+                "select_cached_favorite_music",
+                "select_content_declaration",
+                "apply_saved_location",
+                "close",
+            ],
+        )
+        self.assertIn(("submit", "session-2"), manager.ordered_calls)
+        self.assertEqual(
+            manager.closed_session_ids,
+            ["session-1", "session-2"],
+        )
+
+    def test_legacy_location_without_commission_filter_defaults_to_all(self) -> None:
+        """旧任务缺少返佣字段时，正式复核必须显式使用全部地址。"""
+
+        batch = {**self.batch, "items": [dict(self.batch["items"][0])]}
+        batch["items"][0]["locationPreset"] = {
+            key: value
+            for key, value in batch["items"][0]["locationPreset"].items()
+            if key != "commissionFilter"
+        }
+        task = task_service.create_douyin_batch_task(batch)
+        manager = FakeCommerceSessionManager()
+
+        result = DouyinCommerceBatchExecutor(manager).run_preflight(
+            batch,
+            task_id=task["id"],
+        )
+
+        self.assertEqual(result[0]["status"], "preflighted")
+        self.assertEqual(manager.atomic_location_requests[0][4], "all")
 
     def test_baseline_cleanup_failure_closes_item_without_applying_settings(self) -> None:
         """基线清理异常只能将本条记为失败，关闭会话后按既有策略继续。"""

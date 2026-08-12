@@ -387,6 +387,7 @@ class DouyinCommerceSessionManager:
         preset: Mapping[str, Any],
         scope: object,
         keywords: list[str],
+        commission_filter: object,
     ) -> dict[str, Any]:
         """在当前正式发布页原子搜索、应用并回读已存地点。"""
 
@@ -402,6 +403,15 @@ class DouyinCommerceSessionManager:
         except Exception:
             raise DouyinCommerceSessionError(
                 "publish_location_candidate_missing"
+            ) from None
+        try:
+            selected_commission_filter = normalize_commission_filter(
+                commission_filter,
+                default="all",
+            )
+        except Exception:
+            raise DouyinCommerceSessionError(
+                "publish_location_commission_mismatch"
             ) from None
         if not isinstance(keywords, list):
             raise DouyinCommerceSessionError("publish_location_candidate_missing")
@@ -420,6 +430,7 @@ class DouyinCommerceSessionManager:
                 dict(normalized),
                 selected_scope,
                 bounded_keywords,
+                selected_commission_filter,
             )
         )
 
@@ -1128,6 +1139,7 @@ class DouyinCommerceSessionManager:
         preset: dict[str, Any],
         scope: str,
         keywords: list[str],
+        commission_filter: str,
     ) -> dict[str, Any]:
         session = await self._current(session_id)
         self._ensure_editor_not_blocked_by_music_picker(session)
@@ -1138,6 +1150,7 @@ class DouyinCommerceSessionManager:
                     preset,
                     scope,
                     keywords,
+                    commission_filter=commission_filter,
                 )
             )
         except douyin_commerce_service.DouyinCommerceError as exc:
@@ -1148,6 +1161,7 @@ class DouyinCommerceSessionManager:
                 "publish_location_click_failed",
                 "publish_location_readback_mismatch",
                 "publish_location_cleanup_incomplete",
+                "publish_location_commission_mismatch",
             }
             raise DouyinCommerceSessionError(
                 code if code in allowed else "publish_location_click_failed"
@@ -1168,8 +1182,12 @@ class DouyinCommerceSessionManager:
         if matched_keyword not in keywords:
             raise DouyinCommerceSessionError("publish_location_readback_mismatch")
 
-        session.commerce_location_candidates = [dict(normalized)]
-        session.location = dict(normalized)
+        session_location = {
+            key: _normalized(normalized.get(key))
+            for key in ("poiId", "name", "address", "distance")
+        }
+        session.commerce_location_candidates = [dict(session_location)]
+        session.location = dict(session_location)
         session.location_scope = scope
         session.stores = []
         session.selected_store = None

@@ -8151,7 +8151,14 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
             "apply_saved_commerce_location_to_page",
             new_callable=AsyncMock,
             return_value={
-                "location": {**location, "distance": ""},
+                "location": {
+                    **location,
+                    "distance": "",
+                    "commissionType": "commission",
+                    "productCount": 15,
+                    "commissionProductCount": 15,
+                    "commissionLabel": "返佣",
+                },
                 "matchedKeyword": keywords[1],
             },
         ) as apply_atomic:
@@ -8160,6 +8167,7 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
                 location,
                 "domestic",
                 keywords,
+                "commission",
             )
 
         self.assertEqual(apply_atomic.await_count, 1)
@@ -8172,7 +8180,15 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
         self.assertTrue(actual_preset["poiId"].startswith("visible-poi:"))
         self.assertEqual(actual_scope, "domestic")
         self.assertEqual(actual_keywords, keywords)
+        self.assertEqual(
+            apply_atomic.await_args.kwargs,
+            {"commission_filter": "commission"},
+        )
         self.assertTrue(result["location"]["poiId"].startswith("visible-poi:"))
+        self.assertEqual(
+            set(result["location"]),
+            {"poiId", "name", "address", "distance"},
+        )
         self.assertEqual(result["matchedKeyword"], keywords[1])
         self.assertEqual(manager._session.location_scope, "domestic")
         self.assertEqual(
@@ -8184,6 +8200,86 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
         self.assertEqual(manager._session.preflight_fingerprint, "")
         self.assertEqual(manager._session.schedule_time, "")
         self.assertEqual(manager._session.uploader.location_verification, location["name"])
+
+    def test_apply_saved_location_keeps_commission_mismatch_as_fixed_public_error(self) -> None:
+        """返佣状态变化必须保留固定码，且不得串出底层异常 cause。"""
+
+        class OpenPage:
+            def is_closed(self) -> bool:
+                return False
+
+        location = {
+            "poiId": "poi-001",
+            "name": "北海银滩景区",
+            "address": "广西壮族自治区北海市银海区银滩大道中段",
+        }
+        manager = douyin_commerce_session.DouyinCommerceSessionManager()
+        manager._session = douyin_commerce_session._CommerceEditorSession(
+            session_id="session-demo",
+            upload_payload={},
+            account_name="测试账号",
+            browser=None,
+            context=None,
+            page=OpenPage(),
+            playwright=None,
+            uploader=None,
+        )
+        with patch.object(
+            douyin_commerce_session.douyin_commerce_service,
+            "apply_saved_commerce_location_to_page",
+            new_callable=AsyncMock,
+            side_effect=douyin_commerce_service.DouyinCommerceError(
+                "publish_location_commission_mismatch"
+            ),
+        ):
+            with self.assertRaises(
+                douyin_commerce_session.DouyinCommerceSessionError
+            ) as raised:
+                manager.apply_saved_location(
+                    "session-demo",
+                    location,
+                    "domestic",
+                    [location["address"]],
+                    "commission",
+                )
+
+        self.assertEqual(
+            str(raised.exception),
+            "publish_location_commission_mismatch",
+        )
+        self.assertIsNone(raised.exception.__cause__)
+
+    def test_apply_saved_location_rejects_invalid_commission_filter_before_dom_action(self) -> None:
+        """不可信返佣筛选不得进入 DOM，也不得泄露规范化异常。"""
+
+        location = {
+            "poiId": "poi-001",
+            "name": "北海银滩景区",
+            "address": "广西壮族自治区北海市银海区银滩大道中段",
+        }
+        manager = douyin_commerce_session.DouyinCommerceSessionManager()
+        with patch.object(
+            douyin_commerce_session.douyin_commerce_service,
+            "apply_saved_commerce_location_to_page",
+            new_callable=AsyncMock,
+        ) as apply_atomic:
+            with self.assertRaises(
+                douyin_commerce_session.DouyinCommerceSessionError
+            ) as raised:
+                manager.apply_saved_location(
+                    "session-demo",
+                    location,
+                    "domestic",
+                    [location["address"]],
+                    {"commission": True},
+                )
+
+        self.assertEqual(
+            str(raised.exception),
+            "publish_location_commission_mismatch",
+        )
+        self.assertIsNone(raised.exception.__cause__)
+        apply_atomic.assert_not_awaited()
 
     def test_apply_saved_location_rejects_missing_keywords_before_dom_action(self) -> None:
         """空关键词不得打开正式发布页的地点面板。"""
@@ -8208,6 +8304,7 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
                     location,
                     "domestic",
                     ["", "  "],
+                    "all",
                 )
 
         apply_atomic.assert_not_awaited()

@@ -42,7 +42,7 @@ class TaskDetailDialogTests(unittest.TestCase):
                     "batchItemIndex": 12,
                     "fileName": "b24dad24-92ee-11f1-aa95-16d46793b38a_测试13.mp4",
                     "filePath": "/tmp/b24dad24-92ee-11f1-aa95-16d46793b38a_测试13.mp4",
-                    "locationSummary": "夜南香北京烤鸭(蓬莱店)（山东省烟台市蓬莱区）",
+                    "locationSummary": "地点【返佣】（地址）",
                     "scheduleSummary": "北京时间定时 2026-08-09 21:30",
                     "status": "failed",
                     "message": "抖音带货位置搜索失败：抖音带货模式当前值无法识别",
@@ -52,7 +52,7 @@ class TaskDetailDialogTests(unittest.TestCase):
                     "batchItemIndex": 1,
                     "fileName": "b2e76584-92ee-11f1-aa95-16d46793b38a_测试24.mp4",
                     "filePath": "/tmp/b2e76584-92ee-11f1-aa95-16d46793b38a_测试24.mp4",
-                    "locationSummary": "夜南香北京烤鸭（陕西省西安市）",
+                    "locationSummary": "地点【无佣】（地址）",
                     "scheduleSummary": "北京时间定时 2026-08-09 16:00",
                     "status": "success",
                     "message": "抖音作品管理页已读到定时回执",
@@ -86,10 +86,14 @@ class TaskDetailDialogTests(unittest.TestCase):
         self.assertEqual(table.rowCount(), 2)
         self.assertEqual(table.item(0, 0).text(), "1")
         self.assertEqual(table.item(0, 1).text(), "测试24.mp4")
+        self.assertEqual(table.item(0, 2).text(), "地点【无佣】（地址）")
+        self.assertEqual(table.item(0, 2).toolTip(), "地点【无佣】（地址）")
         self.assertEqual(table.item(0, 5).text(), "平台已回读")
         self.assertIn("b2e76584-", table.item(0, 1).toolTip())
         self.assertEqual(table.item(1, 0).text(), "12")
         self.assertEqual(table.item(1, 1).text(), "测试13.mp4")
+        self.assertEqual(table.item(1, 2).text(), "地点【返佣】（地址）")
+        self.assertEqual(table.item(1, 2).toolTip(), "地点【返佣】（地址）")
         self.assertIn("抖音带货位置搜索失败", table.item(1, 5).text())
 
     def test_batch_task_filters_and_focuses_the_first_failed_video(self) -> None:
