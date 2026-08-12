@@ -16,6 +16,7 @@ import unittest
 from typing import Any, Mapping
 from unittest import mock
 
+from app_core import douyin_commerce_service, douyin_commerce_session
 from app_core.douyin_commerce_collectors import (
     DouyinCommerceCollectorError,
     DouyinCommerceCollectorManager,
@@ -395,6 +396,128 @@ class DouyinCommerceCollectorManagerTests(unittest.TestCase):
                 )
             ],
         )
+
+    def test_metadata_search_crosses_real_collector_session_and_service_when_filter_is_empty(self):
+        """过滤空也必须经真实三层链路作为成功结果返回。"""
+
+        class SearchInput:
+            def __init__(self) -> None:
+                self.value = ""
+                self.scroll_into_view_if_needed = mock.AsyncMock()
+                self.click = mock.AsyncMock()
+
+            async def fill(self, value: str, **_kwargs) -> None:
+                self.value = value
+
+            async def evaluate(self, _script: str) -> str:
+                return self.value
+
+        class Page:
+            def __init__(self) -> None:
+                self.is_closed = mock.MagicMock(return_value=False)
+                self.wait_for_timeout = mock.AsyncMock()
+
+        page = Page()
+        created: list[douyin_commerce_session.DouyinCommerceSessionManager] = []
+
+        class OfflineSessionManager(
+            douyin_commerce_session.DouyinCommerceSessionManager
+        ):
+            def start_upload(self, payload, *, on_progress=None):
+                del on_progress
+                session_id = f"offline-session-{len(created)}"
+                self._session = douyin_commerce_session._CommerceEditorSession(
+                    session_id=session_id,
+                    upload_payload=dict(payload),
+                    account_name="测试账号",
+                    browser=None,
+                    context=None,
+                    page=page,
+                    playwright=None,
+                    uploader=None,
+                )
+                return {"status": "ready", "sessionId": session_id}
+
+            def close_strict(self, session_id=None):
+                del session_id
+                self._session = None
+                if self._loop is not None:
+                    self._loop.call_soon_threadsafe(self._loop.stop)
+                if self._thread is not None:
+                    self._thread.join(timeout=1)
+
+            close = close_strict
+
+        def build_session_manager():
+            manager = OfflineSessionManager()
+            created.append(manager)
+            return manager
+
+        manager = DouyinCommerceCollectorManager(
+            manager_factory=build_session_manager,
+            probe_payload_builder=lambda payload: {
+                **payload,
+                "fileList": ["probe.mp4"],
+                "runtimeMode": "preflight",
+                "debugDryRun": True,
+            },
+        )
+        rows = [
+            {
+                "name": f"北海无佣地点 {index}",
+                "address": f"广西北海市测试路 {index} 号",
+                "commerceInfo": "3件商品 · 0件返佣",
+                "unknown": "must-not-return",
+            }
+            for index in range(3)
+        ]
+        try:
+            with mock.patch.object(
+                douyin_commerce_service,
+                "_ensure_position_tag",
+                new_callable=mock.AsyncMock,
+            ), mock.patch.object(
+                douyin_commerce_service,
+                "_ensure_local_group_buy_mode",
+                new_callable=mock.AsyncMock,
+                return_value=object(),
+            ), mock.patch.object(
+                douyin_commerce_service,
+                "_open_commerce_search_input",
+                new_callable=mock.AsyncMock,
+                return_value=SearchInput(),
+            ), mock.patch.object(
+                douyin_commerce_service,
+                "set_commerce_location_scope",
+                new_callable=mock.AsyncMock,
+                return_value="国内",
+            ), mock.patch.object(
+                douyin_commerce_service,
+                "_visible_commerce_location_result_snapshot",
+                new_callable=mock.AsyncMock,
+                return_value=(object(), rows, "fresh-three-no-commission"),
+            ), mock.patch.object(
+                douyin_commerce_service,
+                "close_commerce_store_selector",
+                new_callable=mock.AsyncMock,
+            ):
+                generation_id = manager.begin_generation(self.upload_payload)[
+                    "setupGenerationId"
+                ]
+                result = manager.search_locations(
+                    generation_id,
+                    "北海",
+                    "domestic",
+                    commission_filter="commission",
+                    include_metadata=True,
+                )
+        finally:
+            manager.close_generation(reason="test_cleanup")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["platformResultCount"], 3)
+        self.assertEqual(result["candidates"], [])
+        self.assertNotIn("rawCandidates", result)
 
     def test_real_probe_builder_preserves_account_id_for_runtime_and_diagnostics(self):
         """真实探针白名单必须把 UI 的整数账号 ID 交给协调器。"""

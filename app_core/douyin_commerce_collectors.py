@@ -604,6 +604,7 @@ class DouyinCommerceCollectorManager:
         scope: object,
         *,
         commission_filter: object = "all",
+        include_metadata: bool = False,
     ) -> dict[str, object]:
         """按固定范围将地点搜索路由到独立会话。"""
 
@@ -645,6 +646,7 @@ class DouyinCommerceCollectorManager:
                     normalized_scope,
                     action_instance_id,
                     selected_commission_filter,
+                    include_metadata is True,
                 ),
             )
         self._action_queue.start(action)
@@ -1258,6 +1260,7 @@ class DouyinCommerceCollectorManager:
         scope: str,
         action_instance_id: str,
         commission_filter: str,
+        include_metadata: bool,
     ) -> dict[str, object]:
         started_at = monotonic()
         collector = self._ensure_collector(
@@ -1269,11 +1272,16 @@ class DouyinCommerceCollectorManager:
             raise DouyinCommerceCollectorError("collector_scope_mismatch")
         self._validate_active_collector(generation_id, collector)
         try:
+            search_kwargs: dict[str, object] = {
+                "commission_filter": commission_filter,
+            }
+            if include_metadata:
+                search_kwargs["include_metadata"] = True
             result = collector.manager.search_locations(
                 collector.session_id,
                 keyword,
                 scope,
-                commission_filter=commission_filter,
+                **search_kwargs,
             )
         except Exception as error:
             if not self._mark_failed(generation_id, collector):
@@ -1309,8 +1317,27 @@ class DouyinCommerceCollectorManager:
             raise DouyinCommerceCollectorError(
                 error_code, event_emitted=True
             ) from None
+        platform_result_count: int | None = None
         try:
-            public_result = [dict(item) for item in result]
+            raw_candidates = result
+            if include_metadata:
+                if not isinstance(result, Mapping):
+                    raise TypeError("metadata_result_invalid")
+                platform_result_count = result.get("platformResultCount")
+                raw_candidates = result.get("candidates")
+                if (
+                    type(platform_result_count) is not int
+                    or platform_result_count < 0
+                    or not isinstance(raw_candidates, list)
+                ):
+                    raise TypeError("metadata_result_invalid")
+            public_result = [dict(item) for item in raw_candidates]
+            if (
+                include_metadata
+                and platform_result_count is not None
+                and platform_result_count < len(public_result)
+            ):
+                raise TypeError("metadata_result_invalid")
         except Exception as error:
             if not self._mark_failed(generation_id, collector):
                 raise DouyinCommerceCollectorError(
@@ -1333,7 +1360,11 @@ class DouyinCommerceCollectorManager:
             raise DouyinCommerceCollectorError(
                 error_code, event_emitted=True
             ) from None
-        if not public_result:
+        if not public_result and not (
+            include_metadata
+            and platform_result_count is not None
+            and platform_result_count > 0
+        ):
             if not self._mark_failed(generation_id, collector):
                 raise DouyinCommerceCollectorError(
                     "stale_result_discarded"
@@ -1352,6 +1383,7 @@ class DouyinCommerceCollectorManager:
             collector_type,
             collector.instance_id,
             candidates=public_result,
+            platform_result_count=platform_result_count,
         )
 
     def _retry_collector_action(
@@ -1841,6 +1873,7 @@ class DouyinCommerceCollectorManager:
         collector_instance_id: str,
         *,
         candidates: list[dict[str, Any]] | None = None,
+        platform_result_count: int | None = None,
     ) -> dict[str, object]:
         """返回带代际、类型、实例三重门禁的统一动作结果。"""
 
@@ -1866,6 +1899,8 @@ class DouyinCommerceCollectorManager:
         }
         if candidates is not None:
             result["candidates"] = [dict(item) for item in candidates]
+        if platform_result_count is not None:
+            result["platformResultCount"] = platform_result_count
         return result
 
     def _contextual_action_error(

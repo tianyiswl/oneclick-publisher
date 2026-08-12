@@ -1644,11 +1644,12 @@ class DouyinCommercePage(QWidget):
                     normalized_keyword,
                     normalized_scope,
                     commission_filter=commission_filter,
+                    include_metadata=True,
                 ),
                 lambda rows: self._batch_location_search_succeeded(
                     normalized_scope,
                     normalized_keyword,
-                    rows if isinstance(rows, list) else [],
+                    rows,
                     commission_filter,
                 ),
                 action_label=(
@@ -1670,6 +1671,7 @@ class DouyinCommercePage(QWidget):
                 normalized_keyword,
                 normalized_scope,
                 commission_filter=commission_filter,
+                include_metadata=True,
             ),
             lambda rows: self._batch_location_search_succeeded(
                 normalized_scope,
@@ -1695,18 +1697,37 @@ class DouyinCommercePage(QWidget):
             else self.batch_location_commission_combo.currentData(),
             default=DEFAULT_COMMISSION_FILTER,
         )
-        raw_candidates = (
-            [dict(item) for item in rows if isinstance(item, dict)]
-            if isinstance(rows, list)
-            else []
+        structured_result = isinstance(rows, Mapping)
+        row_values = rows.get("candidates") if structured_result else rows
+        public_candidates = filter_location_candidates(
+            (
+                [dict(item) for item in row_values if isinstance(item, Mapping)]
+                if isinstance(row_values, list)
+                else []
+            ),
+            "all",
         )
-        candidates = filter_location_candidates(raw_candidates, selected_filter)
+        if structured_result:
+            raw_count = rows.get("platformResultCount")
+            platform_result_count = (
+                raw_count
+                if type(raw_count) is int
+                and raw_count >= len(public_candidates)
+                else len(public_candidates)
+            )
+            candidates = public_candidates
+        else:
+            platform_result_count = len(public_candidates)
+            candidates = filter_location_candidates(
+                public_candidates,
+                selected_filter,
+            )
         self._batch_location_searches[_BATCH_SHARED_LOCATION_SEARCH_KEY] = {
             "scope": scope,
             "keyword": keyword,
             "commissionFilter": selected_filter,
-            "platformResultCount": len(raw_candidates),
-            "rawCandidates": raw_candidates,
+            "platformResultCount": platform_result_count,
+            "rawCandidates": [dict(item) for item in public_candidates],
             "candidates": candidates,
         }
         auto_filled, remaining = self._auto_fill_batch_location_candidates(
@@ -1721,14 +1742,14 @@ class DouyinCommercePage(QWidget):
         }[selected_filter]
         self._set_batch_location_feedback(
             (
-                f"平台返回 {len(raw_candidates)} 个，符合‘{filter_label}’条件 {len(candidates)} 个，自动填充 {auto_filled} 条"
+                f"平台返回 {platform_result_count} 个，符合‘{filter_label}’条件 {len(candidates)} 个，自动填充 {auto_filled} 条"
                 + (f"；还有 {remaining} 条待选择" if remaining else "")
             )
             if auto_filled
-            else f"平台返回 {len(raw_candidates)} 个，符合‘{filter_label}’条件 {len(candidates)} 个，请选择完整地址"
+            else f"平台返回 {platform_result_count} 个，符合‘{filter_label}’条件 {len(candidates)} 个，请选择完整地址"
             if candidates
-            else f"平台返回 {len(raw_candidates)} 个，但没有符合‘{filter_label}’条件"
-            if raw_candidates
+            else f"平台返回 {platform_result_count} 个，但没有符合‘{filter_label}’条件"
+            if platform_result_count
             else "当前抖音编辑页未返回完整地点候选，请更换关键词"
         )
         self._clear_stage_error("location")
@@ -5640,7 +5661,13 @@ class DouyinCommercePage(QWidget):
             return
         if result.get("ok") is not True:
             return
-        payload = result.get("candidates", result.get("result", result))
+        if "platformResultCount" in result:
+            payload = {
+                "platformResultCount": result.get("platformResultCount"),
+                "candidates": result.get("candidates"),
+            }
+        else:
+            payload = result.get("candidates", result.get("result", result))
         try:
             status = douyin_commerce_collectors.commerce_collector_manager.status(
                 generation_id

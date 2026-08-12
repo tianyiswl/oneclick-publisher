@@ -337,7 +337,8 @@ class DouyinCommerceSessionManager:
         scope: object,
         *,
         commission_filter: object = "all",
-    ) -> list[dict[str, Any]]:
+        include_metadata: bool = False,
+    ) -> list[dict[str, Any]] | dict[str, Any]:
         """在当前已上传编辑页搜索发布定位候选，不另开浏览器或使用私有请求。"""
 
         try:
@@ -349,12 +350,17 @@ class DouyinCommerceSessionManager:
             raise DouyinCommerceSessionError(
                 "抖音带货位置搜索失败：返佣筛选值无效"
             ) from None
+        search_kwargs: dict[str, object] = {
+            "commission_filter": selected_commission_filter,
+        }
+        if include_metadata is True:
+            search_kwargs["include_metadata"] = True
         return self._call(
             self._search_locations(
                 session_id,
                 keyword,
                 scope,
-                commission_filter=selected_commission_filter,
+                **search_kwargs,
             )
         )
 
@@ -951,7 +957,8 @@ class DouyinCommerceSessionManager:
         scope: object,
         *,
         commission_filter: object = "all",
-    ) -> list[dict[str, Any]]:
+        include_metadata: bool = False,
+    ) -> list[dict[str, Any]] | dict[str, Any]:
         session = await self._current(session_id)
         self._ensure_editor_not_blocked_by_music_picker(session)
         try:
@@ -971,6 +978,7 @@ class DouyinCommerceSessionManager:
             ) from exc
 
         candidates: list[dict[str, Any]] = []
+        platform_result_count = 0
         for attempt in range(2):
             # 每次检索前先收口上一轮候选。地点候选与当前上传会话复用同一页面，
             # 若旧 listbox 仍展开，带货模式回读可能把菜单项误作当前值。
@@ -981,12 +989,46 @@ class DouyinCommerceSessionManager:
                     f"抖音上一次地点候选未能安全关闭：{_normalized(str(exc))[:220]}"
                 ) from exc
             try:
-                candidates = await douyin_commerce_service.search_commerce_location_store_candidates(
+                service_kwargs: dict[str, object] = {
+                    "scope": selected_scope,
+                    "commission_filter": selected_commission_filter,
+                }
+                if include_metadata is True:
+                    service_kwargs["include_metadata"] = True
+                search_result = await douyin_commerce_service.search_commerce_location_store_candidates(
                     session.page,
                     keyword,
-                    scope=selected_scope,
-                    commission_filter=selected_commission_filter,
+                    **service_kwargs,
                 )
+                if include_metadata is True:
+                    if not isinstance(search_result, Mapping):
+                        raise DouyinCommerceSessionError(
+                            "抖音带货位置搜索失败：元数据回包无效"
+                        )
+                    raw_count = search_result.get("platformResultCount")
+                    raw_candidates = search_result.get("candidates")
+                    if (
+                        type(raw_count) is not int
+                        or raw_count < 0
+                        or not isinstance(raw_candidates, list)
+                    ):
+                        raise DouyinCommerceSessionError(
+                            "抖音带货位置搜索失败：元数据回包无效"
+                        )
+                    candidates = [
+                        dict(item)
+                        for item in raw_candidates
+                        if isinstance(item, Mapping)
+                    ]
+                    if len(candidates) != len(raw_candidates) or raw_count < len(
+                        candidates
+                    ):
+                        raise DouyinCommerceSessionError(
+                            "抖音带货位置搜索失败：元数据回包无效"
+                        )
+                    platform_result_count = raw_count
+                else:
+                    candidates = [dict(item) for item in search_result]
                 break
             except Exception as exc:
                 # 搜索中途失败也尽量收口本次已展开的地点候选；清理失败不得覆盖
@@ -1023,7 +1065,15 @@ class DouyinCommerceSessionManager:
         session.preflight_fingerprint = ""
         session.schedule_time = ""
         self._refresh_editor_stage(session)
-        return [dict(item) for item in session.commerce_location_candidates]
+        public_candidates = [
+            dict(item) for item in session.commerce_location_candidates
+        ]
+        if include_metadata is True:
+            return {
+                "platformResultCount": platform_result_count,
+                "candidates": public_candidates,
+            }
+        return public_candidates
 
     async def _apply_location(
         self,

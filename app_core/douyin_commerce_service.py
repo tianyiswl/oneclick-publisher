@@ -2187,6 +2187,7 @@ async def _wait_for_fresh_commerce_location_results(
     allow_stable_baseline_match: bool = False,
     expected_location: Mapping[str, Any] | None = None,
     commission_filter: object = "all",
+    allow_filtered_empty: bool = False,
     timeout_ms: int = _LOCATION_RESULT_WAIT_TIMEOUT_MS,
     stable_reads_required: int = _LOCATION_RESULT_STABLE_READS,
 ) -> tuple[Any, list[dict[str, str]]]:
@@ -2255,15 +2256,21 @@ async def _wait_for_fresh_commerce_location_results(
                 filtered_target_ready = "存在多个" in str(exc)
             if unfiltered_target_ready and not filtered_target_ready:
                 commission_mismatch_seen = True
-        if listbox is not None and candidates:
+        stable_candidates = candidates
+        if allow_filtered_empty and expected is None and unfiltered_candidates:
+            stable_candidates = unfiltered_candidates
+        if listbox is not None and stable_candidates:
             last_signature = signature
             if not first_complete_logged:
                 first_complete_logged = True
                 douyin_logger.info(
                     f"抖音地点候选首次返回完整数据：关键词={keyword}，"
-                    f"候选数={len(candidates)}，继续等待目标和列表稳定"
+                    f"候选数={len(stable_candidates)}，继续等待目标和列表稳定"
                 )
-            matches_keyword = _location_rows_match_keyword(candidates, keyword)
+            matches_keyword = _location_rows_match_keyword(
+                stable_candidates,
+                keyword,
+            )
             is_fresh = (
                 signature != baseline_signature
                 or allow_stable_baseline_match
@@ -2294,7 +2301,7 @@ async def _wait_for_fresh_commerce_location_results(
                     elapsed = monotonic() - started_at
                     douyin_logger.info(
                         f"抖音地点候选已稳定：关键词={keyword}，"
-                        f"候选数={len(candidates)}，耗时={elapsed:.1f} 秒"
+                        f"候选数={len(stable_candidates)}，耗时={elapsed:.1f} 秒"
                     )
                     # 保持既有内部契约：等待器返回页面原始描述，统一由搜索
                     # 出口归一化；这里只用归一化候选判断完整性与目标身份。
@@ -2331,11 +2338,14 @@ async def search_commerce_location_store_candidates(
     scope: object,
     expected_location: Mapping[str, Any] | None = None,
     commission_filter: object = "all",
-) -> list[dict[str, Any]]:
+    include_metadata: bool = False,
+) -> list[dict[str, Any]] | dict[str, Any]:
     """按“本地/国内”范围和返佣要求读取发布定位候选。
 
     此步骤只会展开“添加标签 → 位置 → 带货模式”后对应的输入框，填入关键词
     并读取结果；不会选择结果、绑定门店、保存草稿或提交发布。
+    默认保持旧的候选列表回包；显式启用元数据时，另返回过滤前
+    可见有效候选数，候选本身仍只包含过滤后的公开结构字段。
     """
 
     selected_commission_filter = normalize_commission_filter(
@@ -2452,15 +2462,28 @@ async def search_commerce_location_store_candidates(
         allow_stable_baseline_match=True,
         expected_location=expected_location,
         commission_filter=selected_commission_filter,
+        allow_filtered_empty=include_metadata is True,
+    )
+    platform_result_count = sum(
+        1
+        for row in rows
+        if normalize_commerce_location_candidate(row) is not None
     )
     candidates = normalize_commerce_location_candidates(
         rows,
         commission_filter=selected_commission_filter,
     )
-    if not candidates:
+    if not candidates and not (
+        include_metadata is True and platform_result_count > 0
+    ):
         raise DouyinCommerceError(
             f"抖音未返回“{normalized_keyword}”的完整可选发布定位"
         )
+    if include_metadata is True:
+        return {
+            "platformResultCount": platform_result_count,
+            "candidates": [dict(item) for item in candidates],
+        }
     return candidates
 
 

@@ -751,6 +751,78 @@ class DouyinCommercePayloadTests(unittest.TestCase):
         self.assertEqual(result[0]["name"], row["name"])
         self.assertNotIn("commerceStore", result[0])
 
+    def test_location_search_metadata_counts_valid_rows_before_filter_and_allows_filtered_empty(self) -> None:
+        """返佣筛选为空不是平台空结果，应返回过滤前有效数量。"""
+
+        class SearchInput:
+            def __init__(self) -> None:
+                self.value = ""
+                self.scroll_into_view_if_needed = AsyncMock()
+                self.click = AsyncMock()
+
+            async def fill(self, value: str, **_kwargs) -> None:
+                self.value = value
+
+            async def evaluate(self, _script: str) -> str:
+                return self.value
+
+        class Page:
+            wait_for_timeout = AsyncMock()
+
+        rows = [
+            {
+                "name": f"北海无佣地点 {index}",
+                "address": f"广西北海市测试路 {index} 号",
+                "commerceInfo": "3件商品 · 0件返佣",
+                "domNode": "<li>must-not-return</li>",
+                "unknown": "must-not-return",
+            }
+            for index in range(3)
+        ]
+        field = SearchInput()
+        with patch.object(
+            douyin_commerce_service,
+            "_ensure_position_tag",
+            new_callable=AsyncMock,
+        ), patch.object(
+            douyin_commerce_service,
+            "_ensure_local_group_buy_mode",
+            new_callable=AsyncMock,
+            return_value=object(),
+        ), patch.object(
+            douyin_commerce_service,
+            "_open_commerce_search_input",
+            new_callable=AsyncMock,
+            return_value=field,
+        ), patch.object(
+            douyin_commerce_service,
+            "set_commerce_location_scope",
+            new_callable=AsyncMock,
+            return_value="国内",
+        ), patch.object(
+            douyin_commerce_service,
+            "_visible_commerce_location_result_snapshot",
+            new_callable=AsyncMock,
+            return_value=(object(), rows, "fresh-three-no-commission"),
+        ):
+            result = asyncio.run(
+                douyin_commerce_service.search_commerce_location_store_candidates(
+                    Page(),
+                    "北海",
+                    scope="domestic",
+                    commission_filter="commission",
+                    include_metadata=True,
+                )
+            )
+
+        self.assertEqual(
+            result,
+            {
+                "platformResultCount": 3,
+                "candidates": [],
+            },
+        )
+
     def test_location_search_stops_when_old_keyword_cannot_be_cleared(self) -> None:
         """平台仍回读旧关键词时，禁止继续输入新词或读取旧候选。"""
 
@@ -8868,6 +8940,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
                 "北海",
                 "domestic",
                 commission_filter="commission",
+                include_metadata=True,
             ),
         )
         state = self.page._batch_location_state()
@@ -8875,6 +8948,50 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.assertEqual(
             [item["poiId"] for item in state["candidates"]],
             ["poi-commission"],
+        )
+
+    def test_batch_location_search_uses_structured_platform_count_without_fake_raw_rows(self) -> None:
+        """UI 必须消费真实链路元数据，不得伪造未过滤候选。"""
+
+        runner = self._ControlledLifecycleRunner()
+        self.page.runner = runner
+        self.page._setup_generation_id = "generation-a"
+        self.page.batch_location_commission_combo.setCurrentIndex(
+            self.page.batch_location_commission_combo.findData("commission")
+        )
+        result = {
+            "ok": True,
+            "setupGenerationId": "generation-a",
+            "collectorType": "domestic_location",
+            "collectorInstanceId": "domestic-a",
+            "platformResultCount": 3,
+            "candidates": [],
+        }
+
+        with patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.search_locations",
+            return_value=result,
+        ) as search, patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.status",
+            return_value=self._collector_status(),
+        ):
+            self.page._search_batch_locations("domestic", "北海")
+            runner.execute(self.page._COLLECTOR_TASK_KEY)
+
+        search.assert_called_once_with(
+            "generation-a",
+            "北海",
+            "domestic",
+            commission_filter="commission",
+            include_metadata=True,
+        )
+        state = self.page._batch_location_state()
+        self.assertEqual(state["platformResultCount"], 3)
+        self.assertEqual(state["rawCandidates"], [])
+        self.assertEqual(state["candidates"], [])
+        self.assertIn(
+            "平台返回 3 个，但没有符合‘返佣’条件",
+            self.page.batch_item_settings_status.text(),
         )
 
     def test_abandon_reset_stops_and_hides_platform_collector_progress(self) -> None:
