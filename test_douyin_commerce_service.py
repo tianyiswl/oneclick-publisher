@@ -38,6 +38,7 @@ from app_core import (
     douyin_commerce_batch_executor,
     douyin_commerce_batch_service,
     douyin_commerce_collectors,
+    douyin_commerce_location_commission as commission,
     douyin_commerce_service,
     douyin_commerce_session,
     douyin_favorite_music_cache,
@@ -226,6 +227,42 @@ class DouyinCommercePayloadTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.tempdir.cleanup()
+
+    def test_commission_summary_classification_is_strict_and_public(self) -> None:
+        cases = [
+            ("15件商品 · 15件返佣", "commission", 15, 15, "返佣"),
+            ("13件商品 · 0件返佣", "no_commission", 13, 0, "无佣"),
+            ("", "no_commission", None, None, "无佣"),
+            ("13件商品", "unknown", 13, None, "待确认"),
+            ("返佣活动", "unknown", None, None, "待确认"),
+        ]
+        for raw, expected_type, products, commission_products, label in cases:
+            with self.subTest(raw=raw):
+                parsed = commission.parse_commission_summary(raw)
+                self.assertEqual(parsed["commissionType"], expected_type)
+                self.assertEqual(parsed["productCount"], products)
+                self.assertEqual(parsed["commissionProductCount"], commission_products)
+                self.assertEqual(parsed["commissionLabel"], label)
+                self.assertNotIn("commerceInfo", parsed)
+
+    def test_commission_filter_does_not_fallback_or_hide_unknown_from_all(self) -> None:
+        rows = [
+            {"poiId": "p1", "commissionType": "commission"},
+            {"poiId": "p2", "commissionType": "no_commission"},
+            {"poiId": "p3", "commissionType": "unknown"},
+        ]
+        self.assertEqual(
+            [row["poiId"] for row in commission.filter_location_candidates(rows, "commission")],
+            ["p1"],
+        )
+        self.assertEqual(
+            [row["poiId"] for row in commission.filter_location_candidates(rows, "no_commission")],
+            ["p2"],
+        )
+        self.assertEqual(
+            [row["poiId"] for row in commission.filter_location_candidates(rows, "all")],
+            ["p1", "p2", "p3"],
+        )
 
     def test_requires_one_account_one_video_and_future_timer(self) -> None:
         checked = douyin_commerce_service.validate_douyin_commerce_payload(self.payload)
