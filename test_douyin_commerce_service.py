@@ -5115,7 +5115,14 @@ class DouyinCommerceUiTests(unittest.TestCase):
         self.assertEqual(self.page._confirmed_declaration, "")
         self.assertEqual(
             self.page._batch_location_state(),
-            {"scope": "domestic", "keyword": "", "candidates": []},
+            {
+                "scope": "domestic",
+                "keyword": "",
+                "commissionFilter": "commission",
+                "platformResultCount": 0,
+                "rawCandidates": [],
+                "candidates": [],
+            },
         )
         self.assertEqual(self.page.batch_publish_mode.currentData(), "immediate")
         self.assertTrue(self.page._saved_content_available)
@@ -5649,7 +5656,14 @@ class DouyinCommerceUiTests(unittest.TestCase):
         self.assertEqual(self.page._batch_schedule_overrides, {})
         self.assertEqual(
             self.page._batch_location_state(),
-            {"scope": "domestic", "keyword": "", "candidates": []},
+            {
+                "scope": "domestic",
+                "keyword": "",
+                "commissionFilter": "commission",
+                "platformResultCount": 0,
+                "rawCandidates": [],
+                "candidates": [],
+            },
         )
         self.assertEqual(self.page.batch_location_scope_combo.currentData(), "domestic")
         self.assertEqual(self.page.batch_location_keyword.text(), "")
@@ -8973,6 +8987,9 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.page._staged_music_confirmed = True
         self.page._staged_location_confirmed = True
         self.page._staged_declaration_confirmed = True
+        self.page.batch_location_commission_combo.setCurrentIndex(
+            self.page.batch_location_commission_combo.findData("no_commission")
+        )
         self.page.title_input.setText("仍需保留的标题")
 
         def close_current(generation_id: str, *, reason: str) -> dict:
@@ -9002,6 +9019,10 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.assertFalse(self.page._staged_music_confirmed)
         self.assertFalse(self.page._staged_location_confirmed)
         self.assertFalse(self.page._staged_declaration_confirmed)
+        self.assertEqual(
+            self.page.batch_location_commission_combo.currentData(),
+            "commission",
+        )
         self.assertEqual(self.page.title_input.text(), "仍需保留的标题")
 
     def test_login_required_closes_setup_generation_before_reset(self) -> None:
@@ -9687,6 +9708,9 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.page._staged_music_confirmed = True
         self.page._staged_location_confirmed = True
         self.page._staged_declaration_confirmed = True
+        self.page.batch_location_commission_combo.setCurrentIndex(
+            self.page.batch_location_commission_combo.findData("no_commission")
+        )
 
         with patch(
             "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.close_generation",
@@ -9708,6 +9732,10 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.assertFalse(self.page._staged_music_confirmed)
         self.assertFalse(self.page._staged_location_confirmed)
         self.assertFalse(self.page._staged_declaration_confirmed)
+        self.assertEqual(
+            self.page.batch_location_commission_combo.currentData(),
+            "commission",
+        )
 
     def test_fully_published_batch_retains_generation_when_close_is_incomplete(self) -> None:
         """明确发布完成仍须等采集器全部关闭后才能撤销句柄和选择。"""
@@ -10272,6 +10300,62 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.assertIsNotNone(second_body.layout().itemAtPosition(1, 0))
         self.assertIsNone(second_body.layout().itemAtPosition(0, 1))
 
+    def test_batch_location_commission_filter_precedes_scope_and_defaults_to_commission(self) -> None:
+        """地点搜索顶部先选返佣条件，新批次默认只看返佣地点。"""
+
+        combo = self.page.findChild(
+            QComboBox, "douyinCommerceBatchCommissionFilter"
+        )
+
+        self.assertIsNotNone(combo)
+        self.assertEqual(
+            [combo.itemText(index) for index in range(combo.count())],
+            ["全部", "返佣", "无佣"],
+        )
+        self.assertEqual(combo.currentData(), "commission")
+        self.assertLess(
+            self.page.batch_location_title_row.indexOf(combo),
+            self.page.batch_location_title_row.indexOf(
+                self.page.batch_location_scope_combo
+            ),
+        )
+
+    def test_clear_current_content_resets_location_filter_for_new_batch(self) -> None:
+        """开始新批次时必须恢复默认返佣筛选。"""
+
+        self.page.batch_location_commission_combo.setCurrentIndex(
+            self.page.batch_location_commission_combo.findData("no_commission")
+        )
+
+        self.page.clear_current_content()
+
+        self.assertEqual(
+            self.page.batch_location_commission_combo.currentData(),
+            "commission",
+        )
+
+    def test_switching_location_scope_keeps_current_commission_filter(self) -> None:
+        """普通切换本地/国内只改范围，不重置返佣筛选。"""
+
+        self.page.batch_location_commission_combo.setCurrentIndex(
+            self.page.batch_location_commission_combo.findData("no_commission")
+        )
+
+        self.page.batch_location_scope_combo.setCurrentIndex(
+            self.page.batch_location_scope_combo.findData("local")
+        )
+        self.assertEqual(
+            self.page.batch_location_commission_combo.currentData(),
+            "no_commission",
+        )
+        self.page.batch_location_scope_combo.setCurrentIndex(
+            self.page.batch_location_scope_combo.findData("domestic")
+        )
+        self.assertEqual(
+            self.page.batch_location_commission_combo.currentData(),
+            "no_commission",
+        )
+
     def test_batch_location_rows_keep_three_to_seven_width_and_fixed_control_heights(self) -> None:
         """地点行须保持视频 3、地点 7 的宽度比例，避免下拉框被裁切。"""
 
@@ -10390,7 +10474,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             "ui.douyin_commerce_page.save_location_preset",
             side_effect=lambda _account_id, candidate, scope: {**candidate, "scope": scope},
         ) as save_preset:
-            self.page._batch_location_search_succeeded("domestic", "测试", candidates)
+            self.page._batch_location_search_succeeded("domestic", "测试", candidates, "all")
 
         self.assertEqual(self.page._batch_locations[paths[0]]["poiId"], "poi-1")
         self.assertEqual(self.page._batch_locations[paths[1]]["poiId"], "existing")
@@ -10400,6 +10484,268 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         # 测试页未 show()，isVisible() 会受父窗口影响；isHidden() 才能验证
         # 组件是否被本次搜索回读显式展示。
         self.assertFalse(self.page.batch_item_settings_status.isHidden())
+
+    def test_batch_location_filter_fills_only_empty_items_and_freezes_saved_commission_metadata(self) -> None:
+        """筛选只填空项，每条已保存地点的返佣证据不随顶部切换。"""
+
+        self.page.video_combo.clear()
+        self.page.video_combo.addItem("请选择视频", None)
+        paths = [f"/tmp/commission-filter-{index}.mp4" for index in range(3)]
+        for index, path in enumerate(paths, start=1):
+            self.page.video_combo.addItem(
+                f"视频 {index}.mp4",
+                {
+                    "id": index,
+                    "storedPath": path,
+                    "filename": f"视频 {index}.mp4",
+                },
+            )
+        self.page._selected_video_indexes = [1, 2, 3]
+        self.page._batch_locations[paths[1]] = {
+            "poiId": "poi-existing",
+            "name": "已选地点",
+            "address": "已选完整地址",
+            "scope": "domestic",
+            "commissionFilter": "commission",
+            "observedCommissionType": "commission",
+        }
+        rows = [
+            {
+                "poiId": "poi-commission",
+                "name": "返佣地点",
+                "address": "返佣完整地址",
+                "commissionType": "commission",
+                "productCount": 6,
+                "commissionProductCount": 2,
+                "commissionLabel": "返佣",
+            },
+            {
+                "poiId": "poi-no-commission",
+                "name": "无佣地点",
+                "address": "无佣完整地址",
+                "commissionType": "no_commission",
+                "productCount": 4,
+                "commissionProductCount": 0,
+                "commissionLabel": "无佣",
+            },
+            {
+                "poiId": "poi-unknown",
+                "name": "待确认地点",
+                "address": "待确认完整地址",
+                "commissionType": "unknown",
+                "productCount": None,
+                "commissionProductCount": None,
+                "commissionLabel": "待确认",
+            },
+        ]
+
+        def save_stable(_account_id, candidate, scope):
+            self.assertNotIn("commissionType", candidate)
+            self.assertNotIn("productCount", candidate)
+            self.assertNotIn("commissionProductCount", candidate)
+            self.assertNotIn("commissionLabel", candidate)
+            return {**candidate, "scope": scope, "id": f"preset-{candidate['poiId']}"}
+
+        with patch(
+            "ui.douyin_commerce_page.save_location_preset",
+            side_effect=save_stable,
+        ) as save_preset:
+            self.page._batch_location_search_succeeded(
+                "domestic", "北海", rows
+            )
+            self.page.batch_location_commission_combo.setCurrentIndex(
+                self.page.batch_location_commission_combo.findData(
+                    "no_commission"
+                )
+            )
+            self.page._batch_location_search_succeeded(
+                "domestic", "北海", rows
+            )
+
+        self.assertEqual(save_preset.call_count, 2)
+        self.assertEqual(
+            self.page._batch_locations[paths[0]]["poiId"],
+            "poi-commission",
+        )
+        self.assertEqual(
+            self.page._batch_locations[paths[1]]["poiId"],
+            "poi-existing",
+        )
+        self.assertEqual(
+            self.page._batch_locations[paths[2]]["poiId"],
+            "poi-no-commission",
+        )
+        self.assertEqual(
+            self.page._batch_locations[paths[0]]["commissionFilter"],
+            "commission",
+        )
+        self.assertEqual(
+            self.page._batch_locations[paths[0]]["observedCommissionType"],
+            "commission",
+        )
+        self.assertEqual(
+            self.page._batch_locations[paths[2]]["commissionFilter"],
+            "no_commission",
+        )
+        self.assertEqual(
+            self.page._batch_locations[paths[2]]["observedCommissionType"],
+            "no_commission",
+        )
+        self.page.batch_location_commission_combo.setCurrentIndex(
+            self.page.batch_location_commission_combo.findData("all")
+        )
+        self.assertEqual(
+            self.page._batch_locations[paths[0]]["commissionFilter"],
+            "commission",
+        )
+        self.assertEqual(
+            self.page._batch_locations[paths[2]]["commissionFilter"],
+            "no_commission",
+        )
+        state = self.page._batch_location_state()
+        self.assertEqual(state["platformResultCount"], 3)
+        self.assertEqual(state["commissionFilter"], "no_commission")
+        self.assertEqual(
+            [candidate["poiId"] for candidate in state["candidates"]],
+            ["poi-no-commission"],
+        )
+
+    def test_batch_location_filter_empty_result_reports_platform_count_without_saving(self) -> None:
+        """平台有候选但筛选为空时，应说明实际数字并且不保存。"""
+
+        rows = [
+            {
+                "poiId": f"poi-no-commission-{index}",
+                "name": f"无佣地点 {index}",
+                "address": f"无佣完整地址 {index}",
+                "commissionType": "no_commission",
+            }
+            for index in range(3)
+        ]
+
+        with patch(
+            "ui.douyin_commerce_page.save_location_preset"
+        ) as save_preset:
+            self.page._batch_location_search_succeeded(
+                "domestic", "北海", rows
+            )
+
+        save_preset.assert_not_called()
+        self.assertIn(
+            "平台返回 3 个，但没有符合‘返佣’条件",
+            self.page.batch_item_settings_status.text(),
+        )
+
+    def test_batch_location_preset_database_receives_only_stable_location_identity(self) -> None:
+        """账号级地点预设不得写入本批筛选和返佣观测摘要。"""
+
+        candidate = {
+            "poiId": "poi-stable-only",
+            "name": "稳定地点",
+            "address": "稳定完整地址",
+            "commissionType": "commission",
+            "productCount": 8,
+            "commissionProductCount": 3,
+            "commissionLabel": "返佣",
+            "commissionFilter": "commission",
+            "observedCommissionType": "commission",
+        }
+
+        with patch(
+            "ui.douyin_commerce_page.save_location_preset",
+            return_value={
+                "id": "preset-stable-only",
+                "poiId": "poi-stable-only",
+                "name": "稳定地点",
+                "address": "稳定完整地址",
+                "scope": "domestic",
+            },
+        ) as save_preset:
+            saved = self.page._save_batch_location_candidate(
+                "/tmp/stable-only.mp4",
+                "domestic",
+                candidate,
+            )
+
+        self.assertTrue(saved)
+        persisted_candidate = save_preset.call_args.args[1]
+        self.assertEqual(
+            persisted_candidate,
+            {
+                "poiId": "poi-stable-only",
+                "name": "稳定地点",
+                "address": "稳定完整地址",
+            },
+        )
+        self.assertEqual(
+            self.page._batch_locations["/tmp/stable-only.mp4"][
+                "observedCommissionType"
+            ],
+            "commission",
+        )
+
+    def test_batch_location_all_filter_keeps_raw_candidates_and_labels_each_commission_type(self) -> None:
+        """全部筛选展示三类候选，且不丢失平台原始结构。"""
+
+        path = "/tmp/all-commission-types.mp4"
+        self.page.video_combo.clear()
+        self.page.video_combo.addItem("请选择视频", None)
+        self.page.video_combo.addItem(
+            "视频 1.mp4",
+            {"id": 1, "storedPath": path, "filename": "视频 1.mp4"},
+        )
+        self.page._selected_video_indexes = [1]
+        self.page.batch_location_commission_combo.setCurrentIndex(
+            self.page.batch_location_commission_combo.findData("all")
+        )
+        rows = [
+            {
+                "poiId": "poi-commission",
+                "name": "返佣地点",
+                "address": "返佣完整地址",
+                "commissionType": "commission",
+            },
+            {
+                "poiId": "poi-no-commission",
+                "name": "无佣地点",
+                "address": "无佣完整地址",
+                "commissionType": "no_commission",
+            },
+            {
+                "poiId": "poi-unknown",
+                "name": "待确认地点",
+                "address": "待确认完整地址",
+                "commissionType": "unknown",
+            },
+        ]
+
+        with patch(
+            "ui.douyin_commerce_page.save_location_preset",
+            side_effect=lambda _account_id, candidate, scope: {
+                **candidate,
+                "scope": scope,
+                "id": "preset-all",
+            },
+        ):
+            self.page._batch_location_search_succeeded(
+                "domestic", "北海", rows
+            )
+
+        state = self.page._batch_location_state()
+        self.assertIn("rawCandidates", state)
+        self.assertEqual(
+            [candidate["poiId"] for candidate in state["rawCandidates"]],
+            ["poi-commission", "poi-no-commission", "poi-unknown"],
+        )
+        dropdown = self.page.batch_item_rows.widget().findChild(
+            QComboBox, "douyinCommerceBatchLocationCandidates"
+        )
+        labels = [
+            dropdown.itemText(index) for index in range(1, dropdown.count())
+        ]
+        self.assertTrue(any(label.endswith("【返佣】") for label in labels))
+        self.assertTrue(any(label.endswith("【无佣】") for label in labels))
+        self.assertTrue(any(label.endswith("【待确认】") for label in labels))
 
     def test_batch_defaults_to_immediate_and_only_generates_interval_when_enabled(self) -> None:
         self.page.video_combo.clear()
@@ -10786,6 +11132,9 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.page._batch_location_searches["__shared_location_search__"] = {
             "scope": "domestic",
             "keyword": "夜南香北京烤鸭",
+            "commissionFilter": "no_commission",
+            "platformResultCount": 1,
+            "rawCandidates": [{"poiId": "temporary"}],
             "candidates": [{"poiId": "temporary"}],
         }
 
@@ -10798,7 +11147,11 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         )
         self.assertEqual(
             payload["lastLocationSearch"],
-            {"scope": "domestic", "keyword": "夜南香北京烤鸭"},
+            {
+                "scope": "domestic",
+                "keyword": "夜南香北京烤鸭",
+                "commissionFilter": "no_commission",
+            },
         )
         self.assertEqual(
             payload["items"][0]["locationPreset"]["address"],
@@ -10855,6 +11208,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
                 "lastLocationSearch": {
                     "scope": "local",
                     "keyword": "夜心数码",
+                    "commissionFilter": "no_commission",
                     "candidates": [{"poiId": "must-not-restore"}],
                 },
                 "publishMode": "immediate",
@@ -10897,8 +11251,14 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         state = self.page._batch_location_state()
         self.assertEqual(state["scope"], "local")
         self.assertEqual(state["keyword"], "夜心数码")
+        self.assertEqual(state["commissionFilter"], "no_commission")
         self.assertEqual(state["candidates"], [])
+        self.assertEqual(state["rawCandidates"], [])
         self.assertEqual(self.page.batch_location_scope_combo.currentData(), "local")
+        self.assertEqual(
+            self.page.batch_location_commission_combo.currentData(),
+            "no_commission",
+        )
         self.assertEqual(self.page.batch_location_keyword.text(), "夜心数码")
 
     def test_batch_music_reads_current_account_cache_without_opening_session(self) -> None:
@@ -11012,7 +11372,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             "address": "广西壮族自治区北海市银海区银滩大道中段",
             "distance": "6km",
         }
-        self.page._batch_location_search_succeeded("domestic", "北海", [candidate])
+        self.page._batch_location_search_succeeded("domestic", "北海", [candidate], "all")
         self.assertEqual(
             self.page._batch_location_searches["__shared_location_search__"]["candidates"][0]["poiId"],
             "poi-1",
@@ -11049,7 +11409,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             "address": "广西壮族自治区北海市银海区银滩大道中段",
         }
 
-        self.page._batch_location_search_succeeded("domestic", "北海", [candidate])
+        self.page._batch_location_search_succeeded("domestic", "北海", [candidate], "all")
         body = self.page.batch_item_rows.widget()
         dropdowns = body.findChildren(QComboBox, "douyinCommerceBatchLocationCandidates")
 
@@ -11090,7 +11450,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             "name": "北海银滩景区",
             "address": "广西壮族自治区北海市银海区银滩大道中段",
         }
-        self.page._batch_location_search_succeeded("domestic", "北海", [candidate])
+        self.page._batch_location_search_succeeded("domestic", "北海", [candidate], "all")
         body = self.page.batch_item_rows.widget()
         dropdown = body.findChild(QComboBox, "douyinCommerceBatchLocationCandidates")
 
@@ -11126,7 +11486,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             "ui.douyin_commerce_page.save_location_preset",
             return_value={**candidate, "scope": "domestic", "id": "preset-clickable"},
         ) as save:
-            self.page._batch_location_search_succeeded("domestic", "北海", [candidate])
+            self.page._batch_location_search_succeeded("domestic", "北海", [candidate], "all")
 
         save.assert_called_once_with(97, candidate, "domestic")
         self.assertEqual(self.page._batch_locations[path]["poiId"], "poi-clickable")
@@ -11136,16 +11496,25 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.assertEqual(dropdown.currentIndex(), 1)
 
     def test_batch_location_placeholder_clears_old_binding_then_next_search_refills(self) -> None:
-        """用户改回“请选择地点”后，旧绑定必须真正清除并允许新搜索重新自动填入。"""
+        """清空返佣地点后改搜无佣，只重填空项而不覆盖已选项。"""
 
         path = "/tmp/location-reselect.mp4"
+        kept_path = "/tmp/location-kept.mp4"
         self.page.video_combo.clear()
         self.page.video_combo.addItem("请选择视频", None)
         self.page.video_combo.addItem(
             "视频 1.mp4",
             {"id": 1, "storedPath": path, "filename": "视频 1.mp4"},
         )
-        self.page._selected_video_indexes = [1]
+        self.page.video_combo.addItem(
+            "视频 2.mp4",
+            {
+                "id": 2,
+                "storedPath": kept_path,
+                "filename": "视频 2.mp4",
+            },
+        )
+        self.page._selected_video_indexes = [1, 2]
         account = {"id": 98, "type": 3, "status": 1, "filePath": "douyin-98.json"}
         self.page.account_combo.clear()
         self.page.account_combo.addItem("账号", account)
@@ -11153,11 +11522,13 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             "poiId": "poi-old",
             "name": "旧地点",
             "address": "旧地点完整地址",
+            "commissionType": "commission",
         }
         new_candidate = {
             "poiId": "poi-new",
             "name": "新地点",
             "address": "新地点完整地址",
+            "commissionType": "no_commission",
         }
 
         def save_candidate(_account_id, candidate, scope):
@@ -11170,19 +11541,34 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             self.page._batch_location_search_succeeded(
                 "domestic", "旧关键词", [old_candidate]
             )
-            dropdown = self.page.batch_item_rows.widget().findChild(
+            self.page._batch_locations[kept_path] = {
+                "poiId": "poi-kept",
+                "name": "保留的返佣地点",
+                "address": "保留的完整地址",
+                "scope": "domestic",
+                "commissionFilter": "commission",
+                "observedCommissionType": "commission",
+            }
+            self.page._render_batch_item_rows()
+            dropdown = self.page.batch_item_rows.widget().findChildren(
                 QComboBox, "douyinCommerceBatchLocationCandidates"
-            )
+            )[0]
             self.assertEqual(dropdown.currentData()["poiId"], "poi-old")
 
             dropdown.setCurrentIndex(0)
 
             self.assertNotIn(path, self.page._batch_locations)
-            rerendered_dropdown = self.page.batch_item_rows.widget().findChild(
+            rerendered_dropdown = self.page.batch_item_rows.widget().findChildren(
                 QComboBox, "douyinCommerceBatchLocationCandidates"
-            )
+            )[0]
             self.assertEqual(rerendered_dropdown.currentIndex(), 0)
             self.assertEqual(rerendered_dropdown.currentText(), "请选择地点")
+
+            self.page.batch_location_commission_combo.setCurrentIndex(
+                self.page.batch_location_commission_combo.findData(
+                    "no_commission"
+                )
+            )
 
             self.page._batch_location_search_succeeded(
                 "domestic", "新关键词", [new_candidate]
@@ -11190,9 +11576,17 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
 
         self.assertEqual(save.call_count, 2)
         self.assertEqual(self.page._batch_locations[path]["poiId"], "poi-new")
-        final_dropdown = self.page.batch_item_rows.widget().findChild(
-            QComboBox, "douyinCommerceBatchLocationCandidates"
+        self.assertEqual(
+            self.page._batch_locations[path]["commissionFilter"],
+            "no_commission",
         )
+        self.assertEqual(
+            self.page._batch_locations[kept_path]["poiId"],
+            "poi-kept",
+        )
+        final_dropdown = self.page.batch_item_rows.widget().findChildren(
+            QComboBox, "douyinCommerceBatchLocationCandidates"
+        )[0]
         self.assertEqual(final_dropdown.currentData()["poiId"], "poi-new")
 
     def test_batch_location_selected_value_is_only_shown_in_dropdown(self) -> None:

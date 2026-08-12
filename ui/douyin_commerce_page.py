@@ -70,6 +70,11 @@ from app_core.douyin_location_preset_service import (
     list_location_presets,
     save_location_preset,
 )
+from app_core.douyin_commerce_location_commission import (
+    DEFAULT_COMMISSION_FILTER,
+    filter_location_candidates,
+    normalize_commission_filter,
+)
 from app_core.douyin_verification import verification_broker
 from app_core.paths import AVATAR_DIR
 
@@ -1369,10 +1374,23 @@ class DouyinCommercePage(QWidget):
         layout.setContentsMargins(18, 16, 18, 18)
         layout.setSpacing(10)
         title_row = QHBoxLayout()
+        self.batch_location_title_row = title_row
         title = QLabel("逐条设置地点")
         title.setObjectName("sectionTitle")
         title_row.addWidget(title)
         title_row.addStretch(1)
+        self.batch_location_commission_combo = QComboBox()
+        self.batch_location_commission_combo.setObjectName(
+            "douyinCommerceBatchCommissionFilter"
+        )
+        self.batch_location_commission_combo.addItem("全部", "all")
+        self.batch_location_commission_combo.addItem("返佣", "commission")
+        self.batch_location_commission_combo.addItem("无佣", "no_commission")
+        self.batch_location_commission_combo.setCurrentIndex(
+            self.batch_location_commission_combo.findData(
+                DEFAULT_COMMISSION_FILTER
+            )
+        )
         self.batch_location_scope_combo = QComboBox()
         self.batch_location_scope_combo.setObjectName("douyinCommerceBatchSharedLocationScope")
         self.batch_location_scope_combo.addItem("本地", douyin_commerce_service.LOCATION_SCOPE_LOCAL)
@@ -1390,6 +1408,7 @@ class DouyinCommercePage(QWidget):
             )
         )
         self.batch_location_keyword.returnPressed.connect(self.batch_location_search_button.click)
+        title_row.addWidget(self.batch_location_commission_combo)
         title_row.addWidget(self.batch_location_scope_combo)
         title_row.addWidget(self.batch_location_keyword, 1)
         title_row.addWidget(self.batch_location_search_button)
@@ -1559,9 +1578,22 @@ class DouyinCommercePage(QWidget):
         scope = _normalized(
             (existing or {}).get("scope")
         ) or douyin_commerce_service.LOCATION_SCOPE_DOMESTIC
+        commission_filter = normalize_commission_filter(
+            (existing or {}).get("commissionFilter"),
+            default=DEFAULT_COMMISSION_FILTER,
+        )
         return {
             "scope": scope,
             "keyword": _normalized((existing or {}).get("keyword")),
+            "commissionFilter": commission_filter,
+            "platformResultCount": int(
+                (existing or {}).get("platformResultCount") or 0
+            ),
+            "rawCandidates": [
+                dict(item)
+                for item in (existing or {}).get("rawCandidates", [])
+                if isinstance(item, dict)
+            ],
             "candidates": [
                 dict(item)
                 for item in (existing or {}).get("candidates", [])
@@ -1584,9 +1616,16 @@ class DouyinCommercePage(QWidget):
         if not normalized_keyword:
             self._set_batch_location_feedback("请输入地点或商户名称")
             return
+        commission_filter = normalize_commission_filter(
+            self.batch_location_commission_combo.currentData(),
+            default=DEFAULT_COMMISSION_FILTER,
+        )
         self._batch_location_searches[_BATCH_SHARED_LOCATION_SEARCH_KEY] = {
             "scope": normalized_scope,
             "keyword": normalized_keyword,
+            "commissionFilter": commission_filter,
+            "platformResultCount": 0,
+            "rawCandidates": [],
             "candidates": [],
         }
         self._set_batch_location_feedback("正在读取抖音地点候选…")
@@ -1606,6 +1645,7 @@ class DouyinCommercePage(QWidget):
                     normalized_scope,
                     normalized_keyword,
                     rows if isinstance(rows, list) else [],
+                    commission_filter,
                 ),
                 action_label=(
                     "正在搜索国内地点"
@@ -1625,7 +1665,10 @@ class DouyinCommercePage(QWidget):
                 session_id, normalized_keyword, normalized_scope
             ),
             lambda rows: self._batch_location_search_succeeded(
-                normalized_scope, normalized_keyword, rows
+                normalized_scope,
+                normalized_keyword,
+                rows,
+                commission_filter,
             ),
             self._batch_location_search_failed,
         )
@@ -1637,24 +1680,48 @@ class DouyinCommercePage(QWidget):
         scope: str,
         keyword: str,
         rows: object,
+        commission_filter: object = None,
     ) -> None:
-        candidates = [dict(item) for item in rows if isinstance(item, dict)] if isinstance(rows, list) else []
+        selected_filter = normalize_commission_filter(
+            commission_filter
+            if commission_filter is not None
+            else self.batch_location_commission_combo.currentData(),
+            default=DEFAULT_COMMISSION_FILTER,
+        )
+        raw_candidates = (
+            [dict(item) for item in rows if isinstance(item, dict)]
+            if isinstance(rows, list)
+            else []
+        )
+        candidates = filter_location_candidates(raw_candidates, selected_filter)
         self._batch_location_searches[_BATCH_SHARED_LOCATION_SEARCH_KEY] = {
             "scope": scope,
             "keyword": keyword,
+            "commissionFilter": selected_filter,
+            "platformResultCount": len(raw_candidates),
+            "rawCandidates": raw_candidates,
             "candidates": candidates,
         }
         auto_filled, remaining = self._auto_fill_batch_location_candidates(
-            scope, candidates
+            scope,
+            candidates,
+            commission_filter=selected_filter,
         )
+        filter_label = {
+            "all": "全部",
+            "commission": "返佣",
+            "no_commission": "无佣",
+        }[selected_filter]
         self._set_batch_location_feedback(
             (
-                f"已读取 {len(candidates)} 个地点候选，自动填充 {auto_filled} 条"
+                f"平台返回 {len(raw_candidates)} 个，符合‘{filter_label}’条件 {len(candidates)} 个，自动填充 {auto_filled} 条"
                 + (f"；还有 {remaining} 条待选择" if remaining else "")
             )
             if auto_filled
-            else f"已读取 {len(candidates)} 个地点候选，请选择完整地址"
+            else f"平台返回 {len(raw_candidates)} 个，符合‘{filter_label}’条件 {len(candidates)} 个，请选择完整地址"
             if candidates
+            else f"平台返回 {len(raw_candidates)} 个，但没有符合‘{filter_label}’条件"
+            if raw_candidates
             else "当前抖音编辑页未返回完整地点候选，请更换关键词"
         )
         self._clear_stage_error("location")
@@ -1664,6 +1731,8 @@ class DouyinCommercePage(QWidget):
     def _batch_location_search_failed(self, message: str) -> None:
         state = self._batch_location_state()
         state["candidates"] = []
+        state["rawCandidates"] = []
+        state["platformResultCount"] = 0
         self._batch_location_searches[_BATCH_SHARED_LOCATION_SEARCH_KEY] = state
         diagnostic = _normalized(message)
         self._set_batch_location_feedback(
@@ -1701,8 +1770,23 @@ class DouyinCommercePage(QWidget):
         if not isinstance(candidate, dict):
             return False
         account = self._selected_account() or {}
+        stable_candidate = {
+            key: value
+            for key, value in candidate.items()
+            if key
+            not in {
+                "commissionType",
+                "productCount",
+                "commissionProductCount",
+                "commissionLabel",
+                "commissionFilter",
+                "observedCommissionType",
+            }
+        }
         try:
-            preset = save_location_preset(account.get("id"), candidate, scope)
+            preset = save_location_preset(
+                account.get("id"), stable_candidate, scope
+            )
         except Exception as exc:
             _LOGGER.warning("抖音带货批量地点保存失败：%s", _normalized(exc))
             return False
@@ -1713,6 +1797,20 @@ class DouyinCommercePage(QWidget):
                 # 原始搜索词属于本批次的恢复意图，不写入账号级地点数据库；
                 # 它随视频地点快照进入草稿和正式发布载荷。
                 preset["searchKeyword"] = search_keyword
+        preset["commissionFilter"] = normalize_commission_filter(
+            search_state.get("commissionFilter"),
+            default=DEFAULT_COMMISSION_FILTER,
+        )
+        preset["observedCommissionType"] = _normalized(
+            candidate.get("commissionType")
+        ) or "unknown"
+        for key in (
+            "productCount",
+            "commissionProductCount",
+            "commissionLabel",
+        ):
+            if key in candidate:
+                preset[key] = candidate[key]
         self._batch_locations[path] = dict(preset)
         self._batch_preflight_fingerprint = ""
         return True
@@ -1721,6 +1819,8 @@ class DouyinCommercePage(QWidget):
         self,
         scope: object,
         candidates: list[dict[str, object]],
+        *,
+        commission_filter: object = None,
     ) -> tuple[int, int]:
         """按候选顺序填充未选择地点的视频，已有设置始终保持不变。"""
 
@@ -1731,7 +1831,16 @@ class DouyinCommercePage(QWidget):
             and _normalized(video.get("storedPath")) not in self._batch_locations
         ]
         filled = 0
+        selected_filter = normalize_commission_filter(
+            commission_filter,
+            default=DEFAULT_COMMISSION_FILTER,
+        )
         for path, candidate in zip(pending_paths, candidates):
+            current_state = self._batch_location_searches.get(
+                _BATCH_SHARED_LOCATION_SEARCH_KEY,
+                {},
+            )
+            current_state["commissionFilter"] = selected_filter
             if self._save_batch_location_candidate(path, scope, candidate):
                 filled += 1
         return filled, max(0, len(pending_paths) - filled)
@@ -1772,6 +1881,7 @@ class DouyinCommercePage(QWidget):
         if not hasattr(self, "batch_location_scope_combo"):
             return
         can_search = bool(self._setup_generation_id or self._session_id) and not self._busy()
+        self.batch_location_commission_combo.setEnabled(can_search)
         self.batch_location_scope_combo.setEnabled(can_search)
         self.batch_location_keyword.setEnabled(can_search)
         self.batch_location_search_button.setEnabled(can_search)
@@ -1848,7 +1958,15 @@ class DouyinCommercePage(QWidget):
             candidate_combo.addItem("请选择地点", None)
             current_index = 0
             for candidate in state["candidates"]:
-                label = f"{candidate.get('name') or ''} · {candidate.get('address') or ''}"
+                suffix = {
+                    "commission": "【返佣】",
+                    "no_commission": "【无佣】",
+                    "unknown": "【待确认】",
+                }.get(_normalized(candidate.get("commissionType")), "【待确认】")
+                label = (
+                    f"{candidate.get('name') or ''} · "
+                    f"{candidate.get('address') or ''}{suffix}"
+                )
                 candidate_combo.addItem(label, dict(candidate))
                 candidate_combo.setItemData(
                     candidate_combo.count() - 1,
@@ -1860,7 +1978,18 @@ class DouyinCommercePage(QWidget):
             # 顶部重新搜索其他关键词时，也要保留每条视频已经选中的地点并直接
             # 显示在下拉框中；不再额外重复展示一块地址文本。
             if current and current_index == 0:
-                label = f"{current.get('name') or ''} · {current.get('address') or ''}"
+                suffix = {
+                    "commission": "【返佣】",
+                    "no_commission": "【无佣】",
+                    "unknown": "【待确认】",
+                }.get(
+                    _normalized(current.get("observedCommissionType")),
+                    "【待确认】",
+                )
+                label = (
+                    f"{current.get('name') or ''} · "
+                    f"{current.get('address') or ''}{suffix}"
+                )
                 candidate_combo.addItem(label, dict(current))
                 candidate_combo.setItemData(
                     candidate_combo.count() - 1,
@@ -3048,6 +3177,13 @@ class DouyinCommercePage(QWidget):
         self.location_candidate_card.setText("尚未选择发布定位")
         self.location_applied_card.setText("尚未选择发布定位")
         self._clear_declaration("请选择作品内容声明")
+        self.batch_location_commission_combo.blockSignals(True)
+        self.batch_location_commission_combo.setCurrentIndex(
+            self.batch_location_commission_combo.findData(
+                DEFAULT_COMMISSION_FILTER
+            )
+        )
+        self.batch_location_commission_combo.blockSignals(False)
         self.batch_location_scope_combo.blockSignals(True)
         self.batch_location_scope_combo.setCurrentIndex(
             self.batch_location_scope_combo.findData(
@@ -4213,6 +4349,7 @@ class DouyinCommercePage(QWidget):
             "lastLocationSearch": {
                 "scope": location_search["scope"],
                 "keyword": location_search["keyword"],
+                "commissionFilter": location_search["commissionFilter"],
             },
             "publishMode": _normalized(self.batch_publish_mode.currentData() or "immediate"),
             "schedule": {
@@ -4317,13 +4454,27 @@ class DouyinCommercePage(QWidget):
             douyin_commerce_service.LOCATION_SCOPE_DOMESTIC,
         }:
             search_scope = douyin_commerce_service.LOCATION_SCOPE_DOMESTIC
+        search_commission_filter = normalize_commission_filter(
+            location_search.get("commissionFilter"),
+            default=DEFAULT_COMMISSION_FILTER,
+        )
         self._batch_location_searches = {
             _BATCH_SHARED_LOCATION_SEARCH_KEY: {
                 "scope": search_scope,
                 "keyword": _normalized(location_search.get("keyword")),
+                "commissionFilter": search_commission_filter,
+                "platformResultCount": 0,
+                "rawCandidates": [],
                 "candidates": [],
             }
         }
+        self.batch_location_commission_combo.blockSignals(True)
+        self.batch_location_commission_combo.setCurrentIndex(
+            self.batch_location_commission_combo.findData(
+                search_commission_filter
+            )
+        )
+        self.batch_location_commission_combo.blockSignals(False)
         presets = {str(item.get("id")): item for item in self._current_location_presets()}
         self._batch_locations = {}
         self._batch_schedule_overrides = {}
@@ -6692,6 +6843,13 @@ class DouyinCommercePage(QWidget):
             )
         )
         self.location_scope_combo.blockSignals(False)
+        self.batch_location_commission_combo.blockSignals(True)
+        self.batch_location_commission_combo.setCurrentIndex(
+            self.batch_location_commission_combo.findData(
+                DEFAULT_COMMISSION_FILTER
+            )
+        )
+        self.batch_location_commission_combo.blockSignals(False)
         self.batch_location_scope_combo.blockSignals(True)
         self.batch_location_scope_combo.setCurrentIndex(
             self.batch_location_scope_combo.findData(
@@ -6746,6 +6904,13 @@ class DouyinCommercePage(QWidget):
         self._batch_locations = {}
         self._batch_location_searches = {}
         self._batch_schedule_overrides = {}
+        self.batch_location_commission_combo.blockSignals(True)
+        self.batch_location_commission_combo.setCurrentIndex(
+            self.batch_location_commission_combo.findData(
+                DEFAULT_COMMISSION_FILTER
+            )
+        )
+        self.batch_location_commission_combo.blockSignals(False)
         self._locations = []
         self._selected_location_data = None
         self._pending_location = None
