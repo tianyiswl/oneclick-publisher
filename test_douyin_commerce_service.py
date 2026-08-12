@@ -9415,6 +9415,382 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             "draft": draft,
         }
 
+    def test_review_button_offers_revision_after_failed_or_manual_paused_batch(
+        self,
+    ) -> None:
+        """若明确可修订的结果仍显示“开始新内容”，该测试必须失败。"""
+
+        self.page.pages.setCurrentIndex(2)
+        self.page._batch_result_task_id = 41
+        self.page._batch_revision_available = True
+
+        self.page._sync_view()
+
+        self.assertEqual(
+            self.page.review_back_button.text(), "返回修改未完成视频"
+        )
+        self.assertTrue(self.page.review_back_button.isEnabled())
+
+    def test_review_button_never_offers_revision_after_all_success_or_ambiguous_receipt(
+        self,
+    ) -> None:
+        """若不可修订结果仍给出修改入口，该测试必须失败。"""
+
+        self.page.pages.setCurrentIndex(2)
+        self.page._batch_result_task_id = 41
+        self.page._batch_revision_available = False
+
+        self.page._sync_view()
+
+        self.assertEqual(self.page.review_back_button.text(), "开始新内容")
+
+    def test_batch_finish_retains_result_task_and_projects_revision_after_cleanup(
+        self,
+    ) -> None:
+        """若结束清理丢失来源任务号或在验证清理前读取资格，该测试必须失败。"""
+
+        events: list[str] = []
+        self.page._batch_task_id = 41
+        plan = {
+            "revisionAllowed": True,
+            "sourceTaskId": 41,
+            "sourceTaskNo": "T08122117-665B",
+            "revisionItemIndexes": [2],
+            "successfulMediaKeys": ["media:1"],
+            "draft": {},
+        }
+        with patch.object(
+            self.page,
+            "_cleanup_douyin_verification",
+            side_effect=lambda: events.append("cleanup"),
+        ), patch(
+            "ui.douyin_commerce_page.task_service.prepare_douyin_batch_revision",
+            side_effect=lambda task_id: (
+                events.append(f"prepare:{task_id}") or plan
+            ),
+        ) as prepare:
+            self.page._batch_operation_finished()
+
+        prepare.assert_called_once_with(41)
+        self.assertEqual(events, ["cleanup", "prepare:41"])
+        self.assertIsNone(self.page._batch_task_id)
+        self.assertEqual(self.page._batch_result_task_id, 41)
+        self.assertTrue(self.page._batch_revision_available)
+
+    def test_return_to_edit_rechecks_task_and_waits_for_zero_alive_barrier(
+        self,
+    ) -> None:
+        """若点击只信缓存或未等到严格零存活就载入草稿，该测试必须失败。"""
+
+        plan = self._load_revision_ui_fixture()
+        self.page.runner = self._InlineRunner()
+        self.page.pages.setCurrentIndex(2)
+        self.page._batch_result_task_id = 41
+        self.page._batch_revision_available = True
+        with patch(
+            "ui.douyin_commerce_page.task_service.prepare_douyin_batch_revision",
+            return_value=plan,
+        ) as prepare, patch.object(
+            self.page,
+            "_close_revision_resources",
+            return_value={
+                "closed": True,
+                "aliveCollectorCount": 0,
+                "aliveSessionCount": 0,
+            },
+        ), patch.object(self.page, "_apply_batch_revision_plan") as apply:
+            self.page.return_unfinished_batch_to_edit()
+
+        prepare.assert_called_once_with(41)
+        apply.assert_called_once_with(plan)
+
+    def test_return_to_edit_keeps_result_page_when_cleanup_is_incomplete(
+        self,
+    ) -> None:
+        """若关闭不完整仍跳页或载入修改批次，该测试必须失败。"""
+
+        plan = self._load_revision_ui_fixture()
+        self.page.runner = self._InlineRunner()
+        self.page.pages.setCurrentIndex(2)
+        self.page._batch_result_task_id = 41
+        self.page._batch_revision_available = True
+        with patch(
+            "ui.douyin_commerce_page.task_service.prepare_douyin_batch_revision",
+            return_value=plan,
+        ), patch.object(
+            self.page,
+            "_close_revision_resources",
+            return_value={
+                "closed": False,
+                "aliveCollectorCount": 1,
+                "aliveSessionCount": 0,
+            },
+        ), patch.object(
+            self.page, "_apply_batch_revision_plan"
+        ) as apply, patch(
+            "ui.douyin_commerce_page.QMessageBox.warning"
+        ) as warning:
+            self.page.return_unfinished_batch_to_edit()
+
+        self.assertEqual(self.page.pages.currentIndex(), 2)
+        self.assertEqual(self.page._batch_result_task_id, 41)
+        apply.assert_not_called()
+        warning.assert_called_once_with(
+            self.page,
+            "返回修改未完成视频",
+            "返回修改前的临时会话未能完全关闭，请重试",
+        )
+
+    def test_return_to_edit_rejects_non_builtin_zero_close_counts(self) -> None:
+        """若布尔值、浮点或字符串零绕过关闭屏障，该测试必须失败。"""
+
+        plan = self._load_revision_ui_fixture()
+        invalid_results = (
+            {
+                "closed": True,
+                "aliveCollectorCount": False,
+                "aliveSessionCount": 0,
+            },
+            {
+                "closed": True,
+                "aliveCollectorCount": 0,
+                "aliveSessionCount": 0.0,
+            },
+            {
+                "closed": True,
+                "aliveCollectorCount": "0",
+                "aliveSessionCount": 0,
+            },
+        )
+        for result in invalid_results:
+            with self.subTest(result=result):
+                self.page.runner = self._InlineRunner()
+                self.page.pages.setCurrentIndex(2)
+                self.page._batch_result_task_id = 41
+                self.page._batch_revision_available = True
+                with patch(
+                    "ui.douyin_commerce_page.task_service.prepare_douyin_batch_revision",
+                    return_value=plan,
+                ), patch.object(
+                    self.page,
+                    "_close_revision_resources",
+                    return_value=result,
+                ), patch.object(
+                    self.page, "_apply_batch_revision_plan"
+                ) as apply, patch(
+                    "ui.douyin_commerce_page.QMessageBox.warning"
+                ):
+                    self.page.return_unfinished_batch_to_edit()
+
+                self.assertEqual(self.page.pages.currentIndex(), 2)
+                apply.assert_not_called()
+
+    def test_revision_close_waits_for_racing_batch_worker_before_collectors(
+        self,
+    ) -> None:
+        """若旧批量 worker 未停就关闭采集资源，该测试必须失败。"""
+
+        events: list[str] = []
+        with patch.object(
+            self.page.runner,
+            "is_running",
+            side_effect=lambda key: key == "douyin_commerce_batch_run",
+        ), patch.object(
+            self.page.runner,
+            "cancel_pending",
+            side_effect=lambda key: events.append(f"cancel:{key}") or False,
+        ), patch.object(
+            self.page.runner,
+            "wait_for_finished",
+            side_effect=lambda key, _timeout: events.append(f"wait:{key}") or True,
+        ), patch.object(
+            self.page,
+            "_close_setup_generation",
+            side_effect=lambda _reason: events.append("close:collector")
+            or {"closed": True, "aliveCollectorCount": 0},
+        ):
+            result = self.page._close_revision_resources()
+
+        self.assertEqual(
+            events,
+            [
+                "cancel:douyin_commerce_batch_run",
+                "wait:douyin_commerce_batch_run",
+                "close:collector",
+            ],
+        )
+        self.assertEqual(
+            result,
+            {
+                "closed": True,
+                "aliveCollectorCount": 0,
+                "aliveSessionCount": 0,
+            },
+        )
+
+    def test_return_to_edit_double_click_enqueues_only_one_close_generation(
+        self,
+    ) -> None:
+        """若双击重复查任务或创建第二个关闭代际，该测试必须失败。"""
+
+        plan = self._load_revision_ui_fixture()
+        runner = self._ControlledLifecycleRunner()
+        self.page.runner = runner
+        self.page.pages.setCurrentIndex(2)
+        self.page._batch_result_task_id = 41
+        self.page._batch_revision_available = True
+        with patch(
+            "ui.douyin_commerce_page.task_service.prepare_douyin_batch_revision",
+            return_value=plan,
+        ) as prepare, patch.object(
+            self.page, "_close_revision_resources"
+        ) as close, patch(
+            "ui.douyin_commerce_page.QMessageBox.warning"
+        ):
+            self.page.return_unfinished_batch_to_edit()
+            self.page.return_unfinished_batch_to_edit()
+
+        prepare.assert_called_once_with(41)
+        close.assert_not_called()
+        self.assertEqual(
+            list(runner.active), ["douyin_commerce_batch_revision"]
+        )
+
+    def test_shutdown_cancels_queued_revision_and_ignores_its_late_callbacks(
+        self,
+    ) -> None:
+        """若退出后排队的返回任务仍能关闭资源或载入草稿，该测试必须失败。"""
+
+        class QueuedPool:
+            def __init__(self) -> None:
+                self.tasks: list[BackgroundTask] = []
+
+            def start(self, task: BackgroundTask) -> None:
+                self.tasks.append(task)
+
+        plan = self._load_revision_ui_fixture()
+        pool = QueuedPool()
+        runner = BackgroundTaskRunner(self.page)
+        runner.pool = pool
+        self.page.runner = runner
+        self.page.pages.setCurrentIndex(2)
+        self.page._batch_result_task_id = 41
+        self.page._batch_revision_available = True
+        with patch(
+            "ui.douyin_commerce_page.task_service.prepare_douyin_batch_revision",
+            return_value=plan,
+        ), patch.object(
+            self.page, "_close_revision_resources"
+        ) as close_revision, patch.object(
+            self.page, "_apply_batch_revision_plan"
+        ) as apply, patch.object(
+            self.page._batch_executor, "request_shutdown", return_value=True
+        ), patch.object(
+            self.page,
+            "_close_setup_generation",
+            return_value={"closed": True, "aliveCollectorCount": 0},
+        ):
+            self.page.return_unfinished_batch_to_edit()
+            queued_revision = pool.tasks[-1]
+
+            shutdown_succeeded = self.page.shutdown()
+            queued_revision.run()
+            self.app.processEvents()
+
+        self.assertTrue(shutdown_succeeded)
+        self.assertFalse(runner.is_running("douyin_commerce_batch_revision"))
+        close_revision.assert_not_called()
+        apply.assert_not_called()
+        self.assertEqual(self.page.pages.currentIndex(), 2)
+
+    def test_stale_revision_close_success_cannot_apply_an_old_plan(self) -> None:
+        """若旧关闭代际迟到后覆盖当前状态，该测试必须失败。"""
+
+        plan = self._load_revision_ui_fixture()
+        self.page._batch_revision_token = 2
+        self.page._batch_result_task_id = 41
+        self.page._session_id = "current-session"
+        with patch.object(
+            self.page, "_cleanup_douyin_verification"
+        ) as cleanup, patch.object(
+            self.page, "_apply_batch_revision_plan"
+        ) as apply:
+            self.page._revision_close_succeeded(
+                1,
+                41,
+                plan,
+                {
+                    "closed": True,
+                    "aliveCollectorCount": 0,
+                    "aliveSessionCount": 0,
+                },
+            )
+
+        cleanup.assert_not_called()
+        apply.assert_not_called()
+        self.assertEqual(self.page._session_id, "current-session")
+
+    def test_revision_confirmation_passes_source_task_into_new_batch(self) -> None:
+        """若再次确认的新任务丢失修订来源关系，该测试必须失败。"""
+
+        payload = {"items": [{"mediaPath": "/tmp/failed.mp4"}]}
+        task = {"id": 99}
+        self.page._batch_revision_source_task_id = 41
+        with patch.object(
+            self.page, "collect_batch_payload", return_value=payload
+        ), patch(
+            "ui.douyin_commerce_page.task_service.create_douyin_batch_task",
+            return_value=task,
+        ) as create, patch.object(
+            self.page, "start_batch_publish"
+        ) as start:
+            self.page.open_batch_submit_confirmation()
+
+        create.assert_called_once_with(
+            payload,
+            mode="oneclick_publish",
+            revision_source_task_id=41,
+        )
+        start.assert_called_once_with(payload, task)
+
+    def test_revision_task_creation_failure_keeps_all_edited_state(self) -> None:
+        """若创建失败清空来源、视频或编辑控件，该测试必须失败。"""
+
+        plan = self._load_revision_ui_fixture()
+        self.page._apply_batch_revision_plan(plan)
+        before_indexes = list(self.page._selected_video_indexes)
+        before_title = self.page.title_input.text()
+        before_source = self.page._batch_revision_source_task_id
+        payload = {"items": [{"mediaPath": "/tmp/failed.mp4"}]}
+        unexpected: BaseException | None = None
+        with patch.object(
+            self.page, "collect_batch_payload", return_value=payload
+        ), patch(
+            "ui.douyin_commerce_page.task_service.create_douyin_batch_task",
+            side_effect=RuntimeError("Cookie=private 验证码123456"),
+        ), patch.object(
+            self.page, "start_batch_publish"
+        ) as start, patch(
+            "ui.douyin_commerce_page.QMessageBox.warning"
+        ) as warning:
+            try:
+                self.page.open_batch_submit_confirmation()
+            except BaseException as exc:
+                unexpected = exc
+
+        self.assertIsNone(unexpected)
+        self.assertEqual(self.page._batch_revision_source_task_id, before_source)
+        self.assertEqual(self.page._selected_video_indexes, before_indexes)
+        self.assertEqual(self.page.title_input.text(), before_title)
+        start.assert_not_called()
+        warning.assert_called_once_with(
+            self.page,
+            "确认批量提交",
+            "新批量任务未能创建，当前修改内容已保留，请重试",
+        )
+        self.assertNotIn("private", str(warning.call_args))
+        self.assertNotIn("123456", str(warning.call_args))
+
     def test_revision_plan_restores_only_unfinished_items_and_all_editable_fields(
         self,
     ) -> None:
@@ -9462,11 +9838,15 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             self.page._batch_revision_source_task_id = 41
             self.page._batch_revision_source_task_no = "T08122117-665B"
             self.page._batch_revision_blocked_media_keys = {"media:1"}
+            self.page._batch_result_task_id = 41
+            self.page._batch_revision_available = True
 
         def assert_revision_state_cleared() -> None:
             self.assertIsNone(self.page._batch_revision_source_task_id)
             self.assertEqual(self.page._batch_revision_source_task_no, "")
             self.assertEqual(self.page._batch_revision_blocked_media_keys, set())
+            self.assertIsNone(self.page._batch_result_task_id)
+            self.assertFalse(self.page._batch_revision_available)
 
         set_revision_state()
         with patch.object(self.page, "_abandon_session"):

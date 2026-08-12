@@ -95,6 +95,7 @@ _VIDEO_PICKER_MAX_WIDTH = 440
 _VIDEO_PICKER_MAX_HEIGHT = 480
 _VIDEO_PICKER_ROW_HEIGHT = 68
 _BATCH_RUN_KEY = "douyin_commerce_batch_run"
+_BATCH_REVISION_TASK_KEY = "douyin_commerce_batch_revision"
 _BATCH_SHARED_LOCATION_SEARCH_KEY = "__shared_location_search__"
 
 COLLECTOR_ERROR_COPY = {
@@ -456,6 +457,12 @@ class DouyinCommercePage(QWidget):
     _REVISION_RESTORE_FAILED_MESSAGE = (
         "未完成视频无法恢复到编辑页，请刷新本机素材后重试。"
     )
+    _REVISION_CLOSE_FAILED_MESSAGE = (
+        "返回修改前的临时会话未能完全关闭，请重试"
+    )
+    _REVISION_STATE_CHANGED_MESSAGE = (
+        "原任务状态已变化，请刷新任务明细后重试"
+    )
     _SHUTDOWN_WAIT_SECONDS = 5.0
     _DEFAULT_CONTENT_DECLARATION = "无需添加自主声明"
     _DISABLED_CONTENT_DECLARATIONS = frozenset({"内容为转载信息"})
@@ -575,12 +582,15 @@ class DouyinCommercePage(QWidget):
         # 批量任务和旧的单条任务必须分开保存；验证轮询会优先使用仍在运行的
         # 批量任务号，确保原生短信/二维码对话框与当前视频保持同一会话。
         self._batch_task_id: int | None = None
+        self._batch_result_task_id: int | None = None
+        self._batch_revision_available = False
         self._batch_preflight_fingerprint = ""
         self._batch_progress_text = ""
         self._batch_result_feedback = ""
         self._batch_revision_source_task_id: int | None = None
         self._batch_revision_source_task_no = ""
         self._batch_revision_blocked_media_keys: set[str] = set()
+        self._batch_revision_token = 0
         # 批次结果仍需留在当前页面供复制；只有用户真正进入下一批平台设置时
         # 才清空共享执行日志，避免多批记录混在一起。
         self._clear_runtime_log_on_next_task = False
@@ -3993,10 +4003,12 @@ class DouyinCommercePage(QWidget):
             self._set_widget_property(self.step_cards[index], "stepState", state)
         self.progress_context_label.setText(self._STEP_HINTS[current_step])
         if hasattr(self, "review_back_button"):
-            has_editor_session = bool(self._session_id or self._setup_generation_id)
-            self.review_back_button.setText(
-                "返回平台设置" if has_editor_session else "开始新内容"
-            )
+            if self._batch_revision_available and not self._busy():
+                self.review_back_button.setText("返回修改未完成视频")
+            elif self._session_id or self._setup_generation_id:
+                self.review_back_button.setText("返回平台设置")
+            else:
+                self.review_back_button.setText("开始新内容")
             self.review_back_button.setEnabled(not self._busy())
         if hasattr(self, "pause_batch_button"):
             batch_running = bool(self._batch_task_id) and self.runner.is_running(
@@ -4404,6 +4416,7 @@ class DouyinCommercePage(QWidget):
                 "douyin_commerce_preflight",
                 "douyin_commerce_submit",
                 _BATCH_RUN_KEY,
+                _BATCH_REVISION_TASK_KEY,
             )
         )
 
@@ -4877,6 +4890,8 @@ class DouyinCommercePage(QWidget):
             return
         task = task_service.create_douyin_batch_task(payload, mode="oneclick_preflight")
         self._batch_task_id = int(task["id"])
+        self._batch_result_task_id = self._batch_task_id
+        self._batch_revision_available = False
         task_id = self._batch_task_id
         self._batch_pause_requested = False
         self._batch_editor_session_ended = False
@@ -4973,9 +4988,28 @@ class DouyinCommercePage(QWidget):
     def _batch_operation_finished(self) -> None:
         """批量提交结束后收束验证内存与原生对话框。"""
 
+        task_id = self._batch_task_id
         self._cleanup_douyin_verification()
         self._batch_task_id = None
         self._batch_pause_requested = False
+        self._batch_revision_available = False
+        if type(task_id) is int and task_id > 0:
+            self._batch_result_task_id = task_id
+            try:
+                plan = task_service.prepare_douyin_batch_revision(task_id)
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                plan = None
+            source_task_id = (
+                plan.get("sourceTaskId") if isinstance(plan, Mapping) else None
+            )
+            self._batch_revision_available = bool(
+                isinstance(plan, Mapping)
+                and plan.get("revisionAllowed") is True
+                and type(source_task_id) is int
+                and source_task_id == task_id
+            )
         self._sync_view()
 
     @staticmethod
@@ -4991,7 +5025,21 @@ class DouyinCommercePage(QWidget):
         except Exception as exc:
             QMessageBox.warning(self, "确认批量提交", str(exc))
             return
-        task = task_service.create_douyin_batch_task(payload, mode="oneclick_publish")
+        try:
+            task = task_service.create_douyin_batch_task(
+                payload,
+                mode="oneclick_publish",
+                revision_source_task_id=self._batch_revision_source_task_id,
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            QMessageBox.warning(
+                self,
+                "确认批量提交",
+                "新批量任务未能创建，当前修改内容已保留，请重试",
+            )
+            return
         self.start_batch_publish(payload, task)
 
     def open_batch_resume(self, task_id: int) -> None:
@@ -5042,6 +5090,8 @@ class DouyinCommercePage(QWidget):
             return
 
         self._batch_task_id = int(task["id"])
+        self._batch_result_task_id = self._batch_task_id
+        self._batch_revision_available = False
         task_id = self._batch_task_id
         self._batch_pause_requested = False
         self._batch_preflight_fingerprint = ""
@@ -7105,10 +7155,186 @@ class DouyinCommercePage(QWidget):
     def return_from_review(self) -> None:
         """从检查页安全返回；会话结束后改为开启下一条内容准备。"""
 
+        if self._batch_revision_available:
+            self.return_unfinished_batch_to_edit()
+            return
         if self._session_id:
             self._go_to_step(1)
             return
         self.start_new_content()
+
+    def return_unfinished_batch_to_edit(self) -> None:
+        """重新核验来源任务，严格关闭临时资源后载入本地修改批次。"""
+
+        task_id = self._batch_result_task_id
+        if self._busy() or type(task_id) is not int or task_id <= 0:
+            return
+        try:
+            plan = task_service.prepare_douyin_batch_revision(task_id)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            self._batch_revision_available = False
+            self._show_revision_return_error(self._REVISION_STATE_CHANGED_MESSAGE)
+            return
+        source_task_id = (
+            plan.get("sourceTaskId") if isinstance(plan, Mapping) else None
+        )
+        if (
+            not isinstance(plan, Mapping)
+            or plan.get("revisionAllowed") is not True
+            or type(source_task_id) is not int
+            or source_task_id != task_id
+        ):
+            self._batch_revision_available = False
+            self._show_revision_return_error(self._REVISION_STATE_CHANGED_MESSAGE)
+            return
+
+        self._batch_revision_token += 1
+        token = self._batch_revision_token
+        started = self.runner.run(
+            _BATCH_REVISION_TASK_KEY,
+            with_progress=lambda _report: self._close_revision_resources(),
+            on_success=lambda result: self._revision_close_succeeded(
+                token, task_id, plan, result
+            ),
+            on_error=lambda _message: self._revision_close_failed(token),
+            on_finished=self._sync_view,
+        )
+        if not started:
+            self._revision_close_failed(token)
+        self._sync_view()
+
+    def _close_revision_resources(self) -> dict[str, object]:
+        """在 worker 内关闭采集代际和正式会话，并只返回脱敏屏障状态。"""
+
+        if self._shutdown_requested.is_set():
+            return {
+                "closed": False,
+                "aliveCollectorCount": 1,
+                "aliveSessionCount": 1,
+            }
+        for runner_key in (
+            _BATCH_RUN_KEY,
+            self._SETUP_GENERATION_TASK_KEY,
+            self._SETUP_GENERATION_CLOSE_TASK_KEY,
+        ):
+            if not self._stop_runner_task_for_revision(runner_key):
+                return {
+                    "closed": False,
+                    "aliveCollectorCount": 1,
+                    "aliveSessionCount": 1,
+                }
+        collector = self._close_setup_generation("return_to_edit")
+        if not self._collector_close_is_complete(collector):
+            return {
+                "closed": False,
+                "aliveCollectorCount": 1,
+                "aliveSessionCount": 0,
+            }
+        session_id = self._session_id
+        if session_id:
+            try:
+                session = (
+                    douyin_commerce_session.commerce_session_manager.close_strict(
+                        session_id
+                    )
+                )
+                status = douyin_commerce_session.commerce_session_manager.status()
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                return {
+                    "closed": False,
+                    "aliveCollectorCount": 0,
+                    "aliveSessionCount": 1,
+                }
+            alive_sessions = (
+                session.get("aliveSessionCount")
+                if isinstance(session, Mapping)
+                else None
+            )
+            if (
+                not isinstance(session, Mapping)
+                or session.get("closed") is not True
+                or type(alive_sessions) is not int
+                or alive_sessions != 0
+                or not isinstance(status, Mapping)
+                or _normalized(status.get("active")).casefold() != "false"
+            ):
+                return {
+                    "closed": False,
+                    "aliveCollectorCount": 0,
+                    "aliveSessionCount": 1,
+                }
+        return {
+            "closed": True,
+            "aliveCollectorCount": 0,
+            "aliveSessionCount": 0,
+        }
+
+    def _stop_runner_task_for_revision(self, key: str) -> bool:
+        """消除点击后才显现的旧 worker 竞态；等待有界且失败关闭。"""
+
+        if not self.runner.is_running(key):
+            return True
+        cancel_pending = getattr(self.runner, "cancel_pending", None)
+        if callable(cancel_pending) and cancel_pending(key):
+            return True
+        wait_for_finished = getattr(self.runner, "wait_for_finished", None)
+        return bool(
+            callable(wait_for_finished)
+            and wait_for_finished(key, self._SHUTDOWN_WAIT_SECONDS)
+        )
+
+    @staticmethod
+    def _revision_close_is_complete(result: object) -> bool:
+        if not isinstance(result, Mapping) or result.get("closed") is not True:
+            return False
+        alive_collectors = result.get("aliveCollectorCount")
+        alive_sessions = result.get("aliveSessionCount")
+        return (
+            type(alive_collectors) is int
+            and alive_collectors == 0
+            and type(alive_sessions) is int
+            and alive_sessions == 0
+        )
+
+    def _revision_close_succeeded(
+        self,
+        token: int,
+        task_id: int,
+        plan: Mapping[str, object],
+        result: object,
+    ) -> None:
+        if (
+            token != self._batch_revision_token
+            or self._shutdown_requested.is_set()
+            or self._batch_result_task_id != task_id
+        ):
+            return
+        if not self._revision_close_is_complete(result):
+            self._revision_close_failed(token)
+            return
+        self._cleanup_douyin_verification()
+        self._session_id = ""
+        self._batch_revision_available = False
+        self._apply_batch_revision_plan(plan)
+
+    def _revision_close_failed(self, token: int) -> None:
+        if token != self._batch_revision_token or self._shutdown_requested.is_set():
+            return
+        self._show_revision_return_error(self._REVISION_CLOSE_FAILED_MESSAGE)
+
+    def _show_revision_return_error(self, message: str) -> None:
+        self._batch_result_feedback = message
+        self.validation_label.setText(message)
+        QMessageBox.warning(
+            self,
+            "返回修改未完成视频",
+            message,
+        )
+        self._sync_view()
 
     def start_new_content(self) -> None:
         """结束临时会话并回到内容准备，不删除本机已保存内容。"""
@@ -7149,7 +7375,10 @@ class DouyinCommercePage(QWidget):
 
         self._reset_platform_collector_progress()
         self._shutdown_requested.set()
+        self._batch_revision_token += 1
         self._batch_executor.request_shutdown(source="client_shutdown")
+        if not self._stop_runner_task_for_revision(_BATCH_REVISION_TASK_KEY):
+            return False
         batch_finished = True
         if self.runner.is_running(_BATCH_RUN_KEY):
             cancel_pending = getattr(self.runner, "cancel_pending", None)
@@ -7341,6 +7570,9 @@ class DouyinCommercePage(QWidget):
     def _clear_batch_revision_state(self) -> None:
         """只在用户放弃、完成或明确开始新批次时结束修订关系。"""
 
+        self._batch_revision_token += 1
+        self._batch_result_task_id = None
+        self._batch_revision_available = False
         self._batch_revision_source_task_id = None
         self._batch_revision_source_task_no = ""
         self._batch_revision_blocked_media_keys = set()
