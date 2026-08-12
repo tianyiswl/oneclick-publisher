@@ -274,6 +274,77 @@ class DouyinCommerceBatchTaskTests(unittest.TestCase):
                 ]
             )
 
+    def test_prepare_revision_rejects_success_item_without_stable_media_key(self) -> None:
+        """若成功项没有稳定媒体键仍放行修订，该测试必须失败。"""
+
+        source = self._create_paused_douyin_batch_source()
+        self._set_revision_source_states(
+            source["id"],
+            ["success", "failed", "pending"],
+            task_status="paused",
+            pause_reason=task_service.PAUSE_REASON_USER_REQUEST,
+        )
+        with database.connect() as conn:
+            row = conn.execute(
+                "SELECT payloadJson FROM publish_tasks WHERE id = ?",
+                (source["id"],),
+            ).fetchone()
+            payloads = json.loads(row["payloadJson"])
+            payloads[0].pop("mediaId", None)
+            payloads[0]["fileList"] = []
+            conn.execute(
+                "UPDATE publish_tasks SET payloadJson = ? WHERE id = ?",
+                (json.dumps(payloads, ensure_ascii=False), source["id"]),
+            )
+            conn.commit()
+
+        plan = task_service.prepare_douyin_batch_revision(source["id"])
+
+        self.assertFalse(plan["revisionAllowed"])
+        self.assertEqual(plan["blockedReason"], "来源任务的成功视频身份无法确认")
+        self.assertEqual(plan["successfulMediaKeys"], [])
+        self.assertNotIn("draft", plan)
+
+    def test_prepare_revision_maps_media_key_error_to_fixed_rejection(self) -> None:
+        """若媒体键构造异常或原文逃出脱敏边界，该测试必须失败。"""
+
+        source = self._create_paused_douyin_batch_source()
+        self._set_revision_source_states(
+            source["id"],
+            ["success", "failed", "pending"],
+            task_status="paused",
+            pause_reason=task_service.PAUSE_REASON_USER_REQUEST,
+        )
+        with database.connect() as conn:
+            row = conn.execute(
+                "SELECT payloadJson FROM publish_tasks WHERE id = ?",
+                (source["id"],),
+            ).fetchone()
+            payloads = json.loads(row["payloadJson"])
+            payloads[0].pop("mediaId", None)
+            conn.execute(
+                "UPDATE publish_tasks SET payloadJson = ? WHERE id = ?",
+                (json.dumps(payloads, ensure_ascii=False), source["id"]),
+            )
+            conn.commit()
+
+        try:
+            with patch(
+                "app_core.task_service.Path.resolve",
+                side_effect=ValueError("sensitive-media-key-error"),
+            ):
+                plan = task_service.prepare_douyin_batch_revision(source["id"])
+        except Exception as exc:
+            self.fail(f"媒体键异常逃出公开边界：{type(exc).__name__}")
+
+        self.assertFalse(plan["revisionAllowed"])
+        self.assertEqual(plan["blockedReason"], "来源任务的成功视频身份无法确认")
+        self.assertNotIn(
+            "sensitive-media-key-error",
+            json.dumps(plan, ensure_ascii=False),
+        )
+        self.assertNotIn("draft", plan)
+
     def test_revision_child_records_source_without_mutating_it(self) -> None:
         """若子任务丢失修订来源或创建时改写来源，该测试必须失败。"""
 

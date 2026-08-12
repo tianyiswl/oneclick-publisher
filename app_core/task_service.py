@@ -728,8 +728,17 @@ def prepare_douyin_batch_revision(task_id: int) -> dict[str, object]:
     successful_media_keys: list[str] = []
     for item, payload in zip(items, payloads):
         if item.get("status") == "success":
-            media_key = _batch_media_key(payload)
-            if media_key and media_key not in successful_media_keys:
+            try:
+                media_key = _batch_media_key(payload)
+            except (OSError, RuntimeError, ValueError):
+                return _revision_blocked(
+                    int(task_id), "来源任务的成功视频身份无法确认", source
+                )
+            if not media_key:
+                return _revision_blocked(
+                    int(task_id), "来源任务的成功视频身份无法确认", source
+                )
+            if media_key not in successful_media_keys:
                 successful_media_keys.append(media_key)
 
     revision_payloads = [payload for _, _, payload in revision_snapshots]
