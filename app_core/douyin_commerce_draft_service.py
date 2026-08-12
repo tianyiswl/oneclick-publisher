@@ -14,6 +14,7 @@ import json
 from typing import Any, Mapping
 
 from . import database
+from .media_path import normalize_media_path
 
 
 class DouyinCommerceContentDraftError(ValueError):
@@ -54,7 +55,7 @@ def normalize_content_draft(payload: Mapping[str, Any]) -> dict[str, Any]:
         "accountId": _integer(payload.get("accountId")),
         "accountFile": _text(payload.get("accountFile")),
         "mediaId": _integer(payload.get("mediaId")),
-        "mediaPath": _text(payload.get("mediaPath")),
+        "mediaPath": normalize_media_path(payload.get("mediaPath")),
         "title": _text(payload.get("title")),
         "description": str(payload.get("description") or "").strip(),
         "tags": _tags(payload.get("tags")),

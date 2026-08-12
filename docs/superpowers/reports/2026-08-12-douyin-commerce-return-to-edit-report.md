@@ -10,7 +10,7 @@ Task 1–5 验收节点：`33cd9185f8ae86b7e947111bba1262c20dac0a15`
 
 ## 结论
 
-Task 1–5 的首轮实现及 Task 6 各轮旧结果 `177/947`、`181/951`、`198/962`、`201/965` 均已因后续生产代码修改降级为历史证据，不能支持最终结论。整分支终审 Fix round 1 先修复 4 个 Important，追加 scoped 审查又发现并修复 2 个 Important：绑定条目确认前变为成功的重复发布竞态，以及 `batch_item_indexes` 宽松类型转换。最终复审追加指出并修复旧 schema v3 草稿会折叠真实 `mediaPath` 内部连续空格的 Important。最终相关组合 `203/203 OK`，最终完整回归 `967/967 OK`，退出码均为 `0`。变更 Python 文件 `py_compile`、`git diff --check`、敏感／占位扫描、变更路径扫描以及返回修改默认零平台动作 AST 检查均通过。
+Task 1–5 的首轮实现及 Task 6 各轮旧结果 `177/947`、`181/951`、`198/962`、`201/965`、`203/967`、`262/969`、`263/970` 均已因后续生产代码修改降级为历史证据，不能支持最终结论。Fix round 2 修复两个 Important：Qt `refresh()` 重排素材后按旧数值位置选入成功媒体并使来源绑定漂移；双空格真实路径在草稿恢复后又被 UI、批量契约或单视频 `fileList` 校验折叠。最终静态路径审计再封住上传身份仍以通用文本规则折叠 `fileList` 的遗漏。最终相关组合 `366/366 OK`，最终完整回归 `971/971 OK`，退出码均为 `0`。变更 Python 文件 `py_compile`、`git diff --check`、敏感／占位扫描、变更路径扫描、通用文本规范化路径残留扫描以及返回修改默认零平台动作 AST 检查均通过。
 
 本结论只证明本地 Python 逻辑、临时 SQLite、离线替身和 Qt offscreen 界面契约。验收期间没有启动真实客户端或浏览器，没有读取真实账号，没有上传、预检、保存平台草稿、提交或发布。真实抖音 DOM、账号状态和平台回执仍为**未验证**，不能表述为真实平台通过。
 
@@ -182,6 +182,41 @@ QT_QPA_PLATFORM=offscreen /Users/andy/Documents/Codex/2026-07-28/new-chat/output
 
 结果：`Ran 967 tests in 34.427s`，`OK`，退出码 `0`。这是最后一次生产修复后唯一份新 full discover。
 
+### Fix round 2 RED／GREEN
+
+1. Qt refresh 稳定身份：RED 时修订选择的失败／待处理媒体 ID `[2, 3]` 在素材重排后变成 `[3, 1]`，明确选入成功媒体 `1`；原媒体消失时也错误保留 1 条选择。GREEN 后 refresh 前快照稳定媒体键与来源序号，重建后只接受唯一键匹配并重新运行成功媒体 blocked guard。缺失、歧义、禁选或绑定不一致时清空选择和当前修订序号，显示固定恢复失败。两个 Qt 单项 `2/2 GREEN`。
+2. 真实路径端到端：RED 时 schema v3 `legacy  final.mp4` 虽能从 SQLite 恢复到 Qt，`collect_upload_payload()` 立即因 `fileList` 被折叠而报“需要且只允许一条可读取的视频素材”。GREEN 后共享 `normalize_media_path()` 只处理首尾空白，并贯穿草稿、UI 路径键、批量契约、单视频 `fileList`、会话身份与本地显示。真实测试覆盖 normalize/save/load → Qt restore → upload/batch collect → resave/load。随后静态路径审计又发现单视频恢复会把 `/tmp/a b.mp4` 与 `/tmp/a  b.mp4` 当作同一路径；冲突测试 RED 明确错选 ID `1`，GREEN 后精确选中双空格 ID `2`。
+
+首次相关命令误包含不存在的 `test_douyin_commerce_session` 模块，在测试发现阶段以 `ModuleNotFoundError` 停止；该命令不计作产品失败或通过证据。会话测试实际在 `test_douyin_commerce_service.py` 内，修正命令后相关组合为 `262/262 OK`。最后单视频路径冲突生产修复使这组及其后 `969/969` full 降级为历史证据。
+
+### Fix round 2 最终相关组合
+
+结果：`Ran 263 tests in 8.201s`，`OK`，退出码 `0`。
+
+### Fix round 2 最终完整回归
+
+```bash
+QT_QPA_PLATFORM=offscreen /Users/andy/Documents/Codex/2026-07-28/new-chat/outputs/一键发桌面UI基座/.venv/bin/python -m unittest discover -v
+```
+
+结果：`Ran 970 tests in 35.285s`，`OK`，退出码 `0`。随后静态路径审计发现上传身份仍以通用文本规则处理 `fileList` 并修改生产代码，因此 `263/970` 已降级为历史证据。
+
+### Fix round 2 最终漏扫项 RED／GREEN
+
+`_upload_identity()` 仍对 `fileList[0]` 使用通用 `_normalized()`，会把 `/tmp/a b.mp4` 与 `/tmp/a  b.mp4` 归并为同一上传身份，存在错误复用旧编辑会话的风险。新增单项先精确 RED：两个身份元组错误相等；最小 GREEN 后文件路径改用共享 `normalize_media_path()`，只去除首尾空白、保留内部连续空格，并明确与共享路径规范化结果一致。单项 `1/1 GREEN`。
+
+### Fix round 2 新最终相关组合
+
+相关组合覆盖批草稿、批契约、单草稿、批执行器、任务服务、普通带货 UI、批量 UI 与任务展示。结果：`Ran 366 tests in 9.792s`，`OK`，退出码 `0`。
+
+### Fix round 2 新最终完整回归
+
+```bash
+QT_QPA_PLATFORM=offscreen /Users/andy/Documents/Codex/2026-07-28/new-chat/outputs/一键发桌面UI基座/.venv/bin/python -m unittest discover -v
+```
+
+结果：`Ran 971 tests in 36.934s`，`OK`，退出码 `0`。这是上传身份生产修复后的唯一份最终 full discover；验收不再重复全量。
+
 ## 核心不变量证据
 
 - 原任务不可变：`test_prepare_revision_keeps_only_failed_and_pending_items` 在规划前后逐字段比较来源任务；`test_revision_child_records_source_without_mutating_it` 在创建修订子任务前后再次比较来源任务。二者均进入相关组合与完整回归并通过。
@@ -192,9 +227,9 @@ QT_QPA_PLATFORM=offscreen /Users/andy/Documents/Codex/2026-07-28/new-chat/output
 
 ## 静态、差异与安全门禁
 
-- `py_compile`：最终变更的 2 个生产文件与 2 个测试文件通过，退出码 `0`。
-- `git diff --check`：工作树通过，无输出；`git diff 3cab2f0 --check` 同样通过。
-- 工作树：写报告前 `git status --short` 为空。
+- `py_compile`：最终变更的 8 个生产 Python 文件与 1 个测试文件通过，退出码 `0`。
+- `git diff --check`：工作树通过，无输出；`git diff 3df684b --check` 同样通过。
+- 工作树：提交前仅包含本功能生产、测试与报告差异。
 - 实施范围路径：无账号状态、数据库／SQLite、媒体、日志、`.env`、`.superpowers/brainstorm/` 或 `outputs/` 文件。
 - 新增生产差异：`TODO`／`FIXME`／`NotImplemented`、空 `pass`／省略号占位均为 `0`。
 - 高置信凭据扫描：AWS access key、私钥头、Bearer 凭据均为 `0`。
@@ -209,6 +244,8 @@ QT_QPA_PLATFORM=offscreen /Users/andy/Documents/Codex/2026-07-28/new-chat/output
 修复后的 scoped 只读复审：`0 Critical / 0 Important / 1 Minor`，`Ready to merge: Yes`。该结论发生在 Fix round 1 之前，因后续生产代码改动降级为历史审查证据。
 
 Fix round 1 首次 scoped 复审：`0 Critical / 2 Important / 0 Minor`，两项为已成功绑定序号可重复进入修订任务，以及序号宽松类型转换。修复后回看又发现 `0 Critical / 1 Important / 0 Minor`：旧 schema v3 真实路径内部空格被折叠。最终 scoped 复审：`0 Critical / 0 Important / 0 Minor`，`Ready to merge: Yes`。
+
+Fix round 2 首次 scoped 复审：`0 Critical / 0 Important / 0 Minor`，`Ready to merge: Yes`；该结论早于最后一行上传身份生产修复，故降级为历史审查证据。最终一行生产修复将在提交后接受只读 scoped 复审，只有 `0 Critical / 0 Important` 时才放行。
 
 ## 证据边界与残余风险
 

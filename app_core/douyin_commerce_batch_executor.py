@@ -25,6 +25,7 @@ from .douyin_commerce_batch_service import (
     item_publish_payload,
     validate_batch_payload,
 )
+from .media_path import normalize_media_path
 from .douyin_commerce_session import commerce_session_manager
 from .douyin_location_preset_service import (
     DouyinLocationPresetError,
@@ -91,7 +92,7 @@ def _text(value: object) -> str:
 
 
 def _safe_item_label(item: Mapping[str, Any], index: int) -> str:
-    name = Path(_text(item.get("mediaPath"))).name
+    name = Path(normalize_media_path(item.get("mediaPath"))).name
     return name or f"第 {index + 1} 条视频"
 
 

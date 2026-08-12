@@ -29,6 +29,7 @@ from .douyin_location_service import (
     normalize_location_keyword,
 )
 from .douyin_music_service import FAVORITE_MANUAL_MUSIC_MODE, normalize_music_readback
+from .media_path import normalize_media_path
 
 
 BATCH_WORKFLOW = "douyin-commerce-batch"
@@ -173,7 +174,7 @@ def _items(value: object) -> list[dict[str, Any]]:
     for index, raw in enumerate(value, start=1):
         if not isinstance(raw, Mapping):
             raise DouyinCommerceBatchError(f"第 {index} 条视频格式无效")
-        media_path = _text(raw.get("mediaPath"))
+        media_path = normalize_media_path(raw.get("mediaPath"))
         if not media_path or not Path(media_path).is_file():
             raise DouyinCommerceBatchError(f"第 {index} 条视频缺少可读取的本地媒体")
         media_id = raw.get("mediaId")

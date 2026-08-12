@@ -51,6 +51,7 @@ from app_core import (
 from uploader.douyin_uploader.main import DouYinVideo
 from app_core import douyin_verification
 from app_core.douyin_commerce_batch_executor import DouyinCommerceBatchExecutor
+from app_core.media_path import normalize_media_path
 from app_core.douyin_verification import DouyinVerificationBroker, VerificationChallenge
 from ui.background_task import BackgroundTask, BackgroundTaskRunner
 from ui.common import apply_style
@@ -5921,6 +5922,22 @@ class DouyinCommerceUiTests(unittest.TestCase):
         ):
             self.assertEqual(content_change_kind(), "reupload")
 
+    def test_upload_identity_preserves_legal_internal_path_spaces(self) -> None:
+        """上传身份按路径规范化处理，不能把单双空格素材视为同一视频。"""
+
+        single_space = self.page._upload_identity(
+            {"accountList": ["douyin.json"], "fileList": ["/tmp/a b.mp4"]}
+        )
+        double_space = self.page._upload_identity(
+            {"accountList": ["douyin.json"], "fileList": ["  /tmp/a  b.mp4  "]}
+        )
+
+        self.assertNotEqual(single_space, double_space)
+        self.assertEqual(
+            double_space,
+            ("douyin.json", normalize_media_path("  /tmp/a  b.mp4  ")),
+        )
+
     def test_reupload_failure_discards_the_closed_old_editor_session(self) -> None:
         """重新上传失败后，不能继续把已关闭的旧会话当作可用。"""
 
@@ -10083,6 +10100,75 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         )
         self.assertEqual(self.page._batch_revision_item_indexes, [3, 2])
 
+    def test_revision_refresh_reorder_restores_media_identity_and_source_binding(
+        self,
+    ) -> None:
+        """refresh 重排素材后必须恢复原媒体，不得按旧位置选入成功项。"""
+
+        plan = self._load_revision_ui_fixture()
+        self.assertTrue(self.page._apply_batch_revision_plan(plan))
+        account = dict(self.page.account_combo.currentData())
+        media_by_id = {
+            self.page.video_combo.itemData(index)["id"]: dict(
+                self.page.video_combo.itemData(index)
+            )
+            for index in range(1, self.page.video_combo.count())
+        }
+
+        with patch(
+            "ui.douyin_commerce_page.account_service.list_accounts",
+            return_value=[account],
+        ), patch(
+            "ui.douyin_commerce_page.media_service.list_media",
+            return_value=[media_by_id[2], media_by_id[3], media_by_id[1]],
+        ), patch(
+            "ui.douyin_commerce_page.QMessageBox.warning"
+        ) as warning:
+            self.page.refresh()
+
+        selected_ids = [video["id"] for video in self.page._selected_videos()]
+        self.assertEqual(selected_ids, [2, 3])
+        self.assertEqual(self.page._batch_revision_item_indexes, [2, 3])
+        self.assertEqual(self.page.video_combo.currentData()["id"], 2)
+        self.assertNotIn(1, selected_ids)
+        warning.assert_not_called()
+
+    def test_revision_refresh_missing_media_fails_closed_and_clears_selection(
+        self,
+    ) -> None:
+        """refresh 后任一原修订媒体消失时必须清空，不自动错绑其他素材。"""
+
+        plan = self._load_revision_ui_fixture()
+        self.assertTrue(self.page._apply_batch_revision_plan(plan))
+        account = dict(self.page.account_combo.currentData())
+        media_by_id = {
+            self.page.video_combo.itemData(index)["id"]: dict(
+                self.page.video_combo.itemData(index)
+            )
+            for index in range(1, self.page.video_combo.count())
+        }
+
+        with patch(
+            "ui.douyin_commerce_page.account_service.list_accounts",
+            return_value=[account],
+        ), patch(
+            "ui.douyin_commerce_page.media_service.list_media",
+            return_value=[media_by_id[3], media_by_id[1]],
+        ), patch(
+            "ui.douyin_commerce_page.QMessageBox.warning"
+        ) as warning:
+            self.page.refresh()
+
+        self.assertEqual(self.page.selected_video_count(), 0)
+        self.assertEqual(self.page._selected_video_indexes, [])
+        self.assertEqual(self.page._batch_revision_item_indexes, [])
+        self.assertEqual(self.page.video_combo.currentIndex(), 0)
+        warning.assert_called_once_with(
+            self.page,
+            "恢复未完成视频",
+            self.page._REVISION_RESTORE_FAILED_MESSAGE,
+        )
+
     def test_revision_video_menu_replaces_current_video_without_dropping_others(
         self,
     ) -> None:
@@ -13717,14 +13803,39 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             "schemaVersion": 3,
             "accountId": 72,
             "accountFile": "douyin-72.json",
-            "shared": {"title": "旧草稿", "description": "待恢复视频", "tags": []},
+            "shared": {
+                "title": "旧草稿",
+                "description": "待恢复视频",
+                "tags": [],
+                "selectedMusic": {
+                    "musicId": "music-1",
+                    "title": "测试音乐",
+                    "creator": "测试",
+                    "duration": "00:30",
+                    "source": "douyin-favorite-visible",
+                },
+                "contentDeclaration": "无需添加自主声明",
+            },
             "publishMode": "immediate",
             "schedule": {
                 "timezone": "Asia/Shanghai",
                 "startTime": "",
                 "intervalMinutes": 0,
             },
-            "items": [{"mediaId": None, "mediaPath": video_path}],
+            "items": [
+                {
+                    "mediaId": None,
+                    "mediaPath": video_path,
+                    "locationPreset": {
+                        "poiId": "poi-1",
+                        "name": "测试地点",
+                        "address": "北京市朝阳区测试路1号",
+                        "scope": "domestic",
+                        "commissionFilter": "all",
+                        "observedCommissionType": "unknown",
+                    },
+                }
+            ],
         }
         account = {
             "id": 72,
@@ -13758,9 +13869,39 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
                 self.page.refresh()
             self.page.restore_batch_content()
 
+            upload_payload = self.page.collect_upload_payload()
+            batch_payload = self.page.collect_batch_payload()
+            resaved = douyin_commerce_batch_draft_service.save_batch_draft(
+                self.page._batch_draft_payload()
+            )
+            reloaded = douyin_commerce_batch_draft_service.load_batch_draft()
+
         self.assertEqual(self.page.selected_video_count(), 1)
         self.assertEqual([video["id"] for video in self.page._selected_videos()], [87])
         self.assertEqual(self.page.video_combo.currentData()["id"], 87)
+        self.assertEqual(upload_payload["fileList"], [video_path])
+        self.assertEqual(batch_payload["items"][0]["mediaPath"], video_path)
+        self.assertEqual(resaved["payload"]["items"][0]["mediaPath"], video_path)
+        self.assertEqual(reloaded["payload"]["items"][0]["mediaPath"], video_path)
+
+    def test_saved_video_restore_distinguishes_single_and_double_space_paths(
+        self,
+    ) -> None:
+        """单空格和双空格是两个真实路径，草稿恢复不得错选首个。"""
+
+        combo = QComboBox()
+        combo.addItem("请选择", None)
+        combo.addItem("单空格", {"id": 1, "storedPath": "/tmp/a b.mp4"})
+        combo.addItem("双空格", {"id": 2, "storedPath": "/tmp/a  b.mp4"})
+
+        restored = self.page._restore_saved_combo(
+            combo,
+            identity=None,
+            path="/tmp/a  b.mp4",
+        )
+
+        self.assertTrue(restored)
+        self.assertEqual(combo.currentData()["id"], 2)
 
     def test_batch_music_reads_current_account_cache_without_opening_session(self) -> None:
         account = {"id": 73, "type": 3, "status": 1, "filePath": "douyin-73.json", "profileName": "主体", "userName": "账号"}

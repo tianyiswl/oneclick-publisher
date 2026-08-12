@@ -78,6 +78,7 @@ from app_core.douyin_commerce_location_commission import (
     normalize_observed_commission_type,
 )
 from app_core.douyin_verification import verification_broker
+from app_core.media_path import normalize_media_path
 from app_core.paths import AVATAR_DIR
 
 from .background_task import BackgroundTaskRunner
@@ -1539,7 +1540,7 @@ class DouyinCommercePage(QWidget):
         videos = self._selected_videos()
         if not 0 <= int(index) < len(videos):
             return ""
-        path = _normalized(videos[int(index)].get("storedPath"))
+        path = normalize_media_path(videos[int(index)].get("storedPath"))
         override = _normalized(self._batch_schedule_overrides.get(path))
         if override:
             return override[-5:]
@@ -1564,7 +1565,9 @@ class DouyinCommercePage(QWidget):
             datetime.strptime(raw, "%Y-%m-%d %H:%M")
         except ValueError as exc:
             raise ValueError("覆盖时间必须为 YYYY-MM-DD HH:MM") from exc
-        self._batch_schedule_overrides[_normalized(videos[int(index)].get("storedPath"))] = raw
+        self._batch_schedule_overrides[
+            normalize_media_path(videos[int(index)].get("storedPath"))
+        ] = raw
         self._batch_preflight_fingerprint = ""
         self._render_batch_item_rows()
 
@@ -1953,10 +1956,11 @@ class DouyinCommercePage(QWidget):
         """按候选顺序填充未选择地点的视频，已有设置始终保持不变。"""
 
         pending_paths = [
-            _normalized(video.get("storedPath"))
+            normalize_media_path(video.get("storedPath"))
             for video in self._selected_videos()
-            if _normalized(video.get("storedPath"))
-            and _normalized(video.get("storedPath")) not in self._batch_locations
+            if normalize_media_path(video.get("storedPath"))
+            and normalize_media_path(video.get("storedPath"))
+            not in self._batch_locations
         ]
         filled = 0
         selected_filter = normalize_commission_filter(
@@ -1980,10 +1984,24 @@ class DouyinCommercePage(QWidget):
         videos = self._selected_videos()
         video_rows = tuple(
             (
-                _normalized(video.get("storedPath")),
+                normalize_media_path(video.get("storedPath")),
                 _normalized(video.get("filename")),
-                _normalized((self._batch_locations.get(_normalized(video.get("storedPath"))) or {}).get("poiId")),
-                _normalized((self._batch_locations.get(_normalized(video.get("storedPath"))) or {}).get("address")),
+                _normalized(
+                    (
+                        self._batch_locations.get(
+                            normalize_media_path(video.get("storedPath"))
+                        )
+                        or {}
+                    ).get("poiId")
+                ),
+                _normalized(
+                    (
+                        self._batch_locations.get(
+                            normalize_media_path(video.get("storedPath"))
+                        )
+                        or {}
+                    ).get("address")
+                ),
             )
             for video in videos
         )
@@ -2053,7 +2071,7 @@ class DouyinCommercePage(QWidget):
         self._sync_batch_location_controls()
         missing_location = 0
         for index, video in enumerate(videos):
-            path = _normalized(video.get("storedPath"))
+            path = normalize_media_path(video.get("storedPath"))
             row = QFrame()
             row.setObjectName("douyinCommerceBatchItemRow")
             row.setFixedHeight(35)
@@ -2610,6 +2628,7 @@ class DouyinCommercePage(QWidget):
 
         previous_account = self._account_key(self._selected_account())
         previous_video = self._video_key(self._selected_video())
+        selected_video_snapshot = self._selected_video_refresh_snapshot()
         self.account_combo.blockSignals(True)
         self.account_combo.clear()
         self.account_combo.addItem("请选择已登录的抖音账号", None)
@@ -2642,7 +2661,8 @@ class DouyinCommercePage(QWidget):
             self.video_combo.addItem(str(media.get("filename") or Path(stored_path).name), dict(media))
         self._restore_combo_data(self.video_combo, previous_video, self._video_key)
         self.video_combo.blockSignals(False)
-        self._refresh_batch_video_list()
+        self._refresh_batch_video_list(previous_media_keys=set())
+        self._restore_video_selection_after_refresh(selected_video_snapshot)
         self._refresh_saved_content_status()
         self._refresh_batch_saved_content_status()
         self._load_tag_history()
@@ -2665,7 +2685,11 @@ class DouyinCommercePage(QWidget):
 
     @staticmethod
     def _video_key(media: object) -> str:
-        return _normalized((media or {}).get("storedPath")) if isinstance(media, dict) else ""
+        return (
+            normalize_media_path((media or {}).get("storedPath"))
+            if isinstance(media, dict)
+            else ""
+        )
 
     @staticmethod
     def _media_key(media: object) -> str:
@@ -2715,15 +2739,113 @@ class DouyinCommercePage(QWidget):
             return True
         return bool(media_keys.intersection(self._batch_revision_blocked_media_keys))
 
-    def _refresh_batch_video_list(self) -> None:
+    def _selected_video_refresh_snapshot(
+        self,
+    ) -> list[tuple[str, int | None]] | None:
+        """在重建素材列表前快照稳定媒体身份与修订来源绑定。"""
+
+        snapshot: list[tuple[str, int | None]] = []
+        for position, index in enumerate(self._selected_video_indexes):
+            if not 0 < index < self.video_combo.count():
+                return None
+            media = self.video_combo.itemData(index)
+            try:
+                media_key = self._media_key(media)
+            except (OSError, RuntimeError, ValueError):
+                return None
+            if not media_key:
+                return None
+            source_index: int | None = None
+            if self._batch_revision_source_task_id is not None:
+                source_index = self._batch_revision_media_item_indexes.get(media_key)
+                if (
+                    type(source_index) is not int
+                    or position >= len(self._batch_revision_item_indexes)
+                    or self._batch_revision_item_indexes[position] != source_index
+                ):
+                    return None
+            snapshot.append((media_key, source_index))
+        return snapshot
+
+    def _restore_video_selection_after_refresh(
+        self,
+        snapshot: list[tuple[str, int | None]] | None,
+    ) -> None:
+        """只按唯一稳定媒体身份恢复；修订中任何不确定均失败关闭。"""
+
+        if snapshot == []:
+            return
+        media_indexes: dict[str, list[int]] = {}
+        for index in range(1, self.video_combo.count()):
+            media = self.video_combo.itemData(index)
+            try:
+                keys = self._media_keys(media)
+            except (OSError, RuntimeError, ValueError):
+                continue
+            for key in keys:
+                media_indexes.setdefault(key, []).append(index)
+        restored: list[int] = []
+        restored_bindings: dict[str, int] = {}
+        failed = snapshot is None
+        for media_key, source_index in snapshot or []:
+            candidates = media_indexes.get(media_key, [])
+            if len(candidates) != 1 or candidates[0] in restored:
+                failed = True
+                break
+            index = candidates[0]
+            media = self.video_combo.itemData(index)
+            if self._revision_media_is_blocked(media):
+                failed = True
+                break
+            if self._batch_revision_source_task_id is not None:
+                if type(source_index) is not int or source_index <= 0:
+                    failed = True
+                    break
+                try:
+                    current_key = self._media_key(media)
+                except (OSError, RuntimeError, ValueError):
+                    failed = True
+                    break
+                if not current_key or current_key in restored_bindings:
+                    failed = True
+                    break
+                restored_bindings[current_key] = source_index
+            restored.append(index)
+        if failed:
+            self._project_batch_video_selection([])
+            if self._batch_revision_source_task_id is not None:
+                self._batch_revision_item_indexes = []
+                QMessageBox.warning(
+                    self,
+                    "恢复未完成视频",
+                    self._REVISION_RESTORE_FAILED_MESSAGE,
+                )
+            return
+        if self._batch_revision_source_task_id is not None:
+            self._batch_revision_media_item_indexes = restored_bindings
+            self._batch_revision_item_indexes = [
+                int(source_index) for _, source_index in snapshot or []
+            ]
+        self._project_batch_video_selection(restored)
+
+    def _refresh_batch_video_list(
+        self,
+        *,
+        previous_media_keys: set[str] | None = None,
+    ) -> None:
         """用多选缩略图列表呈现本机视频；刷新绝不访问平台。"""
 
-        previous_paths = {
-            _normalized((self.video_combo.itemData(index) or {}).get("storedPath"))
-            for index in self._selected_video_indexes
-            if 0 < index < self.video_combo.count()
-            and isinstance(self.video_combo.itemData(index), dict)
-        }
+        if previous_media_keys is None:
+            previous_media_keys = set()
+            for index in self._selected_video_indexes:
+                if not 0 < index < self.video_combo.count():
+                    continue
+                try:
+                    previous_media_keys.update(
+                        self._media_keys(self.video_combo.itemData(index))
+                    )
+                except (OSError, RuntimeError, ValueError):
+                    continue
         self.batch_video_list.blockSignals(True)
         self.batch_video_list.clear()
         self._selected_video_indexes = []
@@ -2735,7 +2857,10 @@ class DouyinCommercePage(QWidget):
             item.setToolTip(self._video_display(media, media_service.video_display_metadata(media)))
             item.setData(Qt.ItemDataRole.UserRole, index)
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            checked = _normalized(media.get("storedPath")) in previous_paths
+            try:
+                checked = bool(self._media_keys(media).intersection(previous_media_keys))
+            except (OSError, RuntimeError, ValueError):
+                checked = False
             item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
             item.setSizeHint(QSize(0, _VIDEO_PICKER_ROW_HEIGHT))
             self.batch_video_list.addItem(item)
@@ -3310,14 +3435,16 @@ class DouyinCommercePage(QWidget):
     @staticmethod
     def _restore_saved_combo(combo: QComboBox, *, identity: object, path: object) -> bool:
         expected_identity = _normalized(identity)
-        expected_path = _normalized(path)
+        expected_path = normalize_media_path(path)
         combo.setCurrentIndex(0)
         for index in range(1, combo.count()):
             item = combo.itemData(index)
             if not isinstance(item, dict):
                 continue
             current_identity = _normalized(item.get("id"))
-            current_path = _normalized(item.get("filePath") or item.get("storedPath"))
+            current_path = normalize_media_path(
+                item.get("filePath") or item.get("storedPath")
+            )
             if expected_path and current_path == expected_path:
                 combo.setCurrentIndex(index)
                 return True
@@ -3555,7 +3682,7 @@ class DouyinCommercePage(QWidget):
         files = payload.get("fileList") or [""]
         return (
             _normalized(accounts[0] if accounts else ""),
-            _normalized(files[0] if files else ""),
+            normalize_media_path(files[0] if files else ""),
         )
 
     @staticmethod
@@ -4580,14 +4707,18 @@ class DouyinCommercePage(QWidget):
             account_file = f"id:{account.get('id')}"
 
         video_paths = [
-            _normalized(video.get("storedPath"))
+            normalize_media_path(video.get("storedPath"))
             for video in self._selected_videos()
-            if _normalized(video.get("storedPath"))
+            if normalize_media_path(video.get("storedPath"))
         ]
         if not video_paths:
             files = source.get("fileList") or []
             if isinstance(files, (list, tuple)):
-                video_paths = [_normalized(path) for path in files if _normalized(path)]
+                video_paths = [
+                    normalize_media_path(path)
+                    for path in files
+                    if normalize_media_path(path)
+                ]
         return json.dumps(
             {
                 "accountFile": account_file,
@@ -4662,7 +4793,11 @@ class DouyinCommercePage(QWidget):
             except ValueError:
                 return False
         return all(
-            _normalized(self._batch_locations.get(_normalized(video.get("storedPath")), {}).get("address"))
+            _normalized(
+                self._batch_locations.get(
+                    normalize_media_path(video.get("storedPath")), {}
+                ).get("address")
+            )
             for video in self._selected_videos()
         )
 
@@ -4689,7 +4824,7 @@ class DouyinCommercePage(QWidget):
             raise douyin_commerce_batch_service.DouyinCommerceBatchError("请选择 1 至 20 条视频")
         items = []
         for video in videos:
-            path = _normalized(video.get("storedPath"))
+            path = normalize_media_path(video.get("storedPath"))
             location = self._batch_locations.get(path)
             if not isinstance(location, dict):
                 raise douyin_commerce_batch_service.DouyinCommerceBatchError("每条视频必须选择带完整地址的官方地点预设")
@@ -4775,16 +4910,24 @@ class DouyinCommercePage(QWidget):
             "items": [
                 {
                     "mediaId": video.get("id"),
-                    "mediaPath": _normalized(video.get("storedPath")),
-                    "locationPresetId": _normalized(self._batch_locations.get(_normalized(video.get("storedPath")), {}).get("id")),
+                    "mediaPath": normalize_media_path(video.get("storedPath")),
+                    "locationPresetId": _normalized(
+                        self._batch_locations.get(
+                            normalize_media_path(video.get("storedPath")), {}
+                        ).get("id")
+                    ),
                     "locationPreset": dict(
                         self._batch_locations.get(
-                            _normalized(video.get("storedPath")),
+                            normalize_media_path(video.get("storedPath")),
                             {},
                         )
                     ),
                     "enableTimer": self.batch_publish_mode.currentData() == "interval-schedule",
-                    "scheduleTimeOverride": _normalized(self._batch_schedule_overrides.get(_normalized(video.get("storedPath")))),
+                    "scheduleTimeOverride": _normalized(
+                        self._batch_schedule_overrides.get(
+                            normalize_media_path(video.get("storedPath"))
+                        )
+                    ),
                 }
                 for video in self._selected_videos()
             ],
@@ -4939,7 +5082,7 @@ class DouyinCommercePage(QWidget):
         self._batch_locations = {}
         self._batch_schedule_overrides = {}
         for item in payload.get("items") or []:
-            path = _normalized(item.get("mediaPath"))
+            path = normalize_media_path(item.get("mediaPath"))
             snapshot = item.get("locationPreset")
             preset = (
                 dict(snapshot)
@@ -5204,7 +5347,11 @@ class DouyinCommercePage(QWidget):
         _LOGGER.info("抖音带货批量执行：%s", self._batch_progress_text)
         if phase == "waiting_verification":
             videos = self._selected_videos()
-            label = Path(_normalized(videos[index - 1].get("storedPath"))).name if 0 < index <= len(videos) else ""
+            label = (
+                Path(normalize_media_path(videos[index - 1].get("storedPath"))).name
+                if 0 < index <= len(videos)
+                else ""
+            )
             self._verification_item_context = {"index": index, "total": total, "label": label}
 
     def _batch_execution_counts(self, total: int) -> tuple[int, int, int]:
@@ -5652,7 +5799,7 @@ class DouyinCommercePage(QWidget):
         if not is_batch:
             return
         for index, video in enumerate(self._selected_videos(), start=1):
-            path = _normalized(video.get("storedPath"))
+            path = normalize_media_path(video.get("storedPath"))
             location = self._batch_locations.get(path) or {}
             card = QFrame()
             card.setObjectName("douyinCommerceBatchReviewRow")
@@ -5700,7 +5847,7 @@ class DouyinCommercePage(QWidget):
 
         lines: list[str] = []
         for index, video in enumerate(self._selected_videos()):
-            path = _normalized(video.get("storedPath"))
+            path = normalize_media_path(video.get("storedPath"))
             location = self._batch_locations.get(path) or {}
             schedule = self.item_schedule_text(index)
             lines.extend(

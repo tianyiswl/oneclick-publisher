@@ -34,6 +34,7 @@ from . import (
     douyin_publish_executor,
 )
 from .douyin_commerce_location_commission import normalize_commission_filter
+from .media_path import normalize_media_path
 from .oneclick_preflight import _account_for_payload, _storage_state
 from .douyin_verification import verification_broker
 from utils.log import douyin_logger
@@ -207,7 +208,7 @@ class DouyinCommerceSessionManager:
         return "|".join(
             (
                 _normalized((payload.get("accountList") or [""])[0]),
-                _normalized((payload.get("fileList") or [""])[0]),
+                normalize_media_path((payload.get("fileList") or [""])[0]),
             )
         )
 

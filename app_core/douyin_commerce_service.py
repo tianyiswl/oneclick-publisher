@@ -35,6 +35,7 @@ from .douyin_music_service import (
     normalize_music_readback,
     validate_favorite_music_mode,
 )
+from .media_path import normalize_media_path
 from utils.log import douyin_logger
 
 
@@ -393,7 +394,9 @@ def _validate_douyin_commerce_content(
     checked["accountList"] = accounts
 
     files = [
-        _normalized(item) for item in checked.get("fileList") or [] if _normalized(item)
+        normalize_media_path(item)
+        for item in checked.get("fileList") or []
+        if normalize_media_path(item)
     ]
     if len(files) != 1 or not Path(files[0]).is_file():
         raise DouyinCommerceError("抖音带货需要且只允许一条可读取的视频素材")
@@ -514,9 +517,9 @@ def validate_douyin_commerce_discovery_payload(
         raise DouyinCommerceError("读取门店一次只能选择一个已登录抖音账号")
     checked["accountList"] = accounts
     files = [
-        _normalized(item)
+        normalize_media_path(item)
         for item in checked.get("fileList") or []
-        if _normalized(item)
+        if normalize_media_path(item)
     ]
     if len(files) != 1 or not Path(files[0]).is_file():
         raise DouyinCommerceError("读取门店前需要且只允许一条可读取的视频素材")
