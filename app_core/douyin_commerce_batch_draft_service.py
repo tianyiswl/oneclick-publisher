@@ -34,6 +34,12 @@ def _text(value: object) -> str:
     return " ".join(str(value or "").replace("\u200b", " ").split())
 
 
+def _media_path(value: object) -> str:
+    """路径不是自然语言；仅去掉首尾空白，保留合法的内部字符。"""
+
+    return str(value or "").strip()
+
+
 def _account_id(value: object) -> int:
     try:
         account_id = int(value)
@@ -140,7 +146,7 @@ def _items(value: object) -> list[dict[str, object]]:
     for index, item in enumerate(value, start=1):
         if not isinstance(item, Mapping):
             raise DouyinCommerceBatchDraftError(f"第 {index} 个批次条目格式无效")
-        media_path = _text(item.get("mediaPath"))
+        media_path = _media_path(item.get("mediaPath"))
         if not media_path:
             raise DouyinCommerceBatchDraftError(f"第 {index} 个批次条目缺少本地媒体路径")
         media_id = item.get("mediaId")

@@ -9843,6 +9843,13 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         with patch.object(
             self.page, "collect_batch_payload", return_value=payload
         ), patch(
+            "ui.douyin_commerce_page.task_service.prepare_douyin_batch_revision",
+            return_value={
+                "revisionAllowed": True,
+                "sourceTaskId": 41,
+                "revisionItemIndexes": [2],
+            },
+        ), patch(
             "ui.douyin_commerce_page.task_service.create_douyin_batch_task",
             return_value=task,
         ) as create, patch.object(
@@ -9857,6 +9864,123 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             batch_item_indexes=[2],
         )
         start.assert_called_once_with(payload, task)
+
+    def test_revision_confirmation_rechecks_source_before_task_creation(self) -> None:
+        """结果页恢复后来源若已变化，确认提交必须留在编辑页并失败关闭。"""
+
+        plan = self._load_revision_ui_fixture()
+        self.assertTrue(self.page._apply_batch_revision_plan(plan))
+        payload = {
+            "items": [
+                {"mediaPath": "/tmp/failed.mp4"},
+                {"mediaPath": "/tmp/pending.mp4"},
+            ]
+        }
+        blocked = {
+            "revisionAllowed": False,
+            "sourceTaskId": 41,
+            "blockedReason": "任务记录不存在或已被删除",
+        }
+        with patch.object(
+            self.page, "collect_batch_payload", return_value=payload
+        ), patch(
+            "ui.douyin_commerce_page.task_service.prepare_douyin_batch_revision",
+            return_value=blocked,
+        ) as prepare, patch(
+            "ui.douyin_commerce_page.task_service.create_douyin_batch_task"
+        ) as create, patch(
+            "ui.douyin_commerce_page.DouyinCommercePage.start_batch_publish"
+        ) as start, patch(
+            "ui.douyin_commerce_page.QMessageBox.warning"
+        ) as warning:
+            self.page.open_batch_submit_confirmation()
+
+        prepare.assert_called_once_with(41)
+        create.assert_not_called()
+        start.assert_not_called()
+        warning.assert_called_once_with(
+            self.page,
+            "确认批量提交",
+            "原任务状态已变化，当前修改内容已保留，请重新返回修改",
+        )
+
+    def test_revision_confirmation_rejects_bound_item_that_became_success(
+        self,
+    ) -> None:
+        """已绑定条目在确认前变成成功时，不得带旧 index 创建子任务。"""
+
+        plan = self._load_revision_ui_fixture()
+        self.assertTrue(self.page._apply_batch_revision_plan(plan))
+        payload = {
+            "items": [
+                {"mediaPath": "/tmp/failed.mp4"},
+                {"mediaPath": "/tmp/pending.mp4"},
+            ]
+        }
+        latest_plan = {
+            **plan,
+            "revisionItemIndexes": [3],
+            "draft": {
+                **plan["draft"],
+                "items": [plan["draft"]["items"][1]],
+            },
+        }
+        with patch.object(
+            self.page, "collect_batch_payload", return_value=payload
+        ), patch(
+            "ui.douyin_commerce_page.task_service.prepare_douyin_batch_revision",
+            return_value=latest_plan,
+        ), patch(
+            "ui.douyin_commerce_page.task_service.create_douyin_batch_task"
+        ) as create, patch.object(
+            self.page, "start_batch_publish"
+        ) as start, patch(
+            "ui.douyin_commerce_page.QMessageBox.warning"
+        ) as warning:
+            self.page.open_batch_submit_confirmation()
+
+        create.assert_not_called()
+        start.assert_not_called()
+        warning.assert_called_once_with(
+            self.page,
+            "确认批量提交",
+            "原任务状态已变化，当前修改内容已保留，请重新返回修改",
+        )
+
+    def test_revision_confirmation_rejects_item_index_length_mismatch(self) -> None:
+        """媒体与来源条目号数量不一致时，不得进入新任务创建。"""
+
+        plan = self._load_revision_ui_fixture()
+        self.assertTrue(self.page._apply_batch_revision_plan(plan))
+        self.page._batch_revision_item_indexes = [2]
+        payload = {
+            "items": [
+                {"mediaPath": "/tmp/failed.mp4"},
+                {"mediaPath": "/tmp/pending.mp4"},
+            ]
+        }
+        with patch.object(
+            self.page, "collect_batch_payload", return_value=payload
+        ), patch(
+            "ui.douyin_commerce_page.task_service.prepare_douyin_batch_revision",
+            return_value=plan,
+        ) as prepare, patch(
+            "ui.douyin_commerce_page.task_service.create_douyin_batch_task"
+        ) as create, patch.object(
+            self.page, "start_batch_publish"
+        ) as start, patch(
+            "ui.douyin_commerce_page.QMessageBox.warning"
+        ) as warning:
+            self.page.open_batch_submit_confirmation()
+
+        prepare.assert_not_called()
+        create.assert_not_called()
+        start.assert_not_called()
+        warning.assert_called_once_with(
+            self.page,
+            "确认批量提交",
+            "修改批次的视频与来源条目无法安全对应，请重新选择视频",
+        )
 
     def test_revision_confirmation_preserves_all_source_item_indexes(self) -> None:
         """修订子任务必须保留来源逐条序号，不能从 1 重新编号。"""
@@ -9873,6 +9997,9 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         with patch.object(
             self.page, "collect_batch_payload", return_value=payload
         ), patch(
+            "ui.douyin_commerce_page.task_service.prepare_douyin_batch_revision",
+            return_value=plan,
+        ), patch(
             "ui.douyin_commerce_page.task_service.create_douyin_batch_task",
             return_value=task,
         ) as create, patch.object(
@@ -9888,6 +10015,102 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         )
         start.assert_called_once_with(payload, task)
 
+    def test_revision_video_menu_keeps_multi_selection_when_focusing_existing_video(
+        self,
+    ) -> None:
+        """修订菜单聚焦已选视频时，不得把多选批次缩成单条。"""
+
+        plan = self._load_revision_ui_fixture()
+        self.assertTrue(self.page._apply_batch_revision_plan(plan))
+        menu = self.page._build_video_picker_menu()
+        rows = menu.findChildren(QPushButton, "douyinCommerceVideoPickerItem")
+
+        rows[2].click()
+
+        self.assertEqual(
+            [video["id"] for video in self.page._selected_videos()], [2, 3]
+        )
+        self.assertEqual(self.page.video_combo.currentData()["id"], 3)
+        self.assertEqual(self.page._batch_revision_item_indexes, [2, 3])
+
+    def test_revision_checkbox_delete_then_add_rebinds_only_vacant_source_index(
+        self,
+    ) -> None:
+        """删除一条后添加新视频，只能继承唯一空出的来源条目号。"""
+
+        plan = self._load_revision_ui_fixture()
+        self.assertTrue(self.page._apply_batch_revision_plan(plan))
+        replacement_file = tempfile.NamedTemporaryFile(suffix=".mp4")
+        self.addCleanup(replacement_file.close)
+        replacement = {
+            "id": 44,
+            "typeText": "视频",
+            "storedPath": replacement_file.name,
+            "filename": Path(replacement_file.name).name,
+        }
+        self.page.video_combo.addItem(replacement["filename"], replacement)
+        self.page._refresh_batch_video_list()
+        failed_row = next(
+            self.page.batch_video_list.item(row)
+            for row in range(self.page.batch_video_list.count())
+            if self.page.batch_video_list.item(row).data(Qt.ItemDataRole.UserRole) == 2
+        )
+        replacement_row = next(
+            self.page.batch_video_list.item(row)
+            for row in range(self.page.batch_video_list.count())
+            if self.page.batch_video_list.item(row).data(Qt.ItemDataRole.UserRole) == 4
+        )
+
+        failed_row.setCheckState(Qt.CheckState.Unchecked)
+        self.assertEqual(self.page._batch_revision_item_indexes, [3])
+        replacement_row.setCheckState(Qt.CheckState.Checked)
+
+        self.assertEqual(
+            [video["id"] for video in self.page._selected_videos()], [3, 44]
+        )
+        self.assertEqual(self.page._batch_revision_item_indexes, [3, 2])
+
+    def test_revision_programmatic_reorder_keeps_indexes_bound_to_media(self) -> None:
+        """修订视频换序时，来源条目号必须随媒体身份换序。"""
+
+        plan = self._load_revision_ui_fixture()
+        self.assertTrue(self.page._apply_batch_revision_plan(plan))
+
+        self.page.select_video_indexes([3, 2])
+
+        self.assertEqual(
+            [video["id"] for video in self.page._selected_videos()], [3, 2]
+        )
+        self.assertEqual(self.page._batch_revision_item_indexes, [3, 2])
+
+    def test_revision_video_menu_replaces_current_video_without_dropping_others(
+        self,
+    ) -> None:
+        """修订菜单更换当前视频时，必须保留其余视频并转移对应条目号。"""
+
+        plan = self._load_revision_ui_fixture()
+        self.assertTrue(self.page._apply_batch_revision_plan(plan))
+        replacement_file = tempfile.NamedTemporaryFile(suffix=".mp4")
+        self.addCleanup(replacement_file.close)
+        replacement = {
+            "id": 44,
+            "typeText": "视频",
+            "storedPath": replacement_file.name,
+            "filename": Path(replacement_file.name).name,
+        }
+        self.page.video_combo.addItem(replacement["filename"], replacement)
+        self.page._refresh_batch_video_list()
+        menu = self.page._build_video_picker_menu()
+        rows = menu.findChildren(QPushButton, "douyinCommerceVideoPickerItem")
+
+        rows[3].click()
+
+        self.assertEqual(
+            [video["id"] for video in self.page._selected_videos()], [44, 3]
+        )
+        self.assertEqual(self.page.video_combo.currentData()["id"], 44)
+        self.assertEqual(self.page._batch_revision_item_indexes, [2, 3])
+
     def test_revision_task_creation_failure_keeps_all_edited_state(self) -> None:
         """若创建失败清空来源、视频或编辑控件，该测试必须失败。"""
 
@@ -9896,10 +10119,18 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         before_indexes = list(self.page._selected_video_indexes)
         before_title = self.page.title_input.text()
         before_source = self.page._batch_revision_source_task_id
-        payload = {"items": [{"mediaPath": "/tmp/failed.mp4"}]}
+        payload = {
+            "items": [
+                {"mediaPath": "/tmp/failed.mp4"},
+                {"mediaPath": "/tmp/pending.mp4"},
+            ]
+        }
         unexpected: BaseException | None = None
         with patch.object(
             self.page, "collect_batch_payload", return_value=payload
+        ), patch(
+            "ui.douyin_commerce_page.task_service.prepare_douyin_batch_revision",
+            return_value=plan,
         ), patch(
             "ui.douyin_commerce_page.task_service.create_douyin_batch_task",
             side_effect=RuntimeError("Cookie=private 验证码123456"),
@@ -13414,6 +13645,122 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             "no_commission",
         )
         self.assertEqual(self.page.batch_location_keyword.text(), "夜心数码")
+
+    def test_restore_legacy_batch_draft_selects_video_by_absolute_path(self) -> None:
+        """旧 schema v3 草稿没有 mediaId 时，必须按真实绝对路径恢复视频。"""
+
+        video_file = tempfile.NamedTemporaryFile(suffix=".mp4")
+        self.addCleanup(video_file.close)
+        video_path = str(Path(video_file.name).resolve(strict=False))
+        account = {
+            "id": 72,
+            "type": 3,
+            "status": 1,
+            "filePath": "douyin-72.json",
+            "profileName": "主体",
+            "userName": "账号",
+        }
+        media = {
+            "id": 87,
+            "typeText": "视频",
+            "storedPath": video_path,
+            "filename": Path(video_path).name,
+        }
+        saved = {
+            "updatedAt": "2026-08-08 17:00",
+            "payload": {
+                "schemaVersion": 3,
+                "accountId": 72,
+                "accountFile": "douyin-72.json",
+                "shared": {"title": "旧草稿", "description": "待恢复视频", "tags": []},
+                "publishMode": "immediate",
+                "schedule": {"timezone": "Asia/Shanghai", "startTime": "", "intervalMinutes": 0},
+                "items": [
+                    {
+                        "mediaId": None,
+                        "mediaPath": video_path,
+                        "locationPresetId": "",
+                        "locationPreset": {},
+                        "enableTimer": False,
+                        "scheduleTimeOverride": "",
+                    }
+                ],
+            },
+        }
+        with patch(
+            "ui.douyin_commerce_page.account_service.list_accounts",
+            return_value=[account],
+        ), patch(
+            "ui.douyin_commerce_page.media_service.list_media",
+            return_value=[media],
+        ):
+            self.page.refresh()
+        with patch(
+            "ui.douyin_commerce_page.douyin_commerce_batch_draft_service.load_batch_draft",
+            return_value=saved,
+        ):
+            self.page.restore_batch_content()
+
+        self.assertEqual(self.page.selected_video_count(), 1)
+        self.assertEqual([video["id"] for video in self.page._selected_videos()], [87])
+        self.assertEqual(self.page.video_combo.currentData()["id"], 87)
+
+    def test_restore_schema_v3_draft_preserves_double_space_media_path(self) -> None:
+        """旧草稿的真实路径经规范化、SQLite 回读和 Qt 恢复都不得折叠内部空格。"""
+
+        tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tempdir.cleanup)
+        root = Path(tempdir.name)
+        video_path = str((root / "legacy  final.mp4").resolve(strict=False))
+        Path(video_path).write_bytes(b"offline-video")
+        raw = {
+            "schemaVersion": 3,
+            "accountId": 72,
+            "accountFile": "douyin-72.json",
+            "shared": {"title": "旧草稿", "description": "待恢复视频", "tags": []},
+            "publishMode": "immediate",
+            "schedule": {
+                "timezone": "Asia/Shanghai",
+                "startTime": "",
+                "intervalMinutes": 0,
+            },
+            "items": [{"mediaId": None, "mediaPath": video_path}],
+        }
+        account = {
+            "id": 72,
+            "type": 3,
+            "status": 1,
+            "filePath": "douyin-72.json",
+            "profileName": "主体",
+            "userName": "账号",
+        }
+        media = {
+            "id": 87,
+            "typeText": "视频",
+            "storedPath": video_path,
+            "filename": Path(video_path).name,
+        }
+
+        with patch.object(database, "DB_PATH", root / "drafts.sqlite3"):
+            normalized = douyin_commerce_batch_draft_service.normalize_batch_draft(raw)
+            saved = douyin_commerce_batch_draft_service.save_batch_draft(raw)
+            loaded = douyin_commerce_batch_draft_service.load_batch_draft()
+            self.assertEqual(normalized["items"][0]["mediaPath"], video_path)
+            self.assertEqual(saved["payload"]["items"][0]["mediaPath"], video_path)
+            self.assertEqual(loaded["payload"]["items"][0]["mediaPath"], video_path)
+            with patch(
+                "ui.douyin_commerce_page.account_service.list_accounts",
+                return_value=[account],
+            ), patch(
+                "ui.douyin_commerce_page.media_service.list_media",
+                return_value=[media],
+            ):
+                self.page.refresh()
+            self.page.restore_batch_content()
+
+        self.assertEqual(self.page.selected_video_count(), 1)
+        self.assertEqual([video["id"] for video in self.page._selected_videos()], [87])
+        self.assertEqual(self.page.video_combo.currentData()["id"], 87)
 
     def test_batch_music_reads_current_account_cache_without_opening_session(self) -> None:
         account = {"id": 73, "type": 3, "status": 1, "filePath": "douyin-73.json", "profileName": "主体", "userName": "账号"}

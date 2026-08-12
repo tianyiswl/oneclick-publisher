@@ -454,6 +454,9 @@ class DouyinCommercePage(QWidget):
     _SETUP_GENERATION_CLOSE_TASK_KEY = "douyin_commerce_setup_generation_close"
     _COLLECTOR_BARRIER_ERROR = "平台设置临时会话未完全关闭，已安全停止"
     _REVISION_MEDIA_BLOCKED_MESSAGE = "已成功发布的视频不能重新加入修改批次。"
+    _REVISION_MEDIA_BINDING_MESSAGE = (
+        "修改批次的视频与来源条目无法安全对应，请先删除一条再添加替换视频。"
+    )
     _REVISION_RESTORE_FAILED_MESSAGE = (
         "未完成视频无法恢复到编辑页，请刷新本机素材后重试。"
     )
@@ -589,7 +592,9 @@ class DouyinCommercePage(QWidget):
         self._batch_result_feedback = ""
         self._batch_revision_source_task_id: int | None = None
         self._batch_revision_source_task_no = ""
+        self._batch_revision_source_item_indexes: list[int] = []
         self._batch_revision_item_indexes: list[int] = []
+        self._batch_revision_media_item_indexes: dict[str, int] = {}
         self._batch_revision_blocked_media_keys: set[str] = set()
         self._batch_revision_token = 0
         # 批次结果仍需留在当前页面供复制；只有用户真正进入下一批平台设置时
@@ -1119,7 +1124,27 @@ class DouyinCommercePage(QWidget):
             )
             return False
         if self._batch_revision_source_task_id is not None:
-            self.select_video_indexes([index])
+            if index in self._selected_video_indexes:
+                self.video_combo.setCurrentIndex(index)
+                return True
+            current = self.video_combo.currentIndex()
+            if current not in self._selected_video_indexes:
+                current = self._selected_video_indexes[0] if self._selected_video_indexes else 0
+            if current <= 0:
+                return False
+            replacement = list(self._selected_video_indexes)
+            replacement[replacement.index(current)] = index
+            if not self._update_revision_video_bindings(
+                replacement, explicit_replacement=(current, index)
+            ):
+                QMessageBox.warning(
+                    self,
+                    "修改未完成视频",
+                    self._REVISION_MEDIA_BINDING_MESSAGE,
+                )
+                return False
+            self._project_batch_video_selection(replacement)
+            self._content_changed()
         else:
             self.video_combo.setCurrentIndex(index)
         return True
@@ -2744,6 +2769,14 @@ class DouyinCommercePage(QWidget):
             item.setCheckState(Qt.CheckState.Unchecked)
             QMessageBox.warning(self, "选择视频", "一次最多选择 20 条视频。")
             return
+        if not self._update_revision_video_bindings(selected):
+            self._project_batch_video_selection(self._selected_video_indexes)
+            QMessageBox.warning(
+                self,
+                "修改未完成视频",
+                self._REVISION_MEDIA_BINDING_MESSAGE,
+            )
+            return
         self._selected_video_indexes = selected
         if selected:
             self.video_combo.blockSignals(True)
@@ -2783,8 +2816,81 @@ class DouyinCommercePage(QWidget):
                 "修改未完成视频",
                 self._REVISION_MEDIA_BLOCKED_MESSAGE,
             )
+        if not self._update_revision_video_bindings(unique):
+            QMessageBox.warning(
+                self,
+                "修改未完成视频",
+                self._REVISION_MEDIA_BINDING_MESSAGE,
+            )
+            return
         self._project_batch_video_selection(unique)
         self._content_changed()
+
+    def _update_revision_video_bindings(
+        self,
+        indexes: list[int],
+        *,
+        explicit_replacement: tuple[int, int] | None = None,
+    ) -> bool:
+        """以媒体身份维护来源条目号；不唯一的替换固定失败。"""
+
+        if self._batch_revision_source_task_id is None:
+            return True
+        source_indexes = list(self._batch_revision_source_item_indexes)
+        if (
+            not source_indexes
+            or any(type(value) is not int or value <= 0 for value in source_indexes)
+            or len(set(source_indexes)) != len(source_indexes)
+        ):
+            return False
+        bindings = dict(self._batch_revision_media_item_indexes)
+        try:
+            if explicit_replacement is not None:
+                old_index, new_index = explicit_replacement
+                old_key = self._media_key(self.video_combo.itemData(old_index))
+                new_key = self._media_key(self.video_combo.itemData(new_index))
+                source_index = bindings.get(old_key)
+                if not old_key or not new_key or source_index not in source_indexes:
+                    return False
+                if new_key in bindings and bindings[new_key] != source_index:
+                    return False
+                bindings = {
+                    key: value
+                    for key, value in bindings.items()
+                    if key != old_key and value != source_index
+                }
+                bindings[new_key] = source_index
+
+            selected_keys = [
+                self._media_key(self.video_combo.itemData(index)) for index in indexes
+            ]
+        except (OSError, RuntimeError, ValueError):
+            return False
+        if any(not key for key in selected_keys) or len(set(selected_keys)) != len(selected_keys):
+            return False
+        unknown_keys = [key for key in selected_keys if key not in bindings]
+        used_indexes = {
+            bindings[key] for key in selected_keys if key in bindings
+        }
+        available_indexes = [
+            value for value in source_indexes if value not in used_indexes
+        ]
+        if unknown_keys:
+            if len(unknown_keys) != 1 or len(available_indexes) != 1:
+                return False
+            source_index = available_indexes[0]
+            bindings = {
+                key: value
+                for key, value in bindings.items()
+                if value != source_index
+            }
+            bindings[unknown_keys[0]] = source_index
+        item_indexes = [bindings[key] for key in selected_keys]
+        if len(set(item_indexes)) != len(item_indexes):
+            return False
+        self._batch_revision_media_item_indexes = bindings
+        self._batch_revision_item_indexes = item_indexes
+        return True
 
     def _project_batch_video_selection(self, indexes: list[int]) -> None:
         """原子投射批量勾选和当前视频；调用方负责资格检查。"""
@@ -4743,16 +4849,16 @@ class DouyinCommercePage(QWidget):
         self.account_combo.blockSignals(False)
         indexes = list(video_indexes or [])
         if video_indexes is None:
-            by_media_key = {}
+            by_media_key: dict[str, int] = {}
             for index in range(1, self.video_combo.count()):
                 media = self.video_combo.itemData(index)
                 if not isinstance(media, dict):
                     continue
                 try:
-                    media_key = self._media_key(media)
+                    media_keys = self._media_keys(media)
                 except (OSError, RuntimeError, ValueError):
                     continue
-                if media_key:
+                for media_key in media_keys:
                     by_media_key[media_key] = index
             for item in payload.get("items") or []:
                 if not isinstance(item, Mapping):
@@ -4986,9 +5092,38 @@ class DouyinCommercePage(QWidget):
             return False
         self._batch_revision_source_task_id = int(prepared["sourceTaskId"])
         self._batch_revision_source_task_no = str(prepared["sourceTaskNo"])
-        self._batch_revision_item_indexes = list(
+        self._batch_revision_source_item_indexes = list(
             prepared["revisionItemIndexes"]
         )
+        self._batch_revision_item_indexes = list(
+            self._batch_revision_source_item_indexes
+        )
+        try:
+            self._batch_revision_media_item_indexes = {
+                self._media_key(self.video_combo.itemData(video_index)): item_index
+                for video_index, item_index in zip(
+                    prepared["videoIndexes"],
+                    self._batch_revision_source_item_indexes,
+                )
+            }
+        except (OSError, RuntimeError, ValueError):
+            self._batch_revision_media_item_indexes = {}
+            QMessageBox.warning(
+                self,
+                "恢复未完成视频",
+                self._REVISION_RESTORE_FAILED_MESSAGE,
+            )
+            return False
+        if len(self._batch_revision_media_item_indexes) != len(
+            self._batch_revision_source_item_indexes
+        ):
+            self._batch_revision_media_item_indexes = {}
+            QMessageBox.warning(
+                self,
+                "恢复未完成视频",
+                self._REVISION_RESTORE_FAILED_MESSAGE,
+            )
+            return False
         self._batch_revision_blocked_media_keys = set(
             prepared["successfulMediaKeys"]
         )
@@ -5146,6 +5281,58 @@ class DouyinCommercePage(QWidget):
         except Exception as exc:
             QMessageBox.warning(self, "确认批量提交", str(exc))
             return
+        if self._batch_revision_source_task_id is not None:
+            payload_items = payload.get("items") if isinstance(payload, Mapping) else None
+            if (
+                not isinstance(payload_items, list)
+                or len(payload_items) != len(self._batch_revision_item_indexes)
+                or any(
+                    type(index) is not int or index <= 0
+                    for index in self._batch_revision_item_indexes
+                )
+                or len(set(self._batch_revision_item_indexes))
+                != len(self._batch_revision_item_indexes)
+            ):
+                QMessageBox.warning(
+                    self,
+                    "确认批量提交",
+                    "修改批次的视频与来源条目无法安全对应，请重新选择视频",
+                )
+                return
+            try:
+                latest_plan = task_service.prepare_douyin_batch_revision(
+                    self._batch_revision_source_task_id
+                )
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                latest_plan = None
+            latest_indexes = (
+                latest_plan.get("revisionItemIndexes")
+                if isinstance(latest_plan, Mapping)
+                else None
+            )
+            if (
+                not isinstance(latest_plan, Mapping)
+                or latest_plan.get("revisionAllowed") is not True
+                or latest_plan.get("sourceTaskId")
+                != self._batch_revision_source_task_id
+                or not isinstance(latest_indexes, list)
+                or any(
+                    type(index) is not int or index <= 0
+                    for index in latest_indexes
+                )
+                or len(set(latest_indexes)) != len(latest_indexes)
+                or not set(self._batch_revision_item_indexes).issubset(
+                    set(latest_indexes)
+                )
+            ):
+                QMessageBox.warning(
+                    self,
+                    "确认批量提交",
+                    "原任务状态已变化，当前修改内容已保留，请重新返回修改",
+                )
+                return
         try:
             task = task_service.create_douyin_batch_task(
                 payload,
@@ -7720,7 +7907,9 @@ class DouyinCommercePage(QWidget):
         self._batch_revision_available = False
         self._batch_revision_source_task_id = None
         self._batch_revision_source_task_no = ""
+        self._batch_revision_source_item_indexes = []
         self._batch_revision_item_indexes = []
+        self._batch_revision_media_item_indexes = {}
         self._batch_revision_blocked_media_keys = set()
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt 固定事件名

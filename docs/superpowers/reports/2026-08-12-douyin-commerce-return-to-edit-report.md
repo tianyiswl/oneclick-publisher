@@ -10,7 +10,7 @@ Task 1–5 验收节点：`33cd9185f8ae86b7e947111bba1262c20dac0a15`
 
 ## 结论
 
-Task 1–5 的首轮实现经聚焦审查发现 4 个 Important，原 `177/177` 相关组合与 `947/947` 全量仅保留为历史证据，不能支持最终结论。4 项均已按单项 RED／GREEN 修复；修复后相关组合 `181/181 OK`，最终完整回归 `951/951 OK`，退出码均为 `0`。指定文件 `py_compile`、最终实施范围 `git diff --check`、敏感／占位扫描、变更路径扫描以及返回修改默认零平台动作 AST 检查均通过。scoped 复审为 `0 Critical / 0 Important / 1 Minor`，结论 `Ready to merge: Yes`。
+Task 1–5 的首轮实现及 Task 6 各轮旧结果 `177/947`、`181/951`、`198/962`、`201/965` 均已因后续生产代码修改降级为历史证据，不能支持最终结论。整分支终审 Fix round 1 先修复 4 个 Important，追加 scoped 审查又发现并修复 2 个 Important：绑定条目确认前变为成功的重复发布竞态，以及 `batch_item_indexes` 宽松类型转换。最终复审追加指出并修复旧 schema v3 草稿会折叠真实 `mediaPath` 内部连续空格的 Important。最终相关组合 `203/203 OK`，最终完整回归 `967/967 OK`，退出码均为 `0`。变更 Python 文件 `py_compile`、`git diff --check`、敏感／占位扫描、变更路径扫描以及返回修改默认零平台动作 AST 检查均通过。
 
 本结论只证明本地 Python 逻辑、临时 SQLite、离线替身和 Qt offscreen 界面契约。验收期间没有启动真实客户端或浏览器，没有读取真实账号，没有上传、预检、保存平台草稿、提交或发布。真实抖音 DOM、账号状态和平台回执仍为**未验证**，不能表述为真实平台通过。
 
@@ -127,7 +127,60 @@ QT_QPA_PLATFORM=offscreen /Users/andy/Documents/Codex/2026-07-28/new-chat/output
 QT_QPA_PLATFORM=offscreen /Users/andy/Documents/Codex/2026-07-28/new-chat/outputs/一键发桌面UI基座/.venv/bin/python -m unittest discover -v
 ```
 
-结果：`Ran 951 tests in 31.464s`，`OK`，退出码 `0`。这是生产修复后最终代码的唯一一份新全量证据，未再重复。
+结果：`Ran 951 tests in 31.464s`，`OK`，退出码 `0`。后续 Fix round 1 再次修改了生产代码，因此该证据已降级为历史证据。
+
+### 整分支终审 Fix round 1 RED／GREEN
+
+1. 旧 schema v3 草稿的 `mediaId=None`：真实 Qt RED 显示绝对路径素材恢复为 `0` 条；GREEN 后草稿恢复同时使用 `media:` 主键和规范化 `path:` 别名，明确断言选中数 `1`、素材 ID `87`、当前视频 ID `87`，不改写合法路径。
+2. 视频与来源条目号绑定：4 个真实 Qt RED 分别复现菜单缩成单条、删除后索引未更新、换序后索引不换序、菜单替换丢失其余视频；GREEN 后以媒体身份维护来源条目号映射，新视频只能继承唯一空出的来源槽位，提交前再拒绝数量错配、非内建正整数或重复索引。
+3. `revisionSourceTaskId` 完整性：RED 证明 UI 提交前未重读、服务可关联不存在／已不可修订的来源、有修订后代的来源仍可删除；GREEN 后 UI 创建前重读规划，服务在同一写事务内重新确认来源存在且仍可关联，`delete_tasks()` 对已有修订后代的来源固定拒绝，多代链仍可追溯。
+4. 批任务创建原子性：RED 显示成功路径使用 `2` 个连接，批次索引／批次事件失败及 `BaseException` 会使用 `3` 个连接（含补偿）；GREEN 后任务头、条目、`created`、批次索引、`batch_created`、修订来源都在同一事务。五个写入阶段故障注入及 `BaseException` 均只使用 `1` 个连接，真实 SQLite 中 tasks/items/events 均为 `0` 孤儿，不再使用二次补偿。
+
+### Fix round 1 最终相关组合
+
+相关组合增加 `test_douyin_commerce_batch_draft_service`，其余与上述范围一致。结果：`Ran 198 tests in 6.184s`，`OK`，退出码 `0`。本轮相关组合只执行一次，无首个失败。
+
+### Fix round 1 最终完整回归
+
+```bash
+QT_QPA_PLATFORM=offscreen /Users/andy/Documents/Codex/2026-07-28/new-chat/outputs/一键发桌面UI基座/.venv/bin/python -m unittest discover -v
+```
+
+结果：`Ran 962 tests in 32.175s`，`OK`，退出码 `0`。追加 scoped 审查后又修改了生产代码，因此该组证据已降级为历史证据。
+
+### Fix round 1 追加 scoped 审查 RED／GREEN
+
+1. 绑定来源项竞态：UI RED 证明来源序号 `2` 在确认前变为 `success`、序号 `3` 仍为 `pending` 时，旧 `[2, 3]` 仍会调用创建；服务 RED 也证明“来源整体仍有待修订项”会错误放行已成功的绑定项。GREEN 后 UI 要求当前绑定序号是最新 `revisionItemIndexes` 的子集；服务在同一写事务内按 `batchItemIndex` 逐项确认唯一存在且仍为 `failed/pending`，旧库缺失序号时才按原始位置回退。
+2. 严格整数边界：`True`、`"1"`、`1.0`、`2.7` 四组 RED 均可被 `int()` 宽松转换并落库；GREEN 后先要求 `type(index) is int`，再校验正数、唯一性和等长。
+3. 首次相关组合立即停在旧多代链测试：该测试直接调用服务时未传递计划给出的来源序号，默认 `[1, 2]` 与真实 `[2, 3]` 冲突。只修正测试令其模拟真实 UI 传递，单项 `1/1 GREEN`。随后发现一个旧 UI 测试桩漏了最新计划必需的 `revisionItemIndexes`，在 offscreen 环境触发模态警告而等待；终止这些无摘要进程后，仅补齐测试桩并单项 `1/1 GREEN`。被中止且没有 `Ran/OK` 的命令不计作验收证据。
+
+### 最终相关组合
+
+相关组合包含 `test_douyin_commerce_batch_draft_service`、`test_douyin_commerce_batch_service`、`test_task_service`、`DouyinCommerceBatchUiTests` 与 `DouyinCommerceTaskPresentationTests`。结果：`Ran 201 tests in 6.814s`，`OK`，退出码 `0`。
+
+### 最终完整回归
+
+```bash
+QT_QPA_PLATFORM=offscreen /Users/andy/Documents/Codex/2026-07-28/new-chat/outputs/一键发桌面UI基座/.venv/bin/python -m unittest discover -v
+```
+
+结果：`Ran 965 tests in 34.331s`，`OK`，退出码 `0`。随后又修改了草稿路径生产代码，因此该证据已降级为历史证据；之前被中止、无摘要的进程仍明确作废。
+
+### 最终追加路径修复 RED／GREEN
+
+真实 schema v3 草稿使用存在的 `legacy  final.mp4`。RED 在 normalize 阶段精确显示路径被改为 `legacy final.mp4`，尚未到 SQLite 和 Qt。GREEN 后 `mediaPath` 改用专用规范化：只去除首尾空白，保留内部字符和连续空格。单项完整覆盖 normalize → save → 真实 SQLite load → Qt restore，并明确断言选中数、素材 ID 和当前视频；全空白路径仍固定拒绝。两项单项均 GREEN。
+
+### 生产路径修复后最终相关组合
+
+结果：`Ran 203 tests in 7.090s`，`OK`，退出码 `0`。
+
+### 生产路径修复后最终完整回归
+
+```bash
+QT_QPA_PLATFORM=offscreen /Users/andy/Documents/Codex/2026-07-28/new-chat/outputs/一键发桌面UI基座/.venv/bin/python -m unittest discover -v
+```
+
+结果：`Ran 967 tests in 34.427s`，`OK`，退出码 `0`。这是最后一次生产修复后唯一份新 full discover。
 
 ## 核心不变量证据
 
@@ -139,8 +192,8 @@ QT_QPA_PLATFORM=offscreen /Users/andy/Documents/Codex/2026-07-28/new-chat/output
 
 ## 静态、差异与安全门禁
 
-- `py_compile`：指定的 5 个生产文件与 3 个测试文件通过，退出码 `0`。
-- `git diff --check`：工作树通过，无输出；`git diff db20b66..HEAD --check` 同样通过。
+- `py_compile`：最终变更的 2 个生产文件与 2 个测试文件通过，退出码 `0`。
+- `git diff --check`：工作树通过，无输出；`git diff 3cab2f0 --check` 同样通过。
 - 工作树：写报告前 `git status --short` 为空。
 - 实施范围路径：无账号状态、数据库／SQLite、媒体、日志、`.env`、`.superpowers/brainstorm/` 或 `outputs/` 文件。
 - 新增生产差异：`TODO`／`FIXME`／`NotImplemented`、空 `pass`／省略号占位均为 `0`。
@@ -153,7 +206,9 @@ QT_QPA_PLATFORM=offscreen /Users/andy/Documents/Codex/2026-07-28/new-chat/output
 
 初次只读审查 `db20b66..33cd918`：`0 Critical / 4 Important / 0 Minor`，结论为修复前不可合并。4 项分别为屏障后旧计划竞态、旧路径身份无法与当前媒体 ID 兼容、批任务第二阶段失败遗留孤儿任务、来源逐条序号未贯通。
 
-修复后的 scoped 只读复审：`0 Critical / 0 Important / 1 Minor`，`Ready to merge: Yes`。唯一 Minor 是竞态新增测试验证了屏障后采用最新合格计划，但没有单独覆盖最新计划变为 `revisionAllowed=false` 的 UI 断言；生产分支已在该状态固定失败关闭并留在结果页。该项不影响本轮放行，保留为测试覆盖补强建议。
+修复后的 scoped 只读复审：`0 Critical / 0 Important / 1 Minor`，`Ready to merge: Yes`。该结论发生在 Fix round 1 之前，因后续生产代码改动降级为历史审查证据。
+
+Fix round 1 首次 scoped 复审：`0 Critical / 2 Important / 0 Minor`，两项为已成功绑定序号可重复进入修订任务，以及序号宽松类型转换。修复后回看又发现 `0 Critical / 1 Important / 0 Minor`：旧 schema v3 真实路径内部空格被折叠。最终 scoped 复审：`0 Critical / 0 Important / 0 Minor`，`Ready to merge: Yes`。
 
 ## 证据边界与残余风险
 

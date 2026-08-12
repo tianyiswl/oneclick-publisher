@@ -271,6 +271,7 @@ class DouyinCommerceBatchTaskTests(unittest.TestCase):
                 "contentType": "video",
             },
             revision_source_task_id=source["id"],
+            batch_item_indexes=first_plan["revisionItemIndexes"],
             schedule_now=datetime(
                 2026, 8, 8, 21, 0, tzinfo=ZoneInfo("Asia/Shanghai")
             ),
@@ -291,6 +292,7 @@ class DouyinCommerceBatchTaskTests(unittest.TestCase):
                 "contentType": "video",
             },
             revision_source_task_id=second["id"],
+            batch_item_indexes=second_plan["revisionItemIndexes"],
             schedule_now=datetime(
                 2026, 8, 8, 21, 0, tzinfo=ZoneInfo("Asia/Shanghai")
             ),
@@ -451,55 +453,247 @@ class DouyinCommerceBatchTaskTests(unittest.TestCase):
         self.assertEqual(detail["revisionSourceTaskNo"], source["taskNo"])
         self.assertEqual(task_service.get_task(source["id"]), before)
 
-    def test_batch_task_creation_failure_removes_partially_created_task(self) -> None:
-        """批次元数据补写失败时，不得残留 pending 任务、条目或事件。"""
+    def test_revision_child_creation_rejects_missing_or_unlinkable_source(self) -> None:
+        """修订创建必须在写入事务内确认来源仍存在且可关联。"""
 
-        with database.connect() as conn:
-            before = {
-                table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-                for table in (
-                    "publish_tasks",
-                    "publish_task_items",
-                    "publish_task_events",
+        before = task_service.list_tasks(limit=100)
+        with self.assertRaisesRegex(ValueError, "^修订来源任务已变化，请重新返回修改$"):
+            task_service.create_douyin_batch_task(
+                self.batch,
+                revision_source_task_id=999999,
+            )
+        self.assertEqual(task_service.list_tasks(limit=100), before)
+
+        source = self._create_paused_douyin_batch_source()
+        self._set_revision_source_states(
+            source["id"],
+            ["success", "success", "success"],
+            task_status="success",
+            pause_reason=None,
+        )
+        before = task_service.list_tasks(limit=100)
+        with self.assertRaisesRegex(ValueError, "^修订来源任务已变化，请重新返回修改$"):
+            task_service.create_douyin_batch_task(
+                self.batch,
+                revision_source_task_id=source["id"],
+            )
+        self.assertEqual(task_service.list_tasks(limit=100), before)
+
+    def test_revision_child_rejects_bound_item_that_became_success(self) -> None:
+        """来源整体仍可修订时，也必须逐项拒绝已变成成功的绑定序号。"""
+
+        source = self._create_paused_douyin_batch_source()
+        self._set_revision_source_states(
+            source["id"],
+            ["success", "success", "pending"],
+            task_status="partial_failed",
+            pause_reason=None,
+        )
+        before = task_service.list_tasks(limit=100)
+        one_item_batch = {**self.batch, "items": [self.batch["items"][1]]}
+
+        with self.assertRaisesRegex(ValueError, "^修订来源任务已变化，请重新返回修改$"):
+            task_service.create_douyin_batch_task(
+                one_item_batch,
+                revision_source_task_id=source["id"],
+                batch_item_indexes=[2],
+            )
+
+        self.assertEqual(task_service.list_tasks(limit=100), before)
+
+    def test_batch_item_indexes_reject_non_builtin_integers(self) -> None:
+        """布尔、字符串和浮点数不得被宽松转换为条目序号。"""
+
+        invalid_indexes = (
+            [True, 2, 3],
+            ["1", 2, 3],
+            [1.0, 2, 3],
+            [1, 2.7, 3],
+        )
+        before = task_service.list_tasks(limit=100)
+
+        for indexes in invalid_indexes:
+            with self.subTest(indexes=indexes), self.assertRaisesRegex(
+                ValueError,
+                "^抖音带货续发视频序号必须为互异正整数$",
+            ):
+                task_service.create_douyin_batch_task(
+                    self.batch,
+                    batch_item_indexes=indexes,
                 )
-            }
+
+        self.assertEqual(task_service.list_tasks(limit=100), before)
+
+    def test_delete_tasks_rejects_source_with_revision_descendant(self) -> None:
+        """来源已有修订后代时，删除来源必须固定拒绝以保留追溯链。"""
+
+        source = self._create_paused_douyin_batch_source()
+        self._set_revision_source_states(
+            source["id"],
+            ["failed", "failed", "failed"],
+            task_status="failed",
+            pause_reason=None,
+        )
+        child = task_service.create_douyin_batch_task(
+            self.batch,
+            revision_source_task_id=source["id"],
+        )
+        self._set_revision_source_states(
+            child["id"],
+            ["failed", "failed", "failed"],
+            task_status="failed",
+            pause_reason=None,
+        )
+
+        with self.assertRaisesRegex(ValueError, "^已有修订后代的来源任务不能删除$"):
+            task_service.delete_tasks([source["id"]])
+
+        self.assertIsNotNone(task_service.get_task(source["id"]))
+        saved_child = task_service.get_task(child["id"])
+        self.assertEqual(saved_child["revisionSourceTaskId"], source["id"])
+        self.assertEqual(saved_child["revisionSourceTaskNo"], source["taskNo"])
+
+    def test_batch_task_creation_rolls_back_every_write_stage_in_one_transaction(
+        self,
+    ) -> None:
+        """任务头、条目、事件和批次元数据任一步失败都必须整体回滚。"""
+
+        markers = (
+            "INSERT INTO publish_tasks",
+            "INSERT INTO publish_task_items",
+            "'created'",
+            "UPDATE publish_task_items",
+            "'batch_created'",
+        )
+        real_connect = task_service.connect
+
+        for marker in markers:
+            with self.subTest(marker=marker):
+                connect_count = 0
+                failed = False
+
+                class FailingCursor:
+                    def __init__(self, cursor, fail) -> None:
+                        self._cursor = cursor
+                        self._fail = fail
+
+                    def execute(self, sql, parameters=()):
+                        self._fail(sql)
+                        return self._cursor.execute(sql, parameters)
+
+                    def __getattr__(self, name):
+                        return getattr(self._cursor, name)
+
+                class FailingConnection:
+                    def __init__(self, conn) -> None:
+                        self._conn = conn
+
+                    def fail(self, sql) -> None:
+                        nonlocal failed
+                        if not failed and marker in str(sql):
+                            failed = True
+                            raise RuntimeError("controlled atomic batch failure")
+
+                    def execute(self, sql, parameters=()):
+                        self.fail(sql)
+                        return self._conn.execute(sql, parameters)
+
+                    def cursor(self):
+                        return FailingCursor(self._conn.cursor(), self.fail)
+
+                    def __getattr__(self, name):
+                        return getattr(self._conn, name)
+
+                @contextmanager
+                def failing_connect():
+                    nonlocal connect_count
+                    connect_count += 1
+                    with real_connect() as conn:
+                        yield FailingConnection(conn)
+
+                with patch.object(
+                    task_service, "connect", new=failing_connect
+                ), self.assertRaisesRegex(
+                    RuntimeError, "^controlled atomic batch failure$"
+                ):
+                    task_service.create_douyin_batch_task(self.batch)
+
+                self.assertTrue(failed)
+                self.assertEqual(connect_count, 1)
+                with database.connect() as conn:
+                    counts = [
+                        conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                        for table in (
+                            "publish_tasks",
+                            "publish_task_items",
+                            "publish_task_events",
+                        )
+                    ]
+                self.assertEqual(counts, [0, 0, 0])
+
+    def test_batch_task_creation_rolls_back_base_exception_without_compensation(
+        self,
+    ) -> None:
+        """BaseException 必须保持原语义传播，且仅由原事务回滚。"""
+
+        class ControlledAbort(BaseException):
+            pass
+
         real_connect = task_service.connect
         connect_count = 0
 
-        class FailingBatchMetadataConnection:
+        class AbortingConnection:
             def __init__(self, conn) -> None:
                 self._conn = conn
 
             def execute(self, sql, parameters=()):
                 if "UPDATE publish_task_items" in str(sql):
-                    raise RuntimeError("controlled batch metadata failure")
+                    raise ControlledAbort("controlled base abort")
                 return self._conn.execute(sql, parameters)
 
             def __getattr__(self, name):
                 return getattr(self._conn, name)
 
         @contextmanager
-        def connect_with_second_phase_failure():
+        def aborting_connect():
             nonlocal connect_count
             connect_count += 1
             with real_connect() as conn:
-                if connect_count == 2:
-                    yield FailingBatchMetadataConnection(conn)
-                else:
-                    yield conn
+                yield AbortingConnection(conn)
 
-        with patch(
-            "app_core.task_service.connect",
-            side_effect=connect_with_second_phase_failure,
-        ), self.assertRaisesRegex(RuntimeError, "controlled batch metadata failure"):
+        with patch.object(task_service, "connect", new=aborting_connect):
+            with self.assertRaises(ControlledAbort):
+                task_service.create_douyin_batch_task(self.batch)
+
+        self.assertEqual(connect_count, 1)
+        with database.connect() as conn:
+            counts = [
+                conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                for table in (
+                    "publish_tasks",
+                    "publish_task_items",
+                    "publish_task_events",
+                )
+            ]
+        self.assertEqual(counts, [0, 0, 0])
+
+    def test_batch_task_creation_success_uses_one_transaction_connection(self) -> None:
+        """成功路径也必须只使用一个写事务连接。"""
+
+        real_connect = task_service.connect
+        connect_count = 0
+
+        @contextmanager
+        def counting_connect():
+            nonlocal connect_count
+            connect_count += 1
+            with real_connect() as conn:
+                yield conn
+
+        with patch.object(task_service, "connect", new=counting_connect):
             task_service.create_douyin_batch_task(self.batch)
 
-        with database.connect() as conn:
-            after = {
-                table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-                for table in before
-            }
-        self.assertEqual(after, before)
+        self.assertEqual(connect_count, 1)
 
     def test_prepare_douyin_batch_resume_only_includes_pending_source_items(self) -> None:
         """若错误复制成功项或丢失原排期，该测试必须失败。"""

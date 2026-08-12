@@ -380,6 +380,17 @@ def delete_tasks(task_ids: list[int]) -> int:
 
     placeholders = ",".join("?" for _ in normalized_ids)
     with connect() as conn:
+        revision_descendant = conn.execute(
+            f"""
+            SELECT 1
+            FROM publish_tasks
+            WHERE revisionSourceTaskId IN ({placeholders})
+            LIMIT 1
+            """,
+            tuple(normalized_ids),
+        ).fetchone()
+        if revision_descendant:
+            raise ValueError("已有修订后代的来源任务不能删除")
         active_rows = conn.execute(
             f"""
             SELECT taskNo, status
@@ -409,7 +420,8 @@ def delete_tasks(task_ids: list[int]) -> int:
     return int(cursor.rowcount)
 
 
-def create_pending_task(
+def _insert_pending_task(
+    conn,
     payloads: list[dict],
     mode: str = "desktop",
     *,
@@ -417,114 +429,186 @@ def create_pending_task(
     revision_source_task_id: int | None = None,
 ) -> dict:
     account_files = sorted({a for payload in payloads for a in payload.get("accountList", [])})
-    with connect() as conn:
-        account_meta = {}
-        if account_files:
-            placeholders = ",".join(["?"] * len(account_files))
-            rows = conn.execute(
-                f"SELECT type, filePath, userName, profileName, remark FROM user_info WHERE filePath IN ({placeholders})",
-                tuple(account_files),
-            ).fetchall()
-            account_meta = {(int(row["type"]), row["filePath"]): dict(row) for row in rows}
+    account_meta = {}
+    if account_files:
+        placeholders = ",".join(["?"] * len(account_files))
+        rows = conn.execute(
+            f"SELECT type, filePath, userName, profileName, remark FROM user_info WHERE filePath IN ({placeholders})",
+            tuple(account_files),
+        ).fetchall()
+        account_meta = {(int(row["type"]), row["filePath"]): dict(row) for row in rows}
 
-        items = []
-        for payload in payloads:
-            platform_type = int(payload.get("type"))
-            # 纯文字没有素材文件，但同样必须生成账号执行项，才能正确回填结果。
-            for file_path in payload.get("fileList", []) or [""]:
-                for account_file in payload.get("accountList", []):
-                    meta = account_meta.get((platform_type, account_file), {})
-                    account_label = _account_display(
-                        meta.get("profileName"),
-                        meta.get("userName"),
-                        meta.get("remark"),
-                        account_file,
-                    )
-                    items.append(
-                        {
-                            "platformType": platform_type,
-                            "platformName": PLATFORMS.get(platform_type, f"平台{platform_type}"),
-                            "contentType": str(payload.get("contentType") or ""),
-                            "accountFile": account_file,
-                            "accountLabel": account_label,
-                            "profileName": meta.get("profileName") or "",
-                            "userName": meta.get("userName") or "",
-                            "accountRemark": meta.get("remark") or "",
-                            "filePath": file_path,
-                            "fileName": Path(file_path).name,
-                        }
-                    )
-        content_type = content_type_for_payloads(payloads)
-        task_no = ""
-        for _ in range(8):
-            candidate = f"T{datetime.now():%m%d%H%M}-{uuid.uuid4().hex[:4].upper()}"
-            exists = conn.execute("SELECT 1 FROM publish_tasks WHERE taskNo = ?", (candidate,)).fetchone()
-            if not exists:
-                task_no = candidate
-                break
-        if not task_no:
-            raise RuntimeError("无法生成唯一任务号，请重试")
-        title = next((payload.get("title") or payload.get("biliTitle") for payload in payloads if payload.get("title") or payload.get("biliTitle")), "")
-        account_summary = "；".join(sorted(set(item["accountLabel"] for item in items)))
-        platform_summary = "、".join(sorted(set(item["platformName"] for item in items)))
-        dry_run = 1 if all(payload.get("debugDryRun") for payload in payloads) else 0
-        cursor = conn.cursor()
+    items = []
+    for payload in payloads:
+        platform_type = int(payload.get("type"))
+        # 纯文字没有素材文件，但同样必须生成账号执行项，才能正确回填结果。
+        for file_path in payload.get("fileList", []) or [""]:
+            for account_file in payload.get("accountList", []):
+                meta = account_meta.get((platform_type, account_file), {})
+                account_label = _account_display(
+                    meta.get("profileName"),
+                    meta.get("userName"),
+                    meta.get("remark"),
+                    account_file,
+                )
+                items.append(
+                    {
+                        "platformType": platform_type,
+                        "platformName": PLATFORMS.get(platform_type, f"平台{platform_type}"),
+                        "contentType": str(payload.get("contentType") or ""),
+                        "accountFile": account_file,
+                        "accountLabel": account_label,
+                        "profileName": meta.get("profileName") or "",
+                        "userName": meta.get("userName") or "",
+                        "accountRemark": meta.get("remark") or "",
+                        "filePath": file_path,
+                        "fileName": Path(file_path).name,
+                    }
+                )
+    content_type = content_type_for_payloads(payloads)
+    task_no = ""
+    for _ in range(8):
+        candidate = f"T{datetime.now():%m%d%H%M}-{uuid.uuid4().hex[:4].upper()}"
+        exists = conn.execute("SELECT 1 FROM publish_tasks WHERE taskNo = ?", (candidate,)).fetchone()
+        if not exists:
+            task_no = candidate
+            break
+    if not task_no:
+        raise RuntimeError("无法生成唯一任务号，请重试")
+    title = next((payload.get("title") or payload.get("biliTitle") for payload in payloads if payload.get("title") or payload.get("biliTitle")), "")
+    account_summary = "；".join(sorted(set(item["accountLabel"] for item in items)))
+    platform_summary = "、".join(sorted(set(item["platformName"] for item in items)))
+    dry_run = 1 if all(payload.get("debugDryRun") for payload in payloads) else 0
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO publish_tasks (
+            taskNo, mode, title, status, dryRun, platformCount, itemCount, contentType,
+            payloadJson, accountSummary, platformSummary, resumeSourceTaskId,
+            revisionSourceTaskId, createdAt
+        )
+        VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            task_no,
+            mode,
+            title,
+            dry_run,
+            len({item["platformType"] for item in items}),
+            len(items),
+            content_type,
+            json.dumps(payloads, ensure_ascii=False),
+            account_summary,
+            platform_summary,
+            resume_source_task_id,
+            revision_source_task_id,
+            _now(),
+        ),
+    )
+    task_id = cursor.lastrowid
+    for item in items:
         cursor.execute(
             """
-            INSERT INTO publish_tasks (
-                taskNo, mode, title, status, dryRun, platformCount, itemCount, contentType,
-                payloadJson, accountSummary, platformSummary, resumeSourceTaskId,
-                revisionSourceTaskId, createdAt
+            INSERT INTO publish_task_items (
+                taskId, platformType, platformName, accountFile, accountLabel,
+                profileName, userName, accountRemark, contentType, filePath, fileName, createdAt
             )
-            VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                task_no,
-                mode,
-                title,
-                dry_run,
-                len({item["platformType"] for item in items}),
-                len(items),
-                content_type,
-                json.dumps(payloads, ensure_ascii=False),
-                account_summary,
-                platform_summary,
-                resume_source_task_id,
-                revision_source_task_id,
+                task_id,
+                item["platformType"],
+                item["platformName"],
+                item["accountFile"],
+                item["accountLabel"],
+                item["profileName"],
+                item["userName"],
+                item["accountRemark"],
+                item["contentType"],
+                item["filePath"],
+                item["fileName"],
                 _now(),
             ),
         )
-        task_id = cursor.lastrowid
-        for item in items:
-            cursor.execute(
-                """
-                INSERT INTO publish_task_items (
-                    taskId, platformType, platformName, accountFile, accountLabel,
-                    profileName, userName, accountRemark, contentType, filePath, fileName, createdAt
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    task_id,
-                    item["platformType"],
-                    item["platformName"],
-                    item["accountFile"],
-                    item["accountLabel"],
-                    item["profileName"],
-                    item["userName"],
-                    item["accountRemark"],
-                    item["contentType"],
-                    item["filePath"],
-                    item["fileName"],
-                    _now(),
-                ),
-            )
-        conn.execute(
-            "INSERT INTO publish_task_events (taskId, level, eventType, message, createdAt) VALUES (?, 'info', 'created', ?, ?)",
-            (task_id, "桌面端已创建发布任务", _now()),
+    conn.execute(
+        "INSERT INTO publish_task_events (taskId, level, eventType, message, createdAt) VALUES (?, 'info', 'created', ?, ?)",
+        (task_id, "桌面端已创建发布任务", _now()),
+    )
+    return {"id": task_id, "taskNo": task_no, "itemCount": len(items)}
+
+
+def create_pending_task(
+    payloads: list[dict],
+    mode: str = "desktop",
+    *,
+    resume_source_task_id: int | None = None,
+    revision_source_task_id: int | None = None,
+) -> dict:
+    with connect() as conn:
+        task = _insert_pending_task(
+            conn,
+            payloads,
+            mode=mode,
+            resume_source_task_id=resume_source_task_id,
+            revision_source_task_id=revision_source_task_id,
         )
         conn.commit()
-    return {"id": task_id, "taskNo": task_no, "itemCount": len(items)}
+    return task
+
+
+def _require_linkable_revision_source(
+    conn,
+    source_task_id: object,
+    requested_item_indexes: list[int],
+) -> None:
+    """在子任务写事务内重新确认修订来源。"""
+
+    if type(source_task_id) is not int or source_task_id <= 0:
+        raise ValueError("修订来源任务已变化，请重新返回修改")
+    source = conn.execute(
+        """
+        SELECT status, pauseReasonCode, payloadJson
+        FROM publish_tasks
+        WHERE id = ?
+        """,
+        (source_task_id,),
+    ).fetchone()
+    source_items = conn.execute(
+        "SELECT batchItemIndex, status FROM publish_task_items WHERE taskId = ? ORDER BY id",
+        (source_task_id,),
+    ).fetchall()
+    statuses = [row["status"] for row in source_items]
+    if (
+        source is None
+        or workflow_from_payload_json(source["payloadJson"])
+        != "douyin-commerce-batch"
+        or not (
+            source["status"] in {"failed", "partial_failed"}
+            or (
+                source["status"] == "paused"
+                and source["pauseReasonCode"] == PAUSE_REASON_USER_REQUEST
+            )
+        )
+        or not statuses
+        or not any(status in {"failed", "pending"} for status in statuses)
+        or any(status not in {"success", "failed", "pending"} for status in statuses)
+    ):
+        raise ValueError("修订来源任务已变化，请重新返回修改")
+    indexed_statuses: dict[int, list[str]] = {}
+    for position, row in enumerate(source_items, start=1):
+        stored_index = row["batchItemIndex"]
+        item_index = (
+            stored_index
+            if type(stored_index) is int and stored_index > 0
+            else position
+        )
+        indexed_statuses.setdefault(item_index, []).append(row["status"])
+    if any(
+        len(indexed_statuses.get(item_index, [])) != 1
+        or indexed_statuses[item_index][0] not in {"failed", "pending"}
+        for item_index in requested_item_indexes
+    ):
+        raise ValueError("修订来源任务已变化，请重新返回修改")
 
 
 def create_douyin_batch_task(
@@ -564,66 +648,68 @@ def create_douyin_batch_task(
     if batch_item_indexes is None:
         resolved_item_indexes = list(range(1, len(items) + 1))
     else:
-        resolved_item_indexes = [int(index) for index in batch_item_indexes]
+        resolved_item_indexes = list(batch_item_indexes)
         if len(resolved_item_indexes) != len(items):
             raise ValueError("抖音带货续发视频序号数量不匹配")
-        if any(index <= 0 for index in resolved_item_indexes) or len(set(resolved_item_indexes)) != len(resolved_item_indexes):
+        if (
+            any(type(index) is not int for index in resolved_item_indexes)
+            or any(index <= 0 for index in resolved_item_indexes)
+            or len(set(resolved_item_indexes)) != len(resolved_item_indexes)
+        ):
             raise ValueError("抖音带货续发视频序号必须为互异正整数")
     payloads = [item_publish_payload(prepared_batch, item) for item in items]
-    task = create_pending_task(
-        payloads,
-        mode=mode,
-        resume_source_task_id=resume_source_task_id,
-        revision_source_task_id=revision_source_task_id,
-    )
     now = _now()
-    try:
-        with connect() as conn:
-            task_items = conn.execute(
-                "SELECT id FROM publish_task_items WHERE taskId = ? ORDER BY id", (task["id"],)
-            ).fetchall()
-            for index, (task_item, payload) in enumerate(zip(task_items, payloads)):
-                poi = payload.get("locationPoi") if isinstance(payload.get("locationPoi"), dict) else {}
-                location_name = str(poi.get("name") or payload.get("locationKeyword") or "").strip()
-                location_address = str(poi.get("address") or "").strip()
-                commission_suffix = {
-                    "commission": "【返佣】",
-                    "no_commission": "【无佣】",
-                }.get(poi.get("observedCommissionType"), "")
-                location_summary = (
-                    f"{location_name}{commission_suffix}（{location_address}）"
-                    if location_address
-                    else f"{location_name}{commission_suffix}"
-                )
-                schedule_summary = (
-                    f"北京时间定时 {payload['scheduleTime']}"
-                    if payload.get("enableTimer") is True and payload.get("scheduleTime")
-                    else "立即发布"
-                )
-                conn.execute(
-                    """
-                    UPDATE publish_task_items
-                    SET batchItemIndex = ?, locationSummary = ?, scheduleSummary = ?
-                    WHERE id = ?
-                    """,
-                    (resolved_item_indexes[index], location_summary, schedule_summary, task_item["id"]),
-                )
-            conn.execute(
-                "INSERT INTO publish_task_events (taskId, level, eventType, message, createdAt) VALUES (?, 'info', 'batch_created', ?, ?)",
-                (task["id"], "已创建抖音带货批量逐视频任务", now),
+    with connect() as conn:
+        if revision_source_task_id is not None:
+            _require_linkable_revision_source(
+                conn,
+                revision_source_task_id,
+                resolved_item_indexes,
             )
-            conn.commit()
-    except BaseException:
-        with connect() as conn:
-            conn.execute(
-                "DELETE FROM publish_task_events WHERE taskId = ?", (task["id"],)
+        task = _insert_pending_task(
+            conn,
+            payloads,
+            mode=mode,
+            resume_source_task_id=resume_source_task_id,
+            revision_source_task_id=revision_source_task_id,
+        )
+        task_items = conn.execute(
+            "SELECT id FROM publish_task_items WHERE taskId = ? ORDER BY id",
+            (task["id"],),
+        ).fetchall()
+        if len(task_items) != len(payloads):
+            raise RuntimeError("批量任务条目数量无法确认")
+        for index, (task_item, payload) in enumerate(zip(task_items, payloads)):
+            poi = payload.get("locationPoi") if isinstance(payload.get("locationPoi"), dict) else {}
+            location_name = str(poi.get("name") or payload.get("locationKeyword") or "").strip()
+            location_address = str(poi.get("address") or "").strip()
+            commission_suffix = {
+                "commission": "【返佣】",
+                "no_commission": "【无佣】",
+            }.get(poi.get("observedCommissionType"), "")
+            location_summary = (
+                f"{location_name}{commission_suffix}（{location_address}）"
+                if location_address
+                else f"{location_name}{commission_suffix}"
+            )
+            schedule_summary = (
+                f"北京时间定时 {payload['scheduleTime']}"
+                if payload.get("enableTimer") is True and payload.get("scheduleTime")
+                else "立即发布"
             )
             conn.execute(
-                "DELETE FROM publish_task_items WHERE taskId = ?", (task["id"],)
+                """
+                UPDATE publish_task_items
+                SET batchItemIndex = ?, locationSummary = ?, scheduleSummary = ?
+                WHERE id = ?
+                """,
+                (resolved_item_indexes[index], location_summary, schedule_summary, task_item["id"]),
             )
-            conn.execute("DELETE FROM publish_tasks WHERE id = ?", (task["id"],))
-            conn.commit()
-        raise
+        conn.execute(
+            "INSERT INTO publish_task_events (taskId, level, eventType, message, createdAt) VALUES (?, 'info', 'batch_created', ?, ?)",
+            (task["id"], "已创建抖音带货批量逐视频任务", now),
+        )
+        conn.commit()
     return task
 
 

@@ -235,6 +235,18 @@ class DouyinCommerceBatchDraftTests(unittest.TestCase):
         with self.assertRaisesRegex(DouyinCommerceBatchDraftError, "1 至 20"):
             normalize_batch_draft(payload)
 
+    def test_media_path_rejects_whitespace_only_value(self) -> None:
+        """路径必须保留合法内容，但全空白仍必须拒绝。"""
+
+        payload = {
+            "accountId": 7,
+            "accountFile": "douyin.json",
+            "shared": {},
+            "items": [{"mediaPath": " \t\n "}],
+        }
+        with self.assertRaisesRegex(DouyinCommerceBatchDraftError, "缺少本地媒体路径"):
+            normalize_batch_draft(payload)
+
 
 if __name__ == "__main__":
     unittest.main()
