@@ -176,12 +176,15 @@ def _items(value: object) -> list[dict[str, Any]]:
         media_path = _text(raw.get("mediaPath"))
         if not media_path or not Path(media_path).is_file():
             raise DouyinCommerceBatchError(f"第 {index} 条视频缺少可读取的本地媒体")
+        media_id = raw.get("mediaId")
+        media_id = media_id if type(media_id) is int and media_id > 0 else None
         override = _text(raw.get("scheduleTimeOverride"))
         # 覆盖时间的有效性会在取得明确的 now 后由 apply_interval_schedule 校验。
         if override:
             _parse_shanghai_time(override, field_name=f"第 {index} 条视频覆盖发布时间")
         result.append(
             {
+                "mediaId": media_id,
                 "mediaPath": media_path,
                 "locationPreset": _location_preset(raw.get("locationPreset"), index=index),
                 "scheduleTimeOverride": override,
@@ -323,6 +326,7 @@ def item_publish_payload(batch: Mapping[str, Any], item: Mapping[str, Any]) -> d
         "contentType": "video",
         "accountList": [batch["accountFile"]],
         "fileList": [item["mediaPath"]],
+        "mediaId": item.get("mediaId"),
         "title": batch["shared"]["title"],
         "description": batch["shared"]["description"],
         "tags": list(batch["shared"]["tags"]),

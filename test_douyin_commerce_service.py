@@ -12191,6 +12191,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
 
         self.assertIs(payload["items"][0]["enableTimer"], False)
         self.assertNotIn("scheduleTime", payload["items"][0])
+        self.assertEqual(payload["items"][0]["mediaId"], 1)
 
     def test_one_selected_video_uses_batch_preflight_instead_of_legacy_single_flow(self) -> None:
         """1 条也必须走 1..20 批量入口，不能悄悄退回旧单视频发布。"""

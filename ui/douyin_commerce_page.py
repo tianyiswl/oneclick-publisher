@@ -4486,6 +4486,7 @@ class DouyinCommercePage(QWidget):
                 raise douyin_commerce_batch_service.DouyinCommerceBatchError("每条视频必须选择带完整地址的官方地点预设")
             items.append(
                 {
+                    "mediaId": video.get("id"),
                     "mediaPath": path,
                     "locationPreset": dict(location),
                     "scheduleTimeOverride": _normalized(self._batch_schedule_overrides.get(path)),
@@ -4564,6 +4565,7 @@ class DouyinCommercePage(QWidget):
             },
             "items": [
                 {
+                    "mediaId": video.get("id"),
                     "mediaPath": _normalized(video.get("storedPath")),
                     "locationPresetId": _normalized(self._batch_locations.get(_normalized(video.get("storedPath")), {}).get("id")),
                     "locationPreset": dict(

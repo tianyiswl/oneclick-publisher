@@ -123,6 +123,22 @@ class DouyinCommerceBatchServiceTests(unittest.TestCase):
         self.assertNotIn("cookie", payload)
         self.assertNotIn("commerceStore", payload)
 
+    def test_batch_items_preserve_builtin_positive_media_identity(self) -> None:
+        from copy import deepcopy
+
+        raw = deepcopy(self.batch)
+        raw["items"][0]["mediaId"] = 71
+        prepared = prepare_batch_for_execution(raw, now=self.shanghai_now)
+        payload = item_publish_payload(prepared, prepared["items"][0])
+        self.assertEqual(prepared["items"][0]["mediaId"], 71)
+        self.assertEqual(payload["mediaId"], 71)
+
+        for invalid in (True, 0, -1, "71"):
+            with self.subTest(invalid=invalid):
+                raw["items"][0]["mediaId"] = invalid
+                prepared = prepare_batch_for_execution(raw, now=self.shanghai_now)
+                self.assertIsNone(prepared["items"][0]["mediaId"])
+
     def test_batch_contract_whitelist_excludes_sensitive_fields(self) -> None:
         raw = {
             **self.batch,
