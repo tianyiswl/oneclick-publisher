@@ -264,6 +264,65 @@ class DouyinCommercePayloadTests(unittest.TestCase):
             ["p1", "p2", "p3"],
         )
 
+    def test_commission_filter_returns_only_public_location_fields(self) -> None:
+        rows = [
+            {
+                "poiId": "p1",
+                "name": "北海银滩景区",
+                "address": "广西北海银海区",
+                "distance": "6.0km",
+                "source": "douyin-visible",
+                "commissionType": "commission",
+                "productCount": 15,
+                "commissionProductCount": 15,
+                "commissionLabel": "返佣",
+                "commerceInfo": "15件商品 · 15件返佣",
+                "text": "原始页面文本",
+                "html": "<div>原始页面</div>",
+                "cookie": "secret",
+                "error": "原始异常",
+            }
+        ]
+
+        self.assertEqual(
+            commission.filter_location_candidates(rows, "all"),
+            [
+                {
+                    "poiId": "p1",
+                    "name": "北海银滩景区",
+                    "address": "广西北海银海区",
+                    "distance": "6.0km",
+                    "source": "douyin-visible",
+                    "commissionType": "commission",
+                    "productCount": 15,
+                    "commissionProductCount": 15,
+                    "commissionLabel": "返佣",
+                }
+            ],
+        )
+
+    def test_commission_normalizers_validate_values_and_use_explicit_defaults(self) -> None:
+        self.assertEqual(
+            commission.normalize_commission_filter(None, default="commission"),
+            "commission",
+        )
+        self.assertEqual(
+            commission.normalize_observed_commission_type(None, default="unknown"),
+            "unknown",
+        )
+        for value in ("other", True, 1):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    commission.normalize_commission_filter(value)
+                with self.assertRaises(ValueError):
+                    commission.normalize_observed_commission_type(value)
+
+    def test_commission_summary_rejects_non_string_values(self) -> None:
+        for value in (True, 1, None):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    commission.parse_commission_summary(value)
+
     def test_requires_one_account_one_video_and_future_timer(self) -> None:
         checked = douyin_commerce_service.validate_douyin_commerce_payload(self.payload)
         self.assertEqual(checked["accountList"], ["oneclick_3_offline.json"])

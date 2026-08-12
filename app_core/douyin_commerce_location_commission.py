@@ -33,12 +33,25 @@ _COMMISSION_LABELS = {
     COMMISSION_FILTER_NO_COMMISSION: "无佣",
     "unknown": "待确认",
 }
+_PUBLIC_LOCATION_CANDIDATE_FIELDS = (
+    "poiId",
+    "name",
+    "address",
+    "distance",
+    "source",
+    "commissionType",
+    "productCount",
+    "commissionProductCount",
+    "commissionLabel",
+)
 
 
 def _text(value: object) -> str:
     """只接受页面可见的文本，避免将布尔值等伪值转换成摘要。"""
 
-    return value.strip() if isinstance(value, str) else ""
+    if not isinstance(value, str):
+        raise ValueError("返佣摘要必须是字符串")
+    return value.strip()
 
 
 def normalize_commission_filter(value: object, *, default: str = "all") -> str:
@@ -108,13 +121,18 @@ def filter_location_candidates(
     for row in rows:
         if not isinstance(row, Mapping):
             continue
-        candidate = dict(row)
         commission_type = normalize_observed_commission_type(
-            candidate.get("commissionType"), default="unknown"
+            row.get("commissionType"), default="unknown"
         )
         if (
             selected_filter == COMMISSION_FILTER_ALL
             or commission_type == selected_filter
         ):
-            candidates.append(candidate)
+            candidates.append(
+                {
+                    field: row[field]
+                    for field in _PUBLIC_LOCATION_CANDIDATE_FIELDS
+                    if field in row
+                }
+            )
     return candidates
