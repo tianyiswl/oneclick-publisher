@@ -9327,6 +9327,200 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.page.close()
 
+    def _load_revision_ui_fixture(self) -> dict[str, object]:
+        tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tempdir.cleanup)
+        root = Path(tempdir.name)
+        videos = []
+        for media_id, name in enumerate(
+            ("done.mp4", "failed.mp4", "pending.mp4"), start=1
+        ):
+            path = root / name
+            path.write_bytes(b"offline-video")
+            videos.append(
+                {
+                    "id": media_id,
+                    "typeText": "视频",
+                    "storedPath": str(path),
+                    "filename": name,
+                }
+            )
+        account = {
+            "id": 71,
+            "type": 3,
+            "status": 1,
+            "filePath": "douyin-71.json",
+            "profileName": "测试主体",
+            "userName": "测试账号",
+        }
+        with patch(
+            "ui.douyin_commerce_page.account_service.list_accounts",
+            return_value=[account],
+        ), patch(
+            "ui.douyin_commerce_page.media_service.list_media",
+            return_value=videos,
+        ):
+            self.page.refresh()
+        location = {
+            "poiId": "poi-1",
+            "name": "测试地点",
+            "address": "北京市朝阳区测试路1号",
+            "scope": "domestic",
+            "commissionFilter": "commission",
+            "observedCommissionType": "commission",
+        }
+        draft = {
+            "accountId": 71,
+            "accountFile": "douyin-71.json",
+            "shared": {
+                "title": "修改后的标题",
+                "description": "修改未完成视频",
+                "tags": ["测试"],
+                "selectedMusic": {
+                    "musicId": "music-1",
+                    "title": "测试音乐",
+                    "creator": "测试",
+                    "duration": "00:30",
+                },
+                "contentDeclaration": "无需添加自主声明",
+            },
+            "lastLocationSearch": {
+                "scope": "domestic",
+                "keyword": "测试地点",
+                "commissionFilter": "commission",
+            },
+            "publishMode": "interval-schedule",
+            "schedule": {
+                "timezone": "Asia/Shanghai",
+                "startTime": "2099-08-13 16:00",
+                "intervalMinutes": 30,
+            },
+            "items": [
+                {
+                    "mediaId": row["id"],
+                    "mediaPath": row["storedPath"],
+                    "locationPreset": location,
+                    "enableTimer": True,
+                    "scheduleTimeOverride": "",
+                }
+                for row in videos[1:]
+            ],
+        }
+        return {
+            "revisionAllowed": True,
+            "sourceTaskId": 41,
+            "sourceTaskNo": "T08122117-665B",
+            "revisionItemIndexes": [2, 3],
+            "successfulMediaKeys": ["media:1"],
+            "draft": draft,
+        }
+
+    def test_revision_plan_restores_only_unfinished_items_and_all_editable_fields(
+        self,
+    ) -> None:
+        plan = self._load_revision_ui_fixture()
+        self.page._apply_batch_revision_plan(plan)
+        self.assertEqual(self.page.selected_video_count(), 2)
+        self.assertEqual(self.page._batch_revision_source_task_id, 41)
+        self.assertEqual(self.page.pages.currentIndex(), 1)
+        self.assertEqual(self.page.title_input.text(), "修改后的标题")
+        self.assertEqual(self.page._selected_music["musicId"], "music-1")
+        self.assertEqual(len(self.page._batch_locations), 2)
+        self.assertEqual(
+            self.page.batch_publish_mode.currentData(), "interval-schedule"
+        )
+
+    def test_revision_blocks_successful_video_from_checkbox_and_programmatic_selection(
+        self,
+    ) -> None:
+        self._load_revision_ui_fixture()
+        self.page._batch_revision_blocked_media_keys = {"media:1"}
+        with patch("ui.douyin_commerce_page.QMessageBox.warning") as warning:
+            self.page.select_video_indexes([1, 2])
+        self.assertEqual(self.page.selected_video_count(), 1)
+        self.assertEqual(self.page._selected_videos()[0]["id"], 2)
+        warning.assert_called_once()
+
+    def test_revision_unchecks_successful_video_selected_directly_in_list(
+        self,
+    ) -> None:
+        self._load_revision_ui_fixture()
+        self.page._batch_revision_blocked_media_keys = {"media:1"}
+        item = self.page.batch_video_list.item(0)
+
+        with patch("ui.douyin_commerce_page.QMessageBox.warning") as warning:
+            item.setCheckState(Qt.CheckState.Checked)
+
+        self.assertEqual(item.checkState(), Qt.CheckState.Unchecked)
+        self.assertEqual(self.page.selected_video_count(), 0)
+        warning.assert_called_once()
+
+    def test_revision_state_clears_only_at_new_abandoned_or_completed_batch_boundaries(
+        self,
+    ) -> None:
+        def set_revision_state() -> None:
+            self.page._batch_revision_source_task_id = 41
+            self.page._batch_revision_source_task_no = "T08122117-665B"
+            self.page._batch_revision_blocked_media_keys = {"media:1"}
+
+        def assert_revision_state_cleared() -> None:
+            self.assertIsNone(self.page._batch_revision_source_task_id)
+            self.assertEqual(self.page._batch_revision_source_task_no, "")
+            self.assertEqual(self.page._batch_revision_blocked_media_keys, set())
+
+        set_revision_state()
+        with patch.object(self.page, "_abandon_session"):
+            self.page.start_new_content()
+        assert_revision_state_cleared()
+
+        set_revision_state()
+        self.page._reset_platform_settings_after_abandon()
+        assert_revision_state_cleared()
+
+        set_revision_state()
+        self.page._clear_current_batch_platform_choices()
+        assert_revision_state_cleared()
+
+    def test_revision_state_survives_setup_operation_failure(self) -> None:
+        self.page._batch_revision_source_task_id = 41
+        self.page._batch_revision_source_task_no = "T08122117-665B"
+        self.page._batch_revision_blocked_media_keys = {"media:1"}
+
+        self.page._finish_setup_generation_close("operation_failed", True)
+
+        self.assertEqual(self.page._batch_revision_source_task_id, 41)
+        self.assertEqual(
+            self.page._batch_revision_source_task_no, "T08122117-665B"
+        )
+        self.assertEqual(
+            self.page._batch_revision_blocked_media_keys, {"media:1"}
+        )
+
+    def test_revision_media_key_error_stays_fixed_and_fail_closed_in_ui(self) -> None:
+        plan = self._load_revision_ui_fixture()
+        self.page._apply_batch_revision_plan(plan)
+        media = dict(self.page.video_combo.itemData(1))
+        media.pop("id")
+        self.page.video_combo.setItemData(1, media)
+
+        with patch(
+            "ui.douyin_commerce_page.Path.resolve",
+            side_effect=ValueError("sensitive-media-key-error"),
+        ), patch("ui.douyin_commerce_page.QMessageBox.warning") as warning:
+            self.page.select_video_indexes([1, 2])
+
+        self.assertEqual(
+            [video["id"] for video in self.page._selected_videos()], [2]
+        )
+        warning.assert_called_once_with(
+            self.page,
+            "修改未完成视频",
+            "已成功发布的视频不能重新加入修改批次。",
+        )
+        self.assertNotIn(
+            "sensitive-media-key-error", str(warning.call_args)
+        )
+
     def _activate_setup_generation(self, generation_id: str = "generation-a") -> None:
         """模拟与当前账号和视频内容绑定的有效设置代际。"""
 

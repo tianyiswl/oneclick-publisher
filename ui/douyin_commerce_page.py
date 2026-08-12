@@ -574,6 +574,9 @@ class DouyinCommercePage(QWidget):
         self._batch_preflight_fingerprint = ""
         self._batch_progress_text = ""
         self._batch_result_feedback = ""
+        self._batch_revision_source_task_id: int | None = None
+        self._batch_revision_source_task_no = ""
+        self._batch_revision_blocked_media_keys: set[str] = set()
         # 批次结果仍需留在当前页面供复制；只有用户真正进入下一批平台设置时
         # 才清空共享执行日志，避免多批记录混在一起。
         self._clear_runtime_log_on_next_task = False
@@ -2614,6 +2617,27 @@ class DouyinCommercePage(QWidget):
     def _video_key(media: object) -> str:
         return _normalized((media or {}).get("storedPath")) if isinstance(media, dict) else ""
 
+    @staticmethod
+    def _media_key(media: object) -> str:
+        if not isinstance(media, Mapping):
+            return ""
+        media_id = media.get("id")
+        if type(media_id) is int and media_id > 0:
+            return f"media:{media_id}"
+        path = _normalized(media.get("storedPath"))
+        return f"path:{Path(path).resolve(strict=False)}" if path else ""
+
+    def _revision_media_is_blocked(self, media: object) -> bool:
+        """修订中媒体身份无法安全确认时按成功项处理，不暴露底层异常。"""
+
+        if not self._batch_revision_blocked_media_keys:
+            return False
+        try:
+            media_key = self._media_key(media)
+        except (OSError, RuntimeError, ValueError):
+            return True
+        return not media_key or media_key in self._batch_revision_blocked_media_keys
+
     def _refresh_batch_video_list(self) -> None:
         """用多选缩略图列表呈现本机视频；刷新绝不访问平台。"""
 
@@ -2647,6 +2671,18 @@ class DouyinCommercePage(QWidget):
         index = item.data(Qt.ItemDataRole.UserRole)
         if not isinstance(index, int):
             return
+        if (
+            item.checkState() == Qt.CheckState.Checked
+            and self._revision_media_is_blocked(self.video_combo.itemData(index))
+        ):
+            blocked = self.batch_video_list.blockSignals(True)
+            item.setCheckState(Qt.CheckState.Unchecked)
+            self.batch_video_list.blockSignals(blocked)
+            QMessageBox.warning(
+                self,
+                "修改未完成视频",
+                "已成功发布的视频不能重新加入修改批次。",
+            )
         selected = [
             int(self.batch_video_list.item(row).data(Qt.ItemDataRole.UserRole))
             for row in range(self.batch_video_list.count())
@@ -2681,6 +2717,20 @@ class DouyinCommercePage(QWidget):
                 unique.append(index)
         if not 1 <= len(unique) <= 20:
             raise ValueError("请选择 1 至 20 条视频")
+        allowed = []
+        blocked_requested = False
+        for index in unique:
+            if self._revision_media_is_blocked(self.video_combo.itemData(index)):
+                blocked_requested = True
+            else:
+                allowed.append(index)
+        unique = allowed
+        if blocked_requested:
+            QMessageBox.warning(
+                self,
+                "修改未完成视频",
+                "已成功发布的视频不能重新加入修改批次。",
+            )
         self.batch_video_list.blockSignals(True)
         for row in range(self.batch_video_list.count()):
             item = self.batch_video_list.item(row)
@@ -2691,7 +2741,7 @@ class DouyinCommercePage(QWidget):
         self.batch_video_list.blockSignals(False)
         self._selected_video_indexes = unique
         self.video_combo.blockSignals(True)
-        self.video_combo.setCurrentIndex(unique[0])
+        self.video_combo.setCurrentIndex(unique[0] if unique else 0)
         self.video_combo.blockSignals(False)
         self._sync_batch_video_status()
         self._content_changed()
@@ -4614,6 +4664,16 @@ class DouyinCommercePage(QWidget):
             self._sync_view()
             return
         payload = dict(saved.get("payload") or {})
+        self._apply_batch_editable_payload(payload)
+        self._refresh_batch_saved_content_status()
+        self._render_batch_item_rows()
+        self._sync_view()
+
+    def _apply_batch_editable_payload(
+        self, payload: Mapping[str, object]
+    ) -> None:
+        """把已校验的本地可编辑快照投射到现有控件；不访问平台。"""
+
         self.account_combo.blockSignals(True)
         self._restore_saved_combo(
             self.account_combo,
@@ -4742,8 +4802,20 @@ class DouyinCommercePage(QWidget):
         self.batch_publish_mode.setCurrentIndex(
             self.batch_publish_mode.findData(publish_mode)
         )
-        self._refresh_batch_saved_content_status()
-        self._render_batch_item_rows()
+
+    def _apply_batch_revision_plan(self, plan: Mapping[str, object]) -> None:
+        """恢复失败或未开始视频，并保留来源任务和成功媒体边界。"""
+
+        self._batch_revision_source_task_id = int(plan["sourceTaskId"])
+        self._batch_revision_source_task_no = _normalized(plan.get("sourceTaskNo"))
+        successful_media_keys = plan.get("successfulMediaKeys", [])
+        self._batch_revision_blocked_media_keys = {
+            str(value)
+            for value in successful_media_keys
+            if isinstance(successful_media_keys, list) and isinstance(value, str)
+        }
+        self._apply_batch_editable_payload(dict(plan["draft"]))
+        self.pages.setCurrentIndex(1)
         self._sync_view()
 
     def start_batch_preflight(self) -> None:
@@ -5768,7 +5840,9 @@ class DouyinCommercePage(QWidget):
             "login_required",
             "operation_failed",
         }:
-            self._reset_platform_settings_after_abandon()
+            self._reset_platform_settings_after_abandon(
+                clear_revision_state=completion == "abandoned"
+            )
             self._uploaded_editor_payload = None
             self._pending_upload_payload = None
             self._refresh_saved_content_status()
@@ -6988,6 +7062,7 @@ class DouyinCommercePage(QWidget):
 
         if self._busy():
             return
+        self._clear_batch_revision_state()
         self._abandon_session(silent=True)
         self.pages.setCurrentIndex(0)
         self._sync_view()
@@ -7074,13 +7149,17 @@ class DouyinCommercePage(QWidget):
                 legacy_session_closed = False
         return setup_finished and collectors_closed and legacy_session_closed
 
-    def _reset_platform_settings_after_abandon(self) -> None:
+    def _reset_platform_settings_after_abandon(
+        self, *, clear_revision_state: bool = True
+    ) -> None:
         """将平台设置恢复为一次全新上传的默认状态。
 
         内容准备中的账号、视频、标题、文案和话题保留；音乐、地点、
         声明与定时属于已放弃会话的发布意图，必须全部丢弃。
         """
 
+        if clear_revision_state:
+            self._clear_batch_revision_state()
         self._reset_platform_collector_progress()
         self._setup_generation_content_fingerprint = ""
         self._clear_music_candidates()
@@ -7175,6 +7254,7 @@ class DouyinCommercePage(QWidget):
     def _clear_current_batch_platform_choices(self) -> None:
         """明确完成后清除本批发布意图，账号候选缓存仍保留在独立缓存层。"""
 
+        self._clear_batch_revision_state()
         self._reset_platform_collector_progress()
         self._clear_music_candidates()
         self._selected_music = None
@@ -7204,6 +7284,13 @@ class DouyinCommercePage(QWidget):
         self._staged_declaration_confirmed = False
         self._batch_preflight_fingerprint = ""
         self._preflight_fingerprint = ""
+
+    def _clear_batch_revision_state(self) -> None:
+        """只在用户放弃、完成或明确开始新批次时结束修订关系。"""
+
+        self._batch_revision_source_task_id = None
+        self._batch_revision_source_task_no = ""
+        self._batch_revision_blocked_media_keys = set()
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt 固定事件名
         if self._session_id and not self._busy():
