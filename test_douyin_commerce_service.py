@@ -9551,6 +9551,53 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         ):
             self.page.collect_upload_payload()
 
+    def test_normal_video_picker_keeps_single_video_out_of_batch_selection(
+        self,
+    ) -> None:
+        tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tempdir.cleanup)
+        root = Path(tempdir.name)
+        videos = []
+        for media_id, name in enumerate(("first.mp4", "second.mp4"), start=1):
+            path = root / name
+            path.write_bytes(b"offline-video")
+            videos.append(
+                {
+                    "id": media_id,
+                    "typeText": "视频",
+                    "storedPath": str(path),
+                    "filename": name,
+                }
+            )
+        account = {
+            "id": 81,
+            "type": 3,
+            "status": 1,
+            "filePath": "douyin-81.json",
+            "profileName": "普通主体",
+            "userName": "普通账号",
+        }
+        with patch(
+            "ui.douyin_commerce_page.account_service.list_accounts",
+            return_value=[account],
+        ), patch(
+            "ui.douyin_commerce_page.media_service.list_media",
+            return_value=videos,
+        ):
+            self.page.refresh()
+        self.page.account_combo.setCurrentIndex(1)
+        self.page.description_input.setPlainText("普通单视频菜单选择测试文案")
+        menu = self.page._build_video_picker_menu()
+        rows = menu.findChildren(QPushButton, "douyinCommerceVideoPickerItem")
+
+        rows[1].click()
+        payload = self.page.collect_upload_payload()
+
+        self.assertIsNone(self.page._batch_revision_source_task_id)
+        self.assertEqual(self.page.selected_video_count(), 0)
+        self.assertEqual(self.page.video_combo.currentIndex(), 2)
+        self.assertEqual(payload["fileList"], [videos[1]["storedPath"]])
+
     def test_revision_path_media_key_preserves_legal_internal_double_spaces(
         self,
     ) -> None:

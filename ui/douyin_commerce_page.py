@@ -1107,7 +1107,10 @@ class DouyinCommercePage(QWidget):
                 self._REVISION_MEDIA_BLOCKED_MESSAGE,
             )
             return False
-        self.select_video_indexes([index])
+        if self._batch_revision_source_task_id is not None:
+            self.select_video_indexes([index])
+        else:
+            self.video_combo.setCurrentIndex(index)
         return True
 
     def _open_video_picker(self) -> None:
