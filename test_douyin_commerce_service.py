@@ -9504,7 +9504,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.page.video_combo.setItemData(1, media)
 
         with patch(
-            "ui.douyin_commerce_page.Path.resolve",
+            "app_core.task_service.Path.resolve",
             side_effect=ValueError("sensitive-media-key-error"),
         ), patch("ui.douyin_commerce_page.QMessageBox.warning") as warning:
             self.page.select_video_indexes([1, 2])
@@ -9520,6 +9520,105 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.assertNotIn(
             "sensitive-media-key-error", str(warning.call_args)
         )
+
+    def test_revision_video_picker_cannot_select_successful_media_for_upload(
+        self,
+    ) -> None:
+        plan = self._load_revision_ui_fixture()
+        self.page._apply_batch_revision_plan(plan)
+        failed_path = plan["draft"]["items"][0]["mediaPath"]
+        menu = self.page._build_video_picker_menu()
+        rows = menu.findChildren(QPushButton, "douyinCommerceVideoPickerItem")
+
+        with patch("ui.douyin_commerce_page.QMessageBox.warning") as warning:
+            rows[0].click()
+            payload = self.page.collect_upload_payload()
+
+        self.assertEqual(self.page.video_combo.currentIndex(), 2)
+        self.assertEqual(
+            [video["id"] for video in self.page._selected_videos()], [2, 3]
+        )
+        self.assertEqual(payload["fileList"], [failed_path])
+        warning.assert_called_once_with(
+            self.page,
+            "修改未完成视频",
+            "已成功发布的视频不能重新加入修改批次。",
+        )
+        self.page.video_combo.setCurrentIndex(1)
+        with self.assertRaisesRegex(
+            douyin_commerce_service.DouyinCommerceError,
+            "已成功发布的视频不能重新加入修改批次",
+        ):
+            self.page.collect_upload_payload()
+
+    def test_revision_path_media_key_preserves_legal_internal_double_spaces(
+        self,
+    ) -> None:
+        tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tempdir.cleanup)
+        done_path = Path(tempdir.name) / "done  final.mp4"
+        done_path.write_bytes(b"offline-video")
+        media = {
+            "typeText": "视频",
+            "storedPath": str(done_path),
+            "filename": done_path.name,
+        }
+        with patch(
+            "ui.douyin_commerce_page.media_service.list_media",
+            return_value=[media],
+        ):
+            self.page.refresh()
+        service_key = task_service._batch_media_key(
+            {"fileList": [str(done_path)]}
+        )
+        self.assertEqual(
+            service_key, f"path:{done_path.resolve(strict=False)}"
+        )
+        self.page._batch_revision_blocked_media_keys = {service_key}
+
+        with patch("ui.douyin_commerce_page.QMessageBox.warning") as warning:
+            selected = self.page._select_local_video(1)
+
+        self.assertFalse(selected)
+        self.assertEqual(self.page.video_combo.currentIndex(), 0)
+        warning.assert_called_once_with(
+            self.page,
+            "修改未完成视频",
+            "已成功发布的视频不能重新加入修改批次。",
+        )
+
+    def test_revision_with_no_mappable_media_clears_old_selection_and_stays_put(
+        self,
+    ) -> None:
+        plan = self._load_revision_ui_fixture()
+        self.page.select_video_indexes([1])
+        missing_draft = {
+            **plan["draft"],
+            "items": [
+                {
+                    "mediaId": 999,
+                    "mediaPath": "/missing/private  source.mp4",
+                    "locationPreset": {},
+                    "enableTimer": False,
+                    "scheduleTimeOverride": "",
+                }
+            ],
+        }
+        missing_plan = {**plan, "draft": missing_draft}
+        self.page.pages.setCurrentIndex(0)
+
+        with patch("ui.douyin_commerce_page.QMessageBox.warning") as warning:
+            self.page._apply_batch_revision_plan(missing_plan)
+
+        self.assertEqual(self.page.selected_video_count(), 0)
+        self.assertEqual(self.page.video_combo.currentIndex(), 0)
+        self.assertEqual(self.page.pages.currentIndex(), 0)
+        warning.assert_called_once_with(
+            self.page,
+            "恢复未完成视频",
+            "未完成视频无法恢复到编辑页，请刷新本机素材后重试。",
+        )
+        self.assertNotIn("private", str(warning.call_args))
 
     def _activate_setup_generation(self, generation_id: str = "generation-a") -> None:
         """模拟与当前账号和视频内容绑定的有效设置代际。"""

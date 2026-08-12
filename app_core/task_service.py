@@ -632,17 +632,23 @@ def _revision_blocked(
     }
 
 
+def build_douyin_batch_media_key(media_id: object, media_path: object) -> str:
+    """构造服务层与 UI 共用的稳定媒体身份，不改写合法文件名。"""
+
+    if type(media_id) is int and media_id > 0:
+        return f"media:{media_id}"
+    path = str(media_path or "").strip()
+    return f"path:{Path(path).resolve(strict=False)}" if path else ""
+
+
 def _batch_media_key(payload: dict) -> str:
     """使用稳定媒体身份，兼容没有 mediaId 的历史任务。"""
 
-    media_id = payload.get("mediaId")
-    if type(media_id) is int and media_id > 0:
-        return f"media:{media_id}"
     file_list = payload.get("fileList")
-    path = str(
+    media_path = (
         file_list[0] if isinstance(file_list, list) and file_list else ""
-    ).strip()
-    return f"path:{Path(path).resolve(strict=False)}" if path else ""
+    )
+    return build_douyin_batch_media_key(payload.get("mediaId"), media_path)
 
 
 def _revision_schedule_interval(payloads: list[dict]) -> int:

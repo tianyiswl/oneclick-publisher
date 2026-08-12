@@ -452,6 +452,10 @@ class DouyinCommercePage(QWidget):
     _SETUP_GENERATION_TASK_KEY = "douyin_commerce_setup_generation"
     _SETUP_GENERATION_CLOSE_TASK_KEY = "douyin_commerce_setup_generation_close"
     _COLLECTOR_BARRIER_ERROR = "平台设置临时会话未完全关闭，已安全停止"
+    _REVISION_MEDIA_BLOCKED_MESSAGE = "已成功发布的视频不能重新加入修改批次。"
+    _REVISION_RESTORE_FAILED_MESSAGE = (
+        "未完成视频无法恢复到编辑页，请刷新本机素材后重试。"
+    )
     _SHUTDOWN_WAIT_SECONDS = 5.0
     _DEFAULT_CONTENT_DECLARATION = "无需添加自主声明"
     _DISABLED_CONTENT_DECLARATIONS = frozenset({"内容为转载信息"})
@@ -1096,7 +1100,14 @@ class DouyinCommercePage(QWidget):
 
         if not 1 <= index < self.video_combo.count():
             return False
-        self.video_combo.setCurrentIndex(index)
+        if self._revision_media_is_blocked(self.video_combo.itemData(index)):
+            QMessageBox.warning(
+                self,
+                "修改未完成视频",
+                self._REVISION_MEDIA_BLOCKED_MESSAGE,
+            )
+            return False
+        self.select_video_indexes([index])
         return True
 
     def _open_video_picker(self) -> None:
@@ -2621,11 +2632,9 @@ class DouyinCommercePage(QWidget):
     def _media_key(media: object) -> str:
         if not isinstance(media, Mapping):
             return ""
-        media_id = media.get("id")
-        if type(media_id) is int and media_id > 0:
-            return f"media:{media_id}"
-        path = _normalized(media.get("storedPath"))
-        return f"path:{Path(path).resolve(strict=False)}" if path else ""
+        return task_service.build_douyin_batch_media_key(
+            media.get("id"), media.get("storedPath")
+        )
 
     def _revision_media_is_blocked(self, media: object) -> bool:
         """修订中媒体身份无法安全确认时按成功项处理，不暴露底层异常。"""
@@ -2681,7 +2690,7 @@ class DouyinCommercePage(QWidget):
             QMessageBox.warning(
                 self,
                 "修改未完成视频",
-                "已成功发布的视频不能重新加入修改批次。",
+                self._REVISION_MEDIA_BLOCKED_MESSAGE,
             )
         selected = [
             int(self.batch_video_list.item(row).data(Qt.ItemDataRole.UserRole))
@@ -2729,8 +2738,15 @@ class DouyinCommercePage(QWidget):
             QMessageBox.warning(
                 self,
                 "修改未完成视频",
-                "已成功发布的视频不能重新加入修改批次。",
+                self._REVISION_MEDIA_BLOCKED_MESSAGE,
             )
+        self._project_batch_video_selection(unique)
+        self._content_changed()
+
+    def _project_batch_video_selection(self, indexes: list[int]) -> None:
+        """原子投射批量勾选和当前视频；调用方负责资格检查。"""
+
+        unique = list(indexes)
         self.batch_video_list.blockSignals(True)
         for row in range(self.batch_video_list.count()):
             item = self.batch_video_list.item(row)
@@ -2744,7 +2760,6 @@ class DouyinCommercePage(QWidget):
         self.video_combo.setCurrentIndex(unique[0] if unique else 0)
         self.video_combo.blockSignals(False)
         self._sync_batch_video_status()
-        self._content_changed()
 
     def select_all_batch_videos(self) -> None:
         """选择当前素材列表中最多二十条视频，不访问平台。"""
@@ -2770,15 +2785,7 @@ class DouyinCommercePage(QWidget):
         if self._busy():
             QMessageBox.warning(self, "取消全选", "当前正在处理，请等待操作完成后再修改视频。")
             return
-        self.batch_video_list.blockSignals(True)
-        for row in range(self.batch_video_list.count()):
-            self.batch_video_list.item(row).setCheckState(Qt.CheckState.Unchecked)
-        self.batch_video_list.blockSignals(False)
-        self._selected_video_indexes = []
-        self.video_combo.blockSignals(True)
-        self.video_combo.setCurrentIndex(0)
-        self.video_combo.blockSignals(False)
-        self._sync_batch_video_status()
+        self._project_batch_video_selection([])
         self._content_changed()
 
     def selected_video_count(self) -> int:
@@ -4674,22 +4681,36 @@ class DouyinCommercePage(QWidget):
     ) -> None:
         """把已校验的本地可编辑快照投射到现有控件；不访问平台。"""
 
+        self._project_batch_video_selection([])
         self.account_combo.blockSignals(True)
         self._restore_saved_combo(
             self.account_combo,
             identity=payload.get("accountId"), path=payload.get("accountFile"),
         )
         self.account_combo.blockSignals(False)
-        by_path = {
-            _normalized(self.video_combo.itemData(index).get("storedPath")): index
-            for index in range(1, self.video_combo.count())
-            if isinstance(self.video_combo.itemData(index), dict)
-        }
-        indexes = [
-            by_path[_normalized(item.get("mediaPath"))]
-            for item in payload.get("items") or []
-            if _normalized(item.get("mediaPath")) in by_path
-        ]
+        by_media_key = {}
+        for index in range(1, self.video_combo.count()):
+            media = self.video_combo.itemData(index)
+            if not isinstance(media, dict):
+                continue
+            try:
+                media_key = self._media_key(media)
+            except (OSError, RuntimeError, ValueError):
+                continue
+            if media_key:
+                by_media_key[media_key] = index
+        indexes = []
+        for item in payload.get("items") or []:
+            if not isinstance(item, Mapping):
+                continue
+            try:
+                media_key = task_service.build_douyin_batch_media_key(
+                    item.get("mediaId"), item.get("mediaPath")
+                )
+            except (OSError, RuntimeError, ValueError):
+                continue
+            if media_key in by_media_key:
+                indexes.append(by_media_key[media_key])
         if indexes:
             self.select_video_indexes(indexes)
         shared = payload.get("shared") if isinstance(payload.get("shared"), dict) else {}
@@ -4806,15 +4827,40 @@ class DouyinCommercePage(QWidget):
     def _apply_batch_revision_plan(self, plan: Mapping[str, object]) -> None:
         """恢复失败或未开始视频，并保留来源任务和成功媒体边界。"""
 
-        self._batch_revision_source_task_id = int(plan["sourceTaskId"])
-        self._batch_revision_source_task_no = _normalized(plan.get("sourceTaskNo"))
-        successful_media_keys = plan.get("successfulMediaKeys", [])
-        self._batch_revision_blocked_media_keys = {
-            str(value)
-            for value in successful_media_keys
-            if isinstance(successful_media_keys, list) and isinstance(value, str)
-        }
-        self._apply_batch_editable_payload(dict(plan["draft"]))
+        self._project_batch_video_selection([])
+        try:
+            self._batch_revision_source_task_id = int(plan["sourceTaskId"])
+            self._batch_revision_source_task_no = _normalized(
+                plan.get("sourceTaskNo")
+            )
+            successful_media_keys = plan.get("successfulMediaKeys", [])
+            if not isinstance(successful_media_keys, list):
+                raise ValueError("invalid revision media keys")
+            self._batch_revision_blocked_media_keys = {
+                str(value)
+                for value in successful_media_keys
+                if isinstance(value, str)
+            }
+            draft = plan.get("draft")
+            if not isinstance(draft, Mapping):
+                raise ValueError("invalid revision draft")
+            self._apply_batch_editable_payload(draft)
+        except Exception:
+            QMessageBox.warning(
+                self,
+                "恢复未完成视频",
+                self._REVISION_RESTORE_FAILED_MESSAGE,
+            )
+            self._sync_view()
+            return
+        if not self._selected_video_indexes:
+            QMessageBox.warning(
+                self,
+                "恢复未完成视频",
+                self._REVISION_RESTORE_FAILED_MESSAGE,
+            )
+            self._sync_view()
+            return
         self.pages.setCurrentIndex(1)
         self._sync_view()
 
@@ -5125,6 +5171,10 @@ class DouyinCommercePage(QWidget):
             raise douyin_commerce_service.DouyinCommerceError("所选账号不是状态正常的抖音账号")
         if not video:
             raise douyin_commerce_service.DouyinCommerceError("请选择一条视频素材")
+        if self._revision_media_is_blocked(video):
+            raise douyin_commerce_service.DouyinCommerceError(
+                self._REVISION_MEDIA_BLOCKED_MESSAGE
+            )
         payload = {
             "type": 3,
             "workflow": douyin_commerce_service.DOUYIN_COMMERCE_WORKFLOW,
