@@ -17,6 +17,11 @@ from pathlib import Path
 from time import monotonic
 from typing import Any, Mapping
 
+from .douyin_commerce_location_commission import (
+    filter_location_candidates,
+    normalize_commission_filter,
+    parse_commission_summary,
+)
 from .douyin_location_service import normalize_location_candidate, normalize_location_keyword
 from .douyin_location_preset_service import (
     DouyinLocationPresetError,
@@ -203,7 +208,7 @@ def normalize_commerce_store_candidates(
     return result
 
 
-def normalize_commerce_location_candidate(value: object) -> dict[str, str] | None:
+def normalize_commerce_location_candidate(value: object) -> dict[str, Any] | None:
     """规范化新版抖音带货页中可见的“发布定位”候选。
 
     新版抖音把地点搜索结果展示在带货模式的同一个控件内，但“发布定位”和
@@ -229,25 +234,37 @@ def normalize_commerce_location_candidate(value: object) -> dict[str, str] | Non
         return None
     return {
         **location,
+        **parse_commission_summary(_normalized(value.get("commerceInfo"))),
         "source": "douyin-visible-commerce-location",
     }
 
 
-def normalize_commerce_location_candidates(rows: object) -> list[dict[str, Any]]:
-    """去重并保留新版编辑页可见的发布定位候选。
+def normalize_commerce_location_candidates(
+    rows: object,
+    *,
+    commission_filter: object = "all",
+) -> list[dict[str, Any]]:
+    """先按返佣要求筛选，再按 POI 身份去重可见发布定位候选。
 
-    即使抖音结果项同时展示商品/返佣信息，也不把它提取为门店候选或任务字段。
-    首版只验证发布定位；门店绑定已从一键发流程中移除。
+    原始商品/返佣文案只在当前 DOM 读取阶段存在；出口仅保留解析后的公开结构
+    字段。首版仍只验证发布定位；门店绑定已从一键发流程中移除。
     """
 
     if not isinstance(rows, list):
         return []
+    selected_filter = normalize_commission_filter(
+        commission_filter,
+        default="all",
+    )
+    normalized_rows = [
+        location
+        for row in rows
+        if (location := normalize_commerce_location_candidate(row))
+    ]
+    filtered_rows = filter_location_candidates(normalized_rows, selected_filter)
     result: list[dict[str, Any]] = []
     seen_locations: set[str] = set()
-    for row in rows:
-        location = normalize_commerce_location_candidate(row)
-        if not location:
-            continue
+    for location in filtered_rows:
         location_id = _normalized(location.get("poiId"))
         if location_id in seen_locations:
             raise DouyinCommerceError("抖音发布定位候选出现重复完整地址，无法安全选择")
@@ -2169,6 +2186,7 @@ async def _wait_for_fresh_commerce_location_results(
     keyword: str,
     allow_stable_baseline_match: bool = False,
     expected_location: Mapping[str, Any] | None = None,
+    commission_filter: object = "all",
     timeout_ms: int = _LOCATION_RESULT_WAIT_TIMEOUT_MS,
     stable_reads_required: int = _LOCATION_RESULT_STABLE_READS,
 ) -> tuple[Any, list[dict[str, str]]]:
@@ -2179,10 +2197,15 @@ async def _wait_for_fresh_commerce_location_results(
     结果可能与清空后的快照完全相同；连续两次回读一致且匹配关键词时，可将其
     视为已稳定的当前范围结果，而不是误报为旧候选。
 
-    正式发布可传入 ``expected_location``。慢网络下即使先出现空列表、非目标
-    候选或分批渲染的候选，也必须等目标 POI 出现且列表连续稳定后才返回。
+    正式发布可传入 ``expected_location`` 和 ``commission_filter``。慢网络下
+    即使先出现空列表、非目标候选或分批渲染的候选，也必须等符合返佣要求的
+    目标 POI 出现且列表连续稳定后才返回。
     """
 
+    selected_commission_filter = normalize_commission_filter(
+        commission_filter,
+        default="all",
+    )
     normalized_timeout_ms = max(
         _LOCATION_RESULT_POLL_INTERVAL_MS,
         int(timeout_ms),
@@ -2203,13 +2226,35 @@ async def _wait_for_fresh_commerce_location_results(
     stable_reads = 0
     first_complete_logged = False
     target_seen_logged = False
+    commission_mismatch_seen = False
     douyin_logger.info(
         f"抖音地点候选开始等待：关键词={keyword}，最长等待="
         f"{normalized_timeout_ms / 1000:.1f} 秒，稳定要求={required_reads} 次"
     )
     for _ in range(max_reads):
         listbox, rows, signature = await _visible_commerce_location_result_snapshot(page)
-        candidates = normalize_commerce_location_candidates(rows)
+        unfiltered_candidates = [
+            candidate
+            for row in rows
+            if (candidate := normalize_commerce_location_candidate(row))
+        ]
+        candidates = normalize_commerce_location_candidates(
+            rows,
+            commission_filter=selected_commission_filter,
+        )
+        if expected is not None and selected_commission_filter != "all":
+            try:
+                match_location_preset(expected, unfiltered_candidates)
+                unfiltered_target_ready = True
+            except DouyinLocationPresetError as exc:
+                unfiltered_target_ready = "存在多个" in str(exc)
+            try:
+                match_location_preset(expected, candidates)
+                filtered_target_ready = True
+            except DouyinLocationPresetError as exc:
+                filtered_target_ready = "存在多个" in str(exc)
+            if unfiltered_target_ready and not filtered_target_ready:
+                commission_mismatch_seen = True
         if listbox is not None and candidates:
             last_signature = signature
             if not first_complete_logged:
@@ -2268,6 +2313,8 @@ async def _wait_for_fresh_commerce_location_results(
         f"是否出现完整候选={'是' if first_complete_logged else '否'}，"
         f"是否出现目标={'是' if target_seen_logged else '否'}"
     )
+    if commission_mismatch_seen:
+        raise DouyinCommerceError("publish_location_commission_mismatch")
     if last_signature and last_signature == baseline_signature:
         raise DouyinCommerceError(
             f"抖音“{keyword}”地点结果仍是切换范围前的旧候选，未展示错误地址，请重试"
@@ -2283,13 +2330,18 @@ async def search_commerce_location_store_candidates(
     *,
     scope: object,
     expected_location: Mapping[str, Any] | None = None,
+    commission_filter: object = "all",
 ) -> list[dict[str, Any]]:
-    """按用户选择的“本地/国内”范围读取发布定位候选。
+    """按“本地/国内”范围和返佣要求读取发布定位候选。
 
     此步骤只会展开“添加标签 → 位置 → 带货模式”后对应的输入框，填入关键词
     并读取结果；不会选择结果、绑定门店、保存草稿或提交发布。
     """
 
+    selected_commission_filter = normalize_commission_filter(
+        commission_filter,
+        default="all",
+    )
     normalized_keyword = normalize_location_keyword(keyword)
     await _ensure_position_tag(page)
     store_control = await _ensure_local_group_buy_mode(page)
@@ -2399,8 +2451,12 @@ async def search_commerce_location_store_candidates(
         keyword=normalized_keyword,
         allow_stable_baseline_match=True,
         expected_location=expected_location,
+        commission_filter=selected_commission_filter,
     )
-    candidates = normalize_commerce_location_candidates(rows)
+    candidates = normalize_commerce_location_candidates(
+        rows,
+        commission_filter=selected_commission_filter,
+    )
     if not candidates:
         raise DouyinCommerceError(
             f"抖音未返回“{normalized_keyword}”的完整可选发布定位"
@@ -2536,10 +2592,15 @@ async def apply_saved_commerce_location_to_page(
     preset: Mapping[str, Any],
     scope: object,
     keywords: list[str],
+    commission_filter: object = "all",
 ) -> dict[str, Any]:
-    """在同一地点面板中完成搜索、唯一匹配、点击和回读。"""
+    """在同一地点面板中完成搜索、返佣过滤、唯一匹配、点击和回读。"""
 
     selected_scope = normalize_commerce_location_scope(scope)
+    selected_commission_filter = normalize_commission_filter(
+        commission_filter,
+        default="all",
+    )
     bounded_keywords = list(
         dict.fromkeys(
             normalized
@@ -2570,14 +2631,37 @@ async def apply_saved_commerce_location_to_page(
                     keyword,
                     scope=selected_scope,
                     expected_location=expected,
+                    commission_filter=selected_commission_filter,
                 )
             except DouyinCommerceError as exc:
+                if str(exc) == "publish_location_commission_mismatch":
+                    raise
                 douyin_logger.warning(
                     f"抖音发布定位关键词“{keyword}”搜索失败："
                     f"{_normalized(str(exc))[:220] or type(exc).__name__}；"
                     "将尝试下一关键词"
                 )
                 continue
+            filtered_candidates = filter_location_candidates(
+                candidates,
+                selected_commission_filter,
+            )
+            if selected_commission_filter != "all":
+                try:
+                    match_location_preset(expected, candidates)
+                    unfiltered_target_ready = True
+                except DouyinLocationPresetError as exc:
+                    unfiltered_target_ready = "存在多个" in str(exc)
+                try:
+                    match_location_preset(expected, filtered_candidates)
+                    filtered_target_ready = True
+                except DouyinLocationPresetError as exc:
+                    filtered_target_ready = "存在多个" in str(exc)
+                if unfiltered_target_ready and not filtered_target_ready:
+                    raise DouyinCommerceError(
+                        "publish_location_commission_mismatch"
+                    )
+            candidates = filtered_candidates
             candidate_summary = [
                 (
                     f"{_normalized(row.get('name'))} · "

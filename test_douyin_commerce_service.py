@@ -323,6 +323,34 @@ class DouyinCommercePayloadTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     commission.parse_commission_summary(value)
 
+    def test_visible_location_candidate_keeps_structured_commission_only(self) -> None:
+        candidate = douyin_commerce_service.normalize_commerce_location_candidate({
+            "name": "夜南香北京烤鸭",
+            "address": "陕西省安康市汉滨区江北办富民街2号",
+            "commerceInfo": "15件商品 · 15件返佣",
+            "text": "must-not-persist",
+        })
+        self.assertEqual(candidate["commissionType"], "commission")
+        self.assertEqual(candidate["productCount"], 15)
+        self.assertEqual(candidate["commissionProductCount"], 15)
+        self.assertNotIn("commerceInfo", candidate)
+        self.assertNotIn("text", candidate)
+
+    def test_same_location_commission_variants_are_filtered_before_ambiguity(self) -> None:
+        rows = [
+            {"name": "同名店", "address": "北京市朝阳区测试路1号", "commerceInfo": "1件商品 · 1件返佣"},
+            {"name": "同名店", "address": "北京市朝阳区测试路1号", "commerceInfo": ""},
+        ]
+        commission_rows = douyin_commerce_service.normalize_commerce_location_candidates(
+            rows, commission_filter="commission"
+        )
+        self.assertEqual(len(commission_rows), 1)
+        self.assertEqual(commission_rows[0]["commissionType"], "commission")
+        with self.assertRaisesRegex(douyin_commerce_service.DouyinCommerceError, "重复"):
+            douyin_commerce_service.normalize_commerce_location_candidates(
+                rows, commission_filter="all"
+            )
+
     def test_requires_one_account_one_video_and_future_timer(self) -> None:
         checked = douyin_commerce_service.validate_douyin_commerce_payload(self.payload)
         self.assertEqual(checked["accountList"], ["oneclick_3_offline.json"])
@@ -2188,6 +2216,49 @@ class DouyinCommercePayloadTests(unittest.TestCase):
         self.assertEqual(expected_location["name"], row["name"])
         self.assertEqual(expected_location["address"], row["address"])
         reopen.assert_not_awaited()
+
+    def test_saved_location_rejects_commission_mismatch_before_click(self) -> None:
+        """保存要求返佣而当前同地点只有无佣时，必须在点击前安全停止。"""
+
+        preset = {
+            "name": "夜南香北京烤鸭",
+            "address": "陕西省安康市汉滨区江北办富民街2号",
+            "commerceInfo": "1件商品 · 1件返佣",
+        }
+        current = douyin_commerce_service.normalize_commerce_location_candidate({
+            "name": preset["name"],
+            "address": preset["address"],
+            "commerceInfo": "",
+        })
+        with patch.object(
+            douyin_commerce_service,
+            "search_commerce_location_store_candidates",
+            new_callable=AsyncMock,
+            return_value=[current],
+        ), patch.object(
+            douyin_commerce_service,
+            "_apply_open_commerce_location_to_page",
+            new_callable=AsyncMock,
+        ) as apply_open, patch.object(
+            douyin_commerce_service,
+            "close_commerce_store_selector",
+            new_callable=AsyncMock,
+        ):
+            with self.assertRaisesRegex(
+                douyin_commerce_service.DouyinCommerceError,
+                "^publish_location_commission_mismatch$",
+            ):
+                asyncio.run(
+                    douyin_commerce_service.apply_saved_commerce_location_to_page(
+                        object(),
+                        preset,
+                        "domestic",
+                        [preset["address"]],
+                        commission_filter="commission",
+                    )
+                )
+
+        apply_open.assert_not_awaited()
 
     def test_saved_location_closes_first_search_before_keyword_fallback(self) -> None:
         """第一关键词未匹配时必须收口该面板，第二关键词才能使用新候选。"""
