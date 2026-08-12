@@ -245,7 +245,7 @@ QT_QPA_PLATFORM=offscreen /Users/andy/Documents/Codex/2026-07-28/new-chat/output
 
 Fix round 1 首次 scoped 复审：`0 Critical / 2 Important / 0 Minor`，两项为已成功绑定序号可重复进入修订任务，以及序号宽松类型转换。修复后回看又发现 `0 Critical / 1 Important / 0 Minor`：旧 schema v3 真实路径内部空格被折叠。最终 scoped 复审：`0 Critical / 0 Important / 0 Minor`，`Ready to merge: Yes`。
 
-Fix round 2 首次 scoped 复审：`0 Critical / 0 Important / 0 Minor`，`Ready to merge: Yes`；该结论早于最后一行上传身份生产修复，故降级为历史审查证据。最终一行生产修复将在提交后接受只读 scoped 复审，只有 `0 Critical / 0 Important` 时才放行。
+Fix round 2 首次 scoped 复审：`0 Critical / 0 Important / 0 Minor`，`Ready to merge: Yes`；该结论早于最后一行上传身份生产修复，故降级为历史审查证据。对最终提交 `33699ae887854bd47c41a0d863ef2ed61769c2d4` 的只读 scoped 复审为 `0 Critical / 0 Important / 0 Minor`，`Ready to merge: Yes`。复审确认共享路径模块已纳入提交、`fileList` 上传身份可区分单双空格并触发重传，以及 refresh 身份／来源绑定、旧 schema v3 路径链、UI 与事务逐项状态门禁和严格内建整数边界均无回退。
 
 ## 证据边界与残余风险
 
