@@ -2564,11 +2564,27 @@ async def _location_option_targets(
                     const isVisibleCommerceNode = candidate => {
                         if (!candidate || candidate.closest?.('[hidden], [aria-hidden="true"]')) return false;
                         const view = candidate.ownerDocument?.defaultView;
-                        const style = view?.getComputedStyle(candidate);
-                        if (!style || style.display === 'none'
-                            || style.visibility === 'hidden' || style.visibility === 'collapse'
-                            || style.opacity === '0' || style.contentVisibility === 'hidden') return false;
+                        for (let current = candidate; current; current = current.parentElement) {
+                            const style = view?.getComputedStyle(current);
+                            if (!style || style.display === 'none'
+                                || style.visibility === 'hidden' || style.visibility === 'collapse'
+                                || Number.parseFloat(style.opacity) === 0
+                                || style.contentVisibility === 'hidden') return false;
+                            if (current === node) break;
+                        }
                         return candidate.getClientRects().length > 0;
+                    };
+                    const visibleCommerceText = candidate => {
+                        if (!isVisibleCommerceNode(candidate)) return '';
+                        const clone = candidate.cloneNode(true);
+                        const originals = Array.from(candidate.querySelectorAll('*'));
+                        const clones = Array.from(clone.querySelectorAll('*'));
+                        for (let index = originals.length - 1; index >= 0; index -= 1) {
+                            if (!isVisibleCommerceNode(originals[index])) {
+                                clones[index]?.remove();
+                            }
+                        }
+                        return normalize(clone.textContent);
                     };
                     const commerceCandidates = [];
                     if (commerceNode && !isIdentityNode(commerceNode) && isVisibleCommerceNode(commerceNode)) {
@@ -2580,7 +2596,7 @@ async def _location_option_targets(
                         }
                     });
                     const commerceInfo = commerceCandidates
-                        .map(candidate => normalize(candidate.innerText))
+                        .map(visibleCommerceText)
                         .find(looksCommerce) || '';
                     return { name, address, commerceInfo };
                 }"""
@@ -2958,11 +2974,27 @@ async def _store_option_descriptors(listbox) -> list[dict[str, str]]:
                     const isVisibleCommerceNode = candidate => {
                         if (!candidate || candidate.closest?.('[hidden], [aria-hidden="true"]')) return false;
                         const view = candidate.ownerDocument?.defaultView;
-                        const style = view?.getComputedStyle(candidate);
-                        if (!style || style.display === 'none'
-                            || style.visibility === 'hidden' || style.visibility === 'collapse'
-                            || style.opacity === '0' || style.contentVisibility === 'hidden') return false;
+                        for (let current = candidate; current; current = current.parentElement) {
+                            const style = view?.getComputedStyle(current);
+                            if (!style || style.display === 'none'
+                                || style.visibility === 'hidden' || style.visibility === 'collapse'
+                                || Number.parseFloat(style.opacity) === 0
+                                || style.contentVisibility === 'hidden') return false;
+                            if (current === node) break;
+                        }
                         return candidate.getClientRects().length > 0;
+                    };
+                    const visibleCommerceText = candidate => {
+                        if (!isVisibleCommerceNode(candidate)) return '';
+                        const clone = candidate.cloneNode(true);
+                        const originals = Array.from(candidate.querySelectorAll('*'));
+                        const clones = Array.from(clone.querySelectorAll('*'));
+                        for (let index = originals.length - 1; index >= 0; index -= 1) {
+                            if (!isVisibleCommerceNode(originals[index])) {
+                                clones[index]?.remove();
+                            }
+                        }
+                        return normalize(clone.textContent);
                     };
                     const commerceCandidates = [];
                     if (commerceNode && !isIdentityNode(commerceNode) && isVisibleCommerceNode(commerceNode)) {
@@ -2974,7 +3006,7 @@ async def _store_option_descriptors(listbox) -> list[dict[str, str]]:
                         }
                     });
                     const commerceInfo = commerceCandidates
-                        .map(candidate => normalize(candidate.innerText))
+                        .map(visibleCommerceText)
                         .find(looksCommerce) || '';
                     const ariaSelected = node.getAttribute('aria-selected');
                     const selectionClassTokens = Array.from(node.classList || [])

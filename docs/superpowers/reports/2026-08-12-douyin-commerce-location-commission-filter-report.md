@@ -14,7 +14,7 @@
 
 原“离线实施验收通过”结论已被对 `14d8d40..6bc0743` 的终审推翻。终审发现 1 个 Critical、7 个 Important 和 3 个 Minor；其中包括点击无效仍伪造回读、采集代际与内容漂移、批量会话关闭不严格等安全性问题。因此，旧全量测试通过仅是当时测试集的历史证据，不证明当时功能已正确或风险已清零。
 
-本轮已按终审 finding 逐组补 RED 并修复至单项 GREEN。修复后收尾 diff 审计又发现并修复了 `not-selected` 假选中、隐藏返佣节点泄入和 setup 入队后未立即锁定三个缺口；第二轮复审再补齐 `un-selected` / `un_chosen` 分隔写法，最后只读复审确认无 blocker。最终相关组合 `451/451` 和完整离线回归 `913/913` 均通过；终审所列 1 个 Critical、7 个 Important、3 个 Minor 已在离线契约层收口，当前离线验收通过。
+终审所列 finding 曾逐组补 RED 并修复至单项 GREEN，scoped re-review round 2/5 又发现并闭环两项：可见 wrapper 的 `innerText` 会重新带入隐藏后代返佣文本；任意顺序 M3 测试只检查了 mock 自己追加的成功标记，未证明生产 UI 回调真正接纳结果。两项已完成单项 RED/GREEN，Round 2 新相关组合 `452/452` 与新最终全量 `914/914` 均通过，当前本地离线契约验收通过。
 
 本结论只证明本地代码、离线替身、Qt offscreen 界面契约以及本地隔离 HTML 的 DOM 契约。没有连接抖音平台，没有启动真实账号会话，没有上传素材，没有执行预检，没有保存平台草稿，也没有正式提交或发布。
 
@@ -47,21 +47,27 @@ QT_QPA_PLATFORM=offscreen /Users/andy/Documents/Codex/2026-07-28/new-chat/output
 
 ## 终审修复后新证据
 
-- 审计前历史证据：相关组合 `449/449`、全量 `911/911` 曾通过，但随后生产 diff 审计发现 3 个缺口，两者已作废。第一次 `451/451`、`913/913` 之后又发现 `un-selected` 分隔写法缺口，因此同样作为历史证据，不是当前验收证据。
+- 历史证据：旧 `901`、`449/911`、首轮 `451/913` 以及上轮最终 `451/913` 均已被后续终审或 scoped re-review 推翻，不是当前验收证据。
 - 相关组合：Service Payload + DOM + SessionContract、collectors、BatchUi、batch executor、draft/batch draft/batch service、task service/page。
-- 相关组合最终结果：`Ran 451 tests in 15.628s`，`OK`，退出码 `0`。
+- 上轮相关组合历史结果：`Ran 451 tests in 15.628s`，`OK`，退出码 `0`。Round 2 新鲜相关组合：`Ran 452 tests in 16.203s`，`OK`，退出码 `0`。
 - 完整离线回归命令：`QT_QPA_PLATFORM=offscreen ../../.venv/bin/python -m unittest discover -v`。
-- 完整离线回归最终有效结果：`Ran 913 tests in 30.004s`，`OK`，退出码 `0`。
+- 上轮完整离线回归历史结果：`Ran 913 tests in 30.004s`，`OK`，退出码 `0`。Round 2 新鲜最终全量：`Ran 914 tests in 31.071s`，`OK`，退出码 `0`。
 - 全部证据仍仅限离线替身、Qt offscreen 和本地隔离 HTML。
+
+## Scoped re-review round 2/5
+
+- I2 RED：本地隔离 DOM 在可见 wrapper 内嵌 `aria-hidden=true` 或 `opacity:0` 的“15件商品 · 15件返佣”；两个场景都被旧 wrapper `innerText` 误读为返佣，`Ran 1 test in 0.670s`，`FAILED (failures=1)`。GREEN：两个 DOM 入口统一校验祖先链可见性，在 clone 中剔除隐藏后代后才读 `textContent`；隐藏场景均为 `no_commission`，真正可见嵌套徽标仍为 `commission`。`Ran 1 test in 0.334s`，`OK`。
+- M3 RED：新测试使用生产 `BackgroundTaskRunner` 和受控任务池，mock 只返回结构化 envelope，不再断言 mock 自己的 `ok`。未改生产时新测试已直接通过，证明此项是测试证据缺口；受控 mutation 临时切断生产成功回调后，三种顺序均因 UI 计数仍为 `0` 失败，`Ran 1 test in 0.149s`，`FAILED (failures=3)`。GREEN：恢复生产回调后，逐顺序断言 UI 已接纳的范围、关键词、返佣筛选、平台计数、候选数、返佣类型与无错误状态，并保留 `commission_filter/include_metadata` 参数断言。`Ran 1 test in 0.137s`，`OK`。
 
 ## 终审 finding 状态
 
 - C1：已修复。点击后只接受真实面板唯一选中节点回读，重新核对 POI、名称、完整地址与佣型；`aria-selected=true` 作为权威证据，无 ARIA 时仅放行精确 `selected/chosen` token，否定或混合 token 安全停止。证据不足统一固定码停止。
-- I1–I7：已修复。数量解析、DOM 摘要、代际内容指纹、搜索意图隔离、异佣型 UI 快照、过滤后判重与批执行严格零存活关闭均已回归。
-- M1–M3：已修复。结构化归一化幂等、签名含佣型／数量、Mock 关键字参数及成功状态断言均已补齐。
+- I1–I7：已修复。I2 追加验证可见 wrapper 不再带入隐藏后代，且真正可见嵌套徽标仍可读；新组合／全量通过。
+- M1–M3：已修复。M3 现通过真实 runner 成功回调后的 UI 状态、候选数和无错误文案证明接纳，不再检查 mock 自己的成功值；新组合／全量通过。
 
 ## 终审修复后收尾审计
 
+- Round 2 独立只读 diff 复审：I2 隐藏后代剔除与可见嵌套徽标保留均符合契约；M3 确实经生产 runner、Qt signals 及生产成功 handler 接纳并断言最终 UI 状态；无 blocker。
 - `py_compile`：9 个指定生产文件和 2 个相关测试文件通过，退出码 `0`。
 - AST：9 个指定生产文件全部可解析。
 - `git diff --check`：通过，无输出。

@@ -2708,6 +2708,90 @@ class DouyinCommercePayloadTests(unittest.TestCase):
 class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
     """用真实 DOM 约束地点 portal，避免把整张发布页的输入框算进来。"""
 
+    async def test_hidden_descendant_commission_text_is_excluded_in_both_dom_entries(
+        self,
+    ) -> None:
+        """可见包装节点不得把隐藏后代的返佣文本重新带入摘要。"""
+
+        html = """
+        <div id="location-results" role="listbox">
+          <div id="aria-hidden-option" role="option">
+            <span data-store-name>北海商品城甲</span>
+            <span data-store-address>广西北海市商品街1号</span>
+            <div class="visible-wrapper">
+              <span aria-hidden="true">15件商品 · 15件返佣</span>
+            </div>
+          </div>
+          <div id="transparent-option" role="option">
+            <span data-store-name>北海商品城乙</span>
+            <span data-store-address>广西北海市商品街2号</span>
+            <div class="visible-wrapper">
+              <span style="opacity: 0">15件商品 · 15件返佣</span>
+            </div>
+          </div>
+          <div id="visible-option" role="option">
+            <span data-store-name>北海商品城丙</span>
+            <span data-store-address>广西北海市商品街3号</span>
+            <div class="visible-wrapper">
+              <span><strong data-commerce-info>15件商品 · 15件返佣</strong></span>
+            </div>
+          </div>
+        </div>
+        """
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+                listbox = page.locator("#location-results")
+
+                rows = await douyin_commerce_service._store_option_descriptors(listbox)
+                self.assertEqual(
+                    [row["commerceInfo"] for row in rows],
+                    ["", "", "15件商品 · 15件返佣"],
+                )
+                self.assertEqual(
+                    [
+                        douyin_commerce_service.normalize_commerce_location_candidate(row)[
+                            "commissionType"
+                        ]
+                        for row in rows
+                    ],
+                    ["no_commission", "no_commission", "commission"],
+                )
+
+                scenarios = (
+                    (
+                        "aria-hidden-option",
+                        "北海商品城甲",
+                        "广西北海市商品街1号",
+                        "no_commission",
+                    ),
+                    (
+                        "transparent-option",
+                        "北海商品城乙",
+                        "广西北海市商品街2号",
+                        "no_commission",
+                    ),
+                    (
+                        "visible-option",
+                        "北海商品城丙",
+                        "广西北海市商品街3号",
+                        "commission",
+                    ),
+                )
+                for option_id, name, address, commission_filter in scenarios:
+                    with self.subTest(option_id=option_id):
+                        targets = await douyin_commerce_service._location_option_targets(
+                            listbox,
+                            {"name": name, "address": address},
+                            commission_filter=commission_filter,
+                        )
+                        self.assertEqual(len(targets), 1)
+                        self.assertEqual(await targets[0].get_attribute("id"), option_id)
+            finally:
+                await browser.close()
+
     async def test_location_name_with_product_word_without_badge_is_no_commission(
         self,
     ) -> None:
@@ -10509,10 +10593,18 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.assertIn("cleanup_incomplete", self.page.platform_review_status.text())
 
     def test_music_domestic_and_local_collectors_accept_any_order_in_one_generation(self) -> None:
-        """三种操作顺序都复用同一代际，且不会清空已暂存的独立选择。"""
+        """任意顺序的结构化回包都必须经真实 runner 回调链被 UI 接纳。"""
 
         candidate = {"musicId": "music-1", "title": "收藏歌", "creator": "作者", "duration": "00:30"}
-        location = {"poiId": "poi-1", "name": "夜南香", "address": "陕西省安康市完整地址"}
+        location = {
+            "poiId": "poi-1",
+            "name": "夜南香",
+            "address": "陕西省安康市完整地址",
+            "commissionType": "commission",
+            "productCount": 15,
+            "commissionProductCount": 15,
+            "commissionLabel": "返佣",
+        }
         active = self._collector_status(music="active", local="active")
         orders = (
             ("music", "domestic", "local"),
@@ -10522,13 +10614,32 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
 
         for order in orders:
             with self.subTest(order=order):
-                self.page.runner = self._InlineRunner()
+                class QueuedPool:
+                    def __init__(self) -> None:
+                        self.tasks: list[BackgroundTask] = []
+
+                    def start(self, task: BackgroundTask) -> None:
+                        self.tasks.append(task)
+
+                    def run_next(self) -> None:
+                        task = self.tasks.pop(0)
+                        task.run()
+                        QApplication.processEvents()
+
+                pool = QueuedPool()
+                runner = BackgroundTaskRunner(self.page)
+                runner.pool = pool
+                self.page.runner = runner
                 self._activate_setup_generation()
                 self.page._setup_generation_content_fingerprint = (
                     self.page._setup_content_fingerprint()
                 )
+                self.page._batch_location_searches = {}
+                self.page._batch_location_search_token = 0
+                self.page._selected_music = None
+                self.page._music_candidates = []
                 self.page._stage_declaration_selection("内容由AI生成")
-                successful_location_results: list[dict[str, object]] = []
+                accepted_location_states: list[dict[str, object]] = []
 
                 def music_result(_generation_id: str) -> dict:
                     return {
@@ -10560,7 +10671,6 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
                         "platformResultCount": 1,
                         "candidates": [location],
                     }
-                    successful_location_results.append(result)
                     return result
 
                 with patch(
@@ -10576,9 +10686,28 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
                     for action in order:
                         if action == "music":
                             self.page._refresh_favorite_music_candidates()
+                            pool.run_next()
                             self.page._stage_music_selection(candidate)
                         else:
                             self.page._search_batch_locations(action, "夜南香")
+                            pool.run_next()
+                            state = self.page._batch_location_state()
+                            accepted_location_states.append(state)
+                            self.assertEqual(state["scope"], action)
+                            self.assertEqual(state["keyword"], "夜南香")
+                            self.assertEqual(state["commissionFilter"], "commission")
+                            self.assertEqual(state["platformResultCount"], 1)
+                            self.assertEqual(len(state["candidates"]), 1)
+                            self.assertEqual(
+                                state["candidates"][0]["commissionType"],
+                                "commission",
+                            )
+                            self.assertIn("平台返回 1 个", self.page._batch_location_feedback)
+                            self.assertIn("符合‘返佣’条件 1 个", self.page._batch_location_feedback)
+                            self.assertNotIn("失败", self.page._batch_location_feedback)
+                            self.assertNotIn("错误", self.page._batch_location_feedback)
+
+                self.assertFalse(runner.is_running(self.page._COLLECTOR_TASK_KEY))
 
                 if "music" in order:
                     refresh_music.assert_called_once_with("generation-a")
@@ -10602,10 +10731,12 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
                         for _scope in expected_scopes
                     ],
                 )
-                self.assertTrue(successful_location_results)
-                self.assertTrue(
-                    all(result.get("ok") is True for result in successful_location_results)
+                self.assertEqual(
+                    [state["scope"] for state in accepted_location_states],
+                    expected_scopes,
                 )
+                self.assertNotIn("失败", self.page.domestic_collector_status.text())
+                self.assertNotIn("失败", self.page.local_collector_status.text())
                 self.assertEqual(self.page._selected_music["musicId"], "music-1")
                 self.assertEqual(self.page._confirmed_declaration, "内容由AI生成")
 
