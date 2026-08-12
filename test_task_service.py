@@ -451,6 +451,56 @@ class DouyinCommerceBatchTaskTests(unittest.TestCase):
         self.assertEqual(detail["revisionSourceTaskNo"], source["taskNo"])
         self.assertEqual(task_service.get_task(source["id"]), before)
 
+    def test_batch_task_creation_failure_removes_partially_created_task(self) -> None:
+        """批次元数据补写失败时，不得残留 pending 任务、条目或事件。"""
+
+        with database.connect() as conn:
+            before = {
+                table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                for table in (
+                    "publish_tasks",
+                    "publish_task_items",
+                    "publish_task_events",
+                )
+            }
+        real_connect = task_service.connect
+        connect_count = 0
+
+        class FailingBatchMetadataConnection:
+            def __init__(self, conn) -> None:
+                self._conn = conn
+
+            def execute(self, sql, parameters=()):
+                if "UPDATE publish_task_items" in str(sql):
+                    raise RuntimeError("controlled batch metadata failure")
+                return self._conn.execute(sql, parameters)
+
+            def __getattr__(self, name):
+                return getattr(self._conn, name)
+
+        @contextmanager
+        def connect_with_second_phase_failure():
+            nonlocal connect_count
+            connect_count += 1
+            with real_connect() as conn:
+                if connect_count == 2:
+                    yield FailingBatchMetadataConnection(conn)
+                else:
+                    yield conn
+
+        with patch(
+            "app_core.task_service.connect",
+            side_effect=connect_with_second_phase_failure,
+        ), self.assertRaisesRegex(RuntimeError, "controlled batch metadata failure"):
+            task_service.create_douyin_batch_task(self.batch)
+
+        with database.connect() as conn:
+            after = {
+                table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                for table in before
+            }
+        self.assertEqual(after, before)
+
     def test_prepare_douyin_batch_resume_only_includes_pending_source_items(self) -> None:
         """若错误复制成功项或丢失原排期，该测试必须失败。"""
 

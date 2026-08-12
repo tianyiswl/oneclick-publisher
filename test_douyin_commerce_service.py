@@ -9502,8 +9502,34 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         ), patch.object(self.page, "_apply_batch_revision_plan") as apply:
             self.page.return_unfinished_batch_to_edit()
 
-        prepare.assert_called_once_with(41)
+        self.assertEqual(prepare.call_args_list, [call(41), call(41)])
         apply.assert_called_once_with(plan)
+
+    def test_return_to_edit_rechecks_revision_plan_after_close_barrier(self) -> None:
+        """关闭期间来源状态变化时，只能应用屏障后的最新修订计划。"""
+
+        initial_plan = self._load_revision_ui_fixture()
+        latest_plan = {**initial_plan, "sourceTaskNo": "T08122117-LATEST"}
+        self.page.runner = self._InlineRunner()
+        self.page.pages.setCurrentIndex(2)
+        self.page._batch_result_task_id = 41
+        self.page._batch_revision_available = True
+        with patch(
+            "ui.douyin_commerce_page.task_service.prepare_douyin_batch_revision",
+            side_effect=[initial_plan, latest_plan],
+        ) as prepare, patch.object(
+            self.page,
+            "_close_revision_resources",
+            return_value={
+                "closed": True,
+                "aliveCollectorCount": 0,
+                "aliveSessionCount": 0,
+            },
+        ), patch.object(self.page, "_apply_batch_revision_plan") as apply:
+            self.page.return_unfinished_batch_to_edit()
+
+        self.assertEqual(prepare.call_args_list, [call(41), call(41)])
+        apply.assert_called_once_with(latest_plan)
 
     def test_return_to_edit_keeps_result_page_when_cleanup_is_incomplete(
         self,
@@ -9813,6 +9839,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         payload = {"items": [{"mediaPath": "/tmp/failed.mp4"}]}
         task = {"id": 99}
         self.page._batch_revision_source_task_id = 41
+        self.page._batch_revision_item_indexes = [2]
         with patch.object(
             self.page, "collect_batch_payload", return_value=payload
         ), patch(
@@ -9827,6 +9854,37 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             payload,
             mode="oneclick_publish",
             revision_source_task_id=41,
+            batch_item_indexes=[2],
+        )
+        start.assert_called_once_with(payload, task)
+
+    def test_revision_confirmation_preserves_all_source_item_indexes(self) -> None:
+        """修订子任务必须保留来源逐条序号，不能从 1 重新编号。"""
+
+        plan = self._load_revision_ui_fixture()
+        self.assertTrue(self.page._apply_batch_revision_plan(plan))
+        payload = {
+            "items": [
+                {"mediaPath": "/tmp/failed.mp4"},
+                {"mediaPath": "/tmp/pending.mp4"},
+            ]
+        }
+        task = {"id": 99}
+        with patch.object(
+            self.page, "collect_batch_payload", return_value=payload
+        ), patch(
+            "ui.douyin_commerce_page.task_service.create_douyin_batch_task",
+            return_value=task,
+        ) as create, patch.object(
+            self.page, "start_batch_publish"
+        ) as start:
+            self.page.open_batch_submit_confirmation()
+
+        create.assert_called_once_with(
+            payload,
+            mode="oneclick_publish",
+            revision_source_task_id=41,
+            batch_item_indexes=[2, 3],
         )
         start.assert_called_once_with(payload, task)
 
@@ -9914,6 +9972,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         def set_revision_state() -> None:
             self.page._batch_revision_source_task_id = 41
             self.page._batch_revision_source_task_no = "T08122117-665B"
+            self.page._batch_revision_item_indexes = [2, 3]
             self.page._batch_revision_blocked_media_keys = {"media:1"}
             self.page._batch_result_task_id = 41
             self.page._batch_revision_available = True
@@ -9921,6 +9980,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         def assert_revision_state_cleared() -> None:
             self.assertIsNone(self.page._batch_revision_source_task_id)
             self.assertEqual(self.page._batch_revision_source_task_no, "")
+            self.assertEqual(self.page._batch_revision_item_indexes, [])
             self.assertEqual(self.page._batch_revision_blocked_media_keys, set())
             self.assertIsNone(self.page._batch_result_task_id)
             self.assertFalse(self.page._batch_revision_available)
@@ -10091,6 +10151,37 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             "已成功发布的视频不能重新加入修改批次。",
         )
 
+    def test_revision_legacy_path_identity_matches_current_media_with_id(self) -> None:
+        """旧任务只有路径身份时，也必须映射并锁住当前已有 ID 的同一素材。"""
+
+        plan = self._load_revision_ui_fixture()
+        done_path = self.page.video_combo.itemData(1)["storedPath"]
+        legacy_items = [
+            {**item, "mediaId": None} for item in plan["draft"]["items"]
+        ]
+        legacy_plan = {
+            **plan,
+            "successfulMediaKeys": [
+                f"path:{Path(done_path).resolve(strict=False)}"
+            ],
+            "draft": {**plan["draft"], "items": legacy_items},
+        }
+
+        with patch("ui.douyin_commerce_page.QMessageBox.warning") as warning:
+            applied = self.page._apply_batch_revision_plan(legacy_plan)
+            selected = self.page._select_local_video(1)
+
+        self.assertTrue(applied)
+        self.assertEqual(
+            [video["id"] for video in self.page._selected_videos()], [2, 3]
+        )
+        self.assertFalse(selected)
+        warning.assert_called_once_with(
+            self.page,
+            "修改未完成视频",
+            "已成功发布的视频不能重新加入修改批次。",
+        )
+
     def test_revision_restore_prevalidates_atomically_and_can_retry(self) -> None:
         """任一素材无法映射时，结果页状态必须原封不动并允许原计划重试。"""
 
@@ -10123,7 +10214,10 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             "aliveSessionCount": 0,
         }
 
-        with patch("ui.douyin_commerce_page.QMessageBox.warning") as warning:
+        with patch(
+            "ui.douyin_commerce_page.task_service.prepare_douyin_batch_revision",
+            return_value=missing_plan,
+        ), patch("ui.douyin_commerce_page.QMessageBox.warning") as warning:
             self.page._revision_close_succeeded(3, 41, missing_plan, closed)
 
         self.assertEqual(self.page.selected_video_count(), 1)
@@ -10142,7 +10236,10 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         )
         self.assertNotIn("private", str(warning.call_args))
 
-        with patch("ui.douyin_commerce_page.QMessageBox.warning") as retry_warning:
+        with patch(
+            "ui.douyin_commerce_page.task_service.prepare_douyin_batch_revision",
+            return_value=plan,
+        ), patch("ui.douyin_commerce_page.QMessageBox.warning") as retry_warning:
             self.page._revision_close_succeeded(3, 41, plan, closed)
 
         retry_warning.assert_not_called()

@@ -577,41 +577,53 @@ def create_douyin_batch_task(
         revision_source_task_id=revision_source_task_id,
     )
     now = _now()
-    with connect() as conn:
-        task_items = conn.execute(
-            "SELECT id FROM publish_task_items WHERE taskId = ? ORDER BY id", (task["id"],)
-        ).fetchall()
-        for index, (task_item, payload) in enumerate(zip(task_items, payloads)):
-            poi = payload.get("locationPoi") if isinstance(payload.get("locationPoi"), dict) else {}
-            location_name = str(poi.get("name") or payload.get("locationKeyword") or "").strip()
-            location_address = str(poi.get("address") or "").strip()
-            commission_suffix = {
-                "commission": "【返佣】",
-                "no_commission": "【无佣】",
-            }.get(poi.get("observedCommissionType"), "")
-            location_summary = (
-                f"{location_name}{commission_suffix}（{location_address}）"
-                if location_address
-                else f"{location_name}{commission_suffix}"
+    try:
+        with connect() as conn:
+            task_items = conn.execute(
+                "SELECT id FROM publish_task_items WHERE taskId = ? ORDER BY id", (task["id"],)
+            ).fetchall()
+            for index, (task_item, payload) in enumerate(zip(task_items, payloads)):
+                poi = payload.get("locationPoi") if isinstance(payload.get("locationPoi"), dict) else {}
+                location_name = str(poi.get("name") or payload.get("locationKeyword") or "").strip()
+                location_address = str(poi.get("address") or "").strip()
+                commission_suffix = {
+                    "commission": "【返佣】",
+                    "no_commission": "【无佣】",
+                }.get(poi.get("observedCommissionType"), "")
+                location_summary = (
+                    f"{location_name}{commission_suffix}（{location_address}）"
+                    if location_address
+                    else f"{location_name}{commission_suffix}"
+                )
+                schedule_summary = (
+                    f"北京时间定时 {payload['scheduleTime']}"
+                    if payload.get("enableTimer") is True and payload.get("scheduleTime")
+                    else "立即发布"
+                )
+                conn.execute(
+                    """
+                    UPDATE publish_task_items
+                    SET batchItemIndex = ?, locationSummary = ?, scheduleSummary = ?
+                    WHERE id = ?
+                    """,
+                    (resolved_item_indexes[index], location_summary, schedule_summary, task_item["id"]),
+                )
+            conn.execute(
+                "INSERT INTO publish_task_events (taskId, level, eventType, message, createdAt) VALUES (?, 'info', 'batch_created', ?, ?)",
+                (task["id"], "已创建抖音带货批量逐视频任务", now),
             )
-            schedule_summary = (
-                f"北京时间定时 {payload['scheduleTime']}"
-                if payload.get("enableTimer") is True and payload.get("scheduleTime")
-                else "立即发布"
+            conn.commit()
+    except BaseException:
+        with connect() as conn:
+            conn.execute(
+                "DELETE FROM publish_task_events WHERE taskId = ?", (task["id"],)
             )
             conn.execute(
-                """
-                UPDATE publish_task_items
-                SET batchItemIndex = ?, locationSummary = ?, scheduleSummary = ?
-                WHERE id = ?
-                """,
-                (resolved_item_indexes[index], location_summary, schedule_summary, task_item["id"]),
+                "DELETE FROM publish_task_items WHERE taskId = ?", (task["id"],)
             )
-        conn.execute(
-            "INSERT INTO publish_task_events (taskId, level, eventType, message, createdAt) VALUES (?, 'info', 'batch_created', ?, ?)",
-            (task["id"], "已创建抖音带货批量逐视频任务", now),
-        )
-        conn.commit()
+            conn.execute("DELETE FROM publish_tasks WHERE id = ?", (task["id"],))
+            conn.commit()
+        raise
     return task
 
 

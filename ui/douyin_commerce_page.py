@@ -589,6 +589,7 @@ class DouyinCommercePage(QWidget):
         self._batch_result_feedback = ""
         self._batch_revision_source_task_id: int | None = None
         self._batch_revision_source_task_no = ""
+        self._batch_revision_item_indexes: list[int] = []
         self._batch_revision_blocked_media_keys: set[str] = set()
         self._batch_revision_token = 0
         # 批次结果仍需留在当前页面供复制；只有用户真正进入下一批平台设置时
@@ -2649,6 +2650,24 @@ class DouyinCommercePage(QWidget):
             media.get("id"), media.get("storedPath")
         )
 
+    @staticmethod
+    def _media_keys(media: object) -> set[str]:
+        """同时提供当前 ID 主键与旧任务路径别名。"""
+
+        if not isinstance(media, Mapping):
+            return set()
+        keys = {
+            task_service.build_douyin_batch_media_key(
+                media.get("id"), media.get("storedPath")
+            )
+        }
+        media_path = str(media.get("storedPath") or "").strip()
+        if media_path:
+            keys.add(
+                task_service.build_douyin_batch_media_key(None, media_path)
+            )
+        return {key for key in keys if key}
+
     def _revision_media_is_blocked(self, media: object) -> bool:
         """修订中媒体身份无法安全确认时按成功项处理，不暴露底层异常。"""
 
@@ -2658,7 +2677,18 @@ class DouyinCommercePage(QWidget):
             media_key = self._media_key(media)
         except (OSError, RuntimeError, ValueError):
             return True
-        return not media_key or media_key in self._batch_revision_blocked_media_keys
+        if not media_key or media_key in self._batch_revision_blocked_media_keys:
+            return True
+        if not any(
+            key.startswith("path:")
+            for key in self._batch_revision_blocked_media_keys
+        ):
+            return False
+        try:
+            media_keys = self._media_keys(media)
+        except (OSError, RuntimeError, ValueError):
+            return True
+        return bool(media_keys.intersection(self._batch_revision_blocked_media_keys))
 
     def _refresh_batch_video_list(self) -> None:
         """用多选缩略图列表呈现本机视频；刷新绝不访问平台。"""
@@ -4854,12 +4884,14 @@ class DouyinCommercePage(QWidget):
         """只读校验修订计划，确保全部控件身份可唯一恢复后再投射。"""
 
         source_task_id = plan.get("sourceTaskId")
+        revision_item_indexes = plan.get("revisionItemIndexes")
         successful_media_keys = plan.get("successfulMediaKeys")
         draft = plan.get("draft")
         if (
             plan.get("revisionAllowed") is not True
             or type(source_task_id) is not int
             or source_task_id <= 0
+            or not isinstance(revision_item_indexes, list)
             or not isinstance(successful_media_keys, list)
             or any(
                 not isinstance(value, str) or not value
@@ -4871,6 +4903,15 @@ class DouyinCommercePage(QWidget):
         normalized_draft = (
             douyin_commerce_batch_draft_service.normalize_batch_draft(draft)
         )
+        if (
+            len(revision_item_indexes) != len(normalized_draft["items"])
+            or any(
+                type(index) is not int or index <= 0
+                for index in revision_item_indexes
+            )
+            or len(set(revision_item_indexes)) != len(revision_item_indexes)
+        ):
+            raise ValueError("invalid revision item indexes")
 
         expected_account_id = _normalized(normalized_draft.get("accountId"))
         expected_account_path = _normalized(normalized_draft.get("accountFile"))
@@ -4899,10 +4940,10 @@ class DouyinCommercePage(QWidget):
             if not isinstance(media, Mapping):
                 continue
             try:
-                media_key = self._media_key(media)
+                media_keys = self._media_keys(media)
             except (OSError, RuntimeError, ValueError):
                 continue
-            if media_key:
+            for media_key in media_keys:
                 media_indexes.setdefault(media_key, []).append(index)
         blocked_media_keys = set(successful_media_keys)
         revision_indexes: list[int] = []
@@ -4923,6 +4964,7 @@ class DouyinCommercePage(QWidget):
         return {
             "sourceTaskId": source_task_id,
             "sourceTaskNo": _normalized(plan.get("sourceTaskNo")),
+            "revisionItemIndexes": list(revision_item_indexes),
             "successfulMediaKeys": blocked_media_keys,
             "draft": normalized_draft,
             "accountIndex": account_indexes[0],
@@ -4944,6 +4986,9 @@ class DouyinCommercePage(QWidget):
             return False
         self._batch_revision_source_task_id = int(prepared["sourceTaskId"])
         self._batch_revision_source_task_no = str(prepared["sourceTaskNo"])
+        self._batch_revision_item_indexes = list(
+            prepared["revisionItemIndexes"]
+        )
         self._batch_revision_blocked_media_keys = set(
             prepared["successfulMediaKeys"]
         )
@@ -5106,6 +5151,11 @@ class DouyinCommercePage(QWidget):
                 payload,
                 mode="oneclick_publish",
                 revision_source_task_id=self._batch_revision_source_task_id,
+                batch_item_indexes=(
+                    list(self._batch_revision_item_indexes)
+                    if self._batch_revision_source_task_id is not None
+                    else None
+                ),
             )
         except (KeyboardInterrupt, SystemExit):
             raise
@@ -7380,7 +7430,7 @@ class DouyinCommercePage(QWidget):
         self,
         token: int,
         task_id: int,
-        plan: Mapping[str, object],
+        _initial_plan: Mapping[str, object],
         result: object,
     ) -> None:
         if (
@@ -7391,6 +7441,24 @@ class DouyinCommercePage(QWidget):
             return
         if not self._revision_close_is_complete(result):
             self._revision_close_failed(token)
+            return
+        try:
+            plan = task_service.prepare_douyin_batch_revision(task_id)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            plan = None
+        source_task_id = (
+            plan.get("sourceTaskId") if isinstance(plan, Mapping) else None
+        )
+        if (
+            not isinstance(plan, Mapping)
+            or plan.get("revisionAllowed") is not True
+            or type(source_task_id) is not int
+            or source_task_id != task_id
+        ):
+            self._batch_revision_available = False
+            self._show_revision_return_error(self._REVISION_STATE_CHANGED_MESSAGE)
             return
         if not self._apply_batch_revision_plan(plan):
             return
@@ -7652,6 +7720,7 @@ class DouyinCommercePage(QWidget):
         self._batch_revision_available = False
         self._batch_revision_source_task_id = None
         self._batch_revision_source_task_no = ""
+        self._batch_revision_item_indexes = []
         self._batch_revision_blocked_media_keys = set()
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt 固定事件名
