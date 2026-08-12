@@ -17,6 +17,7 @@ from time import monotonic
 from typing import Any, Callable, Mapping
 from uuid import uuid4
 
+from .douyin_commerce_location_commission import normalize_commission_filter
 from .douyin_commerce_probe import build_probe_upload_payload
 from .douyin_commerce_session import DouyinCommerceSessionManager
 from .douyin_commerce_setup_state import (
@@ -601,6 +602,8 @@ class DouyinCommerceCollectorManager:
         generation_id: str,
         keyword: object,
         scope: object,
+        *,
+        commission_filter: object = "all",
     ) -> dict[str, object]:
         """按固定范围将地点搜索路由到独立会话。"""
 
@@ -613,6 +616,13 @@ class DouyinCommerceCollectorManager:
         normalized_keyword = self._normalize_public_text(
             keyword, error_code="collector_unknown"
         )
+        try:
+            selected_commission_filter = normalize_commission_filter(
+                commission_filter,
+                default="all",
+            )
+        except Exception:
+            raise DouyinCommerceCollectorError("collector_unknown") from None
         collector_type = _LOCATION_COLLECTORS.get(normalized_scope)
         if collector_type is None:
             raise DouyinCommerceCollectorError("collector_scope_mismatch")
@@ -634,6 +644,7 @@ class DouyinCommerceCollectorManager:
                     normalized_keyword,
                     normalized_scope,
                     action_instance_id,
+                    selected_commission_filter,
                 ),
             )
         self._action_queue.start(action)
@@ -1246,6 +1257,7 @@ class DouyinCommerceCollectorManager:
         keyword: object,
         scope: str,
         action_instance_id: str,
+        commission_filter: str,
     ) -> dict[str, object]:
         started_at = monotonic()
         collector = self._ensure_collector(
@@ -1261,6 +1273,7 @@ class DouyinCommerceCollectorManager:
                 collector.session_id,
                 keyword,
                 scope,
+                commission_filter=commission_filter,
             )
         except Exception as error:
             if not self._mark_failed(generation_id, collector):

@@ -74,6 +74,7 @@ from app_core.douyin_commerce_location_commission import (
     DEFAULT_COMMISSION_FILTER,
     filter_location_candidates,
     normalize_commission_filter,
+    normalize_observed_commission_type,
 )
 from app_core.douyin_verification import verification_broker
 from app_core.paths import AVATAR_DIR
@@ -1639,7 +1640,10 @@ class DouyinCommercePage(QWidget):
             started = self._run_collector_action(
                 collector_type,
                 lambda: douyin_commerce_collectors.commerce_collector_manager.search_locations(
-                    generation_id, normalized_keyword, normalized_scope
+                    generation_id,
+                    normalized_keyword,
+                    normalized_scope,
+                    commission_filter=commission_filter,
                 ),
                 lambda rows: self._batch_location_search_succeeded(
                     normalized_scope,
@@ -1662,7 +1666,10 @@ class DouyinCommercePage(QWidget):
         started = self._start_immediate_write(
             "batch_location_search",
             lambda: douyin_commerce_session.commerce_session_manager.search_locations(
-                session_id, normalized_keyword, normalized_scope
+                session_id,
+                normalized_keyword,
+                normalized_scope,
+                commission_filter=commission_filter,
             ),
             lambda rows: self._batch_location_search_succeeded(
                 normalized_scope,
@@ -1771,17 +1778,8 @@ class DouyinCommercePage(QWidget):
             return False
         account = self._selected_account() or {}
         stable_candidate = {
-            key: value
-            for key, value in candidate.items()
-            if key
-            not in {
-                "commissionType",
-                "productCount",
-                "commissionProductCount",
-                "commissionLabel",
-                "commissionFilter",
-                "observedCommissionType",
-            }
+            key: candidate.get(key)
+            for key in ("poiId", "name", "address")
         }
         try:
             preset = save_location_preset(
@@ -1801,16 +1799,22 @@ class DouyinCommercePage(QWidget):
             search_state.get("commissionFilter"),
             default=DEFAULT_COMMISSION_FILTER,
         )
-        preset["observedCommissionType"] = _normalized(
-            candidate.get("commissionType")
-        ) or "unknown"
-        for key in (
-            "productCount",
-            "commissionProductCount",
-            "commissionLabel",
-        ):
-            if key in candidate:
-                preset[key] = candidate[key]
+        try:
+            preset["observedCommissionType"] = (
+                normalize_observed_commission_type(
+                    candidate.get("commissionType"),
+                    default="unknown",
+                )
+            )
+        except ValueError:
+            preset["observedCommissionType"] = "unknown"
+        for key in ("productCount", "commissionProductCount"):
+            value = candidate.get(key)
+            preset[key] = (
+                value if type(value) is int and value >= 0 else None
+            )
+        if "commissionLabel" in candidate:
+            preset["commissionLabel"] = candidate["commissionLabel"]
         self._batch_locations[path] = dict(preset)
         self._batch_preflight_fingerprint = ""
         return True

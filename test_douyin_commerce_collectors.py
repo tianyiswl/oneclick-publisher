@@ -43,7 +43,7 @@ class FakeSessionManager:
         self.start_session_override: str | None = None
         self.start_result_override: dict[str, str] | None = None
         self.refresh_calls: list[str] = []
-        self.location_calls: list[tuple[str, object, object]] = []
+        self.location_calls: list[tuple[str, object, object, object]] = []
         self.location_scopes: list[object] = []
         self.close_calls: list[str | None] = []
         self.close_thread_idents: list[int] = []
@@ -97,8 +97,12 @@ class FakeSessionManager:
         session_id: str,
         keyword: object,
         scope: object,
+        *,
+        commission_filter: object = "all",
     ) -> list[dict[str, Any]]:
-        self.location_calls.append((session_id, keyword, scope))
+        self.location_calls.append(
+            (session_id, keyword, scope, commission_filter)
+        )
         self.location_scopes.append(scope)
         self.location_started.set()
         if self.release_location is not None:
@@ -362,6 +366,35 @@ class DouyinCommerceCollectorManagerTests(unittest.TestCase):
         self.assertEqual(event["candidateCount"], 1)
         self.assertEqual(event["outcome"], "success")
         self.assertEqual(event["errorCode"], "collector_unknown")
+
+    def test_location_search_normalizes_and_passes_commission_filter_to_session_manager(self):
+        """协调器必须在 POI 去重前把返佣筛选传给真实会话搜索边界。"""
+
+        generation_id = self.manager.begin_generation(self.upload_payload)[
+            "setupGenerationId"
+        ]
+
+        try:
+            self.manager.search_locations(
+                generation_id,
+                "侨港风情街",
+                "domestic",
+                commission_filter="commission",
+            )
+        except TypeError as exc:
+            self.fail(f"地点搜索边界未接收返佣筛选：{exc}")
+
+        self.assertEqual(
+            self.factory.instances[0].location_calls,
+            [
+                (
+                    self.factory.instances[0].session_id,
+                    "侨港风情街",
+                    "domestic",
+                    "commission",
+                )
+            ],
+        )
 
     def test_real_probe_builder_preserves_account_id_for_runtime_and_diagnostics(self):
         """真实探针白名单必须把 UI 的整数账号 ID 交给协调器。"""

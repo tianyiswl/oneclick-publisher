@@ -5814,6 +5814,61 @@ class DouyinCommerceTaskPresentationTests(unittest.TestCase):
 
 
 class DouyinCommerceSessionContractTests(unittest.TestCase):
+    def test_location_search_passes_normalized_commission_filter_to_service_before_dedupe(self):
+        """会话搜索必须让 service 先按返佣筛选，再做 POI 唯一性判定。"""
+
+        manager = douyin_commerce_session.DouyinCommerceSessionManager()
+        page = MagicMock()
+        page.is_closed.return_value = False
+        manager._session = douyin_commerce_session._CommerceEditorSession(
+            session_id="session-demo",
+            upload_payload={},
+            account_name="测试账号",
+            browser=None,
+            context=None,
+            page=page,
+            playwright=None,
+            uploader=None,
+        )
+        candidates = [
+            {
+                "poiId": "poi-commission",
+                "name": "返佣地点",
+                "address": "完整地址",
+                "commissionType": "commission",
+            }
+        ]
+
+        with patch.object(
+            douyin_commerce_session.douyin_commerce_service,
+            "search_commerce_location_store_candidates",
+            new_callable=AsyncMock,
+            return_value=candidates,
+        ) as search, patch.object(
+            douyin_commerce_session.douyin_commerce_service,
+            "close_commerce_store_selector",
+            new_callable=AsyncMock,
+        ):
+            try:
+                result = asyncio.run(
+                    manager._search_locations(
+                        "session-demo",
+                        "北海",
+                        "domestic",
+                        commission_filter="commission",
+                    )
+                )
+            except TypeError as exc:
+                self.fail(f"会话搜索边界未接收返佣筛选：{exc}")
+
+        self.assertEqual(result, candidates)
+        search.assert_awaited_once_with(
+            page,
+            "北海",
+            scope="domestic",
+            commission_filter="commission",
+        )
+
     def test_strict_close_records_cancelled_step_and_continues_later_resources(self):
         context = MagicMock()
         context.close = AsyncMock(side_effect=asyncio.CancelledError())
@@ -6150,7 +6205,10 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
         self.assertIsNone(manager._session.music_dialog)
         self.assertIsNone(manager._session.music_picker_page)
         search.assert_awaited_once_with(
-            manager._session.page, "北海夜南香", scope="domestic"
+            manager._session.page,
+            "北海夜南香",
+            scope="domestic",
+            commission_filter="all",
         )
         self.assertEqual(manager._session.music_candidates, [])
 
@@ -6515,7 +6573,12 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
         # 音乐服务关闭抽屉后，session 不得遗留抽屉状态。
         self.assertIsNone(manager._session.music_picker_page)
         self.assertIsNone(manager._session.music_dialog)
-        search.assert_awaited_once_with(editor_page, "北海", scope="domestic")
+        search.assert_awaited_once_with(
+            editor_page,
+            "北海",
+            scope="domestic",
+            commission_filter="all",
+        )
         self.assertEqual(selected["musicId"], "music-new")
         self.assertEqual(result, [location])
 
@@ -6585,7 +6648,12 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
         self.assertIsNone(manager._session.music_picker_page)
         self.assertIsNone(manager._session.music_dialog)
         self.assertEqual(manager._session.selected_music["musicId"], "music-b")
-        search.assert_awaited_once_with(manager._session.page, "北海夜南香", scope="domestic")
+        search.assert_awaited_once_with(
+            manager._session.page,
+            "北海夜南香",
+            scope="domestic",
+            commission_filter="all",
+        )
 
     def test_session_manager_defaults_upload_context_to_background(self) -> None:
         """上传会话默认后台；显式 false 才允许兼容旧调用。"""
@@ -6986,7 +7054,12 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
                 manager._search_locations("session-demo", "北海", "domestic")
             )
 
-        search.assert_awaited_once_with(manager._session.page, "北海", scope="domestic")
+        search.assert_awaited_once_with(
+            manager._session.page,
+            "北海",
+            scope="domestic",
+            commission_filter="all",
+        )
         self.assertEqual(result, expected)
         self.assertEqual(manager._session.selected_declaration, "无需添加自主声明")
 
@@ -7914,7 +7987,12 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
                 manager._search_locations("session-demo", "北海", "domestic")
             )
 
-        search.assert_awaited_once_with(manager._session.page, "北海", scope="domestic")
+        search.assert_awaited_once_with(
+            manager._session.page,
+            "北海",
+            scope="domestic",
+            commission_filter="all",
+        )
         self.assertEqual(close_selector.await_count, 2)
         self.assertEqual(result, expected)
         self.assertEqual(manager._session.commerce_location_candidates, expected)
@@ -8743,6 +8821,61 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         runner.finish(self.page._COLLECTOR_TASK_KEY)
 
         self.assertTrue(self.page.platform_collector_progress_frame.isHidden())
+
+    def test_batch_location_search_captures_filter_for_manager_call_and_late_callback(self) -> None:
+        """发起搜索时的筛选必须同时冻结到底层调用和迟到回调。"""
+
+        runner = self._ControlledLifecycleRunner()
+        self.page.runner = runner
+        self.page._setup_generation_id = "generation-a"
+        self.page.batch_location_commission_combo.setCurrentIndex(
+            self.page.batch_location_commission_combo.findData("commission")
+        )
+        candidate = {
+            "poiId": "poi-commission",
+            "name": "返佣地点",
+            "address": "返佣完整地址",
+            "commissionType": "commission",
+        }
+        result = {
+            "ok": True,
+            "setupGenerationId": "generation-a",
+            "collectorType": "domestic_location",
+            "collectorInstanceId": "domestic-a",
+            "candidates": [candidate],
+        }
+        status = self._collector_status()
+
+        with patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.search_locations",
+            return_value=result,
+        ) as search, patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.status",
+            return_value=status,
+        ):
+            self.page._search_batch_locations("domestic", "北海")
+            self.page.batch_location_commission_combo.setCurrentIndex(
+                self.page.batch_location_commission_combo.findData(
+                    "no_commission"
+                )
+            )
+            runner.execute(self.page._COLLECTOR_TASK_KEY)
+
+        self.assertEqual(
+            search.call_args,
+            call(
+                "generation-a",
+                "北海",
+                "domestic",
+                commission_filter="commission",
+            ),
+        )
+        state = self.page._batch_location_state()
+        self.assertEqual(state["commissionFilter"], "commission")
+        self.assertEqual(
+            [item["poiId"] for item in state["candidates"]],
+            ["poi-commission"],
+        )
 
     def test_abandon_reset_stops_and_hides_platform_collector_progress(self) -> None:
         """放弃或代际重置时必须停止计时器并清除进度所有者。"""
@@ -10649,6 +10782,10 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             "commissionLabel": "返佣",
             "commissionFilter": "commission",
             "observedCommissionType": "commission",
+            "distance": "2km",
+            "source": "douyin-visible-commerce-location",
+            "commerceInfo": "8 件商品 3 件返佣",
+            "unknown": "不得写入稳定预设",
         }
 
         with patch(
@@ -10683,6 +10820,86 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             ],
             "commission",
         )
+
+    def test_batch_location_snapshot_normalizes_observed_type_and_nonnegative_integer_counts(self) -> None:
+        """本批返佣快照必须拒绝布尔、负数、字符串和非法类型。"""
+
+        cases = [
+            (
+                "/tmp/invalid-bool.mp4",
+                True,
+                True,
+                -1,
+                "unknown",
+                None,
+                None,
+            ),
+            (
+                "/tmp/invalid-string.mp4",
+                "unexpected",
+                "4",
+                2,
+                "unknown",
+                None,
+                2,
+            ),
+            (
+                "/tmp/valid-zero.mp4",
+                "no_commission",
+                0,
+                0,
+                "no_commission",
+                0,
+                0,
+            ),
+        ]
+
+        with patch(
+            "ui.douyin_commerce_page.save_location_preset",
+            side_effect=lambda _account_id, candidate, scope: {
+                **candidate,
+                "scope": scope,
+                "id": f"preset-{candidate['poiId']}",
+            },
+        ):
+            for (
+                path,
+                observed_type,
+                product_count,
+                commission_count,
+                expected_type,
+                expected_product_count,
+                expected_commission_count,
+            ) in cases:
+                with self.subTest(path=path):
+                    self.assertTrue(
+                        self.page._save_batch_location_candidate(
+                            path,
+                            "domestic",
+                            {
+                                "poiId": Path(path).stem,
+                                "name": "地点",
+                                "address": "完整地址",
+                                "commissionType": observed_type,
+                                "productCount": product_count,
+                                "commissionProductCount": commission_count,
+                                "commissionLabel": "待校验",
+                            },
+                        )
+                    )
+                    snapshot = self.page._batch_locations[path]
+                    self.assertEqual(
+                        snapshot["observedCommissionType"],
+                        expected_type,
+                    )
+                    self.assertEqual(
+                        snapshot["productCount"],
+                        expected_product_count,
+                    )
+                    self.assertEqual(
+                        snapshot["commissionProductCount"],
+                        expected_commission_count,
+                    )
 
     def test_batch_location_all_filter_keeps_raw_candidates_and_labels_each_commission_type(self) -> None:
         """全部筛选展示三类候选，且不丢失平台原始结构。"""
@@ -11386,7 +11603,15 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         ) as save:
             self.page._select_batch_location_candidate(path, "domestic", candidate)
 
-        save.assert_called_once_with(99, candidate, "domestic")
+        save.assert_called_once_with(
+            99,
+            {
+                "poiId": "poi-1",
+                "name": "北海银滩景区",
+                "address": "广西壮族自治区北海市银海区银滩大道中段",
+            },
+            "domestic",
+        )
         self.assertEqual(self.page._batch_locations[path]["address"], candidate["address"])
         self.assertEqual(self.page._batch_locations[path]["searchKeyword"], "北海")
 

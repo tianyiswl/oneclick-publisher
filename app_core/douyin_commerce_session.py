@@ -33,6 +33,7 @@ from . import (
     douyin_music_service,
     douyin_publish_executor,
 )
+from .douyin_commerce_location_commission import normalize_commission_filter
 from .oneclick_preflight import _account_for_payload, _storage_state
 from .douyin_verification import verification_broker
 from utils.log import douyin_logger
@@ -334,10 +335,28 @@ class DouyinCommerceSessionManager:
         session_id: str,
         keyword: object,
         scope: object,
+        *,
+        commission_filter: object = "all",
     ) -> list[dict[str, Any]]:
         """在当前已上传编辑页搜索发布定位候选，不另开浏览器或使用私有请求。"""
 
-        return self._call(self._search_locations(session_id, keyword, scope))
+        try:
+            selected_commission_filter = normalize_commission_filter(
+                commission_filter,
+                default="all",
+            )
+        except Exception:
+            raise DouyinCommerceSessionError(
+                "抖音带货位置搜索失败：返佣筛选值无效"
+            ) from None
+        return self._call(
+            self._search_locations(
+                session_id,
+                keyword,
+                scope,
+                commission_filter=selected_commission_filter,
+            )
+        )
 
     def prepare_publish_settings(self, session_id: str) -> dict[str, object]:
         """在正式发布页应用设置前建立可验证的干净基线。"""
@@ -930,9 +949,20 @@ class DouyinCommerceSessionManager:
         session_id: str,
         keyword: object,
         scope: object,
+        *,
+        commission_filter: object = "all",
     ) -> list[dict[str, Any]]:
         session = await self._current(session_id)
         self._ensure_editor_not_blocked_by_music_picker(session)
+        try:
+            selected_commission_filter = normalize_commission_filter(
+                commission_filter,
+                default="all",
+            )
+        except Exception:
+            raise DouyinCommerceSessionError(
+                "抖音带货位置搜索失败：返佣筛选值无效"
+            ) from None
         try:
             selected_scope = douyin_commerce_service.normalize_commerce_location_scope(scope)
         except Exception as exc:
@@ -955,6 +985,7 @@ class DouyinCommerceSessionManager:
                     session.page,
                     keyword,
                     scope=selected_scope,
+                    commission_filter=selected_commission_filter,
                 )
                 break
             except Exception as exc:
