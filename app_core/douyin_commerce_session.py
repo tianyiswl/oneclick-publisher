@@ -500,7 +500,7 @@ class DouyinCommerceSessionManager:
             # 页面销毁或应用退出时的重复关闭无需打断 UI。
             return
 
-    def close_strict(self, session_id: str | None = None) -> None:
+    def close_strict(self, session_id: str | None = None) -> dict[str, object]:
         """严格关闭会话；任一资源失败都向关闭屏障返回固定信号。"""
 
         try:
@@ -509,6 +509,18 @@ class DouyinCommerceSessionManager:
             raise DouyinCommerceSessionError(
                 "commerce_session_close_failed"
             ) from None
+        status = self.status()
+        if (
+            not isinstance(status, Mapping)
+            or _normalized(status.get("active")).casefold() != "false"
+        ):
+            raise DouyinCommerceSessionError(
+                "commerce_session_close_failed"
+            ) from None
+        return {
+            "closed": True,
+            "aliveSessionCount": 0,
+        }
 
     def status(self) -> dict[str, str]:
         return self._call(self._status())

@@ -19,6 +19,7 @@ from typing import Any, Mapping
 
 from .douyin_commerce_location_commission import (
     filter_location_candidates,
+    normalize_candidate_commission_fields,
     normalize_commission_filter,
     parse_commission_summary,
 )
@@ -234,7 +235,7 @@ def normalize_commerce_location_candidate(value: object) -> dict[str, Any] | Non
         return None
     return {
         **location,
-        **parse_commission_summary(_normalized(value.get("commerceInfo"))),
+        **normalize_candidate_commission_fields(value),
         "source": "douyin-visible-commerce-location",
     }
 
@@ -2117,17 +2118,29 @@ async def set_commerce_location_scope(page, scope: object) -> str:
 def _location_result_signature(rows: list[Mapping[str, Any]]) -> str:
     """返回可见地点列表的最小快照，用于排除输入前的旧候选。"""
 
-    return "\n".join(
-        "\u241f".join(
-            (
-                _normalized(row.get("name")),
-                _normalized(row.get("address")),
-                _normalized(row.get("distance")),
+    signatures: list[str] = []
+    for row in rows:
+        if not (_normalized(row.get("name")) or _normalized(row.get("address"))):
+            continue
+        commission = normalize_candidate_commission_fields(row)
+
+        def count_text(field: str) -> str:
+            value = commission.get(field)
+            return str(value) if type(value) is int and value >= 0 else ""
+
+        signatures.append(
+            "\u241f".join(
+                (
+                    _normalized(row.get("name")),
+                    _normalized(row.get("address")),
+                    _normalized(row.get("distance")),
+                    _normalized(commission.get("commissionType")),
+                    count_text("productCount"),
+                    count_text("commissionProductCount"),
+                )
             )
         )
-        for row in rows
-        if _normalized(row.get("name")) or _normalized(row.get("address"))
-    )
+    return "\n".join(signatures)
 
 
 def _location_rows_match_keyword(rows: list[Mapping[str, Any]], keyword: str) -> bool:
@@ -2532,15 +2545,43 @@ async def _location_option_targets(
                             && !/(?:商品|返佣|佣金|团购|套餐|券|专区)/.test(text)
                             && /(?:自治区|省|市|区|县|镇|乡|街|路|大道|巷|号|楼|村)/.test(text);
                     };
-                    const looksCommerce = value => /(?:商品|返佣|佣金|团购|套餐|券)/.test(value);
+                    const looksCommerce = value => {
+                        const text = normalize(value);
+                        return /(?:^|[^\\d,，.+-])(?:\\d{1,3}(?:[,，]\\d{3})+|\\d+)(?![\\d,，.+-])\\s*件(?:商品|返佣)/.test(text)
+                            || /(?:返佣|佣金)/.test(text);
+                    };
                     const nameNode = node.querySelector('[data-store-name], [class*="name-"], [class*="name_"], [class*="title-"]');
                     const addressNode = node.querySelector('[data-store-address], [class*="address-"], [class*="address_"], [class*="addr"]');
                     const commerceNode = node.querySelector('[class*="cps-item"], [data-commerce-info], [class*="commission"], [class*="product"]');
                     const name = normalize(nameNode && (nameNode.innerText || nameNode.textContent)) || lines[0] || '';
                     const address = normalize(addressNode && (addressNode.innerText || addressNode.textContent))
                         || lines.find(line => looksAddress(line)) || '';
-                    const commerceInfo = normalize(commerceNode && (commerceNode.innerText || commerceNode.textContent))
-                        || lines.find(line => looksCommerce(line)) || '';
+                    const isIdentityNode = candidate => Boolean(candidate && (
+                        candidate === nameNode || candidate === addressNode
+                        || nameNode?.contains(candidate) || addressNode?.contains(candidate)
+                        || candidate.contains?.(nameNode) || candidate.contains?.(addressNode)
+                    ));
+                    const isVisibleCommerceNode = candidate => {
+                        if (!candidate || candidate.closest?.('[hidden], [aria-hidden="true"]')) return false;
+                        const view = candidate.ownerDocument?.defaultView;
+                        const style = view?.getComputedStyle(candidate);
+                        if (!style || style.display === 'none'
+                            || style.visibility === 'hidden' || style.visibility === 'collapse'
+                            || style.opacity === '0' || style.contentVisibility === 'hidden') return false;
+                        return candidate.getClientRects().length > 0;
+                    };
+                    const commerceCandidates = [];
+                    if (commerceNode && !isIdentityNode(commerceNode) && isVisibleCommerceNode(commerceNode)) {
+                        commerceCandidates.push(commerceNode);
+                    }
+                    Array.from(node.querySelectorAll('*')).forEach(candidate => {
+                        if (!isIdentityNode(candidate) && isVisibleCommerceNode(candidate)) {
+                            commerceCandidates.push(candidate);
+                        }
+                    });
+                    const commerceInfo = commerceCandidates
+                        .map(candidate => normalize(candidate.innerText))
+                        .find(looksCommerce) || '';
                     return { name, address, commerceInfo };
                 }"""
             )
@@ -2614,12 +2655,36 @@ async def _apply_open_commerce_location_to_page(
         raise DouyinCommerceError("publish_location_click_failed") from None
     try:
         await page.wait_for_timeout(450)
-        _, _, mode_value, selected_name = await _anchor_controls(page)
+        _, store_control, mode_value, selected_name = await _anchor_controls(page)
     except Exception:
         raise DouyinCommerceError("publish_location_readback_mismatch") from None
     if mode_value != _COMMERCE_MODE_TEXT or selected_name != location["name"]:
         raise DouyinCommerceError("publish_location_readback_mismatch")
-    return {"location": location}
+    try:
+        verify_listbox = await _open_store_selector(page, store_control)
+        selected_rows = [
+            row
+            for row in await _store_option_descriptors(verify_listbox)
+            if _normalized(row.get("selected")) == "true"
+        ]
+        selected_locations = normalize_commerce_location_candidates(
+            selected_rows,
+            commission_filter=selected_commission_filter,
+        )
+    except Exception:
+        raise DouyinCommerceError("publish_location_readback_mismatch") from None
+    verified = [
+        row
+        for row in selected_locations
+        if _normalized(row.get("poiId")) == location["poiId"]
+        and _normalized(row.get("name")) == location["name"]
+        and _normalized(row.get("address")) == location["address"]
+        and _normalized(row.get("commissionType"))
+        == _normalized(normalized.get("commissionType"))
+    ]
+    if len(verified) != 1:
+        raise DouyinCommerceError("publish_location_readback_mismatch") from None
+    return {"location": dict(verified[0])}
 
 
 async def apply_commerce_location_to_page(
@@ -2854,7 +2919,6 @@ async def _store_option_descriptors(listbox) -> list[dict[str, str]]:
     """只抽取页面上可见的门店标识、名称和地址，不保存原始 DOM。"""
 
     rows: list[dict[str, str]] = []
-    seen: set[str] = set()
     locator = listbox.locator(':scope > [role="option"]')
     for index in range(await locator.count()):
         node = locator.nth(index)
@@ -2875,17 +2939,52 @@ async def _store_option_descriptors(listbox) -> list[dict[str, str]]:
                             && !/(?:商品|返佣|佣金|团购|套餐|券|专区)/.test(text)
                             && /(?:自治区|省|市|区|县|镇|乡|街|路|大道|巷|号|楼|村)/.test(text);
                     };
-                    const looksCommerce = value => /(?:商品|返佣|佣金|团购|套餐|券)/.test(value);
+                    const looksCommerce = value => {
+                        const text = normalize(value);
+                        return /(?:^|[^\\d,，.+-])(?:\\d{1,3}(?:[,，]\\d{3})+|\\d+)(?![\\d,，.+-])\\s*件(?:商品|返佣)/.test(text)
+                            || /(?:返佣|佣金)/.test(text);
+                    };
                     const nameNode = node.querySelector('[data-store-name], [class*="name-"], [class*="name_"], [class*="title-"]');
                     const addressNode = node.querySelector('[data-store-address], [class*="address-"], [class*="address_"], [class*="addr"]');
                     const commerceNode = node.querySelector('[class*="cps-item"], [data-commerce-info], [class*="commission"], [class*="product"]');
                     const name = normalize(nameNode && (nameNode.innerText || nameNode.textContent)) || lines[0] || '';
                     const address = normalize(addressNode && (addressNode.innerText || addressNode.textContent))
                         || lines.find(line => looksAddress(line)) || '';
-                    const commerceInfo = normalize(commerceNode && (commerceNode.innerText || commerceNode.textContent))
-                        || lines.find(line => looksCommerce(line)) || '';
-                    const selected = node.getAttribute('aria-selected') === 'true'
-                        || /(?:^|[-_\\s])(selected|chosen)(?:$|[-_\\s])/i.test(String(node.className || ''));
+                    const isIdentityNode = candidate => Boolean(candidate && (
+                        candidate === nameNode || candidate === addressNode
+                        || nameNode?.contains(candidate) || addressNode?.contains(candidate)
+                        || candidate.contains?.(nameNode) || candidate.contains?.(addressNode)
+                    ));
+                    const isVisibleCommerceNode = candidate => {
+                        if (!candidate || candidate.closest?.('[hidden], [aria-hidden="true"]')) return false;
+                        const view = candidate.ownerDocument?.defaultView;
+                        const style = view?.getComputedStyle(candidate);
+                        if (!style || style.display === 'none'
+                            || style.visibility === 'hidden' || style.visibility === 'collapse'
+                            || style.opacity === '0' || style.contentVisibility === 'hidden') return false;
+                        return candidate.getClientRects().length > 0;
+                    };
+                    const commerceCandidates = [];
+                    if (commerceNode && !isIdentityNode(commerceNode) && isVisibleCommerceNode(commerceNode)) {
+                        commerceCandidates.push(commerceNode);
+                    }
+                    Array.from(node.querySelectorAll('*')).forEach(candidate => {
+                        if (!isIdentityNode(candidate) && isVisibleCommerceNode(candidate)) {
+                            commerceCandidates.push(candidate);
+                        }
+                    });
+                    const commerceInfo = commerceCandidates
+                        .map(candidate => normalize(candidate.innerText))
+                        .find(looksCommerce) || '';
+                    const ariaSelected = node.getAttribute('aria-selected');
+                    const selectionClassTokens = Array.from(node.classList || [])
+                        .filter(token => /selected|chosen/i.test(token));
+                    const explicitSelectedClass = selectionClassTokens.length > 0
+                        && selectionClassTokens.every(
+                            token => /^(?:selected|chosen)$/i.test(token)
+                        );
+                    const selected = ariaSelected === 'true'
+                        || (ariaSelected === null && explicitSelectedClass);
                     return {
                         storeId: attr('data-store-id') || attr('data-shop-id') || attr('data-id'),
                         name,
@@ -2905,17 +3004,9 @@ async def _store_option_descriptors(listbox) -> list[dict[str, str]]:
             _normalized(descriptor.get("name")),
             _normalized(descriptor.get("address")),
         )
-        commission_type = _normalized(
-            parse_commission_summary(
-                _normalized(descriptor.get("commerceInfo"))
-            ).get("commissionType")
-        )
-        # 同名同址的返佣/无佣节点只在当前 DOM 回合用佣型区分；原门店身份
-        # 与发布定位的持久化 POI 身份都不附加佣型。
-        key = f"{store_id or visible_identity}:{commission_type}"
-        if not key or key in seen:
-            continue
-        seen.add(key)
+        # 每个可见 option 都是当前平台面板的独立证据。没有可证明的
+        # 虚拟列表克隆规则时绝不在 DOM 层去重；返佣筛选后仍重复由
+        # 归一化边界以明确错误安全停止。
         descriptor["storeId"] = store_id or visible_identity
         rows.append({str(key): _normalized(value) for key, value in descriptor.items()})
     return rows

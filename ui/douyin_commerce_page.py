@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+import json
 import logging
 from pathlib import Path
 import re
@@ -497,6 +498,7 @@ class DouyinCommercePage(QWidget):
         # 平台设置采集代际与正式发布会话严格分离。这里永远不保存三个
         # 采集器内部的 sessionId，只保留协调器公开的代际和实例状态。
         self._setup_generation_id = ""
+        self._setup_generation_content_fingerprint = ""
         self._setup_generation_cleanup_required = False
         self._shutdown_requested = threading.Event()
         self._collector_status: dict[str, object] = {}
@@ -562,6 +564,7 @@ class DouyinCommercePage(QWidget):
         self._selected_video_indexes: list[int] = []
         self._batch_locations: dict[str, dict[str, object]] = {}
         self._batch_location_searches: dict[str, dict[str, object]] = {}
+        self._batch_location_search_token = 0
         self._batch_location_feedback = ""
         self._batch_item_rows_signature: tuple[object, ...] | None = None
         self._batch_schedule_overrides: dict[str, str] = {}
@@ -1573,7 +1576,7 @@ class DouyinCommercePage(QWidget):
         self._select_batch_location_candidate(path, scope, combo.currentData())
 
     def _batch_location_state(self) -> dict[str, object]:
-        """返回本次批量共用的地点搜索状态，不把候选 DOM 写入草稿。"""
+        """返回上次已接纳结果；这不是顶部控件的当前搜索意图。"""
 
         existing = self._batch_location_searches.get(_BATCH_SHARED_LOCATION_SEARCH_KEY)
         scope = _normalized(
@@ -1602,11 +1605,34 @@ class DouyinCommercePage(QWidget):
             ],
         }
 
+    def _batch_location_search_intent(self) -> dict[str, str]:
+        """直接读取顶部控件，不受旧结果或迟到回调影响。"""
+
+        try:
+            scope = douyin_commerce_service.normalize_commerce_location_scope(
+                self.batch_location_scope_combo.currentData()
+            )
+        except Exception:
+            scope = douyin_commerce_service.LOCATION_SCOPE_DOMESTIC
+        return {
+            "scope": scope,
+            "keyword": _normalized(self.batch_location_keyword.text()),
+            "commissionFilter": normalize_commission_filter(
+                self.batch_location_commission_combo.currentData(),
+                default=DEFAULT_COMMISSION_FILTER,
+            ),
+        }
+
     def _search_batch_locations(self, scope: object, keyword: object) -> None:
         """用一次设置会话读取所有视频共用的官方地点候选。"""
 
         if not self._setup_generation_id and not self._session_id:
             self._set_batch_location_feedback("请先完成内容准备并等待设置会话就绪")
+            return
+        if self._setup_generation_id and self._reject_stale_setup_generation():
+            self._set_batch_location_feedback(
+                "账号或视频已变更，旧平台设置代际正在关闭，请稍后重新继续"
+            )
             return
         try:
             normalized_scope = douyin_commerce_service.normalize_commerce_location_scope(scope)
@@ -1621,6 +1647,8 @@ class DouyinCommercePage(QWidget):
             self.batch_location_commission_combo.currentData(),
             default=DEFAULT_COMMISSION_FILTER,
         )
+        self._batch_location_search_token += 1
+        request_token = self._batch_location_search_token
         self._batch_location_searches[_BATCH_SHARED_LOCATION_SEARCH_KEY] = {
             "scope": normalized_scope,
             "keyword": normalized_keyword,
@@ -1651,6 +1679,7 @@ class DouyinCommercePage(QWidget):
                     normalized_keyword,
                     rows,
                     commission_filter,
+                    request_token=request_token,
                 ),
                 action_label=(
                     "正在搜索国内地点"
@@ -1678,8 +1707,12 @@ class DouyinCommercePage(QWidget):
                 normalized_keyword,
                 rows,
                 commission_filter,
+                request_token=request_token,
             ),
-            self._batch_location_search_failed,
+            lambda message: self._batch_location_search_failed(
+                message,
+                request_token=request_token,
+            ),
         )
         if not started:
             self._set_batch_location_feedback("地点搜索任务未启动，请等待当前操作结束后重试")
@@ -1690,7 +1723,14 @@ class DouyinCommercePage(QWidget):
         keyword: str,
         rows: object,
         commission_filter: object = None,
+        *,
+        request_token: int | None = None,
     ) -> None:
+        if (
+            request_token is not None
+            and request_token != self._batch_location_search_token
+        ):
+            return
         selected_filter = normalize_commission_filter(
             commission_filter
             if commission_filter is not None
@@ -1756,7 +1796,17 @@ class DouyinCommercePage(QWidget):
         self._render_batch_item_rows()
         self._sync_view()
 
-    def _batch_location_search_failed(self, message: str) -> None:
+    def _batch_location_search_failed(
+        self,
+        message: str,
+        *,
+        request_token: int | None = None,
+    ) -> None:
+        if (
+            request_token is not None
+            and request_token != self._batch_location_search_token
+        ):
+            return
         state = self._batch_location_state()
         state["candidates"] = []
         state["rawCandidates"] = []
@@ -1948,15 +1998,6 @@ class DouyinCommercePage(QWidget):
             return
         state = self._batch_location_state()
         self._sync_batch_location_controls()
-        scope_index = self.batch_location_scope_combo.findData(state["scope"])
-        if scope_index >= 0 and self.batch_location_scope_combo.currentIndex() != scope_index:
-            self.batch_location_scope_combo.blockSignals(True)
-            self.batch_location_scope_combo.setCurrentIndex(scope_index)
-            self.batch_location_scope_combo.blockSignals(False)
-        if self.batch_location_keyword.text() != str(state["keyword"]):
-            self.batch_location_keyword.blockSignals(True)
-            self.batch_location_keyword.setText(str(state["keyword"]))
-            self.batch_location_keyword.blockSignals(False)
         missing_location = 0
         for index, video in enumerate(videos):
             path = _normalized(video.get("storedPath"))
@@ -1982,12 +2023,26 @@ class DouyinCommercePage(QWidget):
             )
             candidate_combo.addItem("请选择地点", None)
             current_index = 0
+            try:
+                current_commission_type = normalize_observed_commission_type(
+                    current.get("observedCommissionType"),
+                    default="unknown",
+                )
+            except ValueError:
+                current_commission_type = "unknown"
             for candidate in state["candidates"]:
+                try:
+                    candidate_commission_type = normalize_observed_commission_type(
+                        candidate.get("commissionType"),
+                        default="unknown",
+                    )
+                except ValueError:
+                    candidate_commission_type = "unknown"
                 suffix = {
                     "commission": "【返佣】",
                     "no_commission": "【无佣】",
                     "unknown": "【待确认】",
-                }.get(_normalized(candidate.get("commissionType")), "【待确认】")
+                }.get(candidate_commission_type, "【待确认】")
                 label = (
                     f"{candidate.get('name') or ''} · "
                     f"{candidate.get('address') or ''}{suffix}"
@@ -1998,7 +2053,11 @@ class DouyinCommercePage(QWidget):
                     label,
                     Qt.ItemDataRole.ToolTipRole,
                 )
-                if _normalized(candidate.get("poiId")) == _normalized(current.get("poiId")):
+                if (
+                    _normalized(candidate.get("poiId"))
+                    == _normalized(current.get("poiId"))
+                    and candidate_commission_type == current_commission_type
+                ):
                     current_index = candidate_combo.count() - 1
             # 顶部重新搜索其他关键词时，也要保留每条视频已经选中的地点并直接
             # 显示在下拉框中；不再额外重复展示一块地址文本。
@@ -2488,6 +2547,14 @@ class DouyinCommercePage(QWidget):
     def refresh(self) -> None:
         """刷新本地账号和素材选择，不自动检测或打开平台浏览器。"""
 
+        if self._setup_content_mutation_locked():
+            QMessageBox.warning(
+                self,
+                "刷新账号与视频",
+                "当前平台设置代际正在使用这组账号和视频。请先放弃本次设置，再刷新内容。",
+            )
+            return
+
         previous_account = self._account_key(self._selected_account())
         previous_video = self._video_key(self._selected_video())
         self.account_combo.blockSignals(True)
@@ -2600,6 +2667,14 @@ class DouyinCommercePage(QWidget):
     def select_video_indexes(self, indexes: list[int]) -> None:
         """供界面测试和恢复草稿使用的受限多视频选择入口。"""
 
+        if self._setup_content_mutation_locked():
+            QMessageBox.warning(
+                self,
+                "修改视频",
+                "当前平台设置代际已绑定所选视频。请先放弃本次设置。",
+            )
+            return
+
         unique = []
         for index in indexes:
             if isinstance(index, int) and 1 <= index < self.video_combo.count() and index not in unique:
@@ -2624,6 +2699,9 @@ class DouyinCommercePage(QWidget):
     def select_all_batch_videos(self) -> None:
         """选择当前素材列表中最多二十条视频，不访问平台。"""
 
+        if self._setup_content_mutation_locked():
+            QMessageBox.warning(self, "全选视频", "请先放弃当前平台设置，再修改视频。")
+            return
         if self._busy():
             QMessageBox.warning(self, "全选视频", "当前正在处理，请等待操作完成后再修改视频。")
             return
@@ -2636,6 +2714,9 @@ class DouyinCommercePage(QWidget):
     def clear_batch_video_selection(self) -> None:
         """取消所有视频勾选，仅清空本地批次选择。"""
 
+        if self._setup_content_mutation_locked():
+            QMessageBox.warning(self, "取消全选", "请先放弃当前平台设置，再修改视频。")
+            return
         if self._busy():
             QMessageBox.warning(self, "取消全选", "当前正在处理，请等待操作完成后再修改视频。")
             return
@@ -2935,7 +3016,11 @@ class DouyinCommercePage(QWidget):
         video_text = self._video_display(video, video_metadata)
         self.video_card.setText(video_text)
         self._sync_video_thumbnail(video)
-        self.video_replace_button.setEnabled(self.video_combo.count() > 1 and not self._busy())
+        self.video_replace_button.setEnabled(
+            self.video_combo.count() > 1
+            and not self._busy()
+            and not self._setup_content_mutation_locked()
+        )
 
     @staticmethod
     def _video_display(media: dict, metadata: dict[str, str] | None = None) -> str:
@@ -3065,6 +3150,13 @@ class DouyinCommercePage(QWidget):
     def restore_saved_content(self) -> None:
         """恢复上次本机内容准备；有临时编辑会话时拒绝覆盖。"""
 
+        if self._setup_content_mutation_locked():
+            QMessageBox.warning(
+                self,
+                "恢复已保存内容",
+                "当前平台设置代际已绑定账号和视频。请先放弃本次设置。",
+            )
+            return
         if self._session_id:
             QMessageBox.warning(
                 self,
@@ -3142,6 +3234,13 @@ class DouyinCommercePage(QWidget):
     def clear_current_content(self) -> None:
         """清空当前表单，不删除可恢复的本地保存内容。"""
 
+        if self._setup_content_mutation_locked():
+            QMessageBox.warning(
+                self,
+                "清空当前信息",
+                "当前平台设置代际已绑定账号和视频。请先放弃本次设置。",
+            )
+            return
         if self._session_id:
             QMessageBox.warning(
                 self,
@@ -3176,6 +3275,7 @@ class DouyinCommercePage(QWidget):
         self.batch_video_list.blockSignals(False)
         self._selected_video_indexes = []
         self._batch_locations = {}
+        self._batch_location_search_token += 1
         self._batch_location_searches = {}
         self._batch_schedule_overrides = {}
         self._batch_location_feedback = ""
@@ -3821,6 +3921,7 @@ class DouyinCommercePage(QWidget):
         current_step = self.pages.currentIndex()
         self._refresh_schedule_default()
         batch_mode = self.selected_video_count() >= 1
+        setup_content_locked = self._setup_content_mutation_locked()
         for index, label in enumerate(self.step_labels):
             if index == current_step:
                 state = "active"
@@ -3849,6 +3950,9 @@ class DouyinCommercePage(QWidget):
                 "将在当前视频后暂停" if self._batch_pause_requested else "暂停发布"
             )
         self._sync_content_cards()
+        self.account_combo.setEnabled(not setup_content_locked and not self._busy())
+        self.video_combo.setEnabled(not setup_content_locked and not self._busy())
+        self.batch_video_list.setEnabled(not setup_content_locked and not self._busy())
 
         if batch_mode and self._batch_editor_session_ended and not self._session_id:
             self.content_notice.setText(self._BATCH_EDITOR_SESSION_ENDED_HINT)
@@ -3914,10 +4018,17 @@ class DouyinCommercePage(QWidget):
         self.abandon_button.setVisible(bool(self._session_id or self._setup_generation_id))
         self.save_content_button.setEnabled(not self._busy())
         self.restore_content_button.setEnabled(
-            self._saved_content_available and not self._session_id and not self._busy()
+            self._saved_content_available
+            and not self._session_id
+            and not self._busy()
+            and not setup_content_locked
         )
-        self.clear_content_button.setEnabled(not self._session_id and not self._busy())
-        can_edit_batch_content = not self._session_id and not self._busy()
+        self.clear_content_button.setEnabled(
+            not self._session_id and not self._busy() and not setup_content_locked
+        )
+        can_edit_batch_content = (
+            not self._session_id and not self._busy() and not setup_content_locked
+        )
         self.select_all_videos_button.setEnabled(can_edit_batch_content)
         self.clear_video_selection_button.setEnabled(can_edit_batch_content)
         self.batch_save_content_button.setEnabled(not self._busy())
@@ -4236,6 +4347,68 @@ class DouyinCommercePage(QWidget):
             )
         )
 
+    def _setup_content_mutation_locked(self) -> bool:
+        """采集代际存活期间禁止改写其绑定的账号和视频。"""
+
+        return bool(
+            self._setup_generation_id
+            or self._setup_generation_cleanup_required
+            or self.runner.is_running(self._SETUP_GENERATION_TASK_KEY)
+            or self.runner.is_running(self._SETUP_GENERATION_CLOSE_TASK_KEY)
+        )
+
+    def _setup_content_fingerprint(self, payload: Mapping[str, Any] | None = None) -> str:
+        """只绑定决定平台身份的账号与整批视频，文案可继续本地编辑。"""
+
+        source = payload if isinstance(payload, Mapping) else {}
+        account = self._selected_account() or {}
+        account_file = _normalized(account.get("filePath"))
+        if not account_file:
+            accounts = source.get("accountList") or []
+            if isinstance(accounts, (list, tuple)) and accounts:
+                account_file = _normalized(accounts[0])
+        if not account_file and account.get("id") is not None:
+            account_file = f"id:{account.get('id')}"
+
+        video_paths = [
+            _normalized(video.get("storedPath"))
+            for video in self._selected_videos()
+            if _normalized(video.get("storedPath"))
+        ]
+        if not video_paths:
+            files = source.get("fileList") or []
+            if isinstance(files, (list, tuple)):
+                video_paths = [_normalized(path) for path in files if _normalized(path)]
+        return json.dumps(
+            {
+                "accountFile": account_file,
+                "videoPaths": video_paths,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    def _setup_generation_matches_current_content(self) -> bool:
+        """未绑定或与当前账号/视频不符时一律失效。"""
+
+        bound = _normalized(self._setup_generation_content_fingerprint)
+        return bool(bound and bound == self._setup_content_fingerprint())
+
+    def _reject_stale_setup_generation(self) -> bool:
+        """发现内容漂移时只异步派发严格关闭，绝不阻塞 Qt 线程。"""
+
+        if not self._setup_generation_id:
+            return False
+        if self._setup_generation_matches_current_content():
+            return False
+        self._dispatch_setup_generation_close(
+            reason="content_changed",
+            completion="content_changed",
+            silent=True,
+        )
+        return True
+
     def _content_is_valid(self) -> bool:
         if self.selected_video_count() >= 1:
             return self._batch_content_is_valid()
@@ -4359,7 +4532,7 @@ class DouyinCommercePage(QWidget):
 
     def _batch_draft_payload(self) -> dict:
         account = self._selected_account() or {}
-        location_search = self._batch_location_state()
+        location_search = self._batch_location_search_intent()
         return {
             "accountId": account.get("id"),
             "accountFile": account.get("filePath"),
@@ -4370,7 +4543,8 @@ class DouyinCommercePage(QWidget):
                 "selectedMusic": dict(self._selected_music or {}),
                 "contentDeclaration": self._selected_declaration(),
             },
-            # 只保存用户最后的搜索意图；平台候选必须在新会话中重新读取。
+            # 只保存顶部控件的当前意图；上次结果的筛选只冻结
+            # 在已选视频快照中，迟到回调不得改写草稿恢复值。
             "lastLocationSearch": {
                 "scope": location_search["scope"],
                 "keyword": location_search["keyword"],
@@ -4421,6 +4595,13 @@ class DouyinCommercePage(QWidget):
     def restore_batch_content(self) -> None:
         """直接恢复本地草稿；仅缺失的账号/素材留在界面上提示，不弹成功提示。"""
 
+        if self._setup_content_mutation_locked():
+            QMessageBox.warning(
+                self,
+                "恢复已保存内容",
+                "当前平台设置代际已绑定账号和视频。请先放弃本次设置。",
+            )
+            return
         try:
             saved = douyin_commerce_batch_draft_service.load_batch_draft()
         except Exception as exc:
@@ -4483,6 +4664,7 @@ class DouyinCommercePage(QWidget):
             location_search.get("commissionFilter"),
             default=DEFAULT_COMMISSION_FILTER,
         )
+        self._batch_location_search_token += 1
         self._batch_location_searches = {
             _BATCH_SHARED_LOCATION_SEARCH_KEY: {
                 "scope": search_scope,
@@ -4500,6 +4682,16 @@ class DouyinCommercePage(QWidget):
             )
         )
         self.batch_location_commission_combo.blockSignals(False)
+        self.batch_location_scope_combo.blockSignals(True)
+        self.batch_location_scope_combo.setCurrentIndex(
+            self.batch_location_scope_combo.findData(search_scope)
+        )
+        self.batch_location_scope_combo.blockSignals(False)
+        self.batch_location_keyword.blockSignals(True)
+        self.batch_location_keyword.setText(
+            _normalized(location_search.get("keyword"))
+        )
+        self.batch_location_keyword.blockSignals(False)
         presets = {str(item.get("id")): item for item in self._current_location_presets()}
         self._batch_locations = {}
         self._batch_schedule_overrides = {}
@@ -5256,6 +5448,7 @@ class DouyinCommercePage(QWidget):
             return
         self._clear_runtime_log_for_new_task_if_needed()
         old_generation_id = self._setup_generation_id
+        start_content_fingerprint = self._setup_content_fingerprint(payload)
         self._setup_start_token += 1
         start_token = self._setup_start_token
         self._reset_platform_collector_progress()
@@ -5321,7 +5514,10 @@ class DouyinCommercePage(QWidget):
             with_progress=begin,
             on_progress=self._set_commerce_progress,
             on_success=lambda result: self._accept_setup_generation_result(
-                start_token, payload, result
+                start_token,
+                payload,
+                result,
+                start_content_fingerprint=start_content_fingerprint,
             ),
             on_error=lambda message: self._setup_generation_failed(start_token, message),
             on_finished=lambda: self._setup_generation_finished(start_token),
@@ -5329,6 +5525,9 @@ class DouyinCommercePage(QWidget):
         if not started:
             self._setup_generation_failed(start_token, "collector_start_failed")
             self._setup_generation_finished(start_token)
+        # 真实 runner 在返回 True 前已登记 active；立即刷新锁定投影，
+        # 不让账号或视频控件在 worker 运行窗口继续可编辑。
+        self._sync_view()
 
     def _setup_generation_finished(self, start_token: int) -> None:
         self._finish_platform_collector_progress(
@@ -5339,10 +5538,36 @@ class DouyinCommercePage(QWidget):
         self._sync_view()
 
     def _accept_setup_generation_result(
-        self, start_token: int, payload: Mapping[str, Any], result: object
+        self,
+        start_token: int,
+        payload: Mapping[str, Any],
+        result: object,
+        *,
+        start_content_fingerprint: str,
     ) -> None:
         if self._shutdown_requested.is_set() or start_token != self._setup_start_token:
             return
+        if start_content_fingerprint != self._setup_content_fingerprint():
+            generation_id = (
+                _normalized(result.get("setupGenerationId"))
+                if isinstance(result, Mapping)
+                else ""
+            )
+            if generation_id:
+                self._setup_generation_id = generation_id
+                self._setup_generation_content_fingerprint = start_content_fingerprint
+            self._setup_generation_cleanup_required = True
+            self._setup_start_error_code = "content_changed"
+            self.platform_review_status.setText(
+                "账号或视频已变更，正在关闭失效的平台设置代际…"
+            )
+            self._dispatch_setup_generation_close(
+                reason="content_changed",
+                completion="content_changed",
+                silent=True,
+            )
+            return
+        self._setup_generation_content_fingerprint = start_content_fingerprint
         self._setup_generation_succeeded(result)
         result_generation_id = (
             _normalized(result.get("setupGenerationId"))
@@ -5453,6 +5678,7 @@ class DouyinCommercePage(QWidget):
             self._setup_generation_cleanup_required = False
             if not generation_id or self._setup_generation_id == generation_id:
                 self._setup_generation_id = ""
+                self._setup_generation_content_fingerprint = ""
         elif not self._setup_generation_id:
             returned_generation_id = _normalized(result.get("setupGenerationId"))
             if returned_generation_id:
@@ -5534,7 +5760,12 @@ class DouyinCommercePage(QWidget):
         self._sync_view()
 
     def _finish_setup_generation_close(self, completion: str, silent: bool) -> None:
-        if completion in {"abandoned", "login_required", "operation_failed"}:
+        if completion in {
+            "abandoned",
+            "content_changed",
+            "login_required",
+            "operation_failed",
+        }:
             self._reset_platform_settings_after_abandon()
             self._uploaded_editor_payload = None
             self._pending_upload_payload = None
@@ -5572,6 +5803,8 @@ class DouyinCommercePage(QWidget):
     ) -> bool:
         generation_id = self._setup_generation_id
         if not generation_id or self.runner.is_running(self._COLLECTOR_TASK_KEY):
+            return False
+        if self._reject_stale_setup_generation():
             return False
         self._collector_action_tokens[collector_type] += 1
         action_token = self._collector_action_tokens[collector_type]
@@ -5644,6 +5877,8 @@ class DouyinCommercePage(QWidget):
             or action_token != self._collector_action_tokens.get(collector_type)
         ):
             return
+        if self._reject_stale_setup_generation():
+            return
         if not isinstance(result, Mapping):
             return
         if (
@@ -5700,6 +5935,8 @@ class DouyinCommercePage(QWidget):
             generation_id != self._setup_generation_id
             or action_token != self._collector_action_tokens.get(collector_type)
         ):
+            return
+        if self._reject_stale_setup_generation():
             return
         if not isinstance(message, Mapping):
             return
@@ -5795,6 +6032,12 @@ class DouyinCommercePage(QWidget):
                 payload = self.collect_upload_payload()
             except (ValueError, douyin_commerce_service.DouyinCommerceError) as exc:
                 QMessageBox.warning(self, "继续", str(exc))
+                return
+            if (
+                self._setup_generation_id
+                and self._setup_generation_matches_current_content()
+            ):
+                self._go_to_step(1)
                 return
             self._start_setup_generation(payload)
             return
@@ -6837,6 +7080,7 @@ class DouyinCommercePage(QWidget):
         """
 
         self._reset_platform_collector_progress()
+        self._setup_generation_content_fingerprint = ""
         self._clear_music_candidates()
         self._selected_music = None
         self._collector_status = {}
@@ -6853,6 +7097,7 @@ class DouyinCommercePage(QWidget):
         self.music_card.setText("尚未选择收藏音乐")
         self.music_status.setText("本次上传会话已结束")
         self._batch_locations = {}
+        self._batch_location_search_token += 1
         self._batch_location_searches = {}
         self._batch_schedule_overrides = {}
         self._batch_location_feedback = ""
@@ -6933,6 +7178,7 @@ class DouyinCommercePage(QWidget):
         self._selected_music = None
         self._pending_music = None
         self._batch_locations = {}
+        self._batch_location_search_token += 1
         self._batch_location_searches = {}
         self._batch_schedule_overrides = {}
         self.batch_location_commission_combo.blockSignals(True)

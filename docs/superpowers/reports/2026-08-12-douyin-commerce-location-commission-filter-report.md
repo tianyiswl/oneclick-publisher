@@ -6,11 +6,15 @@
 
 实施基线：`14d8d40`
 
-代码收尾：无额外修复；本报告是 Task 6 唯一提交内容。
+原始验收节点：`6bc0743`
+
+终审修复起点：`6bc0743`
 
 ## 结论
 
-本次离线实施验收通过。设置页、候选解析、批次草稿、逐视频任务载荷、续发、正式发布地点复核和任务明细已形成一致的返佣筛选契约；全量回归、指定生产文件编译、差异检查、范围审计和敏感字段审计均通过。
+原“离线实施验收通过”结论已被对 `14d8d40..6bc0743` 的终审推翻。终审发现 1 个 Critical、7 个 Important 和 3 个 Minor；其中包括点击无效仍伪造回读、采集代际与内容漂移、批量会话关闭不严格等安全性问题。因此，旧全量测试通过仅是当时测试集的历史证据，不证明当时功能已正确或风险已清零。
+
+本轮已按终审 finding 逐组补 RED 并修复至单项 GREEN。修复后收尾 diff 审计又发现并修复了 `not-selected` 假选中、隐藏返佣节点泄入和 setup 入队后未立即锁定三个缺口；第二轮复审再补齐 `un-selected` / `un_chosen` 分隔写法，最后只读复审确认无 blocker。最终相关组合 `451/451` 和完整离线回归 `913/913` 均通过；终审所列 1 个 Critical、7 个 Important、3 个 Minor 已在离线契约层收口，当前离线验收通过。
 
 本结论只证明本地代码、离线替身、Qt offscreen 界面契约以及本地隔离 HTML 的 DOM 契约。没有连接抖音平台，没有启动真实账号会话，没有上传素材，没有执行预检，没有保存平台草稿，也没有正式提交或发布。
 
@@ -29,22 +33,46 @@
 | 账号级预设边界 | 通过 | `save_location_preset` 仅接收 `poiId/name/address` 稳定身份 |
 | 无原始 DOM 持久化 | 通过 | 批次、草稿、设置页持久化边界无 `commerceInfo/innerHTML/outerHTML/Cookie/verificationCode` |
 
-## 全量回归
+## 旧全量回归（已被终审推翻）
 
-严格在静态审计和敏感扫描通过后，只运行了整个实施唯一一次完整回归：
+Task 6 当时记录过以下完整回归：
 
 ```bash
 QT_QPA_PLATFORM=offscreen /Users/andy/Documents/Codex/2026-07-28/new-chat/outputs/一键发桌面UI基座/.venv/bin/python -m unittest discover -v
 ```
 
-结果：`Ran 901 tests in 32.231s`，`OK`，退出码 `0`。
+历史结果：`Ran 901 tests in 32.231s`，`OK`，退出码 `0`。
 
-首轮全量没有失败，因此未做代码修复、未运行第二次全量。测试过程未访问真实抖音；其中地点 DOM 用例使用本地隔离 HTML 与无账号的 headless Chromium，只验证 DOM 提取、筛选、唯一点击和回读契约。
+这 901 项不包含本轮终审补入的失败用例，已不能作为当前代码的验收结论。它只能说明旧测试集在当时退出码为 0。
 
-## 编译、差异与敏感审计
+## 终审修复后新证据
 
-- 指定的 9 个生产文件执行 `py_compile`：通过。
+- 审计前历史证据：相关组合 `449/449`、全量 `911/911` 曾通过，但随后生产 diff 审计发现 3 个缺口，两者已作废。第一次 `451/451`、`913/913` 之后又发现 `un-selected` 分隔写法缺口，因此同样作为历史证据，不是当前验收证据。
+- 相关组合：Service Payload + DOM + SessionContract、collectors、BatchUi、batch executor、draft/batch draft/batch service、task service/page。
+- 相关组合最终结果：`Ran 451 tests in 15.628s`，`OK`，退出码 `0`。
+- 完整离线回归命令：`QT_QPA_PLATFORM=offscreen ../../.venv/bin/python -m unittest discover -v`。
+- 完整离线回归最终有效结果：`Ran 913 tests in 30.004s`，`OK`，退出码 `0`。
+- 全部证据仍仅限离线替身、Qt offscreen 和本地隔离 HTML。
+
+## 终审 finding 状态
+
+- C1：已修复。点击后只接受真实面板唯一选中节点回读，重新核对 POI、名称、完整地址与佣型；`aria-selected=true` 作为权威证据，无 ARIA 时仅放行精确 `selected/chosen` token，否定或混合 token 安全停止。证据不足统一固定码停止。
+- I1–I7：已修复。数量解析、DOM 摘要、代际内容指纹、搜索意图隔离、异佣型 UI 快照、过滤后判重与批执行严格零存活关闭均已回归。
+- M1–M3：已修复。结构化归一化幂等、签名含佣型／数量、Mock 关键字参数及成功状态断言均已补齐。
+
+## 终审修复后收尾审计
+
+- `py_compile`：9 个指定生产文件和 2 个相关测试文件通过，退出码 `0`。
+- AST：9 个指定生产文件全部可解析。
 - `git diff --check`：通过，无输出。
+- 真正持久化模块（batch service、batch draft service、设置页）的禁用字段名精确 AST 常量：`0`。即时归一化器中有 `3` 个 `commerceInfo` AST 常量引用（源码两行），仅执行原始 DOM 摘要输入类型检查与即时解析；输出不包含该字段，不进入公开候选、批次或草稿。
+- 新增生产 diff 未发现 `TODO/FIXME/NotImplemented`，未发现 AWS key、私钥或 Bearer 凭据模式。
+- `progress.md` 无变更。
+
+## 旧编译、差异与敏感审计（历史证据）
+
+- Task 6 指定的 9 个生产文件执行 `py_compile`：当时通过。
+- `git diff --check`：当时通过，无输出。
 - AST：10 个相关生产文件全部可解析。
 - 范围：相对实施基线仅改动计划授权的生产与测试文件；`ui/task_page.py` 只验证，无生产差异。
 - 占位实现：新增生产差异中未发现 `TODO`、`FIXME`、`NotImplemented`、空 `pass` 或省略号占位。

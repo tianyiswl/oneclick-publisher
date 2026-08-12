@@ -323,6 +323,52 @@ class DouyinCommercePayloadTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     commission.parse_commission_summary(value)
 
+    def test_commission_summary_parses_all_bounded_tokens_and_rejects_conflicts(
+        self,
+    ) -> None:
+        cases = [
+            (
+                "1,234件商品 · 1,234件返佣",
+                "commission",
+                1234,
+                1234,
+            ),
+            (
+                "1，234件商品 · 0件返佣",
+                "no_commission",
+                1234,
+                0,
+            ),
+            (
+                "1,23件商品 · 1,23件返佣",
+                "unknown",
+                None,
+                None,
+            ),
+            (
+                "15件商品 · 2件返佣 / 3件返佣",
+                "unknown",
+                15,
+                None,
+            ),
+            (
+                "15件商品 / 16件商品 · 2件返佣",
+                "unknown",
+                None,
+                2,
+            ),
+        ]
+
+        for raw, expected_type, product_count, commission_count in cases:
+            with self.subTest(raw=raw):
+                parsed = commission.parse_commission_summary(raw)
+                self.assertEqual(parsed["commissionType"], expected_type)
+                self.assertEqual(parsed["productCount"], product_count)
+                self.assertEqual(
+                    parsed["commissionProductCount"],
+                    commission_count,
+                )
+
     def test_visible_location_candidate_keeps_structured_commission_only(self) -> None:
         candidate = douyin_commerce_service.normalize_commerce_location_candidate({
             "name": "夜南香北京烤鸭",
@@ -335,6 +381,83 @@ class DouyinCommercePayloadTests(unittest.TestCase):
         self.assertEqual(candidate["commissionProductCount"], 15)
         self.assertNotIn("commerceInfo", candidate)
         self.assertNotIn("text", candidate)
+
+    def test_structured_commission_candidate_is_idempotent_and_rejects_invalid_types(self) -> None:
+        """已结构化佣型必须严格保留，非字符串原始摘要不得伪装成无佣。"""
+
+        raw = {
+            "name": "幂等返佣地点",
+            "address": "广西北海市海城区测试路1号",
+            "commerceInfo": "1,234件商品 · 12件返佣",
+        }
+        once = douyin_commerce_service.normalize_commerce_location_candidate(raw)
+        twice = douyin_commerce_service.normalize_commerce_location_candidate(once)
+
+        self.assertEqual(twice, once)
+        self.assertEqual(twice["commissionType"], "commission")
+        self.assertEqual(twice["productCount"], 1234)
+        self.assertEqual(twice["commissionProductCount"], 12)
+
+        structured = douyin_commerce_service.normalize_commerce_location_candidate(
+            {
+                "name": "已结构化无佣地点",
+                "address": "广西北海市海城区测试路2号",
+                "commissionType": "no_commission",
+                "productCount": 8,
+                "commissionProductCount": 0,
+                "commissionLabel": "无佣",
+            }
+        )
+        self.assertEqual(structured["commissionType"], "no_commission")
+        self.assertEqual(structured["productCount"], 8)
+        self.assertEqual(structured["commissionProductCount"], 0)
+
+        with self.assertRaises(ValueError):
+            douyin_commerce_service.normalize_commerce_location_candidate(
+                {
+                    "name": "非法佣型",
+                    "address": "广西北海市海城区测试路3号",
+                    "commissionType": "commission-ish",
+                }
+            )
+
+        for raw_summary in (None, False, 0, {"text": ""}):
+            with self.subTest(raw_summary=raw_summary):
+                candidate = douyin_commerce_service.normalize_commerce_location_candidate(
+                    {
+                        "name": "非文本摘要",
+                        "address": "广西北海市海城区测试路4号",
+                        "commerceInfo": raw_summary,
+                    }
+                )
+                self.assertEqual(candidate["commissionType"], "unknown")
+                self.assertNotEqual(candidate["commissionType"], "no_commission")
+
+    def test_location_result_signature_changes_with_structured_commission_evidence(self) -> None:
+        """同一地点的佣型或数量变化必须生成不同稳定快照。"""
+
+        base = {
+            "name": "签名地点",
+            "address": "广西北海市海城区签名路1号",
+            "distance": "1km",
+            "commissionType": "commission",
+            "productCount": 8,
+            "commissionProductCount": 2,
+        }
+        signatures = {
+            douyin_commerce_service._location_result_signature([base]),
+            douyin_commerce_service._location_result_signature(
+                [{**base, "commissionType": "no_commission"}]
+            ),
+            douyin_commerce_service._location_result_signature(
+                [{**base, "productCount": 9}]
+            ),
+            douyin_commerce_service._location_result_signature(
+                [{**base, "commissionProductCount": 0}]
+            ),
+        }
+
+        self.assertEqual(len(signatures), 4)
 
     def test_same_location_commission_variants_are_filtered_before_ambiguity(self) -> None:
         rows = [
@@ -2237,7 +2360,7 @@ class DouyinCommercePayloadTests(unittest.TestCase):
             douyin_commerce_service,
             "_store_option_descriptors",
             new_callable=AsyncMock,
-            return_value=[row],
+            side_effect=[[row], [{**row, "selected": "true"}]],
         ), patch.object(
             douyin_commerce_service,
             "_location_option_targets",
@@ -2258,7 +2381,10 @@ class DouyinCommercePayloadTests(unittest.TestCase):
             )
 
         mode.assert_awaited_once_with(page)
-        open_selector.assert_awaited_once_with(page, mode.return_value)
+        self.assertEqual(open_selector.await_count, 2)
+        open_selector.assert_has_awaits(
+            [call(page, mode.return_value), call(page, None)]
+        )
         target.click.assert_awaited_once_with(timeout=8_000)
         bind_store.assert_not_awaited()
         self.assertEqual(result["location"]["name"], row["name"])
@@ -2582,6 +2708,103 @@ class DouyinCommercePayloadTests(unittest.TestCase):
 class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
     """用真实 DOM 约束地点 portal，避免把整张发布页的输入框算进来。"""
 
+    async def test_location_name_with_product_word_without_badge_is_no_commission(
+        self,
+    ) -> None:
+        """DOM 摘要兜底必须排除名称和地址，无徽标仍属无佣。"""
+
+        html = """
+        <div id="location-results" role="listbox">
+          <div role="option">
+            <span data-store-name>北海商品城</span>
+            <span data-store-address>广西北海市商品街1号</span>
+            <span data-commerce-info hidden>9件商品 · 9件返佣</span>
+          </div>
+        </div>
+        """
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+
+                rows = await douyin_commerce_service._store_option_descriptors(
+                    page.locator("#location-results")
+                )
+                candidate = (
+                    douyin_commerce_service.normalize_commerce_location_candidate(
+                        rows[0]
+                    )
+                )
+
+                self.assertEqual(rows[0]["commerceInfo"], "")
+                self.assertEqual(candidate["commissionType"], "no_commission")
+                self.assertIsNone(candidate["productCount"])
+                self.assertIsNone(candidate["commissionProductCount"])
+            finally:
+                await browser.close()
+
+    async def test_keyword_equal_location_name_and_noop_click_cannot_fake_readback(
+        self,
+    ) -> None:
+        """搜索词已等于地点名时，无效点击不得复用点击前候选伪装成回读。"""
+
+        html = """
+        <main>
+          <section id="location-row">
+            <span>位置</span>
+            <div id="commerce-mode" class="semi-select" tabindex="0">
+              <div class="semi-select-selection">
+                <span class="semi-select-selection-text">带货模式</span>
+              </div>
+            </div>
+            <input id="location-input" value="同名店">
+          </section>
+        </main>
+        <div id="location-results" role="listbox">
+          <div id="commission" class="is-un-selected" role="option">
+            <span data-store-name>同名店</span>
+            <span data-store-address>北京市朝阳区测试路1号</span>
+            <span data-commerce-info>1件商品 · 1件返佣</span>
+          </div>
+        </div>
+        """
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+                listbox = page.locator("#location-results")
+
+                with self.assertRaisesRegex(
+                    douyin_commerce_service.DouyinCommerceError,
+                    "^publish_location_readback_mismatch$",
+                ) as raised:
+                    await douyin_commerce_service._apply_open_commerce_location_to_page(
+                        page,
+                        listbox,
+                        {
+                            "name": "同名店",
+                            "address": "北京市朝阳区测试路1号",
+                            "commissionType": "commission",
+                            "productCount": 1,
+                            "commissionProductCount": 1,
+                            "commissionLabel": "返佣",
+                        },
+                        commission_filter="commission",
+                    )
+
+                self.assertIsNone(raised.exception.__cause__)
+                self.assertIsNone(
+                    await page.locator("#commission").get_attribute("aria-selected")
+                )
+                self.assertEqual(
+                    await page.locator("#commission").get_attribute("class"),
+                    "is-un-selected",
+                )
+            finally:
+                await browser.close()
+
     async def test_same_location_commission_variants_click_only_matching_dom_option(self) -> None:
         """同名同址返佣变体必须保留到当前面板，并只点击符合筛选的节点。"""
 
@@ -2612,6 +2835,9 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
         <script>
           document.querySelectorAll('#location-results [role="option"]').forEach(node => {
             node.addEventListener('click', () => {
+              document.querySelectorAll('#location-results [role="option"]')
+                .forEach(option => option.setAttribute('aria-selected', 'false'));
+              node.setAttribute('aria-selected', 'true');
               document.body.dataset.clickedOption = node.id;
               document.querySelector('#location-input').value = '同名店';
             });
@@ -2650,6 +2876,102 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(result["location"]["name"], "同名店")
                 self.assertNotIn("commerceInfo", result["location"])
+            finally:
+                await browser.close()
+
+    async def test_same_commission_duplicate_options_survive_dom_then_stop_after_filter(self) -> None:
+        """同佣型重复 option 不得在 DOM 描述层去重，筛选后仍重复才停止。"""
+
+        html = """
+        <div id="location-results" role="listbox">
+          <div id="commission-a" role="option">
+            <span data-store-name>重复返佣店</span>
+            <span data-store-address>北京市朝阳区测试路8号</span>
+            <span data-commerce-info>8件商品 · 2件返佣</span>
+          </div>
+          <div id="commission-b" role="option">
+            <span data-store-name>重复返佣店</span>
+            <span data-store-address>北京市朝阳区测试路8号</span>
+            <span data-commerce-info>8件商品 · 2件返佣</span>
+          </div>
+        </div>
+        """
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+                descriptors = await douyin_commerce_service._store_option_descriptors(
+                    page.locator("#location-results")
+                )
+
+                self.assertEqual(len(descriptors), 2)
+                self.assertEqual(
+                    douyin_commerce_service.normalize_commerce_location_candidates(
+                        descriptors,
+                        commission_filter="no_commission",
+                    ),
+                    [],
+                )
+                with self.assertRaisesRegex(
+                    douyin_commerce_service.DouyinCommerceError,
+                    "重复完整地址",
+                ):
+                    douyin_commerce_service.normalize_commerce_location_candidates(
+                        descriptors,
+                        commission_filter="commission",
+                    )
+            finally:
+                await browser.close()
+
+    async def test_all_filter_readback_rejects_changed_commission_type(self) -> None:
+        """`all` 也必须核对点击后佣型，不能只核对同 POI 身份。"""
+
+        html = """
+        <main>
+          <section><span>位置</span>
+            <div class="semi-select"><div class="semi-select-selection">
+              <span class="semi-select-selection-text">带货模式</span>
+            </div></div>
+            <input id="location-input">
+          </section>
+        </main>
+        <div id="location-results" role="listbox">
+          <div id="candidate" role="option">
+            <span data-store-name>同名店</span>
+            <span data-store-address>北京市朝阳区测试路1号</span>
+            <span data-commerce-info>1件商品 · 1件返佣</span>
+          </div>
+        </div>
+        <script>
+          document.querySelector('#candidate').addEventListener('click', () => {
+            document.querySelector('#candidate').setAttribute('aria-selected', 'true');
+            document.querySelector('[data-commerce-info]').innerText = '1件商品 · 0件返佣';
+            document.querySelector('#location-input').value = '同名店';
+          });
+        </script>
+        """
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+                with self.assertRaisesRegex(
+                    douyin_commerce_service.DouyinCommerceError,
+                    "^publish_location_readback_mismatch$",
+                ):
+                    await douyin_commerce_service._apply_open_commerce_location_to_page(
+                        page,
+                        page.locator("#location-results"),
+                        {
+                            "name": "同名店",
+                            "address": "北京市朝阳区测试路1号",
+                            "commissionType": "commission",
+                            "productCount": 1,
+                            "commissionProductCount": 1,
+                        },
+                        commission_filter="all",
+                    )
             finally:
                 await browser.close()
 
@@ -8818,6 +9140,14 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.page.close()
 
+    def _activate_setup_generation(self, generation_id: str = "generation-a") -> None:
+        """模拟与当前账号和视频内容绑定的有效设置代际。"""
+
+        self.page._setup_generation_id = generation_id
+        self.page._setup_generation_content_fingerprint = (
+            self.page._setup_content_fingerprint()
+        )
+
     class _InlineRunner:
         """让页面的后台任务在离线 UI 测试中同步完成。"""
 
@@ -8996,7 +9326,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
 
         runner = self._ControlledLifecycleRunner()
         self.page.runner = runner
-        self.page._setup_generation_id = "generation-a"
+        self._activate_setup_generation()
 
         self.page._refresh_favorite_music_candidates()
         self.assertTrue(
@@ -9038,7 +9368,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
 
         runner = self._ControlledLifecycleRunner()
         self.page.runner = runner
-        self.page._setup_generation_id = "generation-a"
+        self._activate_setup_generation()
         self.page.batch_location_commission_combo.setCurrentIndex(
             self.page.batch_location_commission_combo.findData("commission")
         )
@@ -9094,7 +9424,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
 
         runner = self._ControlledLifecycleRunner()
         self.page.runner = runner
-        self.page._setup_generation_id = "generation-a"
+        self._activate_setup_generation()
         self.page.batch_location_commission_combo.setCurrentIndex(
             self.page.batch_location_commission_combo.findData("commission")
         )
@@ -9172,6 +9502,27 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             runner.finish(self.page._SETUP_GENERATION_TASK_KEY)
 
         self.assertTrue(self.page.platform_collector_progress_frame.isHidden())
+
+    def test_queued_setup_generation_immediately_locks_content_controls(self) -> None:
+        """setup 入队即锁定账号和视频，不等 worker 回调后才投影。"""
+
+        runner = self._ControlledLifecycleRunner()
+        self.page.runner = runner
+        self.page.account_combo.setEnabled(True)
+        self.page.video_combo.setEnabled(True)
+        self.page.batch_video_list.setEnabled(True)
+
+        self.page._start_setup_generation(
+            {
+                "accountList": ["douyin-setup.json"],
+                "fileList": ["/tmp/setup-video.mp4"],
+            }
+        )
+
+        self.assertTrue(runner.is_running(self.page._SETUP_GENERATION_TASK_KEY))
+        self.assertFalse(self.page.account_combo.isEnabled())
+        self.assertFalse(self.page.video_combo.isEnabled())
+        self.assertFalse(self.page.batch_video_list.isEnabled())
 
     def test_login_required_resets_platform_collector_progress(self) -> None:
         """登录失效时不得留下仍在计时的旧采集动作。"""
@@ -9255,6 +9606,10 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.page.runner = self._InlineRunner()
         with patch.object(self.page, "_batch_content_is_valid", return_value=True), patch.object(
             self.page, "collect_upload_payload", return_value=payload
+        ), patch.object(
+            self.page,
+            "_setup_content_fingerprint",
+            return_value="test-content-fingerprint",
         ), patch(
             "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.begin_generation",
             return_value=self._collector_status(),
@@ -9276,7 +9631,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         """采集页选择只更新本批公开字段，最终执行器才重新核验并写入。"""
 
         self.page._selected_video_indexes = [1]
-        self.page._setup_generation_id = "generation-a"
+        self._activate_setup_generation()
         music = {
             "musicId": "music-1",
             "title": "收藏歌",
@@ -9326,7 +9681,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         """只重试失败采集器；旧代际回调不得覆盖当前 UI。"""
 
         self.page.runner = self._InlineRunner()
-        self.page._setup_generation_id = "generation-a"
+        self._activate_setup_generation()
         self.page._selected_music = {"musicId": "music-1", "title": "收藏歌"}
         self.page._batch_location_searches["__shared_location_search__"] = {
             "scope": "domestic",
@@ -9361,7 +9716,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         )
         self.assertTrue(self.page.retry_collector_button.isHidden())
 
-        self.page._setup_generation_id = "generation-b"
+        self._activate_setup_generation("generation-b")
         self.page._setup_generation_succeeded(self._collector_status())
         self.assertEqual(self.page._setup_generation_id, "generation-b")
 
@@ -9369,7 +9724,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         """放弃代际关闭采集器并清本批选择，但保留内容输入和本地缓存。"""
 
         self.page.runner = self._InlineRunner()
-        self.page._setup_generation_id = "generation-a"
+        self._activate_setup_generation()
         self.page._selected_music = {"musicId": "music-1", "title": "收藏歌"}
         self.page._batch_locations = {"/tmp/a.mp4": {"poiId": "poi-1"}}
         self.page._confirmed_declaration = "内容由AI生成"
@@ -9418,7 +9773,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         """登录失效必须统一关闭当前代际，不得只清理 UI 句柄。"""
 
         self.page.runner = self._InlineRunner()
-        self.page._setup_generation_id = "generation-a"
+        self._activate_setup_generation()
         self.page._selected_music = {"musicId": "music-1", "title": "收藏歌"}
 
         with patch(
@@ -9438,7 +9793,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         """账号或内容变化创建新代际前，先以固定原因关闭旧代际。"""
 
         self.page.runner = self._InlineRunner()
-        self.page._setup_generation_id = "generation-a"
+        self._activate_setup_generation()
         order: list[tuple[str, str]] = []
         started = self._collector_status()
         started["setupGenerationId"] = "generation-b"
@@ -9517,7 +9872,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
     def test_shutdown_closes_collectors_and_legacy_publish_session_without_dialog(self) -> None:
         """客户端退出时必须尽力关闭代际和旧正式会话，且不弹窗。"""
 
-        self.page._setup_generation_id = "generation-a"
+        self._activate_setup_generation()
         self.page._session_id = "session-legacy"
         with patch(
             "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.close_generation",
@@ -9731,7 +10086,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         )
         for close_result in invalid_results:
             with self.subTest(close_result=close_result):
-                self.page._setup_generation_id = "generation-a"
+                self._activate_setup_generation()
                 operation = MagicMock()
                 with patch(
                     "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.close_generation",
@@ -9797,7 +10152,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             task = self._create_offline_pending_task(mode="oneclick_preflight")
             runner = self._ControlledLifecycleRunner()
             self.page.runner = runner
-            self.page._setup_generation_id = "generation-a"
+            self._activate_setup_generation()
             self.page._selected_video_indexes = [1]
             payload = {"items": [{"mediaPath": "/tmp/offline-video.mp4"}]}
             with patch.object(
@@ -9839,7 +10194,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             task = self._create_offline_pending_task(mode="oneclick_publish")
             runner = self._ControlledLifecycleRunner()
             self.page.runner = runner
-            self.page._setup_generation_id = "generation-a"
+            self._activate_setup_generation()
             self.page._selected_video_indexes = [1]
             payload = {"items": [{"mediaPath": "/tmp/offline-video.mp4"}]}
             with patch(
@@ -9872,7 +10227,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         """预检关闭屏障未取得零存活时，不得创建任何正式编辑会话。"""
 
         self.page.runner = self._InlineRunner()
-        self.page._setup_generation_id = "generation-a"
+        self._activate_setup_generation()
         self.page._selected_video_indexes = [1]
         payload = {"items": [{"mediaPath": "/tmp/video-1.mp4"}]}
         with patch.object(
@@ -9906,7 +10261,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         """正式发布关闭屏障失败时，不得上传第一条视频。"""
 
         self.page.runner = self._InlineRunner()
-        self.page._setup_generation_id = "generation-a"
+        self._activate_setup_generation()
         self.page._selected_video_indexes = [1]
         payload = {"items": [{"mediaPath": "/tmp/video-1.mp4"}]}
         with patch.object(
@@ -9939,7 +10294,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         """零存活回读必须先清除代际句柄，再进入执行器。"""
 
         self.page.runner = self._InlineRunner()
-        self.page._setup_generation_id = "generation-a"
+        self._activate_setup_generation()
         self.page._selected_video_indexes = [1]
         payload = {"items": [{"mediaPath": "/tmp/video-1.mp4"}]}
 
@@ -9973,7 +10328,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         """正式发布执行器也只能在零存活回读后启动。"""
 
         self.page.runner = self._InlineRunner()
-        self.page._setup_generation_id = "generation-a"
+        self._activate_setup_generation()
         self.page._selected_video_indexes = [1]
         payload = {"items": [{"mediaPath": "/tmp/video-1.mp4"}]}
 
@@ -10023,7 +10378,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         """放弃关闭不完整时保留安全重试所需句柄与本批选择。"""
 
         self.page.runner = self._InlineRunner()
-        self.page._setup_generation_id = "generation-a"
+        self._activate_setup_generation()
         self.page._selected_music = {"musicId": "music-1", "title": "收藏歌"}
         self.page._batch_locations = {"/tmp/a.mp4": {"poiId": "poi-1"}}
         self.page._confirmed_declaration = "内容由AI生成"
@@ -10050,7 +10405,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
     def test_abandon_generation_close_is_dispatched_without_blocking_ui(self) -> None:
         """放弃只派发后台关闭；调用返回前不得同步进入可能阻塞的 close。"""
 
-        self.page._setup_generation_id = "generation-a"
+        self._activate_setup_generation()
         self.page._selected_music = {"musicId": "music-1", "title": "收藏歌"}
         self.page.runner = MagicMock()
         self.page.runner.is_running.return_value = False
@@ -10070,7 +10425,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         """后台关闭异常只显示固定码，并保留后续安全重试所需状态。"""
 
         self.page.runner = self._InlineRunner()
-        self.page._setup_generation_id = "generation-a"
+        self._activate_setup_generation()
         self.page._selected_music = {"musicId": "music-1", "title": "收藏歌"}
 
         with patch(
@@ -10090,7 +10445,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         """整批有明确发布回执后，当前批选择不得自动沿用到下一批。"""
 
         self.page.runner = self._InlineRunner()
-        self.page._setup_generation_id = "generation-a"
+        self._activate_setup_generation()
         self.page._selected_music = {"musicId": "music-1", "title": "收藏歌"}
         self.page._batch_locations = {"/tmp/a.mp4": {"poiId": "poi-1"}}
         self.page._confirmed_declaration = "内容由AI生成"
@@ -10130,7 +10485,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         """明确发布完成仍须等采集器全部关闭后才能撤销句柄和选择。"""
 
         self.page.runner = self._InlineRunner()
-        self.page._setup_generation_id = "generation-a"
+        self._activate_setup_generation()
         self.page._selected_music = {"musicId": "music-1", "title": "收藏歌"}
         self.page._batch_locations = {"/tmp/a.mp4": {"poiId": "poi-1"}}
         self.page._confirmed_declaration = "内容由AI生成"
@@ -10168,8 +10523,12 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         for order in orders:
             with self.subTest(order=order):
                 self.page.runner = self._InlineRunner()
-                self.page._setup_generation_id = "generation-a"
+                self._activate_setup_generation()
+                self.page._setup_generation_content_fingerprint = (
+                    self.page._setup_content_fingerprint()
+                )
                 self.page._stage_declaration_selection("内容由AI生成")
+                successful_location_results: list[dict[str, object]] = []
 
                 def music_result(_generation_id: str) -> dict:
                     return {
@@ -10180,19 +10539,29 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
                         "candidates": [candidate],
                     }
 
-                def location_result(
-                    _generation_id: str, _keyword: str, scope: str
-                ) -> dict:
+                def location_result(*args, **kwargs) -> dict:
+                    self.assertEqual(len(args), 3)
+                    _generation_id, _keyword, scope = args
+                    self.assertEqual(
+                        kwargs,
+                        {
+                            "commission_filter": "commission",
+                            "include_metadata": True,
+                        },
+                    )
                     collector_type = f"{scope}_location"
-                    return {
+                    result = {
                         **active,
                         "ok": True,
                         "collectorType": collector_type,
                         "collectorInstanceId": active["collectorInstanceIds"][
                             collector_type
                         ],
+                        "platformResultCount": 1,
                         "candidates": [location],
                     }
+                    successful_location_results.append(result)
+                    return result
 
                 with patch(
                     "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.refresh_favorite_music",
@@ -10213,13 +10582,29 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
 
                 if "music" in order:
                     refresh_music.assert_called_once_with("generation-a")
+                expected_scopes = [
+                    action for action in order if action in {"domestic", "local"}
+                ]
                 self.assertEqual(
                     [item.args for item in search_locations.call_args_list],
                     [
-                        ("generation-a", "夜南香", action)
-                        for action in order
-                        if action in {"domestic", "local"}
+                        ("generation-a", "夜南香", scope)
+                        for scope in expected_scopes
                     ],
+                )
+                self.assertEqual(
+                    [item.kwargs for item in search_locations.call_args_list],
+                    [
+                        {
+                            "commission_filter": "commission",
+                            "include_metadata": True,
+                        }
+                        for _scope in expected_scopes
+                    ],
+                )
+                self.assertTrue(successful_location_results)
+                self.assertTrue(
+                    all(result.get("ok") is True for result in successful_location_results)
                 )
                 self.assertEqual(self.page._selected_music["musicId"], "music-1")
                 self.assertEqual(self.page._confirmed_declaration, "内容由AI生成")
@@ -10227,7 +10612,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
     def test_late_collector_instance_callback_cannot_write_current_candidates(self) -> None:
         """同代际旧实例回调也必须丢弃，不能只检查 generationId。"""
 
-        self.page._setup_generation_id = "generation-a"
+        self._activate_setup_generation()
         self.page._collector_action_tokens["favorite_music"] = 4
         accepted: list[object] = []
         current = self._collector_status(music="active")
@@ -10264,7 +10649,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
     def test_late_collector_instance_failure_cannot_replace_current_status(self) -> None:
         """旧实例失败回调不得把当前新实例标记为失败或暴露重试入口。"""
 
-        self.page._setup_generation_id = "generation-a"
+        self._activate_setup_generation()
         self.page._collector_action_tokens["favorite_music"] = 4
         current = self._collector_status(music="active")
         current["collectorInstanceIds"]["favorite_music"] = "music-new"
@@ -10291,7 +10676,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
     def test_current_music_login_required_routes_to_account_management(self) -> None:
         """收藏音乐懒启动的当前实例登录失效必须进入账号管理。"""
 
-        self.page._setup_generation_id = "generation-a"
+        self._activate_setup_generation()
         self.page._collector_action_tokens["favorite_music"] = 4
         current = self._collector_status(music="active")
         self.page._render_collector_status(current)
@@ -10318,7 +10703,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
     def test_current_local_login_required_routes_to_account_management(self) -> None:
         """本地点懒启动的当前实例登录失效必须进入账号管理。"""
 
-        self.page._setup_generation_id = "generation-a"
+        self._activate_setup_generation()
         self.page._collector_action_tokens["local_location"] = 7
         current = self._collector_status(local="active")
         current["generationState"] = "ready"
@@ -10347,7 +10732,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
     def test_late_music_login_required_does_not_route_to_account_management(self) -> None:
         """旧音乐实例的迟到登录错误不得打断当前新实例。"""
 
-        self.page._setup_generation_id = "generation-a"
+        self._activate_setup_generation()
         self.page._collector_action_tokens["favorite_music"] = 4
         current = self._collector_status(music="active")
         current["collectorInstanceIds"]["favorite_music"] = "music-new"
@@ -10375,7 +10760,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
     def test_music_login_required_during_cancelling_generation_is_discarded(self) -> None:
         """音乐登录错误到达时若代际已取消，不得清选择或切到账号管理。"""
 
-        self.page._setup_generation_id = "generation-a"
+        self._activate_setup_generation()
         self.page._collector_action_tokens["favorite_music"] = 4
         self.page._selected_music = {"musicId": "music-1", "title": "收藏歌"}
         self.page._batch_locations = {"/tmp/a.mp4": {"poiId": "poi-1"}}
@@ -10406,7 +10791,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
     def test_local_login_required_during_closing_collectors_is_discarded(self) -> None:
         """本地点登录错误到达时若采集器正在关闭，不得清选择或切页。"""
 
-        self.page._setup_generation_id = "generation-a"
+        self._activate_setup_generation()
         self.page._collector_action_tokens["local_location"] = 7
         self.page._selected_music = {"musicId": "music-1", "title": "收藏歌"}
         self.page._batch_locations = {"/tmp/a.mp4": {"poiId": "poi-1"}}
@@ -10437,7 +10822,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
     def test_retry_cleanup_failure_for_current_old_instance_is_visible(self) -> None:
         """retry 旧实例关闭失败应显示固定失败并保留单槽重试入口。"""
 
-        self.page._setup_generation_id = "generation-a"
+        self._activate_setup_generation()
         self.page._collector_action_tokens["domestic_location"] = 3
         current = self._collector_status(domestic="failed")
         self.page._render_collector_status(current)
@@ -10999,6 +11384,137 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             ["poi-no-commission"],
         )
 
+    def test_late_location_result_does_not_overwrite_current_intent_or_saved_draft(self) -> None:
+        """迟到结果保留发起时筛选，但不得覆盖顶部当前意图或草稿。"""
+
+        path = "/tmp/late-location-result.mp4"
+        self.page.video_combo.clear()
+        self.page.video_combo.addItem("请选择视频", None)
+        self.page.video_combo.addItem(
+            "late.mp4",
+            {"id": 1, "storedPath": path, "filename": "late.mp4"},
+        )
+        self.page._selected_video_indexes = [1]
+        self.page.account_combo.clear()
+        self.page.account_combo.addItem(
+            "账号",
+            {"id": 91, "filePath": "douyin-91.json", "type": 3, "status": 1},
+        )
+
+        # 旧请求发起后，用户已把顶部改成新的恢复意图。
+        self.page.batch_location_commission_combo.setCurrentIndex(
+            self.page.batch_location_commission_combo.findData("no_commission")
+        )
+        self.page.batch_location_scope_combo.setCurrentIndex(
+            self.page.batch_location_scope_combo.findData("local")
+        )
+        self.page.batch_location_keyword.setText("新关键词")
+        old_result = {
+            "poiId": "poi-old-commission",
+            "name": "旧返佣地点",
+            "address": "旧返佣地点完整地址",
+            "commissionType": "commission",
+            "productCount": 8,
+            "commissionProductCount": 2,
+        }
+
+        with patch(
+            "ui.douyin_commerce_page.save_location_preset",
+            return_value={
+                "id": "preset-old",
+                "poiId": "poi-old-commission",
+                "name": "旧返佣地点",
+                "address": "旧返佣地点完整地址",
+                "scope": "domestic",
+            },
+        ):
+            self.page._batch_location_search_succeeded(
+                "domestic",
+                "旧关键词",
+                [old_result],
+                "commission",
+            )
+
+        self.assertEqual(self.page.batch_location_scope_combo.currentData(), "local")
+        self.assertEqual(self.page.batch_location_keyword.text(), "新关键词")
+        self.assertEqual(
+            self.page.batch_location_commission_combo.currentData(),
+            "no_commission",
+        )
+        draft = self.page._batch_draft_payload()
+        self.assertEqual(
+            draft["lastLocationSearch"],
+            {
+                "scope": "local",
+                "keyword": "新关键词",
+                "commissionFilter": "no_commission",
+            },
+        )
+        # 自动填入的该视频必须冻结旧结果发起时的返佣条件。
+        self.assertEqual(
+            self.page._batch_locations[path]["commissionFilter"],
+            "commission",
+        )
+        self.assertEqual(
+            self.page._batch_locations[path]["observedCommissionType"],
+            "commission",
+        )
+
+    def test_same_poi_with_different_commission_type_keeps_saved_snapshot_option(self) -> None:
+        """同一 POI 的新返佣候选不得替换已保存的无佣视频快照。"""
+
+        path = "/tmp/same-poi-different-commission.mp4"
+        self.page.video_combo.clear()
+        self.page.video_combo.addItem("请选择视频", None)
+        self.page.video_combo.addItem(
+            "same-poi.mp4",
+            {"id": 1, "storedPath": path, "filename": "same-poi.mp4"},
+        )
+        self.page._selected_video_indexes = [1]
+        self.page._batch_locations[path] = {
+            "id": "preset-no-commission",
+            "poiId": "poi-same",
+            "name": "同名商场",
+            "address": "同名商场完整地址",
+            "scope": "domestic",
+            "commissionFilter": "no_commission",
+            "observedCommissionType": "no_commission",
+            "productCount": 4,
+            "commissionProductCount": 0,
+        }
+        current_result = {
+            "poiId": "poi-same",
+            "name": "同名商场",
+            "address": "同名商场完整地址",
+            "commissionType": "commission",
+            "productCount": 8,
+            "commissionProductCount": 2,
+        }
+
+        self.page._batch_location_search_succeeded(
+            "domestic",
+            "同名商场",
+            [current_result],
+            "all",
+        )
+
+        dropdown = self.page.batch_item_rows.widget().findChild(
+            QComboBox,
+            "douyinCommerceBatchLocationCandidates",
+        )
+        self.assertEqual(dropdown.count(), 3)
+        self.assertEqual(
+            dropdown.currentData()["id"],
+            "preset-no-commission",
+        )
+        self.assertTrue(dropdown.currentText().endswith("【无佣】"))
+        self.assertTrue(
+            any(
+                dropdown.itemText(index).endswith("【返佣】")
+                for index in range(1, dropdown.count())
+            )
+        )
+
     def test_batch_location_filter_empty_result_reports_platform_count_without_saving(self) -> None:
         """平台有候选但筛选为空时，应说明实际数字并且不保存。"""
 
@@ -11558,7 +12074,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.assertEqual(normalized["items"][1]["scheduleTimeOverride"], "2026-08-10 12:00")
 
     def test_batch_draft_payload_includes_stable_platform_intent(self) -> None:
-        """保存本地内容必须包含音乐、声明、地点快照和最后搜索意图。"""
+        """保存本地内容必须包含音乐、声明、地点快照和当前搜索意图。"""
 
         video_file = tempfile.NamedTemporaryFile(suffix=".mp4")
         self.addCleanup(video_file.close)
@@ -11610,6 +12126,10 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             "rawCandidates": [{"poiId": "temporary"}],
             "candidates": [{"poiId": "temporary"}],
         }
+        self.page.batch_location_keyword.setText("夜南香北京烤鸭")
+        self.page.batch_location_commission_combo.setCurrentIndex(
+            self.page.batch_location_commission_combo.findData("no_commission")
+        )
 
         payload = self.page._batch_draft_payload()
 
@@ -11780,6 +12300,136 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
 
         start_generation.assert_called_once_with(setup_payload)
         start_upload.assert_not_called()
+
+    def test_active_setup_generation_locks_content_and_rejects_stale_fingerprint(self) -> None:
+        """活跃采集代际不得被改账号/视频，也不得接纳变更后的搜索或迟到回调。"""
+
+        account = {
+            "id": 72,
+            "type": 3,
+            "status": 1,
+            "filePath": "douyin-a.json",
+            "profileName": "主体",
+            "userName": "账号 A",
+        }
+        first = {"id": 1, "storedPath": "/tmp/first.mp4", "filename": "first.mp4"}
+        second = {"id": 2, "storedPath": "/tmp/second.mp4", "filename": "second.mp4"}
+        self.page.account_combo.clear()
+        self.page.account_combo.addItem("请选择", None)
+        self.page.account_combo.addItem("账号 A", account)
+        self.page.account_combo.setCurrentIndex(1)
+        self.page.video_combo.clear()
+        self.page.video_combo.addItem("请选择", None)
+        self.page.video_combo.addItem("first.mp4", first)
+        self.page.video_combo.addItem("second.mp4", second)
+        self.page._refresh_batch_video_list()
+        self.page.select_video_indexes([1])
+        self.page._saved_content_available = True
+        self.page._batch_saved_content_available = True
+        self._activate_setup_generation()
+        self.page._setup_generation_content_fingerprint = json.dumps(
+            {
+                "accountFile": "douyin-a.json",
+                "videoPaths": ["/tmp/first.mp4"],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+        self.page._sync_view()
+
+        self.assertFalse(self.page.account_combo.isEnabled())
+        self.assertFalse(self.page.batch_video_list.isEnabled())
+        self.assertFalse(self.page.video_replace_button.isEnabled())
+        self.assertFalse(self.page.clear_content_button.isEnabled())
+        self.assertFalse(self.page.restore_content_button.isEnabled())
+        self.assertFalse(self.page.batch_clear_content_button.isEnabled())
+        self.assertFalse(self.page.batch_restore_content_button.isEnabled())
+        with patch.object(QMessageBox, "warning") as warning, patch(
+            "ui.douyin_commerce_page.douyin_commerce_batch_draft_service.load_batch_draft"
+        ) as load_batch:
+            self.page.clear_current_content()
+            self.page.restore_batch_content()
+        warning.assert_called()
+        load_batch.assert_not_called()
+        self.assertEqual(self.page.account_combo.currentData()["filePath"], "douyin-a.json")
+        self.assertEqual(self.page._selected_video_indexes, [1])
+
+        # 模拟界面以外的异常状态漂移：旧代际只能异步关闭，不得继续搜索。
+        self.page._selected_video_indexes = [2]
+        self.page.video_combo.blockSignals(True)
+        self.page.video_combo.setCurrentIndex(2)
+        self.page.video_combo.blockSignals(False)
+        self.page.runner = self._InlineRunner()
+        with patch.object(
+            self.page,
+            "_dispatch_setup_generation_close",
+            return_value=True,
+        ) as dispatch_close, patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.search_locations"
+        ) as search:
+            self.page._search_batch_locations("domestic", "北海")
+        search.assert_not_called()
+        dispatch_close.assert_called_once_with(
+            reason="content_changed",
+            completion="content_changed",
+            silent=True,
+        )
+
+        # 已在途中的旧回调同样必须在调用 on_success 前复核内容指纹。
+        self.page._collector_action_tokens["domestic_location"] = 7
+        accepted = MagicMock()
+        with patch.object(
+            self.page,
+            "_dispatch_setup_generation_close",
+            return_value=True,
+        ) as dispatch_close, patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.status",
+            return_value=self._collector_status(),
+        ) as status:
+            self.page._collector_action_succeeded(
+                "generation-a",
+                "domestic_location",
+                7,
+                {
+                    "ok": True,
+                    "setupGenerationId": "generation-a",
+                    "collectorType": "domestic_location",
+                    "collectorInstanceId": "domestic-a",
+                    "candidates": [],
+                },
+                accepted,
+            )
+        accepted.assert_not_called()
+        status.assert_not_called()
+        dispatch_close.assert_called_once_with(
+            reason="content_changed",
+            completion="content_changed",
+            silent=True,
+        )
+
+        # 内容未变时“继续”复用已绑定代际，不重复启动或阻塞 Qt。
+        self.page._selected_video_indexes = [1]
+        self.page.video_combo.blockSignals(True)
+        self.page.video_combo.setCurrentIndex(1)
+        self.page.video_combo.blockSignals(False)
+        setup_payload = {
+            "accountList": ["douyin-a.json"],
+            "fileList": ["/tmp/first.mp4"],
+            "title": "标题",
+            "description": "文案",
+            "tags": [],
+        }
+        with patch.object(self.page, "_batch_content_is_valid", return_value=True), patch.object(
+            self.page, "collect_upload_payload", return_value=setup_payload
+        ), patch.object(self.page, "_start_setup_generation") as start_generation, patch.object(
+            self.page, "_go_to_step"
+        ) as go_to_step:
+            self.page.continue_after_content()
+
+        start_generation.assert_not_called()
+        go_to_step.assert_called_once_with(1)
 
     def test_batch_default_declaration_and_schedule_share_the_left_platform_column(self) -> None:
         """批量默认无需声明；发布方式与间隔位于声明下方的同一共享区。"""

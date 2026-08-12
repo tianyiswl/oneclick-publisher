@@ -12,6 +12,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 import re
+import sys
 import threading
 from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo
@@ -54,6 +55,13 @@ _AMBIGUOUS_SUBMIT_MARKERS = (
 
 class DouyinCommerceBatchExecutorError(RuntimeError):
     """批量带货任务不能安全继续。"""
+
+
+_BATCH_SESSION_CLEANUP_ERROR_CODE = "batch_session_cleanup_incomplete"
+
+
+class _BatchSessionCleanupIncomplete(DouyinCommerceBatchExecutorError):
+    """当前视频会话未能严格归零，后续条目不得开始。"""
 
 
 @dataclass(frozen=True)
@@ -391,6 +399,33 @@ class DouyinCommerceBatchExecutor:
     def _prepare_batch(self, batch: Mapping[str, Any]) -> dict[str, Any]:
         checked = validate_batch_payload(batch)
         return apply_interval_schedule(checked, now=self._now())
+
+    def _close_session_barrier(self, session_id: str) -> None:
+        """只接受严格关闭且回读零存活，不回退到吞错 `close`。"""
+
+        strict_close = getattr(self._manager, "close_strict", None)
+        if not callable(strict_close):
+            raise _BatchSessionCleanupIncomplete(
+                _BATCH_SESSION_CLEANUP_ERROR_CODE
+            ) from None
+        try:
+            result = strict_close(session_id)
+            status = self._manager.status()
+        except Exception:
+            raise _BatchSessionCleanupIncomplete(
+                _BATCH_SESSION_CLEANUP_ERROR_CODE
+            ) from None
+        if (
+            not isinstance(result, Mapping)
+            or result.get("closed") is not True
+            or type(result.get("aliveSessionCount")) is not int
+            or result.get("aliveSessionCount") != 0
+            or not isinstance(status, Mapping)
+            or _text(status.get("active")).casefold() != "false"
+        ):
+            raise _BatchSessionCleanupIncomplete(
+                _BATCH_SESSION_CLEANUP_ERROR_CODE
+            ) from None
 
     def _task_item_ids(self, task_id: int, expected_count: int) -> list[int]:
         task = self._task_store.get_task(int(task_id))
@@ -782,17 +817,45 @@ class DouyinCommerceBatchExecutor:
                 )
                 results.append({"index": index, "label": label, "status": "paused"})
                 continue
-            result = self._run_item(
-                batch,
-                item,
-                task_id=task_id,
-                item_id=item_id,
-                index=index,
-                total=total,
-                publish=publish,
-                progress=progress,
-                run_generation=run_generation,
-            )
+            try:
+                result = self._run_item(
+                    batch,
+                    item,
+                    task_id=task_id,
+                    item_id=item_id,
+                    index=index,
+                    total=total,
+                    publish=publish,
+                    progress=progress,
+                    run_generation=run_generation,
+                )
+            except _BatchSessionCleanupIncomplete:
+                pause_reason = (
+                    "当前视频的临时会话未能严格关闭，"
+                    f"已暂停整批（错误码 {_BATCH_SESSION_CLEANUP_ERROR_CODE}）"
+                )
+                result = {
+                    "index": index,
+                    "label": label,
+                    "status": "cleanup_incomplete",
+                    "diagnostic": _BATCH_SESSION_CLEANUP_ERROR_CODE,
+                }
+                results.append(result)
+                paused = True
+                paused_result_status = "pending"
+                self._task_store.mark_task_paused(
+                    task_id,
+                    pause_reason,
+                    pause_reason_code=task_service.PAUSE_REASON_CLEANUP_INCOMPLETE,
+                )
+                self._emit(
+                    progress,
+                    index=index,
+                    total=total,
+                    phase="cleanup_incomplete",
+                    message=pause_reason,
+                )
+                continue
             results.append(result)
             if result["status"] == "client_shutdown":
                 paused = True
@@ -1206,7 +1269,18 @@ class DouyinCommerceBatchExecutor:
             }
         finally:
             if session_id and not retain_session:
-                self._manager.close(session_id)
+                active_exception = sys.exc_info()[1]
+                try:
+                    self._close_session_barrier(session_id)
+                except _BatchSessionCleanupIncomplete:
+                    # 关闭屏障的普通失败不能覆盖正在传播的
+                    # KeyboardInterrupt/SystemExit 或其他 BaseException。
+                    if active_exception is not None and not isinstance(
+                        active_exception,
+                        Exception,
+                    ):
+                        raise active_exception
+                    raise
 
 
 # 发布服务只通过这个受控实例进入批量执行器；实际成功回执仍只能由同一 submit

@@ -12,8 +12,9 @@ COMMISSION_FILTER_COMMISSION = "commission"
 COMMISSION_FILTER_NO_COMMISSION = "no_commission"
 DEFAULT_COMMISSION_FILTER = COMMISSION_FILTER_COMMISSION
 
-_PRODUCT_RE = re.compile(r"(?P<count>\d+)\s*件商品")
-_COMMISSION_RE = re.compile(r"(?P<count>\d+)\s*件返佣")
+_COUNT_TOKEN = r"(?<![\d,，.+-])(?P<count>(?:\d{1,3}(?:[,，]\d{3})+|\d+))(?![\d,，.+-])"
+_PRODUCT_RE = re.compile(rf"{_COUNT_TOKEN}\s*件商品")
+_COMMISSION_RE = re.compile(rf"{_COUNT_TOKEN}\s*件返佣")
 _FILTER_VALUES = frozenset(
     {
         COMMISSION_FILTER_ALL,
@@ -84,11 +85,22 @@ def parse_commission_summary(value: object) -> dict[str, object]:
     """从页面可见中文摘要中提取返佣分类与精确数量。"""
 
     text = _text(value)
-    product_match = _PRODUCT_RE.search(text)
-    commission_match = _COMMISSION_RE.search(text)
-    product_count = int(product_match.group("count")) if product_match else None
-    commission_count = int(commission_match.group("count")) if commission_match else None
-    if commission_count is not None:
+    product_values = {
+        int(match.group("count").replace(",", "").replace("，", ""))
+        for match in _PRODUCT_RE.finditer(text)
+    }
+    commission_values = {
+        int(match.group("count").replace(",", "").replace("，", ""))
+        for match in _COMMISSION_RE.finditer(text)
+    }
+    product_count = next(iter(product_values)) if len(product_values) == 1 else None
+    commission_count = (
+        next(iter(commission_values)) if len(commission_values) == 1 else None
+    )
+    has_conflict = len(product_values) > 1 or len(commission_values) > 1
+    if has_conflict:
+        kind = "unknown"
+    elif commission_count is not None:
         kind = (
             COMMISSION_FILTER_COMMISSION
             if commission_count > 0
@@ -104,6 +116,37 @@ def parse_commission_summary(value: object) -> dict[str, object]:
         "commissionProductCount": commission_count,
         "commissionLabel": _COMMISSION_LABELS[kind],
     }
+
+
+def normalize_candidate_commission_fields(
+    value: Mapping[object, object],
+) -> dict[str, object]:
+    """幂等规范化原始 DOM 摘要或已结构化的返佣字段。"""
+
+    if "commissionType" in value:
+        raw_type = value.get("commissionType")
+        # 已结构化字段不是“缺省”；None、布尔值和别名均必须
+        # 明确拒绝，否则二次归一化会悄悄改写已观测佣型。
+        if not isinstance(raw_type, str):
+            raise ValueError("返佣类型无效")
+        kind = normalize_observed_commission_type(raw_type)
+        result: dict[str, object] = {
+            "commissionType": kind,
+            "commissionLabel": _COMMISSION_LABELS[kind],
+        }
+        for field in ("productCount", "commissionProductCount"):
+            count = value.get(field)
+            result[field] = count if type(count) is int and count >= 0 else None
+        return result
+
+    if "commerceInfo" in value and not isinstance(value.get("commerceInfo"), str):
+        return {
+            "commissionType": "unknown",
+            "productCount": None,
+            "commissionProductCount": None,
+            "commissionLabel": _COMMISSION_LABELS["unknown"],
+        }
+    return parse_commission_summary(value.get("commerceInfo", ""))
 
 
 def filter_location_candidates(

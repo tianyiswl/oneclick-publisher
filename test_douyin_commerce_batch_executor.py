@@ -249,6 +249,13 @@ class FakeCommerceSessionManager:
             self.closed_session_ids.append(session_id)
             self.open_sessions -= 1
 
+    def close_strict(self, session_id: str | None = None) -> dict[str, object]:
+        self.close(session_id)
+        return {
+            "closed": self.open_sessions == 0,
+            "aliveSessionCount": self.open_sessions,
+        }
+
     def status(self) -> dict[str, str]:
         return {"active": "true" if self.open_sessions else "false", "stage": ""}
 
@@ -581,6 +588,72 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
         )
         self.assertEqual(manager.started_session_ids[:2], ["session-1", "session-2"])
         self.assertEqual(manager.closed_session_ids[:2], ["session-1", "session-2"])
+
+    def test_strict_close_barrier_pauses_batch_and_preserves_process_control(self) -> None:
+        """每条结束必须严格归零；关闭失败暂停整批，进程控制异常原样传播。"""
+
+        class IncompleteCloseManager(FakeCommerceSessionManager):
+            def __init__(self) -> None:
+                super().__init__()
+                self.strict_close_calls: list[str | None] = []
+                self.regular_close_calls = 0
+
+            def close(self, session_id: str | None = None) -> None:
+                self.regular_close_calls += 1
+                super().close(session_id)
+
+            def close_strict(self, session_id: str | None = None) -> dict[str, object]:
+                self.strict_close_calls.append(session_id)
+                return {
+                    "closed": False,
+                    "aliveSessionCount": 1,
+                }
+
+        manager = IncompleteCloseManager()
+        result = DouyinCommerceBatchExecutor(manager).run_preflight(
+            self.batch,
+            task_id=self.task["id"],
+        )
+
+        self.assertEqual(
+            [row["status"] for row in result],
+            ["cleanup_incomplete", "pending", "pending"],
+        )
+        self.assertEqual(result[0]["diagnostic"], "batch_session_cleanup_incomplete")
+        self.assertEqual(manager.strict_close_calls, ["session-1"])
+        self.assertEqual(manager.regular_close_calls, 0)
+        self.assertEqual(manager.open_sessions, 1)
+        self.assertEqual(
+            [call for call in manager.calls if call.startswith("start_upload:")],
+            ["start_upload:0"],
+        )
+        saved = task_service.get_task(self.task["id"])
+        self.assertEqual(
+            (saved["status"], saved["pauseReasonCode"]),
+            ("paused", "cleanup_incomplete"),
+        )
+
+        class ProcessControl(BaseException):
+            pass
+
+        for error_type in (KeyboardInterrupt, SystemExit, ProcessControl):
+            with self.subTest(error_type=error_type.__name__):
+                original = error_type("关闭阶段的进程控制信号")
+                task = task_service.create_douyin_batch_task(self.batch)
+
+                class InterruptedCloseManager(FakeCommerceSessionManager):
+                    def close_strict(self, _session_id: str | None = None) -> dict[str, object]:
+                        raise original
+
+                with self.assertRaises(error_type) as caught:
+                    DouyinCommerceBatchExecutor(
+                        InterruptedCloseManager()
+                    ).run_preflight(
+                        self.batch,
+                        task_id=task["id"],
+                    )
+
+                self.assertIs(caught.exception, original)
 
     def test_clean_status_with_open_layer_is_rejected_as_dirty_baseline(self) -> None:
         """status=clean 不足以放行，仍有浮层时不得写入或记 published。"""
