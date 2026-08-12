@@ -9628,6 +9628,82 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             },
         )
 
+    def test_revision_close_uses_manager_state_when_page_session_id_is_empty(
+        self,
+    ) -> None:
+        """若 manager 仍 active 却因页面 ID 为空绕过严格关闭，该测试必须失败。"""
+
+        class StatefulSessionManager:
+            def __init__(
+                self,
+                *,
+                close_result: dict[str, object] | None = None,
+                remains_active: bool = False,
+            ) -> None:
+                self.active = True
+                self.close_result = close_result or {
+                    "closed": True,
+                    "aliveSessionCount": 0,
+                }
+                self.remains_active = remains_active
+                self.closed_session_ids: list[str | None] = []
+
+            def status(self) -> dict[str, str]:
+                return {"active": "true" if self.active else "false"}
+
+            def close_strict(self, session_id: str | None = None) -> dict[str, object]:
+                self.closed_session_ids.append(session_id)
+                if not self.remains_active:
+                    self.active = False
+                return dict(self.close_result)
+
+        valid = StatefulSessionManager()
+        malformed = (
+            StatefulSessionManager(
+                close_result={"closed": 1, "aliveSessionCount": 0}
+            ),
+            StatefulSessionManager(
+                close_result={"closed": True, "aliveSessionCount": False}
+            ),
+            StatefulSessionManager(remains_active=True),
+        )
+        self.page._session_id = ""
+
+        with patch(
+            "ui.douyin_commerce_page.douyin_commerce_session.commerce_session_manager",
+            valid,
+        ):
+            valid_result = self.page._close_revision_resources()
+
+        self.assertEqual(valid.closed_session_ids, [None])
+        self.assertEqual(
+            valid_result,
+            {
+                "closed": True,
+                "aliveCollectorCount": 0,
+                "aliveSessionCount": 0,
+            },
+        )
+        for manager in malformed:
+            with self.subTest(
+                close_result=manager.close_result,
+                remains_active=manager.remains_active,
+            ), patch(
+                "ui.douyin_commerce_page.douyin_commerce_session.commerce_session_manager",
+                manager,
+            ):
+                result = self.page._close_revision_resources()
+
+                self.assertEqual(manager.closed_session_ids, [None])
+                self.assertEqual(
+                    result,
+                    {
+                        "closed": False,
+                        "aliveCollectorCount": 0,
+                        "aliveSessionCount": 1,
+                    },
+                )
+
     def test_return_to_edit_double_click_enqueues_only_one_close_generation(
         self,
     ) -> None:
@@ -10014,11 +10090,18 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             "已成功发布的视频不能重新加入修改批次。",
         )
 
-    def test_revision_with_no_mappable_media_clears_old_selection_and_stays_put(
-        self,
-    ) -> None:
+    def test_revision_restore_prevalidates_atomically_and_can_retry(self) -> None:
+        """任一素材无法映射时，结果页状态必须原封不动并允许原计划重试。"""
+
         plan = self._load_revision_ui_fixture()
         self.page.select_video_indexes([1])
+        self.page.title_input.setText("结果页原内容")
+        self.page._batch_revision_source_task_id = 7
+        self.page._batch_revision_source_task_no = "OLD-SOURCE"
+        self.page._batch_revision_blocked_media_keys = {"media:old"}
+        self.page._batch_result_task_id = 41
+        self.page._batch_revision_available = True
+        self.page._batch_revision_token = 3
         missing_draft = {
             **plan["draft"],
             "items": [
@@ -10032,20 +10115,44 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             ],
         }
         missing_plan = {**plan, "draft": missing_draft}
-        self.page.pages.setCurrentIndex(0)
+        self.page.pages.setCurrentIndex(2)
+        closed = {
+            "closed": True,
+            "aliveCollectorCount": 0,
+            "aliveSessionCount": 0,
+        }
 
         with patch("ui.douyin_commerce_page.QMessageBox.warning") as warning:
-            self.page._apply_batch_revision_plan(missing_plan)
+            self.page._revision_close_succeeded(3, 41, missing_plan, closed)
 
-        self.assertEqual(self.page.selected_video_count(), 0)
-        self.assertEqual(self.page.video_combo.currentIndex(), 0)
-        self.assertEqual(self.page.pages.currentIndex(), 0)
+        self.assertEqual(self.page.selected_video_count(), 1)
+        self.assertEqual(self.page._selected_videos()[0]["id"], 1)
+        self.assertEqual(self.page.title_input.text(), "结果页原内容")
+        self.assertEqual(self.page.pages.currentIndex(), 2)
+        self.assertEqual(self.page._batch_revision_source_task_id, 7)
+        self.assertEqual(self.page._batch_revision_source_task_no, "OLD-SOURCE")
+        self.assertEqual(self.page._batch_revision_blocked_media_keys, {"media:old"})
+        self.assertEqual(self.page._batch_result_task_id, 41)
+        self.assertTrue(self.page._batch_revision_available)
         warning.assert_called_once_with(
             self.page,
             "恢复未完成视频",
             "未完成视频无法恢复到编辑页，请刷新本机素材后重试。",
         )
         self.assertNotIn("private", str(warning.call_args))
+
+        with patch("ui.douyin_commerce_page.QMessageBox.warning") as retry_warning:
+            self.page._revision_close_succeeded(3, 41, plan, closed)
+
+        retry_warning.assert_not_called()
+        self.assertEqual(
+            [video["id"] for video in self.page._selected_videos()], [2, 3]
+        )
+        self.assertEqual(self.page.title_input.text(), "修改后的标题")
+        self.assertEqual(self.page.pages.currentIndex(), 1)
+        self.assertEqual(self.page._batch_revision_source_task_id, 41)
+        self.assertEqual(self.page._batch_result_task_id, 41)
+        self.assertFalse(self.page._batch_revision_available)
 
     def _activate_setup_generation(self, generation_id: str = "generation-a") -> None:
         """模拟与当前账号和视频内容绑定的有效设置代际。"""

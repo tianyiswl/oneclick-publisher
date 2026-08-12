@@ -673,6 +673,66 @@ def _revision_schedule_interval(payloads: list[dict]) -> int:
     return intervals[0] if intervals else 1
 
 
+def _revision_ancestor_successful_media_keys(
+    source: dict, successful_media_keys: list[str]
+) -> list[str] | None:
+    """汇总整条修订祖先链；任何断链、环或损坏快照都按失败处理。"""
+
+    source_id = source.get("id")
+    if type(source_id) is not int or source_id <= 0:
+        return None
+    visited = {source_id}
+    ancestor_id = source.get("revisionSourceTaskId")
+    result = list(successful_media_keys)
+    while ancestor_id is not None:
+        if (
+            type(ancestor_id) is not int
+            or ancestor_id <= 0
+            or ancestor_id in visited
+        ):
+            return None
+        visited.add(ancestor_id)
+        ancestor = get_task(ancestor_id)
+        if not ancestor or ancestor.get("workflow") != "douyin-commerce-batch":
+            return None
+        if ancestor.get("status") == "paused":
+            if ancestor.get("pauseReasonCode") != PAUSE_REASON_USER_REQUEST:
+                return None
+        elif ancestor.get("status") not in {"failed", "partial_failed"}:
+            return None
+        try:
+            raw_payloads = json.loads(ancestor.get("payloadJson") or "")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        items = ancestor.get("items")
+        if (
+            not isinstance(raw_payloads, list)
+            or not raw_payloads
+            or any(not isinstance(payload, dict) for payload in raw_payloads)
+            or not isinstance(items, list)
+            or len(items) != len(raw_payloads)
+            or any(
+                not isinstance(item, dict)
+                or item.get("status") not in {"success", "failed", "pending"}
+                for item in items
+            )
+        ):
+            return None
+        for item, payload in zip(items, raw_payloads):
+            if item.get("status") != "success":
+                continue
+            try:
+                media_key = _batch_media_key(payload)
+            except (OSError, RuntimeError, ValueError):
+                return None
+            if not media_key:
+                return None
+            if media_key not in result:
+                result.append(media_key)
+        ancestor_id = ancestor.get("revisionSourceTaskId")
+    return result
+
+
 def prepare_douyin_batch_revision(task_id: int) -> dict[str, object]:
     """从来源任务纯读生成失败或未开始视频的可编辑快照。"""
 
@@ -746,6 +806,13 @@ def prepare_douyin_batch_revision(task_id: int) -> dict[str, object]:
                 )
             if media_key not in successful_media_keys:
                 successful_media_keys.append(media_key)
+    successful_media_keys = _revision_ancestor_successful_media_keys(
+        source, successful_media_keys
+    )
+    if successful_media_keys is None:
+        return _revision_blocked(
+            int(task_id), "来源任务的修改链无法确认", source
+        )
 
     revision_payloads = [payload for _, _, payload in revision_snapshots]
     account_files = revision_payloads[0].get("accountList")

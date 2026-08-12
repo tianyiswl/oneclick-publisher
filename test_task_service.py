@@ -249,6 +249,90 @@ class DouyinCommerceBatchTaskTests(unittest.TestCase):
         self.assertEqual(plan["successfulMediaKeys"], ["media:1"])
         self.assertEqual(after, before)
 
+    def test_prepare_revision_aggregates_all_ancestors_and_rejects_bad_chain(
+        self,
+    ) -> None:
+        """多代修订必须锁住全部祖先成功项；环或断链必须固定拒绝。"""
+
+        source = self._create_paused_douyin_batch_source()
+        self._set_revision_source_states(
+            source["id"],
+            ["success", "failed", "pending"],
+            task_status="partial_failed",
+            pause_reason=None,
+        )
+        first_plan = task_service.prepare_douyin_batch_revision(source["id"])
+        second = task_service.create_douyin_batch_task(
+            {
+                **first_plan["draft"],
+                "type": 3,
+                "workflow": "douyin-commerce-batch",
+                "commerceMode": "local-group-buy",
+                "contentType": "video",
+            },
+            revision_source_task_id=source["id"],
+            schedule_now=datetime(
+                2026, 8, 8, 21, 0, tzinfo=ZoneInfo("Asia/Shanghai")
+            ),
+        )
+        self._set_revision_source_states(
+            second["id"],
+            ["success", "failed"],
+            task_status="partial_failed",
+            pause_reason=None,
+        )
+        second_plan = task_service.prepare_douyin_batch_revision(second["id"])
+        third = task_service.create_douyin_batch_task(
+            {
+                **second_plan["draft"],
+                "type": 3,
+                "workflow": "douyin-commerce-batch",
+                "commerceMode": "local-group-buy",
+                "contentType": "video",
+            },
+            revision_source_task_id=second["id"],
+            schedule_now=datetime(
+                2026, 8, 8, 21, 0, tzinfo=ZoneInfo("Asia/Shanghai")
+            ),
+        )
+        self._set_revision_source_states(
+            third["id"],
+            ["failed"],
+            task_status="failed",
+            pause_reason=None,
+        )
+
+        plan = task_service.prepare_douyin_batch_revision(third["id"])
+
+        self.assertTrue(plan["revisionAllowed"])
+        self.assertEqual(plan["successfulMediaKeys"], ["media:2", "media:1"])
+
+        with database.connect() as conn:
+            conn.execute(
+                "UPDATE publish_tasks SET revisionSourceTaskId = ? WHERE id = ?",
+                (third["id"], source["id"]),
+            )
+            conn.commit()
+        cycle = task_service.prepare_douyin_batch_revision(third["id"])
+        self.assertFalse(cycle["revisionAllowed"])
+        self.assertEqual(cycle["blockedReason"], "来源任务的修改链无法确认")
+        self.assertNotIn("draft", cycle)
+
+        with database.connect() as conn:
+            conn.execute(
+                "UPDATE publish_tasks SET revisionSourceTaskId = NULL WHERE id = ?",
+                (source["id"],),
+            )
+            conn.execute(
+                "UPDATE publish_tasks SET revisionSourceTaskId = ? WHERE id = ?",
+                (999999, second["id"]),
+            )
+            conn.commit()
+        damaged = task_service.prepare_douyin_batch_revision(third["id"])
+        self.assertFalse(damaged["revisionAllowed"])
+        self.assertEqual(damaged["blockedReason"], "来源任务的修改链无法确认")
+        self.assertNotIn("draft", damaged)
+
     def test_prepare_revision_rejects_ambiguous_and_nonmanual_pauses(self) -> None:
         """若非人工暂停的任务被还原为可编辑草稿，该测试必须失败。"""
 

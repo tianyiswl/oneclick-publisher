@@ -4693,40 +4693,48 @@ class DouyinCommercePage(QWidget):
         self._sync_view()
 
     def _apply_batch_editable_payload(
-        self, payload: Mapping[str, object]
+        self,
+        payload: Mapping[str, object],
+        *,
+        account_index: int | None = None,
+        video_indexes: list[int] | None = None,
     ) -> None:
         """把已校验的本地可编辑快照投射到现有控件；不访问平台。"""
 
         self._project_batch_video_selection([])
         self.account_combo.blockSignals(True)
-        self._restore_saved_combo(
-            self.account_combo,
-            identity=payload.get("accountId"), path=payload.get("accountFile"),
-        )
+        if account_index is None:
+            self._restore_saved_combo(
+                self.account_combo,
+                identity=payload.get("accountId"), path=payload.get("accountFile"),
+            )
+        else:
+            self.account_combo.setCurrentIndex(account_index)
         self.account_combo.blockSignals(False)
-        by_media_key = {}
-        for index in range(1, self.video_combo.count()):
-            media = self.video_combo.itemData(index)
-            if not isinstance(media, dict):
-                continue
-            try:
-                media_key = self._media_key(media)
-            except (OSError, RuntimeError, ValueError):
-                continue
-            if media_key:
-                by_media_key[media_key] = index
-        indexes = []
-        for item in payload.get("items") or []:
-            if not isinstance(item, Mapping):
-                continue
-            try:
-                media_key = task_service.build_douyin_batch_media_key(
-                    item.get("mediaId"), item.get("mediaPath")
-                )
-            except (OSError, RuntimeError, ValueError):
-                continue
-            if media_key in by_media_key:
-                indexes.append(by_media_key[media_key])
+        indexes = list(video_indexes or [])
+        if video_indexes is None:
+            by_media_key = {}
+            for index in range(1, self.video_combo.count()):
+                media = self.video_combo.itemData(index)
+                if not isinstance(media, dict):
+                    continue
+                try:
+                    media_key = self._media_key(media)
+                except (OSError, RuntimeError, ValueError):
+                    continue
+                if media_key:
+                    by_media_key[media_key] = index
+            for item in payload.get("items") or []:
+                if not isinstance(item, Mapping):
+                    continue
+                try:
+                    media_key = task_service.build_douyin_batch_media_key(
+                        item.get("mediaId"), item.get("mediaPath")
+                    )
+                except (OSError, RuntimeError, ValueError):
+                    continue
+                if media_key in by_media_key:
+                    indexes.append(by_media_key[media_key])
         if indexes:
             self.select_video_indexes(indexes)
         shared = payload.get("shared") if isinstance(payload.get("shared"), dict) else {}
@@ -4840,27 +4848,92 @@ class DouyinCommercePage(QWidget):
             self.batch_publish_mode.findData(publish_mode)
         )
 
-    def _apply_batch_revision_plan(self, plan: Mapping[str, object]) -> None:
+    def _prepare_batch_revision_ui_plan(
+        self, plan: Mapping[str, object]
+    ) -> dict[str, object]:
+        """只读校验修订计划，确保全部控件身份可唯一恢复后再投射。"""
+
+        source_task_id = plan.get("sourceTaskId")
+        successful_media_keys = plan.get("successfulMediaKeys")
+        draft = plan.get("draft")
+        if (
+            plan.get("revisionAllowed") is not True
+            or type(source_task_id) is not int
+            or source_task_id <= 0
+            or not isinstance(successful_media_keys, list)
+            or any(
+                not isinstance(value, str) or not value
+                for value in successful_media_keys
+            )
+            or not isinstance(draft, Mapping)
+        ):
+            raise ValueError("invalid revision plan")
+        normalized_draft = (
+            douyin_commerce_batch_draft_service.normalize_batch_draft(draft)
+        )
+
+        expected_account_id = _normalized(normalized_draft.get("accountId"))
+        expected_account_path = _normalized(normalized_draft.get("accountFile"))
+        account_indexes: list[int] = []
+        for index in range(1, self.account_combo.count()):
+            account = self.account_combo.itemData(index)
+            if not isinstance(account, Mapping):
+                continue
+            account_id = _normalized(account.get("id"))
+            account_path = _normalized(account.get("filePath"))
+            if (
+                expected_account_path
+                and account_path == expected_account_path
+            ) or (
+                not expected_account_path
+                and expected_account_id
+                and account_id == expected_account_id
+            ):
+                account_indexes.append(index)
+        if len(account_indexes) != 1:
+            raise ValueError("revision account cannot be mapped uniquely")
+
+        media_indexes: dict[str, list[int]] = {}
+        for index in range(1, self.video_combo.count()):
+            media = self.video_combo.itemData(index)
+            if not isinstance(media, Mapping):
+                continue
+            try:
+                media_key = self._media_key(media)
+            except (OSError, RuntimeError, ValueError):
+                continue
+            if media_key:
+                media_indexes.setdefault(media_key, []).append(index)
+        blocked_media_keys = set(successful_media_keys)
+        revision_indexes: list[int] = []
+        for item in normalized_draft["items"]:
+            media_key = task_service.build_douyin_batch_media_key(
+                item.get("mediaId"), item.get("mediaPath")
+            )
+            candidates = media_indexes.get(media_key, [])
+            if (
+                media_key in blocked_media_keys
+                or len(candidates) != 1
+                or candidates[0] in revision_indexes
+            ):
+                raise ValueError("revision media cannot be mapped uniquely")
+            revision_indexes.append(candidates[0])
+        if not revision_indexes:
+            raise ValueError("revision plan has no unfinished media")
+        return {
+            "sourceTaskId": source_task_id,
+            "sourceTaskNo": _normalized(plan.get("sourceTaskNo")),
+            "successfulMediaKeys": blocked_media_keys,
+            "draft": normalized_draft,
+            "accountIndex": account_indexes[0],
+            "videoIndexes": revision_indexes,
+        }
+
+    def _apply_batch_revision_plan(self, plan: Mapping[str, object]) -> bool:
         """恢复失败或未开始视频，并保留来源任务和成功媒体边界。"""
 
-        self._project_batch_video_selection([])
         try:
-            self._batch_revision_source_task_id = int(plan["sourceTaskId"])
-            self._batch_revision_source_task_no = _normalized(
-                plan.get("sourceTaskNo")
-            )
-            successful_media_keys = plan.get("successfulMediaKeys", [])
-            if not isinstance(successful_media_keys, list):
-                raise ValueError("invalid revision media keys")
-            self._batch_revision_blocked_media_keys = {
-                str(value)
-                for value in successful_media_keys
-                if isinstance(value, str)
-            }
-            draft = plan.get("draft")
-            if not isinstance(draft, Mapping):
-                raise ValueError("invalid revision draft")
-            self._apply_batch_editable_payload(draft)
+            prepared = self._prepare_batch_revision_ui_plan(plan)
         except Exception:
             QMessageBox.warning(
                 self,
@@ -4868,17 +4941,20 @@ class DouyinCommercePage(QWidget):
                 self._REVISION_RESTORE_FAILED_MESSAGE,
             )
             self._sync_view()
-            return
-        if not self._selected_video_indexes:
-            QMessageBox.warning(
-                self,
-                "恢复未完成视频",
-                self._REVISION_RESTORE_FAILED_MESSAGE,
-            )
-            self._sync_view()
-            return
+            return False
+        self._batch_revision_source_task_id = int(prepared["sourceTaskId"])
+        self._batch_revision_source_task_no = str(prepared["sourceTaskNo"])
+        self._batch_revision_blocked_media_keys = set(
+            prepared["successfulMediaKeys"]
+        )
+        self._apply_batch_editable_payload(
+            prepared["draft"],
+            account_index=int(prepared["accountIndex"]),
+            video_indexes=list(prepared["videoIndexes"]),
+        )
         self.pages.setCurrentIndex(1)
         self._sync_view()
+        return True
 
     def start_batch_preflight(self) -> None:
         """在后台逐条执行批量 dry-run；不会保存草稿或最终发表。"""
@@ -7232,41 +7308,41 @@ class DouyinCommercePage(QWidget):
                 "aliveCollectorCount": 1,
                 "aliveSessionCount": 0,
             }
-        session_id = self._session_id
-        if session_id:
-            try:
-                session = (
-                    douyin_commerce_session.commerce_session_manager.close_strict(
-                        session_id
-                    )
-                )
-                status = douyin_commerce_session.commerce_session_manager.status()
-            except (KeyboardInterrupt, SystemExit):
-                raise
-            except Exception:
-                return {
-                    "closed": False,
-                    "aliveCollectorCount": 0,
-                    "aliveSessionCount": 1,
-                }
-            alive_sessions = (
-                session.get("aliveSessionCount")
-                if isinstance(session, Mapping)
-                else None
+        manager = douyin_commerce_session.commerce_session_manager
+        try:
+            status = manager.status()
+            manager_active = (
+                _normalized(status.get("active")).casefold()
+                if isinstance(status, Mapping)
+                else ""
             )
-            if (
-                not isinstance(session, Mapping)
-                or session.get("closed") is not True
-                or type(alive_sessions) is not int
-                or alive_sessions != 0
-                or not isinstance(status, Mapping)
-                or _normalized(status.get("active")).casefold() != "false"
-            ):
-                return {
-                    "closed": False,
-                    "aliveCollectorCount": 0,
-                    "aliveSessionCount": 1,
-                }
+            if manager_active not in {"true", "false"}:
+                raise ValueError("invalid session manager status")
+            if manager_active == "true":
+                session = manager.close_strict(self._session_id or None)
+                status = manager.status()
+                alive_sessions = (
+                    session.get("aliveSessionCount")
+                    if isinstance(session, Mapping)
+                    else None
+                )
+                if (
+                    not isinstance(session, Mapping)
+                    or session.get("closed") is not True
+                    or type(alive_sessions) is not int
+                    or alive_sessions != 0
+                    or not isinstance(status, Mapping)
+                    or _normalized(status.get("active")).casefold() != "false"
+                ):
+                    raise ValueError("session manager did not close strictly")
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            return {
+                "closed": False,
+                "aliveCollectorCount": 0,
+                "aliveSessionCount": 1,
+            }
         return {
             "closed": True,
             "aliveCollectorCount": 0,
@@ -7316,10 +7392,11 @@ class DouyinCommercePage(QWidget):
         if not self._revision_close_is_complete(result):
             self._revision_close_failed(token)
             return
+        if not self._apply_batch_revision_plan(plan):
+            return
         self._cleanup_douyin_verification()
         self._session_id = ""
         self._batch_revision_available = False
-        self._apply_batch_revision_plan(plan)
 
     def _revision_close_failed(self, token: int) -> None:
         if token != self._batch_revision_token or self._shutdown_requested.is_set():
