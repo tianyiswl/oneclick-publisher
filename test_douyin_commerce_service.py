@@ -59,6 +59,7 @@ from ui.douyin_commerce_page import (
     DouyinCommercePage,
     _ImeAwarePlainTextEdit,
 )
+from ui.task_page import TaskDetailDialog
 from ui.runtime_log import runtime_log_bus
 from utils import base_social_media
 from test_douyin_commerce_batch_executor import FakeCommerceSessionManager
@@ -14175,6 +14176,48 @@ class DouyinCommerceBatchRoutingTests(unittest.TestCase):
             captured["thread"]["kwargs"]["prepared_batch"]["items"][0]["enableTimer"],
             False,
         )
+
+
+class DouyinCommerceTaskDetailUiTests(unittest.TestCase):
+    """修改批次来源只在任务详情中作本地只读展示。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_task_detail_shows_revision_source_task_number(self) -> None:
+        """缺少来源行时，应捕获修改批次与原任务无法关联的回归。"""
+        task = task_service._attach_content_type(
+            {
+                "id": 99,
+                "taskNo": "T08122130-NEW1",
+                "status": "failed",
+                "title": "修改任务",
+                "payloadJson": json.dumps(
+                    [
+                        {
+                            "contentType": "video",
+                            "workflow": "douyin-commerce",
+                            "batchWorkflow": "douyin-commerce-batch",
+                            "fileList": ["/tmp/failed.mp4"],
+                            "enableTimer": False,
+                        }
+                    ],
+                    ensure_ascii=False,
+                ),
+                "items": [],
+                "events": [],
+                "revisionSourceTaskId": 41,
+                "revisionSourceTaskNo": "T08122117-665B",
+            }
+        )
+
+        dialog = TaskDetailDialog(task)
+        self.addCleanup(dialog.close)
+        labels = [label.text() for label in dialog.findChildren(QLabel)]
+
+        self.assertIn("修改来源", labels)
+        self.assertIn("修改自 T08122117-665B", labels)
 
 
 if __name__ == "__main__":

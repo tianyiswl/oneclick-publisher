@@ -90,12 +90,36 @@ class TaskDetailDialog(QDialog):
             ("创建时间", task.get("createdAt"), 4, 0, 1),
             ("完成时间", task.get("finishedAt"), 4, 2, 1),
         ]
+        next_summary_row = 5
         if self._is_batch_task():
-            summary_values.append(("批量结果", self._batch_result_summary(), 5, 0, 5))
+            summary_values.append(
+                ("批量结果", self._batch_result_summary(), next_summary_row, 0, 5)
+            )
+            next_summary_row += 1
         elif task.get("commerceSummary"):
-            summary_values.append(("带货信息", task.get("commerceSummary"), 5, 0, 5))
+            summary_values.append(
+                ("带货信息", task.get("commerceSummary"), next_summary_row, 0, 5)
+            )
+            next_summary_row += 1
+        if (
+            type(task.get("revisionSourceTaskId")) is int
+            and task["revisionSourceTaskId"] > 0
+            and str(task.get("revisionSourceTaskNo") or "").strip()
+        ):
+            summary_values.append(
+                (
+                    "修改来源",
+                    f"修改自 {task['revisionSourceTaskNo']}",
+                    next_summary_row,
+                    0,
+                    5,
+                )
+            )
+            next_summary_row += 1
         if not self._is_batch_task() or task.get("lastError"):
-            summary_values.append(("失败原因", task.get("lastError"), 6, 0, 5))
+            summary_values.append(
+                ("失败原因", task.get("lastError"), next_summary_row, 0, 5)
+            )
         for label_text, value, row, column, span in summary_values:
             label = QLabel(label_text)
             label.setProperty("role", "caption")
