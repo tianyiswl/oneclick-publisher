@@ -2464,13 +2464,22 @@ async def search_commerce_location_store_candidates(
     return candidates
 
 
-async def _location_option_targets(listbox, location: Mapping[str, Any]) -> list[Any]:
-    """返回名称与完整地址均精确匹配的可点击发布定位项。
+async def _location_option_targets(
+    listbox,
+    location: Mapping[str, Any],
+    *,
+    commission_filter: object = "all",
+) -> list[Any]:
+    """返回名称、完整地址与返佣要求均精确匹配的可点击发布定位项。
 
     不以页面请求、隐藏属性或门店 ID 反推地点。列表中同名地点必须再用完整地址
     消歧；若仍不是唯一项，则由调用方安全停止。
     """
 
+    selected_commission_filter = normalize_commission_filter(
+        commission_filter,
+        default="all",
+    )
     expected_name = _normalized(location.get("name"))
     expected_address = _normalized(location.get("address"))
     if not expected_name or not expected_address:
@@ -2495,17 +2504,27 @@ async def _location_option_targets(listbox, location: Mapping[str, Any]) -> list
                             && !/(?:商品|返佣|佣金|团购|套餐|券|专区)/.test(text)
                             && /(?:自治区|省|市|区|县|镇|乡|街|路|大道|巷|号|楼|村)/.test(text);
                     };
+                    const looksCommerce = value => /(?:商品|返佣|佣金|团购|套餐|券)/.test(value);
                     const nameNode = node.querySelector('[data-store-name], [class*="name-"], [class*="name_"], [class*="title-"]');
                     const addressNode = node.querySelector('[data-store-address], [class*="address-"], [class*="address_"], [class*="addr"]');
+                    const commerceNode = node.querySelector('[class*="cps-item"], [data-commerce-info], [class*="commission"], [class*="product"]');
                     const name = normalize(nameNode && (nameNode.innerText || nameNode.textContent)) || lines[0] || '';
                     const address = normalize(addressNode && (addressNode.innerText || addressNode.textContent))
                         || lines.find(line => looksAddress(line)) || '';
-                    return { name, address };
+                    const commerceInfo = normalize(commerceNode && (commerceNode.innerText || commerceNode.textContent))
+                        || lines.find(line => looksCommerce(line)) || '';
+                    return { name, address, commerceInfo };
                 }"""
             )
         except Exception:
             continue
         if not isinstance(actual, Mapping):
+            continue
+        normalized_actual = normalize_commerce_location_candidate(actual)
+        if not normalized_actual or not filter_location_candidates(
+            [normalized_actual],
+            selected_commission_filter,
+        ):
             continue
         if (
             _normalized(actual.get("name")) == expected_name
@@ -2519,9 +2538,15 @@ async def _apply_open_commerce_location_to_page(
     page,
     listbox,
     candidate: Mapping[str, Any],
+    *,
+    commission_filter: object = "all",
 ) -> dict[str, Any]:
     """从当前已打开的地点面板点击唯一候选并回读。"""
 
+    selected_commission_filter = normalize_commission_filter(
+        commission_filter,
+        default="all",
+    )
     normalized = normalize_commerce_location_candidate(candidate)
     if not normalized:
         raise DouyinCommerceError("publish_location_candidate_missing")
@@ -2530,7 +2555,8 @@ async def _apply_open_commerce_location_to_page(
         for key in ("poiId", "name", "address", "distance")
     }
     visible_locations = normalize_commerce_location_candidates(
-        await _store_option_descriptors(listbox)
+        await _store_option_descriptors(listbox),
+        commission_filter=selected_commission_filter,
     )
     matched_locations = [
         row
@@ -2546,7 +2572,11 @@ async def _apply_open_commerce_location_to_page(
             else "publish_location_candidate_missing"
         )
         raise DouyinCommerceError(code)
-    targets = await _location_option_targets(listbox, location)
+    targets = await _location_option_targets(
+        listbox,
+        location,
+        commission_filter=selected_commission_filter,
+    )
     if len(targets) != 1:
         raise DouyinCommerceError("publish_location_click_failed")
     try:
@@ -2696,11 +2726,19 @@ async def apply_saved_commerce_location_to_page(
                     f"抖音发布定位关键词“{keyword}”已匹配目标，但候选面板已消失"
                 )
                 raise DouyinCommerceError("publish_location_click_failed")
-            result = await _apply_open_commerce_location_to_page(
-                page,
-                listbox,
-                matched,
-            )
+            if selected_commission_filter == "all":
+                result = await _apply_open_commerce_location_to_page(
+                    page,
+                    listbox,
+                    matched,
+                )
+            else:
+                result = await _apply_open_commerce_location_to_page(
+                    page,
+                    listbox,
+                    matched,
+                    commission_filter=selected_commission_filter,
+                )
             douyin_logger.success(
                 f"抖音发布定位关键词“{keyword}”已命中并回读目标：{target_text}"
             )
@@ -2834,13 +2872,23 @@ async def _store_option_descriptors(listbox) -> list[dict[str, str]]:
             continue
         if not isinstance(descriptor, dict):
             continue
-        key = _normalized(descriptor.get("storeId")) or _visible_store_identity(
-            _normalized(descriptor.get("name")), _normalized(descriptor.get("address"))
+        store_id = _normalized(descriptor.get("storeId"))
+        visible_identity = _visible_store_identity(
+            _normalized(descriptor.get("name")),
+            _normalized(descriptor.get("address")),
         )
+        commission_type = _normalized(
+            parse_commission_summary(
+                _normalized(descriptor.get("commerceInfo"))
+            ).get("commissionType")
+        )
+        # 同名同址的返佣/无佣节点只在当前 DOM 回合用佣型区分；原门店身份
+        # 与发布定位的持久化 POI 身份都不附加佣型。
+        key = f"{store_id or visible_identity}:{commission_type}"
         if not key or key in seen:
             continue
         seen.add(key)
-        descriptor["storeId"] = key
+        descriptor["storeId"] = store_id or visible_identity
         rows.append({str(key): _normalized(value) for key, value in descriptor.items()})
     return rows
 

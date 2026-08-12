@@ -2468,6 +2468,77 @@ class DouyinCommercePayloadTests(unittest.TestCase):
 class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
     """用真实 DOM 约束地点 portal，避免把整张发布页的输入框算进来。"""
 
+    async def test_same_location_commission_variants_click_only_matching_dom_option(self) -> None:
+        """同名同址返佣变体必须保留到当前面板，并只点击符合筛选的节点。"""
+
+        html = """
+        <main>
+          <section id="location-row">
+            <span>位置</span>
+            <div id="commerce-mode" class="semi-select" tabindex="0">
+              <div class="semi-select-selection">
+                <span class="semi-select-selection-text">带货模式</span>
+              </div>
+            </div>
+            <input id="location-input">
+          </section>
+        </main>
+        <div id="location-results" role="listbox">
+          <div id="no-commission" role="option">
+            <span data-store-name>同名店</span>
+            <span data-store-address>北京市朝阳区测试路1号</span>
+            <span data-commerce-info>1件商品 · 0件返佣</span>
+          </div>
+          <div id="commission" role="option">
+            <span data-store-name>同名店</span>
+            <span data-store-address>北京市朝阳区测试路1号</span>
+            <span data-commerce-info>1件商品 · 1件返佣</span>
+          </div>
+        </div>
+        <script>
+          document.querySelectorAll('#location-results [role="option"]').forEach(node => {
+            node.addEventListener('click', () => {
+              document.body.dataset.clickedOption = node.id;
+              document.querySelector('#location-input').value = '同名店';
+            });
+          });
+        </script>
+        """
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+                listbox = page.locator("#location-results")
+
+                descriptors = await douyin_commerce_service._store_option_descriptors(
+                    listbox
+                )
+                self.assertEqual(len(descriptors), 2)
+
+                result = await douyin_commerce_service._apply_open_commerce_location_to_page(
+                    page,
+                    listbox,
+                    {
+                        "name": "同名店",
+                        "address": "北京市朝阳区测试路1号",
+                        "commissionType": "commission",
+                        "productCount": 1,
+                        "commissionProductCount": 1,
+                        "commissionLabel": "返佣",
+                    },
+                    commission_filter="commission",
+                )
+
+                self.assertEqual(
+                    await page.locator("body").get_attribute("data-clicked-option"),
+                    "commission",
+                )
+                self.assertEqual(result["location"]["name"], "同名店")
+                self.assertNotIn("commerceInfo", result["location"])
+            finally:
+                await browser.close()
+
     async def test_anchor_controls_reads_selected_mode_without_open_menu_text(self) -> None:
         """模式菜单展开时只能回读已选值，不能把菜单全文当成当前模式。"""
 
