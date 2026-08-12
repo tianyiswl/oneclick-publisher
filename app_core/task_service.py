@@ -301,7 +301,19 @@ def get_task(task_id: int) -> dict | None:
             return None
         items = conn.execute("SELECT * FROM publish_task_items WHERE taskId = ? ORDER BY id", (task_id,)).fetchall()
         events = conn.execute("SELECT * FROM publish_task_events WHERE taskId = ? ORDER BY id", (task_id,)).fetchall()
+        revision_source_id = row["revisionSourceTaskId"]
+        revision_source = (
+            conn.execute(
+                "SELECT taskNo FROM publish_tasks WHERE id = ?",
+                (revision_source_id,),
+            ).fetchone()
+            if type(revision_source_id) is int and revision_source_id > 0
+            else None
+        )
     data = _attach_content_type(dict(row))
+    data["revisionSourceTaskNo"] = (
+        str(revision_source["taskNo"] or "") if revision_source else ""
+    )
     data["items"] = [dict(item) for item in items]
     data["events"] = [dict(event) for event in events]
     return data
@@ -402,6 +414,7 @@ def create_pending_task(
     mode: str = "desktop",
     *,
     resume_source_task_id: int | None = None,
+    revision_source_task_id: int | None = None,
 ) -> dict:
     account_files = sorted({a for payload in payloads for a in payload.get("accountList", [])})
     with connect() as conn:
@@ -460,9 +473,10 @@ def create_pending_task(
             """
             INSERT INTO publish_tasks (
                 taskNo, mode, title, status, dryRun, platformCount, itemCount, contentType,
-                payloadJson, accountSummary, platformSummary, resumeSourceTaskId, createdAt
+                payloadJson, accountSummary, platformSummary, resumeSourceTaskId,
+                revisionSourceTaskId, createdAt
             )
-            VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 task_no,
@@ -476,6 +490,7 @@ def create_pending_task(
                 account_summary,
                 platform_summary,
                 resume_source_task_id,
+                revision_source_task_id,
                 _now(),
             ),
         )
@@ -518,6 +533,7 @@ def create_douyin_batch_task(
     *,
     schedule_now=None,
     resume_source_task_id: int | None = None,
+    revision_source_task_id: int | None = None,
     batch_item_indexes: list[int] | None = None,
 ) -> dict:
     """为批量信封中的每条视频创建独立、可审计的发布项。"""
@@ -558,6 +574,7 @@ def create_douyin_batch_task(
         payloads,
         mode=mode,
         resume_source_task_id=resume_source_task_id,
+        revision_source_task_id=revision_source_task_id,
     )
     now = _now()
     with connect() as conn:
@@ -596,6 +613,224 @@ def create_douyin_batch_task(
         )
         conn.commit()
     return task
+
+
+def _revision_blocked(
+    task_id: int,
+    reason: str,
+    source: dict | None = None,
+) -> dict[str, object]:
+    """返回不带原始载荷或本地路径的固定修订拒绝结果。"""
+
+    return {
+        "revisionAllowed": False,
+        "blockedReason": reason,
+        "sourceTaskId": int(task_id),
+        "sourceTaskNo": str((source or {}).get("taskNo") or ""),
+        "revisionItemIndexes": [],
+        "successfulMediaKeys": [],
+    }
+
+
+def _batch_media_key(payload: dict) -> str:
+    """使用稳定媒体身份，兼容没有 mediaId 的历史任务。"""
+
+    media_id = payload.get("mediaId")
+    if type(media_id) is int and media_id > 0:
+        return f"media:{media_id}"
+    file_list = payload.get("fileList")
+    path = str(
+        file_list[0] if isinstance(file_list, list) and file_list else ""
+    ).strip()
+    return f"path:{Path(path).resolve(strict=False)}" if path else ""
+
+
+def _revision_schedule_interval(payloads: list[dict]) -> int:
+    """从已保存的逐条时间恢复间隔；单条任务使用最小有效值。"""
+
+    parsed: list[datetime] = []
+    for payload in payloads:
+        try:
+            parsed.append(
+                datetime.strptime(
+                    str(payload.get("scheduleTime") or "").strip(),
+                    "%Y-%m-%d %H:%M",
+                )
+            )
+        except ValueError:
+            return 1
+    intervals = [
+        int((later - earlier).total_seconds() // 60)
+        for earlier, later in zip(parsed, parsed[1:])
+        if later > earlier
+    ]
+    return intervals[0] if intervals else 1
+
+
+def prepare_douyin_batch_revision(task_id: int) -> dict[str, object]:
+    """从来源任务纯读生成失败或未开始视频的可编辑快照。"""
+
+    source = get_task(int(task_id))
+    if not source:
+        return _revision_blocked(int(task_id), "任务记录不存在或已被删除")
+    if source["workflow"] != "douyin-commerce-batch":
+        return _revision_blocked(
+            int(task_id), "仅支持抖音带货批量任务返回修改", source
+        )
+    if source["status"] == "paused":
+        if source.get("pauseReasonCode") != PAUSE_REASON_USER_REQUEST:
+            return _revision_blocked(
+                int(task_id), "当前暂停原因不能返回修改", source
+            )
+    elif source["status"] not in {"failed", "partial_failed"}:
+        return _revision_blocked(
+            int(task_id), "当前任务尚未结束或没有明确失败结果", source
+        )
+    source_items = source.get("items")
+    if isinstance(source_items, list) and any(
+        item.get("status") == "running"
+        for item in source_items
+        if isinstance(item, dict)
+    ):
+        return _revision_blocked(
+            int(task_id), "当前任务仍有视频正在处理", source
+        )
+    try:
+        raw_payloads = json.loads(source.get("payloadJson") or "")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return _revision_blocked(int(task_id), "来源任务的批次快照无法读取", source)
+    items = source.get("items")
+    if (
+        not isinstance(raw_payloads, list)
+        or not raw_payloads
+        or not isinstance(items, list)
+        or len(items) != len(raw_payloads)
+    ):
+        return _revision_blocked(int(task_id), "来源任务的批次快照无法读取", source)
+    if any(not isinstance(payload, dict) for payload in raw_payloads):
+        return _revision_blocked(int(task_id), "来源任务的批次快照无法读取", source)
+    payloads = [dict(payload) for payload in raw_payloads]
+
+    allowed_statuses = {"success", "failed", "pending"}
+    if any(
+        not isinstance(item, dict) or item.get("status") not in allowed_statuses
+        for item in items
+    ):
+        return _revision_blocked(int(task_id), "来源任务的视频状态无法确认", source)
+    revision_snapshots = [
+        (position, item, payload)
+        for position, (item, payload) in enumerate(zip(items, payloads), start=1)
+        if item.get("status") in {"failed", "pending"}
+    ]
+    if not revision_snapshots:
+        return _revision_blocked(int(task_id), "来源任务没有失败或未开始的视频", source)
+
+    successful_media_keys: list[str] = []
+    for item, payload in zip(items, payloads):
+        if item.get("status") == "success":
+            media_key = _batch_media_key(payload)
+            if media_key and media_key not in successful_media_keys:
+                successful_media_keys.append(media_key)
+
+    revision_payloads = [payload for _, _, payload in revision_snapshots]
+    account_files = revision_payloads[0].get("accountList")
+    if not isinstance(account_files, list) or len(account_files) != 1:
+        return _revision_blocked(int(task_id), "来源任务的批次快照无法读取", source)
+    account_file = str(account_files[0] or "").strip()
+    if not account_file or any(
+        payload.get("accountList") != [account_file] for payload in revision_payloads
+    ):
+        return _revision_blocked(int(task_id), "来源任务的批次快照无法读取", source)
+    with connect() as conn:
+        account = conn.execute(
+            "SELECT id FROM user_info WHERE type = 3 AND filePath = ? LIMIT 1",
+            (account_file,),
+        ).fetchone()
+    if not account:
+        return _revision_blocked(int(task_id), "来源任务的抖音账号当前不可用", source)
+
+    scheduled_flags = [payload.get("enableTimer") is True for payload in revision_payloads]
+    if any(flag != scheduled_flags[0] for flag in scheduled_flags):
+        return _revision_blocked(int(task_id), "来源任务的批次快照无法读取", source)
+    scheduled = scheduled_flags[0]
+    draft_items: list[dict[str, object]] = []
+    revision_indexes: list[int] = []
+    for position, item, payload in revision_snapshots:
+        if payload.get("batchWorkflow") != "douyin-commerce-batch":
+            return _revision_blocked(int(task_id), "来源任务的批次快照无法读取", source)
+        file_list = payload.get("fileList")
+        media_path = str(
+            file_list[0]
+            if isinstance(file_list, list) and len(file_list) == 1
+            else ""
+        ).strip()
+        if not media_path or not Path(media_path).is_file():
+            return _revision_blocked(int(task_id), "来源任务包含不可用的本地媒体", source)
+        location = payload.get("locationPoi")
+        if not isinstance(location, dict) or not location:
+            return _revision_blocked(int(task_id), "来源任务的地点快照无法读取", source)
+        batch_index = item.get("batchItemIndex")
+        revision_indexes.append(
+            batch_index
+            if type(batch_index) is int and batch_index > 0
+            else position
+        )
+        draft_items.append(
+            {
+                "mediaId": payload.get("mediaId"),
+                "mediaPath": media_path,
+                "locationPresetId": str(location.get("id") or "").strip(),
+                "locationPreset": dict(location),
+                "enableTimer": scheduled,
+                "scheduleTimeOverride": (
+                    str(payload.get("scheduleTime") or "").strip() if scheduled else ""
+                ),
+            }
+        )
+
+    first_payload = revision_payloads[0]
+    last_payload = revision_payloads[-1]
+    first_schedule_time = str(first_payload.get("scheduleTime") or "").strip()
+    draft = {
+        "accountId": int(account["id"]),
+        "accountFile": account_file,
+        "shared": {
+            "title": first_payload.get("title"),
+            "description": first_payload.get("description"),
+            "tags": first_payload.get("tags"),
+            "selectedMusic": first_payload.get("selectedMusic"),
+            "contentDeclaration": first_payload.get("contentDeclaration"),
+        },
+        "lastLocationSearch": {
+            "scope": last_payload.get("locationScope"),
+            "keyword": last_payload.get("locationSearchKeyword"),
+            "commissionFilter": last_payload.get("locationCommissionFilter"),
+        },
+        "publishMode": "interval-schedule" if scheduled else "immediate",
+        "schedule": {
+            "timezone": "Asia/Shanghai",
+            "startTime": first_schedule_time if scheduled else "",
+            "intervalMinutes": (
+                _revision_schedule_interval(revision_payloads) if scheduled else 0
+            ),
+        },
+        "items": draft_items,
+    }
+    try:
+        from .douyin_commerce_batch_draft_service import normalize_batch_draft
+
+        draft = normalize_batch_draft(draft)
+    except Exception:
+        return _revision_blocked(int(task_id), "来源任务的批次快照无法读取", source)
+    return {
+        "revisionAllowed": True,
+        "blockedReason": "",
+        "sourceTaskId": int(task_id),
+        "sourceTaskNo": str(source.get("taskNo") or ""),
+        "revisionItemIndexes": revision_indexes,
+        "successfulMediaKeys": successful_media_keys,
+        "draft": draft,
+    }
 
 
 def _resume_blocked(

@@ -124,6 +124,7 @@ class DouyinCommerceBatchTaskTests(unittest.TestCase):
             },
             "items": [
                 {
+                    "mediaId": index,
                     "mediaPath": media_path,
                     "locationPreset": {
                         "poiId": f"resume-poi-{index}",
@@ -171,6 +172,31 @@ class DouyinCommerceBatchTaskTests(unittest.TestCase):
         )
         return source
 
+    def _set_revision_source_states(
+        self,
+        task_id: int,
+        statuses: list[str],
+        *,
+        task_status: str,
+        pause_reason: str | None,
+    ) -> None:
+        with database.connect() as conn:
+            rows = conn.execute(
+                "SELECT id FROM publish_task_items WHERE taskId = ? ORDER BY id",
+                (int(task_id),),
+            ).fetchall()
+            self.assertEqual(len(rows), len(statuses))
+            for row, status in zip(rows, statuses):
+                conn.execute(
+                    "UPDATE publish_task_items SET status = ? WHERE id = ?",
+                    (status, int(row["id"])),
+                )
+            conn.execute(
+                "UPDATE publish_tasks SET status = ?, pauseReasonCode = ? WHERE id = ?",
+                (task_status, pause_reason, int(task_id)),
+            )
+            conn.commit()
+
     @staticmethod
     def _write_final_receipt(*args, **kwargs) -> None:
         """通过未来批量执行器唯一允许导入的内部写入模块执行。"""
@@ -201,6 +227,74 @@ class DouyinCommerceBatchTaskTests(unittest.TestCase):
             detail["items"][2]["locationSummary"],
             "北海银滩景区（广西壮族自治区北海市银海区银滩大道中段）",
         )
+
+    def test_prepare_revision_keeps_only_failed_and_pending_items(self) -> None:
+        """若修订草稿带回成功项、丢失失败项或改写来源任务，该测试必须失败。"""
+
+        source = self._create_paused_douyin_batch_source()
+        self._set_revision_source_states(
+            source["id"],
+            ["success", "failed", "pending"],
+            task_status="paused",
+            pause_reason=task_service.PAUSE_REASON_USER_REQUEST,
+        )
+        before = task_service.get_task(source["id"])
+
+        plan = task_service.prepare_douyin_batch_revision(source["id"])
+
+        after = task_service.get_task(source["id"])
+        self.assertTrue(plan["revisionAllowed"])
+        self.assertEqual(plan["revisionItemIndexes"], [2, 3])
+        self.assertEqual(len(plan["draft"]["items"]), 2)
+        self.assertEqual(plan["successfulMediaKeys"], ["media:1"])
+        self.assertEqual(after, before)
+
+    def test_prepare_revision_rejects_ambiguous_and_nonmanual_pauses(self) -> None:
+        """若非人工暂停的任务被还原为可编辑草稿，该测试必须失败。"""
+
+        for reason in (
+            task_service.PAUSE_REASON_RECEIPT_AMBIGUOUS,
+            task_service.PAUSE_REASON_WAITING_LOGIN,
+            task_service.PAUSE_REASON_WAITING_VERIFICATION,
+            task_service.PAUSE_REASON_AUTO_FAILURE,
+            task_service.PAUSE_REASON_CLIENT_SHUTDOWN,
+            task_service.PAUSE_REASON_CLEANUP_INCOMPLETE,
+        ):
+            source = self._create_paused_douyin_batch_source()
+            self._set_revision_source_states(
+                source["id"],
+                ["success", "pending", "pending"],
+                task_status="paused",
+                pause_reason=reason,
+            )
+
+            self.assertFalse(
+                task_service.prepare_douyin_batch_revision(source["id"])[
+                    "revisionAllowed"
+                ]
+            )
+
+    def test_revision_child_records_source_without_mutating_it(self) -> None:
+        """若子任务丢失修订来源或创建时改写来源，该测试必须失败。"""
+
+        source = self._create_paused_douyin_batch_source()
+        self._set_revision_source_states(
+            source["id"],
+            ["failed", "failed", "failed"],
+            task_status="failed",
+            pause_reason=None,
+        )
+        before = task_service.get_task(source["id"])
+
+        child = task_service.create_douyin_batch_task(
+            self.batch,
+            revision_source_task_id=source["id"],
+        )
+
+        detail = task_service.get_task(child["id"])
+        self.assertEqual(detail["revisionSourceTaskId"], source["id"])
+        self.assertEqual(detail["revisionSourceTaskNo"], source["taskNo"])
+        self.assertEqual(task_service.get_task(source["id"]), before)
 
     def test_prepare_douyin_batch_resume_only_includes_pending_source_items(self) -> None:
         """若错误复制成功项或丢失原排期，该测试必须失败。"""
