@@ -12385,6 +12385,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             payload["items"][0]["locationPreset"]["address"],
             "陕西省安康市汉滨区江北办富民街2号",
         )
+        self.assertEqual(payload["items"][0]["mediaId"], 1)
 
     def test_restore_batch_content_uses_snapshot_and_drops_saved_candidates(self) -> None:
         """预设表缺失时仍恢复完整地点，但候选必须等待新会话重新读取。"""

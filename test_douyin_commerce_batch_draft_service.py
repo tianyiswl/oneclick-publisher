@@ -160,6 +160,7 @@ class DouyinCommerceBatchDraftTests(unittest.TestCase):
             normalized["items"],
             [
                 {
+                    "mediaId": None,
                     "mediaPath": "/tmp/a.mp4",
                     "locationPresetId": "",
                     "locationPreset": {},
@@ -169,6 +170,29 @@ class DouyinCommerceBatchDraftTests(unittest.TestCase):
             ],
         )
         self.assertNotIn("token", normalized)
+
+    def test_draft_roundtrip_preserves_only_positive_builtin_media_identity(self) -> None:
+        raw = {
+            "accountId": 7,
+            "accountFile": "douyin.json",
+            "shared": {"title": "标题", "description": "文案", "tags": []},
+            "items": [{"mediaPath": "/tmp/a.mp4", "mediaId": 71}],
+        }
+
+        normalized = normalize_batch_draft(raw)
+        saved = save_batch_draft(raw)
+        restored = load_batch_draft()
+
+        self.assertEqual(normalized["items"][0]["mediaId"], 71)
+        self.assertEqual(saved["payload"]["items"][0]["mediaId"], 71)
+        self.assertEqual(restored["payload"]["items"][0]["mediaId"], 71)
+
+        for invalid in (True, 0, -1, "71"):
+            with self.subTest(invalid=invalid):
+                normalized = normalize_batch_draft(
+                    {**raw, "items": [{"mediaPath": "/tmp/a.mp4", "mediaId": invalid}]}
+                )
+                self.assertIsNone(normalized["items"][0]["mediaId"])
 
     def test_roundtrip_keeps_batch_mode_shanghai_schedule_and_per_item_override(self) -> None:
         """真实 SQLite 回读必须完整保留排期控件，而非只在内存规范化。"""

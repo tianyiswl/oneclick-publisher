@@ -143,6 +143,8 @@ def _items(value: object) -> list[dict[str, object]]:
         media_path = _text(item.get("mediaPath"))
         if not media_path:
             raise DouyinCommerceBatchDraftError(f"第 {index} 个批次条目缺少本地媒体路径")
+        media_id = item.get("mediaId")
+        media_id = media_id if type(media_id) is int and media_id > 0 else None
         schedule_time = _text(item.get("scheduleTimeOverride"))
         location_preset_id = _text(item.get("locationPresetId"))
         location_preset = _location_preset(item.get("locationPreset"))
@@ -152,6 +154,7 @@ def _items(value: object) -> list[dict[str, object]]:
             location_preset_id = _text(location_preset.get("id")) or location_preset_id
         result.append(
             {
+                "mediaId": media_id,
                 "mediaPath": media_path,
                 "locationPresetId": location_preset_id,
                 "locationPreset": location_preset,
