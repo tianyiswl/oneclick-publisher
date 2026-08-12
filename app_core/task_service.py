@@ -566,7 +566,15 @@ def create_douyin_batch_task(
             poi = payload.get("locationPoi") if isinstance(payload.get("locationPoi"), dict) else {}
             location_name = str(poi.get("name") or payload.get("locationKeyword") or "").strip()
             location_address = str(poi.get("address") or "").strip()
-            location_summary = f"{location_name}（{location_address}）" if location_address else location_name
+            commission_suffix = {
+                "commission": "【返佣】",
+                "no_commission": "【无佣】",
+            }.get(poi.get("observedCommissionType"), "")
+            location_summary = (
+                f"{location_name}{commission_suffix}（{location_address}）"
+                if location_address
+                else f"{location_name}{commission_suffix}"
+            )
             schedule_summary = (
                 f"北京时间定时 {payload['scheduleTime']}"
                 if payload.get("enableTimer") is True and payload.get("scheduleTime")
@@ -707,10 +715,23 @@ def _build_douyin_batch_from_pending_payloads(
         schedule_time = str(payload.get("scheduleTime") or "").strip() if item_scheduled else ""
         if item_scheduled and not schedule_time:
             raise ValueError(f"原批次第 {source_item['batchItemIndex']} 条视频缺少原定时时间")
+        location_preset = {
+            "poiId": location.get("poiId"),
+            "name": location.get("name"),
+            "address": location.get("address"),
+            "distance": location.get("distance"),
+            "scope": payload.get("locationScope") or location.get("scope"),
+            "searchKeyword": payload.get("locationSearchKeyword")
+            or location.get("searchKeyword"),
+            "commissionFilter": payload.get("locationCommissionFilter"),
+            "observedCommissionType": location.get("observedCommissionType"),
+            "productCount": location.get("productCount"),
+            "commissionProductCount": location.get("commissionProductCount"),
+        }
         items.append(
             {
                 "mediaPath": media_path,
-                "locationPreset": dict(location),
+                "locationPreset": location_preset,
                 "scheduleTimeOverride": schedule_time,
             }
         )

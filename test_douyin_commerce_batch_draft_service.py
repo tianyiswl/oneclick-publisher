@@ -29,7 +29,7 @@ class DouyinCommerceBatchDraftTests(unittest.TestCase):
         self.database_patch.stop()
         self.temporary_directory.cleanup()
 
-    def test_batch_draft_v3_keeps_stable_platform_intent_without_session_cache(self) -> None:
+    def test_batch_draft_v4_keeps_commission_intent_without_session_cache(self) -> None:
         saved = save_batch_draft(
             {
                 "accountId": 7,
@@ -50,6 +50,7 @@ class DouyinCommerceBatchDraftTests(unittest.TestCase):
                 "lastLocationSearch": {
                     "scope": "domestic",
                     "keyword": "夜南香北京烤鸭",
+                    "commissionFilter": "no_commission",
                     "candidates": [{"poiId": "must-not-persist"}],
                 },
                 "items": [
@@ -64,6 +65,11 @@ class DouyinCommerceBatchDraftTests(unittest.TestCase):
                             "address": "陕西省安康市汉滨区江北办富民街2号",
                             "scope": "domestic",
                             "verifiedAt": "2026-08-08 15:00",
+                            "commissionFilter": "commission",
+                            "observedCommissionType": "commission",
+                            "productCount": 15,
+                            "commissionProductCount": 15,
+                            "commerceInfo": "must-not-persist",
                             "domMarker": "must-not-persist",
                         },
                         "enableTimer": False,
@@ -72,7 +78,7 @@ class DouyinCommerceBatchDraftTests(unittest.TestCase):
                 "cookie": "must-not-persist",
             }
         )
-        self.assertEqual(saved["payload"]["schemaVersion"], 3)
+        self.assertEqual(saved["payload"]["schemaVersion"], 4)
         self.assertEqual(saved["payload"]["shared"]["selectedMusic"]["musicId"], "music-1")
         self.assertNotIn("sessionMarker", saved["payload"]["shared"]["selectedMusic"])
         self.assertEqual(
@@ -81,21 +87,31 @@ class DouyinCommerceBatchDraftTests(unittest.TestCase):
         )
         self.assertEqual(
             saved["payload"]["lastLocationSearch"],
-            {"scope": "domestic", "keyword": "夜南香北京烤鸭"},
+            {
+                "scope": "domestic",
+                "keyword": "夜南香北京烤鸭",
+                "commissionFilter": "no_commission",
+            },
         )
         self.assertEqual(saved["payload"]["items"][0]["locationPresetId"], "p1")
         self.assertEqual(
             saved["payload"]["items"][0]["locationPreset"]["address"],
             "陕西省安康市汉滨区江北办富民街2号",
         )
-        self.assertNotIn("domMarker", saved["payload"]["items"][0]["locationPreset"])
+        location = saved["payload"]["items"][0]["locationPreset"]
+        self.assertEqual(location["commissionFilter"], "commission")
+        self.assertEqual(location["observedCommissionType"], "commission")
+        self.assertEqual(location["productCount"], 15)
+        self.assertEqual(location["commissionProductCount"], 15)
+        self.assertNotIn("commerceInfo", location)
+        self.assertNotIn("domMarker", location)
         self.assertNotIn("cookie", saved["payload"])
         self.assertEqual(load_batch_draft(), saved)
 
-    def test_schema_v2_draft_upgrades_with_empty_optional_platform_intent(self) -> None:
+    def test_schema_v3_draft_upgrades_with_legacy_commission_defaults(self) -> None:
         normalized = normalize_batch_draft(
             {
-                "schemaVersion": 2,
+                "schemaVersion": 3,
                 "accountId": 7,
                 "accountFile": "douyin.json",
                 "shared": {"title": "标题", "description": "文案", "tags": []},
@@ -103,16 +119,32 @@ class DouyinCommerceBatchDraftTests(unittest.TestCase):
                     {
                         "mediaPath": "/tmp/a.mp4",
                         "locationPresetId": "p1",
+                        "locationPreset": {
+                            "id": "p1",
+                            "poiId": "poi-1",
+                            "name": "旧地点",
+                            "address": "广西壮族自治区北海市旧址1号",
+                            "scope": "domestic",
+                            "productCount": True,
+                            "commissionProductCount": -1,
+                        },
                     }
                 ],
             }
         )
 
-        self.assertEqual(normalized["schemaVersion"], 3)
+        self.assertEqual(normalized["schemaVersion"], 4)
         self.assertEqual(normalized["shared"]["selectedMusic"], {})
         self.assertEqual(normalized["shared"]["contentDeclaration"], "")
-        self.assertEqual(normalized["lastLocationSearch"], {"scope": "domestic", "keyword": ""})
-        self.assertEqual(normalized["items"][0]["locationPreset"], {})
+        self.assertEqual(
+            normalized["lastLocationSearch"],
+            {"scope": "domestic", "keyword": "", "commissionFilter": "commission"},
+        )
+        location = normalized["items"][0]["locationPreset"]
+        self.assertEqual(location["commissionFilter"], "all")
+        self.assertEqual(location["observedCommissionType"], "unknown")
+        self.assertIsNone(location["productCount"])
+        self.assertIsNone(location["commissionProductCount"])
 
     def test_unknown_and_sensitive_item_fields_are_not_persisted(self) -> None:
         normalized = normalize_batch_draft(

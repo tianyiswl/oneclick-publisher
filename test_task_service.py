@@ -61,6 +61,22 @@ class DouyinCommerceBatchTaskTests(unittest.TestCase):
                 for index in range(1, 4)
             ],
         }
+        self.batch["items"][0]["locationPreset"].update(
+            {
+                "commissionFilter": "all",
+                "observedCommissionType": "commission",
+                "productCount": 15,
+                "commissionProductCount": 15,
+            }
+        )
+        self.batch["items"][1]["locationPreset"].update(
+            {
+                "commissionFilter": "all",
+                "observedCommissionType": "no_commission",
+                "productCount": 8,
+                "commissionProductCount": 0,
+            }
+        )
 
     def tearDown(self) -> None:
         self.publish_task_db_patch.stop()
@@ -114,6 +130,18 @@ class DouyinCommerceBatchTaskTests(unittest.TestCase):
                         "name": f"续发地点{index}",
                         "address": f"北京市朝阳区续发路{index}号",
                         "scope": "domestic",
+                        "commissionFilter": (
+                            "commission",
+                            "no_commission",
+                            "all",
+                        )[index - 1],
+                        "observedCommissionType": (
+                            "commission",
+                            "no_commission",
+                            "commission",
+                        )[index - 1],
+                        "productCount": 10 + index,
+                        "commissionProductCount": 0 if index == 2 else index,
                     },
                     "scheduleTimeOverride": "",
                 }
@@ -161,6 +189,18 @@ class DouyinCommerceBatchTaskTests(unittest.TestCase):
         self.assertEqual(len(detail["items"]), 3)
         self.assertIn("北海银滩景区", detail["commerceSummary"])
         self.assertIn("立即发布", detail["commerceSummary"])
+        self.assertEqual(
+            detail["items"][0]["locationSummary"],
+            "北海银滩景区【返佣】（广西壮族自治区北海市银海区银滩大道中段）",
+        )
+        self.assertEqual(
+            detail["items"][1]["locationSummary"],
+            "北海银滩景区【无佣】（广西壮族自治区北海市银海区银滩大道中段）",
+        )
+        self.assertEqual(
+            detail["items"][2]["locationSummary"],
+            "北海银滩景区（广西壮族自治区北海市银海区银滩大道中段）",
+        )
 
     def test_prepare_douyin_batch_resume_only_includes_pending_source_items(self) -> None:
         """若错误复制成功项或丢失原排期，该测试必须失败。"""
@@ -187,6 +227,20 @@ class DouyinCommerceBatchTaskTests(unittest.TestCase):
         """若续发覆盖来源条目或重排原视频序号，该测试必须失败。"""
 
         source = self._create_paused_douyin_batch_source()
+        with database.connect() as conn:
+            row = conn.execute(
+                "SELECT payloadJson FROM publish_tasks WHERE id = ?", (source["id"],)
+            ).fetchone()
+            payloads = json.loads(row["payloadJson"])
+            for payload in payloads[1:]:
+                payload["locationPoi"].pop("commissionFilter")
+                payload["locationPoi"]["commerceInfo"] = "must-not-survive"
+                payload["locationPoi"]["domMarker"] = "must-not-survive"
+                payload["locationPoi"]["unknownField"] = "must-not-survive"
+            conn.execute(
+                "UPDATE publish_tasks SET payloadJson = ? WHERE id = ?",
+                (json.dumps(payloads, ensure_ascii=False), source["id"]),
+            )
         source_before = task_service.get_task(source["id"])
 
         created = task_service.create_douyin_batch_resume(
@@ -199,6 +253,19 @@ class DouyinCommerceBatchTaskTests(unittest.TestCase):
         self.assertEqual(child["mode"], "oneclick_resume")
         self.assertEqual(child["resumeSourceTaskId"], source["id"])
         self.assertEqual([item["batchItemIndex"] for item in child["items"]], [2, 3])
+        child_payloads = json.loads(child["payloadJson"])
+        self.assertEqual(
+            [payload["locationCommissionFilter"] for payload in child_payloads],
+            ["no_commission", "all"],
+        )
+        self.assertEqual(
+            [payload["locationPoi"]["observedCommissionType"] for payload in child_payloads],
+            ["no_commission", "commission"],
+        )
+        for payload in child_payloads:
+            self.assertNotIn("commerceInfo", payload["locationPoi"])
+            self.assertNotIn("domMarker", payload["locationPoi"])
+            self.assertNotIn("unknownField", payload["locationPoi"])
         self.assertEqual(source_after["status"], source_before["status"])
         self.assertEqual(source_after["successCount"], source_before["successCount"])
         self.assertEqual(source_after["failedCount"], source_before["failedCount"])

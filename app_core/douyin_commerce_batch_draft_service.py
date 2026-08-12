@@ -17,6 +17,11 @@ from .douyin_commerce_service import (
     normalize_commerce_location_scope,
     normalize_content_declaration,
 )
+from .douyin_commerce_location_commission import (
+    DEFAULT_COMMISSION_FILTER,
+    normalize_commission_filter,
+    normalize_observed_commission_type,
+)
 from .douyin_location_service import normalize_location_candidate
 from .douyin_music_service import normalize_music_readback
 
@@ -89,14 +94,24 @@ def _location_preset(value: object) -> dict[str, object]:
         scope = normalize_commerce_location_scope(value.get("scope"))
     except Exception as exc:
         raise DouyinCommerceBatchDraftError(str(exc)) from exc
-    return {
+    result = {
         "id": _text(value.get("id")),
         "poiId": location["poiId"],
         "name": location["name"],
         "address": location["address"],
         "scope": scope,
         "verifiedAt": _text(value.get("verifiedAt")),
+        "commissionFilter": normalize_commission_filter(
+            value.get("commissionFilter"), default="all"
+        ),
+        "observedCommissionType": normalize_observed_commission_type(
+            value.get("observedCommissionType"), default="unknown"
+        ),
     }
+    for field in ("productCount", "commissionProductCount"):
+        count = value.get(field)
+        result[field] = count if type(count) is int and count >= 0 else None
+    return result
 
 
 def _last_location_search(value: object) -> dict[str, str]:
@@ -109,7 +124,13 @@ def _last_location_search(value: object) -> dict[str, str]:
         )
     except Exception as exc:
         raise DouyinCommerceBatchDraftError(str(exc)) from exc
-    return {"scope": scope, "keyword": _text(raw.get("keyword"))}
+    return {
+        "scope": scope,
+        "keyword": _text(raw.get("keyword")),
+        "commissionFilter": normalize_commission_filter(
+            raw.get("commissionFilter"), default=DEFAULT_COMMISSION_FILTER
+        ),
+    }
 
 
 def _items(value: object) -> list[dict[str, object]]:
@@ -187,7 +208,7 @@ def normalize_batch_draft(payload: Mapping[str, Any]) -> dict[str, Any]:
         payload.get("publishMode") or ("interval-schedule" if legacy_timer else "immediate")
     )
     return {
-        "schemaVersion": 3,
+        "schemaVersion": 4,
         "accountId": _account_id(payload.get("accountId")),
         "accountFile": account_file,
         "shared": _shared(payload.get("shared")),

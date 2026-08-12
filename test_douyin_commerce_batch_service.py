@@ -79,6 +79,11 @@ class DouyinCommerceBatchServiceTests(unittest.TestCase):
                 "name": "北海银滩景区",
                 "address": "广西壮族自治区北海市银海区银滩大道中段",
                 "scope": "domestic",
+                "commissionFilter": "commission",
+                "observedCommissionType": "commission",
+                "productCount": 15,
+                "commissionProductCount": 15,
+                "commerceInfo": "must-not-survive",
             },
             "scheduleTimeOverride": schedule_time_override,
         }
@@ -111,6 +116,10 @@ class DouyinCommerceBatchServiceTests(unittest.TestCase):
         self.assertEqual(payload["batchWorkflow"], "douyin-commerce-batch")
         self.assertEqual(payload["accountList"], ["oneclick_3_offline.json"])
         self.assertEqual(payload["fileList"], [self.media_paths[0]])
+        self.assertEqual(payload["locationCommissionFilter"], "commission")
+        self.assertEqual(
+            payload["locationPoi"]["observedCommissionType"], "commission"
+        )
         self.assertNotIn("cookie", payload)
         self.assertNotIn("commerceStore", payload)
 
@@ -127,12 +136,66 @@ class DouyinCommerceBatchServiceTests(unittest.TestCase):
 
         self.assertEqual(
             set(checked),
-            {"type", "workflow", "commerceMode", "contentType", "accountFile", "shared", "publishMode", "schedule", "items"},
+            {
+                "type",
+                "workflow",
+                "commerceMode",
+                "contentType",
+                "accountFile",
+                "backgroundMode",
+                "shared",
+                "publishMode",
+                "schedule",
+                "items",
+            },
         )
         self.assertNotIn("cookie", checked["shared"])
         self.assertNotIn("verificationCode", checked["shared"])
         self.assertNotIn("browser", checked["items"][0])
         self.assertNotIn("cookie", checked["items"][0])
+        location = checked["items"][0]["locationPreset"]
+        self.assertEqual(location["commissionFilter"], "commission")
+        self.assertEqual(location["observedCommissionType"], "commission")
+        self.assertEqual(location["productCount"], 15)
+        self.assertEqual(location["commissionProductCount"], 15)
+        self.assertNotIn("commerceInfo", location)
+
+    def test_legacy_location_without_commission_fields_defaults_to_all(self) -> None:
+        legacy_item = self._item(self.media_paths[0])
+        for field in (
+            "commissionFilter",
+            "observedCommissionType",
+            "productCount",
+            "commissionProductCount",
+            "commerceInfo",
+        ):
+            legacy_item["locationPreset"].pop(field)
+        checked = apply_interval_schedule(
+            validate_batch_payload(
+                {**self.batch, "items": [legacy_item]}, now=self.shanghai_now
+            ),
+            now=self.shanghai_now,
+        )
+
+        payload = item_publish_payload(checked, checked["items"][0])
+
+        self.assertEqual(payload["locationCommissionFilter"], "all")
+        self.assertEqual(payload["locationPoi"]["observedCommissionType"], "unknown")
+        self.assertIsNone(payload["locationPoi"]["productCount"])
+        self.assertIsNone(payload["locationPoi"]["commissionProductCount"])
+
+    def test_location_product_counts_only_accept_non_negative_integers(self) -> None:
+        item = self._item(self.media_paths[0])
+        item["locationPreset"]["productCount"] = True
+        item["locationPreset"]["commissionProductCount"] = -1
+
+        checked = validate_batch_payload(
+            {**self.batch, "items": [item]}, now=self.shanghai_now
+        )
+
+        location = checked["items"][0]["locationPreset"]
+        self.assertIsNone(location["productCount"])
+        self.assertIsNone(location["commissionProductCount"])
 
     def test_non_numeric_platform_type_raises_batch_error(self) -> None:
         with self.assertRaisesRegex(DouyinCommerceBatchError, "抖音平台"):

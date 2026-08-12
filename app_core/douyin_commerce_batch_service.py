@@ -19,6 +19,10 @@ from .douyin_commerce_service import (
     normalize_commerce_location_scope,
     normalize_content_declaration,
 )
+from .douyin_commerce_location_commission import (
+    normalize_commission_filter,
+    normalize_observed_commission_type,
+)
 from .douyin_location_service import (
     DouyinLocationSearchError,
     normalize_location_candidate,
@@ -128,19 +132,29 @@ def _shared(value: object) -> dict[str, Any]:
     }
 
 
-def _location_preset(value: object, *, index: int) -> dict[str, str]:
+def _location_preset(value: object, *, index: int) -> dict[str, Any]:
+    raw = value if isinstance(value, Mapping) else {}
     location = normalize_location_candidate(value)
     if not location or not location["address"]:
         raise DouyinCommerceBatchError(f"第 {index} 条视频必须选择带完整地址的官方地点预设")
     try:
         scope = normalize_commerce_location_scope(
-            value.get("scope") if isinstance(value, Mapping) else None
+            raw.get("scope")
         )
     except Exception as exc:
         raise DouyinCommerceBatchError(f"第 {index} 条视频地点预设范围无效：{exc}") from exc
     result = {**location, "scope": scope}
+    result["commissionFilter"] = normalize_commission_filter(
+        raw.get("commissionFilter"), default="all"
+    )
+    result["observedCommissionType"] = normalize_observed_commission_type(
+        raw.get("observedCommissionType"), default="unknown"
+    )
+    for field in ("productCount", "commissionProductCount"):
+        count = raw.get(field)
+        result[field] = count if type(count) is int and count >= 0 else None
     search_keyword = _text(
-        value.get("searchKeyword") if isinstance(value, Mapping) else None
+        raw.get("searchKeyword")
     )
     if search_keyword:
         try:
@@ -317,6 +331,9 @@ def item_publish_payload(batch: Mapping[str, Any], item: Mapping[str, Any]) -> d
         "musicMode": FAVORITE_MANUAL_MUSIC_MODE,
         "contentDeclaration": batch["shared"]["contentDeclaration"],
         "locationPoi": dict(item["locationPreset"]),
+        "locationCommissionFilter": item["locationPreset"].get(
+            "commissionFilter", "all"
+        ),
         "locationKeyword": item["locationPreset"]["name"],
         "locationSearchKeyword": _text(
             item["locationPreset"].get("searchKeyword")
