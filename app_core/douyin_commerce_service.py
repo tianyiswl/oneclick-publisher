@@ -2659,6 +2659,8 @@ async def _apply_open_commerce_location_to_page(
         if _normalized(row.get("poiId")) == location["poiId"]
         and _normalized(row.get("name")) == location["name"]
         and _normalized(row.get("address")) == location["address"]
+        and _normalized(row.get("commissionType"))
+        == _normalized(normalized.get("commissionType"))
     ]
     if len(matched_locations) != 1:
         code = (
@@ -2691,6 +2693,15 @@ async def _apply_open_commerce_location_to_page(
         raise DouyinCommerceError("publish_location_readback_mismatch") from None
     if mode_value != _COMMERCE_MODE_TEXT or selected_name != location["name"]:
         raise DouyinCommerceError("publish_location_readback_mismatch")
+    try:
+        clicked_panel_closed = not await listbox.is_visible()
+    except Exception:
+        clicked_panel_closed = False
+    if clicked_panel_closed:
+        douyin_logger.info(
+            "抖音发布定位已通过候选面板收口与控件目标值回读确认"
+        )
+        return {"location": dict(matched_locations[0])}
     try:
         verify_listbox = await _open_store_selector(page, store_control)
         verify_rows = await _store_option_descriptors(verify_listbox)

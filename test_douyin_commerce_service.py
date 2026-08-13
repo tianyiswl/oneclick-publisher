@@ -3206,6 +3206,83 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await browser.close()
 
+    async def test_closed_location_panel_proves_click_without_reopening_search_results(
+        self,
+    ) -> None:
+        """点击收口候选面板后，不得用下一次搜索列表否定本次唯一候选。"""
+
+        html = """
+        <main>
+          <section id="location-row">
+            <span>位置</span>
+            <div id="commerce-mode" class="semi-select" tabindex="0">
+              <div class="semi-select-selection">
+                <span class="semi-select-selection-text">带货模式</span>
+              </div>
+            </div>
+            <input id="location-input" value="夜南香北京烤鸭(南开店)">
+          </section>
+        </main>
+        <div id="location-results" role="listbox">
+          <div id="target" class="semi-select-option" role="option">
+            <span data-store-name>夜南香北京烤鸭(南开店)</span>
+            <span data-store-address>天津市南开区王府壹号鼎域名邸10-8号</span>
+            <span data-commerce-info>15件商品 · 15件返佣</span>
+          </div>
+        </div>
+        <div id="next-search-results" role="listbox" style="display:none">
+          <div class="semi-select-option" role="option">
+            <span data-store-name>其他地点</span>
+            <span data-store-address>天津市和平区其他路1号</span>
+            <span data-commerce-info>8件商品 · 8件返佣</span>
+          </div>
+        </div>
+        <script>
+          let selected = false;
+          document.querySelector('#target').addEventListener('click', () => {
+            selected = true;
+            document.querySelector('#location-input').value = '夜南香北京烤鸭(南开店)';
+            document.querySelector('#location-results').style.display = 'none';
+          });
+          document.querySelector('#location-input').addEventListener('click', () => {
+            if (selected) {
+              document.querySelector('#next-search-results').style.display = 'block';
+            }
+          });
+        </script>
+        """
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+
+                try:
+                    result = await douyin_commerce_service._apply_open_commerce_location_to_page(
+                        page,
+                        page.locator("#location-results"),
+                        {
+                            "name": "夜南香北京烤鸭(南开店)",
+                            "address": "天津市南开区王府壹号鼎域名邸10-8号",
+                            "commissionType": "commission",
+                            "productCount": 15,
+                            "commissionProductCount": 15,
+                        },
+                        commission_filter="commission",
+                    )
+                except douyin_commerce_service.DouyinCommerceError as exc:
+                    self.fail(f"已收口的唯一候选点击被下一次搜索状态否定：{exc}")
+
+                self.assertEqual(
+                    result["location"]["name"],
+                    "夜南香北京烤鸭(南开店)",
+                )
+                self.assertEqual(result["location"]["commissionType"], "commission")
+                self.assertFalse(await page.locator("#location-results").is_visible())
+                self.assertFalse(await page.locator("#next-search-results").is_visible())
+            finally:
+                await browser.close()
+
     async def test_same_commission_duplicate_options_survive_dom_then_stop_after_filter(self) -> None:
         """同佣型重复 option 不得在 DOM 描述层去重，筛选后仍重复才停止。"""
 
