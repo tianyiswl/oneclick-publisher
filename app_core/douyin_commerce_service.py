@@ -2709,6 +2709,12 @@ async def _apply_open_commerce_location_to_page(
         == _normalized(normalized.get("commissionType"))
     ]
     if len(verified) != 1:
+        douyin_logger.warning(
+            "抖音发布定位点击后严格回读不一致："
+            f"选中候选数={len(selected_rows)}，"
+            f"筛选后选中数={len(selected_locations)}，"
+            f"身份匹配数={len(verified)}"
+        )
         raise DouyinCommerceError("publish_location_readback_mismatch") from None
     return {"location": dict(verified[0])}
 
@@ -3017,8 +3023,11 @@ async def _store_option_descriptors(listbox) -> list[dict[str, str]]:
                         && selectionClassTokens.every(
                             token => /^(?:selected|chosen)$/i.test(token)
                         );
+                    const explicitSemiSelectedClass = Array.from(node.classList || [])
+                        .some(token => token === 'semi-select-option-selected');
                     const selected = ariaSelected === 'true'
-                        || (ariaSelected === null && explicitSelectedClass);
+                        || (ariaSelected === null
+                            && (explicitSelectedClass || explicitSemiSelectedClass));
                     return {
                         storeId: attr('data-store-id') || attr('data-shop-id') || attr('data-id'),
                         name,

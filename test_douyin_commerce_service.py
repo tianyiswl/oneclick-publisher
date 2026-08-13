@@ -2965,23 +2965,33 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
                 await page.set_content(html)
                 listbox = page.locator("#location-results")
 
-                with self.assertRaisesRegex(
-                    douyin_commerce_service.DouyinCommerceError,
-                    "^publish_location_readback_mismatch$",
-                ) as raised:
-                    await douyin_commerce_service._apply_open_commerce_location_to_page(
-                        page,
-                        listbox,
-                        {
-                            "name": "同名店",
-                            "address": "北京市朝阳区测试路1号",
-                            "commissionType": "commission",
-                            "productCount": 1,
-                            "commissionProductCount": 1,
-                            "commissionLabel": "返佣",
-                        },
-                        commission_filter="commission",
-                    )
+                with patch.object(
+                    douyin_commerce_service.douyin_logger,
+                    "warning",
+                ) as warning_log:
+                    with self.assertRaisesRegex(
+                        douyin_commerce_service.DouyinCommerceError,
+                        "^publish_location_readback_mismatch$",
+                    ) as raised:
+                        await douyin_commerce_service._apply_open_commerce_location_to_page(
+                            page,
+                            listbox,
+                            {
+                                "name": "同名店",
+                                "address": "北京市朝阳区测试路1号",
+                                "commissionType": "commission",
+                                "productCount": 1,
+                                "commissionProductCount": 1,
+                                "commissionLabel": "返佣",
+                            },
+                            commission_filter="commission",
+                        )
+
+                diagnostics = "\n".join(
+                    str(call.args[0]) for call in warning_log.call_args_list
+                )
+                self.assertIn("选中候选数=0", diagnostics)
+                self.assertIn("身份匹配数=0", diagnostics)
 
                 self.assertIsNone(raised.exception.__cause__)
                 self.assertIsNone(
@@ -3065,6 +3075,63 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(result["location"]["name"], "同名店")
                 self.assertNotIn("commerceInfo", result["location"])
+            finally:
+                await browser.close()
+
+    async def test_real_semi_selected_class_proves_location_readback(self) -> None:
+        """Semi 地点选项的明确选中类必须能完成点击后回读。"""
+
+        html = """
+        <main>
+          <section id="location-row">
+            <span>位置</span>
+            <div id="commerce-mode" class="semi-select" tabindex="0">
+              <div class="semi-select-selection">
+                <span class="semi-select-selection-text">带货模式</span>
+              </div>
+            </div>
+            <input id="location-input">
+          </section>
+        </main>
+        <div id="location-results" role="listbox">
+          <div id="commission" class="semi-select-option" role="option">
+            <span data-store-name>同名店</span>
+            <span data-store-address>北京市朝阳区测试路1号</span>
+            <span data-commerce-info>1件商品 · 1件返佣</span>
+          </div>
+        </div>
+        <script>
+          document.querySelector('#commission').addEventListener('click', event => {
+            event.currentTarget.classList.add('semi-select-option-selected');
+            document.querySelector('#location-input').value = '同名店';
+          });
+        </script>
+        """
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+
+                try:
+                    result = await douyin_commerce_service._apply_open_commerce_location_to_page(
+                        page,
+                        page.locator("#location-results"),
+                        {
+                            "name": "同名店",
+                            "address": "北京市朝阳区测试路1号",
+                            "commissionType": "commission",
+                            "productCount": 1,
+                            "commissionProductCount": 1,
+                        },
+                        commission_filter="commission",
+                    )
+                except douyin_commerce_service.DouyinCommerceError as exc:
+                    self.fail(f"Semi 明确选中类未被回读：{exc}")
+
+                self.assertEqual(result["location"]["name"], "同名店")
+                self.assertEqual(result["location"]["address"], "北京市朝阳区测试路1号")
+                self.assertEqual(result["location"]["commissionType"], "commission")
             finally:
                 await browser.close()
 
