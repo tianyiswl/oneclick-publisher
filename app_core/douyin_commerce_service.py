@@ -2892,6 +2892,22 @@ async def apply_saved_commerce_location_to_page(
                     f"均未匹配目标“{target_text}”；将尝试下一关键词"
                 )
                 continue
+            matched_candidates = [
+                row
+                for row in candidates
+                if isinstance(row, Mapping)
+                and all(
+                    _normalized(row.get(field)) == _normalized(matched.get(field))
+                    for field in ("poiId", "name", "address")
+                )
+            ]
+            if len(matched_candidates) != 1:
+                raise DouyinCommerceError(
+                    "publish_location_candidate_ambiguous"
+                    if len(matched_candidates) > 1
+                    else "publish_location_candidate_missing"
+                )
+            matched_candidate = dict(matched_candidates[0])
             listbox = await _visible_store_listbox(page)
             if listbox is None:
                 douyin_logger.warning(
@@ -2902,13 +2918,13 @@ async def apply_saved_commerce_location_to_page(
                 result = await _apply_open_commerce_location_to_page(
                     page,
                     listbox,
-                    matched,
+                    matched_candidate,
                 )
             else:
                 result = await _apply_open_commerce_location_to_page(
                     page,
                     listbox,
-                    matched,
+                    matched_candidate,
                     commission_filter=selected_commission_filter,
                 )
             douyin_logger.success(

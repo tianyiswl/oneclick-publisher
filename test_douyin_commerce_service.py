@@ -2459,6 +2459,63 @@ class DouyinCommercePayloadTests(unittest.TestCase):
         self.assertEqual(expected_location["address"], row["address"])
         reopen.assert_not_awaited()
 
+    def test_saved_location_keeps_commission_fields_for_click_verification(self) -> None:
+        """通用地点匹配不得剥掉正式点击所需的返佣观测字段。"""
+
+        page = object()
+        listbox = object()
+        preset = {
+            "poiId": "visible-poi:target",
+            "name": "夜南香·北京烤鸭(济南店)",
+            "address": "山东省济南市市中区十六里河街道办事处万科山望花园9号楼-117",
+            "commissionType": "commission",
+            "productCount": 15,
+            "commissionProductCount": 15,
+            "commissionLabel": "返佣",
+        }
+        applied_candidates: list[dict[str, object]] = []
+
+        async def apply_open(_page, actual_listbox, candidate, **kwargs):
+            self.assertIs(actual_listbox, listbox)
+            applied_candidates.append(dict(candidate))
+            self.assertEqual(kwargs["commission_filter"], "commission")
+            return {"location": dict(candidate)}
+
+        with patch.object(
+            douyin_commerce_service,
+            "search_commerce_location_store_candidates",
+            new_callable=AsyncMock,
+            return_value=[dict(preset)],
+        ), patch.object(
+            douyin_commerce_service,
+            "_visible_store_listbox",
+            new_callable=AsyncMock,
+            return_value=listbox,
+        ), patch.object(
+            douyin_commerce_service,
+            "_apply_open_commerce_location_to_page",
+            side_effect=apply_open,
+        ), patch.object(
+            douyin_commerce_service,
+            "close_commerce_store_selector",
+            new_callable=AsyncMock,
+        ):
+            result = asyncio.run(
+                douyin_commerce_service.apply_saved_commerce_location_to_page(
+                    page,
+                    preset,
+                    "domestic",
+                    ["夜南香"],
+                    commission_filter="commission",
+                )
+            )
+
+        self.assertEqual(len(applied_candidates), 1)
+        self.assertEqual(applied_candidates[0].get("commissionType"), "commission")
+        self.assertEqual(applied_candidates[0].get("productCount"), 15)
+        self.assertEqual(applied_candidates[0].get("commissionProductCount"), 15)
+        self.assertEqual(result["location"].get("commissionType"), "commission")
+
     def test_saved_location_rejects_commission_mismatch_before_click(self) -> None:
         """保存要求返佣而当前同地点只有无佣时，必须在点击前安全停止。"""
 
