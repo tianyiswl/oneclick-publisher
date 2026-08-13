@@ -3135,6 +3135,77 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await browser.close()
 
+    async def test_location_value_transition_proves_readback_without_selected_marker(
+        self,
+    ) -> None:
+        """平台不持久化 selected 标记时，必须用点击前后值变化和重读身份证明成功。"""
+
+        html = """
+        <main>
+          <section id="location-row">
+            <span>位置</span>
+            <div id="commerce-mode" class="semi-select" tabindex="0">
+              <div class="semi-select-selection">
+                <span class="semi-select-selection-text">带货模式</span>
+              </div>
+            </div>
+            <input id="location-input" value="夜南香">
+          </section>
+        </main>
+        <div id="location-results" role="listbox">
+          <div id="commission" class="semi-select-option" role="option">
+            <span data-store-name>夜南香北京烤鸭(南开店)</span>
+            <span data-store-address>天津市南开区王府壹号鼎域名邸10-8号</span>
+            <span data-commerce-info>15件商品 · 15件返佣</span>
+          </div>
+        </div>
+        <script>
+          document.querySelector('#commission').addEventListener('click', () => {
+            document.querySelector('#location-input').value = '夜南香北京烤鸭(南开店)';
+          });
+        </script>
+        """
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+
+                try:
+                    result = await douyin_commerce_service._apply_open_commerce_location_to_page(
+                        page,
+                        page.locator("#location-results"),
+                        {
+                            "name": "夜南香北京烤鸭(南开店)",
+                            "address": "天津市南开区王府壹号鼎域名邸10-8号",
+                            "commissionType": "commission",
+                            "productCount": 15,
+                            "commissionProductCount": 15,
+                        },
+                        commission_filter="commission",
+                    )
+                except douyin_commerce_service.DouyinCommerceError as exc:
+                    self.fail(f"明确的地点值迁移未被回读：{exc}")
+
+                self.assertEqual(
+                    result["location"]["name"],
+                    "夜南香北京烤鸭(南开店)",
+                )
+                self.assertEqual(
+                    result["location"]["address"],
+                    "天津市南开区王府壹号鼎域名邸10-8号",
+                )
+                self.assertEqual(result["location"]["commissionType"], "commission")
+                self.assertIsNone(
+                    await page.locator("#commission").get_attribute("aria-selected")
+                )
+                self.assertEqual(
+                    await page.locator("#commission").get_attribute("class"),
+                    "semi-select-option",
+                )
+            finally:
+                await browser.close()
+
     async def test_same_commission_duplicate_options_survive_dom_then_stop_after_filter(self) -> None:
         """同佣型重复 option 不得在 DOM 描述层去重，筛选后仍重复才停止。"""
 

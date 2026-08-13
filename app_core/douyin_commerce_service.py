@@ -2675,6 +2675,11 @@ async def _apply_open_commerce_location_to_page(
     if len(targets) != 1:
         raise DouyinCommerceError("publish_location_click_failed")
     try:
+        _, _, before_mode_value, before_selected_name = await _anchor_controls(page)
+    except Exception:
+        before_mode_value = ""
+        before_selected_name = ""
+    try:
         await targets[0].scroll_into_view_if_needed(timeout=5_000)
         await targets[0].click(timeout=8_000)
     except Exception:
@@ -2688,11 +2693,16 @@ async def _apply_open_commerce_location_to_page(
         raise DouyinCommerceError("publish_location_readback_mismatch")
     try:
         verify_listbox = await _open_store_selector(page, store_control)
+        verify_rows = await _store_option_descriptors(verify_listbox)
         selected_rows = [
             row
-            for row in await _store_option_descriptors(verify_listbox)
+            for row in verify_rows
             if _normalized(row.get("selected")) == "true"
         ]
+        reopened_locations = normalize_commerce_location_candidates(
+            verify_rows,
+            commission_filter=selected_commission_filter,
+        )
         selected_locations = normalize_commerce_location_candidates(
             selected_rows,
             commission_filter=selected_commission_filter,
@@ -2708,15 +2718,41 @@ async def _apply_open_commerce_location_to_page(
         and _normalized(row.get("commissionType"))
         == _normalized(normalized.get("commissionType"))
     ]
-    if len(verified) != 1:
-        douyin_logger.warning(
-            "抖音发布定位点击后严格回读不一致："
-            f"选中候选数={len(selected_rows)}，"
-            f"筛选后选中数={len(selected_locations)}，"
-            f"身份匹配数={len(verified)}"
+    if len(verified) == 1:
+        return {"location": dict(verified[0])}
+
+    reopened_verified = [
+        row
+        for row in reopened_locations
+        if _normalized(row.get("poiId")) == location["poiId"]
+        and _normalized(row.get("name")) == location["name"]
+        and _normalized(row.get("address")) == location["address"]
+        and _normalized(row.get("commissionType"))
+        == _normalized(normalized.get("commissionType"))
+    ]
+    value_transition_proved = (
+        len(selected_rows) == 0
+        and before_mode_value == _COMMERCE_MODE_TEXT
+        and before_selected_name != location["name"]
+        and mode_value == _COMMERCE_MODE_TEXT
+        and selected_name == location["name"]
+        and len(reopened_verified) == 1
+    )
+    if value_transition_proved:
+        douyin_logger.info(
+            "抖音发布定位已通过点击前后值迁移与候选身份重读确认"
         )
-        raise DouyinCommerceError("publish_location_readback_mismatch") from None
-    return {"location": dict(verified[0])}
+        return {"location": dict(reopened_verified[0])}
+
+    douyin_logger.warning(
+        "抖音发布定位点击后严格回读不一致："
+        f"选中候选数={len(selected_rows)}，"
+        f"筛选后选中数={len(selected_locations)}，"
+        f"身份匹配数={len(verified)}，"
+        f"重读身份匹配数={len(reopened_verified)}，"
+        f"值迁移证明={'是' if value_transition_proved else '否'}"
+    )
+    raise DouyinCommerceError("publish_location_readback_mismatch") from None
 
 
 async def apply_commerce_location_to_page(
