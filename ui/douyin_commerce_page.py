@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -584,9 +585,15 @@ class DouyinCommercePage(QWidget):
         self._batch_locations: dict[str, dict[str, object]] = {}
         self._batch_location_searches: dict[str, dict[str, object]] = {}
         self._batch_location_search_token = 0
-        self._batch_location_load_more_pending = False
-        self._batch_location_cache_pending = False
-        self._batch_location_merge_pending = False
+        self._batch_location_load_more_pending_owners: set[
+            tuple[int, str, str, str, str]
+        ] = set()
+        self._batch_location_cache_pending_owners: set[
+            tuple[int, str, str, str, str]
+        ] = set()
+        self._batch_location_merge_pending_owners: set[
+            tuple[int, str, str, str, str]
+        ] = set()
         self._batch_location_feedback = ""
         self._batch_item_rows_signature: tuple[object, ...] | None = None
         self._batch_schedule_overrides: dict[str, str] = {}
@@ -1670,9 +1677,6 @@ class DouyinCommercePage(QWidget):
 
         self._batch_location_search_token += 1
         self._batch_location_searches = {}
-        self._batch_location_load_more_pending = False
-        self._batch_location_cache_pending = False
-        self._batch_location_merge_pending = False
         self._batch_item_rows_signature = None
         self._batch_location_feedback = ""
         if hasattr(self, "batch_item_settings_status"):
@@ -1745,6 +1749,109 @@ class DouyinCommercePage(QWidget):
         return (
             request_token == self._batch_location_search_token
             and _normalized(account.get("id")) == _normalized(account_id)
+        )
+
+    @staticmethod
+    def _batch_location_request_owner(
+        cache_query: douyin_location_cache.LocationCacheQuery,
+        request_token: int,
+    ) -> tuple[int, str, str, str, str]:
+        """为缓存 worker 固定不可变请求身份。"""
+
+        return (
+            int(request_token),
+            _normalized(cache_query.account_id),
+            _normalized(cache_query.scope),
+            _normalized(cache_query.keyword),
+            normalize_commission_filter(
+                cache_query.commission_filter,
+                default=DEFAULT_COMMISSION_FILTER,
+            ),
+        )
+
+    def _batch_location_owner_is_current(
+        self,
+        owner: tuple[int, str, str, str, str] | None,
+    ) -> bool:
+        if owner is None:
+            return False
+        request_token, account_id, scope, keyword, commission_filter = owner
+        if not self._batch_location_request_is_current(request_token, account_id):
+            return False
+        intent = self._batch_location_search_intent()
+        return (
+            intent["scope"] == scope
+            and intent["keyword"] == keyword
+            and intent["commissionFilter"] == commission_filter
+        )
+
+    @staticmethod
+    def _batch_location_request_task_key(
+        prefix: str,
+        owner: tuple[int, str, str, str, str],
+    ) -> str:
+        """任务键隔离每次请求，但不泄露关键词原文。"""
+
+        request_token, account_id, scope, keyword, commission_filter = owner
+        identity = json.dumps(
+            [account_id, scope, keyword, commission_filter],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        digest = hashlib.sha256(identity).hexdigest()[:16]
+        return f"{prefix}:{request_token}:{digest}"
+
+    @property
+    def _batch_location_cache_pending(self) -> bool:
+        return any(
+            self._batch_location_owner_is_current(owner)
+            for owner in self._batch_location_cache_pending_owners
+        )
+
+    @property
+    def _batch_location_merge_pending(self) -> bool:
+        return any(
+            self._batch_location_owner_is_current(owner)
+            for owner in self._batch_location_merge_pending_owners
+        )
+
+    @property
+    def _batch_location_load_more_pending(self) -> bool:
+        return any(
+            self._batch_location_owner_is_current(owner)
+            for owner in self._batch_location_load_more_pending_owners
+        )
+
+    def _set_batch_location_pending(
+        self,
+        kind: str,
+        owner: tuple[int, str, str, str, str],
+        pending: bool,
+    ) -> None:
+        attribute = {
+            "cache": "_batch_location_cache_pending_owners",
+            "merge": "_batch_location_merge_pending_owners",
+            "load_more": "_batch_location_load_more_pending_owners",
+        }[kind]
+        owners = getattr(self, attribute)
+        if pending:
+            owners.add(owner)
+        else:
+            owners.discard(owner)
+
+    def _clear_batch_location_pending_for_token(
+        self,
+        kind: str,
+        request_token: int,
+    ) -> None:
+        attribute = {
+            "cache": "_batch_location_cache_pending_owners",
+            "merge": "_batch_location_merge_pending_owners",
+            "load_more": "_batch_location_load_more_pending_owners",
+        }[kind]
+        owners = getattr(self, attribute)
+        owners.difference_update(
+            {owner for owner in owners if owner[0] == request_token}
         )
 
     def _batch_location_cache_query(
@@ -1848,9 +1955,6 @@ class DouyinCommercePage(QWidget):
         )
         self._batch_location_search_token += 1
         request_token = self._batch_location_search_token
-        self._batch_location_load_more_pending = False
-        self._batch_location_cache_pending = False
-        self._batch_location_merge_pending = False
         try:
             cache_query = self._batch_location_cache_query(
                 normalized_scope,
@@ -1862,11 +1966,16 @@ class DouyinCommercePage(QWidget):
             self._set_batch_location_feedback("地点缓存读取失败，请重新搜索")
             self._sync_batch_location_controls()
             return
-        self._batch_location_cache_pending = True
+        request_owner = self._batch_location_request_owner(
+            cache_query, request_token
+        )
+        self._set_batch_location_pending("cache", request_owner, True)
         self._set_batch_location_feedback("正在读取地点缓存…")
         self._sync_batch_location_controls()
         started = self.runner.run(
-            self._LOCATION_CACHE_SEARCH_TASK_KEY,
+            self._batch_location_request_task_key(
+                self._LOCATION_CACHE_SEARCH_TASK_KEY, request_owner
+            ),
             with_progress=lambda _report: douyin_location_cache.get_cached_locations(
                 cache_query
             ),
@@ -1885,7 +1994,7 @@ class DouyinCommercePage(QWidget):
             on_finished=self._sync_batch_location_controls,
         )
         if not started:
-            self._batch_location_cache_pending = False
+            self._set_batch_location_pending("cache", request_owner, False)
             self._set_batch_location_feedback(
                 "地点缓存读取任务未启动，请稍后重试"
             )
@@ -1901,11 +2010,14 @@ class DouyinCommercePage(QWidget):
         *,
         request_token: int,
     ) -> None:
+        request_owner = self._batch_location_request_owner(
+            cache_query, request_token
+        )
+        self._set_batch_location_pending("cache", request_owner, False)
         if not self._batch_location_request_is_current(
             request_token, cache_query.account_id
         ):
             return
-        self._batch_location_cache_pending = False
         if not isinstance(cached_page, Mapping) or not isinstance(
             cached_page.get("candidates"), list
         ):
@@ -1981,11 +2093,14 @@ class DouyinCommercePage(QWidget):
         *,
         request_token: int,
     ) -> None:
+        request_owner = self._batch_location_request_owner(
+            cache_query, request_token
+        )
+        self._set_batch_location_pending("cache", request_owner, False)
         if not self._batch_location_request_is_current(
             request_token, cache_query.account_id
         ):
             return
-        self._batch_location_cache_pending = False
         self._set_batch_location_feedback("地点缓存读取失败，请重新搜索")
         self._sync_batch_location_controls()
 
@@ -2003,8 +2118,11 @@ class DouyinCommercePage(QWidget):
             request_token, cache_query.account_id
         ):
             return False
+        request_owner = self._batch_location_request_owner(
+            cache_query, request_token
+        )
         if from_load_more:
-            self._batch_location_load_more_pending = True
+            self._set_batch_location_pending("load_more", request_owner, True)
             self._set_batch_location_feedback("正在建立平台地点上下文…")
         elif state["candidates"]:
             self._set_batch_location_feedback(
@@ -2047,7 +2165,9 @@ class DouyinCommercePage(QWidget):
                 ),
             )
             if not started:
-                self._batch_location_load_more_pending = False
+                self._set_batch_location_pending(
+                    "load_more", request_owner, False
+                )
                 self._set_batch_location_feedback(
                     "地点搜索任务未启动，请等待当前操作结束后重试"
                 )
@@ -2077,7 +2197,7 @@ class DouyinCommercePage(QWidget):
             ),
         )
         if not started:
-            self._batch_location_load_more_pending = False
+            self._set_batch_location_pending("load_more", request_owner, False)
             self._set_batch_location_feedback("地点搜索任务未启动，请等待当前操作结束后重试")
             self._sync_batch_location_controls()
         return started
@@ -2231,7 +2351,13 @@ class DouyinCommercePage(QWidget):
                 request_token=request_token,
             )
         if not merge_started:
-            self._batch_location_load_more_pending = False
+            if cache_query is not None and request_token is not None:
+                request_owner = self._batch_location_request_owner(
+                    cache_query, request_token
+                )
+                self._set_batch_location_pending(
+                    "load_more", request_owner, False
+                )
         self._sync_batch_location_controls()
 
     def _start_batch_location_cache_merge(
@@ -2247,10 +2373,15 @@ class DouyinCommercePage(QWidget):
             request_token, cache_query.account_id
         ):
             return False
-        self._batch_location_merge_pending = True
+        request_owner = self._batch_location_request_owner(
+            cache_query, request_token
+        )
+        self._set_batch_location_pending("merge", request_owner, True)
         self._sync_batch_location_controls()
         started = self.runner.run(
-            self._LOCATION_CACHE_MERGE_TASK_KEY,
+            self._batch_location_request_task_key(
+                self._LOCATION_CACHE_MERGE_TASK_KEY, request_owner
+            ),
             with_progress=lambda _report: douyin_location_cache.merge_platform_locations(
                 cache_query,
                 [dict(item) for item in public_candidates],
@@ -2279,12 +2410,15 @@ class DouyinCommercePage(QWidget):
         *,
         request_token: int,
     ) -> None:
+        request_owner = self._batch_location_request_owner(
+            cache_query, request_token
+        )
+        self._set_batch_location_pending("merge", request_owner, False)
+        self._set_batch_location_pending("load_more", request_owner, False)
         if not self._batch_location_request_is_current(
             request_token, cache_query.account_id
         ):
             return
-        self._batch_location_merge_pending = False
-        self._batch_location_load_more_pending = False
         if not isinstance(merged_page, Mapping):
             self._batch_location_cache_merge_failed(
                 cache_query, request_token=request_token
@@ -2318,12 +2452,15 @@ class DouyinCommercePage(QWidget):
         *,
         request_token: int,
     ) -> None:
+        request_owner = self._batch_location_request_owner(
+            cache_query, request_token
+        )
+        self._set_batch_location_pending("merge", request_owner, False)
+        self._set_batch_location_pending("load_more", request_owner, False)
         if not self._batch_location_request_is_current(
             request_token, cache_query.account_id
         ):
             return
-        self._batch_location_merge_pending = False
-        self._batch_location_load_more_pending = False
         self._set_batch_location_feedback("地点缓存更新失败，已保留现有候选")
         self._sync_batch_location_controls()
 
@@ -2355,12 +2492,17 @@ class DouyinCommercePage(QWidget):
             self._set_batch_location_feedback("地点缓存读取失败，请重试加载")
             self._sync_batch_location_controls()
             return
+        request_owner = self._batch_location_request_owner(
+            cache_query, request_token
+        )
         if cache_offset < cache_total:
-            self._batch_location_load_more_pending = True
+            self._set_batch_location_pending("load_more", request_owner, True)
             self._set_batch_location_feedback("正在加载更多…")
             self._sync_batch_location_controls()
             started = self.runner.run(
-                self._LOCATION_CACHE_PAGE_TASK_KEY,
+                self._batch_location_request_task_key(
+                    self._LOCATION_CACHE_PAGE_TASK_KEY, request_owner
+                ),
                 with_progress=lambda _report: douyin_location_cache.get_cached_locations(
                     cache_query,
                     offset=cache_offset,
@@ -2394,7 +2536,7 @@ class DouyinCommercePage(QWidget):
         previous_candidates = [
             dict(item) for item in state["platformCandidates"]
         ]
-        self._batch_location_load_more_pending = True
+        self._set_batch_location_pending("load_more", request_owner, True)
         self._set_batch_location_feedback("正在加载更多…")
         self._sync_batch_location_controls()
         if self._setup_generation_id:
@@ -2437,7 +2579,9 @@ class DouyinCommercePage(QWidget):
                 ),
             )
         if not started:
-            self._batch_location_load_more_pending = False
+            self._set_batch_location_pending(
+                "load_more", request_owner, False
+            )
             self._set_batch_location_feedback(
                 "更多地点任务未启动，请等待当前操作结束后重试"
             )
@@ -2451,11 +2595,14 @@ class DouyinCommercePage(QWidget):
         cache_offset: int,
         request_token: int,
     ) -> None:
+        request_owner = self._batch_location_request_owner(
+            cache_query, request_token
+        )
+        self._set_batch_location_pending("load_more", request_owner, False)
         if not self._batch_location_request_is_current(
             request_token, cache_query.account_id
         ):
             return
-        self._batch_location_load_more_pending = False
         if not isinstance(cached_page, Mapping) or not isinstance(
             cached_page.get("candidates"), list
         ):
@@ -2518,11 +2665,14 @@ class DouyinCommercePage(QWidget):
         *,
         request_token: int,
     ) -> None:
+        request_owner = self._batch_location_request_owner(
+            cache_query, request_token
+        )
+        self._set_batch_location_pending("load_more", request_owner, False)
         if not self._batch_location_request_is_current(
             request_token, cache_query.account_id
         ):
             return
-        self._batch_location_load_more_pending = False
         self._set_batch_location_feedback("地点缓存读取失败，请重试加载")
         self._sync_batch_location_controls()
 
@@ -2536,6 +2686,9 @@ class DouyinCommercePage(QWidget):
         if not self._batch_location_request_is_current(
             request_token, cache_query.account_id
         ):
+            self._clear_batch_location_pending_for_token(
+                "load_more", request_token
+            )
             return
         if not isinstance(rows, Mapping):
             self._batch_location_load_more_failed(
@@ -2631,7 +2784,12 @@ class DouyinCommercePage(QWidget):
             request_token=request_token,
         )
         if not merge_started:
-            self._batch_location_load_more_pending = False
+            request_owner = self._batch_location_request_owner(
+                cache_query, request_token
+            )
+            self._set_batch_location_pending(
+                "load_more", request_owner, False
+            )
         self._sync_batch_location_controls()
 
     def _batch_location_load_more_failed(
@@ -2640,9 +2798,11 @@ class DouyinCommercePage(QWidget):
         *,
         request_token: int,
     ) -> None:
+        self._clear_batch_location_pending_for_token(
+            "load_more", request_token
+        )
         if request_token != self._batch_location_search_token:
             return
-        self._batch_location_load_more_pending = False
         _LOGGER.warning("抖音带货更多地点读取失败：%s", _normalized(message))
         self._set_batch_location_feedback("更多地点读取失败，已保留现有候选")
         self._sync_batch_location_controls()
@@ -2653,12 +2813,15 @@ class DouyinCommercePage(QWidget):
         *,
         request_token: int | None = None,
     ) -> None:
+        if request_token is not None:
+            self._clear_batch_location_pending_for_token(
+                "load_more", request_token
+            )
         if (
             request_token is not None
             and request_token != self._batch_location_search_token
         ):
             return
-        self._batch_location_load_more_pending = False
         state = self._batch_location_state()
         state["platformResultCount"] = 0
         state["platformContextReady"] = False
@@ -4435,9 +4598,9 @@ class DouyinCommercePage(QWidget):
         self._batch_locations = {}
         self._batch_location_search_token += 1
         self._batch_location_searches = {}
-        self._batch_location_load_more_pending = False
-        self._batch_location_cache_pending = False
-        self._batch_location_merge_pending = False
+        self._batch_location_load_more_pending_owners.clear()
+        self._batch_location_cache_pending_owners.clear()
+        self._batch_location_merge_pending_owners.clear()
         self._batch_schedule_overrides = {}
         self._batch_location_feedback = ""
         # “清空当前内容”必须覆盖完整发布意图，不能只清标题/文案后继续沿用
@@ -5880,9 +6043,9 @@ class DouyinCommercePage(QWidget):
             default=DEFAULT_COMMISSION_FILTER,
         )
         self._batch_location_search_token += 1
-        self._batch_location_load_more_pending = False
-        self._batch_location_cache_pending = False
-        self._batch_location_merge_pending = False
+        self._batch_location_load_more_pending_owners.clear()
+        self._batch_location_cache_pending_owners.clear()
+        self._batch_location_merge_pending_owners.clear()
         self._batch_location_searches = {
             _BATCH_SHARED_LOCATION_SEARCH_KEY: {
                 "scope": search_scope,
@@ -7337,7 +7500,15 @@ class DouyinCommercePage(QWidget):
             and generation_id == self._setup_generation_id
             and action_token == self._collector_action_tokens.get(collector_type)
         ):
-            self._batch_location_load_more_pending = False
+            current_owners = [
+                owner
+                for owner in self._batch_location_load_more_pending_owners
+                if self._batch_location_owner_is_current(owner)
+            ]
+            for request_owner in current_owners:
+                self._set_batch_location_pending(
+                    "load_more", request_owner, False
+                )
             self._set_batch_location_feedback(
                 "更多地点读取失败，已保留现有候选"
             )
@@ -8794,9 +8965,9 @@ class DouyinCommercePage(QWidget):
         self._batch_locations = {}
         self._batch_location_search_token += 1
         self._batch_location_searches = {}
-        self._batch_location_load_more_pending = False
-        self._batch_location_cache_pending = False
-        self._batch_location_merge_pending = False
+        self._batch_location_load_more_pending_owners.clear()
+        self._batch_location_cache_pending_owners.clear()
+        self._batch_location_merge_pending_owners.clear()
         self._batch_schedule_overrides = {}
         self._batch_location_feedback = ""
         self._batch_item_rows_signature = None
@@ -8879,9 +9050,9 @@ class DouyinCommercePage(QWidget):
         self._batch_locations = {}
         self._batch_location_search_token += 1
         self._batch_location_searches = {}
-        self._batch_location_load_more_pending = False
-        self._batch_location_cache_pending = False
-        self._batch_location_merge_pending = False
+        self._batch_location_load_more_pending_owners.clear()
+        self._batch_location_cache_pending_owners.clear()
+        self._batch_location_merge_pending_owners.clear()
         self._batch_schedule_overrides = {}
         self.batch_location_commission_combo.blockSignals(True)
         self.batch_location_commission_combo.setCurrentIndex(

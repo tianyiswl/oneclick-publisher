@@ -11795,6 +11795,129 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             if callable(on_finished):
                 on_finished()
 
+    class _QueuedBackgroundPool:
+        """保留真实 BackgroundTask，由测试明确决定释放顺序。"""
+
+        def __init__(self) -> None:
+            self.tasks: list[BackgroundTask] = []
+
+        def start(self, task: BackgroundTask) -> None:
+            self.tasks.append(task)
+
+    @staticmethod
+    def _run_real_background_task(
+        runner: BackgroundTaskRunner,
+        key: str,
+    ) -> None:
+        task = runner.active[key]
+        task.run()
+        QApplication.processEvents()
+
+    def _queue_interleaved_location_merges(
+        self,
+        *,
+        merge_side_effect,
+    ) -> tuple[
+        BackgroundTaskRunner,
+        str,
+        list[str],
+        object,
+    ]:
+        """挂起 A merge，再让新关键词 B 走完平台首屏。"""
+
+        self._activate_cached_location_search(account_id=901)
+        self.page._setup_generation_id = ""
+        self.page._setup_generation_content_fingerprint = ""
+        self.page._session_id = "session-interleaved-cache"
+        pool = self._QueuedBackgroundPool()
+        runner = BackgroundTaskRunner(self.page)
+        runner.pool = pool
+        self.page.runner = runner
+        empty_page = self._cache_page([])
+        candidate_a = {
+            "poiId": "poi-a",
+            "name": "A 平台地点",
+            "address": "北海市 A 路 1 号",
+            "commissionType": "commission",
+        }
+        candidate_b = {
+            "poiId": "poi-b",
+            "name": "B 平台地点",
+            "address": "南宁市 B 路 2 号",
+            "commissionType": "commission",
+        }
+        cache_get_patcher = patch.object(
+            douyin_location_cache,
+            "get_cached_locations",
+            return_value=empty_page,
+        )
+        merge_patcher = patch.object(
+            douyin_location_cache,
+            "merge_platform_locations",
+            side_effect=merge_side_effect,
+        )
+        platform_search_patcher = patch(
+            "ui.douyin_commerce_page.douyin_commerce_session.commerce_session_manager.search_locations",
+            return_value={
+                "platformResultCount": 1,
+                "candidates": [candidate_b],
+            },
+        )
+        cache_get_patcher.start()
+        merge = merge_patcher.start()
+        platform_search_patcher.start()
+        self.addCleanup(cache_get_patcher.stop)
+        self.addCleanup(merge_patcher.stop)
+        self.addCleanup(platform_search_patcher.stop)
+
+        token_a = self.page._batch_location_search_token
+        query_a = douyin_location_cache.LocationCacheQuery(
+            account_id="901",
+            scope="domestic",
+            keyword="北海",
+            commission_filter="commission",
+        )
+        self.page._batch_location_search_succeeded(
+            "domestic",
+            "北海",
+            {"platformResultCount": 1, "candidates": [candidate_a]},
+            "commission",
+            request_token=token_a,
+            cache_query=query_a,
+        )
+        merge_keys = [
+            key
+            for key in runner.active
+            if key.startswith(self.page._LOCATION_CACHE_MERGE_TASK_KEY)
+        ]
+        self.assertEqual(len(merge_keys), 1)
+        merge_a_key = merge_keys[0]
+
+        self.page.batch_location_keyword.setText("南宁")
+        self.page.batch_location_keyword.textEdited.emit("南宁")
+        self.page._search_batch_locations("domestic", "南宁")
+        cache_search_keys = [
+            key
+            for key in runner.active
+            if key.startswith(self.page._LOCATION_CACHE_SEARCH_TASK_KEY)
+        ]
+        self.assertEqual(len(cache_search_keys), 1)
+        self._run_real_background_task(runner, cache_search_keys[0])
+        self.assertIn(self.page._IMMEDIATE_WRITE_KEY, runner.active)
+        self._run_real_background_task(runner, self.page._IMMEDIATE_WRITE_KEY)
+        QApplication.processEvents()
+
+        return (
+            runner,
+            merge_a_key,
+            [
+                key
+                for key in runner.active
+                if key.startswith(self.page._LOCATION_CACHE_MERGE_TASK_KEY)
+            ],
+            merge,
+        )
+
     @staticmethod
     def _collector_status(
         *,
@@ -11873,23 +11996,35 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.page.batch_location_keyword.setText("北海")
         self.page._sync_batch_location_controls()
 
+    def _only_location_cache_task_key(self, prefix: str) -> str:
+        runner = self.page.runner
+        keys = [key for key in runner.active if key.startswith(prefix)]
+        self.assertEqual(len(keys), 1, runner.active)
+        return keys[0]
+
     def _finish_location_cache_search(self) -> None:
         runner = self.page.runner
-        self.assertIn("douyin_commerce_location_cache_search", runner.active)
-        runner.execute("douyin_commerce_location_cache_search")
-        runner.finish("douyin_commerce_location_cache_search")
+        key = self._only_location_cache_task_key(
+            self.page._LOCATION_CACHE_SEARCH_TASK_KEY
+        )
+        runner.execute(key)
+        runner.finish(key)
 
     def _finish_location_cache_page(self) -> None:
         runner = self.page.runner
-        self.assertIn("douyin_commerce_location_cache_page", runner.active)
-        runner.execute("douyin_commerce_location_cache_page")
-        runner.finish("douyin_commerce_location_cache_page")
+        key = self._only_location_cache_task_key(
+            self.page._LOCATION_CACHE_PAGE_TASK_KEY
+        )
+        runner.execute(key)
+        runner.finish(key)
 
     def _finish_location_cache_merge(self) -> None:
         runner = self.page.runner
-        self.assertIn("douyin_commerce_location_cache_merge", runner.active)
-        runner.execute("douyin_commerce_location_cache_merge")
-        runner.finish("douyin_commerce_location_cache_merge")
+        key = self._only_location_cache_task_key(
+            self.page._LOCATION_CACHE_MERGE_TASK_KEY
+        )
+        runner.execute(key)
+        runner.finish(key)
 
     @staticmethod
     def _cache_page(
@@ -11992,15 +12127,11 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             return_value=next_page,
         ) as platform_load_more:
             self.page.batch_location_search_button.click()
-            self.assertIn("douyin_commerce_location_cache_search", runner.active)
-            runner.execute("douyin_commerce_location_cache_search")
-            runner.finish("douyin_commerce_location_cache_search")
+            self._finish_location_cache_search()
 
             for expected_count in range(20, cache_count + 1, 10):
                 self.page.batch_location_load_more_button.click()
-                self.assertIn("douyin_commerce_location_cache_page", runner.active)
-                runner.execute("douyin_commerce_location_cache_page")
-                runner.finish("douyin_commerce_location_cache_page")
+                self._finish_location_cache_page()
                 self.assertEqual(
                     len(self.page._batch_location_state()["candidates"]),
                     expected_count,
@@ -12010,9 +12141,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             self.assertIn(self.page._IMMEDIATE_WRITE_KEY, runner.active)
             runner.execute(self.page._IMMEDIATE_WRITE_KEY)
             runner.finish(self.page._IMMEDIATE_WRITE_KEY)
-            self.assertIn("douyin_commerce_location_cache_merge", runner.active)
-            runner.execute("douyin_commerce_location_cache_merge")
-            runner.finish("douyin_commerce_location_cache_merge")
+            self._finish_location_cache_merge()
 
             state = self.page._batch_location_state()
             self.assertIs(state.get("platformContextReady"), True)
@@ -12023,9 +12152,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             self.assertIn(self.page._IMMEDIATE_WRITE_KEY, runner.active)
             runner.execute(self.page._IMMEDIATE_WRITE_KEY)
             runner.finish(self.page._IMMEDIATE_WRITE_KEY)
-            self.assertIn("douyin_commerce_location_cache_merge", runner.active)
-            runner.execute("douyin_commerce_location_cache_merge")
-            runner.finish("douyin_commerce_location_cache_merge")
+            self._finish_location_cache_merge()
 
         platform_search.assert_awaited_once()
         platform_load_more.assert_awaited_once_with(
@@ -12158,6 +12285,98 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
 
         merge.assert_called_once()
         self.assertEqual(self.page._batch_location_state()["candidates"], [])
+
+    def test_new_request_merge_starts_while_old_request_merge_is_pending(
+        self,
+    ) -> None:
+        """A merge 挂起时，B 必须以新请求身份独立入队。"""
+
+        def merge_page(query, candidates, **_kwargs):
+            return {
+                "candidates": list(candidates),
+                "offset": 0,
+                "limit": 10,
+                "total": 99 if query.keyword == "北海" else 1,
+                "hasMore": False,
+            }
+
+        runner, merge_a_key, merge_keys, merge = (
+            self._queue_interleaved_location_merges(
+                merge_side_effect=merge_page,
+            )
+        )
+
+        self.assertEqual(len(merge_keys), 2)
+        merge_b_key = next(key for key in merge_keys if key != merge_a_key)
+        self._run_real_background_task(runner, merge_b_key)
+        self.assertEqual(merge.call_count, 1)
+        query_b = merge.call_args.args[0]
+        self.assertEqual(
+            (
+                query_b.account_id,
+                query_b.scope,
+                query_b.keyword,
+                query_b.commission_filter,
+            ),
+            ("901", "domestic", "南宁", "commission"),
+        )
+        state_b = self.page._batch_location_state()
+        feedback_b = self.page._batch_location_feedback
+        self.assertEqual(state_b["keyword"], "南宁")
+        self.assertEqual(state_b["candidates"][0]["poiId"], "poi-b")
+        self.assertFalse(self.page._batch_location_merge_pending)
+
+        self._run_real_background_task(runner, merge_a_key)
+
+        self.assertEqual(merge.call_count, 2)
+        self.assertEqual(self.page._batch_location_state(), state_b)
+        self.assertEqual(self.page._batch_location_feedback, feedback_b)
+        self.assertFalse(self.page._batch_location_merge_pending)
+
+    def test_current_request_merge_failure_is_not_overwritten_by_old_merge(
+        self,
+    ) -> None:
+        """B merge 失败只显示 B 的固定反馈，迟到 A 不得改写。"""
+
+        def merge_page(query, candidates, **_kwargs):
+            if query.keyword == "南宁":
+                raise RuntimeError("/private/cache/b-merge.db")
+            return {
+                "candidates": list(candidates),
+                "offset": 0,
+                "limit": 10,
+                "total": 99,
+                "hasMore": False,
+            }
+
+        runner, merge_a_key, merge_keys, merge = (
+            self._queue_interleaved_location_merges(
+                merge_side_effect=merge_page,
+            )
+        )
+
+        self.assertEqual(len(merge_keys), 2)
+        merge_b_key = next(key for key in merge_keys if key != merge_a_key)
+        self._run_real_background_task(runner, merge_b_key)
+        self.assertEqual(
+            self.page._batch_location_feedback,
+            "地点缓存更新失败，已保留现有候选",
+        )
+        self.assertNotIn("private", self.page._batch_location_feedback)
+        state_b = self.page._batch_location_state()
+        self.assertEqual(state_b["keyword"], "南宁")
+        self.assertEqual(state_b["candidates"][0]["poiId"], "poi-b")
+        self.assertFalse(self.page._batch_location_merge_pending)
+
+        self._run_real_background_task(runner, merge_a_key)
+
+        self.assertEqual(merge.call_count, 2)
+        self.assertEqual(self.page._batch_location_state(), state_b)
+        self.assertEqual(
+            self.page._batch_location_feedback,
+            "地点缓存更新失败，已保留现有候选",
+        )
+        self.assertFalse(self.page._batch_location_merge_pending)
 
     def test_revalidation_cache_shows_reusable_rows_and_starts_platform_search(
         self,
@@ -12947,8 +13166,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             return_value=self._collector_status(),
         ):
             self.page._search_batch_locations("domestic", "北海")
-            runner.execute("douyin_commerce_location_cache_search")
-            runner.finish("douyin_commerce_location_cache_search")
+            self._finish_location_cache_search()
             runner.execute(self.page._COLLECTOR_TASK_KEY)
 
         search.assert_called_once_with(
