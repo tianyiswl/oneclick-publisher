@@ -384,3 +384,56 @@ QT_QPA_PLATFORM=offscreen <venv-python> -m unittest discover -f -q
 - 前置：核对实现提交、报告提交及本节 `654/1090` 测试证据。
 - 动作：按主任务的独立复审结论决定是否集成 `feature/douyin-location-pagination-cache`。
 - 完成证据：集成侧记录采用的提交 SHA；若继续审查，仅新增明确 finding，不把旧 `1088` 当作当前证据。
+
+## 13. Final remediation cycle 5（2026-08-16）
+
+### 13.1 权威、范围与结论
+
+- 本轮唯一精确需求：`final-review-remediation-5.md`；起始 HEAD：`95860052165a1ce58fc0ac924804303a0bf4c712`。
+- 实现提交 SHA：`fcc4809d97fb2e5f0e7d1e28a547760320917ad0`（`fcc4809 修复通用对话框地点控件归属边界`）。
+- 范围：只修复通用 dialog/editor 内普通 wrapper 的地点控件归属误判；产品代码只收紧一个 DOM 边界条件，测试只增加指定负例，无范围外重构。
+- 结论：指定 Important 已完成确定性 RED→最小 GREEN；显式 location/poi panel 正例保留，同面板多个独立控件仍 fail-closed。
+- 闭环层级：交付闭环。没有登录真实账号、连接真实浏览器会话、上传、提交或发布；DOM 测试仅使用本地 headless HTML。
+- 证据降级：cycle 4 的 `1090 tests / 42.019s` 及更早全量均只作历史，不代表当前树。
+
+### 13.2 通用 dialog 内普通 wrapper 无地点所有权
+
+- RED：`test_generic_dialog_content_wrapper_has_no_location_ownership`；夹具为 `role=dialog > ordinary dialog-content wrapper > 双标记输入 + location listbox + 无关加载更多按钮`。旧实现进入无关按钮点击路径并报 `publish_location_load_more_failed`；`Ran 1 test in 5.569s`，exit `1`。
+- GREEN：同一命名用例 `Ran 1 test in 0.278s`，`OK`，exit `0`；返回 `hasMore=False` / `stopReason=no_visible_load_more_control`，无关按钮点击数为 `0`。
+- 最小修复：受控锚点与 listbox 的最小共同祖先只要位于通用 `dialog/editor` owner 内，就不能证明地点所有权。显式 `data-oneclick-commerce-location-panel` 及 location/poi 面板标记仍优先有效。
+
+### 13.3 一次相关 DOM 组合
+
+- 解释器：`/Users/andy/Documents/Codex/2026-07-28/new-chat/outputs/一键发桌面UI基座/.venv/bin/python`。
+- 用例：cycle5 新负例、显式地点面板正例、通用 dialog 直接父级负例、共享 dialog 双标记负例、同面板多独立控件拒绝。
+- 结果：`Ran 5 tests in 1.304s`，`OK`，exit `0`。
+
+### 13.4 唯一一次新最终全量
+
+```text
+QT_QPA_PLATFORM=offscreen /Users/andy/Documents/Codex/2026-07-28/new-chat/outputs/一键发桌面UI基座/.venv/bin/python -m unittest discover -f -q
+```
+
+- 结果：`Ran 1091 tests in 42.623s`，`OK`，`real 42.95s`，`user 29.93s`，`sys 6.59s`，exit `0`。
+- 全量之后没有再修改产品代码或测试；只追加本证据报告。
+
+### 13.5 静态、敏感与差异检查
+
+- `py_compile`：编译 1 个受影响产品文件与 1 个测试文件，exit `0`。
+- `git diff --check`：无输出，exit `0`。
+- 占位扫描：受影响产品/测试新增行中 `TODO|FIXME|XXX|NotImplementedError|raise NotImplemented|pass` 无命中，`rg` exit `1`。
+- 敏感扫描：受影响产品/测试新增行中长 `sk-`、AWS access key、private-key header、长 Bearer token 模式无命中，`rg` exit `1`。
+- 未新增真实 Cookie、密码、API Key、验证码、二维码链接、账号凭据、客户/订单数据或真实平台 DOM 快照。
+
+### 13.6 尚未验证与安全停点
+
+- 尚未验证：真实抖音当日 DOM、overlay/footer 层级、真实账号平台分页与最终读回。这是本轮禁止真实平台动作的预期边界，不将离线证据冒充运行或结果闭环。
+- 本轮分配的未解决 Important：无。
+- 安全停点：分支与 worktree 保留，未合并、未推送、未清理。
+
+### 13.7 唯一下一步
+
+- 执行者：父任务/集成者。
+- 前置：核对实现提交、报告提交及本节 `5/1091` 测试证据。
+- 动作：按主任务的独立复审结论决定是否集成 `feature/douyin-location-pagination-cache`。
+- 完成证据：集成侧记录采用的提交 SHA；若继续审查，只新增明确 finding，不把旧 `1090` 当作当前证据。
