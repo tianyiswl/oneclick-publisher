@@ -2419,8 +2419,9 @@ class DouyinCommercePayloadTests(unittest.TestCase):
             events.append("listbox")
             return listbox
 
-        async def apply_open(_page, actual_listbox, candidate):
+        async def apply_open(_page, actual_listbox, candidate, **kwargs):
             self.assertIs(actual_listbox, listbox)
+            self.assertGreater(kwargs["deadline"], 0)
             self.assertEqual(
                 {key: candidate.get(key) for key in ("poiId", "name", "address")},
                 {
@@ -2611,9 +2612,11 @@ class DouyinCommercePayloadTests(unittest.TestCase):
             previous_candidates,
             commission_filter,
             timeout_ms,
+            deadline,
         ):
             self.assertEqual(commission_filter, "all")
             self.assertGreater(timeout_ms, 0)
+            self.assertGreater(deadline, 0)
             events.append("load_more:店名")
             return {
                 "platformResultCount": len(previous_candidates),
@@ -2623,8 +2626,9 @@ class DouyinCommercePayloadTests(unittest.TestCase):
                 "stopReason": "no_visible_load_more_control",
             }
 
-        async def apply_open(_page, actual_listbox, candidate):
+        async def apply_open(_page, actual_listbox, candidate, **kwargs):
             self.assertIs(actual_listbox, listbox)
+            self.assertGreater(kwargs["deadline"], 0)
             self.assertEqual(
                 {key: candidate.get(key) for key in ("poiId", "name", "address")},
                 {
@@ -2814,6 +2818,313 @@ class DouyinCommercePayloadTests(unittest.TestCase):
 
 class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
     """用真实 DOM 约束地点 portal，避免把整张发布页的输入框算进来。"""
+
+    async def test_publish_search_deadline_stops_before_next_dom_action(self) -> None:
+        """搜索内部两个 DOM 动作耗尽总预算后，范围切换不得再启动。"""
+
+        clock = {"now": 0.0}
+        timeouts: list[int] = []
+
+        class ControlledInput:
+            async def scroll_into_view_if_needed(self, *, timeout: int) -> None:
+                timeouts.append(timeout)
+                clock["now"] += 0.6
+
+            async def click(self, *, timeout: int) -> None:
+                timeouts.append(timeout)
+                clock["now"] += 0.6
+
+        input_control = ControlledInput()
+        scope_switch = AsyncMock(return_value="国内")
+        with patch.object(
+            douyin_commerce_service,
+            "monotonic",
+            side_effect=lambda: clock["now"],
+        ), patch.object(
+            douyin_commerce_service,
+            "_ensure_position_tag",
+            new_callable=AsyncMock,
+        ), patch.object(
+            douyin_commerce_service,
+            "_ensure_local_group_buy_mode",
+            new_callable=AsyncMock,
+            return_value=object(),
+        ), patch.object(
+            douyin_commerce_service,
+            "_open_commerce_search_input",
+            new_callable=AsyncMock,
+            return_value=input_control,
+        ), patch.object(
+            douyin_commerce_service,
+            "set_commerce_location_scope",
+            new=scope_switch,
+        ):
+            with self.assertRaisesRegex(
+                douyin_commerce_service.DouyinCommerceError,
+                "^publish_location_load_more_limit$",
+            ) as raised:
+                await douyin_commerce_service.search_commerce_location_store_candidates(
+                    object(),
+                    "夜南香",
+                    scope="domestic",
+                    deadline=1.0,
+                )
+
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertEqual(len(timeouts), 2)
+        self.assertLessEqual(timeouts[0], 1_000)
+        self.assertLessEqual(timeouts[1], 400)
+        scope_switch.assert_not_awaited()
+
+    async def test_publish_load_more_deadline_stops_before_candidate_poll(self) -> None:
+        """加载更多的 scroll/click 耗尽总预算后，不得再进入候选轮询。"""
+
+        clock = {"now": 0.0}
+        timeouts: list[int] = []
+
+        class ControlledLoadMore:
+            async def scroll_into_view_if_needed(self, *, timeout: int) -> None:
+                timeouts.append(timeout)
+                clock["now"] += 0.6
+
+            async def click(self, *, timeout: int) -> None:
+                timeouts.append(timeout)
+                clock["now"] += 0.6
+
+        first = douyin_commerce_service.normalize_commerce_location_candidate(
+            {
+                "poiId": "poi-first",
+                "name": "首批候选",
+                "address": "广西北海市测试路1号",
+                "commerceInfo": "1件商品 · 1件返佣",
+            }
+        )
+        snapshot = AsyncMock(return_value=(1, [first]))
+        with patch.object(
+            douyin_commerce_service,
+            "monotonic",
+            side_effect=lambda: clock["now"],
+        ), patch.object(
+            douyin_commerce_service,
+            "_load_more_control_or_fail",
+            new_callable=AsyncMock,
+            return_value=ControlledLoadMore(),
+        ), patch.object(
+            douyin_commerce_service,
+            "_load_more_candidates_snapshot_or_fail",
+            new=snapshot,
+        ):
+            with self.assertRaisesRegex(
+                douyin_commerce_service.DouyinCommerceError,
+                "^publish_location_load_more_limit$",
+            ) as raised:
+                await douyin_commerce_service.load_more_commerce_location_candidates(
+                    object(),
+                    previous_candidates=[first],
+                    deadline=1.0,
+                )
+
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertEqual(snapshot.await_count, 1)
+        self.assertEqual(len(timeouts), 2)
+        self.assertLessEqual(timeouts[0], 1_000)
+        self.assertLessEqual(timeouts[1], 400)
+
+    async def test_publish_apply_deadline_stops_before_final_target_click(self) -> None:
+        """目标候选滚动耗尽总预算后，最终点击必须保持未发生。"""
+
+        clock = {"now": 0.0}
+        target = MagicMock()
+
+        async def scroll(*, timeout: int) -> None:
+            clock["now"] += 0.6
+
+        target.scroll_into_view_if_needed = AsyncMock(side_effect=scroll)
+        target.click = AsyncMock()
+        candidate = douyin_commerce_service.normalize_commerce_location_candidate(
+            {
+                "poiId": "poi-target",
+                "name": "夜南香北京烤鸭",
+                "address": "广西北海市万泉城二区3号",
+                "commerceInfo": "1件商品 · 1件返佣",
+            }
+        )
+        with patch.object(
+            douyin_commerce_service,
+            "monotonic",
+            side_effect=lambda: clock["now"],
+        ), patch.object(
+            douyin_commerce_service,
+            "_store_option_descriptors",
+            new_callable=AsyncMock,
+            return_value=[candidate],
+        ), patch.object(
+            douyin_commerce_service,
+            "_location_option_targets",
+            new_callable=AsyncMock,
+            return_value=[target],
+        ), patch.object(
+            douyin_commerce_service,
+            "_anchor_controls",
+            new_callable=AsyncMock,
+            return_value=(None, None, "带货模式", ""),
+        ):
+            with self.assertRaisesRegex(
+                douyin_commerce_service.DouyinCommerceError,
+                "^publish_location_load_more_limit$",
+            ) as raised:
+                await douyin_commerce_service._apply_open_commerce_location_to_page(
+                    object(),
+                    object(),
+                    candidate,
+                    deadline=0.5,
+                )
+
+        self.assertIsNone(raised.exception.__cause__)
+        target.scroll_into_view_if_needed.assert_awaited_once()
+        target.click.assert_not_awaited()
+
+    async def test_publish_apply_clicks_target_when_deadline_has_room(self) -> None:
+        """总预算余量充足时，目标仍必须正常点击并严格回读。"""
+
+        clock = {"now": 0.0}
+        target = MagicMock()
+
+        async def advance_action(*, timeout: int) -> None:
+            clock["now"] += 0.1
+
+        target.scroll_into_view_if_needed = AsyncMock(side_effect=advance_action)
+        target.click = AsyncMock(side_effect=advance_action)
+        listbox = MagicMock()
+        listbox.is_visible = AsyncMock(return_value=False)
+        page = MagicMock()
+
+        async def advance_wait(milliseconds: int) -> None:
+            clock["now"] += milliseconds / 1000
+
+        page.wait_for_timeout = AsyncMock(side_effect=advance_wait)
+        candidate = douyin_commerce_service.normalize_commerce_location_candidate(
+            {
+                "poiId": "poi-target",
+                "name": "夜南香北京烤鸭",
+                "address": "广西北海市万泉城二区3号",
+                "commerceInfo": "1件商品 · 1件返佣",
+            }
+        )
+        readbacks = AsyncMock(
+            side_effect=[
+                (None, None, "带货模式", ""),
+                (None, None, "带货模式", candidate["name"]),
+            ]
+        )
+        with patch.object(
+            douyin_commerce_service,
+            "monotonic",
+            side_effect=lambda: clock["now"],
+        ), patch.object(
+            douyin_commerce_service,
+            "_store_option_descriptors",
+            new_callable=AsyncMock,
+            return_value=[candidate],
+        ), patch.object(
+            douyin_commerce_service,
+            "_location_option_targets",
+            new_callable=AsyncMock,
+            return_value=[target],
+        ), patch.object(
+            douyin_commerce_service,
+            "_anchor_controls",
+            new=readbacks,
+        ):
+            result = await douyin_commerce_service._apply_open_commerce_location_to_page(
+                page,
+                listbox,
+                candidate,
+                deadline=10.0,
+            )
+
+        target.click.assert_awaited_once()
+        self.assertEqual(result["location"]["name"], "夜南香北京烤鸭")
+
+    async def test_publish_threads_one_deadline_through_search_load_and_apply(
+        self,
+    ) -> None:
+        """正式发布的搜索、分页和点击必须共用同一绝对时间点。"""
+
+        first = douyin_commerce_service.normalize_commerce_location_candidate(
+            {
+                "poiId": "poi-first",
+                "name": "非目标",
+                "address": "广西北海市候选路1号",
+                "commerceInfo": "1件商品 · 1件返佣",
+            }
+        )
+        preset = douyin_commerce_service.normalize_commerce_location_candidate(
+            {
+                "poiId": "poi-target",
+                "name": "目标",
+                "address": "广西北海市目标路1号",
+                "commerceInfo": "1件商品 · 1件返佣",
+            }
+        )
+        deadlines: list[float] = []
+
+        async def search(_page, _keyword, **kwargs):
+            deadlines.append(kwargs["deadline"])
+            return [first]
+
+        async def load_more(_page, **kwargs):
+            deadlines.append(kwargs["deadline"])
+            return {
+                "platformResultCount": 2,
+                "candidates": [first, preset],
+                "newCandidateCount": 1,
+                "hasMore": False,
+                "stopReason": "loaded",
+            }
+
+        async def apply_open(_page, _listbox, _candidate, **kwargs):
+            deadlines.append(kwargs["deadline"])
+            return {"location": dict(preset)}
+
+        with patch.object(
+            douyin_commerce_service,
+            "monotonic",
+            return_value=10.0,
+        ), patch.object(
+            douyin_commerce_service,
+            "search_commerce_location_store_candidates",
+            new=search,
+        ), patch.object(
+            douyin_commerce_service,
+            "load_more_commerce_location_candidates",
+            new=load_more,
+        ), patch.object(
+            douyin_commerce_service,
+            "_visible_store_listbox",
+            new_callable=AsyncMock,
+            return_value=object(),
+        ), patch.object(
+            douyin_commerce_service,
+            "_apply_open_commerce_location_to_page",
+            new=apply_open,
+        ), patch.object(
+            douyin_commerce_service,
+            "close_commerce_store_selector",
+            new_callable=AsyncMock,
+        ):
+            result = await douyin_commerce_service.apply_saved_commerce_location_to_page(
+                object(),
+                preset,
+                "domestic",
+                ["目标"],
+                "commission",
+            )
+
+        self.assertEqual(result["location"]["name"], "目标")
+        self.assertEqual(len(deadlines), 3)
+        self.assertEqual(len(set(deadlines)), 1)
+        self.assertGreater(deadlines[0], 10.0)
 
     async def test_visibility_override_and_hidden_portal_obey_effective_visibility(
         self,
