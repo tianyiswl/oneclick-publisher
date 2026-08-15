@@ -129,6 +129,16 @@ def _same_store(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
 
 
 @dataclass
+class _LocationSearchContext:
+    keyword: str
+    scope: str
+    commission_filter: str
+    candidates: list[dict[str, Any]]
+    load_more_count: int = 0
+    zero_growth_count: int = 0
+
+
+@dataclass
 class _CommerceEditorSession:
     """只在进程内存在的受控抖音编辑器状态。"""
 
@@ -147,6 +157,7 @@ class _CommerceEditorSession:
     music_candidates: list[dict[str, str]] = field(default_factory=list)
     selected_music: dict[str, str] | None = None
     commerce_location_candidates: list[dict[str, Any]] = field(default_factory=list)
+    location_search_context: _LocationSearchContext | None = None
     location: dict[str, str] | None = None
     location_scope: str = ""
     selected_declaration: str = ""
@@ -362,6 +373,49 @@ class DouyinCommerceSessionManager:
                 keyword,
                 scope,
                 **search_kwargs,
+            )
+        )
+
+    def load_more_locations(
+        self,
+        session_id: str,
+        keyword: object,
+        scope: object,
+        *,
+        commission_filter: object,
+        previous_candidates: object,
+    ) -> dict[str, object]:
+        """为同一地点搜索上下文加载下一页公开候选。"""
+
+        try:
+            selected_scope = douyin_commerce_service.normalize_commerce_location_scope(
+                scope
+            )
+            selected_commission_filter = normalize_commission_filter(
+                commission_filter,
+                default="all",
+            )
+        except Exception:
+            raise DouyinCommerceSessionError(
+                "collector_search_context_mismatch"
+            ) from None
+        try:
+            if not isinstance(previous_candidates, list) or any(
+                not isinstance(item, Mapping) for item in previous_candidates
+            ):
+                raise TypeError("previous_candidates_invalid")
+            previous_snapshot = [dict(item) for item in previous_candidates]
+        except Exception:
+            raise DouyinCommerceSessionError(
+                "publish_location_load_more_failed"
+            ) from None
+        return self._call(
+            self._load_more_locations(
+                session_id,
+                _normalized(keyword),
+                selected_scope,
+                commission_filter=selected_commission_filter,
+                previous_candidates=previous_snapshot,
             )
         )
 
@@ -960,6 +1014,7 @@ class DouyinCommerceSessionManager:
         session.music_candidates = []
         session.selected_music = None
         session.commerce_location_candidates = []
+        session.location_search_context = None
         session.location = None
         session.location_scope = ""
         session.selected_declaration = ""
@@ -1000,6 +1055,9 @@ class DouyinCommerceSessionManager:
             raise DouyinCommerceSessionError(
                 f"抖音带货位置搜索失败：{_normalized(str(exc))[:260]}"
             ) from exc
+
+        # 新检索一旦开始，旧分页上下文立即失效；失败也不能恢复旧页。
+        session.location_search_context = None
 
         candidates: list[dict[str, Any]] = []
         platform_result_count = 0
@@ -1073,15 +1131,15 @@ class DouyinCommerceSessionManager:
                 raise DouyinCommerceSessionError(
                     f"抖音带货位置搜索失败：{error_text[:260]}"
                 ) from exc
-        try:
-            await douyin_commerce_service.close_commerce_store_selector(session.page)
-        except Exception as exc:
-            raise DouyinCommerceSessionError(
-                f"抖音地点候选读取后未能安全关闭：{_normalized(str(exc))[:220]}"
-            ) from exc
         # 新搜索结果会改变发布定位。任何此前的门店选择、预检或定时回读都
         # 必须失效，避免误把旧门店用于新地点。
         session.commerce_location_candidates = [dict(item) for item in candidates]
+        session.location_search_context = _LocationSearchContext(
+            keyword=_normalized(keyword),
+            scope=selected_scope,
+            commission_filter=selected_commission_filter,
+            candidates=[dict(item) for item in candidates],
+        )
         session.location = None
         session.location_scope = selected_scope
         session.stores = []
@@ -1098,6 +1156,93 @@ class DouyinCommerceSessionManager:
                 "candidates": public_candidates,
             }
         return public_candidates
+
+    async def _load_more_locations(
+        self,
+        session_id: str,
+        keyword: object,
+        scope: object,
+        *,
+        commission_filter: object,
+        previous_candidates: object,
+    ) -> dict[str, object]:
+        session = await self._current(session_id)
+        self._ensure_editor_not_blocked_by_music_picker(session)
+        try:
+            selected_scope = douyin_commerce_service.normalize_commerce_location_scope(
+                scope
+            )
+            selected_commission_filter = normalize_commission_filter(
+                commission_filter,
+                default="all",
+            )
+        except Exception:
+            raise DouyinCommerceSessionError(
+                "collector_search_context_mismatch"
+            ) from None
+        context = session.location_search_context
+        if context is None or (
+            context.keyword,
+            context.scope,
+            context.commission_filter,
+        ) != (
+            _normalized(keyword),
+            selected_scope,
+            selected_commission_filter,
+        ):
+            raise DouyinCommerceSessionError(
+                "collector_search_context_mismatch"
+            ) from None
+        try:
+            result = await douyin_commerce_service.load_more_commerce_location_candidates(
+                session.page,
+                previous_candidates=previous_candidates,
+                commission_filter=selected_commission_filter,
+            )
+            if not isinstance(result, Mapping):
+                raise TypeError("metadata_result_invalid")
+            raw_count = result.get("platformResultCount")
+            raw_candidates = result.get("candidates")
+            raw_new_count = result.get("newCandidateCount")
+            raw_has_more = result.get("hasMore")
+            raw_stop_reason = result.get("stopReason")
+            if (
+                type(raw_count) is not int
+                or raw_count < 0
+                or not isinstance(raw_candidates, list)
+                or type(raw_new_count) is not int
+                or raw_new_count < 0
+                or type(raw_has_more) is not bool
+                or not isinstance(raw_stop_reason, str)
+                or not raw_stop_reason
+            ):
+                raise TypeError("metadata_result_invalid")
+            candidates = [
+                dict(item) for item in raw_candidates if isinstance(item, Mapping)
+            ]
+            if len(candidates) != len(raw_candidates):
+                raise TypeError("metadata_result_invalid")
+        except Exception:
+            raise DouyinCommerceSessionError(
+                "publish_location_load_more_failed"
+            ) from None
+        if session.location_search_context is not context:
+            raise DouyinCommerceSessionError(
+                "collector_search_context_mismatch"
+            ) from None
+        context.candidates = [dict(item) for item in candidates]
+        context.load_more_count += 1
+        context.zero_growth_count = (
+            context.zero_growth_count + 1 if raw_new_count == 0 else 0
+        )
+        session.commerce_location_candidates = [dict(item) for item in candidates]
+        return {
+            "platformResultCount": raw_count,
+            "candidates": [dict(item) for item in candidates],
+            "newCandidateCount": raw_new_count,
+            "hasMore": raw_has_more,
+            "stopReason": raw_stop_reason,
+        }
 
     async def _apply_location(
         self,
@@ -1705,6 +1850,7 @@ class DouyinCommerceSessionManager:
             return
         if session_id and _normalized(session_id) != session.session_id:
             raise DouyinCommerceSessionError("无法关闭已替换的抖音带货会话")
+        session.location_search_context = None
         self._session = None
         await self._close_resources(
             context=session.context,
@@ -1720,6 +1866,7 @@ class DouyinCommerceSessionManager:
             raise DouyinCommerceSessionError(
                 "commerce_session_close_failed"
             ) from None
+        session.location_search_context = None
         complete = await self._close_resources_strict(session)
         if not complete:
             raise DouyinCommerceSessionError(

@@ -45,6 +45,9 @@ class FakeSessionManager:
         self.start_result_override: dict[str, str] | None = None
         self.refresh_calls: list[str] = []
         self.location_calls: list[tuple[str, object, object, object]] = []
+        self.load_more_calls: list[
+            tuple[str, object, object, object, list[dict[str, Any]]]
+        ] = []
         self.location_scopes: list[object] = []
         self.close_calls: list[str | None] = []
         self.close_thread_idents: list[int] = []
@@ -53,11 +56,16 @@ class FakeSessionManager:
         self.close_during_location = False
         self.refresh_started = threading.Event()
         self.location_started = threading.Event()
+        self.load_more_started = threading.Event()
         self.release_refresh: threading.Event | None = None
         self.release_location: threading.Event | None = None
+        self.release_load_more: threading.Event | None = None
         self.refresh_error: Exception | None = None
         self.search_error: Exception | None = None
         self.location_result_override: object | None = None
+        self.load_more_result_override: object | None = None
+        self.location_search_context: tuple[str, str, str] | None = None
+        self.current_location_candidates: list[dict[str, Any]] = []
         self.close_failures_remaining = 0
 
     def start_upload(
@@ -110,15 +118,65 @@ class FakeSessionManager:
             self.release_location.wait(timeout=2)
         if self.search_error is not None:
             raise self.search_error
-        if self.location_result_override is not None:
-            return self.location_result_override
-        return [
-            {
-                "poiId": f"poi-{self.manager_id}",
-                "name": str(keyword),
-                "address": "广西北海",
+        result = self.location_result_override
+        if result is None:
+            result = [
+                {
+                    "poiId": f"poi-{self.manager_id}",
+                    "name": str(keyword),
+                    "address": "广西北海",
+                }
+            ]
+        if isinstance(result, list):
+            self.location_search_context = (
+                str(keyword),
+                str(scope),
+                str(commission_filter),
+            )
+            self.current_location_candidates = [dict(item) for item in result]
+        return result
+
+    def load_more_locations(
+        self,
+        session_id: str,
+        keyword: object,
+        scope: object,
+        *,
+        commission_filter: object,
+        previous_candidates: object,
+    ) -> dict[str, object]:
+        context = (str(keyword), str(scope), str(commission_filter))
+        if context != self.location_search_context:
+            raise RuntimeError("collector_search_context_mismatch")
+        previous = [dict(item) for item in previous_candidates]
+        self.load_more_calls.append(
+            (session_id, keyword, scope, commission_filter, previous)
+        )
+        self.load_more_started.set()
+        if self.release_load_more is not None:
+            self.release_load_more.wait(timeout=2)
+        if self.load_more_result_override is not None:
+            result = self.load_more_result_override
+        else:
+            result = {
+                "platformResultCount": len(previous) + 1,
+                "candidates": previous
+                + [
+                    {
+                        "poiId": f"poi-more-{self.manager_id}",
+                        "name": str(keyword),
+                        "address": "广西北海新页",
+                    }
+                ],
+                "newCandidateCount": 1,
+                "hasMore": True,
+                "stopReason": "loaded",
             }
-        ]
+        if isinstance(result, Mapping) and isinstance(result.get("candidates"), list):
+            self.current_location_candidates = [
+                dict(item) for item in result["candidates"]
+            ]
+        return result
 
     def close(self, session_id: str | None = None) -> None:
         self.close_started.set()
@@ -395,6 +453,127 @@ class DouyinCommerceCollectorManagerTests(unittest.TestCase):
                     "commission",
                 )
             ],
+        )
+
+    def test_load_more_requires_same_keyword_scope_and_filter(self):
+        generation_id = self.manager.begin_generation(self.upload_payload)[
+            "setupGenerationId"
+        ]
+        searched = self.manager.search_locations(
+            generation_id,
+            "夜南香",
+            "domestic",
+            commission_filter="commission",
+        )
+
+        with self.assertRaisesRegex(
+            DouyinCommerceCollectorError,
+            "collector_search_context_mismatch",
+        ) as raised:
+            self.manager.load_more_locations(
+                generation_id,
+                "新关键词",
+                "domestic",
+                commission_filter="commission",
+                previous_candidates=searched["candidates"],
+            )
+
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertEqual(
+            self.manager.status(generation_id)["collectors"][
+                "domestic_location"
+            ],
+            "active",
+        )
+
+    def test_late_load_more_is_discarded(self):
+        generation_id = self.manager.begin_generation(self.upload_payload)[
+            "setupGenerationId"
+        ]
+        searched = self.manager.search_locations(
+            generation_id,
+            "夜南香",
+            "domestic",
+            commission_filter="commission",
+        )
+        previous_candidates = searched["candidates"]
+        old_manager = self.factory.instances[0]
+        old_manager.release_load_more = threading.Event()
+        old_instance_id = self.manager.status(generation_id)[
+            "collectorInstanceIds"
+        ]["domestic_location"]
+        outcome: dict[str, object] = {}
+        load_more_thread = threading.Thread(
+            target=lambda: self._capture_call(
+                outcome,
+                "load_more",
+                lambda: self.manager.load_more_locations(
+                    generation_id,
+                    "夜南香",
+                    "domestic",
+                    commission_filter="commission",
+                    previous_candidates=previous_candidates,
+                ),
+            )
+        )
+        load_more_thread.start()
+        self.assertTrue(old_manager.load_more_started.wait(timeout=1))
+
+        with self.manager._state_lock:
+            runtime = self.manager._runtime
+            old_runtime = runtime.collectors[CollectorType.DOMESTIC_LOCATION]
+            replacement_manager = self.factory()
+            replacement_manager.start_upload(self.upload_payload)
+            replacement_manager.search_locations(
+                replacement_manager.session_id,
+                "新搜索",
+                "domestic",
+                commission_filter="commission",
+            )
+            replacement = type(old_runtime)(
+                collector_type=CollectorType.DOMESTIC_LOCATION,
+                manager=replacement_manager,
+                instance_id="replacement-instance",
+                session_id=replacement_manager.session_id,
+                fixed_scope="domestic",
+            )
+            runtime.collectors[CollectorType.DOMESTIC_LOCATION] = replacement
+            slot = runtime.generation.collectors[CollectorType.DOMESTIC_LOCATION]
+            slot.instance_id = replacement.instance_id
+            slot.session_id = replacement.session_id
+
+        music_thread = threading.Thread(
+            target=lambda: self._capture_call(
+                outcome,
+                "music",
+                lambda: self.manager.refresh_favorite_music(generation_id),
+            )
+        )
+        music_thread.start()
+        time.sleep(0.05)
+        self.assertEqual(len(self.factory.instances), 2)
+
+        old_manager.release_load_more.set()
+        load_more_thread.join(timeout=1)
+        music_thread.join(timeout=1)
+
+        self.assertFalse(load_more_thread.is_alive())
+        self.assertFalse(music_thread.is_alive())
+        self.assertEqual(len(self.factory.instances), 3)
+        error = outcome["load_more_error"]
+        self.assertIsInstance(error, DouyinCommerceCollectorError)
+        self.assertEqual(str(error), "stale_result_discarded")
+        self.assertEqual(
+            error.to_public_action_result()["collectorInstanceId"],
+            old_instance_id,
+        )
+        self.assertEqual(
+            replacement_manager.location_search_context,
+            ("新搜索", "domestic", "commission"),
+        )
+        self.assertEqual(
+            replacement_manager.current_location_candidates[0]["name"],
+            "新搜索",
         )
 
     def test_metadata_search_crosses_real_collector_session_and_service_when_filter_is_empty(self):

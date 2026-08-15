@@ -666,6 +666,82 @@ class DouyinCommerceCollectorManager:
                 error, generation_id, collector_type, action_instance_id
             ) from None
 
+    def load_more_locations(
+        self,
+        generation_id: str,
+        keyword: object,
+        scope: object,
+        *,
+        commission_filter: object,
+        previous_candidates: object,
+    ) -> dict[str, object]:
+        """在同一地点搜索会话中串行读取下一页候选。"""
+
+        normalized_scope = self._normalize_public_text(
+            scope, error_code="collector_scope_mismatch"
+        ).strip().casefold()
+        generation_id = self._normalize_public_text(
+            generation_id, error_code="stale_result_discarded"
+        )
+        normalized_keyword = self._normalize_public_text(
+            keyword, error_code="collector_unknown"
+        )
+        try:
+            selected_commission_filter = normalize_commission_filter(
+                commission_filter,
+                default="all",
+            )
+            if not isinstance(previous_candidates, list) or any(
+                not isinstance(item, Mapping) for item in previous_candidates
+            ):
+                raise TypeError("previous_candidates_invalid")
+            previous_snapshot = [dict(item) for item in previous_candidates]
+        except Exception:
+            raise DouyinCommerceCollectorError(
+                "publish_location_load_more_failed"
+            ) from None
+        collector_type = _LOCATION_COLLECTORS.get(normalized_scope)
+        if collector_type is None:
+            raise DouyinCommerceCollectorError("collector_scope_mismatch")
+        request_id = str(uuid4())
+        with self._state_lock:
+            runtime = self._require_collecting_runtime(generation_id)
+            current = runtime.collectors.get(collector_type)
+            action_instance_id = (
+                current.instance_id if current is not None else str(uuid4())
+            )
+            action = self._action_queue.reserve(
+                generation_id,
+                request_id,
+                collector_type,
+                lambda: self._load_more_locations_action(
+                    generation_id,
+                    collector_type,
+                    request_id,
+                    normalized_keyword,
+                    normalized_scope,
+                    action_instance_id,
+                    selected_commission_filter,
+                    previous_snapshot,
+                ),
+            )
+        self._action_queue.start(action)
+        try:
+            return self._wait_public_action(
+                action,
+                generation_id=generation_id,
+                collector_type=collector_type,
+                request_id=request_id,
+                action_name="load_more_locations",
+                action_instance_id=action_instance_id,
+                scope=normalized_scope,
+                keyword=normalized_keyword,
+            )
+        except DouyinCommerceCollectorError as error:
+            raise self._contextual_action_error(
+                error, generation_id, collector_type, action_instance_id
+            ) from None
+
     def retry_collector(
         self,
         generation_id: str,
@@ -1386,6 +1462,120 @@ class DouyinCommerceCollectorManager:
             platform_result_count=platform_result_count,
         )
 
+    def _load_more_locations_action(
+        self,
+        generation_id: str,
+        collector_type: CollectorType,
+        request_id: str,
+        keyword: str,
+        scope: str,
+        action_instance_id: str,
+        commission_filter: str,
+        previous_candidates: list[dict[str, Any]],
+    ) -> dict[str, object]:
+        started_at = monotonic()
+        collector = self._ensure_collector(
+            generation_id,
+            collector_type,
+            action_instance_id=action_instance_id,
+        )
+        if collector.fixed_scope != scope:
+            raise DouyinCommerceCollectorError("collector_scope_mismatch")
+        self._validate_active_collector(generation_id, collector)
+        try:
+            result = collector.manager.load_more_locations(
+                collector.session_id,
+                keyword,
+                scope,
+                commission_filter=commission_filter,
+                previous_candidates=[dict(item) for item in previous_candidates],
+            )
+        except Exception as error:
+            error_code = self._classify_diagnostic_error(error)
+            if error_code == "collector_search_context_mismatch":
+                self._validate_active_collector(generation_id, collector)
+            elif not self._mark_failed(generation_id, collector):
+                self._emit_event(
+                    request_id=request_id,
+                    generation_id=generation_id,
+                    collector=collector,
+                    phase="result",
+                    action="load_more_locations",
+                    scope=scope,
+                    keyword=keyword,
+                    outcome="discarded",
+                    error_code="stale_result_discarded",
+                    duration_ms=self._elapsed_ms(started_at),
+                )
+                raise DouyinCommerceCollectorError(
+                    "stale_result_discarded", event_emitted=True
+                ) from None
+            self._log_diagnostic_failure(error_code, error)
+            self._emit_event(
+                request_id=request_id,
+                generation_id=generation_id,
+                collector=collector,
+                phase="result",
+                action="load_more_locations",
+                scope=scope,
+                keyword=keyword,
+                duration_ms=self._elapsed_ms(started_at),
+                outcome="failed",
+                error_code=error_code,
+            )
+            raise DouyinCommerceCollectorError(
+                error_code, event_emitted=True
+            ) from None
+        try:
+            if not isinstance(result, Mapping):
+                raise TypeError("metadata_result_invalid")
+            platform_result_count = result.get("platformResultCount")
+            raw_candidates = result.get("candidates")
+            new_candidate_count = result.get("newCandidateCount")
+            has_more = result.get("hasMore")
+            stop_reason = result.get("stopReason")
+            if (
+                type(platform_result_count) is not int
+                or platform_result_count < 0
+                or not isinstance(raw_candidates, list)
+                or type(new_candidate_count) is not int
+                or new_candidate_count < 0
+                or type(has_more) is not bool
+                or not isinstance(stop_reason, str)
+                or not stop_reason
+            ):
+                raise TypeError("metadata_result_invalid")
+            public_result = [dict(item) for item in raw_candidates]
+        except Exception as error:
+            if not self._mark_failed(generation_id, collector):
+                raise DouyinCommerceCollectorError(
+                    "stale_result_discarded"
+                ) from None
+            self._log_diagnostic_failure(
+                "publish_location_load_more_failed", error
+            )
+            raise DouyinCommerceCollectorError(
+                "publish_location_load_more_failed"
+            ) from None
+        self._accept_or_discard(
+            generation_id,
+            collector,
+            request_id=request_id,
+            action="load_more_locations",
+            scope=scope,
+            keyword=keyword,
+        )
+        return self._public_action_result(
+            generation_id,
+            collector_type,
+            collector.instance_id,
+            candidates=public_result,
+            platform_result_count=platform_result_count,
+            new_candidate_count=new_candidate_count,
+            has_more=has_more,
+            stop_reason=stop_reason,
+        )
+
     def _retry_collector_action(
         self,
         generation_id: str,
@@ -1874,6 +2064,9 @@ class DouyinCommerceCollectorManager:
         *,
         candidates: list[dict[str, Any]] | None = None,
         platform_result_count: int | None = None,
+        new_candidate_count: int | None = None,
+        has_more: bool | None = None,
+        stop_reason: str | None = None,
     ) -> dict[str, object]:
         """返回带代际、类型、实例三重门禁的统一动作结果。"""
 
@@ -1901,6 +2094,12 @@ class DouyinCommerceCollectorManager:
             result["candidates"] = [dict(item) for item in candidates]
         if platform_result_count is not None:
             result["platformResultCount"] = platform_result_count
+        if new_candidate_count is not None:
+            result["newCandidateCount"] = new_candidate_count
+        if has_more is not None:
+            result["hasMore"] = has_more
+        if stop_reason is not None:
+            result["stopReason"] = stop_reason
         return result
 
     def _contextual_action_error(
@@ -2039,6 +2238,11 @@ class DouyinCommerceCollectorManager:
         """按固定优先级将底层异常收敛为公开错误码。"""
 
         detail = cls._trusted_diagnostic_text(error).strip().casefold()
+        if detail in {
+            "collector_search_context_mismatch",
+            "publish_location_load_more_failed",
+        }:
+            return detail
         if any(marker in detail for marker in _LOGIN_MARKERS):
             return "login_required"
         if any(marker in detail for marker in _SCOPE_MARKERS) or (
@@ -2083,6 +2287,8 @@ class DouyinCommerceCollectorManager:
                 "candidate_empty",
                 "rate_limited_or_degraded",
                 "cleanup_incomplete",
+                "collector_search_context_mismatch",
+                "publish_location_load_more_failed",
                 "collector_unknown",
             }
             else "collector_unknown"

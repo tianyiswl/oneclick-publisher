@@ -7201,6 +7201,96 @@ class DouyinCommerceTaskPresentationTests(unittest.TestCase):
 
 
 class DouyinCommerceSessionContractTests(unittest.TestCase):
+    def test_load_more_returns_public_metadata(self):
+        manager = douyin_commerce_session.DouyinCommerceSessionManager()
+        page = MagicMock()
+        page.is_closed.return_value = False
+        manager._session = douyin_commerce_session._CommerceEditorSession(
+            session_id="session-demo",
+            upload_payload={},
+            account_name="测试账号",
+            browser=None,
+            context=None,
+            page=page,
+            playwright=None,
+            uploader=None,
+        )
+        first_page = [
+            {
+                "poiId": "poi-001",
+                "name": "夜南香",
+                "address": "广西北海第一页",
+                "commissionType": "commission",
+            }
+        ]
+        expected = {
+            "platformResultCount": 2,
+            "candidates": first_page
+            + [
+                {
+                    "poiId": "poi-002",
+                    "name": "夜南香二店",
+                    "address": "广西北海第二页",
+                    "commissionType": "commission",
+                }
+            ],
+            "newCandidateCount": 1,
+            "hasMore": True,
+            "stopReason": "loaded",
+        }
+
+        with patch.object(
+            manager,
+            "_call",
+            side_effect=lambda coroutine: asyncio.run(coroutine),
+        ), patch.object(
+            douyin_commerce_session.douyin_commerce_service,
+            "search_commerce_location_store_candidates",
+            new_callable=AsyncMock,
+            return_value=first_page,
+        ), patch.object(
+            douyin_commerce_session.douyin_commerce_service,
+            "close_commerce_store_selector",
+            new_callable=AsyncMock,
+        ) as close_selector:
+            manager.search_locations(
+                "session-demo",
+                "夜南香",
+                "domestic",
+                commission_filter="commission",
+            )
+            self.assertEqual(close_selector.await_count, 1)
+        with patch.object(
+            manager,
+            "_call",
+            side_effect=lambda coroutine: asyncio.run(coroutine),
+        ), patch.object(
+            douyin_commerce_session.douyin_commerce_service,
+            "load_more_commerce_location_candidates",
+            new_callable=AsyncMock,
+            return_value=expected,
+        ) as load_more:
+            result = manager.load_more_locations(
+                "session-demo",
+                "夜南香",
+                "domestic",
+                commission_filter="commission",
+                previous_candidates=first_page,
+            )
+
+        self.assertEqual(result, expected)
+        load_more.assert_awaited_once_with(
+            page,
+            previous_candidates=first_page,
+            commission_filter="commission",
+        )
+        self.assertEqual(
+            manager._session.commerce_location_candidates,
+            expected["candidates"],
+        )
+        self.assertEqual(manager._session.location_search_context.load_more_count, 1)
+        self.assertEqual(manager._session.location_search_context.zero_growth_count, 0)
+
     def test_location_search_passes_normalized_commission_filter_to_service_before_dedupe(self):
         """会话搜索必须让 service 先按返佣筛选，再做 POI 唯一性判定。"""
 
@@ -9380,7 +9470,7 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
             scope="domestic",
             commission_filter="all",
         )
-        self.assertEqual(close_selector.await_count, 2)
+        self.assertEqual(close_selector.await_count, 1)
         self.assertEqual(result, expected)
         self.assertEqual(manager._session.commerce_location_candidates, expected)
         self.assertIsNone(manager._session.location)
@@ -9723,7 +9813,7 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
         self.assertEqual(search.await_count, 2)
         refresh_music.assert_not_awaited()
         page.wait_for_timeout.assert_awaited_once_with(1_500)
-        self.assertEqual(close_selector.await_count, 4)
+        self.assertEqual(close_selector.await_count, 3)
         self.assertEqual(result, expected)
 
     def test_prepare_publish_settings_closes_layers_before_clearing_state(self) -> None:
