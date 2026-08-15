@@ -2538,7 +2538,11 @@ async def _unique_visible_load_more_control(page) -> Any | None:
                     + 'a[href], [role="button"], [tabindex], [onclick]'
                 )).filter(isEffectivelyVisible).filter(node => {
                     if (node.matches('[disabled], [aria-disabled="true"]')
-                        || node.closest('[disabled], [aria-disabled="true"]')) return false;
+                        || node.closest('[disabled], [aria-disabled="true"], [inert]')) return false;
+                    const view = node.ownerDocument?.defaultView;
+                    for (let current = node; current; current = current.parentElement) {
+                        if (view?.getComputedStyle(current)?.pointerEvents === 'none') return false;
+                    }
                     const text = normalize(node instanceof HTMLInputElement
                         ? node.value : (node.innerText || node.textContent));
                     return text.includes('点击加载更多') || text.includes('加载更多');
@@ -2560,6 +2564,27 @@ async def _unique_visible_load_more_control(page) -> Any | None:
     return None
 
 
+def _commerce_location_candidate_identity(
+    candidate: Mapping[str, Any],
+) -> tuple[str, str, str, str]:
+    """返回地点候选的完整公开身份，保留同 POI 的返佣变体。"""
+
+    return (
+        _normalized(candidate.get("poiId")),
+        _normalized(candidate.get("name")),
+        _normalized(candidate.get("address")),
+        _normalized(candidate.get("commissionType")),
+    )
+
+
+def _commerce_location_candidates_signature(rows: list[Mapping[str, Any]]) -> str:
+    """将完整公开身份收敛为可比较的稳定快照。"""
+
+    return "\n".join(
+        "\u241f".join(_commerce_location_candidate_identity(row)) for row in rows
+    )
+
+
 def _dedupe_public_commerce_location_candidates(
     rows: object,
     *,
@@ -2570,7 +2595,7 @@ def _dedupe_public_commerce_location_candidates(
     if not isinstance(rows, list):
         return []
     result: list[dict[str, Any]] = []
-    seen: set[str] = set()
+    seen: set[tuple[str, str, str, str]] = set()
     for row in rows:
         candidate = normalize_commerce_location_candidate(row)
         if candidate is None:
@@ -2579,10 +2604,10 @@ def _dedupe_public_commerce_location_candidates(
         if not filtered:
             continue
         public_candidate = dict(filtered[0])
-        candidate_id = _normalized(public_candidate.get("poiId"))
-        if not candidate_id or candidate_id in seen:
+        candidate_identity = _commerce_location_candidate_identity(public_candidate)
+        if not candidate_identity[0] or candidate_identity in seen:
             continue
-        seen.add(candidate_id)
+        seen.add(candidate_identity)
         result.append(public_candidate)
     return result
 
@@ -2609,6 +2634,31 @@ async def _commerce_location_candidates_snapshot(
     return len(platform_candidates), candidates
 
 
+async def _load_more_control_or_fail(page) -> Any | None:
+    """把加载更多控件读取失败统一收敛为公开固定错误。"""
+
+    try:
+        return await _unique_visible_load_more_control(page)
+    except Exception:
+        raise DouyinCommerceError("publish_location_load_more_failed") from None
+
+
+async def _load_more_candidates_snapshot_or_fail(
+    page,
+    *,
+    commission_filter: str,
+) -> tuple[int, list[dict[str, Any]]]:
+    """把候选快照读取失败统一收敛为公开固定错误。"""
+
+    try:
+        return await _commerce_location_candidates_snapshot(
+            page,
+            commission_filter=commission_filter,
+        )
+    except Exception:
+        raise DouyinCommerceError("publish_location_load_more_failed") from None
+
+
 async def load_more_commerce_location_candidates(
     page,
     *,
@@ -2621,22 +2671,24 @@ async def load_more_commerce_location_candidates(
     try:
         selected_filter = normalize_commission_filter(commission_filter, default="all")
         normalized_timeout_ms = max(_LOCATION_RESULT_POLL_INTERVAL_MS, int(timeout_ms))
-    except (TypeError, ValueError) as exc:
-        raise DouyinCommerceError("publish_location_load_more_failed") from exc
+    except (TypeError, ValueError):
+        raise DouyinCommerceError("publish_location_load_more_failed") from None
 
     previous = _dedupe_public_commerce_location_candidates(
         previous_candidates,
         commission_filter=selected_filter,
     )
-    previous_ids = {_normalized(candidate.get("poiId")) for candidate in previous}
-    control = await _unique_visible_load_more_control(page)
+    previous_identities = {
+        _commerce_location_candidate_identity(candidate) for candidate in previous
+    }
+    control = await _load_more_control_or_fail(page)
     if control is None:
-        platform_result_count, current = await _commerce_location_candidates_snapshot(
+        platform_result_count, current = await _load_more_candidates_snapshot_or_fail(
             page,
-            commission_filter=selected_filter,
+            commission_filter="all",
         )
         candidates = _dedupe_public_commerce_location_candidates(
-            current + previous,
+            filter_location_candidates(current, selected_filter) + previous,
             commission_filter=selected_filter,
         )
         return {
@@ -2646,11 +2698,16 @@ async def load_more_commerce_location_candidates(
             "hasMore": False,
             "stopReason": "no_visible_load_more_control",
         }
+    _, baseline_candidates = await _load_more_candidates_snapshot_or_fail(
+        page,
+        commission_filter="all",
+    )
+    baseline_signature = _commerce_location_candidates_signature(baseline_candidates)
     try:
         await control.scroll_into_view_if_needed(timeout=5_000)
         await control.click(timeout=5_000)
-    except Exception as exc:
-        raise DouyinCommerceError("publish_location_load_more_failed") from exc
+    except Exception:
+        raise DouyinCommerceError("publish_location_load_more_failed") from None
 
     max_reads = max(
         _LOCATION_RESULT_STABLE_READS,
@@ -2660,25 +2717,31 @@ async def load_more_commerce_location_candidates(
     stable_reads = 0
     platform_result_count = 0
     candidates: list[dict[str, Any]] = list(previous)
+    baseline_changed = False
     for read_index in range(max_reads):
-        platform_result_count, current = await _commerce_location_candidates_snapshot(
+        platform_result_count, current = await _load_more_candidates_snapshot_or_fail(
             page,
-            commission_filter=selected_filter,
+            commission_filter="all",
         )
+        current_signature = _commerce_location_candidates_signature(current)
         candidates = _dedupe_public_commerce_location_candidates(
-            current + previous,
+            filter_location_candidates(current, selected_filter) + previous,
             commission_filter=selected_filter,
         )
-        signature = _location_result_signature(candidates)
-        if signature == stable_signature:
+        if current_signature == baseline_signature:
+            stable_signature = ""
+            stable_reads = 0
+        elif current_signature == stable_signature:
+            baseline_changed = True
             stable_reads += 1
         else:
-            stable_signature = signature
+            baseline_changed = True
+            stable_signature = current_signature
             stable_reads = 1
-        if stable_reads >= _LOCATION_RESULT_STABLE_READS:
-            has_more = await _unique_visible_load_more_control(page) is not None
+        if baseline_changed and stable_reads >= _LOCATION_RESULT_STABLE_READS:
+            has_more = await _load_more_control_or_fail(page) is not None
             new_candidate_count = sum(
-                _normalized(candidate.get("poiId")) not in previous_ids
+                _commerce_location_candidate_identity(candidate) not in previous_identities
                 for candidate in candidates
             )
             return {
@@ -2690,6 +2753,15 @@ async def load_more_commerce_location_candidates(
             }
         if read_index + 1 < max_reads:
             await page.wait_for_timeout(_LOCATION_RESULT_POLL_INTERVAL_MS)
+    if not baseline_changed:
+        has_more = await _load_more_control_or_fail(page) is not None
+        return {
+            "platformResultCount": platform_result_count,
+            "candidates": candidates,
+            "newCandidateCount": 0,
+            "hasMore": has_more,
+            "stopReason": "no_new_candidates",
+        }
     raise DouyinCommerceError("publish_location_load_more_failed")
 
 

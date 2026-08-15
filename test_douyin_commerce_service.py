@@ -4277,6 +4277,257 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await browser.close()
 
+    async def test_load_more_waits_for_growth_arriving_after_three_old_snapshots(
+        self,
+    ) -> None:
+        """平台慢于 700ms 追加候选时，旧快照稳定不能提前收口。"""
+
+        previous = douyin_commerce_service.normalize_commerce_location_candidates(
+            [
+                {
+                    "name": "首屏地点",
+                    "address": "广西北海市测试路 1 号",
+                    "commerceInfo": "1件商品 · 1件返佣",
+                }
+            ],
+            commission_filter="commission",
+        )
+        appended = douyin_commerce_service.normalize_commerce_location_candidates(
+            [
+                {
+                    "name": "慢加载地点",
+                    "address": "广西北海市新增路 2 号",
+                    "commerceInfo": "1件商品 · 1件返佣",
+                }
+            ],
+            commission_filter="commission",
+        )
+
+        class Page:
+            wait_for_timeout = AsyncMock()
+
+        control = MagicMock()
+        control.scroll_into_view_if_needed = AsyncMock()
+        control.click = AsyncMock()
+        snapshots = [
+            (1, previous),
+            (1, previous),
+            (1, previous),
+            (1, previous),
+            (2, previous + appended),
+            (2, previous + appended),
+            (2, previous + appended),
+        ]
+        with patch.object(
+            douyin_commerce_service,
+            "_unique_visible_load_more_control",
+            new_callable=AsyncMock,
+            return_value=control,
+        ), patch.object(
+            douyin_commerce_service,
+            "_commerce_location_candidates_snapshot",
+            new_callable=AsyncMock,
+            side_effect=snapshots,
+        ) as snapshot:
+            result = await douyin_commerce_service.load_more_commerce_location_candidates(
+                Page(),
+                previous_candidates=previous,
+                commission_filter="commission",
+                timeout_ms=2_000,
+            )
+
+        self.assertEqual(result["newCandidateCount"], 1)
+        self.assertEqual(result["platformResultCount"], 2)
+        self.assertEqual(snapshot.await_count, 7)
+
+    async def test_load_more_keeps_commission_variants_with_same_poi_identity(
+        self,
+    ) -> None:
+        """同一可见 POI 的返佣和无佣条目不能彼此吞掉。"""
+
+        commission_candidate = douyin_commerce_service.normalize_commerce_location_candidates(
+            [
+                {
+                    "name": "同址佣型地点",
+                    "address": "广西北海市测试路 3 号",
+                    "commerceInfo": "2件商品 · 1件返佣",
+                }
+            ],
+            commission_filter="all",
+        )
+        no_commission_candidate = (
+            douyin_commerce_service.normalize_commerce_location_candidates(
+                [
+                    {
+                        "name": "同址佣型地点",
+                        "address": "广西北海市测试路 3 号",
+                        "commerceInfo": "2件商品 · 0件返佣",
+                    }
+                ],
+                commission_filter="all",
+            )
+        )
+
+        class Page:
+            wait_for_timeout = AsyncMock()
+
+        control = MagicMock()
+        control.scroll_into_view_if_needed = AsyncMock()
+        control.click = AsyncMock()
+        snapshots = [(1, commission_candidate)] + [
+            (2, commission_candidate + no_commission_candidate)
+        ] * 3
+        with patch.object(
+            douyin_commerce_service,
+            "_unique_visible_load_more_control",
+            new_callable=AsyncMock,
+            return_value=control,
+        ), patch.object(
+            douyin_commerce_service,
+            "_commerce_location_candidates_snapshot",
+            new_callable=AsyncMock,
+            side_effect=snapshots,
+        ):
+            result = await douyin_commerce_service.load_more_commerce_location_candidates(
+                Page(),
+                previous_candidates=commission_candidate,
+                commission_filter="all",
+                timeout_ms=700,
+            )
+
+        self.assertEqual(result["newCandidateCount"], 1)
+        self.assertEqual(
+            [candidate["commissionType"] for candidate in result["candidates"]],
+            ["commission", "no_commission"],
+        )
+
+    async def test_load_more_hides_untrusted_playwright_exceptions(self) -> None:
+        """控件、快照和点击失败不得把 Playwright 原文泄漏给调用方。"""
+
+        previous = douyin_commerce_service.normalize_commerce_location_candidates(
+            [
+                {
+                    "name": "首屏地点",
+                    "address": "广西北海市测试路 4 号",
+                    "commerceInfo": "1件商品 · 1件返佣",
+                }
+            ]
+        )
+
+        class UntrustedPlaywrightError(RuntimeError):
+            def __str__(self) -> str:
+                return "private-selector <div>untrusted-dom-text</div>"
+
+        class EvaluateFailurePage:
+            async def evaluate(self, _script: str):
+                raise UntrustedPlaywrightError()
+
+        async def assert_fixed_error(coro) -> None:
+            with self.assertRaises(douyin_commerce_service.DouyinCommerceError) as caught:
+                await coro
+            self.assertEqual(str(caught.exception), "publish_location_load_more_failed")
+            self.assertIsNone(caught.exception.__cause__)
+            self.assertNotIn("private-selector", str(caught.exception))
+            self.assertNotIn("untrusted-dom-text", str(caught.exception))
+
+        with self.subTest(boundary="control"):
+            await assert_fixed_error(
+                douyin_commerce_service.load_more_commerce_location_candidates(
+                    EvaluateFailurePage(),
+                    previous_candidates=previous,
+                )
+            )
+
+        control = MagicMock()
+        control.scroll_into_view_if_needed = AsyncMock()
+        control.click = AsyncMock()
+        with self.subTest(boundary="snapshot"), patch.object(
+            douyin_commerce_service,
+            "_unique_visible_load_more_control",
+            new_callable=AsyncMock,
+            return_value=control,
+        ), patch.object(
+            douyin_commerce_service,
+            "_commerce_location_candidates_snapshot",
+            new_callable=AsyncMock,
+            side_effect=UntrustedPlaywrightError(),
+        ):
+            await assert_fixed_error(
+                douyin_commerce_service.load_more_commerce_location_candidates(
+                    object(),
+                    previous_candidates=previous,
+                )
+            )
+
+        failing_control = MagicMock()
+        failing_control.scroll_into_view_if_needed = AsyncMock()
+        failing_control.click = AsyncMock(side_effect=UntrustedPlaywrightError())
+        with self.subTest(boundary="click"), patch.object(
+            douyin_commerce_service,
+            "_unique_visible_load_more_control",
+            new_callable=AsyncMock,
+            return_value=failing_control,
+        ), patch.object(
+            douyin_commerce_service,
+            "_commerce_location_candidates_snapshot",
+            new_callable=AsyncMock,
+            return_value=(1, previous),
+        ):
+            await assert_fixed_error(
+                douyin_commerce_service.load_more_commerce_location_candidates(
+                    object(),
+                    previous_candidates=previous,
+                )
+            )
+
+    async def test_load_more_ignores_inert_and_pointer_disabled_controls(self) -> None:
+        """不可点击的唯一匹配控件等同于不存在，不能触发点击超时。"""
+
+        cases = (
+            ("inert", '<div inert><button id="load-more">加载更多</button></div>'),
+            (
+                "pointer_events",
+                '<div style="pointer-events:none"><button id="load-more">加载更多</button></div>',
+            ),
+        )
+        for case, control_html in cases:
+            with self.subTest(case=case):
+                html = f"""
+                <div id="location-results" role="listbox">
+                  <div role="option"><span data-store-name>首屏地点</span>
+                    <span data-store-address>广西北海市测试路 5 号</span></div>
+                </div>
+                {control_html}
+                <script>
+                  window.loadMoreClicks = 0;
+                  document.querySelector('#load-more').addEventListener('click', () => {{
+                    window.loadMoreClicks += 1;
+                  }});
+                </script>
+                """
+                async with async_playwright() as playwright:
+                    browser = await playwright.chromium.launch(headless=True)
+                    try:
+                        page = await browser.new_page()
+                        await page.set_content(html)
+                        previous = douyin_commerce_service.normalize_commerce_location_candidates(
+                            await douyin_commerce_service._store_option_descriptors(
+                                page.locator("#location-results")
+                            )
+                        )
+
+                        result = await douyin_commerce_service.load_more_commerce_location_candidates(
+                            page,
+                            previous_candidates=previous,
+                            timeout_ms=350,
+                        )
+
+                        self.assertFalse(result["hasMore"])
+                        self.assertEqual(result["newCandidateCount"], 0)
+                        self.assertEqual(await page.evaluate("window.loadMoreClicks"), 0)
+                    finally:
+                        await browser.close()
+
 
 class DouyinCommerceMusicRuleTests(unittest.TestCase):
     def test_only_visible_favorite_modes_are_accepted(self) -> None:
