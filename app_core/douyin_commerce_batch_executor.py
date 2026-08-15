@@ -17,7 +17,7 @@ import threading
 from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo
 
-from . import account_service, task_service
+from . import task_service
 from ._douyin_commerce_batch_receipt_writer import _write_final_batch_receipt
 from .douyin_commerce_batch_service import (
     SHANGHAI_TIMEZONE,
@@ -64,9 +64,7 @@ _LOCATION_CACHE_FAILURE_CODES = frozenset(
     {
         "publish_location_not_found_after_all_pages",
         "publish_location_candidate_ambiguous",
-        "publish_location_click_failed",
         "publish_location_readback_mismatch",
-        "publish_location_cleanup_incomplete",
         "publish_location_commission_mismatch",
     }
 )
@@ -424,36 +422,9 @@ class DouyinCommerceBatchExecutor:
         checked = validate_batch_payload(batch)
         return apply_interval_schedule(checked, now=self._now())
 
-    @staticmethod
-    def _location_cache_account_id(batch: Mapping[str, Any]) -> str:
-        """用受控账号台账把批次文件反查为缓存账号 ID。"""
-
-        account_file = _text(batch.get("accountFile"))
-        accounts = account_service.list_accounts()
-        exact_matches = [
-            account
-            for account in accounts
-            if int(account.get("type") or 0) == 3
-            and _text(account.get("filePath")) == account_file
-        ]
-        matches = exact_matches
-        if not matches and account_file:
-            account_name = Path(account_file).name
-            matches = [
-                account
-                for account in accounts
-                if int(account.get("type") or 0) == 3
-                and Path(_text(account.get("filePath"))).name == account_name
-            ]
-        if len(matches) != 1 or not _text(matches[0].get("id")):
-            raise DouyinCommerceBatchExecutorError(
-                "location_cache_account_unresolved"
-            ) from None
-        return _text(matches[0].get("id"))
-
     def _record_location_cache_result(
         self,
-        batch: Mapping[str, Any],
+        account_id: str,
         location: Mapping[str, Any],
         scope: str,
         *,
@@ -469,7 +440,6 @@ class DouyinCommerceBatchExecutor:
                 location.get("observedCommissionType")
                 or location.get("commissionType")
             )
-            account_id = self._location_cache_account_id(batch)
             finished_at = self._now()
             if success:
                 record_location_publish_result(
@@ -1046,6 +1016,12 @@ class DouyinCommerceBatchExecutor:
             if not isinstance(upload, Mapping) or not _text(upload.get("sessionId")):
                 raise DouyinCommerceBatchExecutorError("抖音上传会话未返回唯一会话标识")
             session_id = _text(upload.get("sessionId"))
+            frozen_account_id = upload.get("accountId")
+            if type(frozen_account_id) is not int or frozen_account_id <= 0:
+                raise DouyinCommerceBatchExecutorError(
+                    "抖音上传会话未返回有效账号标识"
+                ) from None
+            location_cache_account_id = str(frozen_account_id)
 
             baseline = self._manager.prepare_publish_settings(session_id)
             if (
@@ -1105,7 +1081,7 @@ class DouyinCommerceBatchExecutor:
                 location_error_code = _text(exc)
                 if publish and location_error_code in _LOCATION_CACHE_FAILURE_CODES:
                     self._record_location_cache_result(
-                        batch,
+                        location_cache_account_id,
                         location,
                         scope,
                         success=False,
@@ -1263,7 +1239,7 @@ class DouyinCommerceBatchExecutor:
             )
             final_receipt_recorded = True
             self._record_location_cache_result(
-                batch,
+                location_cache_account_id,
                 location,
                 scope,
                 success=True,

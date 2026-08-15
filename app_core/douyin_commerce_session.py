@@ -341,7 +341,7 @@ class DouyinCommerceSessionManager:
         payload: Mapping[str, Any],
         *,
         on_progress: Callable[[dict[str, str]], None] | None = None,
-    ) -> dict[str, str]:
+    ) -> dict[str, object]:
         """后台上传一次视频并停在同一编辑会话，尚不选音乐、地点或声明。"""
 
         checked = douyin_commerce_service.validate_douyin_commerce_upload_payload(
@@ -771,7 +771,7 @@ class DouyinCommerceSessionManager:
         payload: dict[str, Any],
         *,
         on_progress: Callable[[dict[str, str]], None] | None = None,
-    ) -> dict[str, str]:
+    ) -> dict[str, object]:
         await self._close(None)
         from playwright.async_api import async_playwright
         from uploader.douyin_uploader.main import DouYinVideo
@@ -866,6 +866,7 @@ class DouyinCommerceSessionManager:
             return {
                 "status": "ready",
                 "sessionId": session.session_id,
+                "accountId": session.account_id,
                 "account": actual_account,
                 "video": Path(str(payload["fileList"][0])).name,
                 "message": "视频已上传并回读标题、文案；尚未选择音乐、地点、声明或定时。",

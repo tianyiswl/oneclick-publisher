@@ -2375,6 +2375,7 @@ async def search_commerce_location_store_candidates(
     expected_location: Mapping[str, Any] | None = None,
     commission_filter: object = "all",
     include_metadata: bool = False,
+    timeout_ms: int = _LOCATION_RESULT_WAIT_TIMEOUT_MS,
 ) -> list[dict[str, Any]] | dict[str, Any]:
     """按“本地/国内”范围和返佣要求读取发布定位候选。
 
@@ -2499,6 +2500,7 @@ async def search_commerce_location_store_candidates(
         expected_location=expected_location,
         commission_filter=selected_commission_filter,
         allow_filtered_empty=include_metadata is True,
+        timeout_ms=timeout_ms,
     )
     platform_result_count = sum(
         1
@@ -2698,9 +2700,11 @@ async def _load_more_commerce_location_candidates_impl(
             "hasMore": False,
             "stopReason": "no_visible_load_more_control",
         }
-    _, baseline_candidates = await _load_more_candidates_snapshot_or_fail(
-        page,
-        commission_filter="all",
+    baseline_platform_result_count, baseline_candidates = (
+        await _load_more_candidates_snapshot_or_fail(
+            page,
+            commission_filter="all",
+        )
     )
     baseline_identities = {
         _commerce_location_candidate_identity(candidate) for candidate in baseline_candidates
@@ -2718,6 +2722,8 @@ async def _load_more_commerce_location_candidates_impl(
     )
     stable_signature = ""
     stable_reads = 0
+    zero_growth_signature = ""
+    zero_growth_stable_reads = 0
     platform_result_count = 0
     candidates: list[dict[str, Any]] = list(previous)
     new_identity_seen = False
@@ -2737,6 +2743,24 @@ async def _load_more_commerce_location_candidates_impl(
         if not current_identities - known_identities:
             stable_signature = ""
             stable_reads = 0
+            if platform_result_count > baseline_platform_result_count:
+                if current_signature == zero_growth_signature:
+                    zero_growth_stable_reads += 1
+                else:
+                    zero_growth_signature = current_signature
+                    zero_growth_stable_reads = 1
+                if zero_growth_stable_reads >= _LOCATION_RESULT_STABLE_READS:
+                    has_more = await _load_more_control_or_fail(page) is not None
+                    return {
+                        "platformResultCount": platform_result_count,
+                        "candidates": candidates,
+                        "newCandidateCount": 0,
+                        "hasMore": has_more,
+                        "stopReason": "no_new_candidates",
+                    }
+            else:
+                zero_growth_signature = ""
+                zero_growth_stable_reads = 0
         elif current_signature == stable_signature:
             new_identity_seen = True
             stable_reads += 1
@@ -2761,13 +2785,14 @@ async def _load_more_commerce_location_candidates_impl(
             await page.wait_for_timeout(_LOCATION_RESULT_POLL_INTERVAL_MS)
     if not new_identity_seen:
         has_more = await _load_more_control_or_fail(page) is not None
-        return {
-            "platformResultCount": platform_result_count,
-            "candidates": candidates,
-            "newCandidateCount": 0,
-            "hasMore": has_more,
-            "stopReason": "no_new_candidates",
-        }
+        if not has_more:
+            return {
+                "platformResultCount": platform_result_count,
+                "candidates": candidates,
+                "newCandidateCount": 0,
+                "hasMore": False,
+                "stopReason": "no_visible_load_more_control",
+            }
     raise DouyinCommerceError("publish_location_load_more_failed")
 
 
@@ -3113,13 +3138,26 @@ async def apply_saved_commerce_location_to_page(
         f"{_normalized(expected.get('name'))} · {_normalized(expected.get('address'))}"
     ).strip(" ·")
     any_search_succeeded = False
+    total_click_count = 0
+    seen_candidate_identities: set[tuple[str, str, str, str]] = set()
+    commission_mismatch_seen = False
+    wait_deadline = monotonic() + _LOCATION_RESULT_WAIT_TIMEOUT_MS / 1000
+
+    def remaining_wait_timeout_ms() -> int:
+        remaining = int((wait_deadline - monotonic()) * 1000)
+        if remaining <= 0:
+            raise DouyinCommerceError("publish_location_load_more_limit") from None
+        return remaining
+
     for attempt, keyword in enumerate(bounded_keywords, start=1):
+        search_timeout_ms = remaining_wait_timeout_ms()
         douyin_logger.info(
             f"抖音发布定位第 {attempt}/{len(bounded_keywords)} 次搜索："
             f"范围={scope_label}，关键词={keyword}，目标={target_text}"
         )
         await _close_commerce_store_selector_strict(page)
         panel_may_be_open = False
+        active_process_control_error: BaseException | None = None
         try:
             panel_may_be_open = True
             try:
@@ -3127,8 +3165,8 @@ async def apply_saved_commerce_location_to_page(
                     page,
                     keyword,
                     scope=selected_scope,
-                    expected_location=expected,
                     commission_filter="all",
+                    timeout_ms=search_timeout_ms,
                 )
             except DouyinCommerceError as exc:
                 if str(exc) == "publish_location_commission_mismatch":
@@ -3159,9 +3197,11 @@ async def apply_saved_commerce_location_to_page(
                 f"抖音发布定位关键词“{keyword}”返回 {len(candidates)} 个完整候选："
                 f"{candidate_summary or ['无']}"
             )
-            click_count = 0
+            seen_candidate_identities.update(
+                _commerce_location_candidate_identity(candidate)
+                for candidate in candidates
+            )
             consecutive_zero_growth = 0
-            commission_mismatch_seen = False
             exhausted = False
             matched_candidates: list[dict[str, Any]] = []
             while True:
@@ -3184,25 +3224,23 @@ async def apply_saved_commerce_location_to_page(
                     != expected_identity[3]
                     for row in candidates
                 )
-                if commission_mismatch_seen and selected_commission_filter != "all":
-                    raise DouyinCommerceError(
-                        "publish_location_commission_mismatch"
-                    ) from None
                 if exhausted:
                     break
-                if len(candidates) >= max_candidates:
+                if len(seen_candidate_identities) >= max_candidates:
                     raise DouyinCommerceError(
                         "publish_location_load_more_limit"
                     ) from None
-                if click_count >= max_load_more_clicks:
+                if total_click_count >= max_load_more_clicks:
                     raise DouyinCommerceError(
                         "publish_location_load_more_limit"
                     ) from None
+                load_timeout_ms = remaining_wait_timeout_ms()
                 try:
                     load_result = await load_more_commerce_location_candidates(
                         page,
                         previous_candidates=candidates,
                         commission_filter="all",
+                        timeout_ms=load_timeout_ms,
                     )
                     raw_candidates = load_result.get("candidates")
                     new_candidate_count = load_result.get("newCandidateCount")
@@ -3218,7 +3256,7 @@ async def apply_saved_commerce_location_to_page(
                     raise DouyinCommerceError(
                         "publish_location_load_more_failed"
                     ) from None
-                click_count += 1
+                total_click_count += 1
                 candidates = [
                     candidate
                     for row in raw_candidates
@@ -3226,7 +3264,11 @@ async def apply_saved_commerce_location_to_page(
                         candidate := normalize_commerce_location_candidate(row)
                     ) is not None
                 ]
-                if len(candidates) > max_candidates:
+                seen_candidate_identities.update(
+                    _commerce_location_candidate_identity(candidate)
+                    for candidate in candidates
+                )
+                if len(seen_candidate_identities) > max_candidates:
                     raise DouyinCommerceError(
                         "publish_location_load_more_limit"
                     ) from None
@@ -3236,15 +3278,12 @@ async def apply_saved_commerce_location_to_page(
                     else 0
                 )
                 douyin_logger.info(
-                    f"抖音发布定位关键词“{keyword}”加载第 {click_count} 次："
-                    f"累计有效候选={len(candidates)}，新增={new_candidate_count}"
+                    f"抖音发布定位关键词“{keyword}”累计加载第 {total_click_count} 次："
+                    f"全关键词累计有效候选={len(seen_candidate_identities)}，"
+                    f"本轮新增={new_candidate_count}"
                 )
                 exhausted = not has_more or consecutive_zero_growth >= 2
             if not matched_candidates:
-                if commission_mismatch_seen:
-                    raise DouyinCommerceError(
-                        "publish_location_commission_mismatch"
-                    ) from None
                 douyin_logger.warning(
                     f"抖音发布定位关键词“{keyword}”已读完可用批次，"
                     f"累计 {len(candidates)} 个候选均未匹配目标“{target_text}”；"
@@ -3279,14 +3318,29 @@ async def apply_saved_commerce_location_to_page(
             raise
         except Exception:
             raise DouyinCommerceError("publish_location_click_failed") from None
+        except BaseException as exc:
+            active_process_control_error = exc
+            raise
         finally:
             if panel_may_be_open:
-                await _close_commerce_store_selector_strict(page)
+                try:
+                    await _close_commerce_store_selector_strict(page)
+                except Exception:
+                    if active_process_control_error is None:
+                        raise
+                    douyin_logger.warning(
+                        "抖音发布定位进程控制异常期间面板清理失败："
+                        "publish_location_cleanup_incomplete"
+                    )
 
     douyin_logger.warning(
         f"抖音发布定位恢复结束：范围={scope_label}，目标={target_text}，"
         f"全部关键词均未返回唯一匹配，已尝试={bounded_keywords}"
     )
+    if commission_mismatch_seen:
+        raise DouyinCommerceError(
+            "publish_location_commission_mismatch"
+        ) from None
     raise DouyinCommerceError(
         "publish_location_not_found_after_all_pages"
         if any_search_succeeded

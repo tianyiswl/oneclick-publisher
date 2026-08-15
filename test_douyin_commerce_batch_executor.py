@@ -84,7 +84,7 @@ class FakeCommerceSessionManager:
         self.started_session_ids.append(session_id)
         self.open_sessions += 1
         self.max_open_sessions = max(self.max_open_sessions, self.open_sessions)
-        return {"sessionId": session_id}
+        return {"sessionId": session_id, "accountId": 31}
 
     def prepare_publish_settings(self, session_id: str) -> dict:
         index = self._index_by_session[session_id]

@@ -138,6 +138,74 @@ class DouyinLocationCacheTests(unittest.TestCase):
         self.assertEqual(cached_status("account-a", target), "needs_revalidation")
         self.assertFalse(location_requires_revalidation(other, now=BASE_TIME + timedelta(minutes=1)))
 
+    def test_not_found_after_all_pages_marks_target_for_revalidation(self) -> None:
+        """完整分页仍找不到目标时，真实缓存行必须转为待校对。"""
+
+        merged = merge_platform_locations(
+            query("account-a"),
+            candidates(1),
+            verified_at=BASE_TIME,
+        )
+        target = merged["candidates"][0]
+
+        record_location_publish_result(
+            "account-a",
+            target,
+            success=False,
+            error_code="publish_location_not_found_after_all_pages",
+            occurred_at=BASE_TIME + timedelta(minutes=1),
+        )
+
+        self.assertEqual(cached_status("account-a", target), "needs_revalidation")
+        self.assertEqual(
+            get_cached_locations(
+                query("account-a"),
+                now=BASE_TIME + timedelta(minutes=1),
+            )["candidates"],
+            [],
+        )
+
+    def test_interaction_and_cleanup_errors_do_not_change_cached_status(self) -> None:
+        """纯点击或面板清理异常不能证明 POI 失效，缓存必须保持可复用。"""
+
+        merged = merge_platform_locations(
+            query("account-a"),
+            candidates(2),
+            verified_at=BASE_TIME,
+        )
+        for target, error_code in zip(
+            merged["candidates"],
+            (
+                "publish_location_click_failed",
+                "publish_location_cleanup_incomplete",
+            ),
+            strict=True,
+        ):
+            record_location_publish_result(
+                "account-a",
+                target,
+                success=False,
+                error_code=error_code,
+                occurred_at=BASE_TIME + timedelta(minutes=1),
+            )
+
+        self.assertEqual(
+            [
+                cached_status("account-a", target)
+                for target in merged["candidates"]
+            ],
+            ["reusable", "reusable"],
+        )
+        self.assertEqual(
+            len(
+                get_cached_locations(
+                    query("account-a"),
+                    now=BASE_TIME + timedelta(minutes=1),
+                )["candidates"]
+            ),
+            2,
+        )
+
     def test_two_consecutive_readback_mismatches_invalidate_only_that_location(self) -> None:
         """第二次找不到 POI 未失效，或误伤相邻 POI 时，本测试必须失败。"""
 

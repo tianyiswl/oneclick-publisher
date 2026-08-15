@@ -2461,10 +2461,9 @@ class DouyinCommercePayloadTests(unittest.TestCase):
 
         self.assertEqual(events, ["search", "listbox", "click"])
         self.assertEqual(result["matchedKeyword"], row["address"])
-        expected_location = search_kwargs[0]["expected_location"]
-        self.assertIsInstance(expected_location, dict)
-        self.assertEqual(expected_location["name"], row["name"])
-        self.assertEqual(expected_location["address"], row["address"])
+        self.assertNotIn("expected_location", search_kwargs[0])
+        self.assertEqual(search_kwargs[0]["commission_filter"], "all")
+        self.assertGreater(search_kwargs[0]["timeout_ms"], 0)
         reopen.assert_not_awaited()
 
     def test_saved_location_keeps_commission_fields_for_click_verification(self) -> None:
@@ -2544,6 +2543,17 @@ class DouyinCommercePayloadTests(unittest.TestCase):
             return_value=[current],
         ), patch.object(
             douyin_commerce_service,
+            "load_more_commerce_location_candidates",
+            new_callable=AsyncMock,
+            return_value={
+                "platformResultCount": 1,
+                "candidates": [current],
+                "newCandidateCount": 0,
+                "hasMore": False,
+                "stopReason": "no_visible_load_more_control",
+            },
+        ), patch.object(
+            douyin_commerce_service,
             "_apply_open_commerce_location_to_page",
             new_callable=AsyncMock,
         ) as apply_open, patch.object(
@@ -2595,8 +2605,15 @@ class DouyinCommercePayloadTests(unittest.TestCase):
         async def close(_page):
             events.append("close")
 
-        async def load_more(_page, *, previous_candidates, commission_filter):
+        async def load_more(
+            _page,
+            *,
+            previous_candidates,
+            commission_filter,
+            timeout_ms,
+        ):
             self.assertEqual(commission_filter, "all")
+            self.assertGreater(timeout_ms, 0)
             events.append("load_more:店名")
             return {
                 "platformResultCount": len(previous_candidates),
@@ -4218,6 +4235,108 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await browser.close()
 
+    async def test_publish_real_search_waiter_returns_first_page_before_loading_target(
+        self,
+    ) -> None:
+        """正式发布搜索等待器必须先交出稳定首屏，目标由外层分页找到。"""
+
+        first = douyin_commerce_service.normalize_commerce_location_candidate(
+            {
+                "name": "夜南香北京烤鸭（银滩店）",
+                "address": "广西北海市银滩大道1号",
+                "commerceInfo": "1件商品 · 1件返佣",
+            }
+        )
+        preset = douyin_commerce_service.normalize_commerce_location_candidate(
+            {
+                "name": "夜南香北京烤鸭（万泉城店）",
+                "address": "广西北海市万泉城二区3号",
+                "commerceInfo": "1件商品 · 1件返佣",
+            }
+        )
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(preset)
+        value = {"text": ""}
+        input_control = AsyncMock()
+
+        async def fill_input(text, **_kwargs):
+            value["text"] = text
+
+        async def read_input(_script):
+            return value["text"]
+
+        input_control.fill.side_effect = fill_input
+        input_control.evaluate.side_effect = read_input
+        page = AsyncMock()
+        snapshot_reads = {"count": 0}
+
+        async def read_snapshot(_page):
+            snapshot_reads["count"] += 1
+            if snapshot_reads["count"] == 1:
+                return None, [], "baseline"
+            return object(), [dict(first)], "stable-first-page"
+
+        loaded = {
+            "platformResultCount": 2,
+            "candidates": [dict(first), dict(preset)],
+            "newCandidateCount": 1,
+            "hasMore": False,
+            "stopReason": "loaded",
+        }
+        with patch.object(
+            douyin_commerce_service,
+            "_ensure_position_tag",
+            new_callable=AsyncMock,
+        ), patch.object(
+            douyin_commerce_service,
+            "_ensure_local_group_buy_mode",
+            new_callable=AsyncMock,
+            return_value=object(),
+        ), patch.object(
+            douyin_commerce_service,
+            "_open_commerce_search_input",
+            new_callable=AsyncMock,
+            return_value=input_control,
+        ), patch.object(
+            douyin_commerce_service,
+            "set_commerce_location_scope",
+            new_callable=AsyncMock,
+        ), patch.object(
+            douyin_commerce_service,
+            "_visible_commerce_location_result_snapshot",
+            new=read_snapshot,
+        ), patch.object(
+            douyin_commerce_service,
+            "load_more_commerce_location_candidates",
+            new_callable=AsyncMock,
+            return_value=loaded,
+        ) as load_more, patch.object(
+            douyin_commerce_service,
+            "_visible_store_listbox",
+            new_callable=AsyncMock,
+            return_value=object(),
+        ), patch.object(
+            douyin_commerce_service,
+            "_apply_open_commerce_location_to_page",
+            new_callable=AsyncMock,
+            return_value={"location": dict(preset)},
+        ), patch.object(
+            douyin_commerce_service,
+            "close_commerce_store_selector",
+            new_callable=AsyncMock,
+        ):
+            result = await douyin_commerce_service.apply_saved_commerce_location_to_page(
+                page,
+                preset,
+                "domestic",
+                ["夜南香"],
+                "commission",
+            )
+
+        self.assertEqual(result["location"]["poiId"], preset["poiId"])
+        self.assertEqual(load_more.await_count, 1)
+        self.assertGreaterEqual(snapshot_reads["count"], 3)
+
     async def test_publish_loads_until_saved_poi_is_found(self) -> None:
         """目标在后续批次时必须继续加载，命中完整身份后立即停止。"""
 
@@ -4369,6 +4488,200 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
                 )
 
         self.assertEqual(load_more.await_count, 10)
+
+    async def test_publish_shares_ten_click_budget_across_three_keywords(self) -> None:
+        """三个兜底关键词合计只能点击十次，不能每词重置预算。"""
+
+        preset = douyin_commerce_service.normalize_commerce_location_candidate(
+            {
+                "name": "永不出现的目标",
+                "address": "广西北海市目标路1号",
+                "commerceInfo": "1件商品 · 1件返佣",
+            }
+        )
+        active_keyword = {"value": ""}
+        rounds: dict[str, int] = {}
+
+        def candidate(keyword: str, index: int) -> dict[str, object]:
+            return douyin_commerce_service.normalize_commerce_location_candidate(
+                {
+                    "name": f"{keyword}候选{index}",
+                    "address": f"广西北海市{keyword}路{index}号",
+                    "commerceInfo": "1件商品 · 1件返佣",
+                }
+            )
+
+        async def search(_page, keyword, **_kwargs):
+            active_keyword["value"] = keyword
+            rounds[keyword] = 0
+            return [candidate(keyword, 0)]
+
+        async def load_more(_page, *, previous_candidates, **_kwargs):
+            keyword = active_keyword["value"]
+            rounds[keyword] += 1
+            return {
+                "platformResultCount": len(previous_candidates) + 1,
+                "candidates": [
+                    *previous_candidates,
+                    candidate(keyword, rounds[keyword]),
+                ],
+                "newCandidateCount": 1,
+                "hasMore": rounds[keyword] < 4,
+                "stopReason": "loaded",
+            }
+
+        with patch.object(
+            douyin_commerce_service,
+            "search_commerce_location_store_candidates",
+            new=search,
+        ), patch.object(
+            douyin_commerce_service,
+            "load_more_commerce_location_candidates",
+            new_callable=AsyncMock,
+            side_effect=load_more,
+        ) as load_more_mock, patch.object(
+            douyin_commerce_service,
+            "close_commerce_store_selector",
+            new_callable=AsyncMock,
+        ):
+            with self.assertRaisesRegex(
+                douyin_commerce_service.DouyinCommerceError,
+                "^publish_location_load_more_limit$",
+            ):
+                await douyin_commerce_service.apply_saved_commerce_location_to_page(
+                    object(),
+                    preset,
+                    "domestic",
+                    ["关键词甲", "关键词乙", "关键词丙"],
+                    "commission",
+                )
+
+        self.assertEqual(load_more_mock.await_count, 10)
+
+    async def test_publish_shares_one_hundred_identities_across_three_keywords(
+        self,
+    ) -> None:
+        """跨关键词累计一百个四字段身份后必须停止，不再加载第三词。"""
+
+        preset = douyin_commerce_service.normalize_commerce_location_candidate(
+            {
+                "name": "永不出现的目标",
+                "address": "广西北海市目标路2号",
+                "commerceInfo": "1件商品 · 1件返佣",
+            }
+        )
+        active_keyword = {"value": ""}
+
+        def candidates(keyword: str, start: int) -> list[dict[str, object]]:
+            return [
+                douyin_commerce_service.normalize_commerce_location_candidate(
+                    {
+                        "name": f"{keyword}候选{index}",
+                        "address": f"广西北海市{keyword}路{index}号",
+                        "commerceInfo": "1件商品 · 1件返佣",
+                    }
+                )
+                for index in range(start, start + 20)
+            ]
+
+        async def search(_page, keyword, **_kwargs):
+            active_keyword["value"] = keyword
+            return candidates(keyword, 0)
+
+        async def load_more(_page, *, previous_candidates, **_kwargs):
+            keyword = active_keyword["value"]
+            return {
+                "platformResultCount": 40,
+                "candidates": [*previous_candidates, *candidates(keyword, 20)],
+                "newCandidateCount": 20,
+                "hasMore": False,
+                "stopReason": "loaded",
+            }
+
+        with patch.object(
+            douyin_commerce_service,
+            "search_commerce_location_store_candidates",
+            new=search,
+        ), patch.object(
+            douyin_commerce_service,
+            "load_more_commerce_location_candidates",
+            new_callable=AsyncMock,
+            side_effect=load_more,
+        ) as load_more_mock, patch.object(
+            douyin_commerce_service,
+            "close_commerce_store_selector",
+            new_callable=AsyncMock,
+        ):
+            with self.assertRaisesRegex(
+                douyin_commerce_service.DouyinCommerceError,
+                "^publish_location_load_more_limit$",
+            ):
+                await douyin_commerce_service.apply_saved_commerce_location_to_page(
+                    object(),
+                    preset,
+                    "domestic",
+                    ["关键词甲", "关键词乙", "关键词丙"],
+                    "commission",
+                )
+
+        self.assertEqual(load_more_mock.await_count, 2)
+
+    async def test_publish_shares_total_wait_budget_across_keywords(self) -> None:
+        """前一关键词耗尽总等待预算后，不得再为下一关键词重开三十秒。"""
+
+        first = douyin_commerce_service.normalize_commerce_location_candidate(
+            {
+                "name": "关键词甲候选",
+                "address": "广西北海市候选路1号",
+                "commerceInfo": "1件商品 · 1件返佣",
+            }
+        )
+        preset = douyin_commerce_service.normalize_commerce_location_candidate(
+            {
+                "name": "永不出现的目标",
+                "address": "广西北海市目标路3号",
+                "commerceInfo": "1件商品 · 1件返佣",
+            }
+        )
+        clock = iter((0.0, 0.0, 0.0, 31.0))
+        with patch.object(
+            douyin_commerce_service,
+            "monotonic",
+            side_effect=lambda: next(clock, 31.0),
+        ), patch.object(
+            douyin_commerce_service,
+            "search_commerce_location_store_candidates",
+            new_callable=AsyncMock,
+            return_value=[first],
+        ) as search, patch.object(
+            douyin_commerce_service,
+            "load_more_commerce_location_candidates",
+            new_callable=AsyncMock,
+            return_value={
+                "platformResultCount": 1,
+                "candidates": [first],
+                "newCandidateCount": 0,
+                "hasMore": False,
+                "stopReason": "no_visible_load_more_control",
+            },
+        ), patch.object(
+            douyin_commerce_service,
+            "close_commerce_store_selector",
+            new_callable=AsyncMock,
+        ):
+            with self.assertRaisesRegex(
+                douyin_commerce_service.DouyinCommerceError,
+                "^publish_location_load_more_limit$",
+            ):
+                await douyin_commerce_service.apply_saved_commerce_location_to_page(
+                    object(),
+                    preset,
+                    "domestic",
+                    ["关键词甲", "关键词乙", "关键词丙"],
+                    "commission",
+                )
+
+        self.assertEqual(search.await_count, 1)
 
     async def test_publish_stops_at_one_hundred_candidates(self) -> None:
         """候选达到一百条时必须在下一次点击前安全停止。"""
@@ -4617,6 +4930,41 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(raised.exception.__cause__)
 
+    async def test_publish_process_control_exception_survives_cleanup_failure(
+        self,
+    ) -> None:
+        """分页中断后仍尝试严格清理，但普通清理错误不得覆盖进程控制异常。"""
+
+        preset = douyin_commerce_service.normalize_commerce_location_candidate(
+            {
+                "name": "夜南香",
+                "address": "广西北海市目标路1号",
+                "commerceInfo": "1件商品 · 1件返佣",
+            }
+        )
+        for exception_type in (
+            KeyboardInterrupt,
+            SystemExit,
+            asyncio.CancelledError,
+        ):
+            with self.subTest(exception_type=exception_type.__name__), patch.object(
+                douyin_commerce_service,
+                "search_commerce_location_store_candidates",
+                new_callable=AsyncMock,
+                side_effect=exception_type("process-control"),
+            ), patch.object(
+                douyin_commerce_service,
+                "close_commerce_store_selector",
+                new_callable=AsyncMock,
+                side_effect=[None, RuntimeError("cleanup-sensitive-detail")],
+            ) as close_selector:
+                with self.assertRaisesRegex(exception_type, "process-control"):
+                    await douyin_commerce_service.apply_saved_commerce_location_to_page(
+                        object(), preset, "domestic", ["夜南香"], "commission"
+                    )
+
+                self.assertEqual(close_selector.await_count, 2)
+
     async def test_publish_matches_all_four_location_identity_fields(self) -> None:
         """同 POI、同名、同址的返佣变体仍不是同一完整身份。"""
 
@@ -4671,6 +5019,60 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
             apply_open.await_args.args[2]["commissionType"],
             "commission",
         )
+        self.assertEqual(result["location"]["commissionType"], "commission")
+
+    async def test_publish_continues_after_commission_mismatch_and_finds_later_page(
+        self,
+    ) -> None:
+        """首屏同 POI 异佣只是证据，第二批出现完整四字段目标时仍须成功。"""
+
+        base = {
+            "name": "夜南香",
+            "address": "广西北海市目标路1号",
+        }
+        no_commission = douyin_commerce_service.normalize_commerce_location_candidate(
+            {**base, "commerceInfo": ""}
+        )
+        preset = douyin_commerce_service.normalize_commerce_location_candidate(
+            {**base, "commerceInfo": "1件商品 · 1件返佣"}
+        )
+        loaded = {
+            "platformResultCount": 2,
+            "candidates": [no_commission, preset],
+            "newCandidateCount": 1,
+            "hasMore": False,
+            "stopReason": "loaded",
+        }
+        with patch.object(
+            douyin_commerce_service,
+            "search_commerce_location_store_candidates",
+            new_callable=AsyncMock,
+            return_value=[no_commission],
+        ), patch.object(
+            douyin_commerce_service,
+            "load_more_commerce_location_candidates",
+            new_callable=AsyncMock,
+            return_value=loaded,
+        ) as load_more, patch.object(
+            douyin_commerce_service,
+            "_visible_store_listbox",
+            new_callable=AsyncMock,
+            return_value=object(),
+        ), patch.object(
+            douyin_commerce_service,
+            "_apply_open_commerce_location_to_page",
+            new_callable=AsyncMock,
+            return_value={"location": dict(preset)},
+        ), patch.object(
+            douyin_commerce_service,
+            "close_commerce_store_selector",
+            new_callable=AsyncMock,
+        ):
+            result = await douyin_commerce_service.apply_saved_commerce_location_to_page(
+                object(), preset, "domestic", ["夜南香"], "commission"
+            )
+
+        self.assertEqual(load_more.await_count, 1)
         self.assertEqual(result["location"]["commissionType"], "commission")
 
     async def test_load_more_clicks_once_and_returns_only_public_metadata(self) -> None:
@@ -4825,6 +5227,103 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["newCandidateCount"], 1)
         self.assertEqual(result["platformResultCount"], 2)
         self.assertEqual(snapshot.await_count, 7)
+
+    async def test_load_more_timeout_with_unchanged_page_and_button_is_failure(
+        self,
+    ) -> None:
+        """等待耗尽后按钮仍在且页面未确认响应，不能伪装成零新增。"""
+
+        previous = douyin_commerce_service.normalize_commerce_location_candidates(
+            [
+                {
+                    "name": "首屏地点",
+                    "address": "广西北海市测试路 1 号",
+                    "commerceInfo": "1件商品 · 1件返佣",
+                }
+            ],
+            commission_filter="commission",
+        )
+
+        class Page:
+            wait_for_timeout = AsyncMock()
+
+        control = MagicMock()
+        control.scroll_into_view_if_needed = AsyncMock()
+        control.click = AsyncMock()
+        with patch.object(
+            douyin_commerce_service,
+            "_unique_visible_load_more_control",
+            new_callable=AsyncMock,
+            return_value=control,
+        ), patch.object(
+            douyin_commerce_service,
+            "_commerce_location_candidates_snapshot",
+            new_callable=AsyncMock,
+            return_value=(1, previous),
+        ):
+            with self.assertRaisesRegex(
+                douyin_commerce_service.DouyinCommerceError,
+                "^publish_location_load_more_failed$",
+            ) as raised:
+                await douyin_commerce_service.load_more_commerce_location_candidates(
+                    Page(),
+                    previous_candidates=previous,
+                    commission_filter="commission",
+                    timeout_ms=700,
+                )
+
+        self.assertIsNone(raised.exception.__cause__)
+        control.click.assert_awaited_once()
+
+    async def test_load_more_returns_zero_after_stable_platform_count_change(
+        self,
+    ) -> None:
+        """平台数量已变化且候选稳定时，可确认本轮响应为零个有效新增。"""
+
+        previous = douyin_commerce_service.normalize_commerce_location_candidates(
+            [
+                {
+                    "name": "首屏地点",
+                    "address": "广西北海市测试路 1 号",
+                    "commerceInfo": "1件商品 · 1件返佣",
+                }
+            ],
+            commission_filter="commission",
+        )
+
+        class Page:
+            wait_for_timeout = AsyncMock()
+
+        control = MagicMock()
+        control.scroll_into_view_if_needed = AsyncMock()
+        control.click = AsyncMock()
+        with patch.object(
+            douyin_commerce_service,
+            "_unique_visible_load_more_control",
+            new_callable=AsyncMock,
+            return_value=control,
+        ), patch.object(
+            douyin_commerce_service,
+            "_commerce_location_candidates_snapshot",
+            new_callable=AsyncMock,
+            side_effect=[
+                (1, previous),
+                (2, previous),
+                (2, previous),
+                (2, previous),
+            ],
+        ) as snapshot:
+            result = await douyin_commerce_service.load_more_commerce_location_candidates(
+                Page(),
+                previous_candidates=previous,
+                commission_filter="commission",
+                timeout_ms=3_000,
+            )
+
+        self.assertEqual(result["newCandidateCount"], 0)
+        self.assertEqual(result["platformResultCount"], 2)
+        self.assertEqual(result["stopReason"], "no_new_candidates")
+        self.assertEqual(snapshot.await_count, 4)
 
     async def test_load_more_ignores_empty_and_reordered_baseline_until_new_identity(
         self,
@@ -7754,11 +8253,6 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
             executor,
             "_record_final_submit_result",
         ), patch(
-            "app_core.douyin_commerce_batch_executor.account_service.list_accounts",
-            return_value=[
-                {"id": 31, "type": 3, "filePath": "douyin-31.json"}
-            ],
-        ), patch(
             "app_core.douyin_commerce_batch_executor.record_location_publish_result"
         ) as record_result:
             result = executor._run_item(
@@ -7802,6 +8296,58 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
         )
         self.assertEqual(manager.closed_session_ids, ["session-1"])
 
+    def test_publish_uses_frozen_session_account_id_after_registry_rebind(self) -> None:
+        """发布期间台账重绑且出现同 basename 时，回写仍须使用启动会话的账号。"""
+
+        batch = self._location_cache_batch()
+
+        class FrozenIdentityManager(FakeCommerceSessionManager):
+            def start_upload(self, payload: dict, **kwargs) -> dict:
+                result = super().start_upload(payload, **kwargs)
+                return {**result, "accountId": 31}
+
+        manager = FrozenIdentityManager()
+        executor = DouyinCommerceBatchExecutor(
+            manager,
+            task_store=MagicMock(),
+        )
+        rebound_accounts = [
+            {
+                "id": 88,
+                "type": 3,
+                "filePath": "/rebound/one/douyin-31.json",
+            },
+            {
+                "id": 99,
+                "type": 3,
+                "filePath": "/rebound/two/douyin-31.json",
+            },
+        ]
+        with patch.object(
+            executor,
+            "_record_final_submit_result",
+        ), patch(
+            "app_core.account_service.list_accounts",
+            return_value=rebound_accounts,
+        ) as list_accounts, patch(
+            "app_core.douyin_commerce_batch_executor.record_location_publish_result"
+        ) as record_result:
+            result = executor._run_item(
+                batch,
+                batch["items"][0],
+                task_id=1,
+                item_id=2,
+                index=0,
+                total=1,
+                publish=True,
+                progress=None,
+                run_generation=0,
+            )
+
+        self.assertEqual(result["status"], "published")
+        self.assertEqual(record_result.call_args.args[0], "31")
+        list_accounts.assert_not_called()
+
     def test_exhausted_location_records_failure_but_network_failure_does_not(self) -> None:
         """只有地点固定码才能写失败，后续网络失败不得改地点状态。"""
 
@@ -7824,11 +8370,6 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
                 raise RuntimeError("network-timeout-sensitive-detail")
 
         with patch(
-            "app_core.douyin_commerce_batch_executor.account_service.list_accounts",
-            return_value=[
-                {"id": 31, "type": 3, "filePath": "douyin-31.json"}
-            ],
-        ), patch(
             "app_core.douyin_commerce_batch_executor.record_location_publish_result"
         ) as record_result:
             location_executor = DouyinCommerceBatchExecutor(
@@ -7879,6 +8420,41 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
         self.assertEqual(network_result["status"], "failed")
         record_result.assert_not_called()
 
+    def test_interaction_and_cleanup_location_errors_do_not_touch_cache(self) -> None:
+        """纯交互或面板清理失败不得被 batch 误报为 POI 失效。"""
+
+        batch = self._location_cache_batch()
+        for error_code in (
+            "publish_location_click_failed",
+            "publish_location_cleanup_incomplete",
+        ):
+            with self.subTest(error_code=error_code):
+                class LocationInteractionFailureManager(FakeCommerceSessionManager):
+                    def apply_saved_location(self, *_args, **_kwargs):
+                        raise RuntimeError(error_code)
+
+                executor = DouyinCommerceBatchExecutor(
+                    LocationInteractionFailureManager(),
+                    task_store=MagicMock(),
+                )
+                with patch(
+                    "app_core.douyin_commerce_batch_executor.record_location_publish_result"
+                ) as record_result:
+                    result = executor._run_item(
+                        batch,
+                        batch["items"][0],
+                        task_id=1,
+                        item_id=2,
+                        index=0,
+                        total=1,
+                        publish=True,
+                        progress=None,
+                        run_generation=0,
+                    )
+
+                self.assertEqual(result["status"], "failed")
+                record_result.assert_not_called()
+
     def test_location_cache_write_failure_cannot_reverse_confirmed_publish(self) -> None:
         """平台成功回读已成立时，本地缓存失败只记固定诊断。"""
 
@@ -7899,11 +8475,6 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
         with patch.object(
             executor,
             "_record_final_submit_result",
-        ), patch(
-            "app_core.douyin_commerce_batch_executor.account_service.list_accounts",
-            return_value=[
-                {"id": 31, "type": 3, "filePath": "douyin-31.json"}
-            ],
         ), patch(
             "app_core.douyin_commerce_batch_executor.record_location_publish_result",
             side_effect=RuntimeError("sensitive-database-detail"),
@@ -7943,11 +8514,6 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
         with patch.object(
             executor,
             "_record_final_submit_result",
-        ), patch(
-            "app_core.douyin_commerce_batch_executor.account_service.list_accounts",
-            return_value=[
-                {"id": 31, "type": 3, "filePath": "douyin-31.json"}
-            ],
         ), patch(
             "app_core.douyin_commerce_batch_executor.record_location_publish_result",
             side_effect=KeyboardInterrupt("client-stop"),

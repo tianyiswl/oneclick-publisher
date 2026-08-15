@@ -24,15 +24,15 @@ LOCATION_REVALIDATE_AFTER = timedelta(days=7)
 
 _LOCATION_REVALIDATION_ERROR_CODES = frozenset(
     {
+        "publish_location_not_found_after_all_pages",
         "publish_location_readback_mismatch",
         "publish_location_candidate_ambiguous",
-        "publish_location_click_failed",
-        "publish_location_cleanup_incomplete",
         "publish_location_commission_mismatch",
     }
 )
 _LOCATION_NOT_FOUND_ERROR_CODES = frozenset(
     {
+        "publish_location_not_found_after_all_pages",
         "publish_location_readback_mismatch",
     }
 )
