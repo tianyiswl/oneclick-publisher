@@ -153,3 +153,96 @@ QT_QPA_PLATFORM=offscreen <venv-python> -m unittest discover -f
 - 前置：核对本报告、实现 SHA 与唯一新全量证据。
 - 动作：按主任务决定保留或集成 `feature/douyin-location-pagination-cache`，不重跑本轮全量。
 - 完成证据：集成侧记录已采用的提交 SHA，且本 worktree 不产生未预期改动。
+
+## 10. Final review remediation cycle 2（2026-08-16）
+
+### 10.1 权威、边界与结论
+
+- 本轮唯一精确需求：`final-review-remediation-2.md`；起始 HEAD：`f46a4396f4494cedb1390382134e0efde3ee10b5`。
+- 实现提交 SHA：`f64244c712229562d97a0208c107a5270e230188`（`f64244c 修复抖音地点缓存复审剩余问题`）。
+- 结论：R1–R5 均已在当前代码验证为真实可达，完成确定性 RED→GREEN；最终独立只读复审为 `PASS`，未发现 Critical、Important 或 Minor load-bearing 问题。
+- 闭环层级：交付闭环。未登录真实账号，未连接真实浏览器会话，未读写真实平台，未执行上传或发布；Playwright 仅运行本地 headless HTML/DOM 契约用例。
+- 证据降级：本文第 5 节的 `1074 tests / 42.047s` 及本轮中途的 `646 tests`、`1082 tests` 均只作历史证据；因其后产品码与测试继续变更，不代表最终树。本轮唯一最终证据为下文 `649` 相关组合与 `1085` 全量。
+
+### 10.2 R1——真实发布 preset 链保留返佣身份
+
+- 独立验证：审查结论成立。UI 正式快照只有 `observedCommissionType`，batch payload 进入 session 后的归一化只识别 `commissionType/commerceInfo`，`commission` 可被改写为 `no_commission`。
+- RED：`test_real_batch_preset_preserves_observed_commission_type_through_session_apply`；`commission` 子用例的真实 session apply 观测到 `no_commission`，exit `1`。
+- GREEN：同一命名用例同时覆盖 `commission/no_commission`，并在 R1–R5 命名组合 `Ran 11 tests in 1.175s`中通过。
+- 修复：batch 受控 preset 边界只归一化一次观测返佣类型，并同时写入 `observedCommissionType` 和严格四字段匹配所需的权威 `commissionType`；非法/缺失值仍按现有兼容规则安全失败。
+
+### 10.3 R2——首次设置搜索的 100 个四字段身份硬门
+
+- 独立验证：审查结论成立。session 与 UI 首屏回包可直接保存 101 个唯一身份，且真实 cache-first 路径会把缓存与 101 个平台候选合并成 100 以上。
+- RED：`test_initial_setup_search_caps_first_hundred_unique_identities` 观测长度 `101 != 100`；`test_initial_platform_search_caps_ui_and_cache_merge_before_autofill` 先以真实缓存回调放入 10 条不重复候选，再回传平台 101 条，观测 UI 状态 `110 != 100`，exit `1`。
+- GREEN：上述 session/UI 两项在 R1–R5 命名组合中通过；第 101 个身份未进入 session、UI state、dropdown、auto-fill 或 cache merge payload。
+- 修复：首屏回包先按 `(poiId,name,address,commissionType)` 稳定去重，保留平台顺序前 100；UI 与已显示缓存合并后再截断总量，在 auto-fill/cache merge 前就设置 `hasMore=False`、`candidate_identity_limit` 和受控上限文案。
+
+### 10.4 R3——从真实 cache-search 路径可达的无感校对
+
+- 独立验证：审查结论成立。缓存回调的 `requiresRevalidation=True` 会被首次平台搜索成功无条件清除，因此真实路径无法进入 reconciliation。
+- RED：`test_cache_search_silently_pages_to_exhaustion_and_second_miss_invalidates`；从真实 cache-search 回调进入后标志变为 `False`，且没有派发后续无感 load-more。
+- GREEN：上述真实链用例与 `test_cache_search_interaction_failure_never_marks_missing` 在 R1–R5 命名组合中通过。
+- 修复：初始搜索保留待校对标志，在有界静默分页期间不清除；只有 `hasMore=False` 且 `stopReason=no_visible_load_more_control` 的确认穷尽会调用完整已见集合的原子校对。空集、部分页、超时或交互失败都不标记 missing。
+
+### 10.5 R4——真实 UI 选择入口的最近选择生命周期
+
+- 独立验证：审查结论成立。真实 `_select_batch_location_candidate` 仅保存 preset，未调用 `record_location_selection`，`lastSelectedAt` 在产品路径始终为空。
+- 首次 RED：`test_real_ui_selection_records_frozen_cache_identity_and_survives_eviction`中受控 runner 未收到 selection 任务。
+- 并发 RED：将同一 query 的 capacity merge 交错在迟到 selection 之前，已选行先被淘汰，旧的纯 `UPDATE` 命中 0 行，最终断言 `poi-cache-099` 不在 100 条保留集中。
+- 生命周期 RED：第一版缺行 UPSERT 把 selection 时间伪造为 `verifiedAt`，`test_late_selection_never_revives_invalid_evicted_row` 观测 `reusable != invalid`；改为永久保留 orphan 后，`test_repeated_capacity_replacement_cleans_orphan_entities` 观测实体数 `300 != 100`；容量淘汰后先收到地点发布失败时，`test_publish_failure_after_eviction_blocks_late_selection_restore` 观测迟到 selection 错误恢复了 target。三项均 exit `1`。
+- GREEN：最终 UI 竞态用例 `Ran 1 test in 0.148s`，且断言恢复行的 `verifiedAt` 与原值完全相同；发布失败、invalid 不复活、orphan 有界和生命周期优先级 4 项 `Ran 4 tests in 0.059s`；随后的 649 项相关组合全部覆盖，均 exit `0`。
+- 修复：成功保存 UI 地点后，用唯一动态 key 异步/最大努力记录冻结 account/query/四字段身份；失败只写固定日志，不撤销 UI 选择，不交付迟到 UI 回调。
+- 竞态收口：保留现有原子 orphan 清理；容量淘汰只把原始 DB lifecycle 放入进程内受控 tombstone（TTL 5 分钟、全局最多 1000 条、同 DB/account/scope/四字段隔离、锁保护）。迟到 selection 只能恢复未过期的原 `reusable` 状态，只更新 `lastSelectedAt`，不修改 `status/verifiedAt`；invalid/expired 不恢复，且更新的受控地点失败会作废同身份 tombstone。
+
+### 10.6 R5——加载更多控件只属于当前地点面板
+
+- 独立验证：审查结论成立。旧实现从 listbox 不断上爬，当地点面板无按钮而共享编辑器祖先有无关“加载更多”时会误点击。
+- RED：`test_load_more_does_not_escape_panel_to_shared_editor_button`；共享祖先分别使用通用 `section` 与 `role=dialog` 时，`_unique_visible_load_more_control` 都返回了无关 locator，exit `1`。
+- GREEN：共享 editor 负例、当前面板正例、父子节点合并为一个逻辑按钮、同面板两个独立按钮 fail-closed，最终 `Ran 4 tests in 0.974s`，exit `0`。
+- 修复：优先使用产品受控 `[data-oneclick-commerce-location-panel]` 与明确 location/poi 边界；移除通用 `dialog/section/aside` owner 猜测；只在最小当前地点区域内查找，折叠祖先/后代逻辑按钮，歧义保持安全拒绝。
+
+### 10.7 Fail-fast 恢复、最终相关组合与唯一全量
+
+- 中途首次相关组合暴露 exit `139`；系统调试确认是旧 UI 选择测试启动真后台 worker，Qt page teardown 时任务仍存活。只将该用例改为受控 runner，两用例最小组合转绿，未改产品语义。
+- 恢复组合依次在首个普通失败停止，暴露 6 个与本轮四字段入口不相干但缺少 `commissionType` 的旧 session 模拟候选。只为这 6 个命名夹具补齐固定佣型：`test_location_search_can_start_before_music_selection`、`test_location_search_never_refreshes_music`、`test_location_search_remains_available_after_music_refresh_closes_picker`、`test_selected_music_keeps_same_session_available_for_location_search`、`test_music_replace_after_refresh_leaves_no_picker_before_location_search`、`test_transient_missing_scope_panel_waits_then_retries_without_music`。
+- 上述恢复后曾得到 `646` 相关与 `1082` 全量；其后 R2/R4/R5 按真实 cache-first、并发 lifecycle 与 `role=dialog` 复审继续修正，故该两组数字已明确降为历史。
+- 最终受影响组合：
+
+```text
+QT_QPA_PLATFORM=offscreen <venv-python> -m unittest -f \
+  test_douyin_location_cache \
+  test_douyin_commerce_batch_service \
+  test_douyin_commerce_collectors \
+  test_douyin_commerce_setup_state \
+  test_douyin_commerce_service
+```
+
+结果：`Ran 649 tests in 29.609s`，`OK`，`real 29.82s`，`user 23.40s`，`sys 4.71s`，exit `0`。
+
+- 唯一一次新最终全量：
+
+```text
+QT_QPA_PLATFORM=offscreen <venv-python> -m unittest discover -f
+```
+
+结果：`Ran 1085 tests in 41.641s`，`OK`，`real 41.94s`，`user 29.29s`，`sys 6.17s`，exit `0`。全量之后未再修改产品代码或测试。
+
+### 10.8 静态、敏感与占位扫描
+
+- `py_compile`：编译 5 个受影响产品文件与 2 个测试文件，exit `0`。
+- `git diff --check`：无输出，exit `0`。
+- 占位扫描：新增行中 `TODO|FIXME|XXX|NotImplementedError|raise NotImplemented|pass` 无命中，`rg` exit `1`。
+- 敏感扫描：新增行中长 `sk-`、AWS access key、private-key header、长 Bearer token 模式无命中，`rg` exit `1`。
+- 未新增真实 Cookie、密码、API Key、验证码、二维码链接、账号凭据、客户/订单数据或真实平台 DOM 快照。
+
+### 10.9 自审、独立复审与安全停点
+
+- 范围：实现提交只修改 7 个产品/测试文件，全部直接用于 R1–R5 或其确定性并发回归；无范围外重构，未覆盖/重置用户改动。
+- 身份与上限：四字段身份在真实 preset→batch→session 链上一致；首屏平台与 UI 合并都无法越过 100。
+- 校对与生命周期：只有确认穷尽会标记 missing；selection 不伪造平台校对时间，invalid/expired/更新失败均不能被迟到 selection 复活；DB 实体与进程内 tombstone 均有界。
+- DOM：加载更多控件不再以通用 editor/dialog/section/aside 猜测 owner；无唯一逻辑按钮时安全停止。
+- 独立复审：最终只读 diff review 对 R1/R3 无新阻塞，确认 R2 cache-first 总量与 R5 `role=dialog` 负例已闭合；在 R4 连续提出并验证了 merge/selection、validity、orphan 无界及 failure/selection 四个竞态后，最终明确 `PASS`，未发现任何 load-bearing 问题。
+- 尚未验证：真实抖音当日 DOM、overlay/footer 层级、真实 POI 属性、虚拟列表回收、平台分页节奏、真实账号与最终平台回读。这是本轮明确禁止真实平台动作的预期边界，不将离线通过冒充运行或结果闭环。
+- 未解决 Critical / Important / Deferred Minor：无。
+- 安全停点：分支与 worktree 保留，未合并、未推送、未清理。
