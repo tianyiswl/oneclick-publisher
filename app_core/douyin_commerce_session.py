@@ -1229,6 +1229,11 @@ class DouyinCommerceSessionManager:
                 raise DouyinCommerceSessionError(
                     f"抖音带货位置搜索失败：{error_text[:260]}"
                 ) from exc
+        unique_candidates = _unique_location_candidates(candidates)
+        identity_limit_reached = (
+            len(unique_candidates) >= _SETUP_LOCATION_MAX_IDENTITIES
+        )
+        candidates = unique_candidates[:_SETUP_LOCATION_MAX_IDENTITIES]
         # 新搜索结果会改变发布定位。任何此前的门店选择、预检或定时回读都
         # 必须失效，避免误把旧门店用于新地点。
         session.commerce_location_candidates = [dict(item) for item in candidates]
@@ -1249,10 +1254,18 @@ class DouyinCommerceSessionManager:
             dict(item) for item in session.commerce_location_candidates
         ]
         if include_metadata is True:
-            return {
+            result: dict[str, object] = {
                 "platformResultCount": platform_result_count,
                 "candidates": public_candidates,
             }
+            if identity_limit_reached:
+                result.update(
+                    {
+                        "hasMore": False,
+                        "stopReason": "candidate_identity_limit",
+                    }
+                )
+            return result
         return public_candidates
 
     async def _load_more_locations(

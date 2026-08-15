@@ -148,9 +148,14 @@ def _location_preset(value: object, *, index: int) -> dict[str, Any]:
     result["commissionFilter"] = normalize_commission_filter(
         raw.get("commissionFilter"), default="all"
     )
-    result["observedCommissionType"] = normalize_observed_commission_type(
+    observed_commission_type = normalize_observed_commission_type(
         raw.get("observedCommissionType"), default="unknown"
     )
+    result["observedCommissionType"] = observed_commission_type
+    # UI 批次快照只公开 observedCommissionType；正式发布会话的地点归一化
+    # 只识别 commissionType/commerceInfo。受控边界必须把已验证观测值投影为
+    # 四字段身份中的权威佣型，不能让空摘要把返佣地点悄悄改成无佣。
+    result["commissionType"] = observed_commission_type
     for field in ("productCount", "commissionProductCount"):
         count = raw.get(field)
         result[field] = count if type(count) is int and count >= 0 else None

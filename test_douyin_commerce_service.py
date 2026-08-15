@@ -5714,6 +5714,64 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await browser.close()
 
+    async def test_load_more_does_not_escape_panel_to_shared_editor_button(
+        self,
+    ) -> None:
+        """地点面板没有按钮时，不得上爬到共享编辑器点击无关控件。"""
+
+        html = """
+        <section id="shared-editor" role="dialog">
+          <div id="location-region">
+            <div id="location-results" role="listbox">
+              <div role="option"><span data-store-name>银滩门店</span>
+                <span data-store-address>广西北海市银海区银滩路 1 号</span></div>
+            </div>
+          </div>
+          <div id="unrelated-panel">
+            <button id="unrelated-load-more"
+              onclick="window.unrelatedClicks += 1">加载更多</button>
+          </div>
+        </section>
+        <script>window.unrelatedClicks = 0;</script>
+        """
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+                first_page = (
+                    douyin_commerce_service.normalize_commerce_location_candidates(
+                        await douyin_commerce_service._store_option_descriptors(
+                            page.locator("#location-results")
+                        )
+                    )
+                )
+                control = (
+                    await douyin_commerce_service._unique_visible_load_more_control(
+                        page
+                    )
+                )
+                self.assertIsNone(control)
+
+                result = await douyin_commerce_service.load_more_commerce_location_candidates(
+                    page,
+                    previous_candidates=first_page,
+                    commission_filter="all",
+                    timeout_ms=5_000,
+                )
+
+                self.assertFalse(result["hasMore"])
+                self.assertEqual(
+                    result["stopReason"],
+                    "no_visible_load_more_control",
+                )
+                self.assertEqual(
+                    await page.evaluate("window.unrelatedClicks"),
+                    0,
+                )
+            finally:
+                await browser.close()
+
     async def test_load_more_collapses_nested_nodes_for_one_logical_button(self) -> None:
         """A button and its labelled descendant represent one logical control."""
 
@@ -8922,7 +8980,11 @@ class DouyinCommerceTaskPresentationTests(unittest.TestCase):
 
 
 class DouyinCommerceSessionContractTests(unittest.TestCase):
-    def _location_cache_batch(self) -> dict[str, object]:
+    def _location_cache_batch(
+        self,
+        *,
+        location_preset: dict[str, object] | None = None,
+    ) -> dict[str, object]:
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         media_path = Path(directory.name) / "offline.mp4"
@@ -8952,7 +9014,8 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
                     "items": [
                         {
                             "mediaPath": str(media_path),
-                            "locationPreset": {
+                            "locationPreset": location_preset
+                            or {
                                 "poiId": "visible-poi:target",
                                 "name": "北海银滩景区",
                                 "address": "广西壮族自治区北海市银海区银滩大道中段",
@@ -9582,6 +9645,73 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
         self.assertFalse(result["hasMore"])
         self.assertEqual(result["stopReason"], "candidate_identity_limit")
 
+    def test_initial_setup_search_caps_first_hundred_unique_identities(
+        self,
+    ) -> None:
+        """首屏一次返回 101 个身份时，会话只保存稳定顺序的前 100 个。"""
+
+        manager = douyin_commerce_session.DouyinCommerceSessionManager()
+        page = MagicMock()
+        page.is_closed.return_value = False
+        manager._session = douyin_commerce_session._CommerceEditorSession(
+            session_id="session-initial-limit",
+            upload_payload={},
+            account_name="测试账号",
+            browser=None,
+            context=None,
+            page=page,
+            playwright=None,
+            uploader=None,
+        )
+        initial = self._session_location_candidates(101)
+        with patch.object(
+            manager,
+            "_call",
+            side_effect=lambda coroutine: asyncio.run(coroutine),
+        ), patch.object(
+            douyin_commerce_session.douyin_commerce_service,
+            "search_commerce_location_store_candidates",
+            new_callable=AsyncMock,
+            return_value={
+                "platformResultCount": 101,
+                "candidates": initial,
+            },
+        ), patch.object(
+            douyin_commerce_session.douyin_commerce_service,
+            "close_commerce_store_selector",
+            new_callable=AsyncMock,
+        ):
+            result = manager.search_locations(
+                "session-initial-limit",
+                "北海",
+                "domestic",
+                commission_filter="commission",
+                include_metadata=True,
+            )
+
+        self.assertEqual(len(result["candidates"]), 100)
+        self.assertEqual(
+            [row["poiId"] for row in result["candidates"]],
+            [row["poiId"] for row in initial[:100]],
+        )
+        self.assertFalse(result["hasMore"])
+        self.assertEqual(result["stopReason"], "candidate_identity_limit")
+        self.assertEqual(
+            manager._session.commerce_location_candidates,
+            initial[:100],
+        )
+        self.assertEqual(
+            manager._session.location_search_context.candidates,
+            initial[:100],
+        )
+        self.assertNotIn(
+            initial[100]["poiId"],
+            {
+                row["poiId"]
+                for row in manager._session.commerce_location_candidates
+            },
+        )
+
     def test_setup_load_more_stops_on_second_effective_zero_growth(self) -> None:
         """底层声称增长也不能覆盖四字段集合实际连续两次零增长。"""
 
@@ -10101,6 +10231,7 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
             "name": "北海夜南香",
             "address": "广西壮族自治区北海市银海区银滩大道 1 号",
             "poiId": "visible-poi:test",
+            "commissionType": "no_commission",
         }]
         with patch.object(
             douyin_commerce_session.douyin_music_service,
@@ -10456,6 +10587,7 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
             "poiId": "poi-1",
             "name": "北海银滩景区",
             "address": "广西壮族自治区北海市银海区银滩大道中段",
+            "commissionType": "no_commission",
             "distance": "6.0km",
         }
         manager = douyin_commerce_session.DouyinCommerceSessionManager()
@@ -10531,7 +10663,12 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
         )
         music_a = {"musicId": "music-a", "title": "音乐 A", "creator": "作者", "duration": "03:21", "marker": "a"}
         music_b = {"musicId": "music-b", "title": "音乐 B", "creator": "作者", "duration": "03:22", "marker": "b"}
-        location = {"poiId": "poi-1", "name": "北海夜南香", "address": "广西壮族自治区北海市银海区银滩大道 1 号"}
+        location = {
+            "poiId": "poi-1",
+            "name": "北海夜南香",
+            "address": "广西壮族自治区北海市银海区银滩大道 1 号",
+            "commissionType": "no_commission",
+        }
         pickers = [(object(), object(), [music_a, music_b]) for _ in range(3)]
 
         async def select(_page, _picker, _dialog, candidate):
@@ -10965,6 +11102,7 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
                 "poiId": "poi-a",
                 "name": "北海银滩景区",
                 "address": "广西壮族自治区北海市银海区银滩大道中段",
+                "commissionType": "no_commission",
                 "distance": "6.0km",
             }
         ]
@@ -12016,6 +12154,79 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
         self.assertEqual(manager._session.schedule_time, "")
         self.assertEqual(manager._session.uploader.location_verification, location["name"])
 
+    def test_real_batch_preset_preserves_observed_commission_type_through_session_apply(
+        self,
+    ) -> None:
+        """UI 批次快照只有 observed 字段时，真实会话仍须按四字段佣型匹配。"""
+
+        class OpenPage:
+            def is_closed(self) -> bool:
+                return False
+
+        for observed_type in ("commission", "no_commission"):
+            with self.subTest(observed_type=observed_type):
+                ui_saved_preset = {
+                    "poiId": f"visible-poi:{observed_type}",
+                    "name": f"{observed_type} 地点",
+                    "address": f"广西北海市测试路 {observed_type} 号",
+                    "scope": "domestic",
+                    "commissionFilter": observed_type,
+                    "observedCommissionType": observed_type,
+                }
+                self.assertNotIn("commissionType", ui_saved_preset)
+                batch = self._location_cache_batch(
+                    location_preset=ui_saved_preset,
+                )
+                payload = douyin_commerce_batch_service.item_publish_payload(
+                    batch,
+                    batch["items"][0],
+                )
+                manager = douyin_commerce_session.DouyinCommerceSessionManager()
+                manager._session = douyin_commerce_session._CommerceEditorSession(
+                    session_id="session-real-batch-preset",
+                    upload_payload={},
+                    account_name="测试账号",
+                    browser=None,
+                    context=None,
+                    page=OpenPage(),
+                    playwright=None,
+                    uploader=None,
+                )
+                keyword = ui_saved_preset["address"]
+
+                async def apply_atomic(
+                    _page,
+                    preset,
+                    _scope,
+                    _keywords,
+                    *,
+                    commission_filter,
+                ):
+                    self.assertEqual(commission_filter, observed_type)
+                    return {
+                        "location": dict(preset),
+                        "matchedKeyword": keyword,
+                    }
+
+                with patch.object(
+                    douyin_commerce_session.douyin_commerce_service,
+                    "apply_saved_commerce_location_to_page",
+                    new=AsyncMock(side_effect=apply_atomic),
+                ) as apply_saved:
+                    manager.apply_saved_location(
+                        "session-real-batch-preset",
+                        payload["locationPoi"],
+                        payload["locationScope"],
+                        [keyword],
+                        payload["locationCommissionFilter"],
+                    )
+
+                actual_preset = apply_saved.await_args.args[1]
+                self.assertEqual(
+                    actual_preset["commissionType"],
+                    observed_type,
+                )
+
     def test_apply_saved_location_keeps_commission_mismatch_as_fixed_public_error(self) -> None:
         """返佣状态变化必须保留固定码，且不得串出底层异常 cause。"""
 
@@ -12243,6 +12454,7 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
                 "poiId": "poi-night-south",
                 "name": "夜南香北京烤鸭",
                 "address": "广西壮族自治区北海市银海区银滩大道 1 号",
+                "commissionType": "no_commission",
                 "distance": "1.2km",
             }
         ]
@@ -12290,7 +12502,14 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
             playwright=None,
             uploader=None,
         )
-        expected = [{"name": "北海夜南香", "address": "广西北海市银海区示例路1号"}]
+        expected = [
+            {
+                "poiId": "poi-transient-scope",
+                "name": "北海夜南香",
+                "address": "广西北海市银海区示例路1号",
+                "commissionType": "no_commission",
+            }
+        ]
         transient_error = douyin_commerce_service.DouyinCommerceError(
             "抖音位置搜索范围‘本地/国内’控件未能唯一显示"
             "（当前地点面板内本地 0 个、国内 0 个；pair-not-in-search-panel），已安全停止"
@@ -14790,6 +15009,239 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             False,
         )
 
+    def test_cache_search_silently_pages_to_exhaustion_and_second_miss_invalidates(
+        self,
+    ) -> None:
+        """待校对缓存须从真实搜索入口自动翻页，并以完整集合原子校对。"""
+
+        temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_directory.cleanup)
+        database_patch = patch.object(
+            database,
+            "DB_PATH",
+            Path(temporary_directory.name) / "revalidation.sqlite3",
+        )
+        database_patch.start()
+        self.addCleanup(database_patch.stop)
+        account_id = "812"
+        cache_query = douyin_location_cache.LocationCacheQuery(
+            account_id=account_id,
+            scope="domestic",
+            keyword="北海",
+            commission_filter="commission",
+        )
+        now = datetime.now(ZoneInfo("UTC"))
+        target = {
+            "poiId": "poi-revalidation-target",
+            "name": "待校对目标",
+            "address": "广西北海市目标路 1 号",
+            "commissionType": "commission",
+            "scope": "domestic",
+        }
+        douyin_location_cache.merge_platform_locations(
+            cache_query,
+            [target],
+            verified_at=now,
+        )
+        douyin_location_cache.record_location_publish_result(
+            account_id,
+            target,
+            success=False,
+            error_code="publish_location_candidate_ambiguous",
+            occurred_at=now + timedelta(seconds=1),
+        )
+        first_seen = {
+            "poiId": "poi-platform-a",
+            "name": "平台地点 A",
+            "address": "广西北海市平台路 1 号",
+            "commissionType": "commission",
+        }
+        second_seen = {
+            "poiId": "poi-platform-b",
+            "name": "平台地点 B",
+            "address": "广西北海市平台路 2 号",
+            "commissionType": "commission",
+        }
+
+        account = {
+            "id": int(account_id),
+            "type": 3,
+            "status": 1,
+            "filePath": f"douyin-{account_id}.json",
+            "userName": "受控测试账号",
+        }
+        self.page.account_combo.clear()
+        self.page.account_combo.addItem("请选择账号", None)
+        self.page.account_combo.addItem("受控测试账号", account)
+        self.page.account_combo.setCurrentIndex(1)
+        self.page._setup_generation_id = ""
+        self.page._session_id = "session-revalidation"
+        runner = self._ControlledLifecycleRunner()
+        self.page.runner = runner
+        self.page.batch_location_commission_combo.setCurrentIndex(
+            self.page.batch_location_commission_combo.findData("commission")
+        )
+        self.page.batch_location_scope_combo.setCurrentIndex(
+            self.page.batch_location_scope_combo.findData("domestic")
+        )
+        self.page.batch_location_keyword.setText("北海")
+        self.page._sync_batch_location_controls()
+
+        def cache_row() -> tuple[str, int]:
+            with database.connect() as conn:
+                row = conn.execute(
+                    "SELECT status, revalidationFailures "
+                    "FROM douyin_location_cache WHERE accountId = ? AND poiId = ?",
+                    (account_id, target["poiId"]),
+                ).fetchone()
+            return str(row["status"]), int(row["revalidationFailures"])
+
+        def next_page(*_args, **_kwargs):
+            if load_more.call_count % 2 == 1:
+                return {
+                    "platformResultCount": 2,
+                    "candidates": [first_seen, second_seen],
+                    "newCandidateCount": 1,
+                    "hasMore": True,
+                    "stopReason": "loaded",
+                }
+            return {
+                "platformResultCount": 2,
+                "candidates": [first_seen, second_seen],
+                "newCandidateCount": 0,
+                "hasMore": False,
+                "stopReason": "no_visible_load_more_control",
+            }
+
+        real_reconcile = douyin_location_cache.reconcile_platform_locations
+        with patch(
+            "ui.douyin_commerce_page.douyin_commerce_session.commerce_session_manager.search_locations",
+            return_value={
+                "platformResultCount": 1,
+                "candidates": [first_seen],
+            },
+        ) as platform_search, patch(
+            "ui.douyin_commerce_page.douyin_commerce_session.commerce_session_manager.load_more_locations",
+            side_effect=next_page,
+        ) as load_more, patch.object(
+            douyin_location_cache,
+            "reconcile_platform_locations",
+            wraps=real_reconcile,
+        ) as reconcile:
+            for expected_failures in (1, 2):
+                self.page.batch_location_search_button.click()
+                self._finish_location_cache_search()
+
+                runner.execute(self.page._IMMEDIATE_WRITE_KEY)
+                self.assertTrue(
+                    self.page._batch_location_state()["requiresRevalidation"]
+                )
+                self.assertEqual(cache_row(), ("needs_revalidation", expected_failures - 1))
+                runner.finish(self.page._IMMEDIATE_WRITE_KEY)
+
+                runner.execute(self.page._IMMEDIATE_WRITE_KEY)
+                self.assertEqual(cache_row(), ("needs_revalidation", expected_failures - 1))
+                self.assertEqual(reconcile.call_count, expected_failures - 1)
+                runner.finish(self.page._IMMEDIATE_WRITE_KEY)
+
+                runner.execute(self.page._IMMEDIATE_WRITE_KEY)
+                runner.finish(self.page._IMMEDIATE_WRITE_KEY)
+                self._finish_location_cache_merge()
+
+                expected_status = (
+                    "invalid" if expected_failures == 2 else "needs_revalidation"
+                )
+                self.assertEqual(cache_row(), (expected_status, expected_failures))
+
+        self.assertEqual(platform_search.call_count, 2)
+        self.assertEqual(load_more.call_count, 4)
+        self.assertEqual(reconcile.call_count, 2)
+        for reconciliation_call in reconcile.call_args_list:
+            self.assertEqual(
+                reconciliation_call.args[1],
+                [first_seen, second_seen],
+            )
+            self.assertIs(
+                reconciliation_call.kwargs["confirmed_exhausted"],
+                True,
+            )
+
+    def test_cache_search_interaction_failure_never_marks_missing(
+        self,
+    ) -> None:
+        """静默校对交互失败只能保留待校对，不能把部分集合当作穷尽。"""
+
+        account_id = "813"
+        account = {
+            "id": int(account_id),
+            "type": 3,
+            "status": 1,
+            "filePath": f"douyin-{account_id}.json",
+            "userName": "受控测试账号",
+        }
+        self.page.account_combo.clear()
+        self.page.account_combo.addItem("请选择账号", None)
+        self.page.account_combo.addItem("受控测试账号", account)
+        self.page.account_combo.setCurrentIndex(1)
+        self.page._setup_generation_id = ""
+        self.page._session_id = "session-revalidation-failure"
+        self.page.runner = self._ControlledLifecycleRunner()
+        self.page.batch_location_commission_combo.setCurrentIndex(
+            self.page.batch_location_commission_combo.findData("commission")
+        )
+        self.page.batch_location_scope_combo.setCurrentIndex(
+            self.page.batch_location_scope_combo.findData("domestic")
+        )
+        self.page.batch_location_keyword.setText("北海")
+        self.page._sync_batch_location_controls()
+        cached = self._cached_location_candidates(1)
+        cache_page = self._cache_page(cached, requires_revalidation=True)
+        first_seen = {
+            "poiId": "poi-platform-partial",
+            "name": "平台部分地点",
+            "address": "广西北海市平台路 9 号",
+            "commissionType": "commission",
+        }
+
+        with patch.object(
+            douyin_location_cache,
+            "get_cached_locations",
+            return_value=cache_page,
+        ), patch(
+            "ui.douyin_commerce_page.douyin_commerce_session.commerce_session_manager.search_locations",
+            return_value={
+                "platformResultCount": 1,
+                "candidates": [first_seen],
+            },
+        ), patch(
+            "ui.douyin_commerce_page.douyin_commerce_session.commerce_session_manager.load_more_locations",
+            side_effect=douyin_commerce_session.DouyinCommerceSessionError(
+                "publish_location_load_more_failed"
+            ),
+        ), patch.object(
+            douyin_location_cache,
+            "reconcile_platform_locations",
+        ) as reconcile:
+            self.page.batch_location_search_button.click()
+            self._finish_location_cache_search()
+            self.page.runner.execute(self.page._IMMEDIATE_WRITE_KEY)
+            self.page.runner.finish(self.page._IMMEDIATE_WRITE_KEY)
+            self.assertIn(
+                self.page._IMMEDIATE_WRITE_KEY,
+                self.page.runner.active,
+            )
+            self.page.runner.execute(self.page._IMMEDIATE_WRITE_KEY)
+            self.page.runner.finish(self.page._IMMEDIATE_WRITE_KEY)
+
+        reconcile.assert_not_called()
+        self.assertTrue(
+            self.page._batch_location_state()["requiresRevalidation"]
+        )
+        self.assertEqual(
+            self.page._batch_location_feedback,
+            "更多地点读取失败，已保留现有候选",
+        )
+
     def test_search_shows_first_ten_cached_without_platform_call(self) -> None:
         """命中可复用缓存时只显示首页，且账号键不得取展示名。"""
 
@@ -15423,6 +15875,111 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.assertFalse(state["hasMore"])
         self.assertFalse(self.page.batch_location_load_more_button.isEnabled())
         self.assertEqual(self.page._batch_location_feedback, "已达到平台加载上限（10 次）")
+
+    def test_initial_platform_search_caps_ui_and_cache_merge_before_autofill(
+        self,
+    ) -> None:
+        """真实首屏回调不得让第 101 个身份进入状态、下拉或缓存合并。"""
+
+        self._activate_cached_location_search(account_id=510)
+        cache_query = self.page._batch_location_cache_query(
+            "domestic", "北海", "commission"
+        )
+        cached = self._cached_location_candidates(10)
+        self.page._selected_video_indexes = []
+        self.page._batch_location_cache_search_succeeded(
+            cache_query,
+            "domestic",
+            "北海",
+            "commission",
+            self._cache_page(cached),
+            request_token=self.page._batch_location_search_token,
+        )
+        path = "/tmp/initial-platform-limit.mp4"
+        self.page.video_combo.clear()
+        self.page.video_combo.addItem("请选择视频", None)
+        self.page.video_combo.addItem(
+            "initial-platform-limit.mp4",
+            {"id": 1, "storedPath": path, "filename": Path(path).name},
+        )
+        self.page._selected_video_indexes = [1]
+        initial = [
+            {
+                **row,
+                "poiId": f"poi-platform-{index:03d}",
+                "name": f"平台首屏地点 {index:03d}",
+                "address": f"北海市平台首屏路 {index:03d} 号",
+            }
+            for index, row in enumerate(self._cached_location_candidates(101))
+        ]
+        excluded_poi = initial[100]["poiId"]
+        original_auto_fill = self.page._auto_fill_batch_location_candidates
+
+        def assert_bounded_before_auto_fill(scope, candidates, **kwargs):
+            state = self.page._batch_location_state()
+            self.assertEqual(len(state["platformCandidates"]), 100)
+            self.assertEqual(len(state["candidates"]), 100)
+            self.assertEqual(len(state["rawCandidates"]), 100)
+            self.assertEqual(len(candidates), 90)
+            self.assertFalse(state["hasMore"])
+            self.assertFalse(
+                self.page.batch_location_load_more_button.isEnabled()
+            )
+            self.assertEqual(
+                self.page._batch_location_feedback,
+                "已达到平台候选上限（100 个）",
+            )
+            self.assertNotIn(
+                excluded_poi,
+                {row["poiId"] for row in state["candidates"]},
+            )
+            return original_auto_fill(scope, candidates, **kwargs)
+
+        with patch.object(
+            self.page,
+            "_auto_fill_batch_location_candidates",
+            side_effect=assert_bounded_before_auto_fill,
+        ), patch.object(
+            self.page,
+            "_start_batch_location_cache_merge",
+            return_value=True,
+        ) as merge, patch(
+            "ui.douyin_commerce_page.save_location_preset",
+            side_effect=lambda _account_id, candidate, scope: {
+                **candidate,
+                "scope": scope,
+                "id": f"preset-{candidate['poiId']}",
+            },
+        ):
+            self.page._batch_location_search_succeeded(
+                "domestic",
+                "北海",
+                {
+                    "platformResultCount": 101,
+                    "candidates": initial,
+                },
+                "commission",
+                request_token=self.page._batch_location_search_token,
+                cache_query=cache_query,
+            )
+
+        merged_candidates = merge.call_args.args[1]
+        self.assertEqual(len(merged_candidates), 100)
+        self.assertNotIn(
+            excluded_poi,
+            {row["poiId"] for row in merged_candidates},
+        )
+        dropdown = self.page.batch_item_rows.widget().findChild(
+            QComboBox,
+            "douyinCommerceBatchLocationCandidates",
+        )
+        self.assertIsNotNone(dropdown)
+        option_pois = {
+            str((dropdown.itemData(index) or {}).get("poiId") or "")
+            for index in range(dropdown.count())
+            if isinstance(dropdown.itemData(index), dict)
+        }
+        self.assertNotIn(excluded_poi, option_pois)
 
     def test_legacy_session_load_more_uses_same_cache_projection(self) -> None:
         """旧会话兼容入口也必须经受控 load-more 和缓存投射。"""
@@ -18013,6 +18570,229 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             "commission",
         )
 
+    def test_real_ui_selection_records_frozen_cache_identity_and_survives_eviction(
+        self,
+    ) -> None:
+        """真实选择入口须异步记录原账号身份，并让该行优先留在 100 条内。"""
+
+        temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_directory.cleanup)
+        database_patch = patch.object(
+            database,
+            "DB_PATH",
+            Path(temporary_directory.name) / "selection.sqlite3",
+        )
+        database_patch.start()
+        self.addCleanup(database_patch.stop)
+        account_id = "914"
+        cache_query = douyin_location_cache.LocationCacheQuery(
+            account_id=account_id,
+            scope="domestic",
+            keyword="北海",
+            commission_filter="commission",
+        )
+        now = datetime.now(ZoneInfo("UTC"))
+        initial = self._cached_location_candidates(100)
+        douyin_location_cache.merge_platform_locations(
+            cache_query,
+            initial,
+            verified_at=now,
+        )
+        selected = dict(initial[-1])
+        original_identity = {
+            key: selected[key]
+            for key in ("poiId", "name", "address", "commissionType")
+        }
+        self.page.account_combo.clear()
+        self.page.account_combo.addItem("请选择账号", None)
+        self.page.account_combo.addItem(
+            "原账号",
+            {
+                "id": int(account_id),
+                "type": 3,
+                "status": 1,
+                "filePath": f"douyin-{account_id}.json",
+            },
+        )
+        self.page.account_combo.addItem(
+            "迟到账号",
+            {
+                "id": 915,
+                "type": 3,
+                "status": 1,
+                "filePath": "douyin-915.json",
+            },
+        )
+        self.page.account_combo.setCurrentIndex(1)
+        self.page._batch_location_searches["__shared_location_search__"] = {
+            "accountId": account_id,
+            "scope": "domestic",
+            "keyword": "北海",
+            "commissionFilter": "commission",
+            "rawCandidates": [dict(selected)],
+            "candidates": [dict(selected)],
+            "platformCandidates": [dict(selected)],
+            "hasMore": False,
+        }
+        runner = self._ControlledLifecycleRunner()
+        self.page.runner = runner
+        path = "/tmp/frozen-selection.mp4"
+
+        self.page._select_batch_location_candidate(
+            path,
+            "domestic",
+            selected,
+        )
+
+        selection_keys = [
+            key
+            for key in runner.active
+            if key.startswith("douyin_commerce_location_cache_selection")
+        ]
+        self.assertEqual(len(selection_keys), 1, runner.active)
+        self.page.account_combo.setCurrentIndex(2)
+        self.page._batch_location_search_token += 1
+        self.page.batch_location_keyword.setText("迟到关键词")
+        selected["poiId"] = "mutated-after-dispatch"
+        selected["name"] = "迟到突变"
+        newcomer = {
+            **initial[0],
+            "poiId": "poi-cache-newcomer",
+            "name": "新进入地点",
+            "address": "北海市新进入路 1 号",
+        }
+        retained_at = now + timedelta(minutes=1)
+        douyin_location_cache.merge_platform_locations(
+            cache_query,
+            [newcomer],
+            verified_at=retained_at,
+        )
+        with database.connect() as conn:
+            links_before_selection = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM douyin_location_cache AS cache
+                JOIN douyin_location_cache_keywords AS keyword
+                  ON keyword.locationCacheId = cache.id
+                WHERE keyword.accountId = ? AND keyword.scope = ?
+                  AND keyword.keyword = ? AND keyword.commissionFilter = ?
+                  AND cache.poiId = ?
+                """,
+                (
+                    cache_query.account_id,
+                    cache_query.scope,
+                    cache_query.keyword,
+                    cache_query.commission_filter,
+                    original_identity["poiId"],
+                ),
+            ).fetchone()["count"]
+        self.assertEqual(links_before_selection, 0)
+
+        runner.execute(selection_keys[0])
+        runner.finish(selection_keys[0])
+
+        saved = self.page._batch_locations[path]
+        self.assertEqual(
+            {key: saved[key] for key in ("poiId", "name", "address")},
+            {
+                key: original_identity[key]
+                for key in ("poiId", "name", "address")
+            },
+        )
+        retained = {
+            row["poiId"]
+            for offset in range(0, 100, 10)
+            for row in douyin_location_cache.get_cached_locations(
+                cache_query,
+                offset=offset,
+                now=retained_at,
+            )["candidates"]
+        }
+        self.assertEqual(len(retained), 100)
+        self.assertIn(original_identity["poiId"], retained)
+        self.assertIn(newcomer["poiId"], retained)
+        with database.connect() as conn:
+            selected_row = conn.execute(
+                "SELECT lastSelectedAt, verifiedAt FROM douyin_location_cache "
+                "WHERE accountId = ? AND poiId = ?",
+                (account_id, original_identity["poiId"]),
+            ).fetchone()
+        self.assertTrue(str(selected_row["lastSelectedAt"] or ""))
+        self.assertEqual(selected_row["verifiedAt"], now.isoformat())
+
+    def test_real_ui_selection_cache_failure_keeps_selection_and_controlled_feedback(
+        self,
+    ) -> None:
+        """选择生命周期写入失败不得撤销已选地点或向 UI 暴露原始异常。"""
+
+        self.page.account_combo.clear()
+        self.page.account_combo.addItem(
+            "测试账号",
+            {
+                "id": 916,
+                "type": 3,
+                "status": 1,
+                "filePath": "douyin-916.json",
+            },
+        )
+        self.page.account_combo.setCurrentIndex(0)
+        candidate = {
+            "poiId": "poi-selection-failure",
+            "name": "选择失败保护地点",
+            "address": "北海市失败保护路 1 号",
+            "commissionType": "commission",
+        }
+        self.page._batch_location_searches["__shared_location_search__"] = {
+            "accountId": "916",
+            "scope": "domestic",
+            "keyword": "北海",
+            "commissionFilter": "commission",
+            "rawCandidates": [dict(candidate)],
+            "candidates": [dict(candidate)],
+            "platformCandidates": [dict(candidate)],
+            "hasMore": False,
+        }
+        runner = self._ControlledLifecycleRunner()
+        self.page.runner = runner
+        path = "/tmp/selection-cache-failure.mp4"
+        with patch(
+            "ui.douyin_commerce_page.save_location_preset",
+            return_value={
+                "id": "preset-selection-failure",
+                "poiId": candidate["poiId"],
+                "name": candidate["name"],
+                "address": candidate["address"],
+                "scope": "domestic",
+            },
+        ), patch.object(
+            douyin_location_cache,
+            "record_location_selection",
+            side_effect=RuntimeError("/private/cache/raw-selection-error"),
+        ):
+            self.page._select_batch_location_candidate(
+                path,
+                "domestic",
+                candidate,
+            )
+            selection_keys = [
+                key
+                for key in runner.active
+                if key.startswith("douyin_commerce_location_cache_selection")
+            ]
+            self.assertEqual(len(selection_keys), 1, runner.active)
+            runner.execute(selection_keys[0])
+            runner.finish(selection_keys[0])
+
+        self.assertEqual(
+            self.page._batch_locations[path]["poiId"],
+            candidate["poiId"],
+        )
+        self.assertEqual(
+            self.page._batch_location_feedback,
+            "已绑定地点；其他视频可继续设置",
+        )
+        self.assertNotIn("private", self.page._batch_location_feedback)
+
     def test_batch_location_snapshot_normalizes_observed_type_and_nonnegative_integer_counts(self) -> None:
         """本批返佣快照必须拒绝布尔、负数、字符串和非法类型。"""
 
@@ -19096,6 +19876,8 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             self.page._batch_location_searches["__shared_location_search__"]["candidates"][0]["poiId"],
             "poi-1",
         )
+        runner = self._ControlledLifecycleRunner()
+        self.page.runner = runner
         with patch(
             "ui.douyin_commerce_page.save_location_preset",
             return_value={**candidate, "scope": "domestic", "id": "preset-1"},
@@ -19113,6 +19895,16 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         )
         self.assertEqual(self.page._batch_locations[path]["address"], candidate["address"])
         self.assertEqual(self.page._batch_locations[path]["searchKeyword"], "北海")
+        self.assertEqual(
+            len(
+                [
+                    key
+                    for key in runner.active
+                    if key.startswith("douyin_commerce_location_cache_selection")
+                ]
+            ),
+            1,
+        )
 
     def test_batch_location_search_results_are_available_to_every_video_dropdown(self) -> None:
         """所有视频行复用顶部搜索结果，界面不再各自创建搜索框。"""

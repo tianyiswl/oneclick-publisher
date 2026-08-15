@@ -7,9 +7,11 @@ Cookie、DOM 标记等会话数据。缓存候选必须在发布前由调用方�
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import threading
 from typing import Any
 
 from . import database
@@ -21,6 +23,8 @@ LOCATION_STATUS_INVALID = "invalid"
 LOCATION_CACHE_PAGE_SIZE = 10
 LOCATION_CACHE_CAPACITY = 100
 LOCATION_REVALIDATE_AFTER = timedelta(days=7)
+_LOCATION_EVICTION_TOMBSTONE_TTL = timedelta(minutes=5)
+_LOCATION_EVICTION_TOMBSTONE_CAPACITY = LOCATION_CACHE_CAPACITY * 10
 _LOCATION_SCOPES = frozenset({"local", "domestic"})
 _LOCATION_COMMISSION_FILTERS = frozenset(
     {"all", "commission", "no_commission"}
@@ -41,6 +45,12 @@ _LOCATION_NOT_FOUND_ERROR_CODES = frozenset(
         "publish_location_readback_mismatch",
     }
 )
+_evicted_location_lock = threading.Lock()
+_evicted_location_tombstones: OrderedDict[
+    tuple[str, ...], tuple[datetime, dict[str, Any]]
+] = OrderedDict()
+
+
 class DouyinLocationCacheError(ValueError):
     """地点缓存的调用参数或公开候选字段不安全。"""
 
@@ -194,6 +204,141 @@ def _candidate_identity(
     )
 
 
+def _evicted_location_key(
+    account_id: object,
+    scope: object,
+    candidate: Mapping[str, Any],
+) -> tuple[str, ...]:
+    return (
+        str(database.DB_PATH),
+        str(account_id),
+        str(scope),
+        *_candidate_identity(candidate),
+    )
+
+
+def _prune_evicted_location_tombstones(current: datetime) -> None:
+    expired = [
+        key
+        for key, (evicted_at, _row) in _evicted_location_tombstones.items()
+        if current >= evicted_at
+        and current - evicted_at >= _LOCATION_EVICTION_TOMBSTONE_TTL
+    ]
+    for key in expired:
+        _evicted_location_tombstones.pop(key, None)
+    while len(_evicted_location_tombstones) > _LOCATION_EVICTION_TOMBSTONE_CAPACITY:
+        _evicted_location_tombstones.popitem(last=False)
+
+
+def _remember_evicted_locations(
+    rows: list[Mapping[str, Any]],
+    *,
+    now: datetime,
+) -> None:
+    with _evicted_location_lock:
+        _prune_evicted_location_tombstones(now)
+        for row in rows:
+            key = _evicted_location_key(row["accountId"], row["scope"], row)
+            _evicted_location_tombstones[key] = (now, dict(row))
+            _evicted_location_tombstones.move_to_end(key)
+        _prune_evicted_location_tombstones(now)
+
+
+def _take_recent_evicted_location(
+    account_id: str,
+    candidate: Mapping[str, Any],
+    *,
+    now: datetime,
+) -> dict[str, Any] | None:
+    key = _evicted_location_key(account_id, candidate["scope"], candidate)
+    with _evicted_location_lock:
+        _prune_evicted_location_tombstones(now)
+        entry = _evicted_location_tombstones.pop(key, None)
+    if entry is None:
+        return None
+    evicted_at, row = entry
+    if now >= evicted_at and now - evicted_at >= _LOCATION_EVICTION_TOMBSTONE_TTL:
+        return None
+    return row
+
+
+def _discard_evicted_location(
+    account_id: str,
+    candidate: Mapping[str, Any],
+) -> None:
+    key = _evicted_location_key(account_id, candidate["scope"], candidate)
+    with _evicted_location_lock:
+        _evicted_location_tombstones.pop(key, None)
+
+
+def _restore_recent_reusable_eviction(
+    conn: Any,
+    account_id: str,
+    candidate: Mapping[str, Any],
+    *,
+    selected_at: datetime,
+) -> Mapping[str, Any] | None:
+    row = _take_recent_evicted_location(
+        account_id,
+        candidate,
+        now=selected_at,
+    )
+    if row is None or row.get("status") != LOCATION_STATUS_REUSABLE:
+        return None
+    verified_at = _parse_timestamp(row.get("verifiedAt"))
+    if verified_at is None or selected_at - verified_at >= LOCATION_REVALIDATE_AFTER:
+        return None
+    timestamp = selected_at.isoformat()
+    conn.execute(
+        """
+        INSERT INTO douyin_location_cache (
+            accountId, scope, poiId, name, address, commissionType,
+            distance, source, productCount, commissionProductCount,
+            commissionLabel, status, verifiedAt, firstSeenAt, lastSeenAt,
+            lastSelectedAt, lastPublishSuccessAt, lastFailureAt,
+            lastErrorCode, revalidationFailures
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            row["accountId"],
+            row["scope"],
+            row["poiId"],
+            row["name"],
+            row["address"],
+            row["commissionType"],
+            row["distance"],
+            row["source"],
+            row["productCount"],
+            row["commissionProductCount"],
+            row["commissionLabel"],
+            row["status"],
+            row["verifiedAt"],
+            row["firstSeenAt"],
+            row["lastSeenAt"],
+            timestamp,
+            row["lastPublishSuccessAt"],
+            row["lastFailureAt"],
+            row["lastErrorCode"],
+            row["revalidationFailures"],
+        ),
+    )
+    return conn.execute(
+        """
+        SELECT id FROM douyin_location_cache
+        WHERE accountId = ? AND scope = ? AND poiId = ? AND name = ?
+          AND address = ? AND commissionType = ?
+        """,
+        (
+            account_id,
+            candidate["scope"],
+            candidate["poiId"],
+            candidate["name"],
+            candidate["address"],
+            candidate["commissionType"],
+        ),
+    ).fetchone()
+
+
 def _evict_excess_locations(
     conn: Any,
     query: LocationCacheQuery,
@@ -285,6 +430,18 @@ def _evict_excess_locations(
             *ids,
         ),
     )
+    orphan_rows = conn.execute(
+        f"""
+        SELECT cache.* FROM douyin_location_cache AS cache
+        WHERE cache.id IN ({placeholders})
+          AND NOT EXISTS (
+              SELECT 1 FROM douyin_location_cache_keywords AS keyword
+              WHERE keyword.locationCacheId = cache.id
+          )
+        """,
+        ids,
+    ).fetchall()
+    _remember_evicted_locations(orphan_rows, now=now)
     conn.execute(
         """
         DELETE FROM douyin_location_cache
@@ -646,15 +803,25 @@ def record_location_selection(
     account_id: str,
     candidate: object,
     *,
+    query: LocationCacheQuery | None = None,
     occurred_at: datetime | None = None,
 ) -> None:
-    """Record a controlled selection signal without changing cache validity."""
+    """Record selection without changing validity; restore its query association."""
 
     safe_account_id = _text(account_id, "账号")
     safe_candidate = _candidate(candidate, require_scope=True)
-    timestamp = _timestamp(occurred_at)
+    safe_query = _query(query) if query is not None else None
+    if safe_query is not None:
+        if (
+            safe_query.account_id != safe_account_id
+            or safe_query.scope != safe_candidate["scope"]
+        ):
+            raise DouyinLocationCacheError("地点缓存选择查询身份不匹配")
+        _validate_candidates_for_query(safe_query, [safe_candidate])
+    current = _now(occurred_at)
+    timestamp = current.isoformat()
     with database.connect() as conn:
-        conn.execute(
+        updated = conn.execute(
             """
             UPDATE douyin_location_cache
             SET lastSelectedAt = ?
@@ -671,6 +838,65 @@ def record_location_selection(
                 safe_candidate["commissionType"],
             ),
         )
+        cache_row = None
+        if updated.rowcount == 1:
+            cache_row = conn.execute(
+                """
+                SELECT id FROM douyin_location_cache
+                WHERE accountId = ? AND scope = ? AND poiId = ? AND name = ?
+                  AND address = ? AND commissionType = ?
+                """,
+                (
+                    safe_account_id,
+                    safe_candidate["scope"],
+                    safe_candidate["poiId"],
+                    safe_candidate["name"],
+                    safe_candidate["address"],
+                    safe_candidate["commissionType"],
+                ),
+            ).fetchone()
+        elif safe_query is not None:
+            cache_row = _restore_recent_reusable_eviction(
+                conn,
+                safe_account_id,
+                safe_candidate,
+                selected_at=current,
+            )
+        if safe_query is None or cache_row is None:
+            return
+        position = conn.execute(
+            """
+            SELECT COALESCE(MAX(position) + 1, 0) AS position
+            FROM douyin_location_cache_keywords
+            WHERE accountId = ? AND scope = ? AND keyword = ?
+              AND commissionFilter = ?
+            """,
+            (
+                safe_query.account_id,
+                safe_query.scope,
+                safe_query.keyword,
+                safe_query.commission_filter,
+            ),
+        ).fetchone()["position"]
+        conn.execute(
+            """
+            INSERT INTO douyin_location_cache_keywords (
+                locationCacheId, accountId, scope, keyword, commissionFilter, position
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(locationCacheId, keyword, commissionFilter) DO UPDATE SET
+                accountId = excluded.accountId,
+                scope = excluded.scope
+            """,
+            (
+                cache_row["id"],
+                safe_query.account_id,
+                safe_query.scope,
+                safe_query.keyword,
+                safe_query.commission_filter,
+                position,
+            ),
+        )
+        _evict_excess_locations(conn, safe_query, now=current)
 
 
 def record_location_publish_result(
@@ -813,3 +1039,4 @@ def record_location_publish_result(
                 safe_candidate["commissionType"],
             ),
         )
+        _discard_evicted_location(safe_account_id, safe_candidate)

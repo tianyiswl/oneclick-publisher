@@ -479,6 +479,37 @@ class DouyinLocationCacheTests(unittest.TestCase):
         )
         self.assertEqual(len(all_cached_ids(location_query, now=BASE_TIME)), 100)
 
+    def test_repeated_capacity_replacement_cleans_orphan_entities(self) -> None:
+        """Replacing a full query repeatedly must not grow orphan entities."""
+
+        location_query = query("account-a", keyword="bounded-entities")
+        for page in range(3):
+            merge_platform_locations(
+                location_query,
+                candidates(
+                    LOCATION_CACHE_CAPACITY,
+                    start=page * LOCATION_CACHE_CAPACITY + 1,
+                ),
+                verified_at=BASE_TIME + timedelta(minutes=page),
+            )
+
+        with database.connect() as conn:
+            entity_count = conn.execute(
+                "SELECT COUNT(*) AS count FROM douyin_location_cache"
+            ).fetchone()["count"]
+            orphan_count = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM douyin_location_cache AS cache
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM douyin_location_cache_keywords AS keyword
+                    WHERE keyword.locationCacheId = cache.id
+                )
+                """
+            ).fetchone()["count"]
+        self.assertEqual(entity_count, LOCATION_CACHE_CAPACITY)
+        self.assertEqual(orphan_count, 0)
+
     def test_capacity_retains_hundred_reusable_when_invalid_and_expired_history_exists(
         self,
     ) -> None:
@@ -602,6 +633,98 @@ class DouyinLocationCacheTests(unittest.TestCase):
             (BASE_TIME + timedelta(minutes=2)).isoformat(),
         )
         self.assertEqual(published_row["lastErrorCode"], "")
+
+    def test_late_selection_never_revives_invalid_evicted_row(self) -> None:
+        """A late selection may preserve history but cannot certify validity."""
+
+        location_query = query("account-a", keyword="late-invalid-selection")
+        target = candidates(1)[0]
+        merge_platform_locations(location_query, [target], verified_at=BASE_TIME)
+        record_location_publish_result(
+            "account-a",
+            {**target, "scope": location_query.scope},
+            success=False,
+            error_code="publish_location_not_found_after_all_pages",
+            occurred_at=BASE_TIME + timedelta(minutes=1),
+        )
+        reconcile_platform_locations(
+            location_query,
+            [],
+            confirmed_exhausted=True,
+            verified_at=BASE_TIME + timedelta(minutes=2),
+        )
+        self.assertEqual(
+            cached_status(
+                "account-a", {**target, "scope": location_query.scope}
+            ),
+            "invalid",
+        )
+
+        fresh = candidates(LOCATION_CACHE_CAPACITY, start=1001)
+        merge_platform_locations(
+            location_query,
+            fresh,
+            verified_at=BASE_TIME + timedelta(minutes=3),
+        )
+        record_location_selection(
+            "account-a",
+            {**target, "scope": location_query.scope},
+            query=location_query,
+            occurred_at=BASE_TIME + timedelta(minutes=4),
+        )
+
+        self.assertNotIn(
+            target["poiId"],
+            all_cached_ids(
+                location_query,
+                now=BASE_TIME + timedelta(minutes=4),
+            ),
+        )
+        self.assertIn(
+            cached_status(
+                "account-a", {**target, "scope": location_query.scope}
+            ),
+            ("", "invalid"),
+        )
+
+    def test_publish_failure_after_eviction_blocks_late_selection_restore(
+        self,
+    ) -> None:
+        """A newer location failure must invalidate an older eviction snapshot."""
+
+        location_query = query("account-a", keyword="failure-after-eviction")
+        initial = candidates(LOCATION_CACHE_CAPACITY)
+        target = {**initial[-1], "scope": location_query.scope}
+        merge_platform_locations(location_query, initial, verified_at=BASE_TIME)
+        merge_platform_locations(
+            location_query,
+            [candidates(1, start=1001)[0]],
+            verified_at=BASE_TIME + timedelta(minutes=1),
+        )
+        self.assertEqual(cached_status("account-a", target), "")
+
+        record_location_publish_result(
+            "account-a",
+            target,
+            success=False,
+            error_code="publish_location_readback_mismatch",
+            occurred_at=BASE_TIME + timedelta(minutes=2),
+        )
+        record_location_selection(
+            "account-a",
+            target,
+            query=location_query,
+            occurred_at=BASE_TIME + timedelta(minutes=3),
+        )
+
+        self.assertNotIn(
+            target["poiId"],
+            all_cached_ids(
+                location_query,
+                now=BASE_TIME + timedelta(minutes=3),
+            ),
+        )
+        self.assertNotEqual(cached_status("account-a", target), "reusable")
 
     def test_public_cache_boundary_rejects_unknown_enums_and_filter_mismatch(
         self,

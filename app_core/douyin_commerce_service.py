@@ -2763,10 +2763,27 @@ async def _unique_visible_load_more_control(page) -> Any | None:
                 if (!listbox || !isEffectivelyVisible(listbox)) {
                     return { count: 0 };
                 }
-                const candidates = Array.from(document.querySelectorAll(
+                const panelSelector = [
+                    '[data-oneclick-commerce-location-panel]',
+                    '[id*="location-panel"]',
+                    '[id*="location_panel"]',
+                    '[id*="poi-panel"]',
+                    '[class*="location-panel"]',
+                    '[class*="location_panel"]',
+                    '[class*="poi-panel"]'
+                ].join(', ');
+                const explicitPanel = listbox.closest(panelSelector);
+                const panel = explicitPanel && explicitPanel !== listbox
+                    ? explicitPanel : listbox.parentElement;
+                if (!panel || panel === document.body
+                    || !isEffectivelyVisible(panel)) return { count: 0 };
+                const candidates = Array.from(panel.querySelectorAll(
                     'button, input[type="button"], input[type="submit"], '
                     + 'a[href], [role="button"], [tabindex], [onclick]'
                 )).filter(isEffectivelyVisible).filter(node => {
+                    if (listbox.contains(node)) return false;
+                    const ownerPanel = node.closest(panelSelector);
+                    if (ownerPanel && ownerPanel !== panel) return false;
                     if (node.matches('[disabled], [aria-disabled="true"]')
                         || node.closest('[disabled], [aria-disabled="true"], [inert]')) return false;
                     const view = node.ownerDocument?.defaultView;
@@ -2777,18 +2794,7 @@ async def _unique_visible_load_more_control(page) -> Any | None:
                         ? node.value : (node.innerText || node.textContent));
                     return text.includes('点击加载更多') || text.includes('加载更多');
                 });
-                let controls = [];
-                for (let region = listbox.parentElement, depth = 0;
-                    region && region !== document.body && depth < 8;
-                    region = region.parentElement, depth += 1) {
-                    const scoped = candidates.filter(node =>
-                        region.contains(node) && !listbox.contains(node));
-                    if (scoped.length) {
-                        controls = scoped;
-                        break;
-                    }
-                }
-                controls = controls.filter(node => !controls.some(other =>
+                const controls = candidates.filter(node => !candidates.some(other =>
                     other !== node && other.contains(node)));
                 document.querySelectorAll('[data-oneclick-commerce-load-more="active"]')
                     .forEach(node => node.removeAttribute(
