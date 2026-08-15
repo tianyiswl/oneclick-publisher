@@ -19,7 +19,10 @@ from uuid import uuid4
 
 from .douyin_commerce_location_commission import normalize_commission_filter
 from .douyin_commerce_probe import build_probe_upload_payload
-from .douyin_commerce_session import DouyinCommerceSessionManager
+from .douyin_commerce_session import (
+    DouyinCommerceSessionManager,
+    snapshot_location_candidates,
+)
 from .douyin_commerce_setup_state import (
     CollectorDiagnosticEvent,
     CollectorState,
@@ -711,35 +714,42 @@ class DouyinCommerceCollectorManager:
                 collector_type=collector_type.value,
                 collector_instance_id=action_instance_id,
             ) from None
-        with self._state_lock:
-            current_runtime = self._require_collecting_runtime(generation_id)
-            current = current_runtime.collectors.get(collector_type)
-            if (
-                current_runtime is not runtime
-                or current is None
-                or current.instance_id != action_instance_id
-            ):
-                raise DouyinCommerceCollectorError(
-                    "stale_result_discarded",
-                    generation_id=generation_id,
-                    collector_type=collector_type.value,
-                    collector_instance_id=action_instance_id,
-                ) from None
-            action = self._action_queue.reserve(
-                generation_id,
-                request_id,
-                collector_type,
-                lambda: self._load_more_locations_action(
+        try:
+            with self._state_lock:
+                current_runtime = self._require_collecting_runtime(
+                    generation_id
+                )
+                current = current_runtime.collectors.get(collector_type)
+                if (
+                    current_runtime is not runtime
+                    or current is None
+                    or current.instance_id != action_instance_id
+                ):
+                    raise DouyinCommerceCollectorError(
+                        "stale_result_discarded"
+                    )
+                action = self._action_queue.reserve(
                     generation_id,
-                    collector_type,
                     request_id,
-                    normalized_keyword,
-                    normalized_scope,
-                    action_instance_id,
-                    selected_commission_filter,
-                    previous_snapshot,
-                ),
-            )
+                    collector_type,
+                    lambda: self._load_more_locations_action(
+                        generation_id,
+                        collector_type,
+                        request_id,
+                        normalized_keyword,
+                        normalized_scope,
+                        action_instance_id,
+                        selected_commission_filter,
+                        previous_snapshot,
+                    ),
+                )
+        except DouyinCommerceCollectorError as error:
+            raise self._contextual_action_error(
+                error,
+                generation_id,
+                collector_type,
+                action_instance_id,
+            ) from None
         self._action_queue.start(action)
         try:
             return self._wait_public_action(
@@ -2364,12 +2374,7 @@ class DouyinCommerceCollectorManager:
         cls,
         candidates: object,
     ) -> list[dict[str, Any]]:
-        snapshot = cls._rebuild_controlled_value(candidates)
-        if type(snapshot) is not list or any(
-            type(item) is not dict for item in snapshot
-        ):
-            raise TypeError("location candidates are not controlled")
-        return snapshot
+        return snapshot_location_candidates(candidates)
 
     @classmethod
     def _rebuild_controlled_value(

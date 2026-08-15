@@ -537,6 +537,117 @@ class DouyinCommerceCollectorManagerTests(unittest.TestCase):
                     },
                 )
 
+    def test_load_more_rejects_unsupported_nested_values_before_queue(self):
+        generation_id = self.manager.begin_generation(self.upload_payload)[
+            "setupGenerationId"
+        ]
+        searched = self.manager.search_locations(
+            generation_id,
+            "夜南香",
+            "domestic",
+            commission_filter="commission",
+        )
+        domestic = self.factory.instances[0]
+        invalid_evidence_values = (
+            ("元组不应进入队列",),
+            {1: "非字符串键不应进入队列"},
+        )
+
+        for invalid_value in invalid_evidence_values:
+            with self.subTest(invalid_value=invalid_value):
+                previous_candidates = [dict(searched["candidates"][0])]
+                previous_candidates[0]["evidence"] = invalid_value
+
+                with self.assertRaises(
+                    DouyinCommerceCollectorError
+                ) as raised:
+                    self.manager.load_more_locations(
+                        generation_id,
+                        "夜南香",
+                        "domestic",
+                        commission_filter="commission",
+                        previous_candidates=previous_candidates,
+                    )
+
+                self.assertIsNone(raised.exception.__cause__)
+                self.assertEqual(
+                    str(raised.exception),
+                    "publish_location_load_more_failed",
+                )
+                self.assertEqual(domestic.load_more_calls, [])
+                self.assertEqual(
+                    self.manager.status(generation_id)["collectors"][
+                        "domestic_location"
+                    ],
+                    "active",
+                )
+
+    def test_load_more_closed_during_snapshot_keeps_captured_context(self):
+        generation_id = self.manager.begin_generation(self.upload_payload)[
+            "setupGenerationId"
+        ]
+        searched = self.manager.search_locations(
+            generation_id,
+            "夜南香",
+            "domestic",
+            commission_filter="commission",
+        )
+        instance_id = self.manager.status(generation_id)[
+            "collectorInstanceIds"
+        ]["domestic_location"]
+        snapshot_started = threading.Event()
+        release_snapshot = threading.Event()
+        original_snapshot = self.manager._snapshot_location_candidates
+        outcome: dict[str, object] = {}
+
+        def blocked_snapshot(candidates):
+            snapshot_started.set()
+            release_snapshot.wait(timeout=2)
+            return original_snapshot(candidates)
+
+        with mock.patch.object(
+            self.manager,
+            "_snapshot_location_candidates",
+            side_effect=blocked_snapshot,
+        ):
+            load_more_thread = threading.Thread(
+                target=lambda: self._capture_call(
+                    outcome,
+                    "load_more",
+                    lambda: self.manager.load_more_locations(
+                        generation_id,
+                        "夜南香",
+                        "domestic",
+                        commission_filter="commission",
+                        previous_candidates=searched["candidates"],
+                    ),
+                )
+            )
+            load_more_thread.start()
+            self.assertTrue(snapshot_started.wait(timeout=1))
+            closed = self.manager.close_generation(
+                generation_id,
+                reason="cancelled",
+            )
+            release_snapshot.set()
+            load_more_thread.join(timeout=1)
+
+        self.assertFalse(load_more_thread.is_alive())
+        self.assertTrue(closed["closed"])
+        error = outcome["load_more_error"]
+        self.assertIsInstance(error, DouyinCommerceCollectorError)
+        self.assertIsNone(error.__cause__)
+        self.assertEqual(
+            error.to_public_action_result(),
+            {
+                "ok": False,
+                "errorCode": "stale_result_discarded",
+                "setupGenerationId": generation_id,
+                "collectorType": "domestic_location",
+                "collectorInstanceId": instance_id,
+            },
+        )
+
     def test_queued_load_more_deep_snapshots_previous_candidates(self):
         generation_id = self.manager.begin_generation(self.upload_payload)[
             "setupGenerationId"

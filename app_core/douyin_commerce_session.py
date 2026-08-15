@@ -120,7 +120,7 @@ def _rebuild_controlled_location_value(
         active.remove(marker)
 
 
-def _snapshot_location_candidates(value: object) -> list[dict[str, Any]]:
+def snapshot_location_candidates(value: object) -> list[dict[str, Any]]:
     snapshot = _rebuild_controlled_location_value(value)
     if type(snapshot) is not list or any(
         type(item) is not dict for item in snapshot
@@ -456,7 +456,7 @@ class DouyinCommerceSessionManager:
                 "collector_search_context_mismatch"
             ) from None
         try:
-            previous_snapshot = _snapshot_location_candidates(
+            previous_snapshot = snapshot_location_candidates(
                 previous_candidates
             )
         except Exception:
@@ -1247,10 +1247,10 @@ class DouyinCommerceSessionManager:
                 "collector_search_context_mismatch"
             ) from None
         try:
-            previous_snapshot = _snapshot_location_candidates(
+            previous_snapshot = snapshot_location_candidates(
                 previous_candidates
             )
-            context_snapshot = _snapshot_location_candidates(
+            context_snapshot = snapshot_location_candidates(
                 context.candidates
             )
         except Exception:
@@ -1287,7 +1287,7 @@ class DouyinCommerceSessionManager:
                 or not raw_stop_reason
             ):
                 raise TypeError("metadata_result_invalid")
-            candidates = _snapshot_location_candidates(raw_candidates)
+            candidates = snapshot_location_candidates(raw_candidates)
         except Exception:
             raise DouyinCommerceSessionError(
                 "publish_location_load_more_failed"
@@ -1300,17 +1300,17 @@ class DouyinCommerceSessionManager:
             raise DouyinCommerceSessionError(
                 "collector_search_context_mismatch"
             ) from None
-        context.candidates = _snapshot_location_candidates(candidates)
+        context.candidates = snapshot_location_candidates(candidates)
         context.load_more_count += 1
         context.zero_growth_count = (
             context.zero_growth_count + 1 if raw_new_count == 0 else 0
         )
-        session.commerce_location_candidates = _snapshot_location_candidates(
+        session.commerce_location_candidates = snapshot_location_candidates(
             candidates
         )
         return {
             "platformResultCount": raw_count,
-            "candidates": _snapshot_location_candidates(candidates),
+            "candidates": snapshot_location_candidates(candidates),
             "newCandidateCount": raw_new_count,
             "hasMore": raw_has_more,
             "stopReason": raw_stop_reason,
