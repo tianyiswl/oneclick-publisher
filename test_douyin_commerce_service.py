@@ -11873,6 +11873,323 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.page.batch_location_keyword.setText("北海")
         self.page._sync_batch_location_controls()
 
+    def _finish_location_cache_search(self) -> None:
+        runner = self.page.runner
+        self.assertIn("douyin_commerce_location_cache_search", runner.active)
+        runner.execute("douyin_commerce_location_cache_search")
+        runner.finish("douyin_commerce_location_cache_search")
+
+    def _finish_location_cache_page(self) -> None:
+        runner = self.page.runner
+        self.assertIn("douyin_commerce_location_cache_page", runner.active)
+        runner.execute("douyin_commerce_location_cache_page")
+        runner.finish("douyin_commerce_location_cache_page")
+
+    def _finish_location_cache_merge(self) -> None:
+        runner = self.page.runner
+        self.assertIn("douyin_commerce_location_cache_merge", runner.active)
+        runner.execute("douyin_commerce_location_cache_merge")
+        runner.finish("douyin_commerce_location_cache_merge")
+
+    @staticmethod
+    def _cache_page(
+        cached: list[dict[str, object]],
+        *,
+        offset: int = 0,
+        requires_revalidation: bool = False,
+    ) -> dict[str, object]:
+        page = cached[offset : offset + 10]
+        return {
+            "candidates": page,
+            "offset": offset,
+            "limit": 10,
+            "total": len(cached),
+            "hasMore": offset + len(page) < len(cached),
+            "requiresRevalidation": requires_revalidation,
+        }
+
+    def _assert_cache_exhaustion_uses_real_session_context(
+        self,
+        cache_count: int,
+    ) -> None:
+        """真实 session 必须先 search 建上下文，再用纯平台快照 load-more。"""
+
+        self._activate_cached_location_search(account_id=700 + cache_count)
+        self.page._setup_generation_id = ""
+        self.page._setup_generation_content_fingerprint = ""
+        self.page._session_id = "session-cache-handoff"
+        runner = self._ControlledLifecycleRunner()
+        self.page.runner = runner
+        cached = self._cached_location_candidates(cache_count)
+        first_platform = {
+            "poiId": "poi-platform-first",
+            "name": "平台首页",
+            "address": "北海市平台路 1 号",
+            "commissionType": "commission",
+        }
+        second_platform = {
+            "poiId": "poi-platform-second",
+            "name": "平台下一页",
+            "address": "北海市平台路 2 号",
+            "commissionType": "commission",
+        }
+        session_manager = douyin_commerce_session.DouyinCommerceSessionManager()
+        platform_page = MagicMock()
+        platform_page.is_closed.return_value = False
+        session_manager._session = douyin_commerce_session._CommerceEditorSession(
+            session_id="session-cache-handoff",
+            upload_payload={},
+            account_name="受控测试账号",
+            browser=None,
+            context=None,
+            page=platform_page,
+            playwright=None,
+            uploader=None,
+        )
+        next_page = {
+            "platformResultCount": 2,
+            "candidates": [first_platform, second_platform],
+            "newCandidateCount": 1,
+            "hasMore": False,
+            "stopReason": "loaded",
+        }
+
+        def cached_page(_query, *, offset=0, **_kwargs):
+            return self._cache_page(cached, offset=offset)
+
+        with patch.object(
+            douyin_location_cache,
+            "get_cached_locations",
+            side_effect=cached_page,
+        ), patch.object(
+            douyin_location_cache,
+            "merge_platform_locations",
+            return_value=self._cache_page(cached),
+        ), patch.object(
+            douyin_commerce_session,
+            "commerce_session_manager",
+            session_manager,
+        ), patch.object(
+            session_manager,
+            "_call",
+            side_effect=lambda coroutine: asyncio.run(coroutine),
+        ), patch.object(
+            douyin_commerce_session.douyin_commerce_service,
+            "close_commerce_store_selector",
+            new_callable=AsyncMock,
+        ), patch.object(
+            douyin_commerce_session.douyin_commerce_service,
+            "search_commerce_location_store_candidates",
+            new_callable=AsyncMock,
+            return_value={
+                "platformResultCount": 1,
+                "candidates": [first_platform],
+            },
+        ) as platform_search, patch.object(
+            douyin_commerce_session.douyin_commerce_service,
+            "load_more_commerce_location_candidates",
+            new_callable=AsyncMock,
+            return_value=next_page,
+        ) as platform_load_more:
+            self.page.batch_location_search_button.click()
+            self.assertIn("douyin_commerce_location_cache_search", runner.active)
+            runner.execute("douyin_commerce_location_cache_search")
+            runner.finish("douyin_commerce_location_cache_search")
+
+            for expected_count in range(20, cache_count + 1, 10):
+                self.page.batch_location_load_more_button.click()
+                self.assertIn("douyin_commerce_location_cache_page", runner.active)
+                runner.execute("douyin_commerce_location_cache_page")
+                runner.finish("douyin_commerce_location_cache_page")
+                self.assertEqual(
+                    len(self.page._batch_location_state()["candidates"]),
+                    expected_count,
+                )
+
+            self.page.batch_location_load_more_button.click()
+            self.assertIn(self.page._IMMEDIATE_WRITE_KEY, runner.active)
+            runner.execute(self.page._IMMEDIATE_WRITE_KEY)
+            runner.finish(self.page._IMMEDIATE_WRITE_KEY)
+            self.assertIn("douyin_commerce_location_cache_merge", runner.active)
+            runner.execute("douyin_commerce_location_cache_merge")
+            runner.finish("douyin_commerce_location_cache_merge")
+
+            state = self.page._batch_location_state()
+            self.assertIs(state.get("platformContextReady"), True)
+            self.assertEqual(state.get("platformCandidates"), [first_platform])
+            self.assertEqual(len(state["candidates"]), cache_count + 1)
+
+            self.page.batch_location_load_more_button.click()
+            self.assertIn(self.page._IMMEDIATE_WRITE_KEY, runner.active)
+            runner.execute(self.page._IMMEDIATE_WRITE_KEY)
+            runner.finish(self.page._IMMEDIATE_WRITE_KEY)
+            self.assertIn("douyin_commerce_location_cache_merge", runner.active)
+            runner.execute("douyin_commerce_location_cache_merge")
+            runner.finish("douyin_commerce_location_cache_merge")
+
+        platform_search.assert_awaited_once()
+        platform_load_more.assert_awaited_once_with(
+            platform_page,
+            previous_candidates=[first_platform],
+            commission_filter="commission",
+        )
+        self.assertEqual(
+            self.page._batch_location_state().get("platformCandidates"),
+            [first_platform, second_platform],
+        )
+        self.assertEqual(
+            len(self.page._batch_location_state()["candidates"]),
+            cache_count + 2,
+        )
+
+    def test_twenty_cached_rows_bootstrap_real_session_context_before_load_more(
+        self,
+    ) -> None:
+        self._assert_cache_exhaustion_uses_real_session_context(20)
+
+    def test_hundred_cached_rows_bootstrap_real_session_context_before_load_more(
+        self,
+    ) -> None:
+        self._assert_cache_exhaustion_uses_real_session_context(100)
+
+    def test_cache_query_is_queued_and_old_account_result_cannot_write_ui(self) -> None:
+        """缓存 worker 未释放时 UI 必须返回；切账号后旧回包必须丢弃。"""
+
+        class QueuedPool:
+            def __init__(self) -> None:
+                self.tasks: list[BackgroundTask] = []
+
+            def start(self, task: BackgroundTask) -> None:
+                self.tasks.append(task)
+
+        self._activate_cached_location_search(account_id=801)
+        pool = QueuedPool()
+        runner = BackgroundTaskRunner(self.page)
+        runner.pool = pool
+        self.page.runner = runner
+        cached = self._cached_location_candidates(10)
+        with patch.object(
+            douyin_location_cache,
+            "get_cached_locations",
+            return_value=self._cache_page(cached),
+        ) as cache_get:
+            self.page.batch_location_search_button.click()
+
+            cache_get.assert_not_called()
+            self.assertEqual(len(pool.tasks), 1)
+            self.assertFalse(self.page.batch_location_search_button.isEnabled())
+
+            self.page.account_combo.addItem(
+                "新账号展示名",
+                {
+                    "id": 802,
+                    "type": 3,
+                    "status": 1,
+                    "filePath": "douyin-802.json",
+                    "userName": "新账号展示名",
+                },
+            )
+            self.page.account_combo.setCurrentIndex(
+                self.page.account_combo.count() - 1
+            )
+            pool.tasks[0].run()
+            QApplication.processEvents()
+
+        cache_get.assert_called_once()
+        self.assertEqual(self.page._batch_location_state()["candidates"], [])
+        self.assertFalse(self.page._batch_location_load_more_pending)
+
+    def test_platform_merge_is_queued_and_stale_account_result_is_discarded(
+        self,
+    ) -> None:
+        """平台回包合并不得阻塞 UI，且账号变更后旧 merge 结果不得回写。"""
+
+        class QueuedPool:
+            def __init__(self) -> None:
+                self.tasks: list[BackgroundTask] = []
+
+            def start(self, task: BackgroundTask) -> None:
+                self.tasks.append(task)
+
+        self._activate_cached_location_search(account_id=803)
+        pool = QueuedPool()
+        runner = BackgroundTaskRunner(self.page)
+        runner.pool = pool
+        self.page.runner = runner
+        cached = self._cached_location_candidates(1)
+        old_token = self.page._batch_location_search_token
+        cache_query = douyin_location_cache.LocationCacheQuery(
+            account_id="803",
+            scope="domestic",
+            keyword="北海",
+            commission_filter="commission",
+        )
+        with patch.object(
+            douyin_location_cache,
+            "merge_platform_locations",
+            return_value=self._cache_page(cached),
+        ) as merge:
+            self.page._batch_location_search_succeeded(
+                "domestic",
+                "北海",
+                {"platformResultCount": 1, "candidates": cached},
+                "commission",
+                request_token=old_token,
+                cache_query=cache_query,
+            )
+
+            merge.assert_not_called()
+            self.assertEqual(len(pool.tasks), 1)
+            self.page.account_combo.addItem(
+                "合并期间新账号",
+                {
+                    "id": 804,
+                    "type": 3,
+                    "status": 1,
+                    "filePath": "douyin-804.json",
+                    "userName": "合并期间新账号",
+                },
+            )
+            self.page.account_combo.setCurrentIndex(
+                self.page.account_combo.count() - 1
+            )
+            pool.tasks[0].run()
+            QApplication.processEvents()
+
+        merge.assert_called_once()
+        self.assertEqual(self.page._batch_location_state()["candidates"], [])
+
+    def test_revalidation_cache_shows_reusable_rows_and_starts_platform_search(
+        self,
+    ) -> None:
+        """缓存混有待校对记录时，只展示可复用项并后台建平台上下文。"""
+
+        self._activate_cached_location_search(account_id=805)
+        runner = self.page.runner
+        cached = self._cached_location_candidates(19)
+        cache_page = self._cache_page(cached, requires_revalidation=True)
+        with patch.object(
+            douyin_location_cache,
+            "get_cached_locations",
+            return_value=cache_page,
+        ), patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.search_locations",
+            return_value={
+                "ok": True,
+                "setupGenerationId": "generation-a",
+                "collectorType": "domestic_location",
+                "collectorInstanceId": "domestic-a",
+                "platformResultCount": 0,
+                "candidates": [],
+            },
+        ) as platform_search:
+            self.page.batch_location_search_button.click()
+            self._finish_location_cache_search()
+
+        self.assertEqual(len(self.page._batch_location_state()["candidates"]), 10)
+        self.assertIn(self.page._COLLECTOR_TASK_KEY, runner.active)
+        platform_search.assert_not_called()
+
     def test_search_shows_first_ten_cached_without_platform_call(self) -> None:
         """命中可复用缓存时只显示首页，且账号键不得取展示名。"""
 
@@ -11893,6 +12210,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.search_locations"
         ) as platform_search:
             self.page.batch_location_search_button.click()
+            self._finish_location_cache_search()
 
         state = self.page._batch_location_state()
         self.assertEqual(len(state["candidates"]), 10)
@@ -11903,7 +12221,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         platform_search.assert_not_called()
 
     def test_load_more_uses_cache_then_platform_once(self) -> None:
-        """加载更多必须先用完本地页，再串行请求一次平台。"""
+        """加载更多必须先用完本地页，再先 search 建上下文并分页。"""
 
         self._activate_cached_location_search(account_id=502)
         cached = self._cached_location_candidates(20)
@@ -11918,21 +12236,27 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
                 "hasMore": offset + len(page) < 20,
             }
 
+        new_platform_candidate = {
+            **cached[0],
+            "poiId": "poi-platform-021",
+            "name": "平台新地点",
+            "address": "北海市平台新地址 21 号",
+        }
+        platform_search_result = {
+            "ok": True,
+            "setupGenerationId": "generation-a",
+            "collectorType": "domestic_location",
+            "collectorInstanceId": "domestic-a",
+            "platformResultCount": 1,
+            "candidates": [],
+        }
         platform_result = {
             "ok": True,
             "setupGenerationId": "generation-a",
             "collectorType": "domestic_location",
             "collectorInstanceId": "domestic-a",
             "platformResultCount": 21,
-            "candidates": cached
-            + [
-                {
-                    **cached[0],
-                    "poiId": "poi-platform-021",
-                    "name": "平台新地点",
-                    "address": "北海市平台新地址 21 号",
-                }
-            ],
+            "candidates": [new_platform_candidate],
             "newCandidateCount": 1,
             "hasMore": False,
             "stopReason": "loaded",
@@ -11952,6 +12276,9 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
                 "hasMore": True,
             },
         ), patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.search_locations",
+            return_value=platform_search_result,
+        ) as platform_search, patch(
             "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.load_more_locations",
             return_value=platform_result,
         ) as platform_load_more, patch(
@@ -11959,19 +12286,51 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             return_value=self._collector_status(),
         ):
             self.page.batch_location_search_button.click()
+            self._finish_location_cache_search()
             load_more = self.page.findChild(
                 QPushButton,
                 "douyinCommerceBatchLoadMoreLocations",
             )
             self.assertIsNotNone(load_more)
-            self.assertTrue(load_more.isEnabled())
+            self.assertTrue(
+                load_more.isEnabled(),
+                (
+                    self.page._batch_location_state(),
+                    self.page._busy(),
+                    self.page._batch_location_load_more_pending,
+                    self.page._batch_location_merge_pending,
+                    self.page.runner.active,
+                ),
+            )
             load_more.click()
+            self._finish_location_cache_page()
             self.assertEqual(len(self.page._batch_location_state()["candidates"]), 20)
-            self.assertTrue(load_more.isEnabled())
+            self.assertTrue(
+                load_more.isEnabled(), self.page._batch_location_state()
+            )
             load_more.click()
             self.page.runner.execute(self.page._COLLECTOR_TASK_KEY)
+            self.page.runner.finish(self.page._COLLECTOR_TASK_KEY)
+            self.assertTrue(
+                load_more.isEnabled(),
+                (
+                    self.page._batch_location_state(),
+                    self.page._busy(),
+                    self.page._batch_location_load_more_pending,
+                    self.page._batch_location_merge_pending,
+                    self.page.runner.active,
+                ),
+            )
+            load_more.click()
+            self.page.runner.execute(self.page._COLLECTOR_TASK_KEY)
+            self.page.runner.finish(self.page._COLLECTOR_TASK_KEY)
+            self._finish_location_cache_merge()
 
+        self.assertEqual(platform_search.call_count, 1)
         self.assertEqual(platform_load_more.call_count, 1)
+        self.assertEqual(
+            platform_load_more.call_args.kwargs["previous_candidates"], []
+        )
 
     def test_cached_search_fills_only_placeholder_videos_and_can_refill_after_clear(
         self,
@@ -12023,6 +12382,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             side_effect=save_candidate,
         ):
             self.page.batch_location_search_button.click()
+            self._finish_location_cache_search()
             self.assertEqual(
                 self.page._batch_locations[first_path]["poiId"],
                 "poi-cache-000",
@@ -12037,6 +12397,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             dropdown.setCurrentIndex(0)
             self.assertNotIn(first_path, self.page._batch_locations)
             self.page.batch_location_search_button.click()
+            self._finish_location_cache_search()
 
         self.assertEqual(
             self.page._batch_locations[first_path]["poiId"],
@@ -12075,6 +12436,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             side_effect=cache_page,
         ) as cache_get:
             self.page.batch_location_search_button.click()
+            self._finish_location_cache_search()
             old_token = self.page._batch_location_search_token
             self.page.account_combo.addItem(
                 "新展示名",
@@ -12092,6 +12454,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             self.assertGreater(self.page._batch_location_search_token, old_token)
             self._activate_setup_generation()
             self.page.batch_location_search_button.click()
+            self._finish_location_cache_search()
 
         self.assertEqual(
             [entry.args[0].account_id for entry in cache_get.call_args_list],
@@ -12218,6 +12581,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             side_effect=RuntimeError("/private/cache/secret.db"),
         ):
             self.page._search_batch_locations("domestic", "新关键词")
+            self._finish_location_cache_search()
 
         self.assertEqual(
             self.page._batch_location_state()["candidates"],
@@ -12241,14 +12605,21 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             "total": 10,
             "hasMore": False,
         }
-        platform_candidates = cached + [
-            {
-                **cached[0],
-                "poiId": "poi-platform-011",
-                "name": "平台候选 011",
-                "address": "北海市平台路 11 号",
-            }
-        ]
+        platform_candidate = {
+            **cached[0],
+            "poiId": "poi-platform-011",
+            "name": "平台候选 011",
+            "address": "北海市平台路 11 号",
+        }
+        platform_candidates = [platform_candidate]
+        platform_search_result = {
+            "ok": True,
+            "setupGenerationId": "generation-a",
+            "collectorType": "domestic_location",
+            "collectorInstanceId": "domestic-a",
+            "platformResultCount": 1,
+            "candidates": [],
+        }
         platform_result = {
             "ok": True,
             "setupGenerationId": "generation-a",
@@ -12275,6 +12646,9 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
                 "hasMore": True,
             },
         ), patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.search_locations",
+            return_value=platform_search_result,
+        ), patch(
             "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.load_more_locations",
             return_value=platform_result,
         ) as load_more, patch(
@@ -12282,7 +12656,31 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             return_value=self._collector_status(),
         ):
             self.page.batch_location_search_button.click()
-            self.assertTrue(self.page.batch_location_load_more_button.isEnabled())
+            self._finish_location_cache_search()
+            self.assertTrue(
+                self.page.batch_location_load_more_button.isEnabled(),
+                (
+                    self.page._batch_location_state(),
+                    self.page._busy(),
+                    self.page._batch_location_load_more_pending,
+                    self.page._batch_location_merge_pending,
+                    self.page.runner.active,
+                ),
+            )
+
+            self.page._load_more_batch_locations()
+            self.page.runner.execute(self.page._COLLECTOR_TASK_KEY)
+            self.page.runner.finish(self.page._COLLECTOR_TASK_KEY)
+            self.assertTrue(
+                self.page.batch_location_load_more_button.isEnabled(),
+                (
+                    self.page._batch_location_state(),
+                    self.page._busy(),
+                    self.page._batch_location_load_more_pending,
+                    self.page._batch_location_merge_pending,
+                    self.page.runner.active,
+                ),
+            )
 
             self.page._load_more_batch_locations()
 
@@ -12294,6 +12692,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             load_more.assert_not_called()
             self.page.runner.execute(self.page._COLLECTOR_TASK_KEY)
             self.page.runner.finish(self.page._COLLECTOR_TASK_KEY)
+            self._finish_location_cache_merge()
 
         state = self.page._batch_location_state()
         self.assertEqual(state["platformLoadCount"], 1)
@@ -12319,7 +12718,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.page._session_id = "session-controlled"
         self.page.runner = self._ControlledLifecycleRunner()
         cached = self._cached_location_candidates(10)
-        platform_candidates = cached + [
+        platform_candidates = [
             {
                 **cached[0],
                 "poiId": "poi-session-011",
@@ -12350,20 +12749,29 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             "merge_platform_locations",
             return_value={**cache_page, "total": 11},
         ), patch(
+            "ui.douyin_commerce_page.douyin_commerce_session.commerce_session_manager.search_locations",
+            return_value={"platformResultCount": 1, "candidates": []},
+        ) as search, patch(
             "ui.douyin_commerce_page.douyin_commerce_session.commerce_session_manager.load_more_locations",
             return_value=result,
         ) as load_more:
             self.page.batch_location_search_button.click()
+            self._finish_location_cache_search()
             self.page.batch_location_load_more_button.click()
             self.page.runner.execute(self.page._IMMEDIATE_WRITE_KEY)
             self.page.runner.finish(self.page._IMMEDIATE_WRITE_KEY)
+            self.page.batch_location_load_more_button.click()
+            self.page.runner.execute(self.page._IMMEDIATE_WRITE_KEY)
+            self.page.runner.finish(self.page._IMMEDIATE_WRITE_KEY)
+            self._finish_location_cache_merge()
 
+        search.assert_called_once()
         load_more.assert_called_once_with(
             "session-controlled",
             "北海",
             "domestic",
             commission_filter="commission",
-            previous_candidates=cached,
+            previous_candidates=[],
         )
         state = self.page._batch_location_state()
         self.assertEqual(state["platformLoadCount"], 1)
@@ -12431,6 +12839,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         runner.finish(self.page._COLLECTOR_TASK_KEY)
 
         self.page._search_batch_locations("domestic", "夜南香")
+        self._finish_location_cache_search()
         self.assertTrue(
             self.page.platform_collector_progress_label.text().startswith(
                 "正在搜索国内地点"
@@ -12439,6 +12848,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         runner.finish(self.page._COLLECTOR_TASK_KEY)
 
         self.page._search_batch_locations("local", "夜南香")
+        self._finish_location_cache_search()
         self.assertTrue(
             self.page.platform_collector_progress_label.text().startswith(
                 "正在搜索本地地点"
@@ -12489,6 +12899,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             return_value=status,
         ):
             self.page._search_batch_locations("domestic", "北海")
+            self._finish_location_cache_search()
             self.page.batch_location_commission_combo.setCurrentIndex(
                 self.page.batch_location_commission_combo.findData(
                     "no_commission"
@@ -12536,6 +12947,8 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             return_value=self._collector_status(),
         ):
             self.page._search_batch_locations("domestic", "北海")
+            runner.execute("douyin_commerce_location_cache_search")
+            runner.finish("douyin_commerce_location_cache_search")
             runner.execute(self.page._COLLECTOR_TASK_KEY)
 
         search.assert_called_once_with(
@@ -12549,6 +12962,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.assertEqual(state["platformResultCount"], 3)
         self.assertEqual(state["rawCandidates"], [])
         self.assertEqual(state["candidates"], [])
+        self.assertTrue(state["hasMore"])
         self.assertIn(
             "平台返回 3 个，但没有符合‘返佣’条件",
             self.page.batch_item_settings_status.text(),
@@ -13697,6 +14111,8 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
                             self.page._stage_music_selection(candidate)
                         else:
                             self.page._search_batch_locations(action, "夜南香")
+                            pool.run_next()
+                            pool.run_next()
                             pool.run_next()
                             state = self.page._batch_location_state()
                             accepted_location_states.append(state)

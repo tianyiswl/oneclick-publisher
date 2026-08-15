@@ -115,10 +115,9 @@ class DouyinLocationCacheTests(unittest.TestCase):
             ids(get_cached_locations(query("account-a"), offset=10, limit=10, now=BASE_TIME)),
             [f"poi-{index}" for index in range(11, 21)],
         )
-        self.assertEqual(
-            len(get_cached_locations(query("account-b"), now=BASE_TIME)["candidates"]),
-            3,
-        )
+        account_b_page = get_cached_locations(query("account-b"), now=BASE_TIME)
+        self.assertEqual(len(account_b_page["candidates"]), 3)
+        self.assertIs(account_b_page["requiresRevalidation"], False)
 
     def test_location_failure_marks_only_target_for_revalidation(self) -> None:
         """错误状态若泄漏到同账号其他地点，本测试必须失败。"""
@@ -188,6 +187,63 @@ class DouyinLocationCacheTests(unittest.TestCase):
             get_cached_locations(query("account-a"), limit=10.0, now=BASE_TIME)
         with self.assertRaises(ValueError):
             get_cached_locations(query("account-a"), limit=True, now=BASE_TIME)
+
+    def test_cache_page_requires_revalidation_when_one_linked_row_needs_review(
+        self,
+    ) -> None:
+        """混合结果中任一关联地点待校对时，不得把查询标成纯缓存可用。"""
+
+        merged = merge_platform_locations(
+            query("account-a"),
+            candidates(20),
+            verified_at=BASE_TIME,
+        )
+        record_location_publish_result(
+            "account-a",
+            merged["candidates"][-1],
+            success=False,
+            error_code="publish_location_candidate_ambiguous",
+            occurred_at=BASE_TIME + timedelta(minutes=1),
+        )
+
+        page = get_cached_locations(
+            query("account-a"),
+            now=BASE_TIME + timedelta(minutes=1),
+        )
+
+        self.assertEqual(page["total"], 19)
+        self.assertEqual(len(page["candidates"]), 10)
+        self.assertIs(page.get("requiresRevalidation"), True)
+
+    def test_cache_page_requires_revalidation_at_exact_seven_day_boundary(
+        self,
+    ) -> None:
+        """一条关联地点恰满七天时必须后台校对，其余新鲜地点仍可展示。"""
+
+        merge_platform_locations(
+            query("account-a"),
+            candidates(20),
+            verified_at=BASE_TIME,
+        )
+        fresh_time = BASE_TIME + timedelta(days=6)
+        with database.connect() as conn:
+            conn.execute(
+                """
+                UPDATE douyin_location_cache
+                SET verifiedAt = ?
+                WHERE accountId = ? AND poiId != ?
+                """,
+                (fresh_time.isoformat(), "account-a", "poi-20"),
+            )
+
+        page = get_cached_locations(
+            query("account-a"),
+            now=BASE_TIME + timedelta(days=7),
+        )
+
+        self.assertEqual(page["total"], 19)
+        self.assertEqual(len(page["candidates"]), 10)
+        self.assertIs(page.get("requiresRevalidation"), True)
 
     def test_pagination_is_fixed_to_ten_rows(self) -> None:
         """调用方可用 limit 绕过十条分页时，本测试必须失败。"""

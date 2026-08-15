@@ -242,7 +242,6 @@ def get_cached_locations(
               ON keyword.locationCacheId = cache.id
             WHERE keyword.accountId = ? AND keyword.scope = ?
               AND keyword.keyword = ? AND keyword.commissionFilter = ?
-              AND cache.status = ?
             ORDER BY keyword.position ASC, cache.id ASC
             """,
             (
@@ -250,12 +249,22 @@ def get_cached_locations(
                 safe_query.scope,
                 safe_query.keyword,
                 safe_query.commission_filter,
-                LOCATION_STATUS_REUSABLE,
             ),
         ).fetchall()
+    public_rows = [_public(row) for row in rows]
     reusable = [
-        public for row in rows if not location_requires_revalidation(public := _public(row), now=current)
+        row
+        for row in public_rows
+        if not location_requires_revalidation(row, now=current)
     ]
+    requires_revalidation = any(
+        row.get("status") == LOCATION_STATUS_NEEDS_REVALIDATION
+        or (
+            row.get("status") == LOCATION_STATUS_REUSABLE
+            and location_requires_revalidation(row, now=current)
+        )
+        for row in public_rows
+    )
     page = reusable[safe_offset : safe_offset + safe_limit]
     return {
         "candidates": page,
@@ -263,6 +272,7 @@ def get_cached_locations(
         "limit": safe_limit,
         "total": len(reusable),
         "hasMore": safe_offset + len(page) < len(reusable),
+        "requiresRevalidation": bool(requires_revalidation),
     }
 
 
