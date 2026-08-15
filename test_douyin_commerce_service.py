@@ -5038,6 +5038,66 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
 
         load_more.assert_not_awaited()
 
+    async def test_publish_rejects_initial_101st_target_before_match_or_readback(
+        self,
+    ) -> None:
+        """首屏第一百零一条即使是目标，也必须在匹配和回读前限额停止。"""
+
+        first_hundred = [
+            douyin_commerce_service.normalize_commerce_location_candidate(
+                {
+                    "name": f"非目标{index}",
+                    "address": f"广西北海市候选路{index}号",
+                    "commerceInfo": "1件商品 · 1件返佣",
+                }
+            )
+            for index in range(100)
+        ]
+        preset = douyin_commerce_service.normalize_commerce_location_candidate(
+            {
+                "name": "首屏超限目标",
+                "address": "广西北海市目标路101号",
+                "commerceInfo": "1件商品 · 1件返佣",
+            }
+        )
+        self.assertIsNotNone(preset)
+        with patch.object(
+            douyin_commerce_service,
+            "search_commerce_location_store_candidates",
+            new_callable=AsyncMock,
+            return_value=[*first_hundred, preset],
+        ), patch.object(
+            douyin_commerce_service,
+            "load_more_commerce_location_candidates",
+            new_callable=AsyncMock,
+        ) as load_more, patch.object(
+            douyin_commerce_service,
+            "_visible_store_listbox",
+            new_callable=AsyncMock,
+            return_value=object(),
+        ) as visible_listbox, patch.object(
+            douyin_commerce_service,
+            "_apply_open_commerce_location_to_page",
+            new_callable=AsyncMock,
+            return_value={"location": dict(preset)},
+        ) as apply_open, patch.object(
+            douyin_commerce_service,
+            "close_commerce_store_selector",
+            new_callable=AsyncMock,
+        ):
+            with self.assertRaisesRegex(
+                douyin_commerce_service.DouyinCommerceError,
+                "^publish_location_load_more_limit$",
+            ) as raised:
+                await douyin_commerce_service.apply_saved_commerce_location_to_page(
+                    object(), preset, "domestic", ["目标"], "commission"
+                )
+
+        self.assertIsNone(raised.exception.__cause__)
+        load_more.assert_not_awaited()
+        visible_listbox.assert_not_awaited()
+        apply_open.assert_not_awaited()
+
     async def test_publish_rejects_a_target_arriving_beyond_candidate_limit(self) -> None:
         """第一百零一条才出现的目标不得绕过候选硬上限。"""
 

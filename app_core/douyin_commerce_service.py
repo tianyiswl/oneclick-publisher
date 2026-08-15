@@ -3538,6 +3538,10 @@ async def apply_saved_commerce_location_to_page(
                 _commerce_location_candidate_identity(candidate)
                 for candidate in candidates
             )
+            if len(seen_candidate_identities) > max_candidates:
+                raise DouyinCommerceError(
+                    "publish_location_load_more_limit"
+                ) from None
             consecutive_zero_growth = 0
             exhausted = False
             matched_candidates: list[dict[str, Any]] = []
