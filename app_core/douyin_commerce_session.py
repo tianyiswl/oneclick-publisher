@@ -1392,6 +1392,9 @@ class DouyinCommerceSessionManager:
                 "publish_location_readback_mismatch",
                 "publish_location_cleanup_incomplete",
                 "publish_location_commission_mismatch",
+                "publish_location_not_found_after_all_pages",
+                "publish_location_load_more_limit",
+                "publish_location_load_more_failed",
             }
             raise DouyinCommerceSessionError(
                 code if code in allowed else "publish_location_click_failed"

@@ -17,7 +17,7 @@ import threading
 from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo
 
-from . import task_service
+from . import account_service, task_service
 from ._douyin_commerce_batch_receipt_writer import _write_final_batch_receipt
 from .douyin_commerce_batch_service import (
     SHANGHAI_TIMEZONE,
@@ -31,6 +31,7 @@ from .douyin_location_preset_service import (
     DouyinLocationPresetError,
     match_location_preset,
 )
+from .douyin_location_cache import record_location_publish_result
 from .douyin_sms_cooldown import DouyinSmsCooldownError, DouyinSmsCooldownGate
 from .douyin_verification import (
     DouyinVerificationError,
@@ -59,6 +60,16 @@ class DouyinCommerceBatchExecutorError(RuntimeError):
 
 
 _BATCH_SESSION_CLEANUP_ERROR_CODE = "batch_session_cleanup_incomplete"
+_LOCATION_CACHE_FAILURE_CODES = frozenset(
+    {
+        "publish_location_not_found_after_all_pages",
+        "publish_location_candidate_ambiguous",
+        "publish_location_click_failed",
+        "publish_location_readback_mismatch",
+        "publish_location_cleanup_incomplete",
+        "publish_location_commission_mismatch",
+    }
+)
 
 
 class _BatchSessionCleanupIncomplete(DouyinCommerceBatchExecutorError):
@@ -167,6 +178,18 @@ _PUBLIC_BATCH_DIAGNOSTICS = {
     "publish_location_commission_mismatch": (
         "发布定位恢复失败：地点存在，但当前返佣状态与设置时不一致"
         "（错误码 publish_location_commission_mismatch）"
+    ),
+    "publish_location_not_found_after_all_pages": (
+        "发布定位恢复失败：已读完可用候选批次，仍未找到完整身份一致的地点"
+        "（错误码 publish_location_not_found_after_all_pages）"
+    ),
+    "publish_location_load_more_limit": (
+        "发布定位恢复失败：已达自动加载安全上限"
+        "（错误码 publish_location_load_more_limit）"
+    ),
+    "publish_location_load_more_failed": (
+        "发布定位恢复失败：平台候选无法继续安全加载"
+        "（错误码 publish_location_load_more_failed）"
     ),
 }
 
@@ -400,6 +423,74 @@ class DouyinCommerceBatchExecutor:
     def _prepare_batch(self, batch: Mapping[str, Any]) -> dict[str, Any]:
         checked = validate_batch_payload(batch)
         return apply_interval_schedule(checked, now=self._now())
+
+    @staticmethod
+    def _location_cache_account_id(batch: Mapping[str, Any]) -> str:
+        """用受控账号台账把批次文件反查为缓存账号 ID。"""
+
+        account_file = _text(batch.get("accountFile"))
+        accounts = account_service.list_accounts()
+        exact_matches = [
+            account
+            for account in accounts
+            if int(account.get("type") or 0) == 3
+            and _text(account.get("filePath")) == account_file
+        ]
+        matches = exact_matches
+        if not matches and account_file:
+            account_name = Path(account_file).name
+            matches = [
+                account
+                for account in accounts
+                if int(account.get("type") or 0) == 3
+                and Path(_text(account.get("filePath"))).name == account_name
+            ]
+        if len(matches) != 1 or not _text(matches[0].get("id")):
+            raise DouyinCommerceBatchExecutorError(
+                "location_cache_account_unresolved"
+            ) from None
+        return _text(matches[0].get("id"))
+
+    def _record_location_cache_result(
+        self,
+        batch: Mapping[str, Any],
+        location: Mapping[str, Any],
+        scope: str,
+        *,
+        success: bool,
+        error_code: str = "",
+    ) -> None:
+        """最大努力回写地点缓存；普通失败不改写发布结果。"""
+
+        try:
+            candidate = dict(location)
+            candidate["scope"] = scope
+            candidate["commissionType"] = _text(
+                location.get("observedCommissionType")
+                or location.get("commissionType")
+            )
+            account_id = self._location_cache_account_id(batch)
+            finished_at = self._now()
+            if success:
+                record_location_publish_result(
+                    account_id,
+                    candidate,
+                    success=True,
+                    occurred_at=finished_at,
+                )
+            else:
+                record_location_publish_result(
+                    account_id,
+                    candidate,
+                    success=False,
+                    error_code=error_code,
+                    occurred_at=finished_at,
+                )
+        except Exception:
+            douyin_logger.warning(
+                "抖音带货地点缓存结果回写失败："
+                "location_cache_result_write_failed"
+            )
 
     def _close_session_barrier(self, session_id: str) -> None:
         """只接受严格关闭且回读零存活，不回退到吞错 `close`。"""
@@ -1011,6 +1102,15 @@ class DouyinCommerceBatchExecutor:
                     f"视频={label}，范围={scope_label}，目标={target_location}，"
                     f"已尝试={location_keywords}，错误={_text(exc) or type(exc).__name__}"
                 )
+                location_error_code = _text(exc)
+                if publish and location_error_code in _LOCATION_CACHE_FAILURE_CODES:
+                    self._record_location_cache_result(
+                        batch,
+                        location,
+                        scope,
+                        success=False,
+                        error_code=location_error_code,
+                    )
                 raise
             applied_location = (
                 applied.get("location")
@@ -1162,6 +1262,12 @@ class DouyinCommerceBatchExecutor:
                 expected_schedule_time=_text(publish_payload.get("scheduleTime")),
             )
             final_receipt_recorded = True
+            self._record_location_cache_result(
+                batch,
+                location,
+                scope,
+                success=True,
+            )
             self._emit(progress, index=index, total=total, phase="published", message=f"第 {index + 1} 条视频已取得平台回读")
             return {"index": index, "label": label, "status": "published"}
         except (KeyboardInterrupt, SystemExit):
