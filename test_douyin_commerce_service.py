@@ -7783,12 +7783,22 @@ class DouyinCommerceUiTests(unittest.TestCase):
         self.assertEqual(
             self.page._batch_location_state(),
             {
+                "accountId": "",
                 "scope": "domestic",
                 "keyword": "",
                 "commissionFilter": "commission",
                 "platformResultCount": 0,
                 "rawCandidates": [],
                 "candidates": [],
+                "platformContextReady": False,
+                "platformCandidates": [],
+                "requiresRevalidation": False,
+                "cacheTotal": 0,
+                "cacheOffset": 0,
+                "platformLoadCount": 0,
+                "zeroGrowthCount": 0,
+                "hasMore": False,
+                "source": "",
             },
         )
         self.assertEqual(self.page.batch_publish_mode.currentData(), "immediate")
@@ -8340,12 +8350,22 @@ class DouyinCommerceUiTests(unittest.TestCase):
         self.assertEqual(
             self.page._batch_location_state(),
             {
+                "accountId": "",
                 "scope": "domestic",
                 "keyword": "",
                 "commissionFilter": "commission",
                 "platformResultCount": 0,
                 "rawCandidates": [],
                 "candidates": [],
+                "platformContextReady": False,
+                "platformCandidates": [],
+                "requiresRevalidation": False,
+                "cacheTotal": 0,
+                "cacheOffset": 0,
+                "platformLoadCount": 0,
+                "zeroGrowthCount": 0,
+                "hasMore": False,
+                "source": "",
             },
         )
         self.assertEqual(self.page.batch_location_scope_combo.currentData(), "domestic")
