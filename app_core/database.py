@@ -171,6 +171,58 @@ def ensure_schema() -> None:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS douyin_location_cache (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                accountId TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                poiId TEXT NOT NULL,
+                name TEXT NOT NULL,
+                address TEXT NOT NULL,
+                commissionType TEXT NOT NULL,
+                distance TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT '',
+                productCount INTEGER,
+                commissionProductCount INTEGER,
+                commissionLabel TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL,
+                verifiedAt TEXT NOT NULL,
+                lastSeenAt TEXT NOT NULL,
+                revalidationFailures INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(accountId, scope, poiId, name, address, commissionType)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS douyin_location_cache_keywords (
+                locationCacheId INTEGER NOT NULL,
+                accountId TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                keyword TEXT NOT NULL,
+                commissionFilter TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                PRIMARY KEY(locationCacheId, keyword, commissionFilter),
+                FOREIGN KEY(locationCacheId) REFERENCES douyin_location_cache(id)
+                    ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_douyin_location_cache_keywords_query
+            ON douyin_location_cache_keywords(
+                accountId, scope, keyword, commissionFilter, position, locationCacheId
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_douyin_location_cache_capacity
+            ON douyin_location_cache(accountId, scope, lastSeenAt, id)
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS douyin_favorite_music_cache (
                 accountId INTEGER NOT NULL,
                 musicId TEXT NOT NULL,
