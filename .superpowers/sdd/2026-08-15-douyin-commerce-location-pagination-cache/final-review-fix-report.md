@@ -326,3 +326,61 @@ QT_QPA_PLATFORM=offscreen <venv-python> -m unittest discover -f -q
 - 前置：核对实现提交、报告提交及本节 652/1088 测试证据。
 - 动作：按主任务的独立复审结论决定是否集成 `feature/douyin-location-pagination-cache`。
 - 完成证据：集成侧记录采用的提交 SHA；若继续审查，仅新增明确 finding，不把旧 `1085` 当作当前证据。
+
+## 12. Final remediation cycle 4（2026-08-16）
+
+### 12.1 权威、范围与结论
+
+- 本轮唯一精确需求：`final-review-remediation-4.md`；起始 HEAD：`754e56427bfefb9e59eadb5b4f67f8dd1eb4f4ce`。
+- 实现提交 SHA：`fdc5407f13d7641094155b7a18cfc81600c6f1f0`（`fdc5407 修复抖音地点缓存第四轮终审问题`）。
+- 范围：只处理 R4-1、R4-2 两项；产品代码只修改 UI 已观察/已接纳身份边界与 service 的加载更多面板归属判定，测试只增加两项指定回归及两条旧清空/复位精确契约字段，无范围外重构。
+- 结论：两项均完成独立 RED→最小 GREEN，本轮分配的未解决项为 0。
+- 闭环层级：交付闭环。没有登录真实账号、连接真实浏览器会话、上传、提交或发布；DOM 测试仅使用本地 headless HTML。
+- 证据降级：cycle 3 的 `1088 tests / 41.703s` 及更早全量均只作历史，不代表当前树；本轮当前证据为下文 `654` 项相关组合与 `1090` 项全量。
+
+### 12.2 R4-1——已观察身份与已接纳/展示身份分离
+
+- RED：`test_revalidation_reconciles_observed_identity_beyond_display_cap`；10 条可复用缓存 + 首轮 80 条平台身份 + 累计 91 条分页身份时，展示集正确截断为 100，但 reconcile 只收到 90 条平台身份，末位 T 被排除；`Ran 1 test in 0.150s`，exit `1`。
+- GREEN：同一命名用例 `Ran 1 test in 0.150s`，`OK`，exit `0`。
+- 修复：独立维护完整四字段 `observedPlatformCandidates`；展示、自动填充和普通 cache merge 仍共用 100 条硬上限。只有 `hasMore=False` 且 `stopReason=no_visible_load_more_control` 的确认穷尽校对使用完整已观察集；T 未进入展示集，但被 reconcile 为 `reusable / revalidationFailures=0`。未证明完整穷尽时仍保留 `requiresRevalidation`。
+
+### 12.3 R4-2——受控输入不能证明通用共享对话框
+
+- RED：`test_controlled_input_cannot_claim_generic_shared_dialog`；输入同时带两个受控标记时，旧实现把其与 listbox 的共享 `role=dialog` 当成地点面板，进入无关按钮点击路径并报 `publish_location_load_more_failed`；`Ran 1 test in 5.288s`，exit `1`。
+- GREEN：同一命名用例 `Ran 1 test in 0.275s`，`OK`，exit `0`；结果 `hasMore=False`、`stopReason=no_visible_load_more_control`，无关按钮点击数为 0。
+- 修复：受控锚点的最小共同祖先若本身是通用 dialog/editor 所有者则 fail closed；显式 location/poi panel 仍优先，更小的受控有界区域仍可用，面板内两个独立控件仍保持歧义停止。
+
+### 12.4 Fail-fast 恢复与最终相关组合
+
+- 首次相关组合使用 `-f` 在第一个普通失败停下：`test_abandon_session_resets_all_platform_settings_but_keeps_content`，旧精确状态断言缺少新内部已观察集的空值。只补该复位契约字段后，命名用例 `Ran 1 test in 0.131s`，`OK`。
+- 最终相关组合：`test_douyin_location_cache` + `test_douyin_commerce_batch_service` + `test_douyin_commerce_collectors` + `test_douyin_commerce_setup_state` + `test_douyin_commerce_service`。
+- 结果：`Ran 654 tests in 30.041s`，`OK`，`real 30.26s`，`user 23.97s`，`sys 4.87s`，exit `0`。
+
+### 12.5 唯一一次新最终全量
+
+```text
+QT_QPA_PLATFORM=offscreen <venv-python> -m unittest discover -f -q
+```
+
+- 结果：`Ran 1090 tests in 42.019s`，`OK`，`real 42.33s`，`user 29.67s`，`sys 6.39s`，exit `0`。
+- 该次全量之后没有再修改产品代码或测试；仅追加本证据报告。旧 `1088` 已明确降为历史。
+
+### 12.6 静态、敏感与差异检查
+
+- `py_compile`：编译 2 个受影响产品文件与 1 个测试文件，exit `0`。
+- `git diff --check`：无输出，exit `0`。
+- 占位扫描：新增行中 `TODO|FIXME|XXX|NotImplementedError|raise NotImplemented|pass` 无命中。
+- 敏感扫描：新增行中长 `sk-`、AWS access key、private-key header、长 Bearer token 模式无命中。
+- 未新增真实 Cookie、密码、API Key、验证码、二维码链接、账号凭据、客户/订单数据或真实平台 DOM 快照。
+
+### 12.7 尚未验证与安全停点
+
+- 尚未验证：真实抖音当日 DOM、真实账号平台分页、真实 POI 四字段与平台读回。这是本轮禁止真实平台动作的预期边界，不将离线证据冒充运行闭环或结果闭环。
+- 安全停点：分支与 worktree 保留，未合并、未推送、未清理。
+
+### 12.8 唯一下一步
+
+- 执行者：父任务/集成者。
+- 前置：核对实现提交、报告提交及本节 `654/1090` 测试证据。
+- 动作：按主任务的独立复审结论决定是否集成 `feature/douyin-location-pagination-cache`。
+- 完成证据：集成侧记录采用的提交 SHA；若继续审查，仅新增明确 finding，不把旧 `1088` 当作当前证据。
