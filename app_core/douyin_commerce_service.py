@@ -2523,6 +2523,176 @@ async def search_commerce_location_store_candidates(
     return candidates
 
 
+async def _unique_visible_load_more_control(page) -> Any | None:
+    """返回当前地点面板唯一可点击的“加载更多”控件。"""
+
+    result = await page.evaluate(
+        """() => {
+"""
+        + _STORE_EFFECTIVE_VISIBILITY_JS
+        + """
+                const normalize = value => String(value || '')
+                    .replace(/[\u200b\u00a0]/g, ' ').replace(/\\s+/g, ' ').trim();
+                const controls = Array.from(document.querySelectorAll(
+                    'button, input[type="button"], input[type="submit"], '
+                    + 'a[href], [role="button"], [tabindex], [onclick]'
+                )).filter(isEffectivelyVisible).filter(node => {
+                    if (node.matches('[disabled], [aria-disabled="true"]')
+                        || node.closest('[disabled], [aria-disabled="true"]')) return false;
+                    const text = normalize(node instanceof HTMLInputElement
+                        ? node.value : (node.innerText || node.textContent));
+                    return text.includes('点击加载更多') || text.includes('加载更多');
+                });
+                document.querySelectorAll('[data-oneclick-commerce-load-more="active"]')
+                    .forEach(node => node.removeAttribute(
+                        'data-oneclick-commerce-load-more'
+                    ));
+                if (controls.length !== 1) return { count: controls.length };
+                controls[0].dataset.oneclickCommerceLoadMore = 'active';
+                return { count: 1 };
+            }"""
+    )
+    count = int(result.get("count") or 0) if isinstance(result, Mapping) else 0
+    if count > 1:
+        raise DouyinCommerceError("publish_location_load_more_failed")
+    if count == 1:
+        return page.locator('[data-oneclick-commerce-load-more="active"]')
+    return None
+
+
+def _dedupe_public_commerce_location_candidates(
+    rows: object,
+    *,
+    commission_filter: str,
+) -> list[dict[str, Any]]:
+    """按可见地点身份保留去重后的公开候选，不把 DOM 细节带出页面层。"""
+
+    if not isinstance(rows, list):
+        return []
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in rows:
+        candidate = normalize_commerce_location_candidate(row)
+        if candidate is None:
+            continue
+        filtered = filter_location_candidates([candidate], commission_filter)
+        if not filtered:
+            continue
+        public_candidate = dict(filtered[0])
+        candidate_id = _normalized(public_candidate.get("poiId"))
+        if not candidate_id or candidate_id in seen:
+            continue
+        seen.add(candidate_id)
+        result.append(public_candidate)
+    return result
+
+
+async def _commerce_location_candidates_snapshot(
+    page,
+    *,
+    commission_filter: str,
+) -> tuple[int, list[dict[str, Any]]]:
+    """读取当前可见地点的公开候选及平台有效候选数。"""
+
+    listbox = await _visible_store_listbox(page)
+    if listbox is None:
+        return 0, []
+    rows = await _store_option_descriptors(listbox)
+    platform_candidates = _dedupe_public_commerce_location_candidates(
+        rows,
+        commission_filter="all",
+    )
+    candidates = _dedupe_public_commerce_location_candidates(
+        rows,
+        commission_filter=commission_filter,
+    )
+    return len(platform_candidates), candidates
+
+
+async def load_more_commerce_location_candidates(
+    page,
+    *,
+    previous_candidates: object,
+    commission_filter: object = "all",
+    timeout_ms: int = _LOCATION_RESULT_WAIT_TIMEOUT_MS,
+) -> dict[str, object]:
+    """单击唯一可见的地点“加载更多”，等候候选增长稳定后返回公开元数据。"""
+
+    try:
+        selected_filter = normalize_commission_filter(commission_filter, default="all")
+        normalized_timeout_ms = max(_LOCATION_RESULT_POLL_INTERVAL_MS, int(timeout_ms))
+    except (TypeError, ValueError) as exc:
+        raise DouyinCommerceError("publish_location_load_more_failed") from exc
+
+    previous = _dedupe_public_commerce_location_candidates(
+        previous_candidates,
+        commission_filter=selected_filter,
+    )
+    previous_ids = {_normalized(candidate.get("poiId")) for candidate in previous}
+    control = await _unique_visible_load_more_control(page)
+    if control is None:
+        platform_result_count, current = await _commerce_location_candidates_snapshot(
+            page,
+            commission_filter=selected_filter,
+        )
+        candidates = _dedupe_public_commerce_location_candidates(
+            current + previous,
+            commission_filter=selected_filter,
+        )
+        return {
+            "platformResultCount": platform_result_count,
+            "candidates": candidates,
+            "newCandidateCount": 0,
+            "hasMore": False,
+            "stopReason": "no_visible_load_more_control",
+        }
+    try:
+        await control.scroll_into_view_if_needed(timeout=5_000)
+        await control.click(timeout=5_000)
+    except Exception as exc:
+        raise DouyinCommerceError("publish_location_load_more_failed") from exc
+
+    max_reads = max(
+        _LOCATION_RESULT_STABLE_READS,
+        normalized_timeout_ms // _LOCATION_RESULT_POLL_INTERVAL_MS + 1,
+    )
+    stable_signature = ""
+    stable_reads = 0
+    platform_result_count = 0
+    candidates: list[dict[str, Any]] = list(previous)
+    for read_index in range(max_reads):
+        platform_result_count, current = await _commerce_location_candidates_snapshot(
+            page,
+            commission_filter=selected_filter,
+        )
+        candidates = _dedupe_public_commerce_location_candidates(
+            current + previous,
+            commission_filter=selected_filter,
+        )
+        signature = _location_result_signature(candidates)
+        if signature == stable_signature:
+            stable_reads += 1
+        else:
+            stable_signature = signature
+            stable_reads = 1
+        if stable_reads >= _LOCATION_RESULT_STABLE_READS:
+            has_more = await _unique_visible_load_more_control(page) is not None
+            new_candidate_count = sum(
+                _normalized(candidate.get("poiId")) not in previous_ids
+                for candidate in candidates
+            )
+            return {
+                "platformResultCount": platform_result_count,
+                "candidates": candidates,
+                "newCandidateCount": new_candidate_count,
+                "hasMore": has_more,
+                "stopReason": "loaded" if new_candidate_count else "no_new_candidates",
+            }
+        if read_index + 1 < max_reads:
+            await page.wait_for_timeout(_LOCATION_RESULT_POLL_INTERVAL_MS)
+    raise DouyinCommerceError("publish_location_load_more_failed")
+
+
 async def _location_option_targets(
     listbox,
     location: Mapping[str, Any],

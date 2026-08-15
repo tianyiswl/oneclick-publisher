@@ -4187,6 +4187,96 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await browser.close()
 
+    async def test_load_more_clicks_once_and_returns_only_public_metadata(self) -> None:
+        """单次加载更多只点击唯一可见控件，并等待新增候选稳定。"""
+
+        initial_rows = "".join(
+            f'''<div role="option"><span data-store-name>首屏地点 {index}</span>
+                <span data-store-address>广西北海市测试路 {index} 号</span>
+                <span data-commerce-info>1件商品 · 1件返佣</span></div>'''
+            for index in range(2)
+        )
+        appended_rows = "".join(
+            f'''<div role="option"><span data-store-name>新增地点 {index}</span>
+                <span data-store-address>广西北海市新增路 {index} 号</span>
+                <span data-commerce-info>1件商品 · 1件返佣</span></div>'''
+            for index in range(8)
+        )
+        html = f"""
+        <div id="location-results" role="listbox">{initial_rows}</div>
+        <button id="load-more" type="button"> 点击加载更多（剩余 8 条） </button>
+        <script>
+          window.loadMoreClicks = 0;
+          document.querySelector('#load-more').addEventListener('click', () => {{
+            window.loadMoreClicks += 1;
+            document.querySelector('#location-results').insertAdjacentHTML(
+              'beforeend', `{appended_rows}`
+            );
+          }});
+        </script>
+        """
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+                first_page = douyin_commerce_service.normalize_commerce_location_candidates(
+                    await douyin_commerce_service._store_option_descriptors(
+                        page.locator("#location-results")
+                    ),
+                    commission_filter="commission",
+                )
+
+                result = await douyin_commerce_service.load_more_commerce_location_candidates(
+                    page,
+                    previous_candidates=first_page,
+                    commission_filter="commission",
+                )
+
+                self.assertEqual(await page.evaluate("window.loadMoreClicks"), 1)
+                self.assertEqual(result["platformResultCount"], 10)
+                self.assertEqual(result["newCandidateCount"], 8)
+                self.assertTrue(result["hasMore"])
+                self.assertEqual(len(result["candidates"]), 10)
+                self.assertNotIn("html", repr(result))
+                self.assertNotIn("locator", repr(result))
+            finally:
+                await browser.close()
+
+    async def test_load_more_rejects_multiple_visible_controls(self) -> None:
+        """多个可见加载更多控件不能猜测点击目标。"""
+
+        html = """
+        <div id="location-results" role="listbox">
+          <div role="option"><span data-store-name>首屏地点</span>
+            <span data-store-address>广西北海市测试路 1 号</span></div>
+        </div>
+        <button type="button">加载更多</button>
+        <div role="button" tabindex="0">点击加载更多</div>
+        """
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+                first_page = douyin_commerce_service.normalize_commerce_location_candidates(
+                    await douyin_commerce_service._store_option_descriptors(
+                        page.locator("#location-results")
+                    )
+                )
+
+                with self.assertRaisesRegex(
+                    douyin_commerce_service.DouyinCommerceError,
+                    "publish_location_load_more_failed",
+                ):
+                    await douyin_commerce_service.load_more_commerce_location_candidates(
+                        page,
+                        previous_candidates=first_page,
+                        commission_filter="all",
+                    )
+            finally:
+                await browser.close()
+
 
 class DouyinCommerceMusicRuleTests(unittest.TestCase):
     def test_only_visible_favorite_modes_are_accepted(self) -> None:
