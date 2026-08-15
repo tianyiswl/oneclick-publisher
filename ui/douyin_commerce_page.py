@@ -1710,6 +1710,14 @@ class DouyinCommercePage(QWidget):
         raw_candidates = self._merge_batch_location_candidates(
             [], (existing or {}).get("rawCandidates", [])
         )
+        observed_platform_candidates = self._merge_batch_location_candidates(
+            [],
+            (existing or {}).get(
+                "observedPlatformCandidates",
+                (existing or {}).get("platformCandidates", []),
+            ),
+            identity_limit=None,
+        )
         accepted_identities = {
             self._batch_location_candidate_identity(candidate)
             for candidate in raw_candidates
@@ -1742,6 +1750,7 @@ class DouyinCommercePage(QWidget):
                 if self._batch_location_candidate_identity(candidate)
                 in accepted_identities
             ],
+            "observedPlatformCandidates": observed_platform_candidates,
             "requiresRevalidation": (
                 (existing or {}).get("requiresRevalidation") is True
             ),
@@ -1948,8 +1957,10 @@ class DouyinCommercePage(QWidget):
         cls,
         existing: object,
         additions: object,
+        *,
+        identity_limit: int | None = _BATCH_LOCATION_MAX_IDENTITIES,
     ) -> list[dict[str, object]]:
-        """按完整平台身份稳定追加，全链路共用 100 条上限。"""
+        """按完整平台身份稳定追加；默认只接纳前 100 条。"""
 
         merged: list[dict[str, object]] = []
         identities: set[tuple[str, str, str, str]] = set()
@@ -1974,7 +1985,7 @@ class DouyinCommercePage(QWidget):
                     continue
                 identities.add(identity)
                 merged.append(candidate)
-                if len(merged) >= _BATCH_LOCATION_MAX_IDENTITIES:
+                if identity_limit is not None and len(merged) >= identity_limit:
                     return merged
         return merged
 
@@ -2147,6 +2158,7 @@ class DouyinCommercePage(QWidget):
             "candidates": [dict(item) for item in cached_candidates],
             "platformContextReady": False,
             "platformCandidates": [],
+            "observedPlatformCandidates": [],
             "requiresRevalidation": requires_revalidation,
             "cacheTotal": cache_total,
             "cacheOffset": cache_offset,
@@ -2374,6 +2386,11 @@ class DouyinCommercePage(QWidget):
         display_raw = self._merge_batch_location_candidates(
             previous_raw, public_candidates
         )
+        observed_platform_candidates = self._merge_batch_location_candidates(
+            current["observedPlatformCandidates"] if same_search else [],
+            public_candidates,
+            identity_limit=None,
+        )
         public_candidates = self._accepted_batch_location_platform_candidates(
             display_raw,
             public_candidates,
@@ -2412,6 +2429,9 @@ class DouyinCommercePage(QWidget):
             "candidates": candidates,
             "platformContextReady": True,
             "platformCandidates": [dict(item) for item in public_candidates],
+            "observedPlatformCandidates": [
+                dict(item) for item in observed_platform_candidates
+            ],
             "requiresRevalidation": (
                 current["requiresRevalidation"] is True if same_search else False
             ),
@@ -2517,9 +2537,15 @@ class DouyinCommercePage(QWidget):
         ):
             return False
         state = self._batch_location_state()
-        accepted_candidates = self._accepted_batch_location_platform_candidates(
-            state["rawCandidates"],
-            public_candidates,
+        accepted_candidates = (
+            self._merge_batch_location_candidates(
+                [], public_candidates, identity_limit=None
+            )
+            if confirmed_exhausted
+            else self._accepted_batch_location_platform_candidates(
+                state["rawCandidates"],
+                public_candidates,
+            )
         )
         request_owner = self._batch_location_request_owner(
             cache_query, request_token
@@ -2961,6 +2987,9 @@ class DouyinCommercePage(QWidget):
         previous_platform_candidates = [
             dict(item) for item in state["platformCandidates"]
         ]
+        previous_observed_platform_candidates = [
+            dict(item) for item in state["observedPlatformCandidates"]
+        ]
         previous_platform_identities = {
             tuple(
                 _normalized(candidate.get(key))
@@ -2971,6 +3000,11 @@ class DouyinCommercePage(QWidget):
         platform_candidate_pool = self._merge_batch_location_candidates(
             previous_platform_candidates,
             public_candidates,
+        )
+        observed_platform_candidate_pool = self._merge_batch_location_candidates(
+            previous_observed_platform_candidates,
+            public_candidates,
+            identity_limit=None,
         )
         display_raw = self._merge_batch_location_candidates(
             state["rawCandidates"], platform_candidate_pool
@@ -3036,6 +3070,9 @@ class DouyinCommercePage(QWidget):
                 "platformCandidates": [
                     dict(item) for item in accumulated_platform_candidates
                 ],
+                "observedPlatformCandidates": [
+                    dict(item) for item in observed_platform_candidate_pool
+                ],
                 "requiresRevalidation": revalidation_was_pending,
                 "platformLoadCount": platform_load_count,
                 "zeroGrowthCount": zero_growth_count,
@@ -3079,7 +3116,11 @@ class DouyinCommercePage(QWidget):
         else:
             merge_started = self._start_batch_location_cache_merge(
                 cache_query,
-                accumulated_platform_candidates,
+                (
+                    observed_platform_candidate_pool
+                    if confirmed_exhausted
+                    else accumulated_platform_candidates
+                ),
                 request_token=request_token,
                 confirmed_exhausted=confirmed_exhausted,
             )
@@ -6466,6 +6507,7 @@ class DouyinCommercePage(QWidget):
                 "candidates": [],
                 "platformContextReady": False,
                 "platformCandidates": [],
+                "observedPlatformCandidates": [],
                 "requiresRevalidation": False,
             }
         }

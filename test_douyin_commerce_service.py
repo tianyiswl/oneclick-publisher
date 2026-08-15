@@ -5826,6 +5826,57 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await browser.close()
 
+    async def test_controlled_input_cannot_claim_generic_shared_dialog(
+        self,
+    ) -> None:
+        """Controlled input context alone cannot make a shared dialog a location panel."""
+
+        html = """
+        <section id="shared-editor" role="dialog">
+          <input id="location-search"
+            data-oneclick-commerce-search-input="active"
+            data-oneclick-commerce-store="active" />
+          <div id="location-results" role="listbox">
+            <div role="option"><span data-store-name>银滩门店</span>
+              <span data-store-address>广西北海市银海区银滩路 1 号</span></div>
+          </div>
+          <button id="unrelated-load-more"
+            onclick="window.unrelatedClicks += 1">加载更多</button>
+        </section>
+        <script>window.unrelatedClicks = 0;</script>
+        """
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+                first_page = (
+                    douyin_commerce_service.normalize_commerce_location_candidates(
+                        await douyin_commerce_service._store_option_descriptors(
+                            page.locator("#location-results")
+                        )
+                    )
+                )
+
+                result = await douyin_commerce_service.load_more_commerce_location_candidates(
+                    page,
+                    previous_candidates=first_page,
+                    commission_filter="all",
+                    timeout_ms=5_000,
+                )
+
+                self.assertFalse(result["hasMore"])
+                self.assertEqual(
+                    result["stopReason"],
+                    "no_visible_load_more_control",
+                )
+                self.assertEqual(
+                    await page.evaluate("window.unrelatedClicks"),
+                    0,
+                )
+            finally:
+                await browser.close()
+
     async def test_load_more_collapses_nested_nodes_for_one_logical_button(self) -> None:
         """A button and its labelled descendant represent one logical control."""
 
@@ -8307,6 +8358,7 @@ class DouyinCommerceUiTests(unittest.TestCase):
                 "candidates": [],
                 "platformContextReady": False,
                 "platformCandidates": [],
+                "observedPlatformCandidates": [],
                 "requiresRevalidation": False,
                 "cacheTotal": 0,
                 "cacheOffset": 0,
@@ -8875,6 +8927,7 @@ class DouyinCommerceUiTests(unittest.TestCase):
                 "candidates": [],
                 "platformContextReady": False,
                 "platformCandidates": [],
+                "observedPlatformCandidates": [],
                 "requiresRevalidation": False,
                 "cacheTotal": 0,
                 "cacheOffset": 0,
@@ -15074,6 +15127,157 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.assertIs(
             self.page._batch_location_state()["requiresRevalidation"],
             False,
+        )
+
+    def test_revalidation_reconciles_observed_identity_beyond_display_cap(
+        self,
+    ) -> None:
+        """Confirmed reconciliation uses all observed identities, not the capped display set."""
+
+        temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_directory.cleanup)
+        database_patch = patch.object(
+            database,
+            "DB_PATH",
+            Path(temporary_directory.name) / "observed-revalidation.sqlite3",
+        )
+        database_patch.start()
+        self.addCleanup(database_patch.stop)
+        account_id = "814"
+        cache_query = douyin_location_cache.LocationCacheQuery(
+            account_id=account_id,
+            scope="domestic",
+            keyword="北海",
+            commission_filter="commission",
+        )
+        now = datetime.now(ZoneInfo("UTC"))
+        cached = self._cached_location_candidates(10)
+        target = {
+            "poiId": "poi-revalidation-target-outside-display-cap",
+            "name": "待校对目标",
+            "address": "广西北海市目标路 1 号",
+            "commissionType": "commission",
+            "scope": "domestic",
+        }
+        douyin_location_cache.merge_platform_locations(
+            cache_query,
+            [*cached, target],
+            verified_at=now,
+        )
+        douyin_location_cache.record_location_publish_result(
+            account_id,
+            target,
+            success=False,
+            error_code="publish_location_candidate_ambiguous",
+            occurred_at=now + timedelta(seconds=1),
+        )
+
+        self._activate_cached_location_search(account_id=int(account_id))
+        self.page._batch_location_searches["__shared_location_search__"] = {
+            "accountId": account_id,
+            "scope": "domestic",
+            "keyword": "北海",
+            "commissionFilter": "commission",
+            "platformResultCount": 0,
+            "rawCandidates": [dict(item) for item in cached],
+            "candidates": [dict(item) for item in cached],
+            "platformContextReady": False,
+            "platformCandidates": [],
+            "requiresRevalidation": True,
+            "cacheTotal": 11,
+            "cacheOffset": 10,
+            "cacheHasMore": False,
+            "platformLoadCount": 0,
+            "zeroGrowthCount": 0,
+            "hasMore": True,
+            "source": "cache",
+        }
+        search_candidates = [
+            {
+                "poiId": f"poi-platform-{index:03d}",
+                "name": f"平台地点 {index:03d}",
+                "address": f"广西北海市平台路 {index:03d} 号",
+                "commissionType": "commission",
+            }
+            for index in range(80)
+        ]
+        cumulative_candidates = [
+            *search_candidates,
+            *[
+                {
+                    "poiId": f"poi-platform-{index:03d}",
+                    "name": f"平台地点 {index:03d}",
+                    "address": f"广西北海市平台路 {index:03d} 号",
+                    "commissionType": "commission",
+                }
+                for index in range(80, 90)
+            ],
+            target,
+        ]
+        request_token = self.page._batch_location_search_token
+        self.page._batch_location_search_succeeded(
+            "domestic",
+            "北海",
+            {
+                "platformResultCount": len(search_candidates),
+                "candidates": search_candidates,
+            },
+            "commission",
+            request_token=request_token,
+            cache_query=cache_query,
+            handoff_load_more=True,
+        )
+        self.assertEqual(
+            len(self.page._batch_location_state()["rawCandidates"]),
+            90,
+        )
+
+        real_reconcile = douyin_location_cache.reconcile_platform_locations
+        with patch.object(
+            douyin_location_cache,
+            "reconcile_platform_locations",
+            wraps=real_reconcile,
+        ) as reconcile:
+            self.page._batch_location_load_more_succeeded(
+                cache_query,
+                {
+                    "platformResultCount": len(cumulative_candidates),
+                    "candidates": cumulative_candidates,
+                    "newCandidateCount": 11,
+                    "hasMore": False,
+                    "stopReason": "no_visible_load_more_control",
+                },
+                request_token=request_token,
+            )
+            self._finish_location_cache_merge()
+
+        state = self.page._batch_location_state()
+        self.assertEqual(len(state["rawCandidates"]), 100)
+        self.assertNotIn(
+            self.page._batch_location_candidate_identity(target),
+            {
+                self.page._batch_location_candidate_identity(candidate)
+                for candidate in state["rawCandidates"]
+            },
+        )
+        reconciliation_candidates = reconcile.call_args.args[1]
+        self.assertEqual(len(reconciliation_candidates), 91)
+        self.assertIn(
+            self.page._batch_location_candidate_identity(target),
+            {
+                self.page._batch_location_candidate_identity(candidate)
+                for candidate in reconciliation_candidates
+            },
+        )
+        with database.connect() as conn:
+            target_row = conn.execute(
+                "SELECT status, revalidationFailures "
+                "FROM douyin_location_cache WHERE accountId = ? AND poiId = ?",
+                (account_id, target["poiId"]),
+            ).fetchone()
+        self.assertEqual(
+            (target_row["status"], target_row["revalidationFailures"]),
+            ("reusable", 0),
         )
 
     def test_cache_search_silently_pages_to_exhaustion_and_second_miss_invalidates(

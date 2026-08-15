@@ -2791,8 +2791,19 @@ async def _unique_visible_load_more_control(page) -> Any | None:
                 };
                 const boundedPanel = controlledAnchors.length === 1
                     ? commonAncestor(controlledAnchors[0], listbox) : null;
+                const genericOwnerSelector = [
+                    '[role="dialog"]',
+                    '[contenteditable="true"]',
+                    '[data-oneclick-commerce-editor]',
+                    '[id*="editor"]',
+                    '[class*="editor"]'
+                ].join(', ');
+                const boundedGenericOwner = boundedPanel
+                    ? boundedPanel.closest(genericOwnerSelector) : null;
+                const boundedLocationRegion = boundedPanel
+                    && boundedPanel !== boundedGenericOwner ? boundedPanel : null;
                 const panel = explicitPanel && explicitPanel !== listbox
-                    ? explicitPanel : boundedPanel;
+                    ? explicitPanel : boundedLocationRegion;
                 if (!panel || panel === document.body
                     || !isEffectivelyVisible(panel)) return { count: 0 };
                 const candidates = Array.from(panel.querySelectorAll(
