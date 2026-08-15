@@ -2659,7 +2659,7 @@ async def _load_more_candidates_snapshot_or_fail(
         raise DouyinCommerceError("publish_location_load_more_failed") from None
 
 
-async def load_more_commerce_location_candidates(
+async def _load_more_commerce_location_candidates_impl(
     page,
     *,
     previous_candidates: object,
@@ -2702,7 +2702,10 @@ async def load_more_commerce_location_candidates(
         page,
         commission_filter="all",
     )
-    baseline_signature = _commerce_location_candidates_signature(baseline_candidates)
+    baseline_identities = {
+        _commerce_location_candidate_identity(candidate) for candidate in baseline_candidates
+    }
+    known_identities = previous_identities | baseline_identities
     try:
         await control.scroll_into_view_if_needed(timeout=5_000)
         await control.click(timeout=5_000)
@@ -2717,28 +2720,31 @@ async def load_more_commerce_location_candidates(
     stable_reads = 0
     platform_result_count = 0
     candidates: list[dict[str, Any]] = list(previous)
-    baseline_changed = False
+    new_identity_seen = False
     for read_index in range(max_reads):
         platform_result_count, current = await _load_more_candidates_snapshot_or_fail(
             page,
             commission_filter="all",
         )
         current_signature = _commerce_location_candidates_signature(current)
+        current_identities = {
+            _commerce_location_candidate_identity(candidate) for candidate in current
+        }
         candidates = _dedupe_public_commerce_location_candidates(
             filter_location_candidates(current, selected_filter) + previous,
             commission_filter=selected_filter,
         )
-        if current_signature == baseline_signature:
+        if not current_identities - known_identities:
             stable_signature = ""
             stable_reads = 0
         elif current_signature == stable_signature:
-            baseline_changed = True
+            new_identity_seen = True
             stable_reads += 1
         else:
-            baseline_changed = True
+            new_identity_seen = True
             stable_signature = current_signature
             stable_reads = 1
-        if baseline_changed and stable_reads >= _LOCATION_RESULT_STABLE_READS:
+        if new_identity_seen and stable_reads >= _LOCATION_RESULT_STABLE_READS:
             has_more = await _load_more_control_or_fail(page) is not None
             new_candidate_count = sum(
                 _commerce_location_candidate_identity(candidate) not in previous_identities
@@ -2753,7 +2759,7 @@ async def load_more_commerce_location_candidates(
             }
         if read_index + 1 < max_reads:
             await page.wait_for_timeout(_LOCATION_RESULT_POLL_INTERVAL_MS)
-    if not baseline_changed:
+    if not new_identity_seen:
         has_more = await _load_more_control_or_fail(page) is not None
         return {
             "platformResultCount": platform_result_count,
@@ -2763,6 +2769,26 @@ async def load_more_commerce_location_candidates(
             "stopReason": "no_new_candidates",
         }
     raise DouyinCommerceError("publish_location_load_more_failed")
+
+
+async def load_more_commerce_location_candidates(
+    page,
+    *,
+    previous_candidates: object,
+    commission_filter: object = "all",
+    timeout_ms: int = _LOCATION_RESULT_WAIT_TIMEOUT_MS,
+) -> dict[str, object]:
+    """公开加载更多入口：所有内部失败只暴露固定错误码。"""
+
+    try:
+        return await _load_more_commerce_location_candidates_impl(
+            page,
+            previous_candidates=previous_candidates,
+            commission_filter=commission_filter,
+            timeout_ms=timeout_ms,
+        )
+    except Exception:
+        raise DouyinCommerceError("publish_location_load_more_failed") from None
 
 
 async def _location_option_targets(

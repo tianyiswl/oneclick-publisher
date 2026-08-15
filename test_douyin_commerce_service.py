@@ -4340,6 +4340,139 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["platformResultCount"], 2)
         self.assertEqual(snapshot.await_count, 7)
 
+    async def test_load_more_ignores_empty_and_reordered_baseline_until_new_identity(
+        self,
+    ) -> None:
+        """列表清空或重排不算增长，必须等到新完整身份出现后才稳定返回。"""
+
+        previous = douyin_commerce_service.normalize_commerce_location_candidates(
+            [
+                {
+                    "name": "首屏地点甲",
+                    "address": "广西北海市测试路 6 号",
+                    "commerceInfo": "1件商品 · 1件返佣",
+                },
+                {
+                    "name": "首屏地点乙",
+                    "address": "广西北海市测试路 7 号",
+                    "commerceInfo": "1件商品 · 1件返佣",
+                },
+            ],
+            commission_filter="commission",
+        )
+        appended = douyin_commerce_service.normalize_commerce_location_candidates(
+            [
+                {
+                    "name": "真实新增地点",
+                    "address": "广西北海市新增路 8 号",
+                    "commerceInfo": "1件商品 · 1件返佣",
+                }
+            ],
+            commission_filter="commission",
+        )
+
+        class Page:
+            wait_for_timeout = AsyncMock()
+
+        control = MagicMock()
+        control.scroll_into_view_if_needed = AsyncMock()
+        control.click = AsyncMock()
+        snapshots = [(2, previous)] + [(0, [])] * 3 + [
+            (2, list(reversed(previous)))
+        ] * 3 + [(3, previous + appended)] * 3
+        with patch.object(
+            douyin_commerce_service,
+            "_unique_visible_load_more_control",
+            new_callable=AsyncMock,
+            return_value=control,
+        ), patch.object(
+            douyin_commerce_service,
+            "_commerce_location_candidates_snapshot",
+            new_callable=AsyncMock,
+            side_effect=snapshots,
+        ) as snapshot:
+            result = await douyin_commerce_service.load_more_commerce_location_candidates(
+                Page(),
+                previous_candidates=previous,
+                commission_filter="commission",
+                timeout_ms=3_000,
+            )
+
+        self.assertEqual(result["newCandidateCount"], 1)
+        self.assertEqual(result["platformResultCount"], 3)
+        self.assertEqual(snapshot.await_count, 10)
+
+    async def test_load_more_public_entry_hides_wait_and_candidate_errors(self) -> None:
+        """等待和候选归一化的异常同样只能暴露固定错误码。"""
+
+        previous = douyin_commerce_service.normalize_commerce_location_candidates(
+            [
+                {
+                    "name": "首屏地点",
+                    "address": "广西北海市测试路 9 号",
+                    "commerceInfo": "1件商品 · 1件返佣",
+                }
+            ]
+        )
+        appended = douyin_commerce_service.normalize_commerce_location_candidates(
+            [
+                {
+                    "name": "新增地点",
+                    "address": "广西北海市新增路 10 号",
+                    "commerceInfo": "1件商品 · 1件返佣",
+                }
+            ]
+        )
+
+        class UntrustedError(RuntimeError):
+            def __str__(self) -> str:
+                return "private-selector <div>sensitive-dom-text</div>"
+
+        async def assert_fixed_error(coro) -> None:
+            with self.assertRaises(douyin_commerce_service.DouyinCommerceError) as caught:
+                await coro
+            self.assertEqual(str(caught.exception), "publish_location_load_more_failed")
+            self.assertIsNone(caught.exception.__cause__)
+            self.assertNotIn("private-selector", str(caught.exception))
+            self.assertNotIn("sensitive-dom-text", str(caught.exception))
+
+        class WaitingPage:
+            wait_for_timeout = AsyncMock(side_effect=UntrustedError())
+
+        control = MagicMock()
+        control.scroll_into_view_if_needed = AsyncMock()
+        control.click = AsyncMock()
+        with self.subTest(boundary="wait_for_timeout"), patch.object(
+            douyin_commerce_service,
+            "_unique_visible_load_more_control",
+            new_callable=AsyncMock,
+            return_value=control,
+        ), patch.object(
+            douyin_commerce_service,
+            "_commerce_location_candidates_snapshot",
+            new_callable=AsyncMock,
+            side_effect=[(1, previous), (2, previous + appended)],
+        ):
+            await assert_fixed_error(
+                douyin_commerce_service.load_more_commerce_location_candidates(
+                    WaitingPage(),
+                    previous_candidates=previous,
+                    timeout_ms=700,
+                )
+            )
+
+        class MaliciousMapping(dict):
+            def get(self, *_args, **_kwargs):
+                raise UntrustedError()
+
+        with self.subTest(boundary="previous_candidates"):
+            await assert_fixed_error(
+                douyin_commerce_service.load_more_commerce_location_candidates(
+                    object(),
+                    previous_candidates=[MaliciousMapping()],
+                )
+            )
+
     async def test_load_more_keeps_commission_variants_with_same_poi_identity(
         self,
     ) -> None:
