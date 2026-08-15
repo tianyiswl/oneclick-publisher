@@ -246,3 +246,83 @@ QT_QPA_PLATFORM=offscreen <venv-python> -m unittest discover -f
 - 尚未验证：真实抖音当日 DOM、overlay/footer 层级、真实 POI 属性、虚拟列表回收、平台分页节奏、真实账号与最终平台回读。这是本轮明确禁止真实平台动作的预期边界，不将离线通过冒充运行或结果闭环。
 - 未解决 Critical / Important / Deferred Minor：无。
 - 安全停点：分支与 worktree 保留，未合并、未推送、未清理。
+
+## 11. Final remediation cycle 3（2026-08-16）
+
+### 11.1 权威、范围与结论
+
+- 本轮唯一精确需求：`final-review-remediation-3.md`；起始 HEAD：`82301cd112d869f98772ec8956a52f49c6d04cb1`。
+- 实现提交 SHA：`7b888002c14cc2c76346a861bd1430b8bb8a5332`（`7b88800 修复抖音地点缓存第三轮终审问题`）。
+- 范围：只处理 R3-1、R3-2、R3-3 三项剩余 Important；产品代码只修改 UI 的组合容量/选择生命周期边界和 service 的加载更多控件归属证明，测试修改只用于三项回归及受影响旧夹具恢复，无范围外重构。
+- 结论：三项均先验证为真实可达，完成确定性 RED→最小 GREEN；本轮分配的剩余 Important 为 0。
+- 闭环层级：交付闭环。没有登录真实账号、连接真实浏览器会话、上传、提交或发布；所有平台行为均由离线替身或本地 DOM 契约模拟。
+- 证据降级：cycle 2 的 `1085 tests / 41.641s` 及更早全量均标为历史，不代表本轮最终实现树；当前证据为下文 `652` 项相关组合与 `1088` 项全量。
+
+### 11.2 R3-1——缓存与平台组合身份总量不超过 100
+
+- 独立验证：旧实现仅按平台候选计数；缓存先进入状态后，平台候选仍可把组合状态、缓存合并和自动填充带到 100 个身份之外。
+- RED：`test_combined_cache_and_platform_limit_rejects_late_next_page_candidate`；10 条缓存加 91 条首屏平台候选后仍保留 `hasMore=True`，下一页身份存在被接受路径；`Ran 1 test`，exit `1`。
+- GREEN：同一命名用例 `Ran 1 test in 0.145s`，`OK`，exit `0`。
+- 修复：所有 cache/platform 候选在状态写入、列表投影、cache merge payload 与 auto-fill 前共用四字段稳定去重和 100 条截断；只允许进入组合集合的平台身份继续流转，组合剩余容量为 0 时关闭 `hasMore/cacheHasMore`。
+
+### 11.3 R3-2——自动填充与手动选择共用生命周期成功边界
+
+- 独立验证：手动选择保存后会登记 `lastSelectedAt`，自动填充只保存 preset，容量压力下无法获得相同的生命周期优先级。
+- RED：`test_auto_fill_records_selection_once_and_retains_candidate_by_lifecycle`；真实自动填充路径收到 0 个 selection task，期望 1 个；`Ran 1 test in 0.138s`，exit `1`。
+- GREEN：同一命名用例 `Ran 1 test in 0.154s`，`OK`，exit `0`；同时验证容量压力后自动填充身份被保留，手动入口只登记一次。
+- 修复：新增唯一 `_bind_batch_location_candidate` 成功边界；preset 保存成功后统一异步、最大努力记录冻结的 account/query/四字段身份，手动与自动入口均只调用一次，记录失败不撤销已保存 preset。
+
+### 11.4 R3-3——无法证明地点面板时拒绝加载更多控件
+
+- 独立验证：listbox 的通用直接父级仍可被当作地点面板；共享 dialog/editor 内的无关“加载更多”存在误点路径。
+- RED：`test_load_more_rejects_generic_dialog_direct_parent_fallback`；通用 dialog 直接父级内的无关控件被返回，exit `1`。
+- GREEN：上述负例与 `test_load_more_control_is_scoped_to_current_location_panel`、`test_load_more_rejects_two_distinct_controls_inside_current_panel` 组合 `Ran 3 tests in 0.739s`，`OK`，exit `0`。
+- 修复：移除 `listbox.parentElement` 通用兜底；只接受显式 location/poi 面板，或当前唯一受控地点搜索输入/门店锚点与 listbox 的最小共同祖先。没有归属证明返回无控件；已证明区域内存在两个独立控件仍 fail-closed。
+
+### 11.5 Fail-fast 恢复与最终相关组合
+
+- 严格在相关组合首个普通失败停止并只修单项：兼容旧夹具中缺失的 `commissionType` 为受控 `unknown`；将三项会触发真实后台 selection worker 的旧 UI 测试替换为受控 lifecycle runner；把“100 条缓存后仍可平台续页”和“10 缓存 + 100 平台均被接受”的旧断言更新为组合硬上限契约。
+- 最终受影响组合：
+
+```text
+QT_QPA_PLATFORM=offscreen <venv-python> -m unittest -f \
+  test_douyin_location_cache \
+  test_douyin_commerce_batch_service \
+  test_douyin_commerce_collectors \
+  test_douyin_commerce_setup_state \
+  test_douyin_commerce_service
+```
+
+- 结果：`Ran 652 tests in 29.881s`，`OK`，`real 30.10s`，`user 23.55s`，`sys 4.89s`，exit `0`。
+
+### 11.6 最终新全量
+
+```text
+QT_QPA_PLATFORM=offscreen <venv-python> -m unittest discover -f -q
+```
+
+- 最终可验收结果：`Ran 1088 tests in 41.703s`，`OK`，`real 41.98s`，`user 29.26s`，`sys 6.28s`，exit `0`。此后未再修改产品代码或测试。
+
+### 11.7 静态、敏感与占位扫描
+
+- `py_compile`：编译 2 个受影响产品文件与 1 个测试文件，exit `0`。
+- `git diff --check` / 暂存差异检查：无输出，exit `0`。
+- 占位扫描：新增行中 `TODO|FIXME|XXX|NotImplementedError|raise NotImplemented|pass` 无命中，`rg` exit `1`。
+- 敏感扫描：新增行中长 `sk-`、AWS access key、private-key header、长 Bearer token 模式无命中，`rg` exit `1`。
+- 未新增真实 Cookie、密码、API Key、验证码、二维码链接、账号凭据、客户/订单数据或真实平台 DOM 快照。
+
+### 11.8 自审、尚未验证与安全停点
+
+- 组合身份：cache/platform 共用同一四字段集合，无法从 state、render、cache merge 或 auto-fill 绕过 100 条上限。
+- 生命周期：自动与手动保存共用一次成功边界；异步记录保持 token/account/query/candidate 冻结，失败不回滚 preset。
+- DOM：通用父级不再构成归属证明；显式地点面板仍工作，歧义控件继续安全停止。
+- 尚未验证：真实抖音当日 DOM、overlay/footer 层级、真实 POI 属性、真实平台分页与账号回读。这是禁止真实平台动作的预期边界，不将离线证据冒充运行闭环或结果闭环。
+- 本轮分配的未解决 Important：无。
+- 安全停点：分支与 worktree 保留，未合并、未推送、未清理。
+
+### 11.9 唯一下一步
+
+- 执行者：父任务/集成者。
+- 前置：核对实现提交、报告提交及本节 652/1088 测试证据。
+- 动作：按主任务的独立复审结论决定是否集成 `feature/douyin-location-pagination-cache`。
+- 完成证据：集成侧记录采用的提交 SHA；若继续审查，仅新增明确 finding，不把旧 `1085` 当作当前证据。
