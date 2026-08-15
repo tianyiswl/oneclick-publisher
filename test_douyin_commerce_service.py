@@ -42,6 +42,7 @@ from app_core import (
     douyin_commerce_service,
     douyin_commerce_session,
     douyin_favorite_music_cache,
+    douyin_location_cache,
     douyin_music_service,
     douyin_publish_executor,
     media_service,
@@ -11651,6 +11652,51 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
     def _activate_setup_generation(self, generation_id: str = "generation-a") -> None:
         """模拟与当前账号和视频内容绑定的有效设置代际。"""
 
+        if not self.page._selected_account():
+            blocked = self.page.account_combo.blockSignals(True)
+            self.page.account_combo.addItem(
+                "受控测试账号",
+                {
+                    "id": 900001,
+                    "type": 3,
+                    "status": 1,
+                    "filePath": "douyin-ui-controlled.json",
+                    "userName": "受控测试账号",
+                },
+            )
+            self.page.account_combo.setCurrentIndex(
+                self.page.account_combo.count() - 1
+            )
+            self.page.account_combo.blockSignals(blocked)
+        if not hasattr(self, "_empty_location_cache_patchers"):
+            empty_page = {
+                "candidates": [],
+                "offset": 0,
+                "limit": 10,
+                "total": 0,
+                "hasMore": False,
+            }
+            get_patcher = patch.object(
+                douyin_location_cache,
+                "get_cached_locations",
+                return_value=empty_page,
+            )
+            merge_patcher = patch.object(
+                douyin_location_cache,
+                "merge_platform_locations",
+                side_effect=lambda _query, candidates, **_kwargs: {
+                    "candidates": list(candidates)[:10],
+                    "offset": 0,
+                    "limit": 10,
+                    "total": len(candidates),
+                    "hasMore": len(candidates) > 10,
+                },
+            )
+            get_patcher.start()
+            merge_patcher.start()
+            self.addCleanup(get_patcher.stop)
+            self.addCleanup(merge_patcher.stop)
+            self._empty_location_cache_patchers = (get_patcher, merge_patcher)
         self.page._setup_generation_id = generation_id
         self.page._setup_generation_content_fingerprint = (
             self.page._setup_content_fingerprint()
@@ -11784,6 +11830,546 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             }
         return status
 
+    @staticmethod
+    def _cached_location_candidates(count: int) -> list[dict[str, object]]:
+        return [
+            {
+                "poiId": f"poi-cache-{index:03d}",
+                "name": f"缓存地点 {index:03d}",
+                "address": f"北海市测试路 {index:03d} 号",
+                "distance": "",
+                "source": "platform",
+                "commissionType": "commission",
+                "productCount": 3,
+                "commissionProductCount": 1,
+                "commissionLabel": "返佣",
+                "scope": "domestic",
+                "status": "reusable",
+                "verifiedAt": "2026-08-15T00:00:00+00:00",
+            }
+            for index in range(count)
+        ]
+
+    def _activate_cached_location_search(self, *, account_id: int = 501) -> None:
+        account = {
+            "id": account_id,
+            "type": 3,
+            "status": 1,
+            "filePath": f"douyin-{account_id}.json",
+            "userName": "只用于展示的账号名",
+        }
+        self.page.account_combo.clear()
+        self.page.account_combo.addItem("请选择账号", None)
+        self.page.account_combo.addItem("只用于展示的账号名", account)
+        self.page.account_combo.setCurrentIndex(1)
+        self._activate_setup_generation()
+        self.page.runner = self._ControlledLifecycleRunner()
+        self.page.batch_location_commission_combo.setCurrentIndex(
+            self.page.batch_location_commission_combo.findData("commission")
+        )
+        self.page.batch_location_scope_combo.setCurrentIndex(
+            self.page.batch_location_scope_combo.findData("domestic")
+        )
+        self.page.batch_location_keyword.setText("北海")
+        self.page._sync_batch_location_controls()
+
+    def test_search_shows_first_ten_cached_without_platform_call(self) -> None:
+        """命中可复用缓存时只显示首页，且账号键不得取展示名。"""
+
+        self._activate_cached_location_search(account_id=501)
+        cached = self._cached_location_candidates(100)
+        cache_page = {
+            "candidates": cached[:10],
+            "offset": 0,
+            "limit": 10,
+            "total": 100,
+            "hasMore": True,
+        }
+        with patch.object(
+            douyin_location_cache,
+            "get_cached_locations",
+            return_value=cache_page,
+        ) as cache_get, patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.search_locations"
+        ) as platform_search:
+            self.page.batch_location_search_button.click()
+
+        state = self.page._batch_location_state()
+        self.assertEqual(len(state["candidates"]), 10)
+        self.assertEqual(state["cacheTotal"], 100)
+        self.assertEqual(state["cacheOffset"], 10)
+        self.assertEqual(state["source"], "cache")
+        self.assertEqual(cache_get.call_args.args[0].account_id, "501")
+        platform_search.assert_not_called()
+
+    def test_load_more_uses_cache_then_platform_once(self) -> None:
+        """加载更多必须先用完本地页，再串行请求一次平台。"""
+
+        self._activate_cached_location_search(account_id=502)
+        cached = self._cached_location_candidates(20)
+
+        def cache_page(_query, *, offset=0, **_kwargs):
+            page = cached[offset : offset + 10]
+            return {
+                "candidates": page,
+                "offset": offset,
+                "limit": 10,
+                "total": 20,
+                "hasMore": offset + len(page) < 20,
+            }
+
+        platform_result = {
+            "ok": True,
+            "setupGenerationId": "generation-a",
+            "collectorType": "domestic_location",
+            "collectorInstanceId": "domestic-a",
+            "platformResultCount": 21,
+            "candidates": cached
+            + [
+                {
+                    **cached[0],
+                    "poiId": "poi-platform-021",
+                    "name": "平台新地点",
+                    "address": "北海市平台新地址 21 号",
+                }
+            ],
+            "newCandidateCount": 1,
+            "hasMore": False,
+            "stopReason": "loaded",
+        }
+        with patch.object(
+            douyin_location_cache,
+            "get_cached_locations",
+            side_effect=cache_page,
+        ), patch.object(
+            douyin_location_cache,
+            "merge_platform_locations",
+            return_value={
+                "candidates": cached[:10],
+                "offset": 0,
+                "limit": 10,
+                "total": 21,
+                "hasMore": True,
+            },
+        ), patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.load_more_locations",
+            return_value=platform_result,
+        ) as platform_load_more, patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.status",
+            return_value=self._collector_status(),
+        ):
+            self.page.batch_location_search_button.click()
+            load_more = self.page.findChild(
+                QPushButton,
+                "douyinCommerceBatchLoadMoreLocations",
+            )
+            self.assertIsNotNone(load_more)
+            self.assertTrue(load_more.isEnabled())
+            load_more.click()
+            self.assertEqual(len(self.page._batch_location_state()["candidates"]), 20)
+            self.assertTrue(load_more.isEnabled())
+            load_more.click()
+            self.page.runner.execute(self.page._COLLECTOR_TASK_KEY)
+
+        self.assertEqual(platform_load_more.call_count, 1)
+
+    def test_cached_search_fills_only_placeholder_videos_and_can_refill_after_clear(
+        self,
+    ) -> None:
+        """缓存自动填充不得覆盖已选视频，清回占位项后可重填。"""
+
+        first_path = "/tmp/cache-placeholder.mp4"
+        kept_path = "/tmp/cache-kept.mp4"
+        self.page.video_combo.clear()
+        self.page.video_combo.addItem("请选择视频", None)
+        for index, path in enumerate((first_path, kept_path), start=1):
+            self.page.video_combo.addItem(
+                f"视频 {index}.mp4",
+                {"id": index, "storedPath": path, "filename": f"视频 {index}.mp4"},
+            )
+        self.page._selected_video_indexes = [1, 2]
+        self.page._batch_locations[kept_path] = {
+            "id": "preset-kept",
+            "poiId": "poi-kept",
+            "name": "已选地点",
+            "address": "北海市已选完整地址",
+            "scope": "domestic",
+            "commissionFilter": "commission",
+            "observedCommissionType": "commission",
+        }
+        self._activate_cached_location_search(account_id=503)
+        cached = self._cached_location_candidates(2)
+        cache_page = {
+            "candidates": cached,
+            "offset": 0,
+            "limit": 10,
+            "total": 2,
+            "hasMore": False,
+        }
+
+        def save_candidate(_account_id, candidate, scope):
+            return {
+                **candidate,
+                "id": f"preset-{candidate['poiId']}",
+                "scope": scope,
+            }
+
+        with patch.object(
+            douyin_location_cache,
+            "get_cached_locations",
+            return_value=cache_page,
+        ), patch(
+            "ui.douyin_commerce_page.save_location_preset",
+            side_effect=save_candidate,
+        ):
+            self.page.batch_location_search_button.click()
+            self.assertEqual(
+                self.page._batch_locations[first_path]["poiId"],
+                "poi-cache-000",
+            )
+            self.assertEqual(
+                self.page._batch_locations[kept_path]["poiId"],
+                "poi-kept",
+            )
+            dropdown = self.page.batch_item_rows.widget().findChildren(
+                QComboBox, "douyinCommerceBatchLocationCandidates"
+            )[0]
+            dropdown.setCurrentIndex(0)
+            self.assertNotIn(first_path, self.page._batch_locations)
+            self.page.batch_location_search_button.click()
+
+        self.assertEqual(
+            self.page._batch_locations[first_path]["poiId"],
+            "poi-cache-000",
+        )
+        self.assertEqual(
+            self.page._batch_locations[kept_path]["poiId"],
+            "poi-kept",
+        )
+
+    def test_account_change_clears_cached_round_and_uses_new_controlled_account_id(
+        self,
+    ) -> None:
+        """切换账号必须清理旧轮次，下次查询只用新 payload.id。"""
+
+        self._activate_cached_location_search(account_id=601)
+        cached = self._cached_location_candidates(1)
+
+        def cache_page(query, **_kwargs):
+            candidate = {
+                **cached[0],
+                "poiId": f"poi-account-{query.account_id}",
+                "name": f"账号 {query.account_id} 地点",
+            }
+            return {
+                "candidates": [candidate],
+                "offset": 0,
+                "limit": 10,
+                "total": 1,
+                "hasMore": False,
+            }
+
+        with patch.object(
+            douyin_location_cache,
+            "get_cached_locations",
+            side_effect=cache_page,
+        ) as cache_get:
+            self.page.batch_location_search_button.click()
+            old_token = self.page._batch_location_search_token
+            self.page.account_combo.addItem(
+                "新展示名",
+                {
+                    "id": 602,
+                    "type": 3,
+                    "status": 1,
+                    "filePath": "douyin-602.json",
+                    "userName": "新展示名",
+                },
+            )
+            self.page.account_combo.setCurrentIndex(2)
+
+            self.assertEqual(self.page._batch_location_state()["candidates"], [])
+            self.assertGreater(self.page._batch_location_search_token, old_token)
+            self._activate_setup_generation()
+            self.page.batch_location_search_button.click()
+
+        self.assertEqual(
+            [entry.args[0].account_id for entry in cache_get.call_args_list],
+            ["601", "602"],
+        )
+        self.assertEqual(
+            self.page._batch_location_state()["candidates"][0]["poiId"],
+            "poi-account-602",
+        )
+
+    def test_search_context_changes_clear_pagination_and_reject_late_callback(
+        self,
+    ) -> None:
+        """关键词、范围、筛选和视频批次变更均应使旧回调失效。"""
+
+        self._activate_cached_location_search(account_id=603)
+        cached = self._cached_location_candidates(1)
+        cache_page = {
+            "candidates": cached,
+            "offset": 0,
+            "limit": 10,
+            "total": 1,
+            "hasMore": False,
+        }
+        with patch.object(
+            douyin_location_cache,
+            "get_cached_locations",
+            return_value=cache_page,
+        ):
+            self.page.batch_location_search_button.click()
+        old_token = self.page._batch_location_search_token
+        old_query = douyin_location_cache.LocationCacheQuery(
+            account_id="603",
+            scope="domestic",
+            keyword="北海",
+            commission_filter="commission",
+        )
+
+        self.page.batch_location_keyword.setText("南宁")
+        self.page.batch_location_keyword.textEdited.emit("南宁")
+
+        self.assertEqual(self.page._batch_location_state()["candidates"], [])
+        self.assertGreater(self.page._batch_location_search_token, old_token)
+        late_result = {
+            "platformResultCount": 2,
+            "candidates": cached,
+            "newCandidateCount": 1,
+            "hasMore": False,
+            "stopReason": "loaded",
+        }
+        with patch.object(
+            douyin_location_cache,
+            "merge_platform_locations",
+        ) as merge:
+            self.page._batch_location_load_more_succeeded(
+                old_query,
+                late_result,
+                request_token=old_token,
+            )
+        merge.assert_not_called()
+        self.assertEqual(self.page._batch_location_state()["candidates"], [])
+
+        for control, value in (
+            (self.page.batch_location_scope_combo, "local"),
+            (self.page.batch_location_commission_combo, "no_commission"),
+        ):
+            self.page._batch_location_searches["__shared_location_search__"] = {
+                "scope": "domestic",
+                "keyword": "北海",
+                "commissionFilter": "commission",
+                "candidates": cached,
+                "rawCandidates": cached,
+                "hasMore": True,
+            }
+            before = self.page._batch_location_search_token
+            control.setCurrentIndex(control.findData(value))
+            self.assertEqual(self.page._batch_location_state()["candidates"], [])
+            self.assertGreater(self.page._batch_location_search_token, before)
+
+        self.page._batch_location_searches["__shared_location_search__"] = {
+            "scope": "domestic",
+            "keyword": "北海",
+            "commissionFilter": "commission",
+            "candidates": cached,
+            "rawCandidates": cached,
+            "hasMore": True,
+        }
+        before = self.page._batch_location_search_token
+        self.page.video_combo.clear()
+        self.page.video_combo.addItem("请选择视频", None)
+        self.page.video_combo.addItem(
+            "新视频.mp4",
+            {"id": 9, "storedPath": "/tmp/new-video.mp4", "filename": "新视频.mp4"},
+        )
+        self.page._refresh_batch_video_list(previous_media_keys=set())
+        self.page.batch_video_list.item(0).setCheckState(Qt.CheckState.Checked)
+        self.assertEqual(self.page._batch_location_state()["candidates"], [])
+        self.assertGreater(self.page._batch_location_search_token, before)
+
+    def test_cache_query_failure_keeps_existing_candidates_and_hides_diagnostic(
+        self,
+    ) -> None:
+        """缓存查询异常只显示固定文案，不破坏现有候选。"""
+
+        self._activate_cached_location_search(account_id=604)
+        existing = self._cached_location_candidates(1)
+        self.page._batch_location_searches["__shared_location_search__"] = {
+            "accountId": "604",
+            "scope": "domestic",
+            "keyword": "旧关键词",
+            "commissionFilter": "commission",
+            "candidates": existing,
+            "rawCandidates": existing,
+            "cacheTotal": 1,
+            "cacheOffset": 1,
+            "platformLoadCount": 0,
+            "zeroGrowthCount": 0,
+            "hasMore": True,
+            "source": "cache",
+        }
+        with patch.object(
+            douyin_location_cache,
+            "get_cached_locations",
+            side_effect=RuntimeError("/private/cache/secret.db"),
+        ):
+            self.page._search_batch_locations("domestic", "新关键词")
+
+        self.assertEqual(
+            self.page._batch_location_state()["candidates"],
+            existing,
+        )
+        self.assertEqual(
+            self.page.batch_item_settings_status.text(),
+            "地点缓存读取失败，请重新搜索",
+        )
+        self.assertNotIn("private", self.page.batch_item_settings_status.text())
+
+    def test_load_more_button_tracks_running_and_platform_progress(self) -> None:
+        """加载中按钮必须禁用，回读后投射五个受控分页字段。"""
+
+        self._activate_cached_location_search(account_id=605)
+        cached = self._cached_location_candidates(10)
+        cache_page = {
+            "candidates": cached,
+            "offset": 0,
+            "limit": 10,
+            "total": 10,
+            "hasMore": False,
+        }
+        platform_candidates = cached + [
+            {
+                **cached[0],
+                "poiId": "poi-platform-011",
+                "name": "平台候选 011",
+                "address": "北海市平台路 11 号",
+            }
+        ]
+        platform_result = {
+            "ok": True,
+            "setupGenerationId": "generation-a",
+            "collectorType": "domestic_location",
+            "collectorInstanceId": "domestic-a",
+            "platformResultCount": 11,
+            "candidates": platform_candidates,
+            "newCandidateCount": 1,
+            "hasMore": False,
+            "stopReason": "loaded",
+        }
+        with patch.object(
+            douyin_location_cache,
+            "get_cached_locations",
+            return_value=cache_page,
+        ), patch.object(
+            douyin_location_cache,
+            "merge_platform_locations",
+            return_value={
+                "candidates": platform_candidates[:10],
+                "offset": 0,
+                "limit": 10,
+                "total": 11,
+                "hasMore": True,
+            },
+        ), patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.load_more_locations",
+            return_value=platform_result,
+        ) as load_more, patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.status",
+            return_value=self._collector_status(),
+        ):
+            self.page.batch_location_search_button.click()
+            self.assertTrue(self.page.batch_location_load_more_button.isEnabled())
+
+            self.page._load_more_batch_locations()
+
+            self.assertEqual(
+                self.page.batch_location_load_more_button.text(),
+                "正在加载更多…",
+            )
+            self.assertFalse(self.page.batch_location_load_more_button.isEnabled())
+            load_more.assert_not_called()
+            self.page.runner.execute(self.page._COLLECTOR_TASK_KEY)
+            self.page.runner.finish(self.page._COLLECTOR_TASK_KEY)
+
+        state = self.page._batch_location_state()
+        self.assertEqual(state["platformLoadCount"], 1)
+        self.assertEqual(state["zeroGrowthCount"], 0)
+        self.assertFalse(state["hasMore"])
+        self.assertEqual(state["source"], "platform")
+        self.assertEqual(len(state["candidates"]), 11)
+        self.assertIn("缓存已显示 11/11 个", self.page._batch_location_feedback)
+        self.assertIn("平台批次 1", self.page._batch_location_feedback)
+        self.assertIn("累计候选 11 个", self.page._batch_location_feedback)
+        self.assertEqual(
+            self.page.batch_location_load_more_button.text(),
+            "加载更多地点",
+        )
+        self.assertFalse(self.page.batch_location_load_more_button.isEnabled())
+
+    def test_legacy_session_load_more_uses_same_cache_projection(self) -> None:
+        """旧会话兼容入口也必须经受控 load-more 和缓存投射。"""
+
+        self._activate_cached_location_search(account_id=606)
+        self.page._setup_generation_id = ""
+        self.page._setup_generation_content_fingerprint = ""
+        self.page._session_id = "session-controlled"
+        self.page.runner = self._ControlledLifecycleRunner()
+        cached = self._cached_location_candidates(10)
+        platform_candidates = cached + [
+            {
+                **cached[0],
+                "poiId": "poi-session-011",
+                "name": "会话候选 011",
+                "address": "北海市会话路 11 号",
+            }
+        ]
+        cache_page = {
+            "candidates": cached,
+            "offset": 0,
+            "limit": 10,
+            "total": 10,
+            "hasMore": False,
+        }
+        result = {
+            "platformResultCount": 11,
+            "candidates": platform_candidates,
+            "newCandidateCount": 1,
+            "hasMore": False,
+            "stopReason": "loaded",
+        }
+        with patch.object(
+            douyin_location_cache,
+            "get_cached_locations",
+            return_value=cache_page,
+        ), patch.object(
+            douyin_location_cache,
+            "merge_platform_locations",
+            return_value={**cache_page, "total": 11},
+        ), patch(
+            "ui.douyin_commerce_page.douyin_commerce_session.commerce_session_manager.load_more_locations",
+            return_value=result,
+        ) as load_more:
+            self.page.batch_location_search_button.click()
+            self.page.batch_location_load_more_button.click()
+            self.page.runner.execute(self.page._IMMEDIATE_WRITE_KEY)
+            self.page.runner.finish(self.page._IMMEDIATE_WRITE_KEY)
+
+        load_more.assert_called_once_with(
+            "session-controlled",
+            "北海",
+            "domestic",
+            commission_filter="commission",
+            previous_candidates=cached,
+        )
+        state = self.page._batch_location_state()
+        self.assertEqual(state["platformLoadCount"], 1)
+        self.assertEqual(state["source"], "platform")
+        self.assertEqual(len(state["candidates"]), 11)
+
     def test_platform_collector_progress_is_indeterminate_and_shows_elapsed_seconds(self) -> None:
         """平台采集只能显示真实等待时间，不得伪造完成百分比。"""
 
@@ -11871,8 +12457,8 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
 
         self.assertTrue(self.page.platform_collector_progress_frame.isHidden())
 
-    def test_batch_location_search_captures_filter_for_manager_call_and_late_callback(self) -> None:
-        """发起搜索时的筛选必须同时冻结到底层调用和迟到回调。"""
+    def test_batch_location_search_captures_filter_and_rejects_callback_after_filter_change(self) -> None:
+        """发起时的筛选传给底层，但筛选变更后必须拒绝迟到回调。"""
 
         runner = self._ControlledLifecycleRunner()
         self.page.runner = runner
@@ -11922,10 +12508,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         )
         state = self.page._batch_location_state()
         self.assertEqual(state["commissionFilter"], "commission")
-        self.assertEqual(
-            [item["poiId"] for item in state["candidates"]],
-            ["poi-commission"],
-        )
+        self.assertEqual(state["candidates"], [])
 
     def test_batch_location_search_uses_structured_platform_count_without_fake_raw_rows(self) -> None:
         """UI 必须消费真实链路元数据，不得伪造未过滤候选。"""
@@ -13932,11 +14515,11 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             "no_commission",
         )
         state = self.page._batch_location_state()
-        self.assertEqual(state["platformResultCount"], 3)
-        self.assertEqual(state["commissionFilter"], "no_commission")
+        self.assertEqual(state["platformResultCount"], 0)
+        self.assertEqual(state["candidates"], [])
         self.assertEqual(
-            [candidate["poiId"] for candidate in state["candidates"]],
-            ["poi-no-commission"],
+            self.page._batch_location_search_intent()["commissionFilter"],
+            "all",
         )
 
     def test_late_location_result_does_not_overwrite_current_intent_or_saved_draft(self) -> None:
@@ -15223,14 +15806,14 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             "address": "广西壮族自治区北海市银海区银滩大道中段",
             "distance": "6km",
         }
+        account = {"id": 99, "type": 3, "status": 1, "filePath": "douyin-99.json"}
+        self.page.account_combo.clear()
+        self.page.account_combo.addItem("账号", account)
         self.page._batch_location_search_succeeded("domestic", "北海", [candidate], "all")
         self.assertEqual(
             self.page._batch_location_searches["__shared_location_search__"]["candidates"][0]["poiId"],
             "poi-1",
         )
-        account = {"id": 99, "type": 3, "status": 1, "filePath": "douyin-99.json"}
-        self.page.account_combo.clear()
-        self.page.account_combo.addItem("账号", account)
         with patch(
             "ui.douyin_commerce_page.save_location_preset",
             return_value={**candidate, "scope": "domestic", "id": "preset-1"},
