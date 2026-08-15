@@ -5877,6 +5877,59 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await browser.close()
 
+    async def test_generic_dialog_content_wrapper_has_no_location_ownership(
+        self,
+    ) -> None:
+        """An ordinary wrapper inside a generic dialog proves no location ownership."""
+
+        html = """
+        <section id="shared-editor" role="dialog">
+          <div id="ordinary-dialog-content">
+            <input id="location-search"
+              data-oneclick-commerce-search-input="active"
+              data-oneclick-commerce-store="active" />
+            <div id="location-results" role="listbox">
+              <div role="option"><span data-store-name>银滩门店</span>
+                <span data-store-address>广西北海市银海区银滩路 1 号</span></div>
+            </div>
+            <button id="unrelated-load-more"
+              onclick="window.unrelatedClicks += 1">加载更多</button>
+          </div>
+        </section>
+        <script>window.unrelatedClicks = 0;</script>
+        """
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+                first_page = (
+                    douyin_commerce_service.normalize_commerce_location_candidates(
+                        await douyin_commerce_service._store_option_descriptors(
+                            page.locator("#location-results")
+                        )
+                    )
+                )
+
+                result = await douyin_commerce_service.load_more_commerce_location_candidates(
+                    page,
+                    previous_candidates=first_page,
+                    commission_filter="all",
+                    timeout_ms=5_000,
+                )
+
+                self.assertFalse(result["hasMore"])
+                self.assertEqual(
+                    result["stopReason"],
+                    "no_visible_load_more_control",
+                )
+                self.assertEqual(
+                    await page.evaluate("window.unrelatedClicks"),
+                    0,
+                )
+            finally:
+                await browser.close()
+
     async def test_load_more_collapses_nested_nodes_for_one_logical_button(self) -> None:
         """A button and its labelled descendant represent one logical control."""
 

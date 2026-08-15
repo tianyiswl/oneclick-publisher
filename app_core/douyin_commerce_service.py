@@ -2801,7 +2801,7 @@ async def _unique_visible_load_more_control(page) -> Any | None:
                 const boundedGenericOwner = boundedPanel
                     ? boundedPanel.closest(genericOwnerSelector) : null;
                 const boundedLocationRegion = boundedPanel
-                    && boundedPanel !== boundedGenericOwner ? boundedPanel : null;
+                    && !boundedGenericOwner ? boundedPanel : null;
                 const panel = explicitPanel && explicitPanel !== listbox
                     ? explicitPanel : boundedLocationRegion;
                 if (!panel || panel === document.body
