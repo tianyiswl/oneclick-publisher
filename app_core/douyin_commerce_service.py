@@ -2773,8 +2773,26 @@ async def _unique_visible_load_more_control(page) -> Any | None:
                     '[class*="poi-panel"]'
                 ].join(', ');
                 const explicitPanel = listbox.closest(panelSelector);
+                const controlledAnchors = Array.from(new Set(Array.from(
+                    document.querySelectorAll(
+                        '[data-oneclick-commerce-search-input="active"], '
+                        + '[data-oneclick-commerce-store="active"]'
+                    )
+                ).filter(isEffectivelyVisible)));
+                const commonAncestor = (left, right) => {
+                    const ancestors = new Set();
+                    for (let current = left; current && current !== document.body;
+                        current = current.parentElement) ancestors.add(current);
+                    for (let current = right; current && current !== document.body;
+                        current = current.parentElement) {
+                        if (ancestors.has(current)) return current;
+                    }
+                    return null;
+                };
+                const boundedPanel = controlledAnchors.length === 1
+                    ? commonAncestor(controlledAnchors[0], listbox) : null;
                 const panel = explicitPanel && explicitPanel !== listbox
-                    ? explicitPanel : listbox.parentElement;
+                    ? explicitPanel : boundedPanel;
                 if (!panel || panel === document.body
                     || !isEffectivelyVisible(panel)) return { count: 0 };
                 const candidates = Array.from(panel.querySelectorAll(

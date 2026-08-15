@@ -100,6 +100,7 @@ _VIDEO_PICKER_ROW_HEIGHT = 68
 _BATCH_RUN_KEY = "douyin_commerce_batch_run"
 _BATCH_REVISION_TASK_KEY = "douyin_commerce_batch_revision"
 _BATCH_SHARED_LOCATION_SEARCH_KEY = "__shared_location_search__"
+_BATCH_LOCATION_MAX_IDENTITIES = 100
 
 COLLECTOR_ERROR_COPY = {
     "collector_start_failed": "采集器启动失败",
@@ -1706,6 +1707,13 @@ class DouyinCommercePage(QWidget):
             (existing or {}).get("commissionFilter"),
             default=DEFAULT_COMMISSION_FILTER,
         )
+        raw_candidates = self._merge_batch_location_candidates(
+            [], (existing or {}).get("rawCandidates", [])
+        )
+        accepted_identities = {
+            self._batch_location_candidate_identity(candidate)
+            for candidate in raw_candidates
+        }
         return {
             "accountId": _normalized((existing or {}).get("accountId")),
             "scope": scope,
@@ -1714,23 +1722,25 @@ class DouyinCommercePage(QWidget):
             "platformResultCount": int(
                 (existing or {}).get("platformResultCount") or 0
             ),
-            "rawCandidates": [
-                dict(item)
-                for item in (existing or {}).get("rawCandidates", [])
-                if isinstance(item, dict)
-            ],
+            "rawCandidates": raw_candidates,
             "candidates": [
-                dict(item)
-                for item in (existing or {}).get("candidates", [])
-                if isinstance(item, dict)
+                candidate
+                for candidate in self._merge_batch_location_candidates(
+                    [], (existing or {}).get("candidates", [])
+                )
+                if self._batch_location_candidate_identity(candidate)
+                in accepted_identities
             ],
             "platformContextReady": (
                 (existing or {}).get("platformContextReady") is True
             ),
             "platformCandidates": [
-                dict(item)
-                for item in (existing or {}).get("platformCandidates", [])
-                if isinstance(item, dict)
+                candidate
+                for candidate in self._merge_batch_location_candidates(
+                    [], (existing or {}).get("platformCandidates", [])
+                )
+                if self._batch_location_candidate_identity(candidate)
+                in accepted_identities
             ],
             "requiresRevalidation": (
                 (existing or {}).get("requiresRevalidation") is True
@@ -1897,15 +1907,22 @@ class DouyinCommercePage(QWidget):
         )
 
     @staticmethod
-    def _batch_location_platform_identity_count(
+    def _batch_location_candidate_identity(
+        candidate: Mapping[str, object],
+    ) -> tuple[str, str, str, str]:
+        return tuple(
+            _normalized(candidate.get(key))
+            for key in ("poiId", "name", "address", "commissionType")
+        )
+
+    @classmethod
+    def _batch_location_combined_identity_count(
+        cls,
         state: Mapping[str, object],
     ) -> int:
         identities = {
-            tuple(
-                _normalized(candidate.get(key))
-                for key in ("poiId", "name", "address", "commissionType")
-            )
-            for candidate in state.get("platformCandidates", [])
+            cls._batch_location_candidate_identity(candidate)
+            for candidate in state.get("rawCandidates", [])
             if isinstance(candidate, Mapping)
         }
         return sum(all(identity) for identity in identities)
@@ -1917,18 +1934,22 @@ class DouyinCommercePage(QWidget):
     ) -> str:
         if int(state.get("platformLoadCount") or 0) >= 10:
             return "已达到平台加载上限（10 次）"
-        if cls._batch_location_platform_identity_count(state) >= 100:
+        if (
+            cls._batch_location_combined_identity_count(state)
+            >= _BATCH_LOCATION_MAX_IDENTITIES
+        ):
             return "已达到平台候选上限（100 个）"
         if int(state.get("zeroGrowthCount") or 0) >= 2:
             return "连续两次没有新增有效地点，已停止加载"
         return ""
 
-    @staticmethod
+    @classmethod
     def _merge_batch_location_candidates(
+        cls,
         existing: object,
         additions: object,
     ) -> list[dict[str, object]]:
-        """按完整平台身份稳定追加，不把同名异址误合并。"""
+        """按完整平台身份稳定追加，全链路共用 100 条上限。"""
 
         merged: list[dict[str, object]] = []
         identities: set[tuple[str, str, str, str]] = set()
@@ -1939,15 +1960,46 @@ class DouyinCommercePage(QWidget):
                 if not isinstance(item, Mapping):
                     continue
                 candidate = dict(item)
-                identity = tuple(
-                    _normalized(candidate.get(key))
-                    for key in ("poiId", "name", "address", "commissionType")
-                )
-                if identity in identities:
+                try:
+                    candidate["commissionType"] = (
+                        normalize_observed_commission_type(
+                            candidate.get("commissionType"),
+                            default="unknown",
+                        )
+                    )
+                except ValueError:
+                    continue
+                identity = cls._batch_location_candidate_identity(candidate)
+                if not all(identity) or identity in identities:
                     continue
                 identities.add(identity)
                 merged.append(candidate)
+                if len(merged) >= _BATCH_LOCATION_MAX_IDENTITIES:
+                    return merged
         return merged
+
+    @classmethod
+    def _accepted_batch_location_platform_candidates(
+        cls,
+        combined_candidates: object,
+        platform_candidates: object,
+    ) -> list[dict[str, object]]:
+        """只保留已进入组合上限集合的平台身份。"""
+
+        accepted_identities = {
+            cls._batch_location_candidate_identity(candidate)
+            for candidate in cls._merge_batch_location_candidates(
+                [], combined_candidates
+            )
+        }
+        return [
+            candidate
+            for candidate in cls._merge_batch_location_candidates(
+                [], platform_candidates
+            )
+            if cls._batch_location_candidate_identity(candidate)
+            in accepted_identities
+        ]
 
     def _batch_location_search_intent(self) -> dict[str, str]:
         """直接读取顶部控件，不受旧结果或迟到回调影响。"""
@@ -2066,11 +2118,14 @@ class DouyinCommercePage(QWidget):
                 cache_query, request_token=request_token
             )
             return
-        cached_candidates = [
-            dict(item)
-            for item in cached_page.get("candidates", [])
-            if isinstance(item, Mapping)
-        ]
+        cached_candidates = self._merge_batch_location_candidates(
+            [],
+            [
+                dict(item)
+                for item in cached_page.get("candidates", [])
+                if isinstance(item, Mapping)
+            ],
+        )
         try:
             cache_total = max(
                 len(cached_candidates), int(cached_page.get("total") or 0)
@@ -2095,11 +2150,17 @@ class DouyinCommercePage(QWidget):
             "requiresRevalidation": requires_revalidation,
             "cacheTotal": cache_total,
             "cacheOffset": cache_offset,
-            "cacheHasMore": cached_page.get("hasMore") is True,
+            "cacheHasMore": (
+                cached_page.get("hasMore") is True
+                and len(cached_candidates) < _BATCH_LOCATION_MAX_IDENTITIES
+            ),
             "platformLoadCount": 0,
             "zeroGrowthCount": 0,
             # 纯缓存耗尽后仍需允许用户建立一次平台上下文。
-            "hasMore": bool(cached_candidates),
+            "hasMore": (
+                bool(cached_candidates)
+                and len(cached_candidates) < _BATCH_LOCATION_MAX_IDENTITIES
+            ),
             "source": "cache" if cached_candidates else "platform",
         }
         self._batch_location_searches[_BATCH_SHARED_LOCATION_SEARCH_KEY] = state
@@ -2290,8 +2351,6 @@ class DouyinCommercePage(QWidget):
                 "all",
             ),
         )
-        platform_identity_limit_reached = len(public_candidates) >= 100
-        public_candidates = public_candidates[:100]
         if structured_result:
             raw_count = rows.get("platformResultCount")
             platform_result_count = (
@@ -2314,7 +2373,14 @@ class DouyinCommercePage(QWidget):
         previous_raw = current["rawCandidates"] if same_search else []
         display_raw = self._merge_batch_location_candidates(
             previous_raw, public_candidates
-        )[:100]
+        )
+        public_candidates = self._accepted_batch_location_platform_candidates(
+            display_raw,
+            public_candidates,
+        )
+        combined_identity_limit_reached = (
+            len(display_raw) >= _BATCH_LOCATION_MAX_IDENTITIES
+        )
         candidates = filter_location_candidates(display_raw, selected_filter)
         previous_identities = {
             tuple(
@@ -2366,7 +2432,7 @@ class DouyinCommercePage(QWidget):
             # 列表存在；保守允许一次 load-more，由 Task 2 终止。
             "hasMore": (
                 False
-                if platform_identity_limit_reached
+                if combined_identity_limit_reached
                 else platform_result_count > 0 or bool(public_candidates)
             ),
             "source": "platform",
@@ -2450,6 +2516,11 @@ class DouyinCommercePage(QWidget):
             request_token, cache_query.account_id
         ):
             return False
+        state = self._batch_location_state()
+        accepted_candidates = self._accepted_batch_location_platform_candidates(
+            state["rawCandidates"],
+            public_candidates,
+        )
         request_owner = self._batch_location_request_owner(
             cache_query, request_token
         )
@@ -2462,13 +2533,13 @@ class DouyinCommercePage(QWidget):
             with_progress=lambda _report: (
                 douyin_location_cache.reconcile_platform_locations(
                     cache_query,
-                    [dict(item) for item in public_candidates],
+                    [dict(item) for item in accepted_candidates],
                     confirmed_exhausted=True,
                 )
                 if confirmed_exhausted
                 else douyin_location_cache.merge_platform_locations(
                     cache_query,
-                    [dict(item) for item in public_candidates],
+                    [dict(item) for item in accepted_candidates],
                 )
             ),
             on_success=lambda merged_page: self._batch_location_cache_merge_succeeded(
@@ -2763,6 +2834,10 @@ class DouyinCommercePage(QWidget):
             if isinstance(item, Mapping)
         ]
         state = self._batch_location_state()
+        previous_identities = {
+            self._batch_location_candidate_identity(candidate)
+            for candidate in state["rawCandidates"]
+        }
         try:
             cache_total = max(
                 int(state["cacheTotal"]), int(cached_page.get("total") or 0)
@@ -2775,25 +2850,41 @@ class DouyinCommercePage(QWidget):
         state["rawCandidates"] = self._merge_batch_location_candidates(
             state["rawCandidates"], page_candidates
         )
-        state["candidates"] = self._merge_batch_location_candidates(
-            state["candidates"], page_candidates
+        state["candidates"] = filter_location_candidates(
+            state["rawCandidates"], state["commissionFilter"]
         )
+        accepted_page_candidates = [
+            candidate
+            for candidate in page_candidates
+            if self._batch_location_candidate_identity(candidate)
+            in {
+                self._batch_location_candidate_identity(item)
+                for item in state["rawCandidates"]
+            }
+            and self._batch_location_candidate_identity(candidate)
+            not in previous_identities
+        ]
         state["cacheTotal"] = cache_total
         state["cacheOffset"] = min(
             cache_total,
             int(state["cacheOffset"]) + len(page_candidates),
         )
-        state["cacheHasMore"] = cached_page.get("hasMore") is True
+        combined_limit_reached = (
+            len(state["rawCandidates"]) >= _BATCH_LOCATION_MAX_IDENTITIES
+        )
+        state["cacheHasMore"] = (
+            cached_page.get("hasMore") is True and not combined_limit_reached
+        )
         state["requiresRevalidation"] = (
             state["requiresRevalidation"] is True
             or cached_page.get("requiresRevalidation") is True
         )
         state["source"] = "cache"
-        state["hasMore"] = True
+        state["hasMore"] = not combined_limit_reached
         self._batch_location_searches[_BATCH_SHARED_LOCATION_SEARCH_KEY] = state
         auto_filled, remaining = self._auto_fill_batch_location_candidates(
             state["scope"],
-            page_candidates,
+            accepted_page_candidates,
             commission_filter=state["commissionFilter"],
         )
         feedback = self._batch_location_progress_text(state)
@@ -2877,10 +2968,19 @@ class DouyinCommercePage(QWidget):
             )
             for candidate in previous_platform_candidates
         }
-        accumulated_platform_candidates = self._merge_batch_location_candidates(
+        platform_candidate_pool = self._merge_batch_location_candidates(
             previous_platform_candidates,
             public_candidates,
-        )[:100]
+        )
+        display_raw = self._merge_batch_location_candidates(
+            state["rawCandidates"], platform_candidate_pool
+        )
+        accumulated_platform_candidates = (
+            self._accepted_batch_location_platform_candidates(
+                display_raw,
+                platform_candidate_pool,
+            )
+        )
         accumulated_platform_identities = {
             tuple(
                 _normalized(candidate.get(key))
@@ -2900,9 +3000,6 @@ class DouyinCommercePage(QWidget):
         }
         selected_filter = normalize_commission_filter(
             state["commissionFilter"], default=DEFAULT_COMMISSION_FILTER
-        )
-        display_raw = self._merge_batch_location_candidates(
-            state["rawCandidates"], accumulated_platform_candidates
         )
         projected = filter_location_candidates(display_raw, selected_filter)
         platform_projected = filter_location_candidates(
@@ -2926,7 +3023,7 @@ class DouyinCommercePage(QWidget):
         effective_has_more = has_more
         if platform_load_count >= 10:
             effective_has_more = False
-        elif len(accumulated_platform_identities) >= 100:
+        elif len(display_raw) >= _BATCH_LOCATION_MAX_IDENTITIES:
             effective_has_more = False
         elif zero_growth_count >= 2:
             effective_has_more = False
@@ -3049,18 +3146,30 @@ class DouyinCommercePage(QWidget):
     ) -> None:
         """选择候选后保存完整 POI 预设，并绑定到当前视频。"""
 
-        if not self._save_batch_location_candidate(path, scope, candidate):
+        if not self._bind_batch_location_candidate(path, scope, candidate):
             self._set_batch_location_feedback("地点身份不完整，未保存")
             return
-        self._record_batch_location_selection(
-            scope,
-            self._batch_locations.get(path),
-        )
         self._staged_location_confirmed = bool(self._batch_locations)
         self._set_batch_location_feedback("已绑定地点；其他视频可继续设置")
         self._clear_stage_error("location")
         self._render_batch_item_rows()
         self._sync_view()
+
+    def _bind_batch_location_candidate(
+        self,
+        path: str,
+        scope: object,
+        candidate: object,
+    ) -> bool:
+        """在唯一的预设保存成功边界记录选择生命周期。"""
+
+        if not self._save_batch_location_candidate(path, scope, candidate):
+            return False
+        self._record_batch_location_selection(
+            scope,
+            self._batch_locations.get(path),
+        )
+        return True
 
     def _save_batch_location_candidate(
         self,
@@ -3215,13 +3324,24 @@ class DouyinCommercePage(QWidget):
             commission_filter,
             default=DEFAULT_COMMISSION_FILTER,
         )
-        for path, candidate in zip(pending_paths, candidates):
+        state = self._batch_location_state()
+        accepted_identities = {
+            self._batch_location_candidate_identity(candidate)
+            for candidate in state["rawCandidates"]
+        }
+        accepted_candidates = [
+            candidate
+            for candidate in self._merge_batch_location_candidates([], candidates)
+            if self._batch_location_candidate_identity(candidate)
+            in accepted_identities
+        ]
+        for path, candidate in zip(pending_paths, accepted_candidates):
             current_state = self._batch_location_searches.get(
                 _BATCH_SHARED_LOCATION_SEARCH_KEY,
                 {},
             )
             current_state["commissionFilter"] = selected_filter
-            if self._save_batch_location_candidate(path, scope, candidate):
+            if self._bind_batch_location_candidate(path, scope, candidate):
                 filled += 1
         return filled, max(0, len(pending_paths) - filled)
 

@@ -5772,6 +5772,60 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await browser.close()
 
+    async def test_load_more_rejects_generic_dialog_direct_parent_fallback(
+        self,
+    ) -> None:
+        """A generic dialog directly owning the listbox proves no location panel."""
+
+        html = """
+        <section id="shared-editor" role="dialog">
+          <div id="location-results" role="listbox">
+            <div role="option"><span data-store-name>银滩门店</span>
+              <span data-store-address>广西北海市银海区银滩路 1 号</span></div>
+          </div>
+          <button id="unrelated-load-more"
+            onclick="window.unrelatedClicks += 1">加载更多</button>
+        </section>
+        <script>window.unrelatedClicks = 0;</script>
+        """
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+                first_page = (
+                    douyin_commerce_service.normalize_commerce_location_candidates(
+                        await douyin_commerce_service._store_option_descriptors(
+                            page.locator("#location-results")
+                        )
+                    )
+                )
+
+                control = (
+                    await douyin_commerce_service._unique_visible_load_more_control(
+                        page
+                    )
+                )
+                self.assertIsNone(control)
+                result = await douyin_commerce_service.load_more_commerce_location_candidates(
+                    page,
+                    previous_candidates=first_page,
+                    commission_filter="all",
+                    timeout_ms=5_000,
+                )
+
+                self.assertFalse(result["hasMore"])
+                self.assertEqual(
+                    result["stopReason"],
+                    "no_visible_load_more_control",
+                )
+                self.assertEqual(
+                    await page.evaluate("window.unrelatedClicks"),
+                    0,
+                )
+            finally:
+                await browser.close()
+
     async def test_load_more_collapses_nested_nodes_for_one_logical_button(self) -> None:
         """A button and its labelled descendant represent one logical control."""
 
@@ -14681,6 +14735,19 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
                 )
 
             self.page.batch_location_load_more_button.click()
+            if cache_count >= 100:
+                self.assertNotIn(self.page._IMMEDIATE_WRITE_KEY, runner.active)
+                self.assertFalse(self.page._batch_location_state()["hasMore"])
+                self.assertFalse(
+                    self.page.batch_location_load_more_button.isEnabled()
+                )
+                platform_search.assert_not_awaited()
+                platform_load_more.assert_not_awaited()
+                self.assertEqual(
+                    len(self.page._batch_location_state()["candidates"]),
+                    100,
+                )
+                return
             self.assertIn(self.page._IMMEDIATE_WRITE_KEY, runner.active)
             runner.execute(self.page._IMMEDIATE_WRITE_KEY)
             runner.finish(self.page._IMMEDIATE_WRITE_KEY)
@@ -14709,7 +14776,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
     ) -> None:
         self._assert_cache_exhaustion_uses_real_session_context(20)
 
-    def test_hundred_cached_rows_bootstrap_real_session_context_before_load_more(
+    def test_hundred_cached_rows_close_combined_limit_without_platform_context(
         self,
     ) -> None:
         self._assert_cache_exhaustion_uses_real_session_context(100)
@@ -15917,7 +15984,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
 
         def assert_bounded_before_auto_fill(scope, candidates, **kwargs):
             state = self.page._batch_location_state()
-            self.assertEqual(len(state["platformCandidates"]), 100)
+            self.assertEqual(len(state["platformCandidates"]), 90)
             self.assertEqual(len(state["candidates"]), 100)
             self.assertEqual(len(state["rawCandidates"]), 100)
             self.assertEqual(len(candidates), 90)
@@ -15964,7 +16031,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             )
 
         merged_candidates = merge.call_args.args[1]
-        self.assertEqual(len(merged_candidates), 100)
+        self.assertEqual(len(merged_candidates), 90)
         self.assertNotIn(
             excluded_poi,
             {row["poiId"] for row in merged_candidates},
@@ -15980,6 +16047,135 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             if isinstance(dropdown.itemData(index), dict)
         }
         self.assertNotIn(excluded_poi, option_pois)
+
+    def test_combined_cache_and_platform_limit_rejects_late_next_page_candidate(
+        self,
+    ) -> None:
+        """Cache plus platform identities share one 100-row acceptance budget."""
+
+        self._activate_cached_location_search(account_id=511)
+        cache_query = self.page._batch_location_cache_query(
+            "domestic", "北海", "commission"
+        )
+        cached = self._cached_location_candidates(10)
+        self.page._selected_video_indexes = []
+        self.page._batch_location_cache_search_succeeded(
+            cache_query,
+            "domestic",
+            "北海",
+            "commission",
+            self._cache_page(cached),
+            request_token=self.page._batch_location_search_token,
+        )
+        paths = [
+            "/tmp/combined-limit-first.mp4",
+            "/tmp/combined-limit-late.mp4",
+        ]
+        self.page.video_combo.clear()
+        self.page.video_combo.addItem("请选择视频", None)
+        for index, path in enumerate(paths, start=1):
+            self.page.video_combo.addItem(
+                Path(path).name,
+                {"id": index, "storedPath": path, "filename": Path(path).name},
+            )
+        self.page._selected_video_indexes = [1]
+        first_page = [
+            {
+                **cached[0],
+                "poiId": f"poi-combined-platform-{index:03d}",
+                "name": f"组合上限地点 {index:03d}",
+                "address": f"北海市组合上限路 {index:03d} 号",
+            }
+            for index in range(91)
+        ]
+        first_excluded_poi = first_page[-1]["poiId"]
+        next_page_candidate = {
+            **cached[0],
+            "poiId": "poi-combined-platform-next",
+            "name": "超额下一页地点",
+            "address": "北海市组合上限路 999 号",
+        }
+
+        def save_candidate(_account_id, candidate, scope):
+            return {
+                **candidate,
+                "id": f"preset-{candidate['poiId']}",
+                "scope": scope,
+            }
+
+        with patch(
+            "ui.douyin_commerce_page.save_location_preset",
+            side_effect=save_candidate,
+        ), patch.object(
+            self.page,
+            "_start_batch_location_cache_merge",
+            return_value=False,
+        ) as merge:
+            self.page._batch_location_search_succeeded(
+                "domestic",
+                "北海",
+                {
+                    "platformResultCount": len(first_page),
+                    "candidates": first_page,
+                },
+                "commission",
+                request_token=self.page._batch_location_search_token,
+                cache_query=cache_query,
+            )
+
+            state = self.page._batch_location_state()
+            self.assertEqual(len(state["candidates"]), 100)
+            self.assertFalse(state["hasMore"])
+            self.assertFalse(
+                self.page.batch_location_load_more_button.isEnabled()
+            )
+            self.assertEqual(
+                self.page._batch_locations[paths[0]]["poiId"],
+                first_page[0]["poiId"],
+            )
+            self.assertNotIn(
+                first_excluded_poi,
+                {candidate["poiId"] for candidate in state["candidates"]},
+            )
+            self.assertNotIn(
+                first_excluded_poi,
+                {
+                    candidate["poiId"]
+                    for call in merge.call_args_list
+                    for candidate in call.args[1]
+                },
+            )
+
+            self.page._selected_video_indexes = [1, 2]
+            self.page._batch_location_load_more_succeeded(
+                cache_query,
+                {
+                    "platformResultCount": len(first_page) + 1,
+                    "candidates": [*first_page, next_page_candidate],
+                    "newCandidateCount": 1,
+                    "hasMore": True,
+                    "stopReason": "loaded",
+                },
+                request_token=self.page._batch_location_search_token,
+            )
+
+        state = self.page._batch_location_state()
+        self.assertEqual(len(state["candidates"]), 100)
+        self.assertFalse(state["hasMore"])
+        self.assertFalse(self.page.batch_location_load_more_button.isEnabled())
+        self.assertNotIn(paths[1], self.page._batch_locations)
+        self.assertNotIn(
+            next_page_candidate["poiId"],
+            {candidate["poiId"] for candidate in state["candidates"]},
+        )
+        self.assertNotIn(
+            next_page_candidate["poiId"],
+            {
+                candidate["poiId"]
+                for call in merge.call_args_list
+                for candidate in call.args[1]
+            },
+        )
 
     def test_legacy_session_load_more_uses_same_cache_projection(self) -> None:
         """旧会话兼容入口也必须经受控 load-more 和缓存投射。"""
@@ -18377,6 +18573,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             "账号",
             {"id": 91, "filePath": "douyin-91.json", "type": 3, "status": 1},
         )
+        self.page.runner = self._ControlledLifecycleRunner()
 
         # 旧请求发起后，用户已把顶部改成新的恢复意图。
         self.page.batch_location_commission_combo.setCurrentIndex(
@@ -18719,6 +18916,155 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             ).fetchone()
         self.assertTrue(str(selected_row["lastSelectedAt"] or ""))
         self.assertEqual(selected_row["verifiedAt"], now.isoformat())
+
+    def test_auto_fill_records_selection_once_and_retains_candidate_by_lifecycle(
+        self,
+    ) -> None:
+        """Auto-fill and manual binding share one post-save selection boundary."""
+
+        temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_directory.cleanup)
+        database_patch = patch.object(
+            database,
+            "DB_PATH",
+            Path(temporary_directory.name) / "auto-fill-selection.sqlite3",
+        )
+        database_patch.start()
+        self.addCleanup(database_patch.stop)
+        account_id = "917"
+        cache_query = douyin_location_cache.LocationCacheQuery(
+            account_id=account_id,
+            scope="domestic",
+            keyword="北海",
+            commission_filter="commission",
+        )
+        now = datetime.now(ZoneInfo("UTC"))
+        initial = self._cached_location_candidates(100)
+        douyin_location_cache.merge_platform_locations(
+            cache_query,
+            initial,
+            verified_at=now,
+        )
+        selected = dict(initial[-1])
+        self.page.account_combo.clear()
+        self.page.account_combo.addItem("请选择账号", None)
+        self.page.account_combo.addItem(
+            "自动填充账号",
+            {
+                "id": int(account_id),
+                "type": 3,
+                "status": 1,
+                "filePath": f"douyin-{account_id}.json",
+            },
+        )
+        self.page.account_combo.setCurrentIndex(1)
+        self.page._batch_location_searches["__shared_location_search__"] = {
+            "accountId": account_id,
+            "scope": "domestic",
+            "keyword": "北海",
+            "commissionFilter": "commission",
+            "rawCandidates": [dict(selected)],
+            "candidates": [dict(selected)],
+            "platformCandidates": [dict(selected)],
+            "hasMore": False,
+        }
+        path = "/tmp/auto-fill-selection.mp4"
+        self.page.video_combo.clear()
+        self.page.video_combo.addItem("请选择视频", None)
+        self.page.video_combo.addItem(
+            Path(path).name,
+            {"id": 1, "storedPath": path, "filename": Path(path).name},
+        )
+        self.page._selected_video_indexes = [1]
+        runner = self._ControlledLifecycleRunner()
+        self.page.runner = runner
+
+        def save_candidate(_account_id, candidate, scope):
+            return {
+                **candidate,
+                "id": f"preset-{candidate['poiId']}",
+                "scope": scope,
+            }
+
+        real_record = douyin_location_cache.record_location_selection
+        with patch(
+            "ui.douyin_commerce_page.save_location_preset",
+            side_effect=save_candidate,
+        ), patch.object(
+            douyin_location_cache,
+            "record_location_selection",
+            wraps=real_record,
+        ) as record:
+            self.assertEqual(
+                self.page._auto_fill_batch_location_candidates(
+                    "domestic",
+                    [selected],
+                    commission_filter="commission",
+                ),
+                (1, 0),
+            )
+            auto_keys = [
+                key
+                for key in runner.active
+                if key.startswith("douyin_commerce_location_cache_selection")
+            ]
+            self.assertEqual(len(auto_keys), 1, runner.active)
+
+            newcomer = {
+                **initial[0],
+                "poiId": "poi-auto-fill-newcomer",
+                "name": "自动填充新地点",
+                "address": "北海市自动填充路 1 号",
+            }
+            retained_at = now + timedelta(minutes=1)
+            douyin_location_cache.merge_platform_locations(
+                cache_query,
+                [newcomer],
+                verified_at=retained_at,
+            )
+            runner.execute(auto_keys[0])
+            runner.finish(auto_keys[0])
+
+            retained = {
+                row["poiId"]
+                for offset in range(0, 100, 10)
+                for row in douyin_location_cache.get_cached_locations(
+                    cache_query,
+                    offset=offset,
+                    now=retained_at,
+                )["candidates"]
+            }
+            self.assertIn(selected["poiId"], retained)
+            self.assertIn(newcomer["poiId"], retained)
+
+            manual_path = "/tmp/manual-selection-once.mp4"
+            self.page._select_batch_location_candidate(
+                manual_path,
+                "domestic",
+                selected,
+            )
+            manual_keys = [
+                key
+                for key in runner.active
+                if key.startswith("douyin_commerce_location_cache_selection")
+            ]
+            self.assertEqual(len(manual_keys), 1, runner.active)
+            runner.execute(manual_keys[0])
+            runner.finish(manual_keys[0])
+
+        self.assertEqual(record.call_count, 2)
+        selected_rows = [
+            row
+            for offset in range(0, 100, 10)
+            for row in douyin_location_cache.get_cached_locations(
+                cache_query,
+                offset=offset,
+                now=retained_at,
+            )["candidates"]
+            if row["poiId"] == selected["poiId"]
+        ]
+        self.assertEqual(len(selected_rows), 1)
+        self.assertTrue(str(selected_rows[0].get("lastSelectedAt") or ""))
 
     def test_real_ui_selection_cache_failure_keeps_selection_and_controlled_feedback(
         self,
@@ -19993,6 +20339,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         account = {"id": 97, "type": 3, "status": 1, "filePath": "douyin-97.json"}
         self.page.account_combo.clear()
         self.page.account_combo.addItem("账号", account)
+        self.page.runner = self._ControlledLifecycleRunner()
         candidate = {
             "poiId": "poi-clickable",
             "name": "北海银滩景区",
@@ -20034,6 +20381,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         account = {"id": 98, "type": 3, "status": 1, "filePath": "douyin-98.json"}
         self.page.account_combo.clear()
         self.page.account_combo.addItem("账号", account)
+        self.page.runner = self._ControlledLifecycleRunner()
         old_candidate = {
             "poiId": "poi-old",
             "name": "旧地点",
