@@ -23,12 +23,17 @@ from app_core import database
 BASE_TIME = datetime(2026, 8, 15, 9, 0, tzinfo=timezone.utc)
 
 
-def query(account_id: str, *, keyword: str = "银滩") -> LocationCacheQuery:
+def query(
+    account_id: str,
+    *,
+    keyword: str = "银滩",
+    commission_filter: str = "all",
+) -> LocationCacheQuery:
     return LocationCacheQuery(
         account_id=account_id,
         scope="domestic",
         keyword=keyword,
-        commission_filter="all",
+        commission_filter=commission_filter,
     )
 
 
@@ -52,6 +57,14 @@ def candidates(count: int, *, start: int = 1) -> list[dict[str, object]]:
 
 def ids(result: dict[str, object]) -> list[str]:
     return [row["poiId"] for row in result["candidates"]]
+
+
+def all_cached_ids(value: LocationCacheQuery, *, now: datetime) -> list[str]:
+    return [
+        poi_id
+        for offset in range(0, LOCATION_CACHE_CAPACITY, 10)
+        for poi_id in ids(get_cached_locations(value, offset=offset, now=now))
+    ]
 
 
 def cached_status(account_id: str, candidate: dict[str, object]) -> str:
@@ -165,17 +178,31 @@ class DouyinLocationCacheTests(unittest.TestCase):
 
         merged = merge_platform_locations(query("account-a"), candidates(1), verified_at=BASE_TIME)
         target = merged["candidates"][0]
-        after_expiry = BASE_TIME + timedelta(days=7, seconds=1)
+        expiration_boundary = BASE_TIME + timedelta(days=7)
 
-        self.assertEqual(get_cached_locations(query("account-a"), now=after_expiry)["candidates"], [])
-        self.assertTrue(location_requires_revalidation(target, now=after_expiry))
+        self.assertEqual(get_cached_locations(query("account-a"), now=expiration_boundary)["candidates"], [])
+        self.assertTrue(location_requires_revalidation(target, now=expiration_boundary))
         with self.assertRaises(ValueError):
             get_cached_locations(query("account-a"), offset=True, now=BASE_TIME)
         with self.assertRaises(ValueError):
             get_cached_locations(query("account-a"), limit=10.0, now=BASE_TIME)
+        with self.assertRaises(ValueError):
+            get_cached_locations(query("account-a"), limit=True, now=BASE_TIME)
 
-    def test_capacity_evicts_oldest_cached_location_and_keyword_links(self) -> None:
-        """超过容量后仍能由旧关键词读取被淘汰地点时，本测试必须失败。"""
+    def test_pagination_is_fixed_to_ten_rows(self) -> None:
+        """调用方可用 limit 绕过十条分页时，本测试必须失败。"""
+
+        merge_platform_locations(query("account-a"), candidates(25), verified_at=BASE_TIME)
+
+        first = get_cached_locations(query("account-a"), offset=0, now=BASE_TIME)
+        second = get_cached_locations(query("account-a"), offset=10, now=BASE_TIME)
+        self.assertEqual(len(first["candidates"]), 10)
+        self.assertEqual(len(second["candidates"]), 10)
+        with self.assertRaises(ValueError):
+            get_cached_locations(query("account-a"), limit=100, now=BASE_TIME)
+
+    def test_capacity_isolated_by_keyword_and_commission_filter(self) -> None:
+        """一个查询组合的第 101 条影响其他组合时，本测试必须失败。"""
 
         merge_platform_locations(
             query("account-a", keyword="旧关键词"),
@@ -184,15 +211,47 @@ class DouyinLocationCacheTests(unittest.TestCase):
         )
         merge_platform_locations(
             query("account-a", keyword="新关键词"),
-            candidates(1, start=LOCATION_CACHE_CAPACITY + 1),
+            candidates(LOCATION_CACHE_CAPACITY, start=LOCATION_CACHE_CAPACITY + 1),
             verified_at=BASE_TIME + timedelta(minutes=1),
         )
+        merge_platform_locations(
+            query("account-a", keyword="返佣", commission_filter="all"),
+            candidates(LOCATION_CACHE_CAPACITY, start=LOCATION_CACHE_CAPACITY * 2 + 1),
+            verified_at=BASE_TIME + timedelta(minutes=2),
+        )
+        merge_platform_locations(
+            query("account-a", keyword="返佣", commission_filter="commission"),
+            candidates(LOCATION_CACHE_CAPACITY, start=LOCATION_CACHE_CAPACITY * 3 + 1),
+            verified_at=BASE_TIME + timedelta(minutes=3),
+        )
 
-        old = get_cached_locations(query("account-a", keyword="旧关键词"), limit=100, now=BASE_TIME + timedelta(minutes=1))
-        new = get_cached_locations(query("account-a", keyword="新关键词"), now=BASE_TIME + timedelta(minutes=1))
-        self.assertEqual(len(old["candidates"]), LOCATION_CACHE_CAPACITY - 1)
-        self.assertNotIn("poi-1", ids(old))
-        self.assertEqual(ids(new), [f"poi-{LOCATION_CACHE_CAPACITY + 1}"])
+        now = BASE_TIME + timedelta(minutes=3)
+        self.assertEqual(len(all_cached_ids(query("account-a", keyword="旧关键词"), now=now)), 100)
+        self.assertEqual(len(all_cached_ids(query("account-a", keyword="新关键词"), now=now)), 100)
+        self.assertEqual(
+            len(all_cached_ids(query("account-a", keyword="返佣", commission_filter="all"), now=now)),
+            100,
+        )
+        self.assertEqual(
+            len(all_cached_ids(query("account-a", keyword="返佣", commission_filter="commission"), now=now)),
+            100,
+        )
+
+    def test_capacity_keeps_first_hundred_platform_results_for_the_same_query(self) -> None:
+        """同一查询超额时若淘汰首屏候选，本测试必须失败。"""
+
+        location_query = query("account-a", keyword="容量")
+        merge_platform_locations(
+            location_query,
+            candidates(LOCATION_CACHE_CAPACITY + 1),
+            verified_at=BASE_TIME,
+        )
+
+        self.assertEqual(
+            ids(get_cached_locations(location_query, offset=0, now=BASE_TIME)),
+            [f"poi-{index}" for index in range(1, 11)],
+        )
+        self.assertEqual(len(all_cached_ids(location_query, now=BASE_TIME)), 100)
 
 
 if __name__ == "__main__":

@@ -133,7 +133,7 @@ def location_requires_revalidation(row: object, *, now: datetime | None = None) 
     verified_at = _parse_timestamp(row.get("verifiedAt"))
     if verified_at is None:
         return True
-    return _now(now) - verified_at > LOCATION_REVALIDATE_AFTER
+    return _now(now) - verified_at >= LOCATION_REVALIDATE_AFTER
 
 
 def _public(row: Mapping[str, Any]) -> dict[str, object]:
@@ -156,34 +156,63 @@ def _public(row: Mapping[str, Any]) -> dict[str, object]:
 def _evict_excess_locations(conn: Any, query: LocationCacheQuery) -> None:
     count = conn.execute(
         """
-        SELECT COUNT(*) AS count FROM douyin_location_cache
-        WHERE accountId = ? AND scope = ?
+        SELECT COUNT(*) AS count
+        FROM douyin_location_cache_keywords
+        WHERE accountId = ? AND scope = ? AND keyword = ? AND commissionFilter = ?
         """,
-        (query.account_id, query.scope),
+        (
+            query.account_id,
+            query.scope,
+            query.keyword,
+            query.commission_filter,
+        ),
     ).fetchone()["count"]
     excess = count - LOCATION_CACHE_CAPACITY
     if excess <= 0:
         return
     rows = conn.execute(
         """
-        SELECT id FROM douyin_location_cache
-        WHERE accountId = ? AND scope = ?
-        ORDER BY lastSeenAt ASC, id ASC
+        SELECT locationCacheId
+        FROM douyin_location_cache_keywords
+        WHERE accountId = ? AND scope = ? AND keyword = ? AND commissionFilter = ?
+        ORDER BY position DESC, locationCacheId DESC
         LIMIT ?
         """,
-        (query.account_id, query.scope, excess),
+        (
+            query.account_id,
+            query.scope,
+            query.keyword,
+            query.commission_filter,
+            excess,
+        ),
     ).fetchall()
-    ids = [row["id"] for row in rows]
+    ids = [row["locationCacheId"] for row in rows]
     if not ids:
         return
     placeholders = ", ".join("?" for _ in ids)
     conn.execute(
-        f"DELETE FROM douyin_location_cache_keywords WHERE locationCacheId IN ({placeholders})",
-        ids,
+        f"""
+        DELETE FROM douyin_location_cache_keywords
+        WHERE accountId = ? AND scope = ? AND keyword = ? AND commissionFilter = ?
+          AND locationCacheId IN ({placeholders})
+        """,
+        (
+            query.account_id,
+            query.scope,
+            query.keyword,
+            query.commission_filter,
+            *ids,
+        ),
     )
     conn.execute(
-        f"DELETE FROM douyin_location_cache WHERE id IN ({placeholders})",
-        ids,
+        """
+        DELETE FROM douyin_location_cache
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM douyin_location_cache_keywords AS keyword
+            WHERE keyword.locationCacheId = douyin_location_cache.id
+        )
+        """
     )
 
 
@@ -199,6 +228,8 @@ def get_cached_locations(
     safe_query = _query(query)
     safe_offset = _pagination(offset, "offset", minimum=0)
     safe_limit = _pagination(limit, "limit", minimum=1)
+    if safe_limit != LOCATION_CACHE_PAGE_SIZE:
+        raise DouyinLocationCacheError(f"地点缓存limit必须为{LOCATION_CACHE_PAGE_SIZE}")
     current = _now(now)
     with database.connect() as conn:
         rows = conn.execute(
@@ -332,7 +363,7 @@ def merge_platform_locations(
                 ),
             )
         _evict_excess_locations(conn, safe_query)
-    return get_cached_locations(safe_query, limit=LOCATION_CACHE_CAPACITY, now=_now(verified_at))
+    return get_cached_locations(safe_query, now=_now(verified_at))
 
 
 def record_location_publish_result(
