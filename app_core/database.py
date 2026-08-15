@@ -21,6 +21,7 @@ def open_connection(
     """打开一个事务连接，并在退出上下文时可靠关闭文件句柄。"""
 
     conn = sqlite3.connect(path)
+    conn.execute("PRAGMA foreign_keys = ON")
     if row_factory:
         conn.row_factory = sqlite3.Row
     try:
@@ -186,10 +187,34 @@ def ensure_schema() -> None:
                 commissionLabel TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL,
                 verifiedAt TEXT NOT NULL,
+                firstSeenAt TEXT NOT NULL,
                 lastSeenAt TEXT NOT NULL,
+                lastSelectedAt TEXT,
+                lastPublishSuccessAt TEXT,
+                lastFailureAt TEXT,
+                lastErrorCode TEXT NOT NULL DEFAULT '',
                 revalidationFailures INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(accountId, scope, poiId, name, address, commissionType)
             )
+            """
+        )
+        _add_columns(
+            conn,
+            "douyin_location_cache",
+            (
+                ("firstSeenAt", "TEXT"),
+                ("lastSelectedAt", "TEXT"),
+                ("lastPublishSuccessAt", "TEXT"),
+                ("lastFailureAt", "TEXT"),
+                ("lastErrorCode", "TEXT NOT NULL DEFAULT ''"),
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE douyin_location_cache
+            SET firstSeenAt = COALESCE(firstSeenAt, lastSeenAt, verifiedAt),
+                lastErrorCode = COALESCE(lastErrorCode, '')
+            WHERE firstSeenAt IS NULL OR lastErrorCode IS NULL
             """
         )
         conn.execute(
@@ -204,6 +229,17 @@ def ensure_schema() -> None:
                 PRIMARY KEY(locationCacheId, keyword, commissionFilter),
                 FOREIGN KEY(locationCacheId) REFERENCES douyin_location_cache(id)
                     ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute(
+            """
+            DELETE FROM douyin_location_cache_keywords
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM douyin_location_cache
+                WHERE douyin_location_cache.id =
+                      douyin_location_cache_keywords.locationCacheId
             )
             """
         )

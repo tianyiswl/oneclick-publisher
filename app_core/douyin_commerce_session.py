@@ -88,6 +88,9 @@ def _normalized(value: object) -> str:
 _LOCATION_SNAPSHOT_SCALAR_TYPES = frozenset(
     {type(None), bool, int, float, str}
 )
+_SETUP_LOCATION_MAX_LOAD_MORE_CLICKS = 10
+_SETUP_LOCATION_MAX_IDENTITIES = 100
+_SETUP_LOCATION_MAX_ZERO_GROWTH = 2
 
 
 def _rebuild_controlled_location_value(
@@ -141,6 +144,46 @@ def _location_candidate_identities(
     )
 
 
+def _unique_location_candidates(
+    candidates: list[dict[str, Any]],
+    *,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    """按四字段身份稳定去重，并可在设置页上限处精确截断。"""
+
+    result: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for candidate in candidates:
+        identity = tuple(
+            _normalized(candidate.get(key))
+            for key in ("poiId", "name", "address", "commissionType")
+        )
+        if not all(identity) or identity in seen:
+            continue
+        seen.add(identity)
+        result.append(dict(candidate))
+        if limit is not None and len(result) >= limit:
+            break
+    return result
+
+
+def _stopped_location_page(
+    context: "_LocationSearchContext",
+    stop_reason: str,
+) -> dict[str, object]:
+    candidates = _unique_location_candidates(
+        snapshot_location_candidates(context.candidates),
+        limit=_SETUP_LOCATION_MAX_IDENTITIES,
+    )
+    return {
+        "platformResultCount": len(candidates),
+        "candidates": snapshot_location_candidates(candidates),
+        "newCandidateCount": 0,
+        "hasMore": False,
+        "stopReason": stop_reason,
+    }
+
+
 def _sms_verification_failure_message(error: Exception) -> str:
     """将验证码失败归因收束为可行动且不泄露页面细节的提示。"""
 
@@ -173,7 +216,7 @@ def _same_music(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
 def _same_location(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
     return all(
         _normalized(left.get(key)) == _normalized(right.get(key))
-        for key in ("poiId", "name", "address")
+        for key in ("poiId", "name", "address", "commissionType")
     )
 
 
@@ -1263,6 +1306,17 @@ class DouyinCommerceSessionManager:
             raise DouyinCommerceSessionError(
                 "collector_search_context_mismatch"
             ) from None
+        unique_before = _unique_location_candidates(
+            context_snapshot,
+            limit=_SETUP_LOCATION_MAX_IDENTITIES,
+        )
+        before_identities = set(_location_candidate_identities(unique_before))
+        if context.load_more_count >= _SETUP_LOCATION_MAX_LOAD_MORE_CLICKS:
+            return _stopped_location_page(context, "load_more_click_limit")
+        if len(before_identities) >= _SETUP_LOCATION_MAX_IDENTITIES:
+            return _stopped_location_page(context, "candidate_identity_limit")
+        if context.zero_growth_count >= _SETUP_LOCATION_MAX_ZERO_GROWTH:
+            return _stopped_location_page(context, "zero_growth_limit")
         self._ensure_editor_not_blocked_by_music_picker(session)
         try:
             result = await douyin_commerce_service.load_more_commerce_location_candidates(
@@ -1301,20 +1355,39 @@ class DouyinCommerceSessionManager:
             raise DouyinCommerceSessionError(
                 "collector_search_context_mismatch"
             ) from None
-        context.candidates = snapshot_location_candidates(candidates)
+        accumulated_candidates = _unique_location_candidates(
+            context_snapshot + candidates,
+            limit=_SETUP_LOCATION_MAX_IDENTITIES,
+        )
+        accumulated_identities = set(
+            _location_candidate_identities(accumulated_candidates)
+        )
+        effective_new_count = len(accumulated_identities - before_identities)
+        context.candidates = snapshot_location_candidates(accumulated_candidates)
         context.load_more_count += 1
         context.zero_growth_count = (
-            context.zero_growth_count + 1 if raw_new_count == 0 else 0
+            context.zero_growth_count + 1 if effective_new_count == 0 else 0
         )
         session.commerce_location_candidates = snapshot_location_candidates(
-            candidates
+            accumulated_candidates
         )
+        stop_reason = raw_stop_reason
+        has_more = raw_has_more
+        if context.load_more_count >= _SETUP_LOCATION_MAX_LOAD_MORE_CLICKS:
+            stop_reason = "load_more_click_limit"
+            has_more = False
+        elif len(accumulated_identities) >= _SETUP_LOCATION_MAX_IDENTITIES:
+            stop_reason = "candidate_identity_limit"
+            has_more = False
+        elif context.zero_growth_count >= _SETUP_LOCATION_MAX_ZERO_GROWTH:
+            stop_reason = "zero_growth_limit"
+            has_more = False
         return {
             "platformResultCount": raw_count,
-            "candidates": snapshot_location_candidates(candidates),
-            "newCandidateCount": raw_new_count,
-            "hasMore": raw_has_more,
-            "stopReason": raw_stop_reason,
+            "candidates": snapshot_location_candidates(accumulated_candidates),
+            "newCandidateCount": effective_new_count,
+            "hasMore": has_more,
+            "stopReason": stop_reason,
         }
 
     async def _apply_location(

@@ -148,8 +148,14 @@ async def _wait_publish_location_timeout(
 ) -> None:
     """固定收敛等待也不得跨过正式发布的总期限。"""
 
-    effective_timeout = _publish_location_remaining_ms(deadline, timeout_ms)
-    await page.wait_for_timeout(effective_timeout)
+    if deadline is None:
+        await page.wait_for_timeout(max(1, int(timeout_ms)))
+        return
+    await _await_publish_location_dom_action(
+        lambda action_timeout: page.wait_for_timeout(action_timeout),
+        deadline=deadline,
+        timeout_ms=timeout_ms,
+    )
 
 
 class DouyinCommerceError(RuntimeError):
@@ -303,9 +309,15 @@ def normalize_commerce_location_candidate(value: object) -> dict[str, Any] | Non
     address = _normalized(value.get("address") or value.get("storeAddress"))
     if not name or not address:
         return None
+    real_poi_id = _normalized(
+        value.get("poiId")
+        or value.get("poi_id")
+        or value.get("locationId")
+        or value.get("location_id")
+    )
     location = normalize_location_candidate(
         {
-            "poiId": _visible_location_identity(name, address),
+            "poiId": real_poi_id or _visible_location_identity(name, address),
             "name": name,
             "address": address,
             "distance": "",
@@ -344,12 +356,12 @@ def normalize_commerce_location_candidates(
     ]
     filtered_rows = filter_location_candidates(normalized_rows, selected_filter)
     result: list[dict[str, Any]] = []
-    seen_locations: set[str] = set()
+    seen_locations: set[tuple[str, str, str, str]] = set()
     for location in filtered_rows:
-        location_id = _normalized(location.get("poiId"))
-        if location_id in seen_locations:
-            raise DouyinCommerceError("抖音发布定位候选出现重复完整地址，无法安全选择")
-        seen_locations.add(location_id)
+        identity = _commerce_location_candidate_identity(location)
+        if not all(identity) or identity in seen_locations:
+            raise DouyinCommerceError("抖音发布定位候选出现重复完整身份，无法安全选择")
+        seen_locations.add(identity)
         result.append(dict(location))
     return result
 
@@ -387,7 +399,7 @@ def normalize_commerce_location_store_candidates(
     if not isinstance(rows, list):
         return []
     result: list[dict[str, Any]] = []
-    seen_locations: set[str] = set()
+    seen_locations: set[tuple[str, str, str, str]] = set()
     seen_stores: set[str] = set()
     for row in rows:
         candidate = normalize_commerce_location_store_candidate(row)
@@ -395,11 +407,11 @@ def normalize_commerce_location_store_candidates(
             continue
         location = candidate
         store = candidate["commerceStore"]
-        location_id = _normalized(location.get("poiId"))
+        location_identity = _commerce_location_candidate_identity(location)
         store_id = _normalized(store.get("storeId"))
-        if location_id in seen_locations or store_id in seen_stores:
+        if location_identity in seen_locations or store_id in seen_stores:
             raise DouyinCommerceError("抖音带货候选出现重复可见身份，无法安全选择")
-        seen_locations.add(location_id)
+        seen_locations.add(location_identity)
         seen_stores.add(store_id)
         result.append(candidate)
     return result
@@ -1688,11 +1700,14 @@ async def _visible_store_listbox(page) -> Any | None:
                         || lines.find(line => looksAddress(line)) || '';
                     return { name, address };
                 };
+                const ownedOptions = list => Array.from(
+                    list.querySelectorAll('[role="option"]')
+                ).filter(option => option.closest('[role="listbox"]') === list);
                 const lists = Array.from(document.querySelectorAll('[role="listbox"]'))
                     .filter(isEffectivelyVisible)
+                    .filter(list => !list.parentElement?.closest('[role="listbox"]'))
                     .filter(list => {
-                        const options = Array.from(list.querySelectorAll(':scope > [role="option"]'))
-                            .filter(isEffectivelyVisible);
+                        const options = ownedOptions(list).filter(isEffectivelyVisible);
                         return options.length > 0 && options.some(option => {
                             const row = descriptor(option);
                             return row.name && row.address && looksAddress(row.address);
@@ -1765,10 +1780,12 @@ async def _visible_commerce_location_overlay(page) -> Any | None:
             if (!panel) return { count: 0 };
             const lists = Array.from(panel.querySelectorAll('[role="listbox"]'))
                 .filter(visible)
+                .filter(list => !list.parentElement?.closest('[role="listbox"]'))
                 .filter(list => {
                     const options = Array.from(
-                        list.querySelectorAll(':scope > [role="option"]')
-                    ).filter(visible);
+                        list.querySelectorAll('[role="option"]')
+                    ).filter(option => option.closest('[role="listbox"]') === list)
+                        .filter(visible);
                     if (options.length === 0) return false;
                     const values = options.map(text);
                     return !(values.length === 2
@@ -2730,6 +2747,9 @@ async def search_commerce_location_store_candidates(
 async def _unique_visible_load_more_control(page) -> Any | None:
     """返回当前地点面板唯一可点击的“加载更多”控件。"""
 
+    if await _visible_store_listbox(page) is None:
+        return None
+
     result = await page.evaluate(
         """() => {
 """
@@ -2737,7 +2757,13 @@ async def _unique_visible_load_more_control(page) -> Any | None:
         + """
                 const normalize = value => String(value || '')
                     .replace(/[\u200b\u00a0]/g, ' ').replace(/\\s+/g, ' ').trim();
-                const controls = Array.from(document.querySelectorAll(
+                const listbox = document.querySelector(
+                    '[data-oneclick-commerce-store-list="active"]'
+                );
+                if (!listbox || !isEffectivelyVisible(listbox)) {
+                    return { count: 0 };
+                }
+                const candidates = Array.from(document.querySelectorAll(
                     'button, input[type="button"], input[type="submit"], '
                     + 'a[href], [role="button"], [tabindex], [onclick]'
                 )).filter(isEffectivelyVisible).filter(node => {
@@ -2751,6 +2777,19 @@ async def _unique_visible_load_more_control(page) -> Any | None:
                         ? node.value : (node.innerText || node.textContent));
                     return text.includes('点击加载更多') || text.includes('加载更多');
                 });
+                let controls = [];
+                for (let region = listbox.parentElement, depth = 0;
+                    region && region !== document.body && depth < 8;
+                    region = region.parentElement, depth += 1) {
+                    const scoped = candidates.filter(node =>
+                        region.contains(node) && !listbox.contains(node));
+                    if (scoped.length) {
+                        controls = scoped;
+                        break;
+                    }
+                }
+                controls = controls.filter(node => !controls.some(other =>
+                    other !== node && other.contains(node)));
                 document.querySelectorAll('[data-oneclick-commerce-load-more="active"]')
                     .forEach(node => node.removeAttribute(
                         'data-oneclick-commerce-load-more'
@@ -2876,6 +2915,8 @@ async def _load_more_commerce_location_candidates_impl(
     try:
         selected_filter = normalize_commission_filter(commission_filter, default="all")
         normalized_timeout_ms = max(_LOCATION_RESULT_POLL_INTERVAL_MS, int(timeout_ms))
+        if deadline is None:
+            deadline = monotonic() + normalized_timeout_ms / 1000
         normalized_timeout_ms = _publish_location_remaining_ms(
             deadline,
             normalized_timeout_ms,
@@ -3063,6 +3104,7 @@ async def load_more_commerce_location_candidates(
 ) -> dict[str, object]:
     """公开加载更多入口：所有内部失败只暴露固定错误码。"""
 
+    has_outer_deadline = deadline is not None
     try:
         return await _load_more_commerce_location_candidates_impl(
             page,
@@ -3072,11 +3114,26 @@ async def load_more_commerce_location_candidates(
             deadline=deadline,
         )
     except DouyinCommerceError as exc:
-        if str(exc) == _PUBLISH_LOCATION_LIMIT_CODE:
+        if str(exc) == _PUBLISH_LOCATION_LIMIT_CODE and has_outer_deadline:
             raise
         raise DouyinCommerceError("publish_location_load_more_failed") from None
     except Exception:
         raise DouyinCommerceError("publish_location_load_more_failed") from None
+
+
+async def _owned_store_option_locator(listbox):
+    """Mark one exact listbox and return all descendant option candidates."""
+
+    await listbox.evaluate(
+        """node => {
+            document.querySelectorAll('[data-oneclick-commerce-owned-listbox]')
+                .forEach(current => current.removeAttribute(
+                    'data-oneclick-commerce-owned-listbox'
+                ));
+            node.dataset.oneclickCommerceOwnedListbox = 'active';
+        }"""
+    )
+    return listbox.locator('[role="option"]')
 
 
 async def _location_option_targets(
@@ -3096,11 +3153,21 @@ async def _location_option_targets(
         commission_filter,
         default="all",
     )
+    expected_poi_id = _normalized(location.get("poiId"))
     expected_name = _normalized(location.get("name"))
     expected_address = _normalized(location.get("address"))
-    if not expected_name or not expected_address:
+    expected_commission_type = _normalized(location.get("commissionType"))
+    if (
+        not expected_poi_id
+        or not expected_name
+        or not expected_address
+        or not expected_commission_type
+    ):
         return []
-    options = listbox.locator(':scope > [role="option"]')
+    options = await _await_publish_location_dom_action(
+        lambda _timeout: _owned_store_option_locator(listbox),
+        deadline=deadline,
+    )
     targets: list[Any] = []
     option_count = await _await_publish_location_dom_action(
         lambda _timeout: options.count(),
@@ -3121,6 +3188,10 @@ async def _location_option_targets(
                 + _STORE_EFFECTIVE_VISIBILITY_JS
                 + """
                     if (!isEffectivelyVisible(node)) return null;
+                    const owner = node.closest('[role="listbox"]');
+                    if (!owner || owner.getAttribute(
+                        'data-oneclick-commerce-owned-listbox'
+                    ) !== 'active') return null;
                     const normalize = value => String(value || '')
                         .replace(/[\u200b\u00a0]/g, ' ').replace(/\\s+/g, ' ').trim();
                     const rawText = String(node.innerText || node.textContent || '')
@@ -3173,7 +3244,16 @@ async def _location_option_targets(
                     const commerceInfo = commerceCandidates
                         .map(visibleCommerceText)
                         .find(looksCommerce) || '';
-                    return { name, address, commerceInfo };
+                    return {
+                        poiId: normalize(
+                            node.getAttribute('data-poi-id')
+                            || node.getAttribute('data-location-id')
+                            || node.getAttribute('data-id')
+                        ),
+                        name,
+                        address,
+                        commerceInfo,
+                    };
                 }"""
                 ),
                 deadline=deadline,
@@ -3192,9 +3272,11 @@ async def _location_option_targets(
             selected_commission_filter,
         ):
             continue
-        if (
-            _normalized(actual.get("name")) == expected_name
-            and _normalized(actual.get("address")) == expected_address
+        if _commerce_location_candidate_identity(normalized_actual) == (
+            expected_poi_id,
+            expected_name,
+            expected_address,
+            expected_commission_type,
         ):
             targets.append(node)
     return targets
@@ -3219,7 +3301,7 @@ async def _apply_open_commerce_location_to_page(
         raise DouyinCommerceError("publish_location_candidate_missing")
     location = {
         key: _normalized(normalized.get(key))
-        for key in ("poiId", "name", "address", "distance")
+        for key in ("poiId", "name", "address", "distance", "commissionType")
     }
     visible_locations = normalize_commerce_location_candidates(
         await _await_publish_location_dom_action(
@@ -3769,7 +3851,7 @@ async def _store_option_descriptors(listbox) -> list[dict[str, str]]:
     """只抽取页面上可见的门店标识、名称和地址，不保存原始 DOM。"""
 
     rows: list[dict[str, str]] = []
-    locator = listbox.locator(':scope > [role="option"]')
+    locator = await _owned_store_option_locator(listbox)
     for index in range(await locator.count()):
         node = locator.nth(index)
         try:
@@ -3781,6 +3863,10 @@ async def _store_option_descriptors(listbox) -> list[dict[str, str]]:
                 + _STORE_EFFECTIVE_VISIBILITY_JS
                 + """
                     if (!isEffectivelyVisible(node)) return null;
+                    const owner = node.closest('[role="listbox"]');
+                    if (!owner || owner.getAttribute(
+                        'data-oneclick-commerce-owned-listbox'
+                    ) !== 'active') return null;
                     const normalize = value => String(value || '').replace(/\\u200b/g, ' ').replace(/\\s+/g, ' ').trim();
                     const attr = name => normalize(node.getAttribute(name));
                     const rawText = String(node.innerText || node.textContent || '')
@@ -3848,6 +3934,7 @@ async def _store_option_descriptors(listbox) -> list[dict[str, str]]:
                             && (explicitSelectedClass || explicitSemiSelectedClass));
                     return {
                         storeId: attr('data-store-id') || attr('data-shop-id') || attr('data-id'),
+                        poiId: attr('data-poi-id') || attr('data-location-id') || attr('data-id'),
                         name,
                         address,
                         commerceInfo,
@@ -3935,7 +4022,7 @@ async def apply_commerce_store_to_page(
     if len(selected_linked) == 1:
         return dict(normalized_store)
 
-    options = listbox.locator(':scope > [role="option"]')
+    options = await _owned_store_option_locator(listbox)
     targets: list[Any] = []
     for index in range(await options.count()):
         node = options.nth(index)
@@ -3944,6 +4031,10 @@ async def apply_commerce_store_to_page(
                 continue
             actual = await node.evaluate(
                 """node => {
+                    const owner = node.closest('[role="listbox"]');
+                    if (!owner || owner.getAttribute(
+                        'data-oneclick-commerce-owned-listbox'
+                    ) !== 'active') return null;
                     const normalize = value => String(value || '').replace(/\\u200b/g, ' ').replace(/\\s+/g, ' ').trim();
                     const rawText = String(node.innerText || node.textContent || '').replace(/[\\u200b\\u00a0]/g, ' ');
                     const lines = rawText.split(/\\n+/).map(normalize).filter(Boolean);

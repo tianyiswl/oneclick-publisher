@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -15,6 +16,8 @@ from app_core.douyin_location_cache import (
     get_cached_locations,
     location_requires_revalidation,
     merge_platform_locations,
+    reconcile_platform_locations,
+    record_location_selection,
     record_location_publish_result,
 )
 from app_core import database
@@ -86,6 +89,30 @@ def cached_status(account_id: str, candidate: dict[str, object]) -> str:
             ),
         ).fetchone()
     return row["status"] if row else ""
+
+
+def cached_revalidation_failures(
+    account_id: str,
+    candidate: dict[str, object],
+) -> int:
+    with database.connect() as conn:
+        row = conn.execute(
+            """
+            SELECT revalidationFailures
+            FROM douyin_location_cache
+            WHERE accountId = ? AND scope = ? AND poiId = ?
+              AND name = ? AND address = ? AND commissionType = ?
+            """,
+            (
+                account_id,
+                candidate["scope"],
+                candidate["poiId"],
+                candidate["name"],
+                candidate["address"],
+                candidate["commissionType"],
+            ),
+        ).fetchone()
+    return int(row["revalidationFailures"]) if row else -1
 
 
 class DouyinLocationCacheTests(unittest.TestCase):
@@ -223,6 +250,81 @@ class DouyinLocationCacheTests(unittest.TestCase):
         rows = get_cached_locations(query("account-a"), now=BASE_TIME + timedelta(minutes=2))
         self.assertEqual(rows["candidates"], [other])
         self.assertEqual(cached_status("account-a", target), "invalid")
+
+    def test_confirmed_exhaustion_reconciles_returned_and_missing_revalidation_rows(
+        self,
+    ) -> None:
+        """只更新返回行会让缺失 POI 永远停在待校对，第二次缺失也不会失效。"""
+
+        merged = merge_platform_locations(
+            query("account-a"),
+            candidates(2),
+            verified_at=BASE_TIME,
+        )
+        returned, missing = merged["candidates"]
+        record_location_publish_result(
+            "account-a",
+            missing,
+            success=False,
+            error_code="publish_location_candidate_ambiguous",
+            occurred_at=BASE_TIME + timedelta(minutes=1),
+        )
+
+        reconcile_platform_locations(
+            query("account-a"),
+            [returned],
+            confirmed_exhausted=True,
+            verified_at=BASE_TIME + timedelta(minutes=2),
+        )
+        self.assertEqual(cached_status("account-a", returned), "reusable")
+        self.assertEqual(cached_status("account-a", missing), "needs_revalidation")
+        self.assertEqual(cached_revalidation_failures("account-a", missing), 1)
+
+        reconcile_platform_locations(
+            query("account-a"),
+            [returned],
+            confirmed_exhausted=True,
+            verified_at=BASE_TIME + timedelta(minutes=3),
+        )
+        self.assertEqual(cached_status("account-a", missing), "invalid")
+        self.assertEqual(cached_revalidation_failures("account-a", missing), 2)
+
+    def test_empty_or_unconfirmed_revalidation_only_marks_confirmed_missing_rows(
+        self,
+    ) -> None:
+        """空平台集合可在确认穷尽后计一次缺失，部分页则绝不能计数。"""
+
+        merged = merge_platform_locations(
+            query("account-a"),
+            candidates(1),
+            verified_at=BASE_TIME,
+        )
+        target = merged["candidates"][0]
+        record_location_publish_result(
+            "account-a",
+            target,
+            success=False,
+            error_code="publish_location_candidate_ambiguous",
+            occurred_at=BASE_TIME + timedelta(minutes=1),
+        )
+
+        reconcile_platform_locations(
+            query("account-a"),
+            [],
+            confirmed_exhausted=False,
+            verified_at=BASE_TIME + timedelta(minutes=2),
+        )
+        self.assertEqual(cached_revalidation_failures("account-a", target), 0)
+        self.assertEqual(cached_status("account-a", target), "needs_revalidation")
+
+        reconcile_platform_locations(
+            query("account-a"),
+            [],
+            confirmed_exhausted=True,
+            verified_at=BASE_TIME + timedelta(minutes=3),
+        )
+        self.assertEqual(cached_revalidation_failures("account-a", target), 1)
+        self.assertEqual(cached_status("account-a", target), "needs_revalidation")
 
     def test_non_location_error_does_not_change_cached_location_status(self) -> None:
         """把上传等非地点错误写入地点状态时，本测试必须失败。"""
@@ -376,6 +478,264 @@ class DouyinLocationCacheTests(unittest.TestCase):
             [f"poi-{index}" for index in range(1, 11)],
         )
         self.assertEqual(len(all_cached_ids(location_query, now=BASE_TIME)), 100)
+
+    def test_capacity_retains_hundred_reusable_when_invalid_and_expired_history_exists(
+        self,
+    ) -> None:
+        """Invalid/expired history must not consume the 100 reusable slots."""
+
+        location_query = query("account-a", keyword="lifecycle-capacity")
+        stale = candidates(2)
+        merge_platform_locations(location_query, stale, verified_at=BASE_TIME)
+        with database.connect() as conn:
+            conn.execute(
+                """
+                UPDATE douyin_location_cache
+                SET status = 'invalid', lastFailureAt = ?, lastErrorCode = ?
+                WHERE accountId = ? AND poiId = ?
+                """,
+                (
+                    (BASE_TIME + timedelta(minutes=1)).isoformat(),
+                    "publish_location_readback_mismatch",
+                    "account-a",
+                    "poi-1",
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE douyin_location_cache
+                SET verifiedAt = ?
+                WHERE accountId = ? AND poiId = ?
+                """,
+                (
+                    (BASE_TIME - timedelta(days=8)).isoformat(),
+                    "account-a",
+                    "poi-2",
+                ),
+            )
+
+        fresh = candidates(LOCATION_CACHE_CAPACITY, start=1001)
+        now = BASE_TIME + timedelta(minutes=2)
+        merge_platform_locations(location_query, fresh, verified_at=now)
+
+        self.assertEqual(
+            all_cached_ids(location_query, now=now),
+            [candidate["poiId"] for candidate in fresh],
+        )
+        with database.connect() as conn:
+            linked_history = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM douyin_location_cache AS cache
+                JOIN douyin_location_cache_keywords AS keyword
+                  ON keyword.locationCacheId = cache.id
+                WHERE keyword.accountId = ? AND keyword.scope = ?
+                  AND keyword.keyword = ? AND keyword.commissionFilter = ?
+                  AND cache.poiId IN ('poi-1', 'poi-2')
+                """,
+                (
+                    location_query.account_id,
+                    location_query.scope,
+                    location_query.keyword,
+                    location_query.commission_filter,
+                ),
+            ).fetchone()["count"]
+        self.assertEqual(linked_history, 0)
+
+    def test_lifecycle_fields_drive_reusable_eviction_priority(self) -> None:
+        """Recent publish and selection signals must survive capacity eviction."""
+
+        location_query = query("account-a", keyword="lifecycle-rank")
+        initial = candidates(LOCATION_CACHE_CAPACITY)
+        merge_platform_locations(location_query, initial, verified_at=BASE_TIME)
+        selected = {**initial[-1], "scope": location_query.scope}
+        published = {**initial[-2], "scope": location_query.scope}
+        failed = {**initial[-3], "scope": location_query.scope}
+        record_location_selection(
+            "account-a",
+            selected,
+            occurred_at=BASE_TIME + timedelta(minutes=1),
+        )
+        record_location_publish_result(
+            "account-a",
+            published,
+            success=True,
+            query=location_query,
+            occurred_at=BASE_TIME + timedelta(minutes=2),
+        )
+        record_location_publish_result(
+            "account-a",
+            failed,
+            success=False,
+            error_code="publish_location_readback_mismatch",
+            occurred_at=BASE_TIME + timedelta(minutes=3),
+        )
+
+        newcomer = candidates(1, start=1001)[0]
+        now = BASE_TIME + timedelta(minutes=4)
+        merge_platform_locations(location_query, [newcomer], verified_at=now)
+
+        retained = set(all_cached_ids(location_query, now=now))
+        self.assertEqual(len(retained), LOCATION_CACHE_CAPACITY)
+        self.assertIn(selected["poiId"], retained)
+        self.assertIn(published["poiId"], retained)
+        self.assertIn(newcomer["poiId"], retained)
+        self.assertNotIn(failed["poiId"], retained)
+        with database.connect() as conn:
+            selected_row = conn.execute(
+                "SELECT firstSeenAt, lastSelectedAt FROM douyin_location_cache "
+                "WHERE accountId = ? AND poiId = ?",
+                ("account-a", selected["poiId"]),
+            ).fetchone()
+            published_row = conn.execute(
+                "SELECT lastPublishSuccessAt, lastErrorCode "
+                "FROM douyin_location_cache WHERE accountId = ? AND poiId = ?",
+                ("account-a", published["poiId"]),
+            ).fetchone()
+        self.assertEqual(selected_row["firstSeenAt"], BASE_TIME.isoformat())
+        self.assertEqual(
+            selected_row["lastSelectedAt"],
+            (BASE_TIME + timedelta(minutes=1)).isoformat(),
+        )
+        self.assertEqual(
+            published_row["lastPublishSuccessAt"],
+            (BASE_TIME + timedelta(minutes=2)).isoformat(),
+        )
+        self.assertEqual(published_row["lastErrorCode"], "")
+
+    def test_public_cache_boundary_rejects_unknown_enums_and_filter_mismatch(
+        self,
+    ) -> None:
+        """Unknown scope/filter values and incompatible candidates fail closed."""
+
+        with self.assertRaises(ValueError):
+            get_cached_locations(
+                LocationCacheQuery("account-a", "world", "银滩", "all"),
+                now=BASE_TIME,
+            )
+        with self.assertRaises(ValueError):
+            get_cached_locations(
+                LocationCacheQuery("account-a", "domestic", "银滩", "paid"),
+                now=BASE_TIME,
+            )
+        no_commission = {
+            **candidates(1)[0],
+            "commissionType": "no_commission",
+            "commissionProductCount": 0,
+            "commissionLabel": "无佣",
+        }
+        with self.assertRaises(ValueError):
+            merge_platform_locations(
+                query("account-a", commission_filter="commission"),
+                [no_commission],
+                verified_at=BASE_TIME,
+            )
+
+    def test_database_connections_enable_foreign_keys_and_cleanup_old_orphans(
+        self,
+    ) -> None:
+        """Every managed connection enables FK and migration removes old orphans."""
+
+        database.ensure_schema()
+        raw = sqlite3.connect(database.DB_PATH)
+        try:
+            raw.execute("PRAGMA foreign_keys = OFF")
+            raw.execute(
+                """
+                INSERT INTO douyin_location_cache_keywords (
+                    locationCacheId, accountId, scope, keyword,
+                    commissionFilter, position
+                ) VALUES (999999, 'account-a', 'domestic', '遗留', 'all', 0)
+                """
+            )
+            raw.commit()
+        finally:
+            raw.close()
+
+        database.ensure_schema()
+        with database.connect() as conn:
+            self.assertEqual(conn.execute("PRAGMA foreign_keys").fetchone()[0], 1)
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM douyin_location_cache_keywords "
+                    "WHERE locationCacheId = 999999"
+                ).fetchone()[0],
+                0,
+            )
+
+    def test_excluded_identity_pagination_survives_platform_reorder(self) -> None:
+        """A mutable merge between pages must not skip or repeat cache rows."""
+
+        location_query = query("account-a", keyword="stable-pages")
+        original = candidates(20)
+        merge_platform_locations(location_query, original, verified_at=BASE_TIME)
+        first = get_cached_locations(
+            location_query,
+            excluded_identities=[],
+            now=BASE_TIME,
+        )
+        seen = list(first["candidates"])
+
+        newcomer = candidates(1, start=1001)[0]
+        now = BASE_TIME + timedelta(minutes=1)
+        merge_platform_locations(
+            location_query,
+            [newcomer, *original],
+            verified_at=now,
+        )
+        while True:
+            page = get_cached_locations(
+                location_query,
+                excluded_identities=seen,
+                now=now,
+            )
+            seen.extend(page["candidates"])
+            if page["hasMore"] is False:
+                break
+
+        seen_ids = [candidate["poiId"] for candidate in seen]
+        self.assertEqual(seen_ids[:10], [f"poi-{index}" for index in range(1, 11)])
+        self.assertEqual(len(seen_ids), 21)
+        self.assertEqual(len(set(seen_ids)), 21)
+        self.assertEqual(set(seen_ids), {row["poiId"] for row in [*original, newcomer]})
+
+    def test_publish_success_upserts_empty_and_previously_evicted_targets(self) -> None:
+        """A verified publish creates the entity and frozen query association."""
+
+        empty_query = query("account-a", keyword="publish-empty")
+        empty_target = {**candidates(1, start=2001)[0], "scope": "domestic"}
+        record_location_publish_result(
+            "account-a",
+            empty_target,
+            success=True,
+            query=empty_query,
+            occurred_at=BASE_TIME,
+        )
+        self.assertEqual(
+            ids(get_cached_locations(empty_query, now=BASE_TIME)),
+            ["poi-2001"],
+        )
+
+        evicted_query = query("account-a", keyword="publish-evicted")
+        seeded = candidates(LOCATION_CACHE_CAPACITY + 1, start=3001)
+        merge_platform_locations(evicted_query, seeded, verified_at=BASE_TIME)
+        evicted_target = {**seeded[-1], "scope": "domestic"}
+        self.assertNotIn(
+            evicted_target["poiId"],
+            all_cached_ids(evicted_query, now=BASE_TIME),
+        )
+
+        published_at = BASE_TIME + timedelta(minutes=1)
+        record_location_publish_result(
+            "account-a",
+            evicted_target,
+            success=True,
+            query=evicted_query,
+            occurred_at=published_at,
+        )
+        retained = all_cached_ids(evicted_query, now=published_at)
+        self.assertEqual(len(retained), LOCATION_CACHE_CAPACITY)
+        self.assertIn(evicted_target["poiId"], retained)
 
 
 if __name__ == "__main__":

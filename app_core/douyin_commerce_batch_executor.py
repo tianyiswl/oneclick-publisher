@@ -31,7 +31,7 @@ from .douyin_location_preset_service import (
     DouyinLocationPresetError,
     match_location_preset,
 )
-from .douyin_location_cache import record_location_publish_result
+from .douyin_location_cache import LocationCacheQuery, record_location_publish_result
 from .douyin_sms_cooldown import DouyinSmsCooldownError, DouyinSmsCooldownGate
 from .douyin_verification import (
     DouyinVerificationError,
@@ -429,6 +429,7 @@ class DouyinCommerceBatchExecutor:
         scope: str,
         *,
         success: bool,
+        query: LocationCacheQuery | None = None,
         error_code: str = "",
     ) -> None:
         """最大努力回写地点缓存；普通失败不改写发布结果。"""
@@ -446,6 +447,7 @@ class DouyinCommerceBatchExecutor:
                     account_id,
                     candidate,
                     success=True,
+                    query=query,
                     occurred_at=finished_at,
                 )
             else:
@@ -1047,6 +1049,17 @@ class DouyinCommerceBatchExecutor:
 
             location = payload["locationPoi"]
             scope = _text(payload["locationScope"])
+            location_cache_query = LocationCacheQuery(
+                account_id=location_cache_account_id,
+                scope=scope,
+                keyword=(
+                    _text(payload.get("locationSearchKeyword"))
+                    or _text(payload.get("locationKeyword"))
+                ),
+                commission_filter=_text(
+                    payload.get("locationCommissionFilter") or "all"
+                ),
+            )
             location_keywords = _location_search_keywords(
                 location,
                 original_keyword=payload.get("locationSearchKeyword"),
@@ -1243,6 +1256,7 @@ class DouyinCommerceBatchExecutor:
                 location,
                 scope,
                 success=True,
+                query=location_cache_query,
             )
             self._emit(progress, index=index, total=total, phase="published", message=f"第 {index + 1} 条视频已取得平台回读")
             return {"index": index, "label": label, "status": "published"}

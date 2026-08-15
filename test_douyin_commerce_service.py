@@ -472,10 +472,14 @@ class DouyinCommercePayloadTests(unittest.TestCase):
         )
         self.assertEqual(len(commission_rows), 1)
         self.assertEqual(commission_rows[0]["commissionType"], "commission")
-        with self.assertRaisesRegex(douyin_commerce_service.DouyinCommerceError, "重复"):
-            douyin_commerce_service.normalize_commerce_location_candidates(
-                rows, commission_filter="all"
-            )
+        all_rows = douyin_commerce_service.normalize_commerce_location_candidates(
+            rows, commission_filter="all"
+        )
+        self.assertEqual(len(all_rows), 2)
+        self.assertEqual(
+            {row["commissionType"] for row in all_rows},
+            {"commission", "no_commission"},
+        )
 
     def test_requires_one_account_one_video_and_future_timer(self) -> None:
         checked = douyin_commerce_service.validate_douyin_commerce_payload(self.payload)
@@ -717,6 +721,9 @@ class DouyinCommercePayloadTests(unittest.TestCase):
                 return Node()
 
         class Listbox:
+            async def evaluate(self, _script):
+                return None
+
             def locator(self, _selector):
                 return Locator()
 
@@ -2310,6 +2317,9 @@ class DouyinCommercePayloadTests(unittest.TestCase):
             def __init__(self, node) -> None:
                 self.node = node
 
+            async def evaluate(self, _script):
+                return None
+
             def locator(self, _selector):
                 return OptionLocator(self.node)
 
@@ -2819,6 +2829,77 @@ class DouyinCommercePayloadTests(unittest.TestCase):
 class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
     """用真实 DOM 约束地点 portal，避免把整张发布页的输入框算进来。"""
 
+    async def test_dom_preserves_real_poi_ids_across_commission_variants(self) -> None:
+        """真实 data-id 若被同名同址摘要覆盖，四字段身份就会错误合并。"""
+
+        html = """
+        <div id="location-results" role="listbox" style="width:480px;height:240px">
+          <div role="option" data-id="poi-real-a" style="height:48px">
+            <span data-store-name>同名地点</span>
+            <span data-store-address>广西北海市银海区测试大道 1 号</span>
+            <span data-commerce-info>2件商品 · 1件返佣</span>
+          </div>
+          <div role="option" data-id="poi-real-b" style="height:48px">
+            <span data-store-name>同名地点</span>
+            <span data-store-address>广西北海市银海区测试大道 1 号</span>
+            <span data-commerce-info>2件商品 · 1件返佣</span>
+          </div>
+          <div role="option" data-id="poi-real-a" style="height:48px">
+            <span data-store-name>同名地点</span>
+            <span data-store-address>广西北海市银海区测试大道 1 号</span>
+            <span data-commerce-info>2件商品 · 0件返佣</span>
+          </div>
+        </div>
+        """
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+                rows = await douyin_commerce_service._store_option_descriptors(
+                    page.locator("#location-results")
+                )
+                candidates = (
+                    douyin_commerce_service.normalize_commerce_location_candidates(
+                        rows,
+                        commission_filter="all",
+                    )
+                )
+            finally:
+                await browser.close()
+
+        self.assertEqual(
+            [
+                (
+                    candidate["poiId"],
+                    candidate["name"],
+                    candidate["address"],
+                    candidate["commissionType"],
+                )
+                for candidate in candidates
+            ],
+            [
+                (
+                    "poi-real-a",
+                    "同名地点",
+                    "广西北海市银海区测试大道 1 号",
+                    "commission",
+                ),
+                (
+                    "poi-real-b",
+                    "同名地点",
+                    "广西北海市银海区测试大道 1 号",
+                    "commission",
+                ),
+                (
+                    "poi-real-a",
+                    "同名地点",
+                    "广西北海市银海区测试大道 1 号",
+                    "no_commission",
+                ),
+            ],
+        )
+
     async def test_publish_search_deadline_stops_before_next_dom_action(self) -> None:
         """搜索内部两个 DOM 动作耗尽总预算后，范围切换不得再启动。"""
 
@@ -2922,6 +3003,62 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
                     object(),
                     previous_candidates=[first],
                     deadline=1.0,
+                )
+
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertEqual(snapshot.await_count, 1)
+        self.assertEqual(len(timeouts), 2)
+        self.assertLessEqual(timeouts[0], 1_000)
+        self.assertLessEqual(timeouts[1], 400)
+
+    async def test_load_more_timeout_without_outer_deadline_is_one_wall_clock_budget(
+        self,
+    ) -> None:
+        """Task 2 timeout bounds every action and exposes one fixed no-cause error."""
+
+        clock = {"now": 0.0}
+        timeouts: list[int] = []
+
+        class ControlledLoadMore:
+            async def scroll_into_view_if_needed(self, *, timeout: int) -> None:
+                timeouts.append(timeout)
+                clock["now"] += 0.6
+
+            async def click(self, *, timeout: int) -> None:
+                timeouts.append(timeout)
+                clock["now"] += 0.6
+
+        first = douyin_commerce_service.normalize_commerce_location_candidate(
+            {
+                "poiId": "poi-local-deadline",
+                "name": "首批候选",
+                "address": "广西北海市测试路 1 号",
+                "commerceInfo": "1件商品 · 1件返佣",
+            }
+        )
+        snapshot = AsyncMock(return_value=(1, [first]))
+        with patch.object(
+            douyin_commerce_service,
+            "monotonic",
+            side_effect=lambda: clock["now"],
+        ), patch.object(
+            douyin_commerce_service,
+            "_load_more_control_or_fail",
+            new_callable=AsyncMock,
+            return_value=ControlledLoadMore(),
+        ), patch.object(
+            douyin_commerce_service,
+            "_load_more_candidates_snapshot_or_fail",
+            new=snapshot,
+        ):
+            with self.assertRaisesRegex(
+                douyin_commerce_service.DouyinCommerceError,
+                "^publish_location_load_more_failed$",
+            ) as raised:
+                await douyin_commerce_service.load_more_commerce_location_candidates(
+                    object(),
+                    previous_candidates=[first],
+                    timeout_ms=1_000,
                 )
 
         self.assertIsNone(raised.exception.__cause__)
@@ -3169,10 +3306,9 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
                     )
                     targets = await douyin_commerce_service._location_option_targets(
                         listbox,
-                        {
-                            "name": "可见返佣店",
-                            "address": "广西北海市海景大道1号",
-                        },
+                        douyin_commerce_service.normalize_commerce_location_candidate(
+                            rows[0]
+                        ),
                         commission_filter="commission",
                     )
                     self.assertEqual(len(targets), 1)
@@ -3236,21 +3372,21 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
 
         html = """
         <div id="location-results" role="listbox">
-          <div id="aria-hidden-option" role="option">
+          <div id="aria-hidden-option" role="option" data-poi-id="poi-hidden-a">
             <span data-store-name>北海商品城甲</span>
             <span data-store-address>广西北海市商品街1号</span>
             <div class="visible-wrapper">
               <span aria-hidden="true">15件商品 · 15件返佣</span>
             </div>
           </div>
-          <div id="transparent-option" role="option">
+          <div id="transparent-option" role="option" data-poi-id="poi-hidden-b">
             <span data-store-name>北海商品城乙</span>
             <span data-store-address>广西北海市商品街2号</span>
             <div class="visible-wrapper">
               <span style="opacity: 0">15件商品 · 15件返佣</span>
             </div>
           </div>
-          <div id="visible-option" role="option">
+          <div id="visible-option" role="option" data-poi-id="poi-visible-c">
             <span data-store-name>北海商品城丙</span>
             <span data-store-address>广西北海市商品街3号</span>
             <div class="visible-wrapper">
@@ -3284,28 +3420,36 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
                 scenarios = (
                     (
                         "aria-hidden-option",
+                        "poi-hidden-a",
                         "北海商品城甲",
                         "广西北海市商品街1号",
                         "no_commission",
                     ),
                     (
                         "transparent-option",
+                        "poi-hidden-b",
                         "北海商品城乙",
                         "广西北海市商品街2号",
                         "no_commission",
                     ),
                     (
                         "visible-option",
+                        "poi-visible-c",
                         "北海商品城丙",
                         "广西北海市商品街3号",
                         "commission",
                     ),
                 )
-                for option_id, name, address, commission_filter in scenarios:
+                for option_id, poi_id, name, address, commission_filter in scenarios:
                     with self.subTest(option_id=option_id):
                         targets = await douyin_commerce_service._location_option_targets(
                             listbox,
-                            {"name": name, "address": address},
+                            {
+                                "poiId": poi_id,
+                                "name": name,
+                                "address": address,
+                                "commissionType": commission_filter,
+                            },
                             commission_filter=commission_filter,
                         )
                         self.assertEqual(len(targets), 1)
@@ -3735,7 +3879,7 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
                 )
                 with self.assertRaisesRegex(
                     douyin_commerce_service.DouyinCommerceError,
-                    "重复完整地址",
+                    "重复完整身份",
                 ):
                     douyin_commerce_service.normalize_commerce_location_candidates(
                         descriptors,
@@ -5462,8 +5606,10 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
             for index in range(8)
         )
         html = f"""
-        <div id="location-results" role="listbox">{initial_rows}</div>
-        <button id="load-more" type="button"> 点击加载更多（剩余 8 条） </button>
+        <div id="location-panel">
+          <div id="location-results" role="listbox">{initial_rows}</div>
+          <button id="load-more" type="button"> 点击加载更多（剩余 8 条） </button>
+        </div>
         <script>
           window.loadMoreClicks = 0;
           document.querySelector('#load-more').addEventListener('click', () => {{
@@ -5506,12 +5652,14 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
         """多个可见加载更多控件不能猜测点击目标。"""
 
         html = """
-        <div id="location-results" role="listbox">
-          <div role="option"><span data-store-name>首屏地点</span>
-            <span data-store-address>广西北海市测试路 1 号</span></div>
+        <div id="location-panel">
+          <div id="location-results" role="listbox">
+            <div role="option"><span data-store-name>首屏地点</span>
+              <span data-store-address>广西北海市测试路 1 号</span></div>
+          </div>
+          <button type="button">加载更多</button>
+          <div role="button" tabindex="0">点击加载更多</div>
         </div>
-        <button type="button">加载更多</button>
-        <div role="button" tabindex="0">点击加载更多</div>
         """
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(headless=True)
@@ -5533,6 +5681,175 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
                         previous_candidates=first_page,
                         commission_filter="all",
                     )
+            finally:
+                await browser.close()
+
+    async def test_load_more_control_is_scoped_to_current_location_panel(self) -> None:
+        """An unrelated document-level load-more button must never be selected."""
+
+        html = """
+        <section id="location-panel">
+          <div id="location-results" role="listbox">
+            <div role="option"><span data-store-name>银滩门店</span>
+              <span data-store-address>广西北海市银海区银滩路 1 号</span></div>
+          </div>
+          <footer><button id="panel-load-more">加载更多</button></footer>
+        </section>
+        <section id="declaration-panel">
+          <button id="unrelated-load-more">加载更多</button>
+        </section>
+        """
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+
+                control = await douyin_commerce_service._unique_visible_load_more_control(
+                    page
+                )
+
+                self.assertIsNotNone(control)
+                self.assertEqual(await control.get_attribute("id"), "panel-load-more")
+            finally:
+                await browser.close()
+
+    async def test_load_more_collapses_nested_nodes_for_one_logical_button(self) -> None:
+        """A button and its labelled descendant represent one logical control."""
+
+        html = """
+        <section id="location-panel">
+          <div id="location-results" role="listbox">
+            <div role="option"><span data-store-name>银滩门店</span>
+              <span data-store-address>广西北海市银海区银滩路 1 号</span></div>
+          </div>
+          <footer><button id="logical-button"><span role="button" tabindex="0">
+            点击加载更多</span></button></footer>
+        </section>
+        """
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+
+                control = await douyin_commerce_service._unique_visible_load_more_control(
+                    page
+                )
+
+                self.assertIsNotNone(control)
+                self.assertEqual(await control.get_attribute("id"), "logical-button")
+            finally:
+                await browser.close()
+
+    async def test_load_more_rejects_two_distinct_controls_inside_current_panel(
+        self,
+    ) -> None:
+        """Two unrelated controls within the same current panel remain ambiguous."""
+
+        html = """
+        <section id="location-panel">
+          <div id="location-results" role="listbox">
+            <div role="option"><span data-store-name>银滩门店</span>
+              <span data-store-address>广西北海市银海区银滩路 1 号</span></div>
+          </div>
+          <footer><button>加载更多</button><a href="#">点击加载更多</a></footer>
+        </section>
+        """
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+
+                with self.assertRaisesRegex(
+                    douyin_commerce_service.DouyinCommerceError,
+                    "publish_location_load_more_failed",
+                ):
+                    await douyin_commerce_service._unique_visible_load_more_control(
+                        page
+                    )
+            finally:
+                await browser.close()
+
+    async def test_nested_virtual_list_options_survive_window_replacement(self) -> None:
+        """Visible owned descendants are reread after the virtual window changes."""
+
+        html = """
+        <div id="location-results" role="listbox">
+          <div id="virtual-holder"><div role="option" data-id="poi-a">
+            <span data-store-name>地点 A</span>
+            <span data-store-address>广西北海市海城区 A 路 1 号</span>
+            <span data-commerce-info>1件商品 · 1件返佣</span>
+          </div></div>
+        </div>
+        """
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+                listbox = await douyin_commerce_service._visible_store_listbox(page)
+                self.assertIsNotNone(listbox)
+                first = await douyin_commerce_service._store_option_descriptors(
+                    listbox
+                )
+                await page.locator("#virtual-holder").evaluate(
+                    """node => { node.innerHTML = `<div role="option" data-id="poi-b">
+                      <span data-store-name>地点 B</span>
+                      <span data-store-address>广西北海市海城区 B 路 2 号</span>
+                      <span data-commerce-info>1件商品 · 1件返佣</span>
+                    </div>`; }"""
+                )
+                second = await douyin_commerce_service._store_option_descriptors(
+                    listbox
+                )
+
+                self.assertEqual([row["poiId"] for row in first], ["poi-a"])
+                self.assertEqual([row["poiId"] for row in second], ["poi-b"])
+            finally:
+                await browser.close()
+
+    async def test_nested_unrelated_listbox_options_are_excluded_from_targets(
+        self,
+    ) -> None:
+        """Only options whose closest listbox is the current one may be read/clicked."""
+
+        html = """
+        <div id="location-results" role="listbox">
+          <div class="virtual-holder"><div id="owned" role="option" data-id="poi-owned">
+            <span data-store-name>当前地点</span>
+            <span data-store-address>广西北海市海城区当前路 1 号</span>
+            <span data-commerce-info>1件商品 · 1件返佣</span>
+          </div></div>
+          <div role="listbox"><div id="nested-unrelated" role="option" data-id="poi-owned">
+            <span data-store-name>当前地点</span>
+            <span data-store-address>广西北海市海城区当前路 1 号</span>
+            <span data-commerce-info>1件商品 · 1件返佣</span>
+          </div></div>
+        </div>
+        """
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+                listbox = await douyin_commerce_service._visible_store_listbox(page)
+                self.assertIsNotNone(listbox)
+                rows = await douyin_commerce_service._store_option_descriptors(listbox)
+                candidates = douyin_commerce_service.normalize_commerce_location_candidates(
+                    rows,
+                    commission_filter="commission",
+                )
+                targets = await douyin_commerce_service._location_option_targets(
+                    listbox,
+                    candidates[0],
+                    commission_filter="commission",
+                )
+
+                self.assertEqual([row["poiId"] for row in rows], ["poi-owned"])
+                self.assertEqual(len(targets), 1)
+                self.assertEqual(await targets[0].get_attribute("id"), "owned")
             finally:
                 await browser.close()
 
@@ -6416,6 +6733,32 @@ class DouyinCommerceUiTests(unittest.TestCase):
         warning.assert_not_called()
         critical.assert_not_called()
 
+    def test_location_pagination_diagnostics_have_controlled_ui_copy(self) -> None:
+        """Known paging failures must not collapse to collector_unknown in the UI."""
+
+        self.page._setup_generation_id = "generation-location-errors"
+        for error_code in (
+            "collector_search_context_mismatch",
+            "publish_location_load_more_failed",
+        ):
+            with self.subTest(error_code=error_code):
+                self.assertEqual(
+                    self.page._public_collector_error_code(error_code),
+                    error_code,
+                )
+                self.page._render_collector_status(
+                    {
+                        "setupGenerationId": "generation-location-errors",
+                        "collectors": {
+                            "domestic_location": {
+                                "state": "failed",
+                                "errorCode": error_code,
+                            }
+                        },
+                    }
+                )
+                self.assertIn(error_code, self.page.domestic_collector_status.text())
+                self.assertNotIn("未知错误", self.page.domestic_collector_status.text())
     def test_copy_collector_diagnostics_uses_fixed_empty_copy(self) -> None:
         self.page._setup_generation_id = "generation-empty"
         with patch(
@@ -7855,6 +8198,7 @@ class DouyinCommerceUiTests(unittest.TestCase):
                 "requiresRevalidation": False,
                 "cacheTotal": 0,
                 "cacheOffset": 0,
+                "cacheHasMore": False,
                 "platformLoadCount": 0,
                 "zeroGrowthCount": 0,
                 "hasMore": False,
@@ -8422,6 +8766,7 @@ class DouyinCommerceUiTests(unittest.TestCase):
                 "requiresRevalidation": False,
                 "cacheTotal": 0,
                 "cacheOffset": 0,
+                "cacheHasMore": False,
                 "platformLoadCount": 0,
                 "zeroGrowthCount": 0,
                 "hasMore": False,
@@ -8683,7 +9028,16 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
         )
         self.assertEqual(
             record_result.call_args.kwargs,
-            {"success": True, "occurred_at": finished_at},
+            {
+                "success": True,
+                "query": douyin_location_cache.LocationCacheQuery(
+                    account_id="31",
+                    scope="domestic",
+                    keyword="北海银滩景区",
+                    commission_filter="commission",
+                ),
+                "occurred_at": finished_at,
+            },
         )
         self.assertEqual(manager.closed_session_ids, ["session-1"])
 
@@ -9090,6 +9444,181 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
         )
         self.assertEqual(manager._session.location_search_context.load_more_count, 1)
         self.assertEqual(manager._session.location_search_context.zero_growth_count, 0)
+
+    @staticmethod
+    def _session_location_candidates(count: int) -> list[dict[str, object]]:
+        return [
+            {
+                "poiId": f"poi-session-limit-{index:03d}",
+                "name": f"分页地点 {index:03d}",
+                "address": f"广西北海市分页路 {index:03d} 号",
+                "commissionType": "commission",
+            }
+            for index in range(count)
+        ]
+
+    def _session_with_location_limit_context(
+        self,
+        candidates: list[dict[str, object]],
+        *,
+        load_more_count: int,
+        zero_growth_count: int,
+    ) -> tuple[
+        douyin_commerce_session.DouyinCommerceSessionManager,
+        MagicMock,
+    ]:
+        manager = douyin_commerce_session.DouyinCommerceSessionManager()
+        page = MagicMock()
+        page.is_closed.return_value = False
+        manager._session = douyin_commerce_session._CommerceEditorSession(
+            session_id="session-limit",
+            upload_payload={},
+            account_name="测试账号",
+            browser=None,
+            context=None,
+            page=page,
+            playwright=None,
+            uploader=None,
+            commerce_location_candidates=[dict(item) for item in candidates],
+            location_scope="domestic",
+            location_search_context=douyin_commerce_session._LocationSearchContext(
+                keyword="北海",
+                scope="domestic",
+                commission_filter="commission",
+                candidates=[dict(item) for item in candidates],
+                load_more_count=load_more_count,
+                zero_growth_count=zero_growth_count,
+            ),
+        )
+        return manager, page
+
+    def test_setup_load_more_stops_on_exact_tenth_click(self) -> None:
+        """第 9 次后的下一次可执行，但第 10 次结果后必须立即封顶。"""
+
+        previous = self._session_location_candidates(9)
+        current = previous + self._session_location_candidates(1)[0:1]
+        current[-1] = {
+            **current[-1],
+            "poiId": "poi-session-limit-new",
+            "name": "第十次新增",
+        }
+        manager, page = self._session_with_location_limit_context(
+            previous,
+            load_more_count=9,
+            zero_growth_count=0,
+        )
+        result_from_dom = {
+            "platformResultCount": len(current),
+            "candidates": current,
+            "newCandidateCount": 1,
+            "hasMore": True,
+            "stopReason": "loaded",
+        }
+        with patch.object(
+            manager,
+            "_call",
+            side_effect=lambda coroutine: asyncio.run(coroutine),
+        ), patch.object(
+            douyin_commerce_session.douyin_commerce_service,
+            "load_more_commerce_location_candidates",
+            new_callable=AsyncMock,
+            return_value=result_from_dom,
+        ) as load_more:
+            result = manager.load_more_locations(
+                "session-limit",
+                "北海",
+                "domestic",
+                commission_filter="commission",
+                previous_candidates=previous,
+            )
+
+        load_more.assert_awaited_once()
+        self.assertEqual(manager._session.location_search_context.load_more_count, 10)
+        self.assertFalse(result["hasMore"])
+        self.assertEqual(result["stopReason"], "load_more_click_limit")
+
+    def test_setup_load_more_stops_on_exact_hundredth_identity(self) -> None:
+        """第 99 个身份后的一个真实新增可接纳，达到 100 后不得继续。"""
+
+        previous = self._session_location_candidates(99)
+        current = previous + [
+            {
+                "poiId": "poi-session-limit-100",
+                "name": "第一百个地点",
+                "address": "广西北海市分页路 100 号",
+                "commissionType": "commission",
+            }
+        ]
+        manager, _page = self._session_with_location_limit_context(
+            previous,
+            load_more_count=3,
+            zero_growth_count=0,
+        )
+        with patch.object(
+            manager,
+            "_call",
+            side_effect=lambda coroutine: asyncio.run(coroutine),
+        ), patch.object(
+            douyin_commerce_session.douyin_commerce_service,
+            "load_more_commerce_location_candidates",
+            new_callable=AsyncMock,
+            return_value={
+                "platformResultCount": 100,
+                "candidates": current,
+                "newCandidateCount": 1,
+                "hasMore": True,
+                "stopReason": "loaded",
+            },
+        ):
+            result = manager.load_more_locations(
+                "session-limit",
+                "北海",
+                "domestic",
+                commission_filter="commission",
+                previous_candidates=previous,
+            )
+
+        self.assertEqual(len(result["candidates"]), 100)
+        self.assertFalse(result["hasMore"])
+        self.assertEqual(result["stopReason"], "candidate_identity_limit")
+
+    def test_setup_load_more_stops_on_second_effective_zero_growth(self) -> None:
+        """底层声称增长也不能覆盖四字段集合实际连续两次零增长。"""
+
+        previous = self._session_location_candidates(3)
+        manager, _page = self._session_with_location_limit_context(
+            previous,
+            load_more_count=1,
+            zero_growth_count=1,
+        )
+        with patch.object(
+            manager,
+            "_call",
+            side_effect=lambda coroutine: asyncio.run(coroutine),
+        ), patch.object(
+            douyin_commerce_session.douyin_commerce_service,
+            "load_more_commerce_location_candidates",
+            new_callable=AsyncMock,
+            return_value={
+                "platformResultCount": 3,
+                "candidates": [dict(item) for item in previous],
+                "newCandidateCount": 1,
+                "hasMore": True,
+                "stopReason": "loaded",
+            },
+        ):
+            result = manager.load_more_locations(
+                "session-limit",
+                "北海",
+                "domestic",
+                commission_filter="commission",
+                previous_candidates=previous,
+            )
+
+        self.assertEqual(result["newCandidateCount"], 0)
+        self.assertFalse(result["hasMore"])
+        self.assertEqual(result["stopReason"], "zero_growth_limit")
+        self.assertEqual(manager._session.location_search_context.zero_growth_count, 2)
 
     def test_load_more_uses_accumulated_context_and_rejects_an_old_page(self):
         manager = douyin_commerce_session.DouyinCommerceSessionManager()
@@ -11412,6 +11941,7 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
             "poiId": "poi-001",
             "name": "北海银滩景区",
             "address": "广西壮族自治区北海市银海区银滩大道中段",
+            "commissionType": "commission",
         }
         manager = douyin_commerce_session.DouyinCommerceSessionManager()
         manager._session = douyin_commerce_session._CommerceEditorSession(
@@ -11462,14 +11992,14 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
         self.assertIs(actual_page, manager._session.page)
         self.assertEqual(actual_preset["name"], location["name"])
         self.assertEqual(actual_preset["address"], location["address"])
-        self.assertTrue(actual_preset["poiId"].startswith("visible-poi:"))
+        self.assertEqual(actual_preset["poiId"], location["poiId"])
         self.assertEqual(actual_scope, "domestic")
         self.assertEqual(actual_keywords, keywords)
         self.assertEqual(
             apply_atomic.await_args.kwargs,
             {"commission_filter": "commission"},
         )
-        self.assertTrue(result["location"]["poiId"].startswith("visible-poi:"))
+        self.assertEqual(result["location"]["poiId"], location["poiId"])
         self.assertEqual(
             set(result["location"]),
             {"poiId", "name", "address", "distance"},
@@ -12011,7 +12541,7 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
             douyin_commerce_session.douyin_commerce_service,
             "apply_commerce_location_to_page",
             new_callable=AsyncMock,
-            return_value=expected,
+            return_value={"location": dict(candidate)},
         ) as apply:
             result = asyncio.run(manager._apply_location("session-demo", candidate))
 
@@ -13863,8 +14393,28 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             "stopReason": "loaded",
         }
 
-        def cached_page(_query, *, offset=0, **_kwargs):
-            return self._cache_page(cached, offset=offset)
+        def cached_page(_query, *, excluded_identities=None, **_kwargs):
+            excluded = {
+                tuple(
+                    str(candidate[key])
+                    for key in ("poiId", "name", "address", "commissionType")
+                )
+                for candidate in (excluded_identities or [])
+            }
+            unseen = [
+                candidate
+                for candidate in cached
+                if tuple(
+                    str(candidate[key])
+                    for key in ("poiId", "name", "address", "commissionType")
+                )
+                not in excluded
+            ]
+            return {
+                **self._cache_page(unseen),
+                "total": len(cached),
+                "hasMore": len(unseen) > 10,
+            }
 
         with patch.object(
             douyin_location_cache,
@@ -13915,14 +14465,6 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             self.assertIn(self.page._IMMEDIATE_WRITE_KEY, runner.active)
             runner.execute(self.page._IMMEDIATE_WRITE_KEY)
             runner.finish(self.page._IMMEDIATE_WRITE_KEY)
-            self._finish_location_cache_merge()
-
-            state = self.page._batch_location_state()
-            self.assertIs(state.get("platformContextReady"), True)
-            self.assertEqual(state.get("platformCandidates"), [first_platform])
-            self.assertEqual(len(state["candidates"]), cache_count + 1)
-
-            self.page.batch_location_load_more_button.click()
             self.assertIn(self.page._IMMEDIATE_WRITE_KEY, runner.active)
             runner.execute(self.page._IMMEDIATE_WRITE_KEY)
             runner.finish(self.page._IMMEDIATE_WRITE_KEY)
@@ -14183,6 +14725,71 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.assertIn(self.page._COLLECTOR_TASK_KEY, runner.active)
         platform_search.assert_not_called()
 
+    def test_confirmed_platform_exhaustion_uses_atomic_cache_reconciliation(
+        self,
+    ) -> None:
+        """待校对搜索确认没有更多页时，空集合也必须走原子 reconcile。"""
+
+        self._activate_cached_location_search(account_id=508)
+        cached = self._cached_location_candidates(1)
+        self.page._batch_location_searches["__shared_location_search__"] = {
+            "accountId": "508",
+            "scope": "domestic",
+            "keyword": "北海",
+            "commissionFilter": "commission",
+            "platformResultCount": 0,
+            "rawCandidates": [dict(item) for item in cached],
+            "candidates": [dict(item) for item in cached],
+            "platformContextReady": True,
+            "platformCandidates": [],
+            "requiresRevalidation": True,
+            "cacheTotal": 1,
+            "cacheOffset": 1,
+            "platformLoadCount": 0,
+            "zeroGrowthCount": 0,
+            "hasMore": True,
+            "source": "platform",
+        }
+        cache_query = self.page._batch_location_cache_query(
+            "domestic", "北海", "commission"
+        )
+        reconciled_page = self._cache_page(
+            cached,
+            requires_revalidation=False,
+        )
+        with patch.object(
+            douyin_location_cache,
+            "reconcile_platform_locations",
+            return_value=reconciled_page,
+        ) as reconcile, patch.object(
+            douyin_location_cache,
+            "merge_platform_locations",
+            return_value=reconciled_page,
+        ) as merge:
+            self.page._batch_location_load_more_succeeded(
+                cache_query,
+                {
+                    "platformResultCount": 0,
+                    "candidates": [],
+                    "newCandidateCount": 0,
+                    "hasMore": False,
+                    "stopReason": "no_visible_load_more_control",
+                },
+                request_token=self.page._batch_location_search_token,
+            )
+            self._finish_location_cache_merge()
+
+        reconcile.assert_called_once_with(
+            cache_query,
+            [],
+            confirmed_exhausted=True,
+        )
+        merge.assert_not_called()
+        self.assertIs(
+            self.page._batch_location_state()["requiresRevalidation"],
+            False,
+        )
+
     def test_search_shows_first_ten_cached_without_platform_call(self) -> None:
         """命中可复用缓存时只显示首页，且账号键不得取展示名。"""
 
@@ -14213,20 +14820,98 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.assertEqual(cache_get.call_args.args[0].account_id, "501")
         platform_search.assert_not_called()
 
+    def test_cache_load_more_excludes_displayed_identities_after_reorder(self) -> None:
+        """Platform reorder between local pages must neither skip nor duplicate rows."""
+
+        self._activate_cached_location_search(account_id=551)
+        cached = self._cached_location_candidates(20)
+        newcomer = {
+            **cached[0],
+            "poiId": "poi-cache-new",
+            "name": "新插入地点",
+            "address": "北海市新插入路 1 号",
+        }
+        calls = 0
+
+        def mutable_page(_query, *, excluded_identities=None, **kwargs):
+            nonlocal calls
+            self.assertNotIn("offset", kwargs)
+            ordering = cached if calls == 0 else [newcomer, *cached]
+            calls += 1
+            excluded = {
+                tuple(
+                    str(candidate[key])
+                    for key in ("poiId", "name", "address", "commissionType")
+                )
+                for candidate in (excluded_identities or [])
+            }
+            unseen = [
+                candidate
+                for candidate in ordering
+                if tuple(
+                    str(candidate[key])
+                    for key in ("poiId", "name", "address", "commissionType")
+                )
+                not in excluded
+            ]
+            return {
+                "candidates": unseen[:10],
+                "offset": 0,
+                "limit": 10,
+                "total": len(ordering),
+                "hasMore": len(unseen) > 10,
+                "requiresRevalidation": False,
+            }
+
+        with patch.object(
+            douyin_location_cache,
+            "get_cached_locations",
+            side_effect=mutable_page,
+        ):
+            self.page.batch_location_search_button.click()
+            self._finish_location_cache_search()
+            self.page.batch_location_load_more_button.click()
+            self._finish_location_cache_page()
+            self.page.batch_location_load_more_button.click()
+            self._finish_location_cache_page()
+
+        displayed = self.page._batch_location_state()["candidates"]
+        displayed_ids = [candidate["poiId"] for candidate in displayed]
+        self.assertEqual(displayed_ids[:10], [row["poiId"] for row in cached[:10]])
+        self.assertEqual(len(displayed_ids), 21)
+        self.assertEqual(len(set(displayed_ids)), 21)
+        self.assertEqual(set(displayed_ids), {row["poiId"] for row in [*cached, newcomer]})
+
     def test_load_more_uses_cache_then_platform_once(self) -> None:
         """加载更多必须先用完本地页，再先 search 建上下文并分页。"""
 
         self._activate_cached_location_search(account_id=502)
         cached = self._cached_location_candidates(20)
 
-        def cache_page(_query, *, offset=0, **_kwargs):
-            page = cached[offset : offset + 10]
+        def cache_page(_query, *, excluded_identities=None, **_kwargs):
+            excluded = {
+                tuple(
+                    str(candidate[key])
+                    for key in ("poiId", "name", "address", "commissionType")
+                )
+                for candidate in (excluded_identities or [])
+            }
+            unseen = [
+                candidate
+                for candidate in cached
+                if tuple(
+                    str(candidate[key])
+                    for key in ("poiId", "name", "address", "commissionType")
+                )
+                not in excluded
+            ]
+            page = unseen[:10]
             return {
                 "candidates": page,
-                "offset": offset,
+                "offset": 0,
                 "limit": 10,
                 "total": 20,
-                "hasMore": offset + len(page) < 20,
+                "hasMore": len(unseen) > 10,
             }
 
         new_platform_candidate = {
@@ -14304,17 +14989,8 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             load_more.click()
             self.page.runner.execute(self.page._COLLECTOR_TASK_KEY)
             self.page.runner.finish(self.page._COLLECTOR_TASK_KEY)
-            self.assertTrue(
-                load_more.isEnabled(),
-                (
-                    self.page._batch_location_state(),
-                    self.page._busy(),
-                    self.page._batch_location_load_more_pending,
-                    self.page._batch_location_merge_pending,
-                    self.page.runner.active,
-                ),
-            )
-            load_more.click()
+            self.assertFalse(load_more.isEnabled())
+            platform_load_more.assert_not_called()
             self.page.runner.execute(self.page._COLLECTOR_TASK_KEY)
             self.page.runner.finish(self.page._COLLECTOR_TASK_KEY)
             self._finish_location_cache_merge()
@@ -14587,7 +15263,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.assertNotIn("private", self.page.batch_item_settings_status.text())
 
     def test_load_more_button_tracks_running_and_platform_progress(self) -> None:
-        """加载中按钮必须禁用，回读后投射五个受控分页字段。"""
+        """首次交接同一点击串行 search/load-more，期间按钮禁用。"""
 
         self._activate_cached_location_search(account_id=605)
         cached = self._cached_location_candidates(10)
@@ -14664,19 +15340,6 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             self.page._load_more_batch_locations()
             self.page.runner.execute(self.page._COLLECTOR_TASK_KEY)
             self.page.runner.finish(self.page._COLLECTOR_TASK_KEY)
-            self.assertTrue(
-                self.page.batch_location_load_more_button.isEnabled(),
-                (
-                    self.page._batch_location_state(),
-                    self.page._busy(),
-                    self.page._batch_location_load_more_pending,
-                    self.page._batch_location_merge_pending,
-                    self.page.runner.active,
-                ),
-            )
-
-            self.page._load_more_batch_locations()
-
             self.assertEqual(
                 self.page.batch_location_load_more_button.text(),
                 "正在加载更多…",
@@ -14701,6 +15364,65 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             "加载更多地点",
         )
         self.assertFalse(self.page.batch_location_load_more_button.isEnabled())
+
+    def test_setup_tenth_platform_result_disables_button_with_controlled_status(
+        self,
+    ) -> None:
+        """第十次平台结果落定后，UI 不得再派发第十一次点击。"""
+
+        self._activate_cached_location_search(account_id=509)
+        previous = self._cached_location_candidates(9)
+        current = previous + [
+            {
+                **previous[0],
+                "poiId": "poi-platform-tenth",
+                "name": "第十次新增地点",
+                "address": "北海市平台路 10 号",
+            }
+        ]
+        self.page._batch_location_searches["__shared_location_search__"] = {
+            "accountId": "509",
+            "scope": "domestic",
+            "keyword": "北海",
+            "commissionFilter": "commission",
+            "platformResultCount": 9,
+            "rawCandidates": [dict(item) for item in previous],
+            "candidates": [dict(item) for item in previous],
+            "platformContextReady": True,
+            "platformCandidates": [dict(item) for item in previous],
+            "requiresRevalidation": False,
+            "cacheTotal": 0,
+            "cacheOffset": 0,
+            "platformLoadCount": 9,
+            "zeroGrowthCount": 0,
+            "hasMore": True,
+            "source": "platform",
+        }
+        cache_query = self.page._batch_location_cache_query(
+            "domestic", "北海", "commission"
+        )
+        with patch.object(
+            self.page,
+            "_start_batch_location_cache_merge",
+            return_value=False,
+        ):
+            self.page._batch_location_load_more_succeeded(
+                cache_query,
+                {
+                    "platformResultCount": 10,
+                    "candidates": current,
+                    "newCandidateCount": 1,
+                    "hasMore": True,
+                    "stopReason": "loaded",
+                },
+                request_token=self.page._batch_location_search_token,
+            )
+
+        state = self.page._batch_location_state()
+        self.assertEqual(state["platformLoadCount"], 10)
+        self.assertFalse(state["hasMore"])
+        self.assertFalse(self.page.batch_location_load_more_button.isEnabled())
+        self.assertEqual(self.page._batch_location_feedback, "已达到平台加载上限（10 次）")
 
     def test_legacy_session_load_more_uses_same_cache_projection(self) -> None:
         """旧会话兼容入口也必须经受控 load-more 和缓存投射。"""
@@ -15392,6 +16114,158 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.assertIs(shutdown_succeeded, True)
         information.assert_not_called()
         warning.assert_not_called()
+
+    def test_shutdown_cancels_queued_dynamic_location_tasks_by_prefix(self) -> None:
+        """Queued cache/search/page/merge workers must become irreversibly inert."""
+
+        class QueuedPool:
+            def __init__(self) -> None:
+                self.tasks: list[BackgroundTask] = []
+
+            def start(self, task: BackgroundTask) -> None:
+                self.tasks.append(task)
+
+        pool = QueuedPool()
+        runner = BackgroundTaskRunner(self.page)
+        runner.pool = pool
+        self.page.runner = runner
+        delivered: list[str] = []
+        keys = [
+            f"{self.page._LOCATION_CACHE_SEARCH_TASK_KEY}:1:a",
+            f"{self.page._LOCATION_CACHE_PAGE_TASK_KEY}:1:a",
+            f"{self.page._LOCATION_CACHE_MERGE_TASK_KEY}:1:a",
+        ]
+        for key in keys:
+            self.assertTrue(
+                runner.run(
+                    key,
+                    lambda key=key: key,
+                    on_success=delivered.append,
+                )
+            )
+
+        with patch.object(
+            self.page._batch_executor, "request_shutdown", return_value=True
+        ), patch.object(
+            self.page,
+            "_close_setup_generation",
+            return_value={"closed": True, "aliveCollectorCount": 0},
+        ):
+            shutdown_succeeded = self.page.shutdown()
+            for task in pool.tasks:
+                task.run()
+            QApplication.processEvents()
+
+        self.assertTrue(shutdown_succeeded)
+        self.assertEqual(delivered, [])
+        self.assertTrue(all(not runner.is_running(key) for key in keys))
+
+    def test_shutdown_running_dynamic_location_timeout_blocks_resource_closes(
+        self,
+    ) -> None:
+        """An owned running cache worker timeout prevents all later resource closes."""
+
+        dynamic_key = f"{self.page._LOCATION_CACHE_MERGE_TASK_KEY}:9:owned"
+
+        class TimedOutDynamicRunner:
+            active = {dynamic_key: object()}
+
+            def is_running(self, key: str) -> bool:
+                return key in self.active
+
+            def cancel_pending(self, _key: str) -> bool:
+                return False
+
+            def wait_for_finished(self, _key: str, _timeout_seconds: float) -> bool:
+                return False
+
+        original_runner = self.page.runner
+
+        self.page.runner = TimedOutDynamicRunner()
+        self.page._setup_generation_id = "generation-a"
+        self.page._session_id = "session-legacy"
+        with patch.object(
+            self.page._batch_executor, "request_shutdown", return_value=True
+        ), patch.object(
+            self.page, "_close_setup_generation"
+        ) as close_generation, patch.object(
+            douyin_commerce_session.commerce_session_manager, "close"
+        ) as close_session:
+            try:
+                shutdown_succeeded = self.page.shutdown()
+            finally:
+                self.page._setup_generation_id = ""
+                self.page._session_id = ""
+                self.page.runner = original_runner
+
+        self.assertFalse(shutdown_succeeded)
+        close_generation.assert_not_called()
+        close_session.assert_not_called()
+
+    def test_shutdown_invalidates_location_owners_and_late_callbacks_cannot_restart_work(
+        self,
+    ) -> None:
+        """Late dynamic results after shutdown cannot mutate UI or enqueue follow-up work."""
+
+        self._activate_cached_location_search(account_id=777)
+        query = douyin_location_cache.LocationCacheQuery(
+            account_id="777",
+            scope="domestic",
+            keyword="北海",
+            commission_filter="commission",
+        )
+        old_token = self.page._batch_location_search_token
+        owner = self.page._batch_location_request_owner(query, old_token)
+        self.page._batch_location_cache_pending_owners.add(owner)
+        self.page._batch_location_load_more_pending_owners.add(owner)
+        self.page._batch_location_merge_pending_owners.add(owner)
+        self.page._batch_location_handoff_queries[owner] = query
+        self.page._set_batch_location_feedback("退出前稳定状态")
+
+        with patch.object(
+            self.page._batch_executor, "request_shutdown", return_value=True
+        ), patch.object(
+            self.page,
+            "_close_setup_generation",
+            return_value={"closed": True, "aliveCollectorCount": 0},
+        ), patch.object(
+            self.page, "_start_batch_location_platform_search"
+        ) as platform_search, patch.object(
+            self.page, "_start_batch_location_cache_merge"
+        ) as cache_merge:
+            self.assertTrue(self.page.shutdown())
+            self.page._batch_location_cache_search_succeeded(
+                query,
+                "domestic",
+                "北海",
+                "commission",
+                {
+                    "candidates": [],
+                    "offset": 0,
+                    "limit": 10,
+                    "total": 0,
+                    "hasMore": False,
+                    "requiresRevalidation": False,
+                },
+                request_token=old_token,
+            )
+            self.page._batch_location_search_succeeded(
+                "domestic",
+                "北海",
+                {"platformResultCount": 0, "candidates": []},
+                "commission",
+                request_token=old_token,
+                cache_query=query,
+            )
+
+        self.assertGreater(self.page._batch_location_search_token, old_token)
+        self.assertEqual(self.page._batch_location_cache_pending_owners, set())
+        self.assertEqual(self.page._batch_location_load_more_pending_owners, set())
+        self.assertEqual(self.page._batch_location_merge_pending_owners, set())
+        self.assertEqual(self.page._batch_location_handoff_queries, {})
+        self.assertEqual(self.page._batch_location_feedback, "退出前稳定状态")
+        platform_search.assert_not_called()
+        cache_merge.assert_not_called()
 
     def test_shutdown_requests_batch_stop_and_refuses_exit_until_worker_finishes(self) -> None:
         """批 worker 未收束时必须拒绝退出，且不得越过它关闭后续资源。"""

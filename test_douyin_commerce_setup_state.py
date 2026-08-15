@@ -175,6 +175,32 @@ class CollectorDiagnosticEventTest(unittest.TestCase):
         self.assertEqual(public["errorCode"], "collector_unknown")
         self.assertEqual(len(public["keyword"]), 80)
 
+    def test_location_pagination_errors_remain_controlled_public_codes(self):
+        for error_code in (
+            "collector_search_context_mismatch",
+            "publish_location_load_more_failed",
+        ):
+            with self.subTest(error_code=error_code):
+                event = CollectorDiagnosticEvent(
+                    request_id="request-1",
+                    setup_generation_id="generation-1",
+                    collector_type=CollectorType.DOMESTIC_LOCATION,
+                    collector_instance_id="domestic-1",
+                    account_masked_id="account-31",
+                    phase="load_more",
+                    action="load_more_locations",
+                    scope="domestic",
+                    keyword="北海",
+                    attempt=1,
+                    candidate_count=10,
+                    duration_ms=800,
+                    outcome="failed",
+                    error_code=error_code,
+                    cleanup_result="closed",
+                )
+
+                self.assertEqual(event.to_public_dict()["errorCode"], error_code)
+
 
 if __name__ == "__main__":
     unittest.main()

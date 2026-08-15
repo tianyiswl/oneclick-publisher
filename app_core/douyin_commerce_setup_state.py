@@ -78,6 +78,8 @@ COLLECTOR_ERROR_CODES = frozenset(
         "stale_result_discarded",
         "cleanup_incomplete",
         "publish_apply_mismatch",
+        "collector_search_context_mismatch",
+        "publish_location_load_more_failed",
         "collector_unknown",
     }
 )

@@ -109,6 +109,23 @@ class BackgroundTaskRunner(QObject):
             return True
         return task.wait_for_finished(timeout_seconds)
 
+    def active_keys_with_prefixes(self, prefixes: tuple[str, ...]) -> list[str]:
+        """Return a stable snapshot of owned dynamic task keys."""
+
+        if not isinstance(prefixes, tuple) or not all(
+            isinstance(prefix, str) and prefix for prefix in prefixes
+        ):
+            raise ValueError("后台任务前缀无效")
+        with self._active_lock:
+            return sorted(
+                key
+                for key in self.active
+                if any(
+                    key == prefix or key.startswith(f"{prefix}:")
+                    for prefix in prefixes
+                )
+            )
+
     def run(
         self,
         key: str,
