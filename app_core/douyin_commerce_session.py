@@ -85,6 +85,62 @@ def _normalized(value: object) -> str:
     return " ".join(str(value or "").replace("\u200b", " ").split())
 
 
+_LOCATION_SNAPSHOT_SCALAR_TYPES = frozenset(
+    {type(None), bool, int, float, str}
+)
+
+
+def _rebuild_controlled_location_value(
+    value: object,
+    active_containers: set[int] | None = None,
+) -> object:
+    value_type = type(value)
+    if value_type in _LOCATION_SNAPSHOT_SCALAR_TYPES:
+        return value
+    if value_type not in {list, dict}:
+        raise TypeError("location candidate value is not controlled")
+    active = active_containers if active_containers is not None else set()
+    marker = id(value)
+    if marker in active:
+        raise TypeError("location candidate contains a cycle")
+    active.add(marker)
+    try:
+        if value_type is list:
+            return [
+                _rebuild_controlled_location_value(item, active)
+                for item in value
+            ]
+        rebuilt: dict[str, object] = {}
+        for key, item in value.items():
+            if type(key) is not str:
+                raise TypeError("location candidate key is not controlled")
+            rebuilt[key] = _rebuild_controlled_location_value(item, active)
+        return rebuilt
+    finally:
+        active.remove(marker)
+
+
+def _snapshot_location_candidates(value: object) -> list[dict[str, Any]]:
+    snapshot = _rebuild_controlled_location_value(value)
+    if type(snapshot) is not list or any(
+        type(item) is not dict for item in snapshot
+    ):
+        raise TypeError("location candidates are not controlled")
+    return snapshot
+
+
+def _location_candidate_identities(
+    candidates: list[dict[str, Any]],
+) -> tuple[tuple[str, str, str, str], ...]:
+    return tuple(
+        tuple(
+            _normalized(candidate.get(key))
+            for key in ("poiId", "name", "address", "commissionType")
+        )
+        for candidate in candidates
+    )
+
+
 def _sms_verification_failure_message(error: Exception) -> str:
     """将验证码失败归因收束为可行动且不泄露页面细节的提示。"""
 
@@ -400,11 +456,9 @@ class DouyinCommerceSessionManager:
                 "collector_search_context_mismatch"
             ) from None
         try:
-            if not isinstance(previous_candidates, list) or any(
-                not isinstance(item, Mapping) for item in previous_candidates
-            ):
-                raise TypeError("previous_candidates_invalid")
-            previous_snapshot = [dict(item) for item in previous_candidates]
+            previous_snapshot = _snapshot_location_candidates(
+                previous_candidates
+            )
         except Exception:
             raise DouyinCommerceSessionError(
                 "publish_location_load_more_failed"
@@ -989,6 +1043,7 @@ class DouyinCommerceSessionManager:
         """关闭当前正式页浮层后，丢弃仅存于内存的旧设置。"""
 
         session = await self._current(session_id)
+        session.location_search_context = None
         if session.music_picker_page is not None or session.music_dialog is not None:
             if session.music_picker_page is None or session.music_dialog is None:
                 raise DouyinCommerceSessionError("正式发布页旧浮层未能清理")
@@ -1014,7 +1069,6 @@ class DouyinCommerceSessionManager:
         session.music_candidates = []
         session.selected_music = None
         session.commerce_location_candidates = []
-        session.location_search_context = None
         session.location = None
         session.location_scope = ""
         session.selected_declaration = ""
@@ -1167,7 +1221,6 @@ class DouyinCommerceSessionManager:
         previous_candidates: object,
     ) -> dict[str, object]:
         session = await self._current(session_id)
-        self._ensure_editor_not_blocked_by_music_picker(session)
         try:
             selected_scope = douyin_commerce_service.normalize_commerce_location_scope(
                 scope
@@ -1194,9 +1247,26 @@ class DouyinCommerceSessionManager:
                 "collector_search_context_mismatch"
             ) from None
         try:
+            previous_snapshot = _snapshot_location_candidates(
+                previous_candidates
+            )
+            context_snapshot = _snapshot_location_candidates(
+                context.candidates
+            )
+        except Exception:
+            raise DouyinCommerceSessionError(
+                "publish_location_load_more_failed"
+            ) from None
+        context_identities = _location_candidate_identities(context_snapshot)
+        if _location_candidate_identities(previous_snapshot) != context_identities:
+            raise DouyinCommerceSessionError(
+                "collector_search_context_mismatch"
+            ) from None
+        self._ensure_editor_not_blocked_by_music_picker(session)
+        try:
             result = await douyin_commerce_service.load_more_commerce_location_candidates(
                 session.page,
-                previous_candidates=previous_candidates,
+                previous_candidates=context_snapshot,
                 commission_filter=selected_commission_filter,
             )
             if not isinstance(result, Mapping):
@@ -1217,28 +1287,30 @@ class DouyinCommerceSessionManager:
                 or not raw_stop_reason
             ):
                 raise TypeError("metadata_result_invalid")
-            candidates = [
-                dict(item) for item in raw_candidates if isinstance(item, Mapping)
-            ]
-            if len(candidates) != len(raw_candidates):
-                raise TypeError("metadata_result_invalid")
+            candidates = _snapshot_location_candidates(raw_candidates)
         except Exception:
             raise DouyinCommerceSessionError(
                 "publish_location_load_more_failed"
             ) from None
-        if session.location_search_context is not context:
+        if (
+            session.location_search_context is not context
+            or _location_candidate_identities(context.candidates)
+            != context_identities
+        ):
             raise DouyinCommerceSessionError(
                 "collector_search_context_mismatch"
             ) from None
-        context.candidates = [dict(item) for item in candidates]
+        context.candidates = _snapshot_location_candidates(candidates)
         context.load_more_count += 1
         context.zero_growth_count = (
             context.zero_growth_count + 1 if raw_new_count == 0 else 0
         )
-        session.commerce_location_candidates = [dict(item) for item in candidates]
+        session.commerce_location_candidates = _snapshot_location_candidates(
+            candidates
+        )
         return {
             "platformResultCount": raw_count,
-            "candidates": [dict(item) for item in candidates],
+            "candidates": _snapshot_location_candidates(candidates),
             "newCandidateCount": raw_new_count,
             "hasMore": raw_has_more,
             "stopReason": raw_stop_reason,

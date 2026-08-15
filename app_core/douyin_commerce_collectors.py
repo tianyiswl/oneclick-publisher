@@ -686,20 +686,6 @@ class DouyinCommerceCollectorManager:
         normalized_keyword = self._normalize_public_text(
             keyword, error_code="collector_unknown"
         )
-        try:
-            selected_commission_filter = normalize_commission_filter(
-                commission_filter,
-                default="all",
-            )
-            if not isinstance(previous_candidates, list) or any(
-                not isinstance(item, Mapping) for item in previous_candidates
-            ):
-                raise TypeError("previous_candidates_invalid")
-            previous_snapshot = [dict(item) for item in previous_candidates]
-        except Exception:
-            raise DouyinCommerceCollectorError(
-                "publish_location_load_more_failed"
-            ) from None
         collector_type = _LOCATION_COLLECTORS.get(normalized_scope)
         if collector_type is None:
             raise DouyinCommerceCollectorError("collector_scope_mismatch")
@@ -710,6 +696,35 @@ class DouyinCommerceCollectorManager:
             action_instance_id = (
                 current.instance_id if current is not None else str(uuid4())
             )
+        try:
+            selected_commission_filter = normalize_commission_filter(
+                commission_filter,
+                default="all",
+            )
+            previous_snapshot = self._snapshot_location_candidates(
+                previous_candidates
+            )
+        except Exception:
+            raise DouyinCommerceCollectorError(
+                "publish_location_load_more_failed",
+                generation_id=generation_id,
+                collector_type=collector_type.value,
+                collector_instance_id=action_instance_id,
+            ) from None
+        with self._state_lock:
+            current_runtime = self._require_collecting_runtime(generation_id)
+            current = current_runtime.collectors.get(collector_type)
+            if (
+                current_runtime is not runtime
+                or current is None
+                or current.instance_id != action_instance_id
+            ):
+                raise DouyinCommerceCollectorError(
+                    "stale_result_discarded",
+                    generation_id=generation_id,
+                    collector_type=collector_type.value,
+                    collector_instance_id=action_instance_id,
+                ) from None
             action = self._action_queue.reserve(
                 generation_id,
                 request_id,
@@ -1488,7 +1503,9 @@ class DouyinCommerceCollectorManager:
                 keyword,
                 scope,
                 commission_filter=commission_filter,
-                previous_candidates=[dict(item) for item in previous_candidates],
+                previous_candidates=self._snapshot_location_candidates(
+                    previous_candidates
+                ),
             )
         except Exception as error:
             error_code = self._classify_diagnostic_error(error)
@@ -2340,6 +2357,18 @@ class DouyinCommerceCollectorManager:
         snapshot = cls._rebuild_controlled_value(whitelisted)
         if type(snapshot) is not dict:
             raise TypeError("probe payload snapshot is invalid")
+        return snapshot
+
+    @classmethod
+    def _snapshot_location_candidates(
+        cls,
+        candidates: object,
+    ) -> list[dict[str, Any]]:
+        snapshot = cls._rebuild_controlled_value(candidates)
+        if type(snapshot) is not list or any(
+            type(item) is not dict for item in snapshot
+        ):
+            raise TypeError("location candidates are not controlled")
         return snapshot
 
     @classmethod

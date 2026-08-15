@@ -486,6 +486,136 @@ class DouyinCommerceCollectorManagerTests(unittest.TestCase):
             "active",
         )
 
+    def test_load_more_validation_failure_keeps_five_field_instance_envelope(self):
+        generation_id = self.manager.begin_generation(self.upload_payload)[
+            "setupGenerationId"
+        ]
+        searched = self.manager.search_locations(
+            generation_id,
+            "夜南香",
+            "domestic",
+            commission_filter="commission",
+        )
+        instance_id = self.manager.status(generation_id)[
+            "collectorInstanceIds"
+        ]["domestic_location"]
+        cases = (
+            {
+                "commission_filter": {"commission": True},
+                "previous_candidates": searched["candidates"],
+            },
+            {
+                "commission_filter": "commission",
+                "previous_candidates": [
+                    {
+                        **searched["candidates"][0],
+                        "evidence": object(),
+                    }
+                ],
+            },
+        )
+
+        for kwargs in cases:
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(DouyinCommerceCollectorError) as raised:
+                    self.manager.load_more_locations(
+                        generation_id,
+                        "夜南香",
+                        "domestic",
+                        **kwargs,
+                    )
+
+                self.assertIsNone(raised.exception.__cause__)
+                self.assertEqual(
+                    raised.exception.to_public_action_result(),
+                    {
+                        "ok": False,
+                        "errorCode": "publish_location_load_more_failed",
+                        "setupGenerationId": generation_id,
+                        "collectorType": "domestic_location",
+                        "collectorInstanceId": instance_id,
+                    },
+                )
+
+    def test_queued_load_more_deep_snapshots_previous_candidates(self):
+        generation_id = self.manager.begin_generation(self.upload_payload)[
+            "setupGenerationId"
+        ]
+        searched = self.manager.search_locations(
+            generation_id,
+            "夜南香",
+            "domestic",
+            commission_filter="commission",
+        )
+        previous_candidates = searched["candidates"]
+        previous_candidates[0]["evidence"] = {
+            "labels": ["排队时"],
+        }
+        domestic = self.factory.instances[0]
+        domestic.location_started.clear()
+        domestic.release_location = threading.Event()
+        outcome: dict[str, object] = {}
+        blocking_search = threading.Thread(
+            target=lambda: self._capture_call(
+                outcome,
+                "blocking_search",
+                lambda: self.manager.search_locations(
+                    generation_id,
+                    "夜南香",
+                    "domestic",
+                    commission_filter="commission",
+                ),
+            )
+        )
+        blocking_search.start()
+        self.assertTrue(domestic.location_started.wait(timeout=1))
+
+        load_more_reserved = threading.Event()
+        original_start = self.manager._action_queue.start
+
+        def observe_reserved_load_more(action):
+            load_more_reserved.set()
+            return original_start(action)
+
+        with mock.patch.object(
+            self.manager._action_queue,
+            "start",
+            side_effect=observe_reserved_load_more,
+        ):
+            load_more_thread = threading.Thread(
+                target=lambda: self._capture_call(
+                    outcome,
+                    "load_more",
+                    lambda: self.manager.load_more_locations(
+                        generation_id,
+                        "夜南香",
+                        "domestic",
+                        commission_filter="commission",
+                        previous_candidates=previous_candidates,
+                    ),
+                )
+            )
+            load_more_thread.start()
+            self.assertTrue(load_more_reserved.wait(timeout=1))
+            previous_candidates[0]["evidence"]["labels"][0] = "排队后突变"
+            previous_candidates[0]["evidence"]["labels"].append("新增")
+            domestic.release_location.set()
+            blocking_search.join(timeout=1)
+            load_more_thread.join(timeout=1)
+
+        self.assertFalse(blocking_search.is_alive())
+        self.assertFalse(load_more_thread.is_alive())
+        self.assertNotIn("load_more_error", outcome)
+        action_previous = domestic.load_more_calls[-1][4]
+        self.assertEqual(
+            action_previous[0]["evidence"],
+            {"labels": ["排队时"]},
+        )
+        self.assertIsNot(
+            action_previous[0]["evidence"],
+            previous_candidates[0]["evidence"],
+        )
+
     def test_late_load_more_is_discarded(self):
         generation_id = self.manager.begin_generation(self.upload_payload)[
             "setupGenerationId"

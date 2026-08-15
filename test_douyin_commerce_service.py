@@ -7201,6 +7201,83 @@ class DouyinCommerceTaskPresentationTests(unittest.TestCase):
 
 
 class DouyinCommerceSessionContractTests(unittest.TestCase):
+    def test_load_more_public_entry_deep_snapshots_and_rejects_uncontrolled_values(self):
+        manager = douyin_commerce_session.DouyinCommerceSessionManager()
+        previous_candidates = [
+            {
+                "poiId": "poi-001",
+                "name": "夜南香",
+                "address": "广西北海第一页",
+                "commissionType": "commission",
+                "evidence": {"labels": ["调用时"]},
+            }
+        ]
+        captured: dict[str, object] = {}
+
+        def capture_call(*_args, **kwargs):
+            captured["previous"] = kwargs["previous_candidates"]
+            return {"captured": True}
+
+        with patch.object(
+            manager,
+            "_load_more_locations",
+            new=capture_call,
+        ), patch.object(
+            manager,
+            "_call",
+            side_effect=lambda value: value,
+        ):
+            self.assertEqual(
+                manager.load_more_locations(
+                    "session-demo",
+                    "夜南香",
+                    "domestic",
+                    commission_filter="commission",
+                    previous_candidates=previous_candidates,
+                ),
+                {"captured": True},
+            )
+
+        previous_candidates[0]["evidence"]["labels"][0] = "调用后突变"
+        previous_candidates[0]["evidence"]["labels"].append("新增")
+        self.assertEqual(
+            captured["previous"][0]["evidence"],
+            {"labels": ["调用时"]},
+        )
+        self.assertIsNot(
+            captured["previous"][0]["evidence"],
+            previous_candidates[0]["evidence"],
+        )
+
+        def fail_if_pagination_coroutine_is_created(*_args, **_kwargs):
+            raise AssertionError("不应创建分页协程")
+
+        with patch.object(
+            manager,
+            "_load_more_locations",
+            new=fail_if_pagination_coroutine_is_created,
+        ):
+            with self.assertRaisesRegex(
+                douyin_commerce_session.DouyinCommerceSessionError,
+                "publish_location_load_more_failed",
+            ) as raised:
+                manager.load_more_locations(
+                    "session-demo",
+                    "夜南香",
+                    "domestic",
+                    commission_filter="commission",
+                    previous_candidates=[
+                        {
+                            "poiId": "poi-001",
+                            "name": "夜南香",
+                            "address": "广西北海第一页",
+                            "evidence": object(),
+                        }
+                    ],
+                )
+
+        self.assertIsNone(raised.exception.__cause__)
+
     def test_load_more_returns_public_metadata(self):
         manager = douyin_commerce_session.DouyinCommerceSessionManager()
         page = MagicMock()
@@ -7290,6 +7367,128 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
         )
         self.assertEqual(manager._session.location_search_context.load_more_count, 1)
         self.assertEqual(manager._session.location_search_context.zero_growth_count, 0)
+
+    def test_load_more_uses_accumulated_context_and_rejects_an_old_page(self):
+        manager = douyin_commerce_session.DouyinCommerceSessionManager()
+        page = MagicMock()
+        page.is_closed.return_value = False
+        first_page = [
+            {
+                "poiId": "poi-001",
+                "name": "夜南香",
+                "address": "广西北海第一页",
+                "commissionType": "commission",
+            }
+        ]
+        second_page = first_page + [
+            {
+                "poiId": "poi-002",
+                "name": "夜南香二店",
+                "address": "广西北海第二页",
+                "commissionType": "commission",
+            }
+        ]
+        session = douyin_commerce_session._CommerceEditorSession(
+            session_id="session-demo",
+            upload_payload={},
+            account_name="测试账号",
+            browser=None,
+            context=None,
+            page=page,
+            playwright=None,
+            uploader=None,
+            commerce_location_candidates=[dict(item) for item in first_page],
+            location_scope="domestic",
+            location_search_context=douyin_commerce_session._LocationSearchContext(
+                keyword="夜南香",
+                scope="domestic",
+                commission_filter="commission",
+                candidates=[dict(item) for item in first_page],
+            ),
+        )
+        manager._session = session
+        first_result = {
+            "platformResultCount": 2,
+            "candidates": second_page,
+            "newCandidateCount": 1,
+            "hasMore": True,
+            "stopReason": "loaded",
+        }
+        with patch.object(
+            manager,
+            "_call",
+            side_effect=lambda coroutine: asyncio.run(coroutine),
+        ), patch.object(
+            douyin_commerce_session.douyin_commerce_service,
+            "load_more_commerce_location_candidates",
+            new_callable=AsyncMock,
+            return_value=first_result,
+        ) as load_more:
+            self.assertEqual(
+                manager.load_more_locations(
+                    "session-demo",
+                    "夜南香",
+                    "domestic",
+                    commission_filter="commission",
+                    previous_candidates=first_page,
+                ),
+                first_result,
+            )
+        load_more.assert_awaited_once_with(
+            page,
+            previous_candidates=first_page,
+            commission_filter="commission",
+        )
+
+        second_result = {
+            "platformResultCount": 2,
+            "candidates": second_page,
+            "newCandidateCount": 0,
+            "hasMore": False,
+            "stopReason": "no_visible_load_more_control",
+        }
+        with patch.object(
+            manager,
+            "_call",
+            side_effect=lambda coroutine: asyncio.run(coroutine),
+        ), patch.object(
+            douyin_commerce_session.douyin_commerce_service,
+            "load_more_commerce_location_candidates",
+            new_callable=AsyncMock,
+            return_value=second_result,
+        ) as load_more:
+            with self.assertRaisesRegex(
+                douyin_commerce_session.DouyinCommerceSessionError,
+                "collector_search_context_mismatch",
+            ) as raised:
+                manager.load_more_locations(
+                    "session-demo",
+                    "夜南香",
+                    "domestic",
+                    commission_filter="commission",
+                    previous_candidates=first_page,
+                )
+            self.assertIsNone(raised.exception.__cause__)
+            load_more.assert_not_awaited()
+
+            self.assertEqual(
+                manager.load_more_locations(
+                    "session-demo",
+                    "夜南香",
+                    "domestic",
+                    commission_filter="commission",
+                    previous_candidates=second_page,
+                ),
+                second_result,
+            )
+
+        load_more.assert_awaited_once_with(
+            page,
+            previous_candidates=second_page,
+            commission_filter="commission",
+        )
+        self.assertEqual(session.location_search_context.load_more_count, 2)
+        self.assertEqual(session.location_search_context.zero_growth_count, 1)
 
     def test_location_search_passes_normalized_commission_filter_to_service_before_dedupe(self):
         """会话搜索必须让 service 先按返佣筛选，再做 POI 唯一性判定。"""
@@ -9913,6 +10112,14 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
         manager = douyin_commerce_session.DouyinCommerceSessionManager()
         page = OpenPage()
         old_music = {"musicId": "music-old", "title": "旧音乐"}
+        previous_candidates = [
+            {
+                "poiId": "poi-001",
+                "name": "夜南香",
+                "address": "广西北海第一页",
+                "commissionType": "commission",
+            }
+        ]
         session = douyin_commerce_session._CommerceEditorSession(
             session_id="session-demo",
             upload_payload={},
@@ -9926,6 +10133,16 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
             music_dialog=object(),
             music_candidates=[dict(old_music)],
             selected_music=dict(old_music),
+            commerce_location_candidates=[
+                dict(item) for item in previous_candidates
+            ],
+            location_scope="domestic",
+            location_search_context=douyin_commerce_session._LocationSearchContext(
+                keyword="夜南香",
+                scope="domestic",
+                commission_filter="commission",
+                candidates=[dict(item) for item in previous_candidates],
+            ),
         )
         manager._session = session
         with patch.object(
@@ -9945,8 +10162,34 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
 
         self.assertEqual(str(raised.exception), "正式发布页旧浮层未能清理")
         close_location_selector.assert_not_awaited()
+        self.assertIsNone(session.location_search_context)
         self.assertEqual(session.music_candidates, [old_music])
         self.assertEqual(session.selected_music, old_music)
+        self.assertEqual(session.commerce_location_candidates, previous_candidates)
+
+        with patch.object(
+            manager,
+            "_call",
+            side_effect=lambda coroutine: asyncio.run(coroutine),
+        ), patch.object(
+            douyin_commerce_session.douyin_commerce_service,
+            "load_more_commerce_location_candidates",
+            new_callable=AsyncMock,
+        ) as load_more:
+            with self.assertRaisesRegex(
+                douyin_commerce_session.DouyinCommerceSessionError,
+                "collector_search_context_mismatch",
+            ) as load_more_error:
+                manager.load_more_locations(
+                    "session-demo",
+                    "夜南香",
+                    "domestic",
+                    commission_filter="commission",
+                    previous_candidates=previous_candidates,
+                )
+
+        self.assertIsNone(load_more_error.exception.__cause__)
+        load_more.assert_not_awaited()
 
     def test_location_selection_does_not_bind_store_without_explicit_store_step(self) -> None:
         class OpenPage:
