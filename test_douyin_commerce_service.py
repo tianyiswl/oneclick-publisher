@@ -5270,6 +5270,129 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(caught.exception.diagnostic["candidateCount"], 100)
         load_more.assert_not_awaited()
 
+    async def test_publish_candidate_limit_on_broad_keyword_continues_exact_keyword(
+        self,
+    ) -> None:
+        """宽词扫描满一百条后必须切换精确词，不能终止整条视频。"""
+
+        broad_candidates = [
+            douyin_commerce_service.normalize_commerce_location_candidate(
+                {
+                    "name": f"夜南香非目标{index}",
+                    "address": f"广西北海市候选路{index}号",
+                    "commerceInfo": "1件商品 · 1件返佣",
+                }
+            )
+            for index in range(100)
+        ]
+        preset = douyin_commerce_service.normalize_commerce_location_candidate(
+            {
+                "name": "夜南香北京烤鸭(南昌县店)",
+                "address": "江西省南昌市南昌县芳草路805号",
+                "commerceInfo": "1件商品 · 1件返佣",
+            }
+        )
+        self.assertIsNotNone(preset)
+        with patch.object(
+            douyin_commerce_service,
+            "search_commerce_location_store_candidates",
+            new_callable=AsyncMock,
+            side_effect=[broad_candidates, [preset]],
+        ) as search, patch.object(
+            douyin_commerce_service,
+            "load_more_commerce_location_candidates",
+            new_callable=AsyncMock,
+        ) as load_more, patch.object(
+            douyin_commerce_service,
+            "_visible_store_listbox",
+            new_callable=AsyncMock,
+            return_value=object(),
+        ), patch.object(
+            douyin_commerce_service,
+            "_apply_open_commerce_location_to_page",
+            new_callable=AsyncMock,
+            return_value={"location": dict(preset)},
+        ), patch.object(
+            douyin_commerce_service,
+            "close_commerce_store_selector",
+            new_callable=AsyncMock,
+        ):
+            result = await douyin_commerce_service.apply_saved_commerce_location_to_page(
+                object(),
+                preset,
+                "domestic",
+                ["夜南香", "夜南香北京烤鸭(南昌县店)"],
+                "commission",
+            )
+
+        self.assertEqual(result["matchedKeyword"], "夜南香北京烤鸭(南昌县店)")
+        self.assertEqual(result["location"]["name"], preset["name"])
+        self.assertEqual(search.await_count, 2)
+        load_more.assert_not_awaited()
+
+    async def test_publish_load_timeout_on_broad_keyword_continues_exact_keyword(
+        self,
+    ) -> None:
+        """宽词分页超时后必须关闭当前面板并尝试精确词。"""
+
+        broad_candidate = douyin_commerce_service.normalize_commerce_location_candidate(
+            {
+                "name": "夜南香非目标",
+                "address": "广西北海市候选路1号",
+                "commerceInfo": "1件商品 · 1件返佣",
+            }
+        )
+        preset = douyin_commerce_service.normalize_commerce_location_candidate(
+            {
+                "name": "夜南香北京烤鸭(蕲春店)",
+                "address": "湖北省黄冈市蕲春县齐昌大道694号",
+                "commerceInfo": "1件商品 · 1件返佣",
+            }
+        )
+        self.assertIsNotNone(broad_candidate)
+        self.assertIsNotNone(preset)
+        load_timeout = douyin_commerce_service.DouyinCommerceError(
+            "publish_location_load_more_limit"
+        )
+        load_timeout.click_performed = True
+        with patch.object(
+            douyin_commerce_service,
+            "search_commerce_location_store_candidates",
+            new_callable=AsyncMock,
+            side_effect=[[broad_candidate], [preset]],
+        ) as search, patch.object(
+            douyin_commerce_service,
+            "load_more_commerce_location_candidates",
+            new_callable=AsyncMock,
+            side_effect=load_timeout,
+        ) as load_more, patch.object(
+            douyin_commerce_service,
+            "_visible_store_listbox",
+            new_callable=AsyncMock,
+            return_value=object(),
+        ), patch.object(
+            douyin_commerce_service,
+            "_apply_open_commerce_location_to_page",
+            new_callable=AsyncMock,
+            return_value={"location": dict(preset)},
+        ), patch.object(
+            douyin_commerce_service,
+            "close_commerce_store_selector",
+            new_callable=AsyncMock,
+        ):
+            result = await douyin_commerce_service.apply_saved_commerce_location_to_page(
+                object(),
+                preset,
+                "domestic",
+                ["夜南香", "夜南香北京烤鸭(蕲春店)"],
+                "commission",
+            )
+
+        self.assertEqual(result["matchedKeyword"], "夜南香北京烤鸭(蕲春店)")
+        self.assertEqual(result["location"]["address"], preset["address"])
+        self.assertEqual(search.await_count, 2)
+        load_more.assert_awaited_once()
+
     async def test_publish_stops_after_ten_clicks(self) -> None:
         """加载次数超出硬上限时必须报告点击上限，不继续点击。"""
 
@@ -5409,10 +5532,10 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(load_more_mock.await_count, 10)
 
-    async def test_publish_shares_one_hundred_identities_across_three_keywords(
+    async def test_publish_scopes_hundred_identity_limit_to_each_keyword(
         self,
     ) -> None:
-        """跨关键词累计一百个四字段身份后必须停止，不再加载第三词。"""
+        """不同关键词可各自扫描候选，不能让宽词占满后续精确词额度。"""
 
         preset = douyin_commerce_service.normalize_commerce_location_candidate(
             {
@@ -5463,10 +5586,9 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
             "close_commerce_store_selector",
             new_callable=AsyncMock,
         ):
-            with self.assertRaisesRegex(
-                douyin_commerce_service.DouyinCommerceError,
-                "^publish_location_candidate_limit$",
-            ):
+            with self.assertRaises(
+                douyin_commerce_service.DouyinCommerceError
+            ) as caught:
                 await douyin_commerce_service.apply_saved_commerce_location_to_page(
                     object(),
                     preset,
@@ -5475,7 +5597,13 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
                     "commission",
                 )
 
-        self.assertEqual(load_more_mock.await_count, 2)
+        self.assertEqual(
+            str(caught.exception),
+            "publish_location_not_found_after_all_pages",
+        )
+        self.assertEqual(caught.exception.diagnostic["keyword"], "关键词丙")
+        self.assertEqual(caught.exception.diagnostic["candidateCount"], 40)
+        self.assertEqual(load_more_mock.await_count, 3)
 
     async def test_publish_restarts_action_deadline_across_keywords(self) -> None:
         """前一关键词已完成后，下一次搜索必须拥有新的单次动作期限。"""

@@ -3786,7 +3786,7 @@ async def apply_saved_commerce_location_to_page(
     max_load_more_clicks: int = 10,
     max_candidates: int = 100,
 ) -> dict[str, Any]:
-    """在同一地点面板中有界分页，命中完整身份后点击并回读。"""
+    """逐关键词有界分页，命中完整身份后点击并回读。"""
 
     selected_scope = normalize_commerce_location_scope(scope)
     selected_commission_filter = normalize_commission_filter(
@@ -3833,10 +3833,10 @@ async def apply_saved_commerce_location_to_page(
     ).strip(" ·")
     successfully_exhausted_keywords: list[str] = []
     total_click_count = 0
-    seen_candidate_identities: set[tuple[str, str, str, str]] = set()
     commission_mismatch_seen = False
 
     for attempt, keyword in enumerate(bounded_keywords, start=1):
+        seen_candidate_identities: set[tuple[str, str, str, str]] = set()
         douyin_logger.info(
             f"抖音发布定位第 {attempt}/{len(bounded_keywords)} 次搜索："
             f"范围={scope_label}，关键词={keyword}，目标={target_text}"
@@ -3911,6 +3911,8 @@ async def apply_saved_commerce_location_to_page(
                 max_candidates=max_candidates,
             )
             exhausted = False
+            candidate_limit_reached = False
+            action_timeout_error: DouyinCommerceError | None = None
             matched_candidates: list[dict[str, Any]] = []
             while True:
                 matched_candidates = [
@@ -3933,16 +3935,8 @@ async def apply_saved_commerce_location_to_page(
                     for row in candidates
                 )
                 if len(seen_candidate_identities) >= max_candidates:
-                    raise _location_failure(
-                        "publish_location_candidate_limit",
-                        stage="load_more",
-                        keyword=keyword,
-                        scope=selected_scope,
-                        clicks=total_click_count,
-                        candidates=len(seen_candidate_identities),
-                        max_candidates=max_candidates,
-                        max_load_more_clicks=max_load_more_clicks,
-                    ) from None
+                    candidate_limit_reached = True
+                    break
                 if total_click_count >= max_load_more_clicks:
                     raise _location_failure(
                         "publish_location_click_limit",
@@ -3987,7 +3981,7 @@ async def apply_saved_commerce_location_to_page(
                     if getattr(exc, "click_performed", False) is True:
                         total_click_count += 1
                     if str(exc) == _PUBLISH_LOCATION_LIMIT_CODE:
-                        raise _location_failure(
+                        action_timeout_error = _location_failure(
                             "publish_location_action_timeout",
                             stage="load_more",
                             keyword=keyword,
@@ -3996,7 +3990,10 @@ async def apply_saved_commerce_location_to_page(
                             candidates=len(seen_candidate_identities),
                             max_candidates=max_candidates,
                             max_load_more_clicks=max_load_more_clicks,
-                        ) from None
+                        )
+                        if attempt == len(bounded_keywords):
+                            raise action_timeout_error from None
+                        break
                     raise DouyinCommerceError(
                         "publish_location_load_more_failed"
                     ) from None
@@ -4020,10 +4017,35 @@ async def apply_saved_commerce_location_to_page(
                 )
                 douyin_logger.info(
                     f"抖音发布定位关键词“{keyword}”累计加载第 {total_click_count} 次："
-                    f"全关键词累计有效候选={len(seen_candidate_identities)}，"
+                    f"当前关键词累计有效候选={len(seen_candidate_identities)}，"
                     f"本轮新增={new_candidate_count}"
                 )
                 exhausted = not has_more
+            if action_timeout_error is not None:
+                douyin_logger.warning(
+                    f"抖音发布定位关键词“{keyword}”分页等待超过安全时限，"
+                    "将切换下一精确关键词继续匹配"
+                )
+                continue
+            if not matched_candidates and candidate_limit_reached:
+                candidate_limit_error = _location_failure(
+                    "publish_location_candidate_limit",
+                    stage="load_more",
+                    keyword=keyword,
+                    scope=selected_scope,
+                    clicks=total_click_count,
+                    candidates=len(seen_candidate_identities),
+                    max_candidates=max_candidates,
+                    max_load_more_clicks=max_load_more_clicks,
+                )
+                if attempt == len(bounded_keywords):
+                    raise candidate_limit_error from None
+                douyin_logger.warning(
+                    f"抖音发布定位关键词“{keyword}”已检查 "
+                    f"{len(seen_candidate_identities)} 个不同候选，"
+                    "将切换下一精确关键词继续匹配"
+                )
+                continue
             if not matched_candidates:
                 successfully_exhausted_keywords.append(keyword)
                 douyin_logger.warning(
