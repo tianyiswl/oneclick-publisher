@@ -2853,20 +2853,18 @@ async def _unique_visible_load_more_control(page) -> Any | None:
                 ].join(', ');
                 const boundedGenericOwner = boundedPanel
                     ? boundedPanel.closest(genericOwnerSelector) : null;
-                const boundedExactLoadMore = boundedPanel
-                    ? Array.from(boundedPanel.querySelectorAll(
-                        'button, input[type="button"], input[type="submit"], '
-                        + 'a[href], [role="button"], [tabindex], [onclick]'
-                    )).some(node => {
+                const exactLoadMoreTextNodes = boundedPanel
+                    ? Array.from(boundedPanel.querySelectorAll('*')).filter(node => {
                         if (!isEffectivelyVisible(node) || listbox.contains(node)) {
                             return false;
                         }
                         const text = normalize(node instanceof HTMLInputElement
                             ? node.value : (node.innerText || node.textContent));
-                        return text.includes('点击加载更多')
+                        return text === '点击加载更多'
                             && Boolean(listbox.compareDocumentPosition(node)
                                 & Node.DOCUMENT_POSITION_FOLLOWING);
-                    }) : false;
+                    }) : [];
+                const boundedExactLoadMore = exactLoadMoreTextNodes.length > 0;
                 const boundedLocationRegion = boundedPanel
                     && (!boundedGenericOwner || boundedExactLoadMore)
                     ? boundedPanel : null;
@@ -2874,7 +2872,7 @@ async def _unique_visible_load_more_control(page) -> Any | None:
                     ? explicitPanel : boundedLocationRegion;
                 if (!panel || panel === document.body
                     || !isEffectivelyVisible(panel)) return { count: 0 };
-                const candidates = Array.from(panel.querySelectorAll(
+                const interactiveCandidates = Array.from(panel.querySelectorAll(
                     'button, input[type="button"], input[type="submit"], '
                     + 'a[href], [role="button"], [tabindex], [onclick]'
                 )).filter(isEffectivelyVisible).filter(node => {
@@ -2891,6 +2889,13 @@ async def _unique_visible_load_more_control(page) -> Any | None:
                         ? node.value : (node.innerText || node.textContent));
                     return text.includes('点击加载更多') || text.includes('加载更多');
                 });
+                // 抖音实页有时把分页入口渲染成普通 div/span，
+                // 由 React 在上层统一代理 click，DOM 上没有 role/onclick。
+                // 仅在已锁定的地点面板内、列表之后接受精确文案。
+                const candidates = Array.from(new Set([
+                    ...interactiveCandidates,
+                    ...exactLoadMoreTextNodes,
+                ])).filter(node => panel.contains(node));
                 const controls = candidates.filter(node => !candidates.some(other =>
                     other !== node && other.contains(node)));
                 document.querySelectorAll('[data-oneclick-commerce-load-more="active"]')
