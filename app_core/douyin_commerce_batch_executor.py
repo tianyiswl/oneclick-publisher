@@ -202,6 +202,57 @@ _LOCATION_DIAGNOSTIC_FIELDS = (
     "clickLimit",
     "operationTimeoutSeconds",
 )
+_PUBLIC_LOCATION_ERROR_CODES = frozenset(
+    {
+        *_PUBLIC_BATCH_DIAGNOSTICS,
+        "publish_location_action_timeout",
+        "publish_location_click_limit",
+        "publish_location_candidate_limit",
+    }
+)
+_UNKNOWN_LOCATION_ERROR_CODE = "publish_location_click_failed"
+_PUBLIC_BATCH_ERROR_CODES = frozenset({"verification_cooldown_failed"})
+
+
+def _exception_fixed_location_error_code(error: Exception) -> str:
+    """只从受控字符串字段识别地点固定码，绝不格式化未知异常。"""
+
+    code = getattr(error, "code", None)
+    if type(code) is str and code in _PUBLIC_LOCATION_ERROR_CODES:
+        return code
+    args = getattr(error, "args", ())
+    if (
+        type(args) is tuple
+        and len(args) == 1
+        and type(args[0]) is str
+        and args[0] in _PUBLIC_LOCATION_ERROR_CODES
+    ):
+        return args[0]
+    return ""
+
+
+def _public_location_error_code(error: Exception) -> str:
+    return _exception_fixed_location_error_code(error) or _UNKNOWN_LOCATION_ERROR_CODE
+
+
+def _controlled_exception_message(error: Exception) -> str:
+    """供内部状态判别使用的异常文本；其返回值不得写入任何公开输出。"""
+
+    args = getattr(error, "args", ())
+    if type(args) is tuple and len(args) == 1 and type(args[0]) is str:
+        return args[0]
+    return ""
+
+
+def _public_batch_error_code(error: Exception) -> str:
+    location_code = _exception_fixed_location_error_code(error)
+    if location_code:
+        return location_code
+    if isinstance(error, DouyinCommerceBatchExecutorError):
+        code = _controlled_exception_message(error)
+        if code in _PUBLIC_BATCH_ERROR_CODES:
+            return code
+    return _UNKNOWN_LOCATION_ERROR_CODE
 
 
 def _public_location_diagnostic(value: object, *, error_code: str) -> dict[str, object]:
@@ -226,6 +277,8 @@ def format_public_location_failure(
     """将受控地点失败码格式化为可显示、可审计的公开说明。"""
 
     code = _text(error_code)
+    if code not in _PUBLIC_LOCATION_ERROR_CODES | _PUBLIC_BATCH_ERROR_CODES:
+        code = _UNKNOWN_LOCATION_ERROR_CODE
     if code == "publish_location_candidate_limit":
         count = diagnostic.get("candidateCount") if diagnostic else None
         clicks = diagnostic.get("loadMoreClicks") if diagnostic else None
@@ -258,7 +311,7 @@ def _public_batch_diagnostic(value: object) -> str:
 def _is_intervention_error(error: Exception) -> bool:
     if isinstance(error, DouyinVerificationError):
         return True
-    message = _text(error).casefold()
+    message = _controlled_exception_message(error).casefold()
     return any(marker in message for marker in _INTERVENTION_MARKERS)
 
 
@@ -274,7 +327,7 @@ def _controlled_upload_pause_status(upload: object) -> str:
 def _is_ambiguous_submit_error(error: Exception) -> bool:
     """最终点击已发生但缺回执时，只能暂停核对，不得继续提交。"""
 
-    message = _text(error)
+    message = _controlled_exception_message(error)
     return any(marker in message for marker in _AMBIGUOUS_SUBMIT_MARKERS)
 
 
@@ -1145,12 +1198,12 @@ class DouyinCommerceBatchExecutor:
                     payload.get("locationCommissionFilter", "all"),
                 )
             except Exception as exc:
+                location_error_code = _public_location_error_code(exc)
                 douyin_logger.warning(
                     f"抖音带货第 {index + 1}/{total} 条发布定位恢复失败："
                     f"视频={label}，范围={scope_label}，目标={target_location}，"
-                    f"已尝试={location_keywords}，错误={_text(exc) or type(exc).__name__}"
+                    f"已尝试={location_keywords}，错误={location_error_code}"
                 )
-                location_error_code = _text(exc)
                 if publish and location_error_code in _LOCATION_CACHE_FAILURE_CODES:
                     self._record_location_cache_result(
                         location_cache_account_id,
@@ -1342,9 +1395,10 @@ class DouyinCommerceBatchExecutor:
                 )
             raise
         except Exception as exc:
-            error_code = _text(exc)[:240] or "未取得可用的平台回执"
+            fixed_error_code = _exception_fixed_location_error_code(exc)
+            error_code = _public_batch_error_code(exc)
             location_diagnostic = _public_location_diagnostic(
-                getattr(exc, "diagnostic", None),
+                getattr(exc, "diagnostic", None) if fixed_error_code else None,
                 error_code=error_code,
             )
             diagnostic = format_public_location_failure(

@@ -333,7 +333,11 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
         )
 
         self.assertEqual([row["status"] for row in result], ["published", "failed", "published"])
-        self.assertEqual(result[1]["diagnostic"], "第 1 条平台回读失败")
+        self.assertEqual(
+            result[1]["diagnostic"],
+            "发布定位恢复失败：已找到目标地点，但平台候选无法安全点击"
+            "（错误码 publish_location_click_failed）",
+        )
         self.assertEqual(manager.max_open_sessions, 1)
         self.assertIn("submit:0", manager.calls)
         self.assertIn("submit:1", manager.calls)
@@ -355,7 +359,7 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
         )
         self.assertEqual([item["status"] for item in task_service.get_task(self.task["id"])["items"]], ["success", "failed", "success"])
         self.assertTrue(
-            any("第 1 条平台回读失败" in event.message for event in events)
+            any("publish_location_click_failed" in event.message for event in events)
         )
         self.assertTrue(any(event.phase == "uploading" for event in events))
 
@@ -626,6 +630,93 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
             },
         )
 
+    def test_unknown_location_error_never_leaks_into_public_failure_outputs(self) -> None:
+        """未知地点异常的原文或诊断字段一旦外泄，此测试必须失败。"""
+
+        injected_samples = (
+            "Cookie=location-secret",
+            "/Users/andy/private-account.json",
+            "<button data-private-dom='1'>",
+            "publish_location_future_unapproved",
+        )
+
+        class MaliciousLocationError(RuntimeError):
+            diagnostic = {
+                "errorCode": "publish_location_future_unapproved",
+                "stage": "<button data-private-dom='1'>",
+                "keyword": "/Users/andy/private-account.json",
+                "candidateCount": 100,
+            }
+
+            def __str__(self) -> str:
+                return "Cookie=location-secret /Users/andy/private-account.json <button data-private-dom='1'>"
+
+        class UnknownLocationManager(FakeCommerceSessionManager):
+            def apply_saved_location(
+                self,
+                session_id: str,
+                preset: dict,
+                scope: str,
+                keywords: list[str],
+                commission_filter: str,
+            ) -> dict:
+                result = super().apply_saved_location(
+                    session_id,
+                    preset,
+                    scope,
+                    keywords,
+                    commission_filter,
+                )
+                if session_id == "session-1":
+                    raise MaliciousLocationError()
+                return result
+
+        class RecordingTaskStore:
+            def __init__(self) -> None:
+                self.progress_writes: list[dict[str, object]] = []
+
+            def __getattr__(self, name: str):
+                return getattr(task_service, name)
+
+            def mark_batch_item_result(self, *args, **kwargs) -> None:
+                self.progress_writes.append(dict(kwargs))
+                task_service.mark_batch_item_result(*args, **kwargs)
+
+        batch = {**self.batch, "items": [dict(item) for item in self.batch["items"][:2]]}
+        task = task_service.create_douyin_batch_task(batch)
+        store = RecordingTaskStore()
+        progress: list[BatchProgressEvent] = []
+
+        result = DouyinCommerceBatchExecutor(
+            UnknownLocationManager(),
+            task_store=store,
+        ).run_publish(
+            batch,
+            task_id=task["id"],
+            confirmed=True,
+            progress=progress.append,
+        )
+
+        self.assertEqual([row["status"] for row in result], ["failed", "published"])
+        self.assertEqual(
+            result[0]["diagnostic"],
+            "发布定位恢复失败：已找到目标地点，但平台候选无法安全点击"
+            "（错误码 publish_location_click_failed）",
+        )
+        failed_write = next(
+            write
+            for write in store.progress_writes
+            if write["event_type"] == "batch_item_failed"
+        )
+        self.assertEqual(failed_write["readback"], {})
+        saved = task_service.get_task(task["id"])
+        public_outputs = repr(
+            result + progress + [saved["items"], saved["events"], failed_write]
+        )
+        for sample in injected_samples:
+            with self.subTest(sample=sample):
+                self.assertNotIn(sample, public_outputs)
+
     def test_legacy_location_without_commission_filter_defaults_to_all(self) -> None:
         """旧任务缺少返佣字段时，正式复核必须显式使用全部地址。"""
 
@@ -659,7 +750,11 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
             [row["status"] for row in result],
             ["failed", "published", "published"],
         )
-        self.assertEqual(result[0]["diagnostic"], "正式发布页旧浮层未能清理")
+        self.assertEqual(
+            result[0]["diagnostic"],
+            "发布定位恢复失败：已找到目标地点，但平台候选无法安全点击"
+            "（错误码 publish_location_click_failed）",
+        )
         self.assertEqual(
             [
                 call
@@ -758,7 +853,9 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
 
         self.assertEqual(result[0]["status"], "failed")
         self.assertEqual(
-            result[0]["diagnostic"], "抖音正式发布页未取得干净设置基线"
+            result[0]["diagnostic"],
+            "发布定位恢复失败：已找到目标地点，但平台候选无法安全点击"
+            "（错误码 publish_location_click_failed）",
         )
         self.assertNotIn(
             ("select_cached_favorite_music", "session-1"), manager.ordered_calls
