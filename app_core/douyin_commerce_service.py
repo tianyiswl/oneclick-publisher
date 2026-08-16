@@ -2800,8 +2800,23 @@ async def _unique_visible_load_more_control(page) -> Any | None:
                 ].join(', ');
                 const boundedGenericOwner = boundedPanel
                     ? boundedPanel.closest(genericOwnerSelector) : null;
+                const boundedExactLoadMore = boundedPanel
+                    ? Array.from(boundedPanel.querySelectorAll(
+                        'button, input[type="button"], input[type="submit"], '
+                        + 'a[href], [role="button"], [tabindex], [onclick]'
+                    )).some(node => {
+                        if (!isEffectivelyVisible(node) || listbox.contains(node)) {
+                            return false;
+                        }
+                        const text = normalize(node instanceof HTMLInputElement
+                            ? node.value : (node.innerText || node.textContent));
+                        return text.includes('点击加载更多')
+                            && Boolean(listbox.compareDocumentPosition(node)
+                                & Node.DOCUMENT_POSITION_FOLLOWING);
+                    }) : false;
                 const boundedLocationRegion = boundedPanel
-                    && !boundedGenericOwner ? boundedPanel : null;
+                    && (!boundedGenericOwner || boundedExactLoadMore)
+                    ? boundedPanel : null;
                 const panel = explicitPanel && explicitPanel !== listbox
                     ? explicitPanel : boundedLocationRegion;
                 if (!panel || panel === document.body

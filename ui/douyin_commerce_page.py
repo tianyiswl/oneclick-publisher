@@ -1537,11 +1537,20 @@ class DouyinCommercePage(QWidget):
             self._load_more_batch_locations
         )
         self.batch_location_load_more_button.setEnabled(False)
-        layout.addWidget(
-            self.batch_location_load_more_button,
-            0,
-            Qt.AlignmentFlag.AlignLeft,
+        self.batch_location_load_more_progress = QProgressBar()
+        self.batch_location_load_more_progress.setObjectName(
+            "douyinCommerceBatchLoadMoreProgress"
         )
+        self.batch_location_load_more_progress.setRange(0, 0)
+        self.batch_location_load_more_progress.setTextVisible(False)
+        self.batch_location_load_more_progress.setFixedWidth(180)
+        self.batch_location_load_more_progress.setVisible(False)
+        load_more_row = QHBoxLayout()
+        load_more_row.setContentsMargins(0, 0, 0, 0)
+        load_more_row.addWidget(self.batch_location_load_more_button)
+        load_more_row.addWidget(self.batch_location_load_more_progress)
+        load_more_row.addStretch(1)
+        layout.addLayout(load_more_row)
         # 以下控件保留给既有本地草稿与测试入口；批量发布方式已移到左栏声明下方。
         self.batch_publish_mode = QComboBox(self)
         self.batch_publish_mode.addItem("立即发布", "immediate")
@@ -2626,10 +2635,6 @@ class DouyinCommercePage(QWidget):
         if reconciled:
             state["requiresRevalidation"] = False
         self._batch_location_searches[_BATCH_SHARED_LOCATION_SEARCH_KEY] = state
-        if int(state["platformLoadCount"]) > 0:
-            self._set_batch_location_feedback(
-                self._batch_location_progress_text(state)
-            )
         self._sync_batch_location_controls()
 
     def _batch_location_cache_merge_failed(
@@ -3461,6 +3466,9 @@ class DouyinCommercePage(QWidget):
                 and not self._batch_location_load_more_pending
                 and not self._batch_location_cache_pending
                 and not self._batch_location_merge_pending
+            )
+            self.batch_location_load_more_progress.setVisible(
+                self._batch_location_load_more_pending
             )
 
     def _set_batch_location_feedback(self, message: object) -> None:

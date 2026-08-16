@@ -5930,6 +5930,65 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await browser.close()
 
+    async def test_generic_dialog_accepts_exact_click_to_load_more_control(
+        self,
+    ) -> None:
+        """真实地点弹层内的“点击加载更多”应被限定在当前列表中点击。"""
+
+        html = """
+        <section id="shared-editor" role="dialog">
+          <div id="location-content">
+            <input id="location-search"
+              data-oneclick-commerce-search-input="active"
+              data-oneclick-commerce-store="active" />
+            <div id="location-results" role="listbox">
+              <div role="option" data-store-id="poi-1">
+                <span data-store-name>银滩门店</span>
+                <span data-store-address>广西北海市银海区银滩路 1 号</span>
+              </div>
+            </div>
+            <button id="real-load-more" onclick="appendLocation()">点击加载更多</button>
+          </div>
+        </section>
+        <script>
+          function appendLocation() {
+            const row = document.createElement('div');
+            row.setAttribute('role', 'option');
+            row.setAttribute('data-store-id', 'poi-2');
+            row.innerHTML = '<span data-store-name>侨港门店</span>'
+              + '<span data-store-address>广西北海市银海区侨港路 2 号</span>';
+            document.querySelector('#location-results').appendChild(row);
+          }
+        </script>
+        """
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+                first_page = (
+                    douyin_commerce_service.normalize_commerce_location_candidates(
+                        await douyin_commerce_service._store_option_descriptors(
+                            page.locator("#location-results")
+                        )
+                    )
+                )
+
+                result = await douyin_commerce_service.load_more_commerce_location_candidates(
+                    page,
+                    previous_candidates=first_page,
+                    commission_filter="all",
+                    timeout_ms=5_000,
+                )
+
+                self.assertEqual(result["newCandidateCount"], 1)
+                self.assertIn(
+                    "侨港门店",
+                    [candidate["name"] for candidate in result["candidates"]],
+                )
+            finally:
+                await browser.close()
+
     async def test_load_more_collapses_nested_nodes_for_one_logical_button(self) -> None:
         """A button and its labelled descendant represent one logical control."""
 
@@ -16114,6 +16173,9 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             )
 
             self.page._load_more_batch_locations()
+            self.assertFalse(
+                self.page.batch_location_load_more_progress.isHidden()
+            )
             self.page.runner.execute(self.page._COLLECTOR_TASK_KEY)
             self.page.runner.finish(self.page._COLLECTOR_TASK_KEY)
             self.assertEqual(
@@ -16132,14 +16194,51 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.assertFalse(state["hasMore"])
         self.assertEqual(state["source"], "platform")
         self.assertEqual(len(state["candidates"]), 11)
-        self.assertIn("缓存已显示 11/11 个", self.page._batch_location_feedback)
-        self.assertIn("平台批次 1", self.page._batch_location_feedback)
-        self.assertIn("累计候选 11 个", self.page._batch_location_feedback)
+        self.assertEqual(self.page._batch_location_feedback, "已加载全部地址")
         self.assertEqual(
             self.page.batch_location_load_more_button.text(),
             "加载更多地点",
         )
         self.assertFalse(self.page.batch_location_load_more_button.isEnabled())
+        self.assertTrue(
+            self.page.batch_location_load_more_progress.isHidden()
+        )
+
+    def test_cache_merge_does_not_overwrite_load_more_terminal_feedback(self) -> None:
+        """缓存写入完成不得把“已加载全部”覆盖回旧统计。"""
+
+        self._activate_cached_location_search(account_id=607)
+        cached = self._cached_location_candidates(6)
+        self.page._batch_location_searches["__shared_location_search__"] = {
+            "accountId": "607",
+            "scope": "domestic",
+            "keyword": "夜南香",
+            "commissionFilter": "commission",
+            "platformResultCount": 6,
+            "rawCandidates": cached,
+            "candidates": cached,
+            "platformContextReady": True,
+            "platformCandidates": cached,
+            "cacheTotal": 6,
+            "cacheOffset": 6,
+            "cacheHasMore": False,
+            "platformLoadCount": 1,
+            "zeroGrowthCount": 1,
+            "hasMore": False,
+            "source": "platform",
+        }
+        query = self.page._batch_location_cache_query(
+            "domestic", "夜南香", "commission"
+        )
+        self.page._set_batch_location_feedback("已加载全部地址")
+
+        self.page._batch_location_cache_merge_succeeded(
+            query,
+            {"total": 6},
+            request_token=self.page._batch_location_search_token,
+        )
+
+        self.assertEqual(self.page._batch_location_feedback, "已加载全部地址")
 
     def test_setup_tenth_platform_result_disables_button_with_controlled_status(
         self,
