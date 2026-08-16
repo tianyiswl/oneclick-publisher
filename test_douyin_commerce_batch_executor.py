@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import json
 from pathlib import Path
 import tempfile
 import threading
@@ -23,7 +24,7 @@ from app_core.douyin_commerce_batch_executor import (
 from app_core.douyin_commerce_batch_service import apply_interval_schedule, validate_batch_payload
 from app_core.douyin_commerce_session import DouyinCommerceSessionError
 from app_core.douyin_location_service import normalize_location_candidate
-from app_core.douyin_sms_cooldown import DouyinSmsCooldownGate
+from app_core.douyin_sms_cooldown import DouyinSmsCooldownError, DouyinSmsCooldownGate
 from app_core.douyin_verification import (
     DouyinVerificationBroker,
     DouyinVerificationError,
@@ -716,6 +717,73 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
         for sample in injected_samples:
             with self.subTest(sample=sample):
                 self.assertNotIn(sample, public_outputs)
+
+    def test_unknown_cooldown_error_never_leaks_from_receipt_sentinel(self) -> None:
+        """冷却哨兵若保留异常原文，会污染最终提交后的公开暂停信息。"""
+
+        injected_samples = (
+            "Cookie=cooldown-secret",
+            "/Users/andy/private-account.json",
+            "<div data-private-dom='1'>",
+        )
+
+        class MaliciousCooldownError(DouyinSmsCooldownError):
+            def __str__(self) -> str:
+                return "Cookie=cooldown-secret /Users/andy/private-account.json <div data-private-dom='1'>"
+
+        class MaliciousCooldownGate:
+            def restore_remaining(self, _account_key: str, _remaining: float) -> None:
+                return None
+
+            def remaining_seconds(self, _account_key: str) -> int:
+                return 0
+
+            def record_trigger(self, _account_key: str) -> None:
+                raise MaliciousCooldownError()
+
+        broker = DouyinVerificationBroker()
+        manager = FakeCommerceSessionManager(
+            challenge_on_index=0,
+            verification_mode="active_success",
+            verification_broker=broker,
+        )
+        progress: list[BatchProgressEvent] = []
+
+        result = DouyinCommerceBatchExecutor(
+            manager,
+            verification_broker=broker,
+            cooldown_gate=MaliciousCooldownGate(),
+        ).run_publish(
+            self.batch,
+            task_id=self.task["id"],
+            confirmed=True,
+            progress=progress.append,
+        )
+
+        self.assertEqual(
+            [row["status"] for row in result],
+            ["receipt_ambiguous", "pending", "pending"],
+        )
+        self.assertEqual(result[0]["diagnostic"], "verification_cooldown_failed")
+        saved = task_service.get_task(self.task["id"])
+        self.assertEqual(
+            json.loads(
+                next(
+                    event["detailJson"]
+                    for event in reversed(saved["events"])
+                    if event["eventType"] == "platform_receipt_ambiguous"
+                )
+            ),
+            {},
+        )
+        public_outputs = repr(result + progress + [saved["items"], saved["events"]])
+        for sample in injected_samples:
+            with self.subTest(sample=sample):
+                self.assertNotIn(sample, public_outputs)
+        self.assertEqual(
+            [call for call in manager.calls if call.startswith("submit:")],
+            ["submit:0"],
+        )
 
     def test_legacy_location_without_commission_filter_defaults_to_all(self) -> None:
         """旧任务缺少返佣字段时，正式复核必须显式使用全部地址。"""

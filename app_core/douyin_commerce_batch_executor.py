@@ -780,15 +780,19 @@ class DouyinCommerceBatchExecutor:
         handled = False
         sentinel = error_sentinel if error_sentinel is not None else []
 
-        def _remember_error(code: str) -> None:
+        def _remember_error(code: object) -> None:
             if not sentinel:
-                sentinel.append(code)
+                sentinel.append(
+                    code
+                    if type(code) is str and code in _PUBLIC_BATCH_ERROR_CODES
+                    else "verification_cooldown_failed"
+                )
 
         def _record_sms_trigger() -> None:
             try:
                 self._cooldown_gate.record_trigger(account_key)
-            except DouyinSmsCooldownError as exc:
-                _remember_error(_text(exc))
+            except DouyinSmsCooldownError:
+                _remember_error("verification_cooldown_failed")
                 return
             except Exception:
                 _remember_error("verification_cooldown_failed")
@@ -934,8 +938,10 @@ class DouyinCommerceBatchExecutor:
                         "verification_cooldown_failed"
                     ) from None
             return ready
-        except DouyinSmsCooldownError as exc:
-            raise DouyinCommerceBatchExecutorError(_text(exc)) from None
+        except DouyinSmsCooldownError:
+            raise DouyinCommerceBatchExecutorError(
+                "verification_cooldown_failed"
+            ) from None
 
     def _run(
         self,
