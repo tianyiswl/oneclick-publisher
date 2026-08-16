@@ -16252,17 +16252,97 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         state = self.page._batch_location_state()
         self.assertEqual(state["platformLoadCount"], 1)
         self.assertEqual(state["zeroGrowthCount"], 0)
-        self.assertFalse(state["hasMore"])
+        self.assertTrue(state["hasMore"])
         self.assertEqual(state["source"], "platform")
         self.assertEqual(len(state["candidates"]), 11)
-        self.assertEqual(self.page._batch_location_feedback, "已加载全部地址")
+        self.assertNotIn(
+            "已加载全部地址",
+            self.page._batch_location_feedback,
+        )
         self.assertEqual(
             self.page.batch_location_load_more_button.text(),
             "加载更多地点",
         )
-        self.assertFalse(self.page.batch_location_load_more_button.isEnabled())
+        self.assertTrue(self.page.batch_location_load_more_button.isEnabled())
         self.assertTrue(
             self.page.batch_location_load_more_progress.isHidden()
+        )
+
+    def test_load_more_button_waits_for_two_zero_growth_pages_before_disabling(
+        self,
+    ) -> None:
+        """单次未发现后续入口不能提前终止用户的再次加载机会。"""
+
+        self._activate_cached_location_search(account_id=608)
+        cached = self._cached_location_candidates(1)
+        self.page._batch_location_searches["__shared_location_search__"] = {
+            "accountId": "608",
+            "scope": "domestic",
+            "keyword": "夜南香",
+            "commissionFilter": "commission",
+            "platformResultCount": 1,
+            "rawCandidates": [dict(item) for item in cached],
+            "candidates": [dict(item) for item in cached],
+            "platformContextReady": True,
+            "platformCandidates": [dict(item) for item in cached],
+            "observedPlatformCandidates": [dict(item) for item in cached],
+            "requiresRevalidation": False,
+            "cacheTotal": 0,
+            "cacheOffset": 0,
+            "cacheHasMore": False,
+            "platformLoadCount": 0,
+            "zeroGrowthCount": 0,
+            "hasMore": True,
+            "source": "platform",
+        }
+        cache_query = self.page._batch_location_cache_query(
+            "domestic", "夜南香", "commission"
+        )
+        zero_growth_result = {
+            "platformResultCount": 1,
+            "candidates": cached,
+            "newCandidateCount": 0,
+            "hasMore": False,
+            "stopReason": "no_visible_load_more_control",
+        }
+
+        with patch.object(
+            self.page,
+            "_start_batch_location_cache_merge",
+            return_value=False,
+        ):
+            self.page._batch_location_load_more_succeeded(
+                cache_query,
+                zero_growth_result,
+                request_token=self.page._batch_location_search_token,
+            )
+
+            first_state = self.page._batch_location_state()
+            self.assertEqual(first_state["zeroGrowthCount"], 1)
+            self.assertTrue(first_state["hasMore"])
+            self.assertTrue(
+                self.page.batch_location_load_more_button.isEnabled()
+            )
+            self.assertEqual(
+                self.page._batch_location_feedback,
+                "本批未新增地址，可再次加载确认",
+            )
+
+            self.page._batch_location_load_more_succeeded(
+                cache_query,
+                zero_growth_result,
+                request_token=self.page._batch_location_search_token,
+            )
+
+        final_state = self.page._batch_location_state()
+        self.assertEqual(final_state["zeroGrowthCount"], 2)
+        self.assertFalse(final_state["hasMore"])
+        self.assertFalse(
+            self.page.batch_location_load_more_button.isEnabled()
+        )
+        self.assertEqual(
+            self.page._batch_location_feedback,
+            "连续两次没有新增有效地点，已停止加载",
         )
 
     def test_cache_merge_does_not_overwrite_load_more_terminal_feedback(self) -> None:
