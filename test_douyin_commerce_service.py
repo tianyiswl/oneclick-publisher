@@ -6062,6 +6062,93 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await browser.close()
 
+    async def test_load_more_uses_exact_row_in_detached_location_portal(self) -> None:
+        """地点 portal 与搜索输入分离时，唯一 listbox 内分页行仍归当前地点。"""
+
+        html = """
+        <style>
+          #detached-results { height: 80px; overflow-y: auto; }
+          #detached-results [role="option"] { height: 120px; }
+          #detached-load-row { height: 30px; }
+        </style>
+        <main>
+          <input data-oneclick-commerce-search-input="active" value="夜南香" />
+          <button data-oneclick-commerce-store="active">选择地点</button>
+        </main>
+        <div class="semi-portal">
+          <div id="detached-results" role="listbox">
+            <div role="option" data-store-id="poi-1">
+              <span data-store-name>夜南香银滩店</span>
+              <span data-store-address>广西北海市银海区银滩路 1 号</span>
+            </div>
+            <div id="detached-load-row"><span>点击加载更多</span></div>
+          </div>
+        </div>
+        <script>
+          window.scrollTopsAtClick = [];
+          window.loadClickCount = 0;
+          document.addEventListener('click', event => {
+            if (!event.target.closest('#detached-load-row')) return;
+            window.loadClickCount += 1;
+            window.scrollTopsAtClick.push(
+              document.querySelector('#detached-results').scrollTop
+            );
+            const row = document.createElement('div');
+            row.setAttribute('role', 'option');
+            row.setAttribute('data-store-id', `poi-${window.loadClickCount + 1}`);
+            row.innerHTML = `<span data-store-name>夜南香新增店${window.loadClickCount}</span>`
+              + `<span data-store-address>广西北海市银海区新增路 ${window.loadClickCount + 1} 号</span>`;
+            document.querySelector('#detached-load-row').before(row);
+          });
+        </script>
+        """
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+                first_page = (
+                    douyin_commerce_service.normalize_commerce_location_candidates(
+                        await douyin_commerce_service._store_option_descriptors(
+                            page.locator("#detached-results")
+                        )
+                    )
+                )
+
+                result = await douyin_commerce_service.load_more_commerce_location_candidates(
+                    page,
+                    previous_candidates=first_page,
+                    commission_filter="all",
+                    timeout_ms=5_000,
+                )
+
+                self.assertEqual(result["newCandidateCount"], 1)
+                self.assertIn(
+                    "夜南香新增店1",
+                    [candidate["name"] for candidate in result["candidates"]],
+                )
+                second_result = (
+                    await douyin_commerce_service.load_more_commerce_location_candidates(
+                        page,
+                        previous_candidates=result["candidates"],
+                        commission_filter="all",
+                        timeout_ms=5_000,
+                    )
+                )
+                self.assertEqual(second_result["newCandidateCount"], 1)
+                self.assertIn(
+                    "夜南香新增店2",
+                    [candidate["name"] for candidate in second_result["candidates"]],
+                )
+                scroll_tops = await page.evaluate("window.scrollTopsAtClick")
+                self.assertEqual(len(scroll_tops), 2)
+                self.assertGreater(
+                    scroll_tops[0], 0
+                )
+                self.assertGreater(scroll_tops[1], scroll_tops[0])
+            finally:
+                await browser.close()
+
     async def test_load_more_reanchors_location_panel_after_platform_rerender(
         self,
     ) -> None:
@@ -16534,10 +16621,10 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             "本批未新增地址，仍可继续加载",
         )
 
-    def test_missing_platform_pager_keeps_retry_and_rebuilds_search_context(
+    def test_missing_platform_pager_stops_instead_of_rebuilding_search_context(
         self,
     ) -> None:
-        """分页入口暂时不可见时不得冒充全部加载，下次点击应重建上下文。"""
+        """滚到底仍无分页入口即收口，不能反复重建同一次平台搜索。"""
 
         self._activate_cached_location_search(account_id=609)
         cached = self._cached_location_candidates(1)
@@ -16582,12 +16669,12 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             )
 
         state = self.page._batch_location_state()
-        self.assertTrue(state["hasMore"])
-        self.assertFalse(state["platformContextReady"])
-        self.assertTrue(self.page.batch_location_load_more_button.isEnabled())
+        self.assertFalse(state["hasMore"])
+        self.assertTrue(state["platformContextReady"])
+        self.assertFalse(self.page.batch_location_load_more_button.isEnabled())
         self.assertEqual(
             self.page._batch_location_feedback,
-            "平台分页入口暂未就绪，可再次加载",
+            "已加载全部地址",
         )
 
         with patch.object(
@@ -16600,11 +16687,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         ) as direct_load_more:
             self.page._load_more_batch_locations()
 
-        restart_search.assert_called_once_with(
-            cache_query,
-            request_token=self.page._batch_location_search_token,
-            from_load_more=True,
-        )
+        restart_search.assert_not_called()
         direct_load_more.assert_not_called()
 
     def test_cache_merge_does_not_overwrite_load_more_terminal_feedback(self) -> None:

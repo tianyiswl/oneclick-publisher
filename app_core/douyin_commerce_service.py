@@ -2800,8 +2800,19 @@ async def search_commerce_location_store_candidates(
 async def _unique_visible_load_more_control(page) -> Any | None:
     """返回当前地点面板唯一可点击的“加载更多”控件。"""
 
-    if await _visible_store_listbox(page) is None:
+    listbox = await _visible_store_listbox(page)
+    if listbox is None:
         return None
+    # 平台只在地址选择框滚到底后展示/激活分页行。每次查找分页入口前都
+    # 明确滚动当前唯一地点 listbox，并派发 scroll 让 React 完成本批渲染；
+    # 点击新增一批后，下次调用会再次滚到新的底部。
+    await listbox.evaluate(
+        """node => {
+            node.scrollTop = Math.max(0, node.scrollHeight - node.clientHeight);
+            node.dispatchEvent(new Event('scroll', { bubbles: true }));
+        }"""
+    )
+    await page.wait_for_timeout(150)
 
     result = await page.evaluate(
         """() => {
@@ -2853,14 +2864,22 @@ async def _unique_visible_load_more_control(page) -> Any | None:
                 ].join(', ');
                 const boundedGenericOwner = boundedPanel
                     ? boundedPanel.closest(genericOwnerSelector) : null;
+                const isExactLoadMoreNode = node => {
+                    if (!isEffectivelyVisible(node)) return false;
+                    const text = normalize(node instanceof HTMLInputElement
+                        ? node.value : (node.innerText || node.textContent));
+                    return text === '点击加载更多';
+                };
+                // 真实页面把地址下拉渲染在独立 portal 中，搜索输入与
+                // listbox 没有共同面板；分页行是该唯一 listbox 的末尾
+                // 子节点。它由当前唯一完整地点列表直接拥有，不再依赖输入框
+                // 祖先关系。后续 Playwright scroll_into_view 会先把列表滚到底。
+                const listboxExactLoadMoreTextNodes = Array.from(
+                    listbox.querySelectorAll('*')
+                ).filter(isExactLoadMoreNode);
                 const exactLoadMoreTextNodes = boundedPanel
                     ? Array.from(boundedPanel.querySelectorAll('*')).filter(node => {
-                        if (!isEffectivelyVisible(node)) {
-                            return false;
-                        }
-                        const text = normalize(node instanceof HTMLInputElement
-                            ? node.value : (node.innerText || node.textContent));
-                        return text === '点击加载更多'
+                        return isExactLoadMoreNode(node)
                             && Boolean(listbox.compareDocumentPosition(node)
                                 & Node.DOCUMENT_POSITION_FOLLOWING);
                     }) : [];
@@ -2868,7 +2887,9 @@ async def _unique_visible_load_more_control(page) -> Any | None:
                 const boundedLocationRegion = boundedPanel
                     && (!boundedGenericOwner || boundedExactLoadMore)
                     ? boundedPanel : null;
-                const panel = explicitPanel && explicitPanel !== listbox
+                const panel = listboxExactLoadMoreTextNodes.length > 0
+                    ? listbox
+                    : explicitPanel && explicitPanel !== listbox
                     ? explicitPanel : boundedLocationRegion;
                 if (!panel || panel === document.body
                     || !isEffectivelyVisible(panel)) return { count: 0 };
@@ -2896,6 +2917,7 @@ async def _unique_visible_load_more_control(page) -> Any | None:
                 // 普通“加载更多”仍只接受列表外的可交互控件。
                 const candidates = Array.from(new Set([
                     ...interactiveCandidates,
+                    ...listboxExactLoadMoreTextNodes,
                     ...exactLoadMoreTextNodes,
                 ])).filter(node => panel.contains(node));
                 const controls = candidates.filter(node => !candidates.some(other =>
