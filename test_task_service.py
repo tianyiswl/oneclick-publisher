@@ -1428,6 +1428,51 @@ class DouyinCommerceBatchTaskTests(unittest.TestCase):
             },
         )
 
+    def test_location_failure_scope_is_whitelisted_only_as_native_nonempty_text(self) -> None:
+        """范围绑定字段缺失或接受伪造类型时，地点诊断会失去可审计边界。"""
+
+        class ForgedStr(str):
+            pass
+
+        cases = (
+            ("local", "local"),
+            (ForgedStr("local"), None),
+            ("", None),
+            ("   ", None),
+            (True, None),
+            (7, None),
+            (7.0, None),
+        )
+        for value, expected in cases:
+            with self.subTest(value=repr(value)):
+                task = task_service.create_douyin_batch_task(self.batch)
+                task_id = task["id"]
+                item_id = task_service.get_task(task_id)["items"][0]["id"]
+                task_service.mark_batch_item_result(
+                    task_id,
+                    item_id,
+                    ok=False,
+                    message="地点范围恢复失败",
+                    event_type="batch_item_failed",
+                    readback={
+                        "scope": value,
+                        "candidateList": ["must-not-store"],
+                        "cookie": "must-not-store",
+                        "dom": "must-not-store",
+                        "path": "/private/platform/profile",
+                        "unknownField": "must-not-store",
+                    },
+                )
+
+                detail = json.loads(task_service.get_task(task_id)["events"][-1]["detailJson"])
+                if expected is None:
+                    self.assertNotIn("scope", detail)
+                else:
+                    self.assertIn("scope", detail)
+                    self.assertEqual(detail["scope"], expected)
+                for forbidden in ("candidateList", "cookie", "dom", "path", "unknownField"):
+                    self.assertNotIn(forbidden, detail)
+
     def test_normal_event_after_success_does_not_roll_back_item_status(self) -> None:
         task = task_service.create_douyin_batch_task(self.batch)
         task_id = task["id"]

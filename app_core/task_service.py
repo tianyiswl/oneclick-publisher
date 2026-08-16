@@ -59,6 +59,7 @@ _LOCATION_DIAGNOSTIC_STRING_FIELDS = frozenset({
     "errorCode",
     "stage",
     "keyword",
+    "scope",
 })
 _LOCATION_DIAGNOSTIC_COUNT_FIELDS = frozenset({
     "loadMoreClicks",
