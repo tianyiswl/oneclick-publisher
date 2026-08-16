@@ -16477,6 +16477,79 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             "本批未新增地址，仍可继续加载",
         )
 
+    def test_missing_platform_pager_keeps_retry_and_rebuilds_search_context(
+        self,
+    ) -> None:
+        """分页入口暂时不可见时不得冒充全部加载，下次点击应重建上下文。"""
+
+        self._activate_cached_location_search(account_id=609)
+        cached = self._cached_location_candidates(1)
+        self.page._batch_location_searches["__shared_location_search__"] = {
+            "accountId": "609",
+            "scope": "domestic",
+            "keyword": "夜南香",
+            "commissionFilter": "commission",
+            "platformResultCount": 1,
+            "rawCandidates": [dict(item) for item in cached],
+            "candidates": [dict(item) for item in cached],
+            "platformContextReady": True,
+            "platformCandidates": [dict(item) for item in cached],
+            "observedPlatformCandidates": [dict(item) for item in cached],
+            "requiresRevalidation": False,
+            "cacheTotal": 0,
+            "cacheOffset": 0,
+            "cacheHasMore": False,
+            "platformLoadCount": 0,
+            "zeroGrowthCount": 0,
+            "hasMore": True,
+            "source": "platform",
+        }
+        cache_query = self.page._batch_location_cache_query(
+            "domestic", "夜南香", "commission"
+        )
+        with patch.object(
+            self.page,
+            "_start_batch_location_cache_merge",
+            return_value=False,
+        ):
+            self.page._batch_location_load_more_succeeded(
+                cache_query,
+                {
+                    "platformResultCount": 1,
+                    "candidates": cached,
+                    "newCandidateCount": 0,
+                    "hasMore": False,
+                    "stopReason": "no_visible_load_more_control",
+                },
+                request_token=self.page._batch_location_search_token,
+            )
+
+        state = self.page._batch_location_state()
+        self.assertTrue(state["hasMore"])
+        self.assertFalse(state["platformContextReady"])
+        self.assertTrue(self.page.batch_location_load_more_button.isEnabled())
+        self.assertEqual(
+            self.page._batch_location_feedback,
+            "平台分页入口暂未就绪，可再次加载",
+        )
+
+        with patch.object(
+            self.page,
+            "_start_batch_location_platform_search",
+            return_value=True,
+        ) as restart_search, patch.object(
+            self.page,
+            "_start_batch_location_platform_load_more",
+        ) as direct_load_more:
+            self.page._load_more_batch_locations()
+
+        restart_search.assert_called_once_with(
+            cache_query,
+            request_token=self.page._batch_location_search_token,
+            from_load_more=True,
+        )
+        direct_load_more.assert_not_called()
+
     def test_cache_merge_does_not_overwrite_load_more_terminal_feedback(self) -> None:
         """缓存写入完成不得把“已加载全部”覆盖回旧统计。"""
 

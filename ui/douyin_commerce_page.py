@@ -3057,7 +3057,13 @@ class DouyinCommercePage(QWidget):
             if effective_new_count == 0
             else 0
         )
-        effective_has_more = has_more
+        pager_temporarily_unavailable = (
+            revalidation_was_pending is False
+            and effective_new_count == 0
+            and has_more is False
+            and stop_reason == "no_visible_load_more_control"
+        )
+        effective_has_more = has_more or pager_temporarily_unavailable
         if platform_load_count >= 10:
             effective_has_more = False
         elif len(display_raw) >= _BATCH_LOCATION_MAX_IDENTITIES:
@@ -3067,7 +3073,7 @@ class DouyinCommercePage(QWidget):
                 "platformResultCount": platform_result_count,
                 "rawCandidates": [dict(item) for item in display_raw],
                 "candidates": [dict(item) for item in projected],
-                "platformContextReady": True,
+                "platformContextReady": not pager_temporarily_unavailable,
                 "platformCandidates": [
                     dict(item) for item in accumulated_platform_candidates
                 ],
@@ -3088,6 +3094,8 @@ class DouyinCommercePage(QWidget):
             commission_filter=selected_filter,
         )
         feedback = self._batch_location_limit_status(state)
+        if not feedback and pager_temporarily_unavailable:
+            feedback = "平台分页入口暂未就绪，可再次加载"
         if not feedback and effective_has_more is False:
             feedback = "已加载全部地址"
         if (
