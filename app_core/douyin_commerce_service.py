@@ -3978,30 +3978,59 @@ async def apply_saved_commerce_location_to_page(
                 )
                 continue
             matched_candidate = dict(matched_candidates[0])
-            listbox = await _await_publish_location_dom_action(
-                lambda _timeout: _visible_store_listbox(page),
-                deadline=None,
+            readback_deadline = (
+                monotonic() + _LOCATION_RESULT_WAIT_TIMEOUT_MS / 1000
             )
+            try:
+                listbox = await _await_publish_location_dom_action(
+                    lambda _timeout: _visible_store_listbox(page),
+                    deadline=readback_deadline,
+                )
+            except DouyinCommerceError as exc:
+                if str(exc) != _PUBLISH_LOCATION_LIMIT_CODE:
+                    raise
+                raise _location_failure(
+                    "publish_location_action_timeout",
+                    stage="readback",
+                    keyword=keyword,
+                    clicks=total_click_count,
+                    candidates=len(seen_candidate_identities),
+                    max_candidates=max_candidates,
+                    max_load_more_clicks=max_load_more_clicks,
+                ) from None
             if listbox is None:
                 douyin_logger.warning(
                     f"抖音发布定位关键词“{keyword}”已匹配目标，但候选面板已消失"
                 )
                 raise DouyinCommerceError("publish_location_click_failed")
-            if selected_commission_filter == "all":
-                result = await _apply_open_commerce_location_to_page(
-                    page,
-                    listbox,
-                    matched_candidate,
-                    deadline=None,
-                )
-            else:
-                result = await _apply_open_commerce_location_to_page(
-                    page,
-                    listbox,
-                    matched_candidate,
-                    commission_filter=selected_commission_filter,
-                    deadline=None,
-                )
+            try:
+                if selected_commission_filter == "all":
+                    result = await _apply_open_commerce_location_to_page(
+                        page,
+                        listbox,
+                        matched_candidate,
+                        deadline=readback_deadline,
+                    )
+                else:
+                    result = await _apply_open_commerce_location_to_page(
+                        page,
+                        listbox,
+                        matched_candidate,
+                        commission_filter=selected_commission_filter,
+                        deadline=readback_deadline,
+                    )
+            except DouyinCommerceError as exc:
+                if str(exc) != _PUBLISH_LOCATION_LIMIT_CODE:
+                    raise
+                raise _location_failure(
+                    "publish_location_action_timeout",
+                    stage="readback",
+                    keyword=keyword,
+                    clicks=total_click_count,
+                    candidates=len(seen_candidate_identities),
+                    max_candidates=max_candidates,
+                    max_load_more_clicks=max_load_more_clicks,
+                ) from None
             douyin_logger.success(
                 f"抖音发布定位关键词“{keyword}”已命中并回读目标：{target_text}"
             )

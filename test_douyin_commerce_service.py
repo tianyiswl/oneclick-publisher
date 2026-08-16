@@ -3183,10 +3183,10 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
         target.click.assert_awaited_once()
         self.assertEqual(result["location"]["name"], "夜南香北京烤鸭")
 
-    async def test_publish_restarts_deadline_for_each_search_and_load(
+    async def test_publish_restarts_deadline_for_each_search_load_and_readback(
         self,
     ) -> None:
-        """搜索和每次分页各有期限；点击回读不复用已完成分页的期限。"""
+        """搜索、分页和命中后的回读都各有独立的单次动作期限。"""
 
         first = douyin_commerce_service.normalize_commerce_location_candidate(
             {
@@ -3205,6 +3205,7 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
             }
         )
         deadlines: list[float] = []
+        clock = iter((10.0, 15.0, 20.0))
 
         async def search(_page, _keyword, **kwargs):
             deadlines.append(kwargs["deadline"])
@@ -3227,7 +3228,7 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(
             douyin_commerce_service,
             "monotonic",
-            side_effect=iter((10.0, 15.0)),
+            side_effect=lambda: next(clock, 20.0),
         ), patch.object(
             douyin_commerce_service,
             "search_commerce_location_store_candidates",
@@ -3260,7 +3261,44 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["location"]["name"], "目标")
         self.assertEqual(len(deadlines), 3)
-        self.assertEqual(deadlines, [40.0, 45.0, None])
+        self.assertEqual(deadlines, [40.0, 45.0, 50.0])
+
+    async def test_publish_reports_readback_action_timeout_with_safe_diagnostic(
+        self,
+    ) -> None:
+        """命中候选后的列表读取超时必须按回读动作期限安全投影。"""
+
+        preset = douyin_commerce_service.normalize_commerce_location_candidate(
+            {
+                "name": "回读超时目标",
+                "address": "广西北海市目标路1号",
+                "commerceInfo": "1件商品 · 1件返佣",
+            }
+        )
+        self.assertIsNotNone(preset)
+        with patch.object(
+            douyin_commerce_service,
+            "search_commerce_location_store_candidates",
+            new_callable=AsyncMock,
+            return_value=[preset],
+        ), patch.object(
+            douyin_commerce_service,
+            "_visible_store_listbox",
+            new_callable=AsyncMock,
+            side_effect=asyncio.TimeoutError(),
+        ), patch.object(
+            douyin_commerce_service,
+            "close_commerce_store_selector",
+            new_callable=AsyncMock,
+        ):
+            with self.assertRaises(douyin_commerce_service.DouyinCommerceError) as caught:
+                await douyin_commerce_service.apply_saved_commerce_location_to_page(
+                    object(), preset, "domestic", ["回读超时目标"], "commission"
+                )
+
+        self.assertEqual(str(caught.exception), "publish_location_action_timeout")
+        self.assertEqual(caught.exception.diagnostic["stage"], "readback")
+        self.assertIsNone(caught.exception.__cause__)
 
     async def test_visibility_override_and_hidden_portal_obey_effective_visibility(
         self,
@@ -13135,6 +13173,83 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
                         )
 
                 self.assertEqual(str(raised.exception), error_code)
+                self.assertIsNone(raised.exception.__cause__)
+
+    def test_apply_saved_location_preserves_new_pagination_diagnostics(self) -> None:
+        """会话层透传新分页码与受控诊断，且不接受未知字段。"""
+
+        class OpenPage:
+            def is_closed(self) -> bool:
+                return False
+
+        location = {
+            "poiId": "visible-poi:target",
+            "name": "北海银滩景区",
+            "address": "广西壮族自治区北海市银海区银滩大道中段",
+            "observedCommissionType": "commission",
+        }
+        for error_code in (
+            "publish_location_action_timeout",
+            "publish_location_click_limit",
+            "publish_location_candidate_limit",
+        ):
+            with self.subTest(error_code=error_code):
+                manager = douyin_commerce_session.DouyinCommerceSessionManager()
+                manager._session = douyin_commerce_session._CommerceEditorSession(
+                    session_id="session-demo",
+                    upload_payload={},
+                    account_name="测试账号",
+                    browser=None,
+                    context=None,
+                    page=OpenPage(),
+                    playwright=None,
+                    uploader=None,
+                )
+                source_error = douyin_commerce_service.DouyinCommerceError(
+                    error_code,
+                    {
+                        "errorCode": error_code,
+                        "stage": "readback",
+                        "keyword": "北海银滩景区",
+                        "loadMoreClicks": 10,
+                        "candidateCount": 100,
+                        "candidateLimit": 100,
+                        "clickLimit": 10,
+                        "operationTimeoutSeconds": 30,
+                    },
+                )
+                source_error.diagnostic["privateDetail"] = "sensitive-dom"
+                with patch.object(
+                    douyin_commerce_session.douyin_commerce_service,
+                    "apply_saved_commerce_location_to_page",
+                    new_callable=AsyncMock,
+                    side_effect=source_error,
+                ):
+                    with self.assertRaises(
+                        douyin_commerce_session.DouyinCommerceSessionError
+                    ) as raised:
+                        manager.apply_saved_location(
+                            "session-demo",
+                            location,
+                            "domestic",
+                            ["北海"],
+                            "commission",
+                        )
+
+                self.assertEqual(str(raised.exception), error_code)
+                self.assertEqual(
+                    raised.exception.diagnostic,
+                    {
+                        "errorCode": error_code,
+                        "stage": "readback",
+                        "keyword": "北海银滩景区",
+                        "loadMoreClicks": 10,
+                        "candidateCount": 100,
+                        "candidateLimit": 100,
+                        "clickLimit": 10,
+                        "operationTimeoutSeconds": 30,
+                    },
+                )
                 self.assertIsNone(raised.exception.__cause__)
 
     def test_apply_saved_location_rejects_invalid_commission_filter_before_dom_action(self) -> None:
