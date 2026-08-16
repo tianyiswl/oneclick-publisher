@@ -3183,10 +3183,10 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
         target.click.assert_awaited_once()
         self.assertEqual(result["location"]["name"], "夜南香北京烤鸭")
 
-    async def test_publish_threads_one_deadline_through_search_load_and_apply(
+    async def test_publish_restarts_deadline_for_each_search_and_load(
         self,
     ) -> None:
-        """正式发布的搜索、分页和点击必须共用同一绝对时间点。"""
+        """搜索和每次分页各有期限；点击回读不复用已完成分页的期限。"""
 
         first = douyin_commerce_service.normalize_commerce_location_candidate(
             {
@@ -3227,7 +3227,7 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(
             douyin_commerce_service,
             "monotonic",
-            return_value=10.0,
+            side_effect=iter((10.0, 15.0)),
         ), patch.object(
             douyin_commerce_service,
             "search_commerce_location_store_candidates",
@@ -3260,8 +3260,7 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["location"]["name"], "目标")
         self.assertEqual(len(deadlines), 3)
-        self.assertEqual(len(set(deadlines)), 1)
-        self.assertGreater(deadlines[0], 10.0)
+        self.assertEqual(deadlines, [40.0, 45.0, None])
 
     async def test_visibility_override_and_hidden_portal_obey_effective_visibility(
         self,
@@ -4874,8 +4873,260 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(load_more.await_count, 2)
         self.assertEqual(result["location"]["poiId"], preset["poiId"])
 
+    async def test_publish_progressive_pages_do_not_share_one_thirty_second_deadline(
+        self,
+    ) -> None:
+        """每次分页均有进展时，累计超过三十秒仍要继续找到第七页目标。"""
+
+        first = douyin_commerce_service.normalize_commerce_location_candidate(
+            {
+                "name": "首屏非目标",
+                "address": "广西北海市候选路0号",
+                "commerceInfo": "1件商品 · 1件返佣",
+            }
+        )
+        preset = douyin_commerce_service.normalize_commerce_location_candidate(
+            {
+                "name": "第七页目标",
+                "address": "广西北海市目标路7号",
+                "commerceInfo": "1件商品 · 1件返佣",
+            }
+        )
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(preset)
+        pages = [first]
+        load_results = []
+        for index in range(1, 8):
+            candidate = (
+                preset
+                if index == 7
+                else douyin_commerce_service.normalize_commerce_location_candidate(
+                    {
+                        "name": f"第{index}页非目标",
+                        "address": f"广西北海市候选路{index}号",
+                        "commerceInfo": "1件商品 · 1件返佣",
+                    }
+                )
+            )
+            pages.append(candidate)
+            load_results.append(
+                {
+                    "platformResultCount": len(pages),
+                    "candidates": list(pages),
+                    "newCandidateCount": 1,
+                    "hasMore": True,
+                    "stopReason": "loaded",
+                }
+            )
+
+        clock = iter(range(0, 400, 5))
+        with patch.object(
+            douyin_commerce_service,
+            "monotonic",
+            side_effect=lambda: next(clock),
+        ), patch.object(
+            douyin_commerce_service,
+            "search_commerce_location_store_candidates",
+            new_callable=AsyncMock,
+            return_value=[first],
+        ), patch.object(
+            douyin_commerce_service,
+            "load_more_commerce_location_candidates",
+            new_callable=AsyncMock,
+            side_effect=load_results,
+        ) as load_more, patch.object(
+            douyin_commerce_service,
+            "_visible_store_listbox",
+            new_callable=AsyncMock,
+            return_value=object(),
+        ), patch.object(
+            douyin_commerce_service,
+            "_apply_open_commerce_location_to_page",
+            new_callable=AsyncMock,
+            return_value={"location": dict(preset)},
+        ), patch.object(
+            douyin_commerce_service,
+            "close_commerce_store_selector",
+            new_callable=AsyncMock,
+        ):
+            result = await douyin_commerce_service.apply_saved_commerce_location_to_page(
+                object(), preset, "domestic", ["第七页目标"], "commission"
+            )
+
+        self.assertEqual(load_more.await_count, 7)
+        self.assertEqual(result["location"]["poiId"], preset["poiId"])
+
+    async def test_publish_reports_action_timeout_with_safe_diagnostic(self) -> None:
+        """单次加载超时时只返回受控诊断，不泄露页面或异常原文。"""
+
+        first = douyin_commerce_service.normalize_commerce_location_candidate(
+            {
+                "name": "非目标",
+                "address": "广西北海市候选路1号",
+                "commerceInfo": "1件商品 · 1件返佣",
+            }
+        )
+        preset = douyin_commerce_service.normalize_commerce_location_candidate(
+            {
+                "name": "超时目标",
+                "address": "广西北海市目标路1号",
+                "commerceInfo": "1件商品 · 1件返佣",
+            }
+        )
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(preset)
+        with patch.object(
+            douyin_commerce_service,
+            "search_commerce_location_store_candidates",
+            new_callable=AsyncMock,
+            return_value=[first],
+        ), patch.object(
+            douyin_commerce_service,
+            "load_more_commerce_location_candidates",
+            new_callable=AsyncMock,
+            side_effect=douyin_commerce_service.DouyinCommerceError(
+                "publish_location_load_more_limit"
+            ),
+        ), patch.object(
+            douyin_commerce_service,
+            "close_commerce_store_selector",
+            new_callable=AsyncMock,
+        ):
+            with self.assertRaises(douyin_commerce_service.DouyinCommerceError) as caught:
+                await douyin_commerce_service.apply_saved_commerce_location_to_page(
+                    object(), preset, "domestic", ["超时目标"], "commission"
+                )
+
+        self.assertEqual(str(caught.exception), "publish_location_action_timeout")
+        self.assertEqual(caught.exception.diagnostic["stage"], "load_more")
+        self.assertEqual(
+            set(caught.exception.diagnostic),
+            {
+                "errorCode",
+                "stage",
+                "keyword",
+                "loadMoreClicks",
+                "candidateCount",
+                "candidateLimit",
+                "clickLimit",
+                "operationTimeoutSeconds",
+            },
+        )
+
+    async def test_publish_reports_click_limit_with_safe_diagnostic(self) -> None:
+        """第十次加载成功后，下一次点击前必须返回点击上限诊断。"""
+
+        first = douyin_commerce_service.normalize_commerce_location_candidate(
+            {
+                "name": "非目标0",
+                "address": "广西北海市候选路0号",
+                "commerceInfo": "1件商品 · 1件返佣",
+            }
+        )
+        preset = douyin_commerce_service.normalize_commerce_location_candidate(
+            {
+                "name": "点击上限目标",
+                "address": "广西北海市目标路1号",
+                "commerceInfo": "1件商品 · 1件返佣",
+            }
+        )
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(preset)
+        accumulated = [first]
+
+        async def load_next(*_args, **_kwargs):
+            index = len(accumulated)
+            accumulated.append(
+                douyin_commerce_service.normalize_commerce_location_candidate(
+                    {
+                        "name": f"非目标{index}",
+                        "address": f"广西北海市候选路{index}号",
+                        "commerceInfo": "1件商品 · 1件返佣",
+                    }
+                )
+            )
+            return {
+                "platformResultCount": len(accumulated),
+                "candidates": list(accumulated),
+                "newCandidateCount": 1,
+                "hasMore": True,
+                "stopReason": "loaded",
+            }
+
+        with patch.object(
+            douyin_commerce_service,
+            "search_commerce_location_store_candidates",
+            new_callable=AsyncMock,
+            return_value=[first],
+        ), patch.object(
+            douyin_commerce_service,
+            "load_more_commerce_location_candidates",
+            new_callable=AsyncMock,
+            side_effect=load_next,
+        ) as load_more, patch.object(
+            douyin_commerce_service,
+            "close_commerce_store_selector",
+            new_callable=AsyncMock,
+        ):
+            with self.assertRaises(douyin_commerce_service.DouyinCommerceError) as caught:
+                await douyin_commerce_service.apply_saved_commerce_location_to_page(
+                    object(),
+                    preset,
+                    "domestic",
+                    ["点击上限目标"],
+                    "commission",
+                )
+
+        self.assertEqual(str(caught.exception), "publish_location_click_limit")
+        self.assertEqual(caught.exception.diagnostic["loadMoreClicks"], 10)
+        self.assertEqual(load_more.await_count, 10)
+
+    async def test_publish_reports_candidate_limit_with_safe_diagnostic(self) -> None:
+        """一百个唯一候选已到达时，下一次点击前必须返回候选上限诊断。"""
+
+        candidates = [
+            douyin_commerce_service.normalize_commerce_location_candidate(
+                {
+                    "name": f"非目标{index}",
+                    "address": f"广西北海市候选路{index}号",
+                    "commerceInfo": "1件商品 · 1件返佣",
+                }
+            )
+            for index in range(100)
+        ]
+        preset = douyin_commerce_service.normalize_commerce_location_candidate(
+            {
+                "name": "候选上限目标",
+                "address": "广西北海市目标路1号",
+                "commerceInfo": "1件商品 · 1件返佣",
+            }
+        )
+        self.assertIsNotNone(preset)
+        with patch.object(
+            douyin_commerce_service,
+            "search_commerce_location_store_candidates",
+            new_callable=AsyncMock,
+            return_value=candidates,
+        ), patch.object(
+            douyin_commerce_service,
+            "load_more_commerce_location_candidates",
+            new_callable=AsyncMock,
+        ) as load_more, patch.object(
+            douyin_commerce_service,
+            "close_commerce_store_selector",
+            new_callable=AsyncMock,
+        ):
+            with self.assertRaises(douyin_commerce_service.DouyinCommerceError) as caught:
+                await douyin_commerce_service.apply_saved_commerce_location_to_page(
+                    object(), preset, "domestic", ["候选上限目标"], "commission"
+                )
+
+        self.assertEqual(str(caught.exception), "publish_location_candidate_limit")
+        self.assertEqual(caught.exception.diagnostic["candidateCount"], 100)
+        load_more.assert_not_awaited()
+
     async def test_publish_stops_after_ten_clicks(self) -> None:
-        """加载次数超出硬上限时必须固定码停止，不继续点击。"""
+        """加载次数超出硬上限时必须报告点击上限，不继续点击。"""
 
         first = douyin_commerce_service.normalize_commerce_location_candidate(
             {
@@ -4930,7 +5181,7 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.assertRaisesRegex(
                 douyin_commerce_service.DouyinCommerceError,
-                "^publish_location_load_more_limit$",
+                "^publish_location_click_limit$",
             ):
                 await douyin_commerce_service.apply_saved_commerce_location_to_page(
                     object(),
@@ -5001,7 +5252,7 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.assertRaisesRegex(
                 douyin_commerce_service.DouyinCommerceError,
-                "^publish_location_load_more_limit$",
+                "^publish_location_click_limit$",
             ):
                 await douyin_commerce_service.apply_saved_commerce_location_to_page(
                     object(),
@@ -5069,7 +5320,7 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.assertRaisesRegex(
                 douyin_commerce_service.DouyinCommerceError,
-                "^publish_location_load_more_limit$",
+                "^publish_location_candidate_limit$",
             ):
                 await douyin_commerce_service.apply_saved_commerce_location_to_page(
                     object(),
@@ -5081,8 +5332,8 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(load_more_mock.await_count, 2)
 
-    async def test_publish_shares_total_wait_budget_across_keywords(self) -> None:
-        """前一关键词耗尽总等待预算后，不得再为下一关键词重开三十秒。"""
+    async def test_publish_restarts_action_deadline_across_keywords(self) -> None:
+        """前一关键词已完成后，下一次搜索必须拥有新的单次动作期限。"""
 
         first = douyin_commerce_service.normalize_commerce_location_candidate(
             {
@@ -5126,7 +5377,7 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.assertRaisesRegex(
                 douyin_commerce_service.DouyinCommerceError,
-                "^publish_location_load_more_limit$",
+                "^publish_location_not_found_after_all_pages$",
             ):
                 await douyin_commerce_service.apply_saved_commerce_location_to_page(
                     object(),
@@ -5136,10 +5387,10 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
                     "commission",
                 )
 
-        self.assertEqual(search.await_count, 1)
+        self.assertEqual(search.await_count, 3)
 
     async def test_publish_stops_at_one_hundred_candidates(self) -> None:
-        """候选达到一百条时必须在下一次点击前安全停止。"""
+        """候选达到一百条时必须在下一次点击前报告候选上限。"""
 
         candidates = [
             douyin_commerce_service.normalize_commerce_location_candidate(
@@ -5174,7 +5425,7 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.assertRaisesRegex(
                 douyin_commerce_service.DouyinCommerceError,
-                "^publish_location_load_more_limit$",
+                "^publish_location_candidate_limit$",
             ):
                 await douyin_commerce_service.apply_saved_commerce_location_to_page(
                     object(), preset, "domestic", ["夜南香"], "commission"
@@ -5231,7 +5482,7 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.assertRaisesRegex(
                 douyin_commerce_service.DouyinCommerceError,
-                "^publish_location_load_more_limit$",
+                "^publish_location_candidate_limit$",
             ) as raised:
                 await douyin_commerce_service.apply_saved_commerce_location_to_page(
                     object(), preset, "domestic", ["目标"], "commission"
@@ -5297,7 +5548,7 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.assertRaisesRegex(
                 douyin_commerce_service.DouyinCommerceError,
-                "^publish_location_load_more_limit$",
+                "^publish_location_candidate_limit$",
             ):
                 await douyin_commerce_service.apply_saved_commerce_location_to_page(
                     object(), preset, "domestic", ["目标"], "commission"
