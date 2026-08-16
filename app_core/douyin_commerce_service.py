@@ -2855,7 +2855,7 @@ async def _unique_visible_load_more_control(page) -> Any | None:
                     ? boundedPanel.closest(genericOwnerSelector) : null;
                 const exactLoadMoreTextNodes = boundedPanel
                     ? Array.from(boundedPanel.querySelectorAll('*')).filter(node => {
-                        if (!isEffectivelyVisible(node) || listbox.contains(node)) {
+                        if (!isEffectivelyVisible(node)) {
                             return false;
                         }
                         const text = normalize(node instanceof HTMLInputElement
@@ -2889,9 +2889,11 @@ async def _unique_visible_load_more_control(page) -> Any | None:
                         ? node.value : (node.innerText || node.textContent));
                     return text.includes('点击加载更多') || text.includes('加载更多');
                 });
-                // 抖音实页有时把分页入口渲染成普通 div/span，
-                // 由 React 在上层统一代理 click，DOM 上没有 role/onclick。
-                // 仅在已锁定的地点面板内、列表之后接受精确文案。
+                // 抖音实页有时把分页入口渲染在 listbox 的末尾，使用普通
+                // div/span 并由 React 在上层统一代理 click，DOM 上没有
+                // role/onclick。精确文案节点已经受当前唯一地点面板、唯一
+                // listbox 和完整地点候选约束，因此允许它位于 listbox 内；
+                // 普通“加载更多”仍只接受列表外的可交互控件。
                 const candidates = Array.from(new Set([
                     ...interactiveCandidates,
                     ...exactLoadMoreTextNodes,

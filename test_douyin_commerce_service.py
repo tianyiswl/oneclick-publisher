@@ -6005,6 +6005,63 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await browser.close()
 
+    async def test_load_more_clicks_exact_row_inside_current_listbox(self) -> None:
+        """实页分页行位于 listbox 内时也必须点击并读取新增地点。"""
+
+        html = """
+        <section role="dialog">
+          <div id="current-location-content">
+            <nav><span>本地</span><span>国内</span></nav>
+            <input value="夜南香" />
+            <div id="location-results" role="listbox">
+              <div role="option" data-store-id="poi-1">
+                <span data-store-name>夜南香银滩店</span>
+                <span data-store-address>广西北海市银海区银滩路 1 号</span>
+              </div>
+              <div id="inside-list-load-row"><span>点击加载更多</span></div>
+            </div>
+          </div>
+        </section>
+        <script>
+          document.addEventListener('click', event => {
+            if (!event.target.closest('#inside-list-load-row')) return;
+            const row = document.createElement('div');
+            row.setAttribute('role', 'option');
+            row.setAttribute('data-store-id', 'poi-2');
+            row.innerHTML = '<span data-store-name>夜南香侨港店</span>'
+              + '<span data-store-address>广西北海市银海区侨港路 2 号</span>';
+            document.querySelector('#inside-list-load-row').before(row);
+          });
+        </script>
+        """
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+                first_page = (
+                    douyin_commerce_service.normalize_commerce_location_candidates(
+                        await douyin_commerce_service._store_option_descriptors(
+                            page.locator("#location-results")
+                        )
+                    )
+                )
+
+                result = await douyin_commerce_service.load_more_commerce_location_candidates(
+                    page,
+                    previous_candidates=first_page,
+                    commission_filter="all",
+                    timeout_ms=5_000,
+                )
+
+                self.assertEqual(result["newCandidateCount"], 1)
+                self.assertIn(
+                    "夜南香侨港店",
+                    [candidate["name"] for candidate in result["candidates"]],
+                )
+            finally:
+                await browser.close()
+
     async def test_load_more_reanchors_location_panel_after_platform_rerender(
         self,
     ) -> None:
