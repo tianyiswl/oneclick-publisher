@@ -5989,6 +5989,66 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await browser.close()
 
+    async def test_load_more_reanchors_location_panel_after_platform_rerender(
+        self,
+    ) -> None:
+        """平台重绘并清掉临时 marker 后，当前地点面板仍应重新取得分页入口。"""
+
+        html = """
+        <section id="shared-editor" role="dialog">
+          <div id="current-location-content">
+            <nav><button>本地</button><button>国内</button></nav>
+            <input id="rerendered-location-search" value="夜南香" />
+            <div id="rerendered-location-results" role="listbox">
+              <div role="option" data-store-id="poi-1">
+                <span data-store-name>夜南香银滩店</span>
+                <span data-store-address>广西北海市银海区银滩路 1 号</span>
+              </div>
+            </div>
+            <button id="rerendered-load-more" onclick="appendRerenderedLocation()">
+              点击加载更多
+            </button>
+          </div>
+        </section>
+        <script>
+          function appendRerenderedLocation() {
+            const row = document.createElement('div');
+            row.setAttribute('role', 'option');
+            row.setAttribute('data-store-id', 'poi-2');
+            row.innerHTML = '<span data-store-name>夜南香侨港店</span>'
+              + '<span data-store-address>广西北海市银海区侨港路 2 号</span>';
+            document.querySelector('#rerendered-location-results').appendChild(row);
+          }
+        </script>
+        """
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+                first_page = (
+                    douyin_commerce_service.normalize_commerce_location_candidates(
+                        await douyin_commerce_service._store_option_descriptors(
+                            page.locator("#rerendered-location-results")
+                        )
+                    )
+                )
+
+                result = await douyin_commerce_service.load_more_commerce_location_candidates(
+                    page,
+                    previous_candidates=first_page,
+                    commission_filter="all",
+                    timeout_ms=5_000,
+                )
+
+                self.assertEqual(result["newCandidateCount"], 1)
+                self.assertIn(
+                    "夜南香侨港店",
+                    [candidate["name"] for candidate in result["candidates"]],
+                )
+            finally:
+                await browser.close()
+
     async def test_load_more_collapses_nested_nodes_for_one_logical_button(self) -> None:
         """A button and its labelled descendant represent one logical control."""
 

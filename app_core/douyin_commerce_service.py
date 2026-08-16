@@ -1704,6 +1704,20 @@ async def _visible_store_listbox(page) -> Any | None:
                 const ownedOptions = list => Array.from(
                     list.querySelectorAll('[role="option"]')
                 ).filter(option => option.closest('[role="listbox"]') === list);
+                const labelLeaves = (root, label) => Array.from(
+                    root.querySelectorAll('*')
+                ).filter(isEffectivelyVisible)
+                    .filter(node => normalize(node.innerText || node.textContent) === label)
+                    .filter(node => !Array.from(node.children).some(child =>
+                        isEffectivelyVisible(child)
+                        && normalize(child.innerText || child.textContent) === label));
+                const editableSelector =
+                    'input, textarea, [contenteditable="true"][role="textbox"]';
+                const editableFields = root => Array.from(
+                    root.querySelectorAll(editableSelector)
+                ).filter(isEffectivelyVisible).filter(node =>
+                    !node.disabled && !node.readOnly
+                    && String(node.type || '').toLowerCase() !== 'hidden');
                 const lists = Array.from(document.querySelectorAll('[role="listbox"]'))
                     .filter(isEffectivelyVisible)
                     .filter(list => !list.parentElement?.closest('[role="listbox"]'))
@@ -1715,7 +1729,45 @@ async def _visible_store_listbox(page) -> Any | None:
                         });
                     });
                 if (lists.length !== 1) return { count: lists.length };
-                lists[0].dataset.oneclickCommerceStoreList = 'active';
+                const list = lists[0];
+                let currentPanel = null;
+                let currentInput = null;
+                for (let current = list.parentElement, depth = 0;
+                    current && current !== document.body && depth < 10;
+                    current = current.parentElement, depth += 1) {
+                    if (labelLeaves(current, '本地').length !== 1
+                        || labelLeaves(current, '国内').length !== 1) {
+                        continue;
+                    }
+                    const fields = editableFields(current);
+                    if (fields.length === 1) {
+                        currentPanel = current;
+                        currentInput = fields[0];
+                    }
+                    break;
+                }
+                // 平台加载新一批候选时可能替换整个地点 portal，旧的 input/panel
+                // marker 会随分离节点消失。候选列表本身已通过唯一完整地点校验，
+                // 这里从同一列表反向重建当前面板 marker，供分页入口继续定位。
+                if (currentPanel && currentInput) {
+                    document.querySelectorAll(
+                        '[data-oneclick-commerce-search-input]'
+                    ).forEach(node => node.removeAttribute(
+                        'data-oneclick-commerce-search-input'
+                    ));
+                    document.querySelectorAll(
+                        '[data-oneclick-commerce-location-panel]'
+                    ).forEach(node => node.removeAttribute(
+                        'data-oneclick-commerce-location-panel'
+                    ));
+                    currentInput.dataset.oneclickCommerceSearchInput = 'active';
+                    currentPanel.dataset.oneclickCommerceLocationPanel = 'active';
+                }
+                document.querySelectorAll('[data-oneclick-commerce-store-list]')
+                    .forEach(node => node.removeAttribute(
+                        'data-oneclick-commerce-store-list'
+                    ));
+                list.dataset.oneclickCommerceStoreList = 'active';
                 return { count: 1 };
             }"""
     )
