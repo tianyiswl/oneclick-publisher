@@ -21,6 +21,7 @@ from app_core.douyin_commerce_batch_executor import (
     _location_search_keywords,
 )
 from app_core.douyin_commerce_batch_service import apply_interval_schedule, validate_batch_payload
+from app_core.douyin_commerce_session import DouyinCommerceSessionError
 from app_core.douyin_location_service import normalize_location_candidate
 from app_core.douyin_sms_cooldown import DouyinSmsCooldownGate
 from app_core.douyin_verification import (
@@ -539,6 +540,90 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
         self.assertEqual(
             manager.closed_session_ids,
             ["session-1", "session-2"],
+        )
+
+    def test_location_limit_failure_passes_exact_public_diagnostic_and_continues(self) -> None:
+        """若执行器丢弃地点上限诊断，失败事件将无法说明安全停止原因。"""
+
+        class LocationLimitManager(FakeCommerceSessionManager):
+            def apply_saved_location(
+                self,
+                session_id: str,
+                preset: dict,
+                scope: str,
+                keywords: list[str],
+                commission_filter: str,
+            ) -> dict:
+                result = super().apply_saved_location(
+                    session_id,
+                    preset,
+                    scope,
+                    keywords,
+                    commission_filter,
+                )
+                if session_id == "session-1":
+                    raise DouyinCommerceSessionError(
+                        "publish_location_candidate_limit",
+                        {
+                            "errorCode": "publish_location_candidate_limit",
+                            "stage": "search",
+                            "keyword": "北海银滩景区",
+                            "loadMoreClicks": 7,
+                            "candidateCount": 100,
+                            "candidateLimit": 100,
+                        },
+                    )
+                return result
+
+        class RecordingTaskStore:
+            def __init__(self) -> None:
+                self.progress_writes: list[dict[str, object]] = []
+
+            def __getattr__(self, name: str):
+                return getattr(task_service, name)
+
+            def get_task(self, task_id: int) -> dict:
+                return task_service.get_task(task_id)
+
+            def mark_batch_item_result(self, *args, **kwargs) -> None:
+                self.progress_writes.append(dict(kwargs))
+                task_service.mark_batch_item_result(*args, **kwargs)
+
+        batch = {**self.batch, "items": [dict(item) for item in self.batch["items"][:2]]}
+        task = task_service.create_douyin_batch_task(batch)
+        store = RecordingTaskStore()
+
+        result = DouyinCommerceBatchExecutor(
+            LocationLimitManager(),
+            task_store=store,
+        ).run_publish(batch, task_id=task["id"], confirmed=True)
+
+        self.assertEqual([row["status"] for row in result], ["failed", "published"])
+        self.assertEqual(
+            result[0]["diagnostic"],
+            "发布定位恢复失败：累计检查 100 个不同地点、加载 7 次仍未命中目标"
+            "（错误码 publish_location_candidate_limit）",
+        )
+        self.assertEqual(
+            task_service.get_task(task["id"])["items"][0]["message"],
+            "第 1 条视频未完成平台回读："
+            "发布定位恢复失败：累计检查 100 个不同地点、加载 7 次仍未命中目标"
+            "（错误码 publish_location_candidate_limit）",
+        )
+        self.assertEqual(
+            next(
+                write["readback"]
+                for write in store.progress_writes
+                if write["event_type"] == "batch_item_failed"
+            ),
+            {
+                "errorCode": "publish_location_candidate_limit",
+                "stage": "search",
+                "keyword": "北海银滩景区",
+                "loadMoreClicks": 7,
+                "candidateCount": 100,
+                "candidateLimit": 100,
+            },
         )
 
     def test_legacy_location_without_commission_filter_defaults_to_all(self) -> None:

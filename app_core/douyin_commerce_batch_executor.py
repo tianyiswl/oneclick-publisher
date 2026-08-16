@@ -192,9 +192,67 @@ _PUBLIC_BATCH_DIAGNOSTICS = {
 }
 
 
+_LOCATION_DIAGNOSTIC_FIELDS = (
+    "errorCode",
+    "stage",
+    "keyword",
+    "loadMoreClicks",
+    "candidateCount",
+    "candidateLimit",
+    "clickLimit",
+    "operationTimeoutSeconds",
+)
+
+
+def _public_location_diagnostic(value: object, *, error_code: str) -> dict[str, object]:
+    """只接收会话层已净化的地点诊断，不让异常附带字段进入任务事件。"""
+
+    if type(value) is not dict:
+        return {}
+    diagnostic = {
+        field: value[field]
+        for field in _LOCATION_DIAGNOSTIC_FIELDS
+        if field in value
+    }
+    if diagnostic:
+        diagnostic["errorCode"] = error_code
+    return diagnostic
+
+
+def format_public_location_failure(
+    error_code: object,
+    diagnostic: Mapping[str, object] | None = None,
+) -> str:
+    """将受控地点失败码格式化为可显示、可审计的公开说明。"""
+
+    code = _text(error_code)
+    if code == "publish_location_candidate_limit":
+        count = diagnostic.get("candidateCount") if diagnostic else None
+        clicks = diagnostic.get("loadMoreClicks") if diagnostic else None
+        if type(count) is int and type(clicks) is int:
+            return (
+                f"发布定位恢复失败：累计检查 {count} 个不同地点、加载 {clicks} 次仍未命中目标"
+                f"（错误码 {code}）"
+            )
+    if code == "publish_location_click_limit":
+        clicks = diagnostic.get("loadMoreClicks") if diagnostic else None
+        if type(clicks) is int:
+            return (
+                f"发布定位恢复失败：已加载 {clicks} 次仍未命中目标，达到自动点击安全上限"
+                f"（错误码 {code}）"
+            )
+    if code == "publish_location_action_timeout":
+        timeout = diagnostic.get("operationTimeoutSeconds") if diagnostic else None
+        if type(timeout) is int:
+            return (
+                f"发布定位恢复失败：平台地点操作超过 {timeout} 秒安全时限"
+                f"（错误码 {code}）"
+            )
+    return _PUBLIC_BATCH_DIAGNOSTICS.get(code, code)
+
+
 def _public_batch_diagnostic(value: object) -> str:
-    diagnostic = _text(value)
-    return _PUBLIC_BATCH_DIAGNOSTICS.get(diagnostic, diagnostic)
+    return format_public_location_failure(_text(value))
 
 
 def _is_intervention_error(error: Exception) -> bool:
@@ -542,6 +600,7 @@ class DouyinCommerceBatchExecutor:
         ok: bool,
         event_type: str,
         message: str,
+        readback: Mapping[str, object] | None = None,
     ) -> None:
         self._task_store.mark_batch_item_result(
             int(task_id),
@@ -549,7 +608,7 @@ class DouyinCommerceBatchExecutor:
             ok=ok,
             event_type=event_type,
             message=message,
-            readback={},
+            readback=dict(readback) if isinstance(readback, Mapping) else {},
         )
 
     def _record_final_submit_result(
@@ -1283,7 +1342,15 @@ class DouyinCommerceBatchExecutor:
                 )
             raise
         except Exception as exc:
-            diagnostic = _text(exc)[:240] or "未取得可用的平台回执"
+            error_code = _text(exc)[:240] or "未取得可用的平台回执"
+            location_diagnostic = _public_location_diagnostic(
+                getattr(exc, "diagnostic", None),
+                error_code=error_code,
+            )
+            diagnostic = format_public_location_failure(
+                error_code,
+                location_diagnostic,
+            )
             if self._has_active_verification(task_id):
                 # 仅 broker 仍持有同一 active 请求时才保留会话。真实 manager 在
                 # 该会话内等待用户输入并从当前 submit 调用继续，因此不会重复提交。
@@ -1347,10 +1414,11 @@ class DouyinCommerceBatchExecutor:
                 task_id, item_id, ok=False, event_type="batch_item_failed",
                 message=(
                     f"第 {index + 1} 条视频未完成平台回读："
-                    f"{_public_batch_diagnostic(diagnostic)}"
+                    f"{diagnostic}"
                 ),
+                readback=location_diagnostic,
             )
-            public_diagnostic = _public_batch_diagnostic(diagnostic)
+            public_diagnostic = diagnostic
             self._emit(
                 progress,
                 index=index,
