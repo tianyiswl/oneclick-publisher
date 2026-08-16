@@ -55,6 +55,18 @@ _BATCH_READBACK_FIELDS = {
     "cooldownStartedAt",
     "cooldownSeconds",
 }
+_LOCATION_DIAGNOSTIC_STRING_FIELDS = frozenset({
+    "errorCode",
+    "stage",
+    "keyword",
+})
+_LOCATION_DIAGNOSTIC_COUNT_FIELDS = frozenset({
+    "loadMoreClicks",
+    "candidateCount",
+    "candidateLimit",
+    "clickLimit",
+    "operationTimeoutSeconds",
+})
 
 
 def _now() -> str:
@@ -89,16 +101,35 @@ def _payloads_from_json(payload_json: object) -> list[dict]:
     return [dict(item) for item in payloads if isinstance(item, dict)] if isinstance(payloads, list) else []
 
 
-def _batch_readback_projection(readback: object) -> dict[str, str]:
+def _batch_readback_projection(readback: object) -> dict[str, str | int]:
     """只保留可审计的非敏感平台回执字段。"""
 
     if not isinstance(readback, dict):
         return {}
-    return {
+    projected: dict[str, str | int] = {
         key: str(value).strip()
         for key, value in readback.items()
         if key in _BATCH_READBACK_FIELDS and isinstance(value, str) and value.strip()
     }
+    projected.update(
+        {
+            key: value
+            for key, value in readback.items()
+            if key in _LOCATION_DIAGNOSTIC_STRING_FIELDS
+            and type(value) is str
+            and value.strip()
+        }
+    )
+    projected.update(
+        {
+            key: value
+            for key, value in readback.items()
+            if key in _LOCATION_DIAGNOSTIC_COUNT_FIELDS
+            and type(value) is int
+            and value >= 0
+        }
+    )
+    return projected
 
 
 def content_type_from_payload_json(payload_json: object) -> str:

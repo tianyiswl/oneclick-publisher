@@ -1384,6 +1384,50 @@ class DouyinCommerceBatchTaskTests(unittest.TestCase):
             {"scheduleTime": "2026-08-07 09:00", "platformPostId": "post-001"},
         )
 
+    def test_location_failure_diagnostic_is_whitelisted_before_persistence(self) -> None:
+        """诊断事件必须只落库公开字段及其严格的原生值类型。"""
+
+        task = task_service.create_douyin_batch_task(self.batch)
+        task_id = task["id"]
+        item_id = task_service.get_task(task_id)["items"][0]["id"]
+
+        class ForgedStr(str):
+            pass
+
+        task_service.mark_batch_item_result(
+            task_id,
+            item_id,
+            ok=False,
+            message="发布定位恢复失败：累计检查 100 个不同地点、加载 7 次仍未命中目标（错误码 publish_location_candidate_limit）",
+            event_type="batch_item_failed",
+            readback={
+                "errorCode": "publish_location_candidate_limit",
+                "stage": ForgedStr("load_more"),
+                "keyword": "夜南香",
+                "loadMoreClicks": 7,
+                "candidateCount": 100,
+                "candidateLimit": "100",
+                "clickLimit": True,
+                "operationTimeoutSeconds": 30.0,
+                "stringCount": "100",
+                "cookie": "must-not-store",
+                "dom": "must-not-store",
+                "path": "/private/platform/profile",
+                "unknownField": "must-not-store",
+            },
+        )
+
+        detail = json.loads(task_service.get_task(task_id)["events"][-1]["detailJson"])
+        self.assertEqual(
+            detail,
+            {
+                "errorCode": "publish_location_candidate_limit",
+                "keyword": "夜南香",
+                "loadMoreClicks": 7,
+                "candidateCount": 100,
+            },
+        )
+
     def test_normal_event_after_success_does_not_roll_back_item_status(self) -> None:
         task = task_service.create_douyin_batch_task(self.batch)
         task_id = task["id"]
