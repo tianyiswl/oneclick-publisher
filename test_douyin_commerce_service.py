@@ -5393,6 +5393,56 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(search.await_count, 2)
         load_more.assert_awaited_once()
 
+    async def test_publish_search_timeout_on_broad_keyword_continues_exact_keyword(
+        self,
+    ) -> None:
+        """宽词首页搜索超时后必须关闭当前面板并尝试精确词。"""
+
+        preset = douyin_commerce_service.normalize_commerce_location_candidate(
+            {
+                "name": "夜南香北京烤鸭(杨头店)",
+                "address": "山东省青岛市即墨区龙泉街道河北杨头村123号正房四同西房两间",
+                "commerceInfo": "1件商品 · 1件返佣",
+            }
+        )
+        self.assertIsNotNone(preset)
+        with patch.object(
+            douyin_commerce_service,
+            "search_commerce_location_store_candidates",
+            new_callable=AsyncMock,
+            side_effect=[
+                douyin_commerce_service.DouyinCommerceError(
+                    "publish_location_load_more_limit"
+                ),
+                [preset],
+            ],
+        ) as search, patch.object(
+            douyin_commerce_service,
+            "_visible_store_listbox",
+            new_callable=AsyncMock,
+            return_value=object(),
+        ), patch.object(
+            douyin_commerce_service,
+            "_apply_open_commerce_location_to_page",
+            new_callable=AsyncMock,
+            return_value={"location": dict(preset)},
+        ), patch.object(
+            douyin_commerce_service,
+            "close_commerce_store_selector",
+            new_callable=AsyncMock,
+        ):
+            result = await douyin_commerce_service.apply_saved_commerce_location_to_page(
+                object(),
+                preset,
+                "domestic",
+                ["夜南香", "夜南香北京烤鸭(杨头店)"],
+                "commission",
+            )
+
+        self.assertEqual(result["matchedKeyword"], "夜南香北京烤鸭(杨头店)")
+        self.assertEqual(result["location"]["poiId"], preset["poiId"])
+        self.assertEqual(search.await_count, 2)
+
     async def test_publish_stops_after_ten_clicks(self) -> None:
         """加载次数超出硬上限时必须报告点击上限，不继续点击。"""
 

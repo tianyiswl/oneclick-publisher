@@ -3870,7 +3870,7 @@ async def apply_saved_commerce_location_to_page(
                 }:
                     raise
                 if str(exc) == _PUBLISH_LOCATION_LIMIT_CODE:
-                    raise _location_failure(
+                    search_timeout_error = _location_failure(
                         "publish_location_action_timeout",
                         stage="search",
                         keyword=keyword,
@@ -3879,7 +3879,14 @@ async def apply_saved_commerce_location_to_page(
                         candidates=len(seen_candidate_identities),
                         max_candidates=max_candidates,
                         max_load_more_clicks=max_load_more_clicks,
-                    ) from None
+                    )
+                    if attempt == len(bounded_keywords):
+                        raise search_timeout_error from None
+                    douyin_logger.warning(
+                        f"抖音发布定位关键词“{keyword}”搜索等待超过安全时限，"
+                        "将切换下一精确关键词继续匹配"
+                    )
+                    continue
                 douyin_logger.warning(
                     f"抖音发布定位关键词“{keyword}”搜索失败："
                     f"{_normalized(str(exc))[:220] or type(exc).__name__}；"
