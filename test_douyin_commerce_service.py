@@ -5305,8 +5305,10 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
 
         apply_open.assert_not_awaited()
 
-    async def test_publish_stops_after_two_consecutive_zero_growth_rounds(self) -> None:
-        """连续两次零新增是受控穷尽，不允许无限点击。"""
+    async def test_publish_continues_after_two_duplicate_pages_until_target_appears(
+        self,
+    ) -> None:
+        """重复页不能冒充穷尽，后续页出现目标时必须继续命中。"""
 
         first = douyin_commerce_service.normalize_commerce_location_candidate(
             {
@@ -5329,6 +5331,13 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
             "hasMore": True,
             "stopReason": "no_new_candidates",
         }
+        target_page = {
+            "platformResultCount": 2,
+            "candidates": [first, preset],
+            "newCandidateCount": 1,
+            "hasMore": True,
+            "stopReason": "loaded",
+        }
         with patch.object(
             douyin_commerce_service,
             "search_commerce_location_store_candidates",
@@ -5338,21 +5347,28 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
             douyin_commerce_service,
             "load_more_commerce_location_candidates",
             new_callable=AsyncMock,
-            side_effect=[zero_growth, zero_growth],
+            side_effect=[zero_growth, zero_growth, target_page],
         ) as load_more, patch.object(
+            douyin_commerce_service,
+            "_visible_store_listbox",
+            new_callable=AsyncMock,
+            return_value=object(),
+        ), patch.object(
+            douyin_commerce_service,
+            "_apply_open_commerce_location_to_page",
+            new_callable=AsyncMock,
+            return_value={"location": dict(preset)},
+        ), patch.object(
             douyin_commerce_service,
             "close_commerce_store_selector",
             new_callable=AsyncMock,
         ):
-            with self.assertRaisesRegex(
-                douyin_commerce_service.DouyinCommerceError,
-                "^publish_location_not_found_after_all_pages$",
-            ):
-                await douyin_commerce_service.apply_saved_commerce_location_to_page(
-                    object(), preset, "domestic", ["夜南香"], "commission"
-                )
+            result = await douyin_commerce_service.apply_saved_commerce_location_to_page(
+                object(), preset, "domestic", ["夜南香"], "commission"
+            )
 
-        self.assertEqual(load_more.await_count, 2)
+        self.assertEqual(load_more.await_count, 3)
+        self.assertEqual(result["location"]["poiId"], preset["poiId"])
 
     async def test_publish_stops_when_platform_reports_no_more_candidates(self) -> None:
         """平台明确无更多时只点击一次，并投影固定穷尽错误。"""
@@ -10052,8 +10068,8 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
             },
         )
 
-    def test_setup_load_more_stops_on_second_effective_zero_growth(self) -> None:
-        """底层声称增长也不能覆盖四字段集合实际连续两次零增长。"""
+    def test_setup_load_more_keeps_platform_has_more_after_duplicate_page(self) -> None:
+        """完整身份重复只记录零增长，不得覆盖平台仍有下一页。"""
 
         previous = self._session_location_candidates(3)
         manager, _page = self._session_with_location_limit_context(
@@ -10074,7 +10090,7 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
                 "candidates": [dict(item) for item in previous],
                 "newCandidateCount": 1,
                 "hasMore": True,
-                "stopReason": "loaded",
+                "stopReason": "no_new_candidates",
             },
         ):
             result = manager.load_more_locations(
@@ -10086,8 +10102,8 @@ class DouyinCommerceSessionContractTests(unittest.TestCase):
             )
 
         self.assertEqual(result["newCandidateCount"], 0)
-        self.assertFalse(result["hasMore"])
-        self.assertEqual(result["stopReason"], "zero_growth_limit")
+        self.assertTrue(result["hasMore"])
+        self.assertEqual(result["stopReason"], "no_new_candidates")
         self.assertEqual(manager._session.location_search_context.zero_growth_count, 2)
 
     def test_load_more_uses_accumulated_context_and_rejects_an_old_page(self):
@@ -16312,26 +16328,23 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         state = self.page._batch_location_state()
         self.assertEqual(state["platformLoadCount"], 1)
         self.assertEqual(state["zeroGrowthCount"], 0)
-        self.assertTrue(state["hasMore"])
+        self.assertFalse(state["hasMore"])
         self.assertEqual(state["source"], "platform")
         self.assertEqual(len(state["candidates"]), 11)
-        self.assertNotIn(
-            "已加载全部地址",
-            self.page._batch_location_feedback,
-        )
+        self.assertEqual(self.page._batch_location_feedback, "已加载全部地址")
         self.assertEqual(
             self.page.batch_location_load_more_button.text(),
             "加载更多地点",
         )
-        self.assertTrue(self.page.batch_location_load_more_button.isEnabled())
+        self.assertFalse(self.page.batch_location_load_more_button.isEnabled())
         self.assertTrue(
             self.page.batch_location_load_more_progress.isHidden()
         )
 
-    def test_load_more_button_waits_for_two_zero_growth_pages_before_disabling(
+    def test_load_more_button_stays_enabled_after_two_duplicate_platform_pages(
         self,
     ) -> None:
-        """单次未发现后续入口不能提前终止用户的再次加载机会。"""
+        """本地已有同样地点时，连续重复页也不得禁用继续加载。"""
 
         self._activate_cached_location_search(account_id=608)
         cached = self._cached_location_candidates(1)
@@ -16362,8 +16375,8 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             "platformResultCount": 1,
             "candidates": cached,
             "newCandidateCount": 0,
-            "hasMore": False,
-            "stopReason": "no_visible_load_more_control",
+            "hasMore": True,
+            "stopReason": "no_new_candidates",
         }
 
         with patch.object(
@@ -16385,7 +16398,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             )
             self.assertEqual(
                 self.page._batch_location_feedback,
-                "本批未新增地址，可再次加载确认",
+                "本批未新增地址，仍可继续加载",
             )
 
             self.page._batch_location_load_more_succeeded(
@@ -16396,13 +16409,13 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
 
         final_state = self.page._batch_location_state()
         self.assertEqual(final_state["zeroGrowthCount"], 2)
-        self.assertFalse(final_state["hasMore"])
-        self.assertFalse(
+        self.assertTrue(final_state["hasMore"])
+        self.assertTrue(
             self.page.batch_location_load_more_button.isEnabled()
         )
         self.assertEqual(
             self.page._batch_location_feedback,
-            "连续两次没有新增有效地点，已停止加载",
+            "本批未新增地址，仍可继续加载",
         )
 
     def test_cache_merge_does_not_overwrite_load_more_terminal_feedback(self) -> None:

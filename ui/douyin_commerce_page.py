@@ -1957,8 +1957,6 @@ class DouyinCommercePage(QWidget):
             >= _BATCH_LOCATION_MAX_IDENTITIES
         ):
             return "已达到平台候选上限（100 个）"
-        if int(state.get("zeroGrowthCount") or 0) >= 2:
-            return "连续两次没有新增有效地点，已停止加载"
         return ""
 
     @classmethod
@@ -3059,21 +3057,10 @@ class DouyinCommercePage(QWidget):
             if effective_new_count == 0
             else 0
         )
-        # 平台地点浮层会在换页重绘时短暂丢失“加载更多”入口，底层因此可能
-        # 回报 hasMore=False。页面仍应按既定的“两次连续零增长”规则给用户
-        # 下一次确认机会，不能用单次 DOM 缺失提前终止分页。
-        effective_has_more = True
+        effective_has_more = has_more
         if platform_load_count >= 10:
             effective_has_more = False
         elif len(display_raw) >= _BATCH_LOCATION_MAX_IDENTITIES:
-            effective_has_more = False
-        elif zero_growth_count >= 2:
-            effective_has_more = False
-        elif (
-            revalidation_was_pending
-            and has_more is False
-            and stop_reason == "no_visible_load_more_control"
-        ):
             effective_has_more = False
         state.update(
             {
@@ -3106,9 +3093,9 @@ class DouyinCommercePage(QWidget):
         if (
             not feedback
             and effective_new_count == 0
-            and zero_growth_count < 2
+            and effective_has_more is True
         ):
-            feedback = "本批未新增地址，可再次加载确认"
+            feedback = "本批未新增地址，仍可继续加载"
         if not feedback:
             feedback = self._batch_location_progress_text(state)
         if auto_filled:

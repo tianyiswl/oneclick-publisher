@@ -3760,7 +3760,6 @@ async def apply_saved_commerce_location_to_page(
                 raise DouyinCommerceError(
                     "publish_location_load_more_limit"
                 ) from None
-            consecutive_zero_growth = 0
             exhausted = False
             matched_candidates: list[dict[str, Any]] = []
             while True:
@@ -3838,17 +3837,12 @@ async def apply_saved_commerce_location_to_page(
                     raise DouyinCommerceError(
                         "publish_location_load_more_limit"
                     ) from None
-                consecutive_zero_growth = (
-                    consecutive_zero_growth + 1
-                    if new_candidate_count == 0
-                    else 0
-                )
                 douyin_logger.info(
                     f"抖音发布定位关键词“{keyword}”累计加载第 {total_click_count} 次："
                     f"全关键词累计有效候选={len(seen_candidate_identities)}，"
                     f"本轮新增={new_candidate_count}"
                 )
-                exhausted = not has_more or consecutive_zero_growth >= 2
+                exhausted = not has_more
             if not matched_candidates:
                 douyin_logger.warning(
                     f"抖音发布定位关键词“{keyword}”已读完可用批次，"

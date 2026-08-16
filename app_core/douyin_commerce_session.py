@@ -90,7 +90,6 @@ _LOCATION_SNAPSHOT_SCALAR_TYPES = frozenset(
 )
 _SETUP_LOCATION_MAX_LOAD_MORE_CLICKS = 10
 _SETUP_LOCATION_MAX_IDENTITIES = 100
-_SETUP_LOCATION_MAX_ZERO_GROWTH = 2
 
 
 def _rebuild_controlled_location_value(
@@ -1328,8 +1327,6 @@ class DouyinCommerceSessionManager:
             return _stopped_location_page(context, "load_more_click_limit")
         if len(before_identities) >= _SETUP_LOCATION_MAX_IDENTITIES:
             return _stopped_location_page(context, "candidate_identity_limit")
-        if context.zero_growth_count >= _SETUP_LOCATION_MAX_ZERO_GROWTH:
-            return _stopped_location_page(context, "zero_growth_limit")
         self._ensure_editor_not_blocked_by_music_picker(session)
         try:
             result = await douyin_commerce_service.load_more_commerce_location_candidates(
@@ -1391,9 +1388,6 @@ class DouyinCommerceSessionManager:
             has_more = False
         elif len(accumulated_identities) >= _SETUP_LOCATION_MAX_IDENTITIES:
             stop_reason = "candidate_identity_limit"
-            has_more = False
-        elif context.zero_growth_count >= _SETUP_LOCATION_MAX_ZERO_GROWTH:
-            stop_reason = "zero_growth_limit"
             has_more = False
         return {
             "platformResultCount": raw_count,
