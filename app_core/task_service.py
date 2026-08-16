@@ -55,19 +55,34 @@ _BATCH_READBACK_FIELDS = {
     "cooldownStartedAt",
     "cooldownSeconds",
 }
-_LOCATION_DIAGNOSTIC_STRING_FIELDS = frozenset({
-    "errorCode",
-    "stage",
-    "keyword",
-    "scope",
+_LOCATION_DIAGNOSTIC_ERROR_CODES = frozenset({
+    "publish_location_candidate_missing",
+    "publish_location_candidate_ambiguous",
+    "publish_location_click_failed",
+    "publish_location_readback_mismatch",
+    "publish_location_cleanup_incomplete",
+    "publish_location_commission_mismatch",
+    "publish_location_not_found_after_all_pages",
+    "publish_location_load_more_limit",
+    "publish_location_load_more_failed",
+    "publish_location_action_timeout",
+    "publish_location_click_limit",
+    "publish_location_candidate_limit",
 })
-_LOCATION_DIAGNOSTIC_COUNT_FIELDS = frozenset({
-    "loadMoreClicks",
-    "candidateCount",
-    "candidateLimit",
-    "clickLimit",
-    "operationTimeoutSeconds",
+_LOCATION_DIAGNOSTIC_STAGES = frozenset({
+    "search",
+    "load_more",
+    "readback",
+    "all_pages",
 })
+_LOCATION_DIAGNOSTIC_SCOPES = frozenset({"local", "domestic"})
+_LOCATION_DIAGNOSTIC_COUNT_LIMITS = {
+    "loadMoreClicks": (0, 10),
+    "candidateCount": (0, 100),
+    "candidateLimit": (1, 100),
+    "clickLimit": (1, 10),
+    "operationTimeoutSeconds": (1, 30),
+}
 
 
 def _now() -> str:
@@ -112,24 +127,44 @@ def _batch_readback_projection(readback: object) -> dict[str, str | int]:
         for key, value in readback.items()
         if key in _BATCH_READBACK_FIELDS and isinstance(value, str) and value.strip()
     }
-    projected.update(
-        {
-            key: value
-            for key, value in readback.items()
-            if key in _LOCATION_DIAGNOSTIC_STRING_FIELDS
-            and type(value) is str
-            and value.strip()
-        }
-    )
-    projected.update(
-        {
-            key: value
-            for key, value in readback.items()
-            if key in _LOCATION_DIAGNOSTIC_COUNT_FIELDS
-            and type(value) is int
-            and value >= 0
-        }
-    )
+    error_code = readback.get("errorCode")
+    if type(error_code) is str and error_code in _LOCATION_DIAGNOSTIC_ERROR_CODES:
+        projected["errorCode"] = error_code
+
+    stage = readback.get("stage")
+    if type(stage) is str and stage in _LOCATION_DIAGNOSTIC_STAGES:
+        projected["stage"] = stage
+
+    scope = readback.get("scope")
+    if type(scope) is str and scope in _LOCATION_DIAGNOSTIC_SCOPES:
+        projected["scope"] = scope
+
+    keyword = readback.get("keyword")
+    if type(keyword) is str:
+        normalized_keyword = " ".join(keyword.split())
+        lowered_keyword = normalized_keyword.casefold()
+        if (
+            normalized_keyword == keyword
+            and 0 < len(keyword) <= 200
+            and not any(
+                fragment in lowered_keyword
+                for fragment in (
+                    "cookie=",
+                    "data-private-",
+                    "document.",
+                    "file:",
+                )
+            )
+            and not any(
+                character in keyword for character in ("<", ">", "/", "\\")
+            )
+        ):
+            projected["keyword"] = keyword
+
+    for key, (minimum, maximum) in _LOCATION_DIAGNOSTIC_COUNT_LIMITS.items():
+        value = readback.get(key)
+        if type(value) is int and minimum <= value <= maximum:
+            projected[key] = value
     return projected
 
 

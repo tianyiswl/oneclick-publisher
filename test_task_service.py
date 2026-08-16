@@ -1473,6 +1473,45 @@ class DouyinCommerceBatchTaskTests(unittest.TestCase):
                 for forbidden in ("candidateList", "cookie", "dom", "path", "unknownField"):
                     self.assertNotIn(forbidden, detail)
 
+    def test_malformed_location_snapshot_cannot_persist_diagnostic_fields(self) -> None:
+        """越界或非枚举九字段不能作为结构化地点诊断落库。"""
+
+        task = task_service.create_douyin_batch_task(self.batch)
+        task_id = task["id"]
+        item_id = task_service.get_task(task_id)["items"][0]["id"]
+        task_service.mark_batch_item_result(
+            task_id,
+            item_id,
+            ok=False,
+            message="固定安全失败说明",
+            event_type="batch_item_failed",
+            readback={
+                "errorCode": "publish_location_candidate_limit",
+                "stage": "<button data-private-dom='1'>",
+                "keyword": "Cookie=location-secret",
+                "scope": "/Users/andy/private-account.json",
+                "loadMoreClicks": 11,
+                "candidateCount": 101,
+                "candidateLimit": 101,
+                "clickLimit": 11,
+                "operationTimeoutSeconds": 31,
+            },
+        )
+
+        detail = json.loads(task_service.get_task(task_id)["events"][-1]["detailJson"])
+        for field in (
+            "stage",
+            "keyword",
+            "scope",
+            "loadMoreClicks",
+            "candidateCount",
+            "candidateLimit",
+            "clickLimit",
+            "operationTimeoutSeconds",
+        ):
+            with self.subTest(field=field):
+                self.assertNotIn(field, detail)
+
     def test_normal_event_after_success_does_not_roll_back_item_status(self) -> None:
         task = task_service.create_douyin_batch_task(self.batch)
         task_id = task["id"]

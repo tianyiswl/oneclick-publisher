@@ -78,6 +78,7 @@ _LOCATION_DIAGNOSTIC_FIELDS = (
     "errorCode",
     "stage",
     "keyword",
+    "scope",
     "loadMoreClicks",
     "candidateCount",
     "candidateLimit",
@@ -176,10 +177,13 @@ class DouyinCommerceError(RuntimeError):
         self,
         code: str,
         diagnostic: Mapping[str, object] | None = None,
+        *,
+        click_performed: bool = False,
     ) -> None:
         super().__init__(code)
         self.code = code
         self.diagnostic = _public_location_diagnostic(diagnostic)
+        self.click_performed = click_performed is True
 
 
 def _public_location_diagnostic(
@@ -201,6 +205,7 @@ def _location_failure(
     *,
     stage: str,
     keyword: str,
+    scope: str,
     clicks: int,
     candidates: int,
     max_candidates: int,
@@ -214,6 +219,7 @@ def _location_failure(
             "errorCode": code,
             "stage": stage,
             "keyword": keyword,
+            "scope": scope,
             "loadMoreClicks": clicks,
             "candidateCount": candidates,
             "candidateLimit": max_candidates,
@@ -3020,6 +3026,25 @@ def _commerce_location_candidates_signature(rows: list[Mapping[str, Any]]) -> st
     )
 
 
+def _admit_publish_location_candidates(
+    rows: list[dict[str, Any]],
+    *,
+    seen_identities: set[tuple[str, str, str, str]],
+    max_candidates: int,
+) -> list[dict[str, Any]]:
+    """按平台稳定顺序只接纳全流程候选上限内的地点。"""
+
+    admitted: list[dict[str, Any]] = []
+    for candidate in rows:
+        identity = _commerce_location_candidate_identity(candidate)
+        if identity not in seen_identities:
+            if len(seen_identities) >= max_candidates:
+                continue
+            seen_identities.add(identity)
+        admitted.append(candidate)
+    return admitted
+
+
 def _dedupe_public_commerce_location_candidates(
     rows: object,
     *,
@@ -3111,28 +3136,18 @@ async def _wait_for_reappearing_load_more_control(
         // _LOCATION_RESULT_POLL_INTERVAL_MS,
     )
     for index in range(checks):
-        try:
-            control = await _await_publish_location_dom_action(
-                lambda _timeout: _load_more_control_or_fail(page),
-                deadline=deadline,
-            )
-        except DouyinCommerceError as exc:
-            if str(exc) == _PUBLISH_LOCATION_LIMIT_CODE:
-                return False
-            raise
+        control = await _await_publish_location_dom_action(
+            lambda _timeout: _load_more_control_or_fail(page),
+            deadline=deadline,
+        )
         if control is not None:
             return True
         if index + 1 < checks:
-            try:
-                await _wait_publish_location_timeout(
-                    page,
-                    _LOCATION_RESULT_POLL_INTERVAL_MS,
-                    deadline=deadline,
-                )
-            except DouyinCommerceError as exc:
-                if str(exc) == _PUBLISH_LOCATION_LIMIT_CODE:
-                    return False
-                raise
+            await _wait_publish_location_timeout(
+                page,
+                _LOCATION_RESULT_POLL_INTERVAL_MS,
+                deadline=deadline,
+            )
     return False
 
 
@@ -3187,6 +3202,7 @@ async def _load_more_commerce_location_candidates_impl(
             "newCandidateCount": 0,
             "hasMore": False,
             "stopReason": "no_visible_load_more_control",
+            "clickPerformed": False,
         }
     baseline_platform_result_count, baseline_candidates = (
         await _await_publish_location_dom_action(
@@ -3233,13 +3249,17 @@ async def _load_more_commerce_location_candidates_impl(
     candidates: list[dict[str, Any]] = list(previous)
     new_identity_seen = False
     for read_index in range(max_reads):
-        platform_result_count, current = await _await_publish_location_dom_action(
-            lambda _timeout: _load_more_candidates_snapshot_or_fail(
-                page,
-                commission_filter="all",
-            ),
-            deadline=deadline,
-        )
+        try:
+            platform_result_count, current = await _await_publish_location_dom_action(
+                lambda _timeout: _load_more_candidates_snapshot_or_fail(
+                    page,
+                    commission_filter="all",
+                ),
+                deadline=deadline,
+            )
+        except DouyinCommerceError as exc:
+            exc.click_performed = True
+            raise
         current_signature = _commerce_location_candidates_signature(current)
         current_identities = {
             _commerce_location_candidate_identity(candidate) for candidate in current
@@ -3258,16 +3278,21 @@ async def _load_more_commerce_location_candidates_impl(
                     zero_growth_signature = current_signature
                     zero_growth_stable_reads = 1
                 if zero_growth_stable_reads >= _LOCATION_RESULT_STABLE_READS:
-                    has_more = await _wait_for_reappearing_load_more_control(
-                        page,
-                        deadline=deadline,
-                    )
+                    try:
+                        has_more = await _wait_for_reappearing_load_more_control(
+                            page,
+                            deadline=deadline,
+                        )
+                    except DouyinCommerceError as exc:
+                        exc.click_performed = True
+                        raise
                     return {
                         "platformResultCount": platform_result_count,
                         "candidates": candidates,
                         "newCandidateCount": 0,
                         "hasMore": has_more,
                         "stopReason": "no_new_candidates",
+                        "clickPerformed": True,
                     }
             else:
                 zero_growth_signature = ""
@@ -3280,10 +3305,14 @@ async def _load_more_commerce_location_candidates_impl(
             stable_signature = current_signature
             stable_reads = 1
         if new_identity_seen and stable_reads >= _LOCATION_RESULT_STABLE_READS:
-            has_more = await _wait_for_reappearing_load_more_control(
-                page,
-                deadline=deadline,
-            )
+            try:
+                has_more = await _wait_for_reappearing_load_more_control(
+                    page,
+                    deadline=deadline,
+                )
+            except DouyinCommerceError as exc:
+                exc.click_performed = True
+                raise
             new_candidate_count = sum(
                 _commerce_location_candidate_identity(candidate) not in previous_identities
                 for candidate in candidates
@@ -3294,18 +3323,27 @@ async def _load_more_commerce_location_candidates_impl(
                 "newCandidateCount": new_candidate_count,
                 "hasMore": has_more,
                 "stopReason": "loaded" if new_candidate_count else "no_new_candidates",
+                "clickPerformed": True,
             }
         if read_index + 1 < max_reads:
-            await _wait_publish_location_timeout(
+            try:
+                await _wait_publish_location_timeout(
+                    page,
+                    _LOCATION_RESULT_POLL_INTERVAL_MS,
+                    deadline=deadline,
+                )
+            except DouyinCommerceError as exc:
+                exc.click_performed = True
+                raise
+    if not new_identity_seen:
+        try:
+            has_more = await _wait_for_reappearing_load_more_control(
                 page,
-                _LOCATION_RESULT_POLL_INTERVAL_MS,
                 deadline=deadline,
             )
-    if not new_identity_seen:
-        has_more = await _wait_for_reappearing_load_more_control(
-            page,
-            deadline=deadline,
-        )
+        except DouyinCommerceError as exc:
+            exc.click_performed = True
+            raise
         if not has_more:
             return {
                 "platformResultCount": platform_result_count,
@@ -3313,10 +3351,17 @@ async def _load_more_commerce_location_candidates_impl(
                 "newCandidateCount": 0,
                 "hasMore": False,
                 "stopReason": "no_visible_load_more_control",
+                "clickPerformed": True,
             }
     if deadline is not None:
-        raise DouyinCommerceError(_PUBLISH_LOCATION_LIMIT_CODE) from None
-    raise DouyinCommerceError("publish_location_load_more_failed")
+        raise DouyinCommerceError(
+            _PUBLISH_LOCATION_LIMIT_CODE,
+            click_performed=True,
+        ) from None
+    raise DouyinCommerceError(
+        "publish_location_load_more_failed",
+        click_performed=True,
+    )
 
 
 async def load_more_commerce_location_candidates(
@@ -3341,7 +3386,10 @@ async def load_more_commerce_location_candidates(
     except DouyinCommerceError as exc:
         if str(exc) == _PUBLISH_LOCATION_LIMIT_CODE and has_outer_deadline:
             raise
-        raise DouyinCommerceError("publish_location_load_more_failed") from None
+        raise DouyinCommerceError(
+            "publish_location_load_more_failed",
+            click_performed=exc.click_performed,
+        ) from None
     except Exception:
         raise DouyinCommerceError("publish_location_load_more_failed") from None
 
@@ -3713,11 +3761,17 @@ async def apply_commerce_location_to_page(
     return await _apply_open_commerce_location_to_page(page, listbox, normalized)
 
 
-async def _close_commerce_store_selector_strict(page) -> None:
+async def _close_commerce_store_selector_strict(
+    page,
+    *,
+    deadline: float | None = None,
+) -> None:
     """收口地点面板；失败时只暴露固定公开错误码。"""
 
+    if deadline is None:
+        deadline = monotonic() + _LOCATION_RESULT_WAIT_TIMEOUT_MS / 1000
     try:
-        await close_commerce_store_selector(page)
+        await close_commerce_store_selector(page, deadline=deadline)
     except Exception:
         raise DouyinCommerceError("publish_location_cleanup_incomplete") from None
 
@@ -3787,9 +3841,15 @@ async def apply_saved_commerce_location_to_page(
             f"抖音发布定位第 {attempt}/{len(bounded_keywords)} 次搜索："
             f"范围={scope_label}，关键词={keyword}，目标={target_text}"
         )
-        await _close_commerce_store_selector_strict(page)
+        pre_cleanup_deadline = (
+            monotonic() + _LOCATION_RESULT_WAIT_TIMEOUT_MS / 1000
+        )
+        await _close_commerce_store_selector_strict(
+            page,
+            deadline=pre_cleanup_deadline,
+        )
         panel_may_be_open = False
-        active_process_control_error: BaseException | None = None
+        active_error: BaseException | None = None
         try:
             panel_may_be_open = True
             try:
@@ -3814,6 +3874,7 @@ async def apply_saved_commerce_location_to_page(
                         "publish_location_action_timeout",
                         stage="search",
                         keyword=keyword,
+                        scope=selected_scope,
                         clicks=total_click_count,
                         candidates=len(seen_candidate_identities),
                         max_candidates=max_candidates,
@@ -3845,20 +3906,11 @@ async def apply_saved_commerce_location_to_page(
                 f"抖音发布定位关键词“{keyword}”返回 {len(candidates)} 个完整候选："
                 f"{candidate_summary or ['无']}"
             )
-            seen_candidate_identities.update(
-                _commerce_location_candidate_identity(candidate)
-                for candidate in candidates
+            candidates = _admit_publish_location_candidates(
+                candidates,
+                seen_identities=seen_candidate_identities,
+                max_candidates=max_candidates,
             )
-            if len(seen_candidate_identities) > max_candidates:
-                raise _location_failure(
-                    "publish_location_candidate_limit",
-                    stage="search",
-                    keyword=keyword,
-                    clicks=total_click_count,
-                    candidates=len(seen_candidate_identities),
-                    max_candidates=max_candidates,
-                    max_load_more_clicks=max_load_more_clicks,
-                ) from None
             exhausted = False
             matched_candidates: list[dict[str, Any]] = []
             while True:
@@ -3881,13 +3933,12 @@ async def apply_saved_commerce_location_to_page(
                     != expected_identity[3]
                     for row in candidates
                 )
-                if exhausted:
-                    break
                 if len(seen_candidate_identities) >= max_candidates:
                     raise _location_failure(
                         "publish_location_candidate_limit",
                         stage="load_more",
                         keyword=keyword,
+                        scope=selected_scope,
                         clicks=total_click_count,
                         candidates=len(seen_candidate_identities),
                         max_candidates=max_candidates,
@@ -3898,11 +3949,14 @@ async def apply_saved_commerce_location_to_page(
                         "publish_location_click_limit",
                         stage="load_more",
                         keyword=keyword,
+                        scope=selected_scope,
                         clicks=total_click_count,
                         candidates=len(seen_candidate_identities),
                         max_candidates=max_candidates,
                         max_load_more_clicks=max_load_more_clicks,
                     ) from None
+                if exhausted:
+                    break
                 try:
                     load_deadline = (
                         monotonic() + _LOCATION_RESULT_WAIT_TIMEOUT_MS / 1000
@@ -3917,6 +3971,12 @@ async def apply_saved_commerce_location_to_page(
                     raw_candidates = load_result.get("candidates")
                     new_candidate_count = load_result.get("newCandidateCount")
                     has_more = load_result.get("hasMore")
+                    click_performed = load_result.get("clickPerformed")
+                    if type(click_performed) is not bool:
+                        click_performed = (
+                            load_result.get("stopReason")
+                            != "no_visible_load_more_control"
+                        )
                     if (
                         not isinstance(raw_candidates, list)
                         or type(new_candidate_count) is not int
@@ -3925,11 +3985,14 @@ async def apply_saved_commerce_location_to_page(
                     ):
                         raise TypeError("publish_location_load_more_failed")
                 except DouyinCommerceError as exc:
+                    if getattr(exc, "click_performed", False) is True:
+                        total_click_count += 1
                     if str(exc) == _PUBLISH_LOCATION_LIMIT_CODE:
                         raise _location_failure(
                             "publish_location_action_timeout",
                             stage="load_more",
                             keyword=keyword,
+                            scope=selected_scope,
                             clicks=total_click_count,
                             candidates=len(seen_candidate_identities),
                             max_candidates=max_candidates,
@@ -3942,7 +4005,8 @@ async def apply_saved_commerce_location_to_page(
                     raise DouyinCommerceError(
                         "publish_location_load_more_failed"
                     ) from None
-                total_click_count += 1
+                if click_performed:
+                    total_click_count += 1
                 candidates = [
                     candidate
                     for row in raw_candidates
@@ -3950,20 +4014,11 @@ async def apply_saved_commerce_location_to_page(
                         candidate := normalize_commerce_location_candidate(row)
                     ) is not None
                 ]
-                seen_candidate_identities.update(
-                    _commerce_location_candidate_identity(candidate)
-                    for candidate in candidates
+                candidates = _admit_publish_location_candidates(
+                    candidates,
+                    seen_identities=seen_candidate_identities,
+                    max_candidates=max_candidates,
                 )
-                if len(seen_candidate_identities) > max_candidates:
-                    raise _location_failure(
-                        "publish_location_candidate_limit",
-                        stage="load_more",
-                        keyword=keyword,
-                        clicks=total_click_count,
-                        candidates=len(seen_candidate_identities),
-                        max_candidates=max_candidates,
-                        max_load_more_clicks=max_load_more_clicks,
-                    ) from None
                 douyin_logger.info(
                     f"抖音发布定位关键词“{keyword}”累计加载第 {total_click_count} 次："
                     f"全关键词累计有效候选={len(seen_candidate_identities)}，"
@@ -3993,6 +4048,7 @@ async def apply_saved_commerce_location_to_page(
                     "publish_location_action_timeout",
                     stage="readback",
                     keyword=keyword,
+                    scope=selected_scope,
                     clicks=total_click_count,
                     candidates=len(seen_candidate_identities),
                     max_candidates=max_candidates,
@@ -4026,6 +4082,7 @@ async def apply_saved_commerce_location_to_page(
                     "publish_location_action_timeout",
                     stage="readback",
                     keyword=keyword,
+                    scope=selected_scope,
                     clicks=total_click_count,
                     candidates=len(seen_candidate_identities),
                     max_candidates=max_candidates,
@@ -4035,22 +4092,31 @@ async def apply_saved_commerce_location_to_page(
                 f"抖音发布定位关键词“{keyword}”已命中并回读目标：{target_text}"
             )
             return {**result, "matchedKeyword": keyword}
-        except DouyinCommerceError:
+        except DouyinCommerceError as exc:
+            active_error = exc
             raise
         except Exception:
-            raise DouyinCommerceError("publish_location_click_failed") from None
+            public_error = DouyinCommerceError("publish_location_click_failed")
+            active_error = public_error
+            raise public_error from None
         except BaseException as exc:
-            active_process_control_error = exc
+            active_error = exc
             raise
         finally:
             if panel_may_be_open:
                 try:
-                    await _close_commerce_store_selector_strict(page)
+                    final_cleanup_deadline = (
+                        monotonic() + _LOCATION_RESULT_WAIT_TIMEOUT_MS / 1000
+                    )
+                    await _close_commerce_store_selector_strict(
+                        page,
+                        deadline=final_cleanup_deadline,
+                    )
                 except Exception:
-                    if active_process_control_error is None:
+                    if active_error is None:
                         raise
                     douyin_logger.warning(
-                        "抖音发布定位进程控制异常期间面板清理失败："
+                        "抖音发布定位原失败处理期间面板清理失败："
                         "publish_location_cleanup_incomplete"
                     )
 
@@ -4062,11 +4128,18 @@ async def apply_saved_commerce_location_to_page(
         raise DouyinCommerceError(
             "publish_location_commission_mismatch"
         ) from None
-    raise DouyinCommerceError(
-        "publish_location_not_found_after_all_pages"
-        if any_search_succeeded
-        else "publish_location_candidate_missing"
-    ) from None
+    if any_search_succeeded:
+        raise _location_failure(
+            "publish_location_not_found_after_all_pages",
+            stage="all_pages",
+            keyword=bounded_keywords[-1],
+            scope=selected_scope,
+            clicks=total_click_count,
+            candidates=len(seen_candidate_identities),
+            max_candidates=max_candidates,
+            max_load_more_clicks=max_load_more_clicks,
+        ) from None
+    raise DouyinCommerceError("publish_location_candidate_missing") from None
 
 
 async def apply_commerce_location_store_to_page(
@@ -4095,41 +4168,91 @@ async def apply_commerce_location_store_to_page(
     return {"location": location, "commerceStore": dict(selected_store)}
 
 
-async def close_commerce_store_selector(page) -> None:
+async def close_commerce_store_selector(
+    page,
+    *,
+    deadline: float | None = None,
+) -> None:
     """关闭当前地点候选浮层，不选择地点或门店。"""
 
+    if deadline is None:
+        deadline = monotonic() + _LOCATION_RESULT_WAIT_TIMEOUT_MS / 1000
     try:
-        input_control = await _visible_commerce_search_input(page)
+        input_control = await _await_publish_location_dom_action(
+            lambda _timeout: _visible_commerce_search_input(page),
+            deadline=deadline,
+        )
     except DouyinCommerceError as exc:
         if "实际 0 个" not in str(exc):
             raise
         input_control = None
     if input_control is not None:
-        overlay = await _visible_commerce_location_overlay(page)
+        overlay = await _await_publish_location_dom_action(
+            lambda _timeout: _visible_commerce_location_overlay(page),
+            deadline=deadline,
+        )
         if overlay is not None:
             try:
-                await input_control.press("Escape", timeout=5_000)
+                await _await_publish_location_dom_action(
+                    lambda action_timeout: input_control.press(
+                        "Escape",
+                        timeout=action_timeout,
+                    ),
+                    deadline=deadline,
+                    timeout_ms=5_000,
+                )
+            except DouyinCommerceError as exc:
+                if str(exc) == _PUBLISH_LOCATION_LIMIT_CODE:
+                    raise
+                raise DouyinCommerceError(
+                    "抖音地点候选浮层无法安全关闭，已停止后续设置"
+                ) from exc
             except Exception as exc:
                 raise DouyinCommerceError(
                     "抖音地点候选浮层无法安全关闭，已停止后续设置"
                 ) from exc
             for _ in range(10):
-                if await _visible_commerce_location_overlay(page) is None:
+                current_overlay = await _await_publish_location_dom_action(
+                    lambda _timeout: _visible_commerce_location_overlay(page),
+                    deadline=deadline,
+                )
+                if current_overlay is None:
                     return
-                await page.wait_for_timeout(150)
+                await _wait_publish_location_timeout(
+                    page,
+                    150,
+                    deadline=deadline,
+                )
             raise DouyinCommerceError(
                 "抖音地点候选浮层无法安全关闭，已停止后续设置"
             )
 
-    listbox = await _visible_store_listbox(page)
+    listbox = await _await_publish_location_dom_action(
+        lambda _timeout: _visible_store_listbox(page),
+        deadline=deadline,
+    )
     if listbox is None:
         return
-    _, store_control, _, _ = await _anchor_controls(page)
-    await _open_exact_select(page, store_control, "可绑定门店")
+    _, store_control, _, _ = await _await_publish_location_dom_action(
+        lambda _timeout: _anchor_controls(page),
+        deadline=deadline,
+    )
+    await _await_publish_location_dom_action(
+        lambda _timeout: _open_exact_select(page, store_control, "可绑定门店"),
+        deadline=deadline,
+    )
     for _ in range(10):
-        if await _visible_store_listbox(page) is None:
+        current_listbox = await _await_publish_location_dom_action(
+            lambda _timeout: _visible_store_listbox(page),
+            deadline=deadline,
+        )
+        if current_listbox is None:
             return
-        await page.wait_for_timeout(150)
+        await _wait_publish_location_timeout(
+            page,
+            150,
+            deadline=deadline,
+        )
     raise DouyinCommerceError("抖音带货门店下拉无法安全关闭，已停止后续设置")
 
 

@@ -45,6 +45,7 @@ _LOCATION_DIAGNOSTIC_FIELDS = (
     "errorCode",
     "stage",
     "keyword",
+    "scope",
     "loadMoreClicks",
     "candidateCount",
     "candidateLimit",

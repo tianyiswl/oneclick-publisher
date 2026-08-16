@@ -26,7 +26,10 @@ from .douyin_commerce_batch_service import (
     validate_batch_payload,
 )
 from .media_path import normalize_media_path
-from .douyin_commerce_session import commerce_session_manager
+from .douyin_commerce_session import (
+    DouyinCommerceSessionError,
+    commerce_session_manager,
+)
 from .douyin_location_preset_service import (
     DouyinLocationPresetError,
     match_location_preset,
@@ -196,6 +199,7 @@ _LOCATION_DIAGNOSTIC_FIELDS = (
     "errorCode",
     "stage",
     "keyword",
+    "scope",
     "loadMoreClicks",
     "candidateCount",
     "candidateLimit",
@@ -212,34 +216,79 @@ _PUBLIC_LOCATION_ERROR_CODES = frozenset(
 )
 _UNKNOWN_LOCATION_ERROR_CODE = "publish_location_click_failed"
 _PUBLIC_BATCH_ERROR_CODES = frozenset({"verification_cooldown_failed"})
+_GENERIC_BATCH_ERROR_CODE = "douyin_batch_item_failed"
+_GENERIC_BATCH_FAILURE_MESSAGE = (
+    "抖音批量发布失败：当前视频未完成平台处理"
+    "（错误码 douyin_batch_item_failed）"
+)
+_LOCATION_STOP_REASONS = {
+    "publish_location_action_timeout": "发布定位恢复失败：单次平台地点操作超过安全时限",
+    "publish_location_click_limit": "发布定位恢复失败：实际加载次数达到安全上限，仍未命中目标",
+    "publish_location_candidate_limit": "发布定位恢复失败：累计候选达到安全上限，仍未命中目标",
+    "publish_location_not_found_after_all_pages": (
+        "发布定位恢复失败：已读完可用候选批次，仍未找到完整身份一致的地点"
+    ),
+}
+_LOCATION_STAGE_LABELS = {
+    "search": "搜索",
+    "load_more": "加载更多",
+    "readback": "回读",
+    "all_pages": "全部批次",
+}
+_LOCATION_SCOPE_LABELS = {"local": "本地", "domestic": "国内"}
+_LOCATION_DIAGNOSTIC_STAGES_BY_CODE = {
+    "publish_location_action_timeout": frozenset(
+        {"search", "load_more", "readback"}
+    ),
+    "publish_location_click_limit": frozenset({"load_more"}),
+    "publish_location_candidate_limit": frozenset({"load_more"}),
+    "publish_location_not_found_after_all_pages": frozenset({"all_pages"}),
+}
+_MAX_LOCATION_CANDIDATES = 100
+_MAX_LOCATION_LOAD_MORE_CLICKS = 10
+_MAX_LOCATION_OPERATION_TIMEOUT_SECONDS = 30
+
+
+def _base_exception_args(error: BaseException) -> tuple[object, ...]:
+    """绕过不可信子类的属性钩子，只读 BaseException 原生 args。"""
+
+    args = BaseException.args.__get__(error, type(error))
+    return args if type(args) is tuple else ()
 
 
 def _exception_fixed_location_error_code(error: Exception) -> str:
-    """只从受控字符串字段识别地点固定码，绝不格式化未知异常。"""
+    """只信任会话层固定码和执行器自身的精确异常类型。"""
 
-    code = getattr(error, "code", None)
-    if type(code) is str and code in _PUBLIC_LOCATION_ERROR_CODES:
-        return code
-    args = getattr(error, "args", ())
-    if (
-        type(args) is tuple
-        and len(args) == 1
-        and type(args[0]) is str
-        and args[0] in _PUBLIC_LOCATION_ERROR_CODES
-    ):
-        return args[0]
+    if type(error) is DouyinCommerceSessionError:
+        code = error.__dict__.get("code")
+        args = _base_exception_args(error)
+        if (
+            type(code) is str
+            and code in _PUBLIC_LOCATION_ERROR_CODES
+            and args == (code,)
+        ):
+            return code
+        return ""
+    if type(error) is DouyinCommerceBatchExecutorError:
+        args = _base_exception_args(error)
+        if (
+            len(args) == 1
+            and type(args[0]) is str
+            and args[0] in _PUBLIC_LOCATION_ERROR_CODES
+        ):
+            return args[0]
     return ""
 
 
 def _public_location_error_code(error: Exception) -> str:
-    return _exception_fixed_location_error_code(error) or _UNKNOWN_LOCATION_ERROR_CODE
+    return _exception_fixed_location_error_code(error) or _GENERIC_BATCH_ERROR_CODE
 
 
 def _controlled_exception_message(error: Exception) -> str:
     """供内部状态判别使用的异常文本；其返回值不得写入任何公开输出。"""
 
-    args = getattr(error, "args", ())
-    if type(args) is tuple and len(args) == 1 and type(args[0]) is str:
+    args = _base_exception_args(error)
+    if len(args) == 1 and type(args[0]) is str:
         return args[0]
     return ""
 
@@ -252,22 +301,71 @@ def _public_batch_error_code(error: Exception) -> str:
         code = _controlled_exception_message(error)
         if code in _PUBLIC_BATCH_ERROR_CODES:
             return code
-    return _UNKNOWN_LOCATION_ERROR_CODE
+    return _GENERIC_BATCH_ERROR_CODE
 
 
-def _public_location_diagnostic(value: object, *, error_code: str) -> dict[str, object]:
-    """只接收会话层已净化的地点诊断，不让异常附带字段进入任务事件。"""
+def _public_non_location_failure(error_code: str) -> str:
+    if error_code in _PUBLIC_BATCH_ERROR_CODES:
+        return error_code
+    return _GENERIC_BATCH_FAILURE_MESSAGE
 
-    if type(value) is not dict:
+
+def _public_location_diagnostic(
+    error: Exception,
+    *,
+    error_code: str,
+    expected_scope: str,
+    expected_keywords: tuple[str, ...],
+) -> dict[str, object]:
+    """只接收精确会话异常的完整且与当前请求一致的九字段快照。"""
+
+    if type(error) is not DouyinCommerceSessionError:
         return {}
-    diagnostic = {
-        field: value[field]
-        for field in _LOCATION_DIAGNOSTIC_FIELDS
-        if field in value
-    }
-    if diagnostic:
-        diagnostic["errorCode"] = error_code
-    return diagnostic
+    value = error.__dict__.get("diagnostic")
+    if type(value) is not dict or set(value) != set(_LOCATION_DIAGNOSTIC_FIELDS):
+        return {}
+
+    code = value.get("errorCode")
+    stage = value.get("stage")
+    keyword = value.get("keyword")
+    scope = value.get("scope")
+    clicks = value.get("loadMoreClicks")
+    candidates = value.get("candidateCount")
+    candidate_limit = value.get("candidateLimit")
+    click_limit = value.get("clickLimit")
+    operation_timeout = value.get("operationTimeoutSeconds")
+    if (
+        type(code) is not str
+        or code != error_code
+        or code not in _LOCATION_DIAGNOSTIC_STAGES_BY_CODE
+        or type(stage) is not str
+        or stage not in _LOCATION_DIAGNOSTIC_STAGES_BY_CODE[code]
+        or type(keyword) is not str
+        or not keyword
+        or len(keyword) > 200
+        or " ".join(keyword.split()) != keyword
+        or keyword not in expected_keywords
+        or type(scope) is not str
+        or scope not in _LOCATION_SCOPE_LABELS
+        or scope != expected_scope
+        or type(clicks) is not int
+        or type(candidates) is not int
+        or type(candidate_limit) is not int
+        or type(click_limit) is not int
+        or type(operation_timeout) is not int
+        or not 0 <= clicks <= click_limit <= _MAX_LOCATION_LOAD_MORE_CLICKS
+        or not 0 <= candidates <= candidate_limit <= _MAX_LOCATION_CANDIDATES
+        or not 1
+        <= operation_timeout
+        <= _MAX_LOCATION_OPERATION_TIMEOUT_SECONDS
+        or (code == "publish_location_click_limit" and clicks != click_limit)
+        or (
+            code == "publish_location_candidate_limit"
+            and candidates != candidate_limit
+        )
+    ):
+        return {}
+    return {field: value[field] for field in _LOCATION_DIAGNOSTIC_FIELDS}
 
 
 def format_public_location_failure(
@@ -277,30 +375,36 @@ def format_public_location_failure(
     """将受控地点失败码格式化为可显示、可审计的公开说明。"""
 
     code = _text(error_code)
-    if code not in _PUBLIC_LOCATION_ERROR_CODES | _PUBLIC_BATCH_ERROR_CODES:
+    if code not in _PUBLIC_LOCATION_ERROR_CODES:
         code = _UNKNOWN_LOCATION_ERROR_CODE
-    if code == "publish_location_candidate_limit":
-        count = diagnostic.get("candidateCount") if diagnostic else None
-        clicks = diagnostic.get("loadMoreClicks") if diagnostic else None
-        if type(count) is int and type(clicks) is int:
+    if code in _LOCATION_STOP_REASONS and diagnostic:
+        stage = diagnostic.get("stage")
+        keyword = diagnostic.get("keyword")
+        scope = diagnostic.get("scope")
+        clicks = diagnostic.get("loadMoreClicks")
+        candidates = diagnostic.get("candidateCount")
+        if (
+            type(stage) is str
+            and stage in _LOCATION_STAGE_LABELS
+            and type(keyword) is str
+            and bool(keyword.strip())
+            and type(scope) is str
+            and scope in _LOCATION_SCOPE_LABELS
+            and type(clicks) is int
+            and clicks >= 0
+            and type(candidates) is int
+            and candidates >= 0
+        ):
             return (
-                f"发布定位恢复失败：累计检查 {count} 个不同地点、加载 {clicks} 次仍未命中目标"
+                f"{_LOCATION_STOP_REASONS[code]}；"
+                f"阶段={_LOCATION_STAGE_LABELS[stage]}，"
+                f"关键词={keyword.strip()}，"
+                f"范围={_LOCATION_SCOPE_LABELS[scope]}，"
+                f"加载={clicks}次，候选={candidates}个"
                 f"（错误码 {code}）"
             )
-    if code == "publish_location_click_limit":
-        clicks = diagnostic.get("loadMoreClicks") if diagnostic else None
-        if type(clicks) is int:
-            return (
-                f"发布定位恢复失败：已加载 {clicks} 次仍未命中目标，达到自动点击安全上限"
-                f"（错误码 {code}）"
-            )
-    if code == "publish_location_action_timeout":
-        timeout = diagnostic.get("operationTimeoutSeconds") if diagnostic else None
-        if type(timeout) is int:
-            return (
-                f"发布定位恢复失败：平台地点操作超过 {timeout} 秒安全时限"
-                f"（错误码 {code}）"
-            )
+    if code in _LOCATION_STOP_REASONS:
+        return f"{_LOCATION_STOP_REASONS[code]}（错误码 {code}）"
     return _PUBLIC_BATCH_DIAGNOSTICS.get(code, code)
 
 
@@ -1112,6 +1216,8 @@ class DouyinCommerceBatchExecutor:
         retain_session = False
         submit_permission_claimed = False
         final_receipt_recorded = False
+        location_diagnostic_scope = ""
+        location_diagnostic_keywords: tuple[str, ...] = ()
         # 上传、地点和预检都必须留在 dry-run 会话；上传阶段已完成标题、文案
         # 与话题的页面回读，不能在同一编辑页重复同步一次内容。重复清空富文本
         # 编辑器会在 Windows 端偶发残留旧文案，且没有任何业务收益。
@@ -1182,6 +1288,8 @@ class DouyinCommerceBatchExecutor:
                 location,
                 original_keyword=payload.get("locationSearchKeyword"),
             )
+            location_diagnostic_scope = scope
+            location_diagnostic_keywords = tuple(location_keywords)
             scope_label = {"local": "本地", "domestic": "国内"}.get(
                 scope,
                 scope or "未确认",
@@ -1205,11 +1313,17 @@ class DouyinCommerceBatchExecutor:
                 )
             except Exception as exc:
                 location_error_code = _public_location_error_code(exc)
-                douyin_logger.warning(
-                    f"抖音带货第 {index + 1}/{total} 条发布定位恢复失败："
-                    f"视频={label}，范围={scope_label}，目标={target_location}，"
-                    f"已尝试={location_keywords}，错误={location_error_code}"
-                )
+                if location_error_code in _PUBLIC_LOCATION_ERROR_CODES:
+                    douyin_logger.warning(
+                        f"抖音带货第 {index + 1}/{total} 条发布定位恢复失败："
+                        f"视频={label}，范围={scope_label}，目标={target_location}，"
+                        f"已尝试={location_keywords}，错误={location_error_code}"
+                    )
+                else:
+                    douyin_logger.warning(
+                        f"抖音带货第 {index + 1}/{total} 条未完成平台处理："
+                        f"视频={label}，错误={_GENERIC_BATCH_ERROR_CODE}"
+                    )
                 if publish and location_error_code in _LOCATION_CACHE_FAILURE_CODES:
                     self._record_location_cache_result(
                         location_cache_account_id,
@@ -1403,14 +1517,25 @@ class DouyinCommerceBatchExecutor:
         except Exception as exc:
             fixed_error_code = _exception_fixed_location_error_code(exc)
             error_code = _public_batch_error_code(exc)
-            location_diagnostic = _public_location_diagnostic(
-                getattr(exc, "diagnostic", None) if fixed_error_code else None,
-                error_code=error_code,
-            )
-            diagnostic = format_public_location_failure(
-                error_code,
-                location_diagnostic,
-            )
+            if fixed_error_code:
+                location_diagnostic = _public_location_diagnostic(
+                    exc,
+                    error_code=error_code,
+                    expected_scope=location_diagnostic_scope,
+                    expected_keywords=location_diagnostic_keywords,
+                )
+                if (
+                    not location_diagnostic
+                    and error_code in _LOCATION_DIAGNOSTIC_STAGES_BY_CODE
+                ):
+                    location_diagnostic = {"errorCode": error_code}
+                diagnostic = format_public_location_failure(
+                    error_code,
+                    location_diagnostic,
+                )
+            else:
+                location_diagnostic = {}
+                diagnostic = _public_non_location_failure(error_code)
             if self._has_active_verification(task_id):
                 # 仅 broker 仍持有同一 active 请求时才保留会话。真实 manager 在
                 # 该会话内等待用户输入并从当前 submit 调用继续，因此不会重复提交。
