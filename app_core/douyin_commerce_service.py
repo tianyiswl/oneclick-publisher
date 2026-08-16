@@ -72,6 +72,7 @@ _LOCATION_DIAGNOSTIC_LABELS = (
 _LOCATION_RESULT_WAIT_TIMEOUT_MS = 30_000
 _LOCATION_RESULT_POLL_INTERVAL_MS = 350
 _LOCATION_RESULT_STABLE_READS = 3
+_LOCATION_LOAD_MORE_REAPPEAR_GRACE_MS = 3_000
 _PUBLISH_LOCATION_LIMIT_CODE = "publish_location_load_more_limit"
 _STORE_EFFECTIVE_VISIBILITY_JS = r"""
                 const isEffectivelyVisible = node => {
@@ -2952,6 +2953,48 @@ async def _load_more_candidates_snapshot_or_fail(
         raise DouyinCommerceError("publish_location_load_more_failed") from None
 
 
+async def _wait_for_reappearing_load_more_control(
+    page,
+    *,
+    deadline: float,
+) -> bool:
+    """候选增长后等待平台重建下一批入口。
+
+    抖音会在加载期间短暂移除按钮；只读一次会把“暂时消失”
+    误判成“已经到底”。这里只在已成功读到新候选后给一个有界重现窗口。
+    """
+
+    checks = max(
+        1,
+        _LOCATION_LOAD_MORE_REAPPEAR_GRACE_MS
+        // _LOCATION_RESULT_POLL_INTERVAL_MS,
+    )
+    for index in range(checks):
+        try:
+            control = await _await_publish_location_dom_action(
+                lambda _timeout: _load_more_control_or_fail(page),
+                deadline=deadline,
+            )
+        except DouyinCommerceError as exc:
+            if str(exc) == _PUBLISH_LOCATION_LIMIT_CODE:
+                return False
+            raise
+        if control is not None:
+            return True
+        if index + 1 < checks:
+            try:
+                await _wait_publish_location_timeout(
+                    page,
+                    _LOCATION_RESULT_POLL_INTERVAL_MS,
+                    deadline=deadline,
+                )
+            except DouyinCommerceError as exc:
+                if str(exc) == _PUBLISH_LOCATION_LIMIT_CODE:
+                    return False
+                raise
+    return False
+
+
 async def _load_more_commerce_location_candidates_impl(
     page,
     *,
@@ -3074,12 +3117,9 @@ async def _load_more_commerce_location_candidates_impl(
                     zero_growth_signature = current_signature
                     zero_growth_stable_reads = 1
                 if zero_growth_stable_reads >= _LOCATION_RESULT_STABLE_READS:
-                    has_more = (
-                        await _await_publish_location_dom_action(
-                            lambda _timeout: _load_more_control_or_fail(page),
-                            deadline=deadline,
-                        )
-                        is not None
+                    has_more = await _wait_for_reappearing_load_more_control(
+                        page,
+                        deadline=deadline,
                     )
                     return {
                         "platformResultCount": platform_result_count,
@@ -3099,12 +3139,9 @@ async def _load_more_commerce_location_candidates_impl(
             stable_signature = current_signature
             stable_reads = 1
         if new_identity_seen and stable_reads >= _LOCATION_RESULT_STABLE_READS:
-            has_more = (
-                await _await_publish_location_dom_action(
-                    lambda _timeout: _load_more_control_or_fail(page),
-                    deadline=deadline,
-                )
-                is not None
+            has_more = await _wait_for_reappearing_load_more_control(
+                page,
+                deadline=deadline,
             )
             new_candidate_count = sum(
                 _commerce_location_candidate_identity(candidate) not in previous_identities
@@ -3124,12 +3161,9 @@ async def _load_more_commerce_location_candidates_impl(
                 deadline=deadline,
             )
     if not new_identity_seen:
-        has_more = (
-            await _await_publish_location_dom_action(
-                lambda _timeout: _load_more_control_or_fail(page),
-                deadline=deadline,
-            )
-            is not None
+        has_more = await _wait_for_reappearing_load_more_control(
+            page,
+            deadline=deadline,
         )
         if not has_more:
             return {

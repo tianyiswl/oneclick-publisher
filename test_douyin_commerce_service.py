@@ -6191,6 +6191,67 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["platformResultCount"], 2)
         self.assertEqual(snapshot.await_count, 7)
 
+    async def test_load_more_waits_for_platform_control_to_reappear_after_growth(
+        self,
+    ) -> None:
+        """新候选稳定后按钮暂时消失，重现后仍应允许下一次加载。"""
+
+        previous = douyin_commerce_service.normalize_commerce_location_candidates(
+            [
+                {
+                    "name": "首屏地点",
+                    "address": "广西北海市测试路 1 号",
+                    "commerceInfo": "1件商品 · 1件返佣",
+                }
+            ],
+            commission_filter="commission",
+        )
+        appended = douyin_commerce_service.normalize_commerce_location_candidates(
+            [
+                {
+                    "name": "第二批地点",
+                    "address": "广西北海市新增路 2 号",
+                    "commerceInfo": "1件商品 · 1件返佣",
+                }
+            ],
+            commission_filter="commission",
+        )
+
+        class Page:
+            wait_for_timeout = AsyncMock()
+
+        first_control = MagicMock()
+        first_control.scroll_into_view_if_needed = AsyncMock()
+        first_control.click = AsyncMock()
+        reappeared_control = MagicMock()
+        snapshots = [
+            (1, previous),
+            (2, previous + appended),
+            (2, previous + appended),
+            (2, previous + appended),
+        ]
+        with patch.object(
+            douyin_commerce_service,
+            "_unique_visible_load_more_control",
+            new_callable=AsyncMock,
+            side_effect=[first_control, None, None, reappeared_control],
+        ) as control_read, patch.object(
+            douyin_commerce_service,
+            "_commerce_location_candidates_snapshot",
+            new_callable=AsyncMock,
+            side_effect=snapshots,
+        ):
+            result = await douyin_commerce_service.load_more_commerce_location_candidates(
+                Page(),
+                previous_candidates=previous,
+                commission_filter="commission",
+                timeout_ms=5_000,
+            )
+
+        self.assertEqual(result["newCandidateCount"], 1)
+        self.assertTrue(result["hasMore"])
+        self.assertEqual(control_read.await_count, 4)
+
     async def test_load_more_timeout_with_unchanged_page_and_button_is_failure(
         self,
     ) -> None:
