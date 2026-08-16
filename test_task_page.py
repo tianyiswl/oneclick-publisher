@@ -119,6 +119,44 @@ class TaskDetailDialogTests(unittest.TestCase):
         self.assertEqual(table.rowCount(), 1)
         self.assertEqual(table.item(0, 1).text(), "测试13.mp4")
 
+    def test_batch_failure_row_and_event_show_exact_location_limit(self) -> None:
+        """地点上限失败须同时保留逐视频提示和净化后的事件详情。"""
+
+        message = (
+            "发布定位恢复失败：累计检查 100 个不同地点、加载 7 次仍未命中目标"
+            "（错误码 publish_location_candidate_limit）"
+        )
+        task = {
+            **self._batch_task(),
+            "items": [{**self._batch_task()["items"][0], "message": message}],
+            "events": [
+                {
+                    "createdAt": "2026-08-08 22:38:12",
+                    "level": "error",
+                    "eventType": "batch_item_failed",
+                    "message": message,
+                    "detailJson": (
+                        '{"errorCode":"publish_location_candidate_limit",'
+                        '"loadMoreClicks":7,"candidateCount":100}'
+                    ),
+                }
+            ],
+        }
+        dialog = TaskDetailDialog(task)
+        self.addCleanup(dialog.close)
+
+        self.assertIn(
+            "累计检查 100 个不同地点",
+            dialog.batch_result_table.item(0, 5).text(),
+        )
+        event_table = next(
+            table for table in dialog.findChildren(QTableWidget) if table.columnCount() == 5
+        )
+        self.assertIn(
+            "publish_location_candidate_limit",
+            event_table.item(0, 4).text(),
+        )
+
     def test_non_batch_task_keeps_the_generic_items_table(self) -> None:
         """批量专用表格不得改变普通任务的十列执行项明细。"""
         task = {

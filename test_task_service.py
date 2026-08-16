@@ -1384,6 +1384,134 @@ class DouyinCommerceBatchTaskTests(unittest.TestCase):
             {"scheduleTime": "2026-08-07 09:00", "platformPostId": "post-001"},
         )
 
+    def test_location_failure_diagnostic_is_whitelisted_before_persistence(self) -> None:
+        """诊断事件必须只落库公开字段及其严格的原生值类型。"""
+
+        task = task_service.create_douyin_batch_task(self.batch)
+        task_id = task["id"]
+        item_id = task_service.get_task(task_id)["items"][0]["id"]
+
+        class ForgedStr(str):
+            pass
+
+        task_service.mark_batch_item_result(
+            task_id,
+            item_id,
+            ok=False,
+            message="发布定位恢复失败：累计检查 100 个不同地点、加载 7 次仍未命中目标（错误码 publish_location_candidate_limit）",
+            event_type="batch_item_failed",
+            readback={
+                "errorCode": "publish_location_candidate_limit",
+                "stage": ForgedStr("load_more"),
+                "keyword": "夜南香",
+                "loadMoreClicks": 7,
+                "candidateCount": 100,
+                "candidateLimit": "100",
+                "clickLimit": True,
+                "operationTimeoutSeconds": 30.0,
+                "stringCount": "100",
+                "cookie": "must-not-store",
+                "dom": "must-not-store",
+                "path": "/private/platform/profile",
+                "unknownField": "must-not-store",
+            },
+        )
+
+        detail = json.loads(task_service.get_task(task_id)["events"][-1]["detailJson"])
+        self.assertEqual(
+            detail,
+            {
+                "errorCode": "publish_location_candidate_limit",
+                "keyword": "夜南香",
+                "loadMoreClicks": 7,
+                "candidateCount": 100,
+            },
+        )
+
+    def test_location_failure_scope_is_whitelisted_only_as_native_nonempty_text(self) -> None:
+        """范围绑定字段缺失或接受伪造类型时，地点诊断会失去可审计边界。"""
+
+        class ForgedStr(str):
+            pass
+
+        cases = (
+            ("local", "local"),
+            (ForgedStr("local"), None),
+            ("", None),
+            ("   ", None),
+            (True, None),
+            (7, None),
+            (7.0, None),
+        )
+        for value, expected in cases:
+            with self.subTest(value=repr(value)):
+                task = task_service.create_douyin_batch_task(self.batch)
+                task_id = task["id"]
+                item_id = task_service.get_task(task_id)["items"][0]["id"]
+                task_service.mark_batch_item_result(
+                    task_id,
+                    item_id,
+                    ok=False,
+                    message="地点范围恢复失败",
+                    event_type="batch_item_failed",
+                    readback={
+                        "scope": value,
+                        "candidateList": ["must-not-store"],
+                        "cookie": "must-not-store",
+                        "dom": "must-not-store",
+                        "path": "/private/platform/profile",
+                        "unknownField": "must-not-store",
+                    },
+                )
+
+                detail = json.loads(task_service.get_task(task_id)["events"][-1]["detailJson"])
+                if expected is None:
+                    self.assertNotIn("scope", detail)
+                else:
+                    self.assertIn("scope", detail)
+                    self.assertEqual(detail["scope"], expected)
+                for forbidden in ("candidateList", "cookie", "dom", "path", "unknownField"):
+                    self.assertNotIn(forbidden, detail)
+
+    def test_malformed_location_snapshot_cannot_persist_diagnostic_fields(self) -> None:
+        """越界或非枚举九字段不能作为结构化地点诊断落库。"""
+
+        task = task_service.create_douyin_batch_task(self.batch)
+        task_id = task["id"]
+        item_id = task_service.get_task(task_id)["items"][0]["id"]
+        task_service.mark_batch_item_result(
+            task_id,
+            item_id,
+            ok=False,
+            message="固定安全失败说明",
+            event_type="batch_item_failed",
+            readback={
+                "errorCode": "publish_location_candidate_limit",
+                "stage": "<button data-private-dom='1'>",
+                "keyword": "Cookie=location-secret",
+                "scope": "/Users/andy/private-account.json",
+                "loadMoreClicks": 11,
+                "candidateCount": 101,
+                "candidateLimit": 101,
+                "clickLimit": 11,
+                "operationTimeoutSeconds": 31,
+            },
+        )
+
+        detail = json.loads(task_service.get_task(task_id)["events"][-1]["detailJson"])
+        for field in (
+            "stage",
+            "keyword",
+            "scope",
+            "loadMoreClicks",
+            "candidateCount",
+            "candidateLimit",
+            "clickLimit",
+            "operationTimeoutSeconds",
+        ):
+            with self.subTest(field=field):
+                self.assertNotIn(field, detail)
+
     def test_normal_event_after_success_does_not_roll_back_item_status(self) -> None:
         task = task_service.create_douyin_batch_task(self.batch)
         task_id = task["id"]

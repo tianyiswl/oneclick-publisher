@@ -6,14 +6,21 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
+import json
 from pathlib import Path
 import tempfile
 import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
-from app_core import database, task_service
+from app_core import (
+    database,
+    douyin_commerce_service,
+    douyin_commerce_session,
+    task_service,
+)
 from app_core.douyin_commerce_batch_executor import (
     BatchProgressEvent,
     DouyinCommerceBatchExecutor,
@@ -21,8 +28,9 @@ from app_core.douyin_commerce_batch_executor import (
     _location_search_keywords,
 )
 from app_core.douyin_commerce_batch_service import apply_interval_schedule, validate_batch_payload
+from app_core.douyin_commerce_session import DouyinCommerceSessionError
 from app_core.douyin_location_service import normalize_location_candidate
-from app_core.douyin_sms_cooldown import DouyinSmsCooldownGate
+from app_core.douyin_sms_cooldown import DouyinSmsCooldownError, DouyinSmsCooldownGate
 from app_core.douyin_verification import (
     DouyinVerificationBroker,
     DouyinVerificationError,
@@ -332,7 +340,11 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
         )
 
         self.assertEqual([row["status"] for row in result], ["published", "failed", "published"])
-        self.assertEqual(result[1]["diagnostic"], "第 1 条平台回读失败")
+        self.assertEqual(
+            result[1]["diagnostic"],
+            "抖音批量发布失败：当前视频未完成平台处理"
+            "（错误码 douyin_batch_item_failed）",
+        )
         self.assertEqual(manager.max_open_sessions, 1)
         self.assertIn("submit:0", manager.calls)
         self.assertIn("submit:1", manager.calls)
@@ -354,7 +366,7 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
         )
         self.assertEqual([item["status"] for item in task_service.get_task(self.task["id"])["items"]], ["success", "failed", "success"])
         self.assertTrue(
-            any("第 1 条平台回读失败" in event.message for event in events)
+            any("douyin_batch_item_failed" in event.message for event in events)
         )
         self.assertTrue(any(event.phase == "uploading" for event in events))
 
@@ -436,7 +448,7 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
             ) -> dict:
                 del preset, scope, keywords, commission_filter
                 self.ordered_calls.append(("apply_saved_location", session_id))
-                raise RuntimeError("publish_location_click_failed")
+                raise DouyinCommerceSessionError("publish_location_click_failed")
 
         batch = {**self.batch, "items": [dict(self.batch["items"][0])]}
         task = task_service.create_douyin_batch_task(batch)
@@ -486,7 +498,9 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
                     commission_filter,
                 )
                 if session_id == "session-1":
-                    raise RuntimeError("publish_location_commission_mismatch")
+                    raise DouyinCommerceSessionError(
+                        "publish_location_commission_mismatch"
+                    )
                 return result
 
         items = [dict(item) for item in self.batch["items"][:2]]
@@ -541,6 +555,657 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
             ["session-1", "session-2"],
         )
 
+    def test_location_limit_failure_passes_exact_public_diagnostic_and_continues(self) -> None:
+        """若执行器丢弃地点上限诊断，失败事件将无法说明安全停止原因。"""
+
+        class LocationLimitManager(FakeCommerceSessionManager):
+            def apply_saved_location(
+                self,
+                session_id: str,
+                preset: dict,
+                scope: str,
+                keywords: list[str],
+                commission_filter: str,
+            ) -> dict:
+                result = super().apply_saved_location(
+                    session_id,
+                    preset,
+                    scope,
+                    keywords,
+                    commission_filter,
+                )
+                if session_id == "session-1":
+                    raise DouyinCommerceSessionError(
+                        "publish_location_candidate_limit",
+                        {
+                            "errorCode": "publish_location_candidate_limit",
+                            "stage": "load_more",
+                            "keyword": "北海银滩景区",
+                            "scope": "domestic",
+                            "loadMoreClicks": 7,
+                            "candidateCount": 100,
+                            "candidateLimit": 100,
+                            "clickLimit": 10,
+                            "operationTimeoutSeconds": 30,
+                        },
+                    )
+                return result
+
+        class RecordingTaskStore:
+            def __init__(self) -> None:
+                self.progress_writes: list[dict[str, object]] = []
+
+            def __getattr__(self, name: str):
+                return getattr(task_service, name)
+
+            def get_task(self, task_id: int) -> dict:
+                return task_service.get_task(task_id)
+
+            def mark_batch_item_result(self, *args, **kwargs) -> None:
+                self.progress_writes.append(dict(kwargs))
+                task_service.mark_batch_item_result(*args, **kwargs)
+
+        batch = {**self.batch, "items": [dict(item) for item in self.batch["items"][:2]]}
+        task = task_service.create_douyin_batch_task(batch)
+        store = RecordingTaskStore()
+
+        result = DouyinCommerceBatchExecutor(
+            LocationLimitManager(),
+            task_store=store,
+        ).run_publish(batch, task_id=task["id"], confirmed=True)
+
+        self.assertEqual([row["status"] for row in result], ["failed", "published"])
+        self.assertEqual(
+            result[0]["diagnostic"],
+            "发布定位恢复失败：累计候选达到安全上限，仍未命中目标；"
+            "阶段=加载更多，关键词=北海银滩景区，范围=国内，加载=7次，候选=100个"
+            "（错误码 publish_location_candidate_limit）",
+        )
+        self.assertEqual(
+            task_service.get_task(task["id"])["items"][0]["message"],
+            "第 1 条视频未完成平台回读："
+            "发布定位恢复失败：累计候选达到安全上限，仍未命中目标；"
+            "阶段=加载更多，关键词=北海银滩景区，范围=国内，加载=7次，候选=100个"
+            "（错误码 publish_location_candidate_limit）",
+        )
+        self.assertEqual(
+            next(
+                write["readback"]
+                for write in store.progress_writes
+                if write["event_type"] == "batch_item_failed"
+            ),
+            {
+                "errorCode": "publish_location_candidate_limit",
+                "stage": "load_more",
+                "keyword": "北海银滩景区",
+                "scope": "domestic",
+                "loadMoreClicks": 7,
+                "candidateCount": 100,
+                "candidateLimit": 100,
+                "clickLimit": 10,
+                "operationTimeoutSeconds": 30,
+            },
+        )
+
+    def test_all_pages_scoped_diagnostic_reaches_task_and_next_video_continues(
+        self,
+    ) -> None:
+        """all-pages 九字段须进入公开说明和 SQLite，且不阻塞下一条。"""
+
+        class AllPagesManager(FakeCommerceSessionManager):
+            def apply_saved_location(
+                self,
+                session_id: str,
+                preset: dict,
+                scope: str,
+                keywords: list[str],
+                commission_filter: str,
+            ) -> dict:
+                result = super().apply_saved_location(
+                    session_id,
+                    preset,
+                    scope,
+                    keywords,
+                    commission_filter,
+                )
+                if session_id == "session-1":
+                    raise DouyinCommerceSessionError(
+                        "publish_location_not_found_after_all_pages",
+                        {
+                            "errorCode": "publish_location_not_found_after_all_pages",
+                            "stage": "all_pages",
+                            "keyword": "北海银滩景区",
+                            "scope": "domestic",
+                            "loadMoreClicks": 4,
+                            "candidateCount": 84,
+                            "candidateLimit": 100,
+                            "clickLimit": 10,
+                            "operationTimeoutSeconds": 30,
+                        },
+                    )
+                return result
+
+        batch = {**self.batch, "items": [dict(item) for item in self.batch["items"][:2]]}
+        task = task_service.create_douyin_batch_task(batch)
+
+        result = DouyinCommerceBatchExecutor(AllPagesManager()).run_publish(
+            batch,
+            task_id=task["id"],
+            confirmed=True,
+        )
+
+        self.assertEqual([row["status"] for row in result], ["failed", "published"])
+        for fragment in (
+            "已读完可用候选批次",
+            "阶段=全部批次",
+            "关键词=北海银滩景区",
+            "范围=国内",
+            "加载=4次",
+            "候选=84个",
+            "publish_location_not_found_after_all_pages",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, result[0]["diagnostic"])
+        saved = task_service.get_task(task["id"])
+        failed_event = next(
+            event
+            for event in saved["events"]
+            if event["eventType"] == "batch_item_failed"
+        )
+        self.assertEqual(
+            json.loads(failed_event["detailJson"]),
+            {
+                "errorCode": "publish_location_not_found_after_all_pages",
+                "stage": "all_pages",
+                "keyword": "北海银滩景区",
+                "scope": "domestic",
+                "loadMoreClicks": 4,
+                "candidateCount": 84,
+                "candidateLimit": 100,
+                "clickLimit": 10,
+                "operationTimeoutSeconds": 30,
+            },
+        )
+
+    def test_mixed_keyword_search_failure_persists_non_all_pages_error_and_continues(
+        self,
+    ) -> None:
+        """真实 service/session 混合搜索失败须以非 all-pages 码落库。"""
+
+        first = douyin_commerce_service.normalize_commerce_location_candidate(
+            {
+                "poiId": "poi-other",
+                "name": "非目标",
+                "address": "广西北海市候选路1号",
+                "commissionType": "unknown",
+            }
+        )
+        no_more = {
+            "platformResultCount": 1,
+            "candidates": [first],
+            "newCandidateCount": 0,
+            "hasMore": False,
+            "stopReason": "no_visible_load_more_control",
+            "clickPerformed": False,
+        }
+
+        class OfflinePage:
+            @staticmethod
+            def is_closed() -> bool:
+                return False
+
+        real_location_manager = (
+            douyin_commerce_session.DouyinCommerceSessionManager()
+        )
+        real_location_manager._call = asyncio.run
+        real_location_manager._session = douyin_commerce_session._CommerceEditorSession(
+            session_id="real-session",
+            upload_payload={},
+            account_name="offline",
+            browser=None,
+            context=None,
+            page=OfflinePage(),
+            playwright=None,
+            uploader=None,
+        )
+
+        class MixedKeywordFailureManager(FakeCommerceSessionManager):
+            def apply_saved_location(
+                self,
+                session_id: str,
+                preset: dict,
+                scope: str,
+                keywords: list[str],
+                commission_filter: str,
+            ) -> dict:
+                result = super().apply_saved_location(
+                    session_id,
+                    preset,
+                    scope,
+                    keywords,
+                    commission_filter,
+                )
+                if session_id == "session-1":
+                    return real_location_manager.apply_saved_location(
+                        "real-session",
+                        preset,
+                        scope,
+                        ["北海银滩景区", "失败检索词"],
+                        commission_filter,
+                    )
+                return result
+
+        batch = {**self.batch, "items": [dict(item) for item in self.batch["items"][:2]]}
+        task = task_service.create_douyin_batch_task(batch)
+
+        with patch.object(
+            douyin_commerce_service,
+            "search_commerce_location_store_candidates",
+            new_callable=AsyncMock,
+            side_effect=[
+                [first],
+                douyin_commerce_service.DouyinCommerceError(
+                    "platform_search_failed"
+                ),
+            ],
+        ), patch.object(
+            douyin_commerce_service,
+            "load_more_commerce_location_candidates",
+            new_callable=AsyncMock,
+            return_value=no_more,
+        ), patch.object(
+            douyin_commerce_service,
+            "close_commerce_store_selector",
+            new_callable=AsyncMock,
+        ):
+            result = DouyinCommerceBatchExecutor(
+                MixedKeywordFailureManager()
+            ).run_publish(
+                batch,
+                task_id=task["id"],
+                confirmed=True,
+            )
+
+        self.assertEqual([row["status"] for row in result], ["failed", "published"])
+        self.assertIn("publish_location_candidate_missing", result[0]["diagnostic"])
+        self.assertNotIn("publish_location_not_found_after_all_pages", result[0]["diagnostic"])
+        failed_event = next(
+            event
+            for event in task_service.get_task(task["id"])["events"]
+            if event["eventType"] == "batch_item_failed"
+        )
+        self.assertEqual(
+            json.loads(failed_event["detailJson"]),
+            {"errorCode": "publish_location_candidate_missing"},
+        )
+
+    def test_unknown_location_error_never_leaks_into_public_failure_outputs(self) -> None:
+        """未知地点异常的原文或诊断字段一旦外泄，此测试必须失败。"""
+
+        injected_samples = (
+            "Cookie=location-secret",
+            "/Users/andy/private-account.json",
+            "<button data-private-dom='1'>",
+            "publish_location_future_unapproved",
+        )
+
+        class MaliciousLocationError(RuntimeError):
+            diagnostic = {
+                "errorCode": "publish_location_future_unapproved",
+                "stage": "<button data-private-dom='1'>",
+                "keyword": "/Users/andy/private-account.json",
+                "candidateCount": 100,
+            }
+
+            def __str__(self) -> str:
+                return "Cookie=location-secret /Users/andy/private-account.json <button data-private-dom='1'>"
+
+        class UnknownLocationManager(FakeCommerceSessionManager):
+            def apply_saved_location(
+                self,
+                session_id: str,
+                preset: dict,
+                scope: str,
+                keywords: list[str],
+                commission_filter: str,
+            ) -> dict:
+                result = super().apply_saved_location(
+                    session_id,
+                    preset,
+                    scope,
+                    keywords,
+                    commission_filter,
+                )
+                if session_id == "session-1":
+                    raise MaliciousLocationError()
+                return result
+
+        class RecordingTaskStore:
+            def __init__(self) -> None:
+                self.progress_writes: list[dict[str, object]] = []
+
+            def __getattr__(self, name: str):
+                return getattr(task_service, name)
+
+            def mark_batch_item_result(self, *args, **kwargs) -> None:
+                self.progress_writes.append(dict(kwargs))
+                task_service.mark_batch_item_result(*args, **kwargs)
+
+        batch = {**self.batch, "items": [dict(item) for item in self.batch["items"][:2]]}
+        task = task_service.create_douyin_batch_task(batch)
+        store = RecordingTaskStore()
+        progress: list[BatchProgressEvent] = []
+
+        result = DouyinCommerceBatchExecutor(
+            UnknownLocationManager(),
+            task_store=store,
+        ).run_publish(
+            batch,
+            task_id=task["id"],
+            confirmed=True,
+            progress=progress.append,
+        )
+
+        self.assertEqual([row["status"] for row in result], ["failed", "published"])
+        self.assertEqual(
+            result[0]["diagnostic"],
+            "抖音批量发布失败：当前视频未完成平台处理"
+            "（错误码 douyin_batch_item_failed）",
+        )
+        failed_write = next(
+            write
+            for write in store.progress_writes
+            if write["event_type"] == "batch_item_failed"
+        )
+        self.assertEqual(failed_write["readback"], {})
+        saved = task_service.get_task(task["id"])
+        public_outputs = repr(
+            result + progress + [saved["items"], saved["events"], failed_write]
+        )
+        for sample in injected_samples:
+            with self.subTest(sample=sample):
+                self.assertNotIn(sample, public_outputs)
+
+    def test_forged_known_location_code_cannot_inject_diagnostic(self) -> None:
+        """任意异常即使伪造已知码，也不是可信地点诊断来源。"""
+
+        injected_samples = (
+            "Cookie=forged-location-secret",
+            "/Users/andy/private-account.json",
+            "<button data-private-dom='1'>",
+        )
+
+        class ForgedKnownLocationError(RuntimeError):
+            code = "publish_location_candidate_limit"
+            diagnostic = {
+                "errorCode": "publish_location_candidate_limit",
+                "stage": "<button data-private-dom='1'>",
+                "keyword": "Cookie=forged-location-secret",
+                "scope": "/Users/andy/private-account.json",
+                "loadMoreClicks": 7,
+                "candidateCount": 100,
+                "candidateLimit": 100,
+                "clickLimit": 10,
+                "operationTimeoutSeconds": 30,
+            }
+
+        class ForgedManager(FakeCommerceSessionManager):
+            def apply_saved_location(
+                self,
+                session_id: str,
+                preset: dict,
+                scope: str,
+                keywords: list[str],
+                commission_filter: str,
+            ) -> dict:
+                result = super().apply_saved_location(
+                    session_id,
+                    preset,
+                    scope,
+                    keywords,
+                    commission_filter,
+                )
+                if session_id == "session-1":
+                    raise ForgedKnownLocationError(
+                        "publish_location_candidate_limit"
+                    )
+                return result
+
+        batch = {**self.batch, "items": [dict(item) for item in self.batch["items"][:2]]}
+        task = task_service.create_douyin_batch_task(batch)
+        progress: list[BatchProgressEvent] = []
+
+        result = DouyinCommerceBatchExecutor(ForgedManager()).run_publish(
+            batch,
+            task_id=task["id"],
+            confirmed=True,
+            progress=progress.append,
+        )
+
+        self.assertEqual([row["status"] for row in result], ["failed", "published"])
+        saved = task_service.get_task(task["id"])
+        failed_event = next(
+            event
+            for event in saved["events"]
+            if event["eventType"] == "batch_item_failed"
+        )
+        self.assertEqual(json.loads(failed_event["detailJson"]), {})
+        public_outputs = repr(result + progress + [saved["items"], saved["events"]])
+        for sample in injected_samples:
+            with self.subTest(sample=sample):
+                self.assertNotIn(sample, public_outputs)
+
+    def test_exception_attributes_that_raise_are_safely_ignored(self) -> None:
+        """读取不可信 code/diagnostic 属性失败时仍固定收敛并继续下一条。"""
+
+        injected = "Cookie=explosive-attribute-secret"
+
+        class ExplosiveAttributeError(RuntimeError):
+            @property
+            def code(self):
+                raise RuntimeError(injected)
+
+            @property
+            def diagnostic(self):
+                raise RuntimeError("/Users/andy/private-account.json")
+
+        class ExplosiveManager(FakeCommerceSessionManager):
+            def apply_saved_location(
+                self,
+                session_id: str,
+                preset: dict,
+                scope: str,
+                keywords: list[str],
+                commission_filter: str,
+            ) -> dict:
+                result = super().apply_saved_location(
+                    session_id,
+                    preset,
+                    scope,
+                    keywords,
+                    commission_filter,
+                )
+                if session_id == "session-1":
+                    raise ExplosiveAttributeError("ordinary failure")
+                return result
+
+        batch = {**self.batch, "items": [dict(item) for item in self.batch["items"][:2]]}
+        task = task_service.create_douyin_batch_task(batch)
+
+        result = DouyinCommerceBatchExecutor(ExplosiveManager()).run_publish(
+            batch,
+            task_id=task["id"],
+            confirmed=True,
+        )
+
+        self.assertEqual([row["status"] for row in result], ["failed", "published"])
+        saved = task_service.get_task(task["id"])
+        self.assertNotIn(injected, repr(result + [saved["items"], saved["events"]]))
+
+    def test_new_location_stop_codes_have_safe_fallback_and_minimal_readback(self) -> None:
+        """新停止码的诊断缺失或畸形时仍须有固定文案和最小回读。"""
+
+        cases = (
+            (
+                "publish_location_action_timeout",
+                None,
+                "发布定位恢复失败：单次平台地点操作超过安全时限"
+                "（错误码 publish_location_action_timeout）",
+            ),
+            (
+                "publish_location_click_limit",
+                {
+                    "errorCode": "publish_location_click_limit",
+                    "stage": "load_more",
+                    "keyword": "北海银滩景区",
+                    "scope": "domestic",
+                    "loadMoreClicks": "10",
+                    "candidateCount": 84,
+                    "candidateLimit": 100,
+                    "clickLimit": 10,
+                    "operationTimeoutSeconds": 30,
+                },
+                "发布定位恢复失败：实际加载次数达到安全上限，仍未命中目标"
+                "（错误码 publish_location_click_limit）",
+            ),
+            (
+                "publish_location_candidate_limit",
+                {
+                    "errorCode": "publish_location_candidate_limit",
+                    "stage": "load_more",
+                    "keyword": "北海银滩景区",
+                    "scope": "domestic",
+                    "loadMoreClicks": 7,
+                    "candidateCount": 101,
+                    "candidateLimit": 100,
+                    "clickLimit": 10,
+                    "operationTimeoutSeconds": 30,
+                },
+                "发布定位恢复失败：累计候选达到安全上限，仍未命中目标"
+                "（错误码 publish_location_candidate_limit）",
+            ),
+        )
+        for error_code, diagnostic, expected_message in cases:
+            with self.subTest(error_code=error_code):
+                class StopCodeManager(FakeCommerceSessionManager):
+                    def apply_saved_location(
+                        self,
+                        session_id: str,
+                        preset: dict,
+                        scope: str,
+                        keywords: list[str],
+                        commission_filter: str,
+                    ) -> dict:
+                        result = super().apply_saved_location(
+                            session_id,
+                            preset,
+                            scope,
+                            keywords,
+                            commission_filter,
+                        )
+                        if session_id == "session-1":
+                            raise DouyinCommerceSessionError(
+                                error_code,
+                                diagnostic,
+                            )
+                        return result
+
+                batch = {
+                    **self.batch,
+                    "items": [dict(item) for item in self.batch["items"][:2]],
+                }
+                task = task_service.create_douyin_batch_task(batch)
+                result = DouyinCommerceBatchExecutor(
+                    StopCodeManager()
+                ).run_publish(
+                    batch,
+                    task_id=task["id"],
+                    confirmed=True,
+                )
+
+                self.assertEqual(
+                    [row["status"] for row in result],
+                    ["failed", "published"],
+                )
+                self.assertEqual(result[0]["diagnostic"], expected_message)
+                saved = task_service.get_task(task["id"])
+                failed_event = next(
+                    event
+                    for event in saved["events"]
+                    if event["eventType"] == "batch_item_failed"
+                )
+                self.assertEqual(
+                    json.loads(failed_event["detailJson"]),
+                    {"errorCode": error_code},
+                )
+
+    def test_unknown_cooldown_error_never_leaks_from_receipt_sentinel(self) -> None:
+        """冷却哨兵若保留异常原文，会污染最终提交后的公开暂停信息。"""
+
+        injected_samples = (
+            "Cookie=cooldown-secret",
+            "/Users/andy/private-account.json",
+            "<div data-private-dom='1'>",
+        )
+
+        class MaliciousCooldownError(DouyinSmsCooldownError):
+            def __str__(self) -> str:
+                return "Cookie=cooldown-secret /Users/andy/private-account.json <div data-private-dom='1'>"
+
+        class MaliciousCooldownGate:
+            def restore_remaining(self, _account_key: str, _remaining: float) -> None:
+                return None
+
+            def remaining_seconds(self, _account_key: str) -> int:
+                return 0
+
+            def record_trigger(self, _account_key: str) -> None:
+                raise MaliciousCooldownError()
+
+        broker = DouyinVerificationBroker()
+        manager = FakeCommerceSessionManager(
+            challenge_on_index=0,
+            verification_mode="active_success",
+            verification_broker=broker,
+        )
+        progress: list[BatchProgressEvent] = []
+
+        result = DouyinCommerceBatchExecutor(
+            manager,
+            verification_broker=broker,
+            cooldown_gate=MaliciousCooldownGate(),
+        ).run_publish(
+            self.batch,
+            task_id=self.task["id"],
+            confirmed=True,
+            progress=progress.append,
+        )
+
+        self.assertEqual(
+            [row["status"] for row in result],
+            ["receipt_ambiguous", "pending", "pending"],
+        )
+        self.assertEqual(result[0]["diagnostic"], "verification_cooldown_failed")
+        saved = task_service.get_task(self.task["id"])
+        self.assertEqual(
+            json.loads(
+                next(
+                    event["detailJson"]
+                    for event in reversed(saved["events"])
+                    if event["eventType"] == "platform_receipt_ambiguous"
+                )
+            ),
+            {},
+        )
+        public_outputs = repr(result + progress + [saved["items"], saved["events"]])
+        for sample in injected_samples:
+            with self.subTest(sample=sample):
+                self.assertNotIn(sample, public_outputs)
+        self.assertEqual(
+            [call for call in manager.calls if call.startswith("submit:")],
+            ["submit:0"],
+        )
+
     def test_legacy_location_without_commission_filter_defaults_to_all(self) -> None:
         """旧任务缺少返佣字段时，正式复核必须显式使用全部地址。"""
 
@@ -574,7 +1239,11 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
             [row["status"] for row in result],
             ["failed", "published", "published"],
         )
-        self.assertEqual(result[0]["diagnostic"], "正式发布页旧浮层未能清理")
+        self.assertEqual(
+            result[0]["diagnostic"],
+            "抖音批量发布失败：当前视频未完成平台处理"
+            "（错误码 douyin_batch_item_failed）",
+        )
         self.assertEqual(
             [
                 call
@@ -588,6 +1257,54 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
         )
         self.assertEqual(manager.started_session_ids[:2], ["session-1", "session-2"])
         self.assertEqual(manager.closed_session_ids[:2], ["session-1", "session-2"])
+
+    def test_non_location_failure_uses_generic_batch_classification_and_continues(self) -> None:
+        """非地点阶段的普通异常必须固定收敛，且下一条继续。"""
+
+        injected_samples = (
+            "Cookie=batch-secret",
+            "/Users/andy/private-account.json",
+            "<div data-private-dom='1'>",
+        )
+
+        class NonLocationFailureManager(FakeCommerceSessionManager):
+            def prepare_publish_settings(self, session_id: str) -> dict:
+                if session_id == "session-1":
+                    raise RuntimeError(" ".join(injected_samples))
+                return super().prepare_publish_settings(session_id)
+
+        batch = {**self.batch, "items": [dict(item) for item in self.batch["items"][:2]]}
+        task = task_service.create_douyin_batch_task(batch)
+        progress: list[BatchProgressEvent] = []
+
+        result = DouyinCommerceBatchExecutor(
+            NonLocationFailureManager()
+        ).run_publish(
+            batch,
+            task_id=task["id"],
+            confirmed=True,
+            progress=progress.append,
+        )
+
+        self.assertEqual([row["status"] for row in result], ["failed", "published"])
+        self.assertEqual(
+            result[0]["diagnostic"],
+            "抖音批量发布失败：当前视频未完成平台处理"
+            "（错误码 douyin_batch_item_failed）",
+        )
+        saved = task_service.get_task(task["id"])
+        failed_event = next(
+            event
+            for event in saved["events"]
+            if event["eventType"] == "batch_item_failed"
+        )
+        self.assertEqual(json.loads(failed_event["detailJson"]), {})
+        public_outputs = repr(result + progress + [saved["items"], saved["events"]])
+        self.assertNotIn("发布定位恢复失败", public_outputs)
+        self.assertNotIn("已找到目标地点", public_outputs)
+        for sample in injected_samples:
+            with self.subTest(sample=sample):
+                self.assertNotIn(sample, public_outputs)
 
     def test_strict_close_barrier_pauses_batch_and_preserves_process_control(self) -> None:
         """每条结束必须严格归零；关闭失败暂停整批，进程控制异常原样传播。"""
@@ -673,7 +1390,9 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
 
         self.assertEqual(result[0]["status"], "failed")
         self.assertEqual(
-            result[0]["diagnostic"], "抖音正式发布页未取得干净设置基线"
+            result[0]["diagnostic"],
+            "抖音批量发布失败：当前视频未完成平台处理"
+            "（错误码 douyin_batch_item_failed）",
         )
         self.assertNotIn(
             ("select_cached_favorite_music", "session-1"), manager.ordered_calls

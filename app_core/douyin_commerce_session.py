@@ -41,10 +41,44 @@ from utils.log import douyin_logger
 
 
 _LOGGER = logging.getLogger(__name__)
+_LOCATION_DIAGNOSTIC_FIELDS = (
+    "errorCode",
+    "stage",
+    "keyword",
+    "scope",
+    "loadMoreClicks",
+    "candidateCount",
+    "candidateLimit",
+    "clickLimit",
+    "operationTimeoutSeconds",
+)
 
 
 class DouyinCommerceSessionError(RuntimeError):
     """分步编辑会话无法继续时抛出。"""
+
+    def __init__(
+        self,
+        code: str,
+        diagnostic: Mapping[str, object] | None = None,
+    ) -> None:
+        super().__init__(code)
+        self.code = code
+        self.diagnostic = _public_location_diagnostic(diagnostic)
+
+
+def _public_location_diagnostic(
+    diagnostic: Mapping[str, object] | None,
+) -> dict[str, object]:
+    """仅将受控地点诊断字段交给会话调用方。"""
+
+    if not isinstance(diagnostic, Mapping):
+        return {}
+    return {
+        field: diagnostic[field]
+        for field in _LOCATION_DIAGNOSTIC_FIELDS
+        if field in diagnostic
+    }
 
 
 @dataclass(frozen=True)
@@ -1476,9 +1510,13 @@ class DouyinCommerceSessionManager:
                 "publish_location_not_found_after_all_pages",
                 "publish_location_load_more_limit",
                 "publish_location_load_more_failed",
+                "publish_location_action_timeout",
+                "publish_location_click_limit",
+                "publish_location_candidate_limit",
             }
             raise DouyinCommerceSessionError(
-                code if code in allowed else "publish_location_click_failed"
+                code if code in allowed else "publish_location_click_failed",
+                exc.diagnostic if code in allowed else None,
             ) from None
         except Exception:
             raise DouyinCommerceSessionError("publish_location_click_failed") from None
