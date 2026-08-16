@@ -1524,10 +1524,7 @@ class DouyinCommerceBatchExecutor:
                     expected_scope=location_diagnostic_scope,
                     expected_keywords=location_diagnostic_keywords,
                 )
-                if (
-                    not location_diagnostic
-                    and error_code in _LOCATION_DIAGNOSTIC_STAGES_BY_CODE
-                ):
+                if not location_diagnostic:
                     location_diagnostic = {"errorCode": error_code}
                 diagnostic = format_public_location_failure(
                     error_code,

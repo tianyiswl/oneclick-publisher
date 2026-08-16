@@ -3831,7 +3831,7 @@ async def apply_saved_commerce_location_to_page(
     target_text = (
         f"{_normalized(expected.get('name'))} · {_normalized(expected.get('address'))}"
     ).strip(" ·")
-    any_search_succeeded = False
+    successfully_exhausted_keywords: list[str] = []
     total_click_count = 0
     seen_candidate_identities: set[tuple[str, str, str, str]] = set()
     commission_mismatch_seen = False
@@ -3886,7 +3886,6 @@ async def apply_saved_commerce_location_to_page(
                     "将尝试下一关键词"
                 )
                 continue
-            any_search_succeeded = True
             candidates = [
                 candidate
                 for row in candidates
@@ -4026,6 +4025,7 @@ async def apply_saved_commerce_location_to_page(
                 )
                 exhausted = not has_more
             if not matched_candidates:
+                successfully_exhausted_keywords.append(keyword)
                 douyin_logger.warning(
                     f"抖音发布定位关键词“{keyword}”已读完可用批次，"
                     f"累计 {len(candidates)} 个候选均未匹配目标“{target_text}”；"
@@ -4128,11 +4128,11 @@ async def apply_saved_commerce_location_to_page(
         raise DouyinCommerceError(
             "publish_location_commission_mismatch"
         ) from None
-    if any_search_succeeded:
+    if len(successfully_exhausted_keywords) == len(bounded_keywords):
         raise _location_failure(
             "publish_location_not_found_after_all_pages",
             stage="all_pages",
-            keyword=bounded_keywords[-1],
+            keyword=successfully_exhausted_keywords[-1],
             scope=selected_scope,
             clicks=total_click_count,
             candidates=len(seen_candidate_identities),

@@ -5951,6 +5951,67 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
+    async def test_publish_does_not_report_all_pages_when_later_keyword_search_fails(
+        self,
+    ) -> None:
+        """只有所有关键词都成功穷尽，才能报告已读完全部批次。"""
+
+        first = douyin_commerce_service.normalize_commerce_location_candidate(
+            {
+                "name": "非目标",
+                "address": "广西北海市候选路1号",
+                "commerceInfo": "1件商品 · 1件返佣",
+            }
+        )
+        preset = douyin_commerce_service.normalize_commerce_location_candidate(
+            {
+                "name": "夜南香",
+                "address": "广西北海市目标路1号",
+                "commerceInfo": "1件商品 · 1件返佣",
+            }
+        )
+        no_more = {
+            "platformResultCount": 1,
+            "candidates": [first],
+            "newCandidateCount": 0,
+            "hasMore": False,
+            "stopReason": "no_visible_load_more_control",
+            "clickPerformed": False,
+        }
+        with patch.object(
+            douyin_commerce_service,
+            "search_commerce_location_store_candidates",
+            new_callable=AsyncMock,
+            side_effect=[
+                [first],
+                douyin_commerce_service.DouyinCommerceError(
+                    "platform_search_failed"
+                ),
+            ],
+        ) as search, patch.object(
+            douyin_commerce_service,
+            "load_more_commerce_location_candidates",
+            new_callable=AsyncMock,
+            return_value=no_more,
+        ) as load_more, patch.object(
+            douyin_commerce_service,
+            "close_commerce_store_selector",
+            new_callable=AsyncMock,
+        ):
+            with self.assertRaises(douyin_commerce_service.DouyinCommerceError) as caught:
+                await douyin_commerce_service.apply_saved_commerce_location_to_page(
+                    object(),
+                    preset,
+                    "domestic",
+                    ["夜南香", "失败检索词"],
+                    "commission",
+                )
+
+        self.assertEqual(str(caught.exception), "publish_location_candidate_missing")
+        self.assertEqual(caught.exception.diagnostic, {})
+        self.assertEqual(search.await_count, 2)
+        self.assertEqual(load_more.await_count, 1)
+
     async def test_publish_projects_ambiguous_load_more_button_to_fixed_error(self) -> None:
         """分页按钮歧义不得泄露 DOM 原文或降级猜测点击。"""
 

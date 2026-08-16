@@ -6,15 +6,21 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import tempfile
 import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
-from app_core import database, task_service
+from app_core import (
+    database,
+    douyin_commerce_service,
+    douyin_commerce_session,
+    task_service,
+)
 from app_core.douyin_commerce_batch_executor import (
     BatchProgressEvent,
     DouyinCommerceBatchExecutor,
@@ -719,6 +725,118 @@ class DouyinCommerceBatchExecutorTests(unittest.TestCase):
                 "clickLimit": 10,
                 "operationTimeoutSeconds": 30,
             },
+        )
+
+    def test_mixed_keyword_search_failure_persists_non_all_pages_error_and_continues(
+        self,
+    ) -> None:
+        """真实 service/session 混合搜索失败须以非 all-pages 码落库。"""
+
+        first = douyin_commerce_service.normalize_commerce_location_candidate(
+            {
+                "poiId": "poi-other",
+                "name": "非目标",
+                "address": "广西北海市候选路1号",
+                "commissionType": "unknown",
+            }
+        )
+        no_more = {
+            "platformResultCount": 1,
+            "candidates": [first],
+            "newCandidateCount": 0,
+            "hasMore": False,
+            "stopReason": "no_visible_load_more_control",
+            "clickPerformed": False,
+        }
+
+        class OfflinePage:
+            @staticmethod
+            def is_closed() -> bool:
+                return False
+
+        real_location_manager = (
+            douyin_commerce_session.DouyinCommerceSessionManager()
+        )
+        real_location_manager._call = asyncio.run
+        real_location_manager._session = douyin_commerce_session._CommerceEditorSession(
+            session_id="real-session",
+            upload_payload={},
+            account_name="offline",
+            browser=None,
+            context=None,
+            page=OfflinePage(),
+            playwright=None,
+            uploader=None,
+        )
+
+        class MixedKeywordFailureManager(FakeCommerceSessionManager):
+            def apply_saved_location(
+                self,
+                session_id: str,
+                preset: dict,
+                scope: str,
+                keywords: list[str],
+                commission_filter: str,
+            ) -> dict:
+                result = super().apply_saved_location(
+                    session_id,
+                    preset,
+                    scope,
+                    keywords,
+                    commission_filter,
+                )
+                if session_id == "session-1":
+                    return real_location_manager.apply_saved_location(
+                        "real-session",
+                        preset,
+                        scope,
+                        ["北海银滩景区", "失败检索词"],
+                        commission_filter,
+                    )
+                return result
+
+        batch = {**self.batch, "items": [dict(item) for item in self.batch["items"][:2]]}
+        task = task_service.create_douyin_batch_task(batch)
+
+        with patch.object(
+            douyin_commerce_service,
+            "search_commerce_location_store_candidates",
+            new_callable=AsyncMock,
+            side_effect=[
+                [first],
+                douyin_commerce_service.DouyinCommerceError(
+                    "platform_search_failed"
+                ),
+            ],
+        ), patch.object(
+            douyin_commerce_service,
+            "load_more_commerce_location_candidates",
+            new_callable=AsyncMock,
+            return_value=no_more,
+        ), patch.object(
+            douyin_commerce_service,
+            "close_commerce_store_selector",
+            new_callable=AsyncMock,
+        ):
+            result = DouyinCommerceBatchExecutor(
+                MixedKeywordFailureManager()
+            ).run_publish(
+                batch,
+                task_id=task["id"],
+                confirmed=True,
+            )
+
+        self.assertEqual([row["status"] for row in result], ["failed", "published"])
+        self.assertIn("publish_location_candidate_missing", result[0]["diagnostic"])
+        self.assertNotIn("publish_location_not_found_after_all_pages", result[0]["diagnostic"])
+        failed_event = next(
+            event
+            for event in task_service.get_task(task["id"])["events"]
+            if event["eventType"] == "batch_item_failed"
+        )
+        self.assertEqual(
+            json.loads(failed_event["detailJson"]),
+            {"errorCode": "publish_location_candidate_missing"},
         )
 
     def test_unknown_location_error_never_leaks_into_public_failure_outputs(self) -> None:

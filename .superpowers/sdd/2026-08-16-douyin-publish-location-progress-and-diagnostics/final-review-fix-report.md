@@ -129,3 +129,18 @@ QT_QPA_PLATFORM=offscreen ../../.venv/bin/python -m unittest \
 1. 证据层仅为离线测试和静态审计；根据本轮禁止访问平台的边界，没有真实抖音页面回读证据。
 2. 诊断信任边界依赖生产会话管理器抛出精确 `DouyinCommerceSessionError`；任意第三方异常会安全降级为通用批次失败，可能牺牲细分错误文案，但不会泄露原始信息。
 3. 非法 `max_*` 参数仍保留旧模糊码，是 findings 明确接受的剩余 Minor，本轮未扩大范围。
+
+## Final fix round 2 — 混合关键词状态
+
+上一版“Important 7/7 已关闭”的结论被 scoped review 推翻：关键词 1 已成功穷尽、关键词 2 搜索失败时，旧实现仍用最后关键词生成 `publish_location_not_found_after_all_pages`。该历史结论不再作为合并证据。
+
+- RED：`test_publish_does_not_report_all_pages_when_later_keyword_search_fails` 实得 `publish_location_not_found_after_all_pages`，期望非 all-pages 固定码。
+- GREEN：服务层改为逐关键词记录 `successfully_exhausted_keywords`；只有所有受控关键词都成功穷尽时才产生 all-pages 九字段。任一关键词搜索失败则固定降级为 `publish_location_candidate_missing`。
+- RED：`test_mixed_keyword_search_failure_persists_non_all_pages_error_and_continues` 初次执行时 SQLite `detailJson={}`。
+- GREEN：可信地点固定码在没有完整九字段时至少保存 `errorCode`；测试真实贯穿 service → session → executor → SQLite，并确认第一条失败后第二条继续。
+- 相邻路径：混合状态、真实单关键词穷尽、all-pages 九字段和两条继续共 5/5 通过。
+- 相关类：`DouyinCommerceLocationDomTests + DouyinCommerceBatchExecutorTests` 为 153/153 通过，34.380 秒，退出码 0。
+- 最终跨层用例在改为真实 service/session 后再次执行 1/1 通过。
+- 静态：4 个改动 Python 文件 `py_compile` 与 `git diff --check` 均退出码 0。
+
+本轮仍仅达到离线交付闭环，未访问真实浏览器、账号或抖音平台。
