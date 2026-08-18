@@ -26,6 +26,9 @@ build/
 dist/
 *.spec
 release/
+seller_release/
+license-private.json
+issue-history.json
 
 # 本机隔离开发工作树
 .worktrees/

@@ -134,6 +134,18 @@ class WindowsBuildTests(unittest.TestCase):
             ):
                 assert_archive_safe(archive)
 
+    def test_archive_with_seller_tool_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive = Path(temp_dir) / "unsafe.zip"
+            with zipfile.ZipFile(archive, "w") as handle:
+                handle.writestr(
+                    f"{APP_EXECUTABLE_NAME}/seller_tools/license_crypto.py",
+                    "private signing code",
+                )
+
+            with self.assertRaisesRegex(RuntimeError, "seller_tools"):
+                assert_archive_safe(archive)
+
     def test_windows_spec_uses_ascii_executable_and_no_macos_bundle(self) -> None:
         spec = render_spec(Path(r"C:\work\oneclick"))
 

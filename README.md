@@ -29,6 +29,10 @@ python desktop_native_app.py --page publish
 QT_QPA_PLATFORM=offscreen python desktop_native_app.py --ui-test
 ```
 
+## 卖家激活码管理器
+
+离线激活码由独立卖家工具签发，客户包只保存验签公钥。卖家端的使用、构建和私钥边界见 `docs/SELLER_LICENSE_MANAGER.md`；在线授权管理平台仍不属于当前交付范围。
+
 ## 数据边界
 
 本仓库不会提交账号资料、登录会话、Cookie、数据库、素材、头像、日志或授权状态。浏览器会话与业务运行数据位于 `demo-runtime/`，不会进入 Git 或应用安装包。

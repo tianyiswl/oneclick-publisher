@@ -6,9 +6,11 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 from tools.build_macos import (
+    assert_archive_safe,
     bundle_playwright_browsers,
     resolve_playwright_browser_dirs,
     write_spec,
@@ -16,6 +18,18 @@ from tools.build_macos import (
 
 
 class MacOSBuildTests(unittest.TestCase):
+    def test_customer_archive_rejects_seller_license_material(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive = Path(temp_dir) / "unsafe.zip"
+            with zipfile.ZipFile(archive, "w") as handle:
+                handle.writestr(
+                    "一键发.app/Contents/Resources/seller_tools/license_crypto.py",
+                    "private signing code",
+                )
+
+            with self.assertRaisesRegex(RuntimeError, "seller_tools"):
+                assert_archive_safe(archive)
+
     def test_resolve_required_playwright_browser_dirs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

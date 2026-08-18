@@ -265,6 +265,9 @@ def assert_archive_safe(zip_path: Path) -> None:
         "oauth_token",
         "access_token",
         "refresh_token",
+        "seller_tools/",
+        "license-private.json",
+        "issue-history.json",
     )
     # zipinfo 会按 ZIP 文件名编码原样输出；中文应用名不保证是 UTF-8。
     # 禁止项均为 ASCII，直接在原始字节中检查，避免因文件名解码失败跳过安全门禁。

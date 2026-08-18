@@ -36,6 +36,9 @@ FORBIDDEN_ARCHIVE_MARKERS = (
     "oauth_token",
     "access_token",
     "refresh_token",
+    "seller_tools/",
+    "license-private.json",
+    "issue-history.json",
 )
 
 
