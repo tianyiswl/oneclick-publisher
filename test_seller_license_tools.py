@@ -82,6 +82,23 @@ class SellerLicenseToolsTests(unittest.TestCase):
 
         self.assertEqual(run_ui_self_test(), "SELLER_LICENSE_UI_OK")
 
+    def test_seller_manager_avoids_macos_accessibility_crash_table(self) -> None:
+        from PyQt6.QtWidgets import QApplication, QTableWidget
+        from seller_tools.license_issuer_gui import LicenseIssuerWindow
+
+        app = QApplication.instance() or QApplication([])
+        window = LicenseIssuerWindow(load_saved_history=False)
+        try:
+            self.assertEqual(window.findChildren(QTableWidget), [])
+            self.assertTrue(window.history_output.isReadOnly())
+            window.records = [{"code": "FT1.TEST-CODE"}]
+            window.history_index_input.setText("1")
+            window.copy_selected_history()
+            self.assertEqual(QApplication.clipboard().text(), "FT1.TEST-CODE")
+        finally:
+            window.close()
+            app.processEvents()
+
 
 if __name__ == "__main__":
     unittest.main()

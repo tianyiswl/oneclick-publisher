@@ -6,7 +6,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from PyQt6.QtCore import QDate, QTimer, Qt
+from PyQt6.QtCore import QDate, Qt
 from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import (
     QApplication,
@@ -15,7 +15,6 @@ from PyQt6.QtWidgets import (
     QFrame,
     QGridLayout,
     QHBoxLayout,
-    QHeaderView,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -23,8 +22,6 @@ from PyQt6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QSizePolicy,
-    QTableWidget,
-    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -209,31 +206,28 @@ class LicenseIssuerWindow(QMainWindow):
         history_header = QHBoxLayout()
         history_title = QLabel("最近出码记录")
         history_title.setObjectName("sectionTitle")
-        history_hint = QLabel("双击记录可直接复制激活码")
+        history_hint = QLabel("输入序号可复制对应激活码")
         history_hint.setObjectName("sectionHint")
-        copy_history_button = button("复制选中记录")
+        self.history_index_input = QLineEdit("1")
+        self.history_index_input.setPlaceholderText("序号")
+        self.history_index_input.setFixedWidth(64)
+        copy_history_button = button("复制指定记录")
         copy_history_button.clicked.connect(self.copy_selected_history)
         history_header.addWidget(history_title)
         history_header.addWidget(history_hint)
         history_header.addStretch()
+        history_header.addWidget(self.history_index_input)
         history_header.addWidget(copy_history_button)
         history_layout.addLayout(history_header)
 
-        self.history_table = QTableWidget(0, 4)
-        self.history_table.setHorizontalHeaderLabels(["生成时间", "订单号", "机器码", "授权期限"])
-        self.history_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.history_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
-        self.history_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.history_table.setAlternatingRowColors(True)
-        self.history_table.setShowGrid(False)
-        self.history_table.verticalHeader().setVisible(False)
-        self.history_table.verticalHeader().setDefaultSectionSize(40)
-        self.history_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        self.history_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.history_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        self.history_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        self.history_table.doubleClicked.connect(self.copy_selected_history)
-        history_layout.addWidget(self.history_table)
+        # macOS 辅助功能会在输入时读取整个窗口树。QTableWidget 动态
+        # 重建行时可使 AppKit 读到失效的可访问性数组并原生崩溃，故改用
+        # 结构稳定的只读文本。
+        self.history_output = QPlainTextEdit()
+        self.history_output.setReadOnly(True)
+        self.history_output.setPlaceholderText("暂无出码记录")
+        self.history_output.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        history_layout.addWidget(self.history_output)
         layout.addWidget(history_card, 1)
 
         self.apply_style()
@@ -346,22 +340,6 @@ class LicenseIssuerWindow(QMainWindow):
             QPushButton[primary="true"]:hover {
                 background: #00796b;
             }
-            QHeaderView::section {
-                background: #eef3f7;
-                border: none;
-                border-bottom: 1px solid #cbd5e1;
-                padding: 10px 8px;
-                font-weight: 700;
-            }
-            QTableWidget {
-                background: #ffffff;
-                alternate-background-color: #f8fafc;
-                border: 1px solid #cbd5e1;
-                border-radius: 6px;
-                gridline-color: transparent;
-                selection-background-color: #dff4ef;
-                selection-color: #0f4f46;
-            }
             """
         )
 
@@ -410,8 +388,7 @@ class LicenseIssuerWindow(QMainWindow):
         self.code_output.setPlainText(code)
         QApplication.clipboard().setText(code)
         self.operation_status.setText("已生成并复制")
-        # 避开 macOS 辅助功能读取窗口树时与表格同步重建发生竞争。
-        QTimer.singleShot(350, self.refresh_history)
+        self.refresh_history()
 
     def copy_current_code(self) -> None:
         code = self.code_output.toPlainText().strip()
@@ -424,36 +401,25 @@ class LicenseIssuerWindow(QMainWindow):
     def refresh_history(self) -> None:
         self.records = load_history()
         visible_records = self.records[:50]
-        self.history_table.setUpdatesEnabled(False)
-        self.history_table.blockSignals(True)
-        try:
-            self.history_table.clearContents()
-            self.history_table.setRowCount(len(visible_records))
-            for row, record in enumerate(visible_records):
-                machine = str(record.get("machineCode") or "")
-                masked_machine = (
-                    f"{machine[:6]}...{machine[-6:]}"
-                    if len(machine) > 12
-                    else machine
-                )
-                values = [
-                    str(record.get("createdAt") or ""),
-                    str(record.get("orderNumber") or "未填写"),
-                    masked_machine,
-                    str(record.get("expiresAt") or "长期有效"),
-                ]
-                for column, value in enumerate(values):
-                    self.history_table.setItem(row, column, QTableWidgetItem(value))
-            if visible_records:
-                self.history_table.selectRow(0)
-        finally:
-            self.history_table.blockSignals(False)
-            self.history_table.setUpdatesEnabled(True)
+        lines = []
+        for index, record in enumerate(visible_records, start=1):
+            machine = str(record.get("machineCode") or "")
+            masked_machine = f"{machine[:6]}...{machine[-6:]}" if len(machine) > 12 else machine
+            lines.append(
+                f"{index}. {record.get('createdAt') or ''}  |  "
+                f"{record.get('orderNumber') or '未填写'}  |  {masked_machine}  |  "
+                f"{record.get('expiresAt') or '长期有效'}"
+            )
+        self.history_output.setPlainText("\n".join(lines))
 
     def copy_selected_history(self) -> None:
-        row = self.history_table.currentRow()
-        if row < 0 or row >= len(self.records):
-            QMessageBox.information(self, "复制记录", "请先选择一条出码记录。")
+        raw_index = self.history_index_input.text().strip()
+        if not raw_index.isdigit() or int(raw_index) < 1:
+            QMessageBox.information(self, "复制记录", "请输入有效的记录序号。")
+            return
+        row = int(raw_index) - 1
+        if row >= min(len(self.records), 50):
+            QMessageBox.information(self, "复制记录", "该记录序号不存在。")
             return
         code = str(self.records[row].get("code") or "")
         if not code:
@@ -483,8 +449,8 @@ def run_ui_self_test() -> str:
     try:
         if window.windowTitle() != APP_TITLE:
             raise RuntimeError("卖家激活码管理器标题异常")
-        if window.history_table.columnCount() != 4:
-            raise RuntimeError("卖家激活码管理器记录表异常")
+        if not window.history_output.isReadOnly():
+            raise RuntimeError("卖家激活码管理器记录区异常")
         return "SELLER_LICENSE_UI_OK"
     finally:
         window.close()
