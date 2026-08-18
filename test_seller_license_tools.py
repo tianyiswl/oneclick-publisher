@@ -99,6 +99,28 @@ class SellerLicenseToolsTests(unittest.TestCase):
             window.close()
             app.processEvents()
 
+    def test_seller_manager_defaults_to_one_month_validity(self) -> None:
+        from PyQt6.QtCore import QDate
+        from PyQt6.QtWidgets import QApplication
+        from seller_tools.license_issuer_gui import LicenseIssuerWindow
+
+        app = QApplication.instance() or QApplication([])
+        window = LicenseIssuerWindow(load_saved_history=False)
+        try:
+            expected_expiry = QDate.currentDate().addMonths(1)
+            self.assertFalse(window.permanent_check.isChecked())
+            self.assertTrue(window.expiry_input.isEnabled())
+            self.assertEqual(window.expiry_input.date(), expected_expiry)
+
+            window.permanent_check.setChecked(True)
+            window.expiry_input.setDate(QDate.currentDate().addYears(1))
+            window.clear_form()
+            self.assertFalse(window.permanent_check.isChecked())
+            self.assertEqual(window.expiry_input.date(), expected_expiry)
+        finally:
+            window.close()
+            app.processEvents()
+
 
 if __name__ == "__main__":
     unittest.main()
