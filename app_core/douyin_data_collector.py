@@ -3,12 +3,14 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
 from datetime import datetime
 import json
 import math
 from pathlib import Path
 from typing import Callable
+from urllib.parse import urlparse
 
 import requests
 
@@ -19,7 +21,15 @@ from .platform_data_models import CollectionBatch, CollectionFailure, MetricPoin
 DOUYIN_DASHBOARD_URL = (
     "https://creator.douyin.com/janus/douyin/creator/data/overview/dashboard"
 )
+DOUYIN_DATA_PAGE_URL = "https://creator.douyin.com/creator-micro/home"
+_BROWSER_RESPONSE_PATHS = frozenset(
+    {
+        "/aweme/janus/creator/data/overview/all/",
+        "/janus/douyin/creator/data/overview/dashboard",
+    }
+)
 _REQUEST_TIMEOUT_SECONDS = 20.0
+_BROWSER_TIMEOUT_SECONDS = 30.0
 _RAW_METRIC_MAP = {
     "play": "views",
     "play_cnt": "views",
@@ -119,13 +129,29 @@ def _metric_value(metric: Mapping) -> tuple[int | float, str]:
     return value, _observed_at(latest.get("date_time"))
 
 
+def _default_playwright_factory():
+    from playwright.async_api import async_playwright
+
+    return async_playwright()
+
+
 class DouyinDataCollector:
     def __init__(
         self,
         *,
         session_factory: Callable[[], object] = requests.Session,
+        playwright_factory: Callable[[], object] = _default_playwright_factory,
+        browser_timeout_seconds: float = _BROWSER_TIMEOUT_SECONDS,
     ) -> None:
         self._session_factory = session_factory
+        self._playwright_factory = playwright_factory
+        if type(browser_timeout_seconds) not in (int, float):
+            raise DouyinDataCollectionError(
+                "metric_payload_invalid", fallback_allowed=False
+            )
+        self._browser_timeout_seconds = max(
+            0.001, float(browser_timeout_seconds)
+        )
 
     def _load_state(self, state_path: Path) -> dict:
         try:
@@ -235,6 +261,80 @@ class DouyinDataCollector:
             metrics=tuple(points),
         )
 
+    def _parse_current_overview(
+        self,
+        payload: object,
+        account_id: int,
+    ) -> CollectionBatch:
+        if not isinstance(payload, Mapping):
+            raise DouyinDataCollectionError(
+                "metric_payload_invalid", fallback_allowed=False
+            )
+        if _contains_login_rejection(payload):
+            raise DouyinDataCollectionError(
+                "login_required", fallback_allowed=False
+            )
+        status_code = payload.get("status_code")
+        if type(status_code) is not int or status_code != 0:
+            raise DouyinDataCollectionError(
+                "metric_payload_invalid", fallback_allowed=False
+            )
+        data = payload.get("data")
+        if not isinstance(data, Mapping):
+            return self._parse_payload(payload, account_id)
+        points: list[MetricPoint] = []
+        seen: set[str] = set()
+        for raw_key, raw_metric in data.items():
+            if type(raw_key) is not str or not isinstance(raw_metric, Mapping):
+                continue
+            metric_key = _RAW_METRIC_MAP.get(raw_key)
+            if metric_key is None or metric_key in seen:
+                continue
+            nested_status = raw_metric.get("status_code")
+            if type(nested_status) is int and nested_status != 0:
+                raise DouyinDataCollectionError(
+                    "metric_payload_invalid", fallback_allowed=False
+                )
+            observed_at = datetime.now().astimezone().isoformat(
+                timespec="seconds"
+            )
+            value = raw_metric.get("current_count")
+            options = raw_metric.get("option_list")
+            if (
+                raw_key == "fans"
+                and type(options) is list
+                and options
+                and isinstance(options[-1], Mapping)
+            ):
+                value = options[-1].get("count")
+            if type(options) is list and options and isinstance(options[-1], Mapping):
+                observed_at = _observed_at(options[-1].get("date"))
+            if type(value) not in (int, float) or not math.isfinite(float(value)):
+                raise DouyinDataCollectionError(
+                    "metric_payload_invalid", fallback_allowed=False
+                )
+            points.append(
+                MetricPoint(
+                    entity_type="account",
+                    entity_key=f"account:{account_id}",
+                    metric_key=metric_key,
+                    raw_metric_key=raw_key,
+                    metric_value=value,
+                    metric_unit="count",
+                    observed_at=observed_at,
+                )
+            )
+            seen.add(metric_key)
+        if not points:
+            raise DouyinDataCollectionError(
+                "metric_payload_empty", fallback_allowed=False
+            )
+        return CollectionBatch(
+            platform_type=3,
+            source_mode="browser_signed",
+            metrics=tuple(points),
+        )
+
     def collect_direct(self, account: dict) -> CollectionBatch:
         account_id, state_path = _required_account(account)
         state = self._load_state(state_path)
@@ -274,5 +374,170 @@ class DouyinDataCollector:
                 except BaseException:
                     pass
 
+    @staticmethod
+    async def _close_resource(resource: object | None) -> BaseException | None:
+        if resource is None:
+            return None
+        close = getattr(resource, "close", None)
+        if close is None:
+            close = getattr(resource, "stop", None)
+        if close is None:
+            return RuntimeError("resource close unavailable")
+        try:
+            result = close()
+            if hasattr(result, "__await__"):
+                await result
+        except BaseException as exc:
+            return exc
+        return None
+
+    async def _collect_browser_signed_async(
+        self,
+        account: dict,
+        report: Callable[[dict], None] | None,
+    ) -> CollectionBatch:
+        account_id, state_path = _required_account(account)
+        playwright = None
+        browser = None
+        context = None
+        page = None
+        listener_tasks: set[asyncio.Task] = set()
+        result: CollectionBatch | None = None
+        caught: BaseException | None = None
+        cleanup_errors: list[BaseException] = []
+        loop = asyncio.get_running_loop()
+        response_future: asyncio.Future = loop.create_future()
+
+        def emit(stage: str, message: str) -> None:
+            if report is None:
+                return
+            try:
+                report({"stage": stage, "message": message})
+            except Exception:
+                return
+
+        async def consume_response(response: object) -> None:
+            if response_future.done():
+                return
+            try:
+                url = getattr(response, "url", "")
+                parsed = urlparse(url if type(url) is str else "")
+                if (
+                    parsed.scheme != "https"
+                    or parsed.hostname != "creator.douyin.com"
+                    or parsed.path not in _BROWSER_RESPONSE_PATHS
+                ):
+                    return
+                payload = await response.json()
+                batch = self._parse_current_overview(payload, account_id)
+                if not response_future.done():
+                    response_future.set_result(batch)
+            except DouyinDataCollectionError as exc:
+                if not response_future.done():
+                    response_future.set_exception(exc)
+            except (KeyboardInterrupt, SystemExit) as exc:
+                if not response_future.done():
+                    response_future.set_exception(exc)
+            except BaseException:
+                if not response_future.done():
+                    response_future.set_exception(
+                        DouyinDataCollectionError(
+                            "metric_payload_invalid",
+                            fallback_allowed=False,
+                        )
+                    )
+
+        def observe_response(response: object) -> None:
+            task = asyncio.create_task(consume_response(response))
+            listener_tasks.add(task)
+            task.add_done_callback(listener_tasks.discard)
+
+        try:
+            emit("browser_signed", "正在读取抖音官方数据")
+            starter = self._playwright_factory()
+            playwright = await starter.start()
+            browser = await playwright.chromium.launch(headless=True)
+            context = await browser.new_context(storage_state=str(state_path))
+            page = await context.new_page()
+            page.on("response", observe_response)
+            await page.goto(
+                DOUYIN_DATA_PAGE_URL,
+                wait_until="domcontentloaded",
+                timeout=self._browser_timeout_seconds * 1000,
+            )
+            current_url = str(getattr(page, "url", "") or "").lower()
+            if any(
+                marker in current_url
+                for marker in ("/verification", "/login", "passport.")
+            ):
+                raise DouyinDataCollectionError(
+                    "login_required", fallback_allowed=False
+                )
+            try:
+                result = await asyncio.wait_for(
+                    response_future,
+                    timeout=self._browser_timeout_seconds,
+                )
+            except TimeoutError:
+                raise DouyinDataCollectionError(
+                    "browser_signature_timeout", fallback_allowed=False
+                ) from None
+        except BaseException as exc:
+            caught = exc
+        finally:
+            for task in tuple(listener_tasks):
+                if not task.done():
+                    task.cancel()
+            if listener_tasks:
+                await asyncio.gather(*listener_tasks, return_exceptions=True)
+            for resource in (page, context, browser, playwright):
+                close_error = await self._close_resource(resource)
+                if close_error is not None:
+                    cleanup_errors.append(close_error)
+
+        if isinstance(caught, (KeyboardInterrupt, SystemExit)):
+            raise caught
+        for cleanup_error in cleanup_errors:
+            if isinstance(cleanup_error, (KeyboardInterrupt, SystemExit)):
+                raise cleanup_error
+        if cleanup_errors:
+            raise DouyinDataCollectionError(
+                "browser_cleanup_incomplete", fallback_allowed=False
+            ) from None
+        if isinstance(caught, DouyinDataCollectionError):
+            raise caught
+        if caught is not None:
+            raise DouyinDataCollectionError(
+                "metric_payload_invalid", fallback_allowed=False
+            ) from None
+        if result is None:
+            raise DouyinDataCollectionError(
+                "metric_payload_empty", fallback_allowed=False
+            )
+        return result
+
+    def collect_browser_signed(
+        self,
+        account: dict,
+        report: Callable[[dict], None] | None = None,
+    ) -> CollectionBatch:
+        try:
+            return asyncio.run(
+                self._collect_browser_signed_async(account, report)
+            )
+        except DouyinDataCollectionError:
+            raise
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:
+            raise DouyinDataCollectionError(
+                "metric_payload_invalid", fallback_allowed=False
+            ) from None
+
     def collect(self, account: dict) -> CollectionBatch:
-        return self.collect_direct(account)
+        try:
+            return self.collect_direct(account)
+        except DouyinDataCollectionError as exc:
+            if not exc.fallback_allowed:
+                raise
+        return self.collect_browser_signed(account)

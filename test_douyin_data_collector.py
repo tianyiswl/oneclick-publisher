@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import tempfile
 import unittest
@@ -251,6 +252,243 @@ class DouyinDirectCollectorTests(unittest.TestCase):
                     raised.exception.error_code,
                     "collector_not_available",
                 )
+
+
+class FakeBrowserResponse:
+    def __init__(self, url: str, payload: object) -> None:
+        self.url = url
+        self._payload = payload
+
+    async def json(self) -> object:
+        return self._payload
+
+
+class FakeBrowserPage:
+    def __init__(
+        self,
+        response: FakeBrowserResponse | None,
+        *,
+        final_url: str = "https://creator.douyin.com/creator-micro/home",
+    ) -> None:
+        self.response = response
+        self.url = final_url
+        self.listeners: dict[str, object] = {}
+        self.goto_calls: list[tuple[str, str, float]] = []
+        self.closed = 0
+
+    def on(self, event: str, callback) -> None:
+        self.listeners[event] = callback
+
+    async def goto(
+        self,
+        url: str,
+        *,
+        wait_until: str,
+        timeout: float,
+    ) -> None:
+        self.goto_calls.append((url, wait_until, timeout))
+        if self.response is not None:
+            self.listeners["response"](self.response)
+            await asyncio.sleep(0)
+
+    async def close(self) -> None:
+        self.closed += 1
+
+
+class FakeBrowserContext:
+    def __init__(
+        self,
+        page: FakeBrowserPage,
+        *,
+        close_error: BaseException | None = None,
+    ) -> None:
+        self.page = page
+        self.close_error = close_error
+        self.storage_states: list[str] = []
+        self.closed = 0
+
+    async def new_page(self) -> FakeBrowserPage:
+        return self.page
+
+    async def close(self) -> None:
+        self.closed += 1
+        if self.close_error is not None:
+            raise self.close_error
+
+
+class FakeBrowser:
+    def __init__(self, context: FakeBrowserContext) -> None:
+        self.context = context
+        self.launch_context_calls: list[str] = []
+        self.closed = 0
+
+    async def new_context(self, *, storage_state: str) -> FakeBrowserContext:
+        self.launch_context_calls.append(storage_state)
+        return self.context
+
+    async def close(self) -> None:
+        self.closed += 1
+
+
+class FakeChromium:
+    def __init__(self, browser: FakeBrowser) -> None:
+        self.browser = browser
+        self.launch_calls: list[dict] = []
+
+    async def launch(self, **options) -> FakeBrowser:
+        self.launch_calls.append(dict(options))
+        return self.browser
+
+
+class FakePlaywright:
+    def __init__(self, browser: FakeBrowser) -> None:
+        self.chromium = FakeChromium(browser)
+        self.stopped = 0
+
+    async def stop(self) -> None:
+        self.stopped += 1
+
+
+class FakePlaywrightStarter:
+    def __init__(self, playwright: FakePlaywright) -> None:
+        self.playwright = playwright
+
+    async def start(self) -> FakePlaywright:
+        return self.playwright
+
+
+class DouyinBrowserSignedCollectorTests(DouyinDirectCollectorTests):
+    @staticmethod
+    def _current_overview_payload() -> dict:
+        return {
+            "status_code": 0,
+            "status_message": "",
+            "data": {
+                "play": {
+                    "status_code": 0,
+                    "current_count": 230,
+                    "option_list": [
+                        {"date": "20260819", "count": 100},
+                        {"date": "20260820", "count": 230},
+                    ],
+                },
+                "digg": {
+                    "status_code": 0,
+                    "current_count": 18,
+                    "option_list": [{"date": "20260820", "count": 18}],
+                },
+                "private_metric": {
+                    "status_code": 0,
+                    "current_count": 999,
+                },
+            },
+        }
+
+    def _collector_with_browser(
+        self,
+        response: FakeBrowserResponse | None,
+        *,
+        final_url: str = "https://creator.douyin.com/creator-micro/home",
+        close_error: BaseException | None = None,
+        timeout: float = 0.05,
+    ):
+        page = FakeBrowserPage(response, final_url=final_url)
+        context = FakeBrowserContext(page, close_error=close_error)
+        browser = FakeBrowser(context)
+        playwright = FakePlaywright(browser)
+        collector = DouyinDataCollector(
+            session_factory=lambda: FakeSession({}),
+            playwright_factory=lambda: FakePlaywrightStarter(playwright),
+            browser_timeout_seconds=timeout,
+        )
+        return collector, page, context, browser, playwright
+
+    def test_browser_signed_accepts_only_allowlisted_official_response_and_closes(self) -> None:
+        """官方响应路径或严格关闭缺失时，本测试必须失败。"""
+
+        response = FakeBrowserResponse(
+            "https://creator.douyin.com/aweme/janus/creator/data/overview/all/"
+            "?msToken=private",
+            self._current_overview_payload(),
+        )
+        collector, page, context, browser, playwright = (
+            self._collector_with_browser(response)
+        )
+
+        batch = collector.collect_browser_signed(self.account)
+
+        self.assertEqual(batch.source_mode, "browser_signed")
+        self.assertEqual(
+            [(point.metric_key, point.metric_value) for point in batch.metrics],
+            [("views", 230), ("likes", 18)],
+        )
+        self.assertEqual(page.closed, 1)
+        self.assertEqual(context.closed, 1)
+        self.assertEqual(browser.closed, 1)
+        self.assertEqual(playwright.stopped, 1)
+        self.assertEqual(playwright.chromium.launch_calls, [{"headless": True}])
+
+    def test_non_allowlisted_response_times_out_without_being_parsed(self) -> None:
+        """同域未知接口不能被当作数据指标来源。"""
+
+        response = FakeBrowserResponse(
+            "https://creator.douyin.com/web/api/media/aweme/create/",
+            self._current_overview_payload(),
+        )
+        collector, _page, _context, _browser, _playwright = (
+            self._collector_with_browser(response, timeout=0.01)
+        )
+
+        with self.assertRaises(DouyinDataCollectionError) as raised:
+            collector.collect_browser_signed(self.account)
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "browser_signature_timeout",
+        )
+        self.assertIsNone(raised.exception.__cause__)
+
+    def test_verification_page_returns_login_required(self) -> None:
+        """验证页必须停止，不能等待超时或尝试页面内请求。"""
+
+        collector, page, context, browser, playwright = (
+            self._collector_with_browser(
+                None,
+                final_url="https://creator.douyin.com/verification",
+            )
+        )
+
+        with self.assertRaises(DouyinDataCollectionError) as raised:
+            collector.collect_browser_signed(self.account)
+
+        self.assertEqual(raised.exception.error_code, "login_required")
+        self.assertEqual((page.closed, context.closed, browser.closed), (1, 1, 1))
+        self.assertEqual(playwright.stopped, 1)
+
+    def test_cleanup_failure_overrides_apparent_metric_success(self) -> None:
+        """资源未严格归零时不得写入刚捕获的指标。"""
+
+        response = FakeBrowserResponse(
+            "https://creator.douyin.com/aweme/janus/creator/data/overview/all/",
+            self._current_overview_payload(),
+        )
+        collector, page, context, browser, playwright = (
+            self._collector_with_browser(
+                response,
+                close_error=RuntimeError("sensitive browser path"),
+            )
+        )
+
+        with self.assertRaises(DouyinDataCollectionError) as raised:
+            collector.collect_browser_signed(self.account)
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "browser_cleanup_incomplete",
+        )
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertEqual((page.closed, context.closed, browser.closed), (1, 1, 1))
+        self.assertEqual(playwright.stopped, 1)
 
 
 if __name__ == "__main__":
