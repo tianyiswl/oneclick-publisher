@@ -39,6 +39,7 @@ from .background_task import BackgroundTaskRunner
 from .common import button
 from .account_page import AccountPage
 from .dashboard_page import DashboardPage
+from .data_monitor_page import DataMonitorPage
 from .douyin_commerce_page import DouyinCommercePage
 from .help_dialog import HelpDialog
 from .media_page import MediaPage
@@ -352,6 +353,10 @@ class MainWindow(QMainWindow):
         )
         self.tasks = TaskPage()
         self.tasks.resume_douyin_batch_requested.connect(self._open_douyin_batch_resume)
+        self.data_monitor = DataMonitorPage()
+        self.data_monitor.request_account_management.connect(
+            lambda: self._set_current_page(1)
+        )
         self.page_definitions = (
             ("工作台", self.dashboard, "ui/assets/nav-dashboard.svg"),
             ("账号管理", self.accounts, "ui/assets/nav-accounts.svg"),
@@ -359,9 +364,9 @@ class MainWindow(QMainWindow):
             ("发布中心", self.publish, "ui/assets/nav-publish.svg"),
             ("抖音带货", self.douyin_commerce, "ui/assets/nav-publish.svg"),
             ("任务记录", self.tasks, "ui/assets/nav-tasks.svg"),
+            ("数据监测", self.data_monitor, "ui/assets/nav-dashboard.svg"),
         )
         self.coming_soon_definitions = (
-            ("数据监测", "ui/assets/nav-dashboard.svg"),
             ("海外平台", "ui/assets/nav-publish.svg"),
         )
         self.nav_buttons: list[QPushButton] = []
@@ -641,6 +646,7 @@ class MainWindow(QMainWindow):
             "publish": 3,
             "commerce": 4,
             "tasks": 5,
+            "data": 6,
         }
         try:
             index = page_indexes[str(page_key)]
@@ -664,6 +670,9 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         if self.douyin_commerce.shutdown() is not True:
+            event.ignore()
+            return
+        if self.data_monitor.shutdown() is not True:
             event.ignore()
             return
         self.accounts.stop_auto_checking()
