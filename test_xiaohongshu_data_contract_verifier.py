@@ -1049,6 +1049,42 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
                     ["page", "context", "browser", "playwright"],
                 )
 
+    def test_review_probe_reports_navigation_and_closes_every_resource(self):
+        response = FakeResponse(
+            "https://creator.xiaohongshu.com/api/galaxy/creator/datacenter/overview",
+            "application/json", {"data": {"views": 12}},
+        )
+        fake = FakePlaywright(responses=(response,))
+        result = verifier._probe_with_browser(
+            eligible_account(), playwright_factory=lambda: fake,
+            monotonic=FakeClock(), utc_now=fixed_now,
+        )
+        review = verifier._review_schema(result)
+        self.assertEqual(review["navigation"], [
+            {"phase": "account_home", "path": "/creator/home"},
+            {"phase": "data_analysis", "path": "/statistics/data-analysis"},
+        ])
+        self.assertTrue(result["cleanup"]["closed"])
+        self.assertIs(type(result["cleanup"]["aliveResourceCount"]), int)
+        self.assertEqual(result["cleanup"]["aliveResourceCount"], 0)
+        self.assertEqual(fake.page.fetch_calls, 0)
+        self.assertEqual(fake.page.click_calls, 0)
+        self.assertNotIn("navigation", verifier.sanitize_probe_report(result))
+
+    def test_review_mode_keeps_response_identity_and_byte_budgets(self):
+        response = CountingResponse(
+            "https://creator.xiaohongshu.com/api/galaxy/creator/datacenter/overview",
+            "application/json", {"data": {"views": 1}},
+        )
+        fake = FakePlaywright(responses=(response, response))
+        result = verifier._probe_with_browser(
+            eligible_account(), playwright_factory=lambda: fake,
+            monotonic=FakeClock(), utc_now=fixed_now,
+        )
+        review = verifier._review_schema(result)
+        self.assertEqual(len(review["responses"]), 1)
+        self.assertEqual(response.instance_json_calls, 1)
+
     def test_probe_adapts_async_playwright_and_reads_shapes_before_cleanup(self):
         fake = AsyncFakePlaywright()
         with patch.object(
@@ -1264,6 +1300,8 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
         payload = verifier.build_plan()
         payload.update({"mode": "execute", "status": "failed",
                         "errorCode": "xiaohongshu_contracts_unobserved",
+                        "navigation": [{"phase": "account_home",
+                                        "path": "/creator/home"}],
                         "responses": [{"path": "/api/galaxy/creator/datacenter/list",
                                        "keyPaths": ["data.note_list"],
                                        "fieldTypes": {"data.note_list": "list"}}]})
@@ -1272,7 +1310,11 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
              patch.object(verifier, "_write_report") as writer:
             code = verifier.main(["--execute", "--review-schema"], stdout=output)
         self.assertEqual(code, 1)
-        self.assertIn("schemaReview", json.loads(output.getvalue()))
+        reviewed_payload = json.loads(output.getvalue())
+        self.assertEqual(reviewed_payload["schemaReview"]["navigation"], [
+            {"phase": "account_home", "path": "/creator/home"},
+        ])
+        self.assertNotIn("navigation", reviewed_payload)
         writer.assert_not_called()
         invalid = io.StringIO()
         self.assertEqual(verifier.main(["--review-schema"], stdout=invalid), 2)

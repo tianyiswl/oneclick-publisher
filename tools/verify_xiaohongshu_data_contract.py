@@ -37,6 +37,7 @@ _REVIEW_SENSITIVE_NAMES = frozenset({
     "authorization", "cookie", "cookies", "token", "ticket", "session",
     "sessionid", "password", "passwd", "secret", "phone", "mobile", "email",
 })
+_REVIEW_STATIC_HYPHENATED_NAMES = frozenset({"data-analysis", "note-detail"})
 _MAX_RESPONSE_BODY_BYTES = 1_048_576
 _MAX_TOTAL_RESPONSE_BODY_BYTES = 4_194_304
 _ACCOUNT_SELECTION_REQUIRED = "xiaohongshu_account_selection_required"
@@ -81,6 +82,11 @@ _DATA_ANALYSIS_URL = (
 )
 _NOTE_DETAIL_URL = "https://creator.xiaohongshu.com/statistics/note-detail"
 _NOTE_ID = re.compile(r"^[0-9a-f]{24}$", re.IGNORECASE)
+_REVIEW_NAVIGATION_PATHS = MappingProxyType({
+    "account_home": "/creator/home",
+    "data_analysis": "/statistics/data-analysis",
+    "content_lifetime": "/statistics/note-detail",
+})
 _NETWORK_QUIET_TIMEOUT_MS = 30_000
 _PASSIVE_CAPTURE_WAIT_MS = 2_000
 _TOTAL_TIMEOUT_SECONDS = 60.0
@@ -267,7 +273,8 @@ def _review_path(value: object) -> str:
         if _REVIEW_ID_SEGMENT.fullmatch(lowered):
             output.append(":id")
         elif (
-            _REVIEW_SAFE_NAME.fullmatch(lowered)
+            (_REVIEW_SAFE_NAME.fullmatch(lowered)
+             or lowered in _REVIEW_STATIC_HYPHENATED_NAMES)
             and lowered not in _REVIEW_SENSITIVE_NAMES
         ):
             output.append(lowered)
@@ -340,11 +347,29 @@ def _review_list_lengths(value: object) -> dict[str, int]:
     return reviewed
 
 
+def _review_navigation(value: object) -> list[dict[str, str]]:
+    if type(value) is not list:
+        return []
+    reviewed: list[dict[str, str]] = []
+    for source in value[:len(_REVIEW_NAVIGATION_PATHS)]:
+        if type(source) is not dict:
+            continue
+        phase = source.get("phase")
+        path = _review_path(source.get("path"))
+        if (
+            type(phase) is str
+            and _REVIEW_NAVIGATION_PATHS.get(phase) == path
+        ):
+            reviewed.append({"phase": phase, "path": path})
+    return reviewed
+
+
 def _review_schema(report: object) -> dict[str, object]:
-    if type(report) is not dict or type(report.get("responses")) is not list:
-        return {"responses": []}
+    if type(report) is not dict:
+        return {"responses": [], "navigation": []}
     reviewed: list[dict[str, object]] = []
-    for source in report["responses"][:_RESPONSE_LIMIT]:
+    responses = report.get("responses")
+    for source in responses[:_RESPONSE_LIMIT] if type(responses) is list else ():
         if type(source) is not dict:
             continue
         path = _review_path(source.get("url") or source.get("path"))
@@ -381,7 +406,10 @@ def _review_schema(report: object) -> dict[str, object]:
             if pagination_keys:
                 row["paginationKeys"] = pagination_keys
         reviewed.append(row)
-    return {"responses": reviewed}
+    return {
+        "responses": reviewed,
+        "navigation": _review_navigation(report.get("navigation")),
+    }
 
 
 def _enum_text(value: object, allowed: frozenset[str], default: str = "") -> str:
@@ -1364,6 +1392,7 @@ async def _run_probe(
     response_budget_exhausted = False
     retained_response_ids: set[int] = set()
     shapes: list[dict[str, object]] = []
+    navigation: list[dict[str, str]] = []
     caught: BaseException | None = None
     cleanup_errors: list[BaseException] = []
 
@@ -1417,7 +1446,7 @@ async def _run_probe(
             context.new_page(), deadline=work_deadline, monotonic=monotonic
         )
         page.on("response", retain_response)
-        async def navigate(url: str) -> None:
+        async def navigate(phase: str, url: str) -> None:
             navigation_response = await _await_with_deadline(
                 page.goto(
                     url,
@@ -1430,6 +1459,7 @@ async def _run_probe(
             navigation_error = _navigation_error_code(navigation_response)
             if navigation_error is not None:
                 raise ProbeFailure(navigation_error)
+            navigation.append({"phase": phase, "path": _review_path(url)})
             passive_wait = getattr(page, "wait_for_timeout", None)
             if callable(passive_wait):
                 await _await_with_deadline(
@@ -1438,9 +1468,9 @@ async def _run_probe(
                     monotonic=monotonic,
                 )
 
-        await navigate(_CREATOR_HOME)
+        await navigate("account_home", _CREATOR_HOME)
         data_response_start = len(observed_responses)
-        await navigate(_DATA_ANALYSIS_URL)
+        await navigate("data_analysis", _DATA_ANALYSIS_URL)
         note_id = None
         for response, _metadata in tuple(
             observed_responses[data_response_start:]
@@ -1451,7 +1481,9 @@ async def _run_probe(
             if note_id is not None:
                 break
         if note_id is not None:
-            await navigate(f"{_NOTE_DETAIL_URL}?noteId={note_id}")
+            await navigate(
+                "content_lifetime", f"{_NOTE_DETAIL_URL}?noteId={note_id}"
+            )
         for response, metadata in tuple(observed_responses):
             shape = await _async_response_shape(
                 response,
@@ -1507,6 +1539,7 @@ async def _run_probe(
         "errorCode": contract_error,
         "observedAt": _observed_at(utc_now),
         "responses": shapes,
+        "navigation": navigation,
         "cleanup": {
             "closed": alive_count == 0,
             "aliveResourceCount": int(alive_count),
@@ -1524,7 +1557,9 @@ async def _run_probe(
     elif caught is not None:
         report["status"] = "failed"
         report["errorCode"] = "xiaohongshu_probe_failed"
-    return sanitize_probe_report(report), caught
+    sanitized_report = sanitize_probe_report(report)
+    sanitized_report["navigation"] = navigation
+    return sanitized_report, caught
 
 
 def _probe_with_browser(
@@ -1566,7 +1601,9 @@ def _probe_with_browser(
             "errorCode": "xiaohongshu_probe_timeout",
             "observedAt": _observed_at(utc_now),
         })
-        return sanitize_probe_report(report)
+        sanitized_report = sanitize_probe_report(report)
+        sanitized_report["navigation"] = []
+        return sanitized_report
 
 
 def _execute(*, browser_factory, utc_now) -> dict[str, object]:
@@ -1675,7 +1712,7 @@ def main(argv: list[str] | None = None, *, stdout=sys.stdout) -> int:
     output_payload = payload
     if review_schema:
         output_payload = sanitize_probe_report(payload)
-        output_payload["schemaReview"] = _review_schema(output_payload)
+        output_payload["schemaReview"] = _review_schema(payload)
     json.dump(output_payload, stdout, ensure_ascii=False)
     stdout.write("\n")
     return _execution_exit_code(payload)
