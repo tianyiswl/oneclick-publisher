@@ -388,10 +388,19 @@ def record_failed_sync(
 
 
 def _latest_run_details(conn, account_id: int) -> tuple[dict | None, str | None, str | None]:
-    latest_run = conn.execute(
+    latest_attempt = conn.execute(
         """
-        SELECT runs.status, runs.sourceMode, runs.errorCode, runs.metricCount,
-               runs.startedAt, runs.finishedAt
+        SELECT status, sourceMode, errorCode, metricCount, finishedAt
+        FROM platform_data_sync_runs
+        WHERE accountId = ?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (account_id,),
+    ).fetchone()
+    trusted_data_run = conn.execute(
+        """
+        SELECT runs.startedAt, runs.finishedAt
         FROM platform_data_sync_runs AS runs
         WHERE runs.accountId = ?
           AND runs.status IN ('success', 'partial_success')
@@ -408,19 +417,21 @@ def _latest_run_details(conn, account_id: int) -> tuple[dict | None, str | None,
         """,
         (account_id,),
     ).fetchone()
-    if latest_run is None:
-        return None, None, None
-    public_run = {
-        "status": str(latest_run["status"]),
-        "sourceMode": str(latest_run["sourceMode"]),
-        "errorCode": str(latest_run["errorCode"] or ""),
-        "metricCount": int(latest_run["metricCount"] or 0),
-        "finishedAt": str(latest_run["finishedAt"] or ""),
-    }
+    public_run = None
+    if latest_attempt is not None:
+        public_run = {
+            "status": str(latest_attempt["status"]),
+            "sourceMode": str(latest_attempt["sourceMode"]),
+            "errorCode": str(latest_attempt["errorCode"] or ""),
+            "metricCount": int(latest_attempt["metricCount"] or 0),
+            "finishedAt": str(latest_attempt["finishedAt"] or ""),
+        }
+    if trusted_data_run is None:
+        return public_run, None, None
     return (
         public_run,
-        str(latest_run["startedAt"] or "") or None,
-        str(latest_run["finishedAt"] or "") or None,
+        str(trusted_data_run["startedAt"] or "") or None,
+        str(trusted_data_run["finishedAt"] or "") or None,
     )
 
 

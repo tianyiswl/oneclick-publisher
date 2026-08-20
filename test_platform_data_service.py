@@ -1189,7 +1189,7 @@ class PlatformDataServiceTests(unittest.TestCase):
         )
 
     def test_v2_freshness_ignores_legacy_blank_scope_runs(self) -> None:
-        """旧 blank-scope 成功 run 不得覆盖 V2 最新运行与新鲜度。"""
+        """旧 blank-scope 尝试可见，但不得覆盖可信 V2 新鲜度。"""
 
         with patch.object(
             platform_data_service,
@@ -1255,10 +1255,15 @@ class PlatformDataServiceTests(unittest.TestCase):
                 self.account_id, 7
             )
 
-        self.assertEqual(summary["latestRun"]["status"], "partial_success")
-        self.assertEqual(summary["latestRun"]["sourceMode"], "direct_session")
         self.assertEqual(
-            summary["latestRun"]["errorCode"], "content_list_unavailable"
+            summary["latestRun"],
+            {
+                "status": "success",
+                "sourceMode": "browser_signed",
+                "errorCode": "",
+                "metricCount": 1,
+                "finishedAt": "2026-08-20T23:31:00+08:00",
+            },
         )
         self.assertEqual(
             summary["platformObservedAt"], "2026-08-19T23:30:00+08:00"
@@ -1266,6 +1271,67 @@ class PlatformDataServiceTests(unittest.TestCase):
         self.assertEqual(
             summary["localSyncedAt"], "2026-08-19T23:31:00+08:00"
         )
+
+    def test_latest_attempt_reports_failure_without_replacing_v2_freshness(self) -> None:
+        """最新失败必须公开，但不能覆盖此前可信 V2 数据的新鲜度。"""
+
+        with patch.object(
+            platform_data_service,
+            "_now",
+            return_value="2026-08-19T23:31:00+08:00",
+        ):
+            platform_data_service.record_collection_sync(
+                self.account_id,
+                CollectionBatch(
+                    platform_type=3,
+                    source_mode="direct_session",
+                    metrics=(
+                        self._v2_point("views", 10, day="2026-08-19"),
+                    ),
+                    contents=(self._content("aweme-1"),),
+                    account_metrics_available=True,
+                    content_data_available=True,
+                    platform_observed_at="2026-08-19T23:30:00+08:00",
+                ),
+            )
+        with patch.object(
+            platform_data_service,
+            "_now",
+            return_value="2026-08-20T23:31:00+08:00",
+        ):
+            platform_data_service.record_failed_sync(
+                self.account_id,
+                3,
+                "browser_signed",
+                "login_required",
+            )
+
+        with patch.object(
+            platform_data_service,
+            "_beijing_today",
+            return_value=date(2026, 8, 20),
+        ):
+            summary = platform_data_service.account_period_summary(
+                self.account_id, 7
+            )
+
+        self.assertEqual(
+            summary["latestRun"],
+            {
+                "status": "failed",
+                "sourceMode": "browser_signed",
+                "errorCode": "login_required",
+                "metricCount": 0,
+                "finishedAt": "2026-08-20T23:31:00+08:00",
+            },
+        )
+        self.assertEqual(
+            summary["platformObservedAt"], "2026-08-19T23:30:00+08:00"
+        )
+        self.assertEqual(
+            summary["localSyncedAt"], "2026-08-19T23:31:00+08:00"
+        )
+        self.assertEqual(summary["metrics"]["views"]["value"], 10)
 
 
 if __name__ == "__main__":
