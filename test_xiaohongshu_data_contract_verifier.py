@@ -828,3 +828,54 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
             for directory in (moved_parent, outside_parent):
                 if directory.exists():
                     shutil.rmtree(directory)
+
+    def test_main_execute_with_report_runs_probe_and_persists_final_report(self):
+        observed = verifier.build_plan()
+        observed.update({
+            "mode": "execute",
+            "status": "failed",
+            "errorCode": "xiaohongshu_probe_failed",
+        })
+        stdout = io.StringIO()
+
+        with patch.object(verifier, "_execute", return_value=observed) as execute:
+            exit_code = verifier.main(
+                ["--execute", "--report", str(self.report_path)],
+                stdout=stdout,
+            )
+
+        self.assertEqual(exit_code, 0)
+        execute.assert_called_once()
+        self.assertTrue(self.report_path.is_file())
+        self.assertEqual(json.loads(stdout.getvalue()), observed)
+        self.assertEqual(json.loads(self.report_path.read_text("utf-8")), observed)
+
+    def test_main_execute_with_report_persists_fixed_account_gate_failure(self):
+        stdout = io.StringIO()
+
+        with patch.object(
+            verifier,
+            "_execute",
+            side_effect=verifier.ProbeFailure(
+                "xiaohongshu_account_selection_required"
+            ),
+        ):
+            exit_code = verifier.main(
+                ["--execute", "--report", str(self.report_path)],
+                stdout=stdout,
+            )
+
+        self.assertEqual(exit_code, 0)
+        report = json.loads(stdout.getvalue())
+        self.assertEqual(report["mode"], "execute")
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(
+            report["errorCode"], "xiaohongshu_account_selection_required"
+        )
+        self.assertEqual(report["responses"], [])
+        self.assertEqual(
+            report["cleanup"], {"closed": True, "aliveResourceCount": 0}
+        )
+        self.assertEqual(
+            json.loads(self.report_path.read_text("utf-8")), report
+        )

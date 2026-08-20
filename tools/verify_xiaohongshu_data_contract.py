@@ -857,7 +857,14 @@ def _execute(*, browser_factory, utc_now) -> dict[str, object]:
 
 def main(argv: list[str] | None = None, *, stdout=sys.stdout) -> int:
     arguments = sys.argv[1:] if argv is None else argv
-    if arguments == ["--execute"]:
+    report_path = None
+    if (
+        len(arguments) == 3
+        and arguments[:2] == ["--execute", "--report"]
+    ):
+        report_path = arguments[2]
+
+    if arguments == ["--execute"] or report_path is not None:
         def browser_factory():
             from playwright.async_api import async_playwright
 
@@ -865,10 +872,20 @@ def main(argv: list[str] | None = None, *, stdout=sys.stdout) -> int:
 
         from datetime import datetime, timezone
 
-        payload = _execute(
-            browser_factory=browser_factory,
-            utc_now=lambda: datetime.now(timezone.utc),
-        )
+        try:
+            payload = _execute(
+                browser_factory=browser_factory,
+                utc_now=lambda: datetime.now(timezone.utc),
+            )
+        except ProbeFailure as failure:
+            payload = build_plan()
+            payload.update({
+                "mode": "execute",
+                "status": "failed",
+                "errorCode": failure.error_code,
+            })
+        if report_path is not None:
+            _write_report(report_path, payload)
     else:
         payload = build_plan()
     json.dump(payload, stdout, ensure_ascii=False)
