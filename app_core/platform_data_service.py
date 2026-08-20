@@ -33,6 +33,7 @@ ALLOWED_ERROR_CODES = frozenset(
         "content_payload_invalid",
     }
 )
+ALLOWED_SYNC_STATUSES = frozenset({"success", "partial_success", "failed"})
 
 _PERIOD_DAYS = frozenset({1, 7, 30})
 _BATCH_WARNING_CODES = frozenset(
@@ -228,6 +229,8 @@ def _finalize_sync_run(
     metric_count: int,
     finished_at: str,
 ) -> None:
+    if status not in ALLOWED_SYNC_STATUSES:
+        raise CollectionFailure("metric_payload_invalid")
     cursor = conn.execute(
         """
         UPDATE platform_data_sync_runs
