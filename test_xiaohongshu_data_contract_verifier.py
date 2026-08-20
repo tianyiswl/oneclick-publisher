@@ -750,7 +750,10 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
         report = json.loads(text)
         self.assertEqual(
             [response["path"] for response in report["responses"]],
-            ["/api/note/:id", "/api/note/:id", "/api/note/:id", "/api/data"],
+            [
+                "/api/note/:id", "/api/note/:id", "/api/note/:id",
+                "/api/data", "/api/note/:id",
+            ],
         )
         for segment in (*dynamic_segments, "private-work-id", "token=secret"):
             self.assertNotIn(segment, text)
@@ -763,6 +766,24 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
         ))
         self.assertIsNotNone(metadata)
         self.assertEqual(metadata[0], "/api/note/:id")
+
+    def test_persisted_report_templates_static_named_dynamic_ids(self):
+        verifier._write_report(self.report_path, {
+            "responses": [{
+                "url": "https://creator.xiaohongshu.com/api/note/data",
+            }, {
+                "url": "https://creator.xiaohongshu.com/api/content/overview",
+            }, {
+                "url": "https://creator.xiaohongshu.com/api/data",
+            }],
+        })
+        text = self.report_path.read_text("utf-8")
+        self.assertEqual(
+            [response["path"] for response in json.loads(text)["responses"]],
+            ["/api/note/:id", "/api/content/:id", "/api/data"],
+        )
+        self.assertNotIn("/api/note/data", text)
+        self.assertNotIn("/api/content/overview", text)
 
     def test_report_writer_does_not_follow_parent_swapped_after_revalidation(self):
         root = self.report_path.parent

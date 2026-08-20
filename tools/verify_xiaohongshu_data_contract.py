@@ -170,10 +170,10 @@ def _endpoint_path(path: object) -> str | None:
 
     normalized: list[str] = []
     for segment in segments:
-        if segment in _STATIC_ENDPOINT_SEGMENTS:
-            normalized.append(segment)
+        if normalized and normalized[-1] in _DYNAMIC_ID_PARENTS:
+            normalized.append(":id")
             continue
-        if segment == ":id" and normalized and normalized[-1] in _DYNAMIC_ID_PARENTS:
+        if segment in _STATIC_ENDPOINT_SEGMENTS:
             normalized.append(segment)
             continue
         is_dynamic_id = (
