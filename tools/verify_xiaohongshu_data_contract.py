@@ -3,8 +3,11 @@
 import asyncio
 import inspect
 import json
+import os
+import re
+import secrets
+import stat
 import sys
-import tempfile
 import time
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -29,6 +32,25 @@ _REPORT_OUTPUT_DIRECTORY = (
     / ".superpowers/sdd/2026-08-20-xiaohongshu-data-contract-discovery"
 )
 _BUILTIN_PATH_TYPE = type(Path())
+_STATIC_ENDPOINT_SEGMENTS = frozenset({
+    "api", "data", "deep", "wide", "cycle", "deadline", "item",
+    "eligible", "overview", "note", "notes", "content", "contents",
+    "list", "lists", "feed", "feeds", "metrics", "stats", "creator",
+    "home", "profile", "account", "accounts", "user", "users", "v1",
+    "v2",
+})
+_DYNAMIC_ID_PARENTS = frozenset({
+    "note", "notes", "item", "content", "contents", "user", "users",
+    "account", "accounts",
+})
+_UUID_ENDPOINT_SEGMENT = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+_HEX_ENDPOINT_SEGMENT = re.compile(r"^[0-9a-f]{12,}$", re.IGNORECASE)
+_HIGH_ENTROPY_ENDPOINT_SEGMENT = re.compile(r"^[A-Za-z0-9_-]{20,}$")
+_DIRECTORY_OPEN_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+_TEMPORARY_OPEN_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
 _CREATOR_HOST = "creator.xiaohongshu.com"
 _CREATOR_HOME = "https://creator.xiaohongshu.com/creator/home"
 _NETWORK_QUIET_TIMEOUT_MS = 30_000
@@ -130,7 +152,44 @@ def _safe_integer_mapping(
     return result
 
 
-def _sanitize_response(value: object) -> dict[str, object]:
+def _endpoint_path(path: object) -> str | None:
+    """Return a static endpoint shape, never a literal identifier segment."""
+    if type(path) is not str:
+        return ""
+    try:
+        raw_path = urlsplit(path).path
+    except ValueError:
+        return ""
+    if not raw_path:
+        return ""
+    if not raw_path.startswith("/"):
+        return None
+    segments = raw_path.split("/")[1:]
+    if not segments or any(not segment for segment in segments):
+        return None
+
+    normalized: list[str] = []
+    for segment in segments:
+        if segment in _STATIC_ENDPOINT_SEGMENTS:
+            normalized.append(segment)
+            continue
+        if segment == ":id" and normalized and normalized[-1] in _DYNAMIC_ID_PARENTS:
+            normalized.append(segment)
+            continue
+        is_dynamic_id = (
+            segment.isdecimal()
+            or _UUID_ENDPOINT_SEGMENT.fullmatch(segment) is not None
+            or _HEX_ENDPOINT_SEGMENT.fullmatch(segment) is not None
+            or _HIGH_ENTROPY_ENDPOINT_SEGMENT.fullmatch(segment) is not None
+        )
+        if is_dynamic_id and normalized and normalized[-1] in _DYNAMIC_ID_PARENTS:
+            normalized.append(":id")
+            continue
+        return None
+    return "/" + "/".join(normalized)
+
+
+def _sanitize_response(value: object) -> dict[str, object] | None:
     source = value if type(value) is dict else {}
     source_url = source.get("url")
     if type(source_url) is str:
@@ -140,9 +199,12 @@ def _sanitize_response(value: object) -> dict[str, object]:
             source_path = ""
     else:
         source_path = source.get("path")
+    safe_path = _endpoint_path(source_path)
+    if safe_path is None:
+        return None
     return {
         "method": _safe_text(source.get("method")),
-        "path": _safe_text(source_path),
+        "path": safe_path,
         "status": _safe_integer(source.get("status")),
         "contentType": _safe_text(source.get("contentType")),
         "keyPaths": _safe_text_list(source.get("keyPaths", source.get("keys")), _KEY_PATH_LIMIT),
@@ -165,6 +227,13 @@ def sanitize_probe_report(value: object) -> dict[str, object]:
     phases = source.get("phases")
     safe_cleanup = cleanup if type(cleanup) is dict else {}
 
+    safe_responses: list[dict[str, object]] = []
+    if type(responses) is list:
+        for response in responses[:_RESPONSE_LIMIT]:
+            safe_response = _sanitize_response(response)
+            if safe_response is not None:
+                safe_responses.append(safe_response)
+
     return {
         "schemaVersion": _safe_text(source.get("schemaVersion"), plan["schemaVersion"]),
         "platformType": _safe_integer(source.get("platformType"), plan["platformType"]),
@@ -173,10 +242,7 @@ def sanitize_probe_report(value: object) -> dict[str, object]:
         "status": _safe_text(source.get("status"), plan["status"]),
         "errorCode": _safe_text(source.get("errorCode")),
         "observedAt": _safe_text(source.get("observedAt")),
-        "responses": [
-            _sanitize_response(response)
-            for response in responses[:_RESPONSE_LIMIT]
-        ] if type(responses) is list else [],
+        "responses": safe_responses,
         "cleanup": {
             "closed": _safe_boolean(safe_cleanup.get("closed")),
             "aliveResourceCount": _safe_integer(safe_cleanup.get("aliveResourceCount")),
@@ -202,6 +268,56 @@ def _report_destination(path: object) -> Path:
     return resolved
 
 
+def _open_report_directory(destination: Path) -> int:
+    """Open the approved parent directory without following replacement links."""
+    root = _REPORT_OUTPUT_DIRECTORY.resolve()
+    relative_parent = destination.parent.relative_to(root)
+    directory_fd = os.open(root, _DIRECTORY_OPEN_FLAGS)
+    try:
+        if not stat.S_ISDIR(os.fstat(directory_fd).st_mode):
+            raise NotADirectoryError
+        for segment in relative_parent.parts:
+            try:
+                next_fd = os.open(
+                    segment, _DIRECTORY_OPEN_FLAGS, dir_fd=directory_fd
+                )
+            except FileNotFoundError:
+                os.mkdir(segment, 0o700, dir_fd=directory_fd)
+                next_fd = os.open(
+                    segment, _DIRECTORY_OPEN_FLAGS, dir_fd=directory_fd
+                )
+            try:
+                if not stat.S_ISDIR(os.fstat(next_fd).st_mode):
+                    raise NotADirectoryError
+            except Exception:
+                os.close(next_fd)
+                raise
+            os.close(directory_fd)
+            directory_fd = next_fd
+        return directory_fd
+    except Exception:
+        os.close(directory_fd)
+        raise
+
+
+def _open_temporary_report_file(directory_fd: int, name: str) -> tuple[int, str]:
+    for _ in range(100):
+        temporary_name = f".{name}.{secrets.token_hex(16)}.tmp"
+        try:
+            return (
+                os.open(
+                    temporary_name,
+                    _TEMPORARY_OPEN_FLAGS,
+                    0o600,
+                    dir_fd=directory_fd,
+                ),
+                temporary_name,
+            )
+        except FileExistsError:
+            continue
+    raise FileExistsError
+
+
 def _write_report(path: Path, report: object) -> None:
     """Persist only the final rebuilt structural report at the approved path."""
     try:
@@ -211,7 +327,9 @@ def _write_report(path: Path, report: object) -> None:
     except Exception:
         raise ProbeFailure(_REPORT_PATH_INVALID) from None
 
-    temporary_path: Path | None = None
+    directory_fd: int | None = None
+    temporary_fd: int | None = None
+    temporary_name: str | None = None
     try:
         serialized = json.dumps(
             sanitize_probe_report(report),
@@ -219,29 +337,41 @@ def _write_report(path: Path, report: object) -> None:
             indent=2,
             sort_keys=True,
         ) + "\n"
-        destination.parent.mkdir(parents=True, exist_ok=True)
         destination = _report_destination(destination)
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=destination.parent,
-            prefix=f".{destination.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as temporary:
-            temporary_path = Path(temporary.name)
+        directory_fd = _open_report_directory(destination)
+        temporary_fd, temporary_name = _open_temporary_report_file(
+            directory_fd, destination.name
+        )
+        temporary = os.fdopen(temporary_fd, mode="w", encoding="utf-8")
+        temporary_fd = None
+        with temporary:
             temporary.write(serialized)
             temporary.flush()
-        temporary_path.replace(destination)
-        temporary_path = None
+        os.replace(
+            temporary_name,
+            destination.name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        temporary_name = None
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception:
         raise ProbeFailure(_REPORT_WRITE_FAILED) from None
     finally:
-        if temporary_path is not None:
+        if temporary_fd is not None:
             try:
-                temporary_path.unlink(missing_ok=True)
+                os.close(temporary_fd)
+            except Exception:
+                pass
+        if temporary_name is not None and directory_fd is not None:
+            try:
+                os.unlink(temporary_name, dir_fd=directory_fd)
+            except Exception:
+                pass
+        if directory_fd is not None:
+            try:
+                os.close(directory_fd)
             except Exception:
                 pass
 
@@ -297,6 +427,9 @@ def _response_metadata(response: object) -> tuple[str, str, int, str] | None:
         return None
     if parsed.scheme != "https" or parsed.hostname != _CREATOR_HOST:
         return None
+    endpoint_path = _endpoint_path(parsed.path)
+    if not endpoint_path:
+        return None
 
     headers = getattr(response, "headers", None)
     if type(headers) is not dict:
@@ -312,7 +445,7 @@ def _response_metadata(response: object) -> tuple[str, str, int, str] | None:
     method = getattr(request, "method", "")
     status = getattr(response, "status", 0)
     return (
-        parsed.path,
+        endpoint_path,
         method if type(method) is str else "",
         status if type(status) is int else 0,
         content_type,

@@ -1,6 +1,7 @@
 import io
 import asyncio
 import json
+import shutil
 import time
 import unittest
 from datetime import datetime, timezone
@@ -642,7 +643,7 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
             "mode": UntrustedText("execute"),
             "platformType": True,
             "responses": [{
-                "url": "https://creator.xiaohongshu.com/" + "a" * 130,
+                "url": "https://creator.xiaohongshu.com/api/data",
                 "status": True,
                 "keyPaths": ["a" * 130] * 301,
             }] * 101,
@@ -703,7 +704,7 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
                 self.assertNotIn("secret", str(raised.exception))
 
     def test_report_writer_removes_same_directory_temporary_file_on_replace_failure(self):
-        with patch.object(Path, "replace", side_effect=OSError("private failure")):
+        with patch.object(verifier.os, "replace", side_effect=OSError("private failure")):
             with self.assertRaisesRegex(
                 verifier.ProbeFailure, "^xiaohongshu_report_write_failed$"
             ) as raised:
@@ -728,3 +729,81 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
             self.assertIsNone(raised.exception.__cause__)
         finally:
             escape_link.unlink(missing_ok=True)
+
+    def test_persisted_report_templates_dynamic_endpoint_path_segments(self):
+        dynamic_segments = (
+            "123e4567-e89b-12d3-a456-426614174000",
+            "12345678901234567890",
+            "67b196bf000000001d0368f8",
+        )
+        verifier._write_report(self.report_path, {
+            "responses": [
+                {"url": f"https://creator.xiaohongshu.com/api/note/{segment}?token=secret"}
+                for segment in dynamic_segments
+            ] + [{
+                "url": "https://creator.xiaohongshu.com/api/data?token=secret",
+            }, {
+                "url": "https://creator.xiaohongshu.com/api/note/private-work-id",
+            }],
+        })
+        text = self.report_path.read_text("utf-8")
+        report = json.loads(text)
+        self.assertEqual(
+            [response["path"] for response in report["responses"]],
+            ["/api/note/:id", "/api/note/:id", "/api/note/:id", "/api/data"],
+        )
+        for segment in (*dynamic_segments, "private-work-id", "token=secret"):
+            self.assertNotIn(segment, text)
+
+    def test_collector_templates_dynamic_endpoint_path_segments(self):
+        metadata = verifier._response_metadata(FakeResponse(
+            "https://creator.xiaohongshu.com/api/note/67b196bf000000001d0368f8?token=secret",
+            "application/json",
+            {},
+        ))
+        self.assertIsNotNone(metadata)
+        self.assertEqual(metadata[0], "/api/note/:id")
+
+    def test_report_writer_does_not_follow_parent_swapped_after_revalidation(self):
+        root = self.report_path.parent
+        parent = root / "probe-report-race-parent"
+        moved_parent = root / "probe-report-race-moved"
+        outside_parent = root.parent / "probe-report-race-outside"
+        destination = parent / "probe-report.json"
+        outside_report = outside_parent / "probe-report.json"
+        for directory in (parent, moved_parent, outside_parent):
+            if directory.is_symlink():
+                directory.unlink()
+            elif directory.exists():
+                shutil.rmtree(directory)
+        parent.mkdir()
+        outside_parent.mkdir()
+        original_destination = verifier._report_destination
+        calls = 0
+
+        def swap_after_revalidation(path):
+            nonlocal calls
+            result = original_destination(path)
+            calls += 1
+            if calls == 2:
+                parent.rename(moved_parent)
+                parent.symlink_to(outside_parent, target_is_directory=True)
+            return result
+
+        try:
+            with patch.object(
+                verifier, "_report_destination", side_effect=swap_after_revalidation
+            ):
+                with self.assertRaisesRegex(
+                    verifier.ProbeFailure, "^xiaohongshu_report_write_failed$"
+                ) as raised:
+                    verifier._write_report(destination, {"status": "success"})
+            self.assertIsNone(raised.exception.__cause__)
+            self.assertEqual(calls, 2)
+            self.assertFalse(outside_report.exists())
+        finally:
+            if parent.is_symlink():
+                parent.unlink()
+            for directory in (moved_parent, outside_parent):
+                if directory.exists():
+                    shutil.rmtree(directory)
