@@ -1,7 +1,11 @@
-"""Emit a zero-action Xiaohongshu data-contract probe plan."""
+"""Emit a zero-action plan or passively observe Xiaohongshu response shapes."""
 
+import asyncio
+import inspect
 import json
 import sys
+import time
+from pathlib import Path
 from urllib.parse import urlsplit
 
 
@@ -17,6 +21,25 @@ _TEXT_LIMIT = 120
 _RESPONSE_LIMIT = 100
 _KEY_PATH_LIMIT = 300
 _ACCOUNT_SELECTION_REQUIRED = "xiaohongshu_account_selection_required"
+_CREATOR_HOST = "creator.xiaohongshu.com"
+_CREATOR_HOME = "https://creator.xiaohongshu.com/creator/home"
+_NETWORK_QUIET_TIMEOUT_MS = 30_000
+_TOTAL_TIMEOUT_SECONDS = 60.0
+_MAX_CLEANUP_BUDGET_SECONDS = 5.0
+_PAGINATION_KEYS = frozenset({
+    "cursor", "next_cursor", "nextcursor", "has_more", "hasmore",
+    "page", "page_no", "page_num", "page_size", "pagesize", "total",
+})
+_CONTENT_IDENTIFIERS = frozenset({"note_id", "item_id", "content_id"})
+_CONTENT_LIST_KEYS = frozenset({"items", "list", "notes", "feeds"})
+_LIFETIME_METRIC_KEYS = frozenset({
+    "view_count", "views", "like_count", "likes", "comment_count",
+    "comments", "share_count", "shares", "collect_count", "collects",
+})
+_ACCOUNT_KEYS = frozenset({
+    "account", "profile", "fans", "fan_count", "follower_count",
+    "followers", "overview", "trend",
+})
 
 
 class ProbeFailure(Exception):
@@ -175,11 +198,374 @@ def _select_single_eligible_account() -> dict[str, object]:
     }
 
 
+def _response_metadata(response: object) -> tuple[str, str, int, str] | None:
+    url = getattr(response, "url", None)
+    if type(url) is not str:
+        return None
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return None
+    if parsed.scheme != "https" or parsed.hostname != _CREATOR_HOST:
+        return None
+
+    headers = getattr(response, "headers", None)
+    if type(headers) is not dict:
+        return None
+    raw_content_type = headers.get("content-type")
+    if type(raw_content_type) is not str:
+        return None
+    content_type = raw_content_type.split(";", 1)[0].strip().lower()
+    if content_type != "application/json":
+        return None
+
+    request = getattr(response, "request", None)
+    method = getattr(request, "method", "")
+    status = getattr(response, "status", 0)
+    return (
+        parsed.path,
+        method if type(method) is str else "",
+        status if type(status) is int else 0,
+        content_type,
+    )
+
+
+def _structural_fields(payload: object) -> tuple[
+    list[str], dict[str, str], dict[str, int], list[str]
+]:
+    key_paths: list[str] = []
+    field_types: dict[str, str] = {}
+    list_lengths: dict[str, int] = {}
+    pagination_keys: list[str] = []
+
+    def visit(value: object, path: str) -> None:
+        value_type = type(value)
+        if path:
+            key_paths.append(path)
+            if value_type in (dict, list, str, int, float, bool, type(None)):
+                field_types[path] = value_type.__name__
+
+        if value_type is dict:
+            for key, child in value.items():
+                if type(key) is not str:
+                    continue
+                child_path = f"{path}.{key}" if path else key
+                if key.lower() in _PAGINATION_KEYS:
+                    pagination_keys.append(child_path)
+                visit(child, child_path)
+        elif value_type is list:
+            if path:
+                list_lengths[path] = len(value)
+            for child in value:
+                visit(child, f"{path}[]" if path else "[]")
+
+    visit(payload, "")
+    return (
+        list(dict.fromkeys(key_paths)),
+        field_types,
+        list_lengths,
+        list(dict.fromkeys(pagination_keys)),
+    )
+
+
+def _shape_from_payload(
+    metadata: tuple[str, str, int, str], payload: object
+) -> dict[str, object]:
+    path, method, status, content_type = metadata
+    key_paths, field_types, list_lengths, pagination_keys = _structural_fields(payload)
+    return {
+        "method": method,
+        "path": path,
+        "status": status,
+        "contentType": content_type,
+        "keyPaths": key_paths,
+        "fieldTypes": field_types,
+        "listLengths": list_lengths,
+        "paginationKeys": pagination_keys,
+    }
+
+
+def _response_shape(response) -> dict[str, object] | None:
+    """Return only an eligible synchronous response's structural contract."""
+    metadata = _response_metadata(response)
+    if metadata is None:
+        return None
+    loader = getattr(response, "json", None)
+    if not callable(loader):
+        return None
+    try:
+        payload = loader()
+    except Exception:
+        return None
+    if inspect.isawaitable(payload):
+        close = getattr(payload, "close", None)
+        if callable(close):
+            close()
+        return None
+    return _shape_from_payload(metadata, payload)
+
+
+async def _async_response_shape(
+    response: object, *, deadline: float, monotonic
+) -> dict[str, object] | None:
+    metadata = _response_metadata(response)
+    if metadata is None:
+        return None
+    loader = getattr(response, "json", None)
+    if not callable(loader):
+        return None
+    try:
+        payload = loader()
+        if inspect.isawaitable(payload):
+            payload = await _await_with_deadline(
+                payload, deadline=deadline, monotonic=monotonic
+            )
+    except TimeoutError:
+        raise
+    except Exception:
+        return None
+    return _shape_from_payload(metadata, payload)
+
+
+def _classify_shape(shape: dict[str, object]) -> str:
+    paths = shape.get("keyPaths")
+    if type(paths) is not list:
+        return "unclassified"
+    tokens = {
+        token.lower().removesuffix("[]")
+        for path in paths
+        if type(path) is str
+        for token in path.split(".")
+    }
+    if tokens & _CONTENT_IDENTIFIERS and tokens & _CONTENT_LIST_KEYS:
+        return "content_list"
+    if tokens & _CONTENT_IDENTIFIERS and tokens & _LIFETIME_METRIC_KEYS:
+        return "content_lifetime"
+    if tokens & _ACCOUNT_KEYS:
+        return "account_overview"
+    return "unclassified"
+
+
+async def _await_with_deadline(value: object, *, deadline: float, monotonic) -> object:
+    if not inspect.isawaitable(value):
+        return value
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        close = getattr(value, "close", None)
+        if callable(close):
+            close()
+        raise TimeoutError
+    return await asyncio.wait_for(value, timeout=remaining)
+
+
+async def _close_resource(
+    resource: object, *, deadline: float, monotonic
+) -> BaseException | None:
+    close = getattr(resource, "close", None)
+    if not callable(close):
+        close = getattr(resource, "stop", None)
+    if not callable(close):
+        return RuntimeError("resource_close_unavailable")
+    try:
+        await _await_with_deadline(
+            close(), deadline=deadline, monotonic=monotonic
+        )
+    except BaseException as exc:
+        return exc
+    return None
+
+
+def _storage_state_path(account: object) -> Path:
+    if type(account) is not dict:
+        raise ProbeFailure("xiaohongshu_session_state_invalid")
+    file_path = account.get("filePath")
+    if type(file_path) is not str or not file_path.strip():
+        raise ProbeFailure("xiaohongshu_session_state_invalid")
+
+    supplied = Path(file_path)
+    if supplied.is_absolute():
+        state_path = supplied
+    else:
+        from app_core.paths import COOKIE_DIR
+
+        state_path = Path(COOKIE_DIR) / supplied.name
+    if not state_path.is_file():
+        raise ProbeFailure("xiaohongshu_session_state_invalid")
+    return state_path
+
+
+def _observed_at(utc_now) -> str:
+    try:
+        value = utc_now()
+        rendered = value.isoformat()
+    except Exception:
+        return ""
+    return rendered if type(rendered) is str else ""
+
+
+async def _run_probe(
+    account: dict,
+    *,
+    playwright_factory,
+    monotonic,
+    utc_now,
+    work_deadline: float,
+    total_deadline: float,
+) -> tuple[dict[str, object], BaseException | None]:
+    playwright = None
+    browser = None
+    context = None
+    page = None
+    observed_responses: list[object] = []
+    shapes: list[dict[str, object]] = []
+    caught: BaseException | None = None
+    cleanup_errors: list[BaseException] = []
+
+    try:
+        state_path = _storage_state_path(account)
+        starter = await _await_with_deadline(
+            playwright_factory(), deadline=work_deadline, monotonic=monotonic
+        )
+        start = getattr(starter, "start", None)
+        playwright = await _await_with_deadline(
+            start(), deadline=work_deadline, monotonic=monotonic
+        ) if callable(start) else starter
+        browser = await _await_with_deadline(
+            playwright.chromium.launch(headless=True),
+            deadline=work_deadline,
+            monotonic=monotonic,
+        )
+        context = await _await_with_deadline(
+            browser.new_context(storage_state=str(state_path)),
+            deadline=work_deadline,
+            monotonic=monotonic,
+        )
+        page = await _await_with_deadline(
+            context.new_page(), deadline=work_deadline, monotonic=monotonic
+        )
+        page.on("response", observed_responses.append)
+        await _await_with_deadline(
+            page.goto(
+                _CREATOR_HOME,
+                wait_until="networkidle",
+                timeout=_NETWORK_QUIET_TIMEOUT_MS,
+            ),
+            deadline=work_deadline,
+            monotonic=monotonic,
+        )
+        for response in observed_responses:
+            shape = await _async_response_shape(
+                response, deadline=work_deadline, monotonic=monotonic
+            )
+            if shape is not None:
+                shapes.append(shape)
+    except BaseException as exc:
+        caught = exc
+    finally:
+        resources = (page, context, browser, playwright)
+        for index, resource in enumerate(resources):
+            if resource is None:
+                continue
+            remaining_count = len(resources) - index
+            remaining_cleanup = max(0.0, total_deadline - monotonic())
+            resource_deadline = (
+                monotonic() + (remaining_cleanup / remaining_count)
+            )
+            close_error = await _close_resource(
+                resource, deadline=resource_deadline, monotonic=monotonic
+            )
+            if close_error is not None:
+                cleanup_errors.append(close_error)
+
+    process_error = next(
+        (
+            error for error in ((caught,) + tuple(cleanup_errors))
+            if isinstance(error, (KeyboardInterrupt, SystemExit))
+        ),
+        None,
+    )
+    if process_error is not None:
+        raise process_error
+
+    alive_count = sum(1 for error in cleanup_errors if error is not None)
+    report = build_plan()
+    report.update({
+        "mode": "execute",
+        "phases": list(dict.fromkeys(_classify_shape(shape) for shape in shapes)),
+        "status": "success",
+        "errorCode": "",
+        "observedAt": _observed_at(utc_now),
+        "responses": shapes,
+        "cleanup": {
+            "closed": alive_count == 0,
+            "aliveResourceCount": int(alive_count),
+        },
+    })
+    if cleanup_errors:
+        report["status"] = "failed"
+        report["errorCode"] = "xiaohongshu_probe_cleanup_incomplete"
+    elif isinstance(caught, (TimeoutError, asyncio.CancelledError)):
+        report["status"] = "failed"
+        report["errorCode"] = "xiaohongshu_probe_timeout"
+    elif isinstance(caught, ProbeFailure):
+        report["status"] = "failed"
+        report["errorCode"] = caught.error_code
+    elif caught is not None:
+        report["status"] = "failed"
+        report["errorCode"] = "xiaohongshu_probe_failed"
+    return sanitize_probe_report(report), caught
+
+
+def _probe_with_browser(
+    account: dict,
+    *,
+    playwright_factory,
+    monotonic,
+    utc_now,
+) -> dict[str, object]:
+    """Run one bounded passive probe with no page-side requests or DOM access."""
+    started_at = monotonic()
+    total_deadline = started_at + _TOTAL_TIMEOUT_SECONDS
+    cleanup_budget = min(
+        _MAX_CLEANUP_BUDGET_SECONDS,
+        _TOTAL_TIMEOUT_SECONDS / 2,
+    )
+    work_deadline = total_deadline - cleanup_budget
+
+    async def bounded_probe() -> dict[str, object]:
+        report, _caught = await _run_probe(
+            account,
+            playwright_factory=playwright_factory,
+            monotonic=monotonic,
+            utc_now=utc_now,
+            work_deadline=work_deadline,
+            total_deadline=total_deadline,
+        )
+        return report
+
+    try:
+        return asyncio.run(bounded_probe())
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except TimeoutError:
+        report = build_plan()
+        report.update({
+            "mode": "execute",
+            "status": "failed",
+            "errorCode": "xiaohongshu_probe_timeout",
+            "observedAt": _observed_at(utc_now),
+        })
+        return sanitize_probe_report(report)
+
+
 def _execute(*, browser_factory, utc_now) -> dict[str, object]:
-    """Apply the explicit account-selection gate without browser activity."""
-    del browser_factory, utc_now
-    _select_single_eligible_account()
-    return build_plan()
+    """Apply the account gate, then run one passive official-page probe."""
+    return _probe_with_browser(
+        _select_single_eligible_account(),
+        playwright_factory=browser_factory,
+        monotonic=time.monotonic,
+        utc_now=utc_now,
+    )
 
 
 def main(argv: list[str] | None = None, *, stdout=sys.stdout) -> int:
@@ -188,7 +574,7 @@ def main(argv: list[str] | None = None, *, stdout=sys.stdout) -> int:
         def browser_factory():
             from playwright.async_api import async_playwright
 
-            return async_playwright
+            return async_playwright()
 
         from datetime import datetime, timezone
 
