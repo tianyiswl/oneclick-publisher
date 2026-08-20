@@ -6,6 +6,9 @@ __pycache__/
 .env
 .env.*
 
+# 小红书探测的本机运行报告
+.superpowers/sdd/2026-08-20-xiaohongshu-data-contract-discovery/probe-report.json
+
 # 一键发本机运行数据：可能包含账号、会话、素材、日志与授权状态
 demo-runtime/
 runtime/

@@ -4,6 +4,7 @@ import json
 import time
 import unittest
 from datetime import datetime, timezone
+from pathlib import Path
 from unittest.mock import patch
 
 import tools.verify_xiaohongshu_data_contract as verifier
@@ -262,6 +263,16 @@ class ExhaustingClock:
 
 
 class XiaohongshuDataContractVerifierTests(unittest.TestCase):
+    def setUp(self):
+        self.report_path = (
+            Path(verifier.__file__).resolve().parents[1]
+            / ".superpowers/sdd/2026-08-20-xiaohongshu-data-contract-discovery"
+            / "probe-report-test.json"
+        )
+
+    def tearDown(self):
+        self.report_path.unlink(missing_ok=True)
+
     def test_probe_closes_playwright_manager_when_start_fails_midway(self):
         manager = AsyncStartManager(failure=RuntimeError("secret start failure"))
         result = verifier._probe_with_browser(
@@ -653,3 +664,67 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
         self.assertIs(type(report), dict)
         self.assertIs(type(report["responses"]), list)
         self.assertIs(type(report["cleanup"]), dict)
+
+    def test_persisted_report_is_finally_sanitized(self):
+        injected = {
+            "status": "success",
+            "account": {"nickname": "private", "phone": "13800000000"},
+            "responses": [{
+                "url": "https://creator.xiaohongshu.com/api?cookie=secret",
+                "keyPaths": ["data.items[].note_id"],
+                "raw": {"note_id": "private-id", "title": "private-title"},
+            }],
+            "cleanup": {"closed": True, "aliveResourceCount": 0, "unknown": "secret"},
+        }
+        verifier._write_report(self.report_path, injected)
+        text = self.report_path.read_text("utf-8")
+        for forbidden in ("13800000000", "private-id", "private-title", "cookie=", "secret"):
+            self.assertNotIn(forbidden, text)
+        self.assertEqual(json.loads(text)["responses"][0]["path"], "/api")
+
+    def test_report_writer_rejects_escape_and_untrusted_path_types(self):
+        class UntrustedPath(str):
+            def __str__(self):
+                raise AssertionError("writer must not stringify untrusted paths")
+
+        paths = (
+            self.report_path.parent / "nested" / ".." / "probe-report.json",
+            self.report_path.parent.parent / "private-report.json",
+            UntrustedPath("private-path-secret"),
+        )
+        for path in paths:
+            with self.subTest(path=type(path).__name__):
+                with self.assertRaises(verifier.ProbeFailure) as raised:
+                    verifier._write_report(path, {"status": "success"})
+                self.assertEqual(
+                    str(raised.exception), "xiaohongshu_report_path_invalid"
+                )
+                self.assertIsNone(raised.exception.__cause__)
+                self.assertNotIn("secret", str(raised.exception))
+
+    def test_report_writer_removes_same_directory_temporary_file_on_replace_failure(self):
+        with patch.object(Path, "replace", side_effect=OSError("private failure")):
+            with self.assertRaisesRegex(
+                verifier.ProbeFailure, "^xiaohongshu_report_write_failed$"
+            ) as raised:
+                verifier._write_report(self.report_path, {"status": "success"})
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertFalse(self.report_path.exists())
+        self.assertEqual(
+            list(self.report_path.parent.glob(f".{self.report_path.name}.*.tmp")),
+            [],
+        )
+
+    def test_report_writer_rejects_symlink_output_escape(self):
+        escape_link = self.report_path.parent / "probe-report-test-escape"
+        escape_link.symlink_to(self.report_path.parent.parent, target_is_directory=True)
+        try:
+            with self.assertRaisesRegex(
+                verifier.ProbeFailure, "^xiaohongshu_report_path_invalid$"
+            ) as raised:
+                verifier._write_report(
+                    escape_link / "private-report.json", {"status": "success"}
+                )
+            self.assertIsNone(raised.exception.__cause__)
+        finally:
+            escape_link.unlink(missing_ok=True)

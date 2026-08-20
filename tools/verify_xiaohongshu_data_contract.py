@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import json
 import sys
+import tempfile
 import time
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -21,6 +22,13 @@ _TEXT_LIMIT = 120
 _RESPONSE_LIMIT = 100
 _KEY_PATH_LIMIT = 300
 _ACCOUNT_SELECTION_REQUIRED = "xiaohongshu_account_selection_required"
+_REPORT_PATH_INVALID = "xiaohongshu_report_path_invalid"
+_REPORT_WRITE_FAILED = "xiaohongshu_report_write_failed"
+_REPORT_OUTPUT_DIRECTORY = (
+    Path(__file__).resolve().parents[1]
+    / ".superpowers/sdd/2026-08-20-xiaohongshu-data-contract-discovery"
+)
+_BUILTIN_PATH_TYPE = type(Path())
 _CREATOR_HOST = "creator.xiaohongshu.com"
 _CREATOR_HOME = "https://creator.xiaohongshu.com/creator/home"
 _NETWORK_QUIET_TIMEOUT_MS = 30_000
@@ -174,6 +182,68 @@ def sanitize_probe_report(value: object) -> dict[str, object]:
             "aliveResourceCount": _safe_integer(safe_cleanup.get("aliveResourceCount")),
         },
     }
+
+
+def _report_destination(path: object) -> Path:
+    """Accept only a built-in path below the dedicated probe-report directory."""
+    if type(path) is str:
+        candidate = Path(path)
+    elif type(path) is _BUILTIN_PATH_TYPE:
+        candidate = path
+    else:
+        raise ProbeFailure(_REPORT_PATH_INVALID)
+
+    if ".." in candidate.parts:
+        raise ProbeFailure(_REPORT_PATH_INVALID)
+    root = _REPORT_OUTPUT_DIRECTORY.resolve()
+    resolved = candidate.resolve()
+    if resolved == root or not resolved.is_relative_to(root):
+        raise ProbeFailure(_REPORT_PATH_INVALID)
+    return resolved
+
+
+def _write_report(path: Path, report: object) -> None:
+    """Persist only the final rebuilt structural report at the approved path."""
+    try:
+        destination = _report_destination(path)
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:
+        raise ProbeFailure(_REPORT_PATH_INVALID) from None
+
+    temporary_path: Path | None = None
+    try:
+        serialized = json.dumps(
+            sanitize_probe_report(report),
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        ) + "\n"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination = _report_destination(destination)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=destination.parent,
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            temporary.write(serialized)
+            temporary.flush()
+        temporary_path.replace(destination)
+        temporary_path = None
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:
+        raise ProbeFailure(_REPORT_WRITE_FAILED) from None
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 def _select_single_eligible_account() -> dict[str, object]:
