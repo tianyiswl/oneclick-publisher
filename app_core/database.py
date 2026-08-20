@@ -285,6 +285,56 @@ def ensure_schema() -> None:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS platform_data_sync_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                accountId INTEGER NOT NULL,
+                platformType INTEGER NOT NULL,
+                sourceMode TEXT NOT NULL,
+                status TEXT NOT NULL,
+                errorCode TEXT NOT NULL DEFAULT '',
+                metricCount INTEGER NOT NULL DEFAULT 0,
+                startedAt TEXT NOT NULL,
+                finishedAt TEXT,
+                FOREIGN KEY(accountId) REFERENCES user_info(id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_platform_data_sync_runs_account
+            ON platform_data_sync_runs(accountId, id DESC)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS platform_metric_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                syncRunId INTEGER NOT NULL,
+                accountId INTEGER NOT NULL,
+                platformType INTEGER NOT NULL,
+                entityType TEXT NOT NULL,
+                entityKey TEXT NOT NULL,
+                metricKey TEXT NOT NULL,
+                rawMetricKey TEXT NOT NULL,
+                metricValue REAL NOT NULL,
+                metricUnit TEXT NOT NULL,
+                observedAt TEXT NOT NULL,
+                createdAt TEXT NOT NULL,
+                UNIQUE(syncRunId, entityType, entityKey, metricKey),
+                FOREIGN KEY(syncRunId) REFERENCES platform_data_sync_runs(id)
+                    ON DELETE CASCADE,
+                FOREIGN KEY(accountId) REFERENCES user_info(id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_platform_metric_snapshots_account
+            ON platform_metric_snapshots(accountId, metricKey, id DESC)
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS publish_tasks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 taskNo TEXT NOT NULL UNIQUE,

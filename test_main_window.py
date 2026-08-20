@@ -76,6 +76,67 @@ class MainWindowShutdownTests(unittest.TestCase):
         stop_auto_checking.assert_not_called()
         close_all.assert_not_called()
 
+    def test_data_monitor_is_a_real_page_and_shutdown_precedes_global_cleanup(self) -> None:
+        """数据监测不能继续留在开发中，且采集任务必须先于全局浏览器关闭。"""
+
+        window = MainWindow()
+        event = QCloseEvent()
+        order: list[str] = []
+        try:
+            labels = [label for label, _page, _icon in window.page_definitions]
+            coming_soon = [label for label, _icon in window.coming_soon_definitions]
+            self.assertIn("数据监测", labels)
+            self.assertNotIn("数据监测", coming_soon)
+            with patch.object(
+                window.douyin_commerce,
+                "shutdown",
+                side_effect=lambda: order.append("commerce") or True,
+            ), patch.object(
+                window.data_monitor,
+                "shutdown",
+                side_effect=lambda: order.append("data") or True,
+            ), patch.object(
+                window.accounts,
+                "stop_auto_checking",
+                side_effect=lambda: order.append("accounts"),
+            ), patch(
+                "ui.main_window.account_browser_service.close_all_backend_sessions",
+                side_effect=lambda *, wait: order.append("global"),
+            ):
+                window.closeEvent(event)
+        finally:
+            window.deleteLater()
+
+        self.assertEqual(order, ["commerce", "data", "accounts", "global"])
+
+    def test_close_event_stops_when_data_monitor_shutdown_fails(self) -> None:
+        """数据采集未收束时不得停止账号检测或关闭全局浏览器。"""
+
+        window = MainWindow()
+        event = QCloseEvent()
+        try:
+            with patch.object(
+                window.douyin_commerce,
+                "shutdown",
+                return_value=True,
+            ), patch.object(
+                window.data_monitor,
+                "shutdown",
+                return_value=False,
+            ), patch.object(
+                window.accounts,
+                "stop_auto_checking",
+            ) as stop_auto, patch(
+                "ui.main_window.account_browser_service.close_all_backend_sessions"
+            ) as close_all:
+                window.closeEvent(event)
+        finally:
+            window.deleteLater()
+
+        self.assertFalse(event.isAccepted())
+        stop_auto.assert_not_called()
+        close_all.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
