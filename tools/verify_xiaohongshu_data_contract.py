@@ -14,6 +14,11 @@ from types import MappingProxyType
 from urllib.parse import urlsplit
 
 
+_BOOTSTRAP_ROOT = Path(__file__).resolve().parents[1]
+if str(_BOOTSTRAP_ROOT) not in sys.path:
+    sys.path.insert(0, str(_BOOTSTRAP_ROOT))
+
+
 _ALLOWED_REPORT_KEYS = frozenset({
     "schemaVersion", "platformType", "mode", "phases", "missingPhases",
     "status", "errorCode", "observedAt", "responses", "cleanup",
@@ -31,7 +36,7 @@ _ACCOUNT_SELECTION_REQUIRED = "xiaohongshu_account_selection_required"
 _ARGUMENTS_INVALID = "xiaohongshu_arguments_invalid"
 _REPORT_PATH_INVALID = "xiaohongshu_report_path_invalid"
 _REPORT_WRITE_FAILED = "xiaohongshu_report_write_failed"
-_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+_REPOSITORY_ROOT = _BOOTSTRAP_ROOT
 _REPORT_OUTPUT_DIRECTORY = (
     _REPOSITORY_ROOT
     / ".superpowers/sdd/2026-08-20-xiaohongshu-data-contract-discovery"
@@ -64,7 +69,13 @@ _DIRECTORY_OPEN_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 _TEMPORARY_OPEN_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
 _CREATOR_HOST = "creator.xiaohongshu.com"
 _CREATOR_HOME = "https://creator.xiaohongshu.com/creator/home"
+_DATA_ANALYSIS_URL = (
+    "https://creator.xiaohongshu.com/statistics/data-analysis?source=official"
+)
+_NOTE_DETAIL_URL = "https://creator.xiaohongshu.com/statistics/note-detail"
+_NOTE_ID = re.compile(r"^[0-9a-f]{24}$", re.IGNORECASE)
 _NETWORK_QUIET_TIMEOUT_MS = 30_000
+_PASSIVE_CAPTURE_WAIT_MS = 2_000
 _TOTAL_TIMEOUT_SECONDS = 60.0
 _MAX_CLEANUP_BUDGET_SECONDS = 5.0
 _STRUCTURAL_DEPTH_LIMIT = 40
@@ -765,9 +776,56 @@ def _navigation_error_code(response: object) -> str | None:
         segment in {"login", "signin"} for segment in segments
     ):
         return _LOGIN_REQUIRED
-    if parsed.path == "/creator/home" and 200 <= status < 400:
+    if parsed.path in {
+        "/creator/home",
+        "/statistics/data-analysis",
+        "/statistics/note-detail",
+    } and 200 <= status < 400:
         return None
     return _NAVIGATION_UNVERIFIED
+
+
+def _first_note_id(payload: object) -> str | None:
+    """Return one transient note id from the platform's own list response."""
+    if type(payload) is not dict:
+        return None
+    data = payload.get("data")
+    if type(data) is not dict:
+        return None
+    for collection_key in ("note_infos", "items"):
+        collection = data.get(collection_key)
+        if type(collection) is not list:
+            continue
+        for item in collection[:_LIST_ITEM_SAMPLE_LIMIT]:
+            if type(item) is not dict:
+                continue
+            for identity_key in ("id", "note_id"):
+                candidate = item.get(identity_key)
+                if type(candidate) is str and _NOTE_ID.fullmatch(candidate):
+                    return candidate
+    return None
+
+
+async def _response_note_id(
+    response: object, *, deadline: float, monotonic
+) -> str | None:
+    metadata = _response_metadata(response)
+    if metadata is None:
+        return None
+    loader = getattr(response, "json", None)
+    if not callable(loader):
+        return None
+    try:
+        payload = loader()
+        if inspect.isawaitable(payload):
+            payload = await _await_with_deadline(
+                payload, deadline=deadline, monotonic=monotonic
+            )
+    except TimeoutError:
+        raise
+    except Exception:
+        return None
+    return _first_note_id(payload)
 
 
 def _structural_fields(
@@ -1159,15 +1217,18 @@ async def _run_probe(
     ] = []
     retained_body_bytes = 0
     response_budget_exhausted = False
+    retained_response_ids: set[int] = set()
     shapes: list[dict[str, object]] = []
     caught: BaseException | None = None
     cleanup_errors: list[BaseException] = []
 
     def retain_response(response: object) -> None:
         nonlocal retained_body_bytes, response_budget_exhausted
+        response_identity = id(response)
         if (
             response_budget_exhausted
             or len(observed_responses) >= _RESPONSE_LIMIT
+            or response_identity in retained_response_ids
         ):
             return
         try:
@@ -1185,6 +1246,7 @@ async def _run_probe(
             response_budget_exhausted = True
             return
         retained_body_bytes = next_total
+        retained_response_ids.add(response_identity)
         observed_responses.append((response, metadata))
 
     try:
@@ -1210,18 +1272,41 @@ async def _run_probe(
             context.new_page(), deadline=work_deadline, monotonic=monotonic
         )
         page.on("response", retain_response)
-        navigation_response = await _await_with_deadline(
-            page.goto(
-                _CREATOR_HOME,
-                wait_until="networkidle",
-                timeout=_NETWORK_QUIET_TIMEOUT_MS,
-            ),
-            deadline=work_deadline,
-            monotonic=monotonic,
-        )
-        navigation_error = _navigation_error_code(navigation_response)
-        if navigation_error is not None:
-            raise ProbeFailure(navigation_error)
+        async def navigate(url: str) -> None:
+            navigation_response = await _await_with_deadline(
+                page.goto(
+                    url,
+                    wait_until="domcontentloaded",
+                    timeout=_NETWORK_QUIET_TIMEOUT_MS,
+                ),
+                deadline=work_deadline,
+                monotonic=monotonic,
+            )
+            navigation_error = _navigation_error_code(navigation_response)
+            if navigation_error is not None:
+                raise ProbeFailure(navigation_error)
+            passive_wait = getattr(page, "wait_for_timeout", None)
+            if callable(passive_wait):
+                await _await_with_deadline(
+                    passive_wait(_PASSIVE_CAPTURE_WAIT_MS),
+                    deadline=work_deadline,
+                    monotonic=monotonic,
+                )
+
+        await navigate(_CREATOR_HOME)
+        data_response_start = len(observed_responses)
+        await navigate(_DATA_ANALYSIS_URL)
+        note_id = None
+        for response, _metadata in tuple(
+            observed_responses[data_response_start:]
+        ):
+            note_id = await _response_note_id(
+                response, deadline=work_deadline, monotonic=monotonic
+            )
+            if note_id is not None:
+                break
+        if note_id is not None:
+            await navigate(f"{_NOTE_DETAIL_URL}?noteId={note_id}")
         for response, metadata in tuple(observed_responses):
             shape = await _async_response_shape(
                 response,

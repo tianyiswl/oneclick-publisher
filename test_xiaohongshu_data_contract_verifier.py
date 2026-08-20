@@ -51,6 +51,9 @@ class FakePage:
         self.owner = owner
         self.response_callback = None
         self.goto_url = None
+        self.goto_urls = []
+        self.goto_kwargs = []
+        self.passive_waits = []
 
     def on(self, event, callback):
         self.owner.events.append(("on", event))
@@ -59,11 +62,16 @@ class FakePage:
     def goto(self, url, **_kwargs):
         self.owner.events.append(("goto", url))
         self.goto_url = url
+        self.goto_urls.append(url)
+        self.goto_kwargs.append(dict(_kwargs))
         if self.owner.failure is not None:
             raise self.owner.failure
         for response in self.owner.responses:
             self.response_callback(response)
         return self.owner.navigation_response
+
+    def wait_for_timeout(self, milliseconds):
+        self.passive_waits.append(milliseconds)
 
     def close(self):
         self.owner.close_order.append("page")
@@ -119,6 +127,24 @@ class FakePlaywright:
 
     def close(self):
         self.close_order.append("playwright")
+
+
+class RouteAwarePage(FakePage):
+    def goto(self, url, **_kwargs):
+        self.owner.events.append(("goto", url))
+        self.goto_url = url
+        self.goto_urls.append(url)
+        self.goto_kwargs.append(dict(_kwargs))
+        for response in self.owner.responses_by_url.get(url, ()):
+            self.response_callback(response)
+        return FakeResponse(url, "text/html; charset=utf-8", None)
+
+
+class RouteAwarePlaywright(FakePlaywright):
+    def __init__(self, responses_by_url):
+        super().__init__()
+        self.responses_by_url = responses_by_url
+        self.page = RouteAwarePage(self)
 
 
 class FakeClock:
@@ -605,12 +631,54 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
         self.assertNotIn("private", json.dumps(result))
         self.assertEqual(fake.page.fetch_calls, 0)
         self.assertEqual(fake.page.click_calls, 0)
+        self.assertEqual(fake.page.goto_url, verifier._DATA_ANALYSIS_URL)
         self.assertEqual(
-            fake.page.goto_url,
-            "https://creator.xiaohongshu.com/creator/home",
+            fake.page.goto_urls,
+            [verifier._CREATOR_HOME, verifier._DATA_ANALYSIS_URL],
         )
         self.assertEqual(fake.events[0], ("on", "response"))
         self.assertEqual(fake.launch_kwargs, {"headless": True})
+
+    def test_probe_passively_navigates_data_analysis_and_one_note_detail(self):
+        list_response = FakeResponse(
+            "https://creator.xiaohongshu.com/api/galaxy/creator/datacenter/note/analyze/list?page_num=1",
+            "application/json",
+            {"data": {"note_infos": [{"id": "6a0ffca800000000080033f8"}]}},
+        )
+        detail_response = FakeResponse(
+            "https://creator.xiaohongshu.com/api/galaxy/creator/datacenter/note/base?note_id=private",
+            "application/json",
+            {"data": {"note_id": "private", "read_count": 3}},
+        )
+        data_url = "https://creator.xiaohongshu.com/statistics/data-analysis?source=official"
+        detail_url = (
+            "https://creator.xiaohongshu.com/statistics/note-detail"
+            "?noteId=6a0ffca800000000080033f8"
+        )
+        fake = RouteAwarePlaywright({
+            verifier._CREATOR_HOME: (),
+            data_url: (list_response,),
+            detail_url: (detail_response,),
+        })
+
+        result = verifier._probe_with_browser(
+            eligible_account(), playwright_factory=lambda: fake,
+            monotonic=FakeClock(), utc_now=fixed_now,
+        )
+
+        self.assertEqual(
+            fake.page.goto_urls,
+            [verifier._CREATOR_HOME, data_url, detail_url],
+        )
+        self.assertEqual(
+            [item["wait_until"] for item in fake.page.goto_kwargs],
+            ["domcontentloaded", "domcontentloaded", "domcontentloaded"],
+        )
+        self.assertEqual(fake.page.passive_waits, [2000, 2000, 2000])
+        self.assertEqual(len(result["responses"]), 2)
+        self.assertNotIn("6a0ffca800000000080033f8", json.dumps(result))
+        self.assertEqual(fake.page.click_calls, 0)
+        self.assertEqual(fake.page.fetch_calls, 0)
 
     def test_probe_never_reports_success_until_all_required_contracts_observed(self):
         reviewed_paths = {
