@@ -49,6 +49,72 @@ def _add_columns(conn: sqlite3.Connection, table: str, definitions: Iterable[tup
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
 
+def _has_v2_metric_identity(conn: sqlite3.Connection) -> bool:
+    for index in conn.execute("PRAGMA index_list(platform_metric_snapshots)"):
+        if not index[2]:
+            continue
+        columns = tuple(
+            row[2]
+            for row in conn.execute(f"PRAGMA index_info({index[1]})")
+        )
+        if columns == (
+            "syncRunId",
+            "entityType",
+            "entityKey",
+            "metricKey",
+            "metricScope",
+            "periodStart",
+            "periodEnd",
+        ):
+            return True
+    return False
+
+
+def _rebuild_metric_snapshots_for_v2(conn: sqlite3.Connection) -> None:
+    if _has_v2_metric_identity(conn):
+        return
+    conn.execute("ALTER TABLE platform_metric_snapshots RENAME TO _legacy_metric_snapshots")
+    conn.execute(
+        """
+        CREATE TABLE platform_metric_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            syncRunId INTEGER NOT NULL,
+            accountId INTEGER NOT NULL,
+            platformType INTEGER NOT NULL,
+            entityType TEXT NOT NULL,
+            entityKey TEXT NOT NULL,
+            metricKey TEXT NOT NULL,
+            rawMetricKey TEXT NOT NULL,
+            metricValue REAL NOT NULL,
+            metricUnit TEXT NOT NULL,
+            metricScope TEXT NOT NULL DEFAULT '',
+            periodStart TEXT NOT NULL DEFAULT '',
+            periodEnd TEXT NOT NULL DEFAULT '',
+            observedAt TEXT NOT NULL,
+            createdAt TEXT NOT NULL,
+            UNIQUE(syncRunId, entityType, entityKey, metricKey,
+                   metricScope, periodStart, periodEnd),
+            FOREIGN KEY(syncRunId) REFERENCES platform_data_sync_runs(id)
+                ON DELETE CASCADE,
+            FOREIGN KEY(accountId) REFERENCES user_info(id) ON DELETE CASCADE
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO platform_metric_snapshots
+            (id, syncRunId, accountId, platformType, entityType, entityKey,
+             metricKey, rawMetricKey, metricValue, metricUnit, metricScope,
+             periodStart, periodEnd, observedAt, createdAt)
+        SELECT id, syncRunId, accountId, platformType, entityType, entityKey,
+               metricKey, rawMetricKey, metricValue, metricUnit, metricScope,
+               periodStart, periodEnd, observedAt, createdAt
+        FROM _legacy_metric_snapshots
+        """
+    )
+    conn.execute("DROP TABLE _legacy_metric_snapshots")
+
+
 def ensure_schema() -> None:
     ensure_runtime_dirs()
     with open_connection(DB_PATH) as conn:
@@ -318,19 +384,67 @@ def ensure_schema() -> None:
                 rawMetricKey TEXT NOT NULL,
                 metricValue REAL NOT NULL,
                 metricUnit TEXT NOT NULL,
+                metricScope TEXT NOT NULL DEFAULT '',
+                periodStart TEXT NOT NULL DEFAULT '',
+                periodEnd TEXT NOT NULL DEFAULT '',
                 observedAt TEXT NOT NULL,
                 createdAt TEXT NOT NULL,
-                UNIQUE(syncRunId, entityType, entityKey, metricKey),
+                UNIQUE(syncRunId, entityType, entityKey, metricKey,
+                       metricScope, periodStart, periodEnd),
                 FOREIGN KEY(syncRunId) REFERENCES platform_data_sync_runs(id)
                     ON DELETE CASCADE,
                 FOREIGN KEY(accountId) REFERENCES user_info(id) ON DELETE CASCADE
             )
             """
         )
+        _add_columns(
+            conn,
+            "platform_metric_snapshots",
+            (
+                ("metricScope", "TEXT NOT NULL DEFAULT ''"),
+                ("periodStart", "TEXT NOT NULL DEFAULT ''"),
+                ("periodEnd", "TEXT NOT NULL DEFAULT ''"),
+            ),
+        )
+        _rebuild_metric_snapshots_for_v2(conn)
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_platform_metric_snapshots_account
             ON platform_metric_snapshots(accountId, metricKey, id DESC)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_platform_metric_snapshots_v2_query
+            ON platform_metric_snapshots(
+                accountId, entityType, metricScope, periodStart, periodEnd,
+                metricKey, id DESC
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS platform_contents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                accountId INTEGER NOT NULL,
+                platformType INTEGER NOT NULL,
+                contentId TEXT NOT NULL,
+                title TEXT NOT NULL,
+                coverUrl TEXT NOT NULL,
+                publishedAt TEXT NOT NULL,
+                contentStatus TEXT NOT NULL,
+                contentType TEXT NOT NULL,
+                firstSeenAt TEXT NOT NULL,
+                lastSeenAt TEXT NOT NULL,
+                UNIQUE(accountId, platformType, contentId),
+                FOREIGN KEY(accountId) REFERENCES user_info(id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_platform_contents_account_published
+            ON platform_contents(accountId, platformType, publishedAt DESC, id DESC)
             """
         )
         conn.execute(

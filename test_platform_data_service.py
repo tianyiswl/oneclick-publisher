@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import math
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,6 +14,7 @@ from app_core import database, platform_data_service
 from app_core.platform_data_models import (
     CollectionBatch,
     CollectionFailure,
+    ContentRecord,
     MetricPoint,
 )
 
@@ -55,8 +57,231 @@ class PlatformDataServiceTests(unittest.TestCase):
             ),
             metric_value=value,
             metric_unit="count",
+            metric_scope="daily_increment",
+            period_start="2026-08-19",
+            period_end="2026-08-19",
             observed_at=observed_at,
         )
+
+    def test_v2_models_require_explicit_scope_and_period(self) -> None:
+        """缺少口径或自然日范围会让不同统计语义混入同一指标。"""
+
+        daily = MetricPoint(
+            entity_type="account",
+            entity_key=f"account:{self.account_id}",
+            metric_key="views",
+            raw_metric_key="play_cnt",
+            metric_value=125,
+            metric_unit="count",
+            metric_scope="daily_increment",
+            period_start="2026-08-19",
+            period_end="2026-08-19",
+            observed_at="2026-08-20T12:00:00+08:00",
+        )
+        content = ContentRecord(
+            content_id="aweme-1",
+            title="作品一",
+            cover_url="https://creator.douyin.com/cover/1.jpg",
+            published_at="2026-08-19T10:00:00+08:00",
+            content_status="published",
+            content_type="video",
+        )
+        self.assertEqual(daily.metric_scope, "daily_increment")
+        self.assertEqual(content.content_id, "aweme-1")
+
+        invalid_points = (
+            {"metric_scope": ""},
+            {"metric_scope": "unbounded"},
+            {"period_start": "2026-08-32"},
+            {"period_start": "2026-08-20", "period_end": "2026-08-19"},
+            {"entity_type": "content", "metric_scope": "daily_increment"},
+            {"entity_type": "account", "metric_key": "views", "metric_scope": "lifetime_total"},
+        )
+        point_values = {
+            "entity_type": "account",
+            "entity_key": f"account:{self.account_id}",
+            "metric_key": "views",
+            "raw_metric_key": "play_cnt",
+            "metric_value": 125,
+            "metric_unit": "count",
+            "metric_scope": "daily_increment",
+            "period_start": "2026-08-19",
+            "period_end": "2026-08-19",
+            "observed_at": "2026-08-20T12:00:00+08:00",
+        }
+        for overrides in invalid_points:
+            with self.subTest(overrides=overrides):
+                with self.assertRaises(CollectionFailure):
+                    MetricPoint(**(point_values | overrides))
+
+        duplicate = MetricPoint(**point_values)
+        with self.assertRaises(CollectionFailure):
+            CollectionBatch(
+                platform_type=3,
+                source_mode="direct_session",
+                metrics=(daily, duplicate),
+                contents=(content,),
+                account_metrics_available=True,
+                content_data_available=True,
+                platform_observed_at="2026-08-20T12:00:00+08:00",
+            )
+
+    def test_schema_migrates_legacy_metrics_without_inventing_scope(self) -> None:
+        """旧快照没有口径和范围，迁移后不得伪造成可汇总的 V2 数据。"""
+
+        legacy_path = Path(self.tempdir.name) / "legacy.db"
+        with database.open_connection(legacy_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE user_info (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    type INTEGER NOT NULL,
+                    filePath TEXT NOT NULL,
+                    userName TEXT NOT NULL,
+                    status INTEGER DEFAULT 0
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE platform_data_sync_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    accountId INTEGER NOT NULL,
+                    platformType INTEGER NOT NULL,
+                    sourceMode TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    errorCode TEXT NOT NULL DEFAULT '',
+                    metricCount INTEGER NOT NULL DEFAULT 0,
+                    startedAt TEXT NOT NULL,
+                    finishedAt TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE platform_metric_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    syncRunId INTEGER NOT NULL,
+                    accountId INTEGER NOT NULL,
+                    platformType INTEGER NOT NULL,
+                    entityType TEXT NOT NULL,
+                    entityKey TEXT NOT NULL,
+                    metricKey TEXT NOT NULL,
+                    rawMetricKey TEXT NOT NULL,
+                    metricValue REAL NOT NULL,
+                    metricUnit TEXT NOT NULL,
+                    observedAt TEXT NOT NULL,
+                    createdAt TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO user_info (id, type, filePath, userName, status)
+                VALUES (9, 3, 'oneclick_3_safe.json', '数据账号', 1)
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO platform_data_sync_runs
+                    (id, accountId, platformType, sourceMode, status, errorCode,
+                     metricCount, startedAt, finishedAt)
+                VALUES (1, 9, 3, 'direct_session', 'success', '', 1,
+                        '2026-08-20T12:00:00+08:00',
+                        '2026-08-20T12:00:00+08:00')
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO platform_metric_snapshots
+                    (syncRunId, accountId, platformType, entityType, entityKey,
+                     metricKey, rawMetricKey, metricValue, metricUnit, observedAt,
+                     createdAt)
+                VALUES (1, 9, 3, 'account', 'account:9', 'views', 'play',
+                        125, 'count', '2026-08-20T12:00:00+08:00',
+                        '2026-08-20T12:00:00+08:00')
+                """
+            )
+
+        with patch.object(database, "DB_PATH", legacy_path):
+            database.ensure_schema()
+            database.ensure_schema()
+            with database.open_connection(legacy_path, row_factory=True) as conn:
+                legacy = conn.execute(
+                    """
+                    SELECT metricScope, periodStart, periodEnd
+                    FROM platform_metric_snapshots
+                    WHERE id = 1
+                    """
+                ).fetchone()
+                v2_count = conn.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM platform_metric_snapshots
+                    WHERE metricScope != ''
+                      AND periodStart != ''
+                      AND periodEnd != ''
+                    """
+                ).fetchone()[0]
+
+        self.assertEqual(tuple(legacy), ("", "", ""))
+        self.assertEqual(v2_count, 0)
+
+    def test_platform_contents_schema_is_idempotent(self) -> None:
+        """重复启动既要保留表结构，也要继续拒绝同账号的重复作品。"""
+
+        database.ensure_schema()
+        database.ensure_schema()
+        with database.connect() as conn:
+            columns = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(platform_contents)")
+            }
+            self.assertTrue(
+                {
+                    "accountId",
+                    "platformType",
+                    "contentId",
+                    "title",
+                    "coverUrl",
+                    "publishedAt",
+                    "contentStatus",
+                    "contentType",
+                    "firstSeenAt",
+                    "lastSeenAt",
+                }.issubset(columns)
+            )
+            row = (
+                self.account_id,
+                3,
+                "aweme-1",
+                "作品一",
+                "https://creator.douyin.com/cover/1.jpg",
+                "2026-08-19T10:00:00+08:00",
+                "published",
+                "video",
+                "2026-08-20T12:00:00+08:00",
+                "2026-08-20T12:00:00+08:00",
+            )
+            conn.execute(
+                """
+                INSERT INTO platform_contents
+                    (accountId, platformType, contentId, title, coverUrl,
+                     publishedAt, contentStatus, contentType, firstSeenAt, lastSeenAt)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                row,
+            )
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute(
+                    """
+                    INSERT INTO platform_contents
+                        (accountId, platformType, contentId, title, coverUrl,
+                         publishedAt, contentStatus, contentType, firstSeenAt, lastSeenAt)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    row,
+                )
 
     def test_success_persists_only_present_metrics_and_never_invents_zero(self) -> None:
         """删除缺失保护会把 likes 伪造成 0，本测试必须失败。"""
@@ -65,6 +290,10 @@ class PlatformDataServiceTests(unittest.TestCase):
             platform_type=3,
             source_mode="direct_session",
             metrics=(self._point("views", 125),),
+            contents=(),
+            account_metrics_available=True,
+            content_data_available=False,
+            platform_observed_at="2026-08-20T12:00:00+08:00",
         )
 
         saved = platform_data_service.record_successful_sync(
@@ -90,6 +319,10 @@ class PlatformDataServiceTests(unittest.TestCase):
                 platform_type=3,
                 source_mode="direct_session",
                 metrics=(self._point("views", 125),),
+                contents=(),
+                account_metrics_available=True,
+                content_data_available=False,
+                platform_observed_at="2026-08-20T12:00:00+08:00",
             ),
         )
 
@@ -116,6 +349,10 @@ class PlatformDataServiceTests(unittest.TestCase):
             platform_type=3,
             source_mode="direct_session",
             metrics=(self._point("views", 125), self._point("likes", 9)),
+            contents=(),
+            account_metrics_available=True,
+            content_data_available=False,
+            platform_observed_at="2026-08-20T12:00:00+08:00",
         )
         original = platform_data_service._insert_metric_snapshot
         calls = 0
@@ -177,6 +414,10 @@ class PlatformDataServiceTests(unittest.TestCase):
                 platform_type=3,
                 source_mode="direct_session",
                 metrics=(self._point("views", 125),),
+                contents=(),
+                account_metrics_available=True,
+                content_data_available=False,
+                platform_observed_at="2026-08-20T12:00:00+08:00",
             ),
         )
 
