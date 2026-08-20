@@ -1656,10 +1656,19 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
             ],
             "status": "failed",
             "errorCode": "xiaohongshu_probe_failed",
+            "navigation": [{"phase": "account_home",
+                            "path": "/creator/home"}],
         })
         stdout = io.StringIO()
+        writer_inputs = []
+        original_writer = verifier._write_report
 
-        with patch.object(verifier, "_execute", return_value=observed) as execute:
+        def record_writer_input(destination, payload):
+            writer_inputs.append(payload)
+            return original_writer(destination, payload)
+
+        with patch.object(verifier, "_execute", return_value=observed) as execute, \
+             patch.object(verifier, "_write_report", side_effect=record_writer_input):
             exit_code = verifier.main(
                 ["--execute", "--report", str(self.report_path)],
                 stdout=stdout,
@@ -1668,8 +1677,11 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         execute.assert_called_once()
         self.assertTrue(self.report_path.is_file())
-        self.assertEqual(json.loads(stdout.getvalue()), observed)
-        self.assertEqual(json.loads(self.report_path.read_text("utf-8")), observed)
+        expected = verifier.sanitize_probe_report(observed)
+        self.assertEqual(json.loads(stdout.getvalue()), expected)
+        self.assertEqual(json.loads(self.report_path.read_text("utf-8")), expected)
+        self.assertEqual(len(writer_inputs), 1)
+        self.assertNotIn("navigation", writer_inputs[0])
 
     def test_main_exit_code_matches_terminal_status_matrix(self):
         reviewed_paths = {
@@ -2069,4 +2081,25 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 1)
         execute.assert_called_once()
-        self.assertEqual(json.loads(stdout.getvalue()), observed)
+        self.assertEqual(
+            json.loads(stdout.getvalue()), verifier.sanitize_probe_report(observed)
+        )
+
+    def test_execute_stdout_omits_navigation_without_schema_review(self):
+        observed = verifier.build_plan()
+        observed.update({
+            "mode": "execute",
+            "status": "failed",
+            "errorCode": "xiaohongshu_contracts_unobserved",
+            "navigation": [{"phase": "account_home",
+                            "path": "/creator/home"}],
+        })
+        stdout = io.StringIO()
+
+        with patch.object(verifier, "_execute", return_value=observed):
+            exit_code = verifier.main(["--execute"], stdout=stdout)
+
+        self.assertEqual(exit_code, 1)
+        payload = json.loads(stdout.getvalue())
+        self.assertNotIn("navigation", payload)
+        self.assertNotIn("schemaReview", payload)

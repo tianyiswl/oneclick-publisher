@@ -1709,9 +1709,8 @@ def main(argv: list[str] | None = None, *, stdout=sys.stdout) -> int:
             json.dump(payload, stdout, ensure_ascii=False)
             stdout.write("\n")
             return 1
-    output_payload = payload
+    output_payload = sanitize_probe_report(payload)
     if review_schema:
-        output_payload = sanitize_probe_report(payload)
         output_payload["schemaReview"] = _review_schema(payload)
     json.dump(output_payload, stdout, ensure_ascii=False)
     stdout.write("\n")
