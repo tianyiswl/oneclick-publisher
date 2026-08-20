@@ -879,3 +879,174 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
         self.assertEqual(
             json.loads(self.report_path.read_text("utf-8")), report
         )
+
+    def test_main_prevalidates_report_destination_before_execute(self):
+        outside_path = self.report_path.parent.parent / "private-report.json"
+        stdout = io.StringIO()
+
+        with patch.object(verifier, "_execute") as execute:
+            try:
+                exit_code = verifier.main(
+                    ["--execute", "--report", str(outside_path)],
+                    stdout=stdout,
+                )
+            except verifier.ProbeFailure:
+                self.fail("main leaked report destination validation failure")
+
+        self.assertNotEqual(exit_code, 0)
+        execute.assert_not_called()
+        report = json.loads(stdout.getvalue())
+        self.assertEqual(report["mode"], "execute")
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(
+            report["errorCode"], "xiaohongshu_report_path_invalid"
+        )
+        self.assertEqual(report["responses"], [])
+        self.assertIs(type(report["cleanup"]["closed"]), bool)
+        self.assertIs(type(report["cleanup"]["aliveResourceCount"]), int)
+        self.assertNotIn(str(outside_path), stdout.getvalue())
+
+    def test_main_prevalidation_redacts_untrusted_filesystem_failure(self):
+        stdout = io.StringIO()
+
+        with patch.object(
+            verifier,
+            "_report_destination",
+            side_effect=OSError("private path failure"),
+        ), patch.object(verifier, "_execute") as execute:
+            try:
+                exit_code = verifier.main(
+                    ["--execute", "--report", str(self.report_path)],
+                    stdout=stdout,
+                )
+            except OSError:
+                self.fail("main leaked report destination filesystem failure")
+
+        self.assertNotEqual(exit_code, 0)
+        execute.assert_not_called()
+        report = json.loads(stdout.getvalue())
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(
+            report["errorCode"], "xiaohongshu_report_path_invalid"
+        )
+        self.assertNotIn("private", stdout.getvalue())
+
+    def test_main_preserves_process_control_from_report_validation_and_writer(self):
+        for failure in (KeyboardInterrupt(), SystemExit()):
+            with self.subTest(stage="validation", failure=type(failure).__name__), \
+                    patch.object(
+                        verifier, "_report_destination", side_effect=failure
+                    ), patch.object(verifier, "_execute") as execute:
+                with self.assertRaises(type(failure)) as raised:
+                    verifier.main(
+                        ["--execute", "--report", str(self.report_path)],
+                        stdout=io.StringIO(),
+                    )
+                self.assertIs(raised.exception, failure)
+                execute.assert_not_called()
+
+            observed = verifier.build_plan()
+            observed.update({"mode": "execute", "status": "failed"})
+            with self.subTest(stage="writer", failure=type(failure).__name__), \
+                    patch.object(
+                        verifier, "_execute", return_value=observed
+                    ), patch.object(
+                        verifier, "_write_report", side_effect=failure
+                    ):
+                with self.assertRaises(type(failure)) as raised:
+                    verifier.main(
+                        ["--execute", "--report", str(self.report_path)],
+                        stdout=io.StringIO(),
+                    )
+                self.assertIs(raised.exception, failure)
+
+    def test_main_writer_failure_outputs_fixed_sanitized_nonzero_terminal(self):
+        observed = verifier.build_plan()
+        observed.update({
+            "mode": "execute",
+            "status": "success",
+            "cleanup": {"closed": False, "aliveResourceCount": 2},
+        })
+        stdout = io.StringIO()
+
+        with patch.object(verifier, "_execute", return_value=observed), patch.object(
+            verifier,
+            "_write_report",
+            side_effect=verifier.ProbeFailure(
+                "xiaohongshu_report_write_failed"
+            ),
+        ):
+            try:
+                exit_code = verifier.main(
+                    ["--execute", "--report", str(self.report_path)],
+                    stdout=stdout,
+                )
+            except verifier.ProbeFailure:
+                self.fail("main leaked report writer failure")
+
+        self.assertNotEqual(exit_code, 0)
+        report = json.loads(stdout.getvalue())
+        self.assertEqual(report["mode"], "execute")
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(
+            report["errorCode"], "xiaohongshu_report_write_failed"
+        )
+        self.assertEqual(
+            report["cleanup"], {"closed": False, "aliveResourceCount": 2}
+        )
+        self.assertIs(type(report["cleanup"]["closed"]), bool)
+        self.assertIs(type(report["cleanup"]["aliveResourceCount"]), int)
+        self.assertNotIn(str(self.report_path), stdout.getvalue())
+        self.assertNotIn("Traceback", stdout.getvalue())
+
+    def test_main_rejects_malformed_execute_arguments_before_import_or_action(self):
+        malformed_arguments = (
+            ["--execute", "--report"],
+            ["--execute", "--unknown"],
+            ["--execute", "extra"],
+            ["--execute", "--report", str(self.report_path), "extra"],
+        )
+        original_import = __import__
+
+        def reject_runtime_import(name, *args, **kwargs):
+            if name == "app_core" or name.startswith("app_core."):
+                raise AssertionError("invalid arguments imported account runtime")
+            if name == "playwright" or name.startswith("playwright."):
+                raise AssertionError("invalid arguments imported browser runtime")
+            return original_import(name, *args, **kwargs)
+
+        for arguments in malformed_arguments:
+            with self.subTest(arguments=arguments), patch.object(
+                verifier, "_execute"
+            ) as execute, patch(
+                "builtins.__import__", side_effect=reject_runtime_import
+            ):
+                stdout = io.StringIO()
+                exit_code = verifier.main(arguments, stdout=stdout)
+
+            self.assertNotEqual(exit_code, 0)
+            execute.assert_not_called()
+            report = json.loads(stdout.getvalue())
+            self.assertEqual(report["mode"], "execute")
+            self.assertEqual(report["status"], "failed")
+            self.assertEqual(
+                report["errorCode"], "xiaohongshu_arguments_invalid"
+            )
+            self.assertEqual(report["responses"], [])
+            self.assertIs(type(report["cleanup"]["closed"]), bool)
+            self.assertIs(type(report["cleanup"]["aliveResourceCount"]), int)
+            self.assertFalse(self.report_path.exists())
+            for argument in arguments:
+                self.assertNotIn(argument, stdout.getvalue())
+
+    def test_main_bare_execute_remains_legal(self):
+        observed = verifier.build_plan()
+        observed.update({"mode": "execute", "status": "failed"})
+        stdout = io.StringIO()
+
+        with patch.object(verifier, "_execute", return_value=observed) as execute:
+            exit_code = verifier.main(["--execute"], stdout=stdout)
+
+        self.assertEqual(exit_code, 0)
+        execute.assert_called_once()
+        self.assertEqual(json.loads(stdout.getvalue()), observed)

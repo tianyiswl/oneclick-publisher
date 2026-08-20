@@ -25,6 +25,7 @@ _TEXT_LIMIT = 120
 _RESPONSE_LIMIT = 100
 _KEY_PATH_LIMIT = 300
 _ACCOUNT_SELECTION_REQUIRED = "xiaohongshu_account_selection_required"
+_ARGUMENTS_INVALID = "xiaohongshu_arguments_invalid"
 _REPORT_PATH_INVALID = "xiaohongshu_report_path_invalid"
 _REPORT_WRITE_FAILED = "xiaohongshu_report_write_failed"
 _REPORT_OUTPUT_DIRECTORY = (
@@ -855,39 +856,79 @@ def _execute(*, browser_factory, utc_now) -> dict[str, object]:
     )
 
 
+def _failed_execution_report(
+    error_code: str, source: object | None = None
+) -> dict[str, object]:
+    report = sanitize_probe_report(
+        build_plan() if source is None else source
+    )
+    report.update({
+        "mode": "execute",
+        "status": "failed",
+        "errorCode": error_code,
+    })
+    return sanitize_probe_report(report)
+
+
 def main(argv: list[str] | None = None, *, stdout=sys.stdout) -> int:
     arguments = sys.argv[1:] if argv is None else argv
-    report_path = None
-    if (
+    if not arguments:
+        payload = build_plan()
+        json.dump(payload, stdout, ensure_ascii=False)
+        stdout.write("\n")
+        return 0
+
+    if arguments == ["--execute"]:
+        report_path = None
+    elif (
         len(arguments) == 3
         and arguments[:2] == ["--execute", "--report"]
     ):
         report_path = arguments[2]
-
-    if arguments == ["--execute"] or report_path is not None:
-        def browser_factory():
-            from playwright.async_api import async_playwright
-
-            return async_playwright()
-
-        from datetime import datetime, timezone
-
-        try:
-            payload = _execute(
-                browser_factory=browser_factory,
-                utc_now=lambda: datetime.now(timezone.utc),
-            )
-        except ProbeFailure as failure:
-            payload = build_plan()
-            payload.update({
-                "mode": "execute",
-                "status": "failed",
-                "errorCode": failure.error_code,
-            })
-        if report_path is not None:
-            _write_report(report_path, payload)
     else:
-        payload = build_plan()
+        payload = _failed_execution_report(_ARGUMENTS_INVALID)
+        json.dump(payload, stdout, ensure_ascii=False)
+        stdout.write("\n")
+        return 2
+
+    if report_path is not None:
+        try:
+            report_path = _report_destination(report_path)
+        except ProbeFailure as failure:
+            payload = _failed_execution_report(failure.error_code)
+            json.dump(payload, stdout, ensure_ascii=False)
+            stdout.write("\n")
+            return 1
+        except Exception:
+            payload = _failed_execution_report(_REPORT_PATH_INVALID)
+            json.dump(payload, stdout, ensure_ascii=False)
+            stdout.write("\n")
+            return 1
+
+    def browser_factory():
+        from playwright.async_api import async_playwright
+
+        return async_playwright()
+
+    from datetime import datetime, timezone
+
+    try:
+        payload = _execute(
+            browser_factory=browser_factory,
+            utc_now=lambda: datetime.now(timezone.utc),
+        )
+    except ProbeFailure as failure:
+        payload = _failed_execution_report(failure.error_code)
+    if report_path is not None:
+        try:
+            _write_report(report_path, payload)
+        except ProbeFailure as failure:
+            payload = _failed_execution_report(
+                failure.error_code, payload
+            )
+            json.dump(payload, stdout, ensure_ascii=False)
+            stdout.write("\n")
+            return 1
     json.dump(payload, stdout, ensure_ascii=False)
     stdout.write("\n")
     return 0
