@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import unittest
 from unittest.mock import patch
@@ -10,6 +11,7 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtTest import QSignalSpy
+from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import QApplication
 
 from ui.background_task import BackgroundTaskRunner
@@ -23,6 +25,13 @@ ACCOUNT = {
     "profileName": "数据主体",
     "userName": "抖音账号",
     "filePath": "oneclick_3_safe.json",
+}
+
+ACCOUNT_B = {
+    **ACCOUNT,
+    "id": 14,
+    "profileName": "数据主体 B",
+    "userName": "抖音账号 B",
 }
 
 
@@ -107,6 +116,7 @@ def period_summary(
             "metricCount": 13,
             "finishedAt": "2026-08-20T12:01:00+08:00",
         },
+        "trustedSourceMode": "direct_session",
         "platformObservedAt": "2026-08-20T12:00:00+08:00",
         "localSyncedAt": "2026-08-20T12:01:00+08:00",
     }
@@ -176,12 +186,13 @@ class DataMonitorPageTests(unittest.TestCase):
         summary=None,
         trends=None,
         contents=None,
+        accounts=None,
         runner=None,
     ) -> DataMonitorPage:
-        accounts = [ACCOUNT, {**ACCOUNT, "id": 13, "type": 1}]
+        account_rows = accounts or [ACCOUNT, {**ACCOUNT, "id": 13, "type": 1}]
         self.accounts_patch = patch(
             "ui.data_monitor_page.account_service.list_accounts",
-            return_value=accounts,
+            return_value=account_rows,
         )
         self.summary_patch = patch(
             "ui.data_monitor_page.platform_data_service.account_data_summary",
@@ -393,6 +404,166 @@ class DataMonitorPageTests(unittest.TestCase):
         self.assertNotIn("/private", page.status_label.text())
         self.assertFalse(runner.is_running("platform-data-sync:12"))
 
+    def test_worker_error_status_survives_finished_cleanup(self) -> None:
+        """worker 失败后 finished 只能恢复控件，不得用旧摘要覆盖失败。"""
+
+        pool = QueuedPool()
+        runner = BackgroundTaskRunner()
+        runner.pool = pool
+        page = self._page(summary=period_summary(), runner=runner)
+        self.period_mock.reset_mock()
+        self.trends_mock.reset_mock()
+        self.contents_mock.reset_mock()
+
+        with patch(
+            "ui.data_monitor_page.platform_data_sync.sync_account_data",
+            side_effect=RuntimeError("Cookie=secret"),
+        ):
+            page.sync_button.click()
+            pool.tasks[0].run()
+            self.app.processEvents()
+
+        self.assertEqual(page.status_label.text(), "数据同步未完成")
+        self.assertTrue(page.sync_button.isEnabled())
+        self.period_mock.assert_not_called()
+        self.trends_mock.assert_not_called()
+        self.contents_mock.assert_not_called()
+
+    def test_successful_worker_refreshes_each_local_query_once(self) -> None:
+        """成功终态只能完整刷新一次，不得在 finished 重复查库。"""
+
+        pool = QueuedPool()
+        runner = BackgroundTaskRunner()
+        runner.pool = pool
+        page = self._page(summary=period_summary(), runner=runner)
+        self.period_mock.reset_mock()
+        self.trends_mock.reset_mock()
+        self.contents_mock.reset_mock()
+
+        with patch(
+            "ui.data_monitor_page.platform_data_sync.sync_account_data",
+            return_value={
+                "accountId": 12,
+                "status": "success",
+                "sourceMode": "direct_session",
+                "errorCode": "",
+                "metricCount": 1,
+                "contentCount": 1,
+            },
+        ):
+            page.sync_button.click()
+            pool.tasks[0].run()
+            self.app.processEvents()
+
+        self.period_mock.assert_called_once_with(12, 7)
+        self.trends_mock.assert_called_once_with(12, 7)
+        self.contents_mock.assert_called_once_with(12, limit=50, offset=0)
+
+    def test_stale_account_callbacks_cannot_mutate_current_account(self) -> None:
+        """A 任务迟到的任何回调都不得与当前 B 账号竞争共享页面状态。"""
+
+        pool = QueuedPool()
+        runner = BackgroundTaskRunner()
+        runner.pool = pool
+        page = self._page(
+            summary=period_summary(),
+            accounts=[ACCOUNT, ACCOUNT_B],
+            runner=runner,
+        )
+
+        page.sync_button.click()
+        task_a = pool.tasks[0]
+        page.account_combo.setCurrentIndex(page.account_combo.findData(14))
+        page.sync_button.click()
+        task_b = pool.tasks[1]
+        task_b.signals.started.emit()
+        self.app.processEvents()
+        self.assertEqual(page.status_label.text(), "正在同步数据…")
+        self.assertFalse(page.sync_button.isEnabled())
+        self.period_mock.reset_mock()
+        self.trends_mock.reset_mock()
+        self.contents_mock.reset_mock()
+
+        task_a.signals.started.emit()
+        task_a.signals.progressed.emit({"stage": "content_list"})
+        task_a.signals.succeeded.emit({"accountId": 12, "status": "success"})
+        task_a.signals.failed.emit("Cookie=secret")
+        task_a.signals.finished.emit()
+        self.app.processEvents()
+
+        self.assertEqual(page.status_label.text(), "正在同步数据…")
+        self.assertFalse(page.sync_button.isEnabled())
+        self.period_mock.assert_not_called()
+        self.trends_mock.assert_not_called()
+        self.contents_mock.assert_not_called()
+        self.assertFalse(runner.is_running("platform-data-sync:12"))
+        self.assertTrue(runner.is_running("platform-data-sync:14"))
+
+        task_b.signals.failed.emit("cleanup")
+        task_b.signals.finished.emit()
+        self.app.processEvents()
+
+    def test_malformed_nested_values_and_dates_fail_closed(self) -> None:
+        """bool/非有限数、非法日期和嵌套容器不得进入文案或绘图。"""
+
+        summary = period_summary()
+        summary["periodStart"] = "2026-02-30"
+        summary["periodEnd"] = "not-a-date"
+        summary["metrics"]["views"]["value"] = True
+        summary["metrics"]["views"]["availability"] = {"bad": True}
+        summary["metrics"]["likes"]["value"] = math.nan
+        summary["metrics"]["followers_net"]["value"] = math.inf
+        summary["trustedSourceMode"] = ["direct_session"]
+        trends = {
+            "items": [
+                {"date": "2026-02-30", "metrics": {"views": 1}},
+                {"date": "2026-08-18", "metrics": {"views": math.nan}},
+                {"date": "2026-08-19", "metrics": {"views": math.inf}},
+                {"date": "2026-08-20", "metrics": {"views": 5}},
+                {"date": "2026-08-21", "metrics": {"views": True}},
+                {"date": "2026-08-22", "metrics": {"views": []}},
+            ],
+        }
+        contents = {
+            "accountId": 12,
+            "total": 1,
+            "limit": 50,
+            "offset": 0,
+            "items": [
+                {
+                    "contentId": "bad",
+                    "title": ["bad"],
+                    "coverUrl": "",
+                    "publishedAt": "2026-02-30T09:00:00+08:00",
+                    "contentStatus": {"bad": True},
+                    "contentType": "video",
+                    "metrics": {
+                        "views": [],
+                        "likes": {},
+                        "comments": math.nan,
+                        "shares": True,
+                    },
+                }
+            ],
+        }
+
+        page = self._page(summary=summary, trends=trends, contents=contents)
+
+        self.assertEqual(page.period_label.text(), "统计区间：—")
+        self.assertEqual(page.metric_values["views"].text(), "—")
+        self.assertEqual(page.metric_values["likes"].text(), "—")
+        self.assertEqual(page.metric_values["followers_net"].text(), "—")
+        self.assertEqual(
+            page.trend_chart.series_for_test("views"),
+            (("2026-08-20", 5),),
+        )
+        for column in range(7):
+            self.assertEqual(page.content_table.item(0, column).text(), "—")
+
+        page.trend_chart.resize(320, 180)
+        canvas = QPixmap(page.trend_chart.size())
+        page.trend_chart.render(canvas)
+
     def test_failed_latest_run_keeps_last_success_and_routes_login_required(self) -> None:
         """失败若清空历史或不提供登录入口，用户无法判断数据状态。"""
 
@@ -400,6 +571,7 @@ class DataMonitorPageTests(unittest.TestCase):
         spy = QSignalSpy(page.request_account_management)
 
         self.assertEqual(page.metric_values["views"].text(), "125")
+        self.assertEqual(page.source_label.text(), "数据来源：会话直连")
         self.assertIn("需要重新登录", page.status_label.text())
         self.assertTrue(page.relogin_button.isVisibleTo(page))
         page.relogin_button.click()

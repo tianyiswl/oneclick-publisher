@@ -1331,6 +1331,7 @@ class PlatformDataServiceTests(unittest.TestCase):
         self.assertEqual(
             summary["localSyncedAt"], "2026-08-19T23:31:00+08:00"
         )
+        self.assertEqual(summary.get("trustedSourceMode"), "direct_session")
         self.assertEqual(summary["metrics"]["views"]["value"], 10)
 
 

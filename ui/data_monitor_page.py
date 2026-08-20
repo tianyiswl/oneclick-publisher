@@ -3,9 +3,10 @@
 
 from __future__ import annotations
 
+import math
 import time
 
-from PyQt6.QtCore import QDate, Qt, pyqtSignal
+from PyQt6.QtCore import QDate, QDateTime, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QPainter, QPainterPath, QPen
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -69,6 +70,25 @@ ERROR_TEXT = {
 }
 
 
+def _finite_number(value: object) -> int | float | None:
+    if type(value) not in (int, float) or not math.isfinite(float(value)):
+        return None
+    return value
+
+
+def _valid_day(value: object) -> bool:
+    if type(value) is not str:
+        return False
+    day = QDate.fromString(value, Qt.DateFormat.ISODate)
+    return day.isValid() and day.toString(Qt.DateFormat.ISODate) == value
+
+
+def _valid_timestamp(value: object) -> bool:
+    if type(value) is not str:
+        return False
+    return QDateTime.fromString(value, Qt.DateFormat.ISODate).isValid()
+
+
 class _TrendChart(QWidget):
     """用平台自然日绘制稀疏趋势，缺失日不补零。"""
 
@@ -89,9 +109,23 @@ class _TrendChart(QWidget):
 
     def set_series(
         self,
-        series: dict[str, tuple[tuple[str, int | float], ...]],
+        series: object,
     ) -> None:
-        self._series = {key: tuple(points) for key, points in series.items()}
+        cleaned: dict[str, tuple[tuple[str, int | float], ...]] = {}
+        if type(series) is dict:
+            for key, points in series.items():
+                if type(key) is not str or type(points) not in (list, tuple):
+                    continue
+                valid_points: list[tuple[str, int | float]] = []
+                for point in points:
+                    if type(point) not in (list, tuple) or len(point) != 2:
+                        continue
+                    day_text, value = point
+                    number = _finite_number(value)
+                    if _valid_day(day_text) and number is not None:
+                        valid_points.append((day_text, number))
+                cleaned[key] = tuple(sorted(valid_points))
+        self._series = cleaned
         self.update()
 
     def set_visible_keys(self, keys: tuple[str, ...]) -> None:
@@ -107,9 +141,11 @@ class _TrendChart(QWidget):
     ) -> list[tuple[int, int | float]]:
         dated: list[tuple[int, int | float]] = []
         for day_text, value in points:
+            number = _finite_number(value)
+            if not _valid_day(day_text) or number is None:
+                continue
             day = QDate.fromString(day_text, Qt.DateFormat.ISODate)
-            if day.isValid():
-                dated.append((day.toJulianDay(), value))
+            dated.append((day.toJulianDay(), number))
         return sorted(dated)
 
     def paintEvent(self, _event) -> None:  # noqa: N802
@@ -179,8 +215,18 @@ class _ContentTable(QTableWidget):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
 
     @staticmethod
-    def _cell(value: object) -> QTableWidgetItem:
-        return QTableWidgetItem("—" if value is None or value == "" else str(value))
+    def _text_cell(value: object) -> QTableWidgetItem:
+        text = value.strip() if type(value) is str else ""
+        return QTableWidgetItem(text or "—")
+
+    @staticmethod
+    def _timestamp_cell(value: object) -> QTableWidgetItem:
+        return QTableWidgetItem(value if _valid_timestamp(value) else "—")
+
+    @staticmethod
+    def _metric_cell(value: object) -> QTableWidgetItem:
+        number = _finite_number(value)
+        return QTableWidgetItem("—" if number is None else f"{number:,}")
 
     def set_payload(self, payload: dict) -> None:
         items = payload.get("items") if type(payload) is dict else None
@@ -192,14 +238,14 @@ class _ContentTable(QTableWidget):
         )
         self.setRowCount(len(rows))
         for row_index, item in enumerate(rows):
-            self.setItem(row_index, 0, self._cell(item.get("title")))
-            self.setItem(row_index, 1, self._cell(item.get("publishedAt")))
-            self.setItem(row_index, 2, self._cell(item.get("contentStatus")))
+            self.setItem(row_index, 0, self._text_cell(item.get("title")))
+            self.setItem(row_index, 1, self._timestamp_cell(item.get("publishedAt")))
+            self.setItem(row_index, 2, self._text_cell(item.get("contentStatus")))
             metrics = item.get("metrics")
             if type(metrics) is not dict:
                 metrics = {}
             for metric_key, column in self._METRIC_COLUMNS:
-                self.setItem(row_index, column, self._cell(metrics.get(metric_key)))
+                self.setItem(row_index, column, self._metric_cell(metrics.get(metric_key)))
 
 
 class DataMonitorPage(QWidget):
@@ -399,20 +445,26 @@ class DataMonitorPage(QWidget):
             metric = metrics.get(key)
             if not isinstance(metric, dict):
                 metric = {}
-            value = metric.get("value")
+            value = _finite_number(metric.get("value"))
             value_label.setText("—" if value is None else f"{value:,}")
             availability = metric.get("availability")
+            if type(availability) is not str:
+                availability = None
             self.metric_captions[key].setText(
                 AVAILABILITY_TEXT.get(availability, "暂未取得")
             )
         latest = summary.get("latestRun") if isinstance(summary, dict) else None
         period_start = summary.get("periodStart") if isinstance(summary, dict) else None
         period_end = summary.get("periodEnd") if isinstance(summary, dict) else None
-        if period_start and period_end:
+        if _valid_day(period_start) and _valid_day(period_end):
             self.period_label.setText(f"统计区间：{period_start} 至 {period_end}")
         else:
             self.period_label.setText("统计区间：—")
-        source_mode = latest.get("sourceMode") if isinstance(latest, dict) else None
+        source_mode = (
+            summary.get("trustedSourceMode") if isinstance(summary, dict) else None
+        )
+        if type(source_mode) is not str:
+            source_mode = None
         self.source_label.setText(
             f"数据来源：{SOURCE_TEXT.get(source_mode, '—')}"
         )
@@ -423,10 +475,10 @@ class DataMonitorPage(QWidget):
             summary.get("localSyncedAt") if isinstance(summary, dict) else None
         )
         self.platform_observed_label.setText(
-            f"平台观察时间：{platform_observed_at or '—'}"
+            f"平台观察时间：{platform_observed_at if _valid_timestamp(platform_observed_at) else '—'}"
         )
         self.local_synced_label.setText(
-            f"本地同步时间：{local_synced_at or '—'}"
+            f"本地同步时间：{local_synced_at if _valid_timestamp(local_synced_at) else '—'}"
         )
         self.relogin_button.hide()
         if not isinstance(latest, dict):
@@ -476,14 +528,15 @@ class DataMonitorPage(QWidget):
         rows = items if type(items) is list else []
         series: dict[str, list[tuple[str, int | float]]] = {}
         for item in rows:
-            if type(item) is not dict or type(item.get("date")) is not str:
+            if type(item) is not dict or not _valid_day(item.get("date")):
                 continue
             metrics = item.get("metrics")
             if type(metrics) is not dict:
                 continue
             for key, value in metrics.items():
-                if type(key) is str and type(value) in (int, float):
-                    series.setdefault(key, []).append((item["date"], value))
+                number = _finite_number(value)
+                if type(key) is str and number is not None:
+                    series.setdefault(key, []).append((item["date"], number))
         self.trend_chart.set_series(
             {key: tuple(points) for key, points in series.items()}
         )
@@ -528,30 +581,44 @@ class DataMonitorPage(QWidget):
         if type(account_id) is not int or account_id <= 0:
             return
         key = f"platform-data-sync:{account_id}"
+        terminal_state = {"value": "pending"}
+
+        def is_current_account() -> bool:
+            return self.account_combo.currentData() == account_id
 
         def started() -> None:
-            if not self._shutting_down:
+            terminal_state["value"] = "running"
+            if not self._shutting_down and is_current_account():
                 self.sync_button.setEnabled(False)
                 self.status_label.setText("正在同步数据…")
 
         def progressed(payload: object) -> None:
-            if self._shutting_down or not isinstance(payload, dict):
+            if (
+                self._shutting_down
+                or not is_current_account()
+                or not isinstance(payload, dict)
+            ):
                 return
-            text = PROGRESS_TEXT.get(payload.get("stage"))
+            stage = payload.get("stage")
+            text = PROGRESS_TEXT.get(stage) if type(stage) is str else None
             if text:
                 self.status_label.setText(text)
 
         def completed(_result: object) -> None:
-            if not self._shutting_down:
+            terminal_state["value"] = "success"
+            if not self._shutting_down and is_current_account():
                 self.refresh()
 
         def failed(_message: str) -> None:
-            if not self._shutting_down:
+            terminal_state["value"] = "failed"
+            if not self._shutting_down and is_current_account():
                 self.status_label.setText("数据同步未完成")
 
         def finished() -> None:
-            if not self._shutting_down:
-                self._render_selected_account()
+            if not self._shutting_down and is_current_account():
+                self.sync_button.setEnabled(
+                    terminal_state["value"] in {"success", "failed"}
+                )
 
         self.runner.run(
             key,

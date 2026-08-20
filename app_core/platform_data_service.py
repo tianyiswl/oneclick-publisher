@@ -390,7 +390,10 @@ def record_failed_sync(
     }
 
 
-def _latest_run_details(conn, account_id: int) -> tuple[dict | None, str | None, str | None]:
+def _latest_run_details(
+    conn,
+    account_id: int,
+) -> tuple[dict | None, str | None, str | None, str | None]:
     latest_attempt = conn.execute(
         """
         SELECT status, sourceMode, errorCode, metricCount, finishedAt
@@ -403,7 +406,7 @@ def _latest_run_details(conn, account_id: int) -> tuple[dict | None, str | None,
     ).fetchone()
     trusted_data_run = conn.execute(
         """
-        SELECT runs.startedAt, runs.finishedAt
+        SELECT runs.sourceMode, runs.startedAt, runs.finishedAt
         FROM platform_data_sync_runs AS runs
         WHERE runs.accountId = ?
           AND runs.status IN ('success', 'partial_success')
@@ -430,9 +433,10 @@ def _latest_run_details(conn, account_id: int) -> tuple[dict | None, str | None,
             "finishedAt": str(latest_attempt["finishedAt"] or ""),
         }
     if trusted_data_run is None:
-        return public_run, None, None
+        return public_run, None, None, None
     return (
         public_run,
+        str(trusted_data_run["sourceMode"]),
         str(trusted_data_run["startedAt"] or "") or None,
         str(trusted_data_run["finishedAt"] or "") or None,
     )
@@ -500,7 +504,9 @@ def account_period_summary(account_id: int, days: int) -> dict:
                 period_end=period_end,
                 scope="lifetime_total",
             )
-            latest_run, observed_at, synced_at = _latest_run_details(conn, account)
+            latest_run, trusted_source, observed_at, synced_at = _latest_run_details(
+                conn, account
+            )
     except CollectionFailure:
         raise
     except (KeyboardInterrupt, SystemExit):
@@ -577,6 +583,7 @@ def account_period_summary(account_id: int, days: int) -> dict:
         "periodEnd": period_end,
         "metrics": metrics,
         "latestRun": latest_run,
+        "trustedSourceMode": trusted_source,
         "platformObservedAt": observed_at,
         "localSyncedAt": synced_at,
     }
