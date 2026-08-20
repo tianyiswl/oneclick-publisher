@@ -52,8 +52,15 @@ def _required_text(value: object) -> str:
     return result
 
 
-def _date_only(value: object) -> str:
+def _controlled_text(value: object) -> str:
     result = _required_text(value)
+    if value != result:
+        raise CollectionFailure("metric_payload_invalid")
+    return result
+
+
+def _date_only(value: object) -> str:
+    result = _controlled_text(value)
     try:
         parsed = datetime.strptime(result, "%Y-%m-%d")
     except ValueError as error:
@@ -77,11 +84,11 @@ class MetricPoint:
     observed_at: str
 
     def __post_init__(self) -> None:
-        entity_type = _required_text(self.entity_type)
+        entity_type = _controlled_text(self.entity_type)
         if entity_type not in ALLOWED_ENTITY_TYPES:
             raise CollectionFailure("metric_payload_invalid")
         _required_text(self.entity_key)
-        metric_key = _required_text(self.metric_key)
+        metric_key = _controlled_text(self.metric_key)
         if metric_key not in ALLOWED_METRIC_KEYS:
             raise CollectionFailure("metric_payload_invalid")
         _required_text(self.raw_metric_key)
@@ -89,9 +96,9 @@ class MetricPoint:
             raise CollectionFailure("metric_payload_invalid")
         if not math.isfinite(float(self.metric_value)):
             raise CollectionFailure("metric_payload_invalid")
-        if _required_text(self.metric_unit) not in ALLOWED_METRIC_UNITS:
+        if _controlled_text(self.metric_unit) not in ALLOWED_METRIC_UNITS:
             raise CollectionFailure("metric_payload_invalid")
-        metric_scope = _required_text(self.metric_scope)
+        metric_scope = _controlled_text(self.metric_scope)
         if metric_scope not in ALLOWED_METRIC_SCOPES:
             raise CollectionFailure("metric_payload_invalid")
         period_start = _date_only(self.period_start)
@@ -125,9 +132,9 @@ class ContentRecord:
         _required_text(self.title)
         _required_text(self.cover_url)
         _required_text(self.published_at)
-        if _required_text(self.content_status) not in ALLOWED_CONTENT_STATUSES:
+        if _controlled_text(self.content_status) not in ALLOWED_CONTENT_STATUSES:
             raise CollectionFailure("metric_payload_invalid")
-        if _required_text(self.content_type) not in ALLOWED_CONTENT_TYPES:
+        if _controlled_text(self.content_type) not in ALLOWED_CONTENT_TYPES:
             raise CollectionFailure("metric_payload_invalid")
 
 
@@ -145,7 +152,7 @@ class CollectionBatch:
     def __post_init__(self) -> None:
         if type(self.platform_type) is not int or self.platform_type <= 0:
             raise CollectionFailure("metric_payload_invalid")
-        if _required_text(self.source_mode) not in ALLOWED_SOURCE_MODES:
+        if _controlled_text(self.source_mode) not in ALLOWED_SOURCE_MODES:
             raise CollectionFailure("metric_payload_invalid")
         if type(self.metrics) is not tuple:
             raise CollectionFailure("metric_payload_invalid")

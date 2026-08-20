@@ -126,6 +126,51 @@ class PlatformDataServiceTests(unittest.TestCase):
                 platform_observed_at="2026-08-20T12:00:00+08:00",
             )
 
+    def test_v2_models_reject_controlled_field_whitespace(self) -> None:
+        """受控字段首尾空白不得绕过白名单、日期或批次身份。"""
+
+        point_values = {
+            "entity_type": "account",
+            "entity_key": f"account:{self.account_id}",
+            "metric_key": "views",
+            "raw_metric_key": "play_cnt",
+            "metric_value": 125,
+            "metric_unit": "count",
+            "metric_scope": "daily_increment",
+            "period_start": "2026-08-19",
+            "period_end": "2026-08-19",
+            "observed_at": "2026-08-20T12:00:00+08:00",
+        }
+        for field, whitespace_value in (
+            ("entity_type", " account "),
+            ("metric_scope", " daily_increment "),
+            ("period_start", " 2026-08-19 "),
+            ("period_end", " 2026-08-19 "),
+        ):
+            with self.subTest(field=field):
+                with self.assertRaises(CollectionFailure):
+                    MetricPoint(**(point_values | {field: whitespace_value}))
+
+        canonical = MetricPoint(**point_values)
+        with self.assertRaises(CollectionFailure):
+            CollectionBatch(
+                platform_type=3,
+                source_mode="direct_session",
+                metrics=(
+                    canonical,
+                    MetricPoint(
+                        **(
+                            point_values
+                            | {"metric_scope": " daily_increment "}
+                        )
+                    ),
+                ),
+                contents=(),
+                account_metrics_available=True,
+                content_data_available=False,
+                platform_observed_at="2026-08-20T12:00:00+08:00",
+            )
+
     def test_schema_migrates_legacy_metrics_without_inventing_scope(self) -> None:
         """旧快照没有口径和范围，迁移后不得伪造成可汇总的 V2 数据。"""
 
