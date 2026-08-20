@@ -588,6 +588,7 @@ class DouyinBrowserSignedCollectorTests(DouyinDirectCollectorTests):
                     "status_code": 0,
                     "current_count": 431,
                     "option_list": [
+                        {"date": "2026-08-19", "count": 11},
                         {"date": "2026-08-20", "count": 12},
                     ],
                 },
@@ -622,6 +623,20 @@ class DouyinBrowserSignedCollectorTests(DouyinDirectCollectorTests):
                 ("views", 100, "daily_increment", "2026-08-19", "2026-08-19"),
                 ("views", 230, "daily_increment", "2026-08-20", "2026-08-20"),
                 (
+                    "followers_net",
+                    11,
+                    "daily_increment",
+                    "2026-08-19",
+                    "2026-08-19",
+                ),
+                (
+                    "followers_net",
+                    12,
+                    "daily_increment",
+                    "2026-08-20",
+                    "2026-08-20",
+                ),
+                (
                     "followers_total",
                     431,
                     "lifetime_total",
@@ -633,6 +648,15 @@ class DouyinBrowserSignedCollectorTests(DouyinDirectCollectorTests):
         self.assertTrue(batch.account_metrics_available)
         self.assertFalse(batch.content_data_available)
         self.assertEqual(batch.contents, ())
+        self.assertEqual(
+            len(
+                {
+                    (point.metric_key, point.metric_scope, point.period_start)
+                    for point in batch.metrics
+                }
+            ),
+            len(batch.metrics),
+        )
 
     def test_browser_signed_accepts_only_allowlisted_official_response_and_closes(self) -> None:
         """官方响应路径或严格关闭缺失时，本测试必须失败。"""

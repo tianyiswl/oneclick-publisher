@@ -401,7 +401,7 @@ class DouyinDataCollector:
                     period_end=platform_day,
                     observed_at=f"{platform_day}T00:00:00+08:00",
                 )
-                parsed_points = (point,)
+                parsed_points = (*daily_points, point)
             else:
                 parsed_points = _parse_daily_points(
                     raw_metric_key=raw_key,
