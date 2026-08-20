@@ -27,29 +27,116 @@ ACCOUNT = {
 
 
 def empty_summary() -> dict:
+    summary = period_summary()
+    summary["latestRun"] = None
+    summary["platformObservedAt"] = None
+    summary["localSyncedAt"] = None
+    for metric in summary["metrics"].values():
+        metric["value"] = None
+        metric["availability"] = "missing"
+        metric["observedDays"] = 0
+    return summary
+
+
+def period_summary(
+    *,
+    status: str = "success",
+    error_code: str = "",
+) -> dict:
+    metrics = {
+        "views": {
+            "value": 321,
+            "scope": "daily_increment",
+            "unit": "count",
+            "availability": "complete",
+            "observedDays": 7,
+        },
+        "likes": {
+            "value": 12,
+            "scope": "daily_increment",
+            "unit": "count",
+            "availability": "partial",
+            "observedDays": 3,
+        },
+        "comments": {
+            "value": None,
+            "scope": "daily_increment",
+            "unit": "count",
+            "availability": "missing",
+            "observedDays": 0,
+        },
+        "shares": {
+            "value": 4,
+            "scope": "daily_increment",
+            "unit": "count",
+            "availability": "complete",
+            "observedDays": 7,
+        },
+        "followers_net": {
+            "value": 8,
+            "scope": "daily_increment",
+            "unit": "count",
+            "availability": "complete",
+            "observedDays": 7,
+        },
+        "profile_visits": {
+            "value": 18,
+            "scope": "daily_increment",
+            "unit": "count",
+            "availability": "complete",
+            "observedDays": 7,
+        },
+        "followers_total": {
+            "value": 2_000,
+            "scope": "lifetime_total",
+            "unit": "count",
+            "availability": "complete",
+            "observedDays": 1,
+        },
+    }
     return {
         "accountId": 12,
-        "latestSuccessAt": None,
-        "latestRun": None,
-        "metrics": {},
-        "observedAt": {},
+        "days": 7,
+        "periodStart": "2026-08-14",
+        "periodEnd": "2026-08-20",
+        "metrics": metrics,
+        "latestRun": {
+            "status": status,
+            "sourceMode": "direct_session",
+            "errorCode": error_code,
+            "metricCount": 13,
+            "finishedAt": "2026-08-20T12:01:00+08:00",
+        },
+        "platformObservedAt": "2026-08-20T12:00:00+08:00",
+        "localSyncedAt": "2026-08-20T12:01:00+08:00",
+    }
+
+
+def empty_trends() -> dict:
+    return {
+        "accountId": 12,
+        "days": 7,
+        "periodStart": "2026-08-14",
+        "periodEnd": "2026-08-20",
+        "items": [],
+    }
+
+
+def empty_contents() -> dict:
+    return {
+        "accountId": 12,
+        "total": 0,
+        "limit": 50,
+        "offset": 0,
+        "items": [],
     }
 
 
 def failed_summary() -> dict:
-    return {
-        "accountId": 12,
-        "latestSuccessAt": "2026-08-20T12:00:00+08:00",
-        "latestRun": {
-            "status": "failed",
-            "sourceMode": "browser_signed",
-            "errorCode": "login_required",
-            "metricCount": 0,
-            "finishedAt": "2026-08-20T12:05:00+08:00",
-        },
-        "metrics": {"views": 125},
-        "observedAt": {"views": "2026-08-20T12:00:00+08:00"},
-    }
+    summary = period_summary(status="failed", error_code="login_required")
+    summary["metrics"]["views"]["value"] = 125
+    summary["latestRun"]["sourceMode"] = "browser_signed"
+    return summary
 
 
 class QueuedPool:
@@ -83,7 +170,14 @@ class DataMonitorPageTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
 
-    def _page(self, *, summary=None, runner=None) -> DataMonitorPage:
+    def _page(
+        self,
+        *,
+        summary=None,
+        trends=None,
+        contents=None,
+        runner=None,
+    ) -> DataMonitorPage:
         accounts = [ACCOUNT, {**ACCOUNT, "id": 13, "type": 1}]
         self.accounts_patch = patch(
             "ui.data_monitor_page.account_service.list_accounts",
@@ -91,15 +185,159 @@ class DataMonitorPageTests(unittest.TestCase):
         )
         self.summary_patch = patch(
             "ui.data_monitor_page.platform_data_service.account_data_summary",
-            return_value=summary or empty_summary(),
+            return_value=summary if summary is not None else empty_summary(),
+        )
+        self.period_patch = patch(
+            "ui.data_monitor_page.platform_data_service.account_period_summary",
+            return_value=summary if summary is not None else empty_summary(),
+        )
+        self.trends_patch = patch(
+            "ui.data_monitor_page.platform_data_service.account_daily_trends",
+            return_value=trends or empty_trends(),
+        )
+        self.contents_patch = patch(
+            "ui.data_monitor_page.platform_data_service.account_contents",
+            return_value=contents or empty_contents(),
         )
         self.accounts_patch.start()
         self.summary_patch.start()
+        self.period_mock = self.period_patch.start()
+        self.trends_mock = self.trends_patch.start()
+        self.contents_mock = self.contents_patch.start()
         self.addCleanup(self.accounts_patch.stop)
         self.addCleanup(self.summary_patch.stop)
+        self.addCleanup(self.period_patch.stop)
+        self.addCleanup(self.trends_patch.stop)
+        self.addCleanup(self.contents_patch.stop)
         page = DataMonitorPage(task_runner=runner)
         self.addCleanup(page.deleteLater)
         return page
+
+    def test_v2_cards_explain_scope_range_and_freshness(self) -> None:
+        """卡片若丢失对象、口径和时间投影，孤立数字会被误解。"""
+
+        page = self._page(summary=period_summary())
+
+        self.assertTrue(hasattr(page, "range_combo"))
+        self.assertEqual(page.range_combo.currentData(), 7)
+        self.assertEqual(page.metric_titles["views"].text(), "账号区间新增播放")
+        self.assertEqual(
+            page.metric_titles["followers_total"].text(),
+            "账号区间末粉丝总数",
+        )
+        self.assertEqual(page.metric_values["comments"].text(), "—")
+        self.assertEqual(page.metric_captions["views"].text(), "完整数据")
+        self.assertEqual(page.metric_captions["likes"].text(), "部分日期")
+        self.assertEqual(page.metric_captions["comments"].text(), "暂未取得")
+        self.assertIn("2026-08-14", page.period_label.text())
+        self.assertIn("2026-08-20", page.period_label.text())
+        self.assertEqual(page.source_label.text(), "数据来源：会话直连")
+        self.assertEqual(
+            page.platform_observed_label.text(),
+            "平台观察时间：2026-08-20T12:00:00+08:00",
+        )
+        self.assertEqual(
+            page.local_synced_label.text(),
+            "本地同步时间：2026-08-20T12:01:00+08:00",
+        )
+
+    def test_range_switch_queries_local_data_without_sync(self) -> None:
+        """时间切换若启动平台同步，会将本地浏览误变成外部读取。"""
+
+        with patch(
+            "ui.data_monitor_page.platform_data_sync.sync_account_data"
+        ) as sync_mock:
+            page = self._page()
+            self.period_mock.reset_mock()
+            self.trends_mock.reset_mock()
+            self.contents_mock.reset_mock()
+
+            page.range_combo.setCurrentIndex(page.range_combo.findData(30))
+            self.app.processEvents()
+
+        sync_mock.assert_not_called()
+        self.period_mock.assert_called_once_with(12, 30)
+        self.trends_mock.assert_called_once_with(12, 30)
+        self.contents_mock.assert_not_called()
+
+    def test_sparse_trend_and_content_table_preserve_missing_values(self) -> None:
+        """稀疏日期或作品缺失值若补零，会制造不存在的趋势与互动。"""
+
+        trends = {
+            "accountId": 12,
+            "days": 7,
+            "periodStart": "2026-08-14",
+            "periodEnd": "2026-08-20",
+            "items": [
+                {"date": "2026-08-18", "metrics": {"views": 10}},
+                {"date": "2026-08-20", "metrics": {"views": 12}},
+            ],
+        }
+        contents = {
+            "accountId": 12,
+            "total": 52,
+            "limit": 50,
+            "offset": 0,
+            "items": [
+                {
+                    "contentId": "older",
+                    "title": "旧作品",
+                    "coverUrl": "",
+                    "publishedAt": "2026-08-19T09:00:00+08:00",
+                    "contentStatus": "published",
+                    "contentType": "video",
+                    "metrics": {"views": 10, "comments": 1},
+                },
+                {
+                    "contentId": "newer",
+                    "title": "新作品",
+                    "coverUrl": "",
+                    "publishedAt": "2026-08-20T09:00:00+08:00",
+                    "contentStatus": "published",
+                    "contentType": "video",
+                    "metrics": {"views": 20, "likes": 2, "shares": 1},
+                },
+            ],
+        }
+        page = self._page(trends=trends, contents=contents)
+
+        self.assertTrue(hasattr(page, "trend_chart"))
+        self.assertEqual(
+            page.trend_chart.series_for_test("views"),
+            (("2026-08-18", 10), ("2026-08-20", 12)),
+        )
+        self.assertNotIn(
+            ("2026-08-19", 0),
+            page.trend_chart.series_for_test("views"),
+        )
+        self.assertEqual(page.content_table.item(0, 0).text(), "新作品")
+        self.assertEqual(page.content_table.item(0, 5).text(), "—")
+
+        self.period_mock.reset_mock()
+        self.trends_mock.reset_mock()
+        self.contents_mock.reset_mock()
+        page.next_page_button.click()
+        self.app.processEvents()
+
+        self.contents_mock.assert_called_once_with(12, limit=50, offset=50)
+        self.period_mock.assert_not_called()
+        self.trends_mock.assert_not_called()
+
+    def test_partial_success_is_not_rendered_as_complete(self) -> None:
+        """账号趋势可用时不得把未取得的作品数据冒充为全部完成。"""
+
+        page = self._page(
+            summary=period_summary(
+                status="partial_success",
+                error_code="content_list_unavailable",
+            )
+        )
+
+        self.assertEqual(
+            page.status_label.text(),
+            "账号趋势已更新，作品数据未取得",
+        )
+        self.assertNotIn("账号趋势和作品数据已更新", page.status_label.text())
 
     def test_only_douyin_accounts_are_listed_and_missing_metrics_render_dash(self) -> None:
         """平台过滤或缺失显示回退会把未支持账号或伪零暴露给用户。"""
@@ -140,6 +378,14 @@ class DataMonitorPageTests(unittest.TestCase):
             page.sync_button.click()
             page.sync_button.click()
             self.assertEqual(len(pool.tasks), 1)
+            pool.tasks[0].signals.progressed.emit(
+                {
+                    "stage": "content_list",
+                    "message": "Cookie=secret /private/path?token=secret",
+                }
+            )
+            self.app.processEvents()
+            self.assertEqual(page.status_label.text(), "正在读取作品列表…")
             pool.tasks[0].run()
             self.app.processEvents()
 
