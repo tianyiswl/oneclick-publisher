@@ -1296,6 +1296,18 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
         self.assertNotIn("authorization", encoded.lower())
         self.assertNotIn("safe_key", encoded)
 
+    def test_schema_review_does_not_evaluate_untrusted_url_truthiness(self):
+        class UntrustedValue:
+            def __bool__(self):
+                raise AssertionError("untrusted truthiness evaluated")
+
+        review = verifier._review_schema({"responses": [{
+            "url": UntrustedValue(),
+            "path": "/api/data",
+        }]})
+
+        self.assertEqual(review["responses"], [{"path": "/api/data"}])
+
     def test_review_cli_is_execute_only_and_persisted_report_stays_sanitized(self):
         payload = verifier.build_plan()
         payload.update({"mode": "execute", "status": "failed",
@@ -1318,6 +1330,31 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
         writer.assert_not_called()
         invalid = io.StringIO()
         self.assertEqual(verifier.main(["--review-schema"], stdout=invalid), 2)
+
+    def test_review_cli_report_keeps_review_only_in_stdout(self):
+        payload = verifier.build_plan()
+        payload.update({
+            "mode": "execute",
+            "status": "failed",
+            "errorCode": "xiaohongshu_contracts_unobserved",
+            "navigation": [{"phase": "account_home", "path": "/creator/home"}],
+            "responses": [{"path": "/api/data"}],
+        })
+        output = io.StringIO()
+        with patch.object(verifier, "_execute", return_value=payload):
+            code = verifier.main([
+                "--execute", "--review-schema", "--report", str(self.report_path),
+            ], stdout=output)
+
+        self.assertEqual(code, 1)
+        stdout_payload = json.loads(output.getvalue())
+        persisted = json.loads(self.report_path.read_text("utf-8"))
+        self.assertIn("schemaReview", stdout_payload)
+        self.assertEqual(stdout_payload["schemaReview"]["navigation"], [
+            {"phase": "account_home", "path": "/creator/home"},
+        ])
+        self.assertNotIn("schemaReview", persisted)
+        self.assertNotIn("navigation", persisted)
 
     def test_persisted_report_is_finally_sanitized(self):
         injected = {

@@ -372,7 +372,9 @@ def _review_schema(report: object) -> dict[str, object]:
     for source in responses[:_RESPONSE_LIMIT] if type(responses) is list else ():
         if type(source) is not dict:
             continue
-        path = _review_path(source.get("url") or source.get("path"))
+        url = source.get("url")
+        path_value = url if type(url) is str else source.get("path")
+        path = _review_path(path_value)
         if not path:
             continue
         row: dict[str, object] = {"path": path}
