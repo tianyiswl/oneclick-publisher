@@ -4,15 +4,15 @@
 - 平台类型：`1`
 - 探测模式：`execute`（经明确授权的一次真实只读探测命令）
 - 终态：`failed`；命令退出码：`1`
-- 固定码：`xiaohongshu_account_selection_required`
+- 固定码：`xiaohongshu_contracts_unobserved`
 
 ## 观测到的响应合同
 
-本次命令在账号选择门前停止；未启动浏览器短会话，未发生页面导航或
-被动响应观测，因此未捕获可记录的官方 JSON 响应。净化报告中的
-`responses` 为空，`phases` 为空，且全部三个必需阶段位于 `missingPhases`。
-因此没有可报告的 endpoint template、method、field path、built-in type、metric
-scope、pagination 字段或 coverage 语义。此结论不触发重试，也不推测缺失的数据合同。
+第二次经明确授权的命令已通过账号选择门，实际进入账号首页和数据分析页。
+被动捕获了 2 类官方 JSON 结构：一类仅含通用操作结果字段；另一类含
+`data.total` 和一个长度为 0 的列表容器。旧探测器没有将每个响应与当时页面
+阶段绑定，因此两类结构均不能安全晋级为数据合同。`phases` 仍为空，全部三个
+必需阶段仍位于 `missingPhases`。此结论不触发重试，也不推测指标语义。
 
 | 分类 | 观测状态 | 缺失的合同证据 |
 | --- | --- | --- |
@@ -22,7 +22,8 @@ scope、pagination 字段或 coverage 语义。此结论不触发重试，也不
 
 ## 分页与覆盖语义
 
-未观测到 pagination fields，故无法确认内容列表的完整遍历能力或覆盖边界。
+观测到 `data.total` 类分页字段和空列表，但旧证据缺少页面阶段绑定，
+故仍无法确认内容列表的完整遍历能力或覆盖边界。
 
 ## 资源清理
 

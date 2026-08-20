@@ -29,6 +29,7 @@ _ALLOWED_RESPONSE_KEYS = frozenset({
 })
 _TEXT_LIMIT = 120
 _RESPONSE_LIMIT = 100
+_REQUEST_PHASE_LIMIT = _RESPONSE_LIMIT * 4
 _KEY_PATH_LIMIT = 300
 _REVIEW_SAFE_NAME = re.compile(r"^[a-z][a-z0-9_]{0,47}$")
 _REVIEW_ID_SEGMENT = re.compile(
@@ -87,6 +88,12 @@ _REVIEW_NAVIGATION_PATHS = MappingProxyType({
     "data_analysis": "/statistics/data-analysis",
     "content_lifetime": "/statistics/note-detail",
 })
+_ALLOWED_OBSERVATION_PHASES = frozenset(_REVIEW_NAVIGATION_PATHS)
+_OBSERVATION_CONTRACT_CANDIDATES = MappingProxyType({
+    "account_home": ("account_overview",),
+    "data_analysis": ("account_overview", "content_list"),
+    "content_lifetime": ("content_lifetime",),
+})
 _NETWORK_QUIET_TIMEOUT_MS = 30_000
 _PASSIVE_CAPTURE_WAIT_MS = 2_000
 _TOTAL_TIMEOUT_SECONDS = 60.0
@@ -108,8 +115,10 @@ _CONTRACTS_INCOMPLETE = "xiaohongshu_contracts_incomplete"
 _LOGIN_REQUIRED = "login_required"
 _VERIFICATION_REQUIRED = "verification_required"
 _NAVIGATION_UNVERIFIED = "xiaohongshu_navigation_unverified"
-_CONTENT_IDENTIFIERS = frozenset({"note_id", "item_id", "content_id"})
-_CONTENT_LIST_KEYS = frozenset({"items", "list", "notes", "feeds"})
+_CONTENT_IDENTIFIERS = frozenset({"note_id", "item_id", "content_id", "id"})
+_CONTENT_LIST_KEYS = frozenset({
+    "items", "list", "notes", "feeds", "note_infos",
+})
 _METRIC_KEYS = frozenset({
     "view_count", "views", "like_count", "likes", "comment_count",
     "comments", "share_count", "shares", "collect_count", "collects",
@@ -378,6 +387,12 @@ def _review_schema(report: object) -> dict[str, object]:
         if not path:
             continue
         row: dict[str, object] = {"path": path}
+        observation_phase = source.get("observationPhase")
+        if (
+            type(observation_phase) is str
+            and observation_phase in _ALLOWED_OBSERVATION_PHASES
+        ):
+            row["observationPhase"] = observation_phase
         method = source.get("method")
         if type(method) is str and method in _ALLOWED_METHODS:
             row["method"] = method
@@ -563,6 +578,9 @@ def _sanitize_response(value: object) -> dict[str, object] | None:
         return None
     status = source.get("status")
     return {
+        "observationPhase": _enum_text(
+            source.get("observationPhase"), _ALLOWED_OBSERVATION_PHASES
+        ),
         "method": _enum_text(source.get("method"), _ALLOWED_METHODS),
         "path": safe_path,
         "status": status if type(status) is int and 100 <= status <= 599 else 0,
@@ -1206,12 +1224,20 @@ def _content_identity_paths(
     evidence: list[tuple[str, tuple[tuple[str, bool], ...]]],
     field_types: dict[str, str],
 ) -> list[tuple[tuple[str, bool], ...]]:
-    return [
-        segments
-        for path, segments in evidence
-        if segments[-1][0] in _CONTENT_IDENTIFIERS
-        and field_types.get(path) in {"str", "int"}
-    ]
+    identities: list[tuple[tuple[str, bool], ...]] = []
+    for path, segments in evidence:
+        identity_key = segments[-1][0]
+        generic_id_is_scoped = identity_key == "id" and any(
+            key == "note_infos" and is_list
+            for key, is_list in segments[:-1]
+        )
+        if (
+            identity_key in _CONTENT_IDENTIFIERS
+            and (identity_key != "id" or generic_id_is_scoped)
+            and field_types.get(path) in {"str", "int"}
+        ):
+            identities.append(segments)
+    return identities
 
 
 def _classify_content_list_shape(
@@ -1225,6 +1251,34 @@ def _classify_content_list_shape(
         ):
             return True
     return False
+
+
+def _classify_empty_paginated_content_list(
+    shape: dict[str, object],
+) -> bool:
+    if shape.get("observationPhase") != "data_analysis":
+        return False
+    list_lengths = shape.get("listLengths")
+    pagination_keys = shape.get("paginationKeys")
+    field_types = shape.get("fieldTypes")
+    if (
+        type(list_lengths) is not dict
+        or type(pagination_keys) is not list
+        or type(field_types) is not dict
+        or field_types.get("data.total") != "int"
+        or "data.total" not in pagination_keys
+    ):
+        return False
+    direct_lists = [
+        path
+        for path, length in list_lengths.items()
+        if type(path) is str
+        and path.startswith("data.")
+        and path.count(".") == 1
+        and type(length) is int
+        and length == 0
+    ]
+    return len(direct_lists) == 1
 
 
 def _classify_content_lifetime_shape(
@@ -1260,24 +1314,35 @@ def _classify_content_lifetime_shape(
 
 
 def _classify_shape(shape: dict[str, object]) -> str:
-    phase = _reviewed_contract_phase(shape.get("path"))
-    if phase is None:
+    reviewed_phase = _reviewed_contract_phase(shape.get("path"))
+    observation_phase = shape.get("observationPhase")
+    if reviewed_phase is not None:
+        candidates = (reviewed_phase,)
+    elif type(observation_phase) is str:
+        candidates = _OBSERVATION_CONTRACT_CANDIDATES.get(
+            observation_phase, ()
+        )
+    else:
+        candidates = ()
+    if not candidates:
         return "unclassified"
     evidence, field_types = _structural_evidence_paths(shape)
     if not evidence:
         return "unclassified"
-    if phase == "account_overview" and _classify_account_shape(
-        evidence, field_types
-    ):
-        return phase
-    if phase == "content_list" and _classify_content_list_shape(
-        evidence, field_types
-    ):
-        return phase
-    if phase == "content_lifetime" and _classify_content_lifetime_shape(
-        evidence, field_types
-    ):
-        return phase
+    classifiers = {
+        "account_overview": _classify_account_shape,
+        "content_list": _classify_content_list_shape,
+        "content_lifetime": _classify_content_lifetime_shape,
+    }
+    matches = [
+        phase
+        for phase in candidates
+        if classifiers[phase](evidence, field_types)
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches and _classify_empty_paginated_content_list(shape):
+        return "content_list"
     return "unclassified"
 
 
@@ -1388,18 +1453,38 @@ async def _run_probe(
     context = None
     page = None
     observed_responses: list[
-        tuple[object, tuple[str, str, int, str, int]]
+        tuple[object, tuple[str, str, int, str, int], str]
     ] = []
     retained_body_bytes = 0
     response_budget_exhausted = False
     retained_response_ids: set[int] = set()
+    request_phases: dict[int, tuple[object, str]] = {}
+    active_observation_phase = ""
     shapes: list[dict[str, object]] = []
     navigation: list[dict[str, str]] = []
     caught: BaseException | None = None
     cleanup_errors: list[BaseException] = []
 
+    def retain_request(request: object) -> None:
+        if (
+            active_observation_phase not in _ALLOWED_OBSERVATION_PHASES
+            or len(request_phases) >= _REQUEST_PHASE_LIMIT
+        ):
+            return
+        request_phases[id(request)] = (request, active_observation_phase)
+
     def retain_response(response: object) -> None:
         nonlocal retained_body_bytes, response_budget_exhausted
+        try:
+            request = getattr(response, "request", None)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            return
+        request_entry = request_phases.pop(id(request), None)
+        if request_entry is None or request_entry[0] is not request:
+            return
+        observation_phase = request_entry[1]
         response_identity = id(response)
         if (
             response_budget_exhausted
@@ -1423,7 +1508,7 @@ async def _run_probe(
             return
         retained_body_bytes = next_total
         retained_response_ids.add(response_identity)
-        observed_responses.append((response, metadata))
+        observed_responses.append((response, metadata, observation_phase))
 
     try:
         state_path = _storage_state_path(account)
@@ -1448,35 +1533,43 @@ async def _run_probe(
             context.new_page(), deadline=work_deadline, monotonic=monotonic
         )
         page.on("response", retain_response)
+        page.on("request", retain_request)
         async def navigate(phase: str, url: str) -> None:
-            navigation_response = await _await_with_deadline(
-                page.goto(
-                    url,
-                    wait_until="domcontentloaded",
-                    timeout=_NETWORK_QUIET_TIMEOUT_MS,
-                ),
-                deadline=work_deadline,
-                monotonic=monotonic,
-            )
-            navigation_error = _navigation_error_code(navigation_response)
-            if navigation_error is not None:
-                raise ProbeFailure(navigation_error)
-            navigation.append({"phase": phase, "path": _review_path(url)})
-            passive_wait = getattr(page, "wait_for_timeout", None)
-            if callable(passive_wait):
-                await _await_with_deadline(
-                    passive_wait(_PASSIVE_CAPTURE_WAIT_MS),
+            nonlocal active_observation_phase
+            active_observation_phase = phase
+            try:
+                navigation_response = await _await_with_deadline(
+                    page.goto(
+                        url,
+                        wait_until="domcontentloaded",
+                        timeout=_NETWORK_QUIET_TIMEOUT_MS,
+                    ),
                     deadline=work_deadline,
                     monotonic=monotonic,
                 )
+                navigation_error = _navigation_error_code(navigation_response)
+                if navigation_error is not None:
+                    raise ProbeFailure(navigation_error)
+                navigation.append({"phase": phase, "path": _review_path(url)})
+                passive_wait = getattr(page, "wait_for_timeout", None)
+                if callable(passive_wait):
+                    await _await_with_deadline(
+                        passive_wait(_PASSIVE_CAPTURE_WAIT_MS),
+                        deadline=work_deadline,
+                        monotonic=monotonic,
+                    )
+            finally:
+                active_observation_phase = ""
 
         await navigate("account_home", _CREATOR_HOME)
         data_response_start = len(observed_responses)
         await navigate("data_analysis", _DATA_ANALYSIS_URL)
         note_id = None
-        for response, _metadata in tuple(
+        for response, _metadata, observation_phase in tuple(
             observed_responses[data_response_start:]
         ):
+            if observation_phase != "data_analysis":
+                continue
             note_id = await _response_note_id(
                 response, deadline=work_deadline, monotonic=monotonic
             )
@@ -1486,7 +1579,7 @@ async def _run_probe(
             await navigate(
                 "content_lifetime", f"{_NOTE_DETAIL_URL}?noteId={note_id}"
             )
-        for response, metadata in tuple(observed_responses):
+        for response, metadata, observation_phase in tuple(observed_responses):
             shape = await _async_response_shape(
                 response,
                 metadata=metadata,
@@ -1494,6 +1587,7 @@ async def _run_probe(
                 monotonic=monotonic,
             )
             if shape is not None:
+                shape["observationPhase"] = observation_phase
                 shapes.append(shape)
     except BaseException as exc:
         caught = exc

@@ -50,6 +50,7 @@ class FakePage:
     def __init__(self, owner):
         self.owner = owner
         self.response_callback = None
+        self.request_callback = None
         self.goto_url = None
         self.goto_urls = []
         self.goto_kwargs = []
@@ -57,7 +58,10 @@ class FakePage:
 
     def on(self, event, callback):
         self.owner.events.append(("on", event))
-        self.response_callback = callback
+        if event == "request":
+            self.request_callback = callback
+        elif event == "response":
+            self.response_callback = callback
 
     def goto(self, url, **_kwargs):
         self.owner.events.append(("goto", url))
@@ -67,6 +71,8 @@ class FakePage:
         if self.owner.failure is not None:
             raise self.owner.failure
         for response in self.owner.responses:
+            if self.request_callback is not None:
+                self.request_callback(response.request)
             self.response_callback(response)
         return self.owner.navigation_response
 
@@ -136,6 +142,8 @@ class RouteAwarePage(FakePage):
         self.goto_urls.append(url)
         self.goto_kwargs.append(dict(_kwargs))
         for response in self.owner.responses_by_url.get(url, ()):
+            if self.request_callback is not None:
+                self.request_callback(response.request)
             self.response_callback(response)
         return FakeResponse(url, "text/html; charset=utf-8", None)
 
@@ -145,6 +153,57 @@ class RouteAwarePlaywright(FakePlaywright):
         super().__init__()
         self.responses_by_url = responses_by_url
         self.page = RouteAwarePage(self)
+
+
+class LateResponsePage(FakePage):
+    def goto(self, url, **_kwargs):
+        self.owner.events.append(("goto", url))
+        self.goto_url = url
+        self.goto_urls.append(url)
+        self.goto_kwargs.append(dict(_kwargs))
+        if url == verifier._CREATOR_HOME:
+            if self.request_callback is not None:
+                self.request_callback(self.owner.delayed_response.request)
+        elif url == verifier._DATA_ANALYSIS_URL:
+            if self.request_callback is not None:
+                self.request_callback(self.owner.list_response.request)
+            self.response_callback(self.owner.list_response)
+        elif url.startswith(verifier._NOTE_DETAIL_URL):
+            self.response_callback(self.owner.delayed_response)
+        return FakeResponse(url, "text/html; charset=utf-8", None)
+
+
+class LateResponsePlaywright(FakePlaywright):
+    def __init__(self, delayed_response, list_response):
+        super().__init__()
+        self.delayed_response = delayed_response
+        self.list_response = list_response
+        self.page = LateResponsePage(self)
+
+
+class LateListResponsePage(FakePage):
+    def goto(self, url, **_kwargs):
+        self.owner.events.append(("goto", url))
+        self.goto_url = url
+        self.goto_urls.append(url)
+        self.goto_kwargs.append(dict(_kwargs))
+        if url == verifier._CREATOR_HOME:
+            if self.request_callback is not None:
+                self.request_callback(self.owner.delayed_response.request)
+        elif url == verifier._DATA_ANALYSIS_URL:
+            self.response_callback(self.owner.delayed_response)
+            if self.request_callback is not None:
+                self.request_callback(self.owner.data_response.request)
+            self.response_callback(self.owner.data_response)
+        return FakeResponse(url, "text/html; charset=utf-8", None)
+
+
+class LateListResponsePlaywright(FakePlaywright):
+    def __init__(self, delayed_response, data_response):
+        super().__init__()
+        self.delayed_response = delayed_response
+        self.data_response = data_response
+        self.page = LateListResponsePage(self)
 
 
 class FakeClock:
@@ -181,6 +240,8 @@ class AsyncFakePage(FakePage):
         self.owner.events.append(("goto", url))
         self.goto_url = url
         for response in self.owner.responses:
+            if self.request_callback is not None:
+                self.request_callback(response.request)
             self.response_callback(response)
         return self.owner.navigation_response
 
@@ -676,9 +737,80 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
         )
         self.assertEqual(fake.page.passive_waits, [2000, 2000, 2000])
         self.assertEqual(len(result["responses"]), 2)
+        self.assertEqual(
+            [item["observationPhase"] for item in result["responses"]],
+            ["data_analysis", "content_lifetime"],
+        )
+        self.assertEqual(result["phases"], ["content_list"])
+        self.assertEqual(result["status"], "partial_success")
         self.assertNotIn("6a0ffca800000000080033f8", json.dumps(result))
         self.assertEqual(fake.page.click_calls, 0)
         self.assertEqual(fake.page.fetch_calls, 0)
+
+    def test_probe_binds_late_response_to_request_start_phase(self):
+        delayed_lifetime = FakeResponse(
+            "https://creator.xiaohongshu.com/api/private/detail",
+            "application/json",
+            {"data": {
+                "note_id": "private-id",
+                "lifetime": {"views": 3},
+            }},
+        )
+        list_response = FakeResponse(
+            "https://creator.xiaohongshu.com/api/private/list",
+            "application/json",
+            {"data": {"note_infos": [{
+                "id": "6a0ffca800000000080033f8",
+            }]}},
+        )
+        fake = LateResponsePlaywright(delayed_lifetime, list_response)
+
+        result = verifier._probe_with_browser(
+            eligible_account(), playwright_factory=lambda: fake,
+            monotonic=FakeClock(), utc_now=fixed_now,
+        )
+
+        self.assertEqual(
+            [item["observationPhase"] for item in result["responses"]],
+            ["data_analysis", "account_home"],
+        )
+        self.assertEqual(result["phases"], ["content_list"])
+        self.assertEqual(
+            result["missingPhases"],
+            ["account_overview", "content_lifetime"],
+        )
+
+    def test_probe_never_uses_late_account_response_as_detail_source(self):
+        delayed_account_list = FakeResponse(
+            "https://creator.xiaohongshu.com/api/private/account-list",
+            "application/json",
+            {"data": {"note_infos": [{
+                "id": "6a0ffca800000000080033f8",
+            }]}},
+        )
+        empty_data_list = FakeResponse(
+            "https://creator.xiaohongshu.com/api/private/data-list",
+            "application/json",
+            {"data": {"note_infos": [], "total": 0}},
+        )
+        fake = LateListResponsePlaywright(
+            delayed_account_list, empty_data_list
+        )
+
+        result = verifier._probe_with_browser(
+            eligible_account(), playwright_factory=lambda: fake,
+            monotonic=FakeClock(), utc_now=fixed_now,
+        )
+
+        self.assertEqual(
+            fake.page.goto_urls,
+            [verifier._CREATOR_HOME, verifier._DATA_ANALYSIS_URL],
+        )
+        self.assertEqual(
+            [item["observationPhase"] for item in result["responses"]],
+            ["account_home", "data_analysis"],
+        )
+        self.assertEqual(result["phases"], ["content_list"])
 
     def test_probe_never_reports_success_until_all_required_contracts_observed(self):
         reviewed_paths = {
@@ -835,6 +967,69 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
                 self.assertIn(identity_key, path_segments)
                 self.assertNotIn("private-content", encoded)
                 self.assertNotIn(":content_identifier", encoded)
+
+    def test_contract_classifier_uses_fixed_observation_phase_with_structure(self):
+        cases = (
+            (
+                "account_home",
+                "https://creator.xiaohongshu.com/api/private/overview",
+                {"data": {"trend": {"fans": 2}}},
+                "account_overview",
+            ),
+            (
+                "data_analysis",
+                "https://creator.xiaohongshu.com/api/private/list",
+                {"data": {"items": [{"note_id": "private-id"}]}},
+                "content_list",
+            ),
+            (
+                "content_lifetime",
+                "https://creator.xiaohongshu.com/api/private/detail",
+                {"data": {"note_id": "private-id", "lifetime": {"views": 3}}},
+                "content_lifetime",
+            ),
+        )
+        for observation_phase, url, payload, expected in cases:
+            with self.subTest(observation_phase=observation_phase):
+                shape = verifier._response_shape(FakeResponse(
+                    url, "application/json", payload,
+                ))
+                shape["observationPhase"] = observation_phase
+                self.assertEqual(verifier._classify_shape(shape), expected)
+
+        ambiguous = verifier._response_shape(FakeResponse(
+            "https://creator.xiaohongshu.com/api/private/mixed",
+            "application/json",
+            {"data": {
+                "trend": {"fans": 2},
+                "items": [{"note_id": "private-id"}],
+            }},
+        ))
+        ambiguous["observationPhase"] = "data_analysis"
+        self.assertEqual(verifier._classify_shape(ambiguous), "unclassified")
+
+    def test_data_analysis_empty_paginated_list_is_content_list_contract(self):
+        shape = verifier._response_shape(FakeResponse(
+            "https://creator.xiaohongshu.com/api/private/creator/list",
+            "application/json",
+            {"data": {"note_infos": [], "total": 0}},
+        ))
+        shape["observationPhase"] = "data_analysis"
+
+        self.assertEqual(shape["listLengths"], {"data.note_infos": 0})
+        self.assertEqual(shape["paginationKeys"], ["data.total"])
+        self.assertEqual(verifier._classify_shape(shape), "content_list")
+
+        wrong_phase = dict(shape, observationPhase="account_home")
+        self.assertEqual(verifier._classify_shape(wrong_phase), "unclassified")
+
+        ambiguous_lists = dict(shape, listLengths={
+            "data.note_infos": 0,
+            "data.items": 0,
+        })
+        self.assertEqual(
+            verifier._classify_shape(ambiguous_lists), "unclassified"
+        )
 
     def test_classifier_requires_reviewed_path_and_common_ancestor_semantics(self):
         reviewed_paths = {
@@ -1307,6 +1502,22 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
         }]})
 
         self.assertEqual(review["responses"], [{"path": "/api/data"}])
+
+    def test_schema_review_retains_only_builtin_observation_phase(self):
+        class UntrustedPhase(str):
+            pass
+
+        review = verifier._review_schema({"responses": [
+            {"path": "/api/data", "observationPhase": "data_analysis"},
+            {"path": "/api/data", "observationPhase": UntrustedPhase(
+                "content_lifetime"
+            )},
+        ]})
+
+        self.assertEqual(
+            review["responses"][0]["observationPhase"], "data_analysis"
+        )
+        self.assertNotIn("observationPhase", review["responses"][1])
 
     def test_review_cli_is_execute_only_and_persisted_report_stays_sanitized(self):
         payload = verifier.build_plan()
