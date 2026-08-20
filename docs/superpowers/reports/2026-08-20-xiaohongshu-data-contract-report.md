@@ -8,6 +8,8 @@
 ## 观测到的响应合同
 
 本次未观测到可记录的官方 JSON 响应，因此没有可报告的 endpoint path、method、结构 key names/types 或 pagination keys。
+按当前 execute 报告语义，实际观测阶段为 `phases=[]`，缺失阶段为
+`missingPhases=[account_overview, content_list, content_lifetime]`。这是对已有账号选择门失败事实的字段纠偏，不代表重新执行了真实探测。
 
 | 分类 | 观测状态 |
 | --- | --- |

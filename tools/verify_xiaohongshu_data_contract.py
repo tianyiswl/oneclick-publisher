@@ -212,9 +212,11 @@ def _normalize_structural_key(value: object) -> str | None:
     """Return a static key name or a fixed template without retaining IDs."""
     if type(value) is not str or not value:
         return None
-    if value in {":identifier", ":key"}:
+    if value in {":content_identifier", ":identifier", ":key"}:
         return value
     lowered = value.lower()
+    if lowered in _CONTENT_IDENTIFIERS:
+        return ":content_identifier"
     if lowered in _IDENTIFIER_STRUCTURAL_KEYS or lowered.endswith("_id"):
         return ":identifier"
     components = frozenset(lowered.split("_"))
@@ -394,8 +396,6 @@ def sanitize_probe_report(value: object) -> dict[str, object]:
     cleanup_closed = _safe_boolean(safe_cleanup.get("closed"))
     cleanup_alive = _safe_integer(safe_cleanup.get("aliveResourceCount"))
     error_code = _enum_text(source.get("errorCode"), _ALLOWED_ERROR_CODES)
-    phases = _sanitize_phases(source.get("phases"))
-    missing_phases = _sanitize_phases(source.get("missingPhases"))
     status = _enum_text(source.get("status"), _ALLOWED_STATUSES, plan["status"])
 
     if mode == "plan":
@@ -403,19 +403,21 @@ def sanitize_probe_report(value: object) -> dict[str, object]:
         missing_phases = []
         status = "planned"
         error_code = ""
-    elif error_code not in {"", _CONTRACTS_UNOBSERVED, _CONTRACTS_INCOMPLETE}:
-        status = "failed"
-        if error_code in {_LOGIN_REQUIRED, _VERIFICATION_REQUIRED}:
-            safe_responses = []
-            phases = []
-            missing_phases = list(_REQUIRED_CONTRACT_PHASES)
-    elif not cleanup_closed or cleanup_alive != 0:
-        status = "failed"
-        error_code = "xiaohongshu_probe_cleanup_incomplete"
     else:
         phases, missing_phases, status, error_code = _contract_outcome(
             safe_responses
         )
+        source_error = _enum_text(source.get("errorCode"), _ALLOWED_ERROR_CODES)
+        if source_error not in {"", _CONTRACTS_UNOBSERVED, _CONTRACTS_INCOMPLETE}:
+            status = "failed"
+            error_code = source_error
+            if error_code in {_LOGIN_REQUIRED, _VERIFICATION_REQUIRED}:
+                safe_responses = []
+                phases = []
+                missing_phases = list(_REQUIRED_CONTRACT_PHASES)
+        elif not cleanup_closed or cleanup_alive != 0:
+            status = "failed"
+            error_code = "xiaohongshu_probe_cleanup_incomplete"
 
     return {
         "schemaVersion": (
@@ -827,7 +829,10 @@ def _classify_shape(shape: dict[str, object]) -> str:
         if type(path) is str
         for token in path.split(".")
     }
-    has_identifier = bool(tokens & _CONTENT_IDENTIFIERS) or ":identifier" in tokens
+    has_identifier = (
+        bool(tokens & _CONTENT_IDENTIFIERS)
+        or ":content_identifier" in tokens
+    )
     if has_identifier and tokens & _CONTENT_LIST_KEYS:
         return "content_list"
     if has_identifier and tokens & _LIFETIME_METRIC_KEYS:

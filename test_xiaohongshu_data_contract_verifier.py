@@ -535,6 +535,65 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
                 self.assertEqual(result["phases"], phases)
                 self.assertEqual(result["missingPhases"], missing)
 
+    def test_contract_classifier_rejects_non_content_identifiers(self):
+        collision_shapes = [
+            verifier._response_shape(FakeResponse(
+                "https://creator.xiaohongshu.com/api/overview",
+                "application/json",
+                {"data": {"overview": {"request_id": "private-request"}}},
+            )),
+            verifier._response_shape(FakeResponse(
+                "https://creator.xiaohongshu.com/api/notes/list",
+                "application/json",
+                {"data": {"items": [{"trace_id": "private-trace"}]}},
+            )),
+            verifier._response_shape(FakeResponse(
+                "https://creator.xiaohongshu.com/api/note/123/metrics",
+                "application/json",
+                {"data": {"session_id": "private-session", "view_count": 3}},
+            )),
+        ]
+        self.assertNotIn(None, collision_shapes)
+        phases, missing, status, error_code = verifier._contract_outcome(
+            collision_shapes
+        )
+        self.assertEqual(phases, ["account_overview"])
+        self.assertEqual(missing, ["content_list", "content_lifetime"])
+        self.assertEqual(status, "partial_success")
+        self.assertEqual(error_code, "xiaohongshu_contracts_incomplete")
+        encoded_collisions = json.dumps(collision_shapes, ensure_ascii=False)
+        for forbidden in ("request_id", "trace_id", "session_id", "private-"):
+            self.assertNotIn(forbidden, encoded_collisions)
+
+        for identity_key in ("note_id", "item_id", "content_id"):
+            with self.subTest(identity_key=identity_key):
+                list_shape = verifier._response_shape(FakeResponse(
+                    "https://creator.xiaohongshu.com/api/notes/list",
+                    "application/json",
+                    {"data": {"items": [{identity_key: "private-content"}]}},
+                ))
+                lifetime_shape = verifier._response_shape(FakeResponse(
+                    "https://creator.xiaohongshu.com/api/note/123/metrics",
+                    "application/json",
+                    {"data": {identity_key: "private-content", "view_count": 3}},
+                ))
+                self.assertEqual(verifier._classify_shape(list_shape), "content_list")
+                self.assertEqual(
+                    verifier._classify_shape(lifetime_shape), "content_lifetime"
+                )
+                encoded = json.dumps(
+                    [list_shape, lifetime_shape], ensure_ascii=False
+                )
+                path_segments = {
+                    segment.removesuffix("[]")
+                    for shape in (list_shape, lifetime_shape)
+                    for path in shape["keyPaths"]
+                    for segment in path.split(".")
+                }
+                self.assertNotIn(identity_key, path_segments)
+                self.assertNotIn("private-content", encoded)
+                self.assertIn(":content_identifier", encoded)
+
     def test_probe_classifies_login_and_verification_without_claiming_contracts(self):
         cases = (
             (
@@ -1044,6 +1103,10 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
         observed = verifier.build_plan()
         observed.update({
             "mode": "execute",
+            "phases": [],
+            "missingPhases": [
+                "account_overview", "content_list", "content_lifetime",
+            ],
             "status": "failed",
             "errorCode": "xiaohongshu_probe_failed",
         })
@@ -1089,6 +1152,82 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
         )
         self.assertEqual(
             json.loads(self.report_path.read_text("utf-8")), report
+        )
+
+    def test_preprobe_failures_report_all_contracts_missing(self):
+        required = ["account_overview", "content_list", "content_lifetime"]
+
+        def assert_all_missing(report):
+            self.assertEqual(report["status"], "failed")
+            self.assertEqual(report["responses"], [])
+            self.assertEqual(report["phases"], [])
+            self.assertEqual(report["missingPhases"], required)
+
+        for error_code in (
+            "xiaohongshu_account_selection_required",
+            "xiaohongshu_probe_failed",
+        ):
+            with self.subTest(error_code=error_code), patch.object(
+                verifier,
+                "_execute",
+                side_effect=verifier.ProbeFailure(error_code),
+            ):
+                stdout = io.StringIO()
+                exit_code = verifier.main(["--execute"], stdout=stdout)
+                self.assertEqual(exit_code, 0)
+                report = json.loads(stdout.getvalue())
+                self.assertEqual(report["errorCode"], error_code)
+                assert_all_missing(report)
+
+        stdout = io.StringIO()
+        exit_code = verifier.main(["--execute", "--unknown"], stdout=stdout)
+        self.assertNotEqual(exit_code, 0)
+        arguments_report = json.loads(stdout.getvalue())
+        self.assertEqual(
+            arguments_report["errorCode"], "xiaohongshu_arguments_invalid"
+        )
+        assert_all_missing(arguments_report)
+
+        stdout = io.StringIO()
+        outside_path = self.report_path.parent.parent / "private-report.json"
+        with patch.object(verifier, "_execute") as execute:
+            exit_code = verifier.main(
+                ["--execute", "--report", str(outside_path)], stdout=stdout
+            )
+        self.assertNotEqual(exit_code, 0)
+        execute.assert_not_called()
+        path_report = json.loads(stdout.getvalue())
+        self.assertEqual(
+            path_report["errorCode"], "xiaohongshu_report_path_invalid"
+        )
+        assert_all_missing(path_report)
+
+        account_shape = verifier._response_shape(FakeResponse(
+            "https://creator.xiaohongshu.com/api/overview",
+            "application/json",
+            {"data": {"fans": 2}},
+        ))
+        partial_source = verifier.sanitize_probe_report({
+            "schemaVersion": "xiaohongshu-data-contract-probe/v1",
+            "platformType": 1,
+            "mode": "execute",
+            "status": "partial_success",
+            "errorCode": "xiaohongshu_contracts_incomplete",
+            "observedAt": "2026-08-20T12:00:00+00:00",
+            "responses": [account_shape],
+            "cleanup": {"closed": True, "aliveResourceCount": 0},
+        })
+        writer_failure = verifier._failed_execution_report(
+            "xiaohongshu_report_write_failed", partial_source
+        )
+        self.assertEqual(writer_failure["status"], "failed")
+        self.assertEqual(
+            writer_failure["errorCode"], "xiaohongshu_report_write_failed"
+        )
+        self.assertEqual(writer_failure["phases"], ["account_overview"])
+        self.assertEqual(
+            writer_failure["missingPhases"],
+            ["content_list", "content_lifetime"],
         )
 
     def test_main_prevalidates_report_destination_before_execute(self):
