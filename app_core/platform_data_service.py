@@ -58,6 +58,12 @@ _PUBLIC_ACCOUNT_METRICS = frozenset(
 _PUBLIC_CONTENT_METRICS = frozenset(
     {"views", "likes", "comments", "shares", "favorites", "downloads"}
 )
+_PUBLIC_URL_ROOT_DOMAINS = (
+    "creator.douyin.com",
+    "douyin.com",
+    "douyinpic.com",
+    "douyincdn.com",
+)
 _BEIJING = ZoneInfo("Asia/Shanghai")
 
 
@@ -99,11 +105,16 @@ def _public_url(value: object) -> str:
     if type(value) is not str:
         return ""
     parsed = urlsplit(value)
+    hostname = parsed.hostname or ""
     if (
-        parsed.scheme not in {"http", "https"}
-        or not parsed.netloc
+        parsed.scheme != "https"
+        or not hostname
         or parsed.username is not None
         or parsed.password is not None
+        or not any(
+            hostname == root or hostname.endswith(f".{root}")
+            for root in _PUBLIC_URL_ROOT_DOMAINS
+        )
     ):
         return ""
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
@@ -237,11 +248,22 @@ def _warning_code(value: object) -> str:
     return value
 
 
+def _validate_metric_identities(
+    account_id: int,
+    batch: CollectionBatch,
+) -> None:
+    account_entity_key = f"account:{account_id}"
+    content_ids = {content.content_id for content in batch.contents}
+    for point in batch.metrics:
+        if point.entity_type == "account" and point.entity_key != account_entity_key:
+            raise CollectionFailure("metric_payload_invalid")
+        if point.entity_type == "content" and point.entity_key not in content_ids:
+            raise CollectionFailure("metric_payload_invalid")
+
+
 def _record_collection_sync(
     account_id: int,
     batch: CollectionBatch,
-    *,
-    legacy_success: bool,
 ) -> dict:
     account = _account_id(account_id)
     if type(batch) is not CollectionBatch:
@@ -249,13 +271,14 @@ def _record_collection_sync(
     platform_type = _platform_type(batch.platform_type)
     source_mode = _source_mode(batch.source_mode)
     warning_code = _warning_code(batch.warning_code)
+    _validate_metric_identities(account, batch)
     complete = (
         batch.account_metrics_available
         and batch.content_data_available
         and not warning_code
     )
-    status = "success" if legacy_success or complete else "partial_success"
-    error_code = "" if legacy_success or complete else warning_code
+    status = "success" if complete else "partial_success"
+    error_code = "" if complete else warning_code
     finished_at = _now()
     try:
         with database.connect() as conn:
@@ -315,13 +338,13 @@ def _record_collection_sync(
 
 
 def record_collection_sync(account_id: int, batch: CollectionBatch) -> dict:
-    return _record_collection_sync(account_id, batch, legacy_success=False)
+    return _record_collection_sync(account_id, batch)
 
 
 def record_successful_sync(account_id: int, batch: CollectionBatch) -> dict:
-    """兼容旧同步编排；Task 5 切换后由 record_collection_sync 表达部分成功。"""
+    """兼容旧同步编排签名，并保留 V2 批次的真实完整度。"""
 
-    return _record_collection_sync(account_id, batch, legacy_success=True)
+    return _record_collection_sync(account_id, batch)
 
 
 def record_failed_sync(
@@ -367,39 +390,37 @@ def record_failed_sync(
 def _latest_run_details(conn, account_id: int) -> tuple[dict | None, str | None, str | None]:
     latest_run = conn.execute(
         """
-        SELECT status, sourceMode, errorCode, metricCount, finishedAt
-        FROM platform_data_sync_runs
-        WHERE accountId = ?
-        ORDER BY id DESC
+        SELECT runs.status, runs.sourceMode, runs.errorCode, runs.metricCount,
+               runs.startedAt, runs.finishedAt
+        FROM platform_data_sync_runs AS runs
+        WHERE runs.accountId = ?
+          AND runs.status IN ('success', 'partial_success')
+          AND EXISTS (
+              SELECT 1
+              FROM platform_metric_snapshots AS snapshots
+              WHERE snapshots.syncRunId = runs.id
+                AND snapshots.metricScope != ''
+                AND snapshots.periodStart != ''
+                AND snapshots.periodEnd != ''
+          )
+        ORDER BY runs.id DESC
         LIMIT 1
         """,
         (account_id,),
     ).fetchone()
-    latest_data = conn.execute(
-        """
-        SELECT startedAt, finishedAt
-        FROM platform_data_sync_runs
-        WHERE accountId = ? AND status IN ('success', 'partial_success')
-        ORDER BY id DESC
-        LIMIT 1
-        """,
-        (account_id,),
-    ).fetchone()
-    public_run = None
-    if latest_run is not None:
-        public_run = {
-            "status": str(latest_run["status"]),
-            "sourceMode": str(latest_run["sourceMode"]),
-            "errorCode": str(latest_run["errorCode"] or ""),
-            "metricCount": int(latest_run["metricCount"] or 0),
-            "finishedAt": str(latest_run["finishedAt"] or ""),
-        }
-    if latest_data is None:
-        return public_run, None, None
+    if latest_run is None:
+        return None, None, None
+    public_run = {
+        "status": str(latest_run["status"]),
+        "sourceMode": str(latest_run["sourceMode"]),
+        "errorCode": str(latest_run["errorCode"] or ""),
+        "metricCount": int(latest_run["metricCount"] or 0),
+        "finishedAt": str(latest_run["finishedAt"] or ""),
+    }
     return (
         public_run,
-        str(latest_data["startedAt"] or "") or None,
-        str(latest_data["finishedAt"] or "") or None,
+        str(latest_run["startedAt"] or "") or None,
+        str(latest_run["finishedAt"] or "") or None,
     )
 
 
@@ -522,11 +543,17 @@ def account_period_summary(account_id: int, days: int) -> dict:
         }
     for metric_key in _ACCOUNT_LIFETIME_METRICS:
         values = lifetime_values.get(metric_key, [])
+        if not values:
+            availability = "missing"
+        elif values[-1][0] == period_end:
+            availability = "complete"
+        else:
+            availability = "partial"
         metrics[metric_key] = {
             "value": values[-1][1] if values else None,
             "scope": "lifetime_total",
             "unit": values[-1][2] if values else "count",
-            "availability": "complete" if values else "missing",
+            "availability": availability,
             "observedDays": len({day for day, _value, _unit in values}),
         }
     return {
@@ -681,7 +708,8 @@ def account_data_summary(account_id: int) -> dict:
                 """
                 SELECT id, finishedAt
                 FROM platform_data_sync_runs
-                WHERE accountId = ? AND status = 'success'
+                WHERE accountId = ?
+                  AND status IN ('success', 'partial_success')
                 ORDER BY id DESC
                 LIMIT 1
                 """,

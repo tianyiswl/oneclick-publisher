@@ -399,7 +399,7 @@ class PlatformDataServiceTests(unittest.TestCase):
         )
         summary = platform_data_service.account_data_summary(self.account_id)
 
-        self.assertEqual(saved["status"], "success")
+        self.assertEqual(saved["status"], "partial_success")
         self.assertEqual(saved["metricCount"], 1)
         self.assertEqual(summary["metrics"], {"views": 125})
         self.assertEqual(
@@ -968,6 +968,304 @@ class PlatformDataServiceTests(unittest.TestCase):
             )
         self.assertEqual(raised.exception.error_code, "metric_payload_invalid")
         self.assertEqual(self._table_counts(), (1, 1, 0))
+
+    def test_legacy_success_entry_preserves_partial_batch_status(self) -> None:
+        """旧调用入口不得把真实采集器的作品不可用批次升级为成功。"""
+
+        saved = platform_data_service.record_successful_sync(
+            self.account_id,
+            CollectionBatch(
+                platform_type=3,
+                source_mode="direct_session",
+                metrics=(self._v2_point("views", 10, day="2026-08-20"),),
+                contents=(),
+                account_metrics_available=True,
+                content_data_available=False,
+                platform_observed_at="2026-08-20T23:30:00+08:00",
+                warning_code="content_list_unavailable",
+            ),
+        )
+
+        self.assertEqual(saved["status"], "partial_success")
+        self.assertEqual(saved["errorCode"], "content_list_unavailable")
+        with database.connect() as conn:
+            run = conn.execute(
+                "SELECT status, errorCode FROM platform_data_sync_runs"
+            ).fetchone()
+        self.assertEqual(
+            (run["status"], run["errorCode"]),
+            ("partial_success", "content_list_unavailable"),
+        )
+
+    def test_lifetime_availability_requires_period_end_observation(self) -> None:
+        """累计值只有窗口末日有观测才完整，较早点不能冒充完整。"""
+
+        def persist_total(day: str, value: int) -> None:
+            platform_data_service.record_collection_sync(
+                self.account_id,
+                CollectionBatch(
+                    platform_type=3,
+                    source_mode="direct_session",
+                    metrics=(
+                        self._v2_point(
+                            "followers_total",
+                            value,
+                            day=day,
+                            metric_scope="lifetime_total",
+                        ),
+                    ),
+                    contents=(),
+                    account_metrics_available=True,
+                    content_data_available=False,
+                    platform_observed_at=f"{day}T23:30:00+08:00",
+                    warning_code="content_list_unavailable",
+                ),
+            )
+
+        persist_total("2026-08-14", 900)
+        with patch.object(
+            platform_data_service,
+            "_beijing_today",
+            return_value=date(2026, 8, 20),
+        ):
+            week_before_end = platform_data_service.account_period_summary(
+                self.account_id, 7
+            )
+            day_without_total = platform_data_service.account_period_summary(
+                self.account_id, 1
+            )
+
+        self.assertEqual(
+            week_before_end["metrics"]["followers_total"]["availability"],
+            "partial",
+        )
+        self.assertEqual(
+            week_before_end["metrics"]["followers_total"]["value"], 900
+        )
+        self.assertEqual(
+            day_without_total["metrics"]["followers_total"]["availability"],
+            "missing",
+        )
+
+        persist_total("2026-08-20", 920)
+        with patch.object(
+            platform_data_service,
+            "_beijing_today",
+            return_value=date(2026, 8, 20),
+        ):
+            week_at_end = platform_data_service.account_period_summary(
+                self.account_id, 7
+            )
+        self.assertEqual(
+            week_at_end["metrics"]["followers_total"]["availability"],
+            "complete",
+        )
+        self.assertEqual(
+            week_at_end["metrics"]["followers_total"]["value"], 920
+        )
+
+    def test_collection_rejects_metric_identity_mismatch_without_writes(self) -> None:
+        """错账号和孤儿作品指标必须在落库前拒绝，不能留下运行头。"""
+
+        invalid_batches = (
+            CollectionBatch(
+                platform_type=3,
+                source_mode="direct_session",
+                metrics=(
+                    self._v2_point(
+                        "views",
+                        10,
+                        day="2026-08-20",
+                        entity_key="account:999",
+                    ),
+                ),
+                contents=(),
+                account_metrics_available=True,
+                content_data_available=False,
+                platform_observed_at="2026-08-20T23:30:00+08:00",
+                warning_code="content_list_unavailable",
+            ),
+            CollectionBatch(
+                platform_type=3,
+                source_mode="direct_session",
+                metrics=(
+                    self._v2_point(
+                        "views",
+                        40,
+                        day="2026-08-20",
+                        entity_type="content",
+                        entity_key="aweme-orphan",
+                        metric_scope="lifetime_total",
+                    ),
+                ),
+                contents=(self._content("aweme-1"),),
+                account_metrics_available=False,
+                content_data_available=True,
+                platform_observed_at="2026-08-20T23:30:00+08:00",
+                warning_code="account_trends_unavailable",
+            ),
+        )
+
+        for batch in invalid_batches:
+            with self.subTest(entity_key=batch.metrics[0].entity_key):
+                with self.assertRaises(CollectionFailure) as raised:
+                    platform_data_service.record_collection_sync(
+                        self.account_id, batch
+                    )
+                self.assertEqual(
+                    raised.exception.error_code, "metric_payload_invalid"
+                )
+                self.assertEqual(self._table_counts(), (0, 0, 0))
+
+    def test_public_cover_url_allows_only_official_https_hosts(self) -> None:
+        """作品封面只可公开受控抖音 HTTPS 主域，不能透出任意网址。"""
+
+        urls = {
+            "allowed-creator": (
+                "https://creator.douyin.com/cover/1.jpg?token=private#preview"
+            ),
+            "allowed-pic": "https://img.douyinpic.com/cover/2.jpg",
+            "allowed-cdn": "https://a.b.douyincdn.com/cover/3.jpg",
+            "http-official": "http://creator.douyin.com/cover/4.jpg",
+            "localhost": "https://localhost/cover/5.jpg",
+            "loopback": "https://127.0.0.1/cover/6.jpg",
+            "evil": "https://evil.example/cover/7.jpg",
+            "fake-suffix": "https://douyin.com.evil.example/cover/8.jpg",
+        }
+        contents = tuple(
+            ContentRecord(
+                content_id=content_id,
+                title=content_id,
+                cover_url=cover_url,
+                published_at="2026-08-20T10:00:00+08:00",
+                content_status="published",
+                content_type="video",
+            )
+            for content_id, cover_url in urls.items()
+        )
+        metrics = tuple(
+            self._v2_point(
+                "views",
+                index,
+                day="2026-08-20",
+                entity_type="content",
+                entity_key=content.content_id,
+                metric_scope="lifetime_total",
+            )
+            for index, content in enumerate(contents, start=1)
+        )
+        platform_data_service.record_collection_sync(
+            self.account_id,
+            CollectionBatch(
+                platform_type=3,
+                source_mode="direct_session",
+                metrics=metrics,
+                contents=contents,
+                account_metrics_available=False,
+                content_data_available=True,
+                platform_observed_at="2026-08-20T23:30:00+08:00",
+                warning_code="account_trends_unavailable",
+            ),
+        )
+
+        page = platform_data_service.account_contents(
+            self.account_id, limit=100
+        )
+        covers = {
+            item["contentId"]: item["coverUrl"] for item in page["items"]
+        }
+        self.assertEqual(
+            covers,
+            {
+                "allowed-creator": "https://creator.douyin.com/cover/1.jpg",
+                "allowed-pic": "https://img.douyinpic.com/cover/2.jpg",
+                "allowed-cdn": "https://a.b.douyincdn.com/cover/3.jpg",
+                "http-official": "",
+                "localhost": "",
+                "loopback": "",
+                "evil": "",
+                "fake-suffix": "",
+            },
+        )
+
+    def test_v2_freshness_ignores_legacy_blank_scope_runs(self) -> None:
+        """旧 blank-scope 成功 run 不得覆盖 V2 最新运行与新鲜度。"""
+
+        with patch.object(
+            platform_data_service,
+            "_now",
+            return_value="2026-08-19T23:31:00+08:00",
+        ):
+            platform_data_service.record_collection_sync(
+                self.account_id,
+                CollectionBatch(
+                    platform_type=3,
+                    source_mode="direct_session",
+                    metrics=(
+                        self._v2_point("views", 10, day="2026-08-19"),
+                    ),
+                    contents=(),
+                    account_metrics_available=True,
+                    content_data_available=False,
+                    platform_observed_at="2026-08-19T23:30:00+08:00",
+                    warning_code="content_list_unavailable",
+                ),
+            )
+
+        with database.connect() as conn:
+            legacy_run_id = int(
+                conn.execute(
+                    """
+                    INSERT INTO platform_data_sync_runs
+                        (accountId, platformType, sourceMode, status,
+                         errorCode, metricCount, startedAt, finishedAt)
+                    VALUES (?, 3, 'browser_signed', 'success', '', 1, ?, ?)
+                    """,
+                    (
+                        self.account_id,
+                        "2026-08-20T23:30:00+08:00",
+                        "2026-08-20T23:31:00+08:00",
+                    ),
+                ).lastrowid
+            )
+            conn.execute(
+                """
+                INSERT INTO platform_metric_snapshots
+                    (syncRunId, accountId, platformType, entityType, entityKey,
+                     metricKey, rawMetricKey, metricValue, metricUnit,
+                     metricScope, periodStart, periodEnd, observedAt, createdAt)
+                VALUES (?, ?, 3, 'account', ?, 'views', 'legacy_play', 999,
+                        'count', '', '', '', ?, ?)
+                """,
+                (
+                    legacy_run_id,
+                    self.account_id,
+                    f"account:{self.account_id}",
+                    "2026-08-20T23:30:00+08:00",
+                    "2026-08-20T23:31:00+08:00",
+                ),
+            )
+
+        with patch.object(
+            platform_data_service,
+            "_beijing_today",
+            return_value=date(2026, 8, 20),
+        ):
+            summary = platform_data_service.account_period_summary(
+                self.account_id, 7
+            )
+
+        self.assertEqual(summary["latestRun"]["status"], "partial_success")
+        self.assertEqual(summary["latestRun"]["sourceMode"], "direct_session")
+        self.assertEqual(
+            summary["latestRun"]["errorCode"], "content_list_unavailable"
+        )
+        self.assertEqual(
+            summary["platformObservedAt"], "2026-08-19T23:30:00+08:00"
+        )
+        self.assertEqual(
+            summary["localSyncedAt"], "2026-08-19T23:31:00+08:00"
+        )
 
 
 if __name__ == "__main__":
