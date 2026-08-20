@@ -1226,6 +1226,57 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
         self.assertIs(type(report["responses"]), list)
         self.assertIs(type(report["cleanup"]), dict)
 
+    def test_schema_review_retains_static_names_and_templates_ids(self):
+        source = {"responses": [{
+            "url": ("https://creator.xiaohongshu.com/api/galaxy/creator/"
+                    "datacenter/note/67b196bf000000001d0368f8?token=secret"),
+            "method": "GET", "status": 200,
+            "contentType": "application/json",
+            "keyPaths": ["data.note_list", "data.note_list[].note_id"],
+            "fieldTypes": {"data.note_list": "list",
+                           "data.note_list[].note_id": "str"},
+            "listLengths": {"data.note_list": 1},
+            "paginationKeys": ["data.total"],
+            "sample": {"title": "private title", "cookie": "secret"},
+        }]}
+        review = verifier._review_schema(source)
+        encoded = json.dumps(review, ensure_ascii=False)
+        self.assertEqual(review["responses"][0]["path"],
+                         "/api/galaxy/creator/datacenter/note/:id")
+        self.assertIn("data.note_list[].note_id", encoded)
+        for forbidden in ("67b196bf000000001d0368f8", "private title", "secret"):
+            self.assertNotIn(forbidden, encoded)
+
+    def test_schema_review_rejects_sensitive_keys_and_non_builtin_containers(self):
+        class UntrustedDict(dict):
+            pass
+        source = {"responses": [{
+            "path": "/api/data",
+            "keyPaths": ["data.cookie", "data.authorization", "data.safe_key"],
+            "fieldTypes": UntrustedDict({"data.safe_key": "int"}),
+        }]}
+        encoded = json.dumps(verifier._review_schema(source), ensure_ascii=False)
+        self.assertNotIn("cookie", encoded.lower())
+        self.assertNotIn("authorization", encoded.lower())
+        self.assertNotIn("safe_key", encoded)
+
+    def test_review_cli_is_execute_only_and_persisted_report_stays_sanitized(self):
+        payload = verifier.build_plan()
+        payload.update({"mode": "execute", "status": "failed",
+                        "errorCode": "xiaohongshu_contracts_unobserved",
+                        "responses": [{"path": "/api/galaxy/creator/datacenter/list",
+                                       "keyPaths": ["data.note_list"],
+                                       "fieldTypes": {"data.note_list": "list"}}]})
+        output = io.StringIO()
+        with patch.object(verifier, "_execute", return_value=payload), \
+             patch.object(verifier, "_write_report") as writer:
+            code = verifier.main(["--execute", "--review-schema"], stdout=output)
+        self.assertEqual(code, 1)
+        self.assertIn("schemaReview", json.loads(output.getvalue()))
+        writer.assert_not_called()
+        invalid = io.StringIO()
+        self.assertEqual(verifier.main(["--review-schema"], stdout=invalid), 2)
+
     def test_persisted_report_is_finally_sanitized(self):
         injected = {
             "status": "success",

@@ -30,6 +30,13 @@ _ALLOWED_RESPONSE_KEYS = frozenset({
 _TEXT_LIMIT = 120
 _RESPONSE_LIMIT = 100
 _KEY_PATH_LIMIT = 300
+_REVIEW_SAFE_NAME = re.compile(r"^[a-z][a-z0-9_]{0,47}$")
+_REVIEW_ID_SEGMENT = re.compile(
+    r"^(?:[0-9]+|[0-9a-f]{24}|[0-9a-f]{8}-[0-9a-f-]{27,})$", re.I)
+_REVIEW_SENSITIVE_NAMES = frozenset({
+    "authorization", "cookie", "cookies", "token", "ticket", "session",
+    "sessionid", "password", "passwd", "secret", "phone", "mobile", "email",
+})
 _MAX_RESPONSE_BODY_BYTES = 1_048_576
 _MAX_TOTAL_RESPONSE_BODY_BYTES = 4_194_304
 _ACCOUNT_SELECTION_REQUIRED = "xiaohongshu_account_selection_required"
@@ -237,6 +244,144 @@ def _safe_integer_mapping(
         if limit is not None and len(result) >= limit:
             break
     return result
+
+
+def _review_path(value: object) -> str:
+    if type(value) is not str:
+        return ""
+    if value.startswith("/") and "?" not in value and "#" not in value:
+        raw_path = value
+    else:
+        try:
+            parsed = urlsplit(value)
+        except ValueError:
+            return ""
+        if parsed.scheme != "https" or parsed.hostname != _CREATOR_HOST:
+            return ""
+        raw_path = parsed.path
+    output: list[str] = []
+    for segment in raw_path.split("/"):
+        if not segment:
+            continue
+        lowered = segment.lower()
+        if _REVIEW_ID_SEGMENT.fullmatch(lowered):
+            output.append(":id")
+        elif (
+            _REVIEW_SAFE_NAME.fullmatch(lowered)
+            and lowered not in _REVIEW_SENSITIVE_NAMES
+        ):
+            output.append(lowered)
+        else:
+            output.append(":segment")
+    return "/" + "/".join(output)
+
+
+def _review_key_path(value: object) -> str:
+    if type(value) is not str or len(value) > 192:
+        return ""
+    parts = value.replace("[]", ".[]").split(".")
+    rebuilt: list[str] = []
+    for part in parts:
+        if part == "[]":
+            if not rebuilt:
+                return ""
+            rebuilt[-1] += "[]"
+        elif (
+            _REVIEW_SAFE_NAME.fullmatch(part)
+            and part not in _REVIEW_SENSITIVE_NAMES
+        ):
+            rebuilt.append(part)
+        else:
+            return ""
+    return ".".join(rebuilt)
+
+
+def _review_key_paths(value: object) -> list[str]:
+    if type(value) is not list:
+        return []
+    reviewed: list[str] = []
+    for item in value[:_KEY_PATH_LIMIT]:
+        path = _review_key_path(item)
+        if path:
+            reviewed.append(path)
+    return reviewed
+
+
+def _review_field_types(value: object) -> dict[str, str]:
+    if type(value) is not dict:
+        return {}
+    reviewed: dict[str, str] = {}
+    for key, item in value.items():
+        path = _review_key_path(key)
+        if not path or type(item) is not str or item not in _ALLOWED_FIELD_TYPES:
+            continue
+        reviewed[path] = item
+        if len(reviewed) >= _KEY_PATH_LIMIT:
+            break
+    return reviewed
+
+
+def _review_list_lengths(value: object) -> dict[str, int]:
+    if type(value) is not dict:
+        return {}
+    reviewed: dict[str, int] = {}
+    for key, item in value.items():
+        path = _review_key_path(key)
+        if (
+            not path
+            or type(item) is not int
+            or item < 0
+            or item > _STRUCTURAL_NODE_LIMIT
+        ):
+            continue
+        reviewed[path] = item
+        if len(reviewed) >= _KEY_PATH_LIMIT:
+            break
+    return reviewed
+
+
+def _review_schema(report: object) -> dict[str, object]:
+    if type(report) is not dict or type(report.get("responses")) is not list:
+        return {"responses": []}
+    reviewed: list[dict[str, object]] = []
+    for source in report["responses"][:_RESPONSE_LIMIT]:
+        if type(source) is not dict:
+            continue
+        path = _review_path(source.get("url") or source.get("path"))
+        if not path:
+            continue
+        row: dict[str, object] = {"path": path}
+        method = source.get("method")
+        if type(method) is str and method in _ALLOWED_METHODS:
+            row["method"] = method
+        status = source.get("status")
+        if type(status) is int and 100 <= status <= 599:
+            row["status"] = status
+        content_type = source.get("contentType")
+        if type(content_type) is str and content_type in _ALLOWED_CONTENT_TYPES:
+            row["contentType"] = content_type
+        structural_values = (
+            (source.get("keyPaths"), list),
+            (source.get("fieldTypes"), dict),
+            (source.get("listLengths"), dict),
+            (source.get("paginationKeys"), list),
+        )
+        if all(value is None or type(value) is expected_type
+               for value, expected_type in structural_values):
+            key_paths = _review_key_paths(source.get("keyPaths"))
+            if key_paths:
+                row["keyPaths"] = key_paths
+            field_types = _review_field_types(source.get("fieldTypes"))
+            if field_types:
+                row["fieldTypes"] = field_types
+            list_lengths = _review_list_lengths(source.get("listLengths"))
+            if list_lengths:
+                row["listLengths"] = list_lengths
+            pagination_keys = _review_key_paths(source.get("paginationKeys"))
+            if pagination_keys:
+                row["paginationKeys"] = pagination_keys
+        reviewed.append(row)
+    return {"responses": reviewed}
 
 
 def _enum_text(value: object, allowed: frozenset[str], default: str = "") -> str:
@@ -1466,13 +1611,23 @@ def main(argv: list[str] | None = None, *, stdout=sys.stdout) -> int:
         stdout.write("\n")
         return 0
 
+    review_schema = False
     if arguments == ["--execute"]:
         report_path = None
+    elif arguments == ["--execute", "--review-schema"]:
+        report_path = None
+        review_schema = True
     elif (
         len(arguments) == 3
         and arguments[:2] == ["--execute", "--report"]
     ):
         report_path = arguments[2]
+    elif (
+        len(arguments) == 4
+        and arguments[:3] == ["--execute", "--review-schema", "--report"]
+    ):
+        report_path = arguments[3]
+        review_schema = True
     else:
         payload = _failed_execution_report(_ARGUMENTS_INVALID)
         json.dump(payload, stdout, ensure_ascii=False)
@@ -1509,7 +1664,7 @@ def main(argv: list[str] | None = None, *, stdout=sys.stdout) -> int:
         payload = _failed_execution_report(failure.error_code)
     if report_path is not None:
         try:
-            _write_report(report_path, payload)
+            _write_report(report_path, sanitize_probe_report(payload))
         except ProbeFailure as failure:
             payload = _failed_execution_report(
                 failure.error_code, payload
@@ -1517,7 +1672,11 @@ def main(argv: list[str] | None = None, *, stdout=sys.stdout) -> int:
             json.dump(payload, stdout, ensure_ascii=False)
             stdout.write("\n")
             return 1
-    json.dump(payload, stdout, ensure_ascii=False)
+    output_payload = payload
+    if review_schema:
+        output_payload = sanitize_probe_report(payload)
+        output_payload["schemaReview"] = _review_schema(output_payload)
+    json.dump(output_payload, stdout, ensure_ascii=False)
     stdout.write("\n")
     return _execution_exit_code(payload)
 
