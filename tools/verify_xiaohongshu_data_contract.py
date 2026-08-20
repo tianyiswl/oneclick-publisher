@@ -30,6 +30,14 @@ _ALLOWED_RESPONSE_KEYS = frozenset({
 _TEXT_LIMIT = 120
 _RESPONSE_LIMIT = 100
 _KEY_PATH_LIMIT = 300
+_REVIEW_SAFE_NAME = re.compile(r"^[a-z][a-z0-9_]{0,47}$")
+_REVIEW_ID_SEGMENT = re.compile(
+    r"^(?:[0-9]+|[0-9a-f]{24}|[0-9a-f]{8}-[0-9a-f-]{27,})$", re.I)
+_REVIEW_SENSITIVE_NAMES = frozenset({
+    "authorization", "cookie", "cookies", "token", "ticket", "session",
+    "sessionid", "password", "passwd", "secret", "phone", "mobile", "email",
+})
+_REVIEW_STATIC_HYPHENATED_NAMES = frozenset({"data-analysis", "note-detail"})
 _MAX_RESPONSE_BODY_BYTES = 1_048_576
 _MAX_TOTAL_RESPONSE_BODY_BYTES = 4_194_304
 _ACCOUNT_SELECTION_REQUIRED = "xiaohongshu_account_selection_required"
@@ -74,6 +82,11 @@ _DATA_ANALYSIS_URL = (
 )
 _NOTE_DETAIL_URL = "https://creator.xiaohongshu.com/statistics/note-detail"
 _NOTE_ID = re.compile(r"^[0-9a-f]{24}$", re.IGNORECASE)
+_REVIEW_NAVIGATION_PATHS = MappingProxyType({
+    "account_home": "/creator/home",
+    "data_analysis": "/statistics/data-analysis",
+    "content_lifetime": "/statistics/note-detail",
+})
 _NETWORK_QUIET_TIMEOUT_MS = 30_000
 _PASSIVE_CAPTURE_WAIT_MS = 2_000
 _TOTAL_TIMEOUT_SECONDS = 60.0
@@ -237,6 +250,168 @@ def _safe_integer_mapping(
         if limit is not None and len(result) >= limit:
             break
     return result
+
+
+def _review_path(value: object) -> str:
+    if type(value) is not str:
+        return ""
+    if value.startswith("/") and "?" not in value and "#" not in value:
+        raw_path = value
+    else:
+        try:
+            parsed = urlsplit(value)
+        except ValueError:
+            return ""
+        if parsed.scheme != "https" or parsed.hostname != _CREATOR_HOST:
+            return ""
+        raw_path = parsed.path
+    output: list[str] = []
+    for segment in raw_path.split("/"):
+        if not segment:
+            continue
+        lowered = segment.lower()
+        if _REVIEW_ID_SEGMENT.fullmatch(lowered):
+            output.append(":id")
+        elif (
+            (_REVIEW_SAFE_NAME.fullmatch(lowered)
+             or lowered in _REVIEW_STATIC_HYPHENATED_NAMES)
+            and lowered not in _REVIEW_SENSITIVE_NAMES
+        ):
+            output.append(lowered)
+        else:
+            output.append(":segment")
+    return "/" + "/".join(output)
+
+
+def _review_key_path(value: object) -> str:
+    if type(value) is not str or len(value) > 192:
+        return ""
+    parts = value.replace("[]", ".[]").split(".")
+    rebuilt: list[str] = []
+    for part in parts:
+        if part == "[]":
+            if not rebuilt:
+                return ""
+            rebuilt[-1] += "[]"
+        elif (
+            _REVIEW_SAFE_NAME.fullmatch(part)
+            and part not in _REVIEW_SENSITIVE_NAMES
+        ):
+            rebuilt.append(part)
+        else:
+            return ""
+    return ".".join(rebuilt)
+
+
+def _review_key_paths(value: object) -> list[str]:
+    if type(value) is not list:
+        return []
+    reviewed: list[str] = []
+    for item in value[:_KEY_PATH_LIMIT]:
+        path = _review_key_path(item)
+        if path:
+            reviewed.append(path)
+    return reviewed
+
+
+def _review_field_types(value: object) -> dict[str, str]:
+    if type(value) is not dict:
+        return {}
+    reviewed: dict[str, str] = {}
+    for key, item in value.items():
+        path = _review_key_path(key)
+        if not path or type(item) is not str or item not in _ALLOWED_FIELD_TYPES:
+            continue
+        reviewed[path] = item
+        if len(reviewed) >= _KEY_PATH_LIMIT:
+            break
+    return reviewed
+
+
+def _review_list_lengths(value: object) -> dict[str, int]:
+    if type(value) is not dict:
+        return {}
+    reviewed: dict[str, int] = {}
+    for key, item in value.items():
+        path = _review_key_path(key)
+        if (
+            not path
+            or type(item) is not int
+            or item < 0
+            or item > _STRUCTURAL_NODE_LIMIT
+        ):
+            continue
+        reviewed[path] = item
+        if len(reviewed) >= _KEY_PATH_LIMIT:
+            break
+    return reviewed
+
+
+def _review_navigation(value: object) -> list[dict[str, str]]:
+    if type(value) is not list:
+        return []
+    reviewed: list[dict[str, str]] = []
+    for source in value[:len(_REVIEW_NAVIGATION_PATHS)]:
+        if type(source) is not dict:
+            continue
+        phase = source.get("phase")
+        path = _review_path(source.get("path"))
+        if (
+            type(phase) is str
+            and _REVIEW_NAVIGATION_PATHS.get(phase) == path
+        ):
+            reviewed.append({"phase": phase, "path": path})
+    return reviewed
+
+
+def _review_schema(report: object) -> dict[str, object]:
+    if type(report) is not dict:
+        return {"responses": [], "navigation": []}
+    reviewed: list[dict[str, object]] = []
+    responses = report.get("responses")
+    for source in responses[:_RESPONSE_LIMIT] if type(responses) is list else ():
+        if type(source) is not dict:
+            continue
+        url = source.get("url")
+        path_value = url if type(url) is str else source.get("path")
+        path = _review_path(path_value)
+        if not path:
+            continue
+        row: dict[str, object] = {"path": path}
+        method = source.get("method")
+        if type(method) is str and method in _ALLOWED_METHODS:
+            row["method"] = method
+        status = source.get("status")
+        if type(status) is int and 100 <= status <= 599:
+            row["status"] = status
+        content_type = source.get("contentType")
+        if type(content_type) is str and content_type in _ALLOWED_CONTENT_TYPES:
+            row["contentType"] = content_type
+        structural_values = (
+            (source.get("keyPaths"), list),
+            (source.get("fieldTypes"), dict),
+            (source.get("listLengths"), dict),
+            (source.get("paginationKeys"), list),
+        )
+        if all(value is None or type(value) is expected_type
+               for value, expected_type in structural_values):
+            key_paths = _review_key_paths(source.get("keyPaths"))
+            if key_paths:
+                row["keyPaths"] = key_paths
+            field_types = _review_field_types(source.get("fieldTypes"))
+            if field_types:
+                row["fieldTypes"] = field_types
+            list_lengths = _review_list_lengths(source.get("listLengths"))
+            if list_lengths:
+                row["listLengths"] = list_lengths
+            pagination_keys = _review_key_paths(source.get("paginationKeys"))
+            if pagination_keys:
+                row["paginationKeys"] = pagination_keys
+        reviewed.append(row)
+    return {
+        "responses": reviewed,
+        "navigation": _review_navigation(report.get("navigation")),
+    }
 
 
 def _enum_text(value: object, allowed: frozenset[str], default: str = "") -> str:
@@ -1219,6 +1394,7 @@ async def _run_probe(
     response_budget_exhausted = False
     retained_response_ids: set[int] = set()
     shapes: list[dict[str, object]] = []
+    navigation: list[dict[str, str]] = []
     caught: BaseException | None = None
     cleanup_errors: list[BaseException] = []
 
@@ -1272,7 +1448,7 @@ async def _run_probe(
             context.new_page(), deadline=work_deadline, monotonic=monotonic
         )
         page.on("response", retain_response)
-        async def navigate(url: str) -> None:
+        async def navigate(phase: str, url: str) -> None:
             navigation_response = await _await_with_deadline(
                 page.goto(
                     url,
@@ -1285,6 +1461,7 @@ async def _run_probe(
             navigation_error = _navigation_error_code(navigation_response)
             if navigation_error is not None:
                 raise ProbeFailure(navigation_error)
+            navigation.append({"phase": phase, "path": _review_path(url)})
             passive_wait = getattr(page, "wait_for_timeout", None)
             if callable(passive_wait):
                 await _await_with_deadline(
@@ -1293,9 +1470,9 @@ async def _run_probe(
                     monotonic=monotonic,
                 )
 
-        await navigate(_CREATOR_HOME)
+        await navigate("account_home", _CREATOR_HOME)
         data_response_start = len(observed_responses)
-        await navigate(_DATA_ANALYSIS_URL)
+        await navigate("data_analysis", _DATA_ANALYSIS_URL)
         note_id = None
         for response, _metadata in tuple(
             observed_responses[data_response_start:]
@@ -1306,7 +1483,9 @@ async def _run_probe(
             if note_id is not None:
                 break
         if note_id is not None:
-            await navigate(f"{_NOTE_DETAIL_URL}?noteId={note_id}")
+            await navigate(
+                "content_lifetime", f"{_NOTE_DETAIL_URL}?noteId={note_id}"
+            )
         for response, metadata in tuple(observed_responses):
             shape = await _async_response_shape(
                 response,
@@ -1362,6 +1541,7 @@ async def _run_probe(
         "errorCode": contract_error,
         "observedAt": _observed_at(utc_now),
         "responses": shapes,
+        "navigation": navigation,
         "cleanup": {
             "closed": alive_count == 0,
             "aliveResourceCount": int(alive_count),
@@ -1379,7 +1559,9 @@ async def _run_probe(
     elif caught is not None:
         report["status"] = "failed"
         report["errorCode"] = "xiaohongshu_probe_failed"
-    return sanitize_probe_report(report), caught
+    sanitized_report = sanitize_probe_report(report)
+    sanitized_report["navigation"] = navigation
+    return sanitized_report, caught
 
 
 def _probe_with_browser(
@@ -1421,7 +1603,9 @@ def _probe_with_browser(
             "errorCode": "xiaohongshu_probe_timeout",
             "observedAt": _observed_at(utc_now),
         })
-        return sanitize_probe_report(report)
+        sanitized_report = sanitize_probe_report(report)
+        sanitized_report["navigation"] = []
+        return sanitized_report
 
 
 def _execute(*, browser_factory, utc_now) -> dict[str, object]:
@@ -1466,13 +1650,23 @@ def main(argv: list[str] | None = None, *, stdout=sys.stdout) -> int:
         stdout.write("\n")
         return 0
 
+    review_schema = False
     if arguments == ["--execute"]:
         report_path = None
+    elif arguments == ["--execute", "--review-schema"]:
+        report_path = None
+        review_schema = True
     elif (
         len(arguments) == 3
         and arguments[:2] == ["--execute", "--report"]
     ):
         report_path = arguments[2]
+    elif (
+        len(arguments) == 4
+        and arguments[:3] == ["--execute", "--review-schema", "--report"]
+    ):
+        report_path = arguments[3]
+        review_schema = True
     else:
         payload = _failed_execution_report(_ARGUMENTS_INVALID)
         json.dump(payload, stdout, ensure_ascii=False)
@@ -1509,7 +1703,7 @@ def main(argv: list[str] | None = None, *, stdout=sys.stdout) -> int:
         payload = _failed_execution_report(failure.error_code)
     if report_path is not None:
         try:
-            _write_report(report_path, payload)
+            _write_report(report_path, sanitize_probe_report(payload))
         except ProbeFailure as failure:
             payload = _failed_execution_report(
                 failure.error_code, payload
@@ -1517,7 +1711,10 @@ def main(argv: list[str] | None = None, *, stdout=sys.stdout) -> int:
             json.dump(payload, stdout, ensure_ascii=False)
             stdout.write("\n")
             return 1
-    json.dump(payload, stdout, ensure_ascii=False)
+    output_payload = sanitize_probe_report(payload)
+    if review_schema:
+        output_payload["schemaReview"] = _review_schema(payload)
+    json.dump(output_payload, stdout, ensure_ascii=False)
     stdout.write("\n")
     return _execution_exit_code(payload)
 

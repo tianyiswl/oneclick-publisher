@@ -1049,6 +1049,42 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
                     ["page", "context", "browser", "playwright"],
                 )
 
+    def test_review_probe_reports_navigation_and_closes_every_resource(self):
+        response = FakeResponse(
+            "https://creator.xiaohongshu.com/api/galaxy/creator/datacenter/overview",
+            "application/json", {"data": {"views": 12}},
+        )
+        fake = FakePlaywright(responses=(response,))
+        result = verifier._probe_with_browser(
+            eligible_account(), playwright_factory=lambda: fake,
+            monotonic=FakeClock(), utc_now=fixed_now,
+        )
+        review = verifier._review_schema(result)
+        self.assertEqual(review["navigation"], [
+            {"phase": "account_home", "path": "/creator/home"},
+            {"phase": "data_analysis", "path": "/statistics/data-analysis"},
+        ])
+        self.assertTrue(result["cleanup"]["closed"])
+        self.assertIs(type(result["cleanup"]["aliveResourceCount"]), int)
+        self.assertEqual(result["cleanup"]["aliveResourceCount"], 0)
+        self.assertEqual(fake.page.fetch_calls, 0)
+        self.assertEqual(fake.page.click_calls, 0)
+        self.assertNotIn("navigation", verifier.sanitize_probe_report(result))
+
+    def test_review_mode_keeps_response_identity_and_byte_budgets(self):
+        response = CountingResponse(
+            "https://creator.xiaohongshu.com/api/galaxy/creator/datacenter/overview",
+            "application/json", {"data": {"views": 1}},
+        )
+        fake = FakePlaywright(responses=(response, response))
+        result = verifier._probe_with_browser(
+            eligible_account(), playwright_factory=lambda: fake,
+            monotonic=FakeClock(), utc_now=fixed_now,
+        )
+        review = verifier._review_schema(result)
+        self.assertEqual(len(review["responses"]), 1)
+        self.assertEqual(response.instance_json_calls, 1)
+
     def test_probe_adapts_async_playwright_and_reads_shapes_before_cleanup(self):
         fake = AsyncFakePlaywright()
         with patch.object(
@@ -1225,6 +1261,100 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
         self.assertIs(type(report), dict)
         self.assertIs(type(report["responses"]), list)
         self.assertIs(type(report["cleanup"]), dict)
+
+    def test_schema_review_retains_static_names_and_templates_ids(self):
+        source = {"responses": [{
+            "url": ("https://creator.xiaohongshu.com/api/galaxy/creator/"
+                    "datacenter/note/67b196bf000000001d0368f8?token=secret"),
+            "method": "GET", "status": 200,
+            "contentType": "application/json",
+            "keyPaths": ["data.note_list", "data.note_list[].note_id"],
+            "fieldTypes": {"data.note_list": "list",
+                           "data.note_list[].note_id": "str"},
+            "listLengths": {"data.note_list": 1},
+            "paginationKeys": ["data.total"],
+            "sample": {"title": "private title", "cookie": "secret"},
+        }]}
+        review = verifier._review_schema(source)
+        encoded = json.dumps(review, ensure_ascii=False)
+        self.assertEqual(review["responses"][0]["path"],
+                         "/api/galaxy/creator/datacenter/note/:id")
+        self.assertIn("data.note_list[].note_id", encoded)
+        for forbidden in ("67b196bf000000001d0368f8", "private title", "secret"):
+            self.assertNotIn(forbidden, encoded)
+
+    def test_schema_review_rejects_sensitive_keys_and_non_builtin_containers(self):
+        class UntrustedDict(dict):
+            pass
+        source = {"responses": [{
+            "path": "/api/data",
+            "keyPaths": ["data.cookie", "data.authorization", "data.safe_key"],
+            "fieldTypes": UntrustedDict({"data.safe_key": "int"}),
+        }]}
+        encoded = json.dumps(verifier._review_schema(source), ensure_ascii=False)
+        self.assertNotIn("cookie", encoded.lower())
+        self.assertNotIn("authorization", encoded.lower())
+        self.assertNotIn("safe_key", encoded)
+
+    def test_schema_review_does_not_evaluate_untrusted_url_truthiness(self):
+        class UntrustedValue:
+            def __bool__(self):
+                raise AssertionError("untrusted truthiness evaluated")
+
+        review = verifier._review_schema({"responses": [{
+            "url": UntrustedValue(),
+            "path": "/api/data",
+        }]})
+
+        self.assertEqual(review["responses"], [{"path": "/api/data"}])
+
+    def test_review_cli_is_execute_only_and_persisted_report_stays_sanitized(self):
+        payload = verifier.build_plan()
+        payload.update({"mode": "execute", "status": "failed",
+                        "errorCode": "xiaohongshu_contracts_unobserved",
+                        "navigation": [{"phase": "account_home",
+                                        "path": "/creator/home"}],
+                        "responses": [{"path": "/api/galaxy/creator/datacenter/list",
+                                       "keyPaths": ["data.note_list"],
+                                       "fieldTypes": {"data.note_list": "list"}}]})
+        output = io.StringIO()
+        with patch.object(verifier, "_execute", return_value=payload), \
+             patch.object(verifier, "_write_report") as writer:
+            code = verifier.main(["--execute", "--review-schema"], stdout=output)
+        self.assertEqual(code, 1)
+        reviewed_payload = json.loads(output.getvalue())
+        self.assertEqual(reviewed_payload["schemaReview"]["navigation"], [
+            {"phase": "account_home", "path": "/creator/home"},
+        ])
+        self.assertNotIn("navigation", reviewed_payload)
+        writer.assert_not_called()
+        invalid = io.StringIO()
+        self.assertEqual(verifier.main(["--review-schema"], stdout=invalid), 2)
+
+    def test_review_cli_report_keeps_review_only_in_stdout(self):
+        payload = verifier.build_plan()
+        payload.update({
+            "mode": "execute",
+            "status": "failed",
+            "errorCode": "xiaohongshu_contracts_unobserved",
+            "navigation": [{"phase": "account_home", "path": "/creator/home"}],
+            "responses": [{"path": "/api/data"}],
+        })
+        output = io.StringIO()
+        with patch.object(verifier, "_execute", return_value=payload):
+            code = verifier.main([
+                "--execute", "--review-schema", "--report", str(self.report_path),
+            ], stdout=output)
+
+        self.assertEqual(code, 1)
+        stdout_payload = json.loads(output.getvalue())
+        persisted = json.loads(self.report_path.read_text("utf-8"))
+        self.assertIn("schemaReview", stdout_payload)
+        self.assertEqual(stdout_payload["schemaReview"]["navigation"], [
+            {"phase": "account_home", "path": "/creator/home"},
+        ])
+        self.assertNotIn("schemaReview", persisted)
+        self.assertNotIn("navigation", persisted)
 
     def test_persisted_report_is_finally_sanitized(self):
         injected = {
@@ -1563,10 +1693,19 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
             ],
             "status": "failed",
             "errorCode": "xiaohongshu_probe_failed",
+            "navigation": [{"phase": "account_home",
+                            "path": "/creator/home"}],
         })
         stdout = io.StringIO()
+        writer_inputs = []
+        original_writer = verifier._write_report
 
-        with patch.object(verifier, "_execute", return_value=observed) as execute:
+        def record_writer_input(destination, payload):
+            writer_inputs.append(payload)
+            return original_writer(destination, payload)
+
+        with patch.object(verifier, "_execute", return_value=observed) as execute, \
+             patch.object(verifier, "_write_report", side_effect=record_writer_input):
             exit_code = verifier.main(
                 ["--execute", "--report", str(self.report_path)],
                 stdout=stdout,
@@ -1575,8 +1714,11 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         execute.assert_called_once()
         self.assertTrue(self.report_path.is_file())
-        self.assertEqual(json.loads(stdout.getvalue()), observed)
-        self.assertEqual(json.loads(self.report_path.read_text("utf-8")), observed)
+        expected = verifier.sanitize_probe_report(observed)
+        self.assertEqual(json.loads(stdout.getvalue()), expected)
+        self.assertEqual(json.loads(self.report_path.read_text("utf-8")), expected)
+        self.assertEqual(len(writer_inputs), 1)
+        self.assertNotIn("navigation", writer_inputs[0])
 
     def test_main_exit_code_matches_terminal_status_matrix(self):
         reviewed_paths = {
@@ -1976,4 +2118,25 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 1)
         execute.assert_called_once()
-        self.assertEqual(json.loads(stdout.getvalue()), observed)
+        self.assertEqual(
+            json.loads(stdout.getvalue()), verifier.sanitize_probe_report(observed)
+        )
+
+    def test_execute_stdout_omits_navigation_without_schema_review(self):
+        observed = verifier.build_plan()
+        observed.update({
+            "mode": "execute",
+            "status": "failed",
+            "errorCode": "xiaohongshu_contracts_unobserved",
+            "navigation": [{"phase": "account_home",
+                            "path": "/creator/home"}],
+        })
+        stdout = io.StringIO()
+
+        with patch.object(verifier, "_execute", return_value=observed):
+            exit_code = verifier.main(["--execute"], stdout=stdout)
+
+        self.assertEqual(exit_code, 1)
+        payload = json.loads(stdout.getvalue())
+        self.assertNotIn("navigation", payload)
+        self.assertNotIn("schemaReview", payload)
