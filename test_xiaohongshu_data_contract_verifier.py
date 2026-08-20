@@ -209,7 +209,223 @@ class AsyncHangingCleanupPlaywright(AsyncHangingPlaywright):
         self.page = AsyncHangingCleanupPage(self)
 
 
+class AsyncStartManager:
+    def __init__(self, *, failure=None, hangs=False):
+        self.failure = failure
+        self.hangs = hangs
+        self.transport_alive = False
+        self.close_order = []
+
+    async def start(self):
+        self.transport_alive = True
+        if self.hangs:
+            await asyncio.sleep(1)
+        if self.failure is not None:
+            raise self.failure
+        raise AssertionError("test manager must not complete start")
+
+    async def __aexit__(self, _exc_type, _exc, _traceback):
+        self.close_order.append("playwright_manager")
+        self.transport_alive = False
+
+
+class CloseGetterFailurePage(FakePage):
+    @property
+    def close(self):
+        self.owner.close_order.append("page_getter")
+        raise self.owner.close_getter_failure
+
+
+class CloseGetterFailurePlaywright(FakePlaywright):
+    def __init__(self, failure):
+        super().__init__()
+        self.close_getter_failure = failure
+        self.page = CloseGetterFailurePage(self)
+
+
+class CountingResponse(FakeResponse):
+    json_calls = 0
+
+    def json(self):
+        type(self).json_calls += 1
+        return self._payload
+
+
+class ExhaustingClock:
+    def __init__(self):
+        self.value = 0.0
+
+    def __call__(self):
+        current = self.value
+        self.value += 1.0
+        return current
+
+
 class XiaohongshuDataContractVerifierTests(unittest.TestCase):
+    def test_probe_closes_playwright_manager_when_start_fails_midway(self):
+        manager = AsyncStartManager(failure=RuntimeError("secret start failure"))
+        result = verifier._probe_with_browser(
+            eligible_account(), playwright_factory=lambda: manager,
+            monotonic=FakeClock(), utc_now=fixed_now,
+        )
+        self.assertEqual(result["errorCode"], "xiaohongshu_probe_failed")
+        self.assertFalse(manager.transport_alive)
+        self.assertEqual(manager.close_order, ["playwright_manager"])
+        self.assertNotIn("secret", json.dumps(result))
+
+    def test_probe_closes_playwright_manager_when_start_times_out_midway(self):
+        manager = AsyncStartManager(hangs=True)
+        with patch.object(verifier, "_TOTAL_TIMEOUT_SECONDS", 0.02):
+            result = verifier._probe_with_browser(
+                eligible_account(), playwright_factory=lambda: manager,
+                monotonic=time.monotonic, utc_now=fixed_now,
+            )
+        self.assertEqual(result["errorCode"], "xiaohongshu_probe_timeout")
+        self.assertFalse(manager.transport_alive)
+        self.assertEqual(manager.close_order, ["playwright_manager"])
+
+    def test_probe_continues_cleanup_when_close_getter_raises_exception(self):
+        fake = CloseGetterFailurePlaywright(RuntimeError("secret getter failure"))
+        result = verifier._probe_with_browser(
+            eligible_account(), playwright_factory=lambda: fake,
+            monotonic=FakeClock(), utc_now=fixed_now,
+        )
+        self.assertEqual(
+            result["errorCode"], "xiaohongshu_probe_cleanup_incomplete"
+        )
+        self.assertEqual(result["cleanup"]["aliveResourceCount"], 1)
+        self.assertEqual(
+            fake.close_order,
+            ["page_getter", "context", "browser", "playwright"],
+        )
+        self.assertNotIn("secret", json.dumps(result))
+
+    def test_probe_propagates_close_getter_process_control_after_all_cleanup(self):
+        for failure in (KeyboardInterrupt(), SystemExit()):
+            fake = CloseGetterFailurePlaywright(failure)
+            with self.subTest(failure=type(failure).__name__):
+                with self.assertRaises(type(failure)) as raised:
+                    verifier._probe_with_browser(
+                        eligible_account(), playwright_factory=lambda: fake,
+                        monotonic=FakeClock(), utc_now=fixed_now,
+                    )
+                self.assertIs(raised.exception, failure)
+                self.assertEqual(
+                    fake.close_order,
+                    ["page_getter", "context", "browser", "playwright"],
+                )
+
+    def test_probe_iteratively_bounds_deep_builtin_payload(self):
+        payload = {"leaf": "private-deep-value"}
+        for _ in range(2_000):
+            payload = {"next": payload}
+        fake = FakePlaywright(responses=[FakeResponse(
+            "https://creator.xiaohongshu.com/api/deep",
+            "application/json",
+            payload,
+        )])
+        result = verifier._probe_with_browser(
+            eligible_account(), playwright_factory=lambda: fake,
+            monotonic=FakeClock(), utc_now=fixed_now,
+        )
+        self.assertEqual(len(result["responses"]), 1)
+        self.assertLessEqual(len(result["responses"][0]["keyPaths"]), 300)
+        self.assertNotIn("private-deep-value", json.dumps(result))
+
+    def test_probe_bounds_wide_dict_and_samples_builtin_list(self):
+        payload = {
+            "wide": {f"key_{index}": f"private-{index}" for index in range(1_000)},
+            "items": [{f"item_{index}": index} for index in range(1_000)],
+        }
+        fake = FakePlaywright(responses=[FakeResponse(
+            "https://creator.xiaohongshu.com/api/wide",
+            "application/json",
+            payload,
+        )])
+        result = verifier._probe_with_browser(
+            eligible_account(), playwright_factory=lambda: fake,
+            monotonic=FakeClock(), utc_now=fixed_now,
+        )
+        response = result["responses"][0]
+        self.assertLessEqual(len(response["fieldTypes"]), 300)
+        self.assertIn("items[].item_0", response["fieldTypes"])
+        self.assertNotIn("items[].item_999", response["fieldTypes"])
+        self.assertNotIn("private-", json.dumps(result))
+
+    def test_probe_detects_cycle_in_builtin_payload(self):
+        payload = {"value": "private-cycle-value"}
+        payload["self"] = payload
+        fake = FakePlaywright(responses=[FakeResponse(
+            "https://creator.xiaohongshu.com/api/cycle",
+            "application/json",
+            payload,
+        )])
+        result = verifier._probe_with_browser(
+            eligible_account(), playwright_factory=lambda: fake,
+            monotonic=FakeClock(), utc_now=fixed_now,
+        )
+        self.assertEqual(len(result["responses"]), 1)
+        self.assertIn("self", result["responses"][0]["keyPaths"])
+        self.assertNotIn("self.self", result["responses"][0]["keyPaths"])
+        self.assertNotIn("private-cycle-value", json.dumps(result))
+
+    def test_probe_structural_walk_honors_total_deadline(self):
+        payload = {f"key_{index}": index for index in range(1_000)}
+        fake = FakePlaywright(responses=[FakeResponse(
+            "https://creator.xiaohongshu.com/api/deadline",
+            "application/json",
+            payload,
+        )])
+        with patch.object(verifier, "_TOTAL_TIMEOUT_SECONDS", 20.0):
+            result = verifier._probe_with_browser(
+                eligible_account(), playwright_factory=lambda: fake,
+                monotonic=ExhaustingClock(), utc_now=fixed_now,
+            )
+        self.assertEqual(result["errorCode"], "xiaohongshu_probe_timeout")
+        self.assertEqual(
+            fake.close_order,
+            ["page", "context", "browser", "playwright"],
+        )
+
+    def test_probe_listener_caps_retained_responses_before_body_reads(self):
+        CountingResponse.json_calls = 0
+        fake = FakePlaywright(responses=[
+            CountingResponse(
+                f"https://creator.xiaohongshu.com/api/item/{index}",
+                "application/json",
+                {"index": index},
+            )
+            for index in range(150)
+        ])
+        result = verifier._probe_with_browser(
+            eligible_account(), playwright_factory=lambda: fake,
+            monotonic=FakeClock(), utc_now=fixed_now,
+        )
+        self.assertEqual(len(result["responses"]), 100)
+        self.assertEqual(CountingResponse.json_calls, 100)
+
+    def test_probe_listener_limit_counts_only_eligible_responses(self):
+        responses = [
+            FakeResponse(
+                f"https://evil.example/static/{index}",
+                "application/json",
+                {"private": index},
+            )
+            for index in range(100)
+        ]
+        responses.append(FakeResponse(
+            "https://creator.xiaohongshu.com/api/eligible",
+            "application/json",
+            {"data": {"fans": 1}},
+        ))
+        fake = FakePlaywright(responses=responses)
+        result = verifier._probe_with_browser(
+            eligible_account(), playwright_factory=lambda: fake,
+            monotonic=FakeClock(), utc_now=fixed_now,
+        )
+        self.assertEqual(len(result["responses"]), 1)
+        self.assertEqual(result["responses"][0]["path"], "/api/eligible")
+
     def test_probe_only_accepts_creator_https_json_and_never_fetches(self):
         fake = FakePlaywright(responses=[
             FakeResponse("https://evil.example/data", "application/json", {"x": 1}),

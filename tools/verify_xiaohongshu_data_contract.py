@@ -26,6 +26,11 @@ _CREATOR_HOME = "https://creator.xiaohongshu.com/creator/home"
 _NETWORK_QUIET_TIMEOUT_MS = 30_000
 _TOTAL_TIMEOUT_SECONDS = 60.0
 _MAX_CLEANUP_BUDGET_SECONDS = 5.0
+_STRUCTURAL_DEPTH_LIMIT = 40
+_STRUCTURAL_NODE_LIMIT = 300
+_DICT_KEY_SAMPLE_LIMIT = 100
+_LIST_ITEM_SAMPLE_LIMIT = 25
+_SYNC_SHAPE_BUDGET_SECONDS = 1.0
 _PAGINATION_KEYS = frozenset({
     "cursor", "next_cursor", "nextcursor", "has_more", "hasmore",
     "page", "page_no", "page_num", "page_size", "pagesize", "total",
@@ -87,24 +92,34 @@ def _safe_text_list(value: object, limit: int | None = None) -> list[str]:
     return [_safe_text(item) for item in items]
 
 
-def _safe_text_mapping(value: object) -> dict[str, str]:
+def _safe_text_mapping(
+    value: object, limit: int | None = None
+) -> dict[str, str]:
     if type(value) is not dict:
         return {}
-    return {
-        _safe_text(key): _safe_text(item)
-        for key, item in value.items()
-        if type(key) is str
-    }
+    result: dict[str, str] = {}
+    for key, item in value.items():
+        if type(key) is not str:
+            continue
+        result[_safe_text(key)] = _safe_text(item)
+        if limit is not None and len(result) >= limit:
+            break
+    return result
 
 
-def _safe_integer_mapping(value: object) -> dict[str, int]:
+def _safe_integer_mapping(
+    value: object, limit: int | None = None
+) -> dict[str, int]:
     if type(value) is not dict:
         return {}
-    return {
-        _safe_text(key): _safe_integer(item)
-        for key, item in value.items()
-        if type(key) is str
-    }
+    result: dict[str, int] = {}
+    for key, item in value.items():
+        if type(key) is not str:
+            continue
+        result[_safe_text(key)] = _safe_integer(item)
+        if limit is not None and len(result) >= limit:
+            break
+    return result
 
 
 def _sanitize_response(value: object) -> dict[str, object]:
@@ -123,9 +138,13 @@ def _sanitize_response(value: object) -> dict[str, object]:
         "status": _safe_integer(source.get("status")),
         "contentType": _safe_text(source.get("contentType")),
         "keyPaths": _safe_text_list(source.get("keyPaths", source.get("keys")), _KEY_PATH_LIMIT),
-        "fieldTypes": _safe_text_mapping(source.get("fieldTypes")),
-        "listLengths": _safe_integer_mapping(source.get("listLengths")),
-        "paginationKeys": _safe_text_list(source.get("paginationKeys")),
+        "fieldTypes": _safe_text_mapping(source.get("fieldTypes"), _KEY_PATH_LIMIT),
+        "listLengths": _safe_integer_mapping(
+            source.get("listLengths"), _KEY_PATH_LIMIT
+        ),
+        "paginationKeys": _safe_text_list(
+            source.get("paginationKeys"), _KEY_PATH_LIMIT
+        ),
     }
 
 
@@ -230,7 +249,9 @@ def _response_metadata(response: object) -> tuple[str, str, int, str] | None:
     )
 
 
-def _structural_fields(payload: object) -> tuple[
+def _structural_fields(
+    payload: object, *, deadline: float, monotonic
+) -> tuple[
     list[str], dict[str, str], dict[str, int], list[str]
 ]:
     key_paths: list[str] = []
@@ -238,13 +259,30 @@ def _structural_fields(payload: object) -> tuple[
     list_lengths: dict[str, int] = {}
     pagination_keys: list[str] = []
 
-    def visit(value: object, path: str) -> None:
+    seen_containers: set[int] = set()
+    stack: list[tuple[object, str, int]] = [(payload, "", 0)]
+    visited_nodes = 0
+
+    while stack and visited_nodes < _STRUCTURAL_NODE_LIMIT:
+        if monotonic() >= deadline:
+            raise TimeoutError
+        value, path, depth = stack.pop()
+        visited_nodes += 1
         value_type = type(value)
         if path:
             key_paths.append(path)
             if value_type in (dict, list, str, int, float, bool, type(None)):
                 field_types[path] = value_type.__name__
 
+        if value_type in (dict, list):
+            identity = id(value)
+            if identity in seen_containers:
+                continue
+            seen_containers.add(identity)
+        if depth >= _STRUCTURAL_DEPTH_LIMIT:
+            continue
+
+        children: list[tuple[object, str, int]] = []
         if value_type is dict:
             for key, child in value.items():
                 if type(key) is not str:
@@ -252,14 +290,19 @@ def _structural_fields(payload: object) -> tuple[
                 child_path = f"{path}.{key}" if path else key
                 if key.lower() in _PAGINATION_KEYS:
                     pagination_keys.append(child_path)
-                visit(child, child_path)
+                children.append((child, child_path, depth + 1))
+                if len(children) >= _DICT_KEY_SAMPLE_LIMIT:
+                    break
         elif value_type is list:
             if path:
                 list_lengths[path] = len(value)
-            for child in value:
-                visit(child, f"{path}[]" if path else "[]")
+            child_path = f"{path}[]" if path else "[]"
+            children.extend(
+                (child, child_path, depth + 1)
+                for child in value[:_LIST_ITEM_SAMPLE_LIMIT]
+            )
+        stack.extend(reversed(children))
 
-    visit(payload, "")
     return (
         list(dict.fromkeys(key_paths)),
         field_types,
@@ -269,10 +312,16 @@ def _structural_fields(payload: object) -> tuple[
 
 
 def _shape_from_payload(
-    metadata: tuple[str, str, int, str], payload: object
+    metadata: tuple[str, str, int, str],
+    payload: object,
+    *,
+    deadline: float,
+    monotonic,
 ) -> dict[str, object]:
     path, method, status, content_type = metadata
-    key_paths, field_types, list_lengths, pagination_keys = _structural_fields(payload)
+    key_paths, field_types, list_lengths, pagination_keys = _structural_fields(
+        payload, deadline=deadline, monotonic=monotonic
+    )
     return {
         "method": method,
         "path": path,
@@ -302,7 +351,16 @@ def _response_shape(response) -> dict[str, object] | None:
         if callable(close):
             close()
         return None
-    return _shape_from_payload(metadata, payload)
+    started_at = time.monotonic()
+    try:
+        return _shape_from_payload(
+            metadata,
+            payload,
+            deadline=started_at + _SYNC_SHAPE_BUDGET_SECONDS,
+            monotonic=time.monotonic,
+        )
+    except TimeoutError:
+        return None
 
 
 async def _async_response_shape(
@@ -324,7 +382,9 @@ async def _async_response_shape(
         raise
     except Exception:
         return None
-    return _shape_from_payload(metadata, payload)
+    return _shape_from_payload(
+        metadata, payload, deadline=deadline, monotonic=monotonic
+    )
 
 
 def _classify_shape(shape: dict[str, object]) -> str:
@@ -361,14 +421,20 @@ async def _await_with_deadline(value: object, *, deadline: float, monotonic) -> 
 async def _close_resource(
     resource: object, *, deadline: float, monotonic
 ) -> BaseException | None:
-    close = getattr(resource, "close", None)
-    if not callable(close):
-        close = getattr(resource, "stop", None)
-    if not callable(close):
-        return RuntimeError("resource_close_unavailable")
     try:
+        close = getattr(resource, "close", None)
+        if not callable(close):
+            close = getattr(resource, "stop", None)
+        exit_context = False
+        if not callable(close):
+            close = getattr(resource, "__aexit__", None)
+            exit_context = callable(close)
+        if not callable(close):
+            return RuntimeError("resource_close_unavailable")
         await _await_with_deadline(
-            close(), deadline=deadline, monotonic=monotonic
+            close(None, None, None) if exit_context else close(),
+            deadline=deadline,
+            monotonic=monotonic,
         )
     except BaseException as exc:
         return exc
@@ -412,6 +478,7 @@ async def _run_probe(
     work_deadline: float,
     total_deadline: float,
 ) -> tuple[dict[str, object], BaseException | None]:
+    playwright_manager = None
     playwright = None
     browser = None
     context = None
@@ -421,15 +488,27 @@ async def _run_probe(
     caught: BaseException | None = None
     cleanup_errors: list[BaseException] = []
 
+    def retain_response(response: object) -> None:
+        if len(observed_responses) >= _RESPONSE_LIMIT:
+            return
+        try:
+            eligible = _response_metadata(response) is not None
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            return
+        if eligible:
+            observed_responses.append(response)
+
     try:
         state_path = _storage_state_path(account)
-        starter = await _await_with_deadline(
+        playwright_manager = await _await_with_deadline(
             playwright_factory(), deadline=work_deadline, monotonic=monotonic
         )
-        start = getattr(starter, "start", None)
+        start = getattr(playwright_manager, "start", None)
         playwright = await _await_with_deadline(
             start(), deadline=work_deadline, monotonic=monotonic
-        ) if callable(start) else starter
+        ) if callable(start) else playwright_manager
         browser = await _await_with_deadline(
             playwright.chromium.launch(headless=True),
             deadline=work_deadline,
@@ -443,7 +522,7 @@ async def _run_probe(
         page = await _await_with_deadline(
             context.new_page(), deadline=work_deadline, monotonic=monotonic
         )
-        page.on("response", observed_responses.append)
+        page.on("response", retain_response)
         await _await_with_deadline(
             page.goto(
                 _CREATOR_HOME,
@@ -462,7 +541,12 @@ async def _run_probe(
     except BaseException as exc:
         caught = exc
     finally:
-        resources = (page, context, browser, playwright)
+        resources = (
+            page,
+            context,
+            browser,
+            playwright if playwright is not None else playwright_manager,
+        )
         for index, resource in enumerate(resources):
             if resource is None:
                 continue
