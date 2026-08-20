@@ -16,6 +16,13 @@ _ALLOWED_RESPONSE_KEYS = frozenset({
 _TEXT_LIMIT = 120
 _RESPONSE_LIMIT = 100
 _KEY_PATH_LIMIT = 300
+_ACCOUNT_SELECTION_REQUIRED = "xiaohongshu_account_selection_required"
+
+
+class ProbeFailure(Exception):
+    def __init__(self, error_code: str) -> None:
+        self.error_code = error_code
+        super().__init__(error_code)
 
 
 def build_plan() -> dict[str, object]:
@@ -127,14 +134,71 @@ def sanitize_probe_report(value: object) -> dict[str, object]:
     }
 
 
-def _execute() -> dict[str, object]:
-    """Reserved for an explicit future execution mode."""
+def _select_single_eligible_account() -> dict[str, object]:
+    try:
+        from app_core import account_service
+
+        accounts = account_service.list_accounts()
+    except Exception:
+        raise ProbeFailure(_ACCOUNT_SELECTION_REQUIRED) from None
+
+    if type(accounts) is not list:
+        raise ProbeFailure(_ACCOUNT_SELECTION_REQUIRED)
+
+    eligible_accounts: list[dict[str, object]] = []
+    for account in accounts:
+        if type(account) is not dict:
+            continue
+        account_id = account.get("id")
+        platform_type = account.get("type")
+        status = account.get("status")
+        if (
+            type(account_id) is int
+            and account_id > 0
+            and type(platform_type) is int
+            and platform_type == 1
+            and type(status) is int
+            and status == 1
+        ):
+            eligible_accounts.append(account)
+
+    if len(eligible_accounts) != 1:
+        raise ProbeFailure(_ACCOUNT_SELECTION_REQUIRED)
+
+    selected = eligible_accounts[0]
+    file_path = selected.get("filePath")
+    return {
+        "id": selected["id"],
+        "type": selected["type"],
+        "status": selected["status"],
+        "filePath": file_path if type(file_path) is str else "",
+    }
+
+
+def _execute(*, browser_factory, utc_now) -> dict[str, object]:
+    """Apply the explicit account-selection gate without browser activity."""
+    del browser_factory, utc_now
+    _select_single_eligible_account()
     return build_plan()
 
 
 def main(argv: list[str] | None = None, *, stdout=sys.stdout) -> int:
-    del argv
-    json.dump(build_plan(), stdout, ensure_ascii=False)
+    arguments = sys.argv[1:] if argv is None else argv
+    if arguments == ["--execute"]:
+        def browser_factory():
+            from playwright.async_api import async_playwright
+
+            return async_playwright
+
+        from datetime import datetime, timezone
+
+        payload = _execute(
+            browser_factory=browser_factory,
+            utc_now=lambda: datetime.now(timezone.utc),
+        )
+    else:
+        payload = build_plan()
+    json.dump(payload, stdout, ensure_ascii=False)
     stdout.write("\n")
     return 0
 

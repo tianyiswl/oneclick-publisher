@@ -7,6 +7,30 @@ import tools.verify_xiaohongshu_data_contract as verifier
 
 
 class XiaohongshuDataContractVerifierTests(unittest.TestCase):
+    def test_execute_requires_exactly_one_normal_xiaohongshu_account(self):
+        cases = (
+            [],
+            [{"id": 1, "type": 1, "status": 0}],
+            [{"id": 1, "type": 1, "status": 1},
+             {"id": 2, "type": 1, "status": 1}],
+            [{"id": 1, "type": True, "status": 1}],
+        )
+        for accounts in cases:
+            with self.subTest(accounts=accounts), patch(
+                "app_core.account_service.list_accounts", return_value=accounts
+            ):
+                with self.assertRaisesRegex(
+                    verifier.ProbeFailure,
+                    "^xiaohongshu_account_selection_required$",
+                ):
+                    verifier._select_single_eligible_account()
+
+    def test_execute_accepts_only_platform_type_one_and_builtin_ids(self):
+        account = {"id": 7, "type": 1, "status": 1, "filePath": "state.json"}
+        with patch("app_core.account_service.list_accounts", return_value=[account]):
+            selected = verifier._select_single_eligible_account()
+        self.assertEqual(selected, account)
+
     def test_default_mode_is_zero_action_plan(self):
         with patch("tools.verify_xiaohongshu_data_contract._execute") as execute:
             output = io.StringIO()
