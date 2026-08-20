@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from app_core.douyin_data_collector import (
     DOUYIN_DASHBOARD_URL,
+    DOUYIN_DATA_PAGE_URL,
     DouyinDataCollectionError,
     DouyinDataCollector,
 )
@@ -690,6 +691,7 @@ class DouyinBrowserSignedCollectorTests(DouyinDirectCollectorTests):
         batch = collector.collect_browser_signed(self.account)
 
         self.assertEqual(batch.source_mode, "browser_signed")
+        self.assertEqual(batch.warning_code, "content_list_unavailable")
         self.assertEqual(
             [
                 (
@@ -712,6 +714,10 @@ class DouyinBrowserSignedCollectorTests(DouyinDirectCollectorTests):
         self.assertEqual(browser.closed, 1)
         self.assertEqual(playwright.stopped, 1)
         self.assertEqual(playwright.chromium.launch_calls, [{"headless": True}])
+        self.assertEqual(
+            page.goto_calls,
+            [(DOUYIN_DATA_PAGE_URL, "domcontentloaded", 50.0)],
+        )
 
     def test_non_allowlisted_response_times_out_without_being_parsed(self) -> None:
         """同域未知接口不能被当作数据指标来源。"""
