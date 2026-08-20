@@ -10,6 +10,7 @@ import stat
 import sys
 import time
 from pathlib import Path
+from types import MappingProxyType
 from urllib.parse import urlsplit
 
 
@@ -24,12 +25,15 @@ _ALLOWED_RESPONSE_KEYS = frozenset({
 _TEXT_LIMIT = 120
 _RESPONSE_LIMIT = 100
 _KEY_PATH_LIMIT = 300
+_MAX_RESPONSE_BODY_BYTES = 1_048_576
+_MAX_TOTAL_RESPONSE_BODY_BYTES = 4_194_304
 _ACCOUNT_SELECTION_REQUIRED = "xiaohongshu_account_selection_required"
 _ARGUMENTS_INVALID = "xiaohongshu_arguments_invalid"
 _REPORT_PATH_INVALID = "xiaohongshu_report_path_invalid"
 _REPORT_WRITE_FAILED = "xiaohongshu_report_write_failed"
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 _REPORT_OUTPUT_DIRECTORY = (
-    Path(__file__).resolve().parents[1]
+    _REPOSITORY_ROOT
     / ".superpowers/sdd/2026-08-20-xiaohongshu-data-contract-discovery"
 )
 _BUILTIN_PATH_TYPE = type(Path())
@@ -40,6 +44,11 @@ _STATIC_ENDPOINT_SEGMENTS = frozenset({
     "home", "profile", "account", "accounts", "user", "users", "v1",
     "v2",
 })
+_REDACTED_ENDPOINT_SEGMENT = ":segment"
+# Empty until a real passive run is reviewed and its complete path template is
+# deliberately promoted. Discovery responses are still retained, but cannot
+# become contract evidence merely because individual segments look familiar.
+_REVIEWED_CONTRACT_PATH_TEMPLATES = MappingProxyType({})
 _DYNAMIC_ID_PARENTS = frozenset({
     "note", "notes", "item", "content", "contents", "user", "users",
     "account", "accounts",
@@ -50,6 +59,7 @@ _UUID_ENDPOINT_SEGMENT = re.compile(
 )
 _HEX_ENDPOINT_SEGMENT = re.compile(r"^[0-9a-f]{12,}$", re.IGNORECASE)
 _HIGH_ENTROPY_ENDPOINT_SEGMENT = re.compile(r"^[A-Za-z0-9_-]{20,}$")
+_CONTENT_LENGTH = re.compile(r"^[0-9]+$")
 _DIRECTORY_OPEN_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 _TEMPORARY_OPEN_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
 _CREATOR_HOST = "creator.xiaohongshu.com"
@@ -76,13 +86,24 @@ _VERIFICATION_REQUIRED = "verification_required"
 _NAVIGATION_UNVERIFIED = "xiaohongshu_navigation_unverified"
 _CONTENT_IDENTIFIERS = frozenset({"note_id", "item_id", "content_id"})
 _CONTENT_LIST_KEYS = frozenset({"items", "list", "notes", "feeds"})
-_LIFETIME_METRIC_KEYS = frozenset({
+_METRIC_KEYS = frozenset({
     "view_count", "views", "like_count", "likes", "comment_count",
     "comments", "share_count", "shares", "collect_count", "collects",
 })
-_ACCOUNT_KEYS = frozenset({
-    "account", "profile", "fans", "fan_count", "follower_count",
-    "followers", "overview", "trend",
+_ACCOUNT_METRIC_KEYS = frozenset({
+    "fans", "fan_count", "follower_count", "followers",
+}) | _METRIC_KEYS
+_ACCOUNT_SCOPE_KEYS = frozenset({
+    "trend", "interval", "window", "range", "period", "daily",
+})
+_CUMULATIVE_SCOPE_KEYS = frozenset({
+    "lifetime", "cumulative", "all_time", "total",
+})
+_NON_LIFETIME_SCOPE_KEYS = frozenset({
+    "interval", "window", "range", "period", "daily",
+})
+_ACCOUNT_CONTAINER_KEYS = frozenset({
+    "account", "profile", "overview",
 })
 _ALLOWED_MODES = frozenset({"plan", "execute"})
 _ALLOWED_STATUSES = frozenset({
@@ -109,17 +130,22 @@ _ALLOWED_CONTENT_TYPES = frozenset({"application/json"})
 _ALLOWED_FIELD_TYPES = frozenset({
     "dict", "list", "str", "int", "float", "bool", "NoneType",
 })
-_IDENTIFIER_STRUCTURAL_KEYS = frozenset({
-    "id", "note_id", "item_id", "content_id", "user_id", "account_id",
-})
 _SENSITIVE_STRUCTURAL_KEYS = frozenset({
     "token", "cookie", "authorization", "set_cookie", "password",
     "secret", "title", "nickname", "phone", "mobile", "body", "content",
 })
 _SAFE_STATIC_STRUCTURAL_KEYS = frozenset({
     "data", "result", "success", "code", "message", "metrics", "stats",
-}) | _PAGINATION_KEYS | _CONTENT_LIST_KEYS | _LIFETIME_METRIC_KEYS | _ACCOUNT_KEYS
-_STRUCTURAL_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+}) | (
+    _PAGINATION_KEYS
+    | _CONTENT_IDENTIFIERS
+    | _CONTENT_LIST_KEYS
+    | _METRIC_KEYS
+    | _ACCOUNT_METRIC_KEYS
+    | _ACCOUNT_SCOPE_KEYS
+    | _CUMULATIVE_SCOPE_KEYS
+    | _ACCOUNT_CONTAINER_KEYS
+)
 _OBSERVED_AT = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
     r"(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$"
@@ -213,26 +239,14 @@ def _normalize_structural_key(value: object) -> str | None:
     if type(value) is not str or not value:
         return None
     if value in {":content_identifier", ":identifier", ":key"}:
-        return value
+        return ":key"
     lowered = value.lower()
-    if lowered in _CONTENT_IDENTIFIERS:
-        return ":content_identifier"
-    if lowered in _IDENTIFIER_STRUCTURAL_KEYS or lowered.endswith("_id"):
-        return ":identifier"
+    if lowered in _SAFE_STATIC_STRUCTURAL_KEYS:
+        return lowered
     components = frozenset(lowered.split("_"))
     if lowered in _SENSITIVE_STRUCTURAL_KEYS or components & _SENSITIVE_STRUCTURAL_KEYS:
         return ":key"
-    if lowered in _SAFE_STATIC_STRUCTURAL_KEYS:
-        return lowered
-    if (
-        value.isdecimal()
-        or _UUID_ENDPOINT_SEGMENT.fullmatch(value) is not None
-        or _HEX_ENDPOINT_SEGMENT.fullmatch(value) is not None
-        or _HIGH_ENTROPY_ENDPOINT_SEGMENT.fullmatch(value) is not None
-        or _STRUCTURAL_KEY.fullmatch(value) is None
-    ):
-        return ":key"
-    return lowered
+    return ":key"
 
 
 def _sanitize_structural_path(value: object) -> str | None:
@@ -309,7 +323,7 @@ def _safe_observed_at(value: object) -> str:
 
 
 def _endpoint_path(path: object) -> str | None:
-    """Return a static endpoint shape, never a literal identifier segment."""
+    """Return a redacted endpoint shape, never a literal unknown segment."""
     if type(path) is not str:
         return ""
     try:
@@ -329,6 +343,9 @@ def _endpoint_path(path: object) -> str | None:
         if normalized and normalized[-1] in _DYNAMIC_ID_PARENTS:
             normalized.append(":id")
             continue
+        if segment in {":id", _REDACTED_ENDPOINT_SEGMENT}:
+            normalized.append(segment)
+            continue
         if segment in _STATIC_ENDPOINT_SEGMENTS:
             normalized.append(segment)
             continue
@@ -338,10 +355,10 @@ def _endpoint_path(path: object) -> str | None:
             or _HEX_ENDPOINT_SEGMENT.fullmatch(segment) is not None
             or _HIGH_ENTROPY_ENDPOINT_SEGMENT.fullmatch(segment) is not None
         )
-        if is_dynamic_id and normalized and normalized[-1] in _DYNAMIC_ID_PARENTS:
+        if is_dynamic_id:
             normalized.append(":id")
             continue
-        return None
+        normalized.append(_REDACTED_ENDPOINT_SEGMENT)
     return "/" + "/".join(normalized)
 
 
@@ -451,28 +468,72 @@ def _report_destination(path: object) -> Path:
 
     if ".." in candidate.parts:
         raise ProbeFailure(_REPORT_PATH_INVALID)
-    root = _REPORT_OUTPUT_DIRECTORY.resolve()
-    resolved = candidate.resolve()
-    if resolved == root or not resolved.is_relative_to(root):
+    repository_root = Path(os.path.abspath(_REPOSITORY_ROOT))
+    root = Path(os.path.abspath(_REPORT_OUTPUT_DIRECTORY))
+    destination = Path(os.path.abspath(
+        candidate if candidate.is_absolute() else repository_root / candidate
+    ))
+    if (
+        root == repository_root
+        or not root.is_relative_to(repository_root)
+        or destination == root
+        or not destination.is_relative_to(root)
+    ):
         raise ProbeFailure(_REPORT_PATH_INVALID)
-    return resolved
+
+    relative = destination.relative_to(repository_root)
+    current = repository_root
+    for index, segment in enumerate(relative.parts):
+        current = current / segment
+        try:
+            mode = current.lstat().st_mode
+        except FileNotFoundError:
+            break
+        is_destination = index == len(relative.parts) - 1
+        if stat.S_ISLNK(mode):
+            raise ProbeFailure(_REPORT_PATH_INVALID)
+        if is_destination:
+            if not stat.S_ISREG(mode):
+                raise ProbeFailure(_REPORT_PATH_INVALID)
+        elif not stat.S_ISDIR(mode):
+            raise ProbeFailure(_REPORT_PATH_INVALID)
+    return destination
+
+
+def _open_repository_root() -> int:
+    repository_root = Path(os.path.abspath(_REPOSITORY_ROOT))
+    directory_fd = os.open(repository_root, _DIRECTORY_OPEN_FLAGS)
+    try:
+        opened = os.fstat(directory_fd)
+        expected = os.stat(repository_root, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or opened.st_dev != expected.st_dev
+            or opened.st_ino != expected.st_ino
+        ):
+            raise NotADirectoryError
+        return directory_fd
+    except Exception:
+        os.close(directory_fd)
+        raise
 
 
 def _open_report_directory(destination: Path) -> int:
-    """Open the approved parent directory without following replacement links."""
-    root = _REPORT_OUTPUT_DIRECTORY.resolve()
-    relative_parent = destination.parent.relative_to(root)
-    directory_fd = os.open(root, _DIRECTORY_OPEN_FLAGS)
+    """Create and open the report parent from the verified repository FD."""
+    repository_root = Path(os.path.abspath(_REPOSITORY_ROOT))
+    relative_parent = destination.parent.relative_to(repository_root)
+    directory_fd = _open_repository_root()
     try:
-        if not stat.S_ISDIR(os.fstat(directory_fd).st_mode):
-            raise NotADirectoryError
         for segment in relative_parent.parts:
             try:
                 next_fd = os.open(
                     segment, _DIRECTORY_OPEN_FLAGS, dir_fd=directory_fd
                 )
             except FileNotFoundError:
-                os.mkdir(segment, 0o700, dir_fd=directory_fd)
+                try:
+                    os.mkdir(segment, 0o700, dir_fd=directory_fd)
+                except FileExistsError:
+                    pass
                 next_fd = os.open(
                     segment, _DIRECTORY_OPEN_FLAGS, dir_fd=directory_fd
                 )
@@ -607,7 +668,9 @@ def _select_single_eligible_account() -> dict[str, object]:
     }
 
 
-def _response_metadata(response: object) -> tuple[str, str, int, str] | None:
+def _response_metadata(
+    response: object,
+) -> tuple[str, str, int, str, int] | None:
     url = getattr(response, "url", None)
     if type(url) is not str:
         return None
@@ -631,14 +694,43 @@ def _response_metadata(response: object) -> tuple[str, str, int, str] | None:
     if content_type != "application/json":
         return None
 
+    raw_content_length = headers.get("content-length")
+    if (
+        type(raw_content_length) is not str
+        or not 1 <= len(raw_content_length) <= 20
+        or _CONTENT_LENGTH.fullmatch(raw_content_length) is None
+    ):
+        return None
+    try:
+        content_length = int(raw_content_length)
+    except ValueError:
+        return None
+    if not 1 <= content_length <= _MAX_RESPONSE_BODY_BYTES:
+        return None
+
+    content_encoding = headers.get("content-encoding")
+    if content_encoding is not None and (
+        type(content_encoding) is not str
+        or content_encoding.strip().lower() != "identity"
+    ):
+        return None
+
     request = getattr(response, "request", None)
     method = getattr(request, "method", "")
     status = getattr(response, "status", 0)
+    if (
+        type(method) is not str
+        or method not in _ALLOWED_METHODS
+        or type(status) is not int
+        or not 200 <= status < 300
+    ):
+        return None
     return (
         endpoint_path,
-        method if type(method) is str else "",
-        status if type(status) is int else 0,
+        method,
+        status,
         content_type,
+        content_length,
     )
 
 
@@ -744,13 +836,13 @@ def _structural_fields(
 
 
 def _shape_from_payload(
-    metadata: tuple[str, str, int, str],
+    metadata: tuple[str, str, int, str, int],
     payload: object,
     *,
     deadline: float,
     monotonic,
 ) -> dict[str, object]:
-    path, method, status, content_type = metadata
+    path, method, status, content_type, _content_length = metadata
     key_paths, field_types, list_lengths, pagination_keys = _structural_fields(
         payload, deadline=deadline, monotonic=monotonic
     )
@@ -796,9 +888,14 @@ def _response_shape(response) -> dict[str, object] | None:
 
 
 async def _async_response_shape(
-    response: object, *, deadline: float, monotonic
+    response: object,
+    *,
+    metadata: tuple[str, str, int, str, int] | None = None,
+    deadline: float,
+    monotonic,
 ) -> dict[str, object] | None:
-    metadata = _response_metadata(response)
+    if metadata is None:
+        metadata = _response_metadata(response)
     if metadata is None:
         return None
     loader = getattr(response, "json", None)
@@ -819,26 +916,135 @@ async def _async_response_shape(
     )
 
 
-def _classify_shape(shape: dict[str, object]) -> str:
+def _reviewed_contract_phase(path: object) -> str | None:
+    if type(path) is not str or _REDACTED_ENDPOINT_SEGMENT in path.split("/"):
+        return None
+    phase = _REVIEWED_CONTRACT_PATH_TEMPLATES.get(path)
+    return phase if phase in _REQUIRED_CONTRACT_PHASES else None
+
+
+def _structural_evidence_paths(
+    shape: dict[str, object],
+) -> tuple[list[tuple[str, tuple[tuple[str, bool], ...]]], dict[str, str]]:
     paths = shape.get("keyPaths")
-    if type(paths) is not list:
-        return "unclassified"
-    tokens = {
-        token.lower().removesuffix("[]")
-        for path in paths
-        if type(path) is str
-        for token in path.split(".")
+    raw_field_types = shape.get("fieldTypes")
+    if type(paths) is not list or type(raw_field_types) is not dict:
+        return [], {}
+
+    field_types = {
+        key: item
+        for key, item in raw_field_types.items()
+        if type(key) is str and item in _ALLOWED_FIELD_TYPES
     }
-    has_identifier = (
-        bool(tokens & _CONTENT_IDENTIFIERS)
-        or ":content_identifier" in tokens
-    )
-    if has_identifier and tokens & _CONTENT_LIST_KEYS:
-        return "content_list"
-    if has_identifier and tokens & _LIFETIME_METRIC_KEYS:
-        return "content_lifetime"
-    if tokens & _ACCOUNT_KEYS:
-        return "account_overview"
+    evidence: list[tuple[str, tuple[tuple[str, bool], ...]]] = []
+    for path in paths:
+        if type(path) is not str or _sanitize_structural_path(path) != path:
+            continue
+        segments: list[tuple[str, bool]] = []
+        for segment in path.split("."):
+            is_list = segment.endswith("[]")
+            key = segment[:-2] if is_list else segment
+            if key.startswith(":") or key not in _SAFE_STATIC_STRUCTURAL_KEYS:
+                segments = []
+                break
+            segments.append((key, is_list))
+        if segments:
+            evidence.append((path, tuple(segments)))
+    return evidence, field_types
+
+
+def _classify_account_shape(
+    evidence: list[tuple[str, tuple[tuple[str, bool], ...]]],
+    field_types: dict[str, str],
+) -> bool:
+    for path, segments in evidence:
+        metric_key = segments[-1][0]
+        scope_keys = {key for key, _is_list in segments[:-1]}
+        if (
+            metric_key in _ACCOUNT_METRIC_KEYS
+            and field_types.get(path) in {"int", "float"}
+            and scope_keys & _ACCOUNT_SCOPE_KEYS
+        ):
+            return True
+    return False
+
+
+def _content_identity_paths(
+    evidence: list[tuple[str, tuple[tuple[str, bool], ...]]],
+    field_types: dict[str, str],
+) -> list[tuple[tuple[str, bool], ...]]:
+    return [
+        segments
+        for path, segments in evidence
+        if segments[-1][0] in _CONTENT_IDENTIFIERS
+        and field_types.get(path) in {"str", "int"}
+    ]
+
+
+def _classify_content_list_shape(
+    evidence: list[tuple[str, tuple[tuple[str, bool], ...]]],
+    field_types: dict[str, str],
+) -> bool:
+    for identity_path in _content_identity_paths(evidence, field_types):
+        if any(
+            is_list and key in _CONTENT_LIST_KEYS
+            for key, is_list in identity_path[:-1]
+        ):
+            return True
+    return False
+
+
+def _classify_content_lifetime_shape(
+    evidence: list[tuple[str, tuple[tuple[str, bool], ...]]],
+    field_types: dict[str, str],
+) -> bool:
+    identities = _content_identity_paths(evidence, field_types)
+    numeric_metrics = [
+        (path, segments)
+        for path, segments in evidence
+        if segments[-1][0] in _METRIC_KEYS
+        and field_types.get(path) in {"int", "float"}
+    ]
+    for identity_path in identities:
+        entity_ancestor = identity_path[:-1]
+        if not entity_ancestor:
+            continue
+        for _metric_path, metric_segments in numeric_metrics:
+            if metric_segments[:len(entity_ancestor)] != entity_ancestor:
+                continue
+            scope_keys = {
+                key
+                for key, _is_list in metric_segments[
+                    len(entity_ancestor):-1
+                ]
+            }
+            if (
+                scope_keys & _CUMULATIVE_SCOPE_KEYS
+                and not scope_keys & _NON_LIFETIME_SCOPE_KEYS
+            ):
+                return True
+    return False
+
+
+def _classify_shape(shape: dict[str, object]) -> str:
+    phase = _reviewed_contract_phase(shape.get("path"))
+    if phase is None:
+        return "unclassified"
+    evidence, field_types = _structural_evidence_paths(shape)
+    if not evidence:
+        return "unclassified"
+    if phase == "account_overview" and _classify_account_shape(
+        evidence, field_types
+    ):
+        return phase
+    if phase == "content_list" and _classify_content_list_shape(
+        evidence, field_types
+    ):
+        return phase
+    if phase == "content_lifetime" and _classify_content_lifetime_shape(
+        evidence, field_types
+    ):
+        return phase
     return "unclassified"
 
 
@@ -948,22 +1154,38 @@ async def _run_probe(
     browser = None
     context = None
     page = None
-    observed_responses: list[object] = []
+    observed_responses: list[
+        tuple[object, tuple[str, str, int, str, int]]
+    ] = []
+    retained_body_bytes = 0
+    response_budget_exhausted = False
     shapes: list[dict[str, object]] = []
     caught: BaseException | None = None
     cleanup_errors: list[BaseException] = []
 
     def retain_response(response: object) -> None:
-        if len(observed_responses) >= _RESPONSE_LIMIT:
+        nonlocal retained_body_bytes, response_budget_exhausted
+        if (
+            response_budget_exhausted
+            or len(observed_responses) >= _RESPONSE_LIMIT
+        ):
             return
         try:
-            eligible = _response_metadata(response) is not None
+            metadata = _response_metadata(response)
         except (KeyboardInterrupt, SystemExit):
             raise
         except Exception:
             return
-        if eligible:
-            observed_responses.append(response)
+        if metadata is None:
+            return
+        next_total = retained_body_bytes + metadata[4]
+        if next_total > _MAX_TOTAL_RESPONSE_BODY_BYTES:
+            observed_responses.clear()
+            retained_body_bytes = 0
+            response_budget_exhausted = True
+            return
+        retained_body_bytes = next_total
+        observed_responses.append((response, metadata))
 
     try:
         state_path = _storage_state_path(account)
@@ -1000,9 +1222,12 @@ async def _run_probe(
         navigation_error = _navigation_error_code(navigation_response)
         if navigation_error is not None:
             raise ProbeFailure(navigation_error)
-        for response in observed_responses:
+        for response, metadata in tuple(observed_responses):
             shape = await _async_response_shape(
-                response, deadline=work_deadline, monotonic=monotonic
+                response,
+                metadata=metadata,
+                deadline=work_deadline,
+                monotonic=monotonic,
             )
             if shape is not None:
                 shapes.append(shape)
@@ -1138,6 +1363,16 @@ def _failed_execution_report(
     return sanitize_probe_report(report)
 
 
+def _execution_exit_code(report: object) -> int:
+    if (
+        type(report) is dict
+        and report.get("mode") == "execute"
+        and report.get("status") == "success"
+    ):
+        return 0
+    return 1
+
+
 def main(argv: list[str] | None = None, *, stdout=sys.stdout) -> int:
     arguments = sys.argv[1:] if argv is None else argv
     if not arguments:
@@ -1199,7 +1434,7 @@ def main(argv: list[str] | None = None, *, stdout=sys.stdout) -> int:
             return 1
     json.dump(payload, stdout, ensure_ascii=False)
     stdout.write("\n")
-    return 0
+    return _execution_exit_code(payload)
 
 
 if __name__ == "__main__":

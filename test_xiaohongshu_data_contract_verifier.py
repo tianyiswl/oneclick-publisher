@@ -2,6 +2,7 @@ import io
 import asyncio
 import json
 import shutil
+import tempfile
 import time
 import unittest
 from datetime import datetime, timezone
@@ -17,9 +18,23 @@ class FakeRequest:
 
 
 class FakeResponse:
-    def __init__(self, url, content_type, payload, *, status=200, method="GET"):
+    def __init__(
+        self,
+        url,
+        content_type,
+        payload,
+        *,
+        status=200,
+        method="GET",
+        content_length="128",
+        content_encoding=None,
+    ):
         self.url = url
         self.headers = {"content-type": content_type}
+        if content_length is not None:
+            self.headers["content-length"] = content_length
+        if content_encoding is not None:
+            self.headers["content-encoding"] = content_encoding
         self._payload = payload
         self.status = status
         self.request = FakeRequest(method)
@@ -179,7 +194,7 @@ class AsyncFakePlaywright(FakePlaywright):
             self,
             "https://creator.xiaohongshu.com/api/overview",
             "Application/JSON; charset=utf-8",
-            {"data": {"fans": 2}},
+            {"data": {"trend": {"fans": 2}}},
         )]
 
     async def stop(self):
@@ -262,8 +277,13 @@ class CloseGetterFailurePlaywright(FakePlaywright):
 class CountingResponse(FakeResponse):
     json_calls = 0
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.instance_json_calls = 0
+
     def json(self):
         type(self).json_calls += 1
+        self.instance_json_calls += 1
         return self._payload
 
 
@@ -374,8 +394,9 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
         )
         response = result["responses"][0]
         self.assertLessEqual(len(response["fieldTypes"]), 300)
-        self.assertIn("items[].item_0", response["fieldTypes"])
-        self.assertNotIn("items[].item_999", response["fieldTypes"])
+        self.assertIn("items[].:key", response["fieldTypes"])
+        self.assertNotIn("item_0", json.dumps(response))
+        self.assertNotIn("item_999", json.dumps(response))
         self.assertNotIn("private-", json.dumps(result))
 
     def test_probe_detects_cycle_in_builtin_payload(self):
@@ -391,8 +412,8 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
             monotonic=FakeClock(), utc_now=fixed_now,
         )
         self.assertEqual(len(result["responses"]), 1)
-        self.assertIn("self", result["responses"][0]["keyPaths"])
-        self.assertNotIn("self.self", result["responses"][0]["keyPaths"])
+        self.assertIn(":key", result["responses"][0]["keyPaths"])
+        self.assertNotIn("self", json.dumps(result["responses"][0]))
         self.assertNotIn("private-cycle-value", json.dumps(result))
 
     def test_probe_structural_walk_honors_total_deadline(self):
@@ -430,6 +451,67 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
         self.assertEqual(len(result["responses"]), 100)
         self.assertEqual(CountingResponse.json_calls, 100)
 
+    def test_response_byte_budgets_reject_before_json_decode(self):
+        direct_cases = (
+            (
+                "single_response_over_limit",
+                {"content_length": "65"},
+            ),
+            (
+                "content_length_missing",
+                {"content_length": None},
+            ),
+            (
+                "content_length_malformed",
+                {"content_length": "12.5"},
+            ),
+            (
+                "compressed_body",
+                {"content_length": "8", "content_encoding": "gzip"},
+            ),
+        )
+        with patch.object(
+            verifier, "_MAX_RESPONSE_BODY_BYTES", 64, create=True
+        ):
+            for label, response_options in direct_cases:
+                response = CountingResponse(
+                    "https://creator.xiaohongshu.com/api/data",
+                    "application/json",
+                    {"data": {"trend": {"fans": 2}}},
+                    **response_options,
+                )
+                with self.subTest(label=label):
+                    self.assertIsNone(verifier._response_shape(response))
+                    self.assertEqual(response.instance_json_calls, 0)
+
+        first = CountingResponse(
+            "https://creator.xiaohongshu.com/api/data/first",
+            "application/json",
+            {"data": {"trend": {"fans": 2}}},
+            content_length="40",
+        )
+        second = CountingResponse(
+            "https://creator.xiaohongshu.com/api/data/second",
+            "application/json",
+            {"data": {"items": [{"note_id": "private-id"}]}},
+            content_length="40",
+        )
+        fake = FakePlaywright(responses=[first, second])
+        with patch.object(
+            verifier, "_MAX_RESPONSE_BODY_BYTES", 64, create=True
+        ), patch.object(
+            verifier, "_MAX_TOTAL_RESPONSE_BODY_BYTES", 64, create=True
+        ):
+            result = verifier._probe_with_browser(
+                eligible_account(), playwright_factory=lambda: fake,
+                monotonic=FakeClock(), utc_now=fixed_now,
+            )
+        self.assertEqual(first.instance_json_calls, 0)
+        self.assertEqual(second.instance_json_calls, 0)
+        self.assertEqual(result["responses"], [])
+        self.assertEqual(result["phases"], [])
+        self.assertEqual(result["status"], "failed")
+
     def test_probe_listener_limit_counts_only_eligible_responses(self):
         responses = [
             FakeResponse(
@@ -451,6 +533,49 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
         )
         self.assertEqual(len(result["responses"]), 1)
         self.assertEqual(result["responses"][0]["path"], "/api/eligible")
+
+    def test_unknown_official_json_path_is_redacted_retained_and_unclassified(self):
+        response = FakeResponse(
+            "https://creator.xiaohongshu.com/api/galaxy/creator/analytics"
+            "?note_id=private-query",
+            "application/json",
+            {
+                "data": {
+                    "overview": {"fans": 2},
+                    "items": [{"note_id": "private-id", "view_count": 3}],
+                },
+            },
+        )
+
+        shape = verifier._response_shape(response)
+        self.assertIsNotNone(shape)
+        self.assertEqual(shape["path"], "/api/:segment/creator/:segment")
+        self.assertEqual(verifier._classify_shape(shape), "unclassified")
+        self.assertEqual(
+            verifier._contract_outcome([shape]),
+            (
+                [],
+                ["account_overview", "content_list", "content_lifetime"],
+                "failed",
+                "xiaohongshu_contracts_unobserved",
+            ),
+        )
+
+        fake = FakePlaywright(responses=[response])
+        result = verifier._probe_with_browser(
+            eligible_account(), playwright_factory=lambda: fake,
+            monotonic=FakeClock(), utc_now=fixed_now,
+        )
+        self.assertEqual(len(result["responses"]), 1)
+        self.assertEqual(
+            result["responses"][0]["path"],
+            "/api/:segment/creator/:segment",
+        )
+        self.assertEqual(result["phases"], [])
+        self.assertEqual(result["status"], "failed")
+        encoded = json.dumps(result, ensure_ascii=False)
+        for forbidden in ("galaxy", "analytics", "note_id=", "private-"):
+            self.assertNotIn(forbidden, encoded)
 
     def test_probe_only_accepts_creator_https_json_and_never_fetches(self):
         fake = FakePlaywright(responses=[
@@ -488,21 +613,31 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
         self.assertEqual(fake.launch_kwargs, {"headless": True})
 
     def test_probe_never_reports_success_until_all_required_contracts_observed(self):
+        reviewed_paths = {
+            "/api/overview": "account_overview",
+            "/api/data/list": "content_list",
+            "/api/note/:id/metrics": "content_lifetime",
+        }
         contracts = [
             FakeResponse(
                 "https://creator.xiaohongshu.com/api/overview",
                 "application/json",
-                {"data": {"fans": 2}},
+                {"data": {"trend": {"fans": 2}}},
             ),
             FakeResponse(
-                "https://creator.xiaohongshu.com/api/notes/list",
+                "https://creator.xiaohongshu.com/api/data/list",
                 "application/json",
                 {"data": {"items": [{"note_id": "private-id"}]}},
             ),
             FakeResponse(
                 "https://creator.xiaohongshu.com/api/note/123/metrics",
                 "application/json",
-                {"data": {"note_id": "private-id", "view_count": 3}},
+                {
+                    "data": {
+                        "note_id": "private-id",
+                        "lifetime": {"view_count": 3},
+                    },
+                },
             ),
         ]
         cases = (
@@ -521,7 +656,11 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
         )
 
         for count, status, error_code, phases, missing in cases:
-            with self.subTest(count=count):
+            with self.subTest(count=count), patch.object(
+                verifier,
+                "_REVIEWED_CONTRACT_PATH_TEMPLATES",
+                reviewed_paths,
+            ):
                 result = verifier._probe_with_browser(
                     eligible_account(),
                     playwright_factory=lambda count=count: FakePlaywright(
@@ -536,27 +675,49 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
                 self.assertEqual(result["missingPhases"], missing)
 
     def test_contract_classifier_rejects_non_content_identifiers(self):
+        reviewed_paths = {
+            "/api/overview": "account_overview",
+            "/api/data/list": "content_list",
+            "/api/note/:id/metrics": "content_lifetime",
+        }
         collision_shapes = [
             verifier._response_shape(FakeResponse(
                 "https://creator.xiaohongshu.com/api/overview",
                 "application/json",
-                {"data": {"overview": {"request_id": "private-request"}}},
+                {
+                    "data": {
+                        "trend": {
+                            "fans": 2,
+                            "request_id": "private-request",
+                        },
+                    },
+                },
             )),
             verifier._response_shape(FakeResponse(
-                "https://creator.xiaohongshu.com/api/notes/list",
+                "https://creator.xiaohongshu.com/api/data/list",
                 "application/json",
                 {"data": {"items": [{"trace_id": "private-trace"}]}},
             )),
             verifier._response_shape(FakeResponse(
                 "https://creator.xiaohongshu.com/api/note/123/metrics",
                 "application/json",
-                {"data": {"session_id": "private-session", "view_count": 3}},
+                {
+                    "data": {
+                        "session_id": "private-session",
+                        "lifetime": {"view_count": 3},
+                    },
+                },
             )),
         ]
         self.assertNotIn(None, collision_shapes)
-        phases, missing, status, error_code = verifier._contract_outcome(
-            collision_shapes
-        )
+        with patch.object(
+            verifier,
+            "_REVIEWED_CONTRACT_PATH_TEMPLATES",
+            reviewed_paths,
+        ):
+            phases, missing, status, error_code = verifier._contract_outcome(
+                collision_shapes
+            )
         self.assertEqual(phases, ["account_overview"])
         self.assertEqual(missing, ["content_list", "content_lifetime"])
         self.assertEqual(status, "partial_success")
@@ -568,19 +729,32 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
         for identity_key in ("note_id", "item_id", "content_id"):
             with self.subTest(identity_key=identity_key):
                 list_shape = verifier._response_shape(FakeResponse(
-                    "https://creator.xiaohongshu.com/api/notes/list",
+                    "https://creator.xiaohongshu.com/api/data/list",
                     "application/json",
                     {"data": {"items": [{identity_key: "private-content"}]}},
                 ))
                 lifetime_shape = verifier._response_shape(FakeResponse(
                     "https://creator.xiaohongshu.com/api/note/123/metrics",
                     "application/json",
-                    {"data": {identity_key: "private-content", "view_count": 3}},
+                    {
+                        "data": {
+                            identity_key: "private-content",
+                            "lifetime": {"view_count": 3},
+                        },
+                    },
                 ))
-                self.assertEqual(verifier._classify_shape(list_shape), "content_list")
-                self.assertEqual(
-                    verifier._classify_shape(lifetime_shape), "content_lifetime"
-                )
+                with patch.object(
+                    verifier,
+                    "_REVIEWED_CONTRACT_PATH_TEMPLATES",
+                    reviewed_paths,
+                ):
+                    self.assertEqual(
+                        verifier._classify_shape(list_shape), "content_list"
+                    )
+                    self.assertEqual(
+                        verifier._classify_shape(lifetime_shape),
+                        "content_lifetime",
+                    )
                 encoded = json.dumps(
                     [list_shape, lifetime_shape], ensure_ascii=False
                 )
@@ -590,9 +764,132 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
                     for path in shape["keyPaths"]
                     for segment in path.split(".")
                 }
-                self.assertNotIn(identity_key, path_segments)
+                self.assertIn(identity_key, path_segments)
                 self.assertNotIn("private-content", encoded)
-                self.assertIn(":content_identifier", encoded)
+                self.assertNotIn(":content_identifier", encoded)
+
+    def test_classifier_requires_reviewed_path_and_common_ancestor_semantics(self):
+        reviewed_paths = {
+            "/api/overview": "account_overview",
+            "/api/data/list": "content_list",
+            "/api/note/:id/metrics": "content_lifetime",
+        }
+
+        profile_only = verifier._response_shape(FakeResponse(
+            "https://creator.xiaohongshu.com/api/overview",
+            "application/json",
+            {"data": {"profile": {}}},
+        ))
+        unrelated_list = verifier._response_shape(FakeResponse(
+            "https://creator.xiaohongshu.com/api/data/list",
+            "application/json",
+            {
+                "data": {
+                    "note_id": "private-id",
+                    "items": [{"message": "private-value"}],
+                },
+            },
+        ))
+        window_metric = verifier._response_shape(FakeResponse(
+            "https://creator.xiaohongshu.com/api/note/123/metrics",
+            "application/json",
+            {
+                "data": {
+                    "note_id": "private-id",
+                    "window": {"view_count": 3},
+                },
+            },
+        ))
+        placeholder_identity = {
+            "method": "GET",
+            "path": "/api/data/list",
+            "status": 200,
+            "contentType": "application/json",
+            "keyPaths": ["data.items[]", "data.items[].:content_identifier"],
+            "fieldTypes": {
+                "data.items[]": "dict",
+                "data.items[].:content_identifier": "str",
+            },
+        }
+
+        valid_account = verifier._response_shape(FakeResponse(
+            "https://creator.xiaohongshu.com/api/overview",
+            "application/json",
+            {"data": {"trend": {"fans": 2}}},
+        ))
+        valid_list = verifier._response_shape(FakeResponse(
+            "https://creator.xiaohongshu.com/api/data/list",
+            "application/json",
+            {"data": {"items": [{"note_id": "private-id"}]}},
+        ))
+        valid_lifetime = verifier._response_shape(FakeResponse(
+            "https://creator.xiaohongshu.com/api/note/123/metrics",
+            "application/json",
+            {
+                "data": {
+                    "note_id": "private-id",
+                    "lifetime": {"view_count": 3},
+                },
+            },
+        ))
+        all_shapes = (
+            profile_only, unrelated_list, window_metric,
+            valid_account, valid_list, valid_lifetime,
+        )
+        self.assertNotIn(None, all_shapes)
+
+        with patch.object(
+            verifier,
+            "_REVIEWED_CONTRACT_PATH_TEMPLATES",
+            reviewed_paths,
+        ):
+            for label, shape in (
+                ("profile_only", profile_only),
+                ("unrelated_list", unrelated_list),
+                ("window_metric", window_metric),
+                ("placeholder_identity", placeholder_identity),
+            ):
+                with self.subTest(label=label):
+                    self.assertEqual(
+                        verifier._classify_shape(shape), "unclassified"
+                    )
+
+            self.assertEqual(
+                verifier._contract_outcome(
+                    [profile_only, unrelated_list, window_metric]
+                ),
+                (
+                    [],
+                    ["account_overview", "content_list", "content_lifetime"],
+                    "failed",
+                    "xiaohongshu_contracts_unobserved",
+                ),
+            )
+            self.assertEqual(
+                [
+                    verifier._classify_shape(shape)
+                    for shape in (valid_account, valid_list, valid_lifetime)
+                ],
+                ["account_overview", "content_list", "content_lifetime"],
+            )
+            self.assertEqual(
+                verifier._contract_outcome(
+                    [valid_account, valid_list, valid_lifetime]
+                ),
+                (
+                    ["account_overview", "content_list", "content_lifetime"],
+                    [],
+                    "success",
+                    "",
+                ),
+            )
+
+        self.assertEqual(
+            verifier._contract_outcome(
+                [valid_account, valid_list, valid_lifetime]
+            )[0],
+            [],
+        )
 
     def test_probe_classifies_login_and_verification_without_claiming_contracts(self):
         cases = (
@@ -686,13 +983,20 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
 
     def test_probe_adapts_async_playwright_and_reads_shapes_before_cleanup(self):
         fake = AsyncFakePlaywright()
-        result = verifier._probe_with_browser(
-            eligible_account(), playwright_factory=lambda: fake,
-            monotonic=FakeClock(), utc_now=fixed_now,
-        )
+        with patch.object(
+            verifier,
+            "_REVIEWED_CONTRACT_PATH_TEMPLATES",
+            {"/api/overview": "account_overview"},
+        ):
+            result = verifier._probe_with_browser(
+                eligible_account(), playwright_factory=lambda: fake,
+                monotonic=FakeClock(), utc_now=fixed_now,
+            )
         self.assertEqual(len(result["responses"]), 1)
         self.assertEqual(result["responses"][0]["contentType"], "application/json")
-        self.assertEqual(result["responses"][0]["fieldTypes"]["data.fans"], "int")
+        self.assertEqual(
+            result["responses"][0]["fieldTypes"]["data.trend.fans"], "int"
+        )
         self.assertEqual(result["phases"], ["account_overview"])
         self.assertEqual(
             fake.close_order,
@@ -877,7 +1181,7 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
         entropy_key = "AbCdEf0123456789GhIjKlMn"
         sensitive_keys = (
             uuid_key, phone_key, entropy_key, "token", "cookie", "title",
-            "nickname", "note_id",
+            "nickname",
         )
         payload = {
             "data": {
@@ -904,6 +1208,7 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
         self.assertIn("data.view_count", shape["keyPaths"])
         self.assertIn("data.:key.like_count", shape["keyPaths"])
         self.assertIn("data.:key[].comment_count", shape["keyPaths"])
+        self.assertIn("data.note_id", shape["keyPaths"])
 
         verifier._write_report(self.report_path, {
             "schemaVersion": entropy_key,
@@ -951,7 +1256,60 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
         self.assertEqual(response["contentType"], "")
         self.assertIn("data.view_count", response["keyPaths"])
         self.assertIn("data.:key.like_count", response["keyPaths"])
+        self.assertIn("data.note_id", response["keyPaths"])
         self.assertEqual(response["fieldTypes"]["data.view_count"], "int")
+
+    def test_unknown_short_structural_keys_are_redacted_at_both_boundaries(self):
+        shape = verifier._response_shape(FakeResponse(
+            "https://creator.xiaohongshu.com/api/data",
+            "application/json",
+            {
+                "data": {
+                    "andy": {"view_count": 1},
+                    "items": [{"mars": {"like_count": 2}}],
+                },
+            },
+        ))
+        self.assertIsNotNone(shape)
+        self.assertIn("data.:key.view_count", shape["keyPaths"])
+        self.assertIn("data.items[].:key.like_count", shape["keyPaths"])
+        collected = json.dumps(shape, ensure_ascii=False)
+        self.assertNotIn("andy", collected)
+        self.assertNotIn("mars", collected)
+
+        verifier._write_report(self.report_path, {
+            "mode": "execute",
+            "responses": [{
+                "method": "GET",
+                "path": "/api/data",
+                "status": 200,
+                "contentType": "application/json",
+                "keyPaths": [
+                    "data.andy.view_count",
+                    "data.items[].mars.like_count",
+                ],
+                "fieldTypes": {
+                    "data.andy.view_count": "int",
+                    "data.items[].mars.like_count": "int",
+                },
+            }],
+            "cleanup": {"closed": True, "aliveResourceCount": 0},
+        })
+        persisted_text = self.report_path.read_text("utf-8")
+        persisted = json.loads(persisted_text)
+        self.assertEqual(
+            persisted["responses"][0]["keyPaths"],
+            ["data.:key.view_count", "data.items[].:key.like_count"],
+        )
+        self.assertEqual(
+            persisted["responses"][0]["fieldTypes"],
+            {
+                "data.:key.view_count": "int",
+                "data.items[].:key.like_count": "int",
+            },
+        )
+        self.assertNotIn("andy", persisted_text)
+        self.assertNotIn("mars", persisted_text)
 
     def test_report_writer_rejects_escape_and_untrusted_path_types(self):
         class UntrustedPath(str):
@@ -972,6 +1330,34 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
                 )
                 self.assertIsNone(raised.exception.__cause__)
                 self.assertNotIn("secret", str(raised.exception))
+
+    def test_report_writer_creates_missing_sdd_tree_from_repository_root_fd(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository_root = Path(temporary_directory) / "clean-repository"
+            repository_root.mkdir()
+            output_directory = (
+                repository_root
+                / ".superpowers/sdd/2026-08-20-xiaohongshu-data-contract-discovery"
+            )
+            destination = output_directory / "probe-report.json"
+
+            with patch.object(
+                verifier, "_REPOSITORY_ROOT", repository_root, create=True
+            ), patch.object(
+                verifier, "_REPORT_OUTPUT_DIRECTORY", output_directory
+            ):
+                try:
+                    verifier._write_report(destination, verifier.build_plan())
+                except verifier.ProbeFailure:
+                    self.fail("writer did not create the missing clean-checkout tree")
+
+            self.assertTrue(destination.is_file())
+            self.assertEqual(
+                json.loads(destination.read_text("utf-8")),
+                verifier.build_plan(),
+            )
+            self.assertTrue((repository_root / ".superpowers").is_dir())
+            self.assertTrue((repository_root / ".superpowers/sdd").is_dir())
 
     def test_report_writer_removes_same_directory_temporary_file_on_replace_failure(self):
         with patch.object(verifier.os, "replace", side_effect=OSError("private failure")):
@@ -1118,11 +1504,129 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
                 stdout=stdout,
             )
 
-        self.assertEqual(exit_code, 0)
+        self.assertEqual(exit_code, 1)
         execute.assert_called_once()
         self.assertTrue(self.report_path.is_file())
         self.assertEqual(json.loads(stdout.getvalue()), observed)
         self.assertEqual(json.loads(self.report_path.read_text("utf-8")), observed)
+
+    def test_main_exit_code_matches_terminal_status_matrix(self):
+        reviewed_paths = {
+            "/api/overview": "account_overview",
+            "/api/data/list": "content_list",
+            "/api/note/:id/metrics": "content_lifetime",
+        }
+        shapes = [
+            verifier._response_shape(FakeResponse(
+                "https://creator.xiaohongshu.com/api/overview",
+                "application/json",
+                {"data": {"trend": {"fans": 2}}},
+            )),
+            verifier._response_shape(FakeResponse(
+                "https://creator.xiaohongshu.com/api/data/list",
+                "application/json",
+                {"data": {"items": [{"note_id": "private-id"}]}},
+            )),
+            verifier._response_shape(FakeResponse(
+                "https://creator.xiaohongshu.com/api/note/123/metrics",
+                "application/json",
+                {
+                    "data": {
+                        "note_id": "private-id",
+                        "lifetime": {"view_count": 3},
+                    },
+                },
+            )),
+        ]
+        self.assertNotIn(None, shapes)
+
+        def execution_report(responses):
+            return verifier.sanitize_probe_report({
+                "schemaVersion": "xiaohongshu-data-contract-probe/v1",
+                "platformType": 1,
+                "mode": "execute",
+                "observedAt": "2026-08-20T12:00:00+00:00",
+                "responses": responses,
+                "cleanup": {"closed": True, "aliveResourceCount": 0},
+            })
+
+        with patch.object(
+            verifier,
+            "_REVIEWED_CONTRACT_PATH_TEMPLATES",
+            reviewed_paths,
+        ):
+            reports = (
+                ("success", execution_report(shapes), 0),
+                ("partial_success", execution_report(shapes[:1]), 1),
+                ("failed", execution_report([]), 1),
+            )
+            for label, observed, expected_exit_code in reports:
+                with self.subTest(status=label), patch.object(
+                    verifier, "_execute", return_value=observed
+                ):
+                    stdout = io.StringIO()
+                    exit_code = verifier.main(
+                        ["--execute", "--report", str(self.report_path)],
+                        stdout=stdout,
+                    )
+                persisted = json.loads(self.report_path.read_text("utf-8"))
+                emitted = json.loads(stdout.getvalue())
+                self.assertEqual(exit_code, expected_exit_code)
+                self.assertEqual(emitted["status"], label)
+                self.assertEqual(persisted, emitted)
+
+        plan_stdout = io.StringIO()
+        self.assertEqual(verifier.main([], stdout=plan_stdout), 0)
+        self.assertEqual(json.loads(plan_stdout.getvalue())["status"], "planned")
+
+        arguments_stdout = io.StringIO()
+        self.assertEqual(
+            verifier.main(["--execute", "--unknown"], stdout=arguments_stdout),
+            2,
+        )
+        self.assertEqual(
+            json.loads(arguments_stdout.getvalue())["status"], "failed"
+        )
+
+        path_stdout = io.StringIO()
+        outside_path = self.report_path.parent.parent / "private-report.json"
+        with patch.object(verifier, "_execute") as execute:
+            self.assertEqual(
+                verifier.main(
+                    ["--execute", "--report", str(outside_path)],
+                    stdout=path_stdout,
+                ),
+                1,
+            )
+        execute.assert_not_called()
+        self.assertEqual(json.loads(path_stdout.getvalue())["status"], "failed")
+
+        writer_stdout = io.StringIO()
+        with patch.object(
+            verifier, "_execute", return_value=execution_report([])
+        ), patch.object(
+            verifier,
+            "_write_report",
+            side_effect=verifier.ProbeFailure(
+                "xiaohongshu_report_write_failed"
+            ),
+        ):
+            self.assertEqual(
+                verifier.main(
+                    ["--execute", "--report", str(self.report_path)],
+                    stdout=writer_stdout,
+                ),
+                1,
+            )
+        self.assertEqual(json.loads(writer_stdout.getvalue())["status"], "failed")
+
+        for failure in (KeyboardInterrupt(), SystemExit()):
+            with self.subTest(process_control=type(failure).__name__), patch.object(
+                verifier, "_execute", side_effect=failure
+            ):
+                with self.assertRaises(type(failure)) as raised:
+                    verifier.main(["--execute"], stdout=io.StringIO())
+                self.assertIs(raised.exception, failure)
 
     def test_main_execute_with_report_persists_fixed_account_gate_failure(self):
         stdout = io.StringIO()
@@ -1139,7 +1643,7 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
                 stdout=stdout,
             )
 
-        self.assertEqual(exit_code, 0)
+        self.assertEqual(exit_code, 1)
         report = json.loads(stdout.getvalue())
         self.assertEqual(report["mode"], "execute")
         self.assertEqual(report["status"], "failed")
@@ -1174,7 +1678,7 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
             ):
                 stdout = io.StringIO()
                 exit_code = verifier.main(["--execute"], stdout=stdout)
-                self.assertEqual(exit_code, 0)
+                self.assertEqual(exit_code, 1)
                 report = json.loads(stdout.getvalue())
                 self.assertEqual(report["errorCode"], error_code)
                 assert_all_missing(report)
@@ -1205,21 +1709,26 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
         account_shape = verifier._response_shape(FakeResponse(
             "https://creator.xiaohongshu.com/api/overview",
             "application/json",
-            {"data": {"fans": 2}},
+            {"data": {"trend": {"fans": 2}}},
         ))
-        partial_source = verifier.sanitize_probe_report({
-            "schemaVersion": "xiaohongshu-data-contract-probe/v1",
-            "platformType": 1,
-            "mode": "execute",
-            "status": "partial_success",
-            "errorCode": "xiaohongshu_contracts_incomplete",
-            "observedAt": "2026-08-20T12:00:00+00:00",
-            "responses": [account_shape],
-            "cleanup": {"closed": True, "aliveResourceCount": 0},
-        })
-        writer_failure = verifier._failed_execution_report(
-            "xiaohongshu_report_write_failed", partial_source
-        )
+        with patch.object(
+            verifier,
+            "_REVIEWED_CONTRACT_PATH_TEMPLATES",
+            {"/api/overview": "account_overview"},
+        ):
+            partial_source = verifier.sanitize_probe_report({
+                "schemaVersion": "xiaohongshu-data-contract-probe/v1",
+                "platformType": 1,
+                "mode": "execute",
+                "status": "partial_success",
+                "errorCode": "xiaohongshu_contracts_incomplete",
+                "observedAt": "2026-08-20T12:00:00+00:00",
+                "responses": [account_shape],
+                "cleanup": {"closed": True, "aliveResourceCount": 0},
+            })
+            writer_failure = verifier._failed_execution_report(
+                "xiaohongshu_report_write_failed", partial_source
+            )
         self.assertEqual(writer_failure["status"], "failed")
         self.assertEqual(
             writer_failure["errorCode"], "xiaohongshu_report_write_failed"
@@ -1397,6 +1906,6 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
         with patch.object(verifier, "_execute", return_value=observed) as execute:
             exit_code = verifier.main(["--execute"], stdout=stdout)
 
-        self.assertEqual(exit_code, 0)
+        self.assertEqual(exit_code, 1)
         execute.assert_called_once()
         self.assertEqual(json.loads(stdout.getvalue()), observed)
