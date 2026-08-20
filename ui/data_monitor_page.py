@@ -262,6 +262,8 @@ class DataMonitorPage(QWidget):
         self._content_limit = 50
         self._content_offset = 0
         self._content_total = 0
+        self._content_availability = "missing"
+        self._content_warning_code = ""
         self._shutting_down = False
         self._sync_terminal_by_account: dict[int, str] = {}
         self._build_ui()
@@ -434,6 +436,8 @@ class DataMonitorPage(QWidget):
             self.content_table.set_payload({"items": []})
             self._content_offset = 0
             self._content_total = 0
+            self._content_availability = "missing"
+            self._content_warning_code = ""
             self._update_content_paging()
             return
         days = self.range_combo.currentData()
@@ -550,6 +554,16 @@ class DataMonitorPage(QWidget):
 
     def _set_contents(self, payload: object) -> None:
         safe_payload = payload if type(payload) is dict else {}
+        availability = safe_payload.get("availability")
+        self._content_availability = (
+            availability
+            if availability in {"available", "partial", "unavailable", "missing"}
+            else "missing"
+        )
+        warning_code = safe_payload.get("warningCode")
+        self._content_warning_code = (
+            warning_code if type(warning_code) is str else ""
+        )
         total = safe_payload.get("total")
         self._content_total = total if type(total) is int and total >= 0 else 0
         self.content_table.set_payload(safe_payload)
@@ -558,9 +572,20 @@ class DataMonitorPage(QWidget):
     def _update_content_paging(self) -> None:
         first = self._content_offset + 1 if self._content_total else 0
         last = min(self._content_offset + self._content_limit, self._content_total)
-        self.content_page_label.setText(
-            f"共 {self._content_total} 条 · {first}-{last}"
-        )
+        if self._content_availability in {"unavailable", "missing"}:
+            if self._content_total:
+                paging_text = f"本次未取得，显示历史 {self._content_total} 条"
+            else:
+                paging_text = "作品数据暂未取得"
+        elif self._content_availability == "partial":
+            paging_text = (
+                f"部分取得 · 共 {self._content_total} 条 · {first}-{last}"
+            )
+        elif self._content_total:
+            paging_text = f"已取得 {self._content_total} 条 · {first}-{last}"
+        else:
+            paging_text = "已取得 0 条"
+        self.content_page_label.setText(paging_text)
         self.previous_page_button.setEnabled(self._content_offset > 0)
         self.next_page_button.setEnabled(
             self._content_offset + self._content_limit < self._content_total

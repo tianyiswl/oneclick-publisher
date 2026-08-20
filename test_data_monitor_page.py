@@ -344,6 +344,60 @@ class DataMonitorPageTests(unittest.TestCase):
         self.period_mock.assert_not_called()
         self.trends_mock.assert_not_called()
 
+    def test_content_header_distinguishes_unavailable_history_and_true_zero(
+        self,
+    ) -> None:
+        """作品本次未取得时不得显示为已取得零条。"""
+
+        page = self._page()
+
+        page._set_contents(
+            {
+                "availability": "unavailable",
+                "warningCode": "content_list_unavailable",
+                "total": 0,
+                "items": [],
+            }
+        )
+        self.assertEqual(page.content_page_label.text(), "作品数据暂未取得")
+        self.assertNotIn("0 条", page.content_page_label.text())
+
+        page._set_contents(
+            {
+                "availability": "unavailable",
+                "warningCode": "content_payload_invalid",
+                "total": 2,
+                "items": [],
+            }
+        )
+        self.assertEqual(
+            page.content_page_label.text(),
+            "本次未取得，显示历史 2 条",
+        )
+
+        page._set_contents(
+            {
+                "availability": "partial",
+                "warningCode": "content_list_truncated",
+                "total": 2,
+                "items": [],
+            }
+        )
+        self.assertEqual(
+            page.content_page_label.text(),
+            "部分取得 · 共 2 条 · 1-2",
+        )
+
+        page._set_contents(
+            {
+                "availability": "available",
+                "warningCode": "",
+                "total": 0,
+                "items": [],
+            }
+        )
+        self.assertEqual(page.content_page_label.text(), "已取得 0 条")
+
     def test_partial_success_is_not_rendered_as_complete(self) -> None:
         """账号趋势可用时不得把未取得的作品数据冒充为全部完成。"""
 

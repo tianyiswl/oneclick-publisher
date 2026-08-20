@@ -30,11 +30,26 @@ def account_point() -> MetricPoint:
     )
 
 
-def valid_batch(source_mode: str) -> CollectionBatch:
+def content_point() -> MetricPoint:
+    return MetricPoint(
+        entity_type="content",
+        entity_key="aweme-1",
+        metric_key="views",
+        raw_metric_key="play",
+        metric_value=400,
+        metric_unit="count",
+        metric_scope="lifetime_total",
+        period_start="2026-08-20",
+        period_end="2026-08-20",
+        observed_at="2026-08-20T12:00:00+08:00",
+    )
+
+
+def valid_batch(source_mode: str, *, warning_code: str = "") -> CollectionBatch:
     return CollectionBatch(
         platform_type=3,
         source_mode=source_mode,
-        metrics=(account_point(),),
+        metrics=(account_point(), content_point()),
         contents=(
             ContentRecord(
                 content_id="aweme-1",
@@ -48,6 +63,7 @@ def valid_batch(source_mode: str) -> CollectionBatch:
         account_metrics_available=True,
         content_data_available=True,
         platform_observed_at="2026-08-20T12:00:00+08:00",
+        warning_code=warning_code,
     )
 
 
@@ -349,7 +365,7 @@ class PlatformDataSyncTests(unittest.TestCase):
                 "status": "failed",
                 "sourceMode": "direct_session",
                 "errorCode": "sync_persist_failed",
-                "metricCount": 1,
+                "metricCount": 2,
                 "contentCount": 1,
             },
         )
@@ -361,7 +377,7 @@ class PlatformDataSyncTests(unittest.TestCase):
         """截断警告若被清空，调用方会把不完整作品列表当作全量。"""
 
         collector = FakeCollector(
-            account_only_batch(
+            valid_batch(
                 "direct_session", warning_code="content_list_truncated"
             )
         )

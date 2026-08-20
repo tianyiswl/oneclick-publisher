@@ -175,6 +175,32 @@ class DouyinDirectCollectorTests(unittest.TestCase):
         )
         self.assertEqual(session.closed, 1)
 
+    def test_direct_response_uses_one_real_observation_time_for_all_points(
+        self,
+    ) -> None:
+        """同一直连响应的观测时间必须唯一，且不能伪装成统计日零点。"""
+
+        observed_at = "2026-08-20T00:00:01+08:00"
+        with patch(
+            "app_core.douyin_data_collector._local_observation_timestamp",
+            return_value=observed_at,
+        ) as observation_clock:
+            batch = DouyinDataCollector(
+                session_factory=lambda: FakeSession(self._valid_payload())
+            ).collect_direct(self.account)
+
+        observation_clock.assert_called_once_with()
+        self.assertEqual(batch.platform_observed_at, observed_at)
+        self.assertEqual(
+            {point.observed_at for point in batch.metrics},
+            {observed_at},
+        )
+        self.assertNotEqual(observed_at, "2026-08-20T00:00:00+08:00")
+        self.assertEqual(
+            {point.period_end for point in batch.metrics},
+            {"2026-08-20"},
+        )
+
     def test_account_batch_marks_content_list_unavailable_without_speculative_request(self) -> None:
         """尚未验证作品接口时，只能保留账户数据，不能猜测补采请求。"""
 
@@ -674,6 +700,46 @@ class DouyinBrowserSignedCollectorTests(DouyinDirectCollectorTests):
                 }
             ),
             len(batch.metrics),
+        )
+
+    def test_browser_response_uses_one_real_observation_time_for_all_points(
+        self,
+    ) -> None:
+        """同一签名响应中的日趋势与粉丝总数必须共用实际观测时间。"""
+
+        payload = self._current_overview_payload()
+        payload["data"]["fans"] = {
+            "status_code": 0,
+            "current_count": 431,
+            "option_list": [{"date": "20260820", "count": 12}],
+        }
+        response = FakeBrowserResponse(
+            "https://creator.douyin.com/aweme/janus/creator/data/overview/all/",
+            payload,
+        )
+        collector, _page, _context, _browser, _playwright = (
+            self._collector_with_browser(response)
+        )
+        observed_at = "2026-08-20T12:34:56+08:00"
+
+        with patch(
+            "app_core.douyin_data_collector._local_observation_timestamp",
+            return_value=observed_at,
+        ) as observation_clock:
+            batch = collector.collect_browser_signed(self.account)
+
+        observation_clock.assert_called_once_with()
+        self.assertEqual(batch.platform_observed_at, observed_at)
+        self.assertEqual(
+            {point.observed_at for point in batch.metrics},
+            {observed_at},
+        )
+        self.assertFalse(
+            any(point.observed_at.endswith("T00:00:00+08:00") for point in batch.metrics)
+        )
+        self.assertIn(
+            ("followers_total", "2026-08-20"),
+            {(point.metric_key, point.period_end) for point in batch.metrics},
         )
 
     def test_browser_signed_accepts_only_allowlisted_official_response_and_closes(self) -> None:

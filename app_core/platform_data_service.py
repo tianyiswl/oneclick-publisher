@@ -89,7 +89,7 @@ def _built_in_int(
 def _period_range(days: object) -> tuple[int, str, str]:
     if type(days) is not int or days not in _PERIOD_DAYS:
         raise CollectionFailure("metric_payload_invalid")
-    end = _beijing_today()
+    end = _beijing_today() - timedelta(days=1)
     start = end - timedelta(days=days - 1)
     return days, start.isoformat(), end.isoformat()
 
@@ -412,6 +412,93 @@ def _latest_run_details(
     }
 
 
+def _content_query_state(conn, account_id: int) -> dict:
+    run_projection = """
+        SELECT runs.id, runs.status, runs.errorCode,
+               runs.startedAt, runs.finishedAt,
+               EXISTS (
+                   SELECT 1
+                   FROM platform_metric_snapshots AS snapshots
+                   WHERE snapshots.syncRunId = runs.id
+                     AND snapshots.entityType = 'content'
+                     AND snapshots.metricScope = 'lifetime_total'
+                     AND snapshots.periodStart != ''
+                     AND snapshots.periodEnd != ''
+               ) AS hasContentMetrics
+        FROM platform_data_sync_runs AS runs
+    """
+    latest_attempt = conn.execute(
+        run_projection
+        + """
+        WHERE runs.accountId = ?
+        ORDER BY runs.id DESC
+        LIMIT 1
+        """,
+        (account_id,),
+    ).fetchone()
+    latest_trusted = conn.execute(
+        run_projection
+        + """
+        WHERE runs.accountId = ?
+          AND runs.status IN ('success', 'partial_success')
+          AND runs.errorCode IN ('', 'content_list_truncated',
+                                 'account_trends_unavailable')
+          AND EXISTS (
+              SELECT 1
+              FROM platform_metric_snapshots AS snapshots
+              WHERE snapshots.syncRunId = runs.id
+                AND snapshots.entityType = 'content'
+                AND snapshots.metricScope = 'lifetime_total'
+                AND snapshots.periodStart != ''
+                AND snapshots.periodEnd != ''
+          )
+        ORDER BY runs.id DESC
+        LIMIT 1
+        """,
+        (account_id,),
+    ).fetchone()
+
+    availability = "missing"
+    warning_code = ""
+    if latest_attempt is not None:
+        status = str(latest_attempt["status"] or "")
+        error_code = str(latest_attempt["errorCode"] or "")
+        has_content_metrics = bool(latest_attempt["hasContentMetrics"])
+        if error_code in {"content_list_unavailable", "content_payload_invalid"}:
+            availability = "unavailable"
+            warning_code = error_code
+        elif error_code == "content_list_truncated":
+            if has_content_metrics:
+                availability = "partial"
+                warning_code = error_code
+            else:
+                availability = "unavailable"
+                warning_code = "content_payload_invalid"
+        elif (
+            status in {"success", "partial_success"}
+            and error_code in {"", "account_trends_unavailable"}
+            and has_content_metrics
+        ):
+            availability = "available"
+
+    data_run = (
+        latest_attempt
+        if availability in {"available", "partial"}
+        else latest_trusted
+    )
+    data_rows = [data_run] if data_run is not None else []
+    return {
+        "availability": availability,
+        "warningCode": warning_code,
+        "platformObservedAt": _latest_controlled_timestamp(
+            data_rows, "startedAt"
+        ),
+        "localSyncedAt": _latest_controlled_timestamp(
+            data_rows, "finishedAt"
+        ),
+    }
+
+
 def _latest_account_rows(
     conn,
     *,
@@ -651,6 +738,7 @@ def account_contents(
     safe_offset = _built_in_int(offset, minimum=0)
     try:
         with database.connect() as conn:
+            content_state = _content_query_state(conn, account)
             total = int(
                 conn.execute(
                     "SELECT COUNT(*) FROM platform_contents WHERE accountId = ?",
@@ -717,6 +805,7 @@ def account_contents(
         raise CollectionFailure("sync_persist_failed") from None
     return {
         "accountId": account,
+        **content_state,
         "total": total,
         "limit": safe_limit,
         "offset": safe_offset,
@@ -754,10 +843,54 @@ def account_data_summary(account_id: int) -> dict:
             if latest_success is not None:
                 rows = conn.execute(
                     """
+                    WITH ranked AS (
+                        SELECT metricKey, metricValue, observedAt,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY metricKey
+                                   ORDER BY
+                                       CASE
+                                           WHEN metricScope IN (
+                                               'daily_increment',
+                                               'lifetime_total'
+                                           )
+                                            AND periodStart != ''
+                                            AND periodEnd != ''
+                                           THEN 0
+                                           ELSE 1
+                                       END,
+                                       CASE
+                                           WHEN metricScope IN (
+                                               'daily_increment',
+                                               'lifetime_total'
+                                           )
+                                           THEN periodEnd
+                                           ELSE ''
+                                       END DESC,
+                                       id DESC
+                               ) AS rowNumber
+                        FROM platform_metric_snapshots
+                        WHERE syncRunId = ?
+                          AND entityType = 'account'
+                          AND (
+                              (
+                                  metricScope IN (
+                                      'daily_increment',
+                                      'lifetime_total'
+                                  )
+                                  AND periodStart != ''
+                                  AND periodEnd != ''
+                              )
+                              OR (
+                                  metricScope = ''
+                                  AND periodStart = ''
+                                  AND periodEnd = ''
+                              )
+                          )
+                    )
                     SELECT metricKey, metricValue, observedAt
-                    FROM platform_metric_snapshots
-                    WHERE syncRunId = ?
-                    ORDER BY id
+                    FROM ranked
+                    WHERE rowNumber = 1
+                    ORDER BY metricKey
                     """,
                     (int(latest_success["id"]),),
                 ).fetchall()

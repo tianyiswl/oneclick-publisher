@@ -224,6 +224,177 @@ class PlatformDataServiceTests(unittest.TestCase):
                 platform_observed_at="2026-08-20T12:00:00+08:00",
             )
 
+    def test_collection_batch_enforces_flag_entity_and_warning_invariants(
+        self,
+    ) -> None:
+        """批次可用性、实体和 warning 任一矛盾都必须固定拒绝。"""
+
+        account_point = self._v2_point("views", 10, day="2026-08-19")
+        content_point = self._v2_point(
+            "views",
+            100,
+            day="2026-08-19",
+            entity_type="content",
+            entity_key="aweme-1",
+            metric_scope="lifetime_total",
+        )
+        unmatched_content_point = self._v2_point(
+            "views",
+            101,
+            day="2026-08-19",
+            entity_type="content",
+            entity_key="aweme-2",
+            metric_scope="lifetime_total",
+        )
+        content = self._content("aweme-1")
+        common = {
+            "platform_type": 3,
+            "source_mode": "direct_session",
+            "platform_observed_at": "2026-08-20T12:00:00+08:00",
+        }
+        invalid_batches = {
+            "available_account_without_account_point": {
+                "metrics": (content_point,),
+                "contents": (content,),
+                "account_metrics_available": True,
+                "content_data_available": True,
+                "warning_code": "",
+            },
+            "unavailable_account_with_account_point": {
+                "metrics": (account_point,),
+                "contents": (),
+                "account_metrics_available": False,
+                "content_data_available": False,
+                "warning_code": "content_list_unavailable",
+            },
+            "product_batch_without_account": {
+                "metrics": (content_point,),
+                "contents": (content,),
+                "account_metrics_available": False,
+                "content_data_available": True,
+                "warning_code": "account_trends_unavailable",
+            },
+            "unavailable_content_with_metadata": {
+                "metrics": (account_point,),
+                "contents": (content,),
+                "account_metrics_available": True,
+                "content_data_available": False,
+                "warning_code": "content_list_unavailable",
+            },
+            "unavailable_content_with_point": {
+                "metrics": (account_point, content_point),
+                "contents": (content,),
+                "account_metrics_available": True,
+                "content_data_available": False,
+                "warning_code": "content_list_unavailable",
+            },
+            "available_content_without_point": {
+                "metrics": (account_point,),
+                "contents": (content,),
+                "account_metrics_available": True,
+                "content_data_available": True,
+                "warning_code": "",
+            },
+            "available_content_with_unmatched_point": {
+                "metrics": (account_point, unmatched_content_point),
+                "contents": (content,),
+                "account_metrics_available": True,
+                "content_data_available": True,
+                "warning_code": "",
+            },
+            "unavailable_warning_with_available_content": {
+                "metrics": (account_point, content_point),
+                "contents": (content,),
+                "account_metrics_available": True,
+                "content_data_available": True,
+                "warning_code": "content_payload_invalid",
+            },
+            "truncated_warning_with_unavailable_content": {
+                "metrics": (account_point,),
+                "contents": (),
+                "account_metrics_available": True,
+                "content_data_available": False,
+                "warning_code": "content_list_truncated",
+            },
+            "missing_warning_with_unavailable_content": {
+                "metrics": (account_point,),
+                "contents": (),
+                "account_metrics_available": True,
+                "content_data_available": False,
+                "warning_code": "",
+            },
+        }
+        for name, values in invalid_batches.items():
+            with self.subTest(name=name):
+                with self.assertRaises(CollectionFailure) as raised:
+                    CollectionBatch(**common, **values)
+                self.assertEqual(
+                    raised.exception.error_code,
+                    "metric_payload_invalid",
+                )
+
+        complete = CollectionBatch(
+            **common,
+            metrics=(account_point, content_point),
+            contents=(content,),
+            account_metrics_available=True,
+            content_data_available=True,
+        )
+        truncated = CollectionBatch(
+            **common,
+            metrics=(account_point, content_point),
+            contents=(content,),
+            account_metrics_available=True,
+            content_data_available=True,
+            warning_code="content_list_truncated",
+        )
+        unavailable = CollectionBatch(
+            **common,
+            metrics=(account_point,),
+            contents=(),
+            account_metrics_available=True,
+            content_data_available=False,
+            warning_code="content_list_unavailable",
+        )
+        self.assertEqual(
+            (complete.warning_code, truncated.warning_code, unavailable.warning_code),
+            ("", "content_list_truncated", "content_list_unavailable"),
+        )
+
+    def test_collection_batch_rejects_duplicate_content_ids(self) -> None:
+        """同批次重复作品 ID 会使元数据与累计指标失去唯一对应。"""
+
+        account_point = self._v2_point("views", 10, day="2026-08-19")
+        content_point = self._v2_point(
+            "views",
+            100,
+            day="2026-08-19",
+            entity_type="content",
+            entity_key="aweme-1",
+            metric_scope="lifetime_total",
+        )
+        duplicate = ContentRecord(
+            content_id="aweme-1",
+            title="重复作品",
+            cover_url="https://creator.douyin.com/cover/duplicate.jpg",
+            published_at="2026-08-19T11:00:00+08:00",
+            content_status="published",
+            content_type="video",
+        )
+
+        with self.assertRaises(CollectionFailure) as raised:
+            CollectionBatch(
+                platform_type=3,
+                source_mode="direct_session",
+                metrics=(account_point, content_point),
+                contents=(self._content("aweme-1"), duplicate),
+                account_metrics_available=True,
+                content_data_available=True,
+                platform_observed_at="2026-08-20T12:00:00+08:00",
+            )
+
+        self.assertEqual(raised.exception.error_code, "metric_payload_invalid")
+
     def test_schema_migrates_legacy_metrics_without_inventing_scope(self) -> None:
         """旧快照没有口径和范围，迁移后不得伪造成可汇总的 V2 数据。"""
 
@@ -392,6 +563,7 @@ class PlatformDataServiceTests(unittest.TestCase):
             account_metrics_available=True,
             content_data_available=False,
             platform_observed_at="2026-08-20T12:00:00+08:00",
+            warning_code="content_list_unavailable",
         )
 
         saved = platform_data_service.record_successful_sync(
@@ -421,6 +593,7 @@ class PlatformDataServiceTests(unittest.TestCase):
                 account_metrics_available=True,
                 content_data_available=False,
                 platform_observed_at="2026-08-20T12:00:00+08:00",
+                warning_code="content_list_unavailable",
             ),
         )
 
@@ -440,6 +613,160 @@ class PlatformDataServiceTests(unittest.TestCase):
         )
         self.assertEqual(summary["latestRun"]["sourceMode"], "browser_signed")
 
+    def test_legacy_summary_uses_latest_account_period_and_ignores_content(
+        self,
+    ) -> None:
+        """30 日乱序账号点必须按日期取最新，同名作品指标不得覆盖。"""
+
+        with database.connect() as conn:
+            run_id = int(
+                conn.execute(
+                    """
+                    INSERT INTO platform_data_sync_runs
+                        (accountId, platformType, sourceMode, status,
+                         errorCode, metricCount, startedAt, finishedAt)
+                    VALUES (?, 3, 'direct_session', 'success', '', 8, ?, ?)
+                    """,
+                    (
+                        self.account_id,
+                        "2026-08-20T12:00:00+08:00",
+                        "2026-08-20T12:01:00+08:00",
+                    ),
+                ).lastrowid
+            )
+            rows = (
+                (
+                    "account",
+                    f"account:{self.account_id}",
+                    "views",
+                    122,
+                    "daily_increment",
+                    "2026-07-22",
+                    "2026-07-22",
+                    "2026-08-20T12:00:01+08:00",
+                ),
+                (
+                    "account",
+                    f"account:{self.account_id}",
+                    "views",
+                    190,
+                    "daily_increment",
+                    "2026-08-19",
+                    "2026-08-19",
+                    "2026-08-20T12:00:02+08:00",
+                ),
+                (
+                    "account",
+                    f"account:{self.account_id}",
+                    "views",
+                    150,
+                    "daily_increment",
+                    "2026-08-05",
+                    "2026-08-05",
+                    "2026-08-20T12:00:03+08:00",
+                ),
+                (
+                    "account",
+                    f"account:{self.account_id}",
+                    "comments",
+                    19,
+                    "daily_increment",
+                    "2026-08-19",
+                    "2026-08-19",
+                    "2026-08-20T12:00:04+08:00",
+                ),
+                (
+                    "account",
+                    f"account:{self.account_id}",
+                    "comments",
+                    5,
+                    "daily_increment",
+                    "2026-08-05",
+                    "2026-08-05",
+                    "2026-08-20T12:00:05+08:00",
+                ),
+                (
+                    "content",
+                    "aweme-same-name",
+                    "views",
+                    9_999,
+                    "lifetime_total",
+                    "2026-08-20",
+                    "2026-08-20",
+                    "2026-08-20T12:00:06+08:00",
+                ),
+                (
+                    "account",
+                    f"account:{self.account_id}",
+                    "likes",
+                    7,
+                    "",
+                    "",
+                    "",
+                    "2026-08-20T12:00:07+08:00",
+                ),
+                (
+                    "content",
+                    "aweme-same-name",
+                    "likes",
+                    8_888,
+                    "",
+                    "",
+                    "",
+                    "2026-08-20T12:00:08+08:00",
+                ),
+            )
+            conn.executemany(
+                """
+                INSERT INTO platform_metric_snapshots
+                    (syncRunId, accountId, platformType, entityType, entityKey,
+                     metricKey, rawMetricKey, metricValue, metricUnit,
+                     metricScope, periodStart, periodEnd, observedAt, createdAt)
+                VALUES (?, ?, 3, ?, ?, ?, ?, ?, 'count', ?, ?, ?, ?, ?)
+                """,
+                (
+                    (
+                        run_id,
+                        self.account_id,
+                        entity_type,
+                        entity_key,
+                        metric_key,
+                        metric_key,
+                        value,
+                        metric_scope,
+                        period_start,
+                        period_end,
+                        observed_at,
+                        observed_at,
+                    )
+                    for (
+                        entity_type,
+                        entity_key,
+                        metric_key,
+                        value,
+                        metric_scope,
+                        period_start,
+                        period_end,
+                        observed_at,
+                    ) in rows
+                ),
+            )
+
+        summary = platform_data_service.account_data_summary(self.account_id)
+
+        self.assertEqual(
+            summary["metrics"],
+            {"views": 190, "comments": 19, "likes": 7},
+        )
+        self.assertEqual(
+            summary["observedAt"],
+            {
+                "views": "2026-08-20T12:00:02+08:00",
+                "comments": "2026-08-20T12:00:04+08:00",
+                "likes": "2026-08-20T12:00:07+08:00",
+            },
+        )
+
     def test_metric_insert_failure_rolls_back_run_and_all_snapshots(self) -> None:
         """运行头与指标必须同事务，否则半写入会伪造一次成功同步。"""
 
@@ -451,6 +778,7 @@ class PlatformDataServiceTests(unittest.TestCase):
             account_metrics_available=True,
             content_data_available=False,
             platform_observed_at="2026-08-20T12:00:00+08:00",
+            warning_code="content_list_unavailable",
         )
         original = platform_data_service._insert_metric_snapshot
         calls = 0
@@ -516,6 +844,7 @@ class PlatformDataServiceTests(unittest.TestCase):
                 account_metrics_available=True,
                 content_data_available=False,
                 platform_observed_at="2026-08-20T12:00:00+08:00",
+                warning_code="content_list_unavailable",
             ),
         )
 
@@ -653,6 +982,42 @@ class PlatformDataServiceTests(unittest.TestCase):
                 self.assertIsNone(raised.exception.__cause__)
                 self.assertEqual(self._table_counts(), (1, 3, 1))
 
+    def test_period_ranges_end_at_beijing_yesterday_across_calendar_boundaries(
+        self,
+    ) -> None:
+        """北京时间零点后仍须以已结算的昨日作为区间末日。"""
+
+        cases = (
+            (
+                date(2027, 1, 1),
+                {
+                    1: ("2026-12-31", "2026-12-31"),
+                    7: ("2026-12-25", "2026-12-31"),
+                    30: ("2026-12-02", "2026-12-31"),
+                },
+            ),
+            (
+                date(2026, 3, 1),
+                {
+                    1: ("2026-02-28", "2026-02-28"),
+                    7: ("2026-02-22", "2026-02-28"),
+                    30: ("2026-01-30", "2026-02-28"),
+                },
+            ),
+        )
+        for beijing_today, expected_by_days in cases:
+            with self.subTest(beijing_today=beijing_today):
+                with patch.object(
+                    platform_data_service,
+                    "_beijing_today",
+                    return_value=beijing_today,
+                ):
+                    for days, expected in expected_by_days.items():
+                        _safe_days, period_start, period_end = (
+                            platform_data_service._period_range(days)
+                        )
+                        self.assertEqual((period_start, period_end), expected)
+
     def test_period_summary_distinguishes_complete_partial_and_missing(self) -> None:
         """范围或缺失判断退化时，稀疏数据会被补零或旧数据污染。"""
 
@@ -750,7 +1115,7 @@ class PlatformDataServiceTests(unittest.TestCase):
         with patch.object(
             platform_data_service,
             "_beijing_today",
-            return_value=date(2026, 8, 20),
+            return_value=date(2026, 8, 21),
             create=True,
         ):
             one_day = platform_data_service.account_period_summary(
@@ -834,6 +1199,7 @@ class PlatformDataServiceTests(unittest.TestCase):
             platform_type=3,
             source_mode="direct_session",
             metrics=(
+                self._v2_point("comments", 1, day="2026-08-19"),
                 self._v2_point(
                     "views",
                     400,
@@ -844,15 +1210,15 @@ class PlatformDataServiceTests(unittest.TestCase):
                 ),
             ),
             contents=(self._content("aweme-1"),),
-            account_metrics_available=False,
+            account_metrics_available=True,
             content_data_available=True,
             platform_observed_at="2026-08-19T23:30:00+08:00",
-            warning_code="account_trends_unavailable",
         )
         second = CollectionBatch(
             platform_type=3,
             source_mode="browser_signed",
             metrics=(
+                self._v2_point("comments", 2, day="2026-08-20"),
                 self._v2_point(
                     "views",
                     450,
@@ -879,10 +1245,9 @@ class PlatformDataServiceTests(unittest.TestCase):
                 ),
             ),
             contents=(self._content("aweme-1"), self._content("aweme-2")),
-            account_metrics_available=False,
+            account_metrics_available=True,
             content_data_available=True,
             platform_observed_at="2026-08-20T23:30:00+08:00",
-            warning_code="account_trends_unavailable",
         )
         platform_data_service.record_collection_sync(self.account_id, first)
         platform_data_service.record_collection_sync(self.account_id, second)
@@ -938,6 +1303,171 @@ class PlatformDataServiceTests(unittest.TestCase):
                 self.assertEqual(
                     raised.exception.error_code, "metric_payload_invalid"
                 )
+
+    def test_account_contents_exposes_latest_availability_and_trusted_time(
+        self,
+    ) -> None:
+        """本次作品失败不得把历史作品报成实时零条。"""
+
+        def account_point(day: str, value: int) -> MetricPoint:
+            return self._v2_point("views", value, day=day)
+
+        def content_point(day: str, value: int) -> MetricPoint:
+            return self._v2_point(
+                "views",
+                value,
+                day=day,
+                entity_type="content",
+                entity_key="aweme-1",
+                metric_scope="lifetime_total",
+            )
+
+        with patch.object(
+            platform_data_service,
+            "_now",
+            return_value="2026-08-19T12:01:00+08:00",
+        ):
+            platform_data_service.record_collection_sync(
+                self.account_id,
+                CollectionBatch(
+                    platform_type=3,
+                    source_mode="direct_session",
+                    metrics=(
+                        account_point("2026-08-18", 10),
+                        content_point("2026-08-18", 400),
+                    ),
+                    contents=(self._content("aweme-1"),),
+                    account_metrics_available=True,
+                    content_data_available=True,
+                    platform_observed_at="2026-08-19T12:00:00+08:00",
+                ),
+            )
+        with patch.object(
+            platform_data_service,
+            "_now",
+            return_value="2026-08-20T12:01:00+08:00",
+        ):
+            platform_data_service.record_collection_sync(
+                self.account_id,
+                CollectionBatch(
+                    platform_type=3,
+                    source_mode="browser_signed",
+                    metrics=(account_point("2026-08-19", 20),),
+                    contents=(),
+                    account_metrics_available=True,
+                    content_data_available=False,
+                    platform_observed_at="2026-08-20T12:00:00+08:00",
+                    warning_code="content_list_unavailable",
+                ),
+            )
+
+        unavailable = platform_data_service.account_contents(self.account_id)
+
+        self.assertEqual(unavailable["availability"], "unavailable")
+        self.assertEqual(unavailable["warningCode"], "content_list_unavailable")
+        self.assertEqual(unavailable["total"], 1)
+        self.assertEqual(
+            unavailable["platformObservedAt"],
+            "2026-08-19T12:00:00+08:00",
+        )
+        self.assertEqual(
+            unavailable["localSyncedAt"],
+            "2026-08-19T12:01:00+08:00",
+        )
+
+        with patch.object(
+            platform_data_service,
+            "_now",
+            return_value="2026-08-20T13:01:00+08:00",
+        ):
+            platform_data_service.record_collection_sync(
+                self.account_id,
+                CollectionBatch(
+                    platform_type=3,
+                    source_mode="browser_signed",
+                    metrics=(
+                        account_point("2026-08-19", 21),
+                        content_point("2026-08-19", 450),
+                    ),
+                    contents=(self._content("aweme-1"),),
+                    account_metrics_available=True,
+                    content_data_available=True,
+                    platform_observed_at="2026-08-20T13:00:00+08:00",
+                    warning_code="content_list_truncated",
+                ),
+            )
+
+        partial = platform_data_service.account_contents(self.account_id)
+
+        self.assertEqual(partial["availability"], "partial")
+        self.assertEqual(partial["warningCode"], "content_list_truncated")
+        self.assertEqual(
+            partial["platformObservedAt"], "2026-08-20T13:00:00+08:00"
+        )
+        self.assertEqual(
+            partial["localSyncedAt"], "2026-08-20T13:01:00+08:00"
+        )
+
+        with database.connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO user_info
+                    (type, filePath, userName, status, profileName, authMode)
+                VALUES (3, 'missing.json', '无作品证据', 1,
+                        '无作品证据', 'browser')
+                """
+            )
+            missing_account_id = int(cursor.lastrowid)
+        missing = platform_data_service.account_contents(missing_account_id)
+        self.assertEqual(missing["availability"], "missing")
+        self.assertEqual(missing["warningCode"], "")
+        self.assertIsNone(missing["platformObservedAt"])
+        self.assertIsNone(missing["localSyncedAt"])
+
+    def test_account_contents_rejects_uncontrolled_data_times(self) -> None:
+        """损坏或含路径的历史时间文本不得穿过公开作品查询。"""
+
+        content_point = self._v2_point(
+            "views",
+            100,
+            day="2026-08-19",
+            entity_type="content",
+            entity_key="aweme-1",
+            metric_scope="lifetime_total",
+        )
+        platform_data_service.record_collection_sync(
+            self.account_id,
+            CollectionBatch(
+                platform_type=3,
+                source_mode="direct_session",
+                metrics=(
+                    self._v2_point("views", 10, day="2026-08-19"),
+                    content_point,
+                ),
+                contents=(self._content("aweme-1"),),
+                account_metrics_available=True,
+                content_data_available=True,
+                platform_observed_at="2026-08-20T12:00:00+08:00",
+            ),
+        )
+        with database.connect() as conn:
+            conn.execute(
+                """
+                UPDATE platform_data_sync_runs
+                SET startedAt = '/private/path?token=secret',
+                    finishedAt = 'not-a-timestamp'
+                WHERE accountId = ?
+                """,
+                (self.account_id,),
+            )
+
+        payload = platform_data_service.account_contents(self.account_id)
+
+        self.assertEqual(payload["availability"], "available")
+        self.assertIsNone(payload["platformObservedAt"])
+        self.assertIsNone(payload["localSyncedAt"])
+        self.assertNotIn("private", repr(payload).lower())
+        self.assertNotIn("secret", repr(payload).lower())
 
     def test_collection_warning_code_is_fixed_and_marks_partial(self) -> None:
         """批次 warning 不能借用登录错误或任意文本污染部分成功回执。"""
@@ -1026,7 +1556,7 @@ class PlatformDataServiceTests(unittest.TestCase):
         with patch.object(
             platform_data_service,
             "_beijing_today",
-            return_value=date(2026, 8, 20),
+            return_value=date(2026, 8, 21),
         ):
             week_before_end = platform_data_service.account_period_summary(
                 self.account_id, 7
@@ -1051,7 +1581,7 @@ class PlatformDataServiceTests(unittest.TestCase):
         with patch.object(
             platform_data_service,
             "_beijing_today",
-            return_value=date(2026, 8, 20),
+            return_value=date(2026, 8, 21),
         ):
             week_at_end = platform_data_service.account_period_summary(
                 self.account_id, 7
@@ -1067,28 +1597,35 @@ class PlatformDataServiceTests(unittest.TestCase):
     def test_collection_rejects_metric_identity_mismatch_without_writes(self) -> None:
         """错账号和孤儿作品指标必须在落库前拒绝，不能留下运行头。"""
 
-        invalid_batches = (
-            CollectionBatch(
-                platform_type=3,
-                source_mode="direct_session",
-                metrics=(
-                    self._v2_point(
-                        "views",
-                        10,
-                        day="2026-08-20",
-                        entity_key="account:999",
-                    ),
+        wrong_account = CollectionBatch(
+            platform_type=3,
+            source_mode="direct_session",
+            metrics=(
+                self._v2_point(
+                    "views",
+                    10,
+                    day="2026-08-20",
+                    entity_key="account:999",
                 ),
-                contents=(),
-                account_metrics_available=True,
-                content_data_available=False,
-                platform_observed_at="2026-08-20T23:30:00+08:00",
-                warning_code="content_list_unavailable",
             ),
+            contents=(),
+            account_metrics_available=True,
+            content_data_available=False,
+            platform_observed_at="2026-08-20T23:30:00+08:00",
+            warning_code="content_list_unavailable",
+        )
+        with self.assertRaises(CollectionFailure) as raised:
+            platform_data_service.record_collection_sync(
+                self.account_id, wrong_account
+            )
+        self.assertEqual(raised.exception.error_code, "metric_payload_invalid")
+
+        with self.assertRaises(CollectionFailure) as raised:
             CollectionBatch(
                 platform_type=3,
                 source_mode="direct_session",
                 metrics=(
+                    self._v2_point("views", 10, day="2026-08-20"),
                     self._v2_point(
                         "views",
                         40,
@@ -1099,23 +1636,12 @@ class PlatformDataServiceTests(unittest.TestCase):
                     ),
                 ),
                 contents=(self._content("aweme-1"),),
-                account_metrics_available=False,
+                account_metrics_available=True,
                 content_data_available=True,
                 platform_observed_at="2026-08-20T23:30:00+08:00",
-                warning_code="account_trends_unavailable",
-            ),
-        )
-
-        for batch in invalid_batches:
-            with self.subTest(entity_key=batch.metrics[0].entity_key):
-                with self.assertRaises(CollectionFailure) as raised:
-                    platform_data_service.record_collection_sync(
-                        self.account_id, batch
-                    )
-                self.assertEqual(
-                    raised.exception.error_code, "metric_payload_invalid"
-                )
-                self.assertEqual(self._table_counts(), (0, 0, 0))
+            )
+        self.assertEqual(raised.exception.error_code, "metric_payload_invalid")
+        self.assertEqual(self._table_counts(), (0, 0, 0))
 
     def test_public_cover_url_allows_only_official_https_hosts(self) -> None:
         """作品封面只可公开受控抖音 HTTPS 主域，不能透出任意网址。"""
@@ -1159,12 +1685,14 @@ class PlatformDataServiceTests(unittest.TestCase):
             CollectionBatch(
                 platform_type=3,
                 source_mode="direct_session",
-                metrics=metrics,
+                metrics=(
+                    self._v2_point("comments", 1, day="2026-08-20"),
+                    *metrics,
+                ),
                 contents=contents,
-                account_metrics_available=False,
+                account_metrics_available=True,
                 content_data_available=True,
                 platform_observed_at="2026-08-20T23:30:00+08:00",
-                warning_code="account_trends_unavailable",
             ),
         )
 
@@ -1287,6 +1815,14 @@ class PlatformDataServiceTests(unittest.TestCase):
                     source_mode="direct_session",
                     metrics=(
                         self._v2_point("views", 10, day="2026-08-19"),
+                        self._v2_point(
+                            "views",
+                            100,
+                            day="2026-08-19",
+                            entity_type="content",
+                            entity_key="aweme-1",
+                            metric_scope="lifetime_total",
+                        ),
                     ),
                     contents=(self._content("aweme-1"),),
                     account_metrics_available=True,
@@ -1420,7 +1956,7 @@ class PlatformDataServiceTests(unittest.TestCase):
         with patch.object(
             platform_data_service,
             "_beijing_today",
-            return_value=date(2026, 8, 20),
+            return_value=date(2026, 8, 21),
         ):
             seven_days = platform_data_service.account_period_summary(
                 self.account_id, 7

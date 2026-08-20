@@ -144,6 +144,7 @@ def _parse_daily_points(
     date_key: str,
     value_key: str,
     day_formats: tuple[str, ...],
+    observed_at: str,
 ) -> tuple[MetricPoint, ...]:
     if type(entries) is not list or not entries:
         raise DouyinDataCollectionError(
@@ -170,7 +171,7 @@ def _parse_daily_points(
             metric_scope="daily_increment",
             period_start=platform_day,
             period_end=platform_day,
-            observed_at=f"{platform_day}T00:00:00+08:00",
+            observed_at=observed_at,
         )
         identity = _daily_point_identity(point)
         if identity in identities:
@@ -185,6 +186,8 @@ def _parse_daily_points(
 def _parse_daily_metric(
     metric: Mapping,
     account_id: int,
+    *,
+    observed_at: str,
 ) -> tuple[MetricPoint, ...]:
     raw_metric_key = metric.get("english_metric_name")
     if type(raw_metric_key) is not str:
@@ -200,6 +203,7 @@ def _parse_daily_metric(
         date_key="date_time",
         value_key="value",
         day_formats=_DIRECT_DAY_FORMATS,
+        observed_at=observed_at,
     )
 
 
@@ -288,6 +292,7 @@ class DouyinDataCollector:
         account_id: int,
         *,
         source_mode: str = "direct_session",
+        observed_at: str | None = None,
     ) -> CollectionBatch:
         if not isinstance(payload, Mapping):
             raise DouyinDataCollectionError(
@@ -307,12 +312,17 @@ class DouyinDataCollector:
             raise DouyinDataCollectionError(
                 "metric_payload_empty", fallback_allowed=True
             )
+        response_observed_at = observed_at or _local_observation_timestamp()
         points: list[MetricPoint] = []
         identities: set[tuple[str, str, str]] = set()
         for metric in metrics:
             if not isinstance(metric, Mapping):
                 continue
-            for point in _parse_daily_metric(metric, account_id):
+            for point in _parse_daily_metric(
+                metric,
+                account_id,
+                observed_at=response_observed_at,
+            ):
                 identity = _daily_point_identity(point)
                 if identity in identities:
                     raise DouyinDataCollectionError(
@@ -331,7 +341,7 @@ class DouyinDataCollector:
             contents=(),
             account_metrics_available=True,
             content_data_available=False,
-            platform_observed_at=_local_observation_timestamp(),
+            platform_observed_at=response_observed_at,
             # 仅账号总览请求经过实测；不得猜测作品列表接口或发起补采。
             warning_code=_CONTENT_LIST_UNAVAILABLE_WARNING,
         )
@@ -355,11 +365,13 @@ class DouyinDataCollector:
                 "metric_payload_invalid", fallback_allowed=False
             )
         data = payload.get("data")
+        response_observed_at = _local_observation_timestamp()
         if not isinstance(data, Mapping):
             return self._parse_payload(
                 payload,
                 account_id,
                 source_mode="browser_signed",
+                observed_at=response_observed_at,
             )
         points: list[MetricPoint] = []
         identities: set[tuple[str, str, str]] = set()
@@ -390,6 +402,7 @@ class DouyinDataCollector:
                     date_key="date",
                     value_key="count",
                     day_formats=_BROWSER_DAY_FORMATS,
+                    observed_at=response_observed_at,
                 )
                 platform_day = daily_points[-1].period_start
                 point = MetricPoint(
@@ -402,7 +415,7 @@ class DouyinDataCollector:
                     metric_scope="lifetime_total",
                     period_start=platform_day,
                     period_end=platform_day,
-                    observed_at=f"{platform_day}T00:00:00+08:00",
+                    observed_at=response_observed_at,
                 )
                 parsed_points = (*daily_points, point)
             else:
@@ -414,6 +427,7 @@ class DouyinDataCollector:
                     date_key="date",
                     value_key="count",
                     day_formats=_BROWSER_DAY_FORMATS,
+                    observed_at=response_observed_at,
                 )
             for point in parsed_points:
                 identity = _daily_point_identity(point)
@@ -434,7 +448,7 @@ class DouyinDataCollector:
             contents=(),
             account_metrics_available=True,
             content_data_available=False,
-            platform_observed_at=_local_observation_timestamp(),
+            platform_observed_at=response_observed_at,
             # 浏览器也只接纳已验证的账号总览响应，作品数据保持不可用。
             warning_code=_CONTENT_LIST_UNAVAILABLE_WARNING,
         )

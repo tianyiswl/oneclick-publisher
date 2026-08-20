@@ -29,6 +29,13 @@ ALLOWED_CONTENT_STATUSES = frozenset(
     {"published", "scheduled", "private", "unavailable"}
 )
 ALLOWED_CONTENT_TYPES = frozenset({"video", "image"})
+ALLOWED_BATCH_WARNING_CODES = frozenset(
+    {
+        "content_list_unavailable",
+        "content_list_truncated",
+        "content_payload_invalid",
+    }
+)
 
 
 class CollectionFailure(RuntimeError):
@@ -156,22 +163,55 @@ class CollectionBatch:
             raise CollectionFailure("metric_payload_invalid")
         if type(self.metrics) is not tuple:
             raise CollectionFailure("metric_payload_invalid")
+        if not all(type(point) is MetricPoint for point in self.metrics):
+            raise CollectionFailure("metric_payload_invalid")
+        account_points = tuple(
+            point for point in self.metrics if point.entity_type == "account"
+        )
+        content_points = tuple(
+            point for point in self.metrics if point.entity_type == "content"
+        )
         if type(self.account_metrics_available) is not bool:
             raise CollectionFailure("metric_payload_invalid")
-        if self.account_metrics_available and not self.metrics:
-            raise CollectionFailure("metric_payload_empty")
-        if not all(type(point) is MetricPoint for point in self.metrics):
+        if not self.account_metrics_available or not account_points:
             raise CollectionFailure("metric_payload_invalid")
         if type(self.contents) is not tuple:
             raise CollectionFailure("metric_payload_invalid")
-        if type(self.content_data_available) is not bool:
-            raise CollectionFailure("metric_payload_invalid")
-        if self.content_data_available and not self.contents:
-            raise CollectionFailure("metric_payload_empty")
         if not all(type(content) is ContentRecord for content in self.contents):
             raise CollectionFailure("metric_payload_invalid")
+        if type(self.content_data_available) is not bool:
+            raise CollectionFailure("metric_payload_invalid")
         _required_text(self.platform_observed_at)
-        if type(self.warning_code) is not str:
+        if (
+            type(self.warning_code) is not str
+            or self.warning_code != self.warning_code.strip()
+            or (
+                self.warning_code
+                and self.warning_code not in ALLOWED_BATCH_WARNING_CODES
+            )
+        ):
+            raise CollectionFailure("metric_payload_invalid")
+        content_id_sequence = tuple(
+            content.content_id for content in self.contents
+        )
+        content_ids = set(content_id_sequence)
+        if len(content_ids) != len(content_id_sequence):
+            raise CollectionFailure("metric_payload_invalid")
+        point_content_ids = {point.entity_key for point in content_points}
+        if self.content_data_available:
+            if (
+                not self.contents
+                or not content_points
+                or point_content_ids != content_ids
+                or self.warning_code not in {"", "content_list_truncated"}
+            ):
+                raise CollectionFailure("metric_payload_invalid")
+        elif (
+            self.contents
+            or content_points
+            or self.warning_code
+            not in {"content_list_unavailable", "content_payload_invalid"}
+        ):
             raise CollectionFailure("metric_payload_invalid")
         identities = {
             (
