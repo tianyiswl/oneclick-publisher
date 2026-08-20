@@ -28,6 +28,7 @@ _BROWSER_RESPONSE_PATHS = frozenset(
         "/janus/douyin/creator/data/overview/dashboard",
     }
 )
+_CONTENT_LIST_UNAVAILABLE_WARNING = "content_list_unavailable"
 _REQUEST_TIMEOUT_SECONDS = 20.0
 _BROWSER_TIMEOUT_SECONDS = 30.0
 _RAW_METRIC_MAP = {
@@ -331,6 +332,8 @@ class DouyinDataCollector:
             account_metrics_available=True,
             content_data_available=False,
             platform_observed_at=_local_observation_timestamp(),
+            # 仅账号总览请求经过实测；不得猜测作品列表接口或发起补采。
+            warning_code=_CONTENT_LIST_UNAVAILABLE_WARNING,
         )
 
     def _parse_current_overview(
@@ -432,6 +435,8 @@ class DouyinDataCollector:
             account_metrics_available=True,
             content_data_available=False,
             platform_observed_at=_local_observation_timestamp(),
+            # 浏览器也只接纳已验证的账号总览响应，作品数据保持不可用。
+            warning_code=_CONTENT_LIST_UNAVAILABLE_WARNING,
         )
 
     def collect_direct(self, account: dict) -> CollectionBatch:

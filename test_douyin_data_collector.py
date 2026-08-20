@@ -174,6 +174,23 @@ class DouyinDirectCollectorTests(unittest.TestCase):
         )
         self.assertEqual(session.closed, 1)
 
+    def test_account_batch_marks_content_list_unavailable_without_speculative_request(self) -> None:
+        """尚未验证作品接口时，只能保留账户数据，不能猜测补采请求。"""
+
+        session = FakeSession(self._valid_payload())
+        batch = DouyinDataCollector(
+            session_factory=lambda: session
+        ).collect_direct(self.account)
+
+        self.assertTrue(batch.account_metrics_available)
+        self.assertFalse(batch.content_data_available)
+        self.assertEqual(batch.contents, ())
+        self.assertEqual(batch.warning_code, "content_list_unavailable")
+        self.assertEqual(
+            session.calls,
+            [(DOUYIN_DASHBOARD_URL, {"recent_days": 30}, 20.0)],
+        )
+
     def test_all_daily_trend_points_are_preserved(self) -> None:
         """只读取最后一天会丢失历史日趋势，本测试必须失败。"""
 
