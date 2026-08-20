@@ -14,8 +14,8 @@ from urllib.parse import urlsplit
 
 
 _ALLOWED_REPORT_KEYS = frozenset({
-    "schemaVersion", "platformType", "mode", "phases", "status",
-    "errorCode", "observedAt", "responses", "cleanup",
+    "schemaVersion", "platformType", "mode", "phases", "missingPhases",
+    "status", "errorCode", "observedAt", "responses", "cleanup",
 })
 _ALLOWED_RESPONSE_KEYS = frozenset({
     "method", "path", "status", "contentType", "keyPaths",
@@ -66,6 +66,14 @@ _PAGINATION_KEYS = frozenset({
     "cursor", "next_cursor", "nextcursor", "has_more", "hasmore",
     "page", "page_no", "page_num", "page_size", "pagesize", "total",
 })
+_REQUIRED_CONTRACT_PHASES = (
+    "account_overview", "content_list", "content_lifetime",
+)
+_CONTRACTS_UNOBSERVED = "xiaohongshu_contracts_unobserved"
+_CONTRACTS_INCOMPLETE = "xiaohongshu_contracts_incomplete"
+_LOGIN_REQUIRED = "login_required"
+_VERIFICATION_REQUIRED = "verification_required"
+_NAVIGATION_UNVERIFIED = "xiaohongshu_navigation_unverified"
 _CONTENT_IDENTIFIERS = frozenset({"note_id", "item_id", "content_id"})
 _CONTENT_LIST_KEYS = frozenset({"items", "list", "notes", "feeds"})
 _LIFETIME_METRIC_KEYS = frozenset({
@@ -76,6 +84,46 @@ _ACCOUNT_KEYS = frozenset({
     "account", "profile", "fans", "fan_count", "follower_count",
     "followers", "overview", "trend",
 })
+_ALLOWED_MODES = frozenset({"plan", "execute"})
+_ALLOWED_STATUSES = frozenset({
+    "planned", "success", "partial_success", "failed",
+})
+_ALLOWED_ERROR_CODES = frozenset({
+    "",
+    _ACCOUNT_SELECTION_REQUIRED,
+    _ARGUMENTS_INVALID,
+    _REPORT_PATH_INVALID,
+    _REPORT_WRITE_FAILED,
+    _CONTRACTS_UNOBSERVED,
+    _CONTRACTS_INCOMPLETE,
+    _LOGIN_REQUIRED,
+    _VERIFICATION_REQUIRED,
+    _NAVIGATION_UNVERIFIED,
+    "xiaohongshu_session_state_invalid",
+    "xiaohongshu_probe_cleanup_incomplete",
+    "xiaohongshu_probe_timeout",
+    "xiaohongshu_probe_failed",
+})
+_ALLOWED_METHODS = frozenset({"GET", "POST"})
+_ALLOWED_CONTENT_TYPES = frozenset({"application/json"})
+_ALLOWED_FIELD_TYPES = frozenset({
+    "dict", "list", "str", "int", "float", "bool", "NoneType",
+})
+_IDENTIFIER_STRUCTURAL_KEYS = frozenset({
+    "id", "note_id", "item_id", "content_id", "user_id", "account_id",
+})
+_SENSITIVE_STRUCTURAL_KEYS = frozenset({
+    "token", "cookie", "authorization", "set_cookie", "password",
+    "secret", "title", "nickname", "phone", "mobile", "body", "content",
+})
+_SAFE_STATIC_STRUCTURAL_KEYS = frozenset({
+    "data", "result", "success", "code", "message", "metrics", "stats",
+}) | _PAGINATION_KEYS | _CONTENT_LIST_KEYS | _LIFETIME_METRIC_KEYS | _ACCOUNT_KEYS
+_STRUCTURAL_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+_OBSERVED_AT = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
+    r"(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$"
+)
 
 
 class ProbeFailure(Exception):
@@ -89,7 +137,8 @@ def build_plan() -> dict[str, object]:
         "schemaVersion": "xiaohongshu-data-contract-probe/v1",
         "platformType": 1,
         "mode": "plan",
-        "phases": ["account_overview", "content_list", "content_lifetime"],
+        "phases": list(_REQUIRED_CONTRACT_PHASES),
+        "missingPhases": [],
         "status": "planned",
         "errorCode": "",
         "observedAt": "",
@@ -153,6 +202,110 @@ def _safe_integer_mapping(
     return result
 
 
+def _enum_text(value: object, allowed: frozenset[str], default: str = "") -> str:
+    if type(value) is str and value in allowed:
+        return value
+    return default
+
+
+def _normalize_structural_key(value: object) -> str | None:
+    """Return a static key name or a fixed template without retaining IDs."""
+    if type(value) is not str or not value:
+        return None
+    if value in {":identifier", ":key"}:
+        return value
+    lowered = value.lower()
+    if lowered in _IDENTIFIER_STRUCTURAL_KEYS or lowered.endswith("_id"):
+        return ":identifier"
+    components = frozenset(lowered.split("_"))
+    if lowered in _SENSITIVE_STRUCTURAL_KEYS or components & _SENSITIVE_STRUCTURAL_KEYS:
+        return ":key"
+    if lowered in _SAFE_STATIC_STRUCTURAL_KEYS:
+        return lowered
+    if (
+        value.isdecimal()
+        or _UUID_ENDPOINT_SEGMENT.fullmatch(value) is not None
+        or _HEX_ENDPOINT_SEGMENT.fullmatch(value) is not None
+        or _HIGH_ENTROPY_ENDPOINT_SEGMENT.fullmatch(value) is not None
+        or _STRUCTURAL_KEY.fullmatch(value) is None
+    ):
+        return ":key"
+    return lowered
+
+
+def _sanitize_structural_path(value: object) -> str | None:
+    if type(value) is not str or not value or len(value) > 4_096:
+        return None
+    normalized: list[str] = []
+    for segment in value.split("."):
+        is_list = segment.endswith("[]")
+        key = segment[:-2] if is_list else segment
+        if key == "" and is_list:
+            normalized.append("[]")
+            continue
+        safe_key = _normalize_structural_key(key)
+        if safe_key is None:
+            return None
+        normalized.append(f"{safe_key}[]" if is_list else safe_key)
+        if len(normalized) > _STRUCTURAL_DEPTH_LIMIT:
+            break
+    return ".".join(normalized)
+
+
+def _sanitize_structural_list(value: object) -> list[str]:
+    if type(value) is not list:
+        return []
+    result: list[str] = []
+    for item in value[:_KEY_PATH_LIMIT]:
+        safe_path = _sanitize_structural_path(item)
+        if safe_path is not None:
+            result.append(safe_path)
+    return result
+
+
+def _sanitize_field_types(value: object) -> dict[str, str]:
+    if type(value) is not dict:
+        return {}
+    result: dict[str, str] = {}
+    for key, item in value.items():
+        safe_path = _sanitize_structural_path(key)
+        if safe_path is None:
+            continue
+        result[safe_path] = _enum_text(item, _ALLOWED_FIELD_TYPES)
+        if len(result) >= _KEY_PATH_LIMIT:
+            break
+    return result
+
+
+def _sanitize_list_lengths(value: object) -> dict[str, int]:
+    if type(value) is not dict:
+        return {}
+    result: dict[str, int] = {}
+    for key, item in value.items():
+        safe_path = _sanitize_structural_path(key)
+        if safe_path is None or type(item) is not int:
+            continue
+        result[safe_path] = max(0, min(item, _STRUCTURAL_NODE_LIMIT))
+        if len(result) >= _KEY_PATH_LIMIT:
+            break
+    return result
+
+
+def _sanitize_phases(value: object) -> list[str]:
+    if type(value) is not list:
+        return []
+    return [
+        phase for phase in _REQUIRED_CONTRACT_PHASES
+        if phase in value
+    ]
+
+
+def _safe_observed_at(value: object) -> str:
+    if type(value) is str and _OBSERVED_AT.fullmatch(value) is not None:
+        return value
+    return ""
+
+
 def _endpoint_path(path: object) -> str | None:
     """Return a static endpoint shape, never a literal identifier segment."""
     if type(path) is not str:
@@ -203,18 +356,21 @@ def _sanitize_response(value: object) -> dict[str, object] | None:
     safe_path = _endpoint_path(source_path)
     if safe_path is None:
         return None
+    status = source.get("status")
     return {
-        "method": _safe_text(source.get("method")),
+        "method": _enum_text(source.get("method"), _ALLOWED_METHODS),
         "path": safe_path,
-        "status": _safe_integer(source.get("status")),
-        "contentType": _safe_text(source.get("contentType")),
-        "keyPaths": _safe_text_list(source.get("keyPaths", source.get("keys")), _KEY_PATH_LIMIT),
-        "fieldTypes": _safe_text_mapping(source.get("fieldTypes"), _KEY_PATH_LIMIT),
-        "listLengths": _safe_integer_mapping(
-            source.get("listLengths"), _KEY_PATH_LIMIT
+        "status": status if type(status) is int and 100 <= status <= 599 else 0,
+        "contentType": _enum_text(
+            source.get("contentType"), _ALLOWED_CONTENT_TYPES
         ),
-        "paginationKeys": _safe_text_list(
-            source.get("paginationKeys"), _KEY_PATH_LIMIT
+        "keyPaths": _sanitize_structural_list(
+            source.get("keyPaths", source.get("keys"))
+        ),
+        "fieldTypes": _sanitize_field_types(source.get("fieldTypes")),
+        "listLengths": _sanitize_list_lengths(source.get("listLengths")),
+        "paginationKeys": _sanitize_structural_list(
+            source.get("paginationKeys")
         ),
     }
 
@@ -225,7 +381,6 @@ def sanitize_probe_report(value: object) -> dict[str, object]:
     plan = build_plan()
     responses = source.get("responses")
     cleanup = source.get("cleanup")
-    phases = source.get("phases")
     safe_cleanup = cleanup if type(cleanup) is dict else {}
 
     safe_responses: list[dict[str, object]] = []
@@ -235,18 +390,50 @@ def sanitize_probe_report(value: object) -> dict[str, object]:
             if safe_response is not None:
                 safe_responses.append(safe_response)
 
+    mode = _enum_text(source.get("mode"), _ALLOWED_MODES, plan["mode"])
+    cleanup_closed = _safe_boolean(safe_cleanup.get("closed"))
+    cleanup_alive = _safe_integer(safe_cleanup.get("aliveResourceCount"))
+    error_code = _enum_text(source.get("errorCode"), _ALLOWED_ERROR_CODES)
+    phases = _sanitize_phases(source.get("phases"))
+    missing_phases = _sanitize_phases(source.get("missingPhases"))
+    status = _enum_text(source.get("status"), _ALLOWED_STATUSES, plan["status"])
+
+    if mode == "plan":
+        phases = list(_REQUIRED_CONTRACT_PHASES)
+        missing_phases = []
+        status = "planned"
+        error_code = ""
+    elif error_code not in {"", _CONTRACTS_UNOBSERVED, _CONTRACTS_INCOMPLETE}:
+        status = "failed"
+        if error_code in {_LOGIN_REQUIRED, _VERIFICATION_REQUIRED}:
+            safe_responses = []
+            phases = []
+            missing_phases = list(_REQUIRED_CONTRACT_PHASES)
+    elif not cleanup_closed or cleanup_alive != 0:
+        status = "failed"
+        error_code = "xiaohongshu_probe_cleanup_incomplete"
+    else:
+        phases, missing_phases, status, error_code = _contract_outcome(
+            safe_responses
+        )
+
     return {
-        "schemaVersion": _safe_text(source.get("schemaVersion"), plan["schemaVersion"]),
-        "platformType": _safe_integer(source.get("platformType"), plan["platformType"]),
-        "mode": _safe_text(source.get("mode"), plan["mode"]),
-        "phases": _safe_text_list(phases) if type(phases) is list else list(plan["phases"]),
-        "status": _safe_text(source.get("status"), plan["status"]),
-        "errorCode": _safe_text(source.get("errorCode")),
-        "observedAt": _safe_text(source.get("observedAt")),
+        "schemaVersion": (
+            plan["schemaVersion"]
+            if source.get("schemaVersion") != plan["schemaVersion"]
+            else source["schemaVersion"]
+        ),
+        "platformType": 1,
+        "mode": mode,
+        "phases": phases,
+        "missingPhases": missing_phases,
+        "status": status,
+        "errorCode": error_code,
+        "observedAt": _safe_observed_at(source.get("observedAt")),
         "responses": safe_responses,
         "cleanup": {
-            "closed": _safe_boolean(safe_cleanup.get("closed")),
-            "aliveResourceCount": _safe_integer(safe_cleanup.get("aliveResourceCount")),
+            "closed": cleanup_closed,
+            "aliveResourceCount": cleanup_alive,
         },
     }
 
@@ -453,6 +640,42 @@ def _response_metadata(response: object) -> tuple[str, str, int, str] | None:
     )
 
 
+def _navigation_error_code(response: object) -> str | None:
+    """Classify only controlled navigation metadata, never body or DOM text."""
+    url = getattr(response, "url", None)
+    status = getattr(response, "status", None)
+    headers = getattr(response, "headers", None)
+    if type(url) is not str or type(status) is not int or type(headers) is not dict:
+        return _NAVIGATION_UNVERIFIED
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return _NAVIGATION_UNVERIFIED
+    if parsed.scheme != "https" or parsed.hostname != _CREATOR_HOST:
+        return _NAVIGATION_UNVERIFIED
+
+    content_type_value = headers.get("content-type")
+    if type(content_type_value) is not str:
+        return _NAVIGATION_UNVERIFIED
+    content_type = content_type_value.split(";", 1)[0].strip().lower()
+    if content_type not in {"text/html", "application/json"}:
+        return _NAVIGATION_UNVERIFIED
+
+    segments = tuple(segment.lower() for segment in parsed.path.split("/") if segment)
+    if any(
+        segment in {"verification", "verify", "captcha", "slider"}
+        for segment in segments
+    ):
+        return _VERIFICATION_REQUIRED
+    if status == 401 or any(
+        segment in {"login", "signin"} for segment in segments
+    ):
+        return _LOGIN_REQUIRED
+    if parsed.path == "/creator/home" and 200 <= status < 400:
+        return None
+    return _NAVIGATION_UNVERIFIED
+
+
 def _structural_fields(
     payload: object, *, deadline: float, monotonic
 ) -> tuple[
@@ -491,7 +714,10 @@ def _structural_fields(
             for key, child in value.items():
                 if type(key) is not str:
                     continue
-                child_path = f"{path}.{key}" if path else key
+                safe_key = _normalize_structural_key(key)
+                if safe_key is None:
+                    continue
+                child_path = f"{path}.{safe_key}" if path else safe_key
                 if key.lower() in _PAGINATION_KEYS:
                     pagination_keys.append(child_path)
                 children.append((child, child_path, depth + 1))
@@ -601,13 +827,43 @@ def _classify_shape(shape: dict[str, object]) -> str:
         if type(path) is str
         for token in path.split(".")
     }
-    if tokens & _CONTENT_IDENTIFIERS and tokens & _CONTENT_LIST_KEYS:
+    has_identifier = bool(tokens & _CONTENT_IDENTIFIERS) or ":identifier" in tokens
+    if has_identifier and tokens & _CONTENT_LIST_KEYS:
         return "content_list"
-    if tokens & _CONTENT_IDENTIFIERS and tokens & _LIFETIME_METRIC_KEYS:
+    if has_identifier and tokens & _LIFETIME_METRIC_KEYS:
         return "content_lifetime"
     if tokens & _ACCOUNT_KEYS:
         return "account_overview"
     return "unclassified"
+
+
+def _contract_outcome(
+    shapes: list[dict[str, object]],
+) -> tuple[list[str], list[str], str, str]:
+    observed: list[str] = []
+    for shape in shapes:
+        if (
+            type(shape.get("path")) is not str
+            or not shape["path"]
+            or shape.get("method") not in {"GET", "POST"}
+            or type(shape.get("status")) is not int
+            or not 200 <= shape["status"] < 300
+            or shape.get("contentType") != "application/json"
+            or type(shape.get("keyPaths")) is not list
+            or not shape["keyPaths"]
+        ):
+            continue
+        phase = _classify_shape(shape)
+        if phase in _REQUIRED_CONTRACT_PHASES and phase not in observed:
+            observed.append(phase)
+
+    observed = [phase for phase in _REQUIRED_CONTRACT_PHASES if phase in observed]
+    missing = [phase for phase in _REQUIRED_CONTRACT_PHASES if phase not in observed]
+    if not observed:
+        return observed, missing, "failed", _CONTRACTS_UNOBSERVED
+    if missing:
+        return observed, missing, "partial_success", _CONTRACTS_INCOMPLETE
+    return observed, [], "success", ""
 
 
 async def _await_with_deadline(value: object, *, deadline: float, monotonic) -> object:
@@ -727,7 +983,7 @@ async def _run_probe(
             context.new_page(), deadline=work_deadline, monotonic=monotonic
         )
         page.on("response", retain_response)
-        await _await_with_deadline(
+        navigation_response = await _await_with_deadline(
             page.goto(
                 _CREATOR_HOME,
                 wait_until="networkidle",
@@ -736,6 +992,9 @@ async def _run_probe(
             deadline=work_deadline,
             monotonic=monotonic,
         )
+        navigation_error = _navigation_error_code(navigation_response)
+        if navigation_error is not None:
+            raise ProbeFailure(navigation_error)
         for response in observed_responses:
             shape = await _async_response_shape(
                 response, deadline=work_deadline, monotonic=monotonic
@@ -776,12 +1035,16 @@ async def _run_probe(
         raise process_error
 
     alive_count = sum(1 for error in cleanup_errors if error is not None)
+    phases, missing_phases, contract_status, contract_error = _contract_outcome(
+        shapes
+    )
     report = build_plan()
     report.update({
         "mode": "execute",
-        "phases": list(dict.fromkeys(_classify_shape(shape) for shape in shapes)),
-        "status": "success",
-        "errorCode": "",
+        "phases": phases,
+        "missingPhases": missing_phases,
+        "status": contract_status,
+        "errorCode": contract_error,
         "observedAt": _observed_at(utc_now),
         "responses": shapes,
         "cleanup": {

@@ -11,11 +11,18 @@ from unittest.mock import patch
 import tools.verify_xiaohongshu_data_contract as verifier
 
 
+class FakeRequest:
+    def __init__(self, method="GET"):
+        self.method = method
+
+
 class FakeResponse:
-    def __init__(self, url, content_type, payload):
+    def __init__(self, url, content_type, payload, *, status=200, method="GET"):
         self.url = url
         self.headers = {"content-type": content_type}
         self._payload = payload
+        self.status = status
+        self.request = FakeRequest(method)
 
     def json(self):
         return self._payload
@@ -41,6 +48,7 @@ class FakePage:
             raise self.owner.failure
         for response in self.owner.responses:
             self.response_callback(response)
+        return self.owner.navigation_response
 
     def close(self):
         self.owner.close_order.append("page")
@@ -79,7 +87,7 @@ class FakeChromium:
 
 
 class FakePlaywright:
-    def __init__(self, responses=(), failure=None):
+    def __init__(self, responses=(), failure=None, navigation_response=None):
         self.responses = responses
         self.failure = failure
         self.close_order = []
@@ -88,6 +96,11 @@ class FakePlaywright:
         self.launch_kwargs = None
         self.page = FakePage(self)
         self.chromium = FakeChromium(self)
+        self.navigation_response = navigation_response or FakeResponse(
+            "https://creator.xiaohongshu.com/creator/home",
+            "text/html; charset=utf-8",
+            None,
+        )
 
     def close(self):
         self.close_order.append("playwright")
@@ -128,6 +141,7 @@ class AsyncFakePage(FakePage):
         self.goto_url = url
         for response in self.owner.responses:
             self.response_callback(response)
+        return self.owner.navigation_response
 
     async def close(self):
         self.owner.close_order.append("page")
@@ -473,6 +487,121 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
         self.assertEqual(fake.events[0], ("on", "response"))
         self.assertEqual(fake.launch_kwargs, {"headless": True})
 
+    def test_probe_never_reports_success_until_all_required_contracts_observed(self):
+        contracts = [
+            FakeResponse(
+                "https://creator.xiaohongshu.com/api/overview",
+                "application/json",
+                {"data": {"fans": 2}},
+            ),
+            FakeResponse(
+                "https://creator.xiaohongshu.com/api/notes/list",
+                "application/json",
+                {"data": {"items": [{"note_id": "private-id"}]}},
+            ),
+            FakeResponse(
+                "https://creator.xiaohongshu.com/api/note/123/metrics",
+                "application/json",
+                {"data": {"note_id": "private-id", "view_count": 3}},
+            ),
+        ]
+        cases = (
+            (0, "failed", "xiaohongshu_contracts_unobserved", [], [
+                "account_overview", "content_list", "content_lifetime",
+            ]),
+            (1, "partial_success", "xiaohongshu_contracts_incomplete", [
+                "account_overview",
+            ], ["content_list", "content_lifetime"]),
+            (2, "partial_success", "xiaohongshu_contracts_incomplete", [
+                "account_overview", "content_list",
+            ], ["content_lifetime"]),
+            (3, "success", "", [
+                "account_overview", "content_list", "content_lifetime",
+            ], []),
+        )
+
+        for count, status, error_code, phases, missing in cases:
+            with self.subTest(count=count):
+                result = verifier._probe_with_browser(
+                    eligible_account(),
+                    playwright_factory=lambda count=count: FakePlaywright(
+                        responses=contracts[:count]
+                    ),
+                    monotonic=FakeClock(),
+                    utc_now=fixed_now,
+                )
+                self.assertEqual(result["status"], status)
+                self.assertEqual(result["errorCode"], error_code)
+                self.assertEqual(result["phases"], phases)
+                self.assertEqual(result["missingPhases"], missing)
+
+    def test_probe_classifies_login_and_verification_without_claiming_contracts(self):
+        cases = (
+            (
+                "login",
+                FakeResponse(
+                    "https://creator.xiaohongshu.com/login",
+                    "text/html; charset=utf-8",
+                    None,
+                ),
+                "login_required",
+            ),
+            (
+                "verification",
+                FakeResponse(
+                    "https://creator.xiaohongshu.com/creator/security/verification",
+                    "text/html; charset=utf-8",
+                    None,
+                    status=403,
+                ),
+                "verification_required",
+            ),
+            (
+                "normal_home_without_contracts",
+                FakeResponse(
+                    "https://creator.xiaohongshu.com/creator/home",
+                    "text/html; charset=utf-8",
+                    None,
+                ),
+                "xiaohongshu_contracts_unobserved",
+            ),
+        )
+
+        for label, navigation, error_code in cases:
+            late_response = CountingResponse(
+                "https://creator.xiaohongshu.com/api/overview",
+                "application/json",
+                {"data": {"fans": 2}},
+            )
+            CountingResponse.json_calls = 0
+            responses = [] if label == "normal_home_without_contracts" else [
+                late_response
+            ]
+            fake = FakePlaywright(
+                responses=responses,
+                navigation_response=navigation,
+            )
+            with self.subTest(label=label):
+                result = verifier._probe_with_browser(
+                    eligible_account(),
+                    playwright_factory=lambda fake=fake: fake,
+                    monotonic=FakeClock(),
+                    utc_now=fixed_now,
+                )
+                self.assertEqual(result["status"], "failed")
+                self.assertEqual(result["errorCode"], error_code)
+                self.assertEqual(result["responses"], [])
+                self.assertEqual(result["phases"], [])
+                self.assertEqual(
+                    result["missingPhases"],
+                    ["account_overview", "content_list", "content_lifetime"],
+                )
+                self.assertEqual(CountingResponse.json_calls, 0)
+                self.assertEqual(
+                    fake.close_order,
+                    ["page", "context", "browser", "playwright"],
+                )
+
     def test_probe_closes_all_resources_on_timeout_and_base_exception(self):
         for failure in (TimeoutError("secret"), KeyboardInterrupt(), SystemExit()):
             fake = FakePlaywright(failure=failure)
@@ -653,7 +782,7 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
         self.assertEqual(len(report["responses"]), 100)
         self.assertEqual(report["responses"][0]["status"], 0)
         self.assertEqual(len(report["responses"][0]["keyPaths"]), 300)
-        self.assertEqual(len(report["responses"][0]["keyPaths"][0]), 120)
+        self.assertEqual(report["responses"][0]["keyPaths"][0], ":key")
 
     def test_report_sanitizer_rebuilds_builtin_containers_with_safe_defaults(self):
         report = verifier.sanitize_probe_report({
@@ -682,6 +811,88 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
         for forbidden in ("13800000000", "private-id", "private-title", "cookie=", "secret"):
             self.assertNotIn(forbidden, text)
         self.assertEqual(json.loads(text)["responses"][0]["path"], "/api")
+
+    def test_persisted_report_redacts_dynamic_object_keys_and_allowed_slot_injections(self):
+        uuid_key = "123e4567-e89b-12d3-a456-426614174000"
+        phone_key = "13800138000"
+        entropy_key = "AbCdEf0123456789GhIjKlMn"
+        sensitive_keys = (
+            uuid_key, phone_key, entropy_key, "token", "cookie", "title",
+            "nickname", "note_id",
+        )
+        payload = {
+            "data": {
+                "view_count": 1,
+                uuid_key: {"like_count": 2},
+                phone_key: [{"comment_count": 3}],
+                entropy_key: {"share_count": 4},
+                "token": "private-token-value",
+                "cookie": "private-cookie-value",
+                "title": "private-title-value",
+                "nickname": "private-nickname-value",
+                "note_id": "private-note-id-value",
+            }
+        }
+        shape = verifier._response_shape(FakeResponse(
+            "https://creator.xiaohongshu.com/api/data",
+            "application/json",
+            payload,
+        ))
+        self.assertIsNotNone(shape)
+        collected = json.dumps(shape, ensure_ascii=False)
+        for forbidden in (*sensitive_keys, "private-"):
+            self.assertNotIn(forbidden, collected)
+        self.assertIn("data.view_count", shape["keyPaths"])
+        self.assertIn("data.:key.like_count", shape["keyPaths"])
+        self.assertIn("data.:key[].comment_count", shape["keyPaths"])
+
+        verifier._write_report(self.report_path, {
+            "schemaVersion": entropy_key,
+            "platformType": 1,
+            "mode": entropy_key,
+            "phases": ["account_overview", uuid_key, "note_id"],
+            "missingPhases": [phone_key, "content_list"],
+            "status": phone_key,
+            "errorCode": "token",
+            "observedAt": uuid_key,
+            "responses": [{
+                "method": entropy_key,
+                "path": "/api/data",
+                "status": 200,
+                "contentType": "cookie",
+                "keyPaths": [
+                    "data.view_count",
+                    f"data.{uuid_key}.like_count",
+                    f"data.{phone_key}[].comment_count",
+                    "data.note_id",
+                    "data.title",
+                ],
+                "fieldTypes": {
+                    "data.view_count": "int",
+                    f"data.{entropy_key}.share_count": "nickname",
+                },
+                "listLengths": {f"data.{phone_key}": 1},
+                "paginationKeys": [f"data.{uuid_key}.next_cursor"],
+            }],
+            "cleanup": {"closed": True, "aliveResourceCount": 0},
+        })
+        text = self.report_path.read_text("utf-8")
+        persisted = json.loads(text)
+        for forbidden in (*sensitive_keys, "private-"):
+            self.assertNotIn(forbidden, text)
+        self.assertEqual(
+            persisted["schemaVersion"],
+            "xiaohongshu-data-contract-probe/v1",
+        )
+        self.assertEqual(persisted["mode"], "plan")
+        self.assertEqual(persisted["status"], "planned")
+        self.assertEqual(persisted["errorCode"], "")
+        response = persisted["responses"][0]
+        self.assertEqual(response["method"], "")
+        self.assertEqual(response["contentType"], "")
+        self.assertIn("data.view_count", response["keyPaths"])
+        self.assertIn("data.:key.like_count", response["keyPaths"])
+        self.assertEqual(response["fieldTypes"]["data.view_count"], "int")
 
     def test_report_writer_rejects_escape_and_untrusted_path_types(self):
         class UntrustedPath(str):
