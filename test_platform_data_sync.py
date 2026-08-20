@@ -316,6 +316,47 @@ class PlatformDataSyncTests(unittest.TestCase):
             ],
         )
 
+    def test_persistence_failed_result_emits_failed_not_partial(self) -> None:
+        """落库失败若显示部分完成，会把未保存数据伪造成可用结果。"""
+
+        collector = FakeCollector(valid_batch("direct_session"))
+        progress: list[dict] = []
+        with patch.object(
+            platform_data_sync.account_service,
+            "list_accounts",
+            return_value=[self.account],
+        ), patch.object(
+            platform_data_sync,
+            "collector_for_platform",
+            return_value=collector,
+        ), patch.object(
+            platform_data_sync.platform_data_service,
+            "record_collection_sync",
+            return_value={
+                "accountId": 12,
+                "status": "failed",
+                "sourceMode": "direct_session",
+                "errorCode": "sync_persist_failed",
+                "metricCount": 0,
+            },
+        ):
+            result = platform_data_sync.sync_account_data(12, report=progress.append)
+
+        self.assertEqual(
+            result,
+            {
+                "accountId": 12,
+                "status": "failed",
+                "sourceMode": "direct_session",
+                "errorCode": "sync_persist_failed",
+                "metricCount": 1,
+                "contentCount": 1,
+            },
+        )
+        self.assertEqual(progress[-1], {"stage": "failed", "message": "数据同步未完成"})
+        self.assertNotIn("partial", [event["stage"] for event in progress])
+        self.assertNotIn("completed", [event["stage"] for event in progress])
+
     def test_content_truncation_warning_survives_partial_sync(self) -> None:
         """截断警告若被清空，调用方会把不完整作品列表当作全量。"""
 

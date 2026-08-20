@@ -22,6 +22,11 @@ _PROGRESS_MESSAGES = {
     "partial": "部分数据已保存",
     "failed": "数据同步未完成",
 }
+_FINAL_STAGE_BY_STATUS = {
+    "success": "completed",
+    "partial_success": "partial",
+    "failed": "failed",
+}
 _PUBLIC_ERROR_CODES = platform_data_service.ALLOWED_ERROR_CODES
 
 
@@ -115,10 +120,7 @@ def sync_account_data(
             metric_count=len(batch.metrics),
             content_count=len(batch.contents),
         )
-        _report_stage(
-            report,
-            "completed" if result["status"] == "success" else "partial",
-        )
+        _report_stage(report, _FINAL_STAGE_BY_STATUS[result["status"]])
         return result
     except DouyinDataCollectionError as exc:
         _report_stage(report, "failed")
