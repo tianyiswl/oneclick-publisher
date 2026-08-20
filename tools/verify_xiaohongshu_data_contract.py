@@ -80,7 +80,13 @@ def _safe_integer_mapping(value: object) -> dict[str, int]:
 def _sanitize_response(value: object) -> dict[str, object]:
     source = value if type(value) is dict else {}
     source_url = source.get("url")
-    source_path = urlsplit(source_url).path if type(source_url) is str else source.get("path")
+    if type(source_url) is str:
+        try:
+            source_path = urlsplit(source_url).path
+        except ValueError:
+            source_path = ""
+    else:
+        source_path = source.get("path")
     return {
         "method": _safe_text(source.get("method")),
         "path": _safe_text(source_path),

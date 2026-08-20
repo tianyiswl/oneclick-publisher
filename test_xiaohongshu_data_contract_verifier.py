@@ -33,6 +33,12 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
         self.assertNotIn("private work", encoded)
         self.assertEqual(report["responses"][0]["path"], "/api/data")
 
+    def test_report_sanitizer_uses_safe_default_for_malformed_builtin_url(self):
+        report = verifier.sanitize_probe_report({
+            "responses": [{"url": "https://["}],
+        })
+        self.assertEqual(report["responses"][0]["path"], "")
+
     def test_report_sanitizer_caps_structural_text_and_rejects_subclasses(self):
         class UntrustedText(str):
             def __str__(self):
