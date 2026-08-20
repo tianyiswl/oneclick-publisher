@@ -46,6 +46,8 @@ _RAW_METRIC_MAP = {
     "profile": "profile_visits",
     "profile_cnt": "profile_visits",
 }
+_DIRECT_DAY_FORMATS = ("%Y%m%d",)
+_BROWSER_DAY_FORMATS = ("%Y%m%d", "%Y-%m-%d", "%Y/%m/%d")
 
 
 class DouyinDataCollectionError(CollectionFailure):
@@ -99,34 +101,105 @@ def _contains_login_rejection(value: object) -> bool:
     return False
 
 
-def _observed_at(date_value: object) -> str:
-    if type(date_value) is str:
-        raw = date_value.strip()
-        if len(raw) == 8 and raw.isdigit():
-            return (
-                f"{raw[:4]}-{raw[4:6]}-{raw[6:8]}"
-                "T00:00:00+08:00"
-            )
+def _local_observation_timestamp() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
-def _metric_value(metric: Mapping) -> tuple[int | float, str]:
-    trends = metric.get("trends")
-    if type(trends) is not list or not trends:
+def _platform_day(value: object, *, formats: tuple[str, ...]) -> str:
+    if type(value) is not str or value != value.strip():
         raise DouyinDataCollectionError(
             "metric_payload_invalid", fallback_allowed=False
         )
-    latest = trends[-1]
-    if not isinstance(latest, Mapping):
-        raise DouyinDataCollectionError(
-            "metric_payload_invalid", fallback_allowed=False
-        )
-    value = latest.get("value")
+    for date_format in formats:
+        try:
+            parsed = datetime.strptime(value, date_format)
+        except ValueError:
+            continue
+        if parsed.strftime(date_format) == value:
+            return parsed.strftime("%Y-%m-%d")
+    raise DouyinDataCollectionError(
+        "metric_payload_invalid", fallback_allowed=False
+    )
+
+
+def _metric_number(value: object) -> int | float:
     if type(value) not in (int, float) or not math.isfinite(float(value)):
         raise DouyinDataCollectionError(
             "metric_payload_invalid", fallback_allowed=False
         )
-    return value, _observed_at(latest.get("date_time"))
+    return value
+
+
+def _daily_point_identity(point: MetricPoint) -> tuple[str, str, str]:
+    return point.metric_key, point.metric_scope, point.period_start
+
+
+def _parse_daily_points(
+    *,
+    raw_metric_key: str,
+    metric_key: str,
+    entries: object,
+    account_id: int,
+    date_key: str,
+    value_key: str,
+    day_formats: tuple[str, ...],
+) -> tuple[MetricPoint, ...]:
+    if type(entries) is not list or not entries:
+        raise DouyinDataCollectionError(
+            "metric_payload_invalid", fallback_allowed=False
+        )
+    entry_snapshot = tuple(entries)
+    points: list[MetricPoint] = []
+    identities: set[tuple[str, str, str]] = set()
+    for entry in entry_snapshot:
+        if not isinstance(entry, Mapping):
+            raise DouyinDataCollectionError(
+                "metric_payload_invalid", fallback_allowed=False
+            )
+        platform_day = _platform_day(
+            entry.get(date_key), formats=day_formats
+        )
+        point = MetricPoint(
+            entity_type="account",
+            entity_key=f"account:{account_id}",
+            metric_key=metric_key,
+            raw_metric_key=raw_metric_key,
+            metric_value=_metric_number(entry.get(value_key)),
+            metric_unit="count",
+            metric_scope="daily_increment",
+            period_start=platform_day,
+            period_end=platform_day,
+            observed_at=f"{platform_day}T00:00:00+08:00",
+        )
+        identity = _daily_point_identity(point)
+        if identity in identities:
+            raise DouyinDataCollectionError(
+                "metric_payload_invalid", fallback_allowed=False
+            )
+        identities.add(identity)
+        points.append(point)
+    return tuple(points)
+
+
+def _parse_daily_metric(
+    metric: Mapping,
+    account_id: int,
+) -> tuple[MetricPoint, ...]:
+    raw_metric_key = metric.get("english_metric_name")
+    if type(raw_metric_key) is not str:
+        return ()
+    metric_key = _RAW_METRIC_MAP.get(raw_metric_key)
+    if metric_key is None:
+        return ()
+    return _parse_daily_points(
+        raw_metric_key=raw_metric_key,
+        metric_key=metric_key,
+        entries=metric.get("trends"),
+        account_id=account_id,
+        date_key="date_time",
+        value_key="value",
+        day_formats=_DIRECT_DAY_FORMATS,
+    )
 
 
 def _default_playwright_factory():
@@ -208,7 +281,13 @@ class DouyinDataCollector:
             }
         )
 
-    def _parse_payload(self, payload: object, account_id: int) -> CollectionBatch:
+    def _parse_payload(
+        self,
+        payload: object,
+        account_id: int,
+        *,
+        source_mode: str = "direct_session",
+    ) -> CollectionBatch:
         if not isinstance(payload, Mapping):
             raise DouyinDataCollectionError(
                 "metric_payload_invalid", fallback_allowed=False
@@ -228,37 +307,30 @@ class DouyinDataCollector:
                 "metric_payload_empty", fallback_allowed=True
             )
         points: list[MetricPoint] = []
-        seen: set[str] = set()
+        identities: set[tuple[str, str, str]] = set()
         for metric in metrics:
             if not isinstance(metric, Mapping):
                 continue
-            raw_key = metric.get("english_metric_name")
-            if type(raw_key) is not str:
-                continue
-            metric_key = _RAW_METRIC_MAP.get(raw_key)
-            if metric_key is None or metric_key in seen:
-                continue
-            value, observed_at = _metric_value(metric)
-            points.append(
-                MetricPoint(
-                    entity_type="account",
-                    entity_key=f"account:{account_id}",
-                    metric_key=metric_key,
-                    raw_metric_key=raw_key,
-                    metric_value=value,
-                    metric_unit="count",
-                    observed_at=observed_at,
-                )
-            )
-            seen.add(metric_key)
+            for point in _parse_daily_metric(metric, account_id):
+                identity = _daily_point_identity(point)
+                if identity in identities:
+                    raise DouyinDataCollectionError(
+                        "metric_payload_invalid", fallback_allowed=False
+                    )
+                identities.add(identity)
+                points.append(point)
         if not points:
             raise DouyinDataCollectionError(
                 "metric_payload_empty", fallback_allowed=True
             )
         return CollectionBatch(
             platform_type=3,
-            source_mode="direct_session",
+            source_mode=source_mode,
             metrics=tuple(points),
+            contents=(),
+            account_metrics_available=True,
+            content_data_available=False,
+            platform_observed_at=_local_observation_timestamp(),
         )
 
     def _parse_current_overview(
@@ -281,50 +353,73 @@ class DouyinDataCollector:
             )
         data = payload.get("data")
         if not isinstance(data, Mapping):
-            return self._parse_payload(payload, account_id)
+            return self._parse_payload(
+                payload,
+                account_id,
+                source_mode="browser_signed",
+            )
         points: list[MetricPoint] = []
-        seen: set[str] = set()
+        identities: set[tuple[str, str, str]] = set()
         for raw_key, raw_metric in data.items():
             if type(raw_key) is not str or not isinstance(raw_metric, Mapping):
                 continue
             metric_key = _RAW_METRIC_MAP.get(raw_key)
-            if metric_key is None or metric_key in seen:
+            if metric_key is None:
                 continue
             nested_status = raw_metric.get("status_code")
             if type(nested_status) is int and nested_status != 0:
                 raise DouyinDataCollectionError(
                     "metric_payload_invalid", fallback_allowed=False
                 )
-            observed_at = datetime.now().astimezone().isoformat(
-                timespec="seconds"
-            )
-            value = raw_metric.get("current_count")
             options = raw_metric.get("option_list")
-            if (
-                raw_key == "fans"
-                and type(options) is list
-                and options
-                and isinstance(options[-1], Mapping)
-            ):
-                value = options[-1].get("count")
-            if type(options) is list and options and isinstance(options[-1], Mapping):
-                observed_at = _observed_at(options[-1].get("date"))
-            if type(value) not in (int, float) or not math.isfinite(float(value)):
+            if options is None:
+                continue
+            if type(options) is not list or not options:
                 raise DouyinDataCollectionError(
                     "metric_payload_invalid", fallback_allowed=False
                 )
-            points.append(
-                MetricPoint(
+            if raw_key == "fans":
+                daily_points = _parse_daily_points(
+                    raw_metric_key=raw_key,
+                    metric_key="followers_net",
+                    entries=options,
+                    account_id=account_id,
+                    date_key="date",
+                    value_key="count",
+                    day_formats=_BROWSER_DAY_FORMATS,
+                )
+                platform_day = daily_points[-1].period_start
+                point = MetricPoint(
                     entity_type="account",
                     entity_key=f"account:{account_id}",
-                    metric_key=metric_key,
+                    metric_key="followers_total",
                     raw_metric_key=raw_key,
-                    metric_value=value,
+                    metric_value=_metric_number(raw_metric.get("current_count")),
                     metric_unit="count",
-                    observed_at=observed_at,
+                    metric_scope="lifetime_total",
+                    period_start=platform_day,
+                    period_end=platform_day,
+                    observed_at=f"{platform_day}T00:00:00+08:00",
                 )
-            )
-            seen.add(metric_key)
+                parsed_points = (point,)
+            else:
+                parsed_points = _parse_daily_points(
+                    raw_metric_key=raw_key,
+                    metric_key=metric_key,
+                    entries=options,
+                    account_id=account_id,
+                    date_key="date",
+                    value_key="count",
+                    day_formats=_BROWSER_DAY_FORMATS,
+                )
+            for point in parsed_points:
+                identity = _daily_point_identity(point)
+                if identity in identities:
+                    raise DouyinDataCollectionError(
+                        "metric_payload_invalid", fallback_allowed=False
+                    )
+                identities.add(identity)
+                points.append(point)
         if not points:
             raise DouyinDataCollectionError(
                 "metric_payload_empty", fallback_allowed=False
@@ -333,6 +428,10 @@ class DouyinDataCollector:
             platform_type=3,
             source_mode="browser_signed",
             metrics=tuple(points),
+            contents=(),
+            account_metrics_available=True,
+            content_data_available=False,
+            platform_observed_at=_local_observation_timestamp(),
         )
 
     def collect_direct(self, account: dict) -> CollectionBatch:

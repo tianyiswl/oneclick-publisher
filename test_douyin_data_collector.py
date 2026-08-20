@@ -143,9 +143,24 @@ class DouyinDirectCollectorTests(unittest.TestCase):
         self.assertEqual(batch.platform_type, 3)
         self.assertEqual(batch.source_mode, "direct_session")
         self.assertEqual(
-            [(item.metric_key, item.metric_value) for item in batch.metrics],
-            [("views", 125), ("likes", 9)],
+            [
+                (
+                    item.metric_key,
+                    item.metric_value,
+                    item.metric_scope,
+                    item.period_start,
+                    item.period_end,
+                )
+                for item in batch.metrics
+            ],
+            [
+                ("views", 125, "daily_increment", "2026-08-20", "2026-08-20"),
+                ("likes", 9, "daily_increment", "2026-08-20", "2026-08-20"),
+            ],
         )
+        self.assertTrue(batch.account_metrics_available)
+        self.assertFalse(batch.content_data_available)
+        self.assertEqual(batch.contents, ())
         self.assertEqual(
             [(name, domain) for name, _value, domain, _path in session.cookies.entries],
             [
@@ -158,6 +173,158 @@ class DouyinDirectCollectorTests(unittest.TestCase):
             [(DOUYIN_DASHBOARD_URL, {"recent_days": 30}, 20.0)],
         )
         self.assertEqual(session.closed, 1)
+
+    def test_all_daily_trend_points_are_preserved(self) -> None:
+        """只读取最后一天会丢失历史日趋势，本测试必须失败。"""
+
+        raw_dates = [
+            "20260722",
+            "20260723",
+            "20260724",
+            "20260725",
+            "20260726",
+            "20260727",
+            "20260728",
+            "20260729",
+            "20260730",
+            "20260731",
+            "20260801",
+            "20260802",
+            "20260803",
+            "20260804",
+            "20260805",
+            "20260806",
+            "20260807",
+            "20260808",
+            "20260809",
+            "20260810",
+            "20260811",
+            "20260812",
+            "20260813",
+            "20260814",
+            "20260815",
+            "20260816",
+            "20260817",
+            "20260818",
+            "20260819",
+            "20260820",
+        ]
+        expected_days = [
+            "2026-07-22",
+            "2026-07-23",
+            "2026-07-24",
+            "2026-07-25",
+            "2026-07-26",
+            "2026-07-27",
+            "2026-07-28",
+            "2026-07-29",
+            "2026-07-30",
+            "2026-07-31",
+            "2026-08-01",
+            "2026-08-02",
+            "2026-08-03",
+            "2026-08-04",
+            "2026-08-05",
+            "2026-08-06",
+            "2026-08-07",
+            "2026-08-08",
+            "2026-08-09",
+            "2026-08-10",
+            "2026-08-11",
+            "2026-08-12",
+            "2026-08-13",
+            "2026-08-14",
+            "2026-08-15",
+            "2026-08-16",
+            "2026-08-17",
+            "2026-08-18",
+            "2026-08-19",
+            "2026-08-20",
+        ]
+        payload = {
+            "status_code": 0,
+            "metrics": [
+                {
+                    "english_metric_name": "play_cnt",
+                    "trends": [
+                        {"date_time": raw_date, "value": index}
+                        for index, raw_date in enumerate(raw_dates, start=1)
+                    ],
+                }
+            ],
+        }
+        batch = DouyinDataCollector(
+            session_factory=lambda: FakeSession(payload)
+        ).collect_direct(self.account)
+
+        points = [
+            point for point in batch.metrics if point.metric_key == "views"
+        ]
+        self.assertEqual(len(points), 30)
+        self.assertEqual(
+            [point.period_start for point in points], expected_days
+        )
+        self.assertTrue(
+            all(point.period_end == point.period_start for point in points)
+        )
+        self.assertTrue(
+            all(point.metric_scope == "daily_increment" for point in points)
+        )
+        self.assertEqual(
+            len(
+                {
+                    (point.metric_key, point.metric_scope, point.period_start)
+                    for point in points
+                }
+            ),
+            30,
+        )
+
+    def test_daily_trend_rejects_invalid_or_duplicate_dates(self) -> None:
+        """伪日期、重复日和弱类型数值都不能伪装成日趋势。"""
+
+        invalid_cases = {
+            "missing_date": [
+                {"value": 1},
+            ],
+            "invalid_date": [
+                {"date_time": "20260230", "value": 1},
+            ],
+            "duplicate_date": [
+                {"date_time": "20260820", "value": 1},
+                {"date_time": "20260820", "value": 2},
+            ],
+            "boolean_value": [
+                {"date_time": "20260820", "value": True},
+            ],
+            "numeric_string": [
+                {"date_time": "20260820", "value": "1"},
+            ],
+        }
+
+        for name, trends in invalid_cases.items():
+            with self.subTest(name=name):
+                payload = {
+                    "status_code": 0,
+                    "metrics": [
+                        {
+                            "english_metric_name": "play_cnt",
+                            "trends": trends,
+                        }
+                    ],
+                }
+                collector = DouyinDataCollector(
+                    session_factory=lambda current=payload: FakeSession(current)
+                )
+
+                with self.assertRaises(DouyinDataCollectionError) as raised:
+                    collector.collect_direct(self.account)
+
+                self.assertEqual(
+                    raised.exception.error_code, "metric_payload_invalid"
+                )
+                self.assertFalse(raised.exception.fallback_allowed)
+                self.assertIsNone(raised.exception.__cause__)
 
     def test_http_200_with_nested_login_rejection_is_not_success(self) -> None:
         """真实探测中的内层 status_code=8 必须进入登录失败而非空指标。"""
@@ -403,6 +570,70 @@ class DouyinBrowserSignedCollectorTests(DouyinDirectCollectorTests):
         )
         return collector, page, context, browser, playwright
 
+    def test_browser_option_list_preserves_daily_scope_and_proven_total(self) -> None:
+        """浏览器趋势必须逐日保留，只有带日期的 fans 当前数才是总粉丝。"""
+
+        payload = {
+            "status_code": 0,
+            "data": {
+                "play": {
+                    "status_code": 0,
+                    "current_count": 999,
+                    "option_list": [
+                        {"date": "2026-08-19", "count": 100},
+                        {"date": "2026-08-20", "count": 230},
+                    ],
+                },
+                "fans": {
+                    "status_code": 0,
+                    "current_count": 431,
+                    "option_list": [
+                        {"date": "2026-08-20", "count": 12},
+                    ],
+                },
+                "digg": {
+                    "status_code": 0,
+                    "current_count": 18,
+                },
+            },
+        }
+        response = FakeBrowserResponse(
+            "https://creator.douyin.com/aweme/janus/creator/data/overview/all/",
+            payload,
+        )
+        collector, _page, _context, _browser, _playwright = (
+            self._collector_with_browser(response)
+        )
+
+        batch = collector.collect_browser_signed(self.account)
+
+        self.assertEqual(
+            [
+                (
+                    point.metric_key,
+                    point.metric_value,
+                    point.metric_scope,
+                    point.period_start,
+                    point.period_end,
+                )
+                for point in batch.metrics
+            ],
+            [
+                ("views", 100, "daily_increment", "2026-08-19", "2026-08-19"),
+                ("views", 230, "daily_increment", "2026-08-20", "2026-08-20"),
+                (
+                    "followers_total",
+                    431,
+                    "lifetime_total",
+                    "2026-08-20",
+                    "2026-08-20",
+                ),
+            ],
+        )
+        self.assertTrue(batch.account_metrics_available)
+        self.assertFalse(batch.content_data_available)
+        self.assertEqual(batch.contents, ())
+
     def test_browser_signed_accepts_only_allowlisted_official_response_and_closes(self) -> None:
         """官方响应路径或严格关闭缺失时，本测试必须失败。"""
 
@@ -419,8 +650,21 @@ class DouyinBrowserSignedCollectorTests(DouyinDirectCollectorTests):
 
         self.assertEqual(batch.source_mode, "browser_signed")
         self.assertEqual(
-            [(point.metric_key, point.metric_value) for point in batch.metrics],
-            [("views", 230), ("likes", 18)],
+            [
+                (
+                    point.metric_key,
+                    point.metric_value,
+                    point.metric_scope,
+                    point.period_start,
+                    point.period_end,
+                )
+                for point in batch.metrics
+            ],
+            [
+                ("views", 100, "daily_increment", "2026-08-19", "2026-08-19"),
+                ("views", 230, "daily_increment", "2026-08-20", "2026-08-20"),
+                ("likes", 18, "daily_increment", "2026-08-20", "2026-08-20"),
+            ],
         )
         self.assertEqual(page.closed, 1)
         self.assertEqual(context.closed, 1)
