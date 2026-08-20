@@ -53,9 +53,6 @@ _ACCOUNT_DAILY_METRICS = (
     "profile_visits",
 )
 _ACCOUNT_LIFETIME_METRICS = ("followers_total",)
-_PUBLIC_ACCOUNT_METRICS = frozenset(
-    (*_ACCOUNT_DAILY_METRICS, *_ACCOUNT_LIFETIME_METRICS)
-)
 _PUBLIC_CONTENT_METRICS = frozenset(
     {"views", "likes", "comments", "shares", "favorites", "downloads"}
 )
@@ -393,7 +390,7 @@ def record_failed_sync(
 def _latest_run_details(
     conn,
     account_id: int,
-) -> tuple[dict | None, str | None, str | None, str | None]:
+) -> dict | None:
     latest_attempt = conn.execute(
         """
         SELECT status, sourceMode, errorCode, metricCount, finishedAt
@@ -404,42 +401,15 @@ def _latest_run_details(
         """,
         (account_id,),
     ).fetchone()
-    trusted_data_run = conn.execute(
-        """
-        SELECT runs.sourceMode, runs.startedAt, runs.finishedAt
-        FROM platform_data_sync_runs AS runs
-        WHERE runs.accountId = ?
-          AND runs.status IN ('success', 'partial_success')
-          AND EXISTS (
-              SELECT 1
-              FROM platform_metric_snapshots AS snapshots
-              WHERE snapshots.syncRunId = runs.id
-                AND snapshots.metricScope != ''
-                AND snapshots.periodStart != ''
-                AND snapshots.periodEnd != ''
-          )
-        ORDER BY runs.id DESC
-        LIMIT 1
-        """,
-        (account_id,),
-    ).fetchone()
-    public_run = None
-    if latest_attempt is not None:
-        public_run = {
-            "status": str(latest_attempt["status"]),
-            "sourceMode": str(latest_attempt["sourceMode"]),
-            "errorCode": str(latest_attempt["errorCode"] or ""),
-            "metricCount": int(latest_attempt["metricCount"] or 0),
-            "finishedAt": str(latest_attempt["finishedAt"] or ""),
-        }
-    if trusted_data_run is None:
-        return public_run, None, None, None
-    return (
-        public_run,
-        str(trusted_data_run["sourceMode"]),
-        str(trusted_data_run["startedAt"] or "") or None,
-        str(trusted_data_run["finishedAt"] or "") or None,
-    )
+    if latest_attempt is None:
+        return None
+    return {
+        "status": str(latest_attempt["status"]),
+        "sourceMode": str(latest_attempt["sourceMode"]),
+        "errorCode": str(latest_attempt["errorCode"] or ""),
+        "metricCount": int(latest_attempt["metricCount"] or 0),
+        "finishedAt": str(latest_attempt["finishedAt"] or ""),
+    }
 
 
 def _latest_account_rows(
@@ -456,7 +426,7 @@ def _latest_account_rows(
             SELECT snapshots.metricKey, snapshots.metricValue,
                    snapshots.metricUnit, snapshots.metricScope,
                    snapshots.periodStart, snapshots.periodEnd,
-                   snapshots.observedAt,
+                   snapshots.observedAt, runs.sourceMode, runs.finishedAt,
                    ROW_NUMBER() OVER (
                        PARTITION BY snapshots.metricKey,
                                     snapshots.metricScope,
@@ -476,13 +446,50 @@ def _latest_account_rows(
               AND runs.status IN ('success', 'partial_success')
         )
         SELECT metricKey, metricValue, metricUnit, metricScope,
-               periodStart, periodEnd, observedAt
+               periodStart, periodEnd, observedAt, sourceMode, finishedAt
         FROM ranked
         WHERE rowNumber = 1
         ORDER BY periodStart, metricKey
         """,
         (account_id, scope, period_start, period_end),
     ).fetchall()
+
+
+def _latest_controlled_timestamp(rows: list, key: str) -> str | None:
+    candidates: list[tuple[datetime, str]] = []
+    for row in rows:
+        value = row[key]
+        if type(value) is not str or not value or value != value.strip():
+            continue
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            continue
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            continue
+        candidates.append((parsed, value))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item[0])[1]
+
+
+def _period_provenance(rows: list) -> tuple[str | None, str | None, str | None]:
+    sources = {
+        str(row["sourceMode"])
+        for row in rows
+        if row["sourceMode"] in ALLOWED_SOURCE_MODES
+    }
+    if len(sources) == 1:
+        source = next(iter(sources))
+    elif len(sources) > 1:
+        source = "mixed"
+    else:
+        source = None
+    return (
+        source,
+        _latest_controlled_timestamp(rows, "observedAt"),
+        _latest_controlled_timestamp(rows, "finishedAt"),
+    )
 
 
 def account_period_summary(account_id: int, days: int) -> dict:
@@ -504,9 +511,7 @@ def account_period_summary(account_id: int, days: int) -> dict:
                 period_end=period_end,
                 scope="lifetime_total",
             )
-            latest_run, trusted_source, observed_at, synced_at = _latest_run_details(
-                conn, account
-            )
+            latest_run = _latest_run_details(conn, account)
     except CollectionFailure:
         raise
     except (KeyboardInterrupt, SystemExit):
@@ -515,10 +520,12 @@ def account_period_summary(account_id: int, days: int) -> dict:
         raise CollectionFailure("sync_persist_failed") from None
 
     daily_values: dict[str, list[tuple[str, int | float, str]]] = {}
+    contribution_rows: list = []
     for row in daily_rows:
         metric_key = str(row["metricKey"])
-        if metric_key not in _PUBLIC_ACCOUNT_METRICS:
+        if metric_key not in _ACCOUNT_DAILY_METRICS:
             continue
+        contribution_rows.append(row)
         daily_values.setdefault(metric_key, []).append(
             (
                 str(row["periodStart"]),
@@ -528,10 +535,12 @@ def account_period_summary(account_id: int, days: int) -> dict:
         )
 
     lifetime_values: dict[str, list[tuple[str, int | float, str]]] = {}
+    lifetime_contributors: dict[str, list] = {}
     for row in lifetime_rows:
         metric_key = str(row["metricKey"])
         if metric_key not in _ACCOUNT_LIFETIME_METRICS:
             continue
+        lifetime_contributors.setdefault(metric_key, []).append(row)
         lifetime_values.setdefault(metric_key, []).append(
             (
                 str(row["periodEnd"]),
@@ -539,6 +548,9 @@ def account_period_summary(account_id: int, days: int) -> dict:
                 str(row["metricUnit"]),
             )
         )
+    contribution_rows.extend(
+        rows[-1] for rows in lifetime_contributors.values() if rows
+    )
 
     metrics: dict[str, dict] = {}
     for metric_key in _ACCOUNT_DAILY_METRICS:
@@ -576,6 +588,7 @@ def account_period_summary(account_id: int, days: int) -> dict:
             "availability": availability,
             "observedDays": len({day for day, _value, _unit in values}),
         }
+    trusted_source, observed_at, synced_at = _period_provenance(contribution_rows)
     return {
         "accountId": account,
         "days": safe_days,

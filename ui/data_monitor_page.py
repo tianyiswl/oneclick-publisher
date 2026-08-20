@@ -47,6 +47,7 @@ AVAILABILITY_TEXT = {
 SOURCE_TEXT = {
     "direct_session": "会话直连",
     "browser_signed": "官方签名读取",
+    "mixed": "混合来源",
 }
 
 PROGRESS_TEXT = {
@@ -262,6 +263,7 @@ class DataMonitorPage(QWidget):
         self._content_offset = 0
         self._content_total = 0
         self._shutting_down = False
+        self._sync_terminal_by_account: dict[int, str] = {}
         self._build_ui()
         self.refresh()
 
@@ -481,7 +483,12 @@ class DataMonitorPage(QWidget):
             f"本地同步时间：{local_synced_at if _valid_timestamp(local_synced_at) else '—'}"
         )
         self.relogin_button.hide()
-        if not isinstance(latest, dict):
+        memory_terminal = self._sync_terminal_by_account.get(account_id)
+        if memory_terminal == "running":
+            self.status_label.setText("正在同步数据…")
+        elif memory_terminal == "failed":
+            self.status_label.setText("数据同步未完成")
+        elif not isinstance(latest, dict):
             self.status_label.setText("尚未同步")
         elif latest.get("status") == "success":
             self.status_label.setText("账号趋势和作品数据已更新")
@@ -588,6 +595,7 @@ class DataMonitorPage(QWidget):
 
         def started() -> None:
             terminal_state["value"] = "running"
+            self._sync_terminal_by_account[account_id] = "running"
             if not self._shutting_down and is_current_account():
                 self.sync_button.setEnabled(False)
                 self.status_label.setText("正在同步数据…")
@@ -606,11 +614,13 @@ class DataMonitorPage(QWidget):
 
         def completed(_result: object) -> None:
             terminal_state["value"] = "success"
+            self._sync_terminal_by_account.pop(account_id, None)
             if not self._shutting_down and is_current_account():
                 self.refresh()
 
         def failed(_message: str) -> None:
             terminal_state["value"] = "failed"
+            self._sync_terminal_by_account[account_id] = "failed"
             if not self._shutting_down and is_current_account():
                 self.status_label.setText("数据同步未完成")
 

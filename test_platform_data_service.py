@@ -798,7 +798,7 @@ class PlatformDataServiceTests(unittest.TestCase):
         self.assertEqual(one_day["metrics"]["views"]["availability"], "complete")
         self.assertEqual(month["metrics"]["views"]["value"], 100)
         self.assertEqual(summary["latestRun"]["status"], "partial_success")
-        self.assertEqual(summary["platformObservedAt"], "2026-08-20T23:30:00+08:00")
+        self.assertEqual(summary["platformObservedAt"], "2026-08-20T23:00:00+08:00")
         self.assertEqual(summary["localSyncedAt"], "2026-08-20T23:31:00+08:00")
         self.assertEqual(
             [item["date"] for item in trends["items"]],
@@ -1266,7 +1266,7 @@ class PlatformDataServiceTests(unittest.TestCase):
             },
         )
         self.assertEqual(
-            summary["platformObservedAt"], "2026-08-19T23:30:00+08:00"
+            summary["platformObservedAt"], "2026-08-19T23:00:00+08:00"
         )
         self.assertEqual(
             summary["localSyncedAt"], "2026-08-19T23:31:00+08:00"
@@ -1326,13 +1326,144 @@ class PlatformDataServiceTests(unittest.TestCase):
             },
         )
         self.assertEqual(
-            summary["platformObservedAt"], "2026-08-19T23:30:00+08:00"
+            summary["platformObservedAt"], "2026-08-19T23:00:00+08:00"
         )
         self.assertEqual(
             summary["localSyncedAt"], "2026-08-19T23:31:00+08:00"
         )
         self.assertEqual(summary.get("trustedSourceMode"), "direct_session")
         self.assertEqual(summary["metrics"]["views"]["value"], 10)
+
+    def test_period_provenance_uses_only_rows_contributing_to_each_window(self) -> None:
+        """来源与时间必须跟随当前区间实际参与汇总的 rows。"""
+
+        def record(
+            source_mode: str,
+            day: str,
+            value: int,
+            *,
+            metric_key: str = "views",
+            metric_scope: str = "daily_increment",
+            platform_observed_at: str,
+            finished_at: str,
+        ) -> None:
+            with patch.object(platform_data_service, "_now", return_value=finished_at):
+                platform_data_service.record_collection_sync(
+                    self.account_id,
+                    CollectionBatch(
+                        platform_type=3,
+                        source_mode=source_mode,
+                        metrics=(
+                            self._v2_point(
+                                metric_key,
+                                value,
+                                day=day,
+                                metric_scope=metric_scope,
+                            ),
+                        ),
+                        contents=(),
+                        account_metrics_available=True,
+                        content_data_available=False,
+                        platform_observed_at=platform_observed_at,
+                        warning_code="content_list_unavailable",
+                    ),
+                )
+
+        record(
+            "direct_session",
+            "2026-07-25",
+            10,
+            platform_observed_at="2026-07-25T23:00:00+08:00",
+            finished_at="2026-07-25T23:31:00+08:00",
+        )
+        record(
+            "browser_signed",
+            "2026-08-19",
+            20,
+            platform_observed_at="2026-08-19T23:00:00+08:00",
+            finished_at="2026-08-19T23:31:00+08:00",
+        )
+        record(
+            "direct_session",
+            "2026-08-18",
+            5_000,
+            metric_key="followers_total",
+            platform_observed_at="2026-08-18T23:00:00+08:00",
+            finished_at="2026-08-18T23:31:00+08:00",
+        )
+        record(
+            "direct_session",
+            "2026-08-17",
+            4_900,
+            metric_key="followers_total",
+            metric_scope="lifetime_total",
+            platform_observed_at="2026-08-17T23:00:00+08:00",
+            finished_at="2026-08-17T23:31:00+08:00",
+        )
+        record(
+            "browser_signed",
+            "2026-08-19",
+            5_100,
+            metric_key="followers_total",
+            metric_scope="lifetime_total",
+            platform_observed_at="2026-08-19T23:00:00+08:00",
+            finished_at="2026-08-19T23:32:00+08:00",
+        )
+        record(
+            "direct_session",
+            "2026-07-21",
+            999,
+            platform_observed_at="2026-08-20T23:00:00+08:00",
+            finished_at="2026-08-20T23:31:00+08:00",
+        )
+
+        with patch.object(
+            platform_data_service,
+            "_beijing_today",
+            return_value=date(2026, 8, 20),
+        ):
+            seven_days = platform_data_service.account_period_summary(
+                self.account_id, 7
+            )
+            thirty_days = platform_data_service.account_period_summary(
+                self.account_id, 30
+            )
+            no_rows = platform_data_service.account_period_summary(
+                self.account_id, 1
+            )
+
+        self.assertEqual(seven_days["trustedSourceMode"], "browser_signed")
+        self.assertEqual(seven_days["metrics"]["views"]["value"], 20)
+        self.assertEqual(
+            seven_days["metrics"]["followers_total"]["value"], 5_100
+        )
+        self.assertEqual(
+            seven_days["platformObservedAt"], "2026-08-19T23:00:00+08:00"
+        )
+        self.assertEqual(
+            seven_days["localSyncedAt"], "2026-08-19T23:32:00+08:00"
+        )
+        self.assertEqual(thirty_days["trustedSourceMode"], "mixed")
+        self.assertEqual(thirty_days["metrics"]["views"]["value"], 30)
+        self.assertEqual(
+            thirty_days["platformObservedAt"], "2026-08-19T23:00:00+08:00"
+        )
+        self.assertEqual(
+            thirty_days["localSyncedAt"], "2026-08-19T23:32:00+08:00"
+        )
+        self.assertIsNone(no_rows["trustedSourceMode"])
+        self.assertIsNone(no_rows["platformObservedAt"])
+        self.assertIsNone(no_rows["localSyncedAt"])
+        self.assertEqual(
+            seven_days["latestRun"],
+            {
+                "status": "partial_success",
+                "sourceMode": "direct_session",
+                "errorCode": "content_list_unavailable",
+                "metricCount": 1,
+                "finishedAt": "2026-08-20T23:31:00+08:00",
+            },
+        )
 
 
 if __name__ == "__main__":

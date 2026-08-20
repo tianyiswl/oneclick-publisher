@@ -252,6 +252,16 @@ class DataMonitorPageTests(unittest.TestCase):
             "本地同步时间：2026-08-20T12:01:00+08:00",
         )
 
+    def test_mixed_contributing_sources_render_controlled_label(self) -> None:
+        """多个可信来源参与区间汇总时，页面必须显式标记混合来源。"""
+
+        summary = period_summary()
+        summary["trustedSourceMode"] = "mixed"
+
+        page = self._page(summary=summary)
+
+        self.assertEqual(page.source_label.text(), "数据来源：混合来源")
+
     def test_range_switch_queries_local_data_without_sync(self) -> None:
         """时间切换若启动平台同步，会将本地浏览误变成外部读取。"""
 
@@ -501,6 +511,41 @@ class DataMonitorPageTests(unittest.TestCase):
 
         task_b.signals.failed.emit("cleanup")
         task_b.signals.finished.emit()
+        self.app.processEvents()
+
+    def test_offscreen_account_error_persists_until_next_sync_starts(self) -> None:
+        """未落库的 A 失败必须跨账号切换保留，且只由 A 的新一轮覆盖。"""
+
+        pool = QueuedPool()
+        runner = BackgroundTaskRunner()
+        runner.pool = pool
+        page = self._page(
+            summary=period_summary(),
+            accounts=[ACCOUNT, ACCOUNT_B],
+            runner=runner,
+        )
+
+        page.sync_button.click()
+        task_a = pool.tasks[0]
+        task_a.signals.started.emit()
+        self.app.processEvents()
+        page.account_combo.setCurrentIndex(page.account_combo.findData(14))
+        task_a.signals.failed.emit("not persisted")
+        task_a.signals.finished.emit()
+        self.app.processEvents()
+
+        page.account_combo.setCurrentIndex(page.account_combo.findData(12))
+        self.assertEqual(page.status_label.text(), "数据同步未完成")
+        self.assertTrue(page.sync_button.isEnabled())
+
+        page.sync_button.click()
+        next_task_a = pool.tasks[1]
+        next_task_a.signals.started.emit()
+        self.app.processEvents()
+        self.assertEqual(page.status_label.text(), "正在同步数据…")
+
+        next_task_a.signals.failed.emit("cleanup")
+        next_task_a.signals.finished.emit()
         self.app.processEvents()
 
     def test_malformed_nested_values_and_dates_fail_closed(self) -> None:
