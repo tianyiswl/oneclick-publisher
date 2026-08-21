@@ -2,8 +2,8 @@
 
 - 离线验收日期：2026-08-21
 - 平台类型：`1`
-- 本轮状态：`seventh_real_run_failed_detail_binding_fixed_offline`
-- 本轮真实客户端运行：`failed_seven_times_each_no_retry`
+- 本轮状态：`eighth_real_run_failed_request_limit`
+- 本轮真实客户端运行：`failed_eight_times_each_no_retry`
 
 ## 交付已验证的内容
 
@@ -156,4 +156,16 @@ Playwright `response.body()` 返回的解压后长度。新采集器遗漏了这
 详情绑定现已按红绿循环修复：请求侧只接受 HTTPS、官方域名和固定作品详情白名单路径，不再假设平台查询
 参数的名称、顺序或附加字段；响应侧继续由 `parse_content_lifetime` 严格要求正文作品 ID 与列表选中 ID
 完全一致。真实参数形式回归、错误作品正文降级和导航边界测试均通过；三个受影响模块共 `90/90` 项通过，
-语法编译与 `git diff --check` 通过。未运行全量测试，也未进行第八次真实同步。
+语法编译与 `git diff --check` 通过。未运行全量测试，第八次真实同步结果见下一节。
+
+## 2026-08-21 第八次真实运行结果
+
+经大帅再次明确授权，正式页面只点击一次“同步数据”，没有自动重试。运行记录 `id=11` 在
+`2026-08-21T16:39:45+08:00` 固定失败为 `metric_payload_invalid`，`metricCount=0`；本地小红书
+指标快照和作品记录仍均为 `0` 条，源码客户端没有遗留子浏览器进程。
+
+本次已越过作品详情请求绑定，证明上一项修复进入了真实路径。新的安全诊断为：
+`endpoint=runtime`、`stage=response_capture`、`reason=request_limit_exceeded`。当前总请求预算仍在
+`remember_request` 中对页面所有请求计数，静态资源和非白名单接口会消耗 `_MAX_REQUESTS=400`，与第四次
+发现的响应预算问题同源。下一步应只保留可关联到审核白名单响应的请求对象，并对该集合执行数量上限；
+修复完成前不进行第九次真实同步。
