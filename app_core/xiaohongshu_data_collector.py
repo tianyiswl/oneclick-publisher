@@ -434,14 +434,7 @@ class XiaohongshuDataCollector:
         runtime_stage = "browser_start"
 
         def remember_request(request: object) -> None:
-            nonlocal retained_request_count, capture_error
             if not phase:
-                return
-            retained_request_count += 1
-            if retained_request_count > _MAX_REQUESTS:
-                capture_error = _payload_error(
-                    "runtime", "response_capture", "request_limit_exceeded"
-                )
                 return
             request_phases[id(request)] = (request, phase)
 
@@ -505,13 +498,20 @@ class XiaohongshuDataCollector:
             transient_failures.pop(path, None)
 
         def remember_response(response: object) -> None:
-            nonlocal capture_error, retained_response_count, response_sequence
+            nonlocal capture_error, retained_request_count
+            nonlocal retained_response_count, response_sequence
             request = getattr(response, "request", None)
             entry = request_phases.pop(id(request), None)
             if entry is None or entry[0] is not request:
                 return
             path = _response_path(response)
             if path is None or _PATH_PHASES[path] != entry[1]:
+                return
+            retained_request_count += 1
+            if retained_request_count > _MAX_REQUESTS:
+                capture_error = _payload_error(
+                    "runtime", "response_capture", "request_limit_exceeded"
+                )
                 return
             response_id = id(response)
             if response_id in scheduled_response_ids or response_id in seen_response_ids:

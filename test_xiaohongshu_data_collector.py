@@ -1044,24 +1044,18 @@ class XiaohongshuDataCollectorTests(unittest.TestCase):
         )
         self.assertNotIn("example.invalid", repr(caught.exception.failure_diagnostic))
 
-    def test_request_limit_exposes_fixed_capture_diagnostic(self) -> None:
+    def test_unreviewed_requests_do_not_consume_reviewed_request_budget(self) -> None:
         responses = tuple(
             _FakeResponse(f"https://creator.xiaohongshu.com/unreviewed/{index}", {})
             for index in range(xiaohongshu_data_collector._MAX_REQUESTS + 1)
         )
-        collector, _fake = self._collector_with_responses({CREATOR_HOME: responses})
+        reviewed = _reviewed_success_responses()
+        reviewed[CREATOR_HOME] = responses + reviewed[CREATOR_HOME]
+        collector, _fake = self._collector_with_responses(reviewed)
 
-        with self.assertRaises(PlatformDataCollectionError) as caught:
-            collector.collect_browser_signed_with_diagnostics(_account())
+        batch = collector.collect_browser_signed(_account())
 
-        self.assertEqual(
-            caught.exception.failure_diagnostic,
-            {
-                "endpoint": "runtime",
-                "stage": "response_capture",
-                "reason": "request_limit_exceeded",
-            },
-        )
+        self.assertGreater(len(batch.metrics), 0)
 
     def test_unreviewed_page_responses_do_not_consume_reviewed_response_budget(self) -> None:
         """静态资源和非白名单接口再多，也不能挤占四个审核接口的响应预算。"""
