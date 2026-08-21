@@ -3,10 +3,25 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+import json
 import math
+from pathlib import Path
+import tempfile
 import unittest
+from unittest.mock import patch
 
+from app_core.platform_data_collection_errors import PlatformDataCollectionError
+from app_core.platform_data_collectors import (
+    collector_for_platform,
+    registered_platform_types,
+)
 from app_core.platform_data_models import CollectionFailure, ContentRecord
+from app_core.xiaohongshu_data_collector import (
+    CREATOR_HOME,
+    DATA_ANALYSIS_URL,
+    XiaohongshuDataCollector,
+)
 from app_core.xiaohongshu_data_contract import (
     XhsContentIdentity,
     parse_account_overview,
@@ -230,4 +245,470 @@ class XiaohongshuDataContractTests(unittest.TestCase):
                 content_status="published",
                 content_type="unavailable",
             )
+        )
+
+
+class _FakeRequest:
+    pass
+
+
+class _FakeResponse:
+    def __init__(
+        self,
+        url: str,
+        payload: object | None = None,
+        *,
+        body: bytes | None = None,
+        status: int = 200,
+        content_type: str = "application/json",
+    ) -> None:
+        self.url = url
+        self.request = _FakeRequest()
+        self.status = status
+        self._body = body if body is not None else json.dumps(payload).encode("utf-8")
+        self.headers = {
+            "content-type": content_type,
+            "content-length": str(len(self._body)),
+        }
+
+    async def body(self) -> bytes:
+        return self._body
+
+
+class _FakePage:
+    def __init__(self, owner: "_FakeRuntime") -> None:
+        self.owner = owner
+        self.listeners: dict[str, object] = {}
+        self.url = CREATOR_HOME
+
+    def on(self, event: str, callback) -> None:
+        self.listeners[event] = callback
+
+    async def goto(self, url: str, **_kwargs) -> object:
+        self.owner.goto_urls.append(url)
+        self.url = self.owner.final_urls.get(url, url)
+        failure = self.owner.goto_failure
+        if failure is not None:
+            raise failure
+        for response in self.owner.responses_by_url.get(url, ()):
+            request_callback = self.listeners.get("request")
+            response_callback = self.listeners.get("response")
+            if request_callback is not None:
+                request_callback(response.request)
+            if response_callback is not None:
+                response_callback(response)
+        return _FakeNavigation(self.url)
+
+    async def wait_for_timeout(self, _milliseconds: int) -> None:
+        return None
+
+    async def close(self) -> None:
+        self.owner.cleanup.append("page")
+        if self.owner.page_close_error is not None:
+            raise self.owner.page_close_error
+
+
+class _FakeNavigation:
+    def __init__(self, url: str) -> None:
+        self.url = url
+        self.status = 200
+        self.headers = {"content-type": "text/html"}
+
+
+class _FakeContext:
+    def __init__(self, owner: "_FakeRuntime") -> None:
+        self.owner = owner
+
+    async def new_page(self) -> _FakePage:
+        return self.owner.page
+
+    async def close(self) -> None:
+        self.owner.cleanup.append("context")
+        if self.owner.context_close_error is not None:
+            raise self.owner.context_close_error
+
+
+class _FakeBrowser:
+    def __init__(self, owner: "_FakeRuntime") -> None:
+        self.owner = owner
+
+    async def new_context(self, *, storage_state: str) -> _FakeContext:
+        self.owner.storage_states.append(storage_state)
+        return _FakeContext(self.owner)
+
+    async def close(self) -> None:
+        self.owner.cleanup.append("browser")
+        if self.owner.browser_close_error is not None:
+            raise self.owner.browser_close_error
+
+
+class _FakeChromium:
+    def __init__(self, owner: "_FakeRuntime") -> None:
+        self.owner = owner
+
+    async def launch(self, **_kwargs) -> _FakeBrowser:
+        return _FakeBrowser(self.owner)
+
+
+class _FakePlaywright:
+    def __init__(self, owner: "_FakeRuntime") -> None:
+        self.owner = owner
+        self.chromium = _FakeChromium(owner)
+
+    async def stop(self) -> None:
+        self.owner.cleanup.append("playwright")
+        if self.owner.playwright_close_error is not None:
+            raise self.owner.playwright_close_error
+
+
+class _FakeStarter:
+    def __init__(self, owner: "_FakeRuntime") -> None:
+        self.owner = owner
+
+    async def start(self) -> _FakePlaywright:
+        return _FakePlaywright(self.owner)
+
+
+class _FakeRuntime:
+    def __init__(
+        self,
+        responses_by_url: dict[str, tuple[_FakeResponse, ...]],
+        *,
+        final_urls: dict[str, str] | None = None,
+        goto_failure: BaseException | None = None,
+        page_close_error: BaseException | None = None,
+        context_close_error: BaseException | None = None,
+        browser_close_error: BaseException | None = None,
+        playwright_close_error: BaseException | None = None,
+    ) -> None:
+        self.responses_by_url = responses_by_url
+        self.final_urls = final_urls or {}
+        self.goto_failure = goto_failure
+        self.page_close_error = page_close_error
+        self.context_close_error = context_close_error
+        self.browser_close_error = browser_close_error
+        self.playwright_close_error = playwright_close_error
+        self.goto_urls: list[str] = []
+        self.cleanup: list[str] = []
+        self.storage_states: list[str] = []
+        self.page = _FakePage(self)
+
+
+class _Clock:
+    def __init__(self, values: tuple[float, ...] = (0.0,)) -> None:
+        self._values = iter(values)
+        self._last = values[-1]
+
+    def __call__(self) -> float:
+        try:
+            self._last = next(self._values)
+        except StopIteration:
+            pass
+        return self._last
+
+
+def _account() -> dict:
+    return {"id": 21, "type": 1, "filePath": "oneclick_1_test.json"}
+
+
+def _detail_url() -> str:
+    return (
+        "https://creator.xiaohongshu.com/statistics/note-detail?noteId="
+        f"{_CONTENT_ID}"
+    )
+
+
+def _reviewed_success_responses() -> dict[str, tuple[_FakeResponse, ...]]:
+    return {
+        CREATOR_HOME: (
+            _FakeResponse(
+                "https://creator.xiaohongshu.com/api/galaxy/v2/creator/"
+                "datacenter/account/base?private=query",
+                {"data": {"fans_count": 3199}},
+            ),
+            _FakeResponse(
+                "https://creator.xiaohongshu.com/api/galaxy/creator/home/"
+                "personal_info?private=query",
+                {"data": {"fans_count": 3199}},
+            ),
+        ),
+        DATA_ANALYSIS_URL: (
+            _FakeResponse(
+                "https://creator.xiaohongshu.com/api/galaxy/creator/"
+                "datacenter/note/analyze/list?page_num=1",
+                {"data": {"note_infos": [{"id": _CONTENT_ID}], "total": 1}},
+            ),
+        ),
+        _detail_url(): (
+            _FakeResponse(
+                "https://creator.xiaohongshu.com/api/galaxy/creator/"
+                "datacenter/note/base?note_id=private",
+                {
+                    "data": {
+                        "note_info": {
+                            "id": _CONTENT_ID,
+                            "view_count": 148,
+                            "like_count": 5,
+                            "comment_count": 9,
+                        },
+                        "collect_count": 2,
+                        "share_count": 4,
+                    }
+                },
+            ),
+        ),
+    }
+
+
+class XiaohongshuDataCollectorTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.cookie_dir = Path(self.tempdir.name)
+        self.state_file = self.cookie_dir / _account()["filePath"]
+        self.state_file.write_text("{}", encoding="utf-8")
+        self.cookie_patch = patch(
+            "app_core.xiaohongshu_data_collector.COOKIE_DIR", self.cookie_dir
+        )
+        self.cookie_patch.start()
+
+    def tearDown(self) -> None:
+        self.cookie_patch.stop()
+        self.tempdir.cleanup()
+
+    def _collector_with_responses(
+        self,
+        responses: dict[str, tuple[_FakeResponse, ...]],
+        **runtime_kwargs,
+    ) -> tuple[XiaohongshuDataCollector, _FakeRuntime]:
+        fake = _FakeRuntime(responses, **runtime_kwargs)
+        return (
+            XiaohongshuDataCollector(
+                browser_factory=lambda: _FakeStarter(fake),
+                utc_now=lambda: datetime(2026, 8, 21, 4, 0, tzinfo=timezone.utc),
+                monotonic=_Clock(),
+            ),
+            fake,
+        )
+
+    def assert_collection_error(self, call, code: str) -> None:
+        with self.assertRaises(PlatformDataCollectionError) as caught:
+            call()
+        self.assertEqual(caught.exception.error_code, code)
+        self.assertEqual(str(caught.exception), code)
+        self.assertIsNone(caught.exception.__cause__)
+
+    def test_browser_signed_collects_one_standard_batch_and_closes_all_resources(self) -> None:
+        """删掉阶段绑定、数据转换或任一关闭动作时，此测试应失败。"""
+
+        collector, fake = self._collector_with_responses(_reviewed_success_responses())
+
+        batch = collector.collect_browser_signed(_account())
+
+        self.assertEqual(batch.platform_type, 1)
+        self.assertEqual(batch.source_mode, "browser_signed")
+        self.assertTrue(batch.account_metrics_available)
+        self.assertTrue(batch.content_data_available)
+        self.assertEqual(len(batch.contents), 1)
+        self.assertEqual(
+            fake.goto_urls, [CREATOR_HOME, DATA_ANALYSIS_URL, _detail_url()]
+        )
+        self.assertEqual(fake.cleanup, ["page", "context", "browser", "playwright"])
+
+    def test_cleanup_failure_never_returns_success(self) -> None:
+        """资源关闭报错若被吞掉，会把不完整会话误写成采集成功。"""
+
+        collector, fake = self._collector_with_responses(
+            _reviewed_success_responses(),
+            context_close_error=RuntimeError("private"),
+        )
+
+        self.assert_collection_error(
+            lambda: collector.collect_browser_signed(_account()),
+            "browser_cleanup_incomplete",
+        )
+        self.assertIn("browser", fake.cleanup)
+        self.assertIn("playwright", fake.cleanup)
+
+    def test_direct_collection_requests_browser_fallback_without_opening_browser(self) -> None:
+        """小红书直连若尝试复制会话请求，就会绕过浏览器签名边界。"""
+
+        collector, fake = self._collector_with_responses(_reviewed_success_responses())
+
+        with self.assertRaises(PlatformDataCollectionError) as caught:
+            collector.collect_direct(_account())
+        self.assertEqual(caught.exception.error_code, "direct_request_rejected")
+        self.assertTrue(caught.exception.fallback_allowed)
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertEqual(fake.goto_urls, [])
+        self.assertEqual(fake.cleanup, [])
+
+    def test_missing_or_linked_state_file_is_rejected_before_browser_start(self) -> None:
+        """缺失或链接状态文件若可启动，会把会话边界交给外部路径决定。"""
+
+        self.state_file.unlink()
+        collector, fake = self._collector_with_responses(_reviewed_success_responses())
+        self.assert_collection_error(
+            lambda: collector.collect_browser_signed(_account()), "session_state_missing"
+        )
+        self.assertEqual(fake.cleanup, [])
+
+        self.state_file.symlink_to(Path(__file__))
+        collector, fake = self._collector_with_responses(_reviewed_success_responses())
+        self.assert_collection_error(
+            lambda: collector.collect_browser_signed(_account()), "session_state_missing"
+        )
+        self.assertEqual(fake.cleanup, [])
+
+    def test_login_or_verification_redirect_stops_collection_and_cleans_up(self) -> None:
+        """登录或验证跳转若继续读取响应，可能把匿名页面数据归给账号。"""
+
+        for redirected_url in (
+            "https://creator.xiaohongshu.com/login",
+            "https://creator.xiaohongshu.com/creator/security/verification",
+        ):
+            with self.subTest(redirected_url=redirected_url):
+                collector, fake = self._collector_with_responses(
+                    {}, final_urls={CREATOR_HOME: redirected_url}
+                )
+                self.assert_collection_error(
+                    lambda: collector.collect_browser_signed(_account()),
+                    "login_required",
+                )
+                self.assertEqual(fake.cleanup, ["page", "context", "browser", "playwright"])
+
+    def test_response_body_and_cumulative_size_limits_fail_closed(self) -> None:
+        """放宽任一字节上限会使单会话保留无界响应体。"""
+
+        oversized = _reviewed_success_responses()
+        oversized[CREATOR_HOME] = (
+            _FakeResponse(
+                "https://creator.xiaohongshu.com/api/galaxy/creator/home/personal_info",
+                body=b"x" * (1_048_576 + 1),
+            ),
+        )
+        collector, _fake = self._collector_with_responses(oversized)
+        self.assert_collection_error(
+            lambda: collector.collect_browser_signed(_account()),
+            "metric_payload_invalid",
+        )
+
+        cumulative = _reviewed_success_responses()
+        medium_body = b"{" + b" " * 1_048_574 + b"}"
+        cumulative[CREATOR_HOME] = tuple(
+            _FakeResponse(
+                "https://creator.xiaohongshu.com/api/galaxy/creator/home/personal_info",
+                body=medium_body,
+            )
+            for _ in range(5)
+        )
+        collector, _fake = self._collector_with_responses(cumulative)
+        self.assert_collection_error(
+            lambda: collector.collect_browser_signed(_account()),
+            "metric_payload_invalid",
+        )
+
+    def test_late_response_keeps_its_request_phase_and_cannot_drive_note_detail(self) -> None:
+        """迟到首页请求若按当前页归类，会把首页响应伪装成作品详情。"""
+
+        delayed = _FakeResponse(
+            "https://creator.xiaohongshu.com/api/galaxy/creator/datacenter/note/base",
+            {"data": {"note_info": {"id": _CONTENT_ID, "view_count": 1}}},
+        )
+
+        class _LatePage(_FakePage):
+            async def goto(self, url: str, **_kwargs) -> object:
+                self.owner.goto_urls.append(url)
+                self.url = url
+                request_callback = self.listeners.get("request")
+                response_callback = self.listeners.get("response")
+                if url == CREATOR_HOME:
+                    for response in self.owner.responses_by_url[url]:
+                        if request_callback is not None:
+                            request_callback(response.request)
+                        if response_callback is not None:
+                            response_callback(response)
+                    if request_callback is not None:
+                        request_callback(delayed.request)
+                elif url == DATA_ANALYSIS_URL:
+                    for response in self.owner.responses_by_url[url]:
+                        if request_callback is not None:
+                            request_callback(response.request)
+                        if response_callback is not None:
+                            response_callback(response)
+                elif url == _detail_url() and response_callback is not None:
+                    response_callback(delayed)
+                return _FakeNavigation(url)
+
+        collector, fake = self._collector_with_responses(_reviewed_success_responses())
+        fake.page = _LatePage(fake)
+        batch = collector.collect_browser_signed(_account())
+        self.assertFalse(batch.content_data_available)
+        self.assertEqual(batch.warning_code, "content_payload_invalid")
+        self.assertEqual(fake.goto_urls, [CREATOR_HOME, DATA_ANALYSIS_URL, _detail_url()])
+
+    def test_duplicate_response_is_rejected(self) -> None:
+        """同一详情响应重复进入时若静默取一份，会掩盖响应去重故障。"""
+
+        responses = _reviewed_success_responses()
+        duplicate = responses[_detail_url()][0]
+        responses[_detail_url()] = (duplicate, duplicate)
+        collector, _fake = self._collector_with_responses(responses)
+        self.assert_collection_error(
+            lambda: collector.collect_browser_signed(_account()),
+            "metric_payload_invalid",
+        )
+
+    def test_content_payload_failure_returns_account_only_batch(self) -> None:
+        """作品详情坏掉时若整个账号指标丢失，会放大局部响应故障。"""
+
+        responses = _reviewed_success_responses()
+        responses[_detail_url()] = (
+            _FakeResponse(
+                "https://creator.xiaohongshu.com/api/galaxy/creator/datacenter/note/base",
+                {"data": {"note_info": {"id": "7b0ffca800000000080033f8"}}},
+            ),
+        )
+        collector, _fake = self._collector_with_responses(responses)
+
+        batch = collector.collect_browser_signed(_account())
+
+        self.assertTrue(batch.account_metrics_available)
+        self.assertFalse(batch.content_data_available)
+        self.assertEqual(batch.contents, ())
+        self.assertEqual(batch.warning_code, "content_payload_invalid")
+
+    def test_total_timeout_returns_fixed_error_after_cleanup(self) -> None:
+        """总时限越界若继续等待，会让短会话失去确定的资源上限。"""
+
+        fake = _FakeRuntime(_reviewed_success_responses())
+        collector = XiaohongshuDataCollector(
+            browser_factory=lambda: _FakeStarter(fake),
+            utc_now=lambda: datetime(2026, 8, 21, tzinfo=timezone.utc),
+            monotonic=_Clock((0.0, 0.0, 0.0, 0.0, 0.0, 56.0, 56.0)),
+        )
+        self.assert_collection_error(
+            lambda: collector.collect_browser_signed(_account()),
+            "browser_signature_timeout",
+        )
+        self.assertEqual(fake.cleanup, ["page", "context", "browser", "playwright"])
+
+    def test_process_control_exceptions_propagate_only_after_cleanup(self) -> None:
+        """进程控制异常若跳过 finally，会遗留浏览器和会话上下文。"""
+
+        for error_type in (KeyboardInterrupt, SystemExit):
+            with self.subTest(error_type=error_type.__name__):
+                collector, fake = self._collector_with_responses(
+                    {}, goto_failure=error_type()
+                )
+                with self.assertRaises(error_type):
+                    collector.collect_browser_signed(_account())
+                self.assertEqual(fake.cleanup, ["page", "context", "browser", "playwright"])
+
+    def test_registry_exposes_xiaohongshu_only_with_a_real_factory(self) -> None:
+        """登记项若是空占位，界面会把不可采集的平台显示为可同步。"""
+
+        self.assertEqual(registered_platform_types(), (1, 3))
+        self.assertIsInstance(
+            collector_for_platform(1, browser_factory=lambda: _FakeStarter(_FakeRuntime({}))),
+            XiaohongshuDataCollector,
         )
