@@ -16,8 +16,34 @@ from app_core.douyin_data_collector import (
     DouyinDataCollectionError,
     DouyinDataCollector,
 )
-from app_core.platform_data_collectors import collector_for_platform
+from app_core.platform_data_collection_errors import PlatformDataCollectionError
+from app_core.platform_data_collectors import (
+    collector_for_platform,
+    registered_platform_types,
+)
 from app_core.platform_data_models import CollectionFailure
+
+
+class DouyinDataCollectorTests(unittest.TestCase):
+    def test_registry_exposes_only_explicit_platforms(self) -> None:
+        """注册查询必须只暴露真实可用的平台，并拒绝布尔值。"""
+
+        self.assertEqual(registered_platform_types(), (3,))
+        with self.assertRaises(CollectionFailure) as caught:
+            collector_for_platform(True)
+        self.assertEqual(caught.exception.error_code, "collector_not_available")
+
+    def test_douyin_error_is_platform_neutral_compatible(self) -> None:
+        """抖音兼容异常必须可由公共编排层统一捕获。"""
+
+        error = DouyinDataCollectionError(
+            "login_required",
+            fallback_allowed=False,
+        )
+
+        self.assertIsInstance(error, PlatformDataCollectionError)
+        self.assertEqual(error.error_code, "login_required")
+        self.assertFalse(error.fallback_allowed)
 
 
 class FakeResponse:

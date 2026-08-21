@@ -15,7 +15,8 @@ from urllib.parse import urlparse
 import requests
 
 from .paths import COOKIE_DIR
-from .platform_data_models import CollectionBatch, CollectionFailure, MetricPoint
+from .platform_data_collection_errors import PlatformDataCollectionError
+from .platform_data_models import CollectionBatch, MetricPoint
 
 
 DOUYIN_DASHBOARD_URL = (
@@ -51,10 +52,13 @@ _DIRECT_DAY_FORMATS = ("%Y%m%d",)
 _BROWSER_DAY_FORMATS = ("%Y%m%d", "%Y-%m-%d", "%Y/%m/%d")
 
 
-class DouyinDataCollectionError(CollectionFailure):
+class DouyinDataCollectionError(PlatformDataCollectionError):
     def __init__(self, error_code: str, *, fallback_allowed: bool) -> None:
-        self.fallback_allowed = bool(fallback_allowed)
-        super().__init__(error_code, retryable=fallback_allowed)
+        super().__init__(
+            error_code,
+            fallback_allowed=fallback_allowed,
+            retryable=fallback_allowed,
+        )
 
 
 def _is_douyin_cookie_domain(value: object) -> bool:

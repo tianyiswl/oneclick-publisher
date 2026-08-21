@@ -12,9 +12,24 @@ class PlatformDataCollector(Protocol):
     def collect(self, account: dict) -> CollectionBatch: ...
 
 
-def collector_for_platform(platform_type: int, **dependencies) -> PlatformDataCollector:
-    if type(platform_type) is not int or platform_type != 3:
-        raise CollectionFailure("collector_not_available")
+def _douyin_factory(**dependencies) -> PlatformDataCollector:
     from .douyin_data_collector import DouyinDataCollector
 
     return DouyinDataCollector(**dependencies)
+
+
+_COLLECTOR_FACTORIES = {3: _douyin_factory}
+
+
+def registered_platform_types() -> tuple[int, ...]:
+    return tuple(sorted(_COLLECTOR_FACTORIES))
+
+
+def collector_for_platform(platform_type: int, **dependencies) -> PlatformDataCollector:
+    if type(platform_type) is not int:
+        raise CollectionFailure("collector_not_available") from None
+    factory = _COLLECTOR_FACTORIES.get(platform_type)
+    if factory is None:
+        raise CollectionFailure("collector_not_available") from None
+
+    return factory(**dependencies)
