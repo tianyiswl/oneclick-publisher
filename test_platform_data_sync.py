@@ -8,13 +8,14 @@ from unittest.mock import Mock, patch
 
 from app_core import platform_data_sync
 from app_core.douyin_data_collector import DouyinDataCollectionError
-from app_core.platform_data_collection_errors import PlatformDataCollectionError
+from app_core.platform_data_collection_errors import CleanupReceipt, PlatformDataCollectionError
 from app_core.platform_data_models import (
     CollectionBatch,
     CollectionFailure,
     ContentRecord,
     MetricPoint,
 )
+from app_core.xiaohongshu_data_collector import XiaohongshuCollectionOutcome
 
 
 def account_point() -> MetricPoint:
@@ -166,6 +167,22 @@ class FakeCollector:
         return self.browser_result
 
 
+class DetailedXhsCollector(FakeCollector):
+    def __init__(self, outcome: XiaohongshuCollectionOutcome) -> None:
+        super().__init__(
+            PlatformDataCollectionError("direct_request_rejected", fallback_allowed=True)
+        )
+        self.outcome = outcome
+        self.validation_modes: list[bool] = []
+
+    def collect_browser_signed_with_diagnostics(
+        self, account: dict, *, validation_mode: bool = False,
+    ) -> XiaohongshuCollectionOutcome:
+        self.browser_calls += 1
+        self.validation_modes.append(validation_mode)
+        return self.outcome
+
+
 class PlatformDataSyncTests(unittest.TestCase):
     def setUp(self) -> None:
         self.account = {
@@ -284,6 +301,224 @@ class PlatformDataSyncTests(unittest.TestCase):
             {"stage": "browser_signed", "message": "正在读取平台官方数据…"},
             progress,
         )
+
+    def test_xhs_browser_success_exposes_only_cleanup_receipt_in_public_result(self) -> None:
+        """同步层若丢掉回执，成功记录无法证明浏览器已完全关闭。"""
+
+        batch = xhs_collection_batch()
+        collector = DetailedXhsCollector(
+            XiaohongshuCollectionOutcome(
+                batch=batch,
+                cleanup=CleanupReceipt(closed=True, alive_resource_count=0),
+            )
+        )
+        with patch.object(
+            platform_data_sync.account_service,
+            "list_accounts",
+            return_value=[xhs_account()],
+        ), patch.object(
+            platform_data_sync,
+            "collector_for_platform",
+            return_value=collector,
+        ), patch.object(
+            platform_data_sync.platform_data_service,
+            "record_collection_sync",
+            return_value={
+                "accountId": 21,
+                "status": "success",
+                "sourceMode": "browser_signed",
+                "errorCode": "",
+                "metricCount": 2,
+            },
+        ):
+            result = platform_data_sync.sync_account_data(21)
+
+        self.assertEqual(
+            result["diagnostics"],
+            {"cleanup": {"closed": True, "aliveResourceCount": 0}},
+        )
+        self.assertNotIn("cookie", repr(result).lower())
+
+    def test_xhs_cleanup_failure_keeps_failure_status_and_controlled_receipt(self) -> None:
+        """关闭失败若被写成成功或带出异常原文，真实验收会得到错误结论。"""
+
+        collector = FakeCollector(
+            PlatformDataCollectionError(
+                "browser_cleanup_incomplete",
+                cleanup_receipt=CleanupReceipt(
+                    closed=False, alive_resource_count=1
+                ),
+            )
+        )
+        with patch.object(
+            platform_data_sync.account_service,
+            "list_accounts",
+            return_value=[xhs_account()],
+        ), patch.object(
+            platform_data_sync,
+            "collector_for_platform",
+            return_value=collector,
+        ), patch.object(
+            platform_data_sync.platform_data_service,
+            "record_failed_sync",
+            return_value={
+                "accountId": 21,
+                "status": "failed",
+                "sourceMode": "direct_session",
+                "errorCode": "browser_cleanup_incomplete",
+                "metricCount": 0,
+            },
+        ):
+            result = platform_data_sync.sync_account_data(21)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["errorCode"], "browser_cleanup_incomplete")
+        self.assertEqual(
+            result["diagnostics"],
+            {"cleanup": {"closed": False, "aliveResourceCount": 1}},
+        )
+        self.assertNotIn("private", repr(result).lower())
+
+    def test_validation_mode_returns_headed_official_and_local_readback_comparison(self) -> None:
+        """验收模式若不把同次本地读回逐项比对，就不能证明写入与官方可见值一致。"""
+
+        batch = xhs_collection_batch()
+        collector = DetailedXhsCollector(
+            XiaohongshuCollectionOutcome(
+                batch=batch,
+                cleanup=CleanupReceipt(closed=True, alive_resource_count=0),
+                validation={
+                    "mode": "official_visible_readback",
+                    "officialVisible": {
+                        "account": {"followersTotal": 125},
+                        "content": {
+                            "contentId": "0123456789abcdef01234567",
+                            "views": 400,
+                        },
+                    },
+                },
+            )
+        )
+        with patch.object(
+            platform_data_sync.account_service,
+            "list_accounts",
+            return_value=[xhs_account()],
+        ), patch.object(
+            platform_data_sync,
+            "collector_for_platform",
+            return_value=collector,
+        ), patch.object(
+            platform_data_sync.platform_data_service,
+            "record_collection_sync",
+            return_value={
+                "accountId": 21,
+                "status": "success",
+                "sourceMode": "browser_signed",
+                "errorCode": "",
+                "metricCount": 2,
+            },
+        ), patch.object(
+            platform_data_sync.platform_data_service,
+            "account_data_summary",
+            return_value={"metrics": {"followers_total": 125}},
+        ), patch.object(
+            platform_data_sync.platform_data_service,
+            "account_contents",
+            return_value={
+                "items": [{
+                    "contentId": "0123456789abcdef01234567",
+                    "metrics": {"views": 400},
+                }]
+            },
+        ):
+            result = platform_data_sync.sync_account_data(
+                21,
+                validation_mode=True,
+                visible_readback=lambda _page, _batch: None,
+            )
+
+        self.assertEqual(collector.validation_modes, [True])
+        self.assertEqual(
+            result["diagnostics"]["validation"],
+            {
+                "mode": "official_visible_readback",
+                "officialVisible": {
+                    "account": {"followersTotal": 125},
+                    "content": {
+                        "contentId": "0123456789abcdef01234567",
+                        "views": 400,
+                    },
+                },
+                "localReadback": {
+                    "account": {"followersTotal": 125},
+                    "content": {
+                        "contentId": "0123456789abcdef01234567",
+                        "views": 400,
+                    },
+                },
+                "matches": {"followersTotal": True, "views": True},
+            },
+        )
+
+    def test_validation_mode_passes_only_explicit_visible_reader_to_xhs_factory(self) -> None:
+        """验证模式若不能传入受控可见读取器，生产调用只能无证据失败。"""
+
+        batch = xhs_collection_batch()
+        reader = lambda _page, _batch: None
+        collector = DetailedXhsCollector(
+            XiaohongshuCollectionOutcome(
+                batch=batch,
+                cleanup=CleanupReceipt(closed=True, alive_resource_count=0),
+                validation={
+                    "mode": "official_visible_readback",
+                    "officialVisible": {
+                        "account": {"followersTotal": 125},
+                        "content": {
+                            "contentId": "0123456789abcdef01234567",
+                            "views": 400,
+                        },
+                    },
+                },
+            )
+        )
+        with patch.object(
+            platform_data_sync.account_service,
+            "list_accounts",
+            return_value=[xhs_account()],
+        ), patch.object(
+            platform_data_sync,
+            "collector_for_platform",
+            return_value=collector,
+        ) as factory, patch.object(
+            platform_data_sync.platform_data_service,
+            "record_collection_sync",
+            return_value={
+                "accountId": 21,
+                "status": "success",
+                "sourceMode": "browser_signed",
+                "errorCode": "",
+                "metricCount": 2,
+            },
+        ), patch.object(
+            platform_data_sync.platform_data_service,
+            "account_data_summary",
+            return_value={"metrics": {"followers_total": 125}},
+        ), patch.object(
+            platform_data_sync.platform_data_service,
+            "account_contents",
+            return_value={
+                "items": [{
+                    "contentId": "0123456789abcdef01234567",
+                    "metrics": {"views": 400},
+                }]
+            },
+        ):
+            platform_data_sync.sync_account_data(
+                21, validation_mode=True, visible_readback=reader
+            )
+
+        self.assertEqual(factory.call_args.args, (1,))
+        self.assertEqual(factory.call_args.kwargs, {"visible_readback": reader})
 
     def test_xhs_collection_failures_are_persisted_with_fixed_public_codes(self) -> None:
         """小红书受控失败不得把会话或浏览器异常原文带出同步边界。"""

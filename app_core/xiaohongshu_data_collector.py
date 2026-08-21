@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import inspect
 import json
@@ -13,7 +14,7 @@ from typing import Callable
 from urllib.parse import parse_qsl, urlsplit
 
 from .paths import COOKIE_DIR
-from .platform_data_collection_errors import PlatformDataCollectionError
+from .platform_data_collection_errors import CleanupReceipt, PlatformDataCollectionError
 from .platform_data_models import CollectionBatch, CollectionFailure
 from .xiaohongshu_data_contract import (
     parse_account_overview,
@@ -34,6 +35,8 @@ _MAX_RESPONSE_BYTES = 1_048_576
 _MAX_TOTAL_RESPONSE_BYTES = 4_194_304
 _MAX_RESPONSES = 100
 _MAX_REQUESTS = _MAX_RESPONSES * 4
+_RESPONSE_CAPTURE_POLL_ATTEMPTS = 3
+_RESPONSE_CAPTURE_POLL_MS = 250
 _ACCOUNT_PATHS = frozenset(
     {
         "/api/galaxy/v2/creator/datacenter/account/base",
@@ -60,12 +63,77 @@ def _default_browser_factory():
     return async_playwright()
 
 
-def _collection_error(error_code: str, *, fallback_allowed: bool = False) -> PlatformDataCollectionError:
+def _collection_error(
+    error_code: str,
+    *,
+    fallback_allowed: bool = False,
+    cleanup_receipt: CleanupReceipt | None = None,
+) -> PlatformDataCollectionError:
     return PlatformDataCollectionError(
         error_code,
         fallback_allowed=fallback_allowed,
         retryable=fallback_allowed,
+        cleanup_receipt=cleanup_receipt,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class XiaohongshuCollectionOutcome:
+    """采集批次与非持久化的清理回执。"""
+
+    batch: CollectionBatch
+    cleanup: CleanupReceipt
+    validation: dict | None = None
+
+    def public_diagnostics(self) -> dict:
+        result = {"cleanup": self.cleanup.public_payload()}
+        if self.validation is not None:
+            result["validation"] = self.validation
+        return result
+
+
+def _visible_readback_payload(value: object, batch: CollectionBatch) -> dict | None:
+    if type(value) is not dict or set(value) != {"account", "content"}:
+        return None
+    account = value.get("account")
+    content = value.get("content")
+    if (
+        type(account) is not dict
+        or set(account) != {"followersTotal"}
+        or type(content) is not dict
+        or set(content) != {"contentId", "views"}
+    ):
+        return None
+    followers_total = account.get("followersTotal")
+    content_id = content.get("contentId")
+    views = content.get("views")
+    if (
+        type(followers_total) not in (int, float)
+        or type(content_id) is not str
+        or type(views) not in (int, float)
+        or not batch.contents
+        or content_id != batch.contents[0].content_id
+    ):
+        return None
+    account_values = {
+        point.metric_key: point.metric_value
+        for point in batch.metrics
+        if point.entity_type == "account"
+    }
+    content_values = {
+        point.metric_key: point.metric_value
+        for point in batch.metrics
+        if point.entity_type == "content" and point.entity_key == content_id
+    }
+    if (
+        account_values.get("followers_total") != followers_total
+        or content_values.get("views") != views
+    ):
+        return None
+    return {
+        "account": {"followersTotal": followers_total},
+        "content": {"contentId": content_id, "views": views},
+    }
 
 
 def _state_path(account: object) -> tuple[int, Path]:
@@ -199,20 +267,40 @@ class XiaohongshuDataCollector:
         browser_factory: Callable[[], object] = _default_browser_factory,
         utc_now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         monotonic: Callable[[], float] | None = None,
+        visible_readback: Callable[[object, CollectionBatch], object] | None = None,
     ) -> None:
         import time
 
         self._browser_factory = browser_factory
         self._utc_now = utc_now
         self._monotonic = monotonic or time.monotonic
+        self._visible_readback = visible_readback
 
     def collect_direct(self, account: dict) -> CollectionBatch:
         _state_path(account)
         raise _collection_error("direct_request_rejected", fallback_allowed=True) from None
 
-    def collect_browser_signed(self, account: dict) -> CollectionBatch:
+    def collect_browser_signed(
+        self, account: dict, *, validation_mode: bool = False
+    ) -> CollectionBatch:
         try:
-            return asyncio.run(self._collect_browser_signed_async(account))
+            return asyncio.run(
+                self._collect_browser_signed_async(account, validation_mode=validation_mode)
+            ).batch
+        except PlatformDataCollectionError:
+            raise
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:
+            raise _collection_error("metric_payload_invalid") from None
+
+    def collect_browser_signed_with_diagnostics(
+        self, account: dict, *, validation_mode: bool = False
+    ) -> XiaohongshuCollectionOutcome:
+        try:
+            return asyncio.run(
+                self._collect_browser_signed_async(account, validation_mode=validation_mode)
+            )
         except PlatformDataCollectionError:
             raise
         except (KeyboardInterrupt, SystemExit):
@@ -228,7 +316,11 @@ class XiaohongshuDataCollector:
                 raise
         return self.collect_browser_signed(account)
 
-    async def _collect_browser_signed_async(self, account: dict) -> CollectionBatch:
+    async def _collect_browser_signed_async(
+        self, account: dict, *, validation_mode: bool
+    ) -> XiaohongshuCollectionOutcome:
+        if type(validation_mode) is not bool:
+            raise _collection_error("metric_payload_invalid") from None
         account_id, state_path = _state_path(account)
         started = self._monotonic()
         total_deadline = started + _TOTAL_TIMEOUT_SECONDS
@@ -250,6 +342,8 @@ class XiaohongshuDataCollector:
         capture_error: PlatformDataCollectionError | None = None
         caught: BaseException | None = None
         cleanup_errors: list[BaseException] = []
+        batch: CollectionBatch | None = None
+        validation = None
 
         def remember_request(request: object) -> None:
             nonlocal retained_request_count, capture_error
@@ -345,16 +439,45 @@ class XiaohongshuDataCollector:
                     monotonic=self._monotonic,
                 )
                 current_url = str(getattr(page, "url", "") or "").lower()
-                if any(marker in current_url for marker in ("/login", "/verification", "passport.")):
-                    raise _collection_error("login_required") from None
                 try:
                     current = urlsplit(current_url)
                 except ValueError:
                     raise _collection_error("metric_payload_invalid") from None
+                current_path = current.path.lower()
+                if (
+                    any(
+                        marker in current_path
+                        for marker in ("/verification", "/captcha", "/challenge")
+                    )
+                    or current.hostname == "captcha.xiaohongshu.com"
+                ):
+                    raise _collection_error("verification_required") from None
+                if (
+                    current_path.startswith("/login")
+                    or (current.hostname or "").startswith("passport.")
+                ):
+                    raise _collection_error("login_required") from None
                 if current.scheme != "https" or current.hostname != _CREATOR_HOST:
                     raise _collection_error("metric_payload_invalid") from None
-                await asyncio.sleep(0)
-                await flush_responses()
+                required_paths = {
+                    _PHASE_ACCOUNT: _ACCOUNT_PATHS,
+                    _PHASE_LIST: {_CONTENT_LIST_PATH},
+                    _PHASE_DETAIL: {_CONTENT_DETAIL_PATH},
+                }[current_phase]
+                for attempt in range(_RESPONSE_CAPTURE_POLL_ATTEMPTS + 1):
+                    await flush_responses()
+                    if any(path in payloads for path in required_paths):
+                        break
+                    if attempt == _RESPONSE_CAPTURE_POLL_ATTEMPTS:
+                        break
+                    waiter = getattr(page, "wait_for_timeout", None)
+                    if not callable(waiter):
+                        raise _collection_error("browser_signature_timeout") from None
+                    await _await_until(
+                        waiter(_RESPONSE_CAPTURE_POLL_MS),
+                        deadline=work_deadline,
+                        monotonic=self._monotonic,
+                    )
             finally:
                 phase = ""
 
@@ -369,7 +492,7 @@ class XiaohongshuDataCollector:
                 else manager
             )
             browser = await _await_until(
-                playwright.chromium.launch(headless=True),
+                playwright.chromium.launch(headless=not validation_mode),
                 deadline=work_deadline,
                 monotonic=self._monotonic,
             )
@@ -403,6 +526,30 @@ class XiaohongshuDataCollector:
                     _PHASE_DETAIL,
                     f"{_NOTE_DETAIL_URL}?noteId={selected_content_id}",
                 )
+            batch = self._batch_from_payloads(
+                account_id=account_id,
+                payloads=payloads,
+                content_warning=content_warning,
+                identities=identities,
+            )
+            if validation_mode:
+                reader = self._visible_readback
+                if not callable(reader):
+                    raise _collection_error("metric_payload_invalid") from None
+                visible = _visible_readback_payload(
+                    await _await_until(
+                        reader(page, batch),
+                        deadline=work_deadline,
+                        monotonic=self._monotonic,
+                    ),
+                    batch,
+                )
+                if visible is None:
+                    raise _collection_error("metric_payload_invalid") from None
+                validation = {
+                    "mode": "official_visible_readback",
+                    "officialVisible": visible,
+                }
         except BaseException as error:
             caught = error
         finally:
@@ -434,15 +581,45 @@ class XiaohongshuDataCollector:
         )
         if process_error is not None:
             raise process_error
+        receipt = CleanupReceipt(
+            closed=not cleanup_errors,
+            alive_resource_count=len(cleanup_errors),
+        )
         if cleanup_errors:
-            raise _collection_error("browser_cleanup_incomplete") from None
+            raise _collection_error(
+                "browser_cleanup_incomplete", cleanup_receipt=receipt
+            ) from None
         if isinstance(caught, TimeoutError):
-            raise _collection_error("browser_signature_timeout") from None
+            raise _collection_error(
+                "browser_signature_timeout", cleanup_receipt=receipt
+            ) from None
         if isinstance(caught, PlatformDataCollectionError):
-            raise caught
+            raise _collection_error(
+                caught.error_code,
+                fallback_allowed=caught.fallback_allowed,
+                cleanup_receipt=receipt,
+            ) from None
         if caught is not None:
-            raise _collection_error("metric_payload_invalid") from None
+            raise _collection_error(
+                "metric_payload_invalid", cleanup_receipt=receipt
+            ) from None
 
+        if batch is None:
+            raise _collection_error("metric_payload_invalid", cleanup_receipt=receipt) from None
+        return XiaohongshuCollectionOutcome(
+            batch=batch,
+            cleanup=receipt,
+            validation=validation,
+        )
+
+    def _batch_from_payloads(
+        self,
+        *,
+        account_id: int,
+        payloads: dict[str, object],
+        content_warning: str,
+        identities: tuple,
+    ) -> CollectionBatch:
         observed_at, platform_day = self._observation_values()
         account_payload = payloads.get("/api/galaxy/creator/home/personal_info")
         if account_payload is None:
@@ -460,7 +637,7 @@ class XiaohongshuDataCollector:
             raise _collection_error("metric_payload_invalid") from None
 
         if content_warning:
-            return CollectionBatch(
+            batch = CollectionBatch(
                 platform_type=1,
                 source_mode="browser_signed",
                 metrics=account_metrics,
@@ -470,8 +647,9 @@ class XiaohongshuDataCollector:
                 platform_observed_at=observed_at,
                 warning_code=content_warning,
             )
+            return batch
         if not identities:
-            return CollectionBatch(
+            batch = CollectionBatch(
                 platform_type=1,
                 source_mode="browser_signed",
                 metrics=account_metrics,
@@ -480,9 +658,10 @@ class XiaohongshuDataCollector:
                 content_data_available=True,
                 platform_observed_at=observed_at,
             )
+            return batch
         detail_payload = payloads.get(_CONTENT_DETAIL_PATH)
         if detail_payload is None:
-            return CollectionBatch(
+            batch = CollectionBatch(
                 platform_type=1,
                 source_mode="browser_signed",
                 metrics=account_metrics,
@@ -492,6 +671,7 @@ class XiaohongshuDataCollector:
                 platform_observed_at=observed_at,
                 warning_code="content_payload_invalid",
             )
+            return batch
         try:
             content, content_metrics = parse_content_lifetime(
                 detail_payload,
@@ -500,7 +680,7 @@ class XiaohongshuDataCollector:
                 platform_day=platform_day,
             )
         except CollectionFailure:
-            return CollectionBatch(
+            batch = CollectionBatch(
                 platform_type=1,
                 source_mode="browser_signed",
                 metrics=account_metrics,
@@ -510,7 +690,8 @@ class XiaohongshuDataCollector:
                 platform_observed_at=observed_at,
                 warning_code="content_payload_invalid",
             )
-        return CollectionBatch(
+            return batch
+        batch = CollectionBatch(
             platform_type=1,
             source_mode="browser_signed",
             metrics=account_metrics + content_metrics,
@@ -519,6 +700,7 @@ class XiaohongshuDataCollector:
             content_data_available=True,
             platform_observed_at=observed_at,
         )
+        return batch
 
     def _observation_values(self) -> tuple[str, str]:
         try:

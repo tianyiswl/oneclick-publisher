@@ -326,7 +326,14 @@ class _FakePage:
         return _FakeNavigation(self.url)
 
     async def wait_for_timeout(self, _milliseconds: int) -> None:
-        return None
+        self.owner.wait_calls += 1
+        for response in self.owner.delayed_responses.pop(0) if self.owner.delayed_responses else ():
+            request_callback = self.listeners.get("request")
+            response_callback = self.listeners.get("response")
+            if request_callback is not None:
+                request_callback(response.request)
+            if response_callback is not None:
+                response_callback(response)
 
     async def close(self) -> None:
         self.owner.cleanup.append("page")
@@ -373,6 +380,7 @@ class _FakeChromium:
         self.owner = owner
 
     async def launch(self, **_kwargs) -> _FakeBrowser:
+        self.owner.launch_options.append(dict(_kwargs))
         return _FakeBrowser(self.owner)
 
 
@@ -406,6 +414,7 @@ class _FakeRuntime:
         context_close_error: BaseException | None = None,
         browser_close_error: BaseException | None = None,
         playwright_close_error: BaseException | None = None,
+        delayed_responses: tuple[tuple[_FakeResponse, ...], ...] = (),
     ) -> None:
         self.responses_by_url = responses_by_url
         self.final_urls = final_urls or {}
@@ -414,7 +423,10 @@ class _FakeRuntime:
         self.context_close_error = context_close_error
         self.browser_close_error = browser_close_error
         self.playwright_close_error = playwright_close_error
+        self.delayed_responses = list(delayed_responses)
         self.goto_urls: list[str] = []
+        self.wait_calls = 0
+        self.launch_options: list[dict] = []
         self.cleanup: list[str] = []
         self.storage_states: list[str] = []
         self.page = _FakePage(self)
@@ -548,6 +560,49 @@ class XiaohongshuDataCollectorTests(unittest.TestCase):
         )
         self.assertEqual(fake.cleanup, ["page", "context", "browser", "playwright"])
 
+    def test_browser_signed_diagnostics_exposes_only_strict_successful_cleanup_receipt(self) -> None:
+        """删掉受控回执会让成功同步无法证明资源已完全关闭。"""
+
+        collector, _fake = self._collector_with_responses(_reviewed_success_responses())
+
+        outcome = collector.collect_browser_signed_with_diagnostics(_account())
+
+        self.assertEqual(outcome.batch.platform_type, 1)
+        self.assertEqual(
+            outcome.public_diagnostics(),
+            {"cleanup": {"closed": True, "aliveResourceCount": 0}},
+        )
+        self.assertIs(type(outcome.cleanup.closed), bool)
+        self.assertIs(type(outcome.cleanup.alive_resource_count), int)
+
+    def test_validation_mode_uses_headed_browser_and_returns_whitelisted_visible_values(self) -> None:
+        """验收模式若仍无头或透传页面文本，就无法做人工比对且会扩大泄露面。"""
+
+        visible = {
+            "account": {"followersTotal": 3199},
+            "content": {"contentId": _CONTENT_ID, "views": 148},
+        }
+        fake = _FakeRuntime(_reviewed_success_responses())
+        collector = XiaohongshuDataCollector(
+            browser_factory=lambda: _FakeStarter(fake),
+            utc_now=lambda: datetime(2026, 8, 21, 4, 0, tzinfo=timezone.utc),
+            monotonic=_Clock(),
+            visible_readback=lambda _page, _batch: visible,
+        )
+
+        outcome = collector.collect_browser_signed_with_diagnostics(
+            _account(), validation_mode=True
+        )
+
+        self.assertEqual(fake.launch_options, [{"headless": False}])
+        self.assertEqual(
+            outcome.public_diagnostics()["validation"],
+            {
+                "mode": "official_visible_readback",
+                "officialVisible": visible,
+            },
+        )
+
     def test_account_metrics_are_scoped_to_the_strict_requested_account(self) -> None:
         """固定 account key 会把不同小红书主体的粉丝累计量混在一起。"""
 
@@ -602,6 +657,42 @@ class XiaohongshuDataCollectorTests(unittest.TestCase):
         self.assertEqual(batch.warning_code, "content_list_unavailable")
         self.assertEqual(fake.goto_urls, [CREATOR_HOME, DATA_ANALYSIS_URL])
 
+    def test_delayed_reviewed_content_list_is_polled_before_partial_result(self) -> None:
+        """把等待退回成一次 sleep(0) 会丢掉稍晚抵达但仍在预算内的合格列表。"""
+
+        responses = _reviewed_success_responses()
+        delayed_list = responses[DATA_ANALYSIS_URL]
+        responses[DATA_ANALYSIS_URL] = ()
+        collector, fake = self._collector_with_responses(
+            responses,
+            delayed_responses=(delayed_list,),
+        )
+
+        batch = collector.collect_browser_signed(_account())
+
+        self.assertTrue(batch.content_data_available)
+        self.assertEqual([content.content_id for content in batch.contents], [_CONTENT_ID])
+        self.assertEqual(fake.goto_urls, [CREATOR_HOME, DATA_ANALYSIS_URL, _detail_url()])
+        self.assertGreaterEqual(fake.wait_calls, 1)
+
+    def test_delayed_reviewed_content_detail_is_polled_before_partial_result(self) -> None:
+        """详情响应晚到时若不按当前阶段轮询，会把已验证作品误报为不可用。"""
+
+        responses = _reviewed_success_responses()
+        delayed_detail = responses[_detail_url()]
+        responses[_detail_url()] = ()
+        collector, fake = self._collector_with_responses(
+            responses,
+            delayed_responses=(delayed_detail,),
+        )
+
+        batch = collector.collect_browser_signed(_account())
+
+        self.assertTrue(batch.content_data_available)
+        self.assertEqual([content.content_id for content in batch.contents], [_CONTENT_ID])
+        self.assertEqual(fake.goto_urls, [CREATOR_HOME, DATA_ANALYSIS_URL, _detail_url()])
+        self.assertGreaterEqual(fake.wait_calls, 1)
+
     def test_cleanup_failure_never_returns_success(self) -> None:
         """资源关闭报错若被吞掉，会把不完整会话误写成采集成功。"""
 
@@ -616,6 +707,24 @@ class XiaohongshuDataCollectorTests(unittest.TestCase):
         )
         self.assertIn("browser", fake.cleanup)
         self.assertIn("playwright", fake.cleanup)
+
+    def test_cleanup_failure_exposes_non_success_receipt_without_error_text(self) -> None:
+        """关闭失败若没有非零回执，调用方会把失败会话误当作完全关闭。"""
+
+        collector, _fake = self._collector_with_responses(
+            _reviewed_success_responses(),
+            context_close_error=RuntimeError("private cleanup failure"),
+        )
+
+        with self.assertRaises(PlatformDataCollectionError) as caught:
+            collector.collect_browser_signed_with_diagnostics(_account())
+
+        self.assertEqual(caught.exception.error_code, "browser_cleanup_incomplete")
+        self.assertEqual(
+            caught.exception.cleanup_receipt.public_payload(),
+            {"closed": False, "aliveResourceCount": 1},
+        )
+        self.assertNotIn("private", repr(caught.exception.cleanup_receipt))
 
     def test_direct_collection_requests_browser_fallback_without_opening_browser(self) -> None:
         """小红书直连若尝试复制会话请求，就会绕过浏览器签名边界。"""
@@ -650,9 +759,13 @@ class XiaohongshuDataCollectorTests(unittest.TestCase):
     def test_login_or_verification_redirect_stops_collection_and_cleans_up(self) -> None:
         """登录或验证跳转若继续读取响应，可能把匿名页面数据归给账号。"""
 
-        for redirected_url in (
-            "https://creator.xiaohongshu.com/login",
-            "https://creator.xiaohongshu.com/creator/security/verification",
+        for redirected_url, expected_code in (
+            ("https://creator.xiaohongshu.com/login", "login_required"),
+            (
+                "https://creator.xiaohongshu.com/creator/security/verification",
+                "verification_required",
+            ),
+            ("https://creator.xiaohongshu.com/captcha/challenge", "verification_required"),
         ):
             with self.subTest(redirected_url=redirected_url):
                 collector, fake = self._collector_with_responses(
@@ -660,7 +773,7 @@ class XiaohongshuDataCollectorTests(unittest.TestCase):
                 )
                 self.assert_collection_error(
                     lambda: collector.collect_browser_signed(_account()),
-                    "login_required",
+                    expected_code,
                 )
                 self.assertEqual(fake.cleanup, ["page", "context", "browser", "playwright"])
 
