@@ -99,6 +99,11 @@ class XiaohongshuDataContractTests(unittest.TestCase):
             )
         )
 
+    def test_parse_content_list_accepts_an_empty_proven_list(self) -> None:
+        rows = parse_content_list({"data": {"note_infos": [], "total": 0}})
+
+        self.assertEqual(rows, ())
+
     def test_content_list_rejects_unknown_containers_duplicates_and_truncation(self) -> None:
         invalid_payloads = (
             {"data": {"note_infos": {"id": _CONTENT_ID}, "total": 1}},
@@ -182,6 +187,25 @@ class XiaohongshuDataContractTests(unittest.TestCase):
                     lambda payload=payload: parse_content_lifetime(
                         payload,
                         XhsContentIdentity(_CONTENT_ID),
+                        observed_at=_OBSERVED_AT,
+                        platform_day=_PLATFORM_DAY,
+                    )
+                )
+
+    def test_lifetime_rejects_empty_or_missing_reviewed_containers(self) -> None:
+        identity = XhsContentIdentity(_CONTENT_ID)
+        invalid_payloads = (
+            {},
+            {"data": {}},
+            {"data": {"note_info": []}},
+            {"data": {"note_info": {"id": _CONTENT_ID}}},
+        )
+        for payload in invalid_payloads:
+            with self.subTest(payload=repr(payload)):
+                self.assert_invalid(
+                    lambda payload=payload: parse_content_lifetime(
+                        payload,
+                        identity,
                         observed_at=_OBSERVED_AT,
                         platform_day=_PLATFORM_DAY,
                     )

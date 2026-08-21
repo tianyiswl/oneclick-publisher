@@ -28,8 +28,8 @@ class DouyinDataCollectorTests(unittest.TestCase):
     def test_registry_exposes_only_explicit_platforms(self) -> None:
         """注册查询必须只暴露真实可用的平台，并拒绝布尔值。"""
 
-        self.assertEqual(registered_platform_types(), (1, 3))
-        for platform_type in (True, "1"):
+        self.assertEqual(registered_platform_types(), (3,))
+        for platform_type in (1, True, "1"):
             with self.subTest(platform_type=platform_type):
                 with self.assertRaises(CollectionFailure) as caught:
                     collector_for_platform(platform_type)
@@ -490,7 +490,7 @@ class DouyinDirectCollectorTests(unittest.TestCase):
     def test_registry_rejects_non_douyin_and_non_builtin_platform_ids(self) -> None:
         """注册表不能为未知平台伪造空采集器。"""
 
-        for platform_type in (2, True, "3"):
+        for platform_type in (1, 2, True, "3"):
             with self.subTest(platform_type=platform_type):
                 with self.assertRaises(CollectionFailure) as raised:
                     collector_for_platform(platform_type)

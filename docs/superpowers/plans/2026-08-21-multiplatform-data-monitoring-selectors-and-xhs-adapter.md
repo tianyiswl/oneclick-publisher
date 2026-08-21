@@ -221,13 +221,12 @@ git commit -m "拆分数据监测平台与主体选择"
 
 ---
 
-### Task 3: Exact Xiaohongshu payload parsers and collector registration
+### Task 3: Exact Xiaohongshu payload parsers
 
 **Files:**
 - Create: `app_core/xiaohongshu_data_contract.py`
 - Modify: `app_core/platform_data_models.py`
 - Create: `test_xiaohongshu_data_collector.py`
-- Modify: `app_core/platform_data_collectors.py`
 
 **Interfaces:**
 - Produces: `parse_account_overview(payload: object, observed_at: str, platform_day: str) -> tuple[MetricPoint, ...]`.
@@ -235,7 +234,7 @@ git commit -m "拆分数据监测平台与主体选择"
 - Produces: `parse_content_lifetime(payload: object, identity: XhsContentIdentity, observed_at: str, platform_day: str) -> tuple[ContentRecord, tuple[MetricPoint, ...]]`.
 - Produces: immutable `XhsContentIdentity(content_id: str)`; no title/date/type is invented at this boundary.
 - Updates: `ContentRecord` accepts exact empty strings for unobserved `title`, `cover_url` and `published_at`, plus `content_status="unavailable"` and `content_type="unavailable"`.
-- Updates: `registered_platform_types() == (1, 3)`.
+- Preserves: `registered_platform_types() == (3,)` until Task 4 creates and registers the real collector.
 
 - [ ] **Step 1: Write failing built-in-only parser tests**
 
@@ -296,11 +295,11 @@ _CONTENT_METRICS = {
 
 Extend `ContentRecord` narrowly so unobserved optional metadata stays absent rather than fabricated: accept only exact built-in strings; `title`, `cover_url` and `published_at` may be `""`; add `"unavailable"` to `ALLOWED_CONTENT_TYPES`; require `content_status="unavailable"` whenever any of those metadata fields is empty. Existing Douyin records remain subject to their current non-empty contract. The Xiaohongshu parser creates an empty-metadata record tied only to the proven content ID and lifetime metrics. Do not persist a derived title, fake URL, observation time as publication time, or guessed image/video type.
 
-- [ ] **Step 4: Register the Xiaohongshu factory lazily**
+- [ ] **Step 4: Keep platform 1 unavailable until the collector exists**
 
-Add `_xiaohongshu_factory(**dependencies)` that imports `XiaohongshuDataCollector` inside the function. Register type `1` beside type `3`. Add a registry test asserting `(1, 3)` and that bool/string types remain rejected.
+Do not add a Xiaohongshu factory or type `1` to the production registry in this task. Keep the registry test asserting `(3,)` and rejecting type `1`, booleans and strings. Task 4 creates the collector and registers it in the same change.
 
-- [ ] **Step 5: Run parser and registry tests**
+- [ ] **Step 5: Run parser and current-registry tests**
 
 ```bash
 .venv/bin/python -m unittest -v \
@@ -324,11 +323,13 @@ git commit -m "增加小红书数据合同转换"
 **Files:**
 - Create: `app_core/xiaohongshu_data_collector.py`
 - Modify: `app_core/xiaohongshu_data_contract.py`
+- Modify: `app_core/platform_data_collectors.py`
 - Test: `test_xiaohongshu_data_collector.py`
 
 **Interfaces:**
 - Produces: `XiaohongshuDataCollector.collect_direct(account: dict) -> CollectionBatch`, which raises a fallback-allowed neutral error without opening a browser.
 - Produces: `XiaohongshuDataCollector.collect_browser_signed(account: dict) -> CollectionBatch`.
+- Updates: registers type `1` with a lazy Xiaohongshu factory only after this collector exists, making `registered_platform_types()` return `(1, 3)`.
 - Constructor dependencies: `browser_factory`, `utc_now`, `monotonic`, with production defaults and fake injection for tests.
 - Consumes exact paths:
   - `/api/galaxy/v2/creator/datacenter/account/base`
