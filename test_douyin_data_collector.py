@@ -33,6 +33,13 @@ class DouyinDataCollectorTests(unittest.TestCase):
             collector_for_platform(True)
         self.assertEqual(caught.exception.error_code, "collector_not_available")
 
+    def test_registry_builds_douyin_collector(self) -> None:
+        """抖音注册项必须创建真实采集器，不能返回空值或占位对象。"""
+
+        collector = collector_for_platform(3)
+
+        self.assertIsInstance(collector, DouyinDataCollector)
+
     def test_douyin_error_is_platform_neutral_compatible(self) -> None:
         """抖音兼容异常必须可由公共编排层统一捕获。"""
 
