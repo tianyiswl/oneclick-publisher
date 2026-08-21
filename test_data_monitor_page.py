@@ -50,6 +50,11 @@ XHS_ACCOUNT_SAME_ID = {
     "userName": "硅基探索 B",
 }
 
+XHS_ACCOUNT_WITH_DOUYIN_ID = {
+    **XHS_ACCOUNT,
+    "id": 12,
+}
+
 
 def empty_summary() -> dict:
     summary = period_summary()
@@ -202,7 +207,7 @@ class BlockingRunner:
         self.waited: list[tuple[str, float]] = []
 
     def active_keys_with_prefixes(self, prefixes: tuple[str, ...]) -> list[str]:
-        return ["platform-data-sync:12"]
+        return ["platform-data-sync:3:12"]
 
     def cancel_pending(self, key: str) -> bool:
         self.cancelled.append(key)
@@ -528,15 +533,14 @@ class DataMonitorPageTests(unittest.TestCase):
             render.assert_called_once_with(include_contents=True)
 
     def test_platform_without_subject_disables_sync(self) -> None:
-        """没有主体的平台不能保留上一平台的同步入口或状态。"""
+        """用户切到没有主体的平台时不能保留上一平台的同步入口或状态。"""
 
         page = self._page(
-            accounts=[XHS_ACCOUNT],
+            accounts=[ACCOUNT],
             registered_platforms=(1, 3),
         )
 
-        page._accounts_by_platform[1] = ()
-        page._refresh_subjects()
+        page.platform_combo.setCurrentIndex(page.platform_combo.findData(1))
 
         self.assertEqual(page.account_combo.count(), 0)
         self.assertFalse(page.sync_button.isEnabled())
@@ -582,7 +586,7 @@ class DataMonitorPageTests(unittest.TestCase):
 
         self.assertNotIn("secret", page.status_label.text())
         self.assertNotIn("/private", page.status_label.text())
-        self.assertFalse(runner.is_running("platform-data-sync:12"))
+        self.assertFalse(runner.is_running("platform-data-sync:3:12"))
 
     def test_worker_error_status_survives_finished_cleanup(self) -> None:
         """worker 失败后 finished 只能恢复控件，不得用旧摘要覆盖失败。"""
@@ -676,11 +680,63 @@ class DataMonitorPageTests(unittest.TestCase):
         self.period_mock.assert_not_called()
         self.trends_mock.assert_not_called()
         self.contents_mock.assert_not_called()
-        self.assertFalse(runner.is_running("platform-data-sync:12"))
-        self.assertTrue(runner.is_running("platform-data-sync:14"))
+        self.assertFalse(runner.is_running("platform-data-sync:3:12"))
+        self.assertTrue(runner.is_running("platform-data-sync:3:14"))
 
         task_b.signals.failed.emit("cleanup")
         task_b.signals.finished.emit()
+        self.app.processEvents()
+
+    def test_stale_cross_platform_same_id_callbacks_cannot_mutate_current_page(self) -> None:
+        """同 ID 的旧平台任务回调若只按 ID 门禁，会污染当前平台页面。"""
+
+        pool = QueuedPool()
+        runner = BackgroundTaskRunner()
+        runner.pool = pool
+        page = self._page(
+            summary=period_summary(),
+            contents=available_contents(),
+            accounts=[ACCOUNT, XHS_ACCOUNT_WITH_DOUYIN_ID],
+            registered_platforms=(1, 3),
+            runner=runner,
+        )
+
+        page.sync_button.click()
+        douyin_task = pool.tasks[0]
+        page.platform_combo.setCurrentIndex(page.platform_combo.findData(1))
+        page.sync_button.click()
+        xhs_task = pool.tasks[1]
+        xhs_task.signals.started.emit()
+        self.app.processEvents()
+        self.assertEqual(page.platform_combo.currentData(), 1)
+        self.assertEqual(page.account_combo.currentData(), 12)
+        self.assertEqual(page.status_label.text(), "正在同步数据…")
+        self.assertFalse(page.sync_button.isEnabled())
+        self.assertEqual(page.content_table.rowCount(), 1)
+        self.period_mock.reset_mock()
+        self.trends_mock.reset_mock()
+        self.contents_mock.reset_mock()
+
+        douyin_task.signals.started.emit()
+        douyin_task.signals.progressed.emit({"stage": "content_list"})
+        douyin_task.signals.succeeded.emit({"accountId": 12, "status": "success"})
+        douyin_task.signals.failed.emit("stale")
+        douyin_task.signals.finished.emit()
+        self.app.processEvents()
+
+        self.assertEqual(page.platform_combo.currentData(), 1)
+        self.assertEqual(page.account_combo.currentData(), 12)
+        self.assertEqual(page.status_label.text(), "正在同步数据…")
+        self.assertFalse(page.sync_button.isEnabled())
+        self.assertEqual(page.content_table.rowCount(), 1)
+        self.period_mock.assert_not_called()
+        self.trends_mock.assert_not_called()
+        self.contents_mock.assert_not_called()
+        self.assertFalse(runner.is_running("platform-data-sync:3:12"))
+        self.assertTrue(runner.is_running("platform-data-sync:1:12"))
+
+        xhs_task.signals.failed.emit("cleanup")
+        xhs_task.signals.finished.emit()
         self.app.processEvents()
 
     def test_offscreen_account_error_persists_until_next_sync_starts(self) -> None:
@@ -799,7 +855,7 @@ class DataMonitorPageTests(unittest.TestCase):
         page = self._page(runner=runner)
 
         self.assertFalse(page.shutdown())
-        self.assertEqual(runner.cancelled, ["platform-data-sync:12"])
+        self.assertEqual(runner.cancelled, ["platform-data-sync:3:12"])
         self.assertEqual(len(runner.waited), 1)
         self.assertLessEqual(runner.waited[0][1], 5.0)
 

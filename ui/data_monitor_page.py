@@ -266,7 +266,7 @@ class DataMonitorPage(QWidget):
         self._content_availability = "missing"
         self._content_warning_code = ""
         self._shutting_down = False
-        self._sync_terminal_by_account: dict[int, str] = {}
+        self._sync_terminal_by_subject: dict[tuple[int, int], str] = {}
         self._accounts_by_platform: dict[int, tuple[dict, ...]] = {}
         self._last_account_by_platform: dict[int, int] = {}
         self._selected_platform_type: int | None = None
@@ -430,9 +430,9 @@ class DataMonitorPage(QWidget):
                 continue
             accounts_by_platform.setdefault(platform_type, []).append(account)
         self._accounts_by_platform = {
-            platform_type: tuple(accounts_by_platform[platform_type])
+            platform_type: tuple(accounts_by_platform.get(platform_type, ()))
             for platform_type in account_service.PLATFORM_ORDER
-            if platform_type in accounts_by_platform
+            if platform_type in registered
         }
         platform_types = tuple(self._accounts_by_platform)
 
@@ -469,6 +469,18 @@ class DataMonitorPage(QWidget):
     def _current_account_id(self) -> int | None:
         account_id = self.account_combo.currentData()
         return account_id if type(account_id) is int and account_id > 0 else None
+
+    def _current_subject_identity(self) -> tuple[int, int] | None:
+        platform_type = self._current_platform_type()
+        account_id = self._current_account_id()
+        if platform_type is None or account_id is None:
+            return None
+        return platform_type, account_id
+
+    @staticmethod
+    def _sync_key(subject_identity: tuple[int, int]) -> str:
+        platform_type, account_id = subject_identity
+        return f"platform-data-sync:{platform_type}:{account_id}"
 
     @staticmethod
     def _subject_label(account: dict) -> str:
@@ -597,7 +609,8 @@ class DataMonitorPage(QWidget):
             f"本地同步时间：{local_synced_at if _valid_timestamp(local_synced_at) else '—'}"
         )
         self.relogin_button.hide()
-        memory_terminal = self._sync_terminal_by_account.get(account_id)
+        subject_identity = self._current_subject_identity()
+        memory_terminal = self._sync_terminal_by_subject.get(subject_identity)
         if memory_terminal == "running":
             self.status_label.setText("正在同步数据…")
         elif memory_terminal == "failed":
@@ -623,7 +636,7 @@ class DataMonitorPage(QWidget):
                 offset=self._content_offset,
             )
             self._set_contents(contents)
-        key = f"platform-data-sync:{account_id}"
+        key = self._sync_key(subject_identity) if subject_identity is not None else ""
         is_running = getattr(self.runner, "is_running", None)
         if callable(is_running):
             active = bool(is_running(key))
@@ -719,26 +732,27 @@ class DataMonitorPage(QWidget):
     def _start_sync(self) -> None:
         if self._shutting_down:
             return
-        account_id = self.account_combo.currentData()
-        if type(account_id) is not int or account_id <= 0:
+        subject_identity = self._current_subject_identity()
+        if subject_identity is None:
             return
-        key = f"platform-data-sync:{account_id}"
+        _platform_type, account_id = subject_identity
+        key = self._sync_key(subject_identity)
         terminal_state = {"value": "pending"}
 
-        def is_current_account() -> bool:
-            return self.account_combo.currentData() == account_id
+        def is_current_subject() -> bool:
+            return self._current_subject_identity() == subject_identity
 
         def started() -> None:
             terminal_state["value"] = "running"
-            self._sync_terminal_by_account[account_id] = "running"
-            if not self._shutting_down and is_current_account():
+            self._sync_terminal_by_subject[subject_identity] = "running"
+            if not self._shutting_down and is_current_subject():
                 self.sync_button.setEnabled(False)
                 self.status_label.setText("正在同步数据…")
 
         def progressed(payload: object) -> None:
             if (
                 self._shutting_down
-                or not is_current_account()
+                or not is_current_subject()
                 or not isinstance(payload, dict)
             ):
                 return
@@ -749,18 +763,18 @@ class DataMonitorPage(QWidget):
 
         def completed(_result: object) -> None:
             terminal_state["value"] = "success"
-            self._sync_terminal_by_account.pop(account_id, None)
-            if not self._shutting_down and is_current_account():
+            self._sync_terminal_by_subject.pop(subject_identity, None)
+            if not self._shutting_down and is_current_subject():
                 self.refresh()
 
         def failed(_message: str) -> None:
             terminal_state["value"] = "failed"
-            self._sync_terminal_by_account[account_id] = "failed"
-            if not self._shutting_down and is_current_account():
+            self._sync_terminal_by_subject[subject_identity] = "failed"
+            if not self._shutting_down and is_current_subject():
                 self.status_label.setText("数据同步未完成")
 
         def finished() -> None:
-            if not self._shutting_down and is_current_account():
+            if not self._shutting_down and is_current_subject():
                 self.sync_button.setEnabled(
                     terminal_state["value"] in {"success", "failed"}
                 )
