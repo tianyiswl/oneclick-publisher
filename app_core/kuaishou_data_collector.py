@@ -24,6 +24,7 @@ from .platform_data_models import (
 _CREATOR_HOST = "cp.kuaishou.com"
 _HOME_PAGE = "https://cp.kuaishou.com/"
 _HOME_PHASE = "home"
+_AUTHORITY_PATH = "/rest/v2/creator/pc/authority/account/current"
 _IDENTITY_PATH = "/rest/cp/creator/pc/home/userInfo"
 _CONTENT_LIST_PATH = "/rest/cp/creator/analysis/pc/home/photo/list"
 _BEIJING = ZoneInfo("Asia/Shanghai")
@@ -41,10 +42,12 @@ KUAISHOU_CONFIG = DomesticCollectorConfig(
     home_url=_HOME_PAGE,
     allowed_hosts=frozenset({_CREATOR_HOST}),
     endpoint_by_path={
+        _AUTHORITY_PATH: "account_base",
         _IDENTITY_PATH: "account_home",
         _CONTENT_LIST_PATH: "content_list",
     },
     phase_by_path={
+        _AUTHORITY_PATH: _HOME_PHASE,
         _IDENTITY_PATH: _HOME_PHASE,
         _CONTENT_LIST_PATH: _HOME_PHASE,
     },
@@ -135,6 +138,41 @@ def _followers_total(captures: tuple[CapturedJson, ...]) -> int:
     return identities.pop()[2]
 
 
+def _require_authority(captures: tuple[CapturedJson, ...]) -> None:
+    payloads = _matching(captures, "account_base", _AUTHORITY_PATH)
+    if not payloads:
+        _invalid()
+    identities: set[tuple[int, str]] = set()
+    for payload in payloads:
+        raw_data = payload.get("data")
+        data = raw_data if isinstance(raw_data, Mapping) else None
+        raw_core = payload.get("coreUserInfo")
+        if not isinstance(raw_core, Mapping) and data is not None:
+            raw_core = data.get("coreUserInfo")
+        core = raw_core if isinstance(raw_core, Mapping) else None
+        login_url = payload.get("loginUrl")
+        if type(login_url) is str and login_url.strip() and core is None:
+            raise PlatformDataCollectionError("login_required") from None
+
+        if _integer(payload.get("result")) != 1:
+            _invalid()
+        if core is not None:
+            identity = core
+        else:
+            successful_data = _mapping(payload.get("data"))
+            if successful_data.get("logined") is False:
+                raise PlatformDataCollectionError("login_required") from None
+            if successful_data.get("logined") is not True:
+                _invalid()
+            identity = successful_data
+        user_id = _integer(identity.get("userId"))
+        if user_id <= 0:
+            _invalid()
+        identities.add((user_id, _required_text(identity.get("userName"))))
+    if len(identities) != 1:
+        _invalid()
+
+
 def _content_record(
     raw_item: object,
     *,
@@ -209,10 +247,13 @@ def _contents(
             records[content_id] = candidate
     if len(totals) != 1:
         _invalid()
+    expected_total = next(iter(totals))
+    if len(records) > expected_total:
+        _invalid()
     ordered = tuple(records.values())
     contents = tuple(item[0] for item in ordered)
     points = tuple(point for item in ordered for point in item[1])
-    return contents, points, True, totals.pop() > len(contents)
+    return contents, points, True, expected_total > len(contents)
 
 
 def parse_captures(
@@ -220,6 +261,7 @@ def parse_captures(
 ) -> CollectionBatch:
     if type(account_id) is not int or account_id <= 0 or type(captures) is not tuple:
         _invalid()
+    _require_authority(captures)
     followers_total = _followers_total(captures)
     observed_at, observed_day = _observation()
     contents, content_points, content_available, truncated = _contents(

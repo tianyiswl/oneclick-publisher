@@ -40,6 +40,19 @@ def kuaishou_captures(
             item[key] = value
     return (
         CapturedJson(
+            endpoint="account_base",
+            phase="home",
+            path="/rest/v2/creator/pc/authority/account/current",
+            payload={
+                "result": 1,
+                "data": {
+                    "logined": True,
+                    "userId": 99,
+                    "userName": "sample",
+                },
+            },
+        ),
+        CapturedJson(
             endpoint="account_home",
             phase="home",
             path="/rest/cp/creator/pc/home/userInfo",
@@ -117,6 +130,66 @@ class KuaishouDataCollectorTests(unittest.TestCase):
         batch = self.parse(kuaishou_captures(total_count=2))
 
         self.assertEqual(batch.warning_code, "content_list_truncated")
+
+    def test_authority_login_shape_returns_fixed_login_required(self) -> None:
+        """主页未跳转时，官方登录入口回执仍必须立即判定登录失效。"""
+
+        login_capture = CapturedJson(
+            endpoint="account_base",
+            phase="home",
+            path="/rest/v2/creator/pc/authority/account/current",
+            payload={
+                "result": 0,
+                "error_id": "controlled",
+                "loginUrl": "https://cp.kuaishou.com/login",
+            },
+        )
+        captures = kuaishou_captures()
+
+        with self.assertRaises(PlatformDataCollectionError) as raised:
+            self.parse((login_capture,) + captures[1:])
+
+        self.assertEqual(raised.exception.error_code, "login_required")
+
+    def test_root_core_user_info_remains_a_valid_authority_shape(self) -> None:
+        """根级有效身份不能因没有冗余 data 包装而被误判合同损坏。"""
+
+        authority_capture = CapturedJson(
+            endpoint="account_base",
+            phase="home",
+            path="/rest/v2/creator/pc/authority/account/current",
+            payload={
+                "result": 1,
+                "coreUserInfo": {"userId": 99, "userName": "sample"},
+            },
+        )
+        captures = kuaishou_captures()
+
+        batch = self.parse((authority_capture,) + captures[1:])
+
+        self.assertEqual(batch.platform_type, 4)
+
+    def test_parser_rejects_merged_contents_exceeding_total_count(self) -> None:
+        """两份第一页各含不同作品时，合并数不能反向超过官方总数。"""
+
+        first = kuaishou_captures(content_id="work-1", total_count=1)
+        second = kuaishou_captures(content_id="work-2", total_count=1)
+
+        with self.assertRaises(CollectionFailure) as raised:
+            self.parse(first + (second[-1],))
+
+        self.assertEqual(raised.exception.error_code, "metric_payload_invalid")
+
+    def test_parser_rejects_inconsistent_total_counts(self) -> None:
+        """同次监听的作品总数互相冲突时不能任取一份。"""
+
+        first = kuaishou_captures(total_count=1)
+        second = kuaishou_captures(total_count=2)
+
+        with self.assertRaises(CollectionFailure) as raised:
+            self.parse(first + (second[-1],))
+
+        self.assertEqual(raised.exception.error_code, "metric_payload_invalid")
 
     def test_parser_rejects_boolean_metric(self) -> None:
         """Python 布尔值不能绕过非负整数指标校验。"""
