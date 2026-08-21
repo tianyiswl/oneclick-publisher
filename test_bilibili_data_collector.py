@@ -316,6 +316,11 @@ class BilibiliDataCollectorTests(unittest.TestCase):
             {point.metric_key for point in batch.metrics if point.entity_type == "account"},
             {"followers_total"},
         )
+        account_point = next(
+            point for point in batch.metrics if point.metric_key == "followers_total"
+        )
+        self.assertEqual(account_point.period_start, "2026-08-20")
+        self.assertEqual(account_point.period_end, "2026-08-20")
 
 
 if __name__ == "__main__":

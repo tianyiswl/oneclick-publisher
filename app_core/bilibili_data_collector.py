@@ -311,6 +311,9 @@ def _account_only_captures(
     _require_identity(captures, phase=_ACCOUNT_PHASE)
     followers_total = _followers_total(captures, phase=_ACCOUNT_PHASE)
     observed_at, observed_day = _observation()
+    account_period_day = (
+        datetime.fromisoformat(observed_day).date() - timedelta(days=1)
+    ).isoformat()
     return CollectionBatch(
         platform_type=5,
         source_mode="browser_signed",
@@ -323,8 +326,8 @@ def _account_only_captures(
                 metric_value=followers_total,
                 metric_unit="count",
                 metric_scope="lifetime_total",
-                period_start=observed_day,
-                period_end=observed_day,
+                period_start=account_period_day,
+                period_end=account_period_day,
                 observed_at=observed_at,
             ),
         ),
@@ -358,6 +361,9 @@ def _content_captures(
         _invalid()
     followers_total = _followers_from_batch(account_batch)
     observed_at, observed_day = _observation()
+    account_period_day = (
+        datetime.fromisoformat(observed_day).date() - timedelta(days=1)
+    ).isoformat()
     contents, content_points, content_available, truncated = _contents(
         captures,
         observed_at=observed_at,
@@ -373,8 +379,8 @@ def _content_captures(
         metric_value=followers_total,
         metric_unit="count",
         metric_scope="lifetime_total",
-        period_start=observed_day,
-        period_end=observed_day,
+        period_start=account_period_day,
+        period_end=account_period_day,
         observed_at=observed_at,
     )
     return CollectionBatch(
