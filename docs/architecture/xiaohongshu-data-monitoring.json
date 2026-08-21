@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "一键发多平台数据监测架构",
+    "output": "xiaohongshu-data-monitoring.html",
+    "quality_profile": "showcase",
+    "viewBox": [1800, 860],
+    "views": [
+      {"id": "selection", "label": "平台与主体选择", "focus": ["platformSelector", "subjectSelector", "syncOrchestrator"], "note": "先选平台，再只显示该平台的账号主体。"},
+      {"id": "collection", "label": "平台采集路径", "focus": ["syncOrchestrator", "collectorRegistry", "douyinCollector", "xhsCollector", "officialPages"], "note": "每个平台只调用自己的采集器，不共用字段推测。"},
+      {"id": "persistence", "label": "写入与回读", "focus": ["syncOrchestrator", "dataService", "localDatabase", "platformSelector", "subjectSelector"], "note": "标准化数据原子写入后，界面才按所选主体回读。"}
+    ]
+  },
+  "components": [
+    {"id": "platformSelector", "type": "frontend", "label": "平台下拉框", "sublabel": "抖音 / 小红书", "pos": [60, 280], "size": [190, 74]},
+    {"id": "subjectSelector", "type": "frontend", "label": "主体下拉框", "sublabel": "当前平台账号", "pos": [320, 280], "size": [210, 74]},
+    {"id": "syncOrchestrator", "type": "backend", "label": "数据同步编排", "sublabel": "accountId 隔离", "pos": [610, 280], "size": [210, 74]},
+    {"id": "collectorRegistry", "type": "backend", "label": "采集器注册表", "sublabel": "platformType 路由", "pos": [900, 280], "size": [210, 74]},
+    {"id": "douyinCollector", "type": "backend", "label": "抖音采集器", "sublabel": "现有正式链路", "pos": [1210, 155], "size": [200, 74]},
+    {"id": "xhsCollector", "type": "backend", "label": "小红书采集器", "sublabel": "已验证只读合同", "pos": [1210, 405], "size": [200, 74]},
+    {"id": "officialPages", "type": "external", "label": "平台官方数据页", "sublabel": "已保存登录态", "pos": [1510, 280], "size": [200, 74]},
+    {"id": "dataService", "type": "backend", "label": "标准数据服务", "sublabel": "CollectionBatch", "pos": [610, 520], "size": [210, 74]},
+    {"id": "localDatabase", "type": "database", "label": "本地数据库", "sublabel": "趋势 / 作品 / 来源", "pos": [320, 520], "size": [210, 74]}
+  ],
+  "boundaries": [
+    {"kind": "region", "label": "桌面客户端", "wraps": ["platformSelector", "subjectSelector", "syncOrchestrator", "collectorRegistry", "douyinCollector", "xhsCollector", "dataService", "localDatabase"], "pad": 28},
+    {"kind": "security-group", "label": "只读短会话边界", "wraps": ["douyinCollector", "xhsCollector", "officialPages"], "pad": 24}
+  ],
+  "connections": [
+    {"id": "choosePlatform", "from": "platformSelector", "to": "subjectSelector", "label": "过滤账号", "variant": "emphasis"},
+    {"id": "chooseSubject", "from": "subjectSelector", "to": "syncOrchestrator", "label": "accountId", "variant": "emphasis"},
+    {"id": "routeCollector", "from": "syncOrchestrator", "to": "collectorRegistry", "label": "platformType"},
+    {"id": "routeDouyin", "from": "collectorRegistry", "to": "douyinCollector", "label": "type=3"},
+    {"id": "routeXhs", "from": "collectorRegistry", "to": "xhsCollector", "label": "type=1"},
+    {"id": "readDouyin", "from": "douyinCollector", "to": "officialPages", "label": "官方只读响应", "variant": "security"},
+    {"id": "readXhs", "from": "xhsCollector", "to": "officialPages", "label": "官方只读响应", "variant": "security"},
+    {"id": "normalize", "from": "syncOrchestrator", "to": "dataService", "label": "标准化批次", "labelDy": 24},
+    {"id": "persist", "from": "dataService", "to": "localDatabase", "label": "原子写入"},
+    {"id": "readback", "from": "localDatabase", "to": "subjectSelector", "label": "按主体回读", "variant": "dashed"}
+  ],
+  "cards": [
+    {"dot": "cyan", "title": "选择规则", "items": ["先选平台，再选主体", "只显示已注册采集器的平台", "平台切换后不残留上一账号数据"]},
+    {"dot": "emerald", "title": "数据边界", "items": ["只读官方数据页自然响应", "不导出 Cookie 或重放签名请求", "只有原子写入完成后才更新界面"]},
+    {"dot": "rose", "title": "失败原则", "items": ["登录失效或验证需求会安全停止", "未取得的指标显示—而不是0", "会话资源未清零不记同步成功"]}
+  ]
+}
