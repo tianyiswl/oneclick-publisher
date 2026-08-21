@@ -3,10 +3,14 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 import math
 import os
+from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -14,6 +18,10 @@ from PyQt6.QtTest import QSignalSpy
 from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import QApplication
 
+from app_core import database, platform_data_service, platform_data_sync
+from app_core import platform_data_collectors
+from app_core.platform_data_collection_errors import PlatformDataCollectionError
+from app_core.platform_data_models import CollectionBatch, MetricPoint
 from ui.background_task import BackgroundTaskRunner
 from ui.data_monitor_page import DataMonitorPage
 
@@ -216,6 +224,25 @@ class BlockingRunner:
     def wait_for_finished(self, key: str, timeout_seconds: float) -> bool:
         self.waited.append((key, timeout_seconds))
         return self.wait_result
+
+
+class _DirectBatchCollector:
+    def __init__(self, batch: CollectionBatch) -> None:
+        self.batch = batch
+
+    def collect_direct(self, _account: dict) -> CollectionBatch:
+        return self.batch
+
+    def collect_browser_signed(self, _account: dict) -> CollectionBatch:
+        raise AssertionError("直连成功不应启动浏览器")
+
+
+class _CleanupFailureCollector:
+    def collect_direct(self, _account: dict) -> CollectionBatch:
+        raise PlatformDataCollectionError("browser_cleanup_incomplete")
+
+    def collect_browser_signed(self, _account: dict) -> CollectionBatch:
+        raise AssertionError("清理失败不应重试浏览器")
 
 
 class DataMonitorPageTests(unittest.TestCase):
@@ -495,6 +522,107 @@ class DataMonitorPageTests(unittest.TestCase):
 
         self.assertEqual(page.status_label.text(), "同步失败：需要重新登录小红书")
         self.assertTrue(page.relogin_button.isVisibleTo(page))
+
+    def test_xhs_sync_persists_real_sqlite_then_page_reads_zero_contents_and_failure(self) -> None:
+        """同步、事务和页面必须共享同一份本地数据，清理失败不能冒充成功。"""
+
+        tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tempdir.cleanup)
+        db_patch = patch.object(database, "DB_PATH", Path(tempdir.name) / "data.db")
+        db_patch.start()
+        self.addCleanup(db_patch.stop)
+        database.ensure_schema()
+        with database.connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO user_info
+                    (type, filePath, userName, status, profileName, authMode)
+                VALUES (1, 'xhs-e2e.json', '小红书测试账号', 1, '小红书测试主体', 'browser')
+                """
+            )
+            account_id = int(cursor.lastrowid)
+        day = (datetime.now(ZoneInfo("Asia/Shanghai")).date() - timedelta(days=1)).isoformat()
+        batch = CollectionBatch(
+            platform_type=1,
+            source_mode="direct_session",
+            metrics=(
+                MetricPoint(
+                    entity_type="account",
+                    entity_key=f"account:{account_id}",
+                    metric_key="followers_total",
+                    raw_metric_key="fans_count",
+                    metric_value=12,
+                    metric_unit="count",
+                    metric_scope="lifetime_total",
+                    period_start=day,
+                    period_end=day,
+                    observed_at=f"{day}T12:00:00+08:00",
+                ),
+            ),
+            contents=(),
+            account_metrics_available=True,
+            content_data_available=True,
+            platform_observed_at=f"{day}T12:00:00+08:00",
+        )
+        original_factory = platform_data_collectors._COLLECTOR_FACTORIES[1]
+        self.addCleanup(
+            lambda: platform_data_collectors._COLLECTOR_FACTORIES.__setitem__(
+                1, original_factory
+            )
+        )
+        platform_data_collectors._COLLECTOR_FACTORIES[1] = (
+            lambda **_dependencies: _DirectBatchCollector(batch)
+        )
+
+        success = platform_data_sync.sync_account_data(account_id)
+        self.assertEqual(
+            success,
+            {
+                "accountId": account_id,
+                "status": "success",
+                "sourceMode": "direct_session",
+                "errorCode": "",
+                "metricCount": 1,
+                "contentCount": 0,
+            },
+        )
+        self.assertEqual(
+            platform_data_service.account_contents(account_id)["availability"],
+            "available",
+        )
+
+        page = DataMonitorPage()
+        self.addCleanup(page.deleteLater)
+        page.platform_combo.setCurrentIndex(page.platform_combo.findData(1))
+        self.app.processEvents()
+        self.assertEqual(page.account_combo.currentData(), account_id)
+        self.assertEqual(page.metric_values["followers_total"].text(), "12")
+        self.assertEqual(page.content_page_label.text(), "已取得 0 条")
+
+        platform_data_collectors._COLLECTOR_FACTORIES[1] = (
+            lambda **_dependencies: _CleanupFailureCollector()
+        )
+        failed = platform_data_sync.sync_account_data(account_id)
+        latest = platform_data_service.account_data_summary(account_id)
+        page.refresh()
+        self.app.processEvents()
+
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["errorCode"], "browser_cleanup_incomplete")
+        self.assertEqual(
+            latest["latestRun"],
+            {
+                "status": "failed",
+                "sourceMode": "direct_session",
+                "errorCode": "browser_cleanup_incomplete",
+                "metricCount": 0,
+                "finishedAt": latest["latestRun"]["finishedAt"],
+            },
+        )
+        self.assertEqual(latest["metrics"], {"followers_total": 12})
+        self.assertEqual(page.status_label.text(), "同步失败：浏览器会话未能完整关闭")
+        self.assertEqual(page.metric_values["followers_total"].text(), "12")
+        self.assertEqual(page.content_page_label.text(), "作品数据暂未取得")
 
     def test_partial_success_is_not_rendered_as_complete(self) -> None:
         """账号趋势可用时不得把未取得的作品数据冒充为全部完成。"""
