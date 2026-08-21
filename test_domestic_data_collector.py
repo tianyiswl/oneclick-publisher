@@ -111,6 +111,12 @@ class FakePage:
         self.closed = True
 
 
+class CompletedResponsePage(FakePage):
+    async def goto(self, url: str, *, wait_until: str, timeout: float) -> None:
+        await super().goto(url, wait_until=wait_until, timeout=timeout)
+        await asyncio.sleep(0)
+
+
 class FakeContext:
     def __init__(self, page: FakePage) -> None:
         self.page = page
@@ -277,6 +283,52 @@ class DomesticBrowserCollectorTests(unittest.TestCase):
         collector = DomesticBrowserCollector(
             config(max_response_bytes=8),
             browser_factory=lambda: fake_browser(payload={"data": {}}, content_length="9"),
+            parse_captures=parsed_batch,
+        )
+
+        with self.assertRaises(PlatformDataCollectionError) as raised:
+            collector.collect(account())
+
+        self.assertEqual(raised.exception.error_code, "metric_payload_invalid")
+
+    def test_collector_keeps_completed_response_task_failures(self) -> None:
+        """若完成任务被过早丢弃，goto 内的坏响应会被错误报告为超时。"""
+        page = CompletedResponsePage(
+            (FakeResponse("https://official.example/reviewed", {"data": {}}),),
+            "https://official.example/home",
+        )
+        starter = FakeStarter(FakeBrowser(FakeContext(page)))
+        collector = DomesticBrowserCollector(
+            config(max_response_bytes=8),
+            browser_factory=lambda: starter,
+            parse_captures=parsed_batch,
+        )
+
+        with self.assertRaises(PlatformDataCollectionError) as raised:
+            collector.collect(account())
+
+        self.assertEqual(raised.exception.error_code, "metric_payload_invalid")
+
+    def test_collector_rejects_response_bound_to_a_different_navigation_phase(self) -> None:
+        """若只按路径贴标签，账号页提前出现的列表响应会串入列表解析。"""
+        page = FakePage(
+            (FakeResponse("https://official.example/list", {"data": {}}),),
+            "https://official.example/home",
+        )
+        starter = FakeStarter(FakeBrowser(FakeContext(page)))
+        collector = DomesticBrowserCollector(
+            config(
+                endpoint_by_path={
+                    "/reviewed": "account_base",
+                    "/list": "content_list",
+                },
+                phase_by_path={"/reviewed": "account", "/list": "list"},
+                navigation_by_phase={
+                    "account": "https://official.example/home",
+                    "list": "https://official.example/list-page",
+                },
+            ),
+            browser_factory=lambda: starter,
             parse_captures=parsed_batch,
         )
 

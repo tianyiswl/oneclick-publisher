@@ -91,6 +91,7 @@ class DomesticCollectorConfig:
     max_total_response_bytes: int = 4_194_304
     max_responses: int = 100
     max_requests: int = 400
+    navigation_by_phase: Mapping[str, str] | None = None
 
     def __post_init__(self) -> None:
         if type(self.platform_type) is not int or self.platform_type <= 0:
@@ -114,6 +115,26 @@ class DomesticCollectorConfig:
             raise CollectionFailure("metric_payload_invalid")
         if any(endpoint not in _FIXED_ENDPOINTS for endpoint in endpoints.values()):
             raise CollectionFailure("metric_payload_invalid")
+        configured_navigation = self.navigation_by_phase
+        if configured_navigation is None:
+            configured_phases = tuple(dict.fromkeys(phases.values()))
+            if len(configured_phases) != 1:
+                raise CollectionFailure("metric_payload_invalid")
+            navigation = MappingProxyType({configured_phases[0]: self.home_url})
+        else:
+            navigation = _immutable_mapping(configured_navigation)
+        if set(navigation) != set(phases.values()):
+            raise CollectionFailure("metric_payload_invalid")
+        for navigation_url in navigation.values():
+            try:
+                parsed_navigation = urlsplit(navigation_url)
+            except ValueError:
+                raise CollectionFailure("metric_payload_invalid") from None
+            if (
+                parsed_navigation.scheme != "https"
+                or parsed_navigation.hostname not in hosts
+            ):
+                raise CollectionFailure("metric_payload_invalid")
         if type(self.total_timeout_seconds) not in (int, float) or not math.isfinite(float(self.total_timeout_seconds)) or self.total_timeout_seconds <= 0:
             raise CollectionFailure("metric_payload_invalid")
         for limit in (
@@ -129,6 +150,7 @@ class DomesticCollectorConfig:
         object.__setattr__(self, "allowed_hosts", hosts)
         object.__setattr__(self, "endpoint_by_path", endpoints)
         object.__setattr__(self, "phase_by_path", phases)
+        object.__setattr__(self, "navigation_by_phase", navigation)
 
 
 def _freeze_json(value: object) -> object:
@@ -270,11 +292,13 @@ class DomesticBrowserCollector:
         caught: BaseException | None = None
         cleanup_errors: list[BaseException] = []
         captures: list[CapturedJson] = []
-        response_tasks: set[asyncio.Task] = set()
-        request_paths: dict[int, tuple[object, str]] = {}
+        response_tasks: list[asyncio.Task] = []
+        request_paths: dict[int, tuple[object, str, str]] = {}
         seen_responses: set[int] = set()
         request_count = response_count = total_bytes = 0
         saw_unreviewed_response = False
+        capture_error: PlatformDataCollectionError | None = None
+        current_phase = ""
 
         def reviewed_path(value: object) -> str | None:
             if type(value) is not str:
@@ -292,14 +316,25 @@ class DomesticBrowserCollector:
             return parsed.path
 
         def remember_request(request: object) -> None:
-            nonlocal request_count
+            nonlocal request_count, capture_error
             path = reviewed_path(getattr(request, "url", None))
             if path is None or id(request) in request_paths:
                 return
             request_count += 1
             if request_count > self._config.max_requests:
-                raise _invalid(stage="request_binding", reason="request_limit_exceeded")
-            request_paths[id(request)] = (request, path)
+                capture_error = _invalid(
+                    stage="request_binding", reason="request_limit_exceeded"
+                )
+                return
+            expected_phase = self._config.phase_by_path[path]
+            if not current_phase or expected_phase != current_phase:
+                capture_error = _invalid(
+                    endpoint=self._config.endpoint_by_path[path],
+                    stage="request_binding",
+                    reason="request_mismatch",
+                )
+                return
+            request_paths[id(request)] = (request, path, current_phase)
 
         async def cache_response(response: object, path: str) -> None:
             nonlocal total_bytes
@@ -356,7 +391,7 @@ class DomesticBrowserCollector:
             )
 
         def remember_response(response: object) -> None:
-            nonlocal response_count, saw_unreviewed_response
+            nonlocal capture_error, response_count, saw_unreviewed_response
             request = getattr(response, "request", None)
             if request is None:
                 return
@@ -367,19 +402,69 @@ class DomesticBrowserCollector:
                 saw_unreviewed_response = True
                 return
             path = reviewed_path(getattr(response, "url", None))
-            if path is None or path != entry[1]:
+            if (
+                path is None
+                or path != entry[1]
+                or entry[2] != self._config.phase_by_path[path]
+            ):
+                capture_error = _invalid(
+                    endpoint=self._config.endpoint_by_path[entry[1]],
+                    stage="request_binding",
+                    reason="request_mismatch",
+                )
                 saw_unreviewed_response = True
                 return
             response_id = id(response)
             if response_id in seen_responses:
-                raise _invalid(endpoint=self._config.endpoint_by_path[path], stage="response_capture", reason="duplicate_response")
+                capture_error = _invalid(
+                    endpoint=self._config.endpoint_by_path[path],
+                    stage="response_capture",
+                    reason="duplicate_response",
+                )
+                return
             seen_responses.add(response_id)
             response_count += 1
             if response_count > self._config.max_responses:
-                raise _invalid(stage="response_capture", reason="response_limit_exceeded")
+                capture_error = _invalid(
+                    stage="response_capture", reason="response_limit_exceeded"
+                )
+                return
             task = asyncio.create_task(cache_response(response, path))
-            response_tasks.add(task)
-            task.add_done_callback(response_tasks.discard)
+            response_tasks.append(task)
+
+        async def flush_responses() -> None:
+            if capture_error is not None:
+                raise capture_error
+            if response_tasks:
+                await asyncio.gather(*tuple(response_tasks))
+            if capture_error is not None:
+                raise capture_error
+
+        async def navigate(phase: str, navigation_url: str) -> None:
+            nonlocal current_phase
+            current_phase = phase
+            await _await_until(
+                page.goto(
+                    navigation_url,
+                    wait_until="domcontentloaded",
+                    timeout=max(1, int((work_deadline - self._monotonic()) * 1000)),
+                ),
+                deadline=work_deadline,
+                monotonic=self._monotonic,
+            )
+            current_url = str(getattr(page, "url", "") or "").lower()
+            try:
+                current = urlsplit(current_url)
+            except ValueError:
+                raise _invalid(stage="navigation", reason="invalid_navigation") from None
+            current_path = current.path
+            if any(marker in current_path for marker in ("/verification", "/captcha", "/challenge")):
+                raise _error("verification_required")
+            if current_path.startswith("/login") or (current.hostname or "").startswith("passport."):
+                raise _error("login_required")
+            if current.scheme != "https" or current.hostname not in self._config.allowed_hosts:
+                raise _invalid(stage="navigation", reason="invalid_navigation")
+            await flush_responses()
 
         try:
             manager = await _await_until(self._browser_factory(), deadline=work_deadline, monotonic=self._monotonic)
@@ -390,21 +475,12 @@ class DomesticBrowserCollector:
             page = await _await_until(context.new_page(), deadline=work_deadline, monotonic=self._monotonic)
             page.on("request", remember_request)
             page.on("response", remember_response)
-            await _await_until(page.goto(self._config.home_url, wait_until="domcontentloaded", timeout=max(1, int((work_deadline - self._monotonic()) * 1000))), deadline=work_deadline, monotonic=self._monotonic)
-            current = reviewed_path(str(getattr(page, "url", "") or ""))
-            current_url = str(getattr(page, "url", "") or "").lower()
-            current_path = urlsplit(current_url).path
-            if any(marker in current_path for marker in ("/verification", "/captcha", "/challenge")):
-                raise _error("verification_required")
-            if current_path.startswith("/login") or (urlsplit(current_url).hostname or "").startswith("passport."):
-                raise _error("login_required")
-            if current is None and urlsplit(current_url).hostname not in self._config.allowed_hosts:
-                raise _invalid(stage="navigation", reason="invalid_navigation")
+            for phase, navigation_url in self._config.navigation_by_phase.items():
+                await navigate(phase, navigation_url)
             if saw_unreviewed_response and not response_tasks:
                 raise _error("metric_payload_empty")
             while not captures:
-                if response_tasks:
-                    await asyncio.gather(*tuple(response_tasks))
+                await flush_responses()
                 if captures:
                     break
                 if work_deadline - self._monotonic() <= 0:
@@ -413,8 +489,7 @@ class DomesticBrowserCollector:
                 if not callable(waiter):
                     raise _error("browser_signature_timeout")
                 await _await_until(waiter(_POLL_MILLISECONDS), deadline=work_deadline, monotonic=self._monotonic)
-            if response_tasks:
-                await asyncio.gather(*tuple(response_tasks))
+            await flush_responses()
             result = self._parse_captures(account_id, tuple(captures))
             if type(result) is not CollectionBatch:
                 raise _error("metric_payload_invalid")
@@ -423,7 +498,7 @@ class DomesticBrowserCollector:
         except BaseException as error:
             caught = error
         finally:
-            for task in tuple(response_tasks):
+            for task in response_tasks:
                 if not task.done():
                     task.cancel()
             if response_tasks:
