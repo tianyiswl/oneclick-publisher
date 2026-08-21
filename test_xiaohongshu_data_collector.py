@@ -907,10 +907,26 @@ class XiaohongshuDataCollectorTests(unittest.TestCase):
             "metric_payload_invalid",
         )
 
+    def test_reviewed_chunked_or_compressed_json_does_not_require_exact_content_length(self) -> None:
+        """官方四个白名单接口可分块传输，压缩长度也不等于解压后的 JSON 长度。"""
+
+        responses = _reviewed_success_responses()
+        chunked = responses[CREATOR_HOME][0]
+        chunked.headers.pop("content-length")
+        compressed = responses[DATA_ANALYSIS_URL][0]
+        compressed.headers["content-length"] = "1"
+
+        collector, _fake = self._collector_with_responses(responses)
+        batch = collector.collect_browser_signed(_account())
+
+        self.assertGreater(len(batch.metrics), 0)
+        self.assertEqual(chunked.body_calls, 1)
+        self.assertEqual(compressed.body_calls, 1)
+
     def test_untrusted_or_over_budget_content_length_rejects_before_body_read(self) -> None:
         """Content-Length 不可信或超预算时，读取 body 本身就已越过资源边界。"""
 
-        for declared_length in (None, "", "-1", "0", "1.0", True, 1):
+        for declared_length in ("", "-1", "0", "1.0", True, 1):
             with self.subTest(declared_length=repr(declared_length)):
                 responses = _reviewed_success_responses()
                 invalid = _FakeResponse(
@@ -918,8 +934,6 @@ class XiaohongshuDataCollectorTests(unittest.TestCase):
                     {"data": {"fans_count": 3199}},
                     content_length=declared_length,
                 )
-                if declared_length is None:
-                    invalid.headers.pop("content-length")
                 responses[CREATOR_HOME] = (invalid,)
                 collector, _fake = self._collector_with_responses(responses)
                 self.assert_collection_error(

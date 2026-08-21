@@ -254,12 +254,14 @@ def _response_path(response: object) -> str | None:
 
 
 def _declared_response_bytes(response: object) -> int | None:
-    """只信任 Playwright ``Response.headers`` 中受控的正整数长度。"""
+    """校验可选长度头；白名单 JSON 的分块响应以 0 表示尚未声明长度。"""
 
     headers = getattr(response, "headers", None)
     if type(headers) is not dict:
         return None
     value = headers.get("content-length")
+    if value is None:
+        return 0
     if type(value) is not str or _CONTENT_LENGTH.fullmatch(value) is None:
         return None
     try:
@@ -459,11 +461,11 @@ class XiaohongshuDataCollector:
             except BaseException:
                 capture_error = _collection_error("metric_payload_invalid")
                 return
-            if (
-                type(body) is not bytes
-                or len(body) != declared_bytes
-                or not 1 <= len(body) <= _MAX_RESPONSE_BYTES
-            ):
+            if type(body) is not bytes or not 1 <= len(body) <= _MAX_RESPONSE_BYTES:
+                capture_error = _collection_error("metric_payload_invalid")
+                return
+            reserved_bytes += max(0, len(body) - declared_bytes)
+            if reserved_bytes > _MAX_TOTAL_RESPONSE_BYTES:
                 capture_error = _collection_error("metric_payload_invalid")
                 return
             try:
