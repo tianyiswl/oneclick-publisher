@@ -42,6 +42,9 @@ class FakeResponse:
     def json(self):
         return self._payload
 
+    def body(self):
+        return json.dumps(self._payload, ensure_ascii=False).encode("utf-8")
+
 
 class FakePage:
     fetch_calls = 0
@@ -204,6 +207,88 @@ class LateListResponsePlaywright(FakePlaywright):
         self.delayed_response = delayed_response
         self.data_response = data_response
         self.page = LateListResponsePage(self)
+
+
+class DelayedDataListPage(FakePage):
+    def __init__(self, owner):
+        super().__init__(owner)
+        self.data_wait_count = 0
+        self.data_response_emitted = False
+
+    def goto(self, url, **_kwargs):
+        self.owner.events.append(("goto", url))
+        self.goto_url = url
+        self.goto_urls.append(url)
+        self.goto_kwargs.append(dict(_kwargs))
+        if url == verifier._DATA_ANALYSIS_URL:
+            self.data_wait_count = 0
+            if self.request_callback is not None:
+                self.request_callback(self.owner.list_response.request)
+        elif url.startswith(verifier._NOTE_DETAIL_URL):
+            if self.request_callback is not None:
+                self.request_callback(self.owner.detail_response.request)
+            self.response_callback(self.owner.detail_response)
+        return FakeResponse(url, "text/html; charset=utf-8", None)
+
+    def wait_for_timeout(self, milliseconds):
+        super().wait_for_timeout(milliseconds)
+        if self.goto_url != verifier._DATA_ANALYSIS_URL:
+            return
+        self.data_wait_count += 1
+        if self.data_wait_count == 2 and not self.data_response_emitted:
+            self.data_response_emitted = True
+            self.response_callback(self.owner.list_response)
+
+
+class DelayedDataListPlaywright(FakePlaywright):
+    def __init__(self, list_response, detail_response):
+        super().__init__()
+        self.list_response = list_response
+        self.detail_response = detail_response
+        self.page = DelayedDataListPage(self)
+
+
+class NoteDataTabLocator:
+    def __init__(self, owner):
+        self.owner = owner
+
+    def count(self):
+        return 1
+
+    def is_visible(self):
+        return True
+
+    def click(self):
+        self.owner.page.click_calls += 1
+        if self.owner.page.request_callback is not None:
+            self.owner.page.request_callback(self.owner.list_response.request)
+        self.owner.page.response_callback(self.owner.list_response)
+
+
+class NoteDataTabPage(FakePage):
+    def goto(self, url, **_kwargs):
+        self.owner.events.append(("goto", url))
+        self.goto_url = url
+        self.goto_urls.append(url)
+        self.goto_kwargs.append(dict(_kwargs))
+        if url.startswith(verifier._NOTE_DETAIL_URL):
+            if self.request_callback is not None:
+                self.request_callback(self.owner.detail_response.request)
+            self.response_callback(self.owner.detail_response)
+        return FakeResponse(url, "text/html; charset=utf-8", None)
+
+    def get_by_text(self, text, *, exact=False):
+        if text == "笔记数据" and exact is True:
+            return NoteDataTabLocator(self.owner)
+        raise AssertionError("only the fixed note-data tab may be located")
+
+
+class NoteDataTabPlaywright(FakePlaywright):
+    def __init__(self, list_response, detail_response):
+        super().__init__()
+        self.list_response = list_response
+        self.detail_response = detail_response
+        self.page = NoteDataTabPage(self)
 
 
 class FakeClock:
@@ -735,7 +820,7 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
             [item["wait_until"] for item in fake.page.goto_kwargs],
             ["domcontentloaded", "domcontentloaded", "domcontentloaded"],
         )
-        self.assertEqual(fake.page.passive_waits, [2000, 2000, 2000])
+        self.assertEqual(fake.page.passive_waits, [6000, 6000, 6000])
         self.assertEqual(len(result["responses"]), 2)
         self.assertEqual(
             [item["observationPhase"] for item in result["responses"]],
@@ -746,6 +831,190 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
         self.assertNotIn("6a0ffca800000000080033f8", json.dumps(result))
         self.assertEqual(fake.page.click_calls, 0)
         self.assertEqual(fake.page.fetch_calls, 0)
+
+    def test_probe_waits_for_delayed_real_content_list_before_detail(self):
+        """作品回复晚于首个固定等待时，不能提前关页并漏掉真实作品。"""
+
+        list_response = FakeResponse(
+            "https://creator.xiaohongshu.com/api/galaxy/creator/datacenter/note/analyze/list?page_num=1",
+            "application/json",
+            {"data": {"note_infos": [{
+                "id": "6a0ffca800000000080033f8",
+                "view_count": 148,
+            }]}},
+        )
+        detail_response = FakeResponse(
+            "https://creator.xiaohongshu.com/api/galaxy/creator/datacenter/note/base?note_id=private",
+            "application/json",
+            {"data": {"note_id": "private", "lifetime": {"views": 148}}},
+        )
+        fake = DelayedDataListPlaywright(list_response, detail_response)
+
+        result = verifier._probe_with_browser(
+            eligible_account(), playwright_factory=lambda: fake,
+            monotonic=FakeClock(), utc_now=fixed_now,
+        )
+
+        self.assertGreaterEqual(fake.page.data_wait_count, 2)
+        self.assertEqual(
+            fake.page.goto_urls,
+            [
+                verifier._CREATOR_HOME,
+                verifier._DATA_ANALYSIS_URL,
+                f"{verifier._NOTE_DETAIL_URL}?noteId=6a0ffca800000000080033f8",
+            ],
+        )
+        self.assertIn("content_list", result["phases"])
+
+    def test_probe_activates_exact_note_data_tab_to_request_content_list(self):
+        """数据页不自动请求作品时，应只点击一次只读的“笔记数据”标签。"""
+
+        list_response = FakeResponse(
+            "https://creator.xiaohongshu.com/api/galaxy/creator/datacenter/note/analyze/list?page_num=1",
+            "application/json",
+            {"data": {"note_infos": [{
+                "id": "6a0ffca800000000080033f8",
+                "view_count": 148,
+            }]}},
+        )
+        detail_response = FakeResponse(
+            "https://creator.xiaohongshu.com/api/galaxy/creator/datacenter/note/base?note_id=private",
+            "application/json",
+            {"data": {"note_id": "private", "lifetime": {"views": 148}}},
+        )
+        fake = NoteDataTabPlaywright(list_response, detail_response)
+
+        result = verifier._probe_with_browser(
+            eligible_account(), playwright_factory=lambda: fake,
+            monotonic=FakeClock(), utc_now=fixed_now,
+        )
+
+        self.assertEqual(fake.page.click_calls, 1)
+        self.assertEqual(
+            fake.page.goto_urls[-1],
+            f"{verifier._NOTE_DETAIL_URL}?noteId=6a0ffca800000000080033f8",
+        )
+        self.assertIn("content_list", result["phases"])
+
+    def test_probe_accepts_bounded_body_for_known_chunked_note_list(self):
+        """官方作品列表没有 Content-Length 时，仍应先按实际字节上限校验再解析。"""
+
+        list_response = FakeResponse(
+            "https://creator.xiaohongshu.com/api/galaxy/creator/datacenter/note/analyze/list?page_num=1",
+            "application/json",
+            {"data": {"note_infos": [{
+                "id": "6a0ffca800000000080033f8",
+                "view_count": 148,
+            }]}},
+            content_length=None,
+        )
+        detail_response = FakeResponse(
+            "https://creator.xiaohongshu.com/api/galaxy/creator/datacenter/note/base?note_id=private",
+            "application/json",
+            {"data": {"note_id": "private", "lifetime": {"views": 148}}},
+        )
+        fake = NoteDataTabPlaywright(list_response, detail_response)
+
+        result = verifier._probe_with_browser(
+            eligible_account(), playwright_factory=lambda: fake,
+            monotonic=FakeClock(), utc_now=fixed_now,
+        )
+
+        self.assertIn("content_list", result["phases"])
+        self.assertEqual(
+            fake.page.goto_urls[-1],
+            f"{verifier._NOTE_DETAIL_URL}?noteId=6a0ffca800000000080033f8",
+        )
+
+    def test_reviewed_real_account_and_lifetime_paths_classify(self):
+        account_shape = verifier._response_shape(FakeResponse(
+            "https://creator.xiaohongshu.com/api/galaxy/v2/creator/datacenter/account/base",
+            "application/json",
+            {"data": {"thirty": {"view_count": 5743}}},
+        ))
+        lifetime_shape = verifier._response_shape(FakeResponse(
+            "https://creator.xiaohongshu.com/api/galaxy/creator/datacenter/note/base?note_id=private",
+            "application/json",
+            {"data": {
+                "note_info": {"id": "6a0ffca800000000080033f8"},
+                "view_count": 5743,
+                "like_count": 11,
+            }},
+        ))
+
+        self.assertEqual(
+            verifier._classify_shape(account_shape), "account_overview"
+        )
+        self.assertEqual(
+            verifier._classify_shape(lifetime_shape), "content_lifetime"
+        )
+
+        bounded_walk_shape = verifier._response_shape(FakeResponse(
+            "https://creator.xiaohongshu.com/api/galaxy/creator/datacenter/note/base?note_id=private",
+            "application/json",
+            {"data": {"share_count": 4}},
+        ))
+        self.assertEqual(
+            verifier._classify_shape(bounded_walk_shape), "content_lifetime"
+        )
+
+    def test_probe_accepts_bounded_body_for_known_chunked_account_overview(self):
+        response = FakeResponse(
+            "https://creator.xiaohongshu.com/api/galaxy/v2/creator/datacenter/account/base",
+            "application/json",
+            {"data": {"thirty": {"view_count": 5743}}},
+            content_length=None,
+        )
+        fake = FakePlaywright(responses=[response])
+
+        result = verifier._probe_with_browser(
+            eligible_account(), playwright_factory=lambda: fake,
+            monotonic=FakeClock(), utc_now=fixed_now,
+        )
+
+        self.assertIn("account_overview", result["phases"])
+
+    def test_probe_accepts_reviewed_personal_info_as_account_overview(self):
+        response = FakeResponse(
+            "https://creator.xiaohongshu.com/api/galaxy/creator/home/personal_info",
+            "application/json",
+            {"data": {"fans_count": 3199}},
+            content_length=None,
+        )
+        fake = FakePlaywright(responses=[response])
+
+        result = verifier._probe_with_browser(
+            eligible_account(), playwright_factory=lambda: fake,
+            monotonic=FakeClock(), utc_now=fixed_now,
+        )
+
+        self.assertIn("account_overview", result["phases"])
+
+    def test_probe_accepts_bounded_body_for_known_chunked_note_base(self):
+        list_response = FakeResponse(
+            "https://creator.xiaohongshu.com/api/galaxy/creator/datacenter/note/analyze/list?page_num=1",
+            "application/json",
+            {"data": {"note_infos": [{
+                "id": "6a0ffca800000000080033f8",
+            }]}},
+        )
+        detail_response = FakeResponse(
+            "https://creator.xiaohongshu.com/api/galaxy/creator/datacenter/note/base?note_id=private",
+            "application/json",
+            {"data": {
+                "note_info": {"id": "6a0ffca800000000080033f8"},
+                "view_count": 148,
+            }},
+            content_length=None,
+        )
+        fake = NoteDataTabPlaywright(list_response, detail_response)
+
+        result = verifier._probe_with_browser(
+            eligible_account(), playwright_factory=lambda: fake,
+            monotonic=FakeClock(), utc_now=fixed_now,
+        )
+
+        self.assertIn("content_lifetime", result["phases"])
 
     def test_probe_binds_late_response_to_request_start_phase(self):
         delayed_lifetime = FakeResponse(

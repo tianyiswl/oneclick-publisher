@@ -41,6 +41,12 @@ _REVIEW_SENSITIVE_NAMES = frozenset({
 _REVIEW_STATIC_HYPHENATED_NAMES = frozenset({"data-analysis", "note-detail"})
 _MAX_RESPONSE_BODY_BYTES = 1_048_576
 _MAX_TOTAL_RESPONSE_BODY_BYTES = 4_194_304
+_KNOWN_CHUNKED_JSON_PATHS = frozenset({
+    "/api/galaxy/v2/creator/datacenter/account/base",
+    "/api/galaxy/creator/home/personal_info",
+    "/api/galaxy/creator/datacenter/note/analyze/list",
+    "/api/galaxy/creator/datacenter/note/base",
+})
 _ACCOUNT_SELECTION_REQUIRED = "xiaohongshu_account_selection_required"
 _ARGUMENTS_INVALID = "xiaohongshu_arguments_invalid"
 _REPORT_PATH_INVALID = "xiaohongshu_report_path_invalid"
@@ -62,7 +68,12 @@ _REDACTED_ENDPOINT_SEGMENT = ":segment"
 # Empty until a real passive run is reviewed and its complete path template is
 # deliberately promoted. Discovery responses are still retained, but cannot
 # become contract evidence merely because individual segments look familiar.
-_REVIEWED_CONTRACT_PATH_TEMPLATES = MappingProxyType({})
+_REVIEWED_CONTRACT_PATH_TEMPLATES = MappingProxyType({
+    "/api/galaxy/v2/creator/datacenter/account/base": "account_overview",
+    "/api/galaxy/creator/home/personal_info": "account_overview",
+    "/api/galaxy/creator/datacenter/note/analyze/list": "content_list",
+    "/api/galaxy/creator/datacenter/note/base": "content_lifetime",
+})
 _DYNAMIC_ID_PARENTS = frozenset({
     "note", "notes", "item", "content", "contents", "user", "users",
     "account", "accounts",
@@ -95,7 +106,9 @@ _OBSERVATION_CONTRACT_CANDIDATES = MappingProxyType({
     "content_lifetime": ("content_lifetime",),
 })
 _NETWORK_QUIET_TIMEOUT_MS = 30_000
-_PASSIVE_CAPTURE_WAIT_MS = 2_000
+_PASSIVE_CAPTURE_WAIT_MS = 6_000
+_CONTENT_LIST_CAPTURE_POLL_MS = 250
+_CONTENT_LIST_CAPTURE_POLL_ATTEMPTS = 32
 _TOTAL_TIMEOUT_SECONDS = 60.0
 _MAX_CLEANUP_BUDGET_SECONDS = 5.0
 _STRUCTURAL_DEPTH_LIMIT = 40
@@ -124,10 +137,11 @@ _METRIC_KEYS = frozenset({
     "comments", "share_count", "shares", "collect_count", "collects",
 })
 _ACCOUNT_METRIC_KEYS = frozenset({
-    "fans", "fan_count", "follower_count", "followers",
+    "fans", "fans_count", "fan_count", "follower_count", "followers",
 }) | _METRIC_KEYS
 _ACCOUNT_SCOPE_KEYS = frozenset({
     "trend", "interval", "window", "range", "period", "daily",
+    "seven", "thirty",
 })
 _CUMULATIVE_SCOPE_KEYS = frozenset({
     "lifetime", "cumulative", "all_time", "total",
@@ -136,7 +150,7 @@ _NON_LIFETIME_SCOPE_KEYS = frozenset({
     "interval", "window", "range", "period", "daily",
 })
 _ACCOUNT_CONTAINER_KEYS = frozenset({
-    "account", "profile", "overview",
+    "account", "profile", "overview", "note_info",
 })
 _ALLOWED_MODES = frozenset({"plan", "execute"})
 _ALLOWED_STATUSES = frozenset({
@@ -573,7 +587,12 @@ def _sanitize_response(value: object) -> dict[str, object] | None:
             source_path = ""
     else:
         source_path = source.get("path")
-    safe_path = _endpoint_path(source_path)
+    safe_path = (
+        source_path
+        if type(source_path) is str
+        and source_path in _REVIEWED_CONTRACT_PATH_TEMPLATES
+        else _endpoint_path(source_path)
+    )
     if safe_path is None:
         return None
     status = source.get("status")
@@ -874,6 +893,8 @@ def _select_single_eligible_account() -> dict[str, object]:
 
 def _response_metadata(
     response: object,
+    *,
+    allow_known_missing_length: bool = False,
 ) -> tuple[str, str, int, str, int] | None:
     url = getattr(response, "url", None)
     if type(url) is not str:
@@ -887,6 +908,8 @@ def _response_metadata(
     endpoint_path = _endpoint_path(parsed.path)
     if not endpoint_path:
         return None
+    if parsed.path in _REVIEWED_CONTRACT_PATH_TEMPLATES:
+        endpoint_path = parsed.path
 
     headers = getattr(response, "headers", None)
     if type(headers) is not dict:
@@ -900,17 +923,24 @@ def _response_metadata(
 
     raw_content_length = headers.get("content-length")
     if (
-        type(raw_content_length) is not str
-        or not 1 <= len(raw_content_length) <= 20
-        or _CONTENT_LENGTH.fullmatch(raw_content_length) is None
+        raw_content_length is None
+        and allow_known_missing_length
+        and parsed.path in _KNOWN_CHUNKED_JSON_PATHS
     ):
-        return None
-    try:
-        content_length = int(raw_content_length)
-    except ValueError:
-        return None
-    if not 1 <= content_length <= _MAX_RESPONSE_BODY_BYTES:
-        return None
+        content_length = 0
+    else:
+        if (
+            type(raw_content_length) is not str
+            or not 1 <= len(raw_content_length) <= 20
+            or _CONTENT_LENGTH.fullmatch(raw_content_length) is None
+        ):
+            return None
+        try:
+            content_length = int(raw_content_length)
+        except ValueError:
+            return None
+        if not 1 <= content_length <= _MAX_RESPONSE_BODY_BYTES:
+            return None
 
     content_encoding = headers.get("content-encoding")
     if content_encoding is not None and (
@@ -1314,6 +1344,23 @@ def _classify_content_lifetime_shape(
     return False
 
 
+def _classify_reviewed_content_lifetime_shape(
+    field_types: dict[str, str],
+) -> bool:
+    """Accept the reviewed official base endpoint's sibling identity/metrics."""
+    return any(
+        field_types.get(f"data.{metric_key}") in {"int", "float"}
+        for metric_key in _METRIC_KEYS
+    )
+
+
+def _classify_reviewed_account_shape(field_types: dict[str, str]) -> bool:
+    return any(
+        field_types.get(f"data.{metric_key}") in {"int", "float"}
+        for metric_key in _ACCOUNT_METRIC_KEYS
+    )
+
+
 def _classify_shape(shape: dict[str, object]) -> str:
     reviewed_phase = _reviewed_contract_phase(shape.get("path"))
     observation_phase = shape.get("observationPhase")
@@ -1330,6 +1377,16 @@ def _classify_shape(shape: dict[str, object]) -> str:
     evidence, field_types = _structural_evidence_paths(shape)
     if not evidence:
         return "unclassified"
+    if (
+        reviewed_phase == "account_overview"
+        and _classify_reviewed_account_shape(field_types)
+    ):
+        return "account_overview"
+    if (
+        reviewed_phase == "content_lifetime"
+        and _classify_reviewed_content_lifetime_shape(field_types)
+    ):
+        return "content_lifetime"
     classifiers = {
         "account_overview": _classify_account_shape,
         "content_list": _classify_content_list_shape,
@@ -1459,6 +1516,7 @@ async def _run_probe(
     retained_body_bytes = 0
     response_budget_exhausted = False
     retained_response_ids: set[int] = set()
+    bounded_payloads: dict[int, object] = {}
     request_phases: dict[int, tuple[object, str]] = {}
     active_observation_phase = ""
     shapes: list[dict[str, object]] = []
@@ -1494,7 +1552,9 @@ async def _run_probe(
         ):
             return
         try:
-            metadata = _response_metadata(response)
+            metadata = _response_metadata(
+                response, allow_known_missing_length=True
+            )
         except (KeyboardInterrupt, SystemExit):
             raise
         except Exception:
@@ -1562,31 +1622,153 @@ async def _run_probe(
             finally:
                 active_observation_phase = ""
 
+        async def wait_for_data_analysis_note_id(
+            start: int, *, poll_attempts: int
+        ) -> str | None:
+            cursor = start
+            for attempt in range(poll_attempts + 1):
+                pending = tuple(observed_responses[cursor:])
+                cursor += len(pending)
+                for response, metadata, observation_phase in pending:
+                    if observation_phase != "data_analysis":
+                        continue
+                    if metadata[4] == 0:
+                        payload = await load_bounded_chunked_payload(
+                            response, metadata=metadata
+                        )
+                        note_id = _first_note_id(payload)
+                    else:
+                        note_id = await _response_note_id(
+                            response,
+                            deadline=work_deadline,
+                            monotonic=monotonic,
+                        )
+                    if note_id is not None:
+                        return note_id
+                if attempt == poll_attempts:
+                    break
+                passive_wait = getattr(page, "wait_for_timeout", None)
+                if not callable(passive_wait):
+                    break
+                await _await_with_deadline(
+                    passive_wait(_CONTENT_LIST_CAPTURE_POLL_MS),
+                    deadline=work_deadline,
+                    monotonic=monotonic,
+                )
+            return None
+
+        async def load_bounded_chunked_payload(
+            response: object,
+            *,
+            metadata: tuple[str, str, int, str, int],
+        ) -> object:
+            nonlocal retained_body_bytes, response_budget_exhausted
+            response_identity = id(response)
+            if response_identity in bounded_payloads:
+                return bounded_payloads[response_identity]
+            if metadata[4] != 0 or response_budget_exhausted:
+                return None
+            loader = getattr(response, "body", None)
+            if not callable(loader):
+                return None
+            try:
+                body = loader()
+                if inspect.isawaitable(body):
+                    body = await _await_with_deadline(
+                        body, deadline=work_deadline, monotonic=monotonic
+                    )
+            except TimeoutError:
+                raise
+            except Exception:
+                return None
+            if type(body) is not bytes or not 1 <= len(body) <= _MAX_RESPONSE_BODY_BYTES:
+                return None
+            next_total = retained_body_bytes + len(body)
+            if next_total > _MAX_TOTAL_RESPONSE_BODY_BYTES:
+                response_budget_exhausted = True
+                bounded_payloads.clear()
+                return None
+            try:
+                payload = json.loads(body)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                return None
+            retained_body_bytes = next_total
+            bounded_payloads[response_identity] = payload
+            return payload
+
+        async def activate_note_data_tab() -> bool:
+            nonlocal active_observation_phase
+            getter = getattr(page, "get_by_text", None)
+            if not callable(getter):
+                return False
+            active_observation_phase = "data_analysis"
+            try:
+                locator = getter("笔记数据", exact=True)
+                count_method = getattr(locator, "count", None)
+                visible_method = getattr(locator, "is_visible", None)
+                click_method = getattr(locator, "click", None)
+                if not all(callable(method) for method in (
+                    count_method, visible_method, click_method
+                )):
+                    return False
+                count = await _await_with_deadline(
+                    count_method(), deadline=work_deadline, monotonic=monotonic
+                )
+                visible = await _await_with_deadline(
+                    visible_method(), deadline=work_deadline, monotonic=monotonic
+                )
+                if type(count) is not int or count != 1 or visible is not True:
+                    return False
+                await _await_with_deadline(
+                    click_method(), deadline=work_deadline, monotonic=monotonic
+                )
+                return True
+            except (KeyboardInterrupt, SystemExit, TimeoutError):
+                raise
+            except Exception:
+                return False
+            finally:
+                active_observation_phase = ""
+
         await navigate("account_home", _CREATOR_HOME)
         data_response_start = len(observed_responses)
         await navigate("data_analysis", _DATA_ANALYSIS_URL)
-        note_id = None
-        for response, _metadata, observation_phase in tuple(
-            observed_responses[data_response_start:]
-        ):
-            if observation_phase != "data_analysis":
-                continue
-            note_id = await _response_note_id(
-                response, deadline=work_deadline, monotonic=monotonic
+        note_id = await wait_for_data_analysis_note_id(
+            data_response_start, poll_attempts=0
+        )
+        if note_id is None:
+            post_activation_start = len(observed_responses)
+            await activate_note_data_tab()
+            note_id = await wait_for_data_analysis_note_id(
+                post_activation_start,
+                poll_attempts=_CONTENT_LIST_CAPTURE_POLL_ATTEMPTS,
             )
-            if note_id is not None:
-                break
         if note_id is not None:
             await navigate(
                 "content_lifetime", f"{_NOTE_DETAIL_URL}?noteId={note_id}"
             )
         for response, metadata, observation_phase in tuple(observed_responses):
-            shape = await _async_response_shape(
-                response,
-                metadata=metadata,
-                deadline=work_deadline,
-                monotonic=monotonic,
-            )
+            if metadata[4] == 0:
+                payload = await load_bounded_chunked_payload(
+                    response, metadata=metadata
+                )
+                shape = (
+                    _shape_from_payload(
+                        metadata,
+                        payload,
+                        deadline=work_deadline,
+                        monotonic=monotonic,
+                    )
+                    if payload is not None
+                    else None
+                )
+            else:
+                shape = await _async_response_shape(
+                    response,
+                    metadata=metadata,
+                    deadline=work_deadline,
+                    monotonic=monotonic,
+                )
             if shape is not None:
                 shape["observationPhase"] = observation_phase
                 shapes.append(shape)
