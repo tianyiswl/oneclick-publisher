@@ -28,6 +28,26 @@ _FAILURE_REASONS = frozenset(
     }
 )
 
+PLATFORM_DATA_COLLECTION_ERROR_CODES = frozenset(
+    {
+        "account_trends_unavailable",
+        "browser_cleanup_incomplete",
+        "browser_signature_timeout",
+        "collector_not_available",
+        "content_list_truncated",
+        "content_list_unavailable",
+        "content_payload_invalid",
+        "direct_request_rejected",
+        "login_required",
+        "metric_payload_empty",
+        "metric_payload_invalid",
+        "session_state_missing",
+        "sync_persist_failed",
+        "validation_readback_mismatch",
+        "verification_required",
+    }
+)
+
 
 def public_failure_diagnostic(value: object) -> dict | None:
     """只接受内部固定枚举，避免带出平台正文或异常原文。"""
@@ -80,6 +100,8 @@ class PlatformDataCollectionError(CollectionFailure):
         cleanup_receipt: CleanupReceipt | None = None,
         failure_diagnostic: dict | None = None,
     ) -> None:
+        if error_code not in PLATFORM_DATA_COLLECTION_ERROR_CODES:
+            error_code = "metric_payload_invalid"
         self.fallback_allowed = (
             type(fallback_allowed) is bool and fallback_allowed
         )
