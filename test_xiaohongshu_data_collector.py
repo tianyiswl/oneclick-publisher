@@ -1194,31 +1194,26 @@ class XiaohongshuDataCollectorTests(unittest.TestCase):
         self.assertEqual(batch.contents, ())
         self.assertEqual(batch.warning_code, "content_payload_invalid")
 
-    def test_detail_request_identity_must_match_list_identity_even_when_payload_matches(self) -> None:
-        """详情 payload 自报同一 ID 不足以证明浏览器请求没有被串到另一条作品。"""
+    def test_detail_request_allows_real_query_shape_and_binds_identity_from_payload(self) -> None:
+        """真实参数形式可变化，作品身份由白名单正文与列表ID严格绑定。"""
 
         responses = _reviewed_success_responses()
+        standard = responses[_detail_url()][0]
         responses[_detail_url()] = (
             _FakeResponse(
-                "https://creator.xiaohongshu.com/api/galaxy/creator/"
-                "datacenter/note/base?noteId=private",
-                {
-                    "data": {
-                        "note_info": {"id": _CONTENT_ID, "view_count": 148},
-                    }
-                },
+                standard.url,
+                body=standard._body,
                 request_url=(
                     "https://creator.xiaohongshu.com/api/galaxy/creator/"
-                    "datacenter/note/base?noteId=7b0ffca800000000080033f8"
+                    "datacenter/note/base?note_id=server-form&source=official"
                 ),
             ),
         )
         collector, _fake = self._collector_with_responses(responses)
 
-        self.assert_collection_error(
-            lambda: collector.collect_browser_signed(_account()),
-            "metric_payload_invalid",
-        )
+        batch = collector.collect_browser_signed(_account())
+
+        self.assertEqual(batch.contents[0].content_id, _CONTENT_ID)
 
     def test_total_timeout_returns_fixed_error_after_cleanup(self) -> None:
         """总时限越界若继续等待，会让短会话失去确定的资源上限。"""

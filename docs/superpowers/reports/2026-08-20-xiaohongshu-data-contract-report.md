@@ -2,7 +2,7 @@
 
 - 离线验收日期：2026-08-21
 - 平台类型：`1`
-- 本轮状态：`seventh_real_run_failed_detail_request_binding`
+- 本轮状态：`seventh_real_run_failed_detail_binding_fixed_offline`
 - 本轮真实客户端运行：`failed_seven_times_each_no_retry`
 
 ## 交付已验证的内容
@@ -152,3 +152,8 @@ Playwright `response.body()` 返回的解压后长度。新采集器遗漏了这
 查询参数严格且只能为 `noteId=<作品ID>`；真实后台请求参数形式并不满足这一假设。作品详情响应正文
 本身已有严格作品 ID 回读校验，因此下一步应把请求绑定收窄为官方域名、HTTPS 和固定白名单路径，
 再由正文内作品 ID 与列表选中 ID 做最终身份绑定；修复完成前不进行第八次真实同步。
+
+详情绑定现已按红绿循环修复：请求侧只接受 HTTPS、官方域名和固定作品详情白名单路径，不再假设平台查询
+参数的名称、顺序或附加字段；响应侧继续由 `parse_content_lifetime` 严格要求正文作品 ID 与列表选中 ID
+完全一致。真实参数形式回归、错误作品正文降级和导航边界测试均通过；三个受影响模块共 `90/90` 项通过，
+语法编译与 `git diff --check` 通过。未运行全量测试，也未进行第八次真实同步。

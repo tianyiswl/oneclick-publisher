@@ -11,7 +11,7 @@ import json
 from pathlib import Path
 import re
 from typing import Callable
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import urlsplit
 
 from .paths import COOKIE_DIR
 from .platform_data_collection_errors import CleanupReceipt, PlatformDataCollectionError
@@ -289,21 +289,21 @@ def _declared_response_bytes(response: object) -> int | None:
 
 
 def _detail_request_matches(request: object, content_id: str) -> bool:
-    """把详情响应绑定到浏览器实际发出的指定作品请求。"""
+    """请求只锁定官方详情端点；作品身份由响应正文严格回读。"""
 
     url = getattr(request, "url", None)
     if type(url) is not str:
         return False
     try:
         parsed = urlsplit(url)
-        pairs = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=True)
     except ValueError:
+        return False
+    if type(content_id) is not str or not content_id:
         return False
     return (
         parsed.scheme == "https"
         and parsed.hostname == _CREATOR_HOST
         and parsed.path == _CONTENT_DETAIL_PATH
-        and pairs == [("noteId", content_id)]
     )
 
 
