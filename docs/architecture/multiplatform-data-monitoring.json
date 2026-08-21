@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "一键发多平台数据监测架构",
+    "output": "multiplatform-data-monitoring.html",
+    "quality_profile": "showcase",
+    "viewBox": [1460, 760],
+    "views": [
+      {"id": "main-sync", "label": "正式同步主路径", "focus": ["monitor_ui", "sync_service", "collector_registry", "domestic_adapters", "session_runtime", "official_platforms"], "note": "用户选择主体后，由对应平台适配器在短会话中读取官方数据。"},
+      {"id": "persist", "label": "标准化与写入", "focus": ["domestic_adapters", "normalizer", "database", "sync_service"], "note": "平台字段转换为统一批次，原子写入后再读回确认。"},
+      {"id": "failure-boundary", "label": "失败保护", "focus": ["session_runtime", "normalizer", "database", "monitor_ui"], "note": "登录、验证、字段变化或写入失败均明确报错，不留下半批数据。"}
+    ]
+  },
+  "components": [
+    {"id": "monitor_ui", "type": "frontend", "label": "数据监测页", "sublabel": "平台 → 主体 → 区间", "pos": [40, 270], "size": [165, 74]},
+    {"id": "sync_service", "type": "backend", "label": "同步编排服务", "sublabel": "进度、失败、结果", "pos": [255, 270], "size": [170, 74]},
+    {"id": "collector_registry", "type": "backend", "label": "采集器注册表", "sublabel": "按 platformType 路由", "pos": [475, 270], "size": [175, 74]},
+    {"id": "domestic_adapters", "type": "backend", "label": "国内平台适配器", "sublabel": "公众号｜视频号｜B站｜快手", "pos": [700, 270], "size": [205, 74], "tag": "平台合同隔离"},
+    {"id": "session_runtime", "type": "security", "label": "受控只读会话", "sublabel": "登录态、超时、清理", "pos": [955, 270], "size": [175, 74]},
+    {"id": "official_platforms", "type": "external", "label": "平台创作者中心", "sublabel": "官方页面与 JSON 响应", "pos": [1180, 270], "size": [195, 74]},
+    {"id": "normalizer", "type": "backend", "label": "统一指标模型", "sublabel": "缺失≠0、口径可追溯", "pos": [700, 475], "size": [205, 74]},
+    {"id": "database", "type": "database", "label": "SQLite 数据层", "sublabel": "批次、指标、作品", "pos": [955, 475], "size": [175, 74]}
+  ],
+  "connections": [
+    {"id": "ui_to_sync", "from": "monitor_ui", "to": "sync_service", "variant": "emphasis"},
+    {"id": "sync_to_registry", "from": "sync_service", "to": "collector_registry"},
+    {"id": "registry_to_adapters", "from": "collector_registry", "to": "domestic_adapters", "label": "选择平台"},
+    {"id": "adapters_to_runtime", "from": "domestic_adapters", "to": "session_runtime", "label": "启动短会话", "labelDy": -31},
+    {"id": "runtime_to_official", "from": "session_runtime", "to": "official_platforms", "label": "HTTPS 只读", "variant": "security", "labelDy": -31},
+    {"id": "adapters_to_normalizer", "from": "domestic_adapters", "to": "normalizer", "label": "白名单字段", "fromSide": "bottom", "toSide": "top", "labelDy": 24},
+    {"id": "normalizer_to_database", "from": "normalizer", "to": "database", "label": "原子写入", "variant": "emphasis"}
+  ],
+  "cards": [
+    {"dot": "emerald", "title": "成功标准", "items": ["真实账号连续同步两次成功", "数据库批次、指标和作品可读回", "页面区分真实零值和未提供"]},
+    {"dot": "amber", "title": "失败处理", "items": ["登录、验证和接口变化分别提示", "任一失败不写入半批数据", "成功和失败后均关闭浏览器资源"]},
+    {"dot": "cyan", "title": "实施顺序", "items": ["公众号 → 视频号 → B站 → 快手", "没有真实账号时只完成离线合同", "集中登录后完成真实验收"]}
+  ]
+}
