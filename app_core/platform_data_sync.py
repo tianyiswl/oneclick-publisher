@@ -9,6 +9,7 @@ from . import account_service, platform_data_service
 from .platform_data_collection_errors import PlatformDataCollectionError
 from .platform_data_collectors import collector_for_platform
 from .platform_data_models import CollectionBatch, CollectionFailure
+from .xiaohongshu_data_collector import official_visible_readback
 
 
 _PROGRESS_MESSAGES = {
@@ -142,47 +143,60 @@ def _public_diagnostics(value: object) -> dict | None:
     return result
 
 
-def _validation_readback(account_id: int, diagnostics: dict) -> dict:
-    official = diagnostics["validation"]["officialVisible"]
-    followers = official["account"]["followersTotal"]
-    content_id = official["content"]["contentId"]
-    views = official["content"]["views"]
-    summary = platform_data_service.account_data_summary(account_id)
-    contents = platform_data_service.account_contents(account_id, limit=1, offset=0)
-    summary_metrics = summary.get("metrics") if type(summary) is dict else None
-    local_followers = (
-        summary_metrics.get("followers_total")
-        if type(summary_metrics) is dict
-        and type(summary_metrics.get("followers_total")) in (int, float)
-        else None
+def _atomic_validation_result(value: object, official_expected: object) -> dict | None:
+    if type(value) is not dict or set(value) != {
+        "officialVisible", "localReadback", "matches"
+    }:
+        return None
+    expected = _public_diagnostics(
+        {
+            "cleanup": {"closed": True, "aliveResourceCount": 0},
+            "validation": {
+                "mode": "official_visible_readback",
+                "officialVisible": official_expected,
+            },
+        }
     )
-    local_content = None
-    items = contents.get("items") if type(contents) is dict else None
-    if type(items) is list:
-        for item in items:
-            if type(item) is not dict or item.get("contentId") != content_id:
-                continue
-            metrics = item.get("metrics")
-            local_views = (
-                metrics.get("views")
-                if type(metrics) is dict and type(metrics.get("views")) in (int, float)
-                else None
-            )
-            local_content = {"contentId": content_id, "views": local_views}
-            break
-    if local_content is None:
-        local_content = {"contentId": content_id, "views": None}
+    if expected is None:
+        return None
+    official = expected["validation"]["officialVisible"]
+    if value.get("officialVisible") != official:
+        return None
+    local = value.get("localReadback")
+    matches = value.get("matches")
+    if (
+        type(local) is not dict
+        or set(local) != {"account", "content"}
+        or type(local.get("account")) is not dict
+        or set(local["account"]) != {"followersTotal"}
+        or type(local.get("content")) is not dict
+        or set(local["content"]) != {"contentId", "views"}
+        or type(matches) is not dict
+        or set(matches) != {"followersTotal", "views"}
+        or type(matches.get("followersTotal")) is not bool
+        or type(matches.get("views")) is not bool
+    ):
+        return None
+    local_followers = local["account"].get("followersTotal")
+    local_content_id = local["content"].get("contentId")
+    local_views = local["content"].get("views")
+    if (
+        type(local_followers) not in (int, float)
+        or type(local_content_id) is not str
+        or type(local_views) not in (int, float)
+        or local_followers != official["account"]["followersTotal"]
+        or local_content_id != official["content"]["contentId"]
+        or local_views != official["content"]["views"]
+        or not all(matches.values())
+    ):
+        return None
     return {
-        "mode": "official_visible_readback",
         "officialVisible": official,
         "localReadback": {
             "account": {"followersTotal": local_followers},
-            "content": local_content,
+            "content": {"contentId": local_content_id, "views": local_views},
         },
-        "matches": {
-            "followersTotal": local_followers == followers,
-            "views": local_content["views"] == views,
-        },
+        "matches": {"followersTotal": True, "views": True},
     }
 
 
@@ -267,10 +281,25 @@ def sync_account_data(
         if batch.content_data_available:
             _report_stage(report, "content_metrics")
         _report_stage(report, "persisting")
-        saved = platform_data_service.record_collection_sync(
-            account_id,
-            batch,
+        saved = (
+            platform_data_service.record_validated_collection_sync(
+                account_id,
+                batch,
+                diagnostics["validation"]["officialVisible"],
+            )
+            if validation_mode and diagnostics is not None and "validation" in diagnostics
+            else platform_data_service.record_collection_sync(account_id, batch)
         )
+        atomic_validation = None
+        if validation_mode:
+            if diagnostics is None or "validation" not in diagnostics:
+                raise CollectionFailure("metric_payload_invalid")
+            atomic_validation = _atomic_validation_result(
+                saved.get("validation"),
+                diagnostics["validation"]["officialVisible"],
+            )
+            if atomic_validation is None:
+                raise CollectionFailure("validation_readback_mismatch")
         result = _public_result(
             saved,
             account_id=account_id,
@@ -280,11 +309,12 @@ def sync_account_data(
             diagnostics=diagnostics,
         )
         if validation_mode:
-            if diagnostics is None or "validation" not in diagnostics:
-                raise CollectionFailure("metric_payload_invalid")
             result["diagnostics"] = {
                 "cleanup": diagnostics["cleanup"],
-                "validation": _validation_readback(account_id, diagnostics),
+                "validation": {
+                    "mode": "official_visible_readback",
+                    **atomic_validation,
+                },
             }
         _report_stage(report, _FINAL_STAGE_BY_STATUS[result["status"]])
         return result
@@ -306,8 +336,28 @@ def sync_account_data(
         )
     except (KeyboardInterrupt, SystemExit):
         raise
-    except CollectionFailure:
-        raise
+    except CollectionFailure as exc:
+        if exc.error_code != "validation_readback_mismatch":
+            raise
+        _report_stage(report, "failed")
+        saved = platform_data_service.record_failed_sync(
+            account_id,
+            platform_type,
+            source_mode,
+            "validation_readback_mismatch",
+        )
+        return _public_result(
+            saved,
+            account_id=account_id,
+            source_mode=source_mode,
+            metric_count=0,
+            content_count=0,
+            diagnostics=(
+                {"cleanup": diagnostics["cleanup"]}
+                if type(diagnostics) is dict and "cleanup" in diagnostics
+                else None
+            ),
+        )
     except BaseException:
         _report_stage(report, "failed")
         saved = platform_data_service.record_failed_sync(

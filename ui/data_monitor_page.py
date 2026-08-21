@@ -776,7 +776,7 @@ class DataMonitorPage(QWidget):
         subject_identity = self._current_subject_identity()
         if subject_identity is None:
             return
-        _platform_type, account_id = subject_identity
+        platform_type, account_id = subject_identity
         key = self._sync_key(subject_identity)
         terminal_state = {"value": "pending"}
 
@@ -822,7 +822,18 @@ class DataMonitorPage(QWidget):
 
         self.runner.run(
             key,
-            with_progress=lambda report: platform_data_sync.sync_account_data(account_id, report=report),
+            with_progress=lambda report: platform_data_sync.sync_account_data(
+                account_id,
+                report=report,
+                **(
+                    {
+                        "validation_mode": True,
+                        "visible_readback": platform_data_sync.official_visible_readback,
+                    }
+                    if platform_type == 1
+                    else {}
+                ),
+            ),
             on_started=started,
             on_progress=progressed,
             on_success=completed,

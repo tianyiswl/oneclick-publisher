@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 import json
 import math
@@ -17,6 +18,7 @@ from app_core.platform_data_collectors import (
     registered_platform_types,
 )
 from app_core.platform_data_models import CollectionFailure, ContentRecord
+from app_core import xiaohongshu_data_collector
 from app_core.xiaohongshu_data_collector import (
     CREATOR_HOME,
     DATA_ANALYSIS_URL,
@@ -327,6 +329,8 @@ class _FakePage:
 
     async def wait_for_timeout(self, _milliseconds: int) -> None:
         self.owner.wait_calls += 1
+        if self.owner.wait_hook is not None:
+            self.owner.wait_hook(_milliseconds)
         for response in self.owner.delayed_responses.pop(0) if self.owner.delayed_responses else ():
             request_callback = self.listeners.get("request")
             response_callback = self.listeners.get("response")
@@ -415,6 +419,7 @@ class _FakeRuntime:
         browser_close_error: BaseException | None = None,
         playwright_close_error: BaseException | None = None,
         delayed_responses: tuple[tuple[_FakeResponse, ...], ...] = (),
+        wait_hook=None,
     ) -> None:
         self.responses_by_url = responses_by_url
         self.final_urls = final_urls or {}
@@ -424,6 +429,7 @@ class _FakeRuntime:
         self.browser_close_error = browser_close_error
         self.playwright_close_error = playwright_close_error
         self.delayed_responses = list(delayed_responses)
+        self.wait_hook = wait_hook
         self.goto_urls: list[str] = []
         self.wait_calls = 0
         self.launch_options: list[dict] = []
@@ -443,6 +449,17 @@ class _Clock:
         except StopIteration:
             pass
         return self._last
+
+
+class _MutableClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance_milliseconds(self, milliseconds: int) -> None:
+        self.now += milliseconds / 1_000
 
 
 def _account(account_id: int = 21, file_path: str = "oneclick_1_test.json") -> dict:
@@ -522,12 +539,17 @@ class XiaohongshuDataCollectorTests(unittest.TestCase):
         responses: dict[str, tuple[_FakeResponse, ...]],
         **runtime_kwargs,
     ) -> tuple[XiaohongshuDataCollector, _FakeRuntime]:
-        fake = _FakeRuntime(responses, **runtime_kwargs)
+        clock = _MutableClock()
+        fake = _FakeRuntime(
+            responses,
+            wait_hook=clock.advance_milliseconds,
+            **runtime_kwargs,
+        )
         return (
             XiaohongshuDataCollector(
                 browser_factory=lambda: _FakeStarter(fake),
                 utc_now=lambda: datetime(2026, 8, 21, 4, 0, tzinfo=timezone.utc),
-                monotonic=_Clock(),
+                monotonic=clock,
             ),
             fake,
         )
@@ -603,6 +625,40 @@ class XiaohongshuDataCollectorTests(unittest.TestCase):
             },
         )
 
+    def test_production_visible_reader_projects_only_verified_numbers(self) -> None:
+        """生产 reader 若回传页面文字或额外字段，就会把可见页以外的数据带出浏览器。"""
+
+        class Page:
+            async def evaluate(self, _script, content_id):
+                self.content_id = content_id
+                return {
+                    "account": {"followersTotal": 3199, "private": "drop"},
+                    "content": {"contentId": content_id, "views": 148, "html": "drop"},
+                }
+
+        batch = XiaohongshuDataCollector(
+            browser_factory=lambda: _FakeStarter(_FakeRuntime(_reviewed_success_responses())),
+            utc_now=lambda: datetime(2026, 8, 21, 4, 0, tzinfo=timezone.utc),
+            monotonic=_Clock(),
+        ).collect_browser_signed(_account())
+        page = Page()
+        reader = getattr(xiaohongshu_data_collector, "official_visible_readback", None)
+
+        self.assertTrue(callable(reader))
+
+        result = asyncio.run(
+            reader(page, batch)
+        )
+
+        self.assertEqual(page.content_id, _CONTENT_ID)
+        self.assertEqual(
+            result,
+            {
+                "account": {"followersTotal": 3199},
+                "content": {"contentId": _CONTENT_ID, "views": 148},
+            },
+        )
+
     def test_account_metrics_are_scoped_to_the_strict_requested_account(self) -> None:
         """固定 account key 会把不同小红书主体的粉丝累计量混在一起。"""
 
@@ -643,18 +699,17 @@ class XiaohongshuDataCollectorTests(unittest.TestCase):
         self.assertEqual(batch.warning_code, "")
         self.assertEqual(fake.goto_urls, [CREATOR_HOME, DATA_ANALYSIS_URL])
 
-    def test_missing_content_list_keeps_account_metrics_but_marks_list_unavailable(self) -> None:
-        """没有可信列表响应与已证实的零条作品必须是两种不同结果。"""
+    def test_missing_content_list_stops_at_deadline_without_partial_snapshot(self) -> None:
+        """列表阶段到 deadline 仍无官方响应时，不能把缺失伪装成部分成功。"""
 
         responses = _reviewed_success_responses()
         responses[DATA_ANALYSIS_URL] = ()
         collector, fake = self._collector_with_responses(responses)
 
-        batch = collector.collect_browser_signed(_account())
-
-        self.assertTrue(batch.account_metrics_available)
-        self.assertFalse(batch.content_data_available)
-        self.assertEqual(batch.warning_code, "content_list_unavailable")
+        self.assert_collection_error(
+            lambda: collector.collect_browser_signed(_account()),
+            "browser_signature_timeout",
+        )
         self.assertEqual(fake.goto_urls, [CREATOR_HOME, DATA_ANALYSIS_URL])
 
     def test_delayed_reviewed_content_list_is_polled_before_partial_result(self) -> None:
@@ -693,27 +748,86 @@ class XiaohongshuDataCollectorTests(unittest.TestCase):
         self.assertEqual(fake.goto_urls, [CREATOR_HOME, DATA_ANALYSIS_URL, _detail_url()])
         self.assertGreaterEqual(fake.wait_calls, 1)
 
-    def test_cleanup_failure_never_returns_success(self) -> None:
-        """资源关闭报错若被吞掉，会把不完整会话误写成采集成功。"""
+    def test_phase_polling_accepts_response_after_750ms_before_shared_deadline(self) -> None:
+        """把阶段等待写死为三次会漏掉 750ms 后、总时限内才到的详情。"""
+
+        responses = _reviewed_success_responses()
+        delayed_detail = responses[_detail_url()]
+        responses[_detail_url()] = ()
+        clock = _MutableClock()
+        fake = _FakeRuntime(
+            responses,
+            delayed_responses=((), (), (), delayed_detail),
+            wait_hook=clock.advance_milliseconds,
+        )
+        collector = XiaohongshuDataCollector(
+            browser_factory=lambda: _FakeStarter(fake),
+            utc_now=lambda: datetime(2026, 8, 21, 4, 0, tzinfo=timezone.utc),
+            monotonic=clock,
+        )
+
+        with patch("app_core.xiaohongshu_data_collector._TOTAL_TIMEOUT_SECONDS", 1.5), patch(
+            "app_core.xiaohongshu_data_collector._CLEANUP_RESERVE_SECONDS", 0.1
+        ):
+            batch = collector.collect_browser_signed(_account())
+
+        self.assertTrue(batch.content_data_available)
+        self.assertEqual([content.content_id for content in batch.contents], [_CONTENT_ID])
+        self.assertEqual(fake.wait_calls, 4)
+        self.assertLess(clock.now, 1.4)
+
+    def test_phase_polling_stops_at_shared_deadline(self) -> None:
+        """deadline 后还继续轮询会让浏览器会话超出统一资源预算。"""
+
+        responses = _reviewed_success_responses()
+        responses[DATA_ANALYSIS_URL] = ()
+        clock = _MutableClock()
+        fake = _FakeRuntime(
+            responses,
+            delayed_responses=((), (), (), (), ()),
+            wait_hook=clock.advance_milliseconds,
+        )
+        collector = XiaohongshuDataCollector(
+            browser_factory=lambda: _FakeStarter(fake),
+            utc_now=lambda: datetime(2026, 8, 21, 4, 0, tzinfo=timezone.utc),
+            monotonic=clock,
+        )
+
+        with patch("app_core.xiaohongshu_data_collector._TOTAL_TIMEOUT_SECONDS", 1.1), patch(
+            "app_core.xiaohongshu_data_collector._CLEANUP_RESERVE_SECONDS", 0.1
+        ):
+            self.assert_collection_error(
+                lambda: collector.collect_browser_signed(_account()),
+                "browser_signature_timeout",
+            )
+
+        self.assertEqual(fake.wait_calls, 4)
+        self.assertEqual(fake.cleanup, ["page", "context", "browser", "playwright"])
+
+    def test_context_close_error_does_not_claim_browser_is_alive_after_browser_closes(self) -> None:
+        """把下层 close 错误数当存活数，会误报已由 browser 关闭的 context。"""
 
         collector, fake = self._collector_with_responses(
             _reviewed_success_responses(),
             context_close_error=RuntimeError("private"),
         )
 
-        self.assert_collection_error(
-            lambda: collector.collect_browser_signed(_account()),
-            "browser_cleanup_incomplete",
+        outcome = collector.collect_browser_signed_with_diagnostics(_account())
+
+        self.assertEqual(
+            outcome.public_diagnostics(),
+            {"cleanup": {"closed": True, "aliveResourceCount": 0}},
         )
         self.assertIn("browser", fake.cleanup)
         self.assertIn("playwright", fake.cleanup)
 
-    def test_cleanup_failure_exposes_non_success_receipt_without_error_text(self) -> None:
-        """关闭失败若没有非零回执，调用方会把失败会话误当作完全关闭。"""
+    def test_browser_close_failure_counts_only_unproven_top_level_resource(self) -> None:
+        """组合 close 异常若把 page/context 错误都累加，会伪造存活资源数。"""
 
         collector, _fake = self._collector_with_responses(
             _reviewed_success_responses(),
             context_close_error=RuntimeError("private cleanup failure"),
+            browser_close_error=RuntimeError("private browser failure"),
         )
 
         with self.assertRaises(PlatformDataCollectionError) as caught:
@@ -877,9 +991,10 @@ class XiaohongshuDataCollectorTests(unittest.TestCase):
 
         collector, fake = self._collector_with_responses(_reviewed_success_responses())
         fake.page = _LatePage(fake)
-        batch = collector.collect_browser_signed(_account())
-        self.assertFalse(batch.content_data_available)
-        self.assertEqual(batch.warning_code, "content_payload_invalid")
+        self.assert_collection_error(
+            lambda: collector.collect_browser_signed(_account()),
+            "browser_signature_timeout",
+        )
         self.assertEqual(fake.goto_urls, [CREATOR_HOME, DATA_ANALYSIS_URL, _detail_url()])
 
     def test_duplicate_response_is_rejected(self) -> None:

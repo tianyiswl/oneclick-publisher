@@ -764,6 +764,67 @@ class DataMonitorPageTests(unittest.TestCase):
         self.assertNotIn("/private", page.status_label.text())
         self.assertFalse(runner.is_running("platform-data-sync:3:12"))
 
+    def test_xhs_sync_click_uses_headed_validation_with_production_reader(self) -> None:
+        """删掉小红书按钮的验收参数时，正式入口会退回无头普通同步。"""
+
+        pool = QueuedPool()
+        runner = BackgroundTaskRunner()
+        runner.pool = pool
+        calls: list[tuple[int, dict]] = []
+
+        def sync(account_id: int, report, **kwargs) -> dict:
+            calls.append((account_id, kwargs))
+            report({"stage": "completed", "message": "ignored"})
+            return {
+                "accountId": account_id,
+                "status": "success",
+                "sourceMode": "browser_signed",
+                "errorCode": "",
+                "metricCount": 2,
+                "contentCount": 1,
+            }
+
+        with patch("ui.data_monitor_page.platform_data_sync.sync_account_data", sync):
+            page = self._page(accounts=[XHS_ACCOUNT], runner=runner)
+            page.platform_combo.setCurrentIndex(page.platform_combo.findData(1))
+            self.app.processEvents()
+            page.sync_button.click()
+            pool.tasks[0].run()
+            self.app.processEvents()
+
+        self.assertEqual(len(calls), 1)
+        account_id, kwargs = calls[0]
+        self.assertEqual(account_id, XHS_ACCOUNT["id"])
+        self.assertEqual(kwargs.get("validation_mode"), True)
+        self.assertTrue(callable(kwargs.get("visible_readback")))
+
+    def test_douyin_sync_click_keeps_ordinary_sync_arguments(self) -> None:
+        """把小红书验收参数误传给抖音会改变已有同步协议。"""
+
+        pool = QueuedPool()
+        runner = BackgroundTaskRunner()
+        runner.pool = pool
+        calls: list[tuple[int, dict]] = []
+
+        def sync(account_id: int, report, **kwargs) -> dict:
+            calls.append((account_id, kwargs))
+            return {
+                "accountId": account_id,
+                "status": "success",
+                "sourceMode": "direct_session",
+                "errorCode": "",
+                "metricCount": 2,
+                "contentCount": 1,
+            }
+
+        with patch("ui.data_monitor_page.platform_data_sync.sync_account_data", sync):
+            page = self._page(accounts=[ACCOUNT], runner=runner)
+            page.sync_button.click()
+            pool.tasks[0].run()
+            self.app.processEvents()
+
+        self.assertEqual(calls, [(ACCOUNT["id"], {})])
+
     def test_worker_error_status_survives_finished_cleanup(self) -> None:
         """worker 失败后 finished 只能恢复控件，不得用旧摘要覆盖失败。"""
 

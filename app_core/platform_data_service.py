@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
+import math
 from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
@@ -32,6 +33,7 @@ ALLOWED_ERROR_CODES = frozenset(
         "content_list_unavailable",
         "content_list_truncated",
         "content_payload_invalid",
+        "validation_readback_mismatch",
     }
 )
 ALLOWED_SYNC_STATUSES = frozenset({"success", "partial_success", "failed"})
@@ -262,9 +264,85 @@ def _validate_metric_identities(
             raise CollectionFailure("metric_payload_invalid")
 
 
+def _validation_visible(value: object) -> dict:
+    if type(value) is not dict or set(value) != {"account", "content"}:
+        raise CollectionFailure("metric_payload_invalid")
+    account = value.get("account")
+    content = value.get("content")
+    if (
+        type(account) is not dict
+        or set(account) != {"followersTotal"}
+        or type(content) is not dict
+        or set(content) != {"contentId", "views"}
+    ):
+        raise CollectionFailure("metric_payload_invalid")
+    followers = account.get("followersTotal")
+    content_id = content.get("contentId")
+    views = content.get("views")
+    if (
+        type(followers) not in (int, float)
+        or not math.isfinite(float(followers))
+        or type(content_id) is not str
+        or type(views) not in (int, float)
+        or not math.isfinite(float(views))
+    ):
+        raise CollectionFailure("metric_payload_invalid")
+    return {
+        "account": {"followersTotal": followers},
+        "content": {"contentId": content_id, "views": views},
+    }
+
+
+def _validated_snapshot_readback(
+    conn,
+    *,
+    sync_run_id: int,
+    account_id: int,
+    expected: dict,
+) -> dict:
+    followers_row = conn.execute(
+        """
+        SELECT metricValue FROM platform_metric_snapshots
+        WHERE syncRunId = ? AND accountId = ? AND entityType = 'account'
+          AND entityKey = ? AND metricKey = 'followers_total'
+        LIMIT 1
+        """,
+        (sync_run_id, account_id, f"account:{account_id}"),
+    ).fetchone()
+    content_id = expected["content"]["contentId"]
+    views_row = conn.execute(
+        """
+        SELECT metricValue FROM platform_metric_snapshots
+        WHERE syncRunId = ? AND accountId = ? AND entityType = 'content'
+          AND entityKey = ? AND metricKey = 'views'
+        LIMIT 1
+        """,
+        (sync_run_id, account_id, content_id),
+    ).fetchone()
+    local_followers = float(followers_row["metricValue"]) if followers_row else None
+    local_views = float(views_row["metricValue"]) if views_row else None
+    local = {
+        "account": {"followersTotal": local_followers},
+        "content": {"contentId": content_id, "views": local_views},
+    }
+    matches = {
+        "followersTotal": local_followers == expected["account"]["followersTotal"],
+        "views": local_views == expected["content"]["views"],
+    }
+    if not all(matches.values()):
+        raise CollectionFailure("validation_readback_mismatch")
+    return {
+        "officialVisible": expected,
+        "localReadback": local,
+        "matches": matches,
+    }
+
+
 def _record_collection_sync(
     account_id: int,
     batch: CollectionBatch,
+    *,
+    validation_visible: object | None = None,
 ) -> dict:
     account = _account_id(account_id)
     if type(batch) is not CollectionBatch:
@@ -273,6 +351,13 @@ def _record_collection_sync(
     source_mode = _source_mode(batch.source_mode)
     warning_code = _warning_code(batch.warning_code)
     _validate_metric_identities(account, batch)
+    validation = (
+        _validation_visible(validation_visible)
+        if validation_visible is not None
+        else None
+    )
+    if validation is not None and platform_type != 1:
+        raise CollectionFailure("metric_payload_invalid")
     complete = (
         batch.account_metrics_available
         and batch.content_data_available
@@ -323,23 +408,50 @@ def _record_collection_sync(
                 metric_count=len(batch.metrics),
                 finished_at=finished_at,
             )
+            validation_result = (
+                _validated_snapshot_readback(
+                    conn,
+                    sync_run_id=sync_run_id,
+                    account_id=account,
+                    expected=validation,
+                )
+                if validation is not None
+                else None
+            )
     except CollectionFailure:
         raise
     except (KeyboardInterrupt, SystemExit):
         raise
     except BaseException:
         raise CollectionFailure("sync_persist_failed") from None
-    return {
+    result = {
         "accountId": account,
         "status": status,
         "sourceMode": source_mode,
         "errorCode": error_code,
         "metricCount": len(batch.metrics),
     }
+    if validation_result is not None:
+        result["validation"] = validation_result
+    return result
 
 
 def record_collection_sync(account_id: int, batch: CollectionBatch) -> dict:
     return _record_collection_sync(account_id, batch)
+
+
+def record_validated_collection_sync(
+    account_id: int,
+    batch: CollectionBatch,
+    official_visible: object,
+) -> dict:
+    """在同一 SQLite 事务中保存并核对官方可见的白名单读回。"""
+
+    return _record_collection_sync(
+        account_id,
+        batch,
+        validation_visible=official_visible,
+    )
 
 
 def record_successful_sync(account_id: int, batch: CollectionBatch) -> dict:

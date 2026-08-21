@@ -409,26 +409,30 @@ class PlatformDataSyncTests(unittest.TestCase):
             return_value=collector,
         ), patch.object(
             platform_data_sync.platform_data_service,
-            "record_collection_sync",
+            "record_validated_collection_sync",
             return_value={
                 "accountId": 21,
                 "status": "success",
                 "sourceMode": "browser_signed",
                 "errorCode": "",
                 "metricCount": 2,
-            },
-        ), patch.object(
-            platform_data_sync.platform_data_service,
-            "account_data_summary",
-            return_value={"metrics": {"followers_total": 125}},
-        ), patch.object(
-            platform_data_sync.platform_data_service,
-            "account_contents",
-            return_value={
-                "items": [{
-                    "contentId": "0123456789abcdef01234567",
-                    "metrics": {"views": 400},
-                }]
+                "validation": {
+                    "officialVisible": {
+                        "account": {"followersTotal": 125},
+                        "content": {
+                            "contentId": "0123456789abcdef01234567",
+                            "views": 400,
+                        },
+                    },
+                    "localReadback": {
+                        "account": {"followersTotal": 125},
+                        "content": {
+                            "contentId": "0123456789abcdef01234567",
+                            "views": 400,
+                        },
+                    },
+                    "matches": {"followersTotal": True, "views": True},
+                },
             },
         ):
             result = platform_data_sync.sync_account_data(
@@ -491,7 +495,127 @@ class PlatformDataSyncTests(unittest.TestCase):
             return_value=collector,
         ) as factory, patch.object(
             platform_data_sync.platform_data_service,
+            "record_validated_collection_sync",
+            return_value={
+                "accountId": 21,
+                "status": "success",
+                "sourceMode": "browser_signed",
+                "errorCode": "",
+                "metricCount": 2,
+                "validation": {
+                    "officialVisible": {
+                        "account": {"followersTotal": 125},
+                        "content": {
+                            "contentId": "0123456789abcdef01234567",
+                            "views": 400,
+                        },
+                    },
+                    "localReadback": {
+                        "account": {"followersTotal": 125},
+                        "content": {
+                            "contentId": "0123456789abcdef01234567",
+                            "views": 400,
+                        },
+                    },
+                    "matches": {"followersTotal": True, "views": True},
+                },
+            },
+        ):
+            platform_data_sync.sync_account_data(
+                21, validation_mode=True, visible_readback=reader
+            )
+
+        self.assertEqual(factory.call_args.args, (1,))
+        self.assertEqual(factory.call_args.kwargs, {"visible_readback": reader})
+
+    def test_validation_mismatch_records_only_failed_run(self) -> None:
+        """若把校验失败仍包装为成功，桌面页会把未证实快照当作可用数据。"""
+
+        collector = DetailedXhsCollector(
+            XiaohongshuCollectionOutcome(
+                batch=xhs_collection_batch(),
+                cleanup=CleanupReceipt(closed=True, alive_resource_count=0),
+                validation={
+                    "mode": "official_visible_readback",
+                    "officialVisible": {
+                        "account": {"followersTotal": 125},
+                        "content": {
+                            "contentId": "0123456789abcdef01234567",
+                            "views": 400,
+                        },
+                    },
+                },
+            )
+        )
+        with patch.object(
+            platform_data_sync.account_service,
+            "list_accounts",
+            return_value=[xhs_account()],
+        ), patch.object(
+            platform_data_sync,
+            "collector_for_platform",
+            return_value=collector,
+        ), patch.object(
+            platform_data_sync.platform_data_service,
+            "record_validated_collection_sync",
+            side_effect=CollectionFailure("validation_readback_mismatch"),
+        ) as validated_write, patch.object(
+            platform_data_sync.platform_data_service,
             "record_collection_sync",
+        ) as ordinary_write, patch.object(
+            platform_data_sync.platform_data_service,
+            "record_failed_sync",
+            return_value={
+                "accountId": 21,
+                "status": "failed",
+                "sourceMode": "browser_signed",
+                "errorCode": "validation_readback_mismatch",
+                "metricCount": 0,
+            },
+        ) as failed_write:
+            result = platform_data_sync.sync_account_data(
+                21,
+                validation_mode=True,
+                visible_readback=lambda _page, _batch: None,
+            )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["errorCode"], "validation_readback_mismatch")
+        self.assertEqual(result["diagnostics"], {"cleanup": {"closed": True, "aliveResourceCount": 0}})
+        self.assertEqual(validated_write.call_count, 1)
+        ordinary_write.assert_not_called()
+        self.assertEqual(failed_write.call_args.args[-1], "validation_readback_mismatch")
+
+    def test_validation_success_without_atomic_readback_proof_is_failed(self) -> None:
+        """服务层若漏回同事务比对，验收同步不能留下没有证明的成功结果。"""
+
+        collector = DetailedXhsCollector(
+            XiaohongshuCollectionOutcome(
+                batch=xhs_collection_batch(),
+                cleanup=CleanupReceipt(closed=True, alive_resource_count=0),
+                validation={
+                    "mode": "official_visible_readback",
+                    "officialVisible": {
+                        "account": {"followersTotal": 125},
+                        "content": {
+                            "contentId": "0123456789abcdef01234567",
+                            "views": 400,
+                        },
+                    },
+                },
+            )
+        )
+        with patch.object(
+            platform_data_sync.account_service,
+            "list_accounts",
+            return_value=[xhs_account()],
+        ), patch.object(
+            platform_data_sync,
+            "collector_for_platform",
+            return_value=collector,
+        ), patch.object(
+            platform_data_sync.platform_data_service,
+            "record_validated_collection_sync",
             return_value={
                 "accountId": 21,
                 "status": "success",
@@ -501,24 +625,24 @@ class PlatformDataSyncTests(unittest.TestCase):
             },
         ), patch.object(
             platform_data_sync.platform_data_service,
-            "account_data_summary",
-            return_value={"metrics": {"followers_total": 125}},
-        ), patch.object(
-            platform_data_sync.platform_data_service,
-            "account_contents",
+            "record_failed_sync",
             return_value={
-                "items": [{
-                    "contentId": "0123456789abcdef01234567",
-                    "metrics": {"views": 400},
-                }]
+                "accountId": 21,
+                "status": "failed",
+                "sourceMode": "browser_signed",
+                "errorCode": "validation_readback_mismatch",
+                "metricCount": 0,
             },
-        ):
-            platform_data_sync.sync_account_data(
-                21, validation_mode=True, visible_readback=reader
+        ) as failed_write:
+            result = platform_data_sync.sync_account_data(
+                21,
+                validation_mode=True,
+                visible_readback=lambda _page, _batch: None,
             )
 
-        self.assertEqual(factory.call_args.args, (1,))
-        self.assertEqual(factory.call_args.kwargs, {"visible_readback": reader})
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["errorCode"], "validation_readback_mismatch")
+        self.assertEqual(failed_write.call_args.args[-1], "validation_readback_mismatch")
 
     def test_xhs_collection_failures_are_persisted_with_fixed_public_codes(self) -> None:
         """小红书受控失败不得把会话或浏览器异常原文带出同步边界。"""

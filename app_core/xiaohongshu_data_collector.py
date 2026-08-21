@@ -35,7 +35,6 @@ _MAX_RESPONSE_BYTES = 1_048_576
 _MAX_TOTAL_RESPONSE_BYTES = 4_194_304
 _MAX_RESPONSES = 100
 _MAX_REQUESTS = _MAX_RESPONSES * 4
-_RESPONSE_CAPTURE_POLL_ATTEMPTS = 3
 _RESPONSE_CAPTURE_POLL_MS = 250
 _ACCOUNT_PATHS = frozenset(
     {
@@ -134,6 +133,71 @@ def _visible_readback_payload(value: object, batch: CollectionBatch) -> dict | N
         "account": {"followersTotal": followers_total},
         "content": {"contentId": content_id, "views": views},
     }
+
+
+async def official_visible_readback(page: object, batch: CollectionBatch) -> dict | None:
+    """从官方可见卡片投影三项验收数字，不回传页面文本或节点。"""
+
+    if type(batch) is not CollectionBatch or not batch.contents:
+        return None
+    evaluate = getattr(page, "evaluate", None)
+    if not callable(evaluate):
+        return None
+    try:
+        value = await evaluate(
+            """(contentId) => {
+                const number = (node) => {
+                  const text = typeof node === "string" ? node : node?.textContent;
+                  if (typeof text !== "string") return null;
+                  const compact = text.replace(/[\\s,，]/g, "");
+                  if (!/^\\d+(?:\\.\\d+)?$/.test(compact)) return null;
+                  const parsed = Number(compact);
+                  return Number.isFinite(parsed) ? parsed : null;
+                };
+                const firstNumber = (selectors) => {
+                  for (const selector of selectors) {
+                    const value = number(document.querySelector(selector));
+                    if (value !== null) return value;
+                  }
+                  return null;
+                };
+                const followersTotal = firstNumber([
+                  '[data-testid="fans-count"]',
+                  '[data-fans-count]',
+                  '.fans-count',
+                ]);
+                const note = Array.from(document.querySelectorAll('[data-note-id]'))
+                  .find((node) => node.getAttribute('data-note-id') === contentId);
+                const views = note === undefined ? null : firstNumber([
+                  `[data-note-id="${CSS.escape(contentId)}"] [data-testid="view-count"]`,
+                  `[data-note-id="${CSS.escape(contentId)}"] [data-view-count]`,
+                  `[data-note-id="${CSS.escape(contentId)}"] .view-count`,
+                ]);
+                return {
+                  account: {followersTotal},
+                  content: {contentId, views},
+                };
+            }""",
+            batch.contents[0].content_id,
+        )
+    except BaseException:
+        return None
+    if type(value) is not dict:
+        return None
+    account = value.get("account")
+    content = value.get("content")
+    if type(account) is not dict or type(content) is not dict:
+        return None
+    return _visible_readback_payload(
+        {
+            "account": {"followersTotal": account.get("followersTotal")},
+            "content": {
+                "contentId": content.get("contentId"),
+                "views": content.get("views"),
+            },
+        },
+        batch,
+    )
 
 
 def _state_path(account: object) -> tuple[int, Path]:
@@ -342,6 +406,8 @@ class XiaohongshuDataCollector:
         capture_error: PlatformDataCollectionError | None = None
         caught: BaseException | None = None
         cleanup_errors: list[BaseException] = []
+        browser_close_error: BaseException | None = None
+        runtime_close_error: BaseException | None = None
         batch: CollectionBatch | None = None
         validation = None
 
@@ -464,17 +530,26 @@ class XiaohongshuDataCollector:
                     _PHASE_LIST: {_CONTENT_LIST_PATH},
                     _PHASE_DETAIL: {_CONTENT_DETAIL_PATH},
                 }[current_phase]
-                for attempt in range(_RESPONSE_CAPTURE_POLL_ATTEMPTS + 1):
+                while True:
                     await flush_responses()
                     if any(path in payloads for path in required_paths):
-                        break
-                    if attempt == _RESPONSE_CAPTURE_POLL_ATTEMPTS:
                         break
                     waiter = getattr(page, "wait_for_timeout", None)
                     if not callable(waiter):
                         raise _collection_error("browser_signature_timeout") from None
+                    remaining = work_deadline - self._monotonic()
+                    if remaining <= 0:
+                        raise _collection_error("browser_signature_timeout") from None
                     await _await_until(
-                        waiter(_RESPONSE_CAPTURE_POLL_MS),
+                        waiter(
+                            max(
+                                1,
+                                min(
+                                    _RESPONSE_CAPTURE_POLL_MS,
+                                    int(remaining * 1_000),
+                                ),
+                            )
+                        ),
                         deadline=work_deadline,
                         monotonic=self._monotonic,
                     )
@@ -570,6 +645,10 @@ class XiaohongshuDataCollector:
                 )
                 if close_error is not None:
                     cleanup_errors.append(close_error)
+                    if index == 2:
+                        browser_close_error = close_error
+                    elif index == 3:
+                        runtime_close_error = close_error
 
         process_error = next(
             (
@@ -582,10 +661,13 @@ class XiaohongshuDataCollector:
         if process_error is not None:
             raise process_error
         receipt = CleanupReceipt(
-            closed=not cleanup_errors,
-            alive_resource_count=len(cleanup_errors),
+            closed=browser_close_error is None and runtime_close_error is None,
+            alive_resource_count=(
+                int(browser_close_error is not None)
+                + int(runtime_close_error is not None)
+            ),
         )
-        if cleanup_errors:
+        if receipt.alive_resource_count:
             raise _collection_error(
                 "browser_cleanup_incomplete", cleanup_receipt=receipt
             ) from None

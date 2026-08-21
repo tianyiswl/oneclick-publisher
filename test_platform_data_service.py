@@ -1085,6 +1085,104 @@ class PlatformDataServiceTests(unittest.TestCase):
             platform_data_service.account_contents(self.account_id)["total"], 0
         )
 
+    def test_validated_xhs_mismatch_rolls_back_new_snapshots_before_failed_run(self) -> None:
+        """删掉同事务读回校验会把与官方页不一致的新快照提交为成功。"""
+
+        with database.connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO user_info
+                    (type, filePath, userName, status, profileName, authMode)
+                VALUES (1, 'oneclick_1_validation.json', '小红书账号', 1, '验收主体', 'browser')
+                """
+            )
+            account_id = int(cursor.lastrowid)
+
+        def xhs_batch(followers: int, views: int) -> CollectionBatch:
+            return CollectionBatch(
+                platform_type=1,
+                source_mode="browser_signed",
+                metrics=(
+                    MetricPoint(
+                        entity_type="account",
+                        entity_key=f"account:{account_id}",
+                        metric_key="followers_total",
+                        raw_metric_key="fans_count",
+                        metric_value=followers,
+                        metric_unit="count",
+                        metric_scope="lifetime_total",
+                        period_start="2026-08-20",
+                        period_end="2026-08-20",
+                        observed_at="2026-08-20T12:00:00+08:00",
+                    ),
+                    MetricPoint(
+                        entity_type="content",
+                        entity_key="0123456789abcdef01234567",
+                        metric_key="views",
+                        raw_metric_key="view_count",
+                        metric_value=views,
+                        metric_unit="count",
+                        metric_scope="lifetime_total",
+                        period_start="2026-08-20",
+                        period_end="2026-08-20",
+                        observed_at="2026-08-20T12:00:00+08:00",
+                    ),
+                ),
+                contents=(
+                    ContentRecord(
+                        content_id="0123456789abcdef01234567",
+                        title="",
+                        cover_url="",
+                        published_at="",
+                        content_status="unavailable",
+                        content_type="unavailable",
+                    ),
+                ),
+                account_metrics_available=True,
+                content_data_available=True,
+                platform_observed_at="2026-08-20T12:00:00+08:00",
+            )
+
+        platform_data_service.record_collection_sync(account_id, xhs_batch(100, 200))
+        writer = getattr(platform_data_service, "record_validated_collection_sync", None)
+        self.assertTrue(callable(writer))
+
+        with self.assertRaises(CollectionFailure) as caught:
+            writer(
+                account_id,
+                xhs_batch(125, 400),
+                {
+                    "account": {"followersTotal": 125},
+                    "content": {
+                        "contentId": "0123456789abcdef01234567",
+                        "views": 401,
+                    },
+                },
+            )
+        self.assertEqual(caught.exception.error_code, "validation_readback_mismatch")
+        platform_data_service.record_failed_sync(
+            account_id, 1, "browser_signed", "validation_readback_mismatch"
+        )
+
+        self.assertEqual(self._table_counts(), (2, 2, 1))
+        with database.connect() as conn:
+            old_views = conn.execute(
+                """
+                SELECT metricValue FROM platform_metric_snapshots
+                WHERE accountId = ? AND entityType = 'content' AND metricKey = 'views'
+                """,
+                (account_id,),
+            ).fetchone()[0]
+            latest = conn.execute(
+                """
+                SELECT status, errorCode FROM platform_data_sync_runs
+                WHERE accountId = ? ORDER BY id DESC LIMIT 1
+                """,
+                (account_id,),
+            ).fetchone()
+        self.assertEqual(old_views, 200)
+        self.assertEqual(tuple(latest), ("failed", "validation_readback_mismatch"))
+
     def test_xhs_confirmed_zero_contents_remains_available_not_missing(self) -> None:
         """小红书已确认零作品不是作品列表缺失，也不能显示为失败。"""
 
