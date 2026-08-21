@@ -99,7 +99,16 @@ class WechatDataCollectorTests(unittest.TestCase):
         self.assertEqual(points[("content", "1001:1", "views")], 80)
         self.assertEqual(batch.contents[0].content_id, "1001:1")
         self.assertEqual(batch.contents[0].title, "sample")
+        self.assertEqual(batch.contents[0].published_at, "2026-04-19")
         self.assertEqual(batch.warning_code, "")
+
+        content_point = next(
+            point
+            for point in batch.metrics
+            if point.entity_type == "content" and point.metric_key == "views"
+        )
+        self.assertEqual(content_point.period_start, "2026-04-21")
+        self.assertEqual(content_point.period_end, "2026-04-21")
 
     def test_parser_returns_account_only_without_manufacturing_articles(self) -> None:
         """文章响应缺失时不能用空壳作品伪造完整同步。"""
@@ -172,7 +181,7 @@ class WechatDataCollectorTests(unittest.TestCase):
             5, wechat_captures(article_date="20260419")
         )
 
-        self.assertEqual(batch.contents[0].published_at, "2026-04-19T00:00:00+08:00")
+        self.assertEqual(batch.contents[0].published_at, "2026-04-19")
 
     def test_parser_normalizes_slash_beijing_article_date(self) -> None:
         """公众号真实列表的斜杠日期必须严格转成北京时间自然日。"""
@@ -181,7 +190,7 @@ class WechatDataCollectorTests(unittest.TestCase):
             5, wechat_captures(article_date="2026/04/19")
         )
 
-        self.assertEqual(batch.contents[0].published_at, "2026-04-19T00:00:00+08:00")
+        self.assertEqual(batch.contents[0].published_at, "2026-04-19")
 
     def test_parser_deduplicates_identical_content_contract_responses(self) -> None:
         """文章列表重复回执不能制造重复作品。"""

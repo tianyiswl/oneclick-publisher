@@ -188,6 +188,40 @@ class StaggeredResponsePage(DynamicNavigationPage):
         await asyncio.sleep(milliseconds / 1000)
 
 
+class CrossPhaseLateResponsePage(DynamicNavigationPage):
+    """账号请求先发出，响应在文章阶段到达，文章响应随后才到。"""
+
+    async def goto(self, url: str, *, wait_until: str, timeout: float) -> None:
+        self.goto_urls.append(url)
+        self.url = url
+        path = urlsplit(url).path
+        if path == "/account-page":
+            first, late = self.responses_by_path[path]
+            self.listeners["request"](first.request)
+            self.listeners["response"](first)
+            self.listeners["request"](late.request)
+
+            async def emit_late_account() -> None:
+                await asyncio.sleep(0.003)
+                self.listeners["response"](late)
+
+            asyncio.create_task(emit_late_account())
+        elif path == "/content-page":
+            content = self.responses_by_path[path][0]
+
+            async def emit_content() -> None:
+                await asyncio.sleep(0.008)
+                self.listeners["request"](content.request)
+                self.listeners["response"](content)
+
+            asyncio.create_task(emit_content())
+        await asyncio.sleep(0)
+
+    async def wait_for_timeout(self, milliseconds: int) -> None:
+        # Compress the collector's poll interval while preserving event order.
+        await asyncio.sleep(0.001)
+
+
 class FakeContext:
     def __init__(self, page: FakePage) -> None:
         self.page = page
@@ -550,6 +584,53 @@ class DomesticBrowserCollectorTests(unittest.TestCase):
                     "account": "/account-page",
                 },
                 phase_settle_milliseconds=10,
+            ),
+            browser_factory=lambda: FakeStarter(FakeBrowser(FakeContext(page))),
+            parse_captures=parser,
+        )
+
+        batch = collector.collect(account())
+
+        self.assertEqual(batch.source_mode, "browser_signed")
+
+    def test_previous_phase_late_response_does_not_release_content_wait(self) -> None:
+        """账号迟到响应不能冒充文章阶段已经取得数据。"""
+
+        page = CrossPhaseLateResponsePage(
+            hrefs=(
+                "https://official.example/account-page?token=private-token",
+                "https://official.example/content-page?token=private-token",
+            ),
+            responses_by_path={
+                "/account-page": (
+                    FakeResponse("https://official.example/account", {"part": 1}),
+                    FakeResponse("https://official.example/account", {"part": 2}),
+                ),
+                "/content-page": (
+                    FakeResponse("https://official.example/content", {"content": {}}),
+                ),
+            },
+        )
+
+        def parser(account_id: int, captures: tuple) -> CollectionBatch:
+            phases = [capture.phase for capture in captures]
+            if "content" not in phases:
+                raise ValueError("content capture is required")
+            return parsed_batch(account_id, captures)
+
+        collector = DomesticBrowserCollector(
+            config(
+                endpoint_by_path={
+                    "/account": "account_base",
+                    "/content": "content_list",
+                },
+                phase_by_path={"/account": "account", "/content": "content"},
+                navigation_by_phase={
+                    "bootstrap": "https://official.example/home",
+                    "account": "/account-page",
+                    "content": "/content-page",
+                },
+                phase_settle_milliseconds=1,
             ),
             browser_factory=lambda: FakeStarter(FakeBrowser(FakeContext(page))),
             parse_captures=parser,

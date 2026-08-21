@@ -458,7 +458,9 @@ class DomesticBrowserCollector:
         async def navigate(phase: str, navigation_url: str) -> None:
             nonlocal current_phase
             current_phase = phase
-            capture_count_before_navigation = len(captures)
+            phase_capture_count_before_navigation = sum(
+                capture.phase == phase for capture in captures
+            )
             target_url = navigation_url
             if navigation_url.startswith("/"):
                 locator = getattr(page, "locator", None)
@@ -531,7 +533,10 @@ class DomesticBrowserCollector:
                 waiter = getattr(page, "wait_for_timeout", None)
                 if not callable(waiter):
                     raise _error("browser_signature_timeout")
-                while len(captures) == capture_count_before_navigation:
+                while (
+                    sum(capture.phase == phase for capture in captures)
+                    == phase_capture_count_before_navigation
+                ):
                     if (
                         len(self._config.navigation_by_phase) == 1
                         and saw_unreviewed_response

@@ -107,6 +107,16 @@ def _observed_at(payload: Mapping[str, object]) -> str:
         _invalid()
 
 
+def _observed_beijing_day(observed_at: str) -> str:
+    try:
+        parsed = datetime.fromisoformat(observed_at)
+    except ValueError:
+        _invalid()
+    if parsed.tzinfo is None:
+        _invalid()
+    return parsed.astimezone(_BEIJING).date().isoformat()
+
+
 def _successful(payload: Mapping[str, object]) -> None:
     base = _mapping(payload.get("base_resp"))
     if _integer(base.get("ret"), nonnegative=False) != 0:
@@ -202,7 +212,7 @@ def _content_rows(
                 content_id=content_id,
                 title=title,
                 cover_url="",
-                published_at=f"{published_day}T00:00:00+08:00",
+                published_at=published_day,
                 content_status="unavailable",
                 content_type="unavailable",
             )
@@ -259,7 +269,7 @@ def parse_captures(
         _account_points(payload, account_id) for payload in completed_payloads
     )
     observed_at = max(parsed[1] for parsed in parsed_accounts)
-    observed_day = max(parsed[2] for parsed in parsed_accounts)
+    observed_day = _observed_beijing_day(observed_at)
     merged_points: dict[tuple[str, str, str, str, str], MetricPoint] = {}
     for points, _payload_observed_at, _payload_day in parsed_accounts:
         for point in points:
