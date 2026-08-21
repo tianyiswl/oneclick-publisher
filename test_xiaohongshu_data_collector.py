@@ -303,6 +303,12 @@ class _FakeResponse:
         return self._body
 
 
+class _FailingBodyResponse(_FakeResponse):
+    async def body(self) -> bytes:
+        self.body_calls += 1
+        raise RuntimeError("private-secret-body-read-failure")
+
+
 class _FakePage:
     def __init__(self, owner: "_FakeRuntime") -> None:
         self.owner = owner
@@ -1071,6 +1077,26 @@ class XiaohongshuDataCollectorTests(unittest.TestCase):
         batch = collector.collect_browser_signed(_account())
 
         self.assertGreater(len(batch.metrics), 0)
+
+    def test_later_account_response_recovers_from_first_body_read_failure(self) -> None:
+        """同一接口首个正文读取失败时，后续合格响应必须能够接替。"""
+
+        responses = _reviewed_success_responses()
+        valid = responses[CREATOR_HOME][0]
+        failed = _FailingBodyResponse(valid.url, {"data": {"fans_count": 1}})
+        responses[CREATOR_HOME] = (failed, valid)
+        collector, _fake = self._collector_with_responses(responses)
+
+        batch = collector.collect_browser_signed(_account())
+
+        followers = [
+            point.metric_value
+            for point in batch.metrics
+            if point.metric_key == "followers_total"
+        ]
+        self.assertEqual(followers, [3199])
+        self.assertEqual(failed.body_calls, 1)
+        self.assertEqual(valid.body_calls, 1)
 
     def test_late_response_keeps_its_request_phase_and_cannot_drive_note_detail(self) -> None:
         """迟到首页请求若按当前页归类，会把首页响应伪装成作品详情。"""

@@ -415,6 +415,7 @@ class XiaohongshuDataCollector:
         request_phases: dict[int, tuple[object, str]] = {}
         response_tasks: set[asyncio.Task] = set()
         payloads: dict[str, object] = {}
+        transient_failures: dict[str, PlatformDataCollectionError] = {}
         seen_response_ids: set[int] = set()
         retained_request_count = 0
         retained_response_count = 0
@@ -478,7 +479,9 @@ class XiaohongshuDataCollector:
             except (KeyboardInterrupt, SystemExit):
                 raise
             except BaseException:
-                capture_error = _payload_error(endpoint, "response_body", "body_read_failed")
+                transient_failures[path] = _payload_error(
+                    endpoint, "response_body", "body_read_failed"
+                )
                 return
             if type(body) is not bytes or not 1 <= len(body) <= _MAX_RESPONSE_BYTES:
                 capture_error = _payload_error(endpoint, "response_body", "body_size_invalid")
@@ -494,6 +497,7 @@ class XiaohongshuDataCollector:
                 return
             seen_response_ids.add(response_id)
             payloads[path] = payload
+            transient_failures.pop(path, None)
 
         def remember_response(response: object) -> None:
             nonlocal capture_error, retained_response_count
@@ -561,15 +565,30 @@ class XiaohongshuDataCollector:
                     _PHASE_LIST: {_CONTENT_LIST_PATH},
                     _PHASE_DETAIL: {_CONTENT_DETAIL_PATH},
                 }[current_phase]
+
+                def required_transient_failure() -> PlatformDataCollectionError | None:
+                    return next(
+                        (
+                            transient_failures[path]
+                            for path in required_paths
+                            if path in transient_failures
+                        ),
+                        None,
+                    )
+
                 while True:
                     await flush_responses()
                     if any(path in payloads for path in required_paths):
                         break
                     waiter = getattr(page, "wait_for_timeout", None)
                     if not callable(waiter):
+                        if (failure := required_transient_failure()) is not None:
+                            raise failure
                         raise _collection_error("browser_signature_timeout") from None
                     remaining = work_deadline - self._monotonic()
                     if remaining <= 0:
+                        if (failure := required_transient_failure()) is not None:
+                            raise failure
                         raise _collection_error("browser_signature_timeout") from None
                     await _await_until(
                         waiter(
