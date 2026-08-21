@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 from app_core import platform_data_collectors, platform_data_sync
 from app_core.bilibili_data_collector import BilibiliDataCollector
 from app_core.douyin_data_collector import DouyinDataCollectionError
+from app_core.kuaishou_data_collector import KuaishouDataCollector
 from app_core.platform_data_collection_errors import CleanupReceipt, PlatformDataCollectionError
 from app_core.platform_data_models import (
     CollectionBatch,
@@ -223,6 +224,15 @@ class PlatformDataSyncTests(unittest.TestCase):
             5, browser_factory=lambda: object()
         )
         self.assertIs(type(collector), BilibiliDataCollector)
+
+    def test_registry_builds_kuaishou_collector(self) -> None:
+        """缺少 type=4 注册会让真实快手账号继续报未支持。"""
+
+        self.assertIn(4, platform_data_collectors.registered_platform_types())
+        collector = platform_data_collectors.collector_for_platform(
+            4, browser_factory=lambda: object()
+        )
+        self.assertIs(type(collector), KuaishouDataCollector)
 
     def test_direct_success_never_starts_browser_and_persists_once(self) -> None:
         """直连成功仍启动浏览器会浪费资源并扩大风控面。"""

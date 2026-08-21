@@ -36,9 +36,16 @@ def _bilibili_factory(**dependencies) -> PlatformDataCollector:
     return BilibiliDataCollector(**dependencies)
 
 
+def _kuaishou_factory(**dependencies) -> PlatformDataCollector:
+    from .kuaishou_data_collector import KuaishouDataCollector
+
+    return KuaishouDataCollector(**dependencies)
+
+
 _COLLECTOR_FACTORIES = {
     1: _xiaohongshu_factory,
     3: _douyin_factory,
+    4: _kuaishou_factory,
     5: _bilibili_factory,
     10: _wechat_factory,
 }
