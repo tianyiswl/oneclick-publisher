@@ -15,14 +15,16 @@ _FAILURE_STAGES = frozenset(
     {
         "response_capture", "response_headers", "response_body", "request_binding",
         "json_decode", "account_parse", "content_list_parse", "content_detail_parse",
-        "visible_readback",
+        "visible_readback", "browser_start", "context_create", "page_create",
+        "navigation", "runtime",
     }
 )
 _FAILURE_REASONS = frozenset(
     {
         "duplicate_response", "invalid_content_length", "body_unavailable",
         "body_read_failed", "body_size_invalid", "request_mismatch", "invalid_json",
-        "payload_shape_invalid", "readback_mismatch",
+        "payload_shape_invalid", "readback_mismatch", "operation_failed",
+        "invalid_navigation", "request_limit_exceeded", "response_limit_exceeded",
     }
 )
 

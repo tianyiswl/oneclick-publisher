@@ -999,6 +999,64 @@ class XiaohongshuDataCollectorTests(unittest.TestCase):
         self.assertNotIn("secret", rendered)
         self.assertNotIn("xiaohongshu.com", rendered)
 
+    def test_browser_start_failure_exposes_fixed_runtime_diagnostic(self) -> None:
+        """浏览器尚未启动时失败，也必须给出固定阶段且不泄露异常原文。"""
+
+        def fail_start():
+            raise RuntimeError("private-secret-browser-error")
+
+        collector = XiaohongshuDataCollector(browser_factory=fail_start)
+
+        with self.assertRaises(PlatformDataCollectionError) as caught:
+            collector.collect_browser_signed_with_diagnostics(_account())
+
+        self.assertEqual(
+            caught.exception.failure_diagnostic,
+            {
+                "endpoint": "runtime",
+                "stage": "browser_start",
+                "reason": "operation_failed",
+            },
+        )
+        self.assertNotIn("secret", repr(caught.exception.failure_diagnostic).lower())
+
+    def test_invalid_navigation_exposes_fixed_runtime_diagnostic(self) -> None:
+        collector, _fake = self._collector_with_responses(
+            {}, final_urls={CREATOR_HOME: "https://example.invalid/private?token=secret"}
+        )
+
+        with self.assertRaises(PlatformDataCollectionError) as caught:
+            collector.collect_browser_signed_with_diagnostics(_account())
+
+        self.assertEqual(
+            caught.exception.failure_diagnostic,
+            {
+                "endpoint": "runtime",
+                "stage": "navigation",
+                "reason": "invalid_navigation",
+            },
+        )
+        self.assertNotIn("example.invalid", repr(caught.exception.failure_diagnostic))
+
+    def test_request_limit_exposes_fixed_capture_diagnostic(self) -> None:
+        responses = tuple(
+            _FakeResponse(f"https://creator.xiaohongshu.com/unreviewed/{index}", {})
+            for index in range(xiaohongshu_data_collector._MAX_REQUESTS + 1)
+        )
+        collector, _fake = self._collector_with_responses({CREATOR_HOME: responses})
+
+        with self.assertRaises(PlatformDataCollectionError) as caught:
+            collector.collect_browser_signed_with_diagnostics(_account())
+
+        self.assertEqual(
+            caught.exception.failure_diagnostic,
+            {
+                "endpoint": "runtime",
+                "stage": "response_capture",
+                "reason": "request_limit_exceeded",
+            },
+        )
+
     def test_late_response_keeps_its_request_phase_and_cannot_drive_note_detail(self) -> None:
         """迟到首页请求若按当前页归类，会把首页响应伪装成作品详情。"""
 

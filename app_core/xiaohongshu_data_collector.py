@@ -427,6 +427,7 @@ class XiaohongshuDataCollector:
         runtime_close_error: BaseException | None = None
         batch: CollectionBatch | None = None
         validation = None
+        runtime_stage = "browser_start"
 
         def remember_request(request: object) -> None:
             nonlocal retained_request_count, capture_error
@@ -434,7 +435,9 @@ class XiaohongshuDataCollector:
                 return
             retained_request_count += 1
             if retained_request_count > _MAX_REQUESTS:
-                capture_error = _collection_error("metric_payload_invalid")
+                capture_error = _payload_error(
+                    "runtime", "response_capture", "request_limit_exceeded"
+                )
                 return
             request_phases[id(request)] = (request, phase)
 
@@ -500,7 +503,9 @@ class XiaohongshuDataCollector:
                 return
             retained_response_count += 1
             if retained_response_count > _MAX_RESPONSES:
-                capture_error = _collection_error("metric_payload_invalid")
+                capture_error = _payload_error(
+                    "runtime", "response_capture", "response_limit_exceeded"
+                )
                 return
             task = asyncio.create_task(cache_response(response, entry[1]))
             response_tasks.add(task)
@@ -514,8 +519,9 @@ class XiaohongshuDataCollector:
                 raise capture_error
 
         async def navigate(current_phase: str, url: str) -> None:
-            nonlocal phase
+            nonlocal phase, runtime_stage
             phase = current_phase
+            runtime_stage = "navigation"
             try:
                 await _await_until(
                     page.goto(url, wait_until="domcontentloaded", timeout=30_000),
@@ -526,7 +532,9 @@ class XiaohongshuDataCollector:
                 try:
                     current = urlsplit(current_url)
                 except ValueError:
-                    raise _payload_error("runtime", "visible_readback", "readback_mismatch") from None
+                    raise _payload_error(
+                        "runtime", "navigation", "invalid_navigation"
+                    ) from None
                 current_path = current.path.lower()
                 if (
                     any(
@@ -542,7 +550,9 @@ class XiaohongshuDataCollector:
                 ):
                     raise _collection_error("login_required") from None
                 if current.scheme != "https" or current.hostname != _CREATOR_HOST:
-                    raise _collection_error("metric_payload_invalid") from None
+                    raise _payload_error(
+                        "runtime", "navigation", "invalid_navigation"
+                    ) from None
                 required_paths = {
                     _PHASE_ACCOUNT: _ACCOUNT_PATHS,
                     _PHASE_LIST: {_CONTENT_LIST_PATH},
@@ -575,6 +585,7 @@ class XiaohongshuDataCollector:
                 phase = ""
 
         try:
+            runtime_stage = "browser_start"
             manager = await _await_until(
                 self._browser_factory(), deadline=work_deadline, monotonic=self._monotonic
             )
@@ -589,11 +600,13 @@ class XiaohongshuDataCollector:
                 deadline=work_deadline,
                 monotonic=self._monotonic,
             )
+            runtime_stage = "context_create"
             context = await _await_until(
                 browser.new_context(storage_state=str(state_path)),
                 deadline=work_deadline,
                 monotonic=self._monotonic,
             )
+            runtime_stage = "page_create"
             page = await _await_until(
                 context.new_page(), deadline=work_deadline, monotonic=self._monotonic
             )
@@ -626,9 +639,12 @@ class XiaohongshuDataCollector:
                 identities=identities,
             )
             if validation_mode:
+                runtime_stage = "visible_readback"
                 reader = self._visible_readback
                 if not callable(reader):
-                    raise _collection_error("metric_payload_invalid") from None
+                    raise _payload_error(
+                        "runtime", "visible_readback", "readback_mismatch"
+                    ) from None
                 visible = _visible_readback_payload(
                     await _await_until(
                         reader(page, batch),
@@ -638,7 +654,9 @@ class XiaohongshuDataCollector:
                     batch,
                 )
                 if visible is None:
-                    raise _collection_error("metric_payload_invalid") from None
+                    raise _payload_error(
+                        "runtime", "visible_readback", "readback_mismatch"
+                    ) from None
                 validation = {
                     "mode": "official_visible_readback",
                     "officialVisible": visible,
@@ -702,7 +720,13 @@ class XiaohongshuDataCollector:
             ) from None
         if caught is not None:
             raise _collection_error(
-                "metric_payload_invalid", cleanup_receipt=receipt
+                "metric_payload_invalid",
+                cleanup_receipt=receipt,
+                failure_diagnostic={
+                    "endpoint": "runtime",
+                    "stage": runtime_stage,
+                    "reason": "operation_failed",
+                },
             ) from None
 
         if batch is None:

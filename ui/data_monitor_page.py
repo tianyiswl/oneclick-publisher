@@ -92,6 +92,11 @@ _DIAGNOSTIC_STAGE_TEXT = {
     "content_list_parse": "作品列表解析",
     "content_detail_parse": "作品详情解析",
     "visible_readback": "页面读回",
+    "browser_start": "浏览器启动",
+    "context_create": "会话创建",
+    "page_create": "页面创建",
+    "navigation": "页面导航",
+    "runtime": "运行环境",
 }
 _DIAGNOSTIC_REASON_TEXT = {
     "duplicate_response": "响应重复",
@@ -103,6 +108,10 @@ _DIAGNOSTIC_REASON_TEXT = {
     "invalid_json": "JSON格式无效",
     "payload_shape_invalid": "数据结构不匹配",
     "readback_mismatch": "页面读回不一致",
+    "operation_failed": "操作失败",
+    "invalid_navigation": "导航目标无效",
+    "request_limit_exceeded": "请求数量超过上限",
+    "response_limit_exceeded": "响应数量超过上限",
 }
 
 
