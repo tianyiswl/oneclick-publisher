@@ -91,6 +91,7 @@ class DomesticCollectorConfig:
     max_total_response_bytes: int = 4_194_304
     max_responses: int = 100
     max_requests: int = 400
+    phase_settle_milliseconds: int = 2_000
     navigation_by_phase: Mapping[str, str] | None = None
 
     def __post_init__(self) -> None:
@@ -123,9 +124,13 @@ class DomesticCollectorConfig:
             navigation = MappingProxyType({configured_phases[0]: self.home_url})
         else:
             navigation = _immutable_mapping(configured_navigation)
-        if set(navigation) != set(phases.values()):
+        if not set(phases.values()).issubset(navigation):
             raise CollectionFailure("metric_payload_invalid")
-        for navigation_url in navigation.values():
+        for index, navigation_url in enumerate(navigation.values()):
+            if navigation_url.startswith("/"):
+                if index == 0 or "?" in navigation_url or "#" in navigation_url:
+                    raise CollectionFailure("metric_payload_invalid")
+                continue
             try:
                 parsed_navigation = urlsplit(navigation_url)
             except ValueError:
@@ -146,6 +151,11 @@ class DomesticCollectorConfig:
             if type(limit) is not int or limit <= 0:
                 raise CollectionFailure("metric_payload_invalid")
         if self.max_total_response_bytes < self.max_response_bytes:
+            raise CollectionFailure("metric_payload_invalid")
+        if (
+            type(self.phase_settle_milliseconds) is not int
+            or not 1 <= self.phase_settle_milliseconds <= 5_000
+        ):
             raise CollectionFailure("metric_payload_invalid")
         object.__setattr__(self, "allowed_hosts", hosts)
         object.__setattr__(self, "endpoint_by_path", endpoints)
@@ -448,9 +458,56 @@ class DomesticBrowserCollector:
         async def navigate(phase: str, navigation_url: str) -> None:
             nonlocal current_phase
             current_phase = phase
+            capture_count_before_navigation = len(captures)
+            target_url = navigation_url
+            if navigation_url.startswith("/"):
+                locator = getattr(page, "locator", None)
+                if not callable(locator):
+                    raise _invalid(
+                        stage="navigation", reason="navigation_link_unavailable"
+                    )
+                try:
+                    href_locator = locator("a[href]")
+                    evaluate_all = getattr(href_locator, "evaluate_all", None)
+                    if not callable(evaluate_all):
+                        raise TypeError
+                    hrefs = await _await_until(
+                        evaluate_all("(nodes) => nodes.map((node) => node.href)"),
+                        deadline=work_deadline,
+                        monotonic=self._monotonic,
+                    )
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                except BaseException:
+                    raise _invalid(
+                        stage="navigation", reason="navigation_link_unavailable"
+                    ) from None
+                if type(hrefs) is not list:
+                    raise _invalid(
+                        stage="navigation", reason="navigation_link_unavailable"
+                    )
+                matches: list[str] = []
+                for href in hrefs:
+                    if type(href) is not str:
+                        continue
+                    try:
+                        parsed_href = urlsplit(href)
+                    except ValueError:
+                        continue
+                    if (
+                        parsed_href.scheme == "https"
+                        and parsed_href.hostname in self._config.allowed_hosts
+                        and parsed_href.path == navigation_url
+                    ):
+                        matches.append(href)
+                if len(matches) != 1:
+                    raise _invalid(
+                        stage="navigation", reason="navigation_link_unavailable"
+                    )
+                target_url = matches[0]
             await _await_until(
                 page.goto(
-                    navigation_url,
+                    target_url,
                     wait_until="domcontentloaded",
                     timeout=max(1, int((work_deadline - self._monotonic()) * 1000)),
                 ),
@@ -470,6 +527,30 @@ class DomesticBrowserCollector:
             if current.scheme != "https" or current.hostname not in self._config.allowed_hosts:
                 raise _invalid(stage="navigation", reason="invalid_navigation")
             await flush_responses()
+            if phase in self._config.phase_by_path.values():
+                waiter = getattr(page, "wait_for_timeout", None)
+                if not callable(waiter):
+                    raise _error("browser_signature_timeout")
+                while len(captures) == capture_count_before_navigation:
+                    if (
+                        len(self._config.navigation_by_phase) == 1
+                        and saw_unreviewed_response
+                    ):
+                        break
+                    if work_deadline - self._monotonic() <= 0:
+                        raise _error("browser_signature_timeout")
+                    await _await_until(
+                        waiter(_POLL_MILLISECONDS),
+                        deadline=work_deadline,
+                        monotonic=self._monotonic,
+                    )
+                    await flush_responses()
+                await _await_until(
+                    waiter(self._config.phase_settle_milliseconds),
+                    deadline=work_deadline,
+                    monotonic=self._monotonic,
+                )
+                await flush_responses()
 
         try:
             manager = await _await_until(self._browser_factory(), deadline=work_deadline, monotonic=self._monotonic)

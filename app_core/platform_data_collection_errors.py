@@ -25,6 +25,7 @@ _FAILURE_REASONS = frozenset(
         "body_read_failed", "body_size_invalid", "request_mismatch", "invalid_json",
         "payload_shape_invalid", "readback_mismatch", "operation_failed",
         "invalid_navigation", "request_limit_exceeded", "response_limit_exceeded",
+        "navigation_link_unavailable",
     }
 )
 

@@ -9,6 +9,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
+from urllib.parse import urlsplit
 
 from app_core.domestic_data_collector import (
     DomesticBrowserCollector,
@@ -26,6 +27,7 @@ def config(**overrides) -> DomesticCollectorConfig:
         "endpoint_by_path": {"/reviewed": "account_base"},
         "phase_by_path": {"/reviewed": "account"},
         "total_timeout_seconds": 0.05,
+        "phase_settle_milliseconds": 1,
     }
     values.update(overrides)
     return DomesticCollectorConfig(**values)
@@ -115,6 +117,75 @@ class CompletedResponsePage(FakePage):
     async def goto(self, url: str, *, wait_until: str, timeout: float) -> None:
         await super().goto(url, wait_until=wait_until, timeout=timeout)
         await asyncio.sleep(0)
+
+
+class FakeHrefLocator:
+    def __init__(self, hrefs: tuple[str, ...]) -> None:
+        self.hrefs = hrefs
+
+    async def evaluate_all(self, _script: str) -> list[str]:
+        return list(self.hrefs)
+
+
+class DynamicNavigationPage(FakePage):
+    def __init__(
+        self,
+        *,
+        hrefs: tuple[str, ...],
+        responses_by_path: dict[str, tuple[FakeResponse, ...]],
+    ) -> None:
+        super().__init__((), "https://official.example/home")
+        self.hrefs = hrefs
+        self.responses_by_path = responses_by_path
+        self.goto_urls: list[str] = []
+
+    def locator(self, selector: str) -> FakeHrefLocator:
+        if selector != "a[href]":
+            raise AssertionError("unexpected selector")
+        return FakeHrefLocator(self.hrefs)
+
+    async def goto(self, url: str, *, wait_until: str, timeout: float) -> None:
+        self.goto_urls.append(url)
+        self.url = url
+        for response in self.responses_by_path.get(urlsplit(url).path, ()):
+            self.listeners["request"](response.request)
+            self.listeners["response"](response)
+        await asyncio.sleep(0)
+
+
+class DelayedDynamicNavigationPage(DynamicNavigationPage):
+    async def goto(self, url: str, *, wait_until: str, timeout: float) -> None:
+        self.goto_urls.append(url)
+        self.url = url
+        responses = self.responses_by_path.get(urlsplit(url).path, ())
+
+        async def emit() -> None:
+            await asyncio.sleep(0.001)
+            for response in responses:
+                self.listeners["request"](response.request)
+                self.listeners["response"](response)
+
+        asyncio.create_task(emit())
+        await asyncio.sleep(0)
+
+
+class StaggeredResponsePage(DynamicNavigationPage):
+    async def goto(self, url: str, *, wait_until: str, timeout: float) -> None:
+        self.goto_urls.append(url)
+        self.url = url
+        responses = self.responses_by_path.get(urlsplit(url).path, ())
+
+        async def emit(response: FakeResponse, delay: float) -> None:
+            await asyncio.sleep(delay)
+            self.listeners["request"](response.request)
+            self.listeners["response"](response)
+
+        for index, response in enumerate(responses, start=1):
+            asyncio.create_task(emit(response, index * 0.003))
+        await asyncio.sleep(0)
+
+    async def wait_for_timeout(self, milliseconds: int) -> None:
+        await asyncio.sleep(milliseconds / 1000)
 
 
 class FakeContext:
@@ -336,6 +407,231 @@ class DomesticBrowserCollectorTests(unittest.TestCase):
             collector.collect(account())
 
         self.assertEqual(raised.exception.error_code, "metric_payload_invalid")
+
+    def test_collector_resolves_one_reviewed_dynamic_navigation_link(self) -> None:
+        """若动态链接不能按固定 host/path 唯一解析，公众号登录态页面无法安全进入数据页。"""
+
+        private_link = "https://official.example/metrics-page?action=view&token=private-token"
+        page = DynamicNavigationPage(
+            hrefs=(private_link,),
+            responses_by_path={
+                "/home": (
+                    FakeResponse("https://official.example/home-data", {"home": {}}),
+                ),
+                "/metrics-page": (
+                    FakeResponse("https://official.example/metrics", {"data": {}}),
+                ),
+            },
+        )
+        seen: list[tuple] = []
+
+        def parser(account_id: int, captures: tuple) -> CollectionBatch:
+            seen.append(captures)
+            return parsed_batch(account_id, captures)
+
+        collector = DomesticBrowserCollector(
+            config(
+                endpoint_by_path={
+                    "/home-data": "account_home",
+                    "/metrics": "account_base",
+                },
+                phase_by_path={"/home-data": "home", "/metrics": "account"},
+                navigation_by_phase={
+                    "home": "https://official.example/home",
+                    "account": "/metrics-page",
+                },
+            ),
+            browser_factory=lambda: FakeStarter(FakeBrowser(FakeContext(page))),
+            parse_captures=parser,
+        )
+
+        collector.collect(account())
+
+        self.assertEqual(page.goto_urls, ["https://official.example/home", private_link])
+        self.assertEqual(
+            [(capture.phase, capture.path) for capture in seen[0]],
+            [("home", "/home-data"), ("account", "/metrics")],
+        )
+        self.assertEqual(
+            collector._config.navigation_by_phase["account"], "/metrics-page"
+        )
+
+    def test_collector_allows_an_uncaptured_bootstrap_navigation_phase(self) -> None:
+        """登录首页只负责提供受控链接时，不应强迫平台伪造首页数据端点。"""
+
+        private_link = "https://official.example/metrics-page?token=private-token"
+        page = DynamicNavigationPage(
+            hrefs=(private_link,),
+            responses_by_path={
+                "/metrics-page": (
+                    FakeResponse("https://official.example/metrics", {"data": {}}),
+                ),
+            },
+        )
+        collector = DomesticBrowserCollector(
+            config(
+                endpoint_by_path={"/metrics": "account_base"},
+                phase_by_path={"/metrics": "account"},
+                navigation_by_phase={
+                    "bootstrap": "https://official.example/home",
+                    "account": "/metrics-page",
+                },
+            ),
+            browser_factory=lambda: FakeStarter(FakeBrowser(FakeContext(page))),
+            parse_captures=parsed_batch,
+        )
+
+        batch = collector.collect(account())
+
+        self.assertEqual(batch.source_mode, "browser_signed")
+
+    def test_collector_waits_for_each_phase_before_following_the_next_link(self) -> None:
+        """账号响应稍晚到达时，不能在切到文章阶段后把它判成串位。"""
+
+        page = DelayedDynamicNavigationPage(
+            hrefs=(
+                "https://official.example/account-page?token=private-token",
+                "https://official.example/content-page?token=private-token",
+            ),
+            responses_by_path={
+                "/account-page": (
+                    FakeResponse("https://official.example/account", {"account": {}}),
+                ),
+                "/content-page": (
+                    FakeResponse("https://official.example/content", {"content": {}}),
+                ),
+            },
+        )
+        collector = DomesticBrowserCollector(
+            config(
+                endpoint_by_path={
+                    "/account": "account_base",
+                    "/content": "content_list",
+                },
+                phase_by_path={"/account": "account", "/content": "content"},
+                navigation_by_phase={
+                    "bootstrap": "https://official.example/home",
+                    "account": "/account-page",
+                    "content": "/content-page",
+                },
+            ),
+            browser_factory=lambda: FakeStarter(FakeBrowser(FakeContext(page))),
+            parse_captures=parsed_batch,
+        )
+
+        batch = collector.collect(account())
+
+        self.assertEqual(batch.source_mode, "browser_signed")
+
+    def test_collector_keeps_responses_arriving_within_phase_settle_window(self) -> None:
+        """同一数据页的稍晚响应不能被下一次导航释放后改报读取失败。"""
+
+        page = StaggeredResponsePage(
+            hrefs=("https://official.example/account-page?token=private-token",),
+            responses_by_path={
+                "/account-page": (
+                    FakeResponse("https://official.example/account", {"part": 1}),
+                    FakeResponse("https://official.example/account", {"part": 2}),
+                ),
+            },
+        )
+
+        def parser(account_id: int, captures: tuple) -> CollectionBatch:
+            if len(captures) != 2:
+                raise ValueError("both reviewed responses are required")
+            return parsed_batch(account_id, captures)
+
+        collector = DomesticBrowserCollector(
+            config(
+                endpoint_by_path={"/account": "account_base"},
+                phase_by_path={"/account": "account"},
+                navigation_by_phase={
+                    "bootstrap": "https://official.example/home",
+                    "account": "/account-page",
+                },
+                phase_settle_milliseconds=10,
+            ),
+            browser_factory=lambda: FakeStarter(FakeBrowser(FakeContext(page))),
+            parse_captures=parser,
+        )
+
+        batch = collector.collect(account())
+
+        self.assertEqual(batch.source_mode, "browser_signed")
+
+    def test_dynamic_navigation_rejects_cross_domain_target(self) -> None:
+        """同路径的跨域链接不能把已登录会话带离审核主机。"""
+
+        self._assert_dynamic_navigation_failure(
+            ("https://evil.example/metrics-page?token=private-token",)
+        )
+
+    def test_dynamic_navigation_rejects_path_mismatch(self) -> None:
+        """仅 host 相同但 path 不同不能被当成审核数据页。"""
+
+        self._assert_dynamic_navigation_failure(
+            ("https://official.example/other?token=private-token",)
+        )
+
+    def test_dynamic_navigation_rejects_multiple_matches_without_leaking_query(self) -> None:
+        """多个候选必须固定失败，且 token/query 不得进入公共异常。"""
+
+        raised = self._assert_dynamic_navigation_failure(
+            (
+                "https://official.example/metrics-page?token=private-token-one",
+                "https://official.example/metrics-page?token=private-token-two",
+            )
+        )
+
+        public_error = repr(raised.exception) + repr(raised.exception.failure_diagnostic)
+        self.assertNotIn("private-token", public_error)
+        self.assertNotIn("?", public_error)
+
+    def test_dynamic_navigation_rejects_missing_match(self) -> None:
+        """页面没有目标链接时不能猜 URL 或继续采集。"""
+
+        self._assert_dynamic_navigation_failure(())
+
+    def _assert_dynamic_navigation_failure(
+        self, hrefs: tuple[str, ...]
+    ):
+        page = DynamicNavigationPage(
+            hrefs=hrefs,
+            responses_by_path={
+                "/home": (
+                    FakeResponse("https://official.example/home-data", {"home": {}}),
+                ),
+            },
+        )
+        collector = DomesticBrowserCollector(
+            config(
+                endpoint_by_path={
+                    "/home-data": "account_home",
+                    "/metrics": "account_base",
+                },
+                phase_by_path={"/home-data": "home", "/metrics": "account"},
+                navigation_by_phase={
+                    "home": "https://official.example/home",
+                    "account": "/metrics-page",
+                },
+            ),
+            browser_factory=lambda: FakeStarter(FakeBrowser(FakeContext(page))),
+            parse_captures=parsed_batch,
+        )
+
+        with self.assertRaises(PlatformDataCollectionError) as raised:
+            collector.collect(account())
+
+        self.assertEqual(raised.exception.error_code, "metric_payload_invalid")
+        self.assertEqual(
+            raised.exception.failure_diagnostic,
+            {
+                "endpoint": "runtime",
+                "stage": "navigation",
+                "reason": "navigation_link_unavailable",
+            },
+        )
+        return raised
 
     def test_collector_rejects_request_count_over_limit(self) -> None:
         """删除请求计数会让异常多的已审核请求绕过短会话上限。"""

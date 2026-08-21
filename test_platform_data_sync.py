@@ -16,6 +16,7 @@ from app_core.platform_data_models import (
     MetricPoint,
 )
 from app_core.xiaohongshu_data_collector import XiaohongshuCollectionOutcome
+from app_core.wechat_data_collector import WechatDataCollector
 
 
 def account_point() -> MetricPoint:
@@ -203,6 +204,15 @@ class PlatformDataSyncTests(unittest.TestCase):
             "filePath": "oneclick_3_safe.json",
             "authMode": "browser",
         }
+
+    def test_registry_builds_wechat_collector(self) -> None:
+        """缺少 type=10 注册会让真实公众号账号继续报未支持。"""
+
+        self.assertIn(10, platform_data_collectors.registered_platform_types())
+        collector = platform_data_collectors.collector_for_platform(
+            10, browser_factory=lambda: object()
+        )
+        self.assertIs(type(collector), WechatDataCollector)
 
     def test_direct_success_never_starts_browser_and_persists_once(self) -> None:
         """直连成功仍启动浏览器会浪费资源并扩大风控面。"""

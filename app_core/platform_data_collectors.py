@@ -24,7 +24,17 @@ def _xiaohongshu_factory(**dependencies) -> PlatformDataCollector:
     return XiaohongshuDataCollector(**dependencies)
 
 
-_COLLECTOR_FACTORIES = {1: _xiaohongshu_factory, 3: _douyin_factory}
+def _wechat_factory(**dependencies) -> PlatformDataCollector:
+    from .wechat_data_collector import WechatDataCollector
+
+    return WechatDataCollector(**dependencies)
+
+
+_COLLECTOR_FACTORIES = {
+    1: _xiaohongshu_factory,
+    3: _douyin_factory,
+    10: _wechat_factory,
+}
 
 
 def registered_platform_types() -> tuple[int, ...]:
