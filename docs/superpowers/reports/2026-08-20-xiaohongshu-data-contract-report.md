@@ -1,41 +1,43 @@
-# 小红书数据只读事实合同报告
+# 小红书数据只读事实合同与离线验收报告
 
-- 执行日期：2026-08-20
+- 离线验收日期：2026-08-21
 - 平台类型：`1`
-- 探测模式：`execute`（经明确授权的一次真实只读探测命令）
-- 终态：`failed`；命令退出码：`1`
-- 固定码：`xiaohongshu_contracts_unobserved`
+- 本轮状态：`offline_delivery_verified`
+- 本轮真实客户端运行：`not_run`
 
-## 观测到的响应合同
+## 交付已验证的内容
 
-第二次经明确授权的命令已通过账号选择门，实际进入账号首页和数据分析页。
-被动捕获了 2 类官方 JSON 结构：一类仅含通用操作结果字段；另一类含
-`data.total` 和一个长度为 0 的列表容器。旧探测器没有将每个响应与当时页面
-阶段绑定，因此两类结构均不能安全晋级为数据合同。`phases` 仍为空，全部三个
-必需阶段仍位于 `missingPhases`。此结论不触发重试，也不推测指标语义。
+数据监测现在按“平台 → 主体”选择账号。小红书使用独立的短会话只读采集器，
+仅接受审核过的官方 JSON 路径，并把已证明的字段转换后通过既有原子写入链路
+保存。缺失字段显示为“—”，不会补成 `0`。
 
-| 分类 | 观测状态 | 缺失的合同证据 |
-| --- | --- | --- |
-| `account_overview` | `missing` | 稳定 endpoint template、method/status、field path/type、人工确认的 metric meaning/time scope、无冲突候选 |
-| `content_list` | `missing` | 稳定 endpoint template、method/status、field path/type、pagination fields、coverage semantics、无冲突候选 |
-| `content_lifetime` | `missing` | 稳定 endpoint template、method/status、field path/type、人工确认的 lifetime metric meaning/time scope、无冲突候选 |
+离线验收结果如下：
 
-## 分页与覆盖语义
+| 检查 | 结果 |
+| --- | --- |
+| 7 个受影响生产模块语法编译 | 通过 |
+| 受影响组合测试 | `125` 项通过 |
+| 小红书采集器回归 | `28` 项通过 |
+| 最终 `unittest discover -v` | `1336` 项通过 |
+| `git diff --check` | 通过 |
 
-观测到 `data.total` 类分页字段和空列表，但旧证据缺少页面阶段绑定，
-故仍无法确认内容列表的完整遍历能力或覆盖边界。
+静态检查确认：采集器没有 `requests`/`fetch` 调用，没有剪贴板或平台写操作，也没有
+本地数据库、文件写入或日志输出入口。Cookie、请求头、响应 body、HTML 和异常原文
+不会进入采集结果、数据库或界面；响应 body 只在短会话的函数局部内存中受上限读取，
+随后仅保留白名单指标或固定错误码。
 
-## 资源清理
+## 尚未验证的真实运行
 
-- `cleanup.closed`: `true`
-- `type(cleanup.aliveResourceCount)`: `int`
-- `cleanup.aliveResourceCount`: `0`
+本轮没有打开浏览器，没有读取真实登录态，没有访问网络，也没有触发同步。因此它只
+证明本地交付和离线运行链路，不证明真实小红书页面、账号数据、数据库读回或业务价值。
 
-清理断言在合同解释前已通过。
+历史上的探测记录不能替代本次生产路径验收；此前报告中的
+`xiaohongshu_contracts_unobserved` 仍只是当时那次探测的结果。
 
-## 结论
+## 当前授权门
 
-`adapter_contract_incomplete`
+下一步只能在大帅对**本次**操作明确授权后进行：打开一条小红书官方只读浏览器会话，
+选择主体“硅基探索”，点击一次“同步数据”。该动作不发布、不上传、不编辑，也不自动重试。
 
-精确缺失项：`account_overview`、`content_list`、`content_lifetime` 的上述合同证据；
-本报告不包含账号、内容、指标或响应样本值。
+执行后才可核对本地读回是否与官方可见值一致、是否没有影响抖音账号，以及资源是否完全关闭。
+在该授权前，本报告不把离线通过写成真实同步成功或内容决策有效。

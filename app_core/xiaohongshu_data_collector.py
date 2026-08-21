@@ -239,7 +239,7 @@ class XiaohongshuDataCollector:
         context = None
         page = None
         phase = ""
-        requests: dict[int, tuple[object, str]] = {}
+        request_phases: dict[int, tuple[object, str]] = {}
         response_tasks: set[asyncio.Task] = set()
         payloads: dict[str, object] = {}
         seen_response_ids: set[int] = set()
@@ -259,7 +259,7 @@ class XiaohongshuDataCollector:
             if retained_request_count > _MAX_REQUESTS:
                 capture_error = _collection_error("metric_payload_invalid")
                 return
-            requests[id(request)] = (request, phase)
+            request_phases[id(request)] = (request, phase)
 
         async def cache_response(response: object, response_phase: str) -> None:
             nonlocal reserved_bytes, capture_error
@@ -317,7 +317,7 @@ class XiaohongshuDataCollector:
         def remember_response(response: object) -> None:
             nonlocal capture_error, retained_response_count
             request = getattr(response, "request", None)
-            entry = requests.pop(id(request), None)
+            entry = request_phases.pop(id(request), None)
             if entry is None or entry[0] is not request:
                 return
             retained_response_count += 1
