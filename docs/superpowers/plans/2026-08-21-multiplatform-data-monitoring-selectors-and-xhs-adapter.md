@@ -1,5 +1,7 @@
 # Multi-platform Data Monitoring Selectors and Xiaohongshu Adapter Implementation Plan
 
+> Command note: examples use `.venv/bin/python` from the repository root. From the isolated `.worktrees/<name>` checkout, use the shared interpreter at `../../.venv/bin/python`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add separate platform and subject selectors to Data Monitoring and connect the already verified Xiaohongshu read-only contracts to the production synchronization pipeline.
@@ -395,7 +397,7 @@ Expected: all finish `OK`; no test opens a real browser or reads a real account.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add app_core/xiaohongshu_data_collector.py app_core/xiaohongshu_data_contract.py test_xiaohongshu_data_collector.py
+git add app_core/xiaohongshu_data_collector.py app_core/xiaohongshu_data_contract.py app_core/platform_data_collectors.py test_xiaohongshu_data_collector.py
 git commit -m "接入小红书只读数据会话"
 ```
 
