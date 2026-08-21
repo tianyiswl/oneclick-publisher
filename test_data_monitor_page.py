@@ -748,6 +748,93 @@ class DataMonitorPageTests(unittest.TestCase):
         )
         self.assertNotIn("作品数据未取得", page.status_label.text())
 
+    def test_partial_truncated_status_requires_matching_content_state(self) -> None:
+        """截断批次与作品查询状态不一致时不得声称已取得最近作品。"""
+
+        base_contents = available_contents()
+        base_contents.update(
+            {
+                "availability": "partial",
+                "warningCode": "content_list_truncated",
+                "total": 2,
+                "coveredCount": 2,
+            }
+        )
+        cases = (
+            {"availability": "available"},
+            {"availability": "unavailable"},
+            {"warningCode": "content_payload_invalid"},
+        )
+        for overrides in cases:
+            with self.subTest(overrides=overrides):
+                contents = {**base_contents, **overrides}
+                page = self._page(
+                    summary=period_summary(
+                        status="partial_success",
+                        error_code="content_list_truncated",
+                    ),
+                    contents=contents,
+                )
+                self.assertEqual(
+                    page.status_label.text(),
+                    "账号趋势已更新，作品数据未取得",
+                )
+
+    def test_partial_truncated_status_rejects_uncontrolled_covered_count(
+        self,
+    ) -> None:
+        """截断作品数量必须是不超过总数的正整数。"""
+
+        for covered_count in (0, -1, "2", 3):
+            with self.subTest(covered_count=covered_count):
+                contents = available_contents()
+                contents.update(
+                    {
+                        "availability": "partial",
+                        "warningCode": "content_list_truncated",
+                        "total": 2,
+                        "coveredCount": covered_count,
+                    }
+                )
+                page = self._page(
+                    summary=period_summary(
+                        status="partial_success",
+                        error_code="content_list_truncated",
+                    ),
+                    contents=contents,
+                )
+                self.assertEqual(
+                    page.status_label.text(),
+                    "账号趋势已更新，作品数据未取得",
+                )
+
+    def test_content_list_unavailable_with_history_keeps_unavailable_status(
+        self,
+    ) -> None:
+        """作品查询不可用时，即使保留历史条数也不得显示为本次取得。"""
+
+        contents = available_contents()
+        contents.update(
+            {
+                "availability": "unavailable",
+                "warningCode": "content_list_unavailable",
+                "total": 2,
+                "coveredCount": 2,
+            }
+        )
+        page = self._page(
+            summary=period_summary(
+                status="partial_success",
+                error_code="content_list_unavailable",
+            ),
+            contents=contents,
+        )
+
+        self.assertEqual(
+            page.status_label.text(),
+            "账号趋势已更新，作品数据未取得",
+        )
+
     def test_registered_platform_accounts_are_listed_and_missing_metrics_render_dash(self) -> None:
         """平台过滤或缺失显示回退会把未支持账号或伪零暴露给用户。"""
 

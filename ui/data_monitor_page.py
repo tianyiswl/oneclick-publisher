@@ -728,7 +728,11 @@ class DataMonitorPage(QWidget):
                 isinstance(latest, dict)
                 and latest.get("status") == "partial_success"
                 and latest.get("errorCode") == "content_list_truncated"
-                and self._content_covered_count > 0
+                and self._content_availability == "partial"
+                and self._content_warning_code == "content_list_truncated"
+                and type(self._content_covered_count) is int
+                and type(self._content_total) is int
+                and 0 < self._content_covered_count <= self._content_total
             ):
                 self.status_label.setText(
                     f"账号趋势已更新，已取得最近 {self._content_covered_count} 条作品"
