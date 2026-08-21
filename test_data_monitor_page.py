@@ -706,6 +706,48 @@ class DataMonitorPageTests(unittest.TestCase):
         )
         self.assertNotIn("账号趋势和作品数据已更新", page.status_label.text())
 
+    def test_partial_truncated_status_reports_recent_content_count(self) -> None:
+        """作品列表截断且已有保存记录时，顶部应说明最近取得的条数。"""
+
+        summary = period_summary(
+            status="partial_success",
+            error_code="content_list_truncated",
+        )
+        contents = available_contents()
+        contents.update(
+            {
+                "accountId": 21,
+                "availability": "partial",
+                "warningCode": "content_list_truncated",
+                "total": 2,
+                "coveredCount": 2,
+                "items": [
+                    *contents["items"],
+                    {
+                        "contentId": "content-2",
+                        "title": "另一条已有作品",
+                        "coverUrl": "",
+                        "publishedAt": "2026-08-19T09:00:00+08:00",
+                        "contentStatus": "published",
+                        "contentType": "video",
+                        "metrics": {"views": 10},
+                    },
+                ],
+            }
+        )
+        page = self._page(
+            summary=summary,
+            contents=contents,
+            accounts=[XHS_ACCOUNT],
+            registered_platforms=(1,),
+        )
+
+        self.assertEqual(
+            page.status_label.text(),
+            "账号趋势已更新，已取得最近 2 条作品",
+        )
+        self.assertNotIn("作品数据未取得", page.status_label.text())
+
     def test_registered_platform_accounts_are_listed_and_missing_metrics_render_dash(self) -> None:
         """平台过滤或缺失显示回退会把未支持账号或伪零暴露给用户。"""
 
