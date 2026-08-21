@@ -501,6 +501,9 @@ class XiaohongshuDataCollector:
             entry = request_phases.pop(id(request), None)
             if entry is None or entry[0] is not request:
                 return
+            path = _response_path(response)
+            if path is None or _PATH_PHASES[path] != entry[1]:
+                return
             retained_response_count += 1
             if retained_response_count > _MAX_RESPONSES:
                 capture_error = _payload_error(

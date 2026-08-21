@@ -1057,6 +1057,21 @@ class XiaohongshuDataCollectorTests(unittest.TestCase):
             },
         )
 
+    def test_unreviewed_page_responses_do_not_consume_reviewed_response_budget(self) -> None:
+        """静态资源和非白名单接口再多，也不能挤占四个审核接口的响应预算。"""
+
+        responses = _reviewed_success_responses()
+        noise = tuple(
+            _FakeResponse(f"https://creator.xiaohongshu.com/unreviewed/{index}", {})
+            for index in range(xiaohongshu_data_collector._MAX_RESPONSES + 50)
+        )
+        responses[CREATOR_HOME] = noise + responses[CREATOR_HOME]
+        collector, _fake = self._collector_with_responses(responses)
+
+        batch = collector.collect_browser_signed(_account())
+
+        self.assertGreater(len(batch.metrics), 0)
+
     def test_late_response_keeps_its_request_phase_and_cannot_drive_note_detail(self) -> None:
         """迟到首页请求若按当前页归类，会把首页响应伪装成作品详情。"""
 
