@@ -53,7 +53,7 @@ SOURCE_TEXT = {
 
 PROGRESS_TEXT = {
     "direct_session": "正在读取已登录账号数据…",
-    "browser_signed": "正在读取抖音官方签名数据…",
+    "browser_signed": "正在读取平台官方数据…",
     "account_metrics": "正在整理账号趋势…",
     "content_list": "正在读取作品列表…",
     "content_metrics": "正在整理作品指标…",
@@ -66,6 +66,10 @@ PROGRESS_TEXT = {
 ERROR_TEXT = {
     "login_required": "需要重新登录",
     "verification_required": "需要完成平台验证",
+    "direct_request_rejected": "平台暂不支持当前读取方式",
+    "session_state_missing": "未找到可用登录状态",
+    "browser_cleanup_incomplete": "浏览器会话未能完整关闭",
+    "content_list_truncated": "作品列表未完整取得",
     "metric_payload_empty": "平台暂未返回可用数据",
     "metric_payload_invalid": "平台数据暂时无法识别",
     "sync_persist_failed": "本地数据保存失败",
@@ -378,6 +382,10 @@ class DataMonitorPage(QWidget):
         self.content_page_label = QLabel("共 0 条")
         self.content_page_label.setProperty("role", "muted")
         contents_header.addWidget(self.content_page_label)
+        self.content_metadata_label = QLabel("")
+        self.content_metadata_label.setProperty("role", "muted")
+        self.content_metadata_label.hide()
+        contents_header.addWidget(self.content_metadata_label)
         self.previous_page_button = button("上一页", variant="secondary", compact=True)
         self.previous_page_button.clicked.connect(lambda: self._change_content_page(-1))
         contents_header.addWidget(self.previous_page_button)
@@ -553,6 +561,8 @@ class DataMonitorPage(QWidget):
         self._content_total = 0
         self._content_availability = "missing"
         self._content_warning_code = ""
+        self.content_metadata_label.hide()
+        self.content_metadata_label.setText("")
         self._update_content_paging()
 
     def _render_data(self, *, include_contents: bool) -> None:
@@ -623,7 +633,9 @@ class DataMonitorPage(QWidget):
             self.status_label.setText("账号趋势已更新，作品数据未取得")
         else:
             code = str(latest.get("errorCode") or "")
-            self.status_label.setText(f"同步失败：{ERROR_TEXT.get(code, '数据同步未完成')}")
+            self.status_label.setText(
+                f"同步失败：{self._error_text(code, self._current_platform_type())}"
+            )
             if code == "login_required":
                 self.relogin_button.show()
         trends = platform_data_service.account_daily_trends(account_id, days)
@@ -690,7 +702,36 @@ class DataMonitorPage(QWidget):
         total = safe_payload.get("total")
         self._content_total = total if type(total) is int and total >= 0 else 0
         self.content_table.set_payload(safe_payload)
+        platform_type = self.platform_combo.currentData()
+        metadata_missing = (
+            platform_type == 1
+            and any(
+                type(item) is dict
+                and (
+                    not isinstance(item.get("title"), str)
+                    or not item["title"].strip()
+                    or not isinstance(item.get("publishedAt"), str)
+                    or not item["publishedAt"].strip()
+                )
+                for item in safe_payload.get("items", ())
+                if type(safe_payload.get("items")) is list
+            )
+        )
+        self.content_metadata_label.setText(
+            "平台未提供标题与发布时间" if metadata_missing else ""
+        )
+        self.content_metadata_label.setVisible(metadata_missing)
         self._update_content_paging()
+
+    @staticmethod
+    def _error_text(error_code: str, platform_type: int | None) -> str:
+        if error_code == "login_required":
+            platform_name = account_service.PLATFORMS.get(platform_type, "当前平台")
+            return f"需要重新登录{platform_name}"
+        if error_code == "verification_required":
+            platform_name = account_service.PLATFORMS.get(platform_type, "当前平台")
+            return f"需要完成{platform_name}验证"
+        return ERROR_TEXT.get(error_code, "数据同步未完成")
 
     def _update_content_paging(self) -> None:
         first = self._content_offset + 1 if self._content_total else 0

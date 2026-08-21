@@ -982,6 +982,153 @@ class PlatformDataServiceTests(unittest.TestCase):
                 self.assertIsNone(raised.exception.__cause__)
                 self.assertEqual(self._table_counts(), (1, 3, 1))
 
+    def test_xhs_persistence_is_atomic_and_keeps_douyin_account_untouched(self) -> None:
+        """按平台和账号隔离，重跑小红书不得改写抖音主体的最新快照。"""
+
+        with database.connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO user_info
+                    (type, filePath, userName, status, profileName, authMode)
+                VALUES (1, 'oneclick_1_safe.json', '小红书账号', 1, '硅基探索', 'browser')
+                """
+            )
+            xhs_account_id = int(cursor.lastrowid)
+
+        def batch(view_count: int) -> CollectionBatch:
+            return CollectionBatch(
+                platform_type=1,
+                source_mode="browser_signed",
+                metrics=(
+                    MetricPoint(
+                        entity_type="account",
+                        entity_key=f"account:{xhs_account_id}",
+                        metric_key="followers_total",
+                        raw_metric_key="fans_count",
+                        metric_value=12,
+                        metric_unit="count",
+                        metric_scope="lifetime_total",
+                        period_start="2026-08-20",
+                        period_end="2026-08-20",
+                        observed_at="2026-08-20T12:00:00+08:00",
+                    ),
+                    MetricPoint(
+                        entity_type="content",
+                        entity_key="0123456789abcdef01234567",
+                        metric_key="views",
+                        raw_metric_key="view_count",
+                        metric_value=view_count,
+                        metric_unit="count",
+                        metric_scope="lifetime_total",
+                        period_start="2026-08-20",
+                        period_end="2026-08-20",
+                        observed_at="2026-08-20T12:00:00+08:00",
+                    ),
+                ),
+                contents=(
+                    ContentRecord(
+                        content_id="0123456789abcdef01234567",
+                        title="",
+                        cover_url="",
+                        published_at="",
+                        content_status="unavailable",
+                        content_type="unavailable",
+                    ),
+                ),
+                account_metrics_available=True,
+                content_data_available=True,
+                platform_observed_at="2026-08-20T12:00:00+08:00",
+            )
+
+        douyin_batch = CollectionBatch(
+            platform_type=3,
+            source_mode="direct_session",
+            metrics=(self._v2_point("views", 9, day="2026-08-20"),),
+            contents=(),
+            account_metrics_available=True,
+            content_data_available=False,
+            platform_observed_at="2026-08-20T12:00:00+08:00",
+            warning_code="content_list_unavailable",
+        )
+        platform_data_service.record_collection_sync(self.account_id, douyin_batch)
+        platform_data_service.record_collection_sync(xhs_account_id, batch(400))
+        platform_data_service.record_collection_sync(xhs_account_id, batch(450))
+
+        with database.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT accountId, platformType, status
+                FROM platform_data_sync_runs
+                ORDER BY id
+                """
+            ).fetchall()
+            xhs_content = conn.execute(
+                """
+                SELECT accountId, platformType, title, publishedAt
+                FROM platform_contents
+                WHERE accountId = ? AND platformType = 1
+                """,
+                (xhs_account_id,),
+            ).fetchone()
+        self.assertEqual(
+            [(row["accountId"], row["platformType"]) for row in rows],
+            [(self.account_id, 3), (xhs_account_id, 1), (xhs_account_id, 1)],
+        )
+        self.assertEqual(
+            tuple(xhs_content), (xhs_account_id, 1, "", "")
+        )
+        self.assertEqual(
+            platform_data_service.account_contents(xhs_account_id)["items"][0]["metrics"],
+            {"views": 450},
+        )
+        self.assertEqual(
+            platform_data_service.account_contents(self.account_id)["total"], 0
+        )
+
+    def test_xhs_confirmed_zero_contents_remains_available_not_missing(self) -> None:
+        """小红书已确认零作品不是作品列表缺失，也不能显示为失败。"""
+
+        with database.connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO user_info
+                    (type, filePath, userName, status, profileName, authMode)
+                VALUES (1, 'oneclick_1_empty.json', '零作品账号', 1, '零作品主体', 'browser')
+                """
+            )
+            account_id = int(cursor.lastrowid)
+        batch = CollectionBatch(
+            platform_type=1,
+            source_mode="browser_signed",
+            metrics=(
+                MetricPoint(
+                    entity_type="account",
+                    entity_key=f"account:{account_id}",
+                    metric_key="followers_total",
+                    raw_metric_key="fans_count",
+                    metric_value=12,
+                    metric_unit="count",
+                    metric_scope="lifetime_total",
+                    period_start="2026-08-20",
+                    period_end="2026-08-20",
+                    observed_at="2026-08-20T12:00:00+08:00",
+                ),
+            ),
+            contents=(),
+            account_metrics_available=True,
+            content_data_available=True,
+            platform_observed_at="2026-08-20T12:00:00+08:00",
+        )
+
+        saved = platform_data_service.record_collection_sync(account_id, batch)
+        contents = platform_data_service.account_contents(account_id)
+
+        self.assertEqual(saved["status"], "success")
+        self.assertEqual(
+            (contents["availability"], contents["warningCode"], contents["total"]),
+            ("available", "", 0),
+        )
+
     def test_period_ranges_end_at_beijing_yesterday_across_calendar_boundaries(
         self,
     ) -> None:

@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from app_core import platform_data_sync
 from app_core.douyin_data_collector import DouyinDataCollectionError
+from app_core.platform_data_collection_errors import PlatformDataCollectionError
 from app_core.platform_data_models import (
     CollectionBatch,
+    CollectionFailure,
     ContentRecord,
     MetricPoint,
 )
@@ -81,6 +83,61 @@ def account_only_batch(
         content_data_available=False,
         platform_observed_at="2026-08-20T12:00:00+08:00",
         warning_code=warning_code,
+    )
+
+
+def xhs_account() -> dict:
+    return {
+        "id": 21,
+        "type": 1,
+        "filePath": "oneclick_1_safe.json",
+        "authMode": "browser",
+    }
+
+
+def xhs_collection_batch() -> CollectionBatch:
+    return CollectionBatch(
+        platform_type=1,
+        source_mode="browser_signed",
+        metrics=(
+            MetricPoint(
+                entity_type="account",
+                entity_key="account:21",
+                metric_key="followers_total",
+                raw_metric_key="fans_count",
+                metric_value=125,
+                metric_unit="count",
+                metric_scope="lifetime_total",
+                period_start="2026-08-20",
+                period_end="2026-08-20",
+                observed_at="2026-08-20T12:00:00+08:00",
+            ),
+            MetricPoint(
+                entity_type="content",
+                entity_key="0123456789abcdef01234567",
+                metric_key="views",
+                raw_metric_key="view_count",
+                metric_value=400,
+                metric_unit="count",
+                metric_scope="lifetime_total",
+                period_start="2026-08-20",
+                period_end="2026-08-20",
+                observed_at="2026-08-20T12:00:00+08:00",
+            ),
+        ),
+        contents=(
+            ContentRecord(
+                content_id="0123456789abcdef01234567",
+                title="",
+                cover_url="",
+                published_at="",
+                content_status="unavailable",
+                content_type="unavailable",
+            ),
+        ),
+        account_metrics_available=True,
+        content_data_available=True,
+        platform_observed_at="2026-08-20T12:00:00+08:00",
     )
 
 
@@ -176,6 +233,123 @@ class PlatformDataSyncTests(unittest.TestCase):
                 {"stage": "completed", "message": "数据同步完成"},
             ],
         )
+
+    def test_xhs_sync_routes_collector_persists_and_returns_public_result(self) -> None:
+        """小红书必须走已登记采集器，并只返回固定同步结果。"""
+
+        batch = xhs_collection_batch()
+        collector = Mock()
+        collector.collect_direct.side_effect = PlatformDataCollectionError(
+            "direct_request_rejected", fallback_allowed=True
+        )
+        collector.collect_browser_signed.return_value = batch
+        progress: list[dict] = []
+        with patch.object(
+            platform_data_sync.account_service,
+            "list_accounts",
+            return_value=[xhs_account()],
+        ), patch.object(
+            platform_data_sync,
+            "collector_for_platform",
+            return_value=collector,
+        ), patch.object(
+            platform_data_sync.platform_data_service,
+            "record_collection_sync",
+            return_value={
+                "accountId": 21,
+                "status": "success",
+                "sourceMode": "browser_signed",
+                "errorCode": "",
+                "metricCount": 2,
+            },
+        ) as record_collection:
+            result = platform_data_sync.sync_account_data(21, report=progress.append)
+
+        self.assertEqual(
+            result,
+            {
+                "accountId": 21,
+                "status": "success",
+                "sourceMode": "browser_signed",
+                "errorCode": "",
+                "metricCount": 2,
+                "contentCount": 1,
+            },
+        )
+        self.assertEqual(collector.collect_direct.call_count, 1)
+        self.assertEqual(collector.collect_browser_signed.call_count, 1)
+        self.assertIs(record_collection.call_args.args[1], batch)
+        self.assertNotIn("抖音", " ".join(event["message"] for event in progress))
+        self.assertIn(
+            {"stage": "browser_signed", "message": "正在读取平台官方数据…"},
+            progress,
+        )
+
+    def test_xhs_collection_failures_are_persisted_with_fixed_public_codes(self) -> None:
+        """小红书受控失败不得把会话或浏览器异常原文带出同步边界。"""
+
+        for code in (
+            "login_required",
+            "verification_required",
+            "metric_payload_invalid",
+            "browser_cleanup_incomplete",
+        ):
+            with self.subTest(code=code):
+                collector = Mock()
+                collector.collect_direct.side_effect = PlatformDataCollectionError(
+                    code
+                )
+                with patch.object(
+                    platform_data_sync.account_service,
+                    "list_accounts",
+                    return_value=[xhs_account()],
+                ), patch.object(
+                    platform_data_sync,
+                    "collector_for_platform",
+                    return_value=collector,
+                ), patch.object(
+                    platform_data_sync.platform_data_service,
+                    "record_failed_sync",
+                    return_value={
+                        "accountId": 21,
+                        "status": "failed",
+                        "sourceMode": "direct_session",
+                        "errorCode": code,
+                        "metricCount": 0,
+                    },
+                ) as record_failed:
+                    result = platform_data_sync.sync_account_data(21)
+
+                self.assertEqual(result["errorCode"], code)
+                self.assertNotIn("private", repr(result).lower())
+                self.assertEqual(record_failed.call_args.args[-1], code)
+
+    def test_registered_collector_failure_is_persisted_as_fixed_public_result(self) -> None:
+        """注册表解析失败也必须留在受控同步边界内。"""
+
+        with patch.object(
+            platform_data_sync.account_service,
+            "list_accounts",
+            return_value=[xhs_account()],
+        ), patch.object(
+            platform_data_sync,
+            "collector_for_platform",
+            side_effect=CollectionFailure("collector_not_available"),
+        ), patch.object(
+            platform_data_sync.platform_data_service,
+            "record_failed_sync",
+            return_value={
+                "accountId": 21,
+                "status": "failed",
+                "sourceMode": "direct_session",
+                "errorCode": "collector_not_available",
+                "metricCount": 0,
+            },
+        ) as record_failed:
+            result = platform_data_sync.sync_account_data(21)
+
+        self.assertEqual(result["errorCode"], "collector_not_available")
+        self.assertEqual(record_failed.call_args.args[-1], "collector_not_available")
 
     def test_only_fallback_allowed_error_starts_browser_signed(self) -> None:
         """普通网络错误不能自动启动浏览器；签名语义拒绝才允许兜底。"""

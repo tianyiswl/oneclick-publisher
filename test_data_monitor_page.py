@@ -451,6 +451,51 @@ class DataMonitorPageTests(unittest.TestCase):
         )
         self.assertEqual(page.content_page_label.text(), "已取得 0 条")
 
+    def test_xhs_missing_content_metadata_renders_dash_and_fixed_caption(self) -> None:
+        """平台缺少标题和日期时，页面只能显示不可得，不能补造元数据。"""
+
+        page = self._page(
+            accounts=[ACCOUNT, XHS_ACCOUNT],
+            registered_platforms=(1, 3),
+        )
+        page.platform_combo.setCurrentIndex(page.platform_combo.findData(1))
+        page._set_contents(
+            {
+                "availability": "available",
+                "warningCode": "",
+                "total": 1,
+                "items": [
+                    {
+                        "contentId": "0123456789abcdef01234567",
+                        "title": "",
+                        "publishedAt": "",
+                        "contentStatus": "unavailable",
+                        "contentType": "unavailable",
+                        "metrics": {"views": 20},
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(page.content_table.item(0, 0).text(), "—")
+        self.assertEqual(page.content_table.item(0, 1).text(), "—")
+        self.assertEqual(page.content_metadata_label.text(), "平台未提供标题与发布时间")
+
+    def test_xhs_login_failure_uses_fixed_platform_specific_copy(self) -> None:
+        """小红书登录失效不能复用抖音文案或显示底层错误内容。"""
+
+        summary = failed_summary()
+        summary["latestRun"]["errorCode"] = "login_required"
+        page = self._page(
+            summary=summary,
+            accounts=[ACCOUNT, XHS_ACCOUNT],
+            registered_platforms=(1, 3),
+        )
+        page.platform_combo.setCurrentIndex(page.platform_combo.findData(1))
+
+        self.assertEqual(page.status_label.text(), "同步失败：需要重新登录小红书")
+        self.assertTrue(page.relogin_button.isVisibleTo(page))
+
     def test_partial_success_is_not_rendered_as_complete(self) -> None:
         """账号趋势可用时不得把未取得的作品数据冒充为全部完成。"""
 

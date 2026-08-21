@@ -21,6 +21,7 @@ ALLOWED_ERROR_CODES = frozenset(
         "collector_not_available",
         "session_state_missing",
         "login_required",
+        "verification_required",
         "direct_request_rejected",
         "browser_signature_timeout",
         "browser_cleanup_incomplete",
@@ -477,7 +478,6 @@ def _content_query_state(conn, account_id: int) -> dict:
         elif (
             status in {"success", "partial_success"}
             and error_code in {"", "account_trends_unavailable"}
-            and has_content_metrics
         ):
             availability = "available"
 

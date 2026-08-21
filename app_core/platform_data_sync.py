@@ -6,14 +6,14 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from . import account_service, platform_data_service
-from .douyin_data_collector import DouyinDataCollectionError
+from .platform_data_collection_errors import PlatformDataCollectionError
 from .platform_data_collectors import collector_for_platform
 from .platform_data_models import CollectionFailure
 
 
 _PROGRESS_MESSAGES = {
     "direct_session": "正在读取已登录账号数据",
-    "browser_signed": "正在读取抖音官方签名数据",
+    "browser_signed": "正在读取平台官方数据…",
     "account_metrics": "正在整理账号核心指标",
     "content_list": "正在读取作品列表",
     "content_metrics": "正在整理作品指标",
@@ -92,13 +92,29 @@ def sync_account_data(
     platform_type = account.get("type")
     if type(platform_type) is not int:
         raise CollectionFailure("collector_not_available")
-    collector = collector_for_platform(platform_type)
     source_mode = "direct_session"
     try:
+        try:
+            collector = collector_for_platform(platform_type)
+        except CollectionFailure as exc:
+            _report_stage(report, "failed")
+            saved = platform_data_service.record_failed_sync(
+                account_id,
+                platform_type,
+                source_mode,
+                _public_error_code(exc.error_code),
+            )
+            return _public_result(
+                saved,
+                account_id=account_id,
+                source_mode=source_mode,
+                metric_count=0,
+                content_count=0,
+            )
         _report_stage(report, "direct_session")
         try:
             batch = collector.collect_direct(account)
-        except DouyinDataCollectionError as direct_error:
+        except PlatformDataCollectionError as direct_error:
             if not direct_error.fallback_allowed:
                 raise
             source_mode = "browser_signed"
@@ -122,7 +138,7 @@ def sync_account_data(
         )
         _report_stage(report, _FINAL_STAGE_BY_STATUS[result["status"]])
         return result
-    except DouyinDataCollectionError as exc:
+    except PlatformDataCollectionError as exc:
         _report_stage(report, "failed")
         saved = platform_data_service.record_failed_sync(
             account_id,
