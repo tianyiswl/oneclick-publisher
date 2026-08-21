@@ -28,7 +28,7 @@ ALLOWED_METRIC_SCOPES = frozenset({"daily_increment", "lifetime_total"})
 ALLOWED_CONTENT_STATUSES = frozenset(
     {"published", "scheduled", "private", "unavailable"}
 )
-ALLOWED_CONTENT_TYPES = frozenset({"video", "image"})
+ALLOWED_CONTENT_TYPES = frozenset({"video", "image", "unavailable"})
 ALLOWED_BATCH_WARNING_CODES = frozenset(
     {
         "content_list_unavailable",
@@ -64,6 +64,12 @@ def _controlled_text(value: object) -> str:
     if value != result:
         raise CollectionFailure("metric_payload_invalid")
     return result
+
+
+def _controlled_optional_text(value: object) -> str:
+    if type(value) is not str or value != value.strip():
+        raise CollectionFailure("metric_payload_invalid")
+    return value
 
 
 def _date_only(value: object) -> str:
@@ -136,13 +142,17 @@ class ContentRecord:
 
     def __post_init__(self) -> None:
         _required_text(self.content_id)
-        _required_text(self.title)
-        _required_text(self.cover_url)
-        _required_text(self.published_at)
-        if _controlled_text(self.content_status) not in ALLOWED_CONTENT_STATUSES:
+        title = _controlled_optional_text(self.title)
+        cover_url = _controlled_optional_text(self.cover_url)
+        published_at = _controlled_optional_text(self.published_at)
+        content_status = _controlled_text(self.content_status)
+        if content_status not in ALLOWED_CONTENT_STATUSES:
             raise CollectionFailure("metric_payload_invalid")
         if _controlled_text(self.content_type) not in ALLOWED_CONTENT_TYPES:
             raise CollectionFailure("metric_payload_invalid")
+        if not title or not cover_url or not published_at:
+            if content_status != "unavailable":
+                raise CollectionFailure("metric_payload_invalid")
 
 
 @dataclass(frozen=True, slots=True)

@@ -18,7 +18,13 @@ def _douyin_factory(**dependencies) -> PlatformDataCollector:
     return DouyinDataCollector(**dependencies)
 
 
-_COLLECTOR_FACTORIES = {3: _douyin_factory}
+def _xiaohongshu_factory(**dependencies) -> PlatformDataCollector:
+    from .xiaohongshu_data_collector import XiaohongshuDataCollector
+
+    return XiaohongshuDataCollector(**dependencies)
+
+
+_COLLECTOR_FACTORIES = {1: _xiaohongshu_factory, 3: _douyin_factory}
 
 
 def registered_platform_types() -> tuple[int, ...]:

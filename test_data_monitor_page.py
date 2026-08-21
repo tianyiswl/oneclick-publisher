@@ -472,7 +472,10 @@ class DataMonitorPageTests(unittest.TestCase):
 
         page = self._page()
 
-        self.assertEqual([page.platform_combo.itemData(i) for i in range(page.platform_combo.count())], [3])
+        self.assertEqual(
+            [page.platform_combo.itemData(i) for i in range(page.platform_combo.count())],
+            [3, 1],
+        )
         self.assertEqual(page.account_combo.count(), 1)
         self.assertEqual(page.account_combo.currentData(), 12)
         self.assertEqual(
