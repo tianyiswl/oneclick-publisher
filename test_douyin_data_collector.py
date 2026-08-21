@@ -28,7 +28,7 @@ class DouyinDataCollectorTests(unittest.TestCase):
     def test_registry_exposes_only_real_collectors_and_rejects_invalid_types(self) -> None:
         """已登记平台必须都有真实工厂，布尔值和未知值不能被当作平台。"""
 
-        self.assertEqual(registered_platform_types(), (1, 3))
+        self.assertEqual(registered_platform_types(), (1, 3, 4, 5, 10))
         for platform_type in (True, "1", 2):
             with self.subTest(platform_type=platform_type):
                 with self.assertRaises(CollectionFailure) as caught:

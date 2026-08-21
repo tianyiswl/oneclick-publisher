@@ -1299,7 +1299,7 @@ class XiaohongshuDataCollectorTests(unittest.TestCase):
     def test_registry_exposes_xiaohongshu_only_with_a_real_factory(self) -> None:
         """登记项若是空占位，界面会把不可采集的平台显示为可同步。"""
 
-        self.assertEqual(registered_platform_types(), (1, 3))
+        self.assertEqual(registered_platform_types(), (1, 3, 4, 5, 10))
         self.assertIsInstance(
             collector_for_platform(1, browser_factory=lambda: _FakeStarter(_FakeRuntime({}))),
             XiaohongshuDataCollector,
