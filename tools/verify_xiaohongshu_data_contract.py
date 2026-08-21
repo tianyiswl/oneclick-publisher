@@ -1696,6 +1696,15 @@ async def _run_probe(
             bounded_payloads[response_identity] = payload
             return payload
 
+        async def cache_chunked_responses(start: int) -> None:
+            for response, metadata, _observation_phase in tuple(
+                observed_responses[start:]
+            ):
+                if metadata[4] == 0:
+                    await load_bounded_chunked_payload(
+                        response, metadata=metadata
+                    )
+
         async def activate_note_data_tab() -> bool:
             nonlocal active_observation_phase
             getter = getattr(page, "get_by_text", None)
@@ -1730,7 +1739,9 @@ async def _run_probe(
             finally:
                 active_observation_phase = ""
 
+        account_response_start = len(observed_responses)
         await navigate("account_home", _CREATOR_HOME)
+        await cache_chunked_responses(account_response_start)
         data_response_start = len(observed_responses)
         await navigate("data_analysis", _DATA_ANALYSIS_URL)
         note_id = await wait_for_data_analysis_note_id(

@@ -291,6 +291,40 @@ class NoteDataTabPlaywright(FakePlaywright):
         self.page = NoteDataTabPage(self)
 
 
+class ExpiringChunkedResponse(FakeResponse):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.expired = False
+
+    def body(self):
+        if self.expired:
+            raise RuntimeError("response body no longer available")
+        return super().body()
+
+
+class ExpiringAccountPage(FakePage):
+    def goto(self, url, **_kwargs):
+        self.owner.events.append(("goto", url))
+        self.goto_url = url
+        self.goto_urls.append(url)
+        self.goto_kwargs.append(dict(_kwargs))
+        if url == verifier._CREATOR_HOME:
+            response = self.owner.account_response
+            if self.request_callback is not None:
+                self.request_callback(response.request)
+            self.response_callback(response)
+        elif url == verifier._DATA_ANALYSIS_URL:
+            self.owner.account_response.expired = True
+        return FakeResponse(url, "text/html; charset=utf-8", None)
+
+
+class ExpiringAccountPlaywright(FakePlaywright):
+    def __init__(self, account_response):
+        super().__init__()
+        self.account_response = account_response
+        self.page = ExpiringAccountPage(self)
+
+
 class FakeClock:
     def __init__(self):
         self.value = 0.0
@@ -982,6 +1016,22 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
             content_length=None,
         )
         fake = FakePlaywright(responses=[response])
+
+        result = verifier._probe_with_browser(
+            eligible_account(), playwright_factory=lambda: fake,
+            monotonic=FakeClock(), utc_now=fixed_now,
+        )
+
+        self.assertIn("account_overview", result["phases"])
+
+    def test_probe_caches_chunked_account_body_before_leaving_home(self):
+        response = ExpiringChunkedResponse(
+            "https://creator.xiaohongshu.com/api/galaxy/creator/home/personal_info",
+            "application/json",
+            {"data": {"fans_count": 3199}},
+            content_length=None,
+        )
+        fake = ExpiringAccountPlaywright(response)
 
         result = verifier._probe_with_browser(
             eligible_account(), playwright_factory=lambda: fake,
