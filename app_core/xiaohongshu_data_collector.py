@@ -417,8 +417,11 @@ class XiaohongshuDataCollector:
         payloads: dict[str, object] = {}
         transient_failures: dict[str, PlatformDataCollectionError] = {}
         seen_response_ids: set[int] = set()
+        scheduled_response_ids: set[int] = set()
+        selected_response_sequence: dict[str, int] = {}
         retained_request_count = 0
         retained_response_count = 0
+        response_sequence = 0
         reserved_bytes = 0
         selected_content_id: str | None = None
         capture_error: PlatformDataCollectionError | None = None
@@ -442,16 +445,15 @@ class XiaohongshuDataCollector:
                 return
             request_phases[id(request)] = (request, phase)
 
-        async def cache_response(response: object, response_phase: str) -> None:
+        async def cache_response(
+            response: object, response_phase: str, sequence: int
+        ) -> None:
             nonlocal reserved_bytes, capture_error
             path = _response_path(response)
             if path is None or _PATH_PHASES[path] != response_phase:
                 return
             endpoint = _PATH_ENDPOINTS[path]
             response_id = id(response)
-            if response_id in seen_response_ids or path in payloads:
-                capture_error = _payload_error(endpoint, "response_capture", "duplicate_response")
-                return
             declared_bytes = _declared_response_bytes(response)
             if declared_bytes is None or reserved_bytes + declared_bytes > _MAX_TOTAL_RESPONSE_BYTES:
                 capture_error = _payload_error(endpoint, "response_headers", "invalid_content_length")
@@ -496,11 +498,14 @@ class XiaohongshuDataCollector:
                 capture_error = _payload_error(endpoint, "json_decode", "invalid_json")
                 return
             seen_response_ids.add(response_id)
-            payloads[path] = payload
+            previous_sequence = selected_response_sequence.get(path)
+            if previous_sequence is None or sequence < previous_sequence:
+                payloads[path] = payload
+                selected_response_sequence[path] = sequence
             transient_failures.pop(path, None)
 
         def remember_response(response: object) -> None:
-            nonlocal capture_error, retained_response_count
+            nonlocal capture_error, retained_response_count, response_sequence
             request = getattr(response, "request", None)
             entry = request_phases.pop(id(request), None)
             if entry is None or entry[0] is not request:
@@ -508,13 +513,23 @@ class XiaohongshuDataCollector:
             path = _response_path(response)
             if path is None or _PATH_PHASES[path] != entry[1]:
                 return
+            response_id = id(response)
+            if response_id in scheduled_response_ids or response_id in seen_response_ids:
+                capture_error = _payload_error(
+                    _PATH_ENDPOINTS[path], "response_capture", "duplicate_response"
+                )
+                return
+            scheduled_response_ids.add(response_id)
             retained_response_count += 1
             if retained_response_count > _MAX_RESPONSES:
                 capture_error = _payload_error(
                     "runtime", "response_capture", "response_limit_exceeded"
                 )
                 return
-            task = asyncio.create_task(cache_response(response, entry[1]))
+            response_sequence += 1
+            task = asyncio.create_task(
+                cache_response(response, entry[1], response_sequence)
+            )
             response_tasks.add(task)
             task.add_done_callback(response_tasks.discard)
 

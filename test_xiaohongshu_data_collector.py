@@ -1098,6 +1098,26 @@ class XiaohongshuDataCollectorTests(unittest.TestCase):
         self.assertEqual(failed.body_calls, 1)
         self.assertEqual(valid.body_calls, 1)
 
+    def test_distinct_same_path_responses_choose_first_valid_response(self) -> None:
+        """同一路径多次正常返回时固定取首个合格响应，不能误判重复或随机覆盖。"""
+
+        responses = _reviewed_success_responses()
+        first = responses[CREATOR_HOME][0]
+        later = _FakeResponse(first.url, {"data": {"fans_count": 9999}})
+        responses[CREATOR_HOME] = (first, later)
+        collector, _fake = self._collector_with_responses(responses)
+
+        batch = collector.collect_browser_signed(_account())
+
+        followers = [
+            point.metric_value
+            for point in batch.metrics
+            if point.metric_key == "followers_total"
+        ]
+        self.assertEqual(followers, [3199])
+        self.assertEqual(first.body_calls, 1)
+        self.assertEqual(later.body_calls, 1)
+
     def test_late_response_keeps_its_request_phase_and_cannot_drive_note_detail(self) -> None:
         """迟到首页请求若按当前页归类，会把首页响应伪装成作品详情。"""
 
