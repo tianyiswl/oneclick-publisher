@@ -1275,6 +1275,7 @@ def _classify_empty_paginated_content_list(
         if type(path) is str
         and path.startswith("data.")
         and path.count(".") == 1
+        and path.removeprefix("data.") in _CONTENT_LIST_KEYS
         and type(length) is int
         and length == 0
     ]

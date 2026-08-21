@@ -1031,6 +1031,20 @@ class XiaohongshuDataContractVerifierTests(unittest.TestCase):
             verifier._classify_shape(ambiguous_lists), "unclassified"
         )
 
+    def test_data_analysis_generic_empty_paginated_list_is_not_content_list(self):
+        """通用空结果若被当成作品列表，会把有作品的账号误报为 0 条。"""
+
+        shape = verifier._response_shape(FakeResponse(
+            "https://creator.xiaohongshu.com/api/private/creator/summary",
+            "application/json",
+            {"data": {"result": [], "total": 0}},
+        ))
+        shape["observationPhase"] = "data_analysis"
+
+        self.assertEqual(shape["listLengths"], {"data.result": 0})
+        self.assertEqual(shape["paginationKeys"], ["data.total"])
+        self.assertEqual(verifier._classify_shape(shape), "unclassified")
+
     def test_classifier_requires_reviewed_path_and_common_ancestor_semantics(self):
         reviewed_paths = {
             "/api/overview": "account_overview",
