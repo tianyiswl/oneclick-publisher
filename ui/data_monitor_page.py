@@ -24,6 +24,7 @@ from PyQt6.QtWidgets import (
 
 from app_core import account_service, platform_data_service, platform_data_sync
 from app_core.platform_data_collectors import registered_platform_types
+from app_core.platform_data_collection_errors import PUBLIC_PLATFORM_DATA_ERROR_TEXT
 
 from .background_task import BackgroundTaskRunner
 from .common import button
@@ -63,17 +64,10 @@ PROGRESS_TEXT = {
     "failed": "数据同步未完成",
 }
 
-ERROR_TEXT = {
-    "login_required": "需要重新登录",
-    "verification_required": "需要完成平台验证",
-    "direct_request_rejected": "平台暂不支持当前读取方式",
-    "session_state_missing": "未找到可用登录状态",
-    "browser_cleanup_incomplete": "浏览器会话未能完整关闭",
-    "content_list_truncated": "作品列表未完整取得",
-    "metric_payload_empty": "平台暂未返回可用数据",
-    "metric_payload_invalid": "平台数据暂时无法识别",
-    "sync_persist_failed": "本地数据保存失败",
-}
+ERROR_TEXT = PUBLIC_PLATFORM_DATA_ERROR_TEXT
+
+_MONITOR_PLATFORM_ORDER = (3, 1, 10, 2, 5, 4)
+_DEMO_ACCOUNT_FILE_PATH = "__oneclick_demo_wechat__.json"
 
 _DIAGNOSTIC_ENDPOINT_TEXT = {
     "account_home": "账号主页",
@@ -124,6 +118,25 @@ def _failure_diagnostic_text(value: object) -> str:
     if not endpoint or not stage or not reason:
         return ""
     return f"接口={endpoint}；阶段={stage}；原因={reason}"
+
+
+def _is_demo_account(account: dict) -> bool:
+    """监测页只接纳可执行真实同步的账号，展示占位账号留在账号管理。"""
+
+    if account.get("filePath") == _DEMO_ACCOUNT_FILE_PATH:
+        return True
+    for field in ("remark", "profileName", "userName"):
+        value = account.get(field)
+        if type(value) is not str:
+            continue
+        text = value.strip()
+        if (
+            text.startswith("演示账号")
+            or text.endswith("（演示）")
+            or text.endswith("(演示)")
+        ):
+            return True
+    return False
 
 
 def _finite_number(value: object) -> int | float | None:
@@ -477,6 +490,8 @@ class DataMonitorPage(QWidget):
         for account in account_service.list_accounts():
             if type(account) is not dict:
                 continue
+            if _is_demo_account(account):
+                continue
             platform_type = account.get("type")
             account_id = account.get("id")
             if (
@@ -487,10 +502,18 @@ class DataMonitorPage(QWidget):
             ):
                 continue
             accounts_by_platform.setdefault(platform_type, []).append(account)
+        platform_order = (
+            _MONITOR_PLATFORM_ORDER
+            + tuple(
+                platform_type
+                for platform_type in account_service.PLATFORM_ORDER
+                if platform_type not in _MONITOR_PLATFORM_ORDER
+            )
+        )
         self._accounts_by_platform = {
-            platform_type: tuple(accounts_by_platform.get(platform_type, ()))
-            for platform_type in account_service.PLATFORM_ORDER
-            if platform_type in registered
+            platform_type: tuple(accounts_by_platform[platform_type])
+            for platform_type in platform_order
+            if platform_type in accounts_by_platform
         }
         platform_types = tuple(self._accounts_by_platform)
 

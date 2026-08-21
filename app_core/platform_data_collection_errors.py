@@ -48,6 +48,23 @@ PLATFORM_DATA_COLLECTION_ERROR_CODES = frozenset(
     }
 )
 
+# 页面只能使用这组固定文案，绝不拼接浏览器、网络或平台异常原文。
+PUBLIC_PLATFORM_DATA_ERROR_TEXT = {
+    "account_trends_unavailable": "平台暂未返回账号数据",
+    "browser_cleanup_incomplete": "浏览器会话未能完整关闭",
+    "browser_signature_timeout": "平台数据读取超时",
+    "collector_not_available": "当前平台暂不支持数据同步",
+    "content_list_truncated": "作品列表未完整取得",
+    "content_list_unavailable": "平台暂未返回作品数据",
+    "content_payload_invalid": "平台页面或数据接口已变化",
+    "direct_request_rejected": "平台暂不支持当前读取方式",
+    "metric_payload_empty": "平台暂未返回可用数据",
+    "metric_payload_invalid": "平台页面或数据接口已变化",
+    "session_state_missing": "未找到可用登录状态",
+    "sync_persist_failed": "本地数据保存失败",
+    "validation_readback_mismatch": "本地数据读回失败",
+}
+
 
 def public_failure_diagnostic(value: object) -> dict | None:
     """只接受内部固定枚举，避免带出平台正文或异常原文。"""

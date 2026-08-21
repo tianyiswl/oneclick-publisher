@@ -63,6 +63,56 @@ XHS_ACCOUNT_WITH_DOUYIN_ID = {
     "id": 12,
 }
 
+WECHAT_DEMO_ACCOUNT = {
+    "id": 30,
+    "type": 10,
+    "platformName": "公众号",
+    "profileName": "一键发示例主体",
+    "userName": "一键发公众号（演示）",
+    "filePath": "__oneclick_demo_wechat__.json",
+    "remark": "演示账号：未连接真实公众号，不可执行登录或发布",
+}
+
+WECHAT_REAL_ACCOUNT = {
+    "id": 31,
+    "type": 10,
+    "platformName": "公众号",
+    "profileName": "公众号主体",
+    "userName": "公众号账号",
+    "filePath": "oneclick_10_safe.json",
+    "remark": "",
+}
+
+CHANNELS_REAL_ACCOUNT = {
+    "id": 20,
+    "type": 2,
+    "platformName": "视频号",
+    "profileName": "视频号主体",
+    "userName": "视频号账号",
+    "filePath": "oneclick_2_safe.json",
+    "remark": "",
+}
+
+BILIBILI_REAL_ACCOUNT = {
+    "id": 21,
+    "type": 5,
+    "platformName": "B站",
+    "profileName": "B站主体",
+    "userName": "B站账号",
+    "filePath": "oneclick_5_safe.json",
+    "remark": "",
+}
+
+KUAISHOU_REAL_ACCOUNT = {
+    "id": 22,
+    "type": 4,
+    "platformName": "快手",
+    "profileName": "快手主体",
+    "userName": "快手账号",
+    "filePath": "oneclick_4_safe.json",
+    "remark": "",
+}
+
 
 def empty_summary() -> dict:
     summary = period_summary()
@@ -656,6 +706,92 @@ class DataMonitorPageTests(unittest.TestCase):
             {"—"},
         )
 
+    def test_domestic_registered_platforms_show_only_real_accounts(self) -> None:
+        """演示账号进入监测选择器会让不可执行账号冒充可同步主体。"""
+
+        page = self._page(
+            accounts=[
+                WECHAT_DEMO_ACCOUNT,
+                WECHAT_REAL_ACCOUNT,
+                CHANNELS_REAL_ACCOUNT,
+                BILIBILI_REAL_ACCOUNT,
+                KUAISHOU_REAL_ACCOUNT,
+            ],
+            registered_platforms=(2, 4, 5, 10),
+        )
+
+        self.assertEqual(
+            [page.platform_combo.itemText(i) for i in range(page.platform_combo.count())],
+            ["公众号", "视频号", "B站", "快手"],
+        )
+        self.assertEqual(page.platform_combo.currentData(), 10)
+        self.assertEqual(page.account_combo.currentData(), WECHAT_REAL_ACCOUNT["id"])
+        self.assertNotIn(
+            WECHAT_DEMO_ACCOUNT["id"],
+            [page.account_combo.itemData(i) for i in range(page.account_combo.count())],
+        )
+
+    def test_monitor_excludes_a_platform_with_only_demo_accounts(self) -> None:
+        """仅有演示账号的平台必须完全从监测页消失。"""
+
+        page = self._page(
+            accounts=[WECHAT_DEMO_ACCOUNT],
+            registered_platforms=(10,),
+        )
+
+        self.assertEqual(page.platform_combo.count(), 0)
+        self.assertEqual(page.account_combo.count(), 0)
+
+    def test_late_result_from_previous_domestic_platform_keeps_current_subject(self) -> None:
+        """旧视频号任务迟到完成时不能把页面切回已选的 B 站主体。"""
+
+        pool = QueuedPool()
+        runner = BackgroundTaskRunner()
+        runner.pool = pool
+        page = self._page(
+            accounts=[CHANNELS_REAL_ACCOUNT, BILIBILI_REAL_ACCOUNT],
+            registered_platforms=(2, 5),
+            runner=runner,
+        )
+
+        self.assertEqual(page._current_subject_identity(), (2, 20))
+        page.sync_button.click()
+        channels_task = pool.tasks[0]
+        page.platform_combo.setCurrentIndex(page.platform_combo.findData(5))
+        self.assertEqual(page._current_subject_identity(), (5, 21))
+
+        channels_task.signals.started.emit()
+        channels_task.signals.succeeded.emit(
+            {"accountId": 20, "status": "success"}
+        )
+        channels_task.signals.finished.emit()
+        self.app.processEvents()
+
+        self.assertEqual(page._current_subject_identity(), (5, 21))
+
+    def test_fixed_failure_copies_cover_platform_and_local_failures(self) -> None:
+        """固定错误码若回退为异常类别，用户无法判断下一步且可能暴露异常原文。"""
+
+        expected = {
+            "login_required": "需要重新登录视频号",
+            "verification_required": "需要完成视频号验证",
+            "metric_payload_invalid": "平台页面或数据接口已变化",
+            "browser_cleanup_incomplete": "浏览器会话未能完整关闭",
+            "sync_persist_failed": "本地数据保存失败",
+            "validation_readback_mismatch": "本地数据读回失败",
+        }
+        for code, text in expected.items():
+            with self.subTest(code=code):
+                summary = failed_summary()
+                summary["latestRun"]["errorCode"] = code
+                page = self._page(
+                    summary=summary,
+                    accounts=[CHANNELS_REAL_ACCOUNT],
+                    registered_platforms=(2,),
+                )
+                self.assertEqual(page.status_label.text(), f"同步失败：{text}")
+                self.assertNotIn("Cookie=secret", page.status_label.text())
+
     def test_platform_then_subject_selectors_filter_and_restore_per_platform(self) -> None:
         """平台切换若复用全局主体记忆，会把另一个平台的主体带回来。"""
 
@@ -708,19 +844,19 @@ class DataMonitorPageTests(unittest.TestCase):
             self.assertEqual(page.content_table.rowCount(), 0)
             render.assert_called_once_with(include_contents=True)
 
-    def test_platform_without_subject_disables_sync(self) -> None:
-        """用户切到没有主体的平台时不能保留上一平台的同步入口或状态。"""
+    def test_platform_without_real_subject_is_hidden(self) -> None:
+        """没有真实主体的平台不能以空选择器形式冒充可同步平台。"""
 
         page = self._page(
             accounts=[ACCOUNT],
             registered_platforms=(1, 3),
         )
 
-        page.platform_combo.setCurrentIndex(page.platform_combo.findData(1))
-
-        self.assertEqual(page.account_combo.count(), 0)
-        self.assertFalse(page.sync_button.isEnabled())
-        self.assertEqual(page.status_label.text(), "请先在账号管理中添加小红书账号")
+        self.assertEqual(
+            [page.platform_combo.itemData(i) for i in range(page.platform_combo.count())],
+            [3],
+        )
+        self.assertEqual(page.account_combo.currentData(), ACCOUNT["id"])
 
     def test_sync_uses_real_runner_dedupes_and_ignores_untrusted_progress_text(self) -> None:
         """同账号重复入队或透传 worker 文案都会破坏同步安全边界。"""
@@ -885,7 +1021,7 @@ class DataMonitorPageTests(unittest.TestCase):
 
         self.assertEqual(
             page.status_label.text(),
-            "同步失败：平台数据暂时无法识别（接口=账号主页；阶段=JSON解析；原因=JSON格式无效）",
+            "同步失败：平台页面或数据接口已变化（接口=账号主页；阶段=JSON解析；原因=JSON格式无效）",
         )
 
     def test_successful_worker_refreshes_each_local_query_once(self) -> None:
