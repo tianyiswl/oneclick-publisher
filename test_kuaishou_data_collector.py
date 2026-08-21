@@ -104,6 +104,11 @@ class KuaishouDataCollectorTests(unittest.TestCase):
         self.assertEqual(batch.platform_type, 4)
         self.assertEqual(batch.contents[0].content_id, "work-1")
         self.assertEqual(points[("account:9", "followers_total")], 120)
+        account_point = next(
+            point for point in batch.metrics if point.metric_key == "followers_total"
+        )
+        self.assertEqual(account_point.period_start, "2026-08-20")
+        self.assertEqual(account_point.period_end, "2026-08-20")
         self.assertEqual(points[("work-1", "views")], 66)
         self.assertEqual(points[("work-1", "likes")], 7)
         self.assertEqual(points[("work-1", "comments")], 1)

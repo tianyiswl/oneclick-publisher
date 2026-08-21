@@ -156,6 +156,11 @@ class BilibiliDataCollectorTests(unittest.TestCase):
         }
         self.assertEqual(batch.platform_type, 5)
         self.assertEqual(points[("account:8", "followers_total")], 120)
+        account_point = next(
+            point for point in batch.metrics if point.metric_key == "followers_total"
+        )
+        self.assertEqual(account_point.period_start, "2026-08-20")
+        self.assertEqual(account_point.period_end, "2026-08-20")
         self.assertEqual(points[("BV1TEST", "views")], 300)
         self.assertEqual(points[("BV1TEST", "likes")], 12)
         self.assertEqual(points[("BV1TEST", "comments")], 2)

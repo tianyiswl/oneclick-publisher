@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from .domestic_data_collector import (
@@ -264,6 +264,9 @@ def parse_captures(
     _require_authority(captures)
     followers_total = _followers_total(captures)
     observed_at, observed_day = _observation()
+    account_period_day = (
+        datetime.fromisoformat(observed_day).date() - timedelta(days=1)
+    ).isoformat()
     contents, content_points, content_available, truncated = _contents(
         captures,
         observed_at=observed_at,
@@ -277,8 +280,8 @@ def parse_captures(
         metric_value=followers_total,
         metric_unit="count",
         metric_scope="lifetime_total",
-        period_start=observed_day,
-        period_end=observed_day,
+        period_start=account_period_day,
+        period_end=account_period_day,
         observed_at=observed_at,
     )
     warning = (
