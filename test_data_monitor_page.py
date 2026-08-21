@@ -764,8 +764,8 @@ class DataMonitorPageTests(unittest.TestCase):
         self.assertNotIn("/private", page.status_label.text())
         self.assertFalse(runner.is_running("platform-data-sync:3:12"))
 
-    def test_xhs_sync_click_uses_headed_validation_with_production_reader(self) -> None:
-        """删掉小红书按钮的验收参数时，正式入口会退回无头普通同步。"""
+    def test_xhs_sync_click_uses_official_response_and_atomic_database_readback(self) -> None:
+        """正式同步不能被要求在同一页面同时找到账号卡片和作品详情卡片。"""
 
         pool = QueuedPool()
         runner = BackgroundTaskRunner()
@@ -795,8 +795,7 @@ class DataMonitorPageTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         account_id, kwargs = calls[0]
         self.assertEqual(account_id, XHS_ACCOUNT["id"])
-        self.assertEqual(kwargs.get("validation_mode"), True)
-        self.assertTrue(callable(kwargs.get("visible_readback")))
+        self.assertEqual(kwargs, {})
 
     def test_douyin_sync_click_keeps_ordinary_sync_arguments(self) -> None:
         """把小红书验收参数误传给抖音会改变已有同步协议。"""

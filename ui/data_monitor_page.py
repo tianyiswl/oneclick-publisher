@@ -895,14 +895,6 @@ class DataMonitorPage(QWidget):
             with_progress=lambda report: platform_data_sync.sync_account_data(
                 account_id,
                 report=report,
-                **(
-                    {
-                        "validation_mode": True,
-                        "visible_readback": platform_data_sync.official_visible_readback,
-                    }
-                    if platform_type == 1
-                    else {}
-                ),
             ),
             on_started=started,
             on_progress=progressed,
