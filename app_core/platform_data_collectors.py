@@ -30,9 +30,16 @@ def _wechat_factory(**dependencies) -> PlatformDataCollector:
     return WechatDataCollector(**dependencies)
 
 
+def _bilibili_factory(**dependencies) -> PlatformDataCollector:
+    from .bilibili_data_collector import BilibiliDataCollector
+
+    return BilibiliDataCollector(**dependencies)
+
+
 _COLLECTOR_FACTORIES = {
     1: _xiaohongshu_factory,
     3: _douyin_factory,
+    5: _bilibili_factory,
     10: _wechat_factory,
 }
 
