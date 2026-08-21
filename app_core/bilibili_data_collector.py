@@ -223,15 +223,23 @@ def _contents(
         return (), (), False, False
 
     records: dict[str, tuple[ContentRecord, tuple[MetricPoint, ...]]] = {}
-    expected_count = 0
+    pagination: tuple[int, int, int] | None = None
     for payload in payloads:
         data = _successful(payload)
         page = _mapping(data.get("page"))
         count = _integer(page.get("count"))
-        _integer(page.get("pn"))
-        _integer(page.get("ps"))
-        expected_count = max(expected_count, count)
-        for raw_item in _sequence(data.get("arc_audits")):
+        page_number = _integer(page.get("pn"))
+        page_size = _integer(page.get("ps"))
+        if page_number != 1 or page_size <= 0:
+            _invalid()
+        current_pagination = (count, page_number, page_size)
+        if pagination is not None and pagination != current_pagination:
+            _invalid()
+        pagination = current_pagination
+        rows = _sequence(data.get("arc_audits"))
+        if len(rows) > page_size:
+            _invalid()
+        for raw_item in rows:
             candidate = _content_record(
                 raw_item,
                 observed_at=observed_at,
@@ -246,6 +254,7 @@ def _contents(
     ordered = tuple(records.values())
     contents = tuple(item[0] for item in ordered)
     points = tuple(point for item in ordered for point in item[1])
+    expected_count = pagination[0] if pagination is not None else 0
     return contents, points, True, expected_count > len(contents)
 
 

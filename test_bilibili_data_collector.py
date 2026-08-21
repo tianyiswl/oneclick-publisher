@@ -27,6 +27,7 @@ def bilibili_captures(
     count: int = 1,
     page_number: int = 1,
     page_size: int = 10,
+    row_count: int = 1,
     phase: str = "submission",
 ) -> tuple[CapturedJson, ...]:
     stat = {
@@ -123,7 +124,7 @@ def bilibili_captures(
                             "Videos": [],
                             "stat": stat,
                         }
-                    ],
+                    ] * row_count,
                     "archives": None,
                     "class": {"is_pubing": 0, "not_pubed": 0, "pubed": count},
                     "page": {"count": count, "pn": page_number, "ps": page_size},
@@ -191,6 +192,43 @@ class BilibiliDataCollectorTests(unittest.TestCase):
         batch = self.parse(bilibili_captures(count=11, page_size=10))
 
         self.assertEqual(batch.warning_code, "content_list_truncated")
+
+    def test_parser_rejects_non_first_archive_page(self) -> None:
+        """晚页不能冒充最近稿件第一页。"""
+
+        with self.assertRaises(CollectionFailure) as raised:
+            self.parse(bilibili_captures(page_number=2))
+
+        self.assertEqual(raised.exception.error_code, "metric_payload_invalid")
+
+    def test_parser_rejects_non_positive_archive_page_size(self) -> None:
+        """无效页大小不能用于判断响应是否完整。"""
+
+        with self.assertRaises(CollectionFailure) as raised:
+            self.parse(bilibili_captures(page_size=0))
+
+        self.assertEqual(raised.exception.error_code, "metric_payload_invalid")
+
+    def test_parser_rejects_more_archives_than_page_size(self) -> None:
+        """单页稿件数超过官方页大小时响应合同不可信。"""
+
+        captures = bilibili_captures(page_size=1, row_count=2)
+
+        with self.assertRaises(CollectionFailure) as raised:
+            self.parse(captures)
+
+        self.assertEqual(raised.exception.error_code, "metric_payload_invalid")
+
+    def test_parser_rejects_conflicting_pagination_metadata(self) -> None:
+        """同次监听中的分页元数据不一致时不能拼接结果。"""
+
+        first = bilibili_captures(count=1, page_size=10)
+        second = bilibili_captures(count=2, page_size=10)
+
+        with self.assertRaises(CollectionFailure) as raised:
+            self.parse(first + (second[-1],))
+
+        self.assertEqual(raised.exception.error_code, "metric_payload_invalid")
 
     def test_parser_keeps_exact_official_bvid(self) -> None:
         """作品身份必须直接使用响应的 BVID，不能从标题或 AID 猜测。"""
