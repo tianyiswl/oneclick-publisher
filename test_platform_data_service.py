@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from app_core import database, platform_data_service
+from app_core import database, platform_data_models, platform_data_service
 from app_core.platform_data_models import (
     CollectionBatch,
     CollectionFailure,
@@ -178,6 +178,82 @@ class PlatformDataServiceTests(unittest.TestCase):
                 content_data_available=True,
                 platform_observed_at="2026-08-20T12:00:00+08:00",
             )
+
+    def test_xhs_model_capability_distinguishes_unsupported_from_snapshot_pending(
+        self,
+    ) -> None:
+        """平台合同缺字段与仍可等跨日快照的指标必须是两种模型语义。"""
+
+        capability = getattr(
+            platform_data_models,
+            "unsupported_account_metric_keys",
+            None,
+        )
+        if not callable(capability):
+            self.fail("unsupported account metric capability is missing")
+
+        unsupported = capability(1)
+
+        self.assertEqual(
+            unsupported,
+            frozenset({"views", "likes", "comments", "shares", "profile_visits"}),
+        )
+        self.assertNotIn("followers_net", unsupported)
+        self.assertNotIn("followers_total", unsupported)
+
+    def test_xhs_period_summary_marks_contract_absence_but_keeps_delta_pending(
+        self,
+    ) -> None:
+        """小红书不提供的账号量显示 unsupported，跨日净增粉仍保持 missing。"""
+
+        with database.connect() as conn:
+            conn.execute(
+                "UPDATE user_info SET type = 1 WHERE id = ?",
+                (self.account_id,),
+            )
+        platform_data_service.record_collection_sync(
+            self.account_id,
+            CollectionBatch(
+                platform_type=1,
+                source_mode="browser_signed",
+                metrics=(
+                    self._v2_point(
+                        "followers_total",
+                        120,
+                        day="2026-08-20",
+                        metric_scope="lifetime_total",
+                    ),
+                ),
+                contents=(),
+                account_metrics_available=True,
+                content_data_available=True,
+                platform_observed_at="2026-08-20T23:30:00+08:00",
+            ),
+        )
+
+        with patch.object(
+            platform_data_service,
+            "_beijing_today",
+            return_value=date(2026, 8, 21),
+        ):
+            summary = platform_data_service.account_period_summary(
+                self.account_id,
+                1,
+            )
+
+        self.assertEqual(summary["metrics"]["views"]["availability"], "unsupported")
+        self.assertEqual(
+            summary["metrics"]["profile_visits"]["availability"],
+            "unsupported",
+        )
+        self.assertEqual(
+            summary["metrics"]["followers_net"]["availability"],
+            "missing",
+        )
+        self.assertEqual(
+            summary["metrics"]["followers_total"]["availability"],
+            "complete",
+        )
 
     def test_v2_models_reject_controlled_field_whitespace(self) -> None:
         """受控字段首尾空白不得绕过白名单、日期或批次身份。"""
@@ -981,6 +1057,92 @@ class PlatformDataServiceTests(unittest.TestCase):
                 )
                 self.assertIsNone(raised.exception.__cause__)
                 self.assertEqual(self._table_counts(), (1, 3, 1))
+
+    def test_xhs_truncated_page_persists_account_and_recent_content_as_partial(
+        self,
+    ) -> None:
+        """普通分页批次必须原子保留账号与最近作品，并公开本次覆盖条数。"""
+
+        with database.connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO user_info
+                    (type, filePath, userName, status, profileName, authMode)
+                VALUES (1, 'oneclick_1_partial.json', '小红书分页账号', 1,
+                        '小红书分页主体', 'browser')
+                """
+            )
+            xhs_account_id = int(cursor.lastrowid)
+        content_id = "0123456789abcdef01234567"
+        batch = CollectionBatch(
+            platform_type=1,
+            source_mode="browser_signed",
+            metrics=(
+                MetricPoint(
+                    entity_type="account",
+                    entity_key=f"account:{xhs_account_id}",
+                    metric_key="followers_total",
+                    raw_metric_key="fans_count",
+                    metric_value=125,
+                    metric_unit="count",
+                    metric_scope="lifetime_total",
+                    period_start="2026-08-20",
+                    period_end="2026-08-20",
+                    observed_at="2026-08-20T23:30:00+08:00",
+                ),
+                MetricPoint(
+                    entity_type="content",
+                    entity_key=content_id,
+                    metric_key="views",
+                    raw_metric_key="view_count",
+                    metric_value=400,
+                    metric_unit="count",
+                    metric_scope="lifetime_total",
+                    period_start="2026-08-20",
+                    period_end="2026-08-20",
+                    observed_at="2026-08-20T23:30:00+08:00",
+                ),
+            ),
+            contents=(
+                ContentRecord(
+                    content_id=content_id,
+                    title="",
+                    cover_url="",
+                    published_at="",
+                    content_status="unavailable",
+                    content_type="unavailable",
+                ),
+            ),
+            account_metrics_available=True,
+            content_data_available=True,
+            platform_observed_at="2026-08-20T23:30:00+08:00",
+            warning_code="content_list_truncated",
+        )
+
+        saved = platform_data_service.record_collection_sync(xhs_account_id, batch)
+        contents = platform_data_service.account_contents(xhs_account_id)
+
+        self.assertEqual(saved["status"], "partial_success")
+        self.assertEqual(saved["errorCode"], "content_list_truncated")
+        self.assertEqual(contents["availability"], "partial")
+        self.assertEqual(contents["coveredCount"], 1)
+        self.assertEqual(
+            [item["contentId"] for item in contents["items"]],
+            [content_id],
+        )
+        with database.connect() as conn:
+            run = conn.execute(
+                """
+                SELECT status, errorCode, metricCount
+                FROM platform_data_sync_runs
+                WHERE accountId = ?
+                """,
+                (xhs_account_id,),
+            ).fetchone()
+        self.assertEqual(
+            tuple(run),
+            ("partial_success", "content_list_truncated", 2),
+        )
 
     def test_xhs_persistence_is_atomic_and_keeps_douyin_account_untouched(self) -> None:
         """按平台和账号隔离，重跑小红书不得改写抖音主体的最新快照。"""

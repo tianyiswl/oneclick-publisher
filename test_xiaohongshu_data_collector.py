@@ -122,11 +122,12 @@ class XiaohongshuDataContractTests(unittest.TestCase):
                 self.assert_invalid(lambda invalid_id=invalid_id: XhsContentIdentity(invalid_id))
 
     def test_parse_content_list_accepts_exact_ids_and_rejects_bool_counts(self) -> None:
-        rows = parse_content_list(
+        page = parse_content_list(
             {"data": {"note_infos": [{"id": _CONTENT_ID}], "total": 1}}
         )
 
-        self.assertEqual(rows, (XhsContentIdentity(_CONTENT_ID),))
+        self.assertEqual(page.identities, (XhsContentIdentity(_CONTENT_ID),))
+        self.assertFalse(page.truncated)
         self.assert_invalid(
             lambda: parse_content_list(
                 {"data": {"note_infos": [{"id": _CONTENT_ID}], "total": True}}
@@ -134,11 +135,12 @@ class XiaohongshuDataContractTests(unittest.TestCase):
         )
 
     def test_parse_content_list_accepts_an_empty_proven_list(self) -> None:
-        rows = parse_content_list({"data": {"note_infos": [], "total": 0}})
+        page = parse_content_list({"data": {"note_infos": [], "total": 0}})
 
-        self.assertEqual(rows, ())
+        self.assertEqual(page.identities, ())
+        self.assertFalse(page.truncated)
 
-    def test_content_list_rejects_unknown_containers_duplicates_and_truncation(self) -> None:
+    def test_content_list_rejects_bad_shapes_and_preserves_a_bounded_page(self) -> None:
         invalid_payloads = (
             {"data": {"note_infos": {"id": _CONTENT_ID}, "total": 1}},
             {"data": {"items": [{"id": _CONTENT_ID}], "total": 1}},
@@ -151,10 +153,26 @@ class XiaohongshuDataContractTests(unittest.TestCase):
                 self.assert_invalid(lambda payload=payload: parse_content_list(payload))
 
         entries = [{"id": f"{index:024x}"} for index in range(51)]
-        with self.assertRaises(CollectionFailure) as raised:
-            parse_content_list({"data": {"note_infos": entries, "total": 51}})
-        self.assertEqual(raised.exception.error_code, "content_list_truncated")
-        self.assertIsNone(raised.exception.__cause__)
+        page = parse_content_list(
+            {"data": {"note_infos": entries, "total": 60}}
+        )
+        self.assertEqual(len(page.identities), 50)
+        self.assertTrue(page.truncated)
+
+    def test_content_list_marks_normal_platform_pagination_without_dropping_rows(
+        self,
+    ) -> None:
+        """total 大于当前页条数是普通分页，不是致命合同错误。"""
+
+        try:
+            page = parse_content_list(
+                {"data": {"note_infos": [{"id": _CONTENT_ID}], "total": 12}}
+            )
+        except CollectionFailure as error:
+            self.fail(f"ordinary pagination was rejected: {error.error_code}")
+
+        self.assertEqual(page.identities, (XhsContentIdentity(_CONTENT_ID),))
+        self.assertTrue(page.truncated)
 
     def test_parse_lifetime_maps_only_reviewed_metrics_and_marks_unknown_text(self) -> None:
         content, points = parse_content_lifetime(
@@ -704,6 +722,48 @@ class XiaohongshuDataCollectorTests(unittest.TestCase):
         self.assertEqual(batch.contents, ())
         self.assertEqual(batch.warning_code, "")
         self.assertEqual(fake.goto_urls, [CREATOR_HOME, DATA_ANALYSIS_URL])
+
+    def test_paginated_content_list_keeps_recent_content_as_partial_success(self) -> None:
+        """普通分页必须保留本页作品和账号指标，并明确列表只取得一部分。"""
+
+        responses = _reviewed_success_responses()
+        responses[DATA_ANALYSIS_URL] = (
+            _FakeResponse(
+                "https://creator.xiaohongshu.com/api/galaxy/creator/"
+                "datacenter/note/analyze/list?page_num=1",
+                {"data": {"note_infos": [{"id": _CONTENT_ID}], "total": 12}},
+            ),
+        )
+        collector, _fake = self._collector_with_responses(responses)
+
+        batch = collector.collect_browser_signed(_account())
+
+        self.assertTrue(batch.account_metrics_available)
+        self.assertTrue(batch.content_data_available)
+        self.assertEqual([item.content_id for item in batch.contents], [_CONTENT_ID])
+        self.assertEqual(batch.warning_code, "content_list_truncated")
+
+    def test_observation_day_uses_beijing_date_during_utc_boundary(self) -> None:
+        """北京时间零点后、UTC 仍是前一天时，快照日期必须按北京时间。"""
+
+        clock = _MutableClock()
+        fake = _FakeRuntime(
+            _reviewed_success_responses(),
+            wait_hook=clock.advance_milliseconds,
+        )
+        collector = XiaohongshuDataCollector(
+            browser_factory=lambda: _FakeStarter(fake),
+            utc_now=lambda: datetime(2026, 8, 20, 16, 30, tzinfo=timezone.utc),
+            monotonic=clock,
+        )
+
+        batch = collector.collect_browser_signed(_account())
+
+        self.assertEqual(batch.platform_observed_at, "2026-08-21T00:30:00+08:00")
+        self.assertEqual(
+            {(point.period_start, point.period_end) for point in batch.metrics},
+            {("2026-08-21", "2026-08-21")},
+        )
 
     def test_missing_content_list_stops_at_deadline_without_partial_snapshot(self) -> None:
         """列表阶段到 deadline 仍无官方响应时，不能把缺失伪装成部分成功。"""

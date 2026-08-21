@@ -6,7 +6,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import Mock, patch
 
-from app_core import platform_data_sync
+from app_core import platform_data_collectors, platform_data_sync
 from app_core.douyin_data_collector import DouyinDataCollectionError
 from app_core.platform_data_collection_errors import CleanupReceipt, PlatformDataCollectionError
 from app_core.platform_data_models import (
@@ -183,6 +183,18 @@ class DetailedXhsCollector(FakeCollector):
         return self.outcome
 
 
+class CollectOnlyDomesticCollector:
+    """模拟 DomesticBrowserCollector 的统一 ``collect`` 协议。"""
+
+    def __init__(self, batch: CollectionBatch) -> None:
+        self.batch = batch
+        self.calls: list[dict] = []
+
+    def collect(self, account: dict) -> CollectionBatch:
+        self.calls.append(account)
+        return self.batch
+
+
 class PlatformDataSyncTests(unittest.TestCase):
     def setUp(self) -> None:
         self.account = {
@@ -249,6 +261,69 @@ class PlatformDataSyncTests(unittest.TestCase):
                 {"stage": "persisting", "message": "正在保存可信指标"},
                 {"stage": "completed", "message": "数据同步完成"},
             ],
+        )
+
+    def test_registry_syncs_a_collect_only_domestic_browser_collector(self) -> None:
+        """统一注册表采集器只有 collect 时，同步编排也必须可持久化其批次。"""
+
+        domestic_account = {
+            "id": 22,
+            "type": 2,
+            "filePath": "oneclick_2_safe.json",
+            "authMode": "browser",
+        }
+        batch = CollectionBatch(
+            platform_type=2,
+            source_mode="browser_signed",
+            metrics=(
+                MetricPoint(
+                    entity_type="account",
+                    entity_key="account:22",
+                    metric_key="views",
+                    raw_metric_key="views",
+                    metric_value=9,
+                    metric_unit="count",
+                    metric_scope="daily_increment",
+                    period_start="2026-08-20",
+                    period_end="2026-08-20",
+                    observed_at="2026-08-20T12:00:00+08:00",
+                ),
+            ),
+            contents=(),
+            account_metrics_available=True,
+            content_data_available=True,
+            platform_observed_at="2026-08-20T12:00:00+08:00",
+        )
+        collector = CollectOnlyDomesticCollector(batch)
+        progress: list[dict] = []
+
+        with patch.object(
+            platform_data_sync.account_service,
+            "list_accounts",
+            return_value=[domestic_account],
+        ), patch.dict(
+            platform_data_collectors._COLLECTOR_FACTORIES,
+            {2: lambda **_dependencies: collector},
+        ), patch.object(
+            platform_data_sync.platform_data_service,
+            "record_collection_sync",
+            return_value={
+                "accountId": 22,
+                "status": "success",
+                "sourceMode": "browser_signed",
+                "errorCode": "",
+                "metricCount": 1,
+            },
+        ) as record_collection:
+            result = platform_data_sync.sync_account_data(22, report=progress.append)
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["sourceMode"], "browser_signed")
+        self.assertEqual(collector.calls, [domestic_account])
+        self.assertIs(record_collection.call_args.args[1], batch)
+        self.assertIn(
+            {"stage": "browser_signed", "message": "正在读取平台官方数据…"},
+            progress,
         )
 
     def test_xhs_sync_routes_collector_persists_and_returns_public_result(self) -> None:
@@ -944,13 +1019,60 @@ class PlatformDataSyncTests(unittest.TestCase):
                 "status": "failed",
                 "sourceMode": "direct_session",
                 "errorCode": "sync_persist_failed",
-                "metricCount": 2,
-                "contentCount": 1,
+                "metricCount": 0,
+                "contentCount": 0,
             },
         )
         self.assertEqual(progress[-1], {"stage": "failed", "message": "数据同步未完成"})
         self.assertNotIn("partial", [event["stage"] for event in progress])
         self.assertNotIn("completed", [event["stage"] for event in progress])
+
+    def test_persistence_exception_returns_controlled_failure_and_records_when_possible(
+        self,
+    ) -> None:
+        """SQLite 异常必须回到固定失败载荷；可写时再补一条失败运行。"""
+
+        collector = FakeCollector(valid_batch("direct_session"))
+        with patch.object(
+            platform_data_sync.account_service,
+            "list_accounts",
+            return_value=[self.account],
+        ), patch.object(
+            platform_data_sync,
+            "collector_for_platform",
+            return_value=collector,
+        ), patch.object(
+            platform_data_sync.platform_data_service,
+            "record_collection_sync",
+            side_effect=CollectionFailure("sync_persist_failed"),
+        ), patch.object(
+            platform_data_sync.platform_data_service,
+            "record_failed_sync",
+            return_value={
+                "accountId": 12,
+                "status": "failed",
+                "sourceMode": "direct_session",
+                "errorCode": "sync_persist_failed",
+                "metricCount": 0,
+            },
+        ) as record_failed:
+            result = platform_data_sync.sync_account_data(12)
+
+        self.assertEqual(
+            result,
+            {
+                "accountId": 12,
+                "status": "failed",
+                "sourceMode": "direct_session",
+                "errorCode": "sync_persist_failed",
+                "metricCount": 0,
+                "contentCount": 0,
+            },
+        )
+        self.assertEqual(
+            record_failed.call_args.args,
+            (12, 3, "direct_session", "sync_persist_failed"),
+        )
 
     def test_content_truncation_warning_survives_partial_sync(self) -> None:
         """截断警告若被清空，调用方会把不完整作品列表当作全量。"""

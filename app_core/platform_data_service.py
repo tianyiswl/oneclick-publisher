@@ -14,6 +14,7 @@ from .platform_data_models import (
     CollectionBatch,
     CollectionFailure,
     MetricPoint,
+    unsupported_account_metric_keys,
 )
 
 
@@ -146,6 +147,16 @@ def _ensure_account(conn, account_id: int, platform_type: int) -> None:
     ).fetchone()
     if row is None or type(row["type"]) is not int or int(row["type"]) != platform_type:
         raise CollectionFailure("metric_payload_invalid")
+
+
+def _account_platform_type(conn, account_id: int) -> int:
+    row = conn.execute(
+        "SELECT type FROM user_info WHERE id = ? LIMIT 1",
+        (account_id,),
+    ).fetchone()
+    if row is None:
+        raise CollectionFailure("metric_payload_invalid")
+    return _platform_type(row["type"])
 
 
 def _insert_metric_snapshot(
@@ -537,7 +548,16 @@ def _content_query_state(conn, account_id: int) -> dict:
                      AND snapshots.metricScope = 'lifetime_total'
                      AND snapshots.periodStart != ''
                      AND snapshots.periodEnd != ''
-               ) AS hasContentMetrics
+               ) AS hasContentMetrics,
+               (
+                   SELECT COUNT(DISTINCT snapshots.entityKey)
+                   FROM platform_metric_snapshots AS snapshots
+                   WHERE snapshots.syncRunId = runs.id
+                     AND snapshots.entityType = 'content'
+                     AND snapshots.metricScope = 'lifetime_total'
+                     AND snapshots.periodStart != ''
+                     AND snapshots.periodEnd != ''
+               ) AS contentCount
         FROM platform_data_sync_runs AS runs
     """
     latest_attempt = conn.execute(
@@ -602,6 +622,9 @@ def _content_query_state(conn, account_id: int) -> dict:
     return {
         "availability": availability,
         "warningCode": warning_code,
+        "coveredCount": (
+            int(data_run["contentCount"] or 0) if data_run is not None else 0
+        ),
         "platformObservedAt": _latest_controlled_timestamp(
             data_rows, "startedAt"
         ),
@@ -696,6 +719,7 @@ def account_period_summary(account_id: int, days: int) -> dict:
     safe_days, period_start, period_end = _period_range(days)
     try:
         with database.connect() as conn:
+            platform_type = _account_platform_type(conn, account)
             daily_rows = _latest_account_rows(
                 conn,
                 account_id=account,
@@ -751,6 +775,7 @@ def account_period_summary(account_id: int, days: int) -> dict:
         rows[-1] for rows in lifetime_contributors.values() if rows
     )
 
+    unsupported_metrics = unsupported_account_metric_keys(platform_type)
     metrics: dict[str, dict] = {}
     for metric_key in _ACCOUNT_DAILY_METRICS:
         values = daily_values.get(metric_key, [])
@@ -760,7 +785,9 @@ def account_period_summary(account_id: int, days: int) -> dict:
         elif observed_days:
             availability = "partial"
         else:
-            availability = "missing"
+            availability = (
+                "unsupported" if metric_key in unsupported_metrics else "missing"
+            )
         metrics[metric_key] = {
             "value": (
                 _public_number(sum(value for _day, value, _unit in values))
@@ -775,7 +802,9 @@ def account_period_summary(account_id: int, days: int) -> dict:
     for metric_key in _ACCOUNT_LIFETIME_METRICS:
         values = lifetime_values.get(metric_key, [])
         if not values:
-            availability = "missing"
+            availability = (
+                "unsupported" if metric_key in unsupported_metrics else "missing"
+            )
         elif values[-1][0] == period_end:
             availability = "complete"
         else:

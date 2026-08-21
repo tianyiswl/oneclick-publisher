@@ -510,12 +510,13 @@ class DataMonitorPageTests(unittest.TestCase):
                 "availability": "partial",
                 "warningCode": "content_list_truncated",
                 "total": 2,
+                "coveredCount": 2,
                 "items": [],
             }
         )
         self.assertEqual(
             page.content_page_label.text(),
-            "部分取得 · 共 2 条 · 1-2",
+            "仅取得最近 2 条 · 1-2",
         )
 
         page._set_contents(
@@ -572,6 +573,21 @@ class DataMonitorPageTests(unittest.TestCase):
 
         self.assertEqual(page.status_label.text(), "同步失败：需要重新登录小红书")
         self.assertTrue(page.relogin_button.isVisibleTo(page))
+
+    def test_xhs_cards_distinguish_unsupported_from_snapshot_pending(self) -> None:
+        """合同不提供的卡片与尚待跨日快照的卡片必须使用不同文案。"""
+
+        summary = empty_summary()
+        summary["metrics"]["views"]["availability"] = "unsupported"
+        summary["metrics"]["followers_net"]["availability"] = "missing"
+        page = self._page(
+            summary=summary,
+            accounts=[XHS_ACCOUNT],
+            registered_platforms=(1,),
+        )
+
+        self.assertEqual(page.metric_captions["views"].text(), "平台未提供")
+        self.assertEqual(page.metric_captions["followers_net"].text(), "暂未取得")
 
     def test_xhs_sync_persists_real_sqlite_then_page_reads_zero_contents_and_failure(self) -> None:
         """同步、事务和页面必须共享同一份本地数据，清理失败不能冒充成功。"""
@@ -1023,6 +1039,57 @@ class DataMonitorPageTests(unittest.TestCase):
             page.status_label.text(),
             "同步失败：平台页面或数据接口已变化（接口=账号主页；阶段=JSON解析；原因=JSON格式无效）",
         )
+
+    def test_immediate_persist_failure_uses_fixed_copy_without_exception_text(self) -> None:
+        """本地保存异常作为受控结果返回时，页面必须立刻显示固定文案。"""
+
+        pool = QueuedPool()
+        runner = BackgroundTaskRunner()
+        runner.pool = pool
+        page = self._page(accounts=[XHS_ACCOUNT], runner=runner)
+        with patch(
+            "ui.data_monitor_page.platform_data_sync.sync_account_data",
+            return_value={
+                "accountId": XHS_ACCOUNT["id"],
+                "status": "failed",
+                "sourceMode": "browser_signed",
+                "errorCode": "sync_persist_failed",
+                "metricCount": 0,
+                "contentCount": 0,
+            },
+        ):
+            page.sync_button.click()
+            pool.tasks[0].run()
+            self.app.processEvents()
+
+        self.assertEqual(page.status_label.text(), "同步失败：本地数据保存失败")
+        self.assertNotIn("SQLite", page.status_label.text())
+
+    def test_immediate_login_required_result_shows_relogin_action(self) -> None:
+        """本轮回调已确认登录失效时，不应等下一次摘要重读才出现登录入口。"""
+
+        pool = QueuedPool()
+        runner = BackgroundTaskRunner()
+        runner.pool = pool
+        page = self._page(accounts=[XHS_ACCOUNT], runner=runner)
+        self.assertFalse(page.relogin_button.isVisibleTo(page))
+        with patch(
+            "ui.data_monitor_page.platform_data_sync.sync_account_data",
+            return_value={
+                "accountId": XHS_ACCOUNT["id"],
+                "status": "failed",
+                "sourceMode": "browser_signed",
+                "errorCode": "login_required",
+                "metricCount": 0,
+                "contentCount": 0,
+            },
+        ):
+            page.sync_button.click()
+            pool.tasks[0].run()
+            self.app.processEvents()
+
+        self.assertEqual(page.status_label.text(), "同步失败：需要重新登录小红书")
+        self.assertTrue(page.relogin_button.isVisibleTo(page))
 
     def test_successful_worker_refreshes_each_local_query_once(self) -> None:
         """成功终态只能完整刷新一次，不得在 finished 重复查库。"""

@@ -28,10 +28,6 @@ def _invalid() -> None:
     raise CollectionFailure("metric_payload_invalid") from None
 
 
-def _truncated() -> None:
-    raise CollectionFailure("content_list_truncated") from None
-
-
 def _mapping(value: object) -> dict:
     if type(value) is not dict:
         _invalid()
@@ -78,6 +74,23 @@ class XhsContentIdentity:
             _invalid()
 
 
+@dataclass(frozen=True, slots=True)
+class XhsContentPage:
+    """已核验的当前页作品身份与分页状态。"""
+
+    identities: tuple[XhsContentIdentity, ...]
+    truncated: bool
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.identities) is not tuple
+            or not all(type(item) is XhsContentIdentity for item in self.identities)
+            or len(self.identities) > _CONTENT_LIMIT
+            or type(self.truncated) is not bool
+        ):
+            _invalid()
+
+
 def parse_account_overview(
     payload: object,
     account_id: int,
@@ -110,26 +123,29 @@ def parse_account_overview(
     return (point,)
 
 
-def parse_content_list(payload: object) -> tuple[XhsContentIdentity, ...]:
-    """只读取已审核列表容器中的精确作品 ID，并拒绝不完整列表。"""
+def parse_content_list(payload: object) -> XhsContentPage:
+    """读取已审核的当前页；普通分页保留最近作品并标记截断。"""
 
     data = _mapping(_mapping(payload).get("data"))
     note_infos = _list(data.get("note_infos"))
     total = data.get("total")
     if type(total) is not int or total < 0:
         _invalid()
-    if len(note_infos) > _CONTENT_LIMIT or total > _CONTENT_LIMIT or total != len(note_infos):
-        _truncated()
+    if total < len(note_infos):
+        _invalid()
 
     identities: list[XhsContentIdentity] = []
     content_ids: set[str] = set()
-    for note_info in note_infos:
+    for note_info in note_infos[:_CONTENT_LIMIT]:
         identity = XhsContentIdentity(_mapping(note_info).get("id"))
         if identity.content_id in content_ids:
             _invalid()
         content_ids.add(identity.content_id)
         identities.append(identity)
-    return tuple(identities)
+    return XhsContentPage(
+        identities=tuple(identities),
+        truncated=total > len(note_infos) or len(note_infos) > _CONTENT_LIMIT,
+    )
 
 
 def parse_content_lifetime(

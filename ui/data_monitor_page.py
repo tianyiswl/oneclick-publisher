@@ -44,6 +44,7 @@ AVAILABILITY_TEXT = {
     "complete": "完整数据",
     "partial": "部分日期",
     "missing": "暂未取得",
+    "unsupported": "平台未提供",
 }
 
 SOURCE_TEXT = {
@@ -330,6 +331,7 @@ class DataMonitorPage(QWidget):
         self._content_limit = 50
         self._content_offset = 0
         self._content_total = 0
+        self._content_covered_count = 0
         self._content_availability = "missing"
         self._content_warning_code = ""
         self._shutting_down = False
@@ -632,6 +634,7 @@ class DataMonitorPage(QWidget):
         self.content_table.set_payload({"items": []})
         self._content_offset = 0
         self._content_total = 0
+        self._content_covered_count = 0
         self._content_availability = "missing"
         self._content_warning_code = ""
         self.content_metadata_label.hide()
@@ -774,6 +777,12 @@ class DataMonitorPage(QWidget):
         )
         total = safe_payload.get("total")
         self._content_total = total if type(total) is int and total >= 0 else 0
+        covered_count = safe_payload.get("coveredCount")
+        self._content_covered_count = (
+            covered_count
+            if type(covered_count) is int and 0 <= covered_count <= self._content_total
+            else 0
+        )
         self.content_table.set_payload(safe_payload)
         platform_type = self.platform_combo.currentData()
         metadata_missing = (
@@ -815,8 +824,12 @@ class DataMonitorPage(QWidget):
             else:
                 paging_text = "作品数据暂未取得"
         elif self._content_availability == "partial":
+            covered_last = min(
+                self._content_offset + self._content_covered_count,
+                self._content_total,
+            )
             paging_text = (
-                f"部分取得 · 共 {self._content_total} 条 · {first}-{last}"
+                f"仅取得最近 {self._content_covered_count} 条 · {first}-{covered_last}"
             )
         elif self._content_total:
             paging_text = f"已取得 {self._content_total} 条 · {first}-{last}"
@@ -861,6 +874,7 @@ class DataMonitorPage(QWidget):
             self._sync_terminal_by_subject[subject_identity] = "running"
             if not self._shutting_down and is_current_subject():
                 self.sync_button.setEnabled(False)
+                self.relogin_button.hide()
                 self.status_label.setText("正在同步数据…")
 
         def progressed(payload: object) -> None:
@@ -886,6 +900,7 @@ class DataMonitorPage(QWidget):
                 return
             if failed_result:
                 error_code = _result.get("errorCode")
+                self.relogin_button.setVisible(error_code == "login_required")
                 base = self._error_text(
                     error_code if type(error_code) is str else "",
                     platform_type,
@@ -905,6 +920,7 @@ class DataMonitorPage(QWidget):
             terminal_state["value"] = "failed"
             self._sync_terminal_by_subject[subject_identity] = "failed"
             if not self._shutting_down and is_current_subject():
+                self.relogin_button.hide()
                 self.status_label.setText("数据同步未完成")
 
         def finished() -> None:

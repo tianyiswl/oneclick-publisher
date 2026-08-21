@@ -36,6 +36,9 @@ ALLOWED_BATCH_WARNING_CODES = frozenset(
         "content_payload_invalid",
     }
 )
+_UNSUPPORTED_ACCOUNT_METRICS_BY_PLATFORM = {
+    1: frozenset({"views", "likes", "comments", "shares", "profile_visits"}),
+}
 
 
 class CollectionFailure(RuntimeError):
@@ -48,6 +51,14 @@ class CollectionFailure(RuntimeError):
         self.error_code = code
         self.retryable = bool(retryable)
         super().__init__(code)
+
+
+def unsupported_account_metric_keys(platform_type: object) -> frozenset[str]:
+    """返回已知不在该平台账号快照合同中提供的指标。"""
+
+    if type(platform_type) is not int or platform_type <= 0:
+        raise CollectionFailure("metric_payload_invalid")
+    return _UNSUPPORTED_ACCOUNT_METRICS_BY_PLATFORM.get(platform_type, frozenset())
 
 
 def _required_text(value: object) -> str:

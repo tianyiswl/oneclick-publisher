@@ -350,6 +350,38 @@ class DomesticBrowserCollectorTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.error_code, "metric_payload_invalid")
 
+    def test_collector_total_request_limit_counts_unreviewed_page_noise(self) -> None:
+        """图片脚本等非白名单请求也必须受整次短会话总请求上限约束。"""
+
+        responses = (
+            FakeResponse("https://official.example/assets/app.js", {}),
+            FakeResponse("https://official.example/assets/cover.png", {}),
+            FakeResponse("https://static.example/assets/vendor.js", {}),
+            FakeResponse("https://official.example/reviewed", {"data": {}}),
+        )
+        starter = FakeStarter(FakeBrowser(FakeContext(FakePage(
+            responses,
+            "https://official.example/home",
+        ))))
+        collector = DomesticBrowserCollector(
+            config(max_requests=3),
+            browser_factory=lambda: starter,
+            parse_captures=parsed_batch,
+        )
+
+        with self.assertRaises(PlatformDataCollectionError) as raised:
+            collector.collect(account())
+
+        self.assertEqual(raised.exception.error_code, "metric_payload_invalid")
+        self.assertEqual(
+            raised.exception.failure_diagnostic,
+            {
+                "endpoint": "runtime",
+                "stage": "request_binding",
+                "reason": "request_limit_exceeded",
+            },
+        )
+
     def test_collector_stops_when_total_timeout_elapses(self) -> None:
         """没有总时限时，未到达审核响应的页面会无限等待。"""
         collector = DomesticBrowserCollector(

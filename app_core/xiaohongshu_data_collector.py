@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 from typing import Callable
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo
 
 from .paths import COOKIE_DIR
 from .platform_data_collection_errors import CleanupReceipt, PlatformDataCollectionError
@@ -60,6 +61,7 @@ _PATH_ENDPOINTS = {
     _CONTENT_DETAIL_PATH: "content_detail",
 }
 _CONTENT_LENGTH = re.compile(r"^[1-9][0-9]{0,19}$")
+_BEIJING = ZoneInfo("Asia/Shanghai")
 
 
 def _default_browser_factory():
@@ -658,10 +660,11 @@ class XiaohongshuDataCollector:
                 content_warning = "content_list_unavailable"
             else:
                 try:
-                    identities = parse_content_list(list_payload)
-                except CollectionFailure as error:
-                    if error.error_code == "content_list_truncated":
-                        raise _collection_error(error.error_code) from None
+                    page_result = parse_content_list(list_payload)
+                    identities = page_result.identities
+                    if page_result.truncated:
+                        content_warning = "content_list_truncated"
+                except CollectionFailure:
                     content_warning = "content_payload_invalid"
             if identities:
                 selected_content_id = identities[0].content_id
@@ -803,7 +806,7 @@ class XiaohongshuDataCollector:
             )
             raise _payload_error(endpoint, "account_parse", "payload_shape_invalid") from None
 
-        if content_warning:
+        if content_warning and content_warning != "content_list_truncated":
             batch = CollectionBatch(
                 platform_type=1,
                 source_mode="browser_signed",
@@ -824,6 +827,7 @@ class XiaohongshuDataCollector:
                 account_metrics_available=True,
                 content_data_available=True,
                 platform_observed_at=observed_at,
+                warning_code=content_warning,
             )
             return batch
         detail_payload = payloads.get(_CONTENT_DETAIL_PATH)
@@ -866,16 +870,22 @@ class XiaohongshuDataCollector:
             account_metrics_available=True,
             content_data_available=True,
             platform_observed_at=observed_at,
+            warning_code=content_warning,
         )
         return batch
 
     def _observation_values(self) -> tuple[str, str]:
         try:
             value = self._utc_now()
-            if not isinstance(value, datetime):
+            if (
+                not isinstance(value, datetime)
+                or value.tzinfo is None
+                or value.utcoffset() is None
+            ):
                 raise TypeError
-            observed_at = value.isoformat()
-            platform_day = value.date().isoformat()
+            beijing_value = value.astimezone(_BEIJING)
+            observed_at = beijing_value.isoformat()
+            platform_day = beijing_value.date().isoformat()
         except (KeyboardInterrupt, SystemExit):
             raise
         except BaseException:

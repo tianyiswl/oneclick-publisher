@@ -294,8 +294,9 @@ class DomesticBrowserCollector:
         captures: list[CapturedJson] = []
         response_tasks: list[asyncio.Task] = []
         request_paths: dict[int, tuple[object, str, str]] = {}
+        seen_requests: dict[int, object] = {}
         seen_responses: set[int] = set()
-        request_count = response_count = total_bytes = 0
+        total_request_count = response_count = total_bytes = 0
         saw_unreviewed_response = False
         capture_error: PlatformDataCollectionError | None = None
         current_phase = ""
@@ -316,15 +317,19 @@ class DomesticBrowserCollector:
             return parsed.path
 
         def remember_request(request: object) -> None:
-            nonlocal request_count, capture_error
-            path = reviewed_path(getattr(request, "url", None))
-            if path is None or id(request) in request_paths:
+            nonlocal total_request_count, capture_error
+            request_id = id(request)
+            if seen_requests.get(request_id) is request:
                 return
-            request_count += 1
-            if request_count > self._config.max_requests:
+            seen_requests[request_id] = request
+            total_request_count += 1
+            if total_request_count > self._config.max_requests:
                 capture_error = _invalid(
                     stage="request_binding", reason="request_limit_exceeded"
                 )
+                return
+            path = reviewed_path(getattr(request, "url", None))
+            if path is None:
                 return
             expected_phase = self._config.phase_by_path[path]
             if not current_phase or expected_phase != current_phase:
@@ -334,7 +339,7 @@ class DomesticBrowserCollector:
                     reason="request_mismatch",
                 )
                 return
-            request_paths[id(request)] = (request, path, current_phase)
+            request_paths[request_id] = (request, path, current_phase)
 
         async def cache_response(response: object, path: str) -> None:
             nonlocal total_bytes

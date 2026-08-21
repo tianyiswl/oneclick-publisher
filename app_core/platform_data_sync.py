@@ -79,6 +79,8 @@ def _public_result(
     else:
         status = "failed"
         error_code = _public_error_code(saved.get("errorCode"))
+        metric_count = 0
+        content_count = 0
     result = {
         "accountId": account_id,
         "status": status,
@@ -224,6 +226,42 @@ def _error_diagnostics(error: PlatformDataCollectionError) -> dict | None:
     return _public_diagnostics(value)
 
 
+def _record_failed_result(
+    *,
+    account_id: int,
+    platform_type: int,
+    source_mode: str,
+    error_code: str,
+    diagnostics: dict | None = None,
+) -> dict:
+    """尽力记录失败；若本地写入本身失败，仍返回固定公开结果。"""
+
+    public_code = _public_error_code(error_code)
+    try:
+        saved = platform_data_service.record_failed_sync(
+            account_id,
+            platform_type,
+            source_mode,
+            public_code,
+        )
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException:
+        public_code = "sync_persist_failed"
+        saved = {
+            "status": "failed",
+            "errorCode": public_code,
+        }
+    return _public_result(
+        saved,
+        account_id=account_id,
+        source_mode=source_mode,
+        metric_count=0,
+        content_count=0,
+        diagnostics=diagnostics,
+    )
+
+
 def sync_account_data(
     account_id: int,
     report: Callable[[dict], None] | None = None,
@@ -251,46 +289,55 @@ def sync_account_data(
             )
         except CollectionFailure as exc:
             _report_stage(report, "failed")
-            saved = platform_data_service.record_failed_sync(
-                account_id,
-                platform_type,
-                source_mode,
-                _public_error_code(exc.error_code),
-            )
-            return _public_result(
-                saved,
+            return _record_failed_result(
                 account_id=account_id,
+                platform_type=platform_type,
                 source_mode=source_mode,
-                metric_count=0,
-                content_count=0,
+                error_code=exc.error_code,
             )
-        _report_stage(report, "direct_session")
-        try:
-            batch = collector.collect_direct(account)
-        except PlatformDataCollectionError as direct_error:
-            if not direct_error.fallback_allowed:
-                raise
+
+        direct_collect = getattr(collector, "collect_direct", None)
+        if callable(direct_collect):
+            _report_stage(report, "direct_session")
+            try:
+                batch = direct_collect(account)
+            except PlatformDataCollectionError as direct_error:
+                if not direct_error.fallback_allowed:
+                    raise
+                source_mode = "browser_signed"
+                _report_stage(report, "browser_signed")
+                detailed_collect = getattr(
+                    type(collector), "collect_browser_signed_with_diagnostics", None
+                )
+                if callable(detailed_collect):
+                    outcome = detailed_collect(
+                        collector, account, validation_mode=validation_mode
+                    )
+                    batch = getattr(outcome, "batch", None)
+                    diagnostics = _public_diagnostics(
+                        outcome.public_diagnostics()
+                        if callable(getattr(outcome, "public_diagnostics", None))
+                        else None
+                    )
+                    if type(batch) is not CollectionBatch or diagnostics is None:
+                        raise CollectionFailure("metric_payload_invalid")
+                    if validation_mode and "validation" not in diagnostics:
+                        raise CollectionFailure("metric_payload_invalid")
+                else:
+                    browser_collect = getattr(collector, "collect_browser_signed", None)
+                    if not callable(browser_collect):
+                        raise CollectionFailure("collector_not_available")
+                    batch = browser_collect(account)
+        else:
+            collect = getattr(collector, "collect", None)
+            if not callable(collect):
+                raise CollectionFailure("collector_not_available")
             source_mode = "browser_signed"
             _report_stage(report, "browser_signed")
-            detailed_collect = getattr(
-                type(collector), "collect_browser_signed_with_diagnostics", None
-            )
-            if callable(detailed_collect):
-                outcome = detailed_collect(
-                    collector, account, validation_mode=validation_mode
-                )
-                batch = getattr(outcome, "batch", None)
-                diagnostics = _public_diagnostics(
-                    outcome.public_diagnostics()
-                    if callable(getattr(outcome, "public_diagnostics", None))
-                    else None
-                )
-                if type(batch) is not CollectionBatch or diagnostics is None:
-                    raise CollectionFailure("metric_payload_invalid")
-                if validation_mode and "validation" not in diagnostics:
-                    raise CollectionFailure("metric_payload_invalid")
-            else:
-                batch = collector.collect_browser_signed(account)
+            batch = collect(account)
+        if type(batch) is not CollectionBatch:
+            raise CollectionFailure("metric_payload_invalid")
+        source_mode = batch.source_mode
         _report_stage(report, "account_metrics")
         _report_stage(report, "content_list")
         if batch.content_data_available:
@@ -335,38 +382,27 @@ def sync_account_data(
         return result
     except PlatformDataCollectionError as exc:
         _report_stage(report, "failed")
-        saved = platform_data_service.record_failed_sync(
-            account_id,
-            platform_type,
-            source_mode,
-            _public_error_code(exc.error_code),
-        )
-        return _public_result(
-            saved,
+        return _record_failed_result(
             account_id=account_id,
+            platform_type=platform_type,
             source_mode=source_mode,
-            metric_count=0,
-            content_count=0,
+            error_code=exc.error_code,
             diagnostics=_error_diagnostics(exc),
         )
     except (KeyboardInterrupt, SystemExit):
         raise
     except CollectionFailure as exc:
-        if exc.error_code != "validation_readback_mismatch":
+        if exc.error_code not in {
+            "sync_persist_failed",
+            "validation_readback_mismatch",
+        }:
             raise
         _report_stage(report, "failed")
-        saved = platform_data_service.record_failed_sync(
-            account_id,
-            platform_type,
-            source_mode,
-            "validation_readback_mismatch",
-        )
-        return _public_result(
-            saved,
+        return _record_failed_result(
             account_id=account_id,
+            platform_type=platform_type,
             source_mode=source_mode,
-            metric_count=0,
-            content_count=0,
+            error_code=exc.error_code,
             diagnostics=(
                 {"cleanup": diagnostics["cleanup"]}
                 if type(diagnostics) is dict and "cleanup" in diagnostics
@@ -375,16 +411,9 @@ def sync_account_data(
         )
     except BaseException:
         _report_stage(report, "failed")
-        saved = platform_data_service.record_failed_sync(
-            account_id,
-            platform_type,
-            source_mode,
-            "metric_payload_invalid",
-        )
-        return _public_result(
-            saved,
+        return _record_failed_result(
             account_id=account_id,
+            platform_type=platform_type,
             source_mode=source_mode,
-            metric_count=0,
-            content_count=0,
+            error_code="metric_payload_invalid",
         )
