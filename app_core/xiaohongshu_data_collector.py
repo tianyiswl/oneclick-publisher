@@ -53,6 +53,12 @@ _PATH_PHASES = {
     _CONTENT_LIST_PATH: _PHASE_LIST,
     _CONTENT_DETAIL_PATH: _PHASE_DETAIL,
 }
+_PATH_ENDPOINTS = {
+    "/api/galaxy/creator/home/personal_info": "account_home",
+    "/api/galaxy/v2/creator/datacenter/account/base": "account_base",
+    _CONTENT_LIST_PATH: "content_list",
+    _CONTENT_DETAIL_PATH: "content_detail",
+}
 _CONTENT_LENGTH = re.compile(r"^[1-9][0-9]{0,19}$")
 
 
@@ -67,12 +73,21 @@ def _collection_error(
     *,
     fallback_allowed: bool = False,
     cleanup_receipt: CleanupReceipt | None = None,
+    failure_diagnostic: dict | None = None,
 ) -> PlatformDataCollectionError:
     return PlatformDataCollectionError(
         error_code,
         fallback_allowed=fallback_allowed,
         retryable=fallback_allowed,
         cleanup_receipt=cleanup_receipt,
+        failure_diagnostic=failure_diagnostic,
+    )
+
+
+def _payload_error(endpoint: str, stage: str, reason: str) -> PlatformDataCollectionError:
+    return _collection_error(
+        "metric_payload_invalid",
+        failure_diagnostic={"endpoint": endpoint, "stage": stage, "reason": reason},
     )
 
 
@@ -428,13 +443,14 @@ class XiaohongshuDataCollector:
             path = _response_path(response)
             if path is None or _PATH_PHASES[path] != response_phase:
                 return
+            endpoint = _PATH_ENDPOINTS[path]
             response_id = id(response)
             if response_id in seen_response_ids or path in payloads:
-                capture_error = _collection_error("metric_payload_invalid")
+                capture_error = _payload_error(endpoint, "response_capture", "duplicate_response")
                 return
             declared_bytes = _declared_response_bytes(response)
             if declared_bytes is None or reserved_bytes + declared_bytes > _MAX_TOTAL_RESPONSE_BYTES:
-                capture_error = _collection_error("metric_payload_invalid")
+                capture_error = _payload_error(endpoint, "response_headers", "invalid_content_length")
                 return
             if path == _CONTENT_DETAIL_PATH and (
                 selected_content_id is None
@@ -442,11 +458,11 @@ class XiaohongshuDataCollector:
                     getattr(response, "request", None), selected_content_id
                 )
             ):
-                capture_error = _collection_error("metric_payload_invalid")
+                capture_error = _payload_error(endpoint, "request_binding", "request_mismatch")
                 return
             loader = getattr(response, "body", None)
             if not callable(loader):
-                capture_error = _collection_error("metric_payload_invalid")
+                capture_error = _payload_error(endpoint, "response_body", "body_unavailable")
                 return
             reserved_bytes += declared_bytes
             try:
@@ -459,19 +475,19 @@ class XiaohongshuDataCollector:
             except (KeyboardInterrupt, SystemExit):
                 raise
             except BaseException:
-                capture_error = _collection_error("metric_payload_invalid")
+                capture_error = _payload_error(endpoint, "response_body", "body_read_failed")
                 return
             if type(body) is not bytes or not 1 <= len(body) <= _MAX_RESPONSE_BYTES:
-                capture_error = _collection_error("metric_payload_invalid")
+                capture_error = _payload_error(endpoint, "response_body", "body_size_invalid")
                 return
             reserved_bytes += max(0, len(body) - declared_bytes)
             if reserved_bytes > _MAX_TOTAL_RESPONSE_BYTES:
-                capture_error = _collection_error("metric_payload_invalid")
+                capture_error = _payload_error(endpoint, "response_body", "body_size_invalid")
                 return
             try:
                 payload = json.loads(body)
             except (UnicodeDecodeError, json.JSONDecodeError):
-                capture_error = _collection_error("metric_payload_invalid")
+                capture_error = _payload_error(endpoint, "json_decode", "invalid_json")
                 return
             seen_response_ids.add(response_id)
             payloads[path] = payload
@@ -510,7 +526,7 @@ class XiaohongshuDataCollector:
                 try:
                     current = urlsplit(current_url)
                 except ValueError:
-                    raise _collection_error("metric_payload_invalid") from None
+                    raise _payload_error("runtime", "visible_readback", "readback_mismatch") from None
                 current_path = current.path.lower()
                 if (
                     any(
@@ -682,6 +698,7 @@ class XiaohongshuDataCollector:
                 caught.error_code,
                 fallback_allowed=caught.fallback_allowed,
                 cleanup_receipt=receipt,
+                failure_diagnostic=caught.failure_diagnostic,
             ) from None
         if caught is not None:
             raise _collection_error(
@@ -709,7 +726,7 @@ class XiaohongshuDataCollector:
         if account_payload is None:
             account_payload = payloads.get("/api/galaxy/v2/creator/datacenter/account/base")
         if account_payload is None:
-            raise _collection_error("metric_payload_invalid") from None
+            raise _payload_error("runtime", "account_parse", "payload_shape_invalid") from None
         try:
             account_metrics = parse_account_overview(
                 account_payload,
@@ -718,7 +735,12 @@ class XiaohongshuDataCollector:
                 platform_day=platform_day,
             )
         except CollectionFailure:
-            raise _collection_error("metric_payload_invalid") from None
+            endpoint = (
+                "account_home"
+                if "/api/galaxy/creator/home/personal_info" in payloads
+                else "account_base"
+            )
+            raise _payload_error(endpoint, "account_parse", "payload_shape_invalid") from None
 
         if content_warning:
             batch = CollectionBatch(

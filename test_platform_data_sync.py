@@ -379,6 +379,52 @@ class PlatformDataSyncTests(unittest.TestCase):
         )
         self.assertNotIn("private", repr(result).lower())
 
+    def test_xhs_failure_exposes_only_allowlisted_failure_diagnostic(self) -> None:
+        collector = FakeCollector(
+            PlatformDataCollectionError(
+                "metric_payload_invalid",
+                cleanup_receipt=CleanupReceipt(closed=True, alive_resource_count=0),
+                failure_diagnostic={
+                    "endpoint": "account_home",
+                    "stage": "json_decode",
+                    "reason": "invalid_json",
+                },
+            )
+        )
+        with patch.object(
+            platform_data_sync.account_service,
+            "list_accounts",
+            return_value=[xhs_account()],
+        ), patch.object(
+            platform_data_sync,
+            "collector_for_platform",
+            return_value=collector,
+        ), patch.object(
+            platform_data_sync.platform_data_service,
+            "record_failed_sync",
+            return_value={
+                "accountId": 21,
+                "status": "failed",
+                "sourceMode": "browser_signed",
+                "errorCode": "metric_payload_invalid",
+                "metricCount": 0,
+            },
+        ):
+            result = platform_data_sync.sync_account_data(21)
+
+        self.assertEqual(
+            result["diagnostics"],
+            {
+                "cleanup": {"closed": True, "aliveResourceCount": 0},
+                "failure": {
+                    "endpoint": "account_home",
+                    "stage": "json_decode",
+                    "reason": "invalid_json",
+                },
+            },
+        )
+        self.assertNotIn("cookie", repr(result).lower())
+
     def test_validation_mode_returns_headed_official_and_local_readback_comparison(self) -> None:
         """验收模式若不把同次本地读回逐项比对，就不能证明写入与官方可见值一致。"""
 

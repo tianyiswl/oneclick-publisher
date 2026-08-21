@@ -75,6 +75,47 @@ ERROR_TEXT = {
     "sync_persist_failed": "本地数据保存失败",
 }
 
+_DIAGNOSTIC_ENDPOINT_TEXT = {
+    "account_home": "账号主页",
+    "account_base": "账号数据",
+    "content_list": "作品列表",
+    "content_detail": "作品详情",
+    "runtime": "页面读回",
+}
+_DIAGNOSTIC_STAGE_TEXT = {
+    "response_capture": "响应采集",
+    "response_headers": "响应头",
+    "response_body": "响应正文读取",
+    "request_binding": "请求绑定",
+    "json_decode": "JSON解析",
+    "account_parse": "账号数据解析",
+    "content_list_parse": "作品列表解析",
+    "content_detail_parse": "作品详情解析",
+    "visible_readback": "页面读回",
+}
+_DIAGNOSTIC_REASON_TEXT = {
+    "duplicate_response": "响应重复",
+    "invalid_content_length": "长度头无效",
+    "body_unavailable": "正文读取不可用",
+    "body_read_failed": "正文读取失败",
+    "body_size_invalid": "正文大小无效",
+    "request_mismatch": "请求与作品不匹配",
+    "invalid_json": "JSON格式无效",
+    "payload_shape_invalid": "数据结构不匹配",
+    "readback_mismatch": "页面读回不一致",
+}
+
+
+def _failure_diagnostic_text(value: object) -> str:
+    if type(value) is not dict or set(value) != {"endpoint", "stage", "reason"}:
+        return ""
+    endpoint = _DIAGNOSTIC_ENDPOINT_TEXT.get(value.get("endpoint"))
+    stage = _DIAGNOSTIC_STAGE_TEXT.get(value.get("stage"))
+    reason = _DIAGNOSTIC_REASON_TEXT.get(value.get("reason"))
+    if not endpoint or not stage or not reason:
+        return ""
+    return f"接口={endpoint}；阶段={stage}；原因={reason}"
+
 
 def _finite_number(value: object) -> int | float | None:
     if type(value) not in (int, float) or not math.isfinite(float(value)):
@@ -803,10 +844,30 @@ class DataMonitorPage(QWidget):
                 self.status_label.setText(text)
 
         def completed(_result: object) -> None:
-            terminal_state["value"] = "success"
-            self._sync_terminal_by_subject.pop(subject_identity, None)
-            if not self._shutting_down and is_current_subject():
-                self.refresh()
+            failed_result = type(_result) is dict and _result.get("status") == "failed"
+            terminal_state["value"] = "failed" if failed_result else "success"
+            if failed_result:
+                self._sync_terminal_by_subject[subject_identity] = "failed"
+            else:
+                self._sync_terminal_by_subject.pop(subject_identity, None)
+            if self._shutting_down or not is_current_subject():
+                return
+            if failed_result:
+                error_code = _result.get("errorCode")
+                base = self._error_text(
+                    error_code if type(error_code) is str else "",
+                    platform_type,
+                )
+                diagnostics = _result.get("diagnostics")
+                failure = (
+                    diagnostics.get("failure") if type(diagnostics) is dict else None
+                )
+                detail = _failure_diagnostic_text(failure)
+                self.status_label.setText(
+                    f"同步失败：{base}" + (f"（{detail}）" if detail else "")
+                )
+                return
+            self.refresh()
 
         def failed(_message: str) -> None:
             terminal_state["value"] = "failed"

@@ -971,6 +971,34 @@ class XiaohongshuDataCollectorTests(unittest.TestCase):
             "metric_payload_invalid",
         )
 
+    def test_invalid_json_exposes_only_fixed_endpoint_stage_and_reason(self) -> None:
+        """真实失败必须能定位校验点，但不得带出正文、URL 参数或账号信息。"""
+
+        responses = _reviewed_success_responses()
+        responses[CREATOR_HOME] = (
+            _FakeResponse(
+                "https://creator.xiaohongshu.com/api/galaxy/creator/home/personal_info",
+                body=b"private-secret-not-json",
+            ),
+        )
+        collector, _fake = self._collector_with_responses(responses)
+
+        with self.assertRaises(PlatformDataCollectionError) as caught:
+            collector.collect_browser_signed_with_diagnostics(_account())
+
+        self.assertEqual(caught.exception.error_code, "metric_payload_invalid")
+        self.assertEqual(
+            caught.exception.failure_diagnostic,
+            {
+                "endpoint": "account_home",
+                "stage": "json_decode",
+                "reason": "invalid_json",
+            },
+        )
+        rendered = repr(caught.exception.failure_diagnostic).lower()
+        self.assertNotIn("secret", rendered)
+        self.assertNotIn("xiaohongshu.com", rendered)
+
     def test_late_response_keeps_its_request_phase_and_cannot_drive_note_detail(self) -> None:
         """迟到首页请求若按当前页归类，会把首页响应伪装成作品详情。"""
 

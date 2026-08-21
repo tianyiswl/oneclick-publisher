@@ -850,6 +850,45 @@ class DataMonitorPageTests(unittest.TestCase):
         self.trends_mock.assert_not_called()
         self.contents_mock.assert_not_called()
 
+    def test_controlled_xhs_failure_diagnostic_is_visible_after_sync(self) -> None:
+        """受控定位信息若被刷新覆盖，下一次真实失败仍无法判断落点。"""
+
+        pool = QueuedPool()
+        runner = BackgroundTaskRunner()
+        runner.pool = pool
+        page = self._page(accounts=[XHS_ACCOUNT], runner=runner)
+        page.platform_combo.setCurrentIndex(page.platform_combo.findData(1))
+        self.app.processEvents()
+
+        result = {
+            "accountId": XHS_ACCOUNT["id"],
+            "status": "failed",
+            "sourceMode": "browser_signed",
+            "errorCode": "metric_payload_invalid",
+            "metricCount": 0,
+            "contentCount": 0,
+            "diagnostics": {
+                "cleanup": {"closed": True, "aliveResourceCount": 0},
+                "failure": {
+                    "endpoint": "account_home",
+                    "stage": "json_decode",
+                    "reason": "invalid_json",
+                },
+            },
+        }
+        with patch(
+            "ui.data_monitor_page.platform_data_sync.sync_account_data",
+            return_value=result,
+        ):
+            page.sync_button.click()
+            pool.tasks[0].run()
+            self.app.processEvents()
+
+        self.assertEqual(
+            page.status_label.text(),
+            "同步失败：平台数据暂时无法识别（接口=账号主页；阶段=JSON解析；原因=JSON格式无效）",
+        )
+
     def test_successful_worker_refreshes_each_local_query_once(self) -> None:
         """成功终态只能完整刷新一次，不得在 finished 重复查库。"""
 

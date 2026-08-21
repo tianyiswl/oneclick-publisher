@@ -6,7 +6,10 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from . import account_service, platform_data_service
-from .platform_data_collection_errors import PlatformDataCollectionError
+from .platform_data_collection_errors import (
+    PlatformDataCollectionError,
+    public_failure_diagnostic,
+)
 from .platform_data_collectors import collector_for_platform
 from .platform_data_models import CollectionBatch, CollectionFailure
 from .xiaohongshu_data_collector import official_visible_readback
@@ -90,7 +93,11 @@ def _public_result(
 
 
 def _public_diagnostics(value: object) -> dict | None:
-    if type(value) is not dict or set(value) not in ({"cleanup"}, {"cleanup", "validation"}):
+    if type(value) is not dict or set(value) not in (
+        {"cleanup"},
+        {"cleanup", "validation"},
+        {"cleanup", "failure"},
+    ):
         return None
     cleanup = value.get("cleanup")
     if type(cleanup) is not dict or set(cleanup) != {"closed", "aliveResourceCount"}:
@@ -105,6 +112,13 @@ def _public_diagnostics(value: object) -> dict | None:
     ):
         return None
     result = {"cleanup": {"closed": closed, "aliveResourceCount": alive}}
+    failure = value.get("failure")
+    if failure is not None:
+        safe_failure = public_failure_diagnostic(failure)
+        if safe_failure is None:
+            return None
+        result["failure"] = safe_failure
+        return result
     validation = value.get("validation")
     if validation is None:
         return result
@@ -202,11 +216,12 @@ def _atomic_validation_result(value: object, official_expected: object) -> dict 
 
 def _error_diagnostics(error: PlatformDataCollectionError) -> dict | None:
     receipt = error.cleanup_receipt
-    return (
-        _public_diagnostics({"cleanup": receipt.public_payload()})
-        if receipt is not None
-        else None
-    )
+    if receipt is None:
+        return None
+    value = {"cleanup": receipt.public_payload()}
+    if error.failure_diagnostic is not None:
+        value["failure"] = error.failure_diagnostic
+    return _public_diagnostics(value)
 
 
 def sync_account_data(
