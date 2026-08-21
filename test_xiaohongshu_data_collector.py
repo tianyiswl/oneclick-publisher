@@ -57,6 +57,7 @@ class XiaohongshuDataContractTests(unittest.TestCase):
     def test_parse_account_overview_uses_only_proven_fans_total(self) -> None:
         points = parse_account_overview(
             {"data": {"fans_count": 3199, "unknown": "ignored"}},
+            account_id=21,
             observed_at=_OBSERVED_AT,
             platform_day=_PLATFORM_DAY,
         )
@@ -66,7 +67,7 @@ class XiaohongshuDataContractTests(unittest.TestCase):
             [("followers_total", 3199, "lifetime_total")],
         )
         self.assertEqual(points[0].entity_type, "account")
-        self.assertEqual(points[0].entity_key, "account")
+        self.assertEqual(points[0].entity_key, "account:21")
         self.assertEqual(points[0].raw_metric_key, "fans_count")
         self.assertEqual((points[0].period_start, points[0].period_end), (_PLATFORM_DAY, _PLATFORM_DAY))
 
@@ -87,6 +88,22 @@ class XiaohongshuDataContractTests(unittest.TestCase):
                 self.assert_invalid(
                     lambda payload=payload: parse_account_overview(
                         payload,
+                        account_id=21,
+                        observed_at=_OBSERVED_AT,
+                        platform_day=_PLATFORM_DAY,
+                    )
+                )
+
+    def test_account_overview_requires_a_strict_subject_id(self) -> None:
+        """主体 ID 若被硬编码或弱类型接收，会把不同账号指标混写。"""
+
+        payload = {"data": {"fans_count": 3199}}
+        for account_id in (True, "21", 0, -1):
+            with self.subTest(account_id=account_id):
+                self.assert_invalid(
+                    lambda account_id=account_id: parse_account_overview(
+                        payload,
+                        account_id=account_id,
                         observed_at=_OBSERVED_AT,
                         platform_day=_PLATFORM_DAY,
                     )
@@ -249,7 +266,8 @@ class XiaohongshuDataContractTests(unittest.TestCase):
 
 
 class _FakeRequest:
-    pass
+    def __init__(self, url: str) -> None:
+        self.url = url
 
 
 class _FakeResponse:
@@ -261,17 +279,25 @@ class _FakeResponse:
         body: bytes | None = None,
         status: int = 200,
         content_type: str = "application/json",
+        content_length: object | None = None,
+        request_url: str | None = None,
     ) -> None:
         self.url = url
-        self.request = _FakeRequest()
+        self.request = _FakeRequest(request_url or url)
         self.status = status
         self._body = body if body is not None else json.dumps(payload).encode("utf-8")
         self.headers = {
             "content-type": content_type,
-            "content-length": str(len(self._body)),
+            "content-length": (
+                str(len(self._body))
+                if content_length is None
+                else content_length
+            ),
         }
+        self.body_calls = 0
 
     async def body(self) -> bytes:
+        self.body_calls += 1
         return self._body
 
 
@@ -407,8 +433,8 @@ class _Clock:
         return self._last
 
 
-def _account() -> dict:
-    return {"id": 21, "type": 1, "filePath": "oneclick_1_test.json"}
+def _account(account_id: int = 21, file_path: str = "oneclick_1_test.json") -> dict:
+    return {"id": account_id, "type": 1, "filePath": file_path}
 
 
 def _detail_url() -> str:
@@ -442,7 +468,7 @@ def _reviewed_success_responses() -> dict[str, tuple[_FakeResponse, ...]]:
         _detail_url(): (
             _FakeResponse(
                 "https://creator.xiaohongshu.com/api/galaxy/creator/"
-                "datacenter/note/base?note_id=private",
+                "datacenter/note/base?noteId=private",
                 {
                     "data": {
                         "note_info": {
@@ -455,6 +481,10 @@ def _reviewed_success_responses() -> dict[str, tuple[_FakeResponse, ...]]:
                         "share_count": 4,
                     }
                 },
+                request_url=(
+                    "https://creator.xiaohongshu.com/api/galaxy/creator/"
+                    f"datacenter/note/base?noteId={_CONTENT_ID}"
+                ),
             ),
         ),
     }
@@ -510,9 +540,67 @@ class XiaohongshuDataCollectorTests(unittest.TestCase):
         self.assertTrue(batch.content_data_available)
         self.assertEqual(len(batch.contents), 1)
         self.assertEqual(
+            {point.entity_key for point in batch.metrics if point.entity_type == "account"},
+            {"account:21"},
+        )
+        self.assertEqual(
             fake.goto_urls, [CREATOR_HOME, DATA_ANALYSIS_URL, _detail_url()]
         )
         self.assertEqual(fake.cleanup, ["page", "context", "browser", "playwright"])
+
+    def test_account_metrics_are_scoped_to_the_strict_requested_account(self) -> None:
+        """固定 account key 会把不同小红书主体的粉丝累计量混在一起。"""
+
+        collector, _fake = self._collector_with_responses(_reviewed_success_responses())
+        first = collector.collect_browser_signed(_account(21))
+        second_state = self.cookie_dir / "oneclick_1_second.json"
+        second_state.write_text("{}", encoding="utf-8")
+        collector, _fake = self._collector_with_responses(_reviewed_success_responses())
+        second = collector.collect_browser_signed(_account(22, second_state.name))
+
+        self.assertEqual(
+            {point.entity_key for point in first.metrics if point.entity_type == "account"},
+            {"account:21"},
+        )
+        self.assertEqual(
+            {point.entity_key for point in second.metrics if point.entity_type == "account"},
+            {"account:22"},
+        )
+
+    def test_proven_empty_content_list_is_a_successful_zero_content_batch(self) -> None:
+        """已证实的空列表不能被当成列表不可用而丢掉账号指标。"""
+
+        responses = _reviewed_success_responses()
+        responses[DATA_ANALYSIS_URL] = (
+            _FakeResponse(
+                "https://creator.xiaohongshu.com/api/galaxy/creator/"
+                "datacenter/note/analyze/list?page_num=1",
+                {"data": {"note_infos": [], "total": 0}},
+            ),
+        )
+        collector, fake = self._collector_with_responses(responses)
+
+        batch = collector.collect_browser_signed(_account())
+
+        self.assertTrue(batch.account_metrics_available)
+        self.assertTrue(batch.content_data_available)
+        self.assertEqual(batch.contents, ())
+        self.assertEqual(batch.warning_code, "")
+        self.assertEqual(fake.goto_urls, [CREATOR_HOME, DATA_ANALYSIS_URL])
+
+    def test_missing_content_list_keeps_account_metrics_but_marks_list_unavailable(self) -> None:
+        """没有可信列表响应与已证实的零条作品必须是两种不同结果。"""
+
+        responses = _reviewed_success_responses()
+        responses[DATA_ANALYSIS_URL] = ()
+        collector, fake = self._collector_with_responses(responses)
+
+        batch = collector.collect_browser_signed(_account())
+
+        self.assertTrue(batch.account_metrics_available)
+        self.assertFalse(batch.content_data_available)
+        self.assertEqual(batch.warning_code, "content_list_unavailable")
+        self.assertEqual(fake.goto_urls, [CREATOR_HOME, DATA_ANALYSIS_URL])
 
     def test_cleanup_failure_never_returns_success(self) -> None:
         """资源关闭报错若被吞掉，会把不完整会话误写成采集成功。"""
@@ -592,6 +680,41 @@ class XiaohongshuDataCollectorTests(unittest.TestCase):
             "metric_payload_invalid",
         )
 
+    def test_untrusted_or_over_budget_content_length_rejects_before_body_read(self) -> None:
+        """Content-Length 不可信或超预算时，读取 body 本身就已越过资源边界。"""
+
+        for declared_length in (None, "", "-1", "0", "1.0", True, 1):
+            with self.subTest(declared_length=repr(declared_length)):
+                responses = _reviewed_success_responses()
+                invalid = _FakeResponse(
+                    "https://creator.xiaohongshu.com/api/galaxy/creator/home/personal_info",
+                    {"data": {"fans_count": 3199}},
+                    content_length=declared_length,
+                )
+                if declared_length is None:
+                    invalid.headers.pop("content-length")
+                responses[CREATOR_HOME] = (invalid,)
+                collector, _fake = self._collector_with_responses(responses)
+                self.assert_collection_error(
+                    lambda: collector.collect_browser_signed(_account()),
+                    "metric_payload_invalid",
+                )
+                self.assertEqual(invalid.body_calls, 0)
+
+        over_budget = _FakeResponse(
+            "https://creator.xiaohongshu.com/api/galaxy/creator/home/personal_info",
+            {"data": {"fans_count": 3199}},
+            content_length="1048577",
+        )
+        responses = _reviewed_success_responses()
+        responses[CREATOR_HOME] = (over_budget,)
+        collector, _fake = self._collector_with_responses(responses)
+        self.assert_collection_error(
+            lambda: collector.collect_browser_signed(_account()),
+            "metric_payload_invalid",
+        )
+        self.assertEqual(over_budget.body_calls, 0)
+
         cumulative = _reviewed_success_responses()
         medium_body = b"{" + b" " * 1_048_574 + b"}"
         cumulative[CREATOR_HOME] = tuple(
@@ -664,8 +787,13 @@ class XiaohongshuDataCollectorTests(unittest.TestCase):
         responses = _reviewed_success_responses()
         responses[_detail_url()] = (
             _FakeResponse(
-                "https://creator.xiaohongshu.com/api/galaxy/creator/datacenter/note/base",
+                "https://creator.xiaohongshu.com/api/galaxy/creator/"
+                "datacenter/note/base?noteId=private",
                 {"data": {"note_info": {"id": "7b0ffca800000000080033f8"}}},
+                request_url=(
+                    "https://creator.xiaohongshu.com/api/galaxy/creator/"
+                    f"datacenter/note/base?noteId={_CONTENT_ID}"
+                ),
             ),
         )
         collector, _fake = self._collector_with_responses(responses)
@@ -676,6 +804,32 @@ class XiaohongshuDataCollectorTests(unittest.TestCase):
         self.assertFalse(batch.content_data_available)
         self.assertEqual(batch.contents, ())
         self.assertEqual(batch.warning_code, "content_payload_invalid")
+
+    def test_detail_request_identity_must_match_list_identity_even_when_payload_matches(self) -> None:
+        """详情 payload 自报同一 ID 不足以证明浏览器请求没有被串到另一条作品。"""
+
+        responses = _reviewed_success_responses()
+        responses[_detail_url()] = (
+            _FakeResponse(
+                "https://creator.xiaohongshu.com/api/galaxy/creator/"
+                "datacenter/note/base?noteId=private",
+                {
+                    "data": {
+                        "note_info": {"id": _CONTENT_ID, "view_count": 148},
+                    }
+                },
+                request_url=(
+                    "https://creator.xiaohongshu.com/api/galaxy/creator/"
+                    "datacenter/note/base?noteId=7b0ffca800000000080033f8"
+                ),
+            ),
+        )
+        collector, _fake = self._collector_with_responses(responses)
+
+        self.assert_collection_error(
+            lambda: collector.collect_browser_signed(_account()),
+            "metric_payload_invalid",
+        )
 
     def test_total_timeout_returns_fixed_error_after_cleanup(self) -> None:
         """总时限越界若继续等待，会让短会话失去确定的资源上限。"""

@@ -80,11 +80,14 @@ class XhsContentIdentity:
 
 def parse_account_overview(
     payload: object,
+    account_id: int,
     observed_at: str,
     platform_day: str,
 ) -> tuple[MetricPoint, ...]:
-    """只将已审核的 ``data.fans_count`` 转成粉丝累计值。"""
+    """只将已审核的 ``data.fans_count`` 转成指定主体的粉丝累计值。"""
 
+    if type(account_id) is not int or account_id <= 0:
+        _invalid()
     data = _mapping(_mapping(payload).get("data"))
     value = _metric_value(data.get("fans_count"))
     day = _platform_day(platform_day)
@@ -92,7 +95,7 @@ def parse_account_overview(
     try:
         point = MetricPoint(
             entity_type="account",
-            entity_key="account",
+            entity_key=f"account:{account_id}",
             metric_key="followers_total",
             raw_metric_key="fans_count",
             metric_value=value,

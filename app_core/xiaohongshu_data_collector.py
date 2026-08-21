@@ -8,8 +8,9 @@ from datetime import datetime, timezone
 import inspect
 import json
 from pathlib import Path
+import re
 from typing import Callable
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 from .paths import COOKIE_DIR
 from .platform_data_collection_errors import PlatformDataCollectionError
@@ -50,6 +51,7 @@ _PATH_PHASES = {
     _CONTENT_LIST_PATH: _PHASE_LIST,
     _CONTENT_DETAIL_PATH: _PHASE_DETAIL,
 }
+_CONTENT_LENGTH = re.compile(r"^[1-9][0-9]{0,19}$")
 
 
 def _default_browser_factory():
@@ -66,7 +68,7 @@ def _collection_error(error_code: str, *, fallback_allowed: bool = False) -> Pla
     )
 
 
-def _state_path(account: object) -> Path:
+def _state_path(account: object) -> tuple[int, Path]:
     if type(account) is not dict:
         raise _collection_error("metric_payload_invalid") from None
     account_id = account.get("id")
@@ -89,7 +91,7 @@ def _state_path(account: object) -> Path:
         raise
     except BaseException:
         raise _collection_error("session_state_missing") from None
-    return path
+    return account_id, path
 
 
 def _response_path(response: object) -> str | None:
@@ -117,6 +119,43 @@ def _response_path(response: object) -> str | None:
     ):
         return None
     return parsed.path
+
+
+def _declared_response_bytes(response: object) -> int | None:
+    """只信任 Playwright ``Response.headers`` 中受控的正整数长度。"""
+
+    headers = getattr(response, "headers", None)
+    if type(headers) is not dict:
+        return None
+    value = headers.get("content-length")
+    if type(value) is not str or _CONTENT_LENGTH.fullmatch(value) is None:
+        return None
+    try:
+        result = int(value)
+    except ValueError:
+        return None
+    if not 1 <= result <= _MAX_RESPONSE_BYTES:
+        return None
+    return result
+
+
+def _detail_request_matches(request: object, content_id: str) -> bool:
+    """把详情响应绑定到浏览器实际发出的指定作品请求。"""
+
+    url = getattr(request, "url", None)
+    if type(url) is not str:
+        return False
+    try:
+        parsed = urlsplit(url)
+        pairs = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=True)
+    except ValueError:
+        return False
+    return (
+        parsed.scheme == "https"
+        and parsed.hostname == _CREATOR_HOST
+        and parsed.path == _CONTENT_DETAIL_PATH
+        and pairs == [("noteId", content_id)]
+    )
 
 
 async def _await_until(value: object, *, deadline: float, monotonic: Callable[[], float]) -> object:
@@ -190,7 +229,7 @@ class XiaohongshuDataCollector:
         return self.collect_browser_signed(account)
 
     async def _collect_browser_signed_async(self, account: dict) -> CollectionBatch:
-        state_path = _state_path(account)
+        account_id, state_path = _state_path(account)
         started = self._monotonic()
         total_deadline = started + _TOTAL_TIMEOUT_SECONDS
         work_deadline = total_deadline - _CLEANUP_RESERVE_SECONDS
@@ -206,7 +245,8 @@ class XiaohongshuDataCollector:
         seen_response_ids: set[int] = set()
         retained_request_count = 0
         retained_response_count = 0
-        retained_bytes = 0
+        reserved_bytes = 0
+        selected_content_id: str | None = None
         capture_error: PlatformDataCollectionError | None = None
         caught: BaseException | None = None
         cleanup_errors: list[BaseException] = []
@@ -222,7 +262,7 @@ class XiaohongshuDataCollector:
             requests[id(request)] = (request, phase)
 
         async def cache_response(response: object, response_phase: str) -> None:
-            nonlocal retained_bytes, capture_error
+            nonlocal reserved_bytes, capture_error
             path = _response_path(response)
             if path is None or _PATH_PHASES[path] != response_phase:
                 return
@@ -230,10 +270,23 @@ class XiaohongshuDataCollector:
             if response_id in seen_response_ids or path in payloads:
                 capture_error = _collection_error("metric_payload_invalid")
                 return
+            declared_bytes = _declared_response_bytes(response)
+            if declared_bytes is None or reserved_bytes + declared_bytes > _MAX_TOTAL_RESPONSE_BYTES:
+                capture_error = _collection_error("metric_payload_invalid")
+                return
+            if path == _CONTENT_DETAIL_PATH and (
+                selected_content_id is None
+                or not _detail_request_matches(
+                    getattr(response, "request", None), selected_content_id
+                )
+            ):
+                capture_error = _collection_error("metric_payload_invalid")
+                return
             loader = getattr(response, "body", None)
             if not callable(loader):
                 capture_error = _collection_error("metric_payload_invalid")
                 return
+            reserved_bytes += declared_bytes
             try:
                 body = await _await_until(
                     loader(), deadline=work_deadline, monotonic=self._monotonic
@@ -246,10 +299,11 @@ class XiaohongshuDataCollector:
             except BaseException:
                 capture_error = _collection_error("metric_payload_invalid")
                 return
-            if type(body) is not bytes or not 1 <= len(body) <= _MAX_RESPONSE_BYTES:
-                capture_error = _collection_error("metric_payload_invalid")
-                return
-            if retained_bytes + len(body) > _MAX_TOTAL_RESPONSE_BYTES:
+            if (
+                type(body) is not bytes
+                or len(body) != declared_bytes
+                or not 1 <= len(body) <= _MAX_RESPONSE_BYTES
+            ):
                 capture_error = _collection_error("metric_payload_invalid")
                 return
             try:
@@ -257,7 +311,6 @@ class XiaohongshuDataCollector:
             except (UnicodeDecodeError, json.JSONDecodeError):
                 capture_error = _collection_error("metric_payload_invalid")
                 return
-            retained_bytes += len(body)
             seen_response_ids.add(response_id)
             payloads[path] = payload
 
@@ -333,16 +386,23 @@ class XiaohongshuDataCollector:
             await navigate(_PHASE_ACCOUNT, CREATOR_HOME)
             await navigate(_PHASE_LIST, DATA_ANALYSIS_URL)
             list_payload = payloads.get(_CONTENT_LIST_PATH)
+            content_warning = ""
+            identities = ()
             if list_payload is None:
-                raise _collection_error("content_list_unavailable") from None
-            try:
-                identities = parse_content_list(list_payload)
-            except CollectionFailure as error:
-                raise _collection_error(error.error_code) from None
-            if not identities:
-                raise _collection_error("content_list_unavailable") from None
-            identity = identities[0]
-            await navigate(_PHASE_DETAIL, f"{_NOTE_DETAIL_URL}?noteId={identity.content_id}")
+                content_warning = "content_list_unavailable"
+            else:
+                try:
+                    identities = parse_content_list(list_payload)
+                except CollectionFailure as error:
+                    if error.error_code == "content_list_truncated":
+                        raise _collection_error(error.error_code) from None
+                    content_warning = "content_payload_invalid"
+            if identities:
+                selected_content_id = identities[0].content_id
+                await navigate(
+                    _PHASE_DETAIL,
+                    f"{_NOTE_DETAIL_URL}?noteId={selected_content_id}",
+                )
         except BaseException as error:
             caught = error
         finally:
@@ -391,11 +451,35 @@ class XiaohongshuDataCollector:
             raise _collection_error("metric_payload_invalid") from None
         try:
             account_metrics = parse_account_overview(
-                account_payload, observed_at=observed_at, platform_day=platform_day
+                account_payload,
+                account_id=account_id,
+                observed_at=observed_at,
+                platform_day=platform_day,
             )
         except CollectionFailure:
             raise _collection_error("metric_payload_invalid") from None
 
+        if content_warning:
+            return CollectionBatch(
+                platform_type=1,
+                source_mode="browser_signed",
+                metrics=account_metrics,
+                contents=(),
+                account_metrics_available=True,
+                content_data_available=False,
+                platform_observed_at=observed_at,
+                warning_code=content_warning,
+            )
+        if not identities:
+            return CollectionBatch(
+                platform_type=1,
+                source_mode="browser_signed",
+                metrics=account_metrics,
+                contents=(),
+                account_metrics_available=True,
+                content_data_available=True,
+                platform_observed_at=observed_at,
+            )
         detail_payload = payloads.get(_CONTENT_DETAIL_PATH)
         if detail_payload is None:
             return CollectionBatch(
@@ -411,7 +495,7 @@ class XiaohongshuDataCollector:
         try:
             content, content_metrics = parse_content_lifetime(
                 detail_payload,
-                identity,
+                identities[0],
                 observed_at=observed_at,
                 platform_day=platform_day,
             )

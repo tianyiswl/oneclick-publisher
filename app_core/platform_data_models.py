@@ -210,9 +210,7 @@ class CollectionBatch:
         point_content_ids = {point.entity_key for point in content_points}
         if self.content_data_available:
             if (
-                not self.contents
-                or not content_points
-                or point_content_ids != content_ids
+                point_content_ids != content_ids
                 or self.warning_code not in {"", "content_list_truncated"}
             ):
                 raise CollectionFailure("metric_payload_invalid")
