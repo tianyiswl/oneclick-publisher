@@ -34,6 +34,22 @@ ACCOUNT_B = {
     "userName": "抖音账号 B",
 }
 
+XHS_ACCOUNT = {
+    **ACCOUNT,
+    "id": 21,
+    "type": 1,
+    "platformName": "小红书",
+    "profileName": "硅基探索",
+    "userName": "硅基探索",
+}
+
+XHS_ACCOUNT_SAME_ID = {
+    **XHS_ACCOUNT,
+    "id": 14,
+    "profileName": "硅基探索 B",
+    "userName": "硅基探索 B",
+}
+
 
 def empty_summary() -> dict:
     summary = period_summary()
@@ -142,6 +158,28 @@ def empty_contents() -> dict:
     }
 
 
+def available_contents() -> dict:
+    return {
+        "accountId": 12,
+        "total": 1,
+        "limit": 50,
+        "offset": 0,
+        "availability": "available",
+        "warningCode": "",
+        "items": [
+            {
+                "contentId": "content-1",
+                "title": "已有作品",
+                "coverUrl": "",
+                "publishedAt": "2026-08-20T09:00:00+08:00",
+                "contentStatus": "published",
+                "contentType": "video",
+                "metrics": {"views": 20},
+            }
+        ],
+    }
+
+
 def failed_summary() -> dict:
     summary = period_summary(status="failed", error_code="login_required")
     summary["metrics"]["views"]["value"] = 125
@@ -188,6 +226,7 @@ class DataMonitorPageTests(unittest.TestCase):
         contents=None,
         accounts=None,
         runner=None,
+        registered_platforms=None,
     ) -> DataMonitorPage:
         account_rows = accounts or [ACCOUNT, {**ACCOUNT, "id": 13, "type": 1}]
         self.accounts_patch = patch(
@@ -210,16 +249,25 @@ class DataMonitorPageTests(unittest.TestCase):
             "ui.data_monitor_page.platform_data_service.account_contents",
             return_value=contents or empty_contents(),
         )
+        self.registry_patch = patch(
+            "ui.data_monitor_page.registered_platform_types",
+            return_value=registered_platforms,
+            create=True,
+        ) if registered_platforms is not None else None
         self.accounts_patch.start()
         self.summary_patch.start()
         self.period_mock = self.period_patch.start()
         self.trends_mock = self.trends_patch.start()
         self.contents_mock = self.contents_patch.start()
+        if self.registry_patch is not None:
+            self.registry_patch.start()
         self.addCleanup(self.accounts_patch.stop)
         self.addCleanup(self.summary_patch.stop)
         self.addCleanup(self.period_patch.stop)
         self.addCleanup(self.trends_patch.stop)
         self.addCleanup(self.contents_patch.stop)
+        if self.registry_patch is not None:
+            self.addCleanup(self.registry_patch.stop)
         page = DataMonitorPage(task_runner=runner)
         self.addCleanup(page.deleteLater)
         return page
@@ -414,17 +462,85 @@ class DataMonitorPageTests(unittest.TestCase):
         )
         self.assertNotIn("账号趋势和作品数据已更新", page.status_label.text())
 
-    def test_only_douyin_accounts_are_listed_and_missing_metrics_render_dash(self) -> None:
+    def test_registered_platform_accounts_are_listed_and_missing_metrics_render_dash(self) -> None:
         """平台过滤或缺失显示回退会把未支持账号或伪零暴露给用户。"""
 
         page = self._page()
 
+        self.assertEqual([page.platform_combo.itemData(i) for i in range(page.platform_combo.count())], [3])
         self.assertEqual(page.account_combo.count(), 1)
         self.assertEqual(page.account_combo.currentData(), 12)
         self.assertEqual(
             {label.text() for label in page.metric_values.values()},
             {"—"},
         )
+
+    def test_platform_then_subject_selectors_filter_and_restore_per_platform(self) -> None:
+        """平台切换若复用全局主体记忆，会把另一个平台的主体带回来。"""
+
+        page = self._page(
+            accounts=[ACCOUNT, ACCOUNT_B, XHS_ACCOUNT],
+            registered_platforms=(1, 3),
+        )
+
+        self.assertEqual(
+            [page.platform_combo.itemData(i) for i in range(page.platform_combo.count())],
+            [3, 1],
+        )
+        self.assertEqual(page.account_combo.count(), 2)
+        page.account_combo.setCurrentIndex(page.account_combo.findData(14))
+        page.platform_combo.setCurrentIndex(page.platform_combo.findData(1))
+        self.assertEqual(page.account_combo.count(), 1)
+        self.assertEqual(page.account_combo.currentData(), 21)
+        self.assertEqual(page.account_combo.currentText(), "硅基探索｜硅基探索")
+        page.platform_combo.setCurrentIndex(page.platform_combo.findData(3))
+        self.assertEqual(page.account_combo.currentData(), 14)
+
+    def test_same_subject_id_isolated_between_platforms(self) -> None:
+        """主体 ID 相同时，平台记忆若未分桶会选回错误主体。"""
+
+        page = self._page(
+            accounts=[ACCOUNT, ACCOUNT_B, XHS_ACCOUNT_SAME_ID, XHS_ACCOUNT],
+            registered_platforms=(1, 3),
+        )
+
+        page.account_combo.setCurrentIndex(page.account_combo.findData(14))
+        page.platform_combo.setCurrentIndex(page.platform_combo.findData(1))
+        page.account_combo.setCurrentIndex(page.account_combo.findData(21))
+        page.platform_combo.setCurrentIndex(page.platform_combo.findData(3))
+
+        self.assertEqual(page.account_combo.currentData(), 14)
+        self.assertEqual(page.account_combo.currentText(), "数据主体 B｜抖音账号 B")
+
+    def test_switch_platform_clears_previous_rows_before_new_account_readback(self) -> None:
+        """切换平台后旧主体的作品行必须先清空，不能短暂冒充新主体数据。"""
+
+        page = self._page(
+            accounts=[ACCOUNT, XHS_ACCOUNT],
+            contents=available_contents(),
+            registered_platforms=(1, 3),
+        )
+
+        self.assertGreater(page.content_table.rowCount(), 0)
+        with patch.object(page, "_render_data") as render:
+            page.platform_combo.setCurrentIndex(page.platform_combo.findData(1))
+            self.assertEqual(page.content_table.rowCount(), 0)
+            render.assert_called_once_with(include_contents=True)
+
+    def test_platform_without_subject_disables_sync(self) -> None:
+        """没有主体的平台不能保留上一平台的同步入口或状态。"""
+
+        page = self._page(
+            accounts=[XHS_ACCOUNT],
+            registered_platforms=(1, 3),
+        )
+
+        page._accounts_by_platform[1] = ()
+        page._refresh_subjects()
+
+        self.assertEqual(page.account_combo.count(), 0)
+        self.assertFalse(page.sync_button.isEnabled())
+        self.assertEqual(page.status_label.text(), "请先在账号管理中添加小红书账号")
 
     def test_sync_uses_real_runner_dedupes_and_ignores_untrusted_progress_text(self) -> None:
         """同账号重复入队或透传 worker 文案都会破坏同步安全边界。"""

@@ -23,6 +23,7 @@ from PyQt6.QtWidgets import (
 )
 
 from app_core import account_service, platform_data_service, platform_data_sync
+from app_core.platform_data_collectors import registered_platform_types
 
 from .background_task import BackgroundTaskRunner
 from .common import button
@@ -266,6 +267,9 @@ class DataMonitorPage(QWidget):
         self._content_warning_code = ""
         self._shutting_down = False
         self._sync_terminal_by_account: dict[int, str] = {}
+        self._accounts_by_platform: dict[int, tuple[dict, ...]] = {}
+        self._last_account_by_platform: dict[int, int] = {}
+        self._selected_platform_type: int | None = None
         self._build_ui()
         self.refresh()
 
@@ -279,6 +283,10 @@ class DataMonitorPage(QWidget):
         title.setObjectName("pageTitle")
         header.addWidget(title)
         header.addStretch()
+        self.platform_combo = QComboBox()
+        self.platform_combo.setMinimumWidth(132)
+        self.platform_combo.currentIndexChanged.connect(self._platform_changed)
+        header.addWidget(self.platform_combo)
         self.account_combo = QComboBox()
         self.account_combo.setMinimumWidth(240)
         self.account_combo.currentIndexChanged.connect(self._render_selected_account)
@@ -397,48 +405,150 @@ class DataMonitorPage(QWidget):
         layout.addStretch(1)
 
     def refresh(self) -> None:
-        selected = self.account_combo.currentData()
-        accounts = [
-            account
-            for account in account_service.list_accounts()
-            if type(account.get("type")) is int and account["type"] == 3
-        ]
+        current_platform = self._current_platform_type()
+        current_account = self._current_account_id()
+        if current_platform is not None and current_account is not None:
+            self._last_account_by_platform[current_platform] = current_account
+
+        registered = {
+            platform_type
+            for platform_type in registered_platform_types()
+            if type(platform_type) is int and platform_type > 0
+        }
+        accounts_by_platform: dict[int, list[dict]] = {}
+        for account in account_service.list_accounts():
+            if type(account) is not dict:
+                continue
+            platform_type = account.get("type")
+            account_id = account.get("id")
+            if (
+                type(platform_type) is not int
+                or platform_type not in registered
+                or type(account_id) is not int
+                or account_id <= 0
+            ):
+                continue
+            accounts_by_platform.setdefault(platform_type, []).append(account)
+        self._accounts_by_platform = {
+            platform_type: tuple(accounts_by_platform[platform_type])
+            for platform_type in account_service.PLATFORM_ORDER
+            if platform_type in accounts_by_platform
+        }
+        platform_types = tuple(self._accounts_by_platform)
+
+        preferred_platform = (
+            current_platform if current_platform in self._accounts_by_platform else None
+        )
+        if preferred_platform is None and platform_types:
+            preferred_platform = platform_types[0]
+
+        self.platform_combo.blockSignals(True)
+        self.platform_combo.clear()
+        for platform_type in platform_types:
+            self.platform_combo.addItem(
+                account_service.PLATFORMS.get(platform_type, f"平台 {platform_type}"),
+                platform_type,
+            )
+        if preferred_platform is not None:
+            self.platform_combo.setCurrentIndex(
+                self.platform_combo.findData(preferred_platform)
+            )
+        self.platform_combo.blockSignals(False)
+        self._selected_platform_type = self._current_platform_type()
+        preferred_account = (
+            self._last_account_by_platform.get(self._selected_platform_type)
+            if self._selected_platform_type is not None
+            else None
+        )
+        self._refresh_subjects(preferred_account_id=preferred_account)
+
+    def _current_platform_type(self) -> int | None:
+        platform_type = self.platform_combo.currentData()
+        return platform_type if type(platform_type) is int and platform_type > 0 else None
+
+    def _current_account_id(self) -> int | None:
+        account_id = self.account_combo.currentData()
+        return account_id if type(account_id) is int and account_id > 0 else None
+
+    @staticmethod
+    def _subject_label(account: dict) -> str:
+        account_id = account["id"]
+        profile_name = account.get("profileName")
+        user_name = account.get("userName")
+        profile = profile_name.strip() if type(profile_name) is str else ""
+        user = user_name.strip() if type(user_name) is str else ""
+        return f"{profile or '未命名主体'}｜{user or f'账号 {account_id}'}"
+
+    def _refresh_subjects(
+        self,
+        *,
+        preferred_account_id: int | None = None,
+    ) -> None:
+        platform_type = self._current_platform_type()
+        accounts = (
+            self._accounts_by_platform.get(platform_type, ())
+            if platform_type is not None
+            else ()
+        )
         self.account_combo.blockSignals(True)
         self.account_combo.clear()
         for account in accounts:
-            label = account.get("profileName") or account.get("userName") or f"抖音账号 {account['id']}"
-            self.account_combo.addItem(str(label), account["id"])
-        if selected is not None:
-            index = self.account_combo.findData(selected)
+            self.account_combo.addItem(self._subject_label(account), account["id"])
+        if type(preferred_account_id) is int and preferred_account_id > 0:
+            index = self.account_combo.findData(preferred_account_id)
             if index >= 0:
                 self.account_combo.setCurrentIndex(index)
         self.account_combo.blockSignals(False)
         self._render_selected_account()
 
+    def _platform_changed(self) -> None:
+        previous_platform = self._selected_platform_type
+        previous_account = self._current_account_id()
+        if previous_platform is not None and previous_account is not None:
+            self._last_account_by_platform[previous_platform] = previous_account
+        self._selected_platform_type = self._current_platform_type()
+        self._clear_account_view("正在读取本地主体数据…")
+        preferred_account = (
+            self._last_account_by_platform.get(self._selected_platform_type)
+            if self._selected_platform_type is not None
+            else None
+        )
+        self._refresh_subjects(preferred_account_id=preferred_account)
+
     def _render_selected_account(self) -> None:
+        platform_type = self._current_platform_type()
+        account_id = self._current_account_id()
+        if platform_type is not None and account_id is not None:
+            self._last_account_by_platform[platform_type] = account_id
+        self._clear_account_view("正在读取本地主体数据…")
         self._render_data(include_contents=True)
+
+    def _clear_account_view(self, message: str) -> None:
+        for value in self.metric_values.values():
+            value.setText("—")
+        for caption in self.metric_captions.values():
+            caption.setText("暂未取得")
+        self.period_label.setText("统计区间：—")
+        self.source_label.setText("数据来源：—")
+        self.platform_observed_label.setText("平台观察时间：—")
+        self.local_synced_label.setText("本地同步时间：—")
+        self.status_label.setText(message)
+        self.relogin_button.hide()
+        self.sync_button.setEnabled(False)
+        self.trend_chart.set_series({})
+        self.content_table.set_payload({"items": []})
+        self._content_offset = 0
+        self._content_total = 0
+        self._content_availability = "missing"
+        self._content_warning_code = ""
+        self._update_content_paging()
 
     def _render_data(self, *, include_contents: bool) -> None:
         account_id = self.account_combo.currentData()
         if type(account_id) is not int or account_id <= 0:
-            for value in self.metric_values.values():
-                value.setText("—")
-            for caption in self.metric_captions.values():
-                caption.setText("暂未取得")
-            self.period_label.setText("统计区间：—")
-            self.source_label.setText("数据来源：—")
-            self.platform_observed_label.setText("平台观察时间：—")
-            self.local_synced_label.setText("本地同步时间：—")
-            self.status_label.setText("请先在账号管理中添加抖音账号")
-            self.relogin_button.hide()
-            self.sync_button.setEnabled(False)
-            self.trend_chart.set_series({})
-            self.content_table.set_payload({"items": []})
-            self._content_offset = 0
-            self._content_total = 0
-            self._content_availability = "missing"
-            self._content_warning_code = ""
-            self._update_content_paging()
+            platform_type = self._current_platform_type()
+            platform_name = account_service.PLATFORMS.get(platform_type, "当前平台")
+            self._clear_account_view(f"请先在账号管理中添加{platform_name}账号")
             return
         days = self.range_combo.currentData()
         if type(days) is not int:
