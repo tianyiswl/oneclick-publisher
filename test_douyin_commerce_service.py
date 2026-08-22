@@ -189,6 +189,56 @@ class DouyinImePlaceholderTests(unittest.TestCase):
 
 
 class DouyinCommercePayloadTests(unittest.TestCase):
+    def test_location_keyword_region_filters_cached_same_name_other_provinces(
+        self,
+    ) -> None:
+        """搜“广东夜南香”不得再展示缓存里其他省的同名门店。"""
+
+        candidates = [
+            {
+                "poiId": "guangdong",
+                "name": "夜南香北京烤鸭",
+                "address": "广东省广州市天河区测试路1号",
+                "commissionType": "commission",
+            },
+            {
+                "poiId": "hubei",
+                "name": "夜南香北京烤鸭",
+                "address": "湖北省黄冈市蕲春县测试路2号",
+                "commissionType": "commission",
+            },
+        ]
+
+        result = douyin_location_cache.filter_locations_for_search_keyword(
+            "广东夜南香", candidates
+        )
+
+        self.assertEqual([item["poiId"] for item in result], ["guangdong"])
+
+    def test_location_keyword_city_filters_cached_same_name_other_cities(self) -> None:
+        """搜“广州夜南香”时，城市名也必须约束缓存地址。"""
+
+        candidates = [
+            {
+                "poiId": "guangzhou",
+                "name": "夜南香北京烤鸭",
+                "address": "广东省广州市天河区测试路1号",
+                "commissionType": "commission",
+            },
+            {
+                "poiId": "wuhan",
+                "name": "夜南香北京烤鸭",
+                "address": "湖北省武汉市江岸区测试路2号",
+                "commissionType": "commission",
+            },
+        ]
+
+        result = douyin_location_cache.filter_locations_for_search_keyword(
+            "广州夜南香", candidates
+        )
+
+        self.assertEqual([item["poiId"] for item in result], ["guangzhou"])
+
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
         self.video = Path(self.tempdir.name) / "commerce.mp4"
@@ -14507,6 +14557,42 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.page.close()
+
+    def test_platform_search_hides_same_name_candidates_outside_keyword_region(
+        self,
+    ) -> None:
+        """平台搜“广东夜南香”即使返回全国门店，界面也只接纳广东。"""
+
+        self.page._batch_location_search_succeeded(
+            "domestic",
+            "广东夜南香",
+            {
+                "platformResultCount": 2,
+                "candidates": [
+                    {
+                        "poiId": "guangdong",
+                        "name": "夜南香北京烤鸭",
+                        "address": "广东省广州市天河区测试路1号",
+                        "commissionType": "commission",
+                    },
+                    {
+                        "poiId": "hubei",
+                        "name": "夜南香北京烤鸭",
+                        "address": "湖北省黄冈市蕲春县测试路2号",
+                        "commissionType": "commission",
+                    },
+                ],
+            },
+            "commission",
+        )
+
+        self.assertEqual(
+            [
+                item["poiId"]
+                for item in self.page._batch_location_state()["candidates"]
+            ],
+            ["guangdong"],
+        )
 
     def _load_revision_ui_fixture(self) -> dict[str, object]:
         tempdir = tempfile.TemporaryDirectory()

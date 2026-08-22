@@ -2138,11 +2138,14 @@ class DouyinCommercePage(QWidget):
             return
         cached_candidates = self._merge_batch_location_candidates(
             [],
-            [
-                dict(item)
-                for item in cached_page.get("candidates", [])
-                if isinstance(item, Mapping)
-            ],
+            douyin_location_cache.filter_locations_for_search_keyword(
+                normalized_keyword,
+                [
+                    dict(item)
+                    for item in cached_page.get("candidates", [])
+                    if isinstance(item, Mapping)
+                ],
+            ),
         )
         try:
             cache_total = max(
@@ -2361,13 +2364,14 @@ class DouyinCommercePage(QWidget):
         row_values = rows.get("candidates") if structured_result else rows
         public_candidates = self._merge_batch_location_candidates(
             [],
-            filter_location_candidates(
-                (
+            douyin_location_cache.filter_locations_for_search_keyword(
+                keyword,
+                filter_location_candidates(
                     [dict(item) for item in row_values if isinstance(item, Mapping)]
                     if isinstance(row_values, list)
-                    else []
+                    else [],
+                    "all",
                 ),
-                "all",
             ),
         )
         if structured_result:
@@ -2857,12 +2861,18 @@ class DouyinCommercePage(QWidget):
                 cache_query, request_token=request_token
             )
             return
+        state = self._batch_location_state()
         page_candidates = [
             dict(item)
-            for item in cached_page.get("candidates", [])
-            if isinstance(item, Mapping)
+            for item in douyin_location_cache.filter_locations_for_search_keyword(
+                state["keyword"],
+                [
+                    dict(item)
+                    for item in cached_page.get("candidates", [])
+                    if isinstance(item, Mapping)
+                ],
+            )
         ]
-        state = self._batch_location_state()
         previous_identities = {
             self._batch_location_candidate_identity(candidate)
             for candidate in state["rawCandidates"]
@@ -2981,11 +2991,16 @@ class DouyinCommercePage(QWidget):
                 "invalid_result", request_token=request_token
             )
             return
-        public_candidates = filter_location_candidates(
-            [dict(item) for item in row_values if isinstance(item, Mapping)],
-            "all",
-        )
         state = self._batch_location_state()
+        public_candidates = list(
+            douyin_location_cache.filter_locations_for_search_keyword(
+                state["keyword"],
+                filter_location_candidates(
+                    [dict(item) for item in row_values if isinstance(item, Mapping)],
+                    "all",
+                ),
+            )
+        )
         revalidation_was_pending = state["requiresRevalidation"] is True
         previous_platform_candidates = [
             dict(item) for item in state["platformCandidates"]

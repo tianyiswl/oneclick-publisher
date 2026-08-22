@@ -11,6 +11,7 @@ from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import re
 import threading
 from typing import Any
 
@@ -30,6 +31,20 @@ _LOCATION_COMMISSION_FILTERS = frozenset(
     {"all", "commission", "no_commission"}
 )
 _LOCATION_COMMISSION_TYPES = frozenset({"commission", "no_commission"})
+_LOCATION_REGION_PREFIXES = tuple(
+    sorted(
+        {
+            "北京", "天津", "上海", "重庆",
+            "河北", "山西", "辽宁", "吉林", "黑龙江",
+            "江苏", "浙江", "安徽", "福建", "江西", "山东",
+            "河南", "湖北", "湖南", "广东", "海南", "四川",
+            "贵州", "云南", "陕西", "甘肃", "青海", "台湾",
+            "内蒙古", "广西", "西藏", "宁夏", "新疆", "香港", "澳门",
+        },
+        key=len,
+        reverse=True,
+    )
+)
 
 _LOCATION_REVALIDATION_ERROR_CODES = frozenset(
     {
@@ -74,6 +89,54 @@ def _text(value: object, field: str) -> str:
 
 def _optional_text(value: object) -> str:
     return " ".join(value.split()) if isinstance(value, str) else ""
+
+
+def filter_locations_for_search_keyword(
+    keyword: object,
+    candidates: list[Mapping[str, Any]],
+) -> list[Mapping[str, Any]]:
+    """搜索词以省级地区开头时，排除其他地区的同名门店。
+
+    完整关键词已出现在门店名时保留候选，避免把“北京烤鸭”
+    这类品牌/品类词误判为只搜北京。
+    """
+
+    normalized_keyword = "".join(_optional_text(keyword).split())
+    region_prefixes = set(_LOCATION_REGION_PREFIXES)
+    for candidate in candidates:
+        address = "".join(_optional_text(candidate.get("address")).split())
+        for match in re.finditer(r"([一-鿿]{2,8})市", address):
+            city = match.group(1)
+            for separator in ("特别行政区", "自治区", "省"):
+                if separator in city:
+                    city = city.rsplit(separator, 1)[-1]
+            if 2 <= len(city) <= 8:
+                region_prefixes.add(city)
+    region = next(
+        (
+            item
+            for item in sorted(region_prefixes, key=len, reverse=True)
+            if normalized_keyword.startswith(item)
+            and len(normalized_keyword) > len(item)
+        ),
+        "",
+    )
+    if not region:
+        return list(candidates)
+    remainder = normalized_keyword[len(region) :]
+    for suffix in ("特别行政区", "壮族自治区", "回族自治区", "维吾尔自治区", "自治区", "省", "市"):
+        if remainder.startswith(suffix):
+            remainder = remainder[len(suffix) :]
+            break
+    filtered: list[Mapping[str, Any]] = []
+    for candidate in candidates:
+        name = "".join(_optional_text(candidate.get("name")).split())
+        address = "".join(_optional_text(candidate.get("address")).split())
+        if normalized_keyword in name or (
+            region in address and remainder and remainder in f"{name}{address}"
+        ):
+            filtered.append(candidate)
+    return filtered
 
 
 def _query(value: object) -> LocationCacheQuery:
@@ -506,7 +569,12 @@ def get_cached_locations(
                 safe_query.commission_filter,
             ),
         ).fetchall()
-    public_rows = [_public(row) for row in rows]
+    public_rows = list(
+        filter_locations_for_search_keyword(
+            safe_query.keyword,
+            [_public(row) for row in rows],
+        )
+    )
     reusable = [
         row
         for row in public_rows
@@ -550,7 +618,13 @@ def merge_platform_locations(
     safe_query = _query(query)
     if not isinstance(candidates, list):
         raise DouyinLocationCacheError("地点缓存候选列表无效")
-    normalized = [_candidate(candidate) for candidate in candidates]
+    normalized = [
+        dict(candidate)
+        for candidate in filter_locations_for_search_keyword(
+            safe_query.keyword,
+            [_candidate(candidate) for candidate in candidates],
+        )
+    ]
     _validate_candidates_for_query(safe_query, normalized)
     identities = {
         (
@@ -657,7 +731,13 @@ def reconcile_platform_locations(
         raise DouyinLocationCacheError("地点缓存穷尽状态无效")
     if not isinstance(candidates, list):
         raise DouyinLocationCacheError("地点缓存候选列表无效")
-    normalized = [_candidate(candidate) for candidate in candidates]
+    normalized = [
+        dict(candidate)
+        for candidate in filter_locations_for_search_keyword(
+            safe_query.keyword,
+            [_candidate(candidate) for candidate in candidates],
+        )
+    ]
     _validate_candidates_for_query(safe_query, normalized)
     returned_identities = {
         _candidate_identity(candidate) for candidate in normalized
