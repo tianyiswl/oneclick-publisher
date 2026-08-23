@@ -16603,6 +16603,37 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.assertIn(self.page._COLLECTOR_TASK_KEY, runner.active)
         platform_search.assert_not_called()
 
+    def test_cache_shortage_for_unassigned_videos_still_refreshes_platform(self) -> None:
+        """缓存不足以填完空白视频时，必须继续真实平台搜索。"""
+
+        self.page.video_combo.clear()
+        self.page.video_combo.addItem("请选择视频", None)
+        for index in range(3):
+            path = f"/tmp/cache-shortage-{index}.mp4"
+            self.page.video_combo.addItem(
+                f"视频 {index}.mp4",
+                {"id": index, "storedPath": path, "filename": f"视频 {index}.mp4"},
+            )
+        self.page._selected_video_indexes = [1, 2, 3]
+        self._activate_cached_location_search(account_id=815)
+        cached = self._cached_location_candidates(2)
+        cache_page = self._cache_page(cached, requires_revalidation=False)
+        with patch.object(
+            douyin_location_cache,
+            "get_cached_locations",
+            return_value=cache_page,
+        ), patch.object(
+            self.page,
+            "_start_batch_location_platform_search",
+            return_value=True,
+        ) as platform_search:
+            self.page.batch_location_search_button.click()
+            self._finish_location_cache_search()
+
+        self.assertEqual(len(self.page._batch_location_state()["candidates"]), 2)
+        platform_search.assert_called_once()
+        self.assertIs(platform_search.call_args.kwargs["from_load_more"], False)
+
     def test_confirmed_platform_exhaustion_uses_atomic_cache_reconciliation(
         self,
     ) -> None:
@@ -20360,6 +20391,58 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         # 测试页未 show()，isVisible() 会受父窗口影响；isHidden() 才能验证
         # 组件是否被本次搜索回读显式展示。
         self.assertFalse(self.page.batch_item_settings_status.isHidden())
+
+    def test_second_region_search_only_fills_videos_left_unassigned(self) -> None:
+        """广东填五条后搜广西，只补剩余两条且不覆盖广东地址。"""
+
+        self.page.video_combo.clear()
+        self.page.video_combo.addItem("请选择视频", None)
+        paths = [f"/tmp/cross-region-{index}.mp4" for index in range(7)]
+        for index, path in enumerate(paths, start=1):
+            self.page.video_combo.addItem(
+                f"视频 {index}.mp4",
+                {"id": index, "storedPath": path, "filename": f"视频 {index}.mp4"},
+            )
+        self.page._selected_video_indexes = list(range(1, 8))
+        guangdong = [
+            {
+                "poiId": f"gd-{index}",
+                "name": f"JOYMARK 广东门店 {index}",
+                "address": f"广东省广州市测试路 {index} 号",
+            }
+            for index in range(1, 6)
+        ]
+        guangxi = [
+            {
+                "poiId": f"gx-{index}",
+                "name": f"JOYMARK 广西门店 {index}",
+                "address": f"广西壮族自治区南宁市测试路 {index} 号",
+            }
+            for index in range(1, 5)
+        ]
+
+        with patch(
+            "ui.douyin_commerce_page.save_location_preset",
+            side_effect=lambda _account_id, candidate, scope: {
+                **candidate,
+                "scope": scope,
+            },
+        ):
+            self.page._batch_location_search_succeeded(
+                "domestic", "广东joymark", guangdong, "all"
+            )
+            self.page._batch_location_search_succeeded(
+                "domestic", "广西joymark", guangxi, "all"
+            )
+
+        self.assertEqual(
+            [self.page._batch_locations[path]["poiId"] for path in paths],
+            ["gd-1", "gd-2", "gd-3", "gd-4", "gd-5", "gx-1", "gx-2"],
+        )
+        self.assertEqual(
+            [item["poiId"] for item in self.page._batch_location_state()["candidates"]],
+            ["gx-1", "gx-2", "gx-3", "gx-4"],
+        )
 
     def test_batch_location_filter_fills_only_empty_items_and_freezes_saved_commission_metadata(self) -> None:
         """筛选只填空项，每条已保存地点的返佣证据不随顶部切换。"""

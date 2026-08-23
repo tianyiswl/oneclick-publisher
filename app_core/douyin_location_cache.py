@@ -101,10 +101,12 @@ def filter_locations_for_search_keyword(
     这类品牌/品类词误判为只搜北京。
     """
 
-    normalized_keyword = "".join(_optional_text(keyword).split())
+    normalized_keyword = "".join(_optional_text(keyword).split()).casefold()
     region_prefixes = set(_LOCATION_REGION_PREFIXES)
     for candidate in candidates:
-        address = "".join(_optional_text(candidate.get("address")).split())
+        address = "".join(
+            _optional_text(candidate.get("address")).split()
+        ).casefold()
         for match in re.finditer(r"([一-鿿]{2,8})市", address):
             city = match.group(1)
             for separator in ("特别行政区", "自治区", "省"):
@@ -130,8 +132,10 @@ def filter_locations_for_search_keyword(
             break
     filtered: list[Mapping[str, Any]] = []
     for candidate in candidates:
-        name = "".join(_optional_text(candidate.get("name")).split())
-        address = "".join(_optional_text(candidate.get("address")).split())
+        name = "".join(_optional_text(candidate.get("name")).split()).casefold()
+        address = "".join(
+            _optional_text(candidate.get("address")).split()
+        ).casefold()
         if normalized_keyword in name or (
             region in address and remainder and remainder in f"{name}{address}"
         ):

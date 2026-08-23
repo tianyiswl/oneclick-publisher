@@ -2200,7 +2200,9 @@ class DouyinCommercePage(QWidget):
         self._clear_stage_error("location")
         self._render_batch_item_rows()
         self._sync_view()
-        if requires_revalidation or not cached_candidates:
+        # 缓存先填当前仍为空的视频；只有缓存不足或需要重新校对时，
+        # 才继续查询平台。缓存刚好够用时不额外占用平台会话。
+        if requires_revalidation or not cached_candidates or remaining:
             self._start_batch_location_platform_search(
                 cache_query,
                 request_token=request_token,
