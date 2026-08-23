@@ -156,7 +156,7 @@ class YouTubeOAuthTokenClient:
             raise OAuthTokenError("oauth_transport_unavailable") from None
 
         payload = _response_payload(response)
-        if not 200 <= response.status_code < 300:
+        if not _response_is_success(response):
             if payload.get("error") == "invalid_grant":
                 raise OAuthTokenError("authorization_invalid")
             raise OAuthTokenError("oauth_token_rejected")
@@ -269,6 +269,16 @@ def _response_payload(response: _OAuthTokenResponse) -> Mapping[str, object]:
     if not isinstance(payload, Mapping):
         raise OAuthTokenError("oauth_token_response_invalid")
     return payload
+
+
+def _response_is_success(response: _OAuthTokenResponse) -> bool:
+    try:
+        status_code = response.status_code
+        if isinstance(status_code, bool) or not isinstance(status_code, int):
+            raise TypeError
+        return 200 <= status_code < 300
+    except Exception:
+        raise OAuthTokenError("oauth_token_response_invalid") from None
 
 
 def _tokens_from_payload(

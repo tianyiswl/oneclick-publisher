@@ -32,6 +32,32 @@ class FakeTokenResponse:
         return self._payload
 
 
+class RaisingStatusTokenResponse:
+    def json(self) -> dict[str, Any]:
+        return {
+            "access_token": "access-token-secret",
+            "refresh_token": "refresh-token-secret",
+            "expires_in": 3600,
+            "scope": YOUTUBE_UPLOAD_SCOPE,
+        }
+
+    @property
+    def status_code(self) -> int:
+        raise RuntimeError("status access exposed access-token-secret")
+
+
+class InvalidStatusTokenResponse:
+    status_code = "not-an-http-status"
+
+    def json(self) -> dict[str, Any]:
+        return {
+            "access_token": "access-token-secret",
+            "refresh_token": "refresh-token-secret",
+            "expires_in": 3600,
+            "scope": YOUTUBE_UPLOAD_SCOPE,
+        }
+
+
 class FakeTokenTransport:
     def __init__(
         self,
@@ -415,6 +441,38 @@ class YouTubeOAuthTokenLifecycleTests(unittest.TestCase):
         self.assertNotIn("authorization-code-secret", str(raised.exception))
         self.assertNotIn("access-token-secret", str(raised.exception))
         self.assertNotIn("server_error", str(raised.exception))
+
+    def test_raising_response_status_is_normalized_without_secret_values(self) -> None:
+        request, callback = self._authorization_values()
+        transport = FakeTokenTransport(response=RaisingStatusTokenResponse())
+        client = YouTubeOAuthTokenClient(transport, clock=lambda: 0.0)
+
+        with self.assertRaisesRegex(OAuthTokenError, "^oauth_token_response_invalid$") as raised:
+            client.exchange_authorization_code(
+                client_id="desktop-client-id",
+                request=request,
+                callback=callback,
+            )
+
+        self.assertNotIn("access-token-secret", str(raised.exception))
+        self.assertNotIn(callback.authorization_code, str(raised.exception))
+        self.assertNotIn(request.code_verifier, str(raised.exception))
+
+    def test_non_integer_response_status_is_normalized_without_secret_values(self) -> None:
+        request, callback = self._authorization_values()
+        transport = FakeTokenTransport(response=InvalidStatusTokenResponse())
+        client = YouTubeOAuthTokenClient(transport, clock=lambda: 0.0)
+
+        with self.assertRaisesRegex(OAuthTokenError, "^oauth_token_response_invalid$") as raised:
+            client.exchange_authorization_code(
+                client_id="desktop-client-id",
+                request=request,
+                callback=callback,
+            )
+
+        self.assertNotIn("access-token-secret", str(raised.exception))
+        self.assertNotIn(callback.authorization_code, str(raised.exception))
+        self.assertNotIn(request.callback_url, str(raised.exception))
 
     def test_credential_store_is_an_injected_protocol_without_cleartext_fallback(self) -> None:
         store = InMemoryCredentialStore()
