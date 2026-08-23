@@ -247,45 +247,155 @@ def _provider_secret_buffer(value: object) -> bytearray | None:
             _zero_buffer(mutable)
 
 
-def _sanitize_prepared_request(request) -> None:
-    if not isinstance(request, requests.PreparedRequest):
-        return
+def _first_control(current, candidate):
+    if current is not None:
+        return current
+    return candidate
+
+
+def _get_cleanup_attribute(obj, name, *, retry_control=False):
+    value = None
+    control = None
     try:
-        headers = request.headers
-        for key in tuple(headers.keys()):
-            if type(key) is str and key.lower() in {
-                "authorization",
-                "proxy-authorization",
-            }:
-                headers.pop(key, None)
-        request.body = None
-        request._body_position = None
-    except BaseException:
-        return
+        attempts = 2 if retry_control else 1
+        for _index in range(attempts):
+            try:
+                value = getattr(obj, name)
+                break
+            except _PROCESS_CONTROL as error:
+                control = _first_control(
+                    control,
+                    (_OUTCOME_CONTROL, _control_outcome_value(error)),
+                )
+            except BaseException:
+                break
+        return value, control
+    finally:
+        obj = None
+        value = None
+        name = None
+        _index = None
 
 
-def _sanitize_outbound_carriers(*, error=None, response=None) -> None:
+def _sanitize_prepared_request(request):
+    control = None
+    headers = None
+    keys = ()
+    key = None
+    try:
+        if not isinstance(request, requests.PreparedRequest):
+            return None
+        try:
+            headers = request.headers
+        except _PROCESS_CONTROL as error:
+            control = _first_control(
+                control,
+                (_OUTCOME_CONTROL, _control_outcome_value(error)),
+            )
+        except BaseException:
+            headers = None
+        if headers is not None:
+            try:
+                keys = tuple(headers.keys())
+            except _PROCESS_CONTROL as error:
+                control = _first_control(
+                    control,
+                    (_OUTCOME_CONTROL, _control_outcome_value(error)),
+                )
+                keys = ()
+            except BaseException:
+                keys = ()
+            for key in keys:
+                if type(key) is not str or key.lower() not in {
+                    "authorization",
+                    "proxy-authorization",
+                }:
+                    continue
+                try:
+                    headers.pop(key, None)
+                except _PROCESS_CONTROL as error:
+                    control = _first_control(
+                        control,
+                        (_OUTCOME_CONTROL, _control_outcome_value(error)),
+                    )
+                except BaseException:
+                    continue
+        for attribute in ("body", "_body_position"):
+            try:
+                setattr(request, attribute, None)
+            except _PROCESS_CONTROL as error:
+                control = _first_control(
+                    control,
+                    (_OUTCOME_CONTROL, _control_outcome_value(error)),
+                )
+            except BaseException:
+                continue
+        return control
+    finally:
+        request = None
+        headers = None
+        keys = None
+        key = None
+        attribute = None
+
+
+def _sanitize_outbound_carriers(*, error=None, response=None):
+    control = None
     requests_to_clear = []
+    responses_to_close = []
     if isinstance(error, requests.exceptions.RequestException):
-        requests_to_clear.append(error.request)
-        external_response = error.response
+        request, current = _get_cleanup_attribute(
+            error,
+            "request",
+            retry_control=True,
+        )
+        control = _first_control(control, current)
+        requests_to_clear.append(request)
+        external_response, current = _get_cleanup_attribute(
+            error,
+            "response",
+            retry_control=True,
+        )
+        control = _first_control(control, current)
         if isinstance(external_response, requests.Response):
-            requests_to_clear.append(external_response.request)
+            responses_to_close.append(external_response)
     if isinstance(response, requests.Response):
-        requests_to_clear.append(response.request)
+        responses_to_close.append(response)
+    for current_response in responses_to_close:
+        request, current = _get_cleanup_attribute(
+            current_response,
+            "request",
+            retry_control=True,
+        )
+        control = _first_control(control, current)
+        requests_to_clear.append(request)
     seen = set()
     for request in requests_to_clear:
         identity = id(request)
         if identity in seen:
             continue
         seen.add(identity)
-        _sanitize_prepared_request(request)
+        current = _sanitize_prepared_request(request)
+        control = _first_control(control, current)
+    error = None
+    response = None
+    external_response = None
+    request = None
+    current = None
+    current_response = None
+    requests_to_clear.clear()
+    return control, tuple(responses_to_close)
 
 
 def _parse_json_outcome(raw_response):
     decoded = None
     try:
-        decoded = raw_response.decode("utf-8")
+        if type(raw_response) is bytes:
+            decoded = raw_response.decode("utf-8")
+        elif type(raw_response) is str:
+            decoded = raw_response
+        else:
+            return (_OUTCOME_FAILURE, "comment_ai_response_invalid")
         return (_OUTCOME_OK, _loads_json(decoded))
     except _PROCESS_CONTROL as error:
         return (_OUTCOME_CONTROL, _control_outcome_value(error))
@@ -374,6 +484,14 @@ class OpenAiCompatibleCommentProvider:
             session_factory = None
             if type(mutable) is bytearray:
                 _zero_buffer(mutable)
+            if self._initial_outcome is not None:
+                owned_secret = self._secret
+                self._secret = None
+                if type(owned_secret) is bytearray:
+                    _zero_buffer(owned_secret)
+                owned_secret = None
+                self._settings = None
+                self._session_factory = None
 
     def analyze(
         self, title: str, comments: tuple[CommentRecord, ...]
@@ -431,6 +549,8 @@ class OpenAiCompatibleCommentProvider:
         validated = None
         classifications = None
         candidates = None
+        cleanup_control = None
+        cleanup_responses = ()
         try:
             refs, ref_to_key, request_comments = self._validate_input(title, comments)
             payload = self._request_payload(title, request_comments)
@@ -465,6 +585,11 @@ class OpenAiCompatibleCommentProvider:
             raw_response = None
             if parsed_outcome[0] != _OUTCOME_OK:
                 outcome = parsed_outcome
+                if parsed_outcome[0] == _OUTCOME_CONTROL:
+                    cleanup_control = _first_control(
+                        cleanup_control,
+                        parsed_outcome,
+                    )
             else:
                 outer = parsed_outcome[1]
                 parsed_outcome = None
@@ -493,6 +618,7 @@ class OpenAiCompatibleCommentProvider:
                 result = None
         except _PROCESS_CONTROL as error:
             outcome = (_OUTCOME_CONTROL, _control_outcome_value(error))
+            cleanup_control = _first_control(cleanup_control, outcome)
         except CommentInsightFailure as exc:
             code = (
                 exc.error_code
@@ -502,19 +628,28 @@ class OpenAiCompatibleCommentProvider:
             outcome = (_OUTCOME_FAILURE, code)
         except (requests.exceptions.Timeout, TimeoutError) as error:
             if isinstance(error, requests.exceptions.RequestException):
-                _sanitize_outbound_carriers(error=error)
-                if isinstance(error.response, requests.Response):
-                    error_response = error.response
+                current, cleanup_responses = _sanitize_outbound_carriers(
+                    error=error
+                )
+                cleanup_control = _first_control(cleanup_control, current)
+                if cleanup_responses:
+                    error_response = cleanup_responses[0]
             outcome = (_OUTCOME_FAILURE, "comment_ai_timeout")
         except requests.exceptions.RequestException as error:
-            _sanitize_outbound_carriers(error=error)
-            if isinstance(error.response, requests.Response):
-                error_response = error.response
+            current, cleanup_responses = _sanitize_outbound_carriers(
+                error=error
+            )
+            cleanup_control = _first_control(cleanup_control, current)
+            if cleanup_responses:
+                error_response = cleanup_responses[0]
             outcome = (_OUTCOME_FAILURE, "comment_ai_service_unavailable")
         except BaseException:
             outcome = (_OUTCOME_FAILURE, "comment_ai_service_unavailable")
         finally:
-            _sanitize_outbound_carriers(response=response)
+            current, cleanup_responses = _sanitize_outbound_carriers(
+                response=response
+            )
+            cleanup_control = _first_control(cleanup_control, current)
             if type(headers) is dict:
                 headers.clear()
             if type(payload) is dict:
@@ -528,7 +663,7 @@ class OpenAiCompatibleCommentProvider:
                 ref_to_key.clear()
             if type(self._secret) is bytearray:
                 _zero_buffer(self._secret)
-            close_control = None
+            close_control = cleanup_control
             for resource in (response, error_response, session):
                 current = _close_resource_outcome(resource)
                 if close_control is None and current is not None:
@@ -555,6 +690,8 @@ class OpenAiCompatibleCommentProvider:
             validated = None
             classifications = None
             candidates = None
+            cleanup_control = None
+            cleanup_responses = None
             close_control = None
             resource = None
             current = None
@@ -785,10 +922,12 @@ class OpenAiCompatibleCommentProvider:
             raise _response_invalid() from None
         if content_size > _MAX_RESPONSE_BYTES:
             raise _response_invalid()
-        try:
-            contract = _loads_json(content)
-        except (json.JSONDecodeError, RecursionError, UnicodeError, ValueError):
-            raise _response_invalid() from None
+        parsed_outcome = _parse_json_outcome(content)
+        content = None
+        if parsed_outcome[0] != _OUTCOME_OK:
+            _raise_clean_outcome(parsed_outcome)
+        contract = parsed_outcome[1]
+        parsed_outcome = None
         return _exact_dict(contract, _CONTRACT_KEYS)
 
     def _validate_contract(self, contract: dict, refs: tuple[str, ...]):

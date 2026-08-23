@@ -41,6 +41,22 @@ def _control_outcome_value(error: BaseException):
     return ("system_exit", code)
 
 
+def _error_outcome(error: BaseException):
+    if isinstance(error, _PROCESS_CONTROL):
+        return (_OUTCOME_CONTROL, _control_outcome_value(error))
+    return (_OUTCOME_FAILURE, None)
+
+
+def _first_outcome(current, candidate):
+    if current is None:
+        return candidate
+    if current[0] != _OUTCOME_CONTROL and (
+        candidate is not None and candidate[0] == _OUTCOME_CONTROL
+    ):
+        return candidate
+    return current
+
+
 def _raise_clean_outcome(outcome) -> None:
     kind, value = outcome
     if kind == _OUTCOME_CONTROL:
@@ -241,27 +257,42 @@ class CommentSecretStore:
             if security.SecKeychainItemFreeContent(None, password_data) != 0:
                 raise _not_configured()
 
-    def _mac_cleanup_partial(
+    def _mac_cleanup_outcome(
         self,
         security,
         core,
         password_data,
         item_ref,
         *,
-        suppress_errors,
-    ) -> None:
-        failure = None
+        release_item,
+    ):
+        outcome = None
         try:
             self._mac_free_content(security, password_data)
         except BaseException as error:
-            failure = error
+            outcome = _first_outcome(outcome, _error_outcome(error))
+        if release_item:
+            try:
+                self._mac_release_item(core, item_ref)
+            except BaseException as error:
+                outcome = _first_outcome(outcome, _error_outcome(error))
+        self = None
+        security = None
+        core = None
+        password_data = None
+        item_ref = None
+        return outcome
+
+    def _mac_release_outcome(self, core, item_ref):
         try:
             self._mac_release_item(core, item_ref)
+            return None
         except BaseException as error:
-            if failure is None:
-                failure = error
-        if failure is not None and not suppress_errors:
-            raise failure
+            return _error_outcome(error)
+        finally:
+            self = None
+            core = None
+            item_ref = None
 
     def _mac_find(self, security, core, *, read_secret):
         ctypes = self._ctypes
@@ -280,70 +311,109 @@ class CommentSecretStore:
                 ctypes.byref(password_data),
                 ctypes.byref(item_ref),
             )
-        except BaseException:
-            self._mac_cleanup_partial(
+        except BaseException as error:
+            outcome = _error_outcome(error)
+            cleanup_outcome = self._mac_cleanup_outcome(
                 security,
                 core,
                 password_data,
                 item_ref,
-                suppress_errors=True,
+                release_item=True,
             )
-            raise
+            outcome = _first_outcome(outcome, cleanup_outcome)
+            _raise_clean_outcome(outcome)
         if status == _MAC_NOT_FOUND:
-            self._mac_cleanup_partial(
+            cleanup_outcome = self._mac_cleanup_outcome(
                 security,
                 core,
                 password_data,
                 item_ref,
-                suppress_errors=False,
+                release_item=True,
             )
+            if cleanup_outcome is not None:
+                _raise_clean_outcome(cleanup_outcome)
             return None, None
         if status != 0:
-            self._mac_cleanup_partial(
+            cleanup_outcome = self._mac_cleanup_outcome(
                 security,
                 core,
                 password_data,
                 item_ref,
-                suppress_errors=False,
+                release_item=True,
             )
+            if cleanup_outcome is not None:
+                _raise_clean_outcome(cleanup_outcome)
             raise _not_configured()
+        native = None
         value = None
-        try:
-            if read_secret:
-                if (
-                    not password_data.value
-                    or password_length.value <= 0
-                    or password_length.value > _MAX_SECRET_BYTES
-                ):
-                    raise _not_configured()
+        if read_secret:
+            if (
+                not password_data.value
+                or password_length.value <= 0
+                or password_length.value > _MAX_SECRET_BYTES
+            ):
+                cleanup_outcome = self._mac_cleanup_outcome(
+                    security,
+                    core,
+                    password_data,
+                    item_ref,
+                    release_item=True,
+                )
+                if cleanup_outcome is not None:
+                    _raise_clean_outcome(cleanup_outcome)
+                raise _not_configured()
+            try:
                 native = bytearray(
                     ctypes.string_at(password_data, password_length.value)
                 )
-                try:
-                    value = native.decode("utf-8")
-                except (UnicodeDecodeError, ValueError):
-                    raise _not_configured() from None
-                finally:
-                    _zero(native)
-                if not _valid_secret_text(value):
-                    value = None
-                    raise _not_configured()
-        except BaseException:
-            value = None
-            self._mac_cleanup_partial(
+            except _PROCESS_CONTROL as error:
+                outcome = _error_outcome(error)
+            except BaseException:
+                outcome = (_OUTCOME_FAILURE, None)
+            else:
+                outcome = None
+            cleanup_outcome = self._mac_cleanup_outcome(
                 security,
                 core,
                 password_data,
                 item_ref,
-                suppress_errors=True,
+                release_item=True,
             )
-            raise
-        try:
-            self._mac_free_content(security, password_data)
-        except BaseException:
-            self._mac_release_item(core, item_ref)
-            raise
-        return value, item_ref
+            outcome = _first_outcome(outcome, cleanup_outcome)
+            if outcome is not None:
+                if type(native) is bytearray:
+                    _zero(native)
+                native = None
+                _raise_clean_outcome(outcome)
+            try:
+                value = native.decode("utf-8")
+            except (UnicodeDecodeError, ValueError):
+                raise _not_configured() from None
+            finally:
+                _zero(native)
+                native = None
+            if not _valid_secret_text(value):
+                value = None
+                raise _not_configured()
+            result = value
+            value = None
+            return result, None
+
+        cleanup_outcome = self._mac_cleanup_outcome(
+            security,
+            core,
+            password_data,
+            item_ref,
+            release_item=False,
+        )
+        if cleanup_outcome is not None:
+            release_outcome = self._mac_release_outcome(core, item_ref)
+            cleanup_outcome = _first_outcome(
+                cleanup_outcome,
+                release_outcome,
+            )
+            _raise_clean_outcome(cleanup_outcome)
+        return None, item_ref
 
     def _mac_release_item(self, core, item_ref) -> None:
         if item_ref is not None and getattr(item_ref, "value", None):
@@ -351,13 +421,12 @@ class CommentSecretStore:
 
     def _mac_read(self) -> str | None:
         security, core = self._mac_libraries()
-        value, item_ref = self._mac_find(
-            security, core, read_secret=True
+        value, _item_ref = self._mac_find(
+            security,
+            core,
+            read_secret=True,
         )
-        try:
-            return value
-        finally:
-            self._mac_release_item(core, item_ref)
+        return value
 
     def _mac_write(self, mutable: bytearray) -> None:
         ctypes = self._ctypes
@@ -453,6 +522,18 @@ class CommentSecretStore:
         advapi.CredFree.argtypes = [ctypes.c_void_p]
         return advapi
 
+    def _windows_free_outcome(self, advapi, credential_pointer):
+        try:
+            if bool(credential_pointer):
+                advapi.CredFree(credential_pointer)
+            return None
+        except BaseException as error:
+            return _error_outcome(error)
+        finally:
+            self = None
+            advapi = None
+            credential_pointer = None
+
     def _windows_read(self) -> str | None:
         ctypes = self._ctypes
         credential_type, credential_pointer_type, wintypes = self._windows_types()
@@ -467,19 +548,26 @@ class CommentSecretStore:
                 0,
                 ctypes.byref(credential_pointer),
             )
-        except BaseException:
-            if bool(credential_pointer):
-                try:
-                    advapi.CredFree(credential_pointer)
-                except BaseException:
-                    pass
-            raise
+        except BaseException as error:
+            outcome = _error_outcome(error)
+            cleanup_outcome = self._windows_free_outcome(
+                advapi,
+                credential_pointer,
+            )
+            outcome = _first_outcome(outcome, cleanup_outcome)
+            _raise_clean_outcome(outcome)
         if not succeeded:
-            if bool(credential_pointer):
-                advapi.CredFree(credential_pointer)
+            cleanup_outcome = self._windows_free_outcome(
+                advapi,
+                credential_pointer,
+            )
+            if cleanup_outcome is not None:
+                _raise_clean_outcome(cleanup_outcome)
             if ctypes.get_last_error() == _WINDOWS_NOT_FOUND:
                 return None
             raise _not_configured()
+        native = None
+        value = None
         try:
             credential = credential_pointer.contents
             length = int(credential.CredentialBlobSize)
@@ -492,18 +580,34 @@ class CommentSecretStore:
             native = bytearray(
                 ctypes.string_at(credential.CredentialBlob, length)
             )
-            try:
-                value = native.decode("utf-8")
-            except (UnicodeDecodeError, ValueError):
-                raise _not_configured() from None
-            finally:
+            outcome = None
+        except _PROCESS_CONTROL as error:
+            outcome = _error_outcome(error)
+        except BaseException:
+            outcome = (_OUTCOME_FAILURE, None)
+        cleanup_outcome = self._windows_free_outcome(
+            advapi,
+            credential_pointer,
+        )
+        outcome = _first_outcome(outcome, cleanup_outcome)
+        if outcome is not None:
+            if type(native) is bytearray:
                 _zero(native)
-            if not _valid_secret_text(value):
-                value = None
-                raise _not_configured()
-            return value
+            native = None
+            _raise_clean_outcome(outcome)
+        try:
+            value = native.decode("utf-8")
+        except (UnicodeDecodeError, ValueError):
+            raise _not_configured() from None
         finally:
-            advapi.CredFree(credential_pointer)
+            _zero(native)
+            native = None
+        if not _valid_secret_text(value):
+            value = None
+            raise _not_configured()
+        result = value
+        value = None
+        return result
 
     def _windows_write(self, mutable: bytearray) -> None:
         ctypes = self._ctypes

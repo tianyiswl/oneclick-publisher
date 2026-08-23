@@ -247,6 +247,89 @@ class RetainedRequestFailureSession:
         self.closed = True
 
 
+class CleanupControlResponse(requests.Response):
+    """A real Response whose cleanup attributes can raise process control."""
+
+    def __init__(self, *, request_control=None, close_control=None) -> None:
+        self._stored_request = None
+        self._request_control = None
+        self._request_control_raised = False
+        super().__init__()
+        self.status_code = 200
+        self.headers = {"Content-Type": "application/json; charset=utf-8"}
+        self._content = response_bytes()
+        self._content_consumed = True
+        self._request_control = request_control
+        self._close_control = close_control
+        self.closed_by_provider = False
+
+    @property
+    def request(self):
+        if (
+            self._request_control is not None
+            and not self._request_control_raised
+        ):
+            self._request_control_raised = True
+            raise self._request_control
+        return self._stored_request
+
+    @request.setter
+    def request(self, value):
+        self._stored_request = value
+
+    def iter_content(self, chunk_size=1, decode_unicode=False):
+        del chunk_size, decode_unicode
+        yield self._content
+
+    def close(self):
+        self.closed_by_provider = True
+        if self._close_control is not None:
+            raise self._close_control
+
+
+class CleanupControlSession:
+    def __init__(
+        self,
+        response,
+        *,
+        post_control=None,
+        close_control=None,
+    ) -> None:
+        self.response = response
+        self.post_control = post_control
+        self.close_control = close_control
+        self.closed = False
+        self.calls = 0
+        self.trust_env = True
+
+    def post(
+        self,
+        url,
+        *,
+        headers,
+        json,
+        timeout,
+        stream,
+        allow_redirects,
+    ):
+        del timeout, stream, allow_redirects
+        self.calls += 1
+        if self.post_control is not None:
+            raise self.post_control
+        self.response.request = requests.Request(
+            "POST",
+            url,
+            headers=headers,
+            json=json,
+        ).prepare()
+        return self.response
+
+    def close(self):
+        self.closed = True
+        if self.close_control is not None:
+            raise self.close_control
+
+
 class FakeSettings:
     def __init__(self, initial=None) -> None:
         self.values = dict(initial or {})
@@ -875,6 +958,111 @@ class CommentSecretStoreTests(unittest.TestCase):
                     else:
                         self.assertEqual(len(native.windows.freed), 1)
 
+    def test_macos_read_releases_before_decode_for_standard_and_control_failures(self):
+        secret = "mac-native-read-private-marker"
+        for retained, expected, expected_code in (
+            (RuntimeError("safe-mac-release-failure"), CommentInsightFailure, None),
+            (SystemExit(37), SystemExit, 37),
+        ):
+            native = FakeCtypes()
+            native.mac.secret = secret
+            original_release = native.core.CFRelease.callback
+
+            def failing_release(value, *, error=retained):
+                original_release(value)
+                raise error
+
+            native.core.CFRelease = FakeFunction(failing_release)
+            store = CommentSecretStore(
+                platform_name="darwin",
+                ctypes_module=native,
+            )
+
+            with self.subTest(error=type(retained).__name__):
+                with self.assertRaises(expected) as raised:
+                    store.read()
+                if expected is CommentInsightFailure:
+                    self.assertEqual(
+                        raised.exception.error_code,
+                        "comment_ai_not_configured",
+                    )
+                else:
+                    self.assertEqual(raised.exception.code, expected_code)
+                self.assertEqual(len(native.mac.freed), 1)
+                self.assertEqual(len(native.core.released), 1)
+                self.assertIsNotNone(retained.__traceback__)
+                self.assertNotIn(secret, exception_trace_text(retained))
+                self.assertNotIn(secret, exception_trace_text(raised.exception))
+
+    def test_windows_read_frees_before_decode_for_standard_and_control_failures(self):
+        secret = "windows-native-read-private-marker"
+        for retained, expected, expected_code in (
+            (RuntimeError("safe-win-free-failure"), CommentInsightFailure, None),
+            (SystemExit(37), SystemExit, 37),
+        ):
+            native = FakeCtypes()
+            native.windows.secret = secret
+            original_free = native.windows.CredFree.callback
+
+            def failing_free(pointer, *, error=retained):
+                original_free(pointer)
+                raise error
+
+            native.windows.CredFree = FakeFunction(failing_free)
+            store = CommentSecretStore(
+                platform_name="win32",
+                ctypes_module=native,
+            )
+
+            with self.subTest(error=type(retained).__name__):
+                with self.assertRaises(expected) as raised:
+                    store.read()
+                if expected is CommentInsightFailure:
+                    self.assertEqual(
+                        raised.exception.error_code,
+                        "comment_ai_not_configured",
+                    )
+                else:
+                    self.assertEqual(raised.exception.code, expected_code)
+                self.assertEqual(len(native.windows.freed), 1)
+                self.assertIsNotNone(retained.__traceback__)
+                self.assertNotIn(secret, exception_trace_text(retained))
+                self.assertNotIn(secret, exception_trace_text(raised.exception))
+
+    def test_macos_read_attempts_all_cleanup_steps_and_keeps_first_control(self):
+        secret = "mac-multiple-cleanup-private-marker"
+        native = FakeCtypes()
+        native.mac.secret = secret
+        first = KeyboardInterrupt()
+        second = SystemExit(37)
+        original_free = native.mac.SecKeychainItemFreeContent.callback
+        original_release = native.core.CFRelease.callback
+
+        def failing_free(*args):
+            original_free(*args)
+            raise first
+
+        def failing_release(value):
+            original_release(value)
+            raise second
+
+        native.mac.SecKeychainItemFreeContent = FakeFunction(failing_free)
+        native.core.CFRelease = FakeFunction(failing_release)
+        store = CommentSecretStore(
+            platform_name="darwin",
+            ctypes_module=native,
+        )
+
+        with self.assertRaises(KeyboardInterrupt) as raised:
+            store.read()
+
+        self.assertEqual(raised.exception.args, ())
+        self.assertEqual(len(native.mac.freed), 1)
+        self.assertEqual(len(native.core.released), 1)
+        for retained in (first, second):
+            self.assertIsNotNone(retained.__traceback__)
+            self.assertNotIn(secret, exception_trace_text(retained))
+
     def test_macos_write_and_delete_do_not_copy_the_old_secret(self):
         for operation in ("write", "delete"):
             native = FakeCtypes()
@@ -1020,6 +1208,62 @@ class CommentAiProviderTests(unittest.TestCase):
         self.assertEqual(original.args, (37,))
         self.assertIsNotNone(original.__traceback__)
         self.assertNotIn(secret, exception_trace_text(original))
+
+    def test_constructor_control_after_secret_transfer_zeros_and_detaches_secret(self):
+        secret = "constructor-transferred-secret-private-marker"
+
+        for original, expected, expected_code in (
+            (
+                RuntimeError("safe-constructor-failure"),
+                CommentInsightFailure,
+                None,
+            ),
+            (KeyboardInterrupt(), KeyboardInterrupt, None),
+            (SystemExit(37), SystemExit, 37),
+        ):
+            transferred_buffers = []
+
+            class InterruptAfterTransferProvider(OpenAiCompatibleCommentProvider):
+                @property
+                def model_name(self):
+                    return self._model_name
+
+                @model_name.setter
+                def model_name(self, value):
+                    self._model_name = value
+                    if value != "model-x":
+                        return
+                    count = getattr(self, "_model_assignment_count", 0) + 1
+                    self._model_assignment_count = count
+                    if count == 2:
+                        transferred_buffers.append(self._secret)
+                        raise original
+
+            provider = InterruptAfterTransferProvider(
+                settings=CommentAiSettings(
+                    "https://ai.example.com/v1",
+                    "model-x",
+                ),
+                secret=secret,
+                session_factory=lambda: RecordingSession(),
+            )
+            transferred = transferred_buffers[0]
+
+            with self.subTest(control=type(original).__name__):
+                with self.assertRaises(expected) as raised:
+                    provider.analyze("作品标题", (comment(),))
+                if expected is SystemExit:
+                    self.assertEqual(raised.exception.code, expected_code)
+                elif expected is CommentInsightFailure:
+                    self.assertEqual(
+                        raised.exception.error_code,
+                        "comment_ai_not_configured",
+                    )
+                self.assertIsNone(provider._secret)
+                self.assertIsInstance(transferred, bytearray)
+                self.assertEqual(bytes(transferred), b"\0" * len(transferred))
+                self.assertNotIn(secret, exception_trace_text(raised.exception))
+                self.assertNotIn(secret, exception_trace_text(original))
 
     def test_request_contains_only_allowed_comment_data_and_uses_one_post(self):
         session = RecordingSession()
@@ -1446,6 +1690,138 @@ class CommentAiProviderTests(unittest.TestCase):
         self.assertIs(retained.__context__, safe_context)
         self.assertNotIn(raw_marker, retained.doc)
         self.assertNotIn(raw_marker, exception_trace_text(raised.exception))
+
+    def test_inner_content_json_decode_error_uses_same_narrow_cleanup_boundary(self):
+        raw_marker = "retained-inner-json-private-marker"
+        retained = json.JSONDecodeError("safe-inner-json-failure", raw_marker, 0)
+        safe_cause = ValueError("safe-inner-json-cause")
+        safe_context = RuntimeError("safe-inner-json-context")
+        retained.__cause__ = safe_cause
+        retained.__context__ = safe_context
+        original_args = retained.args
+        outer = json.loads(response_bytes())
+        provider = self.provider(RecordingSession(FakeResponse()))
+
+        with patch(
+            "app_core.platform_data_comment_ai._loads_json",
+            side_effect=(outer, retained),
+        ):
+            with self.assertRaises(CommentInsightFailure) as raised:
+                provider.analyze("作品标题", (comment(),))
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "comment_ai_response_invalid",
+        )
+        self.assertEqual(retained.args, original_args)
+        self.assertIsNotNone(retained.__traceback__)
+        self.assertIs(retained.__cause__, safe_cause)
+        self.assertIs(retained.__context__, safe_context)
+        self.assertNotIn(raw_marker, retained.doc)
+        self.assertNotIn(raw_marker, exception_trace_text(raised.exception))
+
+    def test_cleanup_controls_never_skip_request_secret_or_resource_cleanup(self):
+        cases = (
+            (
+                KeyboardInterrupt(),
+                None,
+                SystemExit(91),
+                KeyboardInterrupt,
+                None,
+            ),
+            (
+                SystemExit(37),
+                KeyboardInterrupt(),
+                None,
+                SystemExit,
+                37,
+            ),
+            (
+                None,
+                KeyboardInterrupt(),
+                SystemExit(91),
+                KeyboardInterrupt,
+                None,
+            ),
+        )
+        secret = "cleanup-secret-private-marker"
+        title = "cleanup-title-private-marker"
+        body = "cleanup-body-private-marker"
+        comment_key = "e" * 64
+
+        for (
+            request_control,
+            response_close_control,
+            session_close_control,
+            expected,
+            expected_code,
+        ) in cases:
+            response = CleanupControlResponse(
+                request_control=request_control,
+                close_control=response_close_control,
+            )
+            session = CleanupControlSession(
+                response,
+                close_control=session_close_control,
+            )
+            provider = self.provider(session, secret=secret)
+            secret_buffer = provider._secret
+
+            with self.subTest(
+                request=type(request_control).__name__,
+                response_close=type(response_close_control).__name__,
+                session_close=type(session_close_control).__name__,
+            ):
+                with self.assertRaises(expected) as raised:
+                    provider.analyze(
+                        title,
+                        (comment(key=comment_key, body=body),),
+                    )
+                if expected is SystemExit:
+                    self.assertEqual(raised.exception.code, expected_code)
+                prepared = response._stored_request
+                self.assertIsInstance(prepared, requests.PreparedRequest)
+                self.assertNotIn("Authorization", prepared.headers)
+                self.assertNotIn("Proxy-Authorization", prepared.headers)
+                self.assertIn(prepared.body, (None, b"", ""))
+                self.assertEqual(bytes(secret_buffer), b"\0" * len(secret_buffer))
+                self.assertTrue(response.closed_by_provider)
+                self.assertTrue(session.closed)
+                visible = exception_trace_text(raised.exception)
+                for forbidden in (secret, title, body, comment_key):
+                    self.assertNotIn(forbidden, visible)
+                for original in (
+                    request_control,
+                    response_close_control,
+                    session_close_control,
+                ):
+                    if original is None or original.__traceback__ is None:
+                        continue
+                    original_visible = exception_trace_text(original)
+                    for forbidden in (secret, title, body, comment_key):
+                        self.assertNotIn(forbidden, original_visible)
+
+    def test_first_operation_control_survives_later_cleanup_control(self):
+        secret = "first-control-secret-private-marker"
+        first = KeyboardInterrupt()
+        later = SystemExit(91)
+        session = CleanupControlSession(
+            CleanupControlResponse(),
+            post_control=first,
+            close_control=later,
+        )
+        provider = self.provider(session, secret=secret)
+        secret_buffer = provider._secret
+
+        with self.assertRaises(KeyboardInterrupt) as raised:
+            provider.analyze("作品标题", (comment(),))
+
+        self.assertTrue(session.closed)
+        self.assertEqual(bytes(secret_buffer), b"\0" * len(secret_buffer))
+        self.assertNotIn(secret, exception_trace_text(raised.exception))
+        for original in (first, later):
+            self.assertIsNotNone(original.__traceback__)
+            self.assertNotIn(secret, exception_trace_text(original))
 
     def test_redirects_and_environment_credentials_are_disabled(self):
         response = FakeResponse(status_code=302)
