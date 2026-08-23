@@ -92,6 +92,12 @@ def _key(value: object) -> str:
     return value
 
 
+def _evidence_key(value: object) -> str:
+    if type(value) is not str or _KEY_RE.fullmatch(value) is None:
+        raise CommentInsightFailure("comment_ai_evidence_invalid")
+    return value
+
+
 def derive_comment_key(account_id: int, content_id: str, platform_comment_id: str) -> str:
     """由账号、作品和平台评论 ID 生成确定性 SHA-256 匿名键。"""
 
@@ -201,7 +207,10 @@ class CommentCollectionBatch:
         if self.warning_code == "comment_limit_reached":
             if self.accepted_count != 100 or stop_reason != "limit_reached":
                 _failure()
-        if stop_reason == "limit_reached" and self.accepted_count != 100:
+        if stop_reason == "limit_reached" and (
+            self.accepted_count != 100
+            or self.warning_code != "comment_limit_reached"
+        ):
             _failure()
         if stop_reason == "platform_end" and self.warning_code:
             _failure()
@@ -234,11 +243,11 @@ class TopicCandidate:
         _text(self.title)
         _text(self.reason)
         if type(self.evidence_keys) is not tuple or not self.evidence_keys:
-            _failure()
-        if not all(_KEY_RE.fullmatch(key or "") is not None for key in self.evidence_keys):
-            _failure()
+            raise CommentInsightFailure("comment_ai_evidence_invalid")
+        for key in self.evidence_keys:
+            _evidence_key(key)
         if len(set(self.evidence_keys)) != len(self.evidence_keys):
-            _failure()
+            raise CommentInsightFailure("comment_ai_evidence_invalid")
 
 
 @dataclass(frozen=True, slots=True)

@@ -33,6 +33,10 @@ def comment(key: str = "a" * 64, body: str = "  保留原始空格  ") -> Commen
     )
 
 
+def comments(count: int) -> tuple[CommentRecord, ...]:
+    return tuple(comment(f"{index:064x}") for index in range(1, count + 1))
+
+
 class CommentModelsTests(unittest.TestCase):
     def test_comment_id_is_hashed_and_raw_id_never_enters_record(self):
         key = derive_comment_key(12, "work-7", "platform-comment-99")
@@ -147,6 +151,54 @@ class CommentModelsTests(unittest.TestCase):
             )
         with self.assertRaises(CommentInsightFailure):
             TopicCandidate("标题", "理由", ("a" * 64, "a" * 64))
+
+    def test_topic_candidate_rejects_non_string_evidence_with_fixed_error(self):
+        with self.assertRaises(CommentInsightFailure) as raised:
+            TopicCandidate("标题", "理由", (1,))
+        self.assertEqual(raised.exception.error_code, "comment_ai_evidence_invalid")
+
+    def test_exactly_100_without_verified_end_requires_limit_warning(self):
+        batch = CommentCollectionBatch(
+            platform_type=3,
+            source_mode="direct_session",
+            content_id="work-7",
+            comments=comments(100),
+            accepted_count=100,
+            rejected_count=0,
+            page_count=4,
+            stop_reason="limit_reached",
+            warning_code="comment_limit_reached",
+            platform_observed_at=OBSERVED,
+            cleanup_receipt=None,
+        )
+        self.assertEqual(batch.warning_code, "comment_limit_reached")
+
+    def test_warning_is_invalid_for_99_rows(self):
+        with self.assertRaises(CommentInsightFailure):
+            CommentCollectionBatch(
+                platform_type=3, source_mode="direct_session", content_id="work-7",
+                comments=comments(99), accepted_count=99, rejected_count=0, page_count=4,
+                stop_reason="known_comment", warning_code="comment_limit_reached",
+                platform_observed_at=OBSERVED, cleanup_receipt=None,
+            )
+
+    def test_warning_is_invalid_when_100_rows_reach_platform_end(self):
+        with self.assertRaises(CommentInsightFailure):
+            CommentCollectionBatch(
+                platform_type=3, source_mode="direct_session", content_id="work-7",
+                comments=comments(100), accepted_count=100, rejected_count=0, page_count=4,
+                stop_reason="platform_end", warning_code="comment_limit_reached",
+                platform_observed_at=OBSERVED, cleanup_receipt=None,
+            )
+
+    def test_100_rows_without_platform_end_or_limit_warning_is_invalid(self):
+        with self.assertRaises(CommentInsightFailure):
+            CommentCollectionBatch(
+                platform_type=3, source_mode="direct_session", content_id="work-7",
+                comments=comments(100), accepted_count=100, rejected_count=0, page_count=4,
+                stop_reason="limit_reached", warning_code="",
+                platform_observed_at=OBSERVED, cleanup_receipt=None,
+            )
 
 
 if __name__ == "__main__":
