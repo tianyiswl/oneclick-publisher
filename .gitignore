@@ -1,7 +1,7 @@
 # Python 缓存与本机配置
 __pycache__/
 *.py[cod]
-.venv/
+.venv
 .DS_Store
 .env
 .env.*
