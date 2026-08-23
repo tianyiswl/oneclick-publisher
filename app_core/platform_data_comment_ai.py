@@ -33,6 +33,9 @@ _MAX_CANDIDATE_REASON_CHARACTERS = 1000
 _MAX_SECRET_BYTES = 8192
 _MAX_COMMENTS = 100
 _PROCESS_CONTROL = (asyncio.CancelledError, KeyboardInterrupt, SystemExit)
+_OUTCOME_OK = "ok"
+_OUTCOME_FAILURE = "failure"
+_OUTCOME_CONTROL = "control"
 _PUBLIC_AI_ERRORS = frozenset(
     {
         "comment_ai_not_configured",
@@ -80,6 +83,66 @@ def _evidence_invalid() -> CommentInsightFailure:
     return _failure("comment_ai_evidence_invalid")
 
 
+def _control_token(error: BaseException) -> str:
+    if isinstance(error, asyncio.CancelledError):
+        return "cancelled"
+    if isinstance(error, KeyboardInterrupt):
+        return "keyboard_interrupt"
+    return "system_exit"
+
+
+def _scrub_exception(error: BaseException) -> None:
+    """Best-effort removal of provider inputs from retained exceptions."""
+
+    pending = [error]
+    seen = set()
+    while pending:
+        current = pending.pop()
+        identity = id(current)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        try:
+            cause = current.__cause__
+        except BaseException:
+            cause = None
+        try:
+            context = current.__context__
+        except BaseException:
+            context = None
+        if isinstance(cause, BaseException):
+            pending.append(cause)
+        if isinstance(context, BaseException):
+            pending.append(context)
+        for attribute, value in (
+            ("__traceback__", None),
+            ("__context__", None),
+            ("__cause__", None),
+            ("args", ()),
+        ):
+            try:
+                setattr(current, attribute, value)
+            except BaseException:
+                pass
+
+
+def _raise_clean_outcome(outcome) -> None:
+    kind, value = outcome
+    if kind == _OUTCOME_CONTROL:
+        if value == "cancelled":
+            error = asyncio.CancelledError()
+        elif value == "keyboard_interrupt":
+            error = KeyboardInterrupt()
+        else:
+            error = SystemExit()
+    else:
+        error = _failure(value)
+    error.__traceback__ = None
+    error.__context__ = None
+    error.__cause__ = None
+    raise error from None
+
+
 def _plain_text(
     value: object,
     *,
@@ -97,6 +160,10 @@ def _plain_text(
         ord(character) < 32 or ord(character) == 127 for character in value
     ):
         raise _response_invalid()
+    try:
+        value.encode("utf-8")
+    except (UnicodeEncodeError, ValueError):
+        raise _response_invalid() from None
     return value
 
 
@@ -218,6 +285,37 @@ class OpenAiCompatibleCommentProvider:
     def analyze(
         self, title: str, comments: tuple[CommentRecord, ...]
     ) -> InsightResult:
+        outcome = self._analyze_outcome(title, comments)
+        title = None
+        comments = None
+        if outcome[0] == _OUTCOME_OK:
+            return outcome[1]
+        self = None
+        _raise_clean_outcome(outcome)
+
+    def _analyze_outcome(self, title, comments):
+        try:
+            return (_OUTCOME_OK, self._analyze_worker(title, comments))
+        except _PROCESS_CONTROL as error:
+            token = _control_token(error)
+            _scrub_exception(error)
+            return (_OUTCOME_CONTROL, token)
+        except CommentInsightFailure as error:
+            code = (
+                error.error_code
+                if error.error_code in _PUBLIC_AI_ERRORS
+                else "comment_ai_response_invalid"
+            )
+            _scrub_exception(error)
+            return (_OUTCOME_FAILURE, code)
+        except BaseException as error:
+            _scrub_exception(error)
+            return (_OUTCOME_FAILURE, "comment_ai_service_unavailable")
+        finally:
+            title = None
+            comments = None
+
+    def _analyze_worker(self, title, comments) -> InsightResult:
         session = None
         headers = None
         payload = None
@@ -246,12 +344,14 @@ class OpenAiCompatibleCommentProvider:
                 "Accept": "application/json",
             }
             session = self._session_factory()
+            session.trust_env = False
             response = session.post(
                 f"{self._settings.normalized_base_url}/chat/completions",
                 headers=headers,
                 json=payload,
                 timeout=(10, 45),
                 stream=True,
+                allow_redirects=False,
             )
             raw_response = self._validated_response_bytes(response)
             try:
@@ -477,21 +577,56 @@ class OpenAiCompatibleCommentProvider:
     def _extract_contract(self, outer) -> dict:
         if type(outer) is not dict or not set(outer).issubset(_OUTER_KEYS):
             raise _response_invalid()
+        for key, maximum in (
+            ("id", 512),
+            ("object", 64),
+            ("model", 256),
+        ):
+            if key in outer:
+                _plain_text(outer[key], maximum=maximum)
+        if "created" in outer and (
+            type(outer["created"]) is not int or outer["created"] < 0
+        ):
+            raise _response_invalid()
+        if "usage" in outer and type(outer["usage"]) is not dict:
+            raise _response_invalid()
+        for key in ("system_fingerprint", "service_tier"):
+            if key in outer and outer[key] is not None:
+                _plain_text(outer[key], maximum=256)
         choices = outer.get("choices")
         if type(choices) is not list or len(choices) != 1:
             raise _response_invalid()
         choice = choices[0]
         if type(choice) is not dict or not set(choice).issubset(_CHOICE_KEYS):
             raise _response_invalid()
-        if choice.get("index") != 0 or choice.get("finish_reason") != "stop":
+        if (
+            type(choice.get("index")) is not int
+            or choice["index"] != 0
+            or type(choice.get("finish_reason")) is not str
+            or choice["finish_reason"] != "stop"
+        ):
             raise _response_invalid()
+        if "logprobs" in choice and choice["logprobs"] is not None:
+            if type(choice["logprobs"]) is not dict:
+                raise _response_invalid()
         message = choice.get("message")
         if type(message) is not dict or not set(message).issubset(_MESSAGE_KEYS):
             raise _response_invalid()
-        if message.get("role") != "assistant":
+        if (
+            type(message.get("role")) is not str
+            or message["role"] != "assistant"
+        ):
             raise _response_invalid()
+        if "refusal" in message and message["refusal"] is not None:
+            _plain_text(message["refusal"], maximum=1000)
         content = message.get("content")
-        if type(content) is not str or not content or len(content.encode("utf-8")) > _MAX_RESPONSE_BYTES:
+        if type(content) is not str or not content:
+            raise _response_invalid()
+        try:
+            content_size = len(content.encode("utf-8"))
+        except (UnicodeEncodeError, ValueError):
+            raise _response_invalid() from None
+        if content_size > _MAX_RESPONSE_BYTES:
             raise _response_invalid()
         try:
             contract = _loads_json(content)
@@ -538,6 +673,7 @@ class OpenAiCompatibleCommentProvider:
         if seen_classification_refs != expected_refs:
             raise _response_invalid()
         candidates = []
+        seen_candidates = set()
         for item in candidates_raw:
             item = _exact_dict(item, _CANDIDATE_KEYS)
             title = _plain_text(
@@ -560,5 +696,9 @@ class OpenAiCompatibleCommentProvider:
                 for ref in evidence
             ):
                 raise _evidence_invalid()
-            candidates.append((title, reason, tuple(evidence)))
+            candidate = (title, reason, tuple(evidence))
+            if candidate in seen_candidates:
+                raise _response_invalid()
+            seen_candidates.add(candidate)
+            candidates.append(candidate)
         return tuple(classifications), tuple(candidates)

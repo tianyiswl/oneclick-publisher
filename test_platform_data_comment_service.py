@@ -354,10 +354,26 @@ class CommentServiceTests(unittest.TestCase):
         class Session:
             def __init__(self):
                 self.calls = 0
+                self.trust_env = True
 
-            def post(self, _url, *, headers, json, timeout, stream):
+            def post(
+                self,
+                _url,
+                *,
+                headers,
+                json,
+                timeout,
+                stream,
+                allow_redirects,
+            ):
                 self.calls += 1
-                self.assertions = (headers, json, timeout, stream)
+                self.assertions = (
+                    headers,
+                    json,
+                    timeout,
+                    stream,
+                    allow_redirects,
+                )
                 return Response()
 
             def close(self):
@@ -379,6 +395,8 @@ class CommentServiceTests(unittest.TestCase):
         self.assertEqual(result["aiStatus"], "success")
         self.assertEqual(result["aiErrorCode"], "")
         self.assertEqual(session.calls, 1)
+        self.assertIs(session.trust_env, False)
+        self.assertIs(session.assertions[-1], False)
         stored = "\n".join(self.conn.iterdump())
         self.assertNotIn(secret, stored)
         self.assertNotIn(raw_marker, stored)

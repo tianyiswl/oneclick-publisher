@@ -98,6 +98,10 @@ def _normalize_model(value: object) -> str:
         or _has_control(value)
     ):
         raise _not_configured()
+    try:
+        value.encode("utf-8")
+    except (UnicodeEncodeError, ValueError):
+        raise _not_configured() from None
     return value
 
 

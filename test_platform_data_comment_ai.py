@@ -33,6 +33,33 @@ COMMENT_KEY_A = "a" * 64
 COMMENT_KEY_B = "b" * 64
 
 
+def exception_trace_text(error: BaseException) -> str:
+    """Collect every visible exception-chain frame local without hiding values."""
+
+    pending = [error]
+    seen = set()
+    parts = []
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        parts.append(repr(current))
+        trace = current.__traceback__
+        while trace is not None:
+            filename = trace.tb_frame.f_code.co_filename.replace("\\", "/")
+            if "/app_core/" in filename:
+                parts.append(trace.tb_frame.f_code.co_name)
+                for name, value in trace.tb_frame.f_locals.items():
+                    parts.append(f"{name}={value!r}")
+            trace = trace.tb_next
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+    return "\n".join(parts)
+
+
 def comment(
     key: str = COMMENT_KEY_A,
     body: str = "为什么会这样？",
@@ -131,8 +158,18 @@ class RecordingSession:
         self.outcome = FakeResponse() if outcome is None else outcome
         self.calls = []
         self.closed = False
+        self.trust_env = True
 
-    def post(self, url, *, headers, json, timeout, stream):
+    def post(
+        self,
+        url,
+        *,
+        headers,
+        json,
+        timeout,
+        stream,
+        allow_redirects=None,
+    ):
         self.calls.append(
             {
                 "url": url,
@@ -140,6 +177,7 @@ class RecordingSession:
                 "json": deepcopy(json),
                 "timeout": timeout,
                 "stream": stream,
+                "allow_redirects": allow_redirects,
             }
         )
         if isinstance(self.outcome, BaseException):
@@ -495,6 +533,12 @@ class CommentAiSettingsTests(unittest.TestCase):
                     CommentAiSettings("https://ai.example.com/v1", value)
                 self.assertEqual(raised.exception.error_code, "comment_ai_not_configured")
 
+    def test_model_rejects_isolated_surrogate_before_any_network_boundary(self):
+        with self.assertRaises(CommentInsightFailure) as raised:
+            CommentAiSettings("https://ai.example.com/v1", "model-\ud800")
+
+        self.assertEqual(raised.exception.error_code, "comment_ai_not_configured")
+
     def test_qsettings_process_control_is_preserved(self):
         for control_type in (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             class InterruptingSettings(FakeSettings):
@@ -560,6 +604,9 @@ class CommentSecretStoreTests(unittest.TestCase):
             native.windows.CredFree,
         ):
             self.assertIsNotNone(function.argtypes)
+        self.assertIs(native.windows.CredWriteW.restype, wintypes.BOOL)
+        self.assertIs(native.windows.CredReadW.restype, wintypes.BOOL)
+        self.assertIs(native.windows.CredDeleteW.restype, wintypes.BOOL)
         store.write("sk-replacement")
         self.assertEqual(native.windows.secret, "sk-replacement")
         store.delete()
@@ -622,12 +669,161 @@ class CommentSecretStoreTests(unittest.TestCase):
     def test_invalid_secret_is_rejected_without_native_call(self):
         native = FakeCtypes()
         store = CommentSecretStore(platform_name="darwin", ctypes_module=native)
-        for value in ("", " ", "sk\nprivate", "x" * 8193, None, 1, True):
+        for value in (
+            "",
+            " ",
+            "sk\nprivate",
+            "sk\0private",
+            "sk\x7fprivate",
+            "sk-\ud800",
+            "x" * 8193,
+            None,
+            1,
+            True,
+        ):
             with self.subTest(value=repr(value)[:80]):
                 with self.assertRaises(CommentInsightFailure) as raised:
                     store.write(value)
                 self.assertEqual(raised.exception.error_code, "comment_ai_not_configured")
         self.assertIsNone(native.mac.secret)
+
+    def test_write_failure_traceback_contains_no_secret_or_native_context(self):
+        secret = "sk-traceback-private-marker"
+        native_marker = "native-traceback-private-marker"
+        native_error = RuntimeError(native_marker)
+        store = CommentSecretStore(
+            platform_name="darwin",
+            ctypes_module=FakeCtypes(mac_fail=native_error),
+        )
+
+        caught = None
+        try:
+            store.write(secret)
+        except CommentInsightFailure as error:
+            caught = error
+
+        self.assertIsNotNone(caught)
+        visible = exception_trace_text(caught)
+        self.assertNotIn(secret, visible)
+        self.assertNotIn(native_marker, visible)
+        self.assertIsNone(caught.__context__)
+        self.assertIsNone(caught.__cause__)
+        self.assertIsNone(native_error.__traceback__)
+        self.assertIsNone(native_error.__context__)
+        self.assertIsNone(native_error.__cause__)
+        trace = caught.__traceback__
+        while trace is not None:
+            if trace.tb_frame.f_code.co_name == "write":
+                self.assertIsNone(trace.tb_frame.f_locals.get("self"))
+            trace = trace.tb_next
+
+    def test_macos_partial_find_is_always_freed_and_released(self):
+        for terminal in (-50, KeyboardInterrupt()):
+            native = FakeCtypes()
+            native.mac.secret = b"partial-native-secret"
+            original = native.mac.SecKeychainFindGenericPassword.callback
+
+            def partial_find(*args, outcome=terminal):
+                self.assertEqual(original(*args), 0)
+                if isinstance(outcome, BaseException):
+                    raise outcome
+                return outcome
+
+            native.mac.SecKeychainFindGenericPassword = FakeFunction(partial_find)
+            store = CommentSecretStore(
+                platform_name="darwin", ctypes_module=native
+            )
+
+            with self.subTest(terminal=type(terminal).__name__):
+                expected = (
+                    KeyboardInterrupt
+                    if isinstance(terminal, KeyboardInterrupt)
+                    else CommentInsightFailure
+                )
+                with self.assertRaises(expected):
+                    store.read()
+                self.assertEqual(len(native.mac.freed), 1)
+                self.assertEqual(len(native.core.released), 1)
+
+    def test_windows_partial_read_is_always_freed(self):
+        for terminal in (5, KeyboardInterrupt()):
+            native = FakeCtypes()
+            native.windows.secret = b"partial-native-secret"
+            original = native.windows.CredReadW.callback
+
+            def partial_read(*args, outcome=terminal):
+                self.assertEqual(original(*args), 1)
+                if isinstance(outcome, BaseException):
+                    raise outcome
+                native.windows.last_error = outcome
+                return 0
+
+            native.windows.CredReadW = FakeFunction(partial_read)
+            store = CommentSecretStore(
+                platform_name="win32", ctypes_module=native
+            )
+
+            with self.subTest(terminal=type(terminal).__name__):
+                expected = (
+                    KeyboardInterrupt
+                    if isinstance(terminal, KeyboardInterrupt)
+                    else CommentInsightFailure
+                )
+                with self.assertRaises(expected):
+                    store.read()
+                self.assertEqual(len(native.windows.freed), 1)
+
+    def test_native_reads_reject_control_text_after_releasing_memory(self):
+        for platform_name, attribute in (
+            ("darwin", "mac"),
+            ("win32", "windows"),
+        ):
+            for secret in (b"bad\0secret", b"bad\x7fsecret"):
+                native = FakeCtypes()
+                getattr(native, attribute).secret = secret
+                store = CommentSecretStore(
+                    platform_name=platform_name,
+                    ctypes_module=native,
+                )
+
+                with self.subTest(platform=platform_name, secret=secret):
+                    with self.assertRaises(CommentInsightFailure) as raised:
+                        store.read()
+                    self.assertEqual(
+                        raised.exception.error_code, "comment_ai_not_configured"
+                    )
+                    if platform_name == "darwin":
+                        self.assertEqual(len(native.mac.freed), 1)
+                        self.assertEqual(len(native.core.released), 1)
+                    else:
+                        self.assertEqual(len(native.windows.freed), 1)
+
+    def test_macos_write_and_delete_do_not_copy_the_old_secret(self):
+        for operation in ("write", "delete"):
+            native = FakeCtypes()
+            native.mac.secret = "old-secret-must-not-be-copied"
+            copied_old_secret = []
+
+            def tracking_string_at(pointer, length):
+                address = ctypes.cast(pointer, ctypes.c_void_p).value
+                returned = {
+                    ctypes.addressof(value) for value in native.mac.returned
+                }
+                if address in returned:
+                    copied_old_secret.append(address)
+                return ctypes.string_at(pointer, length)
+
+            native.string_at = tracking_string_at
+            store = CommentSecretStore(
+                platform_name="darwin", ctypes_module=native
+            )
+
+            with self.subTest(operation=operation):
+                if operation == "write":
+                    store.write("new-secret")
+                else:
+                    store.delete()
+                self.assertEqual(copied_old_secret, [])
 
     def test_process_control_is_never_converted_to_configuration_failure(self):
         for control_type in (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
@@ -659,6 +855,8 @@ class CommentAiProviderTests(unittest.TestCase):
         self.assertEqual(call["url"], "https://ai.example.com/v1/chat/completions")
         self.assertEqual(call["timeout"], (10, 45))
         self.assertIs(call["stream"], True)
+        self.assertIs(call["allow_redirects"], False)
+        self.assertIs(session.trust_env, False)
         self.assertEqual(call["headers"]["Authorization"], "Bearer sk-private")
         encoded = json.dumps(call["json"], ensure_ascii=False)
         instruction = json.loads(call["json"]["messages"][0]["content"])
@@ -836,6 +1034,7 @@ class CommentAiProviderTests(unittest.TestCase):
                 [{"title": "题目", "reason": "理由", "evidenceRefs": []}],
                 "comment_ai_evidence_invalid",
             ),
+            ([dict(candidate), dict(candidate)], "comment_ai_response_invalid"),
             ([dict(candidate) for _ in range(6)], "comment_ai_response_invalid"),
         )
         for candidates, expected in invalid:
@@ -876,6 +1075,172 @@ class CommentAiProviderTests(unittest.TestCase):
                 self.assertNotIn("sk-marker-private", repr(raised.exception))
                 self.assertEqual(len(session.calls), 1)
                 self.assertTrue(session.closed)
+
+    def test_failure_traceback_and_exception_chain_expose_no_ai_inputs(self):
+        secret = "sk-ai-trace-private"
+        title = "title-trace-private"
+        body = "body-trace-private"
+        comment_key = "d" * 64
+        raw_marker = "raw-response-trace-private"
+        network_error = RuntimeError("network-context-trace-private")
+        cases = (
+            RecordingSession(network_error),
+            RecordingSession(
+                FakeResponse(
+                    ("{\"broken\":\"" + raw_marker + "\"").encode("utf-8")
+                )
+            ),
+        )
+
+        for session in cases:
+            provider = self.provider(session, secret=secret)
+            with self.subTest(outcome=type(session.outcome).__name__):
+                caught = None
+                try:
+                    provider.analyze(title, (comment(comment_key, body),))
+                except CommentInsightFailure as error:
+                    caught = error
+                self.assertIsNotNone(caught)
+                visible = exception_trace_text(caught)
+                for forbidden in (
+                    secret,
+                    title,
+                    body,
+                    comment_key,
+                    raw_marker,
+                    "network-context-trace-private",
+                ):
+                    self.assertNotIn(forbidden, visible)
+                self.assertIsNone(caught.__context__)
+                self.assertIsNone(caught.__cause__)
+                if isinstance(session.outcome, BaseException):
+                    self.assertIsNone(session.outcome.__traceback__)
+                    self.assertIsNone(session.outcome.__context__)
+                    self.assertIsNone(session.outcome.__cause__)
+                trace = caught.__traceback__
+                while trace is not None:
+                    if trace.tb_frame.f_code.co_name == "analyze":
+                        self.assertIsNone(trace.tb_frame.f_locals.get("self"))
+                    trace = trace.tb_next
+
+    def test_process_control_is_rebuilt_without_sensitive_traceback_locals(self):
+        for control_type in (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            marker = f"{control_type.__name__}-private-control"
+            session = RecordingSession(control_type(marker))
+            provider = self.provider(session, secret="sk-control-private")
+
+            with self.subTest(control=control_type.__name__):
+                caught = None
+                try:
+                    provider.analyze(
+                        "title-control-private",
+                        (comment("e" * 64, "body-control-private"),),
+                    )
+                except control_type as error:
+                    caught = error
+                self.assertIsNotNone(caught)
+                visible = exception_trace_text(caught)
+                for forbidden in (
+                    marker,
+                    "sk-control-private",
+                    "title-control-private",
+                    "body-control-private",
+                    "e" * 64,
+                ):
+                    self.assertNotIn(forbidden, visible)
+                self.assertIsNone(caught.__context__)
+                self.assertIsNone(caught.__cause__)
+                self.assertIsNone(session.outcome.__traceback__)
+                self.assertIsNone(session.outcome.__context__)
+                self.assertIsNone(session.outcome.__cause__)
+
+    def test_redirects_and_environment_credentials_are_disabled(self):
+        response = FakeResponse(status_code=302)
+        session = RecordingSession(response)
+        provider = self.provider(session)
+
+        with self.assertRaises(CommentInsightFailure) as raised:
+            provider.analyze("作品标题", (comment(),))
+
+        self.assertEqual(
+            raised.exception.error_code, "comment_ai_service_unavailable"
+        )
+        self.assertEqual(len(session.calls), 1)
+        self.assertEqual(
+            session.calls[0]["url"],
+            "https://ai.example.com/v1/chat/completions",
+        )
+        self.assertIs(session.calls[0]["allow_redirects"], False)
+        self.assertIs(session.trust_env, False)
+        self.assertTrue(response.closed)
+        self.assertTrue(session.closed)
+
+    def test_envelope_optional_fields_require_exact_builtin_types(self):
+        invalid_envelopes = []
+        for path, value in (
+            (("id",), 1),
+            (("object",), False),
+            (("created",), False),
+            (("model",), 1),
+            (("usage",), []),
+            (("system_fingerprint",), False),
+            (("service_tier",), False),
+            (("choices", 0, "index"), False),
+            (("choices", 0, "logprobs"), []),
+            (("choices", 0, "message", "refusal"), False),
+        ):
+            envelope = json.loads(response_bytes())
+            current = envelope
+            for segment in path[:-1]:
+                current = current[segment]
+            current[path[-1]] = value
+            invalid_envelopes.append((path, envelope))
+
+        for path, envelope in invalid_envelopes:
+            raw = json.dumps(envelope, ensure_ascii=False).encode("utf-8")
+            provider = self.provider(RecordingSession(FakeResponse(raw)))
+            with self.subTest(path=path):
+                with self.assertRaises(CommentInsightFailure) as raised:
+                    provider.analyze("作品标题", (comment(),))
+                self.assertEqual(
+                    raised.exception.error_code, "comment_ai_response_invalid"
+                )
+
+    def test_custom_containers_and_surrogate_response_text_are_rejected(self):
+        class CustomDict(dict):
+            pass
+
+        provider = self.provider(RecordingSession())
+        with patch(
+            "app_core.platform_data_comment_ai._loads_json",
+            return_value=CustomDict(json.loads(response_bytes())),
+        ):
+            with self.assertRaises(CommentInsightFailure) as custom_raised:
+                provider.analyze("作品标题", (comment(),))
+        self.assertEqual(
+            custom_raised.exception.error_code, "comment_ai_response_invalid"
+        )
+
+        contract = insight_contract(
+            candidates=[
+                {
+                    "title": "bad-\ud800",
+                    "reason": "理由",
+                    "evidenceRefs": ["C001"],
+                }
+            ]
+        )
+        envelope = json.loads(response_bytes())
+        envelope["choices"][0]["message"]["content"] = json.dumps(
+            contract, ensure_ascii=True
+        )
+        raw = json.dumps(envelope, ensure_ascii=True).encode("utf-8")
+        provider = self.provider(RecordingSession(FakeResponse(raw)))
+        with self.assertRaises(CommentInsightFailure) as surrogate_raised:
+            provider.analyze("作品标题", (comment(),))
+        self.assertEqual(
+            surrogate_raised.exception.error_code, "comment_ai_response_invalid"
+        )
 
     def test_input_and_response_have_hard_type_size_depth_and_count_limits(self):
         too_deep = "[" * 200 + "0" + "]" * 200
