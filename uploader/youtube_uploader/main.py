@@ -74,6 +74,14 @@ def youtube_security_intervention_reason(url: str, body_text: str) -> str | None
 
     normalized_url = str(url or "").lower()
     text = str(body_text or "").lower()
+    if "/signin/rejected" in normalized_url or any(
+        marker in text
+        for marker in (
+            "this browser or app may not be secure",
+            "此浏览器或应用可能不安全",
+        )
+    ):
+        return "Google 拒绝当前浏览器登录，请改用受支持的官方授权方式"
     if any(marker in normalized_url for marker in ("/challenge/", "signin/v2/challenge")):
         return "Google 要求完成账号安全验证"
     if "accounts.google.com" in normalized_url or "/signin" in normalized_url:

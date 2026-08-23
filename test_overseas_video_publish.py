@@ -261,6 +261,11 @@ class OverseasVideoPublishSignalTests(unittest.TestCase):
                 "",
             ),
         )
+        rejected = youtube_security_intervention_reason(
+            "https://accounts.google.com/v3/signin/rejected",
+            "此浏览器或应用可能不安全。请尝试使用其他浏览器。",
+        )
+        self.assertIn("拒绝当前浏览器", rejected)
 
     def test_youtube_content_list_receipt_requires_new_matching_video(self) -> None:
         rows = [
