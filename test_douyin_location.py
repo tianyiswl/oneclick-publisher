@@ -295,6 +295,45 @@ class DouyinLocationMatchingTests(unittest.TestCase):
         self.assertEqual(result, "")
         page.locator.assert_not_called()
 
+    def test_preflight_rejects_live_candidate_without_complete_address(self) -> None:
+        """预检重搜只回名称和 POI 标识时，不能点击缺地址候选。"""
+
+        page = MagicMock()
+        page.wait_for_timeout = AsyncMock()
+        selection_container = MagicMock()
+        selection_container.inner_text = AsyncMock(return_value="北海银滩景区")
+        option = MagicMock()
+        option.click = AsyncMock()
+        payload = {
+            "locationPoi": {
+                "poiId": "poi-1",
+                "name": "北海银滩景区",
+                "address": "广西壮族自治区北海市银海区银滩大道中段",
+            }
+        }
+        live_candidate = {
+            "poiId": "poi-1",
+            "name": "北海银滩景区",
+            "address": "",
+        }
+
+        with patch.object(
+            oneclick_preflight,
+            "_douyin_open_location_search",
+            new=AsyncMock(return_value=selection_container),
+        ), patch.object(
+            oneclick_preflight,
+            "_douyin_visible_location_options",
+            new=AsyncMock(return_value=([option], [live_candidate])),
+        ):
+            with self.assertRaisesRegex(
+                oneclick_preflight.PreflightError,
+                "没有唯一一致的 POI",
+            ):
+                asyncio.run(oneclick_preflight._douyin_set_location(page, payload))
+
+        option.click.assert_not_awaited()
+
 
 class DouyinLocationUiTests(unittest.TestCase):
     @classmethod
