@@ -30,6 +30,7 @@ from . import (
     task_service,
     wechat_publish_executor,
     wechat_publish_policy,
+    xhs_location_service,
     xhs_publish_executor,
 )
 from .paths import VIDEO_DIR
@@ -170,6 +171,51 @@ def _validate_payloads(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
             ]
         runtime_mode = str(payload.get("runtimeMode") or "preflight")
         platform_type = int(payload.get("type") or 0)
+        if platform_type == 1:
+            content_type = str(payload.get("contentType") or "").strip()
+            xhs_location_keys = (
+                "xhsLocationKeyword",
+                "xhsLocationScope",
+                "xhsLocationPoi",
+            )
+            generic_location_keys = (
+                "locationKeyword",
+                "locationScope",
+                "locationPoi",
+            )
+
+            def has_value(key: str) -> bool:
+                value = payload.get(key)
+                if isinstance(value, (dict, list, tuple, set)):
+                    return bool(value)
+                return bool(str(value or "").strip())
+
+            if content_type != "video":
+                if any(key in payload for key in xhs_location_keys):
+                    raise ValueError("小红书地点字段仅支持视频发布")
+                if any(has_value(key) for key in generic_location_keys):
+                    raise ValueError(
+                        "小红书非视频内容不得夹带通用地点字段"
+                    )
+            else:
+                try:
+                    location = xhs_location_service.normalize_location_selection(
+                        payload
+                    )
+                except xhs_location_service.XhsLocationSearchError as exc:
+                    raise ValueError(str(exc)) from exc
+                if location is None:
+                    payload["xhsLocationKeyword"] = ""
+                    payload["xhsLocationScope"] = ""
+                    payload["xhsLocationPoi"] = None
+                else:
+                    payload["xhsLocationKeyword"] = str(
+                        location["searchKeyword"]
+                    )
+                    payload["xhsLocationScope"] = str(location["scope"])
+                    payload["xhsLocationPoi"] = location
+            for key in generic_location_keys:
+                payload.pop(key, None)
         if platform_type == 3:
             location_keyword = " ".join(
                 str(payload.get("locationKeyword") or "").split()

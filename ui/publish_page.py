@@ -58,6 +58,7 @@ from app_core import (
     wechat_content_bundle,
     wechat_publish_policy,
     oneclick_capabilities,
+    xhs_location_service,
 )
 from app_core.paths import VIDEO_DIR
 from app_core.meta_browser_policy import (
@@ -443,6 +444,9 @@ class PublishPage(QWidget):
         self.collection_tasks = BackgroundTaskRunner(self)
         self.location_tasks = BackgroundTaskRunner(self)
         self.account_health_tasks = BackgroundTaskRunner(self)
+        self._xhs_selected_location: dict[str, object] = {}
+        self._xhs_location_generation = 0
+        self._xhs_location_context_signature: tuple[object, ...] | None = None
         self._douyin_selected_location: dict[str, object] = {}
         self._douyin_location_query = ""
         self._topic_tag_editors: list[TopicTagEditor] = []
@@ -1033,6 +1037,12 @@ class PublishPage(QWidget):
         self.douyin_location_results_title: QLabel | None = None
         self.douyin_location_results: QListWidget | None = None
         self.douyin_location_status: QLabel | None = None
+        self.xhs_location_panel: QFrame | None = None
+        self.xhs_location_keyword: QLineEdit | None = None
+        self.xhs_location_search_button: QPushButton | None = None
+        self.xhs_location_results_title: QLabel | None = None
+        self.xhs_location_results: QListWidget | None = None
+        self.xhs_location_status: QLabel | None = None
         self.wechat_group_notification: QCheckBox | None = None
         for platform_type in account_service.PLATFORM_ORDER:
             editor = self._build_platform_editor(platform_type)
@@ -1171,7 +1181,74 @@ class PublishPage(QWidget):
         publish_settings_layout.addRow("发布时间", schedule_row)
         body_layout.addWidget(publish_settings)
 
-        if platform_type == 3:
+        if platform_type == 1:
+            self.xhs_location_panel = QFrame()
+            self.xhs_location_panel.setObjectName("xhsLocationPanel")
+            self.xhs_location_panel.setProperty("subPanel", True)
+            settings_layout = QFormLayout(self.xhs_location_panel)
+            settings_layout.setContentsMargins(12, 10, 12, 10)
+            settings_layout.setHorizontalSpacing(14)
+            settings_layout.setVerticalSpacing(10)
+
+            self.xhs_location_keyword = QLineEdit()
+            self.xhs_location_keyword.setObjectName("xhsLocationKeyword")
+            self.xhs_location_keyword.setPlaceholderText(
+                "搜索小红书官方地点；留空不添加"
+            )
+            self.xhs_location_keyword.setClearButtonEnabled(True)
+            self.xhs_location_keyword.setMaxLength(50)
+            self.xhs_location_keyword.textEdited.connect(
+                self._xhs_location_text_edited
+            )
+            self.xhs_location_search_button = button(
+                "搜索", variant="secondary", compact=True
+            )
+            self.xhs_location_keyword.returnPressed.connect(
+                self.search_xhs_locations
+            )
+            self.xhs_location_search_button.clicked.connect(
+                self.search_xhs_locations
+            )
+            search_row = QWidget()
+            search_layout = QHBoxLayout(search_row)
+            search_layout.setContentsMargins(0, 0, 0, 0)
+            search_layout.setSpacing(8)
+            search_layout.addWidget(self.xhs_location_keyword, 1)
+            search_layout.addWidget(self.xhs_location_search_button)
+            settings_layout.addRow("添加地点", search_row)
+
+            self.xhs_location_results_title = QLabel(
+                "地点候选 · 名称、完整地址与 POI ID"
+            )
+            self.xhs_location_results_title.setObjectName(
+                "xhsLocationResultsTitle"
+            )
+            self.xhs_location_results_title.setVisible(False)
+            settings_layout.addRow(self.xhs_location_results_title)
+            self.xhs_location_results = QListWidget()
+            self.xhs_location_results.setObjectName("xhsLocationResults")
+            self.xhs_location_results.setHorizontalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+            )
+            self.xhs_location_results.setVerticalScrollMode(
+                QListWidget.ScrollMode.ScrollPerPixel
+            )
+            self.xhs_location_results.setFixedHeight(292)
+            self.xhs_location_results.itemClicked.connect(
+                self._select_xhs_location_item
+            )
+            self.xhs_location_results.setVisible(False)
+            settings_layout.addRow(self.xhs_location_results)
+
+            self.xhs_location_status = QLabel(
+                "小红书视频可选；需先保留一个小红书账号"
+            )
+            self.xhs_location_status.setProperty("role", "muted")
+            self.xhs_location_status.setWordWrap(True)
+            settings_layout.addRow("", self.xhs_location_status)
+            self.xhs_location_panel.setVisible(False)
+            body_layout.addWidget(self.xhs_location_panel)
+        elif platform_type == 3:
             settings = QFrame()
             settings.setProperty("subPanel", True)
             settings_layout = QFormLayout(settings)
@@ -1441,6 +1518,308 @@ class PublishPage(QWidget):
             for account in self.selected_accounts()
             if int(account.get("type") or 0) == int(platform_type)
         ]
+
+    def _sync_xhs_location_visibility_and_context(self) -> None:
+        """只在单一小红书视频账号上显示小红书专属定位。"""
+
+        if self.xhs_location_panel is None:
+            return
+        accounts = self.selected_accounts()
+        signature = (
+            self.content_type,
+            tuple(
+                sorted(
+                    (
+                        int(account.get("id") or 0),
+                        int(account.get("type") or 0),
+                    )
+                    for account in accounts
+                )
+            ),
+        )
+        if signature != self._xhs_location_context_signature:
+            self._xhs_location_context_signature = signature
+            self._invalidate_xhs_location()
+        visible = (
+            self.content_type == "video"
+            and len(accounts) == 1
+            and int(accounts[0].get("type") or 0) == 1
+        )
+        self.xhs_location_panel.setVisible(visible)
+
+    def _invalidate_xhs_location(self) -> None:
+        self._xhs_location_generation += 1
+        self._xhs_selected_location = {}
+        if self.xhs_location_results is not None:
+            self.xhs_location_results.clear()
+            self.xhs_location_results.setVisible(False)
+        if self.xhs_location_results_title is not None:
+            self.xhs_location_results_title.setVisible(False)
+
+    def _xhs_location_text_edited(self, _value: str) -> None:
+        """搜索词一变化就作废旧候选和旧选择。"""
+
+        self._invalidate_xhs_location()
+
+    def _set_xhs_location_status(
+        self,
+        text: str,
+        role: str = "muted",
+    ) -> None:
+        if self.xhs_location_status is None:
+            return
+        self.xhs_location_status.setText(text)
+        self.xhs_location_status.setProperty("role", role)
+        self.xhs_location_status.style().unpolish(self.xhs_location_status)
+        self.xhs_location_status.style().polish(self.xhs_location_status)
+
+    @staticmethod
+    def _xhs_account_signature(accounts: list[dict]) -> tuple[tuple[int, int], ...]:
+        return tuple(
+            sorted(
+                (
+                    int(account.get("id") or 0),
+                    int(account.get("type") or 0),
+                )
+                for account in accounts
+            )
+        )
+
+    def _xhs_request_is_current(
+        self,
+        *,
+        keyword: str,
+        account_signature: tuple[tuple[int, int], ...],
+        content_type: str,
+        generation: int,
+    ) -> bool:
+        if self._xhs_location_generation != generation:
+            return False
+        if self.content_type != content_type:
+            return False
+        if self._xhs_account_signature(self.selected_accounts()) != account_signature:
+            return False
+        if self.xhs_location_keyword is None:
+            return False
+        try:
+            current_keyword = xhs_location_service.normalize_location_keyword(
+                self.xhs_location_keyword.text()
+            )
+        except xhs_location_service.XhsLocationSearchError:
+            return False
+        return current_keyword == keyword
+
+    def search_xhs_locations(self) -> None:
+        """用当前唯一小红书账号的本地会话读取官方 POI。"""
+
+        if self.xhs_location_keyword is None:
+            return
+        try:
+            keyword = xhs_location_service.normalize_location_keyword(
+                self.xhs_location_keyword.text()
+            )
+        except xhs_location_service.XhsLocationSearchError as exc:
+            self._set_xhs_location_status(str(exc), "warning")
+            return
+        accounts = self.selected_accounts()
+        if (
+            self.content_type != "video"
+            or len(accounts) != 1
+            or int(accounts[0].get("type") or 0) != 1
+        ):
+            self._invalidate_xhs_location()
+            self._sync_xhs_location_visibility_and_context()
+            self._set_xhs_location_status(
+                "请仅保留一个小红书账号，并选择视频发布",
+                "warning",
+            )
+            return
+        if self.location_tasks.is_running("xhs-location-search"):
+            self._set_xhs_location_status("当前小红书地点搜索尚未完成")
+            return
+
+        account = dict(accounts[0])
+        account_signature = self._xhs_account_signature(accounts)
+        content_type = self.content_type
+        generation = self._xhs_location_generation
+        source_account_id = int(account.get("id") or 0)
+        self.xhs_location_keyword.blockSignals(True)
+        self.xhs_location_keyword.setText(keyword)
+        self.xhs_location_keyword.blockSignals(False)
+        search_button = self.xhs_location_search_button
+
+        def is_current() -> bool:
+            return self._xhs_request_is_current(
+                keyword=keyword,
+                account_signature=account_signature,
+                content_type=content_type,
+                generation=generation,
+            )
+
+        def on_started() -> None:
+            if search_button is not None:
+                search_button.setEnabled(False)
+                search_button.setText("搜索中")
+            self._set_xhs_location_status(f"正在搜索“{keyword}”…")
+
+        def on_success(rows: object) -> None:
+            if not is_current():
+                return
+            self._show_xhs_location_results(
+                rows if isinstance(rows, list) else [],
+                source_account_id=source_account_id,
+                search_keyword=keyword,
+                content_type=content_type,
+            )
+
+        def on_error(message: str) -> None:
+            if not is_current():
+                return
+            self._invalidate_xhs_location()
+            self._set_xhs_location_status(message, "danger")
+
+        def on_finished() -> None:
+            if search_button is not None:
+                search_button.setEnabled(True)
+                search_button.setText("搜索")
+
+        self.location_tasks.run(
+            "xhs-location-search",
+            lambda: xhs_location_service.search_xhs_locations(
+                account,
+                keyword,
+                xhs_location_service.DEFAULT_SCOPE,
+                xhs_location_service.VIDEO_CONTENT_TYPE,
+            ),
+            on_started=on_started,
+            on_success=on_success,
+            on_error=on_error,
+            on_finished=on_finished,
+        )
+
+    def _show_xhs_location_results(
+        self,
+        rows: list[object],
+        *,
+        source_account_id: int,
+        search_keyword: str,
+        content_type: str,
+    ) -> None:
+        if self.xhs_location_results is None:
+            return
+        keyword = xhs_location_service.normalize_location_keyword(search_keyword)
+        self.xhs_location_results.clear()
+        valid_rows: list[dict[str, object]] = []
+        for value in rows:
+            candidate = xhs_location_service.normalize_location_candidate(value)
+            if not candidate:
+                continue
+            selection: dict[str, object] = {
+                **candidate,
+                "sourceAccountId": int(source_account_id),
+                "platformType": 1,
+                "scope": xhs_location_service.DEFAULT_SCOPE,
+                "contentType": str(content_type),
+                "searchKeyword": keyword,
+            }
+            valid_rows.append(selection)
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole, selection)
+            item.setToolTip(
+                f"{selection['name']}\n{selection['address']}\n"
+                f"小红书 POI · {selection['poiId']}"
+            )
+            item.setSizeHint(QSize(0, 98))
+            self.xhs_location_results.addItem(item)
+            self.xhs_location_results.setItemWidget(
+                item,
+                self._xhs_location_candidate_widget(selection),
+            )
+        self.xhs_location_results.setVisible(bool(valid_rows))
+        if self.xhs_location_results_title is not None:
+            self.xhs_location_results_title.setVisible(bool(valid_rows))
+        if valid_rows:
+            self._set_xhs_location_status(
+                f"找到 {len(valid_rows)} 个小红书官方地点，请明确选择一项",
+                "success",
+            )
+        else:
+            self._set_xhs_location_status(
+                "未找到身份完整的小红书地点",
+                "warning",
+            )
+
+    @staticmethod
+    def _xhs_location_candidate_widget(candidate: dict[str, object]) -> QWidget:
+        card = QWidget()
+        card.setObjectName("xhsLocationCandidateCard")
+        card.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(12, 8, 12, 8)
+        layout.setSpacing(4)
+
+        name = QLabel(str(candidate.get("name") or "未命名地点"))
+        name.setObjectName("xhsLocationName")
+        name.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        layout.addWidget(name)
+
+        address = QLabel(str(candidate.get("address") or ""))
+        address.setObjectName("xhsLocationAddress")
+        address.setWordWrap(True)
+        address.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        address.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        layout.addWidget(address)
+
+        poi = QLabel(f"小红书 POI · {candidate.get('poiId') or ''}")
+        poi.setObjectName("xhsLocationPoi")
+        poi.setProperty("role", "caption")
+        poi.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        layout.addWidget(poi)
+        return card
+
+    def _select_xhs_location_item(self, item: QListWidgetItem) -> None:
+        raw = item.data(Qt.ItemDataRole.UserRole)
+        accounts = self.selected_accounts()
+        if (
+            not isinstance(raw, dict)
+            or self.content_type != "video"
+            or len(accounts) != 1
+            or int(accounts[0].get("type") or 0) != 1
+        ):
+            self._invalidate_xhs_location()
+            self._set_xhs_location_status(
+                "小红书账号或内容类型已变更，请重新搜索",
+                "warning",
+            )
+            return
+        keyword = xhs_location_service.normalize_location_keyword(
+            raw.get("searchKeyword")
+        )
+        payload = {
+            "type": 1,
+            "contentType": "video",
+            "accountIds": [int(accounts[0].get("id") or 0)],
+            "xhsLocationKeyword": keyword,
+            "xhsLocationScope": xhs_location_service.DEFAULT_SCOPE,
+            "xhsLocationPoi": raw,
+        }
+        selection = xhs_location_service.normalize_location_selection(payload)
+        if not selection or self.xhs_location_keyword is None:
+            self._invalidate_xhs_location()
+            return
+        self._xhs_selected_location = selection
+        self.xhs_location_keyword.blockSignals(True)
+        self.xhs_location_keyword.setText(keyword)
+        self.xhs_location_keyword.blockSignals(False)
+        if self.xhs_location_results is not None:
+            self.xhs_location_results.setVisible(False)
+        if self.xhs_location_results_title is not None:
+            self.xhs_location_results_title.setVisible(False)
+        self._set_xhs_location_status(
+            f"已选择：{selection['name']}\n{selection['address']}\n"
+            f"小红书 POI · {selection['poiId']}",
+            "success",
+        )
 
     def _set_collection_status(self, platform_type: int, text: str, role: str = "muted") -> None:
         label = self.platform_collection_status[platform_type]
@@ -2503,6 +2882,8 @@ class PublishPage(QWidget):
         self._update_account_health_label()
         if hasattr(self, "platform_nav"):
             self.refresh_platform_navigation()
+        if hasattr(self, "xhs_location_panel"):
+            self._sync_xhs_location_visibility_and_context()
         if account_count:
             QTimer.singleShot(300, self.check_selected_account_health)
 
@@ -3155,6 +3536,53 @@ class PublishPage(QWidget):
                     self.instagram_share_to_feed is None
                     or self.instagram_share_to_feed.isChecked()
                 )
+            if platform_type == 1 and self.content_type == "video":
+                payload.update(
+                    {
+                        "xhsLocationKeyword": "",
+                        "xhsLocationScope": "",
+                        "xhsLocationPoi": None,
+                    }
+                )
+                exact_xhs_context = (
+                    len(accounts) == 1
+                    and len(selected) == 1
+                    and int(selected[0].get("type") or 0) == 1
+                )
+                if exact_xhs_context and self.xhs_location_keyword is not None:
+                    raw_keyword = " ".join(
+                        self.xhs_location_keyword.text().split()
+                    )
+                    if raw_keyword:
+                        if not self._xhs_selected_location:
+                            raise ValueError(
+                                "请从小红书官方地点候选中选择，"
+                                "不能只填写关键词"
+                            )
+                        payload.update(
+                            {
+                                "xhsLocationKeyword": raw_keyword,
+                                "xhsLocationScope": (
+                                    xhs_location_service.DEFAULT_SCOPE
+                                ),
+                                "xhsLocationPoi": dict(
+                                    self._xhs_selected_location
+                                ),
+                            }
+                        )
+                        try:
+                            selection = (
+                                xhs_location_service.normalize_location_selection(
+                                    payload
+                                )
+                            )
+                        except xhs_location_service.XhsLocationSearchError as exc:
+                            raise ValueError(str(exc)) from exc
+                        payload["xhsLocationKeyword"] = str(
+                            selection["searchKeyword"]
+                        )
+                        payload["xhsLocationScope"] = str(selection["scope"])
+                        payload["xhsLocationPoi"] = selection
             if platform_type == 3:
                 payload["syncToToutiao"] = bool(
                     self.douyin_sync_toutiao
@@ -4629,6 +5057,14 @@ class PublishPage(QWidget):
             self.douyin_sync_toutiao.setChecked(
                 bool(payload.get("douyinSyncToutiao", False))
             )
+        if self.xhs_location_keyword is not None:
+            # 小红书 POI 只能属于当次账号、内容类型和完整搜索词；模板和保存
+            # 内容都不得把历史选择重新绑定到当前账号。
+            self.xhs_location_keyword.blockSignals(True)
+            self.xhs_location_keyword.clear()
+            self.xhs_location_keyword.blockSignals(False)
+            self._invalidate_xhs_location()
+            self._set_xhs_location_status("未添加定位")
         if self.douyin_location_keyword is not None:
             location = douyin_location_service.normalize_location_candidate(
                 payload.get("douyinLocation")

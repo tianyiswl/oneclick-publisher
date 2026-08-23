@@ -3,21 +3,636 @@
 
 from __future__ import annotations
 
+import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import AsyncMock, patch
 
-from app_core import account_service, oneclick_preflight, xhs_location_service
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PyQt6.QtWidgets import QApplication, QLabel
+
+from app_core import (
+    account_service,
+    oneclick_preflight,
+    publish_service,
+    xhs_location_service,
+)
 from app_core.xhs_native_adapter import (
     XhsNativeAdapter,
     XhsNativeAdapterError,
     build_native_contract,
 )
 from app_core.xhs_publish_executor import XhsPublishError, run_xhs_publish
+from ui.publish_page import PublishPage
 
 
 _MALFORMED_POST_DATA = object()
+_XHS_CREATOR_PUBLISH_URL = (
+    "https://creator.xiaohongshu.com/publish/publish?source=official"
+)
+
+
+class XhsLocationUiTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_location_panel_is_visible_only_for_one_total_xhs_video_account(self) -> None:
+        page = PublishPage()
+        xhs = {"id": 11, "type": 1, "filePath": "xhs-11.json"}
+        second_xhs = {"id": 12, "type": 1, "filePath": "xhs-12.json"}
+        douyin = {"id": 31, "type": 3, "filePath": "douyin-31.json"}
+        try:
+            self.assertIsNot(page.xhs_location_keyword, page.douyin_location_keyword)
+            cases = [
+                ("video", [], True),
+                ("video", [xhs], False),
+                ("video", [xhs, second_xhs], True),
+                ("video", [xhs, douyin], True),
+                ("video", [douyin], True),
+                ("article", [xhs], True),
+            ]
+            for content_type, accounts, expected_hidden in cases:
+                with self.subTest(content_type=content_type, accounts=accounts):
+                    page.content_type = content_type
+                    with patch.object(page, "selected_accounts", return_value=accounts):
+                        page._sync_xhs_location_visibility_and_context()
+                    self.assertEqual(
+                        page.xhs_location_panel.isHidden(),
+                        expected_hidden,
+                    )
+        finally:
+            page.close()
+
+    def test_account_or_content_change_invalidates_selection_and_candidates(self) -> None:
+        page = PublishPage()
+        xhs = {"id": 11, "type": 1, "filePath": "xhs-11.json"}
+        douyin = {"id": 31, "type": 3, "filePath": "douyin-31.json"}
+        try:
+            page.content_type = "video"
+            with patch.object(page, "selected_accounts", return_value=[xhs]):
+                page.update_selected_labels()
+            page._xhs_selected_location = {"poiId": "poi-old"}
+            page.xhs_location_results.addItem("旧候选")
+            page.xhs_location_results.setVisible(True)
+
+            with patch.object(page, "selected_accounts", return_value=[xhs, douyin]):
+                page.update_selected_labels()
+
+            self.assertTrue(page.xhs_location_panel.isHidden())
+            self.assertEqual(page._xhs_selected_location, {})
+            self.assertEqual(page.xhs_location_results.count(), 0)
+
+            page._xhs_selected_location = {"poiId": "poi-old-again"}
+            page.xhs_location_results.addItem("另一个旧候选")
+            page.content_type = "article"
+            with patch.object(page, "selected_accounts", return_value=[xhs]):
+                page.update_selected_labels()
+            self.assertEqual(page._xhs_selected_location, {})
+            self.assertEqual(page.xhs_location_results.count(), 0)
+        finally:
+            page.close()
+
+    def test_editing_keyword_invalidates_selection_and_candidates(self) -> None:
+        page = PublishPage()
+        xhs = {"id": 11, "type": 1, "filePath": "xhs-11.json"}
+        try:
+            with patch.object(page, "selected_accounts", return_value=[xhs]):
+                page.update_selected_labels()
+            page._xhs_selected_location = {"poiId": "poi-old"}
+            page.xhs_location_results.addItem("旧候选")
+            page.xhs_location_results.setVisible(True)
+            page.xhs_location_keyword.setText("北海老街")
+
+            page.xhs_location_keyword.textEdited.emit("北海老街")
+
+            self.assertEqual(page._xhs_selected_location, {})
+            self.assertEqual(page.xhs_location_results.count(), 0)
+        finally:
+            page.close()
+
+    def test_candidate_card_and_selection_keep_full_query_and_context(self) -> None:
+        page = PublishPage()
+        xhs = {"id": 11, "type": 1, "filePath": "xhs-11.json"}
+        try:
+            with patch.object(page, "selected_accounts", return_value=[xhs]):
+                page.update_selected_labels()
+            page.xhs_location_keyword.setText("  北海  银滩  ")
+            page._show_xhs_location_results(
+                [
+                    {
+                        "poiId": "poi-1",
+                        "name": "北海银滩景区",
+                        "address": "广西北海市银海区银滩大道",
+                        "poiType": "0",
+                        "platform": "xiaohongshu",
+                    }
+                ],
+                source_account_id=11,
+                search_keyword="北海 银滩",
+                content_type="video",
+            )
+
+            item = page.xhs_location_results.item(0)
+            card = page.xhs_location_results.itemWidget(item)
+            self.assertEqual(
+                card.findChild(QLabel, "xhsLocationName").text(),
+                "北海银滩景区",
+            )
+            self.assertEqual(
+                card.findChild(QLabel, "xhsLocationAddress").text(),
+                "广西北海市银海区银滩大道",
+            )
+            self.assertEqual(
+                card.findChild(QLabel, "xhsLocationPoi").text(),
+                "小红书 POI · poi-1",
+            )
+
+            with patch.object(page, "selected_accounts", return_value=[xhs]):
+                page._select_xhs_location_item(item)
+
+            self.assertEqual(page.xhs_location_keyword.text(), "北海 银滩")
+            self.assertEqual(
+                page._xhs_selected_location,
+                {
+                    "poiId": "poi-1",
+                    "name": "北海银滩景区",
+                    "address": "广西北海市银海区银滩大道",
+                    "poiType": "0",
+                    "platform": "xiaohongshu",
+                    "sourceAccountId": 11,
+                    "platformType": 1,
+                    "scope": "platform-default",
+                    "contentType": "video",
+                    "searchKeyword": "北海 银滩",
+                },
+            )
+        finally:
+            page.close()
+
+    def test_search_uses_dedicated_async_key_and_exact_service_context(self) -> None:
+        page = PublishPage()
+        xhs = {"id": 11, "type": 1, "filePath": "xhs-11.json"}
+        try:
+            page.xhs_location_keyword.setText("  北海  银滩  ")
+            with patch.object(page, "selected_accounts", return_value=[xhs]), patch.object(
+                page.location_tasks,
+                "run",
+                return_value=True,
+            ) as run:
+                page.search_xhs_locations()
+
+            self.assertEqual(run.call_args.args[0], "xhs-location-search")
+            work = run.call_args.args[1]
+            with patch.object(
+                xhs_location_service,
+                "search_xhs_locations",
+                return_value=[],
+            ) as search:
+                work()
+            search.assert_called_once_with(
+                xhs,
+                "北海 银滩",
+                "platform-default",
+                "video",
+            )
+        finally:
+            page.close()
+
+    def test_stale_success_is_rejected_for_total_account_or_generation_change(self) -> None:
+        page = PublishPage()
+        xhs = {"id": 11, "type": 1, "filePath": "xhs-11.json"}
+        douyin = {"id": 31, "type": 3, "filePath": "douyin-31.json"}
+        row = {
+            "poiId": "poi-1",
+            "name": "北海银滩景区",
+            "address": "广西北海市银海区银滩大道",
+            "poiType": "0",
+            "platform": "xiaohongshu",
+        }
+        try:
+            page.xhs_location_keyword.setText("北海银滩")
+            calls = []
+
+            def capture(*args, **kwargs) -> bool:
+                calls.append((args, kwargs))
+                return True
+
+            with patch.object(page, "selected_accounts", return_value=[xhs]), patch.object(
+                page.location_tasks,
+                "run",
+                side_effect=capture,
+            ):
+                page.search_xhs_locations()
+            first_success = calls[-1][1]["on_success"]
+
+            with patch.object(
+                page,
+                "selected_accounts",
+                return_value=[xhs, douyin],
+            ):
+                first_success([row])
+            self.assertEqual(page.xhs_location_results.count(), 0)
+
+            calls.clear()
+            with patch.object(page, "selected_accounts", return_value=[xhs]), patch.object(
+                page.location_tasks,
+                "run",
+                side_effect=capture,
+            ):
+                page.search_xhs_locations()
+            stale_a_success = calls[-1][1]["on_success"]
+            page.xhs_location_keyword.setText("北海老街")
+            page.xhs_location_keyword.textEdited.emit("北海老街")
+            page.xhs_location_keyword.setText("北海银滩")
+            page.xhs_location_keyword.textEdited.emit("北海银滩")
+            with patch.object(page, "selected_accounts", return_value=[xhs]):
+                stale_a_success([row])
+            self.assertEqual(page.xhs_location_results.count(), 0)
+        finally:
+            page.close()
+
+
+class XhsLocationPayloadTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    @staticmethod
+    def _account(account_id: int = 11) -> dict[str, object]:
+        return {
+            "id": account_id,
+            "type": 1,
+            "platformName": "小红书",
+            "filePath": f"xhs-{account_id}.json",
+        }
+
+    @staticmethod
+    def _selection(account_id: int = 11) -> dict[str, object]:
+        return {
+            "poiId": "poi-1",
+            "name": "北海银滩景区",
+            "address": "广西北海市银海区银滩大道",
+            "poiType": "0",
+            "platform": "xiaohongshu",
+            "sourceAccountId": account_id,
+            "platformType": 1,
+            "scope": "platform-default",
+            "contentType": "video",
+            "searchKeyword": "北海 银滩",
+        }
+
+    def _collect(self, page: PublishPage, accounts: list[dict]) -> list[dict]:
+        media = {"id": 8, "file_path": "offline.mp4"}
+        with patch.object(page, "selected_accounts", return_value=accounts), patch.object(
+            page,
+            "selected_media",
+            return_value=[media],
+        ), patch("ui.publish_page.publish_config_service.save_tags"):
+            return page.collect_payloads("preflight")
+
+    def test_blank_or_selected_location_uses_only_xhs_fields(self) -> None:
+        page = PublishPage()
+        account = self._account()
+        try:
+            page.common_title_input.setText("定位功能测试")
+            page.title_input.setPlainText("只做离线载荷测试")
+
+            blank = self._collect(page, [account])[0]
+            self.assertEqual(blank["xhsLocationKeyword"], "")
+            self.assertEqual(blank["xhsLocationScope"], "")
+            self.assertIsNone(blank["xhsLocationPoi"])
+            for generic_key in ("locationKeyword", "locationScope", "locationPoi"):
+                self.assertNotIn(generic_key, blank)
+
+            page.xhs_location_keyword.setText("北海 银滩")
+            page._xhs_selected_location = self._selection()
+            selected = self._collect(page, [account])[0]
+            self.assertEqual(selected["xhsLocationKeyword"], "北海 银滩")
+            self.assertEqual(selected["xhsLocationScope"], "platform-default")
+            self.assertEqual(selected["xhsLocationPoi"], self._selection())
+            for generic_key in ("locationKeyword", "locationScope", "locationPoi"):
+                self.assertNotIn(generic_key, selected)
+        finally:
+            page.close()
+
+    def test_keyword_without_selected_candidate_fails_collect_payloads(self) -> None:
+        page = PublishPage()
+        try:
+            page.common_title_input.setText("定位功能测试")
+            page.title_input.setPlainText("只做离线载荷测试")
+            page.xhs_location_keyword.setText("北海银滩")
+            with self.assertRaisesRegex(ValueError, "不能只填写关键词"):
+                self._collect(page, [self._account()])
+        finally:
+            page.close()
+
+    def test_templates_neither_persist_nor_restore_xhs_selection(self) -> None:
+        page = PublishPage()
+        try:
+            page.xhs_location_keyword.setText("北海 银滩")
+            page._xhs_selected_location = self._selection()
+            page.xhs_location_results.addItem("旧候选")
+
+            template = page.payload_for_template()
+            saved_content = page.payload_for_saved_content()["content"]
+            for key in ("xhsLocationKeyword", "xhsLocationScope", "xhsLocationPoi"):
+                self.assertNotIn(key, template)
+                self.assertNotIn(key, saved_content)
+
+            page._apply_content_payload(
+                {
+                    "xhsLocationKeyword": "北海 银滩",
+                    "xhsLocationScope": "platform-default",
+                    "xhsLocationPoi": self._selection(account_id=999),
+                }
+            )
+            self.assertEqual(page.xhs_location_keyword.text(), "")
+            self.assertEqual(page._xhs_selected_location, {})
+            self.assertEqual(page.xhs_location_results.count(), 0)
+        finally:
+            page.close()
+
+    def _service_payload(self, media_path: Path, **changes: object) -> dict[str, object]:
+        selection = self._selection()
+        payload: dict[str, object] = {
+            "type": 1,
+            "contentType": "video",
+            "runtimeMode": "preflight",
+            "debugDryRun": True,
+            "title": "定位服务测试",
+            "description": "只验证浏览器启动前的载荷边界。",
+            "fileList": [str(media_path)],
+            "accountList": ["xhs-11.json"],
+            "accountIds": [11],
+            "xhsLocationKeyword": "北海 银滩",
+            "xhsLocationScope": "platform-default",
+            "xhsLocationPoi": selection,
+        }
+        payload.update(changes)
+        return payload
+
+    def test_publish_service_normalizes_video_location_and_keeps_plain_article(self) -> None:
+        with TemporaryDirectory() as directory:
+            video = Path(directory) / "fixture.mp4"
+            video.write_bytes(b"offline-video")
+            image = Path(directory) / "fixture.png"
+            image.write_bytes(b"offline-image")
+            selection = {
+                **self._selection(),
+                "name": "  北海银滩景区 ",
+                "address": " 广西北海市银海区银滩大道 ",
+                "searchKeyword": "  北海   银滩 ",
+            }
+            normalized = publish_service._validate_payloads(
+                [
+                    self._service_payload(
+                        video,
+                        xhsLocationKeyword="  北海   银滩 ",
+                        xhsLocationPoi=selection,
+                        locationKeyword="",
+                        locationScope="",
+                        locationPoi={},
+                    )
+                ]
+            )[0]
+            self.assertEqual(normalized["xhsLocationKeyword"], "北海 银滩")
+            self.assertEqual(normalized["xhsLocationScope"], "platform-default")
+            self.assertEqual(
+                normalized["xhsLocationPoi"],
+                {
+                    **self._selection(),
+                    "name": "北海银滩景区",
+                    "address": "广西北海市银海区银滩大道",
+                },
+            )
+            for generic_key in ("locationKeyword", "locationScope", "locationPoi"):
+                self.assertNotIn(generic_key, normalized)
+
+            article = self._service_payload(
+                image,
+                contentType="article",
+            )
+            for key in ("xhsLocationKeyword", "xhsLocationScope", "xhsLocationPoi"):
+                article.pop(key)
+            self.assertEqual(
+                publish_service._validate_payloads([article])[0]["contentType"],
+                "article",
+            )
+
+    def test_publish_service_rejects_cross_context_location_before_task_creation(self) -> None:
+        with TemporaryDirectory() as directory:
+            video = Path(directory) / "fixture.mp4"
+            video.write_bytes(b"offline-video")
+            image = Path(directory) / "fixture.png"
+            image.write_bytes(b"offline-image")
+            base = self._service_payload(video)
+            cases = [
+                {
+                    **base,
+                    "xhsLocationPoi": None,
+                },
+                {
+                    **base,
+                    "xhsLocationScope": "domestic",
+                },
+                {
+                    **base,
+                    "accountIds": [99],
+                },
+                {
+                    **base,
+                    "contentType": "article",
+                    "fileList": [str(image)],
+                },
+                {
+                    **base,
+                    "contentType": "article",
+                    "fileList": [str(image)],
+                    "xhsLocationKeyword": "",
+                    "xhsLocationScope": "",
+                    "xhsLocationPoi": None,
+                },
+                {
+                    **base,
+                    "contentType": "article",
+                    "fileList": [str(image)],
+                    "locationKeyword": "北海银滩",
+                },
+                {
+                    **base,
+                    "locationKeyword": "北海银滩",
+                },
+            ]
+            for index, payload in enumerate(cases):
+                with self.subTest(index=index):
+                    with self.assertRaises(ValueError):
+                        publish_service._validate_payloads([payload])
+
+            keyword_only = {**base, "xhsLocationPoi": None}
+            with patch.object(
+                publish_service.task_service,
+                "create_pending_task",
+            ) as create_task:
+                with self.assertRaises(ValueError):
+                    publish_service.start_desktop_publish([keyword_only])
+            create_task.assert_not_called()
+
+
+class _SearchBoundaryPage:
+    def __init__(self, *, current_url: str) -> None:
+        self.url = current_url
+        self.goto_calls: list[tuple[str, dict[str, object]]] = []
+        self.evaluate_calls: list[tuple[str, object]] = []
+
+    async def goto(self, url: str, **kwargs: object) -> None:
+        self.goto_calls.append((url, dict(kwargs)))
+
+    async def evaluate(self, script: str, payload: object) -> object:
+        self.evaluate_calls.append((script, payload))
+        return {
+            "httpStatus": 200,
+            "data": {
+                "poiList": [
+                    {
+                        "poiId": "poi-1",
+                        "name": "北海银滩景区",
+                        "fullAddress": "广西北海市银海区银滩大道",
+                        "poiType": 0,
+                    }
+                ]
+            },
+        }
+
+
+class _SearchBoundaryContext:
+    def __init__(self, page: _SearchBoundaryPage) -> None:
+        self.page = page
+        self.close_calls = 0
+
+    async def new_page(self) -> _SearchBoundaryPage:
+        return self.page
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+
+class _SearchBoundaryBrowser:
+    def __init__(self, page: _SearchBoundaryPage) -> None:
+        self.context = _SearchBoundaryContext(page)
+        self.context_kwargs: list[dict[str, object]] = []
+        self.close_calls = 0
+
+    async def new_context(self, **kwargs: object) -> _SearchBoundaryContext:
+        self.context_kwargs.append(dict(kwargs))
+        return self.context
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+
+class _SearchBoundaryChromium:
+    def __init__(self, browser: _SearchBoundaryBrowser) -> None:
+        self.browser = browser
+        self.launch_kwargs: list[dict[str, object]] = []
+
+    async def launch(self, **kwargs: object) -> _SearchBoundaryBrowser:
+        self.launch_kwargs.append(dict(kwargs))
+        return self.browser
+
+
+class _SearchBoundaryPlaywrightManager:
+    def __init__(self, page: _SearchBoundaryPage) -> None:
+        self.browser = _SearchBoundaryBrowser(page)
+        self.chromium = _SearchBoundaryChromium(self.browser)
+        self.exit_calls = 0
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback) -> None:
+        self.exit_calls += 1
+
+
+class XhsLocationSearchBoundaryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_search_uses_creator_page_and_exact_official_post_protocol(self) -> None:
+        state = Path("/offline/xhs-11.json")
+        page = _SearchBoundaryPage(current_url=_XHS_CREATOR_PUBLISH_URL)
+        manager = _SearchBoundaryPlaywrightManager(page)
+        from playwright import async_api
+
+        with patch.object(
+            xhs_location_service,
+            "_storage_state",
+            return_value=state,
+        ), patch.object(async_api, "async_playwright", return_value=manager):
+            result = await xhs_location_service._search(
+                {"id": 11, "type": 1, "filePath": "xhs-11.json"},
+                "北海 银滩",
+            )
+
+        self.assertEqual(
+            page.goto_calls,
+            [
+                (
+                    _XHS_CREATOR_PUBLISH_URL,
+                    {"wait_until": "domcontentloaded", "timeout": 45_000},
+                )
+            ],
+        )
+        self.assertEqual(
+            page.evaluate_calls[0][1],
+            {
+                "endpoint": (
+                    "https://edith.xiaohongshu.com/web_api/sns/v1/local/poi/creator/search"
+                ),
+                "body": {
+                    "latitude": 0,
+                    "longitude": 0,
+                    "keyword": "北海 银滩",
+                    "page": 1,
+                    "size": 50,
+                    "source": "WEB",
+                    "type": 3,
+                },
+            },
+        )
+        request_script = page.evaluate_calls[0][0]
+        self.assertIn("method: 'POST'", request_script)
+        self.assertIn("credentials: 'include'", request_script)
+        self.assertEqual(result[0]["poiId"], "poi-1")
+        self.assertEqual(manager.browser.context_kwargs, [{"storage_state": str(state)}])
+        self.assertEqual(manager.browser.context.close_calls, 1)
+        self.assertEqual(manager.browser.close_calls, 1)
+        self.assertEqual(manager.exit_calls, 1)
+
+    async def test_search_checks_page_url_and_closes_resources_on_failure(self) -> None:
+        page = _SearchBoundaryPage(
+            current_url="https://www.xiaohongshu.com/login"
+        )
+        manager = _SearchBoundaryPlaywrightManager(page)
+        from playwright import async_api
+
+        with patch.object(
+            xhs_location_service,
+            "_storage_state",
+            return_value=Path("/offline/xhs-11.json"),
+        ), patch.object(async_api, "async_playwright", return_value=manager):
+            with self.assertRaisesRegex(
+                xhs_location_service.XhsLocationSearchError,
+                "会话已失效",
+            ):
+                await xhs_location_service._search(
+                    {"id": 11, "type": 1, "filePath": "xhs-11.json"},
+                    "北海银滩",
+                )
+
+        self.assertEqual(page.evaluate_calls, [])
+        self.assertEqual(manager.browser.context.close_calls, 1)
+        self.assertEqual(manager.browser.close_calls, 1)
+        self.assertEqual(manager.exit_calls, 1)
 
 
 class _FakeResponseRequest:

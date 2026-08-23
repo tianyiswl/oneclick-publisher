@@ -17,7 +17,9 @@ from typing import Any
 from .paths import COOKIE_DIR
 
 
-XHS_LOCATION_PAGE_URL = "https://edith.xiaohongshu.com/"
+XHS_LOCATION_PAGE_URL = (
+    "https://creator.xiaohongshu.com/publish/publish?source=official"
+)
 XHS_LOCATION_SEARCH_ENDPOINT = (
     "https://edith.xiaohongshu.com/web_api/sns/v1/local/poi/creator/search"
 )
@@ -292,7 +294,7 @@ async def _search(account: dict[str, Any], keyword: str) -> list[dict[str, str]]
             context = await browser.new_context(storage_state=str(state))
             page = await context.new_page()
             await page.goto(XHS_LOCATION_PAGE_URL, wait_until="domcontentloaded", timeout=45_000)
-            if "edith.xiaohongshu.com" not in page.url:
+            if "creator.xiaohongshu.com" not in page.url:
                 raise XhsLocationSearchError("小红书会话已失效，请先在账号管理中重新登录")
             response = await page.evaluate(
                 """async ({ endpoint, body }) => {

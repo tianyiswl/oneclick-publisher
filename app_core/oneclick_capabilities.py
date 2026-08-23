@@ -56,6 +56,7 @@ class PlatformCapability:
     requires_cover: bool
     confirmation_policy: ConfirmationPolicy
     notes: str
+    supports_location: bool = False
 
     @property
     def content_label(self) -> str:
@@ -69,6 +70,7 @@ def _capability(
     *,
     requires_assets: bool = False,
     requires_cover: bool = False,
+    supports_location: bool = False,
     notes: str,
 ) -> PlatformCapability:
     return PlatformCapability(
@@ -79,6 +81,7 @@ def _capability(
         requires_cover=requires_cover,
         confirmation_policy=ConfirmationPolicy.PLATFORM_RECEIPT_REQUIRED,
         notes=notes,
+        supports_location=supports_location,
     )
 
 
@@ -88,6 +91,7 @@ def _capability(
 CAPABILITIES: dict[tuple[str, str], PlatformCapability] = {
     ("小红书", ContentType.VIDEO.value): _capability(
         "小红书", ContentType.VIDEO, "video", requires_assets=True,
+        supports_location=True,
         notes="走小红书视频通道。最终发布前需人工确认。",
     ),
     ("小红书", ContentType.IMAGE_TEXT.value): _capability(
@@ -104,14 +108,17 @@ CAPABILITIES: dict[tuple[str, str], PlatformCapability] = {
     ),
     ("抖音", ContentType.VIDEO.value): _capability(
         "抖音", ContentType.VIDEO, "video", requires_assets=True,
+        supports_location=True,
         notes="走抖音视频通道。",
     ),
     ("抖音", ContentType.IMAGE_TEXT.value): _capability(
         "抖音", ContentType.IMAGE_TEXT, "imageText", requires_assets=True,
+        supports_location=True,
         notes="走抖音图文通道，需要图片序列。",
     ),
     ("抖音", ContentType.TEXT.value): _capability(
         "抖音", ContentType.TEXT, "article", requires_cover=True,
+        supports_location=True,
         notes="走抖音文章通道，平台要求单独封面。",
     ),
     ("快手", ContentType.VIDEO.value): _capability(
@@ -175,6 +182,13 @@ def capability_for(platform: str, content_type: str) -> PlatformCapability | Non
 
 def supports(platform: str, content_type: str) -> bool:
     return capability_for(platform, content_type) is not None
+
+
+def supports_location(platform: str, content_type: str) -> bool:
+    """地点能力必须由平台与内容类型显式声明。"""
+
+    capability = capability_for(platform, content_type)
+    return bool(capability and capability.supports_location)
 
 
 def unsupported_message(platform: str, content_type: str) -> str:
