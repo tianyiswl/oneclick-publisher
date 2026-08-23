@@ -31,8 +31,9 @@
 - `app_core/douyin_location*`
 - `app_core/douyin_commerce*`
 - `app_core/_douyin_commerce*`
+- `app_core/xhs_location*`（小红书视频定位，仅限视频场景）
 - `ui/douyin_commerce_page.py`
-- 对应抖音地点、带货测试、设计和验收记录
+- 对应抖音地点、带货测试、设计和验收记录，以及文件名含 `xhs-location`/`xhs_location` 的小红书视频定位测试、设计和验收记录
 
 ### 共享核心，仅集成线可直接修改
 
@@ -48,6 +49,9 @@
 - `app_core/database.py`
 - `app_core/paths.py`
 - `app_core/publish_service.py`
+- `app_core/oneclick_preflight.py`
+- `app_core/xhs_native_adapter.py`
+- `app_core/xhs_publish_executor.py`
 - `app_core/oneclick_authorization.py`
 - `app_core/oneclick_capabilities.py`
 - `app_core/branding.py`

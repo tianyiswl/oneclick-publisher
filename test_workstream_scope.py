@@ -56,6 +56,20 @@ class WorkstreamScopeTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(classify_path(path, "location"), "owned")
 
+    def test_xhs_location_files_are_owned_but_publish_wiring_is_shared(self):
+        for path in (
+            "app_core/xhs_location_service.py",
+            "test_xhs_location.py",
+            "docs/verification/xhs-video-location.md",
+        ):
+            self.assertEqual(classify_path(path, "location"), "owned")
+        for path in (
+            "app_core/oneclick_preflight.py",
+            "app_core/xhs_native_adapter.py",
+            "app_core/xhs_publish_executor.py",
+        ):
+            self.assertEqual(classify_path(path, "location"), "shared")
+
     def test_unrelated_files_require_review(self):
         self.assertEqual(classify_path("ui/dashboard_page.py", "data"), "outside")
         self.assertEqual(classify_path("app_core/task_service.py", "overseas"), "outside")
