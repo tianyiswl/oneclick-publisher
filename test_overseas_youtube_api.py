@@ -640,6 +640,33 @@ class YouTubePrivateResumableUploadTests(unittest.TestCase):
                 self.assertNotIn(self.token, repr(result))
                 self.assertNotIn("raw-provider-body", repr(result))
 
+    def test_oversized_resumable_range_is_terminal_outcome_unknown(self) -> None:
+        oversized_range = "bytes=0-" + ("9" * 5000)
+        transport = FakeYouTubeUploadTransport(
+            post_responses=[self._session_response()],
+            put_responses=[
+                FakeUploadResponse(
+                    308,
+                    {},
+                    headers={"Range": oversized_range},
+                )
+            ],
+        )
+        adapter = self._adapter(transport)
+        session = self._begin(adapter)
+
+        result = adapter.upload_or_resume(session, self.token)
+
+        self.assertEqual(result, self._receipt(state="outcome_unknown", video_id=None))
+        with self.assertRaisesRegex(self._error_type(), "^outcome_unknown$") as raised:
+            adapter.upload_or_resume(session, self.token)
+        self.assertEqual(len(transport.post_calls), 1)
+        self.assertEqual(len(transport.put_calls), 1)
+        self.assertNotIn(self.session_uri, repr(result))
+        self.assertNotIn(self.token, repr(result))
+        self.assertNotIn(self.session_uri, str(raised.exception))
+        self.assertNotIn(self.token, str(raised.exception))
+
     def test_definite_upload_rejection_is_a_stable_failure_without_provider_leakage(self) -> None:
         transport = FakeYouTubeUploadTransport(
             post_responses=[self._session_response()],

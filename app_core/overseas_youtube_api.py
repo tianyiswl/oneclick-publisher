@@ -673,8 +673,12 @@ def _resumable_next_byte(response: object, total_size: int) -> int | None:
     match = re.fullmatch(r"bytes=0-(\d+)", normalized_range)
     if match is None:
         return None
-    next_byte = int(match.group(1)) + 1
-    if next_byte < 0 or next_byte > total_size:
+    try:
+        next_byte = int(match.group(1)) + 1
+        outside_media = next_byte < 0 or next_byte > total_size
+    except Exception:
+        return None
+    if outside_media:
         return None
     return next_byte
 
