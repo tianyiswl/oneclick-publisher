@@ -139,9 +139,9 @@ class YouTubeChannelIdentityClient:
         except Exception:
             raise YouTubeChannelLookupError("channel_lookup_unavailable") from None
 
-        payload = _channel_payload(response)
         if not _channel_response_is_success(response):
             raise YouTubeChannelLookupError("channel_lookup_rejected")
+        payload = _channel_payload(response)
         items = payload.get("items")
         if not isinstance(items, list):
             raise YouTubeChannelLookupError("channel_lookup_response_invalid")
@@ -246,11 +246,9 @@ def _channel_payload(response: _ChannelResponse) -> Mapping[str, object]:
 def _channel_response_is_success(response: _ChannelResponse) -> bool:
     try:
         status_code = response.status_code
-        return (
-            not isinstance(status_code, bool)
-            and isinstance(status_code, int)
-            and 200 <= status_code < 300
-        )
+        if isinstance(status_code, bool) or not isinstance(status_code, int):
+            raise TypeError
+        return 200 <= status_code < 300
     except Exception:
         raise YouTubeChannelLookupError("channel_lookup_response_invalid") from None
 

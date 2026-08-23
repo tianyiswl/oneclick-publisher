@@ -28,6 +28,21 @@ class FakeChannelResponse:
         return self._payload
 
 
+class NonJsonChannelResponse:
+    def __init__(self, status_code: int) -> None:
+        self.status_code = status_code
+
+    def json(self) -> object:
+        raise RuntimeError("raw-provider-body")
+
+
+class InvalidStatusChannelResponse:
+    status_code = "not-an-http-status"
+
+    def json(self) -> object:
+        return {"items": [], "detail": "raw-provider-body"}
+
+
 class FakeReadOnlyTransport:
     def __init__(self, response: FakeChannelResponse | None = None) -> None:
         self._response = response
@@ -200,6 +215,30 @@ class YouTubeChannelIdentityTests(unittest.TestCase):
                     client.lookup_authenticated_channel("access-token-secret")
                 self.assertNotIn("access-token-secret", str(raised.exception))
                 self.assertNotIn("raw-provider-body", str(raised.exception))
+
+    def test_non_success_status_is_rejected_before_parsing_any_body(self) -> None:
+        cases = (
+            FakeChannelResponse(401, ["raw-provider-body"]),
+            NonJsonChannelResponse(500),
+        )
+        for response in cases:
+            with self.subTest(status=response.status_code):
+                transport = FakeReadOnlyTransport(response)  # type: ignore[arg-type]
+                client = YouTubeChannelIdentityClient(transport)
+                with self.assertRaisesRegex(YouTubeChannelLookupError, "^channel_lookup_rejected$") as raised:
+                    client.lookup_authenticated_channel("access-token-secret")
+                self.assertNotIn("access-token-secret", str(raised.exception))
+                self.assertNotIn("raw-provider-body", str(raised.exception))
+
+    def test_invalid_status_type_is_normalized_without_parsing_or_echoing_body(self) -> None:
+        transport = FakeReadOnlyTransport(InvalidStatusChannelResponse())  # type: ignore[arg-type]
+        client = YouTubeChannelIdentityClient(transport)
+
+        with self.assertRaisesRegex(YouTubeChannelLookupError, "^channel_lookup_response_invalid$") as raised:
+            client.lookup_authenticated_channel("access-token-secret")
+
+        self.assertNotIn("access-token-secret", str(raised.exception))
+        self.assertNotIn("raw-provider-body", str(raised.exception))
 
 
 if __name__ == "__main__":
