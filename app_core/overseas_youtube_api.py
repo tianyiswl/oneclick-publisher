@@ -120,40 +120,34 @@ class YouTubeUploadReceipt:
         if self.state not in _PRIVATE_RECEIPT_STATES:
             raise ValueError("upload_state_invalid")
         if self.state in {"uploaded_private", "processing", "processed_private"}:
-            if not isinstance(self.video_id, str) or not self.video_id.strip():
+            if _normalized_nonempty_string(self.video_id) is None:
                 raise ValueError("video_id_required")
         elif self.video_id is not None:
             raise ValueError("video_id_unexpected")
 
 
+@dataclass(frozen=True, slots=True, repr=False)
 class YouTubeResumableSession:
-    """Opaque current-session handle whose representation always redacts URI."""
+    """Opaque immutable handle with no media routing authority."""
 
-    __slots__ = (
-        "_channel_id",
-        "_closed",
-        "_next_byte",
-        "_session_uri",
-        "_total_size",
-        "_upload",
-    )
-
-    def __init__(
-        self,
-        session_uri: str,
-        upload: ValidatedYouTubeUpload,
-        channel_id: str,
-        total_size: int,
-    ) -> None:
-        self._session_uri = session_uri
-        self._upload = upload
-        self._channel_id = channel_id
-        self._total_size = total_size
-        self._next_byte = 0
-        self._closed = False
+    _correlation: object
 
     def __repr__(self) -> str:
         return "YouTubeResumableSession(<redacted>)"
+
+
+@dataclass(slots=True)
+class _ResumableUploadState:
+    """Adapter-owned routing, offset, contract, and terminal state."""
+
+    correlation: object
+    session_uri: str
+    upload: ValidatedYouTubeUpload
+    expected_channel: YouTubeChannelIdentity
+    total_size: int
+    next_byte: int = 0
+    closed: bool = False
+    outcome_unknown: bool = False
 
 
 class _ChannelResponse(Protocol):
@@ -245,7 +239,9 @@ class YouTubeChannelIdentityClient:
         if not _channel_response_is_success(response):
             raise YouTubeChannelLookupError("channel_lookup_rejected")
         payload = _channel_payload(response)
-        items = payload.get("items")
+        payload_ok, items = _mapping_value(payload, "items")
+        if not payload_ok:
+            raise YouTubeChannelLookupError("channel_lookup_response_invalid")
         if not isinstance(items, list):
             raise YouTubeChannelLookupError("channel_lookup_response_invalid")
         if not items:
@@ -255,11 +251,12 @@ class YouTubeChannelIdentityClient:
         item = items[0]
         if not isinstance(item, Mapping):
             raise YouTubeChannelLookupError("channel_lookup_response_invalid")
-        channel_id = item.get("id")
-        if not isinstance(channel_id, str) or not channel_id.strip():
+        item_ok, channel_id = _mapping_value(item, "id")
+        normalized_channel_id = _normalized_nonempty_string(channel_id)
+        if not item_ok or normalized_channel_id is None:
             raise YouTubeChannelLookupError("channel_identity_invalid")
         return YouTubeChannelIdentity(
-            channel_id=channel_id.strip(),
+            channel_id=normalized_channel_id,
             display_name=_channel_display_name(item),
         )
 
@@ -276,7 +273,9 @@ class YouTubePrivateUploadAdapter:
         self._transport = transport
         self._timeout_seconds = timeout_seconds
         self._active_session: YouTubeResumableSession | None = None
+        self._session_state: _ResumableUploadState | None = None
         self._initiation_outcome_unknown = False
+        self._owned_receipt: YouTubeUploadReceipt | None = None
 
     def initiate_resumable_upload(
         self,
@@ -341,16 +340,20 @@ class YouTubePrivateUploadAdapter:
             self._initiation_outcome_unknown = True
             raise YouTubeUploadError("outcome_unknown")
         headers = _upload_response_headers(response)
-        location = _header_value(headers, "Location") if headers is not None else None
-        if location is None or not location.strip():
+        header_ok, location = _header_value(headers, "Location")
+        normalized_location = _normalized_nonempty_string(location)
+        if not header_ok or normalized_location is None:
             self._initiation_outcome_unknown = True
             raise YouTubeUploadError("outcome_unknown")
 
-        session = YouTubeResumableSession(
-            location.strip(),
-            upload,
-            expected_channel.channel_id.strip(),
-            total_size,
+        correlation = object()
+        session = YouTubeResumableSession(correlation)
+        self._session_state = _ResumableUploadState(
+            correlation=correlation,
+            session_uri=normalized_location,
+            upload=upload,
+            expected_channel=expected_channel,
+            total_size=total_size,
         )
         self._active_session = session
         return session
@@ -362,28 +365,37 @@ class YouTubePrivateUploadAdapter:
     ) -> YouTubeUploadReceipt:
         """Send remaining bytes only to this adapter's current session URI."""
         _require_upload_token(access_token)
-        if session is not self._active_session or session._closed:
+        state = self._session_state
+        if session is not self._active_session or state is None:
             raise YouTubeUploadError("upload_session_invalid")
         try:
-            with session._upload.video_path.open("rb") as video_file:
-                current_size = session._upload.video_path.stat().st_size
-                if current_size != session._total_size:
+            correlation_matches = session._correlation is state.correlation
+        except Exception:
+            correlation_matches = False
+        if not correlation_matches or state.closed:
+            raise YouTubeUploadError("upload_session_invalid")
+        if state.outcome_unknown:
+            raise YouTubeUploadError("outcome_unknown")
+        try:
+            with state.upload.video_path.open("rb") as video_file:
+                current_size = state.upload.video_path.stat().st_size
+                if current_size != state.total_size:
                     raise OSError
-                video_file.seek(session._next_byte)
+                video_file.seek(state.next_byte)
                 media = video_file.read()
         except (OSError, TypeError, ValueError):
             raise YouTubeUploadError("upload_failed") from None
 
-        if session._next_byte < session._total_size:
+        if state.next_byte < state.total_size:
             content_range = (
-                f"bytes {session._next_byte}-{session._total_size - 1}/"
-                f"{session._total_size}"
+                f"bytes {state.next_byte}-{state.total_size - 1}/"
+                f"{state.total_size}"
             )
         else:
-            content_range = f"bytes */{session._total_size}"
+            content_range = f"bytes */{state.total_size}"
         try:
             response = self._transport.put(
-                session._session_uri,
+                state.session_uri,
                 headers={
                     "Authorization": f"Bearer {access_token}",
                     "Content-Length": str(len(media)),
@@ -394,29 +406,37 @@ class YouTubePrivateUploadAdapter:
                 timeout=self._timeout_seconds,
             )
         except Exception:
-            return YouTubeUploadReceipt(state="outcome_unknown", video_id=None)
+            return self._mark_upload_outcome_unknown()
 
         status_code = _upload_response_status(response)
         if status_code is None:
-            return YouTubeUploadReceipt(state="outcome_unknown", video_id=None)
+            return self._mark_upload_outcome_unknown()
         if status_code == 308:
-            next_byte = _resumable_next_byte(response, session._total_size)
+            next_byte = _resumable_next_byte(response, state.total_size)
             if next_byte is None:
-                return YouTubeUploadReceipt(state="outcome_unknown", video_id=None)
-            session._next_byte = next_byte
+                return self._mark_upload_outcome_unknown()
+            state.next_byte = next_byte
             return YouTubeUploadReceipt(state="upload_started", video_id=None)
         if status_code == 201:
             payload = _upload_payload(response)
-            video_id = payload.get("id") if payload is not None else None
-            if not isinstance(video_id, str) or not video_id.strip():
-                return YouTubeUploadReceipt(state="outcome_unknown", video_id=None)
-            session._closed = True
-            return YouTubeUploadReceipt(
+            payload_ok, video_id = _mapping_value(payload, "id")
+            normalized_video_id = _normalized_nonempty_string(video_id)
+            if not payload_ok or normalized_video_id is None:
+                return self._mark_upload_outcome_unknown()
+            state.closed = True
+            receipt = YouTubeUploadReceipt(
                 state="uploaded_private",
-                video_id=video_id.strip(),
+                video_id=normalized_video_id,
             )
+            self._owned_receipt = receipt
+            return receipt
         if 400 <= status_code < 500:
             raise YouTubeUploadError("upload_failed")
+        return self._mark_upload_outcome_unknown()
+
+    def _mark_upload_outcome_unknown(self) -> YouTubeUploadReceipt:
+        if self._session_state is not None:
+            self._session_state.outcome_unknown = True
         return YouTubeUploadReceipt(state="outcome_unknown", video_id=None)
 
     def verify_exact_readback(
@@ -427,6 +447,14 @@ class YouTubePrivateUploadAdapter:
         access_token: str,
     ) -> YouTubeUploadReceipt:
         """Verify one exact uploaded ID and report only private saved states."""
+        state = self._session_state
+        if (
+            state is None
+            or receipt is not self._owned_receipt
+            or upload is not state.upload
+            or expected_channel is not state.expected_channel
+        ):
+            raise YouTubeUploadError("readback_mismatch")
         if (
             not isinstance(receipt, YouTubeUploadReceipt)
             or receipt.state not in {"uploaded_private", "processing", "processed_private"}
@@ -456,26 +484,38 @@ class YouTubePrivateUploadAdapter:
         payload = _upload_payload(response)
         if payload is None:
             raise YouTubeUploadError("outcome_unknown")
-        items = payload.get("items")
+        payload_ok, items = _mapping_value(payload, "items")
+        if not payload_ok:
+            raise YouTubeUploadError("outcome_unknown")
         if not isinstance(items, list) or len(items) != 1:
             raise YouTubeUploadError("readback_mismatch")
         item = items[0]
         if not isinstance(item, Mapping):
             raise YouTubeUploadError("readback_mismatch")
-        snippet = item.get("snippet")
-        status = item.get("status")
+        snippet_ok, snippet = _mapping_value(item, "snippet")
+        status_ok, status = _mapping_value(item, "status")
+        if not snippet_ok or not status_ok:
+            raise YouTubeUploadError("outcome_unknown")
         if not isinstance(snippet, Mapping) or not isinstance(status, Mapping):
             raise YouTubeUploadError("readback_mismatch")
+        item_id_ok, item_id = _mapping_value(item, "id")
+        channel_ok, channel_id = _mapping_value(snippet, "channelId")
+        title_ok, title = _mapping_value(snippet, "title")
+        privacy_ok, privacy_status = _mapping_value(status, "privacyStatus")
+        if not all((item_id_ok, channel_ok, title_ok, privacy_ok)):
+            raise YouTubeUploadError("outcome_unknown")
         if (
-            item.get("id") != receipt.video_id
-            or snippet.get("channelId") != expected_channel.channel_id
-            or snippet.get("title") != upload.title
-            or status.get("privacyStatus") != "private"
+            item_id != receipt.video_id
+            or channel_id != state.expected_channel.channel_id
+            or title != state.upload.title
+            or privacy_status != "private"
         ):
             raise YouTubeUploadError("readback_mismatch")
 
         state = _private_processing_state(item, status)
-        return YouTubeUploadReceipt(state=state, video_id=receipt.video_id)
+        verified_receipt = YouTubeUploadReceipt(state=state, video_id=receipt.video_id)
+        self._owned_receipt = verified_receipt
+        return verified_receipt
 
 
 def local_preflight(request: YouTubeUploadRequest) -> ValidatedYouTubeUpload:
@@ -573,13 +613,41 @@ def _upload_response_headers(response: object) -> Mapping[str, object] | None:
     return headers if isinstance(headers, Mapping) else None
 
 
-def _header_value(headers: Mapping[str, object] | None, name: str) -> str | None:
+def _header_value(
+    headers: Mapping[str, object] | None,
+    name: str,
+) -> tuple[bool, str | None]:
     if headers is None:
+        return False, None
+    try:
+        for key, value in headers.items():
+            if isinstance(key, str) and key.lower() == name.lower():
+                return True, value if isinstance(value, str) else None
+    except Exception:
+        return False, None
+    return True, None
+
+
+def _mapping_value(
+    mapping: Mapping[str, object] | None,
+    key: str,
+) -> tuple[bool, object]:
+    if mapping is None:
+        return False, None
+    try:
+        return True, mapping.get(key)
+    except Exception:
+        return False, None
+
+
+def _normalized_nonempty_string(value: object) -> str | None:
+    if not isinstance(value, str):
         return None
-    for key, value in headers.items():
-        if isinstance(key, str) and key.lower() == name.lower():
-            return value if isinstance(value, str) else None
-    return None
+    try:
+        normalized = value.strip()
+    except Exception:
+        return None
+    return normalized if normalized else None
 
 
 def _upload_payload(response: object) -> Mapping[str, object] | None:
@@ -594,10 +662,15 @@ def _resumable_next_byte(response: object, total_size: int) -> int | None:
     headers = _upload_response_headers(response)
     if headers is None:
         return None
-    received_range = _header_value(headers, "Range")
+    header_ok, received_range = _header_value(headers, "Range")
+    if not header_ok:
+        return None
     if received_range is None:
         return 0
-    match = re.fullmatch(r"bytes=0-(\d+)", received_range.strip())
+    normalized_range = _normalized_nonempty_string(received_range)
+    if normalized_range is None:
+        return None
+    match = re.fullmatch(r"bytes=0-(\d+)", normalized_range)
     if match is None:
         return None
     next_byte = int(match.group(1)) + 1
@@ -610,14 +683,19 @@ def _private_processing_state(
     item: Mapping[str, object],
     status: Mapping[str, object],
 ) -> str:
-    upload_status = status.get("uploadStatus")
-    rejection_reason = status.get("rejectionReason")
-    processing_details = item.get("processingDetails")
-    processing_status = (
-        processing_details.get("processingStatus")
-        if isinstance(processing_details, Mapping)
-        else None
-    )
+    upload_ok, upload_status = _mapping_value(status, "uploadStatus")
+    rejection_ok, rejection_reason = _mapping_value(status, "rejectionReason")
+    details_ok, processing_details = _mapping_value(item, "processingDetails")
+    if not all((upload_ok, rejection_ok, details_ok)):
+        raise YouTubeUploadError("outcome_unknown")
+    processing_status: object = None
+    if isinstance(processing_details, Mapping):
+        processing_ok, processing_status = _mapping_value(
+            processing_details,
+            "processingStatus",
+        )
+        if not processing_ok:
+            raise YouTubeUploadError("outcome_unknown")
     if upload_status == "rejected" or (
         isinstance(rejection_reason, str) and rejection_reason
     ):
@@ -655,8 +733,8 @@ def _channel_response_is_success(response: _ChannelResponse) -> bool:
 
 
 def _channel_display_name(item: Mapping[str, object]) -> str | None:
-    snippet = item.get("snippet")
-    if not isinstance(snippet, Mapping):
+    snippet_ok, snippet = _mapping_value(item, "snippet")
+    if not snippet_ok or not isinstance(snippet, Mapping):
         return None
-    title = snippet.get("title")
-    return title if isinstance(title, str) and title else None
+    title_ok, title = _mapping_value(snippet, "title")
+    return title if title_ok and isinstance(title, str) and title else None
