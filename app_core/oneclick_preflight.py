@@ -242,6 +242,24 @@ def _account_for_payload(payload: dict) -> dict:
     raise PreflightError("未找到一键发已登录账号，请先在账号管理中完成登录")
 
 
+def _validate_xhs_account_id(payload: dict, account: dict) -> int:
+    account_ids = payload.get("accountIds")
+    try:
+        actual_id = int(account.get("id") or 0)
+        selected_id = (
+            int(account_ids[0])
+            if isinstance(account_ids, list) and len(account_ids) == 1
+            else 0
+        )
+    except (TypeError, ValueError) as exc:
+        raise PreflightError("小红书当前账号 ID 无效") from exc
+    if actual_id <= 0 or selected_id <= 0 or actual_id != selected_id:
+        raise PreflightError(
+            "小红书当前账号与任务选中账号 ID 不一致"
+        )
+    return actual_id
+
+
 def _wechat_template_for_payload(payload: dict, account: dict | None = None) -> str:
     """根据明确内容包标记或账号身份选择公众号正文模板。"""
 
@@ -643,6 +661,7 @@ async def _xhs_preflight(page, payload: dict) -> str:
     try:
         adapter = XhsNativeAdapter(payload)
         readback = await adapter.fill_content(page)
+        location_readback = await adapter.apply_location(page)
         topic_nodes = await adapter.fill_official_topics(page)
         await adapter.set_declarations(page)
         if payload.get("enableTimer") is True:
@@ -665,7 +684,13 @@ async def _xhs_preflight(page, payload: dict) -> str:
         f"小红书{label}素材已由平台回读{readback['mediaCount']}项，"
         f"标题、正文、{len(topic_nodes)}个官方话题、"
         f"声明配置和发布时间（{schedule_readback}）已回读；"
-        "未保存草稿、未预览、未发布"
+        + (
+            f"当次候选三字段已重新核验，编辑页已回读地点名"
+            f"“{location_readback['editorNameReadback']}”；"
+            if location_readback is not None
+            else "未设置地点；"
+        )
+        + "未主动保存草稿、未预览、未发布"
     )
 
 
@@ -2614,6 +2639,14 @@ async def run_preflight(payload: dict) -> dict:
     platform_type = int(account["type"])
     if platform_type not in {1, 2, 3, 4, 5, 10}:
         raise PreflightError("当前真实预检仅接入小红书、视频号、抖音、快手、B站与公众号")
+    if platform_type == 1:
+        _validate_xhs_account_id(payload, account)
+        from .xhs_native_adapter import XhsNativeAdapterError, build_native_contract
+
+        try:
+            build_native_contract(payload)
+        except XhsNativeAdapterError as exc:
+            raise PreflightError(str(exc)) from exc
     from playwright.async_api import async_playwright
 
     playwright = await async_playwright().start()
