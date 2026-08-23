@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from datetime import datetime
 import inspect
 from pathlib import Path
+import queue
 import re
 import threading
 import time
@@ -32,9 +34,60 @@ _MISSING = object()
 _KEY_RE = re.compile(r"^[0-9a-f]{64}$")
 _TRIGGER_RE = re.compile(r"^(click|scroll):([A-Za-z0-9_.:-]{1,200})$")
 _MAX_RESPONSE_PAGES = 50
+_MAX_QUEUED_RESPONSES = 8
+_MAX_RAW_ROWS = 256
+_MAX_REJECTED_ROWS = 128
+_MAX_PARSED_COMMENTS = 101
 _DEFAULT_TOTAL_TIMEOUT_SECONDS = 30.0
 _REPORT_LOCK = threading.Lock()
-_ACTIVE_REPORT_WORKER: threading.Thread | None = None
+_REPORT_QUEUE: queue.Queue = queue.Queue(maxsize=1)
+_REPORT_WORKER: threading.Thread | None = None
+_REPORT_BUSY = False
+
+
+@dataclass(frozen=True, slots=True)
+class _ParseOutcome:
+    page: CommentPage | None = None
+    rejected_count: int = 0
+    error_code: str = ""
+    control_kind: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class _CollectionOutcome:
+    batch: CommentCollectionBatch | None
+    error_code: str
+    retryable: bool
+    control_kind: str
+    cleanup_receipt: CleanupReceipt
+
+
+class _ParseDeadlineExceeded(RuntimeError):
+    pass
+
+
+class _ContentBindingMismatch(RuntimeError):
+    pass
+
+
+def _control_kind(value: BaseException) -> str:
+    if isinstance(value, asyncio.CancelledError):
+        return "cancelled"
+    if isinstance(value, KeyboardInterrupt):
+        return "keyboard_interrupt"
+    if isinstance(value, SystemExit):
+        return "system_exit"
+    return ""
+
+
+def _raise_fresh_control(kind: str) -> None:
+    if kind == "cancelled":
+        raise asyncio.CancelledError() from None
+    if kind == "keyboard_interrupt":
+        raise KeyboardInterrupt() from None
+    if kind == "system_exit":
+        raise SystemExit() from None
+    _invalid()
 
 
 def _invalid() -> None:
@@ -54,7 +107,7 @@ def _strict_path(root: object, path: object) -> object:
     return value
 
 
-def _comment_rows(payload: object, list_field: object) -> tuple[object, ...]:
+def _comment_rows(payload: object, list_field: object) -> list:
     if type(payload) is not dict or type(list_field) is not str:
         _invalid()
     if not list_field.endswith("[]"):
@@ -62,7 +115,7 @@ def _comment_rows(payload: object, list_field: object) -> tuple[object, ...]:
     value = _strict_path(payload, list_field[:-2])
     if type(value) is not list:
         _invalid()
-    return tuple(value)
+    return value
 
 
 def _row_value(row: object, list_field: str, field: object) -> object:
@@ -76,12 +129,14 @@ def _row_value(row: object, list_field: str, field: object) -> object:
     return value
 
 
-def _parse_comment_page_with_rejections(
+def _parse_comment_page_unsafe(
     contract: DouyinCommentContract,
     payload: object,
     account_id: int,
     content_id: str,
     observed_at: str,
+    *,
+    deadline: float | None = None,
 ) -> tuple[CommentPage, int]:
     if (
         type(contract) is not DouyinCommentContract
@@ -118,8 +173,22 @@ def _parse_comment_page_with_rejections(
 
     records: dict[str, CommentRecord] = {}
     rejected_count = 0
-    for raw_row in rows:
+    truncated_rows = False
+    for index, raw_row in enumerate(rows):
+        if deadline is not None and time.monotonic() >= deadline:
+            raise _ParseDeadlineExceeded
+        if index >= _MAX_RAW_ROWS:
+            _invalid()
         try:
+            row_content_id = _row_value(
+                raw_row,
+                contract.comment_list_field,
+                contract.comment_content_id_field,
+            )
+            if type(row_content_id) is str and row_content_id != content_id:
+                raise _ContentBindingMismatch
+            if type(row_content_id) is not str:
+                _invalid()
             parent_id = _row_value(
                 raw_row,
                 contract.comment_list_field,
@@ -127,13 +196,6 @@ def _parse_comment_page_with_rejections(
             )
             if parent_id is not None:
                 continue
-            row_content_id = _row_value(
-                raw_row,
-                contract.comment_list_field,
-                contract.comment_content_id_field,
-            )
-            if type(row_content_id) is not str or row_content_id != content_id:
-                _invalid()
             platform_comment_id = _row_value(
                 raw_row,
                 contract.comment_list_field,
@@ -176,6 +238,8 @@ def _parse_comment_page_with_rejections(
             )
         except CommentInsightFailure:
             rejected_count += 1
+            if rejected_count > _MAX_REJECTED_ROWS:
+                _invalid()
             continue
         existing = records.get(record.comment_key)
         if existing is not None:
@@ -183,8 +247,11 @@ def _parse_comment_page_with_rejections(
                 _invalid()
             continue
         records[record.comment_key] = record
+        if len(records) >= _MAX_PARSED_COMMENTS:
+            truncated_rows = index + 1 < len(rows)
+            break
 
-    platform_end = not has_more
+    platform_end = not has_more and not truncated_rows
     if not records and not platform_end:
         _invalid()
     return (
@@ -198,6 +265,39 @@ def _parse_comment_page_with_rejections(
     )
 
 
+def _parse_comment_page_outcome(
+    contract: DouyinCommentContract,
+    payload: object,
+    account_id: int,
+    content_id: str,
+    observed_at: str,
+    *,
+    deadline: float | None = None,
+) -> _ParseOutcome:
+    """在原始载荷边界内消化异常，只返回脱敏结果。"""
+
+    try:
+        page, rejected_count = _parse_comment_page_unsafe(
+            contract,
+            payload,
+            account_id,
+            content_id,
+            observed_at,
+            deadline=deadline,
+        )
+    except (asyncio.CancelledError, KeyboardInterrupt, SystemExit) as exc:
+        control_kind = _control_kind(exc)
+        return _ParseOutcome(control_kind=control_kind)
+    except CommentInsightFailure as exc:
+        error_code = exc.error_code
+        return _ParseOutcome(error_code=error_code)
+    except _ParseDeadlineExceeded:
+        return _ParseOutcome(error_code="comment_sync_timeout")
+    except BaseException:
+        return _ParseOutcome(error_code="comment_payload_invalid")
+    return _ParseOutcome(page=page, rejected_count=rejected_count)
+
+
 def parse_comment_page(
     contract: DouyinCommentContract,
     payload: object,
@@ -207,14 +307,21 @@ def parse_comment_page(
 ) -> CommentPage:
     """按已验证合同投影一页评论，不保留身份字段。"""
 
-    page, _rejected_count = _parse_comment_page_with_rejections(
+    outcome = _parse_comment_page_outcome(
         contract,
         payload,
         account_id,
         content_id,
         observed_at,
     )
-    return page
+    payload = None
+    if outcome.control_kind:
+        _raise_fresh_control(outcome.control_kind)
+    if outcome.error_code:
+        raise CommentInsightFailure(outcome.error_code) from None
+    if outcome.page is None:
+        raise CommentInsightFailure("comment_payload_invalid") from None
+    return outcome.page
 
 
 def _observed_at() -> str:
@@ -310,6 +417,18 @@ def _failure_with_cleanup(
     return failure
 
 
+def _raise_fresh_failure(
+    error_code: str,
+    *,
+    retryable: bool = False,
+    cleanup: CleanupReceipt | None = None,
+) -> None:
+    failure = CommentInsightFailure(error_code, retryable=retryable)
+    if cleanup is not None:
+        failure.cleanup_receipt = cleanup
+    raise failure from None
+
+
 def _report_payload(
     *,
     status: str,
@@ -331,47 +450,62 @@ def _report_payload(
     }
 
 
-def _emit_report(
-    report: Callable[[dict], None] | None,
-    payload: dict,
-    deadline: float,
-) -> bool:
-    """报告回调最多只保留一个审计过的守护线程。"""
+def _report_worker_loop() -> None:
+    """单一 worker 串行执行最多一个报告，不保留积压回调。"""
 
-    global _ACTIVE_REPORT_WORKER
-    if report is None:
-        return True
-    completed = threading.Event()
-
-    def invoke() -> None:
-        global _ACTIVE_REPORT_WORKER
+    global _REPORT_BUSY
+    while True:
+        report, payload, completed = _REPORT_QUEUE.get()
         try:
             report(payload)
         except BaseException:
             pass
         finally:
             completed.set()
-            current = threading.current_thread()
             with _REPORT_LOCK:
-                if _ACTIVE_REPORT_WORKER is current:
-                    _ACTIVE_REPORT_WORKER = None
+                _REPORT_BUSY = False
+            report = None
+            payload = None
+            completed = None
 
+
+def _emit_report(
+    report: Callable[[dict], None] | None,
+    payload: dict,
+    deadline: float,
+) -> bool:
+    """仅投递到单一有界 worker；忙时直接丢弃。"""
+
+    global _REPORT_BUSY, _REPORT_WORKER
+    if report is None:
+        return True
+    remaining = _remaining(deadline)
+    if remaining <= 0:
+        return False
+    completed = threading.Event()
     with _REPORT_LOCK:
-        active = _ACTIVE_REPORT_WORKER
-        if active is not None and active.is_alive():
+        if _REPORT_BUSY:
             return False
-        worker = threading.Thread(
-            target=invoke,
-            name="douyin-comment-report",
-            daemon=True,
-        )
-        _ACTIVE_REPORT_WORKER = worker
+        worker = _REPORT_WORKER
+        if worker is None or not worker.is_alive():
+            worker = threading.Thread(
+                target=_report_worker_loop,
+                name="douyin-comment-report",
+                daemon=True,
+            )
+            _REPORT_WORKER = worker
+            try:
+                worker.start()
+            except BaseException:
+                _REPORT_WORKER = None
+                return False
+        _REPORT_BUSY = True
         try:
-            worker.start()
-        except BaseException:
-            _ACTIVE_REPORT_WORKER = None
+            _REPORT_QUEUE.put_nowait((report, payload, completed))
+        except queue.Full:
+            _REPORT_BUSY = False
             return False
-    worker.join(_remaining(deadline))
+    completed.wait(remaining)
     return completed.is_set()
 
 
@@ -461,37 +595,43 @@ class DouyinCommentDataCollector:
         observed_at: str,
         report: Callable[[dict], None] | None,
         total_deadline: float,
-    ) -> CommentCollectionBatch:
+    ) -> _CollectionOutcome:
         playwright = None
         browser = None
         context = None
         page = None
         worker: asyncio.Task | None = None
-        result: tuple[tuple[CommentRecord, ...], int, int, str, str] | None = None
+        result: tuple[object, ...] | None = None
         caught: BaseException | None = None
         cleanup_errors: list[BaseException] = []
         records: dict[str, CommentRecord] = {}
         rejected_count = 0
         page_count = 0
-        response_queue: asyncio.Queue[object] = asyncio.Queue()
+        response_queue: asyncio.Queue[object] = asyncio.Queue(
+            maxsize=_MAX_QUEUED_RESPONSES
+        )
         loop = asyncio.get_running_loop()
         response_future: asyncio.Future = loop.create_future()
-        operation_tasks: set[asyncio.Future] = set()
+        operation_tasks: dict[asyncio.Future, str] = {}
+        owned_resources: dict[str, object] = {}
         cleanup_reservation = min(
             2.0, self._total_timeout_seconds * 0.25
         )
         operation_deadline = total_deadline - cleanup_reservation
         seen_cursors: set[str] = set()
 
-        async def await_operation(awaitable):
+        async def await_operation(awaitable, *, owner: str = ""):
             task = asyncio.ensure_future(awaitable)
-            operation_tasks.add(task)
+            operation_tasks[task] = owner
             try:
                 remaining = operation_deadline - time.monotonic()
                 if remaining > 0:
                     done, _pending = await asyncio.wait((task,), timeout=remaining)
                     if task in done:
-                        return task.result()
+                        value = task.result()
+                        if owner:
+                            owned_resources[owner] = value
+                        return value
                 task.cancel()
                 if isinstance(task, asyncio.Task):
                     task._log_destroy_pending = False
@@ -504,11 +644,51 @@ class DouyinCommentDataCollector:
                 raise
             finally:
                 if task.done():
-                    operation_tasks.discard(task)
+                    operation_tasks.pop(task, None)
 
         def observe_response(response: object) -> None:
-            if not response_future.done():
+            if response_future.done():
+                return
+            try:
+                raw_url = getattr(response, "url", None)
+                parsed = urlsplit(raw_url if type(raw_url) is str else "")
+                request = getattr(response, "request", None)
+                method = getattr(request, "method", None)
+                if (
+                    parsed.scheme != "https"
+                    or parsed.netloc != contract.creator_host
+                    or parsed.path != contract.comment_response_path
+                    or type(method) is not str
+                    or method != contract.comment_response_method
+                ):
+                    return
+                status = getattr(response, "status", None)
+            except BaseException:
+                response_future.set_result(
+                    ("failure", "comment_payload_invalid")
+                )
+                return
+            if status == 401:
+                response_future.set_result(
+                    ("failure", "comment_login_required")
+                )
+                return
+            if status == 403:
+                response_future.set_result(
+                    ("failure", "comment_access_denied")
+                )
+                return
+            if type(status) is not int or status < 200 or status >= 300:
+                response_future.set_result(
+                    ("failure", "comment_payload_invalid")
+                )
+                return
+            try:
                 response_queue.put_nowait(response)
+            except asyncio.QueueFull:
+                response_future.set_result(
+                    ("failure", "comment_payload_invalid")
+                )
 
         def finish(
             comments: tuple[CommentRecord, ...],
@@ -518,6 +698,7 @@ class DouyinCommentDataCollector:
             if not response_future.done():
                 response_future.set_result(
                     (
+                        "success",
                         comments,
                         rejected_count,
                         page_count,
@@ -555,36 +736,62 @@ class DouyinCommentDataCollector:
                     if not callable(reader) or not inspect.iscoroutinefunction(reader):
                         _invalid()
                     payload = await await_operation(reader())
-                    parsed_page, rejected = _parse_comment_page_with_rejections(
+                    parse_outcome = _parse_comment_page_outcome(
                         contract,
                         payload,
                         account_id,
                         content_id,
                         observed_at,
+                        deadline=operation_deadline,
                     )
-                    rejected_count += rejected
+                    payload = None
+                    response = None
+                    if parse_outcome.control_kind:
+                        response_future.set_result(
+                            ("control", parse_outcome.control_kind)
+                        )
+                        return
+                    if parse_outcome.error_code or parse_outcome.page is None:
+                        response_future.set_result(
+                            (
+                                "failure",
+                                parse_outcome.error_code
+                                or "comment_payload_invalid",
+                            )
+                        )
+                        return
+                    parsed_page = parse_outcome.page
+                    rejected_count += parse_outcome.rejected_count
+                    page_exceeds_limit = False
                     for record in parsed_page.comments:
                         existing = records.get(record.comment_key)
                         if existing is not None:
                             if existing != record:
                                 _invalid()
                             continue
+                        if limit == 100 and len(records) >= limit:
+                            page_exceeds_limit = True
+                            break
                         records[record.comment_key] = record
                         if record.comment_key in known_keys:
                             finish(tuple(records.values()), "known_comment", "")
                             return
                         if len(records) >= limit:
-                            if limit == 100:
-                                finish(
-                                    tuple(records.values()),
-                                    "limit_reached",
-                                    "comment_limit_reached",
-                                )
-                            else:
+                            if limit < 100:
                                 finish(tuple(records.values()), "", "")
-                            return
-                    if parsed_page.platform_end:
+                                return
+                    if (
+                        parsed_page.platform_end
+                        and not page_exceeds_limit
+                    ):
                         finish(tuple(records.values()), "platform_end", "")
+                        return
+                    if len(records) >= 100:
+                        finish(
+                            tuple(records.values()),
+                            "limit_reached",
+                            "comment_limit_reached",
+                        )
                         return
                     cursor = parsed_page.next_cursor
                     if type(cursor) is not str or not cursor or cursor in seen_cursors:
@@ -595,33 +802,40 @@ class DouyinCommentDataCollector:
                     )
                 except (asyncio.CancelledError, KeyboardInterrupt, SystemExit) as exc:
                     if not response_future.done():
-                        response_future.set_exception(exc)
-                    raise
+                        response_future.set_result(
+                            ("control", _control_kind(exc))
+                        )
+                    return
                 except CommentInsightFailure as exc:
                     if not response_future.done():
-                        response_future.set_exception(exc)
+                        response_future.set_result(
+                            ("failure", exc.error_code)
+                        )
                     return
-                except TimeoutError as exc:
+                except TimeoutError:
                     if not response_future.done():
-                        response_future.set_exception(exc)
+                        response_future.set_result(("timeout",))
                     return
                 except BaseException:
                     if not response_future.done():
-                        response_future.set_exception(
-                            CommentInsightFailure("comment_payload_invalid")
+                        response_future.set_result(
+                            ("failure", "comment_payload_invalid")
                         )
                     return
 
         try:
             starter = self._playwright_factory()
-            playwright = await await_operation(starter.start())
+            playwright = await await_operation(
+                starter.start(), owner="playwright"
+            )
             browser = await await_operation(
-                playwright.chromium.launch(headless=True)
+                playwright.chromium.launch(headless=True), owner="browser"
             )
             context = await await_operation(
-                browser.new_context(storage_state=str(state_path))
+                browser.new_context(storage_state=str(state_path)),
+                owner="context",
             )
-            page = await await_operation(context.new_page())
+            page = await await_operation(context.new_page(), owner="page")
             page.on("response", observe_response)
             worker = asyncio.create_task(consume_responses())
             encoded_content_id = quote(content_id, safe="")
@@ -661,8 +875,10 @@ class DouyinCommentDataCollector:
                         return TimeoutError()
                     try:
                         task.result()
-                    except BaseException as exc:
-                        return exc
+                    except (asyncio.CancelledError, KeyboardInterrupt, SystemExit) as exc:
+                        return type(exc)()
+                    except BaseException:
+                        return RuntimeError("cleanup failed")
                     return None
                 finally:
                     cleanup_steps -= 1
@@ -680,9 +896,12 @@ class DouyinCommentDataCollector:
                     return RuntimeError("resource close unavailable")
                 try:
                     close_result = close()
-                except BaseException as exc:
+                except (asyncio.CancelledError, KeyboardInterrupt, SystemExit) as exc:
                     cleanup_steps -= 1
-                    return exc
+                    return type(exc)()
+                except BaseException:
+                    cleanup_steps -= 1
+                    return RuntimeError("cleanup failed")
                 return await settle_cleanup(close_result)
 
             if page is not None:
@@ -692,8 +911,11 @@ class DouyinCommentDataCollector:
                 if callable(remove_listener):
                     try:
                         removal = remove_listener("response", observe_response)
-                    except BaseException as exc:
-                        cleanup_errors.append(exc)
+                    except (asyncio.CancelledError, KeyboardInterrupt, SystemExit) as exc:
+                        cleanup_errors.append(type(exc)())
+                        cleanup_steps -= 1
+                    except BaseException:
+                        cleanup_errors.append(RuntimeError("listener removal failed"))
                         cleanup_steps -= 1
                     else:
                         if hasattr(removal, "__await__"):
@@ -719,7 +941,7 @@ class DouyinCommentDataCollector:
                     future_error,
                     (asyncio.CancelledError, KeyboardInterrupt, SystemExit),
                 ):
-                    cleanup_errors.append(future_error)
+                    cleanup_errors.append(type(future_error)())
             cleanup_steps -= 1
 
             worker_cancelled = False
@@ -751,8 +973,27 @@ class DouyinCommentDataCollector:
                 )
                 if operation_error is not None:
                     cleanup_errors.append(operation_error)
+                else:
+                    for task in pending_operations:
+                        owner = operation_tasks.pop(task, "")
+                        try:
+                            late_value = task.result()
+                        except asyncio.CancelledError:
+                            continue
+                        except (KeyboardInterrupt, SystemExit) as exc:
+                            cleanup_errors.append(type(exc)())
+                        except BaseException:
+                            cleanup_errors.append(RuntimeError("operation failed"))
+                        else:
+                            if owner:
+                                owned_resources[owner] = late_value
             else:
                 cleanup_steps -= 1
+
+            page = owned_resources.get("page", page)
+            context = owned_resources.get("context", context)
+            browser = owned_resources.get("browser", browser)
+            playwright = owned_resources.get("playwright", playwright)
 
             for resource in (page, context, browser, playwright):
                 close_error = await close_bounded(resource)
@@ -763,87 +1004,89 @@ class DouyinCommentDataCollector:
             closed=not cleanup_errors,
             alive_resource_count=len(cleanup_errors),
         )
-        if isinstance(caught, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
-            raise caught
+        caught_control = _control_kind(caught) if caught is not None else ""
+        cleanup_control = ""
         for cleanup_error in cleanup_errors:
-            if isinstance(
-                cleanup_error,
-                (asyncio.CancelledError, KeyboardInterrupt, SystemExit),
-            ):
-                raise cleanup_error
+            cleanup_control = _control_kind(cleanup_error)
+            if cleanup_control:
+                break
+
+        def failed_outcome(
+            error_code: str,
+            *,
+            retryable: bool = False,
+        ) -> _CollectionOutcome:
+            _emit_report(
+                report,
+                _report_payload(
+                    status="failed",
+                    error_code=error_code,
+                    accepted_count=0,
+                    rejected_count=rejected_count,
+                    page_count=page_count,
+                    stop_reason="",
+                    cleanup=cleanup,
+                ),
+                total_deadline,
+            )
+            return _CollectionOutcome(
+                batch=None,
+                error_code=error_code,
+                retryable=retryable,
+                control_kind="",
+                cleanup_receipt=cleanup,
+            )
+
+        if caught_control or cleanup_control:
+            control_kind = caught_control or cleanup_control
+            caught = None
+            cleanup_errors.clear()
+            return _CollectionOutcome(
+                batch=None,
+                error_code="",
+                retryable=False,
+                control_kind=control_kind,
+                cleanup_receipt=cleanup,
+            )
         if cleanup_errors:
-            failure = _failure_with_cleanup(
-                "comment_sync_cancelled", cleanup
-            )
-            _emit_report(
-                report,
-                _report_payload(
-                    status="failed",
-                    error_code=failure.error_code,
-                    accepted_count=0,
-                    rejected_count=rejected_count,
-                    page_count=page_count,
-                    stop_reason="",
-                    cleanup=cleanup,
-                ),
-                total_deadline,
-            )
-            raise failure from None
+            caught = None
+            cleanup_errors.clear()
+            return failed_outcome("comment_sync_cancelled")
         if isinstance(caught, TimeoutError):
-            failure = _failure_with_cleanup(
-                "comment_sync_timeout", cleanup, retryable=True
-            )
-            _emit_report(
-                report,
-                _report_payload(
-                    status="failed",
-                    error_code=failure.error_code,
-                    accepted_count=0,
-                    rejected_count=rejected_count,
-                    page_count=page_count,
-                    stop_reason="",
-                    cleanup=cleanup,
-                ),
-                total_deadline,
-            )
-            raise failure from None
+            caught = None
+            return failed_outcome("comment_sync_timeout", retryable=True)
         if isinstance(caught, CommentInsightFailure):
-            caught.cleanup_receipt = cleanup
-            _emit_report(
-                report,
-                _report_payload(
-                    status="failed",
-                    error_code=caught.error_code,
-                    accepted_count=0,
-                    rejected_count=rejected_count,
-                    page_count=page_count,
-                    stop_reason="",
-                    cleanup=cleanup,
-                ),
-                total_deadline,
-            )
-            raise caught from None
+            error_code = caught.error_code
+            caught = None
+            return failed_outcome(error_code)
         if caught is not None:
-            failure = _failure_with_cleanup("comment_payload_invalid", cleanup)
-            _emit_report(
-                report,
-                _report_payload(
-                    status="failed",
-                    error_code=failure.error_code,
-                    accepted_count=0,
-                    rejected_count=rejected_count,
-                    page_count=page_count,
-                    stop_reason="",
-                    cleanup=cleanup,
-                ),
-                total_deadline,
-            )
-            raise failure from None
+            caught = None
+            return failed_outcome("comment_payload_invalid")
         if result is None:
-            raise _failure_with_cleanup(
-                "comment_sync_timeout", cleanup, retryable=True
-            ) from None
-        comments, rejected_count, page_count, stop_reason, warning_code = result
+            return failed_outcome("comment_sync_timeout", retryable=True)
+        result_kind = result[0]
+        if result_kind == "control":
+            return _CollectionOutcome(
+                batch=None,
+                error_code="",
+                retryable=False,
+                control_kind=str(result[1]),
+                cleanup_receipt=cleanup,
+            )
+        if result_kind == "timeout":
+            return failed_outcome("comment_sync_timeout", retryable=True)
+        if result_kind == "failure":
+            return failed_outcome(str(result[1]))
+        if result_kind != "success" or len(result) != 6:
+            return failed_outcome("comment_payload_invalid")
+        (
+            _status,
+            comments,
+            rejected_count,
+            page_count,
+            stop_reason,
+            warning_code,
+        ) = result
         batch = CommentCollectionBatch(
             platform_type=3,
             source_mode="browser_signed",
@@ -870,10 +1113,16 @@ class DouyinCommentDataCollector:
             ),
             total_deadline,
         )
-        return batch
+        return _CollectionOutcome(
+            batch=batch,
+            error_code="",
+            retryable=False,
+            control_kind="",
+            cleanup_receipt=cleanup,
+        )
 
     @staticmethod
-    def _run_short_lived(coroutine) -> CommentCollectionBatch:
+    def _run_short_lived(coroutine) -> _CollectionOutcome:
         """不用 asyncio.run，避免退出时无界等待抗取消任务。"""
 
         loop = asyncio.new_event_loop()
@@ -920,23 +1169,66 @@ class DouyinCommentDataCollector:
         limit: int = 100,
         report=None,
     ) -> CommentCollectionBatch:
-        account_id, state_path, content_id, known_keys, limit = _required_inputs(
-            account, content_id, known_keys, limit, report
-        )
+        early_error = ""
+        early_control = ""
+        account_id = 0
+        state_path: Path | None = None
+        try:
+            account_id, state_path, content_id, known_keys, limit = _required_inputs(
+                account, content_id, known_keys, limit, report
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit) as exc:
+            early_control = _control_kind(exc)
+        except CommentInsightFailure as exc:
+            early_error = exc.error_code
+        except BaseException:
+            early_error = "comment_payload_invalid"
+        account = None
+        if early_control:
+            report = None
+            _raise_fresh_control(early_control)
+        if early_error:
+            report = None
+            _raise_fresh_failure(early_error)
+
+        contract: DouyinCommentContract | None = None
         try:
             contract = _required_contract(self._contract_loader())
-        except CommentInsightFailure:
-            raise
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit) as exc:
+            early_control = _control_kind(exc)
+        except CommentInsightFailure as exc:
+            early_error = exc.error_code
         except BaseException:
-            raise CommentInsightFailure("comment_content_unavailable") from None
+            early_error = "comment_content_unavailable"
+        if early_control:
+            report = None
+            contract = None
+            _raise_fresh_control(early_control)
+        if early_error:
+            report = None
+            contract = None
+            _raise_fresh_failure(early_error)
+
+        observed_at = ""
         try:
             observed_at = self._observed_at_factory()
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit) as exc:
+            early_control = _control_kind(exc)
         except BaseException:
-            _invalid()
+            early_error = "comment_payload_invalid"
+        if early_control:
+            report = None
+            contract = None
+            state_path = None
+            _raise_fresh_control(early_control)
+        if early_error:
+            report = None
+            contract = None
+            state_path = None
+            _raise_fresh_failure(early_error)
+
+        assert state_path is not None
+        assert contract is not None
         total_deadline = time.monotonic() + self._total_timeout_seconds
         coroutine = self._collect_async(
             account_id=account_id,
@@ -949,11 +1241,29 @@ class DouyinCommentDataCollector:
             report=report,
             total_deadline=total_deadline,
         )
+        outcome: _CollectionOutcome | None = None
+        unexpected_error = False
+        unexpected_control = ""
         try:
-            return self._run_short_lived(coroutine)
-        except CommentInsightFailure:
-            raise
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
+            outcome = self._run_short_lived(coroutine)
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit) as exc:
+            unexpected_control = _control_kind(exc)
         except BaseException:
-            raise CommentInsightFailure("comment_payload_invalid") from None
+            unexpected_error = True
+        coroutine = None
+        contract = None
+        state_path = None
+        report = None
+        if unexpected_control:
+            _raise_fresh_control(unexpected_control)
+        if unexpected_error or outcome is None:
+            _raise_fresh_failure("comment_payload_invalid")
+        if outcome.control_kind:
+            _raise_fresh_control(outcome.control_kind)
+        if outcome.batch is not None:
+            return outcome.batch
+        _raise_fresh_failure(
+            outcome.error_code or "comment_payload_invalid",
+            retryable=outcome.retryable,
+            cleanup=outcome.cleanup_receipt,
+        )

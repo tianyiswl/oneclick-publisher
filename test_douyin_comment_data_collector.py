@@ -108,6 +108,39 @@ def comment_payload(
     }
 
 
+def production_exception_artifacts(error: BaseException) -> tuple[str, tuple[object, ...]]:
+    """只检查生产采集器 traceback，避免把测试自己的 fixture 当成泄漏。"""
+
+    encoded: list[str] = []
+    values: list[object] = []
+    pending = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        encoded.append(repr(current.args))
+        traceback = current.__traceback__
+        while traceback is not None:
+            frame = traceback.tb_frame
+            if frame.f_code.co_filename.endswith(
+                "app_core/douyin_comment_data_collector.py"
+            ):
+                for value in frame.f_locals.values():
+                    values.append(value)
+                    try:
+                        encoded.append(repr(value))
+                    except BaseException:
+                        encoded.append("<repr-failed>")
+            traceback = traceback.tb_next
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+    return "\n".join(encoded), tuple(values)
+
+
 class DouyinCommentParserTests(unittest.TestCase):
     def test_parser_hashes_id_discards_author_and_keeps_only_top_level(self) -> None:
         """保留平台 ID、作者对象或子回复任一项都会泄露越界数据。"""
@@ -147,8 +180,8 @@ class DouyinCommentParserTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, encoded)
 
-    def test_malformed_rows_are_rejected_individually_and_content_is_isolated(self) -> None:
-        """一条坏记录不能污染好记录，其他作品的评论也不能混入。"""
+    def test_malformed_rows_are_rejected_individually(self) -> None:
+        """一条普通坏记录不能污染同页好记录。"""
 
         page = parse_comment_page(
             verified_contract(),
@@ -156,7 +189,6 @@ class DouyinCommentParserTests(unittest.TestCase):
                 comment_row("good"),
                 comment_row("bad-like", like_count=-1),
                 comment_row("bad-bool", reply_count=True),
-                comment_row("other-work", content_id="work-8"),
             ),
             account_id=12,
             content_id="work-7",
@@ -323,6 +355,7 @@ class FakePage:
         self.close_error = close_error
         self.close_resists_cancellation = close_resists_cancellation
         self.listeners: dict[str, object] = {}
+        self.listener_history: list[object] = []
         self.listener_removals = 0
         self.goto_calls: list[tuple[str, str, float]] = []
         self.locator_calls: list[str] = []
@@ -332,6 +365,7 @@ class FakePage:
 
     def on(self, event: str, callback) -> None:
         self.listeners[event] = callback
+        self.listener_history.append(callback)
 
     def remove_listener(self, event: str, callback) -> None:
         if self.listeners.get(event) is callback:
@@ -390,12 +424,14 @@ class FakeContext:
         *,
         page_delay: float = 0.0,
         page_error: BaseException | None = None,
+        page_after_cancel_delay: float | None = None,
         close_delay: float = 0.0,
         close_error: BaseException | None = None,
     ) -> None:
         self.page = page
         self.page_delay = page_delay
         self.page_error = page_error
+        self.page_after_cancel_delay = page_after_cancel_delay
         self.close_delay = close_delay
         self.close_error = close_error
         self.storage_states: list[str] = []
@@ -403,7 +439,12 @@ class FakeContext:
 
     async def new_page(self) -> FakePage:
         if self.page_delay:
-            await asyncio.sleep(self.page_delay)
+            try:
+                await asyncio.sleep(self.page_delay)
+            except asyncio.CancelledError:
+                if self.page_after_cancel_delay is None:
+                    raise
+                await asyncio.sleep(self.page_after_cancel_delay)
         if self.page_error is not None:
             raise self.page_error
         return self.page
@@ -423,12 +464,14 @@ class FakeBrowser:
         *,
         context_delay: float = 0.0,
         context_error: BaseException | None = None,
+        context_after_cancel_delay: float | None = None,
         close_delay: float = 0.0,
         close_error: BaseException | None = None,
     ) -> None:
         self.context = context
         self.context_delay = context_delay
         self.context_error = context_error
+        self.context_after_cancel_delay = context_after_cancel_delay
         self.close_delay = close_delay
         self.close_error = close_error
         self.closed = 0
@@ -436,7 +479,12 @@ class FakeBrowser:
     async def new_context(self, *, storage_state: str) -> FakeContext:
         self.context.storage_states.append(storage_state)
         if self.context_delay:
-            await asyncio.sleep(self.context_delay)
+            try:
+                await asyncio.sleep(self.context_delay)
+            except asyncio.CancelledError:
+                if self.context_after_cancel_delay is None:
+                    raise
+                await asyncio.sleep(self.context_after_cancel_delay)
         if self.context_error is not None:
             raise self.context_error
         return self.context
@@ -456,16 +504,23 @@ class FakeChromium:
         *,
         launch_delay: float = 0.0,
         launch_error: BaseException | None = None,
+        launch_after_cancel_delay: float | None = None,
     ) -> None:
         self.browser = browser
         self.launch_delay = launch_delay
         self.launch_error = launch_error
+        self.launch_after_cancel_delay = launch_after_cancel_delay
         self.launch_calls: list[dict] = []
 
     async def launch(self, **options) -> FakeBrowser:
         self.launch_calls.append(dict(options))
         if self.launch_delay:
-            await asyncio.sleep(self.launch_delay)
+            try:
+                await asyncio.sleep(self.launch_delay)
+            except asyncio.CancelledError:
+                if self.launch_after_cancel_delay is None:
+                    raise
+                await asyncio.sleep(self.launch_after_cancel_delay)
         if self.launch_error is not None:
             raise self.launch_error
         return self.browser
@@ -478,6 +533,7 @@ class FakePlaywright:
         *,
         launch_delay: float = 0.0,
         launch_error: BaseException | None = None,
+        launch_after_cancel_delay: float | None = None,
         stop_delay: float = 0.0,
         stop_error: BaseException | None = None,
     ) -> None:
@@ -485,6 +541,7 @@ class FakePlaywright:
             browser,
             launch_delay=launch_delay,
             launch_error=launch_error,
+            launch_after_cancel_delay=launch_after_cancel_delay,
         )
         self.stop_delay = stop_delay
         self.stop_error = stop_error
@@ -505,14 +562,21 @@ class FakeStarter:
         *,
         start_delay: float = 0.0,
         start_error: BaseException | None = None,
+        start_after_cancel_delay: float | None = None,
     ) -> None:
         self.playwright = playwright
         self.start_delay = start_delay
         self.start_error = start_error
+        self.start_after_cancel_delay = start_after_cancel_delay
 
     async def start(self) -> FakePlaywright:
         if self.start_delay:
-            await asyncio.sleep(self.start_delay)
+            try:
+                await asyncio.sleep(self.start_delay)
+            except asyncio.CancelledError:
+                if self.start_after_cancel_delay is None:
+                    raise
+                await asyncio.sleep(self.start_after_cancel_delay)
         if self.start_error is not None:
             raise self.start_error
         return self.playwright
@@ -727,6 +791,71 @@ class DouyinCommentCollectorTests(unittest.TestCase):
         self.assertEqual(second.json_calls, 0)
         self._assert_closed(page, context, browser, playwright)
 
+    def test_non_2xx_exact_contract_responses_fail_before_reading_json(self) -> None:
+        """精确接口的重定向或失败状态不能被当成成功评论页。"""
+
+        cases = (
+            (301, "comment_payload_invalid"),
+            (400, "comment_payload_invalid"),
+            (401, "comment_login_required"),
+            (403, "comment_access_denied"),
+            (404, "comment_payload_invalid"),
+            (500, "comment_payload_invalid"),
+        )
+        for status, expected_code in cases:
+            with self.subTest(status=status):
+                response = FakeResponse(
+                    comment_payload(comment_row(f"status-{status}")),
+                    status=status,
+                )
+                starter, page, context, browser, playwright = self._harness(
+                    ((response,),)
+                )
+
+                with self.assertRaises(CommentInsightFailure) as raised:
+                    self._collector(starter).collect(
+                        self.account, "work-7", frozenset()
+                    )
+
+                self.assertEqual(raised.exception.error_code, expected_code)
+                self.assertEqual(response.json_calls, 0)
+                self._assert_closed(page, context, browser, playwright)
+
+    def test_wrong_or_mixed_content_rows_fail_the_entire_page(self) -> None:
+        """任一作品归属不符都必须丢弃整页，不能只计作普通坏行。"""
+
+        payloads = (
+            comment_payload(comment_row("wrong-only", content_id="work-8")),
+            comment_payload(
+                comment_row("right", content_id="work-7"),
+                comment_row("wrong-mixed", content_id="work-8"),
+            ),
+            comment_payload(
+                comment_row("right-before-nested"),
+                comment_row(
+                    "wrong-nested",
+                    content_id="work-8",
+                    parent_id="parent",
+                ),
+            ),
+        )
+        for payload in payloads:
+            with self.subTest(row_count=len(payload["data"]["comments"])):
+                response = FakeResponse(payload)
+                starter, page, context, browser, playwright = self._harness(
+                    ((response,),)
+                )
+
+                with self.assertRaises(CommentInsightFailure) as raised:
+                    self._collector(starter).collect(
+                        self.account, "work-7", frozenset()
+                    )
+
+                self.assertEqual(
+                    raised.exception.error_code, "comment_payload_invalid"
+                )
+                self._assert_closed(page, context, browser, playwright)
+
     def test_verified_ui_pagination_dedupes_repeated_rows_and_reaches_end(self) -> None:
         """翻页必须仅用合同里的 UI 动作，重复评论在批次中只出现一次。"""
 
@@ -790,6 +919,29 @@ class DouyinCommentCollectorTests(unittest.TestCase):
         self.assertEqual(after_limit.json_calls, 0)
         self._assert_closed(page, context, browser, playwright)
 
+    def test_exact_100_on_verified_terminal_page_reports_platform_end(self) -> None:
+        """终页正好 100 条时，平台已结束必须优先于硬上限警告。"""
+
+        response = FakeResponse(
+            comment_payload(
+                *(comment_row(f"terminal-{index}") for index in range(100))
+            )
+        )
+        starter, page, context, browser, playwright = self._harness(
+            ((response,),)
+        )
+
+        batch = self._collector(starter).collect(
+            self.account, "work-7", frozenset(), limit=100
+        )
+
+        self.assertEqual(batch.accepted_count, 100)
+        self.assertEqual(batch.stop_reason, "platform_end")
+        self.assertEqual(batch.warning_code, "")
+        self.assertEqual(batch.page_count, 1)
+        self.assertEqual(page.trigger_calls, [])
+        self._assert_closed(page, context, browser, playwright)
+
     def test_lower_safe_limit_is_internal_truncation_not_hard_limit_warning(self) -> None:
         """小批量测试不能伪报已触发“100 条”硬上限警告。"""
 
@@ -820,7 +972,6 @@ class DouyinCommentCollectorTests(unittest.TestCase):
             comment_payload(
                 comment_row("good"),
                 comment_row("bad-like", like_count=-1),
-                comment_row("bad-content", content_id="work-8"),
                 comment_row("nested", parent_id="parent"),
             )
         )
@@ -831,7 +982,7 @@ class DouyinCommentCollectorTests(unittest.TestCase):
         )
 
         self.assertEqual(batch.accepted_count, 1)
-        self.assertEqual(batch.rejected_count, 2)
+        self.assertEqual(batch.rejected_count, 1)
         self.assertEqual(batch.stop_reason, "platform_end")
         self._assert_closed(page, context, browser, playwright)
 
@@ -1048,6 +1199,184 @@ class DouyinCommentCollectorTests(unittest.TestCase):
         self.assertNotIn(str(self.state_file), encoded)
         self.assertNotIn("private cleanup", encoded)
 
+    def test_report_delivery_reuses_one_worker_and_drops_while_blocked(self) -> None:
+        """报告回调不得每次新建线程，阻塞时也不得积压旧回调。"""
+
+        report_workers: list[threading.Thread] = []
+
+        def record_report(_payload: dict) -> None:
+            report_workers.append(threading.current_thread())
+
+        for index in range(3):
+            response = FakeResponse(
+                comment_payload(comment_row(f"report-{index}"))
+            )
+            starter, page, context, browser, playwright = self._harness(
+                ((response,),)
+            )
+            batch = self._collector(starter).collect(
+                self.account,
+                "work-7",
+                frozenset(),
+                report=record_report,
+            )
+            self.assertTrue(batch.cleanup_receipt.closed)
+            self._assert_closed(page, context, browser, playwright)
+
+        blocker = threading.Event()
+        blocked_started = threading.Event()
+        blocked_calls = 0
+
+        def blocked_report(_payload: dict) -> None:
+            nonlocal blocked_calls
+            report_workers.append(threading.current_thread())
+            blocked_calls += 1
+            blocked_started.set()
+            blocker.wait()
+
+        first_response = FakeResponse(
+            comment_payload(comment_row("report-blocked"))
+        )
+        first_starter, first_page, first_context, first_browser, first_playwright = (
+            self._harness(((first_response,),))
+        )
+        blocked_outcome: dict[str, object] = {}
+
+        def run_blocked() -> None:
+            blocked_outcome["batch"] = self._collector(
+                first_starter, timeout=0.2
+            ).collect(
+                self.account,
+                "work-7",
+                frozenset(),
+                report=blocked_report,
+            )
+
+        caller = threading.Thread(target=run_blocked, daemon=True)
+        caller.start()
+        self.assertTrue(blocked_started.wait(0.1))
+
+        for index in range(4):
+            response = FakeResponse(
+                comment_payload(comment_row(f"report-dropped-{index}"))
+            )
+            starter, page, context, browser, playwright = self._harness(
+                ((response,),)
+            )
+            batch = self._collector(starter).collect(
+                self.account,
+                "work-7",
+                frozenset(),
+                report=blocked_report,
+            )
+            self.assertTrue(batch.cleanup_receipt.closed)
+            self._assert_closed(page, context, browser, playwright)
+
+        self.assertEqual(blocked_calls, 1)
+        self.assertLessEqual(
+            sum(
+                item.name == "douyin-comment-report"
+                for item in threading.enumerate()
+            ),
+            1,
+        )
+        blocker.set()
+        caller.join(0.3)
+        self.assertFalse(caller.is_alive())
+        self.assertTrue(blocked_outcome["batch"].cleanup_receipt.closed)
+        self._assert_closed(
+            first_page, first_context, first_browser, first_playwright
+        )
+        self.assertEqual(len({id(item) for item in report_workers}), 1)
+
+    def test_fixed_failure_traceback_does_not_retain_raw_response_or_row(self) -> None:
+        """固定错误的 traceback 不得持有评论 ID、正文、作者或响应对象。"""
+
+        first = comment_row(
+            "raw-secret-id",
+            body="raw-secret-body",
+            author={"uid": "raw-secret-uid", "nickname": "raw-secret-name"},
+            like_count=1,
+        )
+        second = dict(first)
+        second["like_count"] = 2
+        payload = comment_payload(first, second)
+        response = FakeResponse(payload)
+        starter, page, context, browser, playwright = self._harness(((response,),))
+
+        with self.assertRaises(CommentInsightFailure) as raised:
+            self._collector(starter).collect(
+                self.account, "work-7", frozenset()
+            )
+
+        encoded, values = production_exception_artifacts(raised.exception)
+        self.assertEqual(raised.exception.error_code, "comment_payload_invalid")
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
+        for forbidden in (
+            "raw-secret-id",
+            "raw-secret-body",
+            "raw-secret-uid",
+            "raw-secret-name",
+        ):
+            self.assertNotIn(forbidden, encoded)
+        self.assertNotIn(response, values)
+        self.assertNotIn(payload, values)
+        self.assertNotIn(first, values)
+        self._assert_closed(page, context, browser, playwright)
+
+    def test_response_process_control_is_recreated_without_raw_values(self) -> None:
+        """响应中的进程控制异常只保留类型，不保留平台原始消息。"""
+
+        for exception_type in (
+            asyncio.CancelledError,
+            KeyboardInterrupt,
+            SystemExit,
+        ):
+            with self.subTest(exception=exception_type.__name__):
+                response = FakeResponse(
+                    comment_payload(comment_row()),
+                    error=exception_type("raw-control-secret"),
+                )
+                starter, page, context, browser, playwright = self._harness(
+                    ((response,),)
+                )
+
+                with self.assertRaises(exception_type) as raised:
+                    self._collector(starter).collect(
+                        self.account, "work-7", frozenset()
+                    )
+
+                encoded, values = production_exception_artifacts(
+                    raised.exception
+                )
+                self.assertNotIn("raw-control-secret", encoded)
+                self.assertEqual(raised.exception.args, ())
+                self.assertNotIn(response, values)
+                self.assertIsNone(raised.exception.__cause__)
+                self.assertIsNone(raised.exception.__context__)
+                self._assert_closed(page, context, browser, playwright)
+
+    def test_cleanup_process_control_is_recreated_without_raw_values(self) -> None:
+        """清理阶段的控制异常也不得带出底层消息。"""
+
+        response = FakeResponse(comment_payload(comment_row()))
+        starter, page, context, browser, playwright = self._harness(((response,),))
+        page.close_error = KeyboardInterrupt("raw-cleanup-control")
+
+        with self.assertRaises(KeyboardInterrupt) as raised:
+            self._collector(starter).collect(
+                self.account, "work-7", frozenset()
+            )
+
+        encoded, values = production_exception_artifacts(raised.exception)
+        self.assertNotIn("raw-cleanup-control", encoded)
+        self.assertEqual(raised.exception.args, ())
+        self.assertNotIn(response, values)
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
+        self._assert_closed(page, context, browser, playwright)
+
     def test_total_deadline_bounds_start_through_all_four_closes(self) -> None:
         """各启动阶段和四层关闭必须共用一个总时限，不得分别重置。"""
 
@@ -1092,6 +1421,168 @@ class DouyinCommentCollectorTests(unittest.TestCase):
         self.assertEqual(raised.exception.error_code, "comment_sync_cancelled")
         self.assertLess(elapsed, 0.08)
         self._assert_closed(page, context, browser, playwright)
+
+    def test_cpu_heavy_50000_row_payload_obeys_total_deadline(self) -> None:
+        """5 万行载荷不得在同步解析里越过总墙钟时限。"""
+
+        rows = [
+            comment_row(
+                f"raw-heavy-{index}",
+                parent_id="nested-parent",
+                author={
+                    "uid": f"raw-heavy-uid-{index}",
+                    "nickname": "raw-heavy-name",
+                },
+            )
+            for index in range(50_000)
+        ]
+        payload = comment_payload(
+            *rows,
+            cursor="heavy-cursor",
+            has_more=True,
+        )
+        response = FakeResponse(payload)
+        starter, page, context, browser, playwright = self._harness(((response,),))
+        collector = self._collector(starter, timeout=0.001)
+
+        outcome, elapsed, diagnostics, still_running = self._run_with_wall_limit(
+            lambda: collector.collect(self.account, "work-7", frozenset()),
+            wall_limit=0.12,
+        )
+
+        self.assertFalse(still_running)
+        self.assertLess(elapsed, 0.12)
+        error = outcome["error"]
+        self.assertIsInstance(error, CommentInsightFailure)
+        self.assertIn(
+            error.error_code,
+            {"comment_sync_timeout", "comment_payload_invalid"},
+        )
+        self.assertNotIn("raw-heavy", diagnostics)
+        self._assert_closed(page, context, browser, playwright)
+
+    def test_matching_response_flood_hits_bounded_queue_without_backlog(self) -> None:
+        """大量精确匹配响应不得在内存中形成无界原始响应队列。"""
+
+        responses = tuple(
+            FakeResponse(
+                comment_payload(comment_row(f"flood-{index}")),
+                delay=0.03,
+            )
+            for index in range(200)
+        )
+        starter, page, context, browser, playwright = self._harness(
+            (responses,)
+        )
+        collector = self._collector(starter, timeout=0.05)
+
+        outcome, elapsed, diagnostics, still_running = self._run_with_wall_limit(
+            lambda: collector.collect(self.account, "work-7", frozenset()),
+            wall_limit=0.18,
+        )
+
+        self.assertFalse(still_running)
+        self.assertLess(elapsed, 0.18)
+        error = outcome["error"]
+        self.assertIsInstance(error, CommentInsightFailure)
+        self.assertEqual(error.error_code, "comment_payload_invalid")
+        self.assertLessEqual(sum(item.json_calls for item in responses), 1)
+        self.assertNotIn("flood-199", diagnostics)
+        self._assert_closed(page, context, browser, playwright)
+
+    def _assert_late_creation_is_owned(self, stage: str) -> None:
+        starter, page, context, browser, playwright = self._harness(())
+        if stage == "playwright":
+            starter.start_delay = 0.04
+            starter.start_after_cancel_delay = 0.001
+        elif stage == "browser":
+            playwright.chromium.launch_delay = 0.04
+            playwright.chromium.launch_after_cancel_delay = 0.001
+        elif stage == "context":
+            browser.context_delay = 0.04
+            browser.context_after_cancel_delay = 0.001
+        else:
+            context.page_delay = 0.04
+            context.page_after_cancel_delay = 0.001
+        collector = self._collector(starter, timeout=0.04)
+
+        with self.assertRaises(CommentInsightFailure) as raised:
+            collector.collect(self.account, "work-7", frozenset())
+
+        self.assertEqual(raised.exception.error_code, "comment_sync_timeout")
+        self.assertTrue(raised.exception.cleanup_receipt.closed)
+        expected = {
+            "playwright": (0, 0, 0, 1),
+            "browser": (0, 0, 1, 1),
+            "context": (0, 1, 1, 1),
+            "page": (1, 1, 1, 1),
+        }[stage]
+        self.assertEqual(
+            (page.closed, context.closed, browser.closed, playwright.stopped),
+            expected,
+        )
+
+    def test_late_playwright_start_result_is_owned_and_stopped(self) -> None:
+        """启动吞掉取消后返回的 Playwright 仍属于本次调用。"""
+
+        self._assert_late_creation_is_owned("playwright")
+
+    def test_creation_result_settled_before_cleanup_is_still_owned(self) -> None:
+        """创建任务在清理扫描前完成时，结果也不得丢失。"""
+
+        starter, page, context, browser, playwright = self._harness(())
+        starter.start_delay = 0.04
+        starter.start_after_cancel_delay = 0.0
+
+        with self.assertRaises(CommentInsightFailure) as raised:
+            self._collector(starter, timeout=0.04).collect(
+                self.account, "work-7", frozenset()
+            )
+
+        self.assertEqual(raised.exception.error_code, "comment_sync_timeout")
+        self.assertTrue(raised.exception.cleanup_receipt.closed)
+        self.assertEqual(playwright.stopped, 1)
+        self.assertEqual(
+            (page.closed, context.closed, browser.closed),
+            (0, 0, 0),
+        )
+
+    def test_late_browser_launch_result_is_owned_and_closed(self) -> None:
+        """启动浏览器超时后晚到的 browser 不能变成无主资源。"""
+
+        self._assert_late_creation_is_owned("browser")
+
+    def test_late_context_creation_result_is_owned_and_closed(self) -> None:
+        """建上下文超时后晚到的 context 必须继续关闭。"""
+
+        self._assert_late_creation_is_owned("context")
+
+    def test_late_page_creation_result_is_owned_and_closed(self) -> None:
+        """建页面超时后晚到的 page 必须继续关闭。"""
+
+        self._assert_late_creation_is_owned("page")
+
+    def test_unresolved_resource_creation_reports_nonzero_alive_receipt(self) -> None:
+        """总时限内仍未解决的资源创建任务不得报 closed=true。"""
+
+        starter, page, context, browser, playwright = self._harness(())
+        starter.start_delay = 0.04
+        starter.start_after_cancel_delay = 0.2
+        collector = self._collector(starter, timeout=0.04)
+
+        outcome, elapsed, diagnostics, still_running = self._run_with_wall_limit(
+            lambda: collector.collect(self.account, "work-7", frozenset())
+        )
+
+        self.assertFalse(still_running)
+        self.assertLess(elapsed, 0.18)
+        error = outcome["error"]
+        self.assertIsInstance(error, CommentInsightFailure)
+        self.assertEqual(error.error_code, "comment_sync_cancelled")
+        self.assertFalse(error.cleanup_receipt.closed)
+        self.assertGreater(error.cleanup_receipt.alive_resource_count, 0)
+        self.assertEqual(playwright.stopped, 0)
+        self.assertEqual(diagnostics, "")
 
     def test_cancellation_resistant_close_and_worker_cannot_hang_or_leak(self) -> None:
         """第三方协程吞掉取消时，公开入口仍须有界且不累积线程或警告。"""
@@ -1216,6 +1707,66 @@ class DouyinCommentCollectorTests(unittest.TestCase):
         self.assertEqual(
             results[13].comments[0].comment_key,
             derive_comment_key(13, "work-8", "second"),
+        )
+
+    def test_late_wrong_content_response_from_reused_page_cannot_contaminate_next_call(self) -> None:
+        """同一页面的旧监听响应不得进入下一次作品采集。"""
+
+        first_response = FakeResponse(
+            comment_payload(comment_row("first-work-7"))
+        )
+        starter, page, context, browser, playwright = self._harness(
+            ((first_response,),)
+        )
+        collector = self._collector(starter, timeout=0.2)
+
+        first_batch = collector.collect(
+            self.account, "work-7", frozenset()
+        )
+        old_listener = page.listener_history[0]
+        self.assertEqual(first_batch.content_id, "work-7")
+
+        second_response = FakeResponse(
+            comment_payload(comment_row("second-work-8", content_id="work-8")),
+            delay=0.03,
+        )
+        page.response_pages = ((second_response,),)
+        page.url = (
+            "https://creator.douyin.com/verified/content/work-8/comments"
+        )
+        page.next_page_index = 0
+        outcome: dict[str, object] = {}
+
+        def collect_second() -> None:
+            try:
+                outcome["batch"] = collector.collect(
+                    self.account, "work-8", frozenset()
+                )
+            except BaseException as exc:
+                outcome["error"] = exc
+
+        runner = threading.Thread(target=collect_second, daemon=True)
+        runner.start()
+        deadline = time.monotonic() + 0.1
+        while len(page.listener_history) < 2 and time.monotonic() < deadline:
+            time.sleep(0.001)
+        self.assertEqual(len(page.listener_history), 2)
+
+        late_old_response = FakeResponse(
+            comment_payload(comment_row("late-work-7", content_id="work-7"))
+        )
+        old_listener(late_old_response)
+        runner.join(0.3)
+
+        self.assertFalse(runner.is_alive())
+        self.assertNotIn("error", outcome)
+        second_batch = outcome["batch"]
+        self.assertEqual(second_batch.content_id, "work-8")
+        self.assertEqual(second_batch.accepted_count, 1)
+        self.assertEqual(late_old_response.json_calls, 0)
+        self.assertEqual(
+            (page.closed, context.closed, browser.closed, playwright.stopped),
+            (2, 2, 2, 2),
         )
 
 
