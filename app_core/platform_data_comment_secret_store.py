@@ -7,6 +7,7 @@ import asyncio
 import ctypes as _ctypes
 from ctypes import wintypes as _native_wintypes
 import sys
+import unicodedata
 
 from .platform_data_comment_models import CommentInsightFailure
 
@@ -29,58 +30,27 @@ def _not_configured() -> CommentInsightFailure:
     return CommentInsightFailure("comment_ai_not_configured")
 
 
-def _control_token(error: BaseException) -> str:
+def _control_outcome_value(error: BaseException):
     if isinstance(error, asyncio.CancelledError):
-        return "cancelled"
+        return ("cancelled", None)
     if isinstance(error, KeyboardInterrupt):
-        return "keyboard_interrupt"
-    return "system_exit"
-
-
-def _scrub_exception(error: BaseException) -> None:
-    """Best-effort removal of native failure state from retained exceptions."""
-
-    pending = [error]
-    seen = set()
-    while pending:
-        current = pending.pop()
-        identity = id(current)
-        if identity in seen:
-            continue
-        seen.add(identity)
-        try:
-            cause = current.__cause__
-        except BaseException:
-            cause = None
-        try:
-            context = current.__context__
-        except BaseException:
-            context = None
-        if isinstance(cause, BaseException):
-            pending.append(cause)
-        if isinstance(context, BaseException):
-            pending.append(context)
-        for attribute, value in (
-            ("__traceback__", None),
-            ("__context__", None),
-            ("__cause__", None),
-            ("args", ()),
-        ):
-            try:
-                setattr(current, attribute, value)
-            except BaseException:
-                pass
+        return ("keyboard_interrupt", None)
+    code = error.code if isinstance(error, SystemExit) else None
+    if type(code) is not int or not -2_147_483_648 <= code <= 2_147_483_647:
+        code = 1
+    return ("system_exit", code)
 
 
 def _raise_clean_outcome(outcome) -> None:
     kind, value = outcome
     if kind == _OUTCOME_CONTROL:
-        if value == "cancelled":
+        control, code = value
+        if control == "cancelled":
             error = asyncio.CancelledError()
-        elif value == "keyboard_interrupt":
+        elif control == "keyboard_interrupt":
             error = KeyboardInterrupt()
         else:
-            error = SystemExit()
+            error = SystemExit(code)
     else:
         error = _not_configured()
     error.__traceback__ = None
@@ -95,24 +65,33 @@ def _valid_secret_text(value: object) -> bool:
         and bool(value)
         and bool(value.strip())
         and not any(
-            ord(character) < 32 or ord(character) == 127 for character in value
+            unicodedata.category(character) == "Cc" for character in value
         )
     )
 
 
 def _secret_buffer(value: object) -> bytearray:
-    if not _valid_secret_text(value):
-        raise _not_configured()
+    encoded = None
     try:
-        encoded = bytearray(value, "utf-8")
-    except BaseException as exc:
-        if isinstance(exc, _PROCESS_CONTROL):
+        if not _valid_secret_text(value):
+            raise _not_configured()
+        try:
+            encoded = bytearray(value, "utf-8")
+        except _PROCESS_CONTROL:
             raise
-        raise _not_configured() from None
-    if not encoded or len(encoded) > _MAX_SECRET_BYTES:
-        _zero(encoded)
-        raise _not_configured()
-    return encoded
+        except BaseException:
+            raise _not_configured() from None
+        if not encoded or len(encoded) > _MAX_SECRET_BYTES:
+            _zero(encoded)
+            encoded = None
+            raise _not_configured()
+        result = encoded
+        encoded = None
+        return result
+    finally:
+        value = None
+        if type(encoded) is bytearray:
+            _zero(encoded)
 
 
 def _zero(value: bytearray) -> None:
@@ -144,12 +123,12 @@ class CommentSecretStore:
                 raise _not_configured()
             return (_OUTCOME_OK, value)
         except _PROCESS_CONTROL as error:
-            token = _control_token(error)
-            _scrub_exception(error)
-            return (_OUTCOME_CONTROL, token)
-        except BaseException as error:
-            _scrub_exception(error)
+            return (_OUTCOME_CONTROL, _control_outcome_value(error))
+        except BaseException:
             return (_OUTCOME_FAILURE, None)
+        finally:
+            self = None
+            value = None
 
     def write(self, secret: str) -> None:
         outcome = self._write_outcome(secret)
@@ -171,16 +150,14 @@ class CommentSecretStore:
                 raise _not_configured()
             return (_OUTCOME_OK, None)
         except _PROCESS_CONTROL as error:
-            token = _control_token(error)
-            _scrub_exception(error)
-            return (_OUTCOME_CONTROL, token)
-        except BaseException as error:
-            _scrub_exception(error)
+            return (_OUTCOME_CONTROL, _control_outcome_value(error))
+        except BaseException:
             return (_OUTCOME_FAILURE, None)
         finally:
             secret = None
             if type(mutable) is bytearray:
                 _zero(mutable)
+            self = None
 
     def delete(self) -> None:
         outcome = self._delete_outcome()
@@ -199,12 +176,11 @@ class CommentSecretStore:
                 raise _not_configured()
             return (_OUTCOME_OK, None)
         except _PROCESS_CONTROL as error:
-            token = _control_token(error)
-            _scrub_exception(error)
-            return (_OUTCOME_CONTROL, token)
-        except BaseException as error:
-            _scrub_exception(error)
+            return (_OUTCOME_CONTROL, _control_outcome_value(error))
+        except BaseException:
             return (_OUTCOME_FAILURE, None)
+        finally:
+            self = None
 
     def _mac_libraries(self):
         ctypes = self._ctypes
@@ -285,7 +261,7 @@ class CommentSecretStore:
             if failure is None:
                 failure = error
         if failure is not None and not suppress_errors:
-            raise failure.with_traceback(None)
+            raise failure
 
     def _mac_find(self, security, core, *, read_secret):
         ctypes = self._ctypes

@@ -405,6 +405,30 @@ class CommentServiceTests(unittest.TestCase):
             2,
         )
 
+    def test_real_unconfigured_provider_reaches_analyze_without_network(self):
+        """构造器延迟的未配置结果必须仍通过真实 service seam 记为跳过。"""
+
+        network_calls = []
+        provider = OpenAiCompatibleCommentProvider(
+            settings=CommentAiSettings("https://ai.example.com/v1", "model-x"),
+            secret="bad-secret-\u0085-private",
+            session_factory=lambda: network_calls.append("called"),
+        )
+
+        result = self._sync(
+            FixedCollector(valid_batch()),
+            ai_provider_factory=lambda: provider,
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["aiStatus"], "skipped")
+        self.assertEqual(result["aiErrorCode"], "comment_ai_not_configured")
+        self.assertEqual(network_calls, [])
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM platform_comments").fetchone()[0],
+            2,
+        )
+
     def test_collector_failure_preserves_old_comments_and_records_one_run(self):
         """采集失败不得清空旧评论，也不得暗中重试制造多条失败运行。"""
 

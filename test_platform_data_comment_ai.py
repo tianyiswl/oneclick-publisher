@@ -188,6 +188,65 @@ class RecordingSession:
         self.closed = True
 
 
+class RetainedRequestFailureSession:
+    """Retain the external exception and request carriers for privacy assertions."""
+
+    def __init__(self) -> None:
+        self.closed = False
+        self.trust_env = True
+        self.error = None
+        self.request = None
+        self.response = None
+        self.cause = ValueError("safe-request-cause")
+        self.context = RuntimeError("safe-request-context")
+
+    def post(
+        self,
+        url,
+        *,
+        headers,
+        json,
+        timeout,
+        stream,
+        allow_redirects,
+    ):
+        request = requests.Request(
+            "POST",
+            url,
+            headers=headers,
+            json=json,
+        ).prepare()
+        response_request = requests.Request(
+            "POST",
+            url,
+            headers=headers,
+            json=json,
+        ).prepare()
+        response = requests.Response()
+        response.status_code = 503
+        response.request = response_request
+        response.closed_by_provider = False
+
+        def close_response():
+            response.closed_by_provider = True
+
+        response.close = close_response
+        error = requests.exceptions.ConnectionError(
+            "safe-request-failure",
+            request=request,
+            response=response,
+        )
+        error.__cause__ = self.cause
+        error.__context__ = self.context
+        self.request = request
+        self.response = response
+        self.error = error
+        raise error
+
+    def close(self):
+        self.closed = True
+
+
 class FakeSettings:
     def __init__(self, initial=None) -> None:
         self.values = dict(initial or {})
@@ -526,7 +585,18 @@ class CommentAiSettingsTests(unittest.TestCase):
                 self.assertEqual(raised.exception.error_code, "comment_ai_not_configured")
 
     def test_model_requires_a_bounded_plain_nonempty_string(self):
-        invalid = ("", " ", " model", "model ", "model\n", "x" * 257, 1, True, None)
+        invalid = (
+            "",
+            " ",
+            " model",
+            "model ",
+            "model\n",
+            "model\u0085private",
+            "x" * 257,
+            1,
+            True,
+            None,
+        )
         for value in invalid:
             with self.subTest(value=repr(value)[:80]):
                 with self.assertRaises(CommentInsightFailure) as raised:
@@ -675,6 +745,7 @@ class CommentSecretStoreTests(unittest.TestCase):
             "sk\nprivate",
             "sk\0private",
             "sk\x7fprivate",
+            "sk\u0085private",
             "sk-\ud800",
             "x" * 8193,
             None,
@@ -708,9 +779,11 @@ class CommentSecretStoreTests(unittest.TestCase):
         self.assertNotIn(native_marker, visible)
         self.assertIsNone(caught.__context__)
         self.assertIsNone(caught.__cause__)
-        self.assertIsNone(native_error.__traceback__)
+        self.assertEqual(native_error.args, (native_marker,))
+        self.assertIsNotNone(native_error.__traceback__)
         self.assertIsNone(native_error.__context__)
         self.assertIsNone(native_error.__cause__)
+        self.assertNotIn(secret, exception_trace_text(native_error))
         trace = caught.__traceback__
         while trace is not None:
             if trace.tb_frame.f_code.co_name == "write":
@@ -778,7 +851,11 @@ class CommentSecretStoreTests(unittest.TestCase):
             ("darwin", "mac"),
             ("win32", "windows"),
         ):
-            for secret in (b"bad\0secret", b"bad\x7fsecret"):
+            for secret in (
+                b"bad\0secret",
+                b"bad\x7fsecret",
+                "bad\u0085secret".encode("utf-8"),
+            ):
                 native = FakeCtypes()
                 getattr(native, attribute).secret = secret
                 store = CommentSecretStore(
@@ -835,6 +912,30 @@ class CommentSecretStoreTests(unittest.TestCase):
                 with self.assertRaises(control_type):
                     store.read()
 
+    def test_secret_store_system_exit_preserves_only_safe_integer_code(self):
+        cases = ((37, 37), ("native-system-exit-sensitive", 1))
+        for original_code, expected_code in cases:
+            original = SystemExit(original_code)
+            store = CommentSecretStore(
+                platform_name="darwin",
+                ctypes_module=FakeCtypes(mac_fail=original),
+            )
+            with self.subTest(original_code=repr(original_code)):
+                caught = None
+                try:
+                    store.read()
+                except SystemExit as error:
+                    caught = error
+                self.assertIsNotNone(caught)
+                self.assertEqual(caught.code, expected_code)
+                self.assertEqual(type(caught.code), int)
+                self.assertNotIn(
+                    "native-system-exit-sensitive",
+                    exception_trace_text(caught),
+                )
+                self.assertEqual(original.args, (original_code,))
+                self.assertIsNotNone(original.__traceback__)
+
 
 class CommentAiProviderTests(unittest.TestCase):
     def provider(self, session, *, base_url="https://ai.example.com/v1", secret="sk-private"):
@@ -843,6 +944,82 @@ class CommentAiProviderTests(unittest.TestCase):
             secret=secret,
             session_factory=lambda: session,
         )
+
+    def test_constructor_never_raises_with_secret_in_its_traceback(self):
+        secret = "constructor-secret-private-marker"
+        cases = (
+            (None, secret, lambda: RecordingSession()),
+            (
+                CommentAiSettings("https://ai.example.com/v1", "model-x"),
+                "bad-\ud800-secret",
+                lambda: RecordingSession(),
+            ),
+            (
+                CommentAiSettings("https://ai.example.com/v1", "model-x"),
+                "bad-\u0085-secret",
+                lambda: RecordingSession(),
+            ),
+            (
+                CommentAiSettings("https://ai.example.com/v1", "model-x"),
+                secret,
+                None,
+            ),
+        )
+
+        for settings, candidate_secret, session_factory in cases:
+            with self.subTest(secret=repr(candidate_secret), settings=settings):
+                constructor_error = None
+                provider = None
+                try:
+                    provider = OpenAiCompatibleCommentProvider(
+                        settings=settings,
+                        secret=candidate_secret,
+                        session_factory=session_factory,
+                    )
+                except BaseException as error:
+                    constructor_error = error
+                if constructor_error is not None:
+                    self.assertNotIn(
+                        candidate_secret,
+                        exception_trace_text(constructor_error),
+                    )
+                    self.fail("constructor raised before sensitive arguments were cleared")
+                caught = None
+                try:
+                    provider.analyze("作品标题", (comment(),))
+                except CommentInsightFailure as error:
+                    caught = error
+                self.assertIsNotNone(caught)
+                self.assertEqual(caught.error_code, "comment_ai_not_configured")
+                self.assertNotIn(candidate_secret, exception_trace_text(caught))
+
+    def test_constructor_control_is_deferred_and_rebuilt_without_secret(self):
+        secret = "constructor-control-secret"
+        original = SystemExit(37)
+        settings = CommentAiSettings("https://ai.example.com/v1", "model-x")
+
+        with patch(
+            "app_core.platform_data_comment_ai._provider_secret_buffer",
+            side_effect=original,
+            create=True,
+        ):
+            provider = OpenAiCompatibleCommentProvider(
+                settings=settings,
+                secret=secret,
+                session_factory=lambda: RecordingSession(),
+            )
+
+        caught = None
+        try:
+            provider.analyze("作品标题", (comment(),))
+        except SystemExit as error:
+            caught = error
+        self.assertIsNotNone(caught)
+        self.assertEqual(caught.code, 37)
+        self.assertNotIn(secret, exception_trace_text(caught))
+        self.assertEqual(original.args, (37,))
+        self.assertIsNotNone(original.__traceback__)
+        self.assertNotIn(secret, exception_trace_text(original))
 
     def test_request_contains_only_allowed_comment_data_and_uses_one_post(self):
         session = RecordingSession()
@@ -1047,6 +1224,37 @@ class CommentAiProviderTests(unittest.TestCase):
                     provider.analyze("作品标题", (comment(),))
                 self.assertEqual(raised.exception.error_code, expected)
 
+        reordered = insight_contract(
+            classifications=[
+                {"ref": "C001", "labels": ["追问"]},
+                {"ref": "C002", "labels": ["认同"]},
+            ],
+            candidates=[
+                {
+                    "title": "题目",
+                    "reason": "理由",
+                    "evidenceRefs": ["C001", "C002"],
+                },
+                {
+                    "title": "题目",
+                    "reason": "理由",
+                    "evidenceRefs": ["C002", "C001"],
+                },
+            ],
+        )
+        provider = self.provider(
+            RecordingSession(FakeResponse(response_bytes(reordered)))
+        )
+        with self.assertRaises(CommentInsightFailure) as reordered_raised:
+            provider.analyze(
+                "作品标题",
+                (comment(COMMENT_KEY_A), comment(COMMENT_KEY_B)),
+            )
+        self.assertEqual(
+            reordered_raised.exception.error_code,
+            "comment_ai_response_invalid",
+        )
+
     def test_http_timeout_network_and_json_failures_have_only_fixed_codes(self):
         marker = "private-request-url-secret-response"
         cases = (
@@ -1114,7 +1322,11 @@ class CommentAiProviderTests(unittest.TestCase):
                 self.assertIsNone(caught.__context__)
                 self.assertIsNone(caught.__cause__)
                 if isinstance(session.outcome, BaseException):
-                    self.assertIsNone(session.outcome.__traceback__)
+                    self.assertEqual(
+                        session.outcome.args,
+                        ("network-context-trace-private",),
+                    )
+                    self.assertIsNotNone(session.outcome.__traceback__)
                     self.assertIsNone(session.outcome.__context__)
                     self.assertIsNone(session.outcome.__cause__)
                 trace = caught.__traceback__
@@ -1150,9 +1362,90 @@ class CommentAiProviderTests(unittest.TestCase):
                     self.assertNotIn(forbidden, visible)
                 self.assertIsNone(caught.__context__)
                 self.assertIsNone(caught.__cause__)
-                self.assertIsNone(session.outcome.__traceback__)
+                self.assertEqual(session.outcome.args, (marker,))
+                self.assertIsNotNone(session.outcome.__traceback__)
                 self.assertIsNone(session.outcome.__context__)
                 self.assertIsNone(session.outcome.__cause__)
+
+    def test_system_exit_preserves_safe_integer_and_redacts_sensitive_code(self):
+        cases = ((37, 37), ("system-exit-sensitive-marker", 1))
+        for original_code, expected_code in cases:
+            original = SystemExit(original_code)
+            provider = self.provider(RecordingSession(original))
+            with self.subTest(original_code=repr(original_code)):
+                caught = None
+                try:
+                    provider.analyze("作品标题", (comment(),))
+                except SystemExit as error:
+                    caught = error
+                self.assertIsNotNone(caught)
+                self.assertEqual(caught.code, expected_code)
+                self.assertEqual(type(caught.code), int)
+                self.assertNotIn(
+                    "system-exit-sensitive-marker",
+                    exception_trace_text(caught),
+                )
+                self.assertEqual(original.args, (original_code,))
+                self.assertIsNotNone(original.__traceback__)
+
+    def test_external_request_exception_keeps_its_chain_but_loses_owned_request_data(self):
+        secret = "retained-request-secret"
+        title = "retained-request-title"
+        body = "retained-request-body"
+        session = RetainedRequestFailureSession()
+        provider = self.provider(session, secret=secret)
+
+        caught = None
+        try:
+            provider.analyze(title, (comment(body=body),))
+        except CommentInsightFailure as error:
+            caught = error
+
+        self.assertIsNotNone(caught)
+        self.assertEqual(caught.error_code, "comment_ai_service_unavailable")
+        self.assertEqual(session.error.args, ("safe-request-failure",))
+        self.assertIsNotNone(session.error.__traceback__)
+        self.assertIs(session.error.__context__, session.context)
+        self.assertIs(session.error.__cause__, session.cause)
+        for request in (session.error.request, session.response.request):
+            self.assertNotIn("Authorization", request.headers)
+            self.assertNotIn("Proxy-Authorization", request.headers)
+            self.assertIn(request.body, (None, b"", ""))
+        self.assertTrue(session.closed)
+        self.assertTrue(session.response.closed_by_provider)
+        visible_public = exception_trace_text(caught)
+        visible_external = exception_trace_text(session.error)
+        for forbidden in (secret, title, body):
+            self.assertNotIn(forbidden, visible_public)
+            self.assertNotIn(forbidden, visible_external)
+
+    def test_retained_json_decode_error_keeps_chain_without_raw_document(self):
+        raw_marker = "retained-json-raw-private-marker"
+        retained = json.JSONDecodeError("safe-json-failure", raw_marker, 0)
+        safe_cause = ValueError("safe-json-cause")
+        safe_context = RuntimeError("safe-json-context")
+        retained.__cause__ = safe_cause
+        retained.__context__ = safe_context
+        original_args = retained.args
+        provider = self.provider(RecordingSession(FakeResponse()))
+
+        with patch(
+            "app_core.platform_data_comment_ai._loads_json",
+            side_effect=retained,
+        ):
+            with self.assertRaises(CommentInsightFailure) as raised:
+                provider.analyze("作品标题", (comment(),))
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "comment_ai_response_invalid",
+        )
+        self.assertEqual(retained.args, original_args)
+        self.assertIsNotNone(retained.__traceback__)
+        self.assertIs(retained.__cause__, safe_cause)
+        self.assertIs(retained.__context__, safe_context)
+        self.assertNotIn(raw_marker, retained.doc)
+        self.assertNotIn(raw_marker, exception_trace_text(raised.exception))
 
     def test_redirects_and_environment_credentials_are_disabled(self):
         response = FakeResponse(status_code=302)
@@ -1338,6 +1631,23 @@ class CommentAiProviderTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.error_code, "comment_ai_response_invalid")
         self.assertEqual(session.calls, [])
+
+    def test_provider_inputs_reject_c1_controls_before_network(self):
+        cases = (
+            ("bad-title-\u0085-private", comment()),
+            ("作品标题", comment(body="bad-body-\u0085-private")),
+        )
+        for title, record in cases:
+            session = RecordingSession()
+            provider = self.provider(session)
+            with self.subTest(title=repr(title), body=repr(record.body)):
+                with self.assertRaises(CommentInsightFailure) as raised:
+                    provider.analyze(title, (record,))
+                self.assertEqual(
+                    raised.exception.error_code,
+                    "comment_ai_response_invalid",
+                )
+                self.assertEqual(session.calls, [])
 
     def test_process_control_is_preserved_and_session_still_closes(self):
         for control_type in (asyncio.CancelledError, KeyboardInterrupt, SystemExit):

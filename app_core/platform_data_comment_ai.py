@@ -7,6 +7,7 @@ import asyncio
 import json
 import math
 import re
+import unicodedata
 
 import requests
 
@@ -83,58 +84,27 @@ def _evidence_invalid() -> CommentInsightFailure:
     return _failure("comment_ai_evidence_invalid")
 
 
-def _control_token(error: BaseException) -> str:
+def _control_outcome_value(error: BaseException):
     if isinstance(error, asyncio.CancelledError):
-        return "cancelled"
+        return ("cancelled", None)
     if isinstance(error, KeyboardInterrupt):
-        return "keyboard_interrupt"
-    return "system_exit"
-
-
-def _scrub_exception(error: BaseException) -> None:
-    """Best-effort removal of provider inputs from retained exceptions."""
-
-    pending = [error]
-    seen = set()
-    while pending:
-        current = pending.pop()
-        identity = id(current)
-        if identity in seen:
-            continue
-        seen.add(identity)
-        try:
-            cause = current.__cause__
-        except BaseException:
-            cause = None
-        try:
-            context = current.__context__
-        except BaseException:
-            context = None
-        if isinstance(cause, BaseException):
-            pending.append(cause)
-        if isinstance(context, BaseException):
-            pending.append(context)
-        for attribute, value in (
-            ("__traceback__", None),
-            ("__context__", None),
-            ("__cause__", None),
-            ("args", ()),
-        ):
-            try:
-                setattr(current, attribute, value)
-            except BaseException:
-                pass
+        return ("keyboard_interrupt", None)
+    code = error.code if isinstance(error, SystemExit) else None
+    if type(code) is not int or not -2_147_483_648 <= code <= 2_147_483_647:
+        code = 1
+    return ("system_exit", code)
 
 
 def _raise_clean_outcome(outcome) -> None:
     kind, value = outcome
     if kind == _OUTCOME_CONTROL:
-        if value == "cancelled":
+        control, code = value
+        if control == "cancelled":
             error = asyncio.CancelledError()
-        elif value == "keyboard_interrupt":
+        elif control == "keyboard_interrupt":
             error = KeyboardInterrupt()
         else:
-            error = SystemExit()
+            error = SystemExit(code)
     else:
         error = _failure(value)
     error.__traceback__ = None
@@ -157,7 +127,7 @@ def _plain_text(
     ):
         raise _response_invalid()
     if not allow_newlines and any(
-        ord(character) < 32 or ord(character) == 127 for character in value
+        unicodedata.category(character) == "Cc" for character in value
     ):
         raise _response_invalid()
     try:
@@ -173,19 +143,6 @@ def _exact_dict(value: object, keys: frozenset[str]) -> dict:
     return value
 
 
-def _safe_close(session) -> None:
-    if session is None:
-        return
-    try:
-        close = getattr(session, "close", None)
-        if callable(close):
-            close()
-    except _PROCESS_CONTROL:
-        raise
-    except BaseException:
-        return
-
-
 def _json_pairs(pairs):
     result = {}
     for key, value in pairs:
@@ -196,15 +153,22 @@ def _json_pairs(pairs):
 
 
 def _loads_json(value: str | bytes):
-    parsed = json.loads(
-        value,
-        object_pairs_hook=_json_pairs,
-        parse_constant=lambda _value: (_ for _ in ()).throw(
-            ValueError("invalid JSON number")
-        ),
-    )
-    _validate_json_tree(parsed)
-    return parsed
+    parsed = None
+    try:
+        parsed = json.loads(
+            value,
+            object_pairs_hook=_json_pairs,
+            parse_constant=lambda _value: (_ for _ in ()).throw(
+                ValueError("invalid JSON number")
+            ),
+        )
+        _validate_json_tree(parsed)
+        return parsed
+    except BaseException:
+        parsed = None
+        raise
+    finally:
+        value = None
 
 
 def _validate_json_tree(root) -> None:
@@ -245,6 +209,116 @@ def _validate_json_tree(root) -> None:
         raise ValueError("non-built-in JSON value")
 
 
+def _zero_buffer(value: bytearray) -> None:
+    for index in range(len(value)):
+        value[index] = 0
+
+
+def _valid_secret_text(value: object) -> bool:
+    return (
+        type(value) is str
+        and bool(value)
+        and bool(value.strip())
+        and not any(
+            unicodedata.category(character) == "Cc" for character in value
+        )
+    )
+
+
+def _provider_secret_buffer(value: object) -> bytearray | None:
+    mutable = None
+    try:
+        if not _valid_secret_text(value):
+            return None
+        try:
+            mutable = bytearray(value, "utf-8")
+        except _PROCESS_CONTROL:
+            raise
+        except BaseException:
+            return None
+        if not mutable or len(mutable) > _MAX_SECRET_BYTES:
+            return None
+        result = mutable
+        mutable = None
+        return result
+    finally:
+        value = None
+        if type(mutable) is bytearray:
+            _zero_buffer(mutable)
+
+
+def _sanitize_prepared_request(request) -> None:
+    if not isinstance(request, requests.PreparedRequest):
+        return
+    try:
+        headers = request.headers
+        for key in tuple(headers.keys()):
+            if type(key) is str and key.lower() in {
+                "authorization",
+                "proxy-authorization",
+            }:
+                headers.pop(key, None)
+        request.body = None
+        request._body_position = None
+    except BaseException:
+        return
+
+
+def _sanitize_outbound_carriers(*, error=None, response=None) -> None:
+    requests_to_clear = []
+    if isinstance(error, requests.exceptions.RequestException):
+        requests_to_clear.append(error.request)
+        external_response = error.response
+        if isinstance(external_response, requests.Response):
+            requests_to_clear.append(external_response.request)
+    if isinstance(response, requests.Response):
+        requests_to_clear.append(response.request)
+    seen = set()
+    for request in requests_to_clear:
+        identity = id(request)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        _sanitize_prepared_request(request)
+
+
+def _parse_json_outcome(raw_response):
+    decoded = None
+    try:
+        decoded = raw_response.decode("utf-8")
+        return (_OUTCOME_OK, _loads_json(decoded))
+    except _PROCESS_CONTROL as error:
+        return (_OUTCOME_CONTROL, _control_outcome_value(error))
+    except json.JSONDecodeError as error:
+        # JSONDecodeError.doc is our decoded response carrier; its other state
+        # belongs to the external exception and is deliberately untouched.
+        error.doc = ""
+        return (_OUTCOME_FAILURE, "comment_ai_response_invalid")
+    except (UnicodeDecodeError, RecursionError, ValueError):
+        return (_OUTCOME_FAILURE, "comment_ai_response_invalid")
+    except BaseException:
+        return (_OUTCOME_FAILURE, "comment_ai_service_unavailable")
+    finally:
+        raw_response = None
+        decoded = None
+
+
+def _close_resource_outcome(resource):
+    try:
+        if resource is None:
+            return None
+        close = getattr(resource, "close", None)
+        if callable(close):
+            close()
+    except _PROCESS_CONTROL as error:
+        return (_OUTCOME_CONTROL, _control_outcome_value(error))
+    except BaseException:
+        return None
+    finally:
+        resource = None
+    return None
+
+
 class OpenAiCompatibleCommentProvider:
     """发起一次受控请求，并在完整校验后才恢复本地评论键。"""
 
@@ -258,29 +332,48 @@ class OpenAiCompatibleCommentProvider:
         secret: str,
         session_factory=requests.Session,
     ) -> None:
-        if type(settings) is not CommentAiSettings or not callable(session_factory):
-            raise _failure("comment_ai_not_configured")
-        if (
-            type(secret) is not str
-            or not secret
-            or not secret.strip()
-            or any(ord(character) < 32 or ord(character) == 127 for character in secret)
-        ):
-            raise _failure("comment_ai_not_configured")
+        self._settings = None
+        self._secret = None
+        self._session_factory = None
+        self._initial_outcome = (
+            _OUTCOME_FAILURE,
+            "comment_ai_not_configured",
+        )
+        self.model_name = "unconfigured"
+        mutable = None
         try:
-            secret_buffer = bytearray(secret, "utf-8")
-        except _PROCESS_CONTROL:
-            raise
+            if type(settings) is CommentAiSettings:
+                self.model_name = settings.model
+            if (
+                type(settings) is not CommentAiSettings
+                or not callable(session_factory)
+            ):
+                return
+            mutable = _provider_secret_buffer(secret)
+            if type(mutable) is not bytearray:
+                return
+            self._settings = settings
+            self._secret = mutable
+            mutable = None
+            self._session_factory = session_factory
+            self._initial_outcome = None
+            self.model_name = settings.model
+        except _PROCESS_CONTROL as error:
+            self._initial_outcome = (
+                _OUTCOME_CONTROL,
+                _control_outcome_value(error),
+            )
         except BaseException:
-            raise _failure("comment_ai_not_configured") from None
-        if not secret_buffer or len(secret_buffer) > _MAX_SECRET_BYTES:
-            for index in range(len(secret_buffer)):
-                secret_buffer[index] = 0
-            raise _failure("comment_ai_not_configured")
-        self._settings = settings
-        self._secret = secret_buffer
-        self._session_factory = session_factory
-        self.model_name = settings.model
+            self._initial_outcome = (
+                _OUTCOME_FAILURE,
+                "comment_ai_not_configured",
+            )
+        finally:
+            settings = None
+            secret = None
+            session_factory = None
+            if type(mutable) is bytearray:
+                _zero_buffer(mutable)
 
     def analyze(
         self, title: str, comments: tuple[CommentRecord, ...]
@@ -295,35 +388,49 @@ class OpenAiCompatibleCommentProvider:
 
     def _analyze_outcome(self, title, comments):
         try:
-            return (_OUTCOME_OK, self._analyze_worker(title, comments))
+            if self._initial_outcome is not None:
+                outcome = self._initial_outcome
+                self._initial_outcome = (
+                    _OUTCOME_FAILURE,
+                    "comment_ai_not_configured",
+                )
+                return outcome
+            return self._analyze_worker_outcome(title, comments)
         except _PROCESS_CONTROL as error:
-            token = _control_token(error)
-            _scrub_exception(error)
-            return (_OUTCOME_CONTROL, token)
+            return (_OUTCOME_CONTROL, _control_outcome_value(error))
         except CommentInsightFailure as error:
             code = (
                 error.error_code
                 if error.error_code in _PUBLIC_AI_ERRORS
                 else "comment_ai_response_invalid"
             )
-            _scrub_exception(error)
             return (_OUTCOME_FAILURE, code)
-        except BaseException as error:
-            _scrub_exception(error)
+        except BaseException:
             return (_OUTCOME_FAILURE, "comment_ai_service_unavailable")
         finally:
             title = None
             comments = None
+            self = None
 
-    def _analyze_worker(self, title, comments) -> InsightResult:
+    def _analyze_worker_outcome(self, title, comments):
+        outcome = (_OUTCOME_FAILURE, "comment_ai_service_unavailable")
         session = None
         headers = None
         payload = None
         response = None
+        error_response = None
         raw_response = None
         outer = None
         contract = None
         secret_text = None
+        refs = None
+        ref_to_key = None
+        request_comments = None
+        encoded_payload = None
+        parsed_outcome = None
+        validated = None
+        classifications = None
+        candidates = None
         try:
             refs, ref_to_key, request_comments = self._validate_input(title, comments)
             payload = self._request_payload(title, request_comments)
@@ -354,57 +461,104 @@ class OpenAiCompatibleCommentProvider:
                 allow_redirects=False,
             )
             raw_response = self._validated_response_bytes(response)
-            try:
-                outer = _loads_json(raw_response.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError):
-                raise _response_invalid() from None
-            contract = self._extract_contract(outer)
-            validated = self._validate_contract(contract, refs)
-            _safe_close(response)
-            response = raw_response = outer = contract = None
-            # No local comment key is restored before every response item has passed.
-            classifications = tuple(
-                CommentClassification(ref_to_key[ref], labels)
-                for ref, labels in validated[0]
-            )
-            candidates = tuple(
-                TopicCandidate(
-                    candidate_title,
-                    reason,
-                    tuple(ref_to_key[ref] for ref in evidence_refs),
+            parsed_outcome = _parse_json_outcome(raw_response)
+            raw_response = None
+            if parsed_outcome[0] != _OUTCOME_OK:
+                outcome = parsed_outcome
+            else:
+                outer = parsed_outcome[1]
+                parsed_outcome = None
+                contract = self._extract_contract(outer)
+                validated = self._validate_contract(contract, refs)
+                # No local comment key is restored before every response item
+                # has passed the complete response contract.
+                classifications = tuple(
+                    CommentClassification(ref_to_key[ref], labels)
+                    for ref, labels in validated[0]
                 )
-                for candidate_title, reason, evidence_refs in validated[1]
-            )
-            return InsightResult(
-                classifications=classifications,
-                candidates=candidates,
-                known_comment_keys=frozenset(ref_to_key.values()),
-            )
-        except _PROCESS_CONTROL:
-            raise
+                candidates = tuple(
+                    TopicCandidate(
+                        candidate_title,
+                        reason,
+                        tuple(ref_to_key[ref] for ref in evidence_refs),
+                    )
+                    for candidate_title, reason, evidence_refs in validated[1]
+                )
+                result = InsightResult(
+                    classifications=classifications,
+                    candidates=candidates,
+                    known_comment_keys=frozenset(ref_to_key.values()),
+                )
+                outcome = (_OUTCOME_OK, result)
+                result = None
+        except _PROCESS_CONTROL as error:
+            outcome = (_OUTCOME_CONTROL, _control_outcome_value(error))
         except CommentInsightFailure as exc:
-            if exc.error_code in _PUBLIC_AI_ERRORS:
-                raise
-            raise _response_invalid() from None
-        except (requests.exceptions.Timeout, TimeoutError):
-            raise _failure("comment_ai_timeout") from None
-        except requests.exceptions.RequestException:
-            raise _failure("comment_ai_service_unavailable") from None
+            code = (
+                exc.error_code
+                if exc.error_code in _PUBLIC_AI_ERRORS
+                else "comment_ai_response_invalid"
+            )
+            outcome = (_OUTCOME_FAILURE, code)
+        except (requests.exceptions.Timeout, TimeoutError) as error:
+            if isinstance(error, requests.exceptions.RequestException):
+                _sanitize_outbound_carriers(error=error)
+                if isinstance(error.response, requests.Response):
+                    error_response = error.response
+            outcome = (_OUTCOME_FAILURE, "comment_ai_timeout")
+        except requests.exceptions.RequestException as error:
+            _sanitize_outbound_carriers(error=error)
+            if isinstance(error.response, requests.Response):
+                error_response = error.response
+            outcome = (_OUTCOME_FAILURE, "comment_ai_service_unavailable")
         except BaseException:
-            raise _failure("comment_ai_service_unavailable") from None
+            outcome = (_OUTCOME_FAILURE, "comment_ai_service_unavailable")
         finally:
+            _sanitize_outbound_carriers(response=response)
             if type(headers) is dict:
                 headers.clear()
             if type(payload) is dict:
                 payload.clear()
-            for index in range(len(self._secret)):
-                self._secret[index] = 0
+            if type(request_comments) is list:
+                for item in request_comments:
+                    if type(item) is dict:
+                        item.clear()
+                request_comments.clear()
+            if type(ref_to_key) is dict:
+                ref_to_key.clear()
+            if type(self._secret) is bytearray:
+                _zero_buffer(self._secret)
+            close_control = None
+            for resource in (response, error_response, session):
+                current = _close_resource_outcome(resource)
+                if close_control is None and current is not None:
+                    close_control = current
+            if close_control is not None:
+                outcome = close_control
+            title = None
+            comments = None
+            self = None
+            session = None
+            headers = None
+            payload = None
+            response = None
+            error_response = None
+            raw_response = None
+            outer = None
+            contract = None
             secret_text = None
-            try:
-                _safe_close(response)
-            finally:
-                _safe_close(session)
-            response = raw_response = outer = contract = None
+            refs = None
+            ref_to_key = None
+            request_comments = None
+            encoded_payload = None
+            parsed_outcome = None
+            validated = None
+            classifications = None
+            candidates = None
+            close_control = None
+            resource = None
+            current = None
+        return outcome
 
     def _validate_input(self, title, comments):
         title = _plain_text(title, maximum=_MAX_TITLE_CHARACTERS)
@@ -425,7 +579,10 @@ class OpenAiCompatibleCommentProvider:
         refs = tuple(f"C{index:03d}" for index in range(1, len(comments) + 1))
         request_comments = []
         for ref, item in zip(refs, comments, strict=True):
-            if type(item.body) is not str:
+            if type(item.body) is not str or any(
+                unicodedata.category(character) == "Cc"
+                for character in item.body
+            ):
                 raise _response_invalid()
             try:
                 body_size = len(item.body.encode("utf-8"))
@@ -696,9 +853,10 @@ class OpenAiCompatibleCommentProvider:
                 for ref in evidence
             ):
                 raise _evidence_invalid()
-            candidate = (title, reason, tuple(evidence))
-            if candidate in seen_candidates:
+            evidence_refs = tuple(evidence)
+            identity = (title, reason, frozenset(evidence_refs))
+            if identity in seen_candidates:
                 raise _response_invalid()
-            seen_candidates.add(candidate)
-            candidates.append(candidate)
+            seen_candidates.add(identity)
+            candidates.append((title, reason, evidence_refs))
         return tuple(classifications), tuple(candidates)

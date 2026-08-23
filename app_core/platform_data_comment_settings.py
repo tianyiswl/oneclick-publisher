@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 import re
+import unicodedata
 from urllib.parse import urlsplit, urlunsplit
 
 from .platform_data_comment_models import CommentInsightFailure
@@ -30,7 +31,7 @@ def _not_configured() -> CommentInsightFailure:
 
 
 def _has_control(value: str) -> bool:
-    return any(ord(character) < 32 or ord(character) == 127 for character in value)
+    return any(unicodedata.category(character) == "Cc" for character in value)
 
 
 def _normalize_base_url(value: object) -> str:
