@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 import hashlib
 import json
 from typing import Callable
@@ -234,18 +235,15 @@ def _batch_error(batch: object, content_id: str) -> str:
         return "comment_payload_invalid"
     if not batch.cleanup_receipt.closed:
         return "comment_sync_cancelled"
+    if batch.stop_reason in {"known_comment", "platform_end"}:
+        return "" if not batch.warning_code else "comment_payload_invalid"
     if (
-        batch.accepted_count < 100
-        and not batch.stop_reason
-        and not batch.warning_code
+        batch.stop_reason == "limit_reached"
+        and batch.warning_code == "comment_limit_reached"
+        and batch.accepted_count == 100
     ):
-        return "comment_payload_invalid"
-    if batch.accepted_count < 100 and batch.stop_reason not in {
-        "known_comment",
-        "platform_end",
-    }:
-        return "comment_payload_invalid"
-    return ""
+        return ""
+    return "comment_payload_invalid"
 
 
 def _comment_fingerprint(comments: tuple[CommentRecord, ...]) -> str:
@@ -258,13 +256,7 @@ def _comment_fingerprint(comments: tuple[CommentRecord, ...]) -> str:
     return digest.hexdigest()
 
 
-def _saved_comment_records(
-    connect_factory,
-    account_id: int,
-    content_id: str,
-) -> tuple[CommentRecord, ...]:
-    with connect_factory() as conn:
-        rows = store.list_comment_rows(conn, account_id, content_id, limit=100)
+def _records_from_rows(rows: list[dict]) -> tuple[CommentRecord, ...]:
     records = []
     for row in rows:
         records.append(
@@ -279,6 +271,71 @@ def _saved_comment_records(
             )
         )
     return tuple(records)
+
+
+def _saved_comment_records(
+    connect_factory,
+    account_id: int,
+    content_id: str,
+) -> tuple[CommentRecord, ...]:
+    with connect_factory() as conn:
+        rows = store.list_comment_rows(conn, account_id, content_id, limit=100)
+    return _records_from_rows(rows)
+
+
+def _valid_ai_metadata(
+    model_name: object,
+    prompt_version: object,
+    schema_version: object,
+) -> tuple[str, str, int]:
+    if (
+        type(model_name) is not str
+        or not model_name
+        or model_name != model_name.strip()
+        or type(prompt_version) is not str
+        or not prompt_version
+        or prompt_version != prompt_version.strip()
+        or type(schema_version) is not int
+        or schema_version <= 0
+    ):
+        raise _payload_failure()
+    return model_name, prompt_version, schema_version
+
+
+def _persist_skipped_insight(
+    conn,
+    *,
+    account_id: int,
+    content_id: str,
+    model_name: str,
+    prompt_version: str,
+    schema_version: int,
+    input_fingerprint: str,
+    comment_count: int,
+) -> dict:
+    timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+    conn.execute(
+        """
+        INSERT INTO comment_insight_runs
+            (accountId, platformType, contentId, status, errorCode, providerType,
+             modelName, promptVersion, schemaVersion, inputFingerprint,
+             commentCount, classificationsJson, candidatesJson, startedAt, finishedAt)
+        VALUES (?, 3, ?, 'skipped', 'comment_ai_not_configured',
+                'openai_compatible', ?, ?, ?, ?, ?, '[]', '[]', ?, ?)
+        """,
+        (
+            account_id,
+            content_id,
+            model_name,
+            prompt_version,
+            schema_version,
+            input_fingerprint,
+            comment_count,
+            timestamp,
+            timestamp,
+        ),
+    )
+    return {"status": "skipped", "errorCode": "comment_ai_not_configured"}
 
 
 def record_comment_ai_outcome(
@@ -299,42 +356,78 @@ def record_comment_ai_outcome(
     account_id = _valid_account_id(account_id)
     content_id = _valid_content_id(content_id)
     connect_factory = _valid_connect_factory(connect_factory)
+    model_name, prompt_version, schema_version = _valid_ai_metadata(
+        model_name, prompt_version, schema_version
+    )
     if type(error_code) is not str:
         raise _payload_failure()
     if result is None:
         if error_code not in _AI_ERROR_CODES:
             raise _payload_failure()
-        if error_code == "comment_ai_not_configured":
-            with connect_factory() as conn:
-                if store.content_for_comment_sync(conn, account_id, content_id) is None:
-                    raise CommentInsightFailure("comment_content_unavailable")
-            return {
-                "status": "skipped",
-                "errorCode": "comment_ai_not_configured",
-            }
     elif type(result) is not InsightResult or error_code:
         raise _payload_failure()
-    with connect_factory() as conn:
-        receipt = store.persist_insight_result(
-            conn,
-            account_id,
-            content_id,
-            provider_type="openai_compatible",
-            model_name=model_name,
-            prompt_version=prompt_version,
-            schema_version=schema_version,
-            input_fingerprint=input_fingerprint,
-            comment_count=comment_count,
-            result=result,
-            error_code=error_code,
-        )
-    status = receipt.get("status")
-    saved_error = receipt.get("errorCode")
-    if status not in {"success", "failed"}:
-        raise _payload_failure()
-    if type(saved_error) is not str or (saved_error and saved_error not in _AI_ERROR_CODES):
-        raise _payload_failure()
-    return {"status": status, "errorCode": saved_error}
+    try:
+        with connect_factory() as conn:
+            if store.content_for_comment_sync(conn, account_id, content_id) is None:
+                raise CommentInsightFailure("comment_content_unavailable")
+            rows = store.list_comment_rows(conn, account_id, content_id, limit=100)
+            comments = _records_from_rows(rows)
+            actual_fingerprint = _comment_fingerprint(comments)
+            actual_count = len(comments)
+            if (
+                type(input_fingerprint) is not str
+                or input_fingerprint != actual_fingerprint
+                or type(comment_count) is not int
+                or comment_count != actual_count
+            ):
+                raise _payload_failure()
+            if result is not None and result.known_comment_keys != frozenset(
+                item.comment_key for item in comments
+            ):
+                raise CommentInsightFailure("comment_ai_evidence_invalid")
+            if error_code == "comment_ai_not_configured":
+                receipt = _persist_skipped_insight(
+                    conn,
+                    account_id=account_id,
+                    content_id=content_id,
+                    model_name=model_name,
+                    prompt_version=prompt_version,
+                    schema_version=schema_version,
+                    input_fingerprint=actual_fingerprint,
+                    comment_count=actual_count,
+                )
+            else:
+                receipt = store.persist_insight_result(
+                    conn,
+                    account_id,
+                    content_id,
+                    provider_type="openai_compatible",
+                    model_name=model_name,
+                    prompt_version=prompt_version,
+                    schema_version=schema_version,
+                    input_fingerprint=actual_fingerprint,
+                    comment_count=actual_count,
+                    result=result,
+                    error_code=error_code,
+                )
+            status = receipt.get("status")
+            saved_error = receipt.get("errorCode")
+            if status not in {"success", "failed", "skipped"}:
+                raise _payload_failure()
+            if status == "skipped":
+                if saved_error != "comment_ai_not_configured":
+                    raise _payload_failure()
+            elif type(saved_error) is not str or (
+                saved_error and saved_error not in _AI_ERROR_CODES
+            ):
+                raise _payload_failure()
+            return {"status": status, "errorCode": saved_error}
+    except _PROCESS_CONTROL:
+        raise
+    except CommentInsightFailure as exc:
+        raise CommentInsightFailure(exc.error_code) from None
+    except BaseException:
+        raise _payload_failure() from None
 
 
 def _run_optional_ai_after_commit(
@@ -386,16 +479,15 @@ def _run_optional_ai_after_commit(
             else "comment_ai_service_unavailable"
         )
         if code == "comment_ai_not_configured":
-            return {"status": "skipped", "errorCode": code}
+            return persist_failure(code, model_name="unconfigured")
         return persist_failure(code)
     except BaseException:
         provider = None
         return persist_failure("comment_ai_service_unavailable")
     if provider is None:
-        return {
-            "status": "skipped",
-            "errorCode": "comment_ai_not_configured",
-        }
+        return persist_failure(
+            "comment_ai_not_configured", model_name="unconfigured"
+        )
     try:
         model_name = getattr(provider, "model_name", None)
         prompt_version = getattr(
@@ -550,6 +642,7 @@ def sync_comments(
             content_id=content_id,
             source_mode="browser_signed",
             error_code=error_code,
+            cancelled=error_code == "comment_sync_cancelled",
         )
         _emit(report, "failed")
         return _public_result(
@@ -657,12 +750,24 @@ def sync_comments(
 def _safe_insight_payload(
     latest: object,
     rows: list[dict],
+    current_fingerprint: str,
+    current_count: int,
 ) -> tuple[dict[str, list[str]], list[dict], str, str]:
     if latest is None:
         return {}, [], "skipped", "comment_ai_not_configured"
     if type(latest) is not dict:
         return {}, [], "failed", "comment_ai_response_invalid"
+    if (
+        latest.get("inputFingerprint") != current_fingerprint
+        or type(latest.get("commentCount")) is not int
+        or latest.get("commentCount") != current_count
+    ):
+        return {}, [], "failed", "comment_ai_response_invalid"
     status = latest.get("status")
+    if status == "skipped":
+        if latest.get("errorCode") == "comment_ai_not_configured":
+            return {}, [], "skipped", "comment_ai_not_configured"
+        return {}, [], "failed", "comment_ai_response_invalid"
     if status == "failed":
         code = latest.get("errorCode")
         if type(code) is not str or code not in _AI_ERROR_CODES:
@@ -687,7 +792,7 @@ def _safe_insight_payload(
             return {}, [], "failed", "comment_ai_response_invalid"
         classifications = json.loads(classifications_json)
         candidates = json.loads(candidates_json)
-    except (TypeError, ValueError, json.JSONDecodeError):
+    except (TypeError, ValueError, RecursionError, json.JSONDecodeError):
         return {}, [], "failed", "comment_ai_response_invalid"
     known = {row.get("commentKey") for row in rows}
     if (
@@ -761,61 +866,78 @@ def comment_panel_payload(
     if type(limit) is not int or limit < 1 or limit > 100:
         raise _payload_failure()
     connect_factory = _valid_connect_factory(connect_factory)
-    with connect_factory() as conn:
-        content = store.content_for_comment_sync(conn, account_id, content_id)
-        if content is None:
-            raise CommentInsightFailure("comment_content_unavailable")
-        rows = store.list_comment_rows(conn, account_id, content_id, limit=100)
-        latest = store.latest_insight(conn, account_id, content_id)
-        sync_row = conn.execute(
-            """
-            SELECT finishedAt FROM platform_comment_sync_runs
-            WHERE accountId = ? AND platformType = 3 AND contentId = ?
-              AND status = 'success'
-            ORDER BY id DESC LIMIT 1
-            """,
-            (account_id, content_id),
-        ).fetchone()
-    last_sync_at = ""
-    if sync_row is not None:
-        last_sync_at = sync_row["finishedAt"] if hasattr(sync_row, "keys") else sync_row[0]
-        if type(last_sync_at) is not str:
-            last_sync_at = ""
-    label_map, candidates, ai_status, ai_error_code = _safe_insight_payload(latest, rows)
-
-    projected_by_key: dict[str, dict] = {}
-    all_comments = []
-    for index, row in enumerate(rows, start=1):
-        key = row.get("commentKey")
-        labels = label_map.get(key, [])
-        item = {
-            "ref": f"C{index:03d}",
-            "body": row.get("body"),
-            "likeCount": row.get("likeCount"),
-            "replyCount": row.get("replyCount"),
-            "commentedAt": row.get("commentedAt"),
-            "labels": labels,
-        }
-        projected_by_key[key] = item
-        if label == "全部" or label in labels:
-            all_comments.append(dict(item))
-    safe_candidates = []
-    for candidate in candidates:
-        safe_candidates.append(
-            {
-                "title": candidate["title"],
-                "reason": candidate["reason"],
-                "evidence": [
-                    dict(projected_by_key[key])
-                    for key in candidate["evidenceKeys"]
-                ],
-            }
+    try:
+        with connect_factory() as conn:
+            content = store.content_for_comment_sync(conn, account_id, content_id)
+            if content is None:
+                raise CommentInsightFailure("comment_content_unavailable")
+            rows = store.list_comment_rows(conn, account_id, content_id, limit=100)
+            latest = store.latest_insight(conn, account_id, content_id)
+            sync_row = conn.execute(
+                """
+                SELECT finishedAt FROM platform_comment_sync_runs
+                WHERE accountId = ? AND platformType = 3 AND contentId = ?
+                  AND status = 'success'
+                ORDER BY id DESC LIMIT 1
+                """,
+                (account_id, content_id),
+            ).fetchone()
+        last_sync_at = ""
+        if sync_row is not None:
+            last_sync_at = (
+                sync_row["finishedAt"]
+                if hasattr(sync_row, "keys")
+                else sync_row[0]
+            )
+            if type(last_sync_at) is not str:
+                last_sync_at = ""
+        comments = _records_from_rows(rows)
+        label_map, candidates, ai_status, ai_error_code = _safe_insight_payload(
+            latest,
+            rows,
+            _comment_fingerprint(comments),
+            len(comments),
         )
-    return {
-        "title": content["title"],
-        "lastSyncAt": last_sync_at,
-        "comments": all_comments[:limit],
-        "candidates": safe_candidates,
-        "aiStatus": ai_status,
-        "aiErrorCode": ai_error_code,
-    }
+
+        projected_by_key: dict[str, dict] = {}
+        all_comments = []
+        for index, row in enumerate(rows, start=1):
+            key = row.get("commentKey")
+            labels = label_map.get(key, [])
+            item = {
+                "ref": f"C{index:03d}",
+                "body": row.get("body"),
+                "likeCount": row.get("likeCount"),
+                "replyCount": row.get("replyCount"),
+                "commentedAt": row.get("commentedAt"),
+                "labels": labels,
+            }
+            projected_by_key[key] = item
+            if label == "全部" or label in labels:
+                all_comments.append(dict(item))
+        safe_candidates = []
+        for candidate in candidates:
+            safe_candidates.append(
+                {
+                    "title": candidate["title"],
+                    "reason": candidate["reason"],
+                    "evidence": [
+                        dict(projected_by_key[key])
+                        for key in candidate["evidenceKeys"]
+                    ],
+                }
+            )
+        return {
+            "title": content["title"],
+            "lastSyncAt": last_sync_at,
+            "comments": all_comments[:limit],
+            "candidates": safe_candidates,
+            "aiStatus": ai_status,
+            "aiErrorCode": ai_error_code,
+        }
+    except _PROCESS_CONTROL:
+        raise
+    except CommentInsightFailure as exc:
+        raise CommentInsightFailure(exc.error_code) from None
+    except BaseException:
+        raise _payload_failure() from None

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import contextmanager
+import hashlib
 import json
 import sqlite3
 import unittest
@@ -82,6 +83,25 @@ def valid_batch(
         platform_observed_at=LATER,
         cleanup_receipt=CleanupReceipt(closed=True, alive_resource_count=0),
     )
+
+
+def current_fingerprint(conn: sqlite3.Connection) -> str:
+    """按服务合同中的当前评论顺序生成测试快照指纹。"""
+
+    digest = hashlib.sha256()
+    rows = conn.execute(
+        """
+        SELECT commentKey, body FROM platform_comments
+        WHERE accountId = 12 AND platformType = 3 AND contentId = 'work-7'
+        ORDER BY commentedAt DESC, id DESC
+        """
+    ).fetchall()
+    for row in rows:
+        digest.update(row["commentKey"].encode("ascii"))
+        digest.update(b"\x1f")
+        digest.update(row["body"].encode("utf-8"))
+        digest.update(b"\x1e")
+    return digest.hexdigest()
 
 
 class FixedCollector:
@@ -354,8 +374,170 @@ class CommentServiceTests(unittest.TestCase):
         )
         self.assertEqual(
             self.conn.execute("SELECT COUNT(*) FROM comment_insight_runs").fetchone()[0],
+            1,
+        )
+        row = self.conn.execute(
+            """
+            SELECT status, errorCode, commentCount, inputFingerprint
+            FROM comment_insight_runs
+            """
+        ).fetchone()
+        self.assertEqual(tuple(row[:3]), ("skipped", "comment_ai_not_configured", 2))
+        self.assertEqual(row["inputFingerprint"], current_fingerprint(self.conn))
+
+    def test_ai_outcome_must_match_the_real_database_comment_snapshot(self):
+        """调用方虚构的评论键、数量或指纹不能被保存为成功洞察。"""
+
+        self._persist_existing()
+        fake_key = "c" * 64
+        fabricated = InsightResult(
+            classifications=(CommentClassification(fake_key, ("追问",)),),
+            candidates=(TopicCandidate("虚构选题", "没有数据库证据", (fake_key,)),),
+            known_comment_keys=frozenset({fake_key}),
+        )
+
+        with self.assertRaises(CommentInsightFailure) as raised:
+            service.record_comment_ai_outcome(
+                12,
+                "work-7",
+                result=fabricated,
+                error_code="",
+                model_name="test-model",
+                prompt_version="comment-insight-v1",
+                schema_version=1,
+                input_fingerprint=current_fingerprint(self.conn),
+                comment_count=1,
+                connect_factory=self.connect,
+            )
+
+        self.assertEqual(raised.exception.error_code, "comment_ai_evidence_invalid")
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM comment_insight_runs WHERE status = 'success'"
+            ).fetchone()[0],
             0,
         )
+
+    def test_ai_outcome_rejects_stale_fingerprint_and_comment_count(self):
+        """即使证据键真实，旧指纹或旧数量也不能写入当前评论快照。"""
+
+        self._persist_existing()
+        insight = InsightResult(
+            classifications=(CommentClassification("a" * 64, ("追问",)),),
+            candidates=(TopicCandidate("回答追问", "真实评论证据", ("a" * 64,)),),
+            known_comment_keys=frozenset({"a" * 64}),
+        )
+        cases = (
+            ("f" * 64, 1),
+            (current_fingerprint(self.conn), 0),
+        )
+
+        for fingerprint, count in cases:
+            with self.subTest(fingerprint=fingerprint, count=count):
+                with self.assertRaises(CommentInsightFailure) as raised:
+                    service.record_comment_ai_outcome(
+                        12,
+                        "work-7",
+                        result=insight,
+                        error_code="",
+                        model_name="test-model",
+                        prompt_version="comment-insight-v1",
+                        schema_version=1,
+                        input_fingerprint=fingerprint,
+                        comment_count=count,
+                        connect_factory=self.connect,
+                    )
+                self.assertEqual(
+                    raised.exception.error_code, "comment_payload_invalid"
+                )
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM comment_insight_runs").fetchone()[0],
+            0,
+        )
+
+    def test_new_comments_record_current_skipped_and_hide_stale_success(self):
+        """未配置 AI 也要覆盖旧成功，否则新评论会展示旧分类和旧选题。"""
+
+        self._sync(FixedCollector(valid_batch()), ai_provider_factory=lambda: None)
+        insight = InsightResult(
+            classifications=(CommentClassification("a" * 64, ("追问",)),),
+            candidates=(TopicCandidate("旧选题", "旧评论证据", ("a" * 64,)),),
+            known_comment_keys=frozenset({"a" * 64, "b" * 64}),
+        )
+        service.record_comment_ai_outcome(
+            12,
+            "work-7",
+            result=insight,
+            error_code="",
+            model_name="test-model",
+            prompt_version="comment-insight-v1",
+            schema_version=1,
+            input_fingerprint=current_fingerprint(self.conn),
+            comment_count=2,
+            connect_factory=self.connect,
+        )
+        new_batch = valid_batch(
+            records=(record("c" * 64, body="这是一条新评论。"),),
+        )
+
+        result = self._sync(
+            FixedCollector(new_batch), ai_provider_factory=lambda: None
+        )
+        panel = service.comment_panel_payload(
+            12, "work-7", connect_factory=self.connect
+        )
+
+        self.assertEqual(result["aiStatus"], "skipped")
+        self.assertEqual(panel["aiStatus"], "skipped")
+        self.assertEqual(panel["aiErrorCode"], "comment_ai_not_configured")
+        self.assertEqual(panel["candidates"], [])
+        latest = self.conn.execute(
+            """
+            SELECT status, errorCode, commentCount, inputFingerprint
+            FROM comment_insight_runs ORDER BY id DESC LIMIT 1
+            """
+        ).fetchone()
+        self.assertEqual(tuple(latest[:3]), ("skipped", "comment_ai_not_configured", 3))
+        self.assertEqual(latest["inputFingerprint"], current_fingerprint(self.conn))
+
+    def test_panel_rejects_latest_insight_after_comment_snapshot_changes(self):
+        """没有后续 AI 运行时，面板也不能把旧快照洞察套到新评论上。"""
+
+        self._persist_existing()
+        insight = InsightResult(
+            classifications=(CommentClassification("a" * 64, ("追问",)),),
+            candidates=(TopicCandidate("旧选题", "旧评论证据", ("a" * 64,)),),
+            known_comment_keys=frozenset({"a" * 64}),
+        )
+        service.record_comment_ai_outcome(
+            12,
+            "work-7",
+            result=insight,
+            error_code="",
+            model_name="test-model",
+            prompt_version="comment-insight-v1",
+            schema_version=1,
+            input_fingerprint=current_fingerprint(self.conn),
+            comment_count=1,
+            connect_factory=self.connect,
+        )
+        with self.conn:
+            store.persist_comment_batch(
+                self.conn,
+                12,
+                valid_batch(
+                    records=(record("b" * 64, body="后来出现的新评论。"),),
+                ),
+            )
+
+        panel = service.comment_panel_payload(
+            12, "work-7", connect_factory=self.connect
+        )
+
+        self.assertEqual(panel["aiStatus"], "failed")
+        self.assertEqual(panel["aiErrorCode"], "comment_ai_response_invalid")
+        self.assertEqual(panel["candidates"], [])
+        self.assertTrue(all(item["labels"] == [] for item in panel["comments"]))
 
     def test_unexpected_ai_failure_is_fixed_and_does_not_leak_secret_text(self):
         """原始 AI 异常不得进入结果、进度或数据库，但评论仍然成功。"""
@@ -393,6 +575,24 @@ class CommentServiceTests(unittest.TestCase):
             "SELECT errorCode FROM platform_comment_sync_runs"
         ).fetchone()
         self.assertEqual(run[0], "comment_payload_invalid")
+
+    def test_fixed_cancel_failure_is_recorded_as_cancelled(self):
+        """固定取消码必须落 cancelled，不能伪装成普通 failed。"""
+
+        failure = CommentInsightFailure("comment_sync_cancelled")
+        failure.cleanup_receipt = CleanupReceipt(
+            closed=True, alive_resource_count=0
+        )
+
+        result = self._sync(FixedCollector(failure))
+        run = self.conn.execute(
+            "SELECT status, errorCode FROM platform_comment_sync_runs"
+        ).fetchone()
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["errorCode"], "comment_sync_cancelled")
+        self.assertEqual(set(result), PUBLIC_RESULT_KEYS)
+        self.assertEqual(tuple(run), ("cancelled", "comment_sync_cancelled"))
 
     def test_process_control_during_ai_outcome_persistence_is_not_swallowed(self):
         """本地洞察写入期间的进程中断不能被伪装成普通 AI 失败。"""
@@ -502,6 +702,60 @@ class CommentServiceTests(unittest.TestCase):
             1,
         )
 
+    def test_hundred_comments_without_terminal_evidence_is_not_success(self):
+        """达到数量上限不等于平台已结束；空终止证据不能被记作成功。"""
+
+        hundred = tuple(
+            record(f"{index:064x}", body=f"评论 {index}")
+            for index in range(1, 101)
+        )
+        incomplete = valid_batch(
+            records=hundred,
+            stop_reason="",
+            warning_code="",
+        )
+
+        result = self._sync(FixedCollector(incomplete))
+        run = self.conn.execute(
+            "SELECT status, errorCode FROM platform_comment_sync_runs"
+        ).fetchone()
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["errorCode"], "comment_payload_invalid")
+        self.assertEqual(tuple(run), ("failed", "comment_payload_invalid"))
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM platform_comments").fetchone()[0],
+            0,
+        )
+
+    def test_hundred_comments_require_a_verified_terminal_reason(self):
+        """100 条只有平台结束、命中旧评论或明确上限三种证据可成功。"""
+
+        hundred = tuple(
+            record(f"{index:064x}", body=f"评论 {index}")
+            for index in range(1, 101)
+        )
+        cases = (
+            ("platform_end", ""),
+            ("known_comment", ""),
+            ("limit_reached", "comment_limit_reached"),
+        )
+
+        for stop_reason, warning_code in cases:
+            with self.subTest(stop_reason=stop_reason):
+                result = self._sync(
+                    FixedCollector(
+                        valid_batch(
+                            records=hundred,
+                            stop_reason=stop_reason,
+                            warning_code=warning_code,
+                        )
+                    )
+                )
+                self.assertEqual(result["status"], "success")
+                self.assertEqual(result["stopReason"], stop_reason)
+                self.assertEqual(result["warningCode"], warning_code)
+
     def test_public_sync_result_has_only_fixed_counts_codes_and_cleanup(self):
         """同步结果不能夹带账号、作品、评论正文、运行 ID 或异常对象。"""
 
@@ -541,7 +795,7 @@ class CommentServiceTests(unittest.TestCase):
             model_name="test-model",
             prompt_version="comment-insight-v1",
             schema_version=1,
-            input_fingerprint="f" * 64,
+            input_fingerprint=current_fingerprint(self.conn),
             comment_count=2,
             connect_factory=self.connect,
         )
@@ -616,7 +870,7 @@ class CommentServiceTests(unittest.TestCase):
                 VALUES (12, 3, 'work-7', 'success', '', 'openai_compatible',
                         'test-model', 'comment-insight-v1', 1, ?, 2, ?, '[]', ?, ?)
                 """,
-                ("f" * 64, malformed, OBSERVED, OBSERVED),
+                (current_fingerprint(self.conn), malformed, OBSERVED, OBSERVED),
             )
 
         panel = service.comment_panel_payload(
@@ -626,6 +880,110 @@ class CommentServiceTests(unittest.TestCase):
         self.assertEqual(panel["aiStatus"], "failed")
         self.assertEqual(panel["aiErrorCode"], "comment_ai_response_invalid")
         self.assertNotIn(raw_marker, repr(panel))
+
+    def test_deep_stored_json_is_projected_as_fixed_failure(self):
+        """小于大小上限的超深 JSON 也不能把 RecursionError 抛到界面。"""
+
+        self._sync(FixedCollector(valid_batch()))
+        deeply_nested = "[" * 10_000 + "0" + "]" * 10_000
+        self.assertLess(len(deeply_nested.encode("utf-8")), 1_000_000)
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO comment_insight_runs
+                    (accountId, platformType, contentId, status, errorCode,
+                     providerType, modelName, promptVersion, schemaVersion,
+                     inputFingerprint, commentCount, classificationsJson,
+                     candidatesJson, startedAt, finishedAt)
+                VALUES (12, 3, 'work-7', 'success', '', 'openai_compatible',
+                        'test-model', 'comment-insight-v1', 1, ?, 2, ?, '[]', ?, ?)
+                """,
+                (
+                    current_fingerprint(self.conn),
+                    deeply_nested,
+                    OBSERVED,
+                    OBSERVED,
+                ),
+            )
+
+        panel = service.comment_panel_payload(
+            12, "work-7", connect_factory=self.connect
+        )
+
+        self.assertEqual(panel["aiStatus"], "failed")
+        self.assertEqual(panel["aiErrorCode"], "comment_ai_response_invalid")
+
+    def test_record_and_panel_map_database_errors_to_fixed_failure(self):
+        """数据库缺表、锁定或损坏不得把原始 OperationalError 透给调用方。"""
+
+        marker = "private-database-path-token"
+
+        @contextmanager
+        def broken_connect():
+            raise sqlite3.OperationalError(marker)
+            yield
+
+        calls = (
+            lambda: service.record_comment_ai_outcome(
+                12,
+                "work-7",
+                result=None,
+                error_code="comment_ai_not_configured",
+                model_name="unconfigured",
+                prompt_version="comment-insight-v1",
+                schema_version=1,
+                input_fingerprint="f" * 64,
+                comment_count=0,
+                connect_factory=broken_connect,
+            ),
+            lambda: service.comment_panel_payload(
+                12, "work-7", connect_factory=broken_connect
+            ),
+        )
+
+        for call in calls:
+            with self.subTest(call=call):
+                with self.assertRaises(CommentInsightFailure) as raised:
+                    call()
+                self.assertEqual(
+                    raised.exception.error_code, "comment_payload_invalid"
+                )
+                self.assertNotIn(marker, repr(raised.exception))
+
+    def test_record_and_panel_preserve_process_control(self):
+        """固定数据库边界不能吞掉取消、键盘中断或进程退出。"""
+
+        for control_type in (
+            asyncio.CancelledError,
+            KeyboardInterrupt,
+            SystemExit,
+        ):
+            @contextmanager
+            def interrupted_connect():
+                raise control_type()
+                yield
+
+            calls = (
+                lambda: service.record_comment_ai_outcome(
+                    12,
+                    "work-7",
+                    result=None,
+                    error_code="comment_ai_not_configured",
+                    model_name="unconfigured",
+                    prompt_version="comment-insight-v1",
+                    schema_version=1,
+                    input_fingerprint="f" * 64,
+                    comment_count=0,
+                    connect_factory=interrupted_connect,
+                ),
+                lambda: service.comment_panel_payload(
+                    12, "work-7", connect_factory=interrupted_connect
+                ),
+            )
+            for call in calls:
+                with self.subTest(control=control_type.__name__, call=call):
+                    with self.assertRaises(control_type):
+                        call()
 
     def test_record_comment_ai_outcome_rejects_uncontrolled_values(self):
         """洞察记录入口不得保存原始异常码、错误类型或半成功结果。"""
