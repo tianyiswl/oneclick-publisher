@@ -618,7 +618,7 @@ class XhsNativeAdapter:
         raw_candidates = [
             candidate
             for candidate in (
-                xhs_location_service.normalize_location_candidate(row)
+                xhs_location_service.normalize_official_location_candidate(row)
                 for row in raw_rows
             )
             if candidate is not None

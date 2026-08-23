@@ -1332,6 +1332,27 @@ class XhsLocationEditorTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(XhsNativeAdapterError):
                     await XhsNativeAdapter(self._payload()).apply_location(page)
 
+    async def test_rejects_address_only_live_response_even_when_dom_matches(self) -> None:
+        page = _FakeXhsEditorPage(
+            self._response(
+                {
+                    "poiId": "poi-1",
+                    "name": "北海银滩",
+                    "address": "广西北海市银海区银滩大道",
+                    "poiType": 0,
+                }
+            ),
+            [("北海银滩", "广西北海市银海区银滩大道")],
+        )
+
+        with self.assertRaises(XhsNativeAdapterError):
+            await XhsNativeAdapter(self._payload()).apply_location(page)
+
+        self.assertNotIn(
+            "location-option-click:北海银滩|广西北海市银海区银滩大道",
+            page.calls,
+        )
+
     async def test_rejects_disabled_multi_location_duplicate_dom_and_bad_readback(self) -> None:
         cases = [
             _FakeXhsEditorPage(
@@ -1457,9 +1478,51 @@ class XhsLocationEditorTests(unittest.IsolatedAsyncioTestCase):
 
 
 class XhsLocationCandidateTests(unittest.TestCase):
+    def test_official_response_requires_full_address_but_canonical_selection_keeps_address(
+        self,
+    ) -> None:
+        canonical = {
+            "poiId": "poi-1",
+            "name": "北海银滩",
+            "address": "广西北海市银海区银滩大道",
+            "poiType": "0",
+            "platform": "xiaohongshu",
+            "sourceAccountId": 11,
+            "platformType": 1,
+            "scope": "platform-default",
+            "contentType": "video",
+            "searchKeyword": "北海银滩",
+        }
+        normalized = xhs_location_service.normalize_location_selection(
+            {
+                "type": 1,
+                "contentType": "video",
+                "accountIds": [11],
+                "xhsLocationKeyword": "北海银滩",
+                "xhsLocationScope": "platform-default",
+                "xhsLocationPoi": canonical,
+            }
+        )
+        self.assertEqual(normalized, canonical)
+        self.assertEqual(
+            xhs_location_service.normalize_location_response(
+                {
+                    "poiList": [
+                        {
+                            "poiId": "poi-raw",
+                            "name": "只有普通地址的原始行",
+                            "address": "广西北海市银海区银滩大道",
+                            "poiType": 0,
+                        }
+                    ]
+                }
+            ),
+            [],
+        )
+
     def test_candidate_accepts_poi_id_or_new_poi_id_and_keeps_zero_type(self) -> None:
         self.assertEqual(
-            xhs_location_service.normalize_location_candidate(
+            xhs_location_service.normalize_official_location_candidate(
                 {
                     "newPoiId": "poi-1",
                     "name": "北海银滩",
@@ -1483,18 +1546,20 @@ class XhsLocationCandidateTests(unittest.TestCase):
             "fullAddress": "广西北海市银海区银滩大道",
             "poiType": "spot",
         }
-        self.assertIsNotNone(xhs_location_service.normalize_location_candidate(complete))
+        self.assertIsNotNone(
+            xhs_location_service.normalize_official_location_candidate(complete)
+        )
         for field in ("poiId", "name", "fullAddress"):
             with self.subTest(field=field):
                 incomplete = dict(complete)
                 incomplete.pop(field)
                 self.assertIsNone(
-                    xhs_location_service.normalize_location_candidate(incomplete)
+                    xhs_location_service.normalize_official_location_candidate(incomplete)
                 )
 
     def test_candidate_keeps_missing_poi_type_as_safe_empty_string(self) -> None:
         self.assertEqual(
-            xhs_location_service.normalize_location_candidate(
+            xhs_location_service.normalize_official_location_candidate(
                 {
                     "poiId": "poi-1",
                     "name": "北海银滩",

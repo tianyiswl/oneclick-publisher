@@ -62,14 +62,17 @@ def _candidate_field(value: dict[str, Any], *names: str) -> str:
     return ""
 
 
-def normalize_location_candidate(value: object) -> dict[str, str] | None:
-    """只保留身份完整的小红书官方 POI。"""
-
+def _normalize_location_candidate_fields(
+    value: object,
+    *,
+    poi_id_fields: tuple[str, ...],
+    address_field: str,
+) -> dict[str, str] | None:
     if not isinstance(value, dict):
         return None
-    poi_id = _candidate_field(value, "poiId", "newPoiId")
+    poi_id = _candidate_field(value, *poi_id_fields)
     name = _candidate_field(value, "name")
-    address = _candidate_field(value, "fullAddress", "address")
+    address = _candidate_field(value, address_field)
     poi_type = _candidate_field(value, "poiType")
     if not poi_id or not name or not address:
         return None
@@ -80,6 +83,28 @@ def normalize_location_candidate(value: object) -> dict[str, str] | None:
         "poiType": poi_type,
         "platform": XHS_PLATFORM,
     }
+
+
+def normalize_official_location_candidate(value: object) -> dict[str, str] | None:
+    """只接受 creator/search 原始行提供的官方完整地址字段。"""
+
+    return _normalize_location_candidate_fields(
+        value,
+        poi_id_fields=("poiId", "newPoiId"),
+        address_field="fullAddress",
+    )
+
+
+def normalize_canonical_location_candidate(value: object) -> dict[str, str] | None:
+    """只接受已标记为小红书的内部 canonical 候选。"""
+
+    if not isinstance(value, dict) or _normalized(value.get("platform")) != XHS_PLATFORM:
+        return None
+    return _normalize_location_candidate_fields(
+        value,
+        poi_id_fields=("poiId",),
+        address_field="address",
+    )
 
 
 def _poi_rows(value: object) -> list[object]:
@@ -103,7 +128,7 @@ def normalize_location_response(
     result: list[dict[str, str]] = []
     by_poi_id: dict[str, dict[str, str]] = {}
     for row in _poi_rows(value):
-        candidate = normalize_location_candidate(row)
+        candidate = normalize_official_location_candidate(row)
         if not candidate:
             continue
         existing = by_poi_id.get(candidate["poiId"])
@@ -218,7 +243,7 @@ def normalize_location_selection(
         raise XhsLocationSearchError("地点平台与小红书不一致")
     if _positive_int(poi_value.get("platformType"), "地点平台类型无效") != XHS_PLATFORM_TYPE:
         raise XhsLocationSearchError("地点平台类型无效")
-    candidate = normalize_location_candidate(poi_value)
+    candidate = normalize_canonical_location_candidate(poi_value)
     if not candidate:
         raise XhsLocationSearchError("请选择完整的小红书地点")
     source_account_id = _positive_int(

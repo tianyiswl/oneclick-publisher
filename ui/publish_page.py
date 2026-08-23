@@ -1760,7 +1760,7 @@ class PublishPage(QWidget):
         self.xhs_location_results.clear()
         valid_rows: list[dict[str, object]] = []
         for value in rows:
-            candidate = xhs_location_service.normalize_location_candidate(value)
+            candidate = xhs_location_service.normalize_canonical_location_candidate(value)
             if not candidate:
                 continue
             selection: dict[str, object] = {
