@@ -14,16 +14,25 @@ from zoneinfo import ZoneInfo
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PyQt6.QtCore import Qt
 from PyQt6.QtTest import QSignalSpy
 from PyQt6.QtGui import QPixmap
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import (
+    QAbstractItemView,
+    QApplication,
+    QLineEdit,
+    QPushButton,
+)
 
 from app_core import database, platform_data_service, platform_data_sync
+from app_core.platform_data_comment_models import CommentInsightFailure
+from app_core.platform_data_comment_service import COMMENT_PROGRESS
+from app_core.platform_data_comment_settings import BASE_URL_KEY, MODEL_KEY
 from app_core import platform_data_collectors
 from app_core.platform_data_collection_errors import PlatformDataCollectionError
 from app_core.platform_data_models import CollectionBatch, MetricPoint
 from ui.background_task import BackgroundTaskRunner
-from ui.data_monitor_page import DataMonitorPage
+from ui.data_monitor_page import DataMonitorPage, _CommentAiSettingsDialog
 
 
 ACCOUNT = {
@@ -243,6 +252,104 @@ def available_contents() -> dict:
     }
 
 
+def available_douyin_contents() -> dict:
+    payload = available_contents()
+    payload["total"] = 2
+    payload["coveredCount"] = 2
+    payload["items"] = [
+        {
+            "contentId": "work-7",
+            "title": "同名作品",
+            "coverUrl": "",
+            "publishedAt": "2026-08-21T09:00:00+08:00",
+            "contentStatus": "published",
+            "contentType": "video",
+            "metrics": {"views": 20, "comments": 2},
+        },
+        {
+            "contentId": "work-8",
+            "title": "同名作品",
+            "coverUrl": "",
+            "publishedAt": "2026-08-20T09:00:00+08:00",
+            "contentStatus": "published",
+            "contentType": "video",
+            "metrics": {"views": 10, "comments": 1},
+        },
+    ]
+    return payload
+
+
+def comment_panel_payload(content_id: str = "work-7") -> dict:
+    work_label = "第二篇" if content_id == "work-8" else "第一篇"
+    first = {
+        "ref": "C001",
+        "body": f"{work_label}的质疑原文",
+        "likeCount": 5,
+        "replyCount": 1,
+        "commentedAt": "2026-08-21T10:00:00+08:00",
+        "labels": ["质疑"],
+    }
+    second = {
+        "ref": "C002",
+        "body": f"{work_label}的真实经历",
+        "likeCount": 2,
+        "replyCount": 0,
+        "commentedAt": "2026-08-21T09:30:00+08:00",
+        "labels": ["真实经历", "选题建议"],
+    }
+    return {
+        "title": "同名作品",
+        "lastSyncAt": "2026-08-21T10:05:00+08:00",
+        "comments": [first, second],
+        "candidates": [
+            {
+                "title": "回答这条质疑",
+                "reason": "解释读者关心的问题",
+                "evidence": [
+                    {
+                        **first,
+                        "body": "不得显示的伪造证据正文",
+                    }
+                ],
+            }
+        ],
+        "aiStatus": "success",
+        "aiErrorCode": "",
+    }
+
+
+class FakeSettings:
+    def __init__(self, values: dict | None = None) -> None:
+        self.values = dict(values or {})
+        self.synced = 0
+
+    def value(self, key: str, default=None):
+        return self.values.get(key, default)
+
+    def setValue(self, key: str, value: object) -> None:  # noqa: N802
+        self.values[key] = value
+
+    def sync(self) -> None:
+        self.synced += 1
+
+
+class FakeSecretStore:
+    def __init__(self) -> None:
+        self.read_count = 0
+        self.writes: list[str] = []
+        self.delete_count = 0
+
+    def read(self):
+        self.read_count += 1
+        raise AssertionError("AI 设置对话框不得读回现有密钥")
+
+    def write(self, secret: str) -> None:
+        self.writes.append(secret)
+
+    def delete(self) -> None:
+        self.delete_count += 1
+
+
 def failed_summary() -> dict:
     summary = period_summary(status="failed", error_code="login_required")
     summary["metrics"]["views"]["value"] = 125
@@ -274,6 +381,22 @@ class BlockingRunner:
     def wait_for_finished(self, key: str, timeout_seconds: float) -> bool:
         self.waited.append((key, timeout_seconds))
         return self.wait_result
+
+
+class MultiPrefixBlockingRunner(BlockingRunner):
+    def __init__(self, *, wait_result: bool) -> None:
+        super().__init__(wait_result=wait_result)
+        self.prefixes: list[tuple[str, ...]] = []
+
+    def active_keys_with_prefixes(self, prefixes: tuple[str, ...]) -> list[str]:
+        self.prefixes.append(prefixes)
+        return [
+            "platform-data-sync:3:12",
+            "platform-comment-sync:3:12:work-7",
+        ]
+
+    def is_running(self, _key: str) -> bool:
+        return False
 
 
 class _DirectBatchCollector:
@@ -1454,6 +1577,452 @@ class DataMonitorPageTests(unittest.TestCase):
         self.assertTrue(page.relogin_button.isVisibleTo(page))
         page.relogin_button.click()
         self.assertEqual(len(spy), 1)
+
+    def test_comment_work_selection_is_single_and_uses_only_stable_content_id(self) -> None:
+        """如果表格多选或把整行数据藏入 UserRole，后台任务会用错作品或扩大敏感数据面。"""
+
+        page = self._page(contents=available_douyin_contents())
+
+        self.assertEqual(
+            page.content_table.selectionMode(),
+            QAbstractItemView.SelectionMode.SingleSelection,
+        )
+        self.assertIsNone(page.content_table.selected_content())
+        self.assertFalse(page.comment_sync_button.isEnabled())
+        self.assertEqual(
+            page.content_table.item(0, 0).data(Qt.ItemDataRole.UserRole),
+            "work-7",
+        )
+        self.assertIsNone(
+            page.content_table.item(0, 1).data(Qt.ItemDataRole.UserRole)
+        )
+        with patch(
+            "ui.data_monitor_page.platform_data_comment_service.comment_panel_payload",
+            return_value=comment_panel_payload("work-8"),
+        ):
+            page.content_table.selectRow(1)
+        self.assertEqual(
+            page.content_table.selected_content(),
+            {"contentId": "work-8", "title": "同名作品"},
+        )
+
+    def test_comment_sync_is_disabled_without_selection_and_unavailable_is_explicit(self) -> None:
+        """未取得作品时如果被误解成没有评论，用户会对空数据做出错误判断。"""
+
+        page = self._page(contents=empty_contents())
+
+        self.assertFalse(page.comment_panel.isHidden())
+        self.assertFalse(page.comment_sync_button.isEnabled())
+        self.assertEqual(
+            page.comment_status_label.text(),
+            "抖音作品列表尚未取得，暂时无法同步评论",
+        )
+
+    def test_non_douyin_platform_hides_and_disables_comment_panel(self) -> None:
+        """首版若在其他平台露出入口，会让不支持的平台冒充可用。"""
+
+        page = self._page(
+            accounts=[XHS_ACCOUNT],
+            contents=available_douyin_contents(),
+            registered_platforms=(1,),
+        )
+
+        self.assertTrue(page.comment_panel.isHidden())
+        self.assertFalse(page.comment_sync_button.isEnabled())
+        self.assertFalse(page.comment_ai_settings_button.isEnabled())
+
+    def test_selected_work_loads_only_its_local_comments_and_latest_insight(self) -> None:
+        """作品标题可能相同，面板必须只按选中作品的稳定 ID 读回。"""
+
+        page = self._page(contents=available_douyin_contents())
+        calls: list[tuple[int, str, str, int]] = []
+
+        def load(account_id: int, content_id: str, label: str, limit: int) -> dict:
+            calls.append((account_id, content_id, label, limit))
+            return comment_panel_payload(content_id)
+
+        with patch(
+            "ui.data_monitor_page.platform_data_comment_service.comment_panel_payload",
+            side_effect=load,
+        ):
+            page.content_table.selectRow(1)
+
+        self.assertEqual(calls, [(12, "work-8", "全部", 100)])
+        self.assertEqual(page.comment_table.rowCount(), 2)
+        self.assertEqual(page.comment_table.item(0, 0).text(), "第二篇的质疑原文")
+        self.assertEqual(page.comment_candidate_tree.topLevelItemCount(), 1)
+        self.assertIn(
+            "回答这条质疑",
+            page.comment_candidate_tree.topLevelItem(0).text(0),
+        )
+
+    def test_comment_progress_accepts_only_exact_fixed_stage_and_message(self) -> None:
+        """工作线程的自由文本若进入页面，异常、路径或凭据可能被暴露。"""
+
+        pool = QueuedPool()
+        runner = BackgroundTaskRunner()
+        runner.pool = pool
+        page = self._page(contents=available_douyin_contents(), runner=runner)
+        with patch(
+            "ui.data_monitor_page.platform_data_comment_service.comment_panel_payload",
+            return_value=comment_panel_payload(),
+        ):
+            page.content_table.selectRow(0)
+        page.comment_sync_button.click()
+        task = pool.tasks[0]
+        task.signals.started.emit()
+        self.app.processEvents()
+        baseline = page.comment_status_label.text()
+
+        task.signals.progressed.emit(
+            {"stage": "collecting", "message": "Cookie=secret /private/path"}
+        )
+        task.signals.progressed.emit(
+            {
+                "stage": "collecting",
+                "message": COMMENT_PROGRESS["collecting"],
+                "raw": "secret",
+            }
+        )
+        self.app.processEvents()
+        self.assertEqual(page.comment_status_label.text(), baseline)
+
+        task.signals.progressed.emit(
+            {"stage": "collecting", "message": COMMENT_PROGRESS["collecting"]}
+        )
+        self.app.processEvents()
+        self.assertEqual(
+            page.comment_status_label.text(), COMMENT_PROGRESS["collecting"]
+        )
+        self.assertNotIn("secret", page.comment_status_label.text())
+
+    def test_stale_comment_callbacks_cannot_overwrite_current_work(self) -> None:
+        """旧作品任务迟到时，不得覆盖用户刚选中的另一篇作品。"""
+
+        pool = QueuedPool()
+        runner = BackgroundTaskRunner()
+        runner.pool = pool
+        page = self._page(contents=available_douyin_contents(), runner=runner)
+        with patch(
+            "ui.data_monitor_page.platform_data_comment_service.comment_panel_payload",
+            side_effect=lambda _account, content, _label, _limit: comment_panel_payload(content),
+        ):
+            page.content_table.selectRow(0)
+            page.comment_sync_button.click()
+            old_task = pool.tasks[0]
+            page.content_table.selectRow(1)
+            expected_status = page.comment_status_label.text()
+            expected_body = page.comment_table.item(0, 0).text()
+
+            old_task.signals.started.emit()
+            old_task.signals.progressed.emit(
+                {"stage": "collecting", "message": COMMENT_PROGRESS["collecting"]}
+            )
+            old_task.signals.succeeded.emit({"status": "success", "errorCode": ""})
+            old_task.signals.failed.emit("Cookie=secret")
+            old_task.signals.finished.emit()
+            self.app.processEvents()
+
+        self.assertEqual(page.content_table.selected_content()["contentId"], "work-8")
+        self.assertEqual(page.comment_status_label.text(), expected_status)
+        self.assertEqual(page.comment_table.item(0, 0).text(), expected_body)
+
+    def test_stale_comment_callbacks_cannot_cross_account_or_platform(self) -> None:
+        """仅比对作品 ID 会让同 ID 的旧账号或旧平台任务污染当前页面。"""
+
+        pool = QueuedPool()
+        runner = BackgroundTaskRunner()
+        runner.pool = pool
+        page = self._page(
+            contents=available_douyin_contents(),
+            accounts=[ACCOUNT, ACCOUNT_B, XHS_ACCOUNT_WITH_DOUYIN_ID],
+            registered_platforms=(1, 3),
+            runner=runner,
+        )
+        with patch(
+            "ui.data_monitor_page.platform_data_comment_service.comment_panel_payload",
+            side_effect=lambda _account, content, _label, _limit: comment_panel_payload(content),
+        ):
+            page.content_table.selectRow(0)
+            page.comment_sync_button.click()
+            old_task = pool.tasks[0]
+            page.account_combo.setCurrentIndex(page.account_combo.findData(14))
+            page.content_table.selectRow(0)
+            account_status = page.comment_status_label.text()
+            account_body = page.comment_table.item(0, 0).text()
+
+            old_task.signals.progressed.emit(
+                {"stage": "collecting", "message": COMMENT_PROGRESS["collecting"]}
+            )
+            old_task.signals.succeeded.emit({"status": "success", "errorCode": ""})
+            old_task.signals.failed.emit("private")
+            self.app.processEvents()
+            self.assertEqual(page._current_comment_identity(), (3, 14, "work-7"))
+            self.assertEqual(page.comment_status_label.text(), account_status)
+            self.assertEqual(page.comment_table.item(0, 0).text(), account_body)
+
+            page.platform_combo.setCurrentIndex(page.platform_combo.findData(1))
+            platform_status = page.comment_status_label.text()
+            old_task.signals.progressed.emit(
+                {"stage": "collecting", "message": COMMENT_PROGRESS["collecting"]}
+            )
+            old_task.signals.succeeded.emit({"status": "success", "errorCode": ""})
+            old_task.signals.finished.emit()
+            self.app.processEvents()
+
+        self.assertTrue(page.comment_panel.isHidden())
+        self.assertEqual(page.comment_status_label.text(), platform_status)
+        self.assertEqual(page.comment_table.rowCount(), 0)
+
+    def test_older_generation_for_same_work_cannot_overwrite_new_task(self) -> None:
+        """同一作品的旧任务信号如果晚到，不得覆盖新一代任务进度。"""
+
+        pool = QueuedPool()
+        runner = BackgroundTaskRunner()
+        runner.pool = pool
+        page = self._page(contents=available_douyin_contents(), runner=runner)
+        with patch(
+            "ui.data_monitor_page.platform_data_comment_service.comment_panel_payload",
+            return_value=comment_panel_payload(),
+        ):
+            page.content_table.selectRow(0)
+            page.comment_sync_button.click()
+            old_task = pool.tasks[0]
+            old_task.signals.finished.emit()
+            self.app.processEvents()
+            page.comment_sync_button.click()
+            new_task = pool.tasks[1]
+            new_task.signals.started.emit()
+            new_task.signals.progressed.emit(
+                {"stage": "collecting", "message": COMMENT_PROGRESS["collecting"]}
+            )
+            self.app.processEvents()
+
+            old_task.signals.succeeded.emit(
+                {"status": "failed", "errorCode": "comment_payload_invalid"}
+            )
+            old_task.signals.failed.emit("private traceback")
+            old_task.signals.finished.emit()
+            self.app.processEvents()
+
+        self.assertEqual(
+            page.comment_status_label.text(), COMMENT_PROGRESS["collecting"]
+        )
+        self.assertFalse(page.comment_sync_button.isEnabled())
+
+    def test_comment_sync_is_keyed_by_platform_account_and_content(self) -> None:
+        """同一作品重复点击只能入队一个受控任务。"""
+
+        pool = QueuedPool()
+        runner = BackgroundTaskRunner()
+        runner.pool = pool
+        page = self._page(contents=available_douyin_contents(), runner=runner)
+        with patch(
+            "ui.data_monitor_page.platform_data_comment_service.comment_panel_payload",
+            return_value=comment_panel_payload(),
+        ):
+            page.content_table.selectRow(0)
+        page.comment_sync_button.click()
+        page.comment_sync_button.click()
+
+        self.assertEqual(len(pool.tasks), 1)
+        self.assertEqual(
+            list(runner.active),
+            ["platform-comment-sync:3:12:work-7"],
+        )
+
+    def test_comment_filter_and_candidate_evidence_use_canonical_local_rows(self) -> None:
+        """选题证据若直接信任候选对象，可能展示不在本地评论列表中的伪造正文。"""
+
+        page = self._page(contents=available_douyin_contents())
+        with patch(
+            "ui.data_monitor_page.platform_data_comment_service.comment_panel_payload",
+            return_value=comment_panel_payload(),
+        ):
+            page.content_table.selectRow(0)
+
+        page.comment_filter_combo.setCurrentIndex(
+            page.comment_filter_combo.findText("质疑")
+        )
+        self.app.processEvents()
+        self.assertEqual(page.comment_table.rowCount(), 1)
+        self.assertEqual(page.comment_table.item(0, 0).text(), "第一篇的质疑原文")
+        self.assertIsNone(
+            page.comment_table.item(0, 0).data(Qt.ItemDataRole.UserRole)
+        )
+        evidence = page.comment_candidate_tree.topLevelItem(0).child(0).text(0)
+        self.assertIn("第一篇的质疑原文", evidence)
+        self.assertNotIn("不得显示的伪造证据正文", evidence)
+
+    def test_comment_panel_has_no_platform_write_actions_or_identifiers(self) -> None:
+        """评论洞察不是评论管理，不得出现任何平台写操作或内部标识。"""
+
+        page = self._page(contents=available_douyin_contents())
+        with patch(
+            "ui.data_monitor_page.platform_data_comment_service.comment_panel_payload",
+            return_value=comment_panel_payload(),
+        ):
+            page.content_table.selectRow(0)
+
+        action_texts = [
+            control.text()
+            for control in page.comment_panel.findChildren(QPushButton)
+        ]
+        for forbidden in ("回复", "删除", "点赞", "发布"):
+            self.assertTrue(all(forbidden not in text for text in action_texts))
+        visible = " ".join(
+            page.comment_table.item(row, column).text()
+            for row in range(page.comment_table.rowCount())
+            for column in range(page.comment_table.columnCount())
+        )
+        visible += " " + page.comment_candidate_tree.topLevelItem(0).text(0)
+        visible += " " + page.comment_candidate_tree.topLevelItem(0).child(0).text(0)
+        for forbidden in ("work-7", "C001", "commentKey", "accountId", "contentId"):
+            self.assertNotIn(forbidden, visible)
+
+    def test_comment_schema_failure_uses_fixed_copy_and_resets_buttons(self) -> None:
+        """集成线尚未接建表入口时，查询或同步失败不得崩溃或暴露 SQLite 异常。"""
+
+        pool = QueuedPool()
+        runner = BackgroundTaskRunner()
+        runner.pool = pool
+        page = self._page(contents=available_douyin_contents(), runner=runner)
+        with patch(
+            "ui.data_monitor_page.platform_data_comment_service.comment_panel_payload",
+            side_effect=CommentInsightFailure("comment_payload_invalid"),
+        ):
+            page.content_table.selectRow(0)
+        self.assertEqual(
+            page.comment_status_label.text(), "评论数据暂未接通，请稍后再试"
+        )
+
+        with patch(
+            "ui.data_monitor_page.platform_data_comment_service.sync_comments",
+            return_value={"status": "failed", "errorCode": "comment_payload_invalid"},
+        ):
+            page.comment_sync_button.click()
+            pool.tasks[0].run()
+            self.app.processEvents()
+        self.assertEqual(
+            page.comment_status_label.text(), "评论数据暂未接通，请稍后再试"
+        )
+        self.assertTrue(page.comment_sync_button.isEnabled())
+        self.assertTrue(page.comment_ai_settings_button.isEnabled())
+
+    def test_successful_comment_sync_reloads_panel_and_resets_buttons(self) -> None:
+        """成功终态若没有重读本地数据并恢复按钮，用户会看到旧评论或无法再次同步。"""
+
+        pool = QueuedPool()
+        runner = BackgroundTaskRunner()
+        runner.pool = pool
+        page = self._page(contents=available_douyin_contents(), runner=runner)
+        payload_reads = 0
+
+        def load(*_args) -> dict:
+            nonlocal payload_reads
+            payload_reads += 1
+            return comment_panel_payload()
+
+        with (
+            patch(
+                "ui.data_monitor_page.platform_data_comment_service.comment_panel_payload",
+                side_effect=load,
+            ),
+            patch(
+                "ui.data_monitor_page.platform_data_comment_service.sync_comments",
+                return_value={"status": "success", "errorCode": ""},
+            ),
+        ):
+            page.content_table.selectRow(0)
+            page.comment_sync_button.click()
+            self.assertFalse(page.comment_sync_button.isEnabled())
+            self.assertFalse(page.comment_ai_settings_button.isEnabled())
+            pool.tasks[0].run()
+            self.app.processEvents()
+
+        self.assertEqual(payload_reads, 2)
+        self.assertEqual(page.comment_table.rowCount(), 2)
+        self.assertTrue(page.comment_sync_button.isEnabled())
+        self.assertTrue(page.comment_ai_settings_button.isEnabled())
+
+    def test_ai_settings_dialog_never_reads_existing_secret_and_uses_fake_native_store(self) -> None:
+        """设置页若读回旧密钥，它就会进入可见控件和 UI 内存。"""
+
+        settings = FakeSettings(
+            {
+                BASE_URL_KEY: "https://ai.example.com/v1",
+                MODEL_KEY: "model-old",
+            }
+        )
+        secret_store = FakeSecretStore()
+        dialog = _CommentAiSettingsDialog(
+            settings=settings,
+            secret_store=secret_store,
+        )
+        self.addCleanup(dialog.deleteLater)
+
+        self.assertEqual(secret_store.read_count, 0)
+        self.assertEqual(dialog.secret_input.text(), "")
+        self.assertEqual(
+            dialog.secret_input.echoMode(), QLineEdit.EchoMode.Password
+        )
+        self.assertIn("已配置", dialog.secret_status_label.text())
+        dialog.model_input.setText("model-new")
+        dialog.secret_input.setText("new-private-key")
+        dialog.save_button.click()
+
+        self.assertEqual(secret_store.read_count, 0)
+        self.assertEqual(secret_store.writes, ["new-private-key"])
+        self.assertEqual(settings.values[BASE_URL_KEY], "https://ai.example.com/v1")
+        self.assertEqual(settings.values[MODEL_KEY], "model-new")
+        self.assertEqual(dialog.secret_input.text(), "")
+
+    def test_ai_settings_clear_is_explicit_and_close_has_no_side_effect(self) -> None:
+        """关闭对话框不能更改凭据；只有显式清除才能删除密钥。"""
+
+        settings = FakeSettings()
+        secret_store = FakeSecretStore()
+        dialog = _CommentAiSettingsDialog(
+            settings=settings,
+            secret_store=secret_store,
+            secret_configured=False,
+        )
+        self.addCleanup(dialog.deleteLater)
+        dialog.reject()
+        self.assertEqual(secret_store.writes, [])
+        self.assertEqual(secret_store.delete_count, 0)
+        self.assertEqual(settings.synced, 0)
+
+        clear_dialog = _CommentAiSettingsDialog(
+            settings=settings,
+            secret_store=secret_store,
+            secret_configured=True,
+        )
+        self.addCleanup(clear_dialog.deleteLater)
+        clear_dialog.clear_secret_button.click()
+        self.assertEqual(secret_store.read_count, 0)
+        self.assertEqual(secret_store.delete_count, 1)
+        self.assertIn("未配置", clear_dialog.secret_status_label.text())
+
+    def test_shutdown_collects_data_and_comment_task_prefixes(self) -> None:
+        """客户端关闭时遗漏评论任务，会让浏览器会话留在后台。"""
+
+        runner = MultiPrefixBlockingRunner(wait_result=True)
+        page = self._page(runner=runner)
+
+        self.assertTrue(page.shutdown())
+        self.assertEqual(
+            runner.prefixes,
+            [("platform-data-sync", "platform-comment-sync")],
+        )
+        self.assertEqual(
+            runner.cancelled,
+            [
+                "platform-data-sync:3:12",
+                "platform-comment-sync:3:12:work-7",
+            ],
+        )
+        self.assertEqual(len(runner.waited), 2)
 
     def test_shutdown_refuses_when_running_sync_cannot_finish(self) -> None:
         """采集 worker 未归零时主窗口不能继续关闭全局浏览器。"""
