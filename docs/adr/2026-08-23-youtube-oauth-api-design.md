@@ -19,7 +19,7 @@ YouTube 首个可验证版本改用 Google 官方“桌面应用 OAuth 2.0 + You
 
 ## 范围
 
-本功能提交只新增海外专属模块、测试、ADR 和海外状态文档：
+本分支包含两个彼此独立的海外专属工作包：一是已有 YouTube Studio 浏览器路线的失败安全加固，二是 Google 官方 OAuth/API 合同。前者位于海外 YouTube 上传器及其离线测试；下列文件只是官方路线的子范围，不是整个分支的完整文件清单：
 
 - `app_core/overseas_youtube_oauth.py`
 - `app_core/overseas_youtube_api.py`

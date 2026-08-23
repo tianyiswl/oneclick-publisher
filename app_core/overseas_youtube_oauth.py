@@ -120,6 +120,7 @@ class YouTubeOAuthTokenClient:
                 "redirect_uri": request.callback_url,
             },
             fallback_refresh_token=None,
+            fallback_scope=None,
         )
 
     def refresh_access_token(
@@ -131,6 +132,10 @@ class YouTubeOAuthTokenClient:
         """Refresh an access token while retaining an omitted refresh token."""
         if not client_id or not existing_tokens.refresh_token:
             raise OAuthTokenError("credential_unavailable")
+        _validate_token_authority(
+            scope=existing_tokens.scope,
+            token_type=existing_tokens.token_type,
+        )
         return self._request_tokens(
             {
                 "client_id": client_id,
@@ -138,6 +143,7 @@ class YouTubeOAuthTokenClient:
                 "refresh_token": existing_tokens.refresh_token,
             },
             fallback_refresh_token=existing_tokens.refresh_token,
+            fallback_scope=existing_tokens.scope,
         )
 
     def _request_tokens(
@@ -145,6 +151,7 @@ class YouTubeOAuthTokenClient:
         data: Mapping[str, str],
         *,
         fallback_refresh_token: str | None,
+        fallback_scope: str | None,
     ) -> OAuthTokens:
         try:
             response = self._transport.post(
@@ -164,6 +171,7 @@ class YouTubeOAuthTokenClient:
             payload,
             expires_at=self._clock(),
             fallback_refresh_token=fallback_refresh_token,
+            fallback_scope=fallback_scope,
         )
 
 
@@ -173,12 +181,159 @@ def pkce_s256_challenge(code_verifier: str) -> str:
     return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
 
 
-def build_authorization_request(client_id: str) -> OAuthAuthorizationRequest:
-    """Create one loopback-only Google desktop authorization request."""
+class OAuthLoopbackAuthorizationSession:
+    """Own one live loopback listener and one secret-safe OAuth request."""
+
+    def __init__(
+        self,
+        request: OAuthAuthorizationRequest,
+        listener: socket.socket,
+    ) -> None:
+        self._request = request
+        self._listener: socket.socket | None = listener
+        self._verifier = OAuthCallbackVerifier(request)
+        self._state_lock = threading.Lock()
+        self._receive_lock = threading.Lock()
+        self._closed = False
+
+    @property
+    def request(self) -> OAuthAuthorizationRequest:
+        """Return the immutable request while retaining listener ownership."""
+        return self._request
+
+    def __repr__(self) -> str:
+        return "OAuthLoopbackAuthorizationSession(<redacted>)"
+
+    __str__ = __repr__
+
+    def consume_callback_url(self, callback_url: str) -> OAuthAuthorizationCallback:
+        """Consume one externally received callback and always release the port."""
+        self._require_active_listener()
+        try:
+            return self._verifier.consume(callback_url)
+        finally:
+            self.close()
+
+    def receive_callback(self, *, timeout_seconds: float) -> OAuthAuthorizationCallback:
+        """Receive one local HTTP callback, respond safely, and close the listener."""
+        try:
+            timeout = float(timeout_seconds)
+        except (TypeError, ValueError):
+            self.close()
+            raise OAuthAuthorizationError("authorization response timeout") from None
+        if (
+            isinstance(timeout_seconds, bool)
+            or not math.isfinite(timeout)
+            or timeout <= 0
+        ):
+            self.close()
+            raise OAuthAuthorizationError("authorization response timeout")
+
+        with self._receive_lock:
+            listener = self._require_active_listener()
+            try:
+                listener.settimeout(timeout)
+                connection, _address = listener.accept()
+            except socket.timeout:
+                self.close()
+                raise OAuthAuthorizationError("authorization response timeout") from None
+            except OSError:
+                self.close()
+                raise OAuthAuthorizationError("authorization response invalid") from None
+
+            with connection:
+                try:
+                    connection.settimeout(timeout)
+                    target = _read_http_callback_target(connection)
+                    callback_url = _callback_url_from_target(
+                        target,
+                        expected=self._request.callback_url,
+                    )
+                    result = self._verifier.consume(callback_url)
+                except OAuthAuthorizationError:
+                    _send_loopback_response(connection, accepted=False)
+                    raise
+                except Exception:
+                    _send_loopback_response(connection, accepted=False)
+                    raise OAuthAuthorizationError(
+                        "authorization response invalid"
+                    ) from None
+                else:
+                    _send_loopback_response(connection, accepted=True)
+                    return result
+                finally:
+                    self.close()
+
+    def cancel(self) -> None:
+        """Cancel the authorization attempt and release its callback port."""
+        self.close()
+
+    def close(self) -> None:
+        """Idempotently release the listener, including a blocked receiver."""
+        listener: socket.socket | None
+        with self._state_lock:
+            if self._closed:
+                return
+            self._closed = True
+            listener = self._listener
+            self._listener = None
+        if listener is not None:
+            try:
+                listener.close()
+            except OSError:
+                pass
+
+    def _require_active_listener(self) -> socket.socket:
+        with self._state_lock:
+            listener = self._listener
+            if self._closed or listener is None:
+                raise OAuthAuthorizationError("authorization session closed")
+            return listener
+
+    def __enter__(self) -> OAuthLoopbackAuthorizationSession:
+        return self
+
+    def __exit__(self, *_exc_info: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+def start_authorization_session(client_id: str) -> OAuthLoopbackAuthorizationSession:
+    """Bind and listen before exposing one desktop OAuth authorization URL."""
     if not client_id:
         raise ValueError("OAuth client ID is required")
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        callback_url = urlunparse(
+            (
+                "http",
+                f"127.0.0.1:{port}",
+                f"/oauth/callback/{secrets.token_urlsafe(24)}",
+                "",
+                "",
+                "",
+            )
+        )
+        request = _authorization_request(client_id, callback_url)
+        return OAuthLoopbackAuthorizationSession(request, listener)
+    except Exception:
+        listener.close()
+        raise
 
-    callback_url = _random_loopback_callback_url()
+
+def _authorization_request(
+    client_id: str,
+    callback_url: str,
+) -> OAuthAuthorizationRequest:
     state = secrets.token_urlsafe(32)
     code_verifier = secrets.token_urlsafe(64)
     query = urlencode(
@@ -237,12 +392,68 @@ class OAuthCallbackVerifier:
         return OAuthAuthorizationCallback(authorized=True, authorization_code=codes[0])
 
 
-def _random_loopback_callback_url() -> str:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
-        listener.bind(("127.0.0.1", 0))
-        port = listener.getsockname()[1]
-    path = f"/oauth/callback/{secrets.token_urlsafe(24)}"
-    return urlunparse(("http", f"127.0.0.1:{port}", path, "", "", ""))
+def _read_http_callback_target(connection: socket.socket) -> str:
+    request_bytes = bytearray()
+    while b"\r\n\r\n" not in request_bytes:
+        chunk = connection.recv(4096)
+        if not chunk:
+            break
+        request_bytes.extend(chunk)
+        if len(request_bytes) > 16384:
+            raise OAuthAuthorizationError("authorization response invalid")
+    try:
+        request_line = bytes(request_bytes).split(b"\r\n", 1)[0].decode("ascii")
+        method, target, version = request_line.split(" ", 2)
+    except (UnicodeError, ValueError):
+        raise OAuthAuthorizationError("authorization response invalid") from None
+    if method != "GET" or version not in {"HTTP/1.0", "HTTP/1.1"}:
+        raise OAuthAuthorizationError("authorization response invalid")
+    return target
+
+
+def _callback_url_from_target(target: str, *, expected: str) -> str:
+    try:
+        parsed_target = urlparse(target)
+        parsed_expected = urlparse(expected)
+    except ValueError:
+        raise OAuthAuthorizationError("authorization response invalid") from None
+    if (
+        parsed_target.scheme
+        or parsed_target.netloc
+        or not parsed_target.path.startswith("/")
+    ):
+        raise OAuthAuthorizationError("authorization response invalid")
+    return urlunparse(
+        (
+            parsed_expected.scheme,
+            parsed_expected.netloc,
+            parsed_target.path,
+            parsed_target.params,
+            parsed_target.query,
+            parsed_target.fragment,
+        )
+    )
+
+
+def _send_loopback_response(connection: socket.socket, *, accepted: bool) -> None:
+    body = (
+        b"Authorization response received. You may close this window."
+        if accepted
+        else b"Authorization response rejected. You may close this window."
+    )
+    status = b"200 OK" if accepted else b"400 Bad Request"
+    response = (
+        b"HTTP/1.1 "
+        + status
+        + b"\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: "
+        + str(len(body)).encode("ascii")
+        + b"\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n"
+        + body
+    )
+    try:
+        connection.sendall(response)
+    except OSError:
+        pass
 
 
 def _matches_callback_endpoint(callback: ParseResult, expected: ParseResult) -> bool:
@@ -288,32 +499,43 @@ def _tokens_from_payload(
     *,
     expires_at: float,
     fallback_refresh_token: str | None,
+    fallback_scope: str | None,
 ) -> OAuthTokens:
     access_token = payload.get("access_token")
     refresh_token = payload.get("refresh_token", fallback_refresh_token)
-    scope = payload.get("scope")
+    scope = payload.get("scope", fallback_scope)
     token_type = payload.get("token_type", "Bearer")
+    raw_expires_in = payload.get("expires_in")
+    if isinstance(raw_expires_in, bool):
+        raise OAuthTokenError("oauth_token_response_invalid")
     try:
-        expires_in = float(payload["expires_in"])
-    except (KeyError, TypeError, ValueError):
+        expires_in = float(raw_expires_in)
+    except (OverflowError, TypeError, ValueError):
         raise OAuthTokenError("oauth_token_response_invalid") from None
     if (
         not isinstance(access_token, str)
         or not access_token
         or not isinstance(refresh_token, str)
         or not refresh_token
-        or not isinstance(scope, str)
-        or not scope
-        or not isinstance(token_type, str)
-        or not token_type
         or not math.isfinite(expires_in)
         or expires_in <= 0
     ):
         raise OAuthTokenError("oauth_token_response_invalid")
+    _validate_token_authority(scope=scope, token_type=token_type)
     return OAuthTokens(
         access_token=access_token,
         refresh_token=refresh_token,
         expires_at=expires_at + expires_in,
         scope=scope,
-        token_type=token_type,
+        token_type="Bearer",
     )
+
+
+def _validate_token_authority(*, scope: object, token_type: object) -> None:
+    if (
+        not isinstance(scope, str)
+        or set(scope.split()) != {YOUTUBE_UPLOAD_SCOPE}
+        or not isinstance(token_type, str)
+        or token_type.casefold() != "bearer"
+    ):
+        raise OAuthTokenError("oauth_token_response_invalid")

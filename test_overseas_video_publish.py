@@ -25,6 +25,94 @@ from uploader.youtube_uploader.main import (
 )
 
 
+class FakeContentLeaf:
+    def __init__(
+        self,
+        *,
+        text: str | None = None,
+        href: str | None = None,
+        visible: bool = True,
+    ) -> None:
+        self.text = text
+        self.href = href
+        self.visible = visible
+
+    @property
+    def first(self):
+        return self
+
+    async def count(self) -> int:
+        return int(self.text is not None or self.href is not None)
+
+    async def is_visible(self) -> bool:
+        return self.visible
+
+    async def inner_text(self, timeout: int = 0) -> str:
+        del timeout
+        if self.text is None:
+            raise RuntimeError("field unreadable")
+        return self.text
+
+    async def get_attribute(self, name: str) -> str | None:
+        return self.href if name == "href" else None
+
+
+class FakeContentRow:
+    def __init__(
+        self,
+        *,
+        video_id: str,
+        title: str | None,
+        visibility: str | None,
+        visible: bool = True,
+    ) -> None:
+        self.visible = visible
+        self.title = FakeContentLeaf(
+            text=title,
+            href=f"/video/{video_id}" if video_id else None,
+        )
+        self.visibility = FakeContentLeaf(text=visibility)
+
+    async def is_visible(self) -> bool:
+        return self.visible
+
+    def locator(self, selector: str) -> FakeContentLeaf:
+        if selector == "#video-title":
+            return self.title
+        return self.visibility
+
+
+class FakeContentRows:
+    def __init__(self, rows: list[FakeContentRow]) -> None:
+        self.rows = rows
+
+    async def count(self) -> int:
+        return len(self.rows)
+
+    def nth(self, index: int) -> FakeContentRow:
+        return self.rows[index]
+
+
+class FakeContentPage:
+    def __init__(
+        self,
+        rows: list[FakeContentRow],
+        *,
+        empty_state_visible: bool = False,
+    ) -> None:
+        self.url = "https://studio.youtube.com/channel/test/videos/"
+        self.rows = FakeContentRows(rows)
+        self.empty_state_visible = empty_state_visible
+
+    def locator(self, selector: str):
+        if selector == "ytcp-video-row":
+            return self.rows
+        return FakeContentLeaf(
+            text="No videos" if self.empty_state_visible else None,
+            visible=self.empty_state_visible,
+        )
+
+
 class OverseasVideoPublishPolicyTests(unittest.TestCase):
     def _payload(self, root: Path, platform_type: int) -> dict:
         video = root / "video.mp4"
@@ -306,6 +394,156 @@ class OverseasVideoPublishSignalTests(unittest.TestCase):
             content_list_receipt="studio_content_list:new-id:private",
         )
         self.assertEqual(signal, "studio_content_list:new-id:private")
+
+    def test_incomplete_content_baseline_is_unknown_instead_of_a_partial_id_set(self) -> None:
+        app = YouTubeVideo("目标视频", "/not/used.mp4", [], "/not/used.json")
+        page = FakeContentPage(
+            [
+                FakeContentRow(
+                    video_id="old-id",
+                    title="目标视频",
+                    visibility="private",
+                ),
+                FakeContentRow(
+                    video_id="unreadable-id",
+                    title="其他视频",
+                    visibility=None,
+                ),
+            ]
+        )
+
+        baseline = asyncio.run(app._content_list_video_ids(page))
+
+        self.assertIsNone(baseline)
+
+    def test_content_baseline_accepts_only_an_explicit_empty_state(self) -> None:
+        app = YouTubeVideo("目标视频", "/not/used.mp4", [], "/not/used.json")
+
+        explicit_empty = asyncio.run(
+            app._content_list_video_ids(
+                FakeContentPage([], empty_state_visible=True)
+            )
+        )
+        unrecognized_empty = asyncio.run(
+            app._content_list_video_ids(FakeContentPage([]))
+        )
+
+        self.assertEqual(explicit_empty, set())
+        self.assertIsNone(unrecognized_empty)
+
+    def test_incomplete_after_save_snapshot_cannot_generate_content_success(self) -> None:
+        app = YouTubeVideo("目标视频", "/not/used.mp4", [], "/not/used.json")
+        app.preexisting_video_ids = {"old-id"}
+        page = FakeContentPage(
+            [
+                FakeContentRow(
+                    video_id="new-id",
+                    title="目标视频",
+                    visibility="private",
+                ),
+                FakeContentRow(
+                    video_id="unreadable-id",
+                    title=None,
+                    visibility="private",
+                ),
+            ]
+        )
+
+        receipt = asyncio.run(app._content_list_receipt(page))
+
+        self.assertIsNone(receipt)
+
+    def test_complete_before_and_after_snapshots_accept_only_new_matching_id(self) -> None:
+        app = YouTubeVideo("目标视频", "/not/used.mp4", [], "/not/used.json")
+        before = FakeContentPage(
+            [
+                FakeContentRow(
+                    video_id="old-id",
+                    title="目标视频",
+                    visibility="private",
+                )
+            ]
+        )
+        app.preexisting_video_ids = asyncio.run(app._content_list_video_ids(before))
+        after = FakeContentPage(
+            [
+                FakeContentRow(
+                    video_id="old-id",
+                    title="目标视频",
+                    visibility="private",
+                ),
+                FakeContentRow(
+                    video_id="new-id",
+                    title="目标视频",
+                    visibility="private",
+                ),
+            ]
+        )
+
+        receipt = asyncio.run(app._content_list_receipt(after))
+
+        self.assertEqual(receipt, "studio_content_list:new-id:private")
+
+    def test_content_baseline_is_captured_before_upload_route_and_file_selection(self) -> None:
+        app = YouTubeVideo("目标视频", "/offline/video.mp4", [], "/not/used.json")
+        self.assertTrue(
+            hasattr(app, "_prepare_upload_mutation"),
+            "Content baseline preparation boundary is not implemented",
+        )
+        events: list[object] = []
+
+        class FileInput:
+            @property
+            def first(self):
+                return self
+
+            async def wait_for(self, *, state: str, timeout: int) -> None:
+                events.append(("file_ready", state, timeout))
+
+            async def set_input_files(self, path: str) -> None:
+                events.append(("file_selected", path))
+
+        class Page:
+            url = "about:blank"
+
+            async def goto(self, url: str, **kwargs: object) -> None:
+                events.append(("goto", url, kwargs))
+                self.url = url
+
+            async def wait_for_timeout(self, milliseconds: int) -> None:
+                events.append(("wait", milliseconds))
+
+            def locator(self, selector: str):
+                self.selector = selector
+                return FileInput()
+
+        async def capture(_page) -> set[str]:
+            events.append("baseline_complete")
+            return {"old-id"}
+
+        app._content_list_video_ids = capture
+        app._wait_for_manual_intervention = AsyncMock(return_value=None)
+        with patch.object(
+            youtube_uploader,
+            "reveal_page_window",
+            new=AsyncMock(return_value=None),
+        ):
+            asyncio.run(app._prepare_upload_mutation(Page()))
+
+        baseline_index = events.index("baseline_complete")
+        upload_index = next(
+            index
+            for index, event in enumerate(events)
+            if isinstance(event, tuple)
+            and event[:2] == ("goto", youtube_uploader.UPLOAD_URL)
+        )
+        file_index = next(
+            index
+            for index, event in enumerate(events)
+            if isinstance(event, tuple) and event[0] == "file_selected"
+        )
+        self.assertLess(baseline_index, upload_index)
+        self.assertLess(upload_index, file_index)
 
     def test_youtube_preflight_receipt_requires_every_requested_field(self) -> None:
         required = {"video", "title", "description", "tags", "audience", "visibility"}

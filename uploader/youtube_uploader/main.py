@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import re
 from pathlib import Path
+from urllib.parse import urljoin, urlparse
 
 from playwright.async_api import Playwright, async_playwright
 
@@ -22,6 +23,7 @@ from utils.publish_observer import publish_event
 
 
 UPLOAD_URL = "https://www.youtube.com/upload"
+STUDIO_HOME_URL = "https://studio.youtube.com"
 FORMAL_LOCK_MESSAGE = "YouTube 正式发布缺少桌面端确认"
 PUBLISH_RESULT_TIMEOUT_SECONDS = 120
 
@@ -146,6 +148,22 @@ def _visibility_key(value: object) -> str:
         if any(option in text for option in options):
             return key
     return text
+
+
+def _is_content_page_url(value: object) -> bool:
+    try:
+        parsed = urlparse(str(value or ""))
+        return bool(
+            parsed.scheme == "https"
+            and parsed.hostname == "studio.youtube.com"
+            and parsed.username is None
+            and parsed.password is None
+            and parsed.port in {None, 443}
+            and not parsed.fragment
+            and re.fullmatch(r"/channel/[^/]+/videos/?", parsed.path)
+        )
+    except ValueError:
+        return False
 
 
 def youtube_content_list_receipt(
@@ -502,24 +520,89 @@ class YouTubeVideo:
     async def _final_button_visible(self, page) -> bool:
         return await self._final_button(page) is not None
 
-    async def _content_list_rows(self, page) -> list[dict[str, str]]:
+    async def _open_content_page(self, page) -> bool:
+        if _is_content_page_url(page.url):
+            return True
+        try:
+            await page.goto(
+                STUDIO_HOME_URL,
+                wait_until="domcontentloaded",
+                timeout=60000,
+            )
+            await page.wait_for_timeout(1500)
+            await self._wait_for_manual_intervention(page)
+            if _is_content_page_url(page.url):
+                return True
+            links = page.locator("a[href*='/videos']")
+            count = await links.count()
+            for index in range(count):
+                href = await links.nth(index).get_attribute("href")
+                target = urljoin(STUDIO_HOME_URL, str(href or ""))
+                if not _is_content_page_url(target):
+                    continue
+                await page.goto(
+                    target,
+                    wait_until="domcontentloaded",
+                    timeout=60000,
+                )
+                await page.wait_for_timeout(1500)
+                await self._wait_for_manual_intervention(page)
+                return _is_content_page_url(page.url)
+        except YouTubeManualInterventionRequired:
+            raise
+        except Exception:
+            return False
+        return False
+
+    async def _content_empty_state_visible(self, page) -> bool:
+        for selector in (
+            "ytcp-video-list ytcp-empty-state",
+            "ytcp-empty-state",
+            "#empty-state",
+            "[test-id='no-videos']",
+        ):
+            locator = page.locator(selector).first
+            try:
+                if await locator.count() and await locator.is_visible():
+                    return True
+            except Exception:
+                return False
+        return False
+
+    async def _content_list_rows(self, page) -> list[dict[str, str]] | None:
+        if not _is_content_page_url(page.url):
+            return None
         rows: list[dict[str, str]] = []
-        locator = page.locator("ytcp-video-row")
-        count = min(await locator.count(), 30)
+        seen_video_ids: set[str] = set()
+        try:
+            locator = page.locator("ytcp-video-row")
+            count = await locator.count()
+        except Exception:
+            return None
+        visible_count = 0
         for index in range(count):
             row = locator.nth(index)
+            try:
+                if not await row.is_visible():
+                    continue
+            except Exception:
+                return None
+            visible_count += 1
             title_locator = row.locator("#video-title").first
             try:
                 title = (await title_locator.inner_text(timeout=1000)).strip()
                 href = str(await title_locator.get_attribute("href") or "")
             except Exception:
-                continue
+                return None
             match = re.search(
                 r"(?:/video/|watch\?v=|youtu\.be/)([A-Za-z0-9_-]{6,})",
                 href,
             )
-            if not match:
-                continue
+            if not title or not match:
+                return None
+            video_id = match.group(1)
+            if video_id in seen_video_ids:
+                return None
             visibility = ""
             for selector in (
                 "#visibility-text",
@@ -528,30 +611,38 @@ class YouTubeVideo:
             ):
                 target = row.locator(selector).first
                 try:
-                    if await target.count():
+                    if await target.count() and await target.is_visible():
                         visibility = (await target.inner_text(timeout=800)).strip()
                         if visibility:
                             break
                 except Exception:
                     continue
-            if not visibility:
-                continue
+            if _visibility_key(visibility) not in {"public", "private", "unlisted"}:
+                return None
+            seen_video_ids.add(video_id)
             rows.append(
                 {
-                    "videoId": match.group(1),
+                    "videoId": video_id,
                     "title": title,
                     "visibility": visibility,
                 }
             )
-        return rows
+        if visible_count:
+            return rows
+        if await self._content_empty_state_visible(page):
+            return []
+        return None
 
     async def _content_list_video_ids(self, page) -> set[str] | None:
-        url = str(page.url or "").lower()
-        if "studio.youtube.com" not in url or "/videos/" not in url:
-            return None
         try:
+            if not await self._open_content_page(page):
+                return None
             rows = await self._content_list_rows(page)
+        except YouTubeManualInterventionRequired:
+            raise
         except Exception:
+            return None
+        if rows is None:
             return None
         return {
             str(row.get("videoId")) for row in rows if row.get("videoId")
@@ -561,8 +652,14 @@ class YouTubeVideo:
         if self.preexisting_video_ids is None:
             return None
         try:
+            if not await self._open_content_page(page):
+                return None
             rows = await self._content_list_rows(page)
+        except YouTubeManualInterventionRequired:
+            raise
         except Exception:
+            return None
+        if rows is None:
             return None
         return youtube_content_list_receipt(
             rows,
@@ -570,6 +667,21 @@ class YouTubeVideo:
             visibility=self.visibility,
             preexisting_video_ids=self.preexisting_video_ids,
         )
+
+    async def _prepare_upload_mutation(self, page) -> None:
+        """Capture a trustworthy read-only baseline before selecting media."""
+        self.preexisting_video_ids = await self._content_list_video_ids(page)
+        if self.preexisting_video_ids is None:
+            youtube_logger.warning(
+                "[youtube] Content 页基线无法完整读取；本次禁用内容列表成功回执"
+            )
+        await page.goto(UPLOAD_URL, wait_until="domcontentloaded", timeout=60000)
+        await reveal_page_window(page)
+        await page.wait_for_timeout(2500)
+        await self._wait_for_manual_intervention(page)
+        file_input = page.locator('input[type="file"]').first
+        await file_input.wait_for(state="attached", timeout=60000)
+        await file_input.set_input_files(self.file_path)
 
     async def _wait_for_publish_result(self, page) -> str:
         loop = asyncio.get_running_loop()
@@ -579,19 +691,19 @@ class YouTubeVideo:
             feedback = await _feedback_text(page)
             upload_dialog_visible = await self._upload_dialog_visible(page)
             final_button_visible = await self._final_button_visible(page)
-            content_list_receipt = None
-            if not upload_dialog_visible and not final_button_visible:
-                content_list_receipt = await self._content_list_receipt(page)
             signal = youtube_publish_success_signal(
                 url=page.url,
                 feedback_text=feedback,
                 upload_dialog_visible=upload_dialog_visible,
                 final_button_visible=final_button_visible,
                 visibility=self.visibility,
-                content_list_receipt=content_list_receipt,
             )
             if signal:
                 return signal
+            if not upload_dialog_visible and not final_button_visible:
+                content_list_receipt = await self._content_list_receipt(page)
+                if content_list_receipt:
+                    return content_list_receipt
             combined = f"{feedback}\n{await _body_text(page)}".lower()
             if any(
                 marker in combined
@@ -648,18 +760,10 @@ class YouTubeVideo:
 
         try:
             verified_fields: set[str] = set()
-            if "youtube.com/upload" not in (page.url or ""):
-                await page.goto(UPLOAD_URL, wait_until="domcontentloaded", timeout=60000)
-            await reveal_page_window(page)
-            await page.wait_for_timeout(2500)
-            await self._wait_for_manual_intervention(page)
+            await self._prepare_upload_mutation(page)
 
             mode_text = "预发布" if self.dry_run else "正式发布"
             youtube_logger.info(f"[youtube] 开始{mode_text}上传：{Path(self.file_path).name}")
-            self.preexisting_video_ids = await self._content_list_video_ids(page)
-            file_input = page.locator('input[type="file"]').first
-            await file_input.wait_for(state="attached", timeout=60000)
-            await file_input.set_input_files(self.file_path)
             await page.locator("#title-textarea").wait_for(state="visible", timeout=120000)
             await _fill_editable(page, "#title-textarea #textbox", self.title[:100])
             verified_fields.add("title")

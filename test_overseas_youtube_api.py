@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """Offline contract tests for the zero-write YouTube API boundary."""
 
-import inspect
 import tempfile
+import threading
 import unittest
 from collections.abc import Iterator, Mapping
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import app_core.overseas_youtube_api as youtube_api
 from app_core.overseas_youtube_api import (
@@ -48,7 +49,9 @@ class InvalidStatusChannelResponse:
 class FakeReadOnlyTransport:
     def __init__(self, response: FakeChannelResponse | None = None) -> None:
         self._response = response
-        self.get_calls: list[tuple[str, dict[str, str], dict[str, str], float]] = []
+        self.get_calls: list[
+            tuple[str, dict[str, str], dict[str, str], float, bool]
+        ] = []
         self.write_calls: list[object] = []
 
     def get(
@@ -58,8 +61,9 @@ class FakeReadOnlyTransport:
         headers: dict[str, str],
         params: dict[str, str],
         timeout: float,
+        allow_redirects: bool,
     ) -> FakeChannelResponse:
-        self.get_calls.append((url, headers, params, timeout))
+        self.get_calls.append((url, headers, params, timeout, allow_redirects))
         assert self._response is not None
         return self._response
 
@@ -118,10 +122,14 @@ class FakeYouTubeUploadTransport:
         post_responses: list[object] | None = None,
         put_responses: list[object] | None = None,
         get_responses: list[object] | None = None,
+        channel_responses: list[object] | None = None,
     ) -> None:
         self.post_responses = list(post_responses or [])
         self.put_responses = list(put_responses or [])
         self.get_responses = list(get_responses or [])
+        self.channel_responses = (
+            None if channel_responses is None else list(channel_responses)
+        )
         self.post_calls: list[dict[str, object]] = []
         self.put_calls: list[dict[str, object]] = []
         self.get_calls: list[dict[str, object]] = []
@@ -145,7 +153,96 @@ class FakeYouTubeUploadTransport:
 
     def get(self, url: str, **kwargs: object) -> object:
         self.get_calls.append({"url": url, **kwargs})
+        if url == YOUTUBE_CHANNELS_ENDPOINT:
+            if self.channel_responses is None:
+                return FakeUploadResponse(
+                    200,
+                    {
+                        "items": [
+                            {
+                                "id": "UC_expected",
+                                "snippet": {"title": "Expected"},
+                            }
+                        ]
+                    },
+                )
+            return self._next(self.channel_responses)
         return self._next(self.get_responses)
+
+
+class BlockingUploadTransport(FakeYouTubeUploadTransport):
+    """Deterministically exposes overlapping initiation or transfer calls."""
+
+    def __init__(
+        self,
+        *,
+        block_operation: str,
+        post_responses: list[object] | None = None,
+        put_responses: list[object] | None = None,
+    ) -> None:
+        super().__init__(
+            post_responses=post_responses,
+            put_responses=put_responses,
+        )
+        self.block_operation = block_operation
+        self.first_entered = threading.Event()
+        self.second_entered = threading.Event()
+        self.release_first = threading.Event()
+        self._call_lock = threading.Lock()
+        self._active_calls = 0
+        self.maximum_active_calls = 0
+
+    def _enter(self, operation: str) -> None:
+        if operation != self.block_operation:
+            return
+        with self._call_lock:
+            self._active_calls += 1
+            self.maximum_active_calls = max(
+                self.maximum_active_calls,
+                self._active_calls,
+            )
+            call_number = self._active_calls
+        if call_number == 1:
+            self.first_entered.set()
+            self.release_first.wait(timeout=2.0)
+        else:
+            self.second_entered.set()
+
+    def _leave(self, operation: str) -> None:
+        if operation != self.block_operation:
+            return
+        with self._call_lock:
+            self._active_calls -= 1
+
+    def post(self, url: str, **kwargs: object) -> object:
+        self._enter("post")
+        try:
+            return super().post(url, **kwargs)
+        finally:
+            self._leave("post")
+
+    def put(self, url: str, **kwargs: object) -> object:
+        self._enter("put")
+        try:
+            return super().put(url, **kwargs)
+        finally:
+            self._leave("put")
+
+
+class ChunkRecordingTransport(FakeYouTubeUploadTransport):
+    """Record chunk boundaries without retaining media bytes in the test."""
+
+    def put(self, url: str, **kwargs: object) -> object:
+        media = kwargs.pop("data")
+        assert isinstance(media, bytes)
+        self.put_calls.append(
+            {
+                "url": url,
+                **kwargs,
+                "data_length": len(media),
+            }
+        )
+        return self._next(self.put_responses)
 
 
 class YouTubeLocalPreflightTests(unittest.TestCase):
@@ -249,15 +346,15 @@ class YouTubeLocalPreflightTests(unittest.TestCase):
                     with self.assertRaisesRegex(YouTubePreflightError, f"^{reason}$"):
                         local_preflight(self._request(video, **changes))
 
-    def test_local_preflight_is_pure_and_never_uses_a_video_insert_endpoint(self) -> None:
+    def test_local_preflight_never_constructs_a_remote_upload_boundary(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             video = Path(raw) / "video.mp4"
             video.write_bytes(b"video")
-            local_preflight(self._request(video))
+            with patch.object(youtube_api, "YouTubePrivateUploadAdapter") as adapter:
+                checked = local_preflight(self._request(video))
 
-        source = inspect.getsource(local_preflight)
-        self.assertNotIn("videos.insert", source)
-        self.assertNotIn("http", source.lower())
+        adapter.assert_not_called()
+        self.assertEqual(checked.video_path, video)
 
 
 class YouTubeChannelIdentityTests(unittest.TestCase):
@@ -274,11 +371,12 @@ class YouTubeChannelIdentityTests(unittest.TestCase):
 
         self.assertEqual(identity, YouTubeChannelIdentity(channel_id="UC_stable_channel", display_name="Channel Name"))
         self.assertEqual(len(transport.get_calls), 1)
-        url, headers, params, timeout = transport.get_calls[0]
+        url, headers, params, timeout, allow_redirects = transport.get_calls[0]
         self.assertEqual(url, YOUTUBE_CHANNELS_ENDPOINT)
         self.assertEqual(headers, {"Authorization": "Bearer access-token-secret"})
         self.assertEqual(params, {"part": "id,snippet", "mine": "true"})
         self.assertGreater(timeout, 0)
+        self.assertIs(allow_redirects, False)
         self.assertEqual(transport.write_calls, [])
         self.assertNotIn("access-token-secret", repr(identity))
         self.assertNotIn("raw-provider-body", repr(identity))
@@ -342,7 +440,10 @@ class YouTubePrivateResumableUploadTests(unittest.TestCase):
         )
         self.identity = YouTubeChannelIdentity(channel_id="UC_expected", display_name="Expected")
         self.token = "access-token-secret"
-        self.session_uri = "https://upload.youtube.example/sensitive-session-token"
+        self.session_uri = (
+            "https://www.googleapis.com/upload/youtube/v3/videos"
+            "?upload_id=sensitive-session-token"
+        )
 
     def _adapter(self, transport: FakeYouTubeUploadTransport) -> Any:
         self.assertTrue(
@@ -368,6 +469,12 @@ class YouTubePrivateResumableUploadTests(unittest.TestCase):
     def _session_response(self) -> FakeUploadResponse:
         return FakeUploadResponse(200, {}, headers={"Location": self.session_uri})
 
+    def _channel_response(self, channel_id: str = "UC_expected") -> FakeUploadResponse:
+        return FakeUploadResponse(
+            200,
+            {"items": [{"id": channel_id, "snippet": {"title": "Expected"}}]},
+        )
+
     def _matching_item(
         self,
         *,
@@ -388,53 +495,286 @@ class YouTubePrivateResumableUploadTests(unittest.TestCase):
         return item
 
     def _begin(self, adapter: Any) -> Any:
-        return adapter.initiate_resumable_upload(
+        plan = adapter.create_confirmed_upload_plan(
             self.validated,
-            self.identity,
-            self.token,
+            credential_reference="credential-reference-secret",
+            expected_channel=self.identity,
+            access_token=self.token,
             confirmed_current=True,
         )
+        return adapter.initiate_resumable_upload(plan)
 
     def _complete_upload(self, adapter: Any) -> Any:
-        return adapter.upload_or_resume(self._begin(adapter), self.token)
+        return adapter.upload_or_resume(self._begin(adapter))
 
-    def test_initiation_requires_current_confirmation_validated_request_identity_and_token(self) -> None:
+    def test_plan_requires_validated_request_and_stable_channel_identity(self) -> None:
         transport = FakeYouTubeUploadTransport()
         adapter = self._adapter(transport)
         error_type = self._error_type()
 
-        for confirmation in (False, None, 1):
-            with self.subTest(confirmation=confirmation):
-                with self.assertRaisesRegex(error_type, "^authorization_denied$"):
-                    adapter.initiate_resumable_upload(
-                        self.validated,
-                        self.identity,
-                        self.token,
-                        confirmed_current=confirmation,
-                    )
         with self.assertRaisesRegex(error_type, "^authorization_invalid$"):
-            adapter.initiate_resumable_upload(
+            adapter.create_confirmed_upload_plan(
                 YouTubeUploadRequest(video_paths=(self.video,), title="raw", description="raw"),
-                self.identity,
-                self.token,
+                credential_reference="credential-reference-secret",
+                expected_channel=self.identity,
+                access_token=self.token,
                 confirmed_current=True,
             )
         with self.assertRaisesRegex(error_type, "^authorization_invalid$"):
-            adapter.initiate_resumable_upload(
+            adapter.create_confirmed_upload_plan(
                 self.validated,
-                object(),
-                self.token,
+                credential_reference="credential-reference-secret",
+                expected_channel=object(),
+                access_token=self.token,
                 confirmed_current=True,
             )
-        with self.assertRaisesRegex(error_type, "^credential_unavailable$"):
-            adapter.initiate_resumable_upload(
-                self.validated,
-                self.identity,
-                "",
+        forged_validated = youtube_api.ValidatedYouTubeUpload(
+            video_path=self.video,
+            title="",
+            description="forged without local preflight",
+            tags=(),
+            category_id=None,
+            made_for_kids=False,
+            notify_subscribers=False,
+        )
+        with self.assertRaisesRegex(error_type, "^authorization_invalid$"):
+            adapter.create_confirmed_upload_plan(
+                forged_validated,
+                credential_reference="credential-reference-secret",
+                expected_channel=self.identity,
+                access_token=self.token,
                 confirmed_current=True,
             )
 
         self.assertEqual(transport.post_calls, [])
+        self.assertEqual(transport.get_calls, [])
+
+    def test_adapter_owned_plan_is_opaque_and_revalidates_bound_channel_before_insert(self) -> None:
+        transport = FakeYouTubeUploadTransport(
+            post_responses=[self._session_response()],
+            channel_responses=[self._channel_response()],
+        )
+        adapter = self._adapter(transport)
+        self.assertTrue(
+            hasattr(adapter, "create_confirmed_upload_plan"),
+            "adapter-owned confirmed upload plan is not implemented",
+        )
+
+        plan = adapter.create_confirmed_upload_plan(
+            self.validated,
+            credential_reference="credential-reference-secret",
+            expected_channel=self.identity,
+            access_token=self.token,
+            confirmed_current=True,
+        )
+
+        public_plan = f"{plan!r} {plan!s}"
+        for secret in (
+            str(self.video),
+            "credential-reference-secret",
+            self.identity.channel_id,
+            self.identity.display_name,
+            self.token,
+            self.validated.title,
+        ):
+            self.assertNotIn(secret, public_plan)
+        for authority_field in (
+            "video_path",
+            "credential_reference",
+            "expected_channel",
+            "access_token",
+            "confirmed_current",
+        ):
+            self.assertFalse(hasattr(plan, authority_field))
+        with self.assertRaises((AttributeError, FrozenInstanceError, TypeError)):
+            plan.access_token = "replacement"  # type: ignore[attr-defined]
+
+        session = adapter.initiate_resumable_upload(plan)
+
+        self.assertIsNotNone(session)
+        self.assertEqual(len(transport.get_calls), 1)
+        self.assertEqual(transport.get_calls[0]["url"], YOUTUBE_CHANNELS_ENDPOINT)
+        self.assertEqual(
+            transport.get_calls[0]["headers"],
+            {"Authorization": "Bearer access-token-secret"},
+        )
+        self.assertEqual(len(transport.post_calls), 1)
+        with self.assertRaisesRegex(self._error_type(), "^upload_plan_used$"):
+            adapter.initiate_resumable_upload(plan)
+        self.assertEqual(len(transport.post_calls), 1)
+
+    def test_plan_rejects_confirmation_credentials_channel_file_and_foreign_or_reused_handle_before_insert(self) -> None:
+        error_type = self._error_type()
+        adapter = self._adapter(FakeYouTubeUploadTransport())
+        self.assertTrue(
+            hasattr(adapter, "create_confirmed_upload_plan"),
+            "adapter-owned confirmed upload plan is not implemented",
+        )
+        for confirmation in (False, None, 1):
+            with self.subTest(confirmation=confirmation):
+                with self.assertRaisesRegex(error_type, "^authorization_denied$"):
+                    adapter.create_confirmed_upload_plan(
+                        self.validated,
+                        credential_reference="credential-reference-secret",
+                        expected_channel=self.identity,
+                        access_token=self.token,
+                        confirmed_current=confirmation,
+                    )
+        for credential_reference, access_token, reason in (
+            ("", self.token, "credential_unavailable"),
+            ("   ", self.token, "credential_unavailable"),
+            ("credential-reference-secret", "", "credential_unavailable"),
+        ):
+            with self.subTest(reason=reason, credential_reference=credential_reference):
+                with self.assertRaisesRegex(error_type, f"^{reason}$"):
+                    adapter.create_confirmed_upload_plan(
+                        self.validated,
+                        credential_reference=credential_reference,
+                        expected_channel=self.identity,
+                        access_token=access_token,
+                        confirmed_current=True,
+                    )
+
+        changed_file_transport = FakeYouTubeUploadTransport(
+            channel_responses=[self._channel_response()],
+        )
+        changed_file_adapter = self._adapter(changed_file_transport)
+        changed_file_plan = changed_file_adapter.create_confirmed_upload_plan(
+            self.validated,
+            credential_reference="credential-reference-secret",
+            expected_channel=self.identity,
+            access_token=self.token,
+            confirmed_current=True,
+        )
+        self.video.write_bytes(b"substituted-media")
+        with self.assertRaisesRegex(error_type, "^upload_file_changed$"):
+            changed_file_adapter.initiate_resumable_upload(changed_file_plan)
+        self.assertEqual(changed_file_transport.post_calls, [])
+
+        self.video.write_bytes(b"abcdefghij")
+        wrong_channel_transport = FakeYouTubeUploadTransport(
+            channel_responses=[self._channel_response("UC_substituted")],
+        )
+        wrong_channel_adapter = self._adapter(wrong_channel_transport)
+        wrong_channel_plan = wrong_channel_adapter.create_confirmed_upload_plan(
+            self.validated,
+            credential_reference="credential-reference-secret",
+            expected_channel=self.identity,
+            access_token=self.token,
+            confirmed_current=True,
+        )
+        with self.assertRaisesRegex(error_type, "^authorization_invalid$"):
+            wrong_channel_adapter.initiate_resumable_upload(wrong_channel_plan)
+        self.assertEqual(wrong_channel_transport.post_calls, [])
+
+        failure_transport = FakeYouTubeUploadTransport(
+            channel_responses=[self._channel_response()],
+            post_responses=[FakeUploadResponse(400, {"detail": "provider-secret"})],
+        )
+        failure_adapter = self._adapter(failure_transport)
+        one_use_plan = failure_adapter.create_confirmed_upload_plan(
+            self.validated,
+            credential_reference="credential-reference-secret",
+            expected_channel=self.identity,
+            access_token=self.token,
+            confirmed_current=True,
+        )
+        with self.assertRaisesRegex(error_type, "^upload_failed$"):
+            failure_adapter.initiate_resumable_upload(one_use_plan)
+        with self.assertRaisesRegex(error_type, "^upload_plan_used$"):
+            failure_adapter.initiate_resumable_upload(one_use_plan)
+        self.assertEqual(len(failure_transport.post_calls), 1)
+
+        foreign_adapter = self._adapter(FakeYouTubeUploadTransport())
+        with self.assertRaisesRegex(error_type, "^upload_plan_invalid$"):
+            foreign_adapter.initiate_resumable_upload(one_use_plan)
+
+    def test_concurrent_initiation_atomically_claims_exactly_one_insert(self) -> None:
+        transport = BlockingUploadTransport(
+            block_operation="post",
+            post_responses=[self._session_response(), self._session_response()],
+        )
+        adapter = self._adapter(transport)
+        plan = adapter.create_confirmed_upload_plan(
+            self.validated,
+            credential_reference="credential-reference-secret",
+            expected_channel=self.identity,
+            access_token=self.token,
+            confirmed_current=True,
+        )
+        start_second = threading.Event()
+        successes: list[object] = []
+        errors: list[Exception] = []
+
+        def initiate(*, wait_for_second: bool) -> None:
+            if wait_for_second:
+                start_second.wait(timeout=2.0)
+            try:
+                successes.append(adapter.initiate_resumable_upload(plan))
+            except Exception as error:
+                errors.append(error)
+
+        first = threading.Thread(target=initiate, kwargs={"wait_for_second": False})
+        second = threading.Thread(target=initiate, kwargs={"wait_for_second": True})
+        first.start()
+        self.assertTrue(transport.first_entered.wait(timeout=1.0))
+        second.start()
+        start_second.set()
+        overlapping_insert = transport.second_entered.wait(timeout=0.5)
+        transport.release_first.set()
+        first.join(timeout=2.0)
+        second.join(timeout=2.0)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertFalse(overlapping_insert)
+        self.assertEqual(len(transport.post_calls), 1)
+        self.assertEqual(len(successes), 1)
+        self.assertEqual(len(errors), 1)
+        self.assertRegex(str(errors[0]), "^upload_plan_used$")
+
+    def test_concurrent_transfer_serializes_put_and_closes_competing_worker(self) -> None:
+        transport = BlockingUploadTransport(
+            block_operation="put",
+            post_responses=[self._session_response()],
+            put_responses=[
+                FakeUploadResponse(201, {"id": "video_exact"}),
+                FakeUploadResponse(201, {"id": "video_exact"}),
+            ],
+        )
+        adapter = self._adapter(transport)
+        session = self._begin(adapter)
+        start_second = threading.Event()
+        receipts: list[object] = []
+        errors: list[Exception] = []
+
+        def transfer(*, wait_for_second: bool) -> None:
+            if wait_for_second:
+                start_second.wait(timeout=2.0)
+            try:
+                receipts.append(adapter.upload_or_resume(session))
+            except Exception as error:
+                errors.append(error)
+
+        first = threading.Thread(target=transfer, kwargs={"wait_for_second": False})
+        second = threading.Thread(target=transfer, kwargs={"wait_for_second": True})
+        first.start()
+        self.assertTrue(transport.first_entered.wait(timeout=1.0))
+        second.start()
+        start_second.set()
+        overlapping_put = transport.second_entered.wait(timeout=0.5)
+        transport.release_first.set()
+        first.join(timeout=2.0)
+        second.join(timeout=2.0)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertFalse(overlapping_put)
+        self.assertEqual(transport.maximum_active_calls, 1)
+        self.assertEqual(len(transport.put_calls), 1)
+        self.assertEqual(receipts, [self._receipt()])
+        self.assertEqual(len(errors), 1)
+        self.assertRegex(str(errors[0]), "^upload_session_invalid$")
 
     def test_successful_private_upload_uses_one_session_and_verifies_only_the_exact_video_id(self) -> None:
         transport = FakeYouTubeUploadTransport(
@@ -470,7 +810,7 @@ class YouTubePrivateResumableUploadTests(unittest.TestCase):
         self.assertNotIn(self.session_uri, repr(session))
         self.assertNotIn(self.token, repr(session))
 
-        uploaded = adapter.upload_or_resume(session, self.token)
+        uploaded = adapter.upload_or_resume(session)
 
         self.assertEqual(uploaded, self._receipt())
         self.assertEqual(len(transport.put_calls), 1)
@@ -489,17 +829,13 @@ class YouTubePrivateResumableUploadTests(unittest.TestCase):
         self.assertNotIn(self.session_uri, repr(uploaded))
         self.assertNotIn(self.token, repr(uploaded))
 
-        verified = adapter.verify_exact_readback(
-            uploaded,
-            self.validated,
-            self.identity,
-            self.token,
-        )
+        verified = adapter.verify_exact_readback(uploaded)
 
         self.assertEqual(verified, self._receipt(state="processed_private"))
-        self.assertEqual(len(transport.get_calls), 1)
+        self.assertEqual(len(transport.get_calls), 2)
+        video_readback = transport.get_calls[-1]
         self.assertEqual(
-            transport.get_calls[0],
+            video_readback,
             {
                 "url": youtube_api.YOUTUBE_VIDEOS_ENDPOINT,
                 "headers": {"Authorization": "Bearer access-token-secret"},
@@ -507,10 +843,11 @@ class YouTubePrivateResumableUploadTests(unittest.TestCase):
                     "part": "id,snippet,status,processingDetails",
                     "id": "video_exact",
                 },
-                "timeout": transport.get_calls[0]["timeout"],
+                "timeout": video_readback["timeout"],
+                "allow_redirects": False,
             },
         )
-        self.assertGreater(transport.get_calls[0]["timeout"], 0)
+        self.assertGreater(video_readback["timeout"], 0)
         self.assertNotIn("public", verified.state)
         with self.assertRaises(FrozenInstanceError):
             verified.state = "public"  # type: ignore[misc]
@@ -535,8 +872,8 @@ class YouTubePrivateResumableUploadTests(unittest.TestCase):
         adapter = self._adapter(transport)
         session = self._begin(adapter)
 
-        incomplete = adapter.upload_or_resume(session, self.token)
-        completed = adapter.upload_or_resume(session, self.token)
+        incomplete = adapter.upload_or_resume(session)
+        completed = adapter.upload_or_resume(session)
 
         self.assertEqual(incomplete, self._receipt(state="upload_started", video_id=None))
         self.assertEqual(completed, self._receipt())
@@ -548,6 +885,94 @@ class YouTubePrivateResumableUploadTests(unittest.TestCase):
         self.assertEqual(transport.put_calls[1]["data"], b"efgh")
         self.assertEqual(transport.put_calls[1]["headers"]["Content-Range"], "bytes 4-7/8")
 
+    def test_sparse_media_is_read_and_sent_as_bounded_resumable_chunks(self) -> None:
+        self.assertTrue(
+            hasattr(youtube_api, "RESUMABLE_CHUNK_SIZE_BYTES"),
+            "bounded resumable chunk size is not implemented",
+        )
+        chunk_size = youtube_api.RESUMABLE_CHUNK_SIZE_BYTES
+        self.assertEqual(chunk_size, 8 * 1024 * 1024)
+        self.assertEqual(chunk_size % (256 * 1024), 0)
+        total_size = chunk_size + 17
+        with self.video.open("wb") as sparse_video:
+            sparse_video.truncate(total_size)
+        self.validated = local_preflight(
+            YouTubeUploadRequest(
+                video_paths=(self.video,),
+                title="Exact private title",
+                description="Private description",
+                notify_subscribers=False,
+            )
+        )
+        transport = ChunkRecordingTransport(
+            post_responses=[self._session_response()],
+            put_responses=[
+                FakeUploadResponse(
+                    308,
+                    {},
+                    headers={"Range": f"bytes=0-{chunk_size - 1}"},
+                ),
+                FakeUploadResponse(201, {"id": "video_exact"}),
+            ],
+        )
+        adapter = self._adapter(transport)
+        session = self._begin(adapter)
+
+        first = adapter.upload_or_resume(session)
+        second = adapter.upload_or_resume(session)
+
+        self.assertEqual(first, self._receipt(state="upload_started", video_id=None))
+        self.assertEqual(second, self._receipt())
+        self.assertEqual(len(transport.post_calls), 1)
+        self.assertEqual(
+            [call["data_length"] for call in transport.put_calls],
+            [chunk_size, 17],
+        )
+        self.assertEqual(
+            [call["headers"]["Content-Range"] for call in transport.put_calls],
+            [
+                f"bytes 0-{chunk_size - 1}/{total_size}",
+                f"bytes {chunk_size}-{total_size - 1}/{total_size}",
+            ],
+        )
+
+    def test_308_acknowledgement_cannot_advance_past_the_sent_chunk(self) -> None:
+        chunk_size = 8 * 1024 * 1024
+        total_size = chunk_size + 100
+        with self.video.open("wb") as sparse_video:
+            sparse_video.truncate(total_size)
+        self.validated = local_preflight(
+            YouTubeUploadRequest(
+                video_paths=(self.video,),
+                title="Exact private title",
+                description="Private description",
+                notify_subscribers=False,
+            )
+        )
+        transport = ChunkRecordingTransport(
+            post_responses=[self._session_response()],
+            put_responses=[
+                FakeUploadResponse(
+                    308,
+                    {},
+                    headers={"Range": f"bytes=0-{chunk_size + 50}"},
+                )
+            ],
+        )
+        adapter = self._adapter(transport)
+        session = self._begin(adapter)
+
+        result = adapter.upload_or_resume(session)
+
+        self.assertEqual(
+            result,
+            self._receipt(state="outcome_unknown", video_id=None),
+        )
+        self.assertEqual(transport.put_calls[0]["data_length"], chunk_size)
+        with self.assertRaisesRegex(self._error_type(), "^outcome_unknown$"):
+            adapter.upload_or_resume(session)
+        self.assertEqual(len(transport.put_calls), 1)
+
     def test_upload_rejects_a_session_returned_by_another_adapter(self) -> None:
         first_transport = FakeYouTubeUploadTransport(post_responses=[self._session_response()])
         second_transport = FakeYouTubeUploadTransport(post_responses=[self._session_response()])
@@ -557,7 +982,7 @@ class YouTubePrivateResumableUploadTests(unittest.TestCase):
         foreign_session = self._begin(second_adapter)
 
         with self.assertRaisesRegex(self._error_type(), "^upload_session_invalid$"):
-            first_adapter.upload_or_resume(foreign_session, self.token)
+            first_adapter.upload_or_resume(foreign_session)
 
         self.assertEqual(first_transport.put_calls, [])
         self.assertEqual(second_transport.put_calls, [])
@@ -577,7 +1002,7 @@ class YouTubePrivateResumableUploadTests(unittest.TestCase):
         with self.assertRaises((AttributeError, FrozenInstanceError, TypeError)):
             session._session_uri = "https://attacker.example/redirect"  # type: ignore[attr-defined]
 
-        result = adapter.upload_or_resume(session, self.token)
+        result = adapter.upload_or_resume(session)
 
         self.assertEqual(result, self._receipt())
         self.assertEqual(len(transport.put_calls), 1)
@@ -588,11 +1013,11 @@ class YouTubePrivateResumableUploadTests(unittest.TestCase):
         tampered_session = self._begin(tamper_adapter)
         object.__setattr__(tampered_session, "_correlation", object())
         with self.assertRaisesRegex(self._error_type(), "^upload_session_invalid$"):
-            tamper_adapter.upload_or_resume(tampered_session, self.token)
+            tamper_adapter.upload_or_resume(tampered_session)
 
         forged_session = object.__new__(youtube_api.YouTubeResumableSession)
         with self.assertRaisesRegex(self._error_type(), "^upload_session_invalid$"):
-            tamper_adapter.upload_or_resume(forged_session, self.token)
+            tamper_adapter.upload_or_resume(forged_session)
         self.assertEqual(tamper_transport.put_calls, [])
 
     def test_missing_location_and_ambiguous_initiation_stop_without_another_insert(self) -> None:
@@ -612,6 +1037,98 @@ class YouTubePrivateResumableUploadTests(unittest.TestCase):
                 self.assertNotIn(self.token, str(raised.exception))
                 self.assertNotIn("provider-timeout", str(raised.exception))
 
+    def test_resumable_location_rejects_unapproved_origin_authority_and_path_before_media(self) -> None:
+        unsafe_locations = (
+            "http://www.googleapis.com/upload/youtube/v3/videos?upload_id=secret",
+            "https://attacker.example/upload/youtube/v3/videos?upload_id=secret",
+            "https://www.googleapis.com.attacker.example/upload/youtube/v3/videos",
+            "https://user:password@www.googleapis.com/upload/youtube/v3/videos",
+            "https://www.googleapis.com:444/upload/youtube/v3/videos",
+            "https://www.googleapis.com/upload/youtube/v3/videos#secret-fragment",
+            "https://www.googleapis.com/youtube/v3/videos",
+            "https://www.googleapis.com/upload/youtube/v3/videos/extra",
+        )
+        for location in unsafe_locations:
+            with self.subTest(location=location):
+                transport = FakeYouTubeUploadTransport(
+                    post_responses=[FakeUploadResponse(200, {}, headers={"Location": location})]
+                )
+                adapter = self._adapter(transport)
+
+                with self.assertRaisesRegex(self._error_type(), "^outcome_unknown$"):
+                    self._begin(adapter)
+
+                self.assertEqual(len(transport.post_calls), 1)
+                self.assertEqual(transport.put_calls, [])
+                self.assertNotEqual(transport.post_calls[0]["url"], location)
+
+    def test_bearer_requests_disable_redirects_and_redirect_responses_are_terminal(self) -> None:
+        redirect_target = "https://attacker.example/collect"
+
+        channel_redirect = FakeYouTubeUploadTransport(
+            channel_responses=[
+                FakeUploadResponse(302, {}, headers={"Location": redirect_target})
+            ]
+        )
+        channel_adapter = self._adapter(channel_redirect)
+        channel_plan = channel_adapter.create_confirmed_upload_plan(
+            self.validated,
+            credential_reference="credential-reference-secret",
+            expected_channel=self.identity,
+            access_token=self.token,
+            confirmed_current=True,
+        )
+        with self.assertRaisesRegex(self._error_type(), "^authorization_invalid$"):
+            channel_adapter.initiate_resumable_upload(channel_plan)
+        self.assertEqual(channel_redirect.post_calls, [])
+        self.assertIn("allow_redirects", channel_redirect.get_calls[0])
+        self.assertIs(channel_redirect.get_calls[0]["allow_redirects"], False)
+
+        post_redirect = FakeYouTubeUploadTransport(
+            post_responses=[
+                FakeUploadResponse(302, {}, headers={"Location": redirect_target})
+            ]
+        )
+        with self.assertRaisesRegex(self._error_type(), "^outcome_unknown$"):
+            self._begin(self._adapter(post_redirect))
+        self.assertIn("allow_redirects", post_redirect.post_calls[0])
+        self.assertIs(post_redirect.post_calls[0]["allow_redirects"], False)
+        self.assertEqual(post_redirect.put_calls, [])
+
+        put_redirect = FakeYouTubeUploadTransport(
+            post_responses=[self._session_response()],
+            put_responses=[
+                FakeUploadResponse(302, {}, headers={"Location": redirect_target})
+            ],
+        )
+        put_adapter = self._adapter(put_redirect)
+        put_result = put_adapter.upload_or_resume(self._begin(put_adapter))
+        self.assertEqual(
+            put_result,
+            self._receipt(state="outcome_unknown", video_id=None),
+        )
+        self.assertEqual(len(put_redirect.put_calls), 1)
+        self.assertEqual(put_redirect.put_calls[0]["url"], self.session_uri)
+        self.assertNotEqual(put_redirect.put_calls[0]["url"], redirect_target)
+        self.assertIn("allow_redirects", put_redirect.put_calls[0])
+        self.assertIs(put_redirect.put_calls[0]["allow_redirects"], False)
+
+        get_redirect = FakeYouTubeUploadTransport(
+            post_responses=[self._session_response()],
+            put_responses=[FakeUploadResponse(201, {"id": "video_exact"})],
+            get_responses=[
+                FakeUploadResponse(302, {}, headers={"Location": redirect_target})
+            ],
+        )
+        get_adapter = self._adapter(get_redirect)
+        uploaded = self._complete_upload(get_adapter)
+        with self.assertRaisesRegex(self._error_type(), "^outcome_unknown$"):
+            get_adapter.verify_exact_readback(uploaded)
+        self.assertEqual(get_redirect.get_calls[-1]["url"], youtube_api.YOUTUBE_VIDEOS_ENDPOINT)
+        self.assertNotEqual(get_redirect.get_calls[-1]["url"], redirect_target)
+        self.assertIn("allow_redirects", get_redirect.get_calls[-1])
+        self.assertIs(get_redirect.get_calls[-1]["allow_redirects"], False)
+
     def test_missing_video_id_or_ambiguous_upload_returns_outcome_unknown_without_new_insert(self) -> None:
         cases = (
             FakeUploadResponse(201, {}),
@@ -629,11 +1146,11 @@ class YouTubePrivateResumableUploadTests(unittest.TestCase):
                 adapter = self._adapter(transport)
                 session = self._begin(adapter)
 
-                result = adapter.upload_or_resume(session, self.token)
+                result = adapter.upload_or_resume(session)
 
                 self.assertEqual(result, self._receipt(state="outcome_unknown", video_id=None))
                 with self.assertRaisesRegex(self._error_type(), "^outcome_unknown$"):
-                    adapter.upload_or_resume(session, self.token)
+                    adapter.upload_or_resume(session)
                 self.assertEqual(len(transport.post_calls), 1)
                 self.assertEqual(len(transport.put_calls), 1)
                 self.assertNotIn(self.session_uri, repr(result))
@@ -655,11 +1172,11 @@ class YouTubePrivateResumableUploadTests(unittest.TestCase):
         adapter = self._adapter(transport)
         session = self._begin(adapter)
 
-        result = adapter.upload_or_resume(session, self.token)
+        result = adapter.upload_or_resume(session)
 
         self.assertEqual(result, self._receipt(state="outcome_unknown", video_id=None))
         with self.assertRaisesRegex(self._error_type(), "^outcome_unknown$") as raised:
-            adapter.upload_or_resume(session, self.token)
+            adapter.upload_or_resume(session)
         self.assertEqual(len(transport.post_calls), 1)
         self.assertEqual(len(transport.put_calls), 1)
         self.assertNotIn(self.session_uri, repr(result))
@@ -676,7 +1193,7 @@ class YouTubePrivateResumableUploadTests(unittest.TestCase):
         session = self._begin(adapter)
 
         with self.assertRaisesRegex(self._error_type(), "^upload_failed$") as raised:
-            adapter.upload_or_resume(session, self.token)
+            adapter.upload_or_resume(session)
 
         self.assertEqual(len(transport.post_calls), 1)
         self.assertEqual(len(transport.put_calls), 1)
@@ -705,15 +1222,10 @@ class YouTubePrivateResumableUploadTests(unittest.TestCase):
                 uploaded = self._complete_upload(adapter)
 
                 with self.assertRaisesRegex(self._error_type(), "^readback_mismatch$") as raised:
-                    adapter.verify_exact_readback(
-                        uploaded,
-                        self.validated,
-                        self.identity,
-                        self.token,
-                    )
+                    adapter.verify_exact_readback(uploaded)
 
-                self.assertEqual(len(transport.get_calls), 1)
-                self.assertEqual(transport.get_calls[0]["params"]["id"], "video_exact")
+                self.assertEqual(len(transport.get_calls), 2)
+                self.assertEqual(transport.get_calls[-1]["params"]["id"], "video_exact")
                 self.assertNotIn("raw-provider-body", str(raised.exception))
                 self.assertNotIn(self.token, str(raised.exception))
 
@@ -733,12 +1245,7 @@ class YouTubePrivateResumableUploadTests(unittest.TestCase):
                 adapter = self._adapter(transport)
                 uploaded = self._complete_upload(adapter)
 
-                result = adapter.verify_exact_readback(
-                    uploaded,
-                    self.validated,
-                    self.identity,
-                    self.token,
-                )
+                result = adapter.verify_exact_readback(uploaded)
 
                 self.assertEqual(result, self._receipt(state=expected_state))
                 self.assertNotIn("public", result.state)
@@ -758,12 +1265,7 @@ class YouTubePrivateResumableUploadTests(unittest.TestCase):
                 adapter = self._adapter(transport)
                 uploaded = self._complete_upload(adapter)
                 with self.assertRaisesRegex(self._error_type(), f"^{expected_reason}$"):
-                    adapter.verify_exact_readback(
-                        uploaded,
-                        self.validated,
-                        self.identity,
-                        self.token,
-                    )
+                    adapter.verify_exact_readback(uploaded)
 
     def test_readback_transport_and_response_ambiguity_are_stable_outcome_unknown(self) -> None:
         cases = (
@@ -771,6 +1273,17 @@ class YouTubePrivateResumableUploadTests(unittest.TestCase):
             FakeUploadResponse("invalid-status", {"detail": "raw-provider-body"}),
             FakeUploadResponse(503, {"detail": "raw-provider-body"}),
             FakeUploadResponse(200, RuntimeError("raw-provider-body")),
+            FakeUploadResponse(
+                200,
+                {
+                    "items": [
+                        self._matching_item(
+                            upload_status="unknown-provider-state",
+                            processing_status="unknown-provider-state",
+                        )
+                    ]
+                },
+            ),
         )
         for response in cases:
             with self.subTest(response=type(response).__name__):
@@ -783,14 +1296,11 @@ class YouTubePrivateResumableUploadTests(unittest.TestCase):
                 uploaded = self._complete_upload(adapter)
 
                 with self.assertRaisesRegex(self._error_type(), "^outcome_unknown$") as raised:
-                    adapter.verify_exact_readback(
-                        uploaded,
-                        self.validated,
-                        self.identity,
-                        self.token,
-                    )
+                    adapter.verify_exact_readback(uploaded)
+                with self.assertRaisesRegex(self._error_type(), "^outcome_unknown$"):
+                    adapter.verify_exact_readback(uploaded)
 
-                self.assertEqual(len(transport.get_calls), 1)
+                self.assertEqual(len(transport.get_calls), 2)
                 self.assertNotIn("raw-provider-body", str(raised.exception))
                 self.assertNotIn("provider-timeout", str(raised.exception))
                 self.assertNotIn(self.token, str(raised.exception))
@@ -827,11 +1337,11 @@ class YouTubePrivateResumableUploadTests(unittest.TestCase):
         resume_adapter = self._adapter(resume_transport)
         session = self._begin(resume_adapter)
 
-        result = resume_adapter.upload_or_resume(session, self.token)
+        result = resume_adapter.upload_or_resume(session)
 
         self.assertEqual(result, self._receipt(state="outcome_unknown", video_id=None))
         with self.assertRaisesRegex(self._error_type(), "^outcome_unknown$"):
-            resume_adapter.upload_or_resume(session, self.token)
+            resume_adapter.upload_or_resume(session)
         self.assertEqual(len(resume_transport.put_calls), 1)
         self.assertNotIn(provider_secret, repr(result))
 
@@ -844,7 +1354,7 @@ class YouTubePrivateResumableUploadTests(unittest.TestCase):
         upload_adapter = self._adapter(upload_transport)
         upload_session = self._begin(upload_adapter)
 
-        upload_result = upload_adapter.upload_or_resume(upload_session, self.token)
+        upload_result = upload_adapter.upload_or_resume(upload_session)
 
         self.assertEqual(upload_result, self._receipt(state="outcome_unknown", video_id=None))
         self.assertNotIn(provider_secret, repr(upload_result))
@@ -882,14 +1392,9 @@ class YouTubePrivateResumableUploadTests(unittest.TestCase):
                 uploaded = self._complete_upload(adapter)
 
                 with self.assertRaisesRegex(self._error_type(), "^outcome_unknown$") as raised:
-                    adapter.verify_exact_readback(
-                        uploaded,
-                        self.validated,
-                        self.identity,
-                        self.token,
-                    )
+                    adapter.verify_exact_readback(uploaded)
 
-                self.assertEqual(len(transport.get_calls), 1)
+                self.assertEqual(len(transport.get_calls), 2)
                 self.assertNotIn(provider_secret, str(raised.exception))
 
     def test_raising_header_and_payload_string_conversion_is_normalized(self) -> None:
@@ -919,54 +1424,27 @@ class YouTubePrivateResumableUploadTests(unittest.TestCase):
         )
         upload_adapter = self._adapter(upload_transport)
 
-        result = upload_adapter.upload_or_resume(self._begin(upload_adapter), self.token)
+        result = upload_adapter.upload_or_resume(self._begin(upload_adapter))
 
         self.assertEqual(result, self._receipt(state="outcome_unknown", video_id=None))
         self.assertNotIn(provider_secret, repr(result))
 
-    def test_readback_requires_adapter_owned_upload_receipt_request_and_channel(self) -> None:
+    def test_readback_requires_adapter_owned_upload_receipt(self) -> None:
         transport = FakeYouTubeUploadTransport(
             post_responses=[self._session_response()],
             put_responses=[FakeUploadResponse(201, {"id": "video_exact"})],
         )
         adapter = self._adapter(transport)
         uploaded = self._complete_upload(adapter)
-        substituted_upload = local_preflight(
-            YouTubeUploadRequest(
-                video_paths=(self.video,),
-                title="Exact private title",
-                description="Private description",
-                tags=("one", "two"),
-                category_id="22",
-                made_for_kids=False,
-                notify_subscribers=False,
-            )
-        )
-        substituted_channel = YouTubeChannelIdentity(
-            channel_id="UC_expected",
-            display_name="Expected",
-        )
-        cases = (
-            (self._receipt(), self.validated, self.identity),
-            (uploaded, substituted_upload, self.identity),
-            (uploaded, self.validated, substituted_channel),
-        )
-        for receipt, upload, channel in cases:
-            with self.subTest(receipt_is_owned=receipt is uploaded, upload_is_owned=upload is self.validated):
-                with self.assertRaisesRegex(self._error_type(), "^readback_mismatch$"):
-                    adapter.verify_exact_readback(receipt, upload, channel, self.token)
+        with self.assertRaisesRegex(self._error_type(), "^readback_mismatch$"):
+            adapter.verify_exact_readback(self._receipt())
 
         before_upload_transport = FakeYouTubeUploadTransport()
         before_upload_adapter = self._adapter(before_upload_transport)
         with self.assertRaisesRegex(self._error_type(), "^readback_mismatch$"):
-            before_upload_adapter.verify_exact_readback(
-                self._receipt(),
-                self.validated,
-                self.identity,
-                self.token,
-            )
+            before_upload_adapter.verify_exact_readback(self._receipt())
 
-        self.assertEqual(transport.get_calls, [])
+        self.assertEqual(len(transport.get_calls), 1)
         self.assertEqual(before_upload_transport.get_calls, [])
 
 
