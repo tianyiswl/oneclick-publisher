@@ -7,6 +7,7 @@ import asyncio
 import json
 from pathlib import Path
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -1094,12 +1095,19 @@ class PassiveObserverTests(unittest.TestCase):
         )
         self.assertEqual(harness.playwright.stopped, 1)
 
-    def test_synchronous_body_reader_obeys_the_hard_total_deadline(self) -> None:
-        """同步 body() 卡住时不能占住观察线程并突破总时限。"""
+    def test_synchronous_body_reader_is_rejected_without_invocation_or_worker(
+        self,
+    ) -> None:
+        """非异步 body() 必须在调用前失败，不能留下永久工作线程。"""
+
+        invoked = 0
+        never_returns = threading.Event()
 
         class BlockingBodyResponse(FakeResponse):
             def body(self) -> bytes:
-                time.sleep(0.2)
+                nonlocal invoked
+                invoked += 1
+                never_returns.wait()
                 return self._body
 
         page = FakePage(
@@ -1113,6 +1121,15 @@ class PassiveObserverTests(unittest.TestCase):
         harness = ObserverHarness(self.root, page)
         reports: list[dict] = []
         first_patch, second_patch = harness.patches()
+        worker_names = {
+            "douyin-comment-contract-shape",
+            "douyin-comment-contract-sync",
+        }
+        workers_before = {
+            thread.ident
+            for thread in threading.enumerate()
+            if thread.name in worker_names
+        }
         started = time.monotonic()
 
         with (
@@ -1127,8 +1144,18 @@ class PassiveObserverTests(unittest.TestCase):
 
         elapsed = time.monotonic() - started
         self.assertLess(elapsed, 0.15)
-        self.assertEqual(raised.exception.error_code, "comment_sync_timeout")
+        workers_after = {
+            thread.ident
+            for thread in threading.enumerate()
+            if thread.name in worker_names
+        }
+        self.assertEqual(invoked, 0)
+        self.assertEqual(workers_after, workers_before)
+        self.assertEqual(raised.exception.error_code, "comment_payload_invalid")
         self.assertTrue(raised.exception.cleanup_receipt.closed)
+        self.assertEqual(
+            raised.exception.cleanup_receipt.alive_resource_count, 0
+        )
         self.assertEqual(
             (page.closed, harness.context.closed, harness.browser.closed),
             (1, 1, 1),
@@ -1137,6 +1164,47 @@ class PassiveObserverTests(unittest.TestCase):
         self.assertNotIn(
             "private-body-value", json.dumps(reports, ensure_ascii=False)
         )
+
+    def test_async_body_reader_still_obeys_the_hard_total_deadline(self) -> None:
+        """官方异步 body() 卡住时仍须按同一总时限取消并完成清理。"""
+
+        invoked = threading.Event()
+
+        class BlockingAsyncBodyResponse(FakeResponse):
+            async def body(self) -> bytes:
+                invoked.set()
+                await asyncio.Event().wait()
+                return self._body
+
+        page = FakePage(
+            (
+                BlockingAsyncBodyResponse(
+                    "https://creator.douyin.com/async-body",
+                    {"data": {"value": "private-async-value"}},
+                ),
+            )
+        )
+        harness = ObserverHarness(self.root, page)
+        first_patch, second_patch = harness.patches()
+        started = time.monotonic()
+
+        with (
+            first_patch,
+            second_patch,
+            patch.object(contract_module, "_TOTAL_WALL_SECONDS", 0.03),
+            self.assertRaises(CommentInsightFailure) as raised,
+        ):
+            contract_module.observe_contract_responses(harness.account, None)
+
+        self.assertLess(time.monotonic() - started, 0.15)
+        self.assertTrue(invoked.is_set())
+        self.assertEqual(raised.exception.error_code, "comment_sync_timeout")
+        self.assertTrue(raised.exception.cleanup_receipt.closed)
+        self.assertEqual(
+            (page.closed, harness.context.closed, harness.browser.closed),
+            (1, 1, 1),
+        )
+        self.assertEqual(harness.playwright.stopped, 1)
 
     def test_cpu_heavy_json_shape_obeys_the_hard_total_deadline(self) -> None:
         """大量数组元素的 JSON 解析和结构遍历也不能突破总时限。"""
@@ -1180,6 +1248,82 @@ class PassiveObserverTests(unittest.TestCase):
             (1, 1, 1),
         )
         self.assertEqual(harness.playwright.stopped, 1)
+
+    def test_repeated_cpu_timeouts_have_one_audited_worker_at_most(self) -> None:
+        """重复 CPU 超时不能累计后台线程，存活线程必须进入清理回执。"""
+
+        release = threading.Event()
+        entered = threading.Event()
+        original_loads = contract_module.json.loads
+        worker_names = {
+            "douyin-comment-contract-shape",
+            "douyin-comment-contract-sync",
+        }
+        workers_before = {
+            thread.ident
+            for thread in threading.enumerate()
+            if thread.name in worker_names
+        }
+        receipts: list[CleanupReceipt] = []
+        error_codes: list[str] = []
+
+        def blocking_loads(body: bytes) -> object:
+            entered.set()
+            release.wait()
+            return original_loads(body)
+
+        try:
+            with (
+                patch.object(contract_module.json, "loads", blocking_loads),
+                patch.object(contract_module, "_TOTAL_WALL_SECONDS", 0.03),
+            ):
+                for index in range(3):
+                    response = FakeResponse(
+                        f"https://creator.douyin.com/cpu-timeout-{index}",
+                        {"data": [index]},
+                    )
+                    page = FakePage((response,))
+                    harness = ObserverHarness(self.root, page)
+                    first_patch, second_patch = harness.patches()
+                    with (
+                        first_patch,
+                        second_patch,
+                        self.assertRaises(CommentInsightFailure) as raised,
+                    ):
+                        contract_module.observe_contract_responses(
+                            harness.account, None
+                        )
+                    receipts.append(raised.exception.cleanup_receipt)
+                    error_codes.append(raised.exception.error_code)
+
+            self.assertTrue(entered.is_set())
+            workers_after = {
+                thread.ident
+                for thread in threading.enumerate()
+                if thread.name in worker_names
+            }
+            self.assertLessEqual(
+                len(workers_after - workers_before),
+                1,
+            )
+            self.assertEqual(
+                error_codes,
+                ["comment_sync_cancelled"] * 3,
+            )
+            for receipt in receipts:
+                self.assertFalse(receipt.closed)
+                self.assertEqual(receipt.alive_resource_count, 1)
+        finally:
+            release.set()
+            for thread in threading.enumerate():
+                if thread.name in worker_names:
+                    thread.join(0.5)
+        remaining_workers = [
+            thread
+            for thread in threading.enumerate()
+            if thread.name in worker_names
+        ]
+        self.assertEqual(remaining_workers, [])
 
     def test_cleanup_failure_returns_only_fixed_error_and_receipt(self) -> None:
         """关闭失败的异常原文不能泄漏，且回执必须如实标明一个资源仍存活。"""

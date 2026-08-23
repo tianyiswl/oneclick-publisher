@@ -94,6 +94,8 @@ _MAX_TOTAL_BYTES = 4 * 1024 * 1024
 _MAX_KEY_PATHS = 2048
 _TOTAL_WALL_SECONDS = 60.0
 _OBSERVATION_WINDOW_MS = 15_000.0
+_SHAPE_WORKER_LOCK = threading.Lock()
+_ACTIVE_SHAPE_WORKER: threading.Thread | None = None
 _PAGINATION_NAMES = frozenset(
     {
         "cursor",
@@ -601,13 +603,15 @@ def _remaining_seconds(deadline: float) -> float:
     return max(0.0, deadline - time.monotonic())
 
 
-def _run_sync_before_deadline(
+def _run_shape_before_deadline(
     operation: Callable[[], object], deadline: float
 ) -> object:
+    global _ACTIVE_SHAPE_WORKER
     completed = threading.Event()
     outcome: list[object] = []
 
     def invoke() -> None:
+        global _ACTIVE_SHAPE_WORKER
         try:
             result = operation()
             if time.monotonic() >= deadline:
@@ -618,13 +622,26 @@ def _run_sync_before_deadline(
             outcome.append(exc)
         finally:
             completed.set()
+            current = threading.current_thread()
+            with _SHAPE_WORKER_LOCK:
+                if _ACTIVE_SHAPE_WORKER is current:
+                    _ACTIVE_SHAPE_WORKER = None
 
     worker = threading.Thread(
         target=invoke,
-        name="douyin-comment-contract-sync",
+        name="douyin-comment-contract-shape",
         daemon=True,
     )
-    worker.start()
+    with _SHAPE_WORKER_LOCK:
+        active = _ACTIVE_SHAPE_WORKER
+        if active is not None and active.is_alive():
+            raise TimeoutError
+        _ACTIVE_SHAPE_WORKER = worker
+        try:
+            worker.start()
+        except BaseException:
+            _ACTIVE_SHAPE_WORKER = None
+            raise
     worker.join(_remaining_seconds(deadline))
     if not completed.is_set():
         raise TimeoutError
@@ -632,6 +649,14 @@ def _run_sync_before_deadline(
     if isinstance(result, BaseException):
         raise result
     return result
+
+
+def _active_shape_workers() -> tuple[threading.Thread, ...]:
+    with _SHAPE_WORKER_LOCK:
+        worker = _ACTIVE_SHAPE_WORKER
+        if worker is None or not worker.is_alive():
+            return ()
+        return (worker,)
 
 
 def _parse_json_shape_before_deadline(
@@ -840,14 +865,11 @@ async def _observe_contract_responses_async(
                 body_reader = getattr(response, "body", None)
                 if not callable(body_reader):
                     raise CommentInsightFailure("comment_payload_invalid")
+                if not inspect.iscoroutinefunction(body_reader):
+                    raise CommentInsightFailure("comment_payload_invalid")
                 if total_bytes >= _MAX_TOTAL_BYTES:
                     raise CommentInsightFailure("comment_payload_invalid")
-                if inspect.iscoroutinefunction(body_reader):
-                    body = body_reader()
-                else:
-                    body = _run_sync_before_deadline(
-                        body_reader, operation_deadline
-                    )
+                body = body_reader()
                 if hasattr(body, "__await__"):
                     body = await _await_before_deadline(
                         body, operation_deadline
@@ -863,7 +885,7 @@ async def _observe_contract_responses_async(
             async with shape_budget_lock:
                 remaining_paths = _MAX_KEY_PATHS - total_key_paths
                 key_paths, field_types, pagination_fields = (
-                    _run_sync_before_deadline(
+                    _run_shape_before_deadline(
                         lambda: _parse_json_shape_before_deadline(
                             body,
                             max_paths=remaining_paths,
@@ -978,6 +1000,15 @@ async def _observe_contract_responses_async(
                 if caught is None:
                     caught = exc
         resources = (page, context, browser, playwright)
+        shape_workers = _active_shape_workers()
+        for index, worker in enumerate(shape_workers):
+            remaining_targets = len(shape_workers) - index + len(resources)
+            worker_deadline = time.monotonic() + (
+                _remaining_seconds(cleanup_deadline) / remaining_targets
+            )
+            worker.join(_remaining_seconds(worker_deadline))
+            if worker.is_alive():
+                cleanup_errors.append(TimeoutError())
         for index, resource in enumerate(resources):
             resource_count = len(resources) - index
             close_deadline = time.monotonic() + (
