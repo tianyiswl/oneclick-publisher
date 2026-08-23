@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
+import gc
 import json
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -744,6 +747,54 @@ class DouyinVerifiedContentParserTests(unittest.TestCase):
                     raised.exception.error_code, "content_payload_invalid"
                 )
 
+    def test_negative_cumulative_content_metric_is_rejected(self) -> None:
+        """累计作品指标不能接受有限负数并当作可信平台事实。"""
+
+        for value in (-1, -0.5):
+            with self.subTest(value=value):
+                payload = valid_content_payload()
+                payload["data"]["items"][0]["metrics"]["views"] = value
+
+                with self.assertRaises(DouyinDataCollectionError) as raised:
+                    parse_verified_content_payload(
+                        verified_content_contract(),
+                        payload,
+                        account_id=12,
+                        observed_at=self.observed_at,
+                    )
+
+                self.assertEqual(
+                    raised.exception.error_code, "content_payload_invalid"
+                )
+
+    def test_account_metric_keys_cannot_be_mapped_as_content_metrics(self) -> None:
+        """账号粉丝或主页访问量不能借合同字段被伪装成作品指标。"""
+
+        for metric_key in (
+            "followers_total",
+            "followers_net",
+            "profile_visits",
+        ):
+            with self.subTest(metric_key=metric_key):
+                contract = replace(
+                    verified_content_contract(),
+                    content_metric_fields=(
+                        (metric_key, "data.items[].metrics.views"),
+                    ),
+                )
+
+                with self.assertRaises(DouyinDataCollectionError) as raised:
+                    parse_verified_content_payload(
+                        contract,
+                        valid_content_payload(),
+                        account_id=12,
+                        observed_at=self.observed_at,
+                    )
+
+                self.assertEqual(
+                    raised.exception.error_code, "content_payload_invalid"
+                )
+
 
 class FakeBrowserResponse:
     def __init__(self, url: str, payload: object) -> None:
@@ -861,17 +912,21 @@ class FakeContentResponse:
         *,
         method: str = "GET",
         delay: float = 0.0,
+        error: BaseException | None = None,
     ) -> None:
         self.url = url
         self.request = FakeContentRequest(method)
         self.payload = payload
         self.delay = delay
+        self.error = error
         self.json_calls = 0
 
     async def json(self) -> object:
         self.json_calls += 1
         if self.delay:
             await asyncio.sleep(self.delay)
+        if self.error is not None:
+            raise self.error
         return self.payload
 
 
@@ -882,16 +937,28 @@ class FakeContentPage:
         *,
         final_url: str = "https://creator.douyin.com/verified/content",
         close_error: BaseException | None = None,
+        goto_delay: float = 0.0,
+        goto_error: BaseException | None = None,
+        close_delay: float = 0.0,
     ) -> None:
         self.responses = responses
         self.url = final_url
         self.close_error = close_error
+        self.goto_delay = goto_delay
+        self.goto_error = goto_error
+        self.close_delay = close_delay
         self.listeners: dict[str, object] = {}
+        self.listener_removals = 0
         self.goto_calls: list[tuple[str, str, float]] = []
         self.closed = 0
 
     def on(self, event: str, callback) -> None:
         self.listeners[event] = callback
+
+    def remove_listener(self, event: str, callback) -> None:
+        if self.listeners.get(event) is callback:
+            self.listeners.pop(event)
+        self.listener_removals += 1
 
     async def goto(
         self,
@@ -903,12 +970,18 @@ class FakeContentPage:
         if "response" not in self.listeners:
             raise AssertionError("response listener must precede navigation")
         self.goto_calls.append((url, wait_until, timeout))
+        if self.goto_delay:
+            await asyncio.sleep(self.goto_delay)
+        if self.goto_error is not None:
+            raise self.goto_error
         for response in self.responses:
             self.listeners["response"](response)
             await asyncio.sleep(0)
 
     async def close(self) -> None:
         self.closed += 1
+        if self.close_delay:
+            await asyncio.sleep(self.close_delay)
         if self.close_error is not None:
             raise self.close_error
 
@@ -918,59 +991,133 @@ class FakeContentContext:
         self,
         page: FakeContentPage,
         *,
+        page_delay: float = 0.0,
+        page_error: BaseException | None = None,
         close_error: BaseException | None = None,
+        close_delay: float = 0.0,
     ) -> None:
         self.page = page
+        self.page_delay = page_delay
+        self.page_error = page_error
         self.close_error = close_error
+        self.close_delay = close_delay
         self.closed = 0
 
     async def new_page(self) -> FakeContentPage:
+        if self.page_delay:
+            await asyncio.sleep(self.page_delay)
+        if self.page_error is not None:
+            raise self.page_error
         return self.page
 
     async def close(self) -> None:
         self.closed += 1
+        if self.close_delay:
+            await asyncio.sleep(self.close_delay)
         if self.close_error is not None:
             raise self.close_error
 
 
 class FakeContentBrowser:
-    def __init__(self, context: FakeContentContext) -> None:
+    def __init__(
+        self,
+        context: FakeContentContext,
+        *,
+        context_delay: float = 0.0,
+        context_error: BaseException | None = None,
+        close_delay: float = 0.0,
+        close_error: BaseException | None = None,
+    ) -> None:
         self.context = context
+        self.context_delay = context_delay
+        self.context_error = context_error
+        self.close_delay = close_delay
+        self.close_error = close_error
         self.storage_states: list[str] = []
         self.closed = 0
 
     async def new_context(self, *, storage_state: str) -> FakeContentContext:
         self.storage_states.append(storage_state)
+        if self.context_delay:
+            await asyncio.sleep(self.context_delay)
+        if self.context_error is not None:
+            raise self.context_error
         return self.context
 
     async def close(self) -> None:
         self.closed += 1
+        if self.close_delay:
+            await asyncio.sleep(self.close_delay)
+        if self.close_error is not None:
+            raise self.close_error
 
 
 class FakeContentChromium:
-    def __init__(self, browser: FakeContentBrowser) -> None:
+    def __init__(
+        self,
+        browser: FakeContentBrowser,
+        *,
+        launch_delay: float = 0.0,
+        launch_error: BaseException | None = None,
+    ) -> None:
         self.browser = browser
+        self.launch_delay = launch_delay
+        self.launch_error = launch_error
         self.launch_calls: list[dict] = []
 
     async def launch(self, **options) -> FakeContentBrowser:
         self.launch_calls.append(dict(options))
+        if self.launch_delay:
+            await asyncio.sleep(self.launch_delay)
+        if self.launch_error is not None:
+            raise self.launch_error
         return self.browser
 
 
 class FakeContentPlaywright:
-    def __init__(self, browser: FakeContentBrowser) -> None:
-        self.chromium = FakeContentChromium(browser)
+    def __init__(
+        self,
+        browser: FakeContentBrowser,
+        *,
+        launch_delay: float = 0.0,
+        launch_error: BaseException | None = None,
+        stop_delay: float = 0.0,
+        stop_error: BaseException | None = None,
+    ) -> None:
+        self.chromium = FakeContentChromium(
+            browser,
+            launch_delay=launch_delay,
+            launch_error=launch_error,
+        )
+        self.stop_delay = stop_delay
+        self.stop_error = stop_error
         self.stopped = 0
 
     async def stop(self) -> None:
         self.stopped += 1
+        if self.stop_delay:
+            await asyncio.sleep(self.stop_delay)
+        if self.stop_error is not None:
+            raise self.stop_error
 
 
 class FakeContentStarter:
-    def __init__(self, playwright: FakeContentPlaywright) -> None:
+    def __init__(
+        self,
+        playwright: FakeContentPlaywright,
+        *,
+        start_delay: float = 0.0,
+        start_error: BaseException | None = None,
+    ) -> None:
         self.playwright = playwright
+        self.start_delay = start_delay
+        self.start_error = start_error
 
     async def start(self) -> FakeContentPlaywright:
+        if self.start_delay:
+            await asyncio.sleep(self.start_delay)
+        if self.start_error is not None:
+            raise self.start_error
         return self.playwright
 
 
@@ -1145,6 +1292,60 @@ class DouyinContentCompletionTests(unittest.TestCase):
         self.assertEqual((page.closed, context.closed, browser.closed), (1, 1, 1))
         self.assertEqual(playwright.stopped, 1)
 
+    def _complete_after_ignored_authority(
+        self, ignored_url: str
+    ) -> tuple[CollectionBatch, FakeContentResponse]:
+        ignored = FakeContentResponse(
+            ignored_url,
+            valid_content_payload("must-not-be-accepted"),
+        )
+        accepted = FakeContentResponse(
+            "https://creator.douyin.com/verified/content/list",
+            valid_content_payload("official-work"),
+        )
+        starter, _page, _context, _browser, _playwright = (
+            self._browser_harness((ignored, accepted))
+        )
+        collector = DouyinDataCollector(
+            contract_loader=verified_content_contract,
+            playwright_factory=lambda: starter,
+            browser_timeout_seconds=0.2,
+        )
+        return (
+            collector.complete_content_data(
+                self.account, self._account_batch()
+            ),
+            ignored,
+        )
+
+    def test_creator_url_with_userinfo_is_not_official_authority(self) -> None:
+        """只比较 hostname 会错收带用户信息的非标准 authority。"""
+
+        completed, ignored = self._complete_after_ignored_authority(
+            "https://user:private@creator.douyin.com/verified/content/list"
+        )
+
+        self.assertEqual(
+            [item.content_id for item in completed.contents],
+            ["official-work"],
+        )
+        self.assertEqual(ignored.json_calls, 0)
+
+    def test_creator_url_with_nondefault_port_is_not_official_authority(
+        self,
+    ) -> None:
+        """只比较 hostname 会错收合同从未授权的显式端口。"""
+
+        completed, ignored = self._complete_after_ignored_authority(
+            "https://creator.douyin.com:444/verified/content/list"
+        )
+
+        self.assertEqual(
+            [item.content_id for item in completed.contents],
+            ["official-work"],
+        )
+        self.assertEqual(ignored.json_calls, 0)
+
     def test_conflicting_duplicate_across_pages_fails_closed_and_cleans(
         self,
     ) -> None:
@@ -1200,6 +1401,250 @@ class DouyinContentCompletionTests(unittest.TestCase):
         self.assertIsNone(raised.exception.__cause__)
         self.assertEqual((page.closed, context.closed, browser.closed), (1, 1, 1))
         self.assertEqual(playwright.stopped, 1)
+
+    def test_total_deadline_bounds_every_pre_response_stage(self) -> None:
+        """启动、建浏览器、建上下文、建页面和导航不能各自无限等待。"""
+
+        for stage in ("startup", "launch", "context", "page", "navigation"):
+            with self.subTest(stage=stage):
+                response = FakeContentResponse(
+                    "https://creator.douyin.com/verified/content/list",
+                    valid_content_payload(),
+                )
+                starter, page, context, browser, playwright = (
+                    self._browser_harness((response,))
+                )
+                if stage == "startup":
+                    starter.start_delay = 0.06
+                elif stage == "launch":
+                    playwright.chromium.launch_delay = 0.06
+                elif stage == "context":
+                    browser.context_delay = 0.06
+                elif stage == "page":
+                    context.page_delay = 0.06
+                else:
+                    page.goto_delay = 0.06
+                collector = DouyinDataCollector(
+                    contract_loader=verified_content_contract,
+                    playwright_factory=lambda starter=starter: starter,
+                    browser_timeout_seconds=0.02,
+                )
+
+                started_at = time.monotonic()
+                with self.assertRaises(DouyinDataCollectionError) as raised:
+                    collector.complete_content_data(
+                        self.account, self._account_batch()
+                    )
+                elapsed = time.monotonic() - started_at
+
+                self.assertEqual(
+                    raised.exception.error_code, "content_list_unavailable"
+                )
+                self.assertLess(elapsed, 0.05)
+
+    def test_response_processing_uses_only_remaining_total_deadline(self) -> None:
+        """前面阶段用掉的时间不能在等响应时重新计时。"""
+
+        response = FakeContentResponse(
+            "https://creator.douyin.com/verified/content/list",
+            valid_content_payload(),
+            delay=0.03,
+        )
+        starter, _page, _context, _browser, _playwright = (
+            self._browser_harness((response,))
+        )
+        starter.start_delay = 0.02
+        collector = DouyinDataCollector(
+            contract_loader=verified_content_contract,
+            playwright_factory=lambda: starter,
+            browser_timeout_seconds=0.04,
+        )
+
+        started_at = time.monotonic()
+        with self.assertRaises(DouyinDataCollectionError) as raised:
+            collector.complete_content_data(self.account, self._account_batch())
+        elapsed = time.monotonic() - started_at
+
+        self.assertEqual(
+            raised.exception.error_code, "content_list_unavailable"
+        )
+        self.assertLess(elapsed, 0.06)
+
+    def test_all_four_close_timeouts_share_bounded_cleanup_reservation(
+        self,
+    ) -> None:
+        """四层资源关闭各自卡住时，仍要全部尝试且按总时限退出。"""
+
+        response = FakeContentResponse(
+            "https://creator.douyin.com/verified/content/list",
+            valid_content_payload(),
+        )
+        starter, page, context, browser, playwright = self._browser_harness(
+            (response,)
+        )
+        page.close_delay = 0.04
+        context.close_delay = 0.04
+        browser.close_delay = 0.04
+        playwright.stop_delay = 0.04
+        collector = DouyinDataCollector(
+            contract_loader=verified_content_contract,
+            playwright_factory=lambda: starter,
+            browser_timeout_seconds=0.04,
+        )
+
+        started_at = time.monotonic()
+        with self.assertRaises(DouyinDataCollectionError) as raised:
+            collector.complete_content_data(self.account, self._account_batch())
+        elapsed = time.monotonic() - started_at
+
+        self.assertEqual(
+            raised.exception.error_code, "browser_cleanup_incomplete"
+        )
+        self.assertLess(elapsed, 0.08)
+        self.assertEqual((page.closed, context.closed, browser.closed), (1, 1, 1))
+        self.assertEqual(playwright.stopped, 1)
+
+    def test_navigation_process_control_exceptions_survive_cleanup(self) -> None:
+        """CancelledError、KeyboardInterrupt 和 SystemExit 不能被改写为业务错误。"""
+
+        for exception_type in (
+            asyncio.CancelledError,
+            KeyboardInterrupt,
+            SystemExit,
+        ):
+            with self.subTest(exception_type=exception_type.__name__):
+                starter, page, context, browser, playwright = (
+                    self._browser_harness(())
+                )
+                page.goto_error = exception_type()
+                collector = DouyinDataCollector(
+                    contract_loader=verified_content_contract,
+                    playwright_factory=lambda starter=starter: starter,
+                    browser_timeout_seconds=0.1,
+                )
+
+                with self.assertRaises(exception_type):
+                    collector.complete_content_data(
+                        self.account, self._account_batch()
+                    )
+
+                self.assertEqual(
+                    (page.closed, context.closed, browser.closed), (1, 1, 1)
+                )
+                self.assertEqual(playwright.stopped, 1)
+
+    def test_response_cancellation_is_not_remapped(self) -> None:
+        """响应解析任务被取消时，调用方必须收到原始取消。"""
+
+        response = FakeContentResponse(
+            "https://creator.douyin.com/verified/content/list",
+            valid_content_payload(),
+            error=asyncio.CancelledError(),
+        )
+        starter, page, context, browser, playwright = self._browser_harness(
+            (response,)
+        )
+        collector = DouyinDataCollector(
+            contract_loader=verified_content_contract,
+            playwright_factory=lambda: starter,
+            browser_timeout_seconds=0.1,
+        )
+
+        with self.assertRaises(asyncio.CancelledError):
+            collector.complete_content_data(self.account, self._account_batch())
+
+        self.assertEqual((page.closed, context.closed, browser.closed), (1, 1, 1))
+        self.assertEqual(playwright.stopped, 1)
+
+    def test_cleanup_process_control_exceptions_survive_all_close_attempts(
+        self,
+    ) -> None:
+        """关闭阶段的进程控制异常也要保留，但不得阻止其他资源关闭。"""
+
+        for exception_type in (
+            asyncio.CancelledError,
+            KeyboardInterrupt,
+            SystemExit,
+        ):
+            with self.subTest(exception_type=exception_type.__name__):
+                response = FakeContentResponse(
+                    "https://creator.douyin.com/verified/content/list",
+                    valid_content_payload(),
+                )
+                starter, page, context, browser, playwright = (
+                    self._browser_harness((response,))
+                )
+                page.close_error = exception_type()
+                collector = DouyinDataCollector(
+                    contract_loader=verified_content_contract,
+                    playwright_factory=lambda starter=starter: starter,
+                    browser_timeout_seconds=0.1,
+                )
+
+                with self.assertRaises(exception_type):
+                    collector.complete_content_data(
+                        self.account, self._account_batch()
+                    )
+
+                self.assertEqual(
+                    (page.closed, context.closed, browser.closed), (1, 1, 1)
+                )
+                self.assertEqual(playwright.stopped, 1)
+
+    def test_early_exit_removes_listener_and_consumes_future_exception(
+        self,
+    ) -> None:
+        """登录、验证或拒绝访问早退不得留下未取回 Future 异常或私密路径。"""
+
+        cases = (
+            ("https://creator.douyin.com/verification", "verification_required"),
+            ("https://creator.douyin.com/login", "login_required"),
+            ("https://creator.douyin.com/forbidden", "metric_payload_invalid"),
+        )
+        for final_url, expected_code in cases:
+            with self.subTest(expected_code=expected_code):
+                response = FakeContentResponse(
+                    "https://creator.douyin.com/verified/content/list",
+                    valid_content_payload(),
+                    error=RuntimeError(f"private path: {self.state_file}"),
+                )
+                starter, page, _context, _browser, _playwright = (
+                    self._browser_harness((response,))
+                )
+                page.url = final_url
+                collector = DouyinDataCollector(
+                    contract_loader=verified_content_contract,
+                    playwright_factory=lambda: starter,
+                    browser_timeout_seconds=0.1,
+                )
+
+                async def exercise() -> tuple[str, int, list[dict]]:
+                    loop = asyncio.get_running_loop()
+                    events: list[dict] = []
+                    loop.set_exception_handler(
+                        lambda _loop, context: events.append(dict(context))
+                    )
+                    error_code = ""
+                    try:
+                        await collector._complete_content_data_async(
+                            self.account,
+                            self._account_batch(),
+                            verified_content_contract(),
+                            None,
+                        )
+                    except DouyinDataCollectionError as exc:
+                        error_code = exc.error_code
+                    removals = page.listener_removals
+                    page.listeners.clear()
+                    gc.collect()
+                    await asyncio.sleep(0)
+                    return error_code, removals, events
+
+                error_code, removals, events = asyncio.run(exercise())
+
+                self.assertEqual(error_code, expected_code)
+                self.assertEqual(removals, 1)
+                self.assertEqual(events, [])
 
     def test_late_cross_account_results_stay_with_their_invocation(self) -> None:
         """共用采集器的旧账号慢响应不能覆盖新账号的作品批次。"""

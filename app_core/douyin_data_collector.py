@@ -24,7 +24,6 @@ from .platform_data_comment_models import CommentInsightFailure
 from .platform_data_models import (
     ALLOWED_CONTENT_STATUSES,
     ALLOWED_CONTENT_TYPES,
-    ALLOWED_METRIC_KEYS,
     CollectionBatch,
     ContentRecord,
     MetricPoint,
@@ -45,6 +44,7 @@ _CONTENT_LIST_UNAVAILABLE_WARNING = "content_list_unavailable"
 _REQUEST_TIMEOUT_SECONDS = 20.0
 _BROWSER_TIMEOUT_SECONDS = 30.0
 _CONTENT_RESPONSE_LIMIT = 50
+_CONTENT_METRIC_KEYS = frozenset({"views", "likes", "comments", "shares"})
 _MISSING = object()
 _RAW_METRIC_MAP = {
     "play": "views",
@@ -306,14 +306,16 @@ def parse_verified_content_payload(
         )
         points: list[MetricPoint] = []
         for metric_key, field in contract.content_metric_fields:
-            if metric_key not in ALLOWED_METRIC_KEYS:
-                continue
+            if metric_key not in _CONTENT_METRIC_KEYS:
+                _content_payload_invalid()
             value = _row_field(row, contract.content_list_field, field)
             if (
                 type(value) not in (int, float)
                 or not math.isfinite(float(value))
             ):
                 continue
+            if value < 0:
+                _content_payload_invalid()
             points.append(
                 MetricPoint(
                     entity_type="content",
@@ -890,6 +892,19 @@ class DouyinDataCollector:
         loop = asyncio.get_running_loop()
         response_future: asyncio.Future = loop.create_future()
         observed_at = _local_observation_timestamp()
+        total_deadline = loop.time() + self._browser_timeout_seconds
+        cleanup_reservation = min(
+            2.0, self._browser_timeout_seconds * 0.25
+        )
+        operation_deadline = total_deadline - cleanup_reservation
+
+        async def await_operation(awaitable):
+            remaining = operation_deadline - loop.time()
+            if remaining <= 0:
+                if hasattr(awaitable, "close"):
+                    awaitable.close()
+                raise TimeoutError
+            return await asyncio.wait_for(awaitable, timeout=remaining)
 
         def observe_response(response: object) -> None:
             if not response_future.done():
@@ -910,7 +925,7 @@ class DouyinDataCollector:
                     method = getattr(request, "method", None)
                     if (
                         parsed.scheme != "https"
-                        or parsed.hostname != contract.creator_host
+                        or parsed.netloc != contract.creator_host
                         or parsed.path != contract.content_response_path
                         or type(method) is not str
                         or method != contract.content_response_method
@@ -965,6 +980,10 @@ class DouyinDataCollector:
                     if not response_future.done():
                         response_future.set_exception(exc)
                     return
+                except asyncio.CancelledError as exc:
+                    if not response_future.done():
+                        response_future.set_exception(exc)
+                    raise
                 except (KeyboardInterrupt, SystemExit) as exc:
                     if not response_future.done():
                         response_future.set_exception(exc)
@@ -981,20 +1000,26 @@ class DouyinDataCollector:
 
         try:
             starter = self._playwright_factory()
-            playwright = await starter.start()
-            browser = await playwright.chromium.launch(headless=True)
-            context = await browser.new_context(storage_state=str(state_path))
-            page = await context.new_page()
+            playwright = await await_operation(starter.start())
+            browser = await await_operation(
+                playwright.chromium.launch(headless=True)
+            )
+            context = await await_operation(
+                browser.new_context(storage_state=str(state_path))
+            )
+            page = await await_operation(context.new_page())
             page.on("response", observe_response)
             worker = asyncio.create_task(consume_responses())
             navigation_url = (
                 f"https://{contract.creator_host}"
                 f"{contract.content_navigation_template}"
             )
-            await page.goto(
-                navigation_url,
-                wait_until="domcontentloaded",
-                timeout=self._browser_timeout_seconds * 1000,
+            await await_operation(
+                page.goto(
+                    navigation_url,
+                    wait_until="domcontentloaded",
+                    timeout=self._browser_timeout_seconds * 1000,
+                )
             )
             current_url = str(getattr(page, "url", "") or "").lower()
             if "/verification" in current_url:
@@ -1009,31 +1034,119 @@ class DouyinDataCollector:
                 raise DouyinDataCollectionError(
                     "access_denied", fallback_allowed=False
                 )
-            try:
-                result = await asyncio.wait_for(
-                    response_future,
-                    timeout=self._browser_timeout_seconds,
-                )
-            except TimeoutError:
-                raise DouyinDataCollectionError(
-                    "content_list_unavailable", fallback_allowed=False
-                ) from None
+            result = await await_operation(response_future)
+        except TimeoutError:
+            caught = DouyinDataCollectionError(
+                "content_list_unavailable", fallback_allowed=False
+            )
         except BaseException as exc:
             caught = exc
         finally:
+            cleanup_steps = 7
+
+            async def settle_cleanup(awaitable) -> BaseException | None:
+                nonlocal cleanup_steps
+                try:
+                    remaining = total_deadline - loop.time()
+                    if remaining <= 0:
+                        task = asyncio.ensure_future(awaitable)
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+                        return TimeoutError()
+                    timeout = remaining / cleanup_steps
+                    try:
+                        await asyncio.wait_for(awaitable, timeout=timeout)
+                    except BaseException as exc:
+                        return exc
+                    return None
+                finally:
+                    cleanup_steps -= 1
+
+            async def close_bounded(resource: object | None) -> BaseException | None:
+                nonlocal cleanup_steps
+                if resource is None:
+                    cleanup_steps -= 1
+                    return None
+                close = getattr(resource, "close", None)
+                if close is None:
+                    close = getattr(resource, "stop", None)
+                if close is None:
+                    cleanup_steps -= 1
+                    return RuntimeError("resource close unavailable")
+                try:
+                    close_result = close()
+                except BaseException as exc:
+                    cleanup_steps -= 1
+                    return exc
+                if hasattr(close_result, "__await__"):
+                    return await settle_cleanup(close_result)
+                cleanup_steps -= 1
+                return None
+
+            if page is not None:
+                remove_listener = getattr(page, "remove_listener", None)
+                if remove_listener is None:
+                    remove_listener = getattr(page, "off", None)
+                if remove_listener is not None:
+                    try:
+                        removal = remove_listener("response", observe_response)
+                    except BaseException as exc:
+                        cleanup_errors.append(exc)
+                        cleanup_steps -= 1
+                    else:
+                        if hasattr(removal, "__await__"):
+                            removal_error = await settle_cleanup(removal)
+                            if removal_error is not None:
+                                cleanup_errors.append(removal_error)
+                        else:
+                            cleanup_steps -= 1
+                else:
+                    cleanup_steps -= 1
+            else:
+                cleanup_steps -= 1
+
+            if not response_future.done():
+                response_future.cancel()
+            if response_future.done():
+                try:
+                    future_error = response_future.exception()
+                except asyncio.CancelledError:
+                    future_error = None
+                if isinstance(
+                    future_error,
+                    (asyncio.CancelledError, KeyboardInterrupt, SystemExit),
+                ):
+                    cleanup_errors.append(future_error)
+            cleanup_steps -= 1
+
+            worker_cancelled_for_cleanup = False
             if worker is not None and not worker.done():
                 worker.cancel()
-            if worker is not None:
-                await asyncio.gather(worker, return_exceptions=True)
+                worker_cancelled_for_cleanup = True
+            if worker is None:
+                cleanup_steps -= 1
+            else:
+                worker_error = await settle_cleanup(worker)
+                if worker_error is not None and not (
+                    worker_cancelled_for_cleanup
+                    and isinstance(worker_error, asyncio.CancelledError)
+                ):
+                    cleanup_errors.append(worker_error)
+
             for resource in (page, context, browser, playwright):
-                close_error = await self._close_resource(resource)
+                close_error = await close_bounded(resource)
                 if close_error is not None:
                     cleanup_errors.append(close_error)
 
-        if isinstance(caught, (KeyboardInterrupt, SystemExit)):
+        if isinstance(
+            caught, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)
+        ):
             raise caught
         for cleanup_error in cleanup_errors:
-            if isinstance(cleanup_error, (KeyboardInterrupt, SystemExit)):
+            if isinstance(
+                cleanup_error,
+                (asyncio.CancelledError, KeyboardInterrupt, SystemExit),
+            ):
                 raise cleanup_error
         if cleanup_errors:
             raise DouyinDataCollectionError(
@@ -1077,7 +1190,7 @@ class DouyinDataCollector:
             raise DouyinDataCollectionError(
                 "content_list_unavailable", fallback_allowed=False
             ) from None
-        except (KeyboardInterrupt, SystemExit):
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             raise
         except BaseException:
             return account_batch
@@ -1092,7 +1205,7 @@ class DouyinDataCollector:
             )
         except DouyinDataCollectionError:
             raise
-        except (KeyboardInterrupt, SystemExit):
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             raise
         except BaseException:
             raise DouyinDataCollectionError(
