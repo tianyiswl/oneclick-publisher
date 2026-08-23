@@ -419,20 +419,30 @@ class FakeFunction:
         return self.callback(*args)
 
 
+class FakeMutationFunction(FakeFunction):
+    """Expose an explicit non-sensitive commit marker at the native boundary."""
+
+    def _oneclick_invoke_with_commit_marker(self, marker, *args):
+        return self.callback(*args, commit_marker=marker)
+
+
 class FakeMacSecurity:
     NOT_FOUND = -25300
 
-    def __init__(self, *, fail=None) -> None:
+    def __init__(self, *, fail=None, after_commit_control=None) -> None:
         self.secret = None
         self.fail = fail
+        self.after_commit_control = after_commit_control
         self.returned = []
         self.freed = []
         self.mutable_views = []
         self.deleted = 0
         self.SecKeychainFindGenericPassword = FakeFunction(self._find)
-        self.SecKeychainAddGenericPassword = FakeFunction(self._add)
-        self.SecKeychainItemModifyAttributesAndData = FakeFunction(self._modify)
-        self.SecKeychainItemDelete = FakeFunction(self._delete)
+        self.SecKeychainAddGenericPassword = FakeMutationFunction(self._add)
+        self.SecKeychainItemModifyAttributesAndData = FakeMutationFunction(
+            self._modify
+        )
+        self.SecKeychainItemDelete = FakeMutationFunction(self._delete)
         self.SecKeychainItemFreeContent = FakeFunction(self._free)
 
     def _maybe_fail(self):
@@ -494,7 +504,11 @@ class FakeMacSecurity:
         password_length,
         password_pointer,
         _item_out,
+        *,
+        commit_marker=None,
     ):
+        if commit_marker is not None:
+            commit_marker.mark_not_committed()
         failure = self._maybe_fail()
         if failure is not None:
             return failure
@@ -505,21 +519,45 @@ class FakeMacSecurity:
             account_pointer,
         )
         self.secret = self._capture(password_length, password_pointer)
+        if commit_marker is not None:
+            commit_marker.mark_committed()
+        if self.after_commit_control is not None:
+            raise self.after_commit_control
         return 0
 
-    def _modify(self, _item, _attributes, password_length, password_pointer):
+    def _modify(
+        self,
+        _item,
+        _attributes,
+        password_length,
+        password_pointer,
+        *,
+        commit_marker=None,
+    ):
+        if commit_marker is not None:
+            commit_marker.mark_not_committed()
         failure = self._maybe_fail()
         if failure is not None:
             return failure
         self.secret = self._capture(password_length, password_pointer)
+        if commit_marker is not None:
+            commit_marker.mark_committed()
+        if self.after_commit_control is not None:
+            raise self.after_commit_control
         return 0
 
-    def _delete(self, _item):
+    def _delete(self, _item, *, commit_marker=None):
+        if commit_marker is not None:
+            commit_marker.mark_not_committed()
         failure = self._maybe_fail()
         if failure is not None:
             return failure
         self.secret = None
         self.deleted += 1
+        if commit_marker is not None:
+            commit_marker.mark_committed()
+        if self.after_commit_control is not None:
+            raise self.after_commit_control
         return 0
 
     def _free(self, _attributes, pointer):
@@ -549,19 +587,27 @@ class FakeCoreFoundation:
 class FakeWindowsAdvapi:
     NOT_FOUND = 1168
 
-    def __init__(self, facade, *, fail=None, partial_read_error=None) -> None:
+    def __init__(
+        self,
+        facade,
+        *,
+        fail=None,
+        partial_read_error=None,
+        after_commit_control=None,
+    ) -> None:
         self.facade = facade
         self.secret = None
         self.fail = fail
         self.partial_read_error = partial_read_error
+        self.after_commit_control = after_commit_control
         self.last_error = 0
         self.mutable_views = []
         self.read_refs = []
         self.freed = []
         self.deleted = 0
-        self.CredWriteW = FakeFunction(self._write)
+        self.CredWriteW = FakeMutationFunction(self._write)
         self.CredReadW = FakeFunction(self._read)
-        self.CredDeleteW = FakeFunction(self._delete)
+        self.CredDeleteW = FakeMutationFunction(self._delete)
         self.CredFree = FakeFunction(self._free)
 
     def _maybe_fail(self):
@@ -572,7 +618,9 @@ class FakeWindowsAdvapi:
             return True
         return False
 
-    def _write(self, credential_pointer, _flags):
+    def _write(self, credential_pointer, _flags, *, commit_marker=None):
+        if commit_marker is not None:
+            commit_marker.mark_not_committed()
         if self._maybe_fail():
             return 0
         credential = credential_pointer._obj
@@ -589,6 +637,10 @@ class FakeWindowsAdvapi:
             "utf-8"
         )
         self.last_error = 0
+        if commit_marker is not None:
+            commit_marker.mark_committed()
+        if self.after_commit_control is not None:
+            raise self.after_commit_control
         return 1
 
     def _install_read_pointer(self, credential_out, value: bytes) -> None:
@@ -626,7 +678,16 @@ class FakeWindowsAdvapi:
         self.last_error = 0
         return 1
 
-    def _delete(self, target, _credential_type, _flags):
+    def _delete(
+        self,
+        target,
+        _credential_type,
+        _flags,
+        *,
+        commit_marker=None,
+    ):
+        if commit_marker is not None:
+            commit_marker.mark_not_committed()
         if self._maybe_fail():
             return 0
         if target != "com.oneclickpublisher.comment-insight" or self.secret is None:
@@ -635,6 +696,10 @@ class FakeWindowsAdvapi:
         self.secret = None
         self.deleted += 1
         self.last_error = 0
+        if commit_marker is not None:
+            commit_marker.mark_committed()
+        if self.after_commit_control is not None:
+            raise self.after_commit_control
         return 1
 
     def _free(self, pointer):
@@ -651,14 +716,20 @@ class FakeCtypes:
         core_fail=None,
         windows_fail=None,
         windows_partial_error=None,
+        mac_after_commit_control=None,
+        windows_after_commit_control=None,
     ) -> None:
-        self.mac = FakeMacSecurity(fail=mac_fail)
+        self.mac = FakeMacSecurity(
+            fail=mac_fail,
+            after_commit_control=mac_after_commit_control,
+        )
         self.core = FakeCoreFoundation(fail=core_fail)
         self.last_error = 0
         self.windows = FakeWindowsAdvapi(
             self,
             fail=windows_fail,
             partial_read_error=windows_partial_error,
+            after_commit_control=windows_after_commit_control,
         )
         for name in (
             "Structure",
@@ -808,6 +879,151 @@ class CommentAiSettingsTests(unittest.TestCase):
 
 
 class CommentSecretStoreTests(unittest.TestCase):
+    def test_opaque_native_control_after_effect_is_unknown_never_uncommitted(self):
+        """Without a commit marker, an applied native mutation stays unknown."""
+
+        write_marker = "opaque-write-control-private-marker"
+        write_cases = (
+            (
+                "darwin",
+                FakeCtypes(mac_after_commit_control=KeyboardInterrupt()),
+                "mac",
+                "SecKeychainItemModifyAttributesAndData",
+                "_modify",
+            ),
+            (
+                "win32",
+                FakeCtypes(windows_after_commit_control=KeyboardInterrupt()),
+                "windows",
+                "CredWriteW",
+                "_write",
+            ),
+        )
+        for platform_name, native, backend_name, entry_name, callback_name in write_cases:
+            backend = getattr(native, backend_name)
+            backend.secret = "old-opaque-write-private-marker"
+            setattr(
+                backend,
+                entry_name,
+                FakeFunction(getattr(backend, callback_name)),
+            )
+            store = CommentSecretStore(
+                platform_name=platform_name,
+                ctypes_module=native,
+            )
+
+            with self.subTest(operation="write", platform=platform_name):
+                receipt = store.write_with_receipt(write_marker)
+                self.assertEqual(backend.secret, write_marker)
+                self.assertIsNone(receipt.committed)
+                self.assertEqual(receipt.commit_state, "unknown")
+                self.assertEqual(receipt.status, "control")
+                self.assertNotIn(write_marker, repr(receipt))
+
+        delete_cases = (
+            (
+                "darwin",
+                FakeCtypes(mac_after_commit_control=KeyboardInterrupt()),
+                "mac",
+                "SecKeychainItemDelete",
+                "_delete",
+            ),
+            (
+                "win32",
+                FakeCtypes(windows_after_commit_control=KeyboardInterrupt()),
+                "windows",
+                "CredDeleteW",
+                "_delete",
+            ),
+        )
+        for platform_name, native, backend_name, entry_name, callback_name in delete_cases:
+            backend = getattr(native, backend_name)
+            backend.secret = "opaque-delete-control-private-marker"
+            setattr(
+                backend,
+                entry_name,
+                FakeFunction(getattr(backend, callback_name)),
+            )
+            store = CommentSecretStore(
+                platform_name=platform_name,
+                ctypes_module=native,
+            )
+
+            with self.subTest(operation="delete", platform=platform_name):
+                receipt = store.delete_with_receipt()
+                self.assertIsNone(backend.secret)
+                self.assertIsNone(receipt.committed)
+                self.assertEqual(receipt.commit_state, "unknown")
+                self.assertEqual(receipt.status, "control")
+                self.assertNotIn("private", repr(receipt))
+
+    def test_native_write_control_after_commit_is_never_reported_uncommitted(self):
+        """A return-boundary control cannot turn an applied write into false."""
+
+        marker = "after-write-control-private-marker"
+        cases = (
+            (
+                "darwin",
+                FakeCtypes(mac_after_commit_control=KeyboardInterrupt()),
+                "mac",
+            ),
+            (
+                "win32",
+                FakeCtypes(windows_after_commit_control=KeyboardInterrupt()),
+                "windows",
+            ),
+        )
+        for platform_name, native, backend_name in cases:
+            backend = getattr(native, backend_name)
+            backend.secret = "old-write-control-private-marker"
+            store = CommentSecretStore(
+                platform_name=platform_name,
+                ctypes_module=native,
+            )
+
+            with self.subTest(platform=platform_name):
+                receipt = store.write_with_receipt(marker)
+                self.assertEqual(backend.secret, marker)
+                self.assertIsNot(receipt.committed, False)
+                self.assertEqual(receipt.commit_state, "committed")
+                self.assertEqual(receipt.status, "control")
+                self.assertEqual(receipt.control, "keyboard_interrupt")
+                self.assertIsNone(receipt.exit_code)
+                self.assertNotIn(marker, repr(receipt))
+
+    def test_native_delete_control_after_commit_is_never_reported_uncommitted(self):
+        """A return-boundary control cannot turn an applied delete into false."""
+
+        cases = (
+            (
+                "darwin",
+                FakeCtypes(mac_after_commit_control=KeyboardInterrupt()),
+                "mac",
+            ),
+            (
+                "win32",
+                FakeCtypes(windows_after_commit_control=KeyboardInterrupt()),
+                "windows",
+            ),
+        )
+        for platform_name, native, backend_name in cases:
+            backend = getattr(native, backend_name)
+            backend.secret = "delete-control-private-marker"
+            store = CommentSecretStore(
+                platform_name=platform_name,
+                ctypes_module=native,
+            )
+
+            with self.subTest(platform=platform_name):
+                receipt = store.delete_with_receipt()
+                self.assertIsNone(backend.secret)
+                self.assertIsNot(receipt.committed, False)
+                self.assertEqual(receipt.commit_state, "committed")
+                self.assertEqual(receipt.status, "control")
+                self.assertEqual(receipt.control, "keyboard_interrupt")
+                self.assertIsNone(receipt.exit_code)
+                self.assertNotIn("private", repr(receipt))
+
     def test_mutation_receipts_distinguish_commit_from_cleanup_failure(self):
         """A native commit followed by cleanup failure must stay marked committed."""
 

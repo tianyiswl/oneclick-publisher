@@ -120,6 +120,9 @@ _UI_OUTCOME_OK = "ok"
 _UI_OUTCOME_FAILURE = "failure"
 _UI_OUTCOME_CONTROL = "control"
 _UI_PROCESS_CONTROL = (asyncio.CancelledError, KeyboardInterrupt, SystemExit)
+_AI_CONFIG_TRANSITION_KEY = "commentInsightAi/configTransition"
+_AI_CONFIG_TRANSITION_VALUE = "pending-v1"
+_AI_CONFIG_BLOCKED_TEXT = "AI 配置不可使用，请重新保存或清除密钥"
 
 ERROR_TEXT = PUBLIC_PLATFORM_DATA_ERROR_TEXT
 
@@ -233,7 +236,15 @@ def _comment_error_text(value: object) -> str:
 def _build_comment_ai_provider():
     """只在后台洞察开始时读取密钥，不把旧密钥交给设置界面。"""
 
-    settings = load_ai_settings(QSettings())
+    settings_store = QSettings()
+    try:
+        if _settings_transition_present(settings_store):
+            return None
+    except _UI_PROCESS_CONTROL:
+        raise
+    except BaseException:
+        return None
+    settings = load_ai_settings(settings_store)
     if settings is None:
         return None
     secret = None
@@ -320,19 +331,36 @@ def _take_secret_buffer(line_edit: QLineEdit):
 
 
 def _nonsecret_settings_snapshot(settings) -> tuple[tuple[bool, object], ...]:
-    return tuple(
-        (bool(settings.contains(key)), settings.value(key, None))
-        for key in (BASE_URL_KEY, MODEL_KEY)
-    )
+    snapshot: list[tuple[bool, object]] = []
+    for key in (BASE_URL_KEY, MODEL_KEY, _AI_CONFIG_TRANSITION_KEY):
+        present = settings.contains(key)
+        if type(present) is not bool:
+            raise RuntimeError("settings snapshot invalid")
+        snapshot.append((present, settings.value(key, None)))
+    return tuple(snapshot)
 
 
 def _settings_sync_succeeded(settings) -> bool:
     return settings.status() == QSettings.Status.NoError
 
 
-def _save_nonsecret_settings(settings, value: CommentAiSettings) -> None:
+def _settings_transition_present(settings) -> bool:
+    present = settings.contains(_AI_CONFIG_TRANSITION_KEY)
+    if type(present) is not bool:
+        raise RuntimeError("settings transition state invalid")
+    return present
+
+
+def _stage_nonsecret_settings(settings, value: CommentAiSettings) -> None:
+    settings.setValue(_AI_CONFIG_TRANSITION_KEY, _AI_CONFIG_TRANSITION_VALUE)
     save_ai_settings(settings, value)
-    if not _settings_sync_succeeded(settings):
+    if (
+        not _settings_sync_succeeded(settings)
+        or settings.value(_AI_CONFIG_TRANSITION_KEY, None)
+        != _AI_CONFIG_TRANSITION_VALUE
+        or settings.value(BASE_URL_KEY, None) != value.normalized_base_url
+        or settings.value(MODEL_KEY, None) != value.model
+    ):
         raise RuntimeError("settings sync failed")
 
 
@@ -341,7 +369,7 @@ def _restore_nonsecret_settings(
     snapshot: tuple[tuple[bool, object], ...],
 ) -> None:
     for key, (existed, value) in zip(
-        (BASE_URL_KEY, MODEL_KEY),
+        (BASE_URL_KEY, MODEL_KEY, _AI_CONFIG_TRANSITION_KEY),
         snapshot,
         strict=True,
     ):
@@ -352,6 +380,37 @@ def _restore_nonsecret_settings(
     settings.sync()
     if not _settings_sync_succeeded(settings):
         raise RuntimeError("settings rollback failed")
+    for key, (existed, value) in zip(
+        (BASE_URL_KEY, MODEL_KEY, _AI_CONFIG_TRANSITION_KEY),
+        snapshot,
+        strict=True,
+    ):
+        present = settings.contains(key)
+        if type(present) is not bool or present != existed:
+            raise RuntimeError("settings rollback failed")
+        if existed and settings.value(key, None) != value:
+            raise RuntimeError("settings rollback failed")
+
+
+def _finish_nonsecret_settings_transition(settings) -> None:
+    settings.remove(_AI_CONFIG_TRANSITION_KEY)
+    settings.sync()
+    if (
+        not _settings_sync_succeeded(settings)
+        or _settings_transition_present(settings)
+    ):
+        raise RuntimeError("settings transition finish failed")
+
+
+def _block_nonsecret_settings(settings) -> None:
+    settings.setValue(_AI_CONFIG_TRANSITION_KEY, _AI_CONFIG_TRANSITION_VALUE)
+    settings.sync()
+    if (
+        not _settings_sync_succeeded(settings)
+        or settings.value(_AI_CONFIG_TRANSITION_KEY, None)
+        != _AI_CONFIG_TRANSITION_VALUE
+    ):
+        raise RuntimeError("settings transition block failed")
 
 
 def _settings_value_outcome(base_input: QLineEdit, model_input: QLineEdit):
@@ -387,11 +446,11 @@ def _settings_snapshot_outcome(settings):
     return _UI_OUTCOME_OK, snapshot
 
 
-def _save_nonsecret_settings_outcome(settings, value: CommentAiSettings):
+def _stage_nonsecret_settings_outcome(settings, value: CommentAiSettings):
     outcome = None
     error = None
     try:
-        _save_nonsecret_settings(settings, value)
+        _stage_nonsecret_settings(settings, value)
     except BaseException as error:
         outcome = _ui_error_outcome(error)
     settings = None
@@ -413,6 +472,30 @@ def _restore_nonsecret_settings_outcome(settings, snapshot):
     return outcome or (_UI_OUTCOME_OK, None)
 
 
+def _finish_nonsecret_settings_transition_outcome(settings):
+    outcome = None
+    error = None
+    try:
+        _finish_nonsecret_settings_transition(settings)
+    except BaseException as error:
+        outcome = _ui_error_outcome(error)
+    settings = None
+    error = None
+    return outcome or (_UI_OUTCOME_OK, None)
+
+
+def _block_nonsecret_settings_outcome(settings):
+    outcome = None
+    error = None
+    try:
+        _block_nonsecret_settings(settings)
+    except BaseException as error:
+        outcome = _ui_error_outcome(error)
+    settings = None
+    error = None
+    return outcome or (_UI_OUTCOME_OK, None)
+
+
 def _write_secret_buffer_receipt(secret_store, mutable: bytearray):
     secret_text = None
     receipt = None
@@ -425,7 +508,12 @@ def _write_secret_buffer_receipt(secret_store, mutable: bytearray):
         receipt = secret_store.write_with_receipt(secret_text)
         if (
             type(receipt) is not SecretMutationReceipt
-            or (receipt.status == "success" and not receipt.committed)
+            or receipt.commit_state
+            not in {"committed", "not_committed", "unknown"}
+            or (
+                receipt.status == "success"
+                and receipt.commit_state != "committed"
+            )
         ):
             receipt = None
             raise ValueError("invalid secret mutation receipt")
@@ -455,6 +543,32 @@ def _mutation_receipt_ui_outcome(receipt: SecretMutationReceipt):
     return (_UI_OUTCOME_FAILURE, None)
 
 
+def _delete_secret_receipt_outcome(secret_store):
+    receipt = None
+    outcome = None
+    error = None
+    try:
+        receipt = secret_store.delete_with_receipt()
+        if (
+            type(receipt) is not SecretMutationReceipt
+            or receipt.commit_state
+            not in {"committed", "not_committed", "unknown"}
+            or (
+                receipt.status == "success"
+                and receipt.commit_state == "unknown"
+            )
+        ):
+            receipt = None
+            raise ValueError("invalid secret mutation receipt")
+    except BaseException as error:
+        outcome = _ui_error_outcome(error)
+    secret_store = None
+    error = None
+    if outcome is not None:
+        return outcome, None
+    return (_UI_OUTCOME_OK, None), receipt
+
+
 class _CommentAiSettingsDialog(QDialog):
     """只编辑非秘密配置和一次性新密钥，从不读回旧密钥。"""
 
@@ -474,16 +588,29 @@ class _CommentAiSettingsDialog(QDialog):
         )
         loaded = load_ai_settings(self._settings)
         try:
-            configured = self._secret_store.is_configured()
+            self._configuration_blocked = _settings_transition_present(
+                self._settings
+            )
         except _UI_PROCESS_CONTROL:
             raise
         except BaseException:
+            self._configuration_blocked = True
+        if self._configuration_blocked:
             self._secret_state = "error"
         else:
-            if type(configured) is not bool:
+            try:
+                configured = self._secret_store.is_configured()
+            except _UI_PROCESS_CONTROL:
+                raise
+            except BaseException:
                 self._secret_state = "error"
             else:
-                self._secret_state = "configured" if configured else "missing"
+                if type(configured) is not bool:
+                    self._secret_state = "error"
+                else:
+                    self._secret_state = (
+                        "configured" if configured else "missing"
+                    )
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 18, 20, 18)
@@ -510,6 +637,8 @@ class _CommentAiSettingsDialog(QDialog):
         self.feedback_label = QLabel("")
         self.feedback_label.setProperty("role", "muted")
         self.feedback_label.setWordWrap(True)
+        if self._configuration_blocked:
+            self.feedback_label.setText(_AI_CONFIG_BLOCKED_TEXT)
         layout.addWidget(self.feedback_label)
 
         actions = QHBoxLayout()
@@ -544,10 +673,14 @@ class _CommentAiSettingsDialog(QDialog):
         mutation_receipt = None
         receipt_outcome = None
         rollback_outcome = None
+        finish_outcome = None
         final_outcome = None
         settings_value = None
         snapshot = None
         secret_replaced = False
+        transition_started = False
+        transition_resolved = False
+        was_configuration_blocked = self._configuration_blocked
         try:
             take_outcome = _take_secret_buffer(self.secret_input)
             if take_outcome[0] == _UI_OUTCOME_OK:
@@ -573,19 +706,27 @@ class _CommentAiSettingsDialog(QDialog):
                     final_outcome = snapshot_outcome
 
             if final_outcome is None:
-                save_outcome = _save_nonsecret_settings_outcome(
-                    self._settings,
-                    settings_value,
-                )
-                if save_outcome[0] != _UI_OUTCOME_OK:
+                if self._configuration_blocked and not secret_buffer:
+                    final_outcome = (_UI_OUTCOME_FAILURE, None)
+                else:
+                    transition_started = True
+                    save_outcome = _stage_nonsecret_settings_outcome(
+                        self._settings,
+                        settings_value,
+                    )
+                if final_outcome is None and save_outcome[0] != _UI_OUTCOME_OK:
                     rollback_outcome = _restore_nonsecret_settings_outcome(
                         self._settings,
                         snapshot,
                     )
+                    transition_resolved = (
+                        rollback_outcome[0] == _UI_OUTCOME_OK
+                        and not was_configuration_blocked
+                    )
                     final_outcome = _first_ui_outcome(
                         save_outcome,
                         None
-                        if rollback_outcome[0] == _UI_OUTCOME_OK
+                        if transition_resolved
                         else rollback_outcome,
                     )
 
@@ -600,35 +741,65 @@ class _CommentAiSettingsDialog(QDialog):
                 )
                 secret_buffer = None
                 if secret_outcome[0] != _UI_OUTCOME_OK:
-                    rollback_outcome = _restore_nonsecret_settings_outcome(
-                        self._settings,
-                        snapshot,
-                    )
-                    final_outcome = _first_ui_outcome(
-                        secret_outcome,
-                        None
-                        if rollback_outcome[0] == _UI_OUTCOME_OK
-                        else rollback_outcome,
-                    )
+                    # No receipt means the native return boundary is
+                    # indeterminate. Keep the persisted transition gate so
+                    # neither endpoint/key version can be used by the worker.
+                    final_outcome = secret_outcome
                 else:
-                    secret_replaced = mutation_receipt.committed
+                    secret_replaced = (
+                        mutation_receipt.commit_state == "committed"
+                    )
                     receipt_outcome = _mutation_receipt_ui_outcome(
                         mutation_receipt
                     )
-                    if receipt_outcome is not None:
-                        rollback_outcome = None
-                        if not mutation_receipt.committed:
-                            rollback_outcome = _restore_nonsecret_settings_outcome(
-                                self._settings,
-                                snapshot,
+                    if mutation_receipt.commit_state == "committed":
+                        finish_outcome = (
+                            _finish_nonsecret_settings_transition_outcome(
+                                self._settings
                             )
+                        )
+                        transition_resolved = (
+                            finish_outcome[0] == _UI_OUTCOME_OK
+                        )
                         final_outcome = _first_ui_outcome(
                             receipt_outcome,
                             None
-                            if rollback_outcome is None
-                            or rollback_outcome[0] == _UI_OUTCOME_OK
+                            if transition_resolved
+                            else finish_outcome,
+                        )
+                    elif mutation_receipt.commit_state == "not_committed":
+                        rollback_outcome = _restore_nonsecret_settings_outcome(
+                            self._settings,
+                            snapshot,
+                        )
+                        transition_resolved = (
+                            rollback_outcome[0] == _UI_OUTCOME_OK
+                            and not was_configuration_blocked
+                        )
+                        final_outcome = _first_ui_outcome(
+                            receipt_outcome
+                            or (_UI_OUTCOME_FAILURE, None),
+                            None
+                            if transition_resolved
                             else rollback_outcome,
                         )
+                    else:
+                        final_outcome = receipt_outcome or (
+                            _UI_OUTCOME_FAILURE,
+                            None,
+                        )
+
+            if (
+                final_outcome is None
+                and transition_started
+                and not mutation_receipt
+            ):
+                finish_outcome = _finish_nonsecret_settings_transition_outcome(
+                    self._settings,
+                )
+                transition_resolved = finish_outcome[0] == _UI_OUTCOME_OK
+                if not transition_resolved:
+                    final_outcome = finish_outcome
         finally:
             try:
                 self.secret_input.clear()
@@ -649,24 +820,32 @@ class _CommentAiSettingsDialog(QDialog):
             mutation_receipt = None
             receipt_outcome = None
             rollback_outcome = None
+            finish_outcome = None
             settings_value = None
             snapshot = None
 
+        if transition_started:
+            self._configuration_blocked = not transition_resolved
         if final_outcome is not None:
-            if secret_replaced:
+            if self._configuration_blocked:
+                self._secret_state = "error"
+            elif secret_replaced:
                 self._secret_state = "configured"
-                self._render_secret_status()
+            self._render_secret_status()
             if final_outcome[0] == _UI_OUTCOME_CONTROL:
                 control_outcome = final_outcome
                 final_outcome = None
                 _raise_clean_ui_control(control_outcome)
-            self.feedback_label.setText(
-                "设置已保存，但系统凭据清理未完成"
-                if secret_replaced
-                else "设置未保存，请检查 HTTPS 地址、模型和密钥"
-            )
-            self._render_secret_status()
+            if self._configuration_blocked:
+                self.feedback_label.setText(_AI_CONFIG_BLOCKED_TEXT)
+            else:
+                self.feedback_label.setText(
+                    "设置已保存，但系统凭据清理未完成"
+                    if secret_replaced
+                    else "设置未保存，请检查 HTTPS 地址、模型和密钥"
+                )
             return
+        self._configuration_blocked = False
         if secret_replaced:
             self._secret_state = "configured"
         self.feedback_label.setText("")
@@ -674,15 +853,91 @@ class _CommentAiSettingsDialog(QDialog):
         self.accept()
 
     def _clear_secret(self) -> None:
+        delete_outcome = None
+        receipt = None
+        receipt_outcome = None
+        transition_outcome = None
+        final_outcome = None
+        deleted = False
+        unknown = False
         try:
-            self._secret_store.delete()
-        except Exception:
-            self.feedback_label.setText("密钥未清除，请稍后再试")
-            return
-        self._secret_state = "missing"
-        self.secret_input.clear()
-        self.feedback_label.setText("")
+            delete_outcome, receipt = _delete_secret_receipt_outcome(
+                self._secret_store
+            )
+            if delete_outcome[0] != _UI_OUTCOME_OK:
+                unknown = True
+                final_outcome = delete_outcome
+            else:
+                receipt_outcome = _mutation_receipt_ui_outcome(receipt)
+                deleted = receipt.commit_state == "committed" or (
+                    receipt.status == "success"
+                    and receipt.commit_state == "not_committed"
+                )
+                unknown = receipt.commit_state == "unknown"
+                final_outcome = receipt_outcome
+
+            if deleted:
+                transition_outcome = (
+                    _finish_nonsecret_settings_transition_outcome(
+                        self._settings
+                    )
+                )
+                self._configuration_blocked = (
+                    transition_outcome[0] != _UI_OUTCOME_OK
+                )
+                final_outcome = _first_ui_outcome(
+                    final_outcome,
+                    None
+                    if not self._configuration_blocked
+                    else transition_outcome,
+                )
+            elif unknown:
+                transition_outcome = _block_nonsecret_settings_outcome(
+                    self._settings
+                )
+                self._configuration_blocked = True
+                final_outcome = _first_ui_outcome(
+                    final_outcome,
+                    None
+                    if transition_outcome[0] == _UI_OUTCOME_OK
+                    else transition_outcome,
+                )
+        finally:
+            try:
+                self.secret_input.clear()
+            except BaseException as error:
+                final_outcome = _first_ui_outcome(
+                    final_outcome,
+                    _ui_error_outcome(error),
+                )
+                error = None
+            delete_outcome = None
+            receipt = None
+            receipt_outcome = None
+            transition_outcome = None
+
+        if deleted:
+            self._secret_state = "missing"
+        elif unknown:
+            self._secret_state = "error"
         self._render_secret_status()
+
+        if final_outcome is not None:
+            if final_outcome[0] == _UI_OUTCOME_CONTROL:
+                control_outcome = final_outcome
+                final_outcome = None
+                _raise_clean_ui_control(control_outcome)
+            if self._configuration_blocked:
+                self.feedback_label.setText(_AI_CONFIG_BLOCKED_TEXT)
+            elif deleted:
+                self.feedback_label.setText(
+                    "密钥已清除，但系统凭据清理未完成"
+                )
+            else:
+                self.feedback_label.setText("密钥未清除，请稍后再试")
+            return
+        self._configuration_blocked = False
+        self.feedback_label.setText("")
 
 
 class _TrendChart(QWidget):

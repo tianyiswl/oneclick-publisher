@@ -25,6 +25,9 @@ _PROCESS_CONTROL = (asyncio.CancelledError, KeyboardInterrupt, SystemExit)
 _OUTCOME_OK = "ok"
 _OUTCOME_FAILURE = "failure"
 _OUTCOME_CONTROL = "control"
+_COMMIT_COMMITTED = "committed"
+_COMMIT_NOT_COMMITTED = "not_committed"
+_COMMIT_UNKNOWN = "unknown"
 
 
 def _not_configured() -> CommentInsightFailure:
@@ -46,18 +49,36 @@ def _control_outcome_value(error: BaseException):
 class SecretMutationReceipt:
     """Non-sensitive result of a native credential mutation.
 
-    ``committed`` reports whether the credential value was changed before a
-    later cleanup failure or process-control signal. The remaining fields are
-    fixed tokens and a sanitized integer exit code only.
+    ``commit_state`` distinguishes a proven commit, a proven non-commit, and
+    an indeterminate native return boundary. ``committed`` stays compatible
+    with the older boolean API while using ``None`` for that indeterminate
+    state. All remaining values are fixed tokens or a sanitized integer.
     """
 
-    committed: bool
+    committed: bool | None
     status: str
     control: str = ""
     exit_code: int | None = None
+    commit_state: str = ""
 
     def __post_init__(self) -> None:
-        if type(self.committed) is not bool or self.status not in {
+        commit_state = self.commit_state
+        if commit_state == "":
+            if type(self.committed) is bool:
+                commit_state = (
+                    _COMMIT_COMMITTED
+                    if self.committed
+                    else _COMMIT_NOT_COMMITTED
+                )
+                object.__setattr__(self, "commit_state", commit_state)
+            else:
+                raise _not_configured()
+        expected_committed = {
+            _COMMIT_COMMITTED: True,
+            _COMMIT_NOT_COMMITTED: False,
+            _COMMIT_UNKNOWN: None,
+        }.get(commit_state, object())
+        if self.committed is not expected_committed or self.status not in {
             "success",
             "failed",
             "control",
@@ -83,9 +104,24 @@ class SecretMutationReceipt:
             raise _not_configured()
 
 
-def _mutation_receipt(committed: bool, outcome) -> SecretMutationReceipt:
+def _mutation_receipt(commit_state: str, outcome) -> SecretMutationReceipt:
+    committed = {
+        _COMMIT_COMMITTED: True,
+        _COMMIT_NOT_COMMITTED: False,
+        _COMMIT_UNKNOWN: None,
+    }.get(commit_state, object())
+    if (
+        committed is not True
+        and committed is not False
+        and committed is not None
+    ):
+        raise _not_configured()
     if outcome is None:
-        return SecretMutationReceipt(committed, "success")
+        return SecretMutationReceipt(
+            committed,
+            "success",
+            commit_state=commit_state,
+        )
     if outcome[0] == _OUTCOME_CONTROL:
         control, code = outcome[1]
         return SecretMutationReceipt(
@@ -93,8 +129,63 @@ def _mutation_receipt(committed: bool, outcome) -> SecretMutationReceipt:
             "control",
             control,
             code,
+            commit_state,
         )
-    return SecretMutationReceipt(committed, "failed")
+    return SecretMutationReceipt(
+        committed,
+        "failed",
+        commit_state=commit_state,
+    )
+
+
+class _NativeCommitMarker:
+    """Fixed-state out marker for injected native mutation boundaries."""
+
+    __slots__ = ("_state",)
+
+    def __init__(self) -> None:
+        self._state = _COMMIT_UNKNOWN
+
+    @property
+    def state(self) -> str:
+        return self._state
+
+    def mark_committed(self) -> None:
+        self._state = _COMMIT_COMMITTED
+
+    def mark_not_committed(self) -> None:
+        self._state = _COMMIT_NOT_COMMITTED
+
+
+def _invoke_native_mutation(function, *arguments):
+    """Invoke one mutation and retain only fixed commit/control evidence."""
+
+    marker = _NativeCommitMarker()
+    result = None
+    outcome = None
+    invoker = None
+    error = None
+    try:
+        invoker = getattr(
+            function,
+            "_oneclick_invoke_with_commit_marker",
+            None,
+        )
+        if invoker is None:
+            result = function(*arguments)
+        elif callable(invoker):
+            result = invoker(marker, *arguments)
+        else:
+            raise _not_configured()
+    except BaseException as error:
+        outcome = _error_outcome(error)
+    commit_state = marker.state
+    marker = None
+    function = None
+    arguments = None
+    invoker = None
+    error = None
+    return result, commit_state, outcome
 
 
 def _receipt_outcome(receipt: SecretMutationReceipt):
@@ -258,15 +349,15 @@ class CommentSecretStore:
 
     def _write_receipt(self, secret) -> SecretMutationReceipt:
         mutable = None
-        committed = False
+        commit_state = _COMMIT_NOT_COMMITTED
         outcome = None
         error = None
         try:
             mutable = _secret_buffer(secret)
             if self._platform == "darwin":
-                committed, outcome = self._mac_write(mutable)
+                commit_state, outcome = self._mac_write(mutable)
             elif self._platform == "win32":
-                committed, outcome = self._windows_write(mutable)
+                commit_state, outcome = self._windows_write(mutable)
             else:
                 raise _not_configured()
         except BaseException as error:
@@ -278,7 +369,7 @@ class CommentSecretStore:
             mutable = None
             self = None
             error = None
-        return _mutation_receipt(committed, outcome)
+        return _mutation_receipt(commit_state, outcome)
 
     def delete(self) -> None:
         receipt = self.delete_with_receipt()
@@ -295,14 +386,14 @@ class CommentSecretStore:
         return self._delete_receipt()
 
     def _delete_receipt(self) -> SecretMutationReceipt:
-        committed = False
+        commit_state = _COMMIT_NOT_COMMITTED
         outcome = None
         error = None
         try:
             if self._platform == "darwin":
-                committed, outcome = self._mac_delete()
+                commit_state, outcome = self._mac_delete()
             elif self._platform == "win32":
-                committed, outcome = self._windows_delete()
+                commit_state, outcome = self._windows_delete()
             else:
                 raise _not_configured()
         except BaseException as error:
@@ -310,7 +401,7 @@ class CommentSecretStore:
         finally:
             self = None
             error = None
-        return _mutation_receipt(committed, outcome)
+        return _mutation_receipt(commit_state, outcome)
 
     def _mac_libraries(self):
         ctypes = self._ctypes
@@ -596,31 +687,40 @@ class CommentSecretStore:
         service = None
         account = None
         status = None
-        committed = False
+        commit_state = _COMMIT_NOT_COMMITTED
         outcome = None
-        error = None
-        try:
-            if item_ref is not None:
-                status = security.SecKeychainItemModifyAttributesAndData(
-                    item_ref, None, len(mutable), secret_pointer
-                )
+        if item_ref is not None:
+            status, commit_state, call_outcome = _invoke_native_mutation(
+                security.SecKeychainItemModifyAttributesAndData,
+                item_ref,
+                None,
+                len(mutable),
+                secret_pointer,
+            )
+        else:
+            service, account = self._mac_names()
+            status, commit_state, call_outcome = _invoke_native_mutation(
+                security.SecKeychainAddGenericPassword,
+                None,
+                len(SERVICE_NAME.encode("utf-8")),
+                ctypes.cast(service, ctypes.c_void_p),
+                len(ACCOUNT_NAME.encode("utf-8")),
+                ctypes.cast(account, ctypes.c_void_p),
+                len(mutable),
+                secret_pointer,
+                None,
+            )
+        outcome = _first_outcome(outcome, call_outcome)
+        if call_outcome is None:
+            if status == 0:
+                commit_state = _COMMIT_COMMITTED
             else:
-                service, account = self._mac_names()
-                status = security.SecKeychainAddGenericPassword(
-                    None,
-                    len(SERVICE_NAME.encode("utf-8")),
-                    ctypes.cast(service, ctypes.c_void_p),
-                    len(ACCOUNT_NAME.encode("utf-8")),
-                    ctypes.cast(account, ctypes.c_void_p),
-                    len(mutable),
-                    secret_pointer,
-                    None,
+                if commit_state != _COMMIT_COMMITTED:
+                    commit_state = _COMMIT_NOT_COMMITTED
+                outcome = _first_outcome(
+                    outcome,
+                    (_OUTCOME_FAILURE, None),
                 )
-            if status != 0:
-                raise _not_configured()
-            committed = True
-        except BaseException as error:
-            outcome = _first_outcome(outcome, _error_outcome(error))
         release_outcome = self._mac_release_outcome(core, item_ref)
         outcome = _first_outcome(outcome, release_outcome)
         ctypes = None
@@ -634,10 +734,10 @@ class CommentSecretStore:
         service = None
         account = None
         status = None
-        error = None
+        call_outcome = None
         release_outcome = None
         self = None
-        return committed, outcome
+        return commit_state, outcome
 
     def _mac_delete(self):
         security, core = self._mac_libraries()
@@ -645,18 +745,18 @@ class CommentSecretStore:
             security, core, read_secret=False
         )
         if item_ref is None:
-            return False, None
-        status = None
-        committed = False
-        outcome = None
-        error = None
-        try:
-            status = security.SecKeychainItemDelete(item_ref)
-            if status != 0:
-                raise _not_configured()
-            committed = True
-        except BaseException as error:
-            outcome = _first_outcome(outcome, _error_outcome(error))
+            return _COMMIT_NOT_COMMITTED, None
+        status, commit_state, outcome = _invoke_native_mutation(
+            security.SecKeychainItemDelete,
+            item_ref,
+        )
+        if outcome is None:
+            if status == 0:
+                commit_state = _COMMIT_COMMITTED
+            else:
+                if commit_state != _COMMIT_COMMITTED:
+                    commit_state = _COMMIT_NOT_COMMITTED
+                outcome = (_OUTCOME_FAILURE, None)
         release_outcome = self._mac_release_outcome(core, item_ref)
         outcome = _first_outcome(outcome, release_outcome)
         security = None
@@ -664,10 +764,9 @@ class CommentSecretStore:
         _existing = None
         item_ref = None
         status = None
-        error = None
         release_outcome = None
         self = None
-        return committed, outcome
+        return commit_state, outcome
 
     def _windows_types(self):
         ctypes = self._ctypes
@@ -880,17 +979,39 @@ class CommentSecretStore:
         credential.Attributes = None
         credential.TargetAlias = None
         credential.UserName = ACCOUNT_NAME
-        if not advapi.CredWriteW(ctypes.byref(credential), 0):
-            raise _not_configured()
-        return True, None
+        succeeded, commit_state, outcome = _invoke_native_mutation(
+            advapi.CredWriteW,
+            ctypes.byref(credential),
+            0,
+        )
+        if outcome is None:
+            if succeeded:
+                commit_state = _COMMIT_COMMITTED
+            else:
+                if commit_state != _COMMIT_COMMITTED:
+                    commit_state = _COMMIT_NOT_COMMITTED
+                outcome = (_OUTCOME_FAILURE, None)
+        return commit_state, outcome
 
     def _windows_delete(self):
         credential_type, credential_pointer_type, wintypes = self._windows_types()
         advapi = self._windows_library(
             credential_type, credential_pointer_type, wintypes
         )
-        if advapi.CredDeleteW(SERVICE_NAME, _WINDOWS_CREDENTIAL_TYPE_GENERIC, 0):
-            return True, None
+        succeeded, commit_state, outcome = _invoke_native_mutation(
+            advapi.CredDeleteW,
+            SERVICE_NAME,
+            _WINDOWS_CREDENTIAL_TYPE_GENERIC,
+            0,
+        )
+        if outcome is not None:
+            return commit_state, outcome
+        if succeeded:
+            return _COMMIT_COMMITTED, None
         if self._ctypes.get_last_error() == _WINDOWS_NOT_FOUND:
-            return False, None
-        raise _not_configured()
+            if commit_state != _COMMIT_COMMITTED:
+                commit_state = _COMMIT_NOT_COMMITTED
+            return commit_state, None
+        if commit_state != _COMMIT_COMMITTED:
+            commit_state = _COMMIT_NOT_COMMITTED
+        return commit_state, (_OUTCOME_FAILURE, None)

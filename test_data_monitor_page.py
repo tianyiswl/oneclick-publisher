@@ -37,7 +37,11 @@ from app_core import platform_data_collectors
 from app_core.platform_data_collection_errors import PlatformDataCollectionError
 from app_core.platform_data_models import CollectionBatch, MetricPoint
 from ui.background_task import BackgroundTaskRunner
-from ui.data_monitor_page import DataMonitorPage, _CommentAiSettingsDialog
+from ui.data_monitor_page import (
+    DataMonitorPage,
+    _CommentAiSettingsDialog,
+    _build_comment_ai_provider,
+)
 
 
 ACCOUNT = {
@@ -369,6 +373,27 @@ class FakeSettings:
         return QSettings.Status.NoError
 
 
+class PersistentFakeSettings(FakeSettings):
+    """Model memory separately from the last successfully synced snapshot."""
+
+    def __init__(self, values: dict | None = None, **kwargs) -> None:
+        super().__init__(values, **kwargs)
+        self.persisted_values = dict(values or {})
+
+    def sync(self) -> None:
+        self.synced += 1
+        if self.events is not None:
+            self.events.append(f"settings:sync:{self.synced}")
+        if self.synced in self.sync_failures:
+            raise RuntimeError("private-settings-sync-error")
+        if self.synced in self.sync_controls:
+            raise self.sync_controls[self.synced]
+        self.persisted_values = dict(self.values)
+
+    def reopen(self):
+        return PersistentFakeSettings(self.persisted_values)
+
+
 class FakeSecretStore:
     def __init__(
         self,
@@ -377,6 +402,7 @@ class FakeSecretStore:
         status_error: BaseException | None = None,
         write_error: BaseException | None = None,
         write_receipt: SecretMutationReceipt | None = None,
+        delete_receipt: SecretMutationReceipt | None = None,
         events: list[str] | None = None,
     ) -> None:
         self.read_count = 0
@@ -387,6 +413,7 @@ class FakeSecretStore:
         self.status_error = status_error
         self.write_error = write_error
         self.write_receipt = write_receipt
+        self.delete_receipt = delete_receipt
         self.events = events
 
     def read(self):
@@ -440,9 +467,27 @@ class FakeSecretStore:
             raise SystemExit(receipt.exit_code)
         raise RuntimeError("fixed-native-write-error")
 
-    def delete(self) -> None:
+    def delete_with_receipt(self) -> SecretMutationReceipt:
         self.delete_count += 1
-        self.configured = False
+        receipt = self.delete_receipt or SecretMutationReceipt(True, "success")
+        if receipt.committed or (
+            receipt.status == "success"
+            and receipt.commit_state == "not_committed"
+        ):
+            self.configured = False
+        return receipt
+
+    def delete(self) -> None:
+        receipt = self.delete_with_receipt()
+        if receipt.status == "success":
+            return
+        if receipt.status == "control":
+            if receipt.control == "cancelled":
+                raise asyncio.CancelledError()
+            if receipt.control == "keyboard_interrupt":
+                raise KeyboardInterrupt()
+            raise SystemExit(receipt.exit_code)
+        raise RuntimeError("fixed-native-delete-error")
 
 
 def ui_exception_trace_text(error: BaseException) -> str:
@@ -2363,10 +2408,16 @@ class DataMonitorPageTests(unittest.TestCase):
         """QSettings 未确认落盘成功时，新密钥绝不能进入原生存储。"""
 
         cases = (
-            FakeSettings(sync_failures=(1,)),
-            FakeSettings(statuses=(QSettings.Status.AccessError,)),
+            (
+                FakeSettings(sync_failures=(1,)),
+                "设置未保存，请检查 HTTPS 地址、模型和密钥",
+            ),
+            (
+                FakeSettings(statuses=(QSettings.Status.AccessError,)),
+                "AI 配置不可使用，请重新保存或清除密钥",
+            ),
         )
-        for settings in cases:
+        for settings, expected_feedback in cases:
             secret_store = FakeSecretStore(configured=False)
             dialog = _CommentAiSettingsDialog(
                 settings=settings,
@@ -2384,7 +2435,7 @@ class DataMonitorPageTests(unittest.TestCase):
                 self.assertEqual(dialog.result(), 0)
                 self.assertEqual(
                     dialog.feedback_label.text(),
-                    "设置未保存，请检查 HTTPS 地址、模型和密钥",
+                    expected_feedback,
                 )
 
     def test_ai_settings_failure_restores_old_values_before_touching_secret(self) -> None:
@@ -2524,8 +2575,182 @@ class DataMonitorPageTests(unittest.TestCase):
         self.assertEqual(dialog.result(), 0)
         self.assertEqual(
             dialog.feedback_label.text(),
-            "设置未保存，请检查 HTTPS 地址、模型和密钥",
+            "AI 配置不可使用，请重新保存或清除密钥",
         )
+
+    def test_ai_settings_failed_rollback_reopens_as_persistently_blocked(self) -> None:
+        """回滚无法落盘时，重开后不得使用可能错配的配置。"""
+
+        old = {
+            BASE_URL_KEY: "https://old.example.com/v1",
+            MODEL_KEY: "model-old",
+        }
+        settings = PersistentFakeSettings(old, sync_failures=(2,))
+        secret_store = FakeSecretStore(
+            configured=True,
+            write_error=RuntimeError("private-native-write-error"),
+        )
+        dialog = _CommentAiSettingsDialog(
+            settings=settings,
+            secret_store=secret_store,
+        )
+        self.addCleanup(dialog.deleteLater)
+        dialog.base_url_input.setText("https://new.example.com/v1")
+        dialog.model_input.setText("model-new")
+        dialog.secret_input.setText("persist-rollback-private-marker")
+
+        dialog.save_button.click()
+
+        reopened_settings = settings.reopen()
+        reopened_dialog = _CommentAiSettingsDialog(
+            settings=reopened_settings,
+            secret_store=secret_store,
+        )
+        self.addCleanup(reopened_dialog.deleteLater)
+        self.assertEqual(
+            reopened_dialog.secret_status_label.text(),
+            "密钥状态：状态读取失败",
+        )
+        self.assertIn("配置不可使用", reopened_dialog.feedback_label.text())
+
+        class ReadableSecretProbe:
+            def __init__(self) -> None:
+                self.read_count = 0
+
+            def read(self):
+                self.read_count += 1
+                return "old-persisted-private-marker"
+
+        probe = ReadableSecretProbe()
+        with (
+            patch(
+                "ui.data_monitor_page.QSettings",
+                return_value=reopened_settings,
+            ),
+            patch(
+                "ui.data_monitor_page.CommentSecretStore",
+                return_value=probe,
+            ),
+        ):
+            provider = _build_comment_ai_provider()
+        self.assertIsNone(provider)
+        self.assertEqual(probe.read_count, 0)
+
+    def test_ai_settings_unknown_native_commit_persists_fail_closed_gate(
+        self,
+    ) -> None:
+        """原生返回边界无法证明是否提交时，不得回滚或读密钥。"""
+
+        settings = PersistentFakeSettings(
+            {
+                BASE_URL_KEY: "https://old.example.com/v1",
+                MODEL_KEY: "model-old",
+            }
+        )
+        secret_store = FakeSecretStore(
+            configured=True,
+            write_receipt=SecretMutationReceipt(
+                None,
+                "failed",
+                commit_state="unknown",
+            ),
+        )
+        dialog = _CommentAiSettingsDialog(
+            settings=settings,
+            secret_store=secret_store,
+        )
+        self.addCleanup(dialog.deleteLater)
+        dialog.base_url_input.setText("https://new.example.com/v1")
+        dialog.model_input.setText("model-new")
+        dialog.secret_input.setText("unknown-commit-private-marker")
+
+        dialog.save_button.click()
+
+        reopened_settings = settings.reopen()
+        reopened_dialog = _CommentAiSettingsDialog(
+            settings=reopened_settings,
+            secret_store=secret_store,
+        )
+        self.addCleanup(reopened_dialog.deleteLater)
+        self.assertEqual(
+            reopened_dialog.secret_status_label.text(),
+            "密钥状态：状态读取失败",
+        )
+        self.assertIn("配置不可使用", reopened_dialog.feedback_label.text())
+
+        class SecretProbe:
+            read_count = 0
+
+            def read(self):
+                self.read_count += 1
+                return "unknown-commit-private-marker"
+
+        probe = SecretProbe()
+        with (
+            patch(
+                "ui.data_monitor_page.QSettings",
+                return_value=reopened_settings,
+            ),
+            patch(
+                "ui.data_monitor_page.CommentSecretStore",
+                return_value=probe,
+            ),
+        ):
+            provider = _build_comment_ai_provider()
+        self.assertIsNone(provider)
+        self.assertEqual(probe.read_count, 0)
+
+    def test_ai_settings_failed_repair_keeps_an_existing_fail_closed_gate(
+        self,
+    ) -> None:
+        """修复一个已封锁配置失败时，不得把旧未知状态解锁。"""
+
+        settings = PersistentFakeSettings(
+            {
+                BASE_URL_KEY: "https://old.example.com/v1",
+                MODEL_KEY: "model-old",
+            }
+        )
+        secret_store = FakeSecretStore(
+            configured=True,
+            write_receipt=SecretMutationReceipt(
+                None,
+                "failed",
+                commit_state="unknown",
+            ),
+        )
+        first = _CommentAiSettingsDialog(
+            settings=settings,
+            secret_store=secret_store,
+        )
+        self.addCleanup(first.deleteLater)
+        first.base_url_input.setText("https://uncertain.example.com/v1")
+        first.model_input.setText("model-uncertain")
+        first.secret_input.setText("uncertain-private-marker")
+        first.save_button.click()
+
+        repair_settings = settings.reopen()
+        secret_store.write_receipt = SecretMutationReceipt(False, "failed")
+        repair = _CommentAiSettingsDialog(
+            settings=repair_settings,
+            secret_store=secret_store,
+        )
+        self.addCleanup(repair.deleteLater)
+        repair.base_url_input.setText("https://repair.example.com/v1")
+        repair.model_input.setText("model-repair")
+        repair.secret_input.setText("repair-private-marker")
+        repair.save_button.click()
+
+        reopened = _CommentAiSettingsDialog(
+            settings=repair_settings.reopen(),
+            secret_store=secret_store,
+        )
+        self.addCleanup(reopened.deleteLater)
+        self.assertEqual(
+            reopened.secret_status_label.text(),
+            "密钥状态：状态读取失败",
+        )
+        self.assertIn("配置不可使用", reopened.feedback_label.text())
 
     def test_ai_settings_committed_cleanup_failure_keeps_new_settings(self) -> None:
         """密钥已替换时，后续清理失败不得把端点回滚到旧版。"""
@@ -2768,6 +2993,155 @@ class DataMonitorPageTests(unittest.TestCase):
         self.addCleanup(reopened.deleteLater)
         self.assertIn("未配置", reopened.secret_status_label.text())
         self.assertEqual(secret_store.status_count, 3)
+
+    def test_ai_settings_clear_uses_receipt_commit_state_on_cleanup_failure(
+        self,
+    ) -> None:
+        """清除已提交时必须显示已删；未提交和未知不得冒充。"""
+
+        cases = (
+            (
+                SecretMutationReceipt(True, "failed"),
+                "密钥状态：未配置",
+                "密钥已清除，但系统凭据清理未完成",
+                False,
+            ),
+            (
+                SecretMutationReceipt(False, "failed"),
+                "密钥状态：已配置",
+                "密钥未清除，请稍后再试",
+                True,
+            ),
+            (
+                SecretMutationReceipt(
+                    None,
+                    "failed",
+                    commit_state="unknown",
+                ),
+                "密钥状态：状态读取失败",
+                "AI 配置不可使用，请重新保存或清除密钥",
+                True,
+            ),
+        )
+        for receipt, expected_status, expected_feedback, configured in cases:
+            secret_store = FakeSecretStore(
+                configured=True,
+                delete_receipt=receipt,
+            )
+            dialog = _CommentAiSettingsDialog(
+                settings=FakeSettings(),
+                secret_store=secret_store,
+            )
+            self.addCleanup(dialog.deleteLater)
+
+            with self.subTest(commit_state=receipt.commit_state):
+                dialog._clear_secret()
+                self.assertEqual(secret_store.delete_count, 1)
+                self.assertEqual(secret_store.configured, configured)
+                self.assertEqual(
+                    dialog.secret_status_label.text(),
+                    expected_status,
+                )
+                self.assertEqual(
+                    dialog.feedback_label.text(),
+                    expected_feedback,
+                )
+
+    def test_ai_settings_clear_control_updates_state_before_clean_rebuild(
+        self,
+    ) -> None:
+        """删除已提交后的清理中断，必须先显示密钥已删。"""
+
+        cases = (
+            (
+                SecretMutationReceipt(
+                    True,
+                    "control",
+                    "keyboard_interrupt",
+                ),
+                "密钥状态：未配置",
+                False,
+            ),
+            (
+                SecretMutationReceipt(
+                    False,
+                    "control",
+                    "keyboard_interrupt",
+                ),
+                "密钥状态：已配置",
+                True,
+            ),
+            (
+                SecretMutationReceipt(
+                    None,
+                    "control",
+                    "keyboard_interrupt",
+                    commit_state="unknown",
+                ),
+                "密钥状态：状态读取失败",
+                True,
+            ),
+        )
+        for receipt, expected_status, configured in cases:
+            secret_store = FakeSecretStore(
+                configured=True,
+                delete_receipt=receipt,
+            )
+            dialog = _CommentAiSettingsDialog(
+                settings=FakeSettings(),
+                secret_store=secret_store,
+            )
+            self.addCleanup(dialog.deleteLater)
+
+            with self.subTest(commit_state=receipt.commit_state):
+                with self.assertRaises(KeyboardInterrupt) as raised:
+                    dialog._clear_secret()
+                self.assertEqual(raised.exception.args, ())
+                self.assertEqual(secret_store.configured, configured)
+                self.assertEqual(
+                    dialog.secret_status_label.text(),
+                    expected_status,
+                )
+
+    def test_ai_settings_clear_reads_real_mac_and_windows_commit_receipts(
+        self,
+    ) -> None:
+        """macOS/Windows 原生删除已生效时，UI 必须先显示未配置。"""
+
+        from test_platform_data_comment_ai import FakeCtypes
+
+        cases = (
+            (
+                "darwin",
+                FakeCtypes(mac_after_commit_control=KeyboardInterrupt()),
+                "mac",
+            ),
+            (
+                "win32",
+                FakeCtypes(windows_after_commit_control=KeyboardInterrupt()),
+                "windows",
+            ),
+        )
+        for platform_name, native, backend_name in cases:
+            backend = getattr(native, backend_name)
+            backend.secret = "real-clear-private-marker"
+            dialog = _CommentAiSettingsDialog(
+                settings=FakeSettings(),
+                secret_store=CommentSecretStore(
+                    platform_name=platform_name,
+                    ctypes_module=native,
+                ),
+            )
+            self.addCleanup(dialog.deleteLater)
+
+            with self.subTest(platform=platform_name):
+                with self.assertRaises(KeyboardInterrupt):
+                    dialog._clear_secret()
+                self.assertIsNone(backend.secret)
+                self.assertEqual(
+                    dialog.secret_status_label.text(),
+                    "密钥状态：未配置",
+                )
 
     def test_shutdown_collects_data_and_comment_task_prefixes(self) -> None:
         """客户端关闭时遗漏评论任务，会让浏览器会话留在后台。"""
