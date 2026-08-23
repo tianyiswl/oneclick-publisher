@@ -13,6 +13,7 @@ from pathlib import Path
 import threading
 import time
 from typing import Any
+from urllib.parse import urlsplit
 
 from .paths import COOKIE_DIR
 
@@ -290,27 +291,41 @@ async def _search(account: dict[str, Any], keyword: str) -> list[dict[str, str]]
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=True)
         context = None
+        operation_completed = False
         try:
             context = await browser.new_context(storage_state=str(state))
             page = await context.new_page()
             await page.goto(XHS_LOCATION_PAGE_URL, wait_until="domcontentloaded", timeout=45_000)
-            if "creator.xiaohongshu.com" not in page.url:
+            current_url = urlsplit(str(page.url))
+            if (
+                current_url.scheme != "https"
+                or current_url.hostname != "creator.xiaohongshu.com"
+                or current_url.path != "/publish/publish"
+            ):
                 raise XhsLocationSearchError("小红书会话已失效，请先在账号管理中重新登录")
             response = await page.evaluate(
-                """async ({ endpoint, body }) => {
+                """async (request) => {
                     const controller = new AbortController();
                     const timeout = setTimeout(() => controller.abort(), 12000);
                     try {
-                        const result = await fetch(endpoint, {
-                            method: 'POST', credentials: 'include',
-                            headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-                            body: JSON.stringify(body), signal: controller.signal,
+                        const result = await fetch(request.endpoint, {
+                            method: request.method,
+                            credentials: request.credentials,
+                            headers: request.headers,
+                            body: JSON.stringify(request.body),
+                            signal: controller.signal,
                         });
                         return { httpStatus: result.status, data: await result.json().catch(() => null) };
                     } finally { clearTimeout(timeout); }
                 }""",
                 {
                     "endpoint": XHS_LOCATION_SEARCH_ENDPOINT,
+                    "method": "POST",
+                    "credentials": "include",
+                    "headers": {
+                        "Content-Type": "application/json",
+                        "Accept": "application/json",
+                    },
                     "body": {
                         "latitude": 0,
                         "longitude": 0,
@@ -325,7 +340,9 @@ async def _search(account: dict[str, Any], keyword: str) -> list[dict[str, str]]
             if not isinstance(response, dict) or int(response.get("httpStatus") or 0) != 200:
                 status = response.get("httpStatus") if isinstance(response, dict) else "未知"
                 raise XhsLocationSearchError(f"小红书地点服务请求失败：HTTP {status}")
-            return normalize_location_response(response.get("data"))
+            rows = normalize_location_response(response.get("data"))
+            operation_completed = True
+            return rows
         except XhsLocationSearchError:
             raise
         except Exception as exc:
@@ -333,9 +350,19 @@ async def _search(account: dict[str, Any], keyword: str) -> list[dict[str, str]]
                 raise XhsLocationSearchError("小红书地点搜索超时，请稍后重试") from exc
             raise XhsLocationSearchError(f"小红书地点搜索异常：{exc}") from exc
         finally:
+            cleanup_error: BaseException | None = None
             if context:
-                await context.close()
-            await browser.close()
+                try:
+                    await context.close()
+                except BaseException as exc:
+                    cleanup_error = exc
+            try:
+                await browser.close()
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+            if operation_completed and cleanup_error is not None:
+                raise cleanup_error
 
 
 def search_xhs_locations(

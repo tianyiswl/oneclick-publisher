@@ -447,6 +447,13 @@ class PublishPage(QWidget):
         self._xhs_selected_location: dict[str, object] = {}
         self._xhs_location_generation = 0
         self._xhs_location_context_signature: tuple[object, ...] | None = None
+        self._xhs_pending_location_search: tuple[
+            dict[str, object],
+            str,
+            tuple[tuple[int, int], ...],
+            str,
+            int,
+        ] | None = None
         self._douyin_selected_location: dict[str, object] = {}
         self._douyin_location_query = ""
         self._topic_tag_editors: list[TopicTagEditor] = []
@@ -1549,6 +1556,7 @@ class PublishPage(QWidget):
 
     def _invalidate_xhs_location(self) -> None:
         self._xhs_location_generation += 1
+        self._xhs_pending_location_search = None
         self._xhs_selected_location = {}
         if self.xhs_location_results is not None:
             self.xhs_location_results.clear()
@@ -1634,14 +1642,36 @@ class PublishPage(QWidget):
                 "warning",
             )
             return
-        if self.location_tasks.is_running("xhs-location-search"):
-            self._set_xhs_location_status("当前小红书地点搜索尚未完成")
-            return
-
         account = dict(accounts[0])
         account_signature = self._xhs_account_signature(accounts)
         content_type = self.content_type
         generation = self._xhs_location_generation
+        request = (
+            account,
+            keyword,
+            account_signature,
+            content_type,
+            generation,
+        )
+        if self.location_tasks.is_running("xhs-location-search"):
+            self._xhs_pending_location_search = request
+            self._set_xhs_location_status(f"已排队搜索“{keyword}”")
+            return
+
+        self._xhs_pending_location_search = None
+        self._start_xhs_location_search(request)
+
+    def _start_xhs_location_search(
+        self,
+        request: tuple[
+            dict[str, object],
+            str,
+            tuple[tuple[int, int], ...],
+            str,
+            int,
+        ],
+    ) -> None:
+        account, keyword, account_signature, content_type, generation = request
         source_account_id = int(account.get("id") or 0)
         self.xhs_location_keyword.blockSignals(True)
         self.xhs_location_keyword.setText(keyword)
@@ -1682,6 +1712,25 @@ class PublishPage(QWidget):
             if search_button is not None:
                 search_button.setEnabled(True)
                 search_button.setText("搜索")
+            pending = self._xhs_pending_location_search
+            self._xhs_pending_location_search = None
+            if pending is None:
+                return
+            (
+                _pending_account,
+                pending_keyword,
+                pending_account_signature,
+                pending_content_type,
+                pending_generation,
+            ) = pending
+            if not self._xhs_request_is_current(
+                keyword=pending_keyword,
+                account_signature=pending_account_signature,
+                content_type=pending_content_type,
+                generation=pending_generation,
+            ):
+                return
+            self._start_xhs_location_search(pending)
 
         self.location_tasks.run(
             "xhs-location-search",

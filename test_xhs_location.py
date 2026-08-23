@@ -201,6 +201,58 @@ class XhsLocationUiTests(unittest.TestCase):
         finally:
             page.close()
 
+    def test_running_search_dispatches_latest_pending_keyword_after_cleanup(self) -> None:
+        page = PublishPage()
+        xhs = {"id": 11, "type": 1, "filePath": "xhs-11.json"}
+        calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+        runner_state = {"active": False}
+
+        def is_running(key: str) -> bool:
+            self.assertEqual(key, "xhs-location-search")
+            return runner_state["active"]
+
+        def run(*args: object, **kwargs: object) -> bool:
+            if runner_state["active"]:
+                return False
+            runner_state["active"] = True
+            calls.append((args, kwargs))
+            return True
+
+        try:
+            with patch.object(page, "selected_accounts", return_value=[xhs]), patch.object(
+                page.location_tasks,
+                "is_running",
+                side_effect=is_running,
+            ), patch.object(page.location_tasks, "run", side_effect=run):
+                page.xhs_location_keyword.setText("地点 A")
+                page.search_xhs_locations()
+                self.assertEqual(len(calls), 1)
+
+                page.xhs_location_keyword.setText("地点 B")
+                page.xhs_location_keyword.textEdited.emit("地点 B")
+                page.search_xhs_locations()
+                page.search_xhs_locations()
+                self.assertEqual(len(calls), 1)
+
+                runner_state["active"] = False
+                calls[0][1]["on_finished"]()
+                self.assertEqual(len(calls), 2)
+
+            with patch.object(
+                xhs_location_service,
+                "search_xhs_locations",
+                return_value=[],
+            ) as search:
+                calls[1][0][1]()
+            search.assert_called_once_with(
+                xhs,
+                "地点 B",
+                "platform-default",
+                "video",
+            )
+        finally:
+            page.close()
+
     def test_stale_success_is_rejected_for_total_account_or_generation_change(self) -> None:
         page = PublishPage()
         xhs = {"id": 11, "type": 1, "filePath": "xhs-11.json"}
@@ -486,12 +538,23 @@ class _SearchBoundaryPage:
         self.url = current_url
         self.goto_calls: list[tuple[str, dict[str, object]]] = []
         self.evaluate_calls: list[tuple[str, object]] = []
+        self.fetch_calls: list[dict[str, object]] = []
 
     async def goto(self, url: str, **kwargs: object) -> None:
         self.goto_calls.append((url, dict(kwargs)))
 
     async def evaluate(self, script: str, payload: object) -> object:
         self.evaluate_calls.append((script, payload))
+        request = payload if isinstance(payload, dict) else {}
+        self.fetch_calls.append(
+            {
+                "endpoint": request.get("endpoint"),
+                "method": request.get("method"),
+                "credentials": request.get("credentials"),
+                "headers": request.get("headers"),
+                "body": request.get("body"),
+            }
+        )
         return {
             "httpStatus": 200,
             "data": {
@@ -511,12 +574,15 @@ class _SearchBoundaryContext:
     def __init__(self, page: _SearchBoundaryPage) -> None:
         self.page = page
         self.close_calls = 0
+        self.close_error: Exception | None = None
 
     async def new_page(self) -> _SearchBoundaryPage:
         return self.page
 
     async def close(self) -> None:
         self.close_calls += 1
+        if self.close_error is not None:
+            raise self.close_error
 
 
 class _SearchBoundaryBrowser:
@@ -583,25 +649,31 @@ class XhsLocationSearchBoundaryTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
         self.assertEqual(
-            page.evaluate_calls[0][1],
-            {
-                "endpoint": (
-                    "https://edith.xiaohongshu.com/web_api/sns/v1/local/poi/creator/search"
-                ),
-                "body": {
-                    "latitude": 0,
-                    "longitude": 0,
-                    "keyword": "北海 银滩",
-                    "page": 1,
-                    "size": 50,
-                    "source": "WEB",
-                    "type": 3,
+            page.fetch_calls,
+            [
+                {
+                    "endpoint": (
+                        "https://edith.xiaohongshu.com/"
+                        "web_api/sns/v1/local/poi/creator/search"
+                    ),
+                    "method": "POST",
+                    "credentials": "include",
+                    "headers": {
+                        "Content-Type": "application/json",
+                        "Accept": "application/json",
+                    },
+                    "body": {
+                        "latitude": 0,
+                        "longitude": 0,
+                        "keyword": "北海 银滩",
+                        "page": 1,
+                        "size": 50,
+                        "source": "WEB",
+                        "type": 3,
+                    },
                 },
-            },
+            ],
         )
-        request_script = page.evaluate_calls[0][0]
-        self.assertIn("method: 'POST'", request_script)
-        self.assertIn("credentials: 'include'", request_script)
         self.assertEqual(result[0]["poiId"], "poi-1")
         self.assertEqual(manager.browser.context_kwargs, [{"storage_state": str(state)}])
         self.assertEqual(manager.browser.context.close_calls, 1)
@@ -609,10 +681,52 @@ class XhsLocationSearchBoundaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(manager.exit_calls, 1)
 
     async def test_search_checks_page_url_and_closes_resources_on_failure(self) -> None:
+        from playwright import async_api
+
+        invalid_urls = [
+            "https://www.xiaohongshu.com/login",
+            (
+                "https://creator.xiaohongshu.com.evil.example/"
+                "publish/publish?source=official"
+            ),
+            "http://creator.xiaohongshu.com/publish/publish?source=official",
+            "https://creator.xiaohongshu.com/publish/other?source=official",
+        ]
+        for current_url in invalid_urls:
+            with self.subTest(current_url=current_url):
+                page = _SearchBoundaryPage(current_url=current_url)
+                manager = _SearchBoundaryPlaywrightManager(page)
+                with patch.object(
+                    xhs_location_service,
+                    "_storage_state",
+                    return_value=Path("/offline/xhs-11.json"),
+                ), patch.object(
+                    async_api,
+                    "async_playwright",
+                    return_value=manager,
+                ):
+                    with self.assertRaisesRegex(
+                        xhs_location_service.XhsLocationSearchError,
+                        "会话已失效",
+                    ):
+                        await xhs_location_service._search(
+                            {"id": 11, "type": 1, "filePath": "xhs-11.json"},
+                            "北海银滩",
+                        )
+
+                self.assertEqual(page.evaluate_calls, [])
+                self.assertEqual(manager.browser.context.close_calls, 1)
+                self.assertEqual(manager.browser.close_calls, 1)
+                self.assertEqual(manager.exit_calls, 1)
+
+    async def test_search_preserves_operation_error_and_closes_browser_when_context_close_fails(
+        self,
+    ) -> None:
         page = _SearchBoundaryPage(
             current_url="https://www.xiaohongshu.com/login"
         )
         manager = _SearchBoundaryPlaywrightManager(page)
+        manager.browser.context.close_error = RuntimeError("context close failed")
         from playwright import async_api
 
         with patch.object(
@@ -629,7 +743,6 @@ class XhsLocationSearchBoundaryTests(unittest.IsolatedAsyncioTestCase):
                     "北海银滩",
                 )
 
-        self.assertEqual(page.evaluate_calls, [])
         self.assertEqual(manager.browser.context.close_calls, 1)
         self.assertEqual(manager.browser.close_calls, 1)
         self.assertEqual(manager.exit_calls, 1)
