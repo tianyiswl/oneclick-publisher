@@ -277,6 +277,8 @@ def _response_is_success(response: _OAuthTokenResponse) -> bool:
         if isinstance(status_code, bool) or not isinstance(status_code, int):
             raise TypeError
         return 200 <= status_code < 300
+    except OAuthTokenError:
+        raise
     except Exception:
         raise OAuthTokenError("oauth_token_response_invalid") from None
 
