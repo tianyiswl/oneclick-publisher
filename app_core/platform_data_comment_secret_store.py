@@ -436,6 +436,11 @@ class CommentSecretStore:
         )
         secret_array = (ctypes.c_ubyte * len(mutable)).from_buffer(mutable)
         secret_pointer = ctypes.cast(secret_array, ctypes.c_void_p)
+        service = None
+        account = None
+        status = None
+        outcome = None
+        error = None
         try:
             if item_ref is not None:
                 status = security.SecKeychainItemModifyAttributesAndData(
@@ -455,8 +460,26 @@ class CommentSecretStore:
                 )
             if status != 0:
                 raise _not_configured()
-        finally:
-            self._mac_release_item(core, item_ref)
+        except BaseException as error:
+            outcome = _first_outcome(outcome, _error_outcome(error))
+        release_outcome = self._mac_release_outcome(core, item_ref)
+        outcome = _first_outcome(outcome, release_outcome)
+        ctypes = None
+        security = None
+        core = None
+        _existing = None
+        item_ref = None
+        mutable = None
+        secret_array = None
+        secret_pointer = None
+        service = None
+        account = None
+        status = None
+        error = None
+        release_outcome = None
+        self = None
+        if outcome is not None:
+            _raise_clean_outcome(outcome)
 
     def _mac_delete(self) -> None:
         security, core = self._mac_libraries()
@@ -465,11 +488,27 @@ class CommentSecretStore:
         )
         if item_ref is None:
             return
+        status = None
+        outcome = None
+        error = None
         try:
-            if security.SecKeychainItemDelete(item_ref) != 0:
+            status = security.SecKeychainItemDelete(item_ref)
+            if status != 0:
                 raise _not_configured()
-        finally:
-            self._mac_release_item(core, item_ref)
+        except BaseException as error:
+            outcome = _first_outcome(outcome, _error_outcome(error))
+        release_outcome = self._mac_release_outcome(core, item_ref)
+        outcome = _first_outcome(outcome, release_outcome)
+        security = None
+        core = None
+        _existing = None
+        item_ref = None
+        status = None
+        error = None
+        release_outcome = None
+        self = None
+        if outcome is not None:
+            _raise_clean_outcome(outcome)
 
     def _windows_types(self):
         ctypes = self._ctypes

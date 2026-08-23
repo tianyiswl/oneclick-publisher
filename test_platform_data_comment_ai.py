@@ -153,6 +153,19 @@ class FakeResponse:
         self.closed = True
 
 
+class StreamingControlResponse(FakeResponse):
+    """Yield one private response chunk before process control interrupts the stream."""
+
+    def __init__(self, marker: str, control: BaseException) -> None:
+        super().__init__(marker.encode("utf-8"))
+        self.control = control
+
+    def iter_content(self, chunk_size):
+        del chunk_size
+        yield self.content
+        raise self.control
+
+
 class RecordingSession:
     def __init__(self, outcome=None) -> None:
         self.outcome = FakeResponse() if outcome is None else outcome
@@ -254,6 +267,7 @@ class CleanupControlResponse(requests.Response):
         self._stored_request = None
         self._request_control = None
         self._request_control_raised = False
+        self.request_access_count = 0
         super().__init__()
         self.status_code = 200
         self.headers = {"Content-Type": "application/json; charset=utf-8"}
@@ -265,6 +279,7 @@ class CleanupControlResponse(requests.Response):
 
     @property
     def request(self):
+        self.request_access_count += 1
         if (
             self._request_control is not None
             and not self._request_control_raised
@@ -294,10 +309,12 @@ class CleanupControlSession:
         *,
         post_control=None,
         close_control=None,
+        request_transform=None,
     ) -> None:
         self.response = response
         self.post_control = post_control
         self.close_control = close_control
+        self.request_transform = request_transform
         self.closed = False
         self.calls = 0
         self.trust_env = True
@@ -316,18 +333,97 @@ class CleanupControlSession:
         self.calls += 1
         if self.post_control is not None:
             raise self.post_control
-        self.response.request = requests.Request(
+        prepared = requests.Request(
             "POST",
             url,
             headers=headers,
             json=json,
         ).prepare()
+        prepared.headers["Proxy-Authorization"] = "proxy-private-marker"
+        if self.request_transform is not None:
+            prepared = self.request_transform(prepared)
+        self.response.request = prepared
         return self.response
 
     def close(self):
         self.closed = True
         if self.close_control is not None:
             raise self.close_control
+
+
+class OneShotHeaders(requests.structures.CaseInsensitiveDict):
+    def __init__(self, data, *, owner, mode=None, error=None) -> None:
+        self._faults_enabled = False
+        self.owner = owner
+        self.mode = mode
+        self.error = error
+        self.raised = False
+        self.pop_count = 0
+        super().__init__(data)
+        self._faults_enabled = True
+
+    def pop(self, key, default=None):
+        if self._faults_enabled:
+            self.pop_count += 1
+            if self.mode == "headers_pop" and not self.raised:
+                self.raised = True
+                raise self.error
+        return super().pop(key, default)
+
+
+class OneShotPreparedRequest(requests.PreparedRequest):
+    def __init__(self, *, mode, error) -> None:
+        self._faults_enabled = False
+        self._headers_store = requests.structures.CaseInsensitiveDict()
+        self.fault_headers = None
+        self._body_store = None
+        self.mode = mode
+        self.error = error
+        self.raised = set()
+        self.counts = {"headers_get": 0, "headers_set": 0, "body_set": 0}
+        super().__init__()
+
+    def load(self, prepared):
+        self._headers_store = OneShotHeaders(
+            prepared.headers,
+            owner=self,
+            mode=self.mode,
+            error=self.error,
+        )
+        self.fault_headers = self._headers_store
+        self._body_store = prepared.body
+        self.method = prepared.method
+        self.url = prepared.url
+        self.hooks = prepared.hooks
+        self._faults_enabled = True
+        return self
+
+    def _raise_once(self, operation):
+        if not self._faults_enabled:
+            return
+        self.counts[operation] += 1
+        if self.mode == operation and operation not in self.raised:
+            self.raised.add(operation)
+            raise self.error
+
+    @property
+    def headers(self):
+        self._raise_once("headers_get")
+        return self._headers_store
+
+    @headers.setter
+    def headers(self, value):
+        self._raise_once("headers_set")
+        self._headers_store = value
+
+    @property
+    def body(self):
+        return self._body_store
+
+    @body.setter
+    def body(self, value):
+        self._raise_once("body_set")
+        self._body_store = value
 
 
 class FakeSettings:
@@ -1090,6 +1186,71 @@ class CommentSecretStoreTests(unittest.TestCase):
                     store.delete()
                 self.assertEqual(copied_old_secret, [])
 
+    def test_macos_write_and_delete_keep_operation_control_over_release_control(self):
+        for operation in ("write", "delete"):
+            native = FakeCtypes()
+            native.mac.secret = "old-secret"
+            first = KeyboardInterrupt()
+            later = SystemExit(37)
+            retained_input = []
+            original_release = native.core.CFRelease.callback
+
+            if operation == "write":
+                original_operation = (
+                    native.mac.SecKeychainItemModifyAttributesAndData.callback
+                )
+
+                def interrupted_operation(*args):
+                    original_operation(*args)
+                    retained_input.append(native.mac.mutable_views[-1])
+                    raise first
+
+                native.mac.SecKeychainItemModifyAttributesAndData = FakeFunction(
+                    interrupted_operation
+                )
+            else:
+                original_operation = native.mac.SecKeychainItemDelete.callback
+
+                def interrupted_operation(*args):
+                    original_operation(*args)
+                    raise first
+
+                native.mac.SecKeychainItemDelete = FakeFunction(interrupted_operation)
+
+            def interrupted_release(value):
+                original_release(value)
+                raise later
+
+            native.core.CFRelease = FakeFunction(interrupted_release)
+            store = CommentSecretStore(
+                platform_name="darwin",
+                ctypes_module=native,
+            )
+
+            with self.subTest(operation=operation):
+                with self.assertRaises(KeyboardInterrupt) as raised:
+                    if operation == "write":
+                        store.write("mac-write-private-marker")
+                    else:
+                        store.delete()
+
+                self.assertEqual(raised.exception.args, ())
+                self.assertEqual(len(native.core.released), 1)
+                self.assertIsNotNone(first.__traceback__)
+                self.assertIsNotNone(later.__traceback__)
+                if retained_input:
+                    self.assertTrue(
+                        all(
+                            bytes(view) == b"\0" * len(view)
+                            for view in retained_input
+                        )
+                    )
+                for retained in (first, later):
+                    self.assertNotIn(
+                        "mac-write-private-marker",
+                        exception_trace_text(retained),
+                    )
+
     def test_process_control_is_never_converted_to_configuration_failure(self):
         for control_type in (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             store = CommentSecretStore(
@@ -1800,6 +1961,152 @@ class CommentAiProviderTests(unittest.TestCase):
                     original_visible = exception_trace_text(original)
                     for forbidden in (secret, title, body, comment_key):
                         self.assertNotIn(forbidden, original_visible)
+
+    def test_request_carrier_one_shot_errors_are_bounded_and_never_leave_secrets(self):
+        secret = "carrier-secret-private-marker"
+        title = "carrier-title-private-marker"
+        body = "carrier-body-private-marker"
+        cases = []
+        for stage in (
+            "response_request",
+            "headers_get",
+            "headers_pop",
+            "headers_set",
+            "body_set",
+        ):
+            for error in (
+                RuntimeError(f"safe-{stage}-failure"),
+                KeyboardInterrupt(),
+            ):
+                cases.append((stage, error))
+
+        for stage, retained in cases:
+            response = CleanupControlResponse(
+                request_control=(retained if stage == "response_request" else None)
+            )
+            request_transform = None
+            if stage != "response_request":
+                request_transform = lambda prepared, current_stage=stage, error=retained: (
+                    OneShotPreparedRequest(
+                        mode=current_stage,
+                        error=error,
+                    ).load(prepared)
+                )
+            session = CleanupControlSession(
+                response,
+                request_transform=request_transform,
+            )
+            provider = self.provider(session, secret=secret)
+            secret_buffer = provider._secret
+            original_args = retained.args
+
+            with self.subTest(stage=stage, error=type(retained).__name__):
+                expected = (
+                    KeyboardInterrupt
+                    if isinstance(retained, KeyboardInterrupt)
+                    else CommentInsightFailure
+                )
+                with self.assertRaises(expected) as raised:
+                    provider.analyze(title, (comment(body=body),))
+                if expected is CommentInsightFailure:
+                    self.assertEqual(
+                        raised.exception.error_code,
+                        "comment_ai_service_unavailable",
+                    )
+
+                prepared = response._stored_request
+                self.assertIsInstance(prepared, requests.PreparedRequest)
+                headers = (
+                    prepared._headers_store
+                    if isinstance(prepared, OneShotPreparedRequest)
+                    else prepared.headers
+                )
+                request_body = (
+                    prepared._body_store
+                    if isinstance(prepared, OneShotPreparedRequest)
+                    else prepared.body
+                )
+                self.assertNotIn("Authorization", headers)
+                self.assertNotIn("Proxy-Authorization", headers)
+                self.assertIn(request_body, (None, b"", ""))
+                self.assertLessEqual(response.request_access_count, 3)
+                if isinstance(prepared, OneShotPreparedRequest):
+                    self.assertTrue(all(count <= 3 for count in prepared.counts.values()))
+                    self.assertLessEqual(prepared.fault_headers.pop_count, 4)
+                self.assertEqual(bytes(secret_buffer), b"\0" * len(secret_buffer))
+                self.assertTrue(response.closed_by_provider)
+                self.assertTrue(session.closed)
+                self.assertEqual(retained.args, original_args)
+                self.assertIsNotNone(retained.__traceback__)
+                for forbidden in (secret, title, body, "proxy-private-marker"):
+                    self.assertNotIn(forbidden, exception_trace_text(raised.exception))
+                    self.assertNotIn(forbidden, exception_trace_text(retained))
+
+    def test_streaming_control_after_private_chunk_returns_only_safe_control(self):
+        marker = "streaming-private-response-marker"
+        for retained, expected, expected_code in (
+            (KeyboardInterrupt(), KeyboardInterrupt, None),
+            (SystemExit(37), SystemExit, 37),
+        ):
+            response = StreamingControlResponse(marker, retained)
+            session = RecordingSession(response)
+            provider = self.provider(session, secret="streaming-secret-marker")
+            secret_buffer = provider._secret
+            original_args = retained.args
+
+            with self.subTest(control=type(retained).__name__):
+                with self.assertRaises(expected) as raised:
+                    provider.analyze("streaming-title-marker", (comment(),))
+                if expected is SystemExit:
+                    self.assertEqual(raised.exception.code, expected_code)
+                self.assertEqual(retained.args, original_args)
+                self.assertIsNotNone(retained.__traceback__)
+                self.assertTrue(response.closed)
+                self.assertTrue(session.closed)
+                self.assertEqual(bytes(secret_buffer), b"\0" * len(secret_buffer))
+                for visible in (
+                    exception_trace_text(raised.exception),
+                    exception_trace_text(retained),
+                ):
+                    self.assertNotIn(marker, visible)
+                    self.assertNotIn("streaming-secret-marker", visible)
+                    self.assertNotIn("streaming-title-marker", visible)
+                trace = retained.__traceback__
+                while trace is not None:
+                    if trace.tb_frame.f_code.co_name == "_validated_response_bytes":
+                        for name in ("response", "iterator", "chunk", "error"):
+                            self.assertIsNone(trace.tb_frame.f_locals.get(name))
+                    trace = trace.tb_next
+
+    def test_close_control_traceback_cannot_reach_closed_resource(self):
+        marker = "close-bound-response-private-marker"
+        retained = KeyboardInterrupt()
+        response = CleanupControlResponse(close_control=retained)
+        response._content = marker.encode("utf-8")
+        session = CleanupControlSession(response)
+        provider = self.provider(session, secret="close-bound-secret-marker")
+        secret_buffer = provider._secret
+
+        with self.assertRaises(KeyboardInterrupt) as raised:
+            provider.analyze("close-bound-title-marker", (comment(),))
+
+        self.assertTrue(response.closed_by_provider)
+        self.assertTrue(session.closed)
+        self.assertEqual(bytes(secret_buffer), b"\0" * len(secret_buffer))
+        self.assertIsNotNone(retained.__traceback__)
+        for visible in (
+            exception_trace_text(raised.exception),
+            exception_trace_text(retained),
+        ):
+            self.assertNotIn(marker, visible)
+            self.assertNotIn("close-bound-secret-marker", visible)
+            self.assertNotIn("close-bound-title-marker", visible)
+        trace = retained.__traceback__
+        while trace is not None:
+            if trace.tb_frame.f_code.co_name == "_close_resource_outcome":
+                for name in ("resource", "close", "error"):
+                    self.assertIsNone(trace.tb_frame.f_locals.get(name))
+            trace = trace.tb_next
 
     def test_first_operation_control_survives_later_cleanup_control(self):
         secret = "first-control-secret-private-marker"
