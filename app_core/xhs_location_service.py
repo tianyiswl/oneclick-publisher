@@ -68,7 +68,7 @@ def normalize_location_candidate(value: object) -> dict[str, str] | None:
     name = _candidate_field(value, "name")
     address = _candidate_field(value, "fullAddress", "address")
     poi_type = _candidate_field(value, "poiType")
-    if not poi_id or not name or not address or not poi_type:
+    if not poi_id or not name or not address:
         return None
     return {
         "poiId": poi_id,

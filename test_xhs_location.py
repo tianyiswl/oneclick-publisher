@@ -37,13 +37,31 @@ class XhsLocationCandidateTests(unittest.TestCase):
             "poiType": "spot",
         }
         self.assertIsNotNone(xhs_location_service.normalize_location_candidate(complete))
-        for field in ("poiId", "name", "fullAddress", "poiType"):
+        for field in ("poiId", "name", "fullAddress"):
             with self.subTest(field=field):
                 incomplete = dict(complete)
                 incomplete.pop(field)
                 self.assertIsNone(
                     xhs_location_service.normalize_location_candidate(incomplete)
                 )
+
+    def test_candidate_keeps_missing_poi_type_as_safe_empty_string(self) -> None:
+        self.assertEqual(
+            xhs_location_service.normalize_location_candidate(
+                {
+                    "poiId": "poi-1",
+                    "name": "北海银滩",
+                    "fullAddress": "广西北海市银海区银滩大道",
+                }
+            ),
+            {
+                "poiId": "poi-1",
+                "name": "北海银滩",
+                "address": "广西北海市银海区银滩大道",
+                "poiType": "",
+                "platform": "xiaohongshu",
+            },
+        )
 
     def test_response_scans_every_row_before_applying_ui_limit(self) -> None:
         addressless = [
