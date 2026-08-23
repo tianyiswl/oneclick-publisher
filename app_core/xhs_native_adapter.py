@@ -566,13 +566,34 @@ class XhsNativeAdapter:
             "地点搜索输入框",
         )
         keyword = str(target["searchKeyword"])
+
+        def _matches_current_location_response(response) -> bool:
+            try:
+                if (
+                    response.url
+                    != xhs_location_service.XHS_LOCATION_SEARCH_ENDPOINT
+                    or str(response.request.method).upper() != "POST"
+                ):
+                    return False
+                request_body = response.request.post_data_json
+            except Exception:
+                return False
+            if not isinstance(request_body, dict):
+                return False
+            return (
+                _normalized(request_body.get("keyword")) == keyword
+                and request_body.get("page") == 1
+                and not isinstance(request_body.get("page"), bool)
+                and request_body.get("size") == 50
+                and not isinstance(request_body.get("size"), bool)
+                and request_body.get("source") == "WEB"
+                and request_body.get("type") == 3
+                and not isinstance(request_body.get("type"), bool)
+            )
+
         try:
             async with page.expect_response(
-                lambda response: (
-                    response.url
-                    == xhs_location_service.XHS_LOCATION_SEARCH_ENDPOINT
-                    and str(response.request.method).upper() == "POST"
-                ),
+                _matches_current_location_response,
                 timeout=15_000,
             ) as response_info:
                 await location_input.fill(keyword, timeout=5_000)

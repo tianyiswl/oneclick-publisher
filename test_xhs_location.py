@@ -17,15 +17,32 @@ from app_core.xhs_native_adapter import (
 from app_core.xhs_publish_executor import XhsPublishError, run_xhs_publish
 
 
+_MALFORMED_POST_DATA = object()
+
+
 class _FakeResponseRequest:
     method = "POST"
 
+    def __init__(self, post_data: object) -> None:
+        self._post_data = post_data
+
+    @property
+    def post_data_json(self) -> object:
+        if self._post_data is _MALFORMED_POST_DATA:
+            raise ValueError("malformed request JSON")
+        return self._post_data
+
 
 class _FakeResponse:
-    def __init__(self, page: "_FakeXhsEditorPage", payload: object) -> None:
+    def __init__(
+        self,
+        page: "_FakeXhsEditorPage",
+        payload: object,
+        post_data: object,
+    ) -> None:
         self.page = page
         self.url = xhs_location_service.XHS_LOCATION_SEARCH_ENDPOINT
-        self.request = _FakeResponseRequest()
+        self.request = _FakeResponseRequest(post_data)
         self._payload = payload
 
     async def json(self) -> object:
@@ -46,13 +63,15 @@ class _FakeResponseExpectation:
     def __init__(self, page: "_FakeXhsEditorPage", predicate) -> None:
         self.page = page
         self.predicate = predicate
-        self.response = _FakeResponse(page, page.response_payload)
 
     async def __aenter__(self) -> _FakeResponseInfo:
         self.page.calls.append("response-listener")
-        if not self.predicate(self.response):
-            raise AssertionError("adapter did not require the exact XHS creator/search POST")
-        return _FakeResponseInfo(self.response)
+        for index, (post_data, payload) in enumerate(self.page.response_sequence):
+            response = _FakeResponse(self.page, payload, post_data)
+            if self.predicate(response):
+                self.page.calls.append(f"response-match:{index}")
+                return _FakeResponseInfo(response)
+        raise AssertionError("adapter did not match a current full-keyword creator/search POST")
 
     async def __aexit__(self, exc_type, exc, traceback) -> None:
         return None
@@ -221,8 +240,23 @@ class _FakeXhsEditorPage:
         selected_name: str = "",
         disabled: bool = False,
         account_name: str = "海风",
+        response_sequence: list[tuple[object, object]] | None = None,
     ) -> None:
         self.response_payload = response_payload
+        self.response_sequence = response_sequence or [
+            (
+                {
+                    "latitude": 0,
+                    "longitude": 0,
+                    "keyword": "北海银滩",
+                    "page": 1,
+                    "size": 50,
+                    "source": "WEB",
+                    "type": 3,
+                },
+                response_payload,
+            )
+        ]
         self.dom_options = dom_options
         self.selected_name = selected_name
         self.disabled = disabled
@@ -490,6 +524,59 @@ class XhsLocationEditorTests(unittest.IsolatedAsyncioTestCase):
             "location-option-click:北海银滩|广西北海市银海区银滩大道",
             page.calls,
         )
+
+    async def test_skips_same_endpoint_responses_until_full_keyword_request(self) -> None:
+        wrong_response = self._response()
+        correct_response = self._response(self._row())
+        page = _FakeXhsEditorPage(
+            correct_response,
+            [("北海银滩", "广西北海市银海区银滩大道")],
+            response_sequence=[
+                (None, wrong_response),
+                (_MALFORMED_POST_DATA, wrong_response),
+                (
+                    {
+                        "latitude": 0,
+                        "longitude": 0,
+                        "keyword": "",
+                        "page": 1,
+                        "size": 50,
+                        "source": "WEB",
+                        "type": 1,
+                    },
+                    wrong_response,
+                ),
+                (
+                    {
+                        "latitude": 22.0,
+                        "longitude": 109.0,
+                        "keyword": "北海老街",
+                        "page": 1,
+                        "size": 50,
+                        "source": "WEB",
+                        "type": 3,
+                    },
+                    wrong_response,
+                ),
+                (
+                    {
+                        "latitude": 22.0,
+                        "longitude": 109.0,
+                        "keyword": "  北海银滩\n",
+                        "page": 1,
+                        "size": 50,
+                        "source": "WEB",
+                        "type": 3,
+                    },
+                    correct_response,
+                ),
+            ],
+        )
+
+        result = await XhsNativeAdapter(self._payload()).apply_location(page)
+
+        self.assertEqual(result["poiId"], "poi-1")
+        self.assertIn("response-match:4", page.calls)
 
     async def test_rejects_changed_or_ambiguous_response_identity(self) -> None:
         cases = [
