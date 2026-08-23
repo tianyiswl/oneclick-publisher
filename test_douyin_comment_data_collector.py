@@ -319,6 +319,9 @@ class FakeRequest:
         self.method = method
 
 
+_DEFAULT_RESPONSE_HEADERS = object()
+
+
 class FakeResponse:
     def __init__(
         self,
@@ -330,15 +333,34 @@ class FakeResponse:
         delay: float = 0.0,
         error: BaseException | None = None,
         resist_cancellation: bool = False,
+        headers: object = _DEFAULT_RESPONSE_HEADERS,
+        headers_after_first_read: object = _DEFAULT_RESPONSE_HEADERS,
     ) -> None:
         self.url = url
         self.request = FakeRequest(method)
         self.status = status
+        self._headers = (
+            {"content-type": "application/json"}
+            if headers is _DEFAULT_RESPONSE_HEADERS
+            else headers
+        )
+        self._headers_after_first_read = headers_after_first_read
+        self.header_reads = 0
         self.payload = payload
         self.delay = delay
         self.error = error
         self.resist_cancellation = resist_cancellation
         self.json_calls = 0
+
+    @property
+    def headers(self) -> object:
+        self.header_reads += 1
+        if (
+            self.header_reads > 1
+            and self._headers_after_first_read is not _DEFAULT_RESPONSE_HEADERS
+        ):
+            return self._headers_after_first_read
+        return self._headers
 
     async def json(self) -> object:
         self.json_calls += 1
@@ -839,6 +861,159 @@ class DouyinCommentCollectorTests(unittest.TestCase):
                 response = FakeResponse(
                     comment_payload(comment_row(f"status-{status}")),
                     status=status,
+                )
+                starter, page, context, browser, playwright = self._harness(
+                    ((response,),)
+                )
+
+                with self.assertRaises(CommentInsightFailure) as raised:
+                    self._collector(starter).collect(
+                        self.account, "work-7", frozenset()
+                    )
+
+                self.assertEqual(raised.exception.error_code, expected_code)
+                self.assertEqual(response.json_calls, 0)
+                self._assert_closed(page, context, browser, playwright)
+
+    def test_content_type_gate_accepts_only_standard_json_media_types(self) -> None:
+        """只有标准 JSON 媒体类型可读正文，其他响应头必须在 JSON 前失败。"""
+
+        huge_content_type = "secret-content-type-" + (
+            "x" * (64 * 1024 * 1024 - len("secret-content-type-"))
+        )
+        cases = (
+            ("json", {"content-type": "application/json"}, True),
+            (
+                "json_charset",
+                {"content-type": "Application/JSON; charset=utf-8"},
+                True,
+            ),
+            (
+                "problem_json",
+                {"content-type": "application/problem+json"},
+                True,
+            ),
+            (
+                "vendor_json_charset",
+                {
+                    "content-type": (
+                        "application/vnd.douyin.comments+json; charset=UTF-8"
+                    )
+                },
+                True,
+            ),
+            ("missing", {}, False),
+            ("non_container", (), False),
+            ("non_string", {"content-type": b"application/json"}, False),
+            ("text_html", {"content-type": "text/html"}, False),
+            ("text_json", {"content-type": "text/json"}, False),
+            ("wildcard", {"content-type": "*/*"}, False),
+            (
+                "structured_wildcard",
+                {"content-type": "application/*+json"},
+                False,
+            ),
+            (
+                "duplicate_header",
+                {
+                    "content-type": "application/json",
+                    "Content-Type": "application/problem+json",
+                },
+                False,
+            ),
+            (
+                "duplicate_charset",
+                {
+                    "content-type": (
+                        "application/json; charset=utf-8; charset=ascii"
+                    )
+                },
+                False,
+            ),
+            (
+                "unsupported_parameter",
+                {"content-type": "application/json; boundary=x"},
+                False,
+            ),
+            ("oversized", {"content-type": huge_content_type}, False),
+        )
+        for name, headers, accepted in cases:
+            with self.subTest(name=name):
+                response = FakeResponse(
+                    comment_payload(comment_row(f"content-type-{name}")),
+                    headers=headers,
+                )
+                starter, page, context, browser, playwright = self._harness(
+                    ((response,),)
+                )
+                timeout = 0.005 if name == "oversized" else 0.2
+                started_at = time.monotonic()
+
+                if accepted:
+                    batch = self._collector(starter, timeout=timeout).collect(
+                        self.account, "work-7", frozenset()
+                    )
+                    self.assertEqual(batch.accepted_count, 1)
+                    self.assertEqual(response.json_calls, 1)
+                else:
+                    with self.assertRaises(CommentInsightFailure) as raised:
+                        self._collector(starter, timeout=timeout).collect(
+                            self.account, "work-7", frozenset()
+                        )
+                    self.assertEqual(
+                        raised.exception.error_code,
+                        "comment_payload_invalid",
+                    )
+                    self.assertEqual(response.json_calls, 0)
+                    self.assertTrue(raised.exception.cleanup_receipt.closed)
+                    self.assertEqual(
+                        raised.exception.cleanup_receipt.alive_resource_count,
+                        0,
+                    )
+                    artifacts, values = production_exception_artifacts(
+                        raised.exception
+                    )
+                    self.assertNotIn("secret-content-type-", artifacts)
+                    self.assertNotIn(response, values)
+                elapsed = time.monotonic() - started_at
+                if name == "oversized":
+                    self.assertLess(elapsed, 0.03)
+                self._assert_closed(page, context, browser, playwright)
+
+    def test_content_type_is_revalidated_after_enqueue_before_json(self) -> None:
+        """响应入队后若类型变化，二次检查必须阻止正文读取。"""
+
+        response = FakeResponse(
+            comment_payload(comment_row("must-not-read-after-header-change")),
+            headers={"content-type": "application/json"},
+            headers_after_first_read={"content-type": "text/html"},
+        )
+        starter, page, context, browser, playwright = self._harness(
+            ((response,),)
+        )
+
+        with self.assertRaises(CommentInsightFailure) as raised:
+            self._collector(starter).collect(
+                self.account, "work-7", frozenset()
+            )
+
+        self.assertEqual(raised.exception.error_code, "comment_payload_invalid")
+        self.assertEqual(response.header_reads, 2)
+        self.assertEqual(response.json_calls, 0)
+        self._assert_closed(page, context, browser, playwright)
+
+    def test_401_and_403_mapping_precedes_content_type_validation(self) -> None:
+        """登录和权限状态必须在读正文前固定映射，不受响应类型干扰。"""
+
+        for status, expected_code in (
+            (401, "comment_login_required"),
+            (403, "comment_access_denied"),
+        ):
+            with self.subTest(status=status):
+                response = FakeResponse(
+                    comment_payload(comment_row(f"status-{status}")),
+                    status=status,
+                    headers={},
                 )
                 starter, page, context, browser, playwright = self._harness(
                     ((response,),)

@@ -33,6 +33,10 @@ from .platform_data_comment_models import (
 _MISSING = object()
 _KEY_RE = re.compile(r"^[0-9a-f]{64}$")
 _TRIGGER_RE = re.compile(r"^(click|scroll):([A-Za-z0-9_.:-]{1,200})$")
+_JSON_MEDIA_TYPE_RE = re.compile(
+    r"^application/(?:json|[a-z0-9][a-z0-9!#$&^_.-]*\+json)$"
+)
+_CHARSET_RE = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
 _MAX_RESPONSE_PAGES = 50
 _MAX_QUEUED_RESPONSES = 8
 _MAX_RAW_ROWS = 256
@@ -46,6 +50,8 @@ _MAX_NAVIGATION_TEMPLATE_LENGTH = 4_096
 _MAX_CONTRACT_FIELD_LENGTH = 512
 _MAX_PAGINATION_TRIGGER_LENGTH = 207
 _MAX_RUNTIME_URL_LENGTH = 8_192
+_MAX_HEADER_NAME_LENGTH = 128
+_MAX_CONTENT_TYPE_LENGTH = 256
 _MAX_CONTENT_ID_LENGTH = 512
 _MAX_STATE_FILE_PATH_LENGTH = 1_024
 _MAX_COMMENT_ID_LENGTH = 512
@@ -597,6 +603,7 @@ async def _project_prepared_page_bounded(
     content_id: str,
     observed_at: str,
     deadline: float,
+    own_job: Callable[[_ProjectionJob | None], None],
 ) -> tuple[_ParseOutcome, _ProjectionJob | None, bool]:
     job, start_error = _start_projection_job(
         prepared, account_id, content_id, observed_at
@@ -614,6 +621,7 @@ async def _project_prepared_page_bounded(
             None,
             False,
         )
+    own_job(job)
     while not job.completed.is_set():
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -624,6 +632,7 @@ async def _project_prepared_page_bounded(
             )
         await asyncio.sleep(min(0.001, remaining))
     outcome = job.outcome
+    own_job(None)
     if outcome is None:
         outcome = _ParseOutcome(error_code="comment_payload_invalid")
     return outcome, None, False
@@ -899,6 +908,61 @@ def _response_contract_status(
     return "ignore"
 
 
+def _response_content_type_status(response: object, deadline: float) -> str:
+    if time.monotonic() >= deadline:
+        return "timeout"
+    headers = getattr(response, "headers", None)
+    if type(headers) is not dict or len(headers) > _MAX_CONTAINER_KEYS:
+        return "invalid"
+    content_type: object = _MISSING
+    for name in headers:
+        if time.monotonic() >= deadline:
+            return "timeout"
+        if (
+            type(name) is not str
+            or len(name) > _MAX_HEADER_NAME_LENGTH
+        ):
+            return "invalid"
+        if name.lower() != "content-type":
+            continue
+        if content_type is not _MISSING:
+            return "invalid"
+        content_type = headers[name]
+    if (
+        type(content_type) is not str
+        or len(content_type) == 0
+        or len(content_type) > _MAX_CONTENT_TYPE_LENGTH
+    ):
+        return "invalid"
+    if time.monotonic() >= deadline:
+        return "timeout"
+    parts = content_type.split(";")
+    if len(parts) not in (1, 2):
+        return "invalid"
+    media_type = parts[0].strip().lower()
+    if _JSON_MEDIA_TYPE_RE.fullmatch(media_type) is None:
+        return "invalid"
+    if len(parts) == 2:
+        parameter = parts[1].strip()
+        if parameter.count("=") != 1:
+            return "invalid"
+        name, charset = parameter.split("=", 1)
+        if name.strip().lower() != "charset":
+            return "invalid"
+        charset = charset.strip()
+        if (
+            len(charset) >= 2
+            and charset.startswith('"')
+            and charset.endswith('"')
+        ):
+            charset = charset[1:-1]
+        if _CHARSET_RE.fullmatch(charset) is None:
+            return "invalid"
+    if time.monotonic() >= deadline:
+        return "timeout"
+    return "valid"
+
+
 class DouyinCommentDataCollector:
     def __init__(
         self,
@@ -1035,22 +1099,39 @@ class DouyinCommentDataCollector:
                 if metadata_status != "match":
                     return
                 status = getattr(response, "status", None)
+                if status == 401:
+                    response_future.set_result(
+                        ("failure", "comment_login_required")
+                    )
+                    return
+                if status == 403:
+                    response_future.set_result(
+                        ("failure", "comment_access_denied")
+                    )
+                    return
+                if type(status) is not int or status < 200 or status >= 300:
+                    response_future.set_result(
+                        ("failure", "comment_payload_invalid")
+                    )
+                    return
+                if time.monotonic() >= operation_deadline:
+                    response_future.set_result(("timeout",))
+                    return
+                content_type_status = _response_content_type_status(
+                    response, operation_deadline
+                )
+                if content_type_status == "timeout":
+                    response_future.set_result(("timeout",))
+                    return
+                if content_type_status != "valid":
+                    response_future.set_result(
+                        ("failure", "comment_payload_invalid")
+                    )
+                    return
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit) as exc:
+                response_future.set_result(("control", _control_kind(exc)))
+                return
             except BaseException:
-                response_future.set_result(
-                    ("failure", "comment_payload_invalid")
-                )
-                return
-            if status == 401:
-                response_future.set_result(
-                    ("failure", "comment_login_required")
-                )
-                return
-            if status == 403:
-                response_future.set_result(
-                    ("failure", "comment_access_denied")
-                )
-                return
-            if type(status) is not int or status < 200 or status >= 300:
                 response_future.set_result(
                     ("failure", "comment_payload_invalid")
                 )
@@ -1097,6 +1178,15 @@ class DouyinCommentDataCollector:
                         raise CommentInsightFailure("comment_login_required")
                     if status == 403:
                         raise CommentInsightFailure("comment_access_denied")
+                    if type(status) is not int or status < 200 or status >= 300:
+                        _invalid()
+                    content_type_status = _response_content_type_status(
+                        response, operation_deadline
+                    )
+                    if content_type_status == "timeout":
+                        raise TimeoutError
+                    if content_type_status != "valid":
+                        _invalid()
                     page_count += 1
                     if page_count > _MAX_RESPONSE_PAGES:
                         _invalid()
@@ -1129,9 +1219,15 @@ class DouyinCommentDataCollector:
                             )
                         )
                         return
+                    def own_projection_job(
+                        value: _ProjectionJob | None,
+                    ) -> None:
+                        nonlocal projection_job
+                        projection_job = value
+
                     (
                         parse_outcome,
-                        projection_job,
+                        returned_projection_job,
                         projection_blocked_by_worker,
                     ) = await _project_prepared_page_bounded(
                         prepared,
@@ -1139,7 +1235,9 @@ class DouyinCommentDataCollector:
                         content_id,
                         observed_at,
                         operation_deadline,
+                        own_projection_job,
                     )
+                    projection_job = returned_projection_job
                     prepared = None
                     if parse_outcome.control_kind:
                         response_future.set_result(
