@@ -36,7 +36,7 @@ def _content_id(value: object) -> str:
 
 
 def _source_mode(value: object) -> str:
-    if value not in {"direct_session", "browser_signed"}:
+    if type(value) is not str or value not in {"direct_session", "browser_signed"}:
         raise CommentInsightFailure("comment_payload_invalid")
     return value
 

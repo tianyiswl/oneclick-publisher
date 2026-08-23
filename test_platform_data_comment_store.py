@@ -310,6 +310,18 @@ class CommentStoreTests(unittest.TestCase):
             )
         self.assertEqual(raised.exception.error_code, "comment_content_unavailable")
 
+    def test_record_failed_comment_sync_rejects_unhashable_source_mode_with_fixed_error(self):
+        """未先检查类型会让列表在来源模式白名单判断中泄露 TypeError。"""
+
+        conn = prepared_connection()
+
+        with self.assertRaises(CommentInsightFailure) as raised:
+            store.record_failed_comment_sync(
+                conn, 12, "work-7", [], "comment_login_required"
+            )
+
+        self.assertEqual(raised.exception.error_code, "comment_payload_invalid")
+
 
 if __name__ == "__main__":
     unittest.main()
