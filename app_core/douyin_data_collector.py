@@ -16,7 +16,19 @@ import requests
 
 from .paths import COOKIE_DIR
 from .platform_data_collection_errors import PlatformDataCollectionError
-from .platform_data_models import CollectionBatch, MetricPoint
+from .platform_data_comment_contract import (
+    DouyinCommentContract,
+    load_verified_contract,
+)
+from .platform_data_comment_models import CommentInsightFailure
+from .platform_data_models import (
+    ALLOWED_CONTENT_STATUSES,
+    ALLOWED_CONTENT_TYPES,
+    ALLOWED_METRIC_KEYS,
+    CollectionBatch,
+    ContentRecord,
+    MetricPoint,
+)
 
 
 DOUYIN_DASHBOARD_URL = (
@@ -32,6 +44,8 @@ _BROWSER_RESPONSE_PATHS = frozenset(
 _CONTENT_LIST_UNAVAILABLE_WARNING = "content_list_unavailable"
 _REQUEST_TIMEOUT_SECONDS = 20.0
 _BROWSER_TIMEOUT_SECONDS = 30.0
+_CONTENT_RESPONSE_LIMIT = 50
+_MISSING = object()
 _RAW_METRIC_MAP = {
     "play": "views",
     "play_cnt": "views",
@@ -135,6 +149,202 @@ def _metric_number(value: object) -> int | float:
     return value
 
 
+def _content_payload_invalid() -> None:
+    raise DouyinDataCollectionError(
+        "content_payload_invalid", fallback_allowed=False
+    )
+
+
+def _strict_path_value(root: object, path: object) -> object:
+    if type(root) is not dict or type(path) is not str or not path:
+        _content_payload_invalid()
+    value = root
+    for segment in path.split("."):
+        if not segment or segment.endswith("[]") or type(value) is not dict:
+            _content_payload_invalid()
+        if segment not in value:
+            return _MISSING
+        value = value[segment]
+    return value
+
+
+def _content_rows(payload: object, list_field: object) -> tuple[dict, ...]:
+    if type(list_field) is not str or not list_field.endswith("[]"):
+        _content_payload_invalid()
+    value = _strict_path_value(payload, list_field[:-2])
+    if type(value) is not list:
+        _content_payload_invalid()
+    if not all(type(item) is dict for item in value):
+        _content_payload_invalid()
+    return tuple(value)
+
+
+def _row_field(row: dict, list_field: str, field: object) -> object:
+    prefix = f"{list_field}."
+    if type(field) is not str or not field.startswith(prefix):
+        _content_payload_invalid()
+    relative_path = field[len(prefix) :]
+    return _strict_path_value(row, relative_path)
+
+
+def _stable_content_id(value: object) -> str:
+    if (
+        type(value) is not str
+        or not value
+        or value != value.strip()
+    ):
+        _content_payload_invalid()
+    return value
+
+
+def _optional_controlled_text(value: object) -> str:
+    if value is _MISSING or value is None:
+        return ""
+    if type(value) is not str or value != value.strip():
+        return ""
+    return value
+
+
+def _observed_day(observed_at: object) -> str:
+    if type(observed_at) is not str or observed_at != observed_at.strip():
+        _content_payload_invalid()
+    try:
+        parsed = datetime.fromisoformat(observed_at)
+    except ValueError:
+        _content_payload_invalid()
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        _content_payload_invalid()
+    return parsed.date().isoformat()
+
+
+def parse_verified_content_payload(
+    contract: DouyinCommentContract,
+    payload: object,
+    account_id: int,
+    observed_at: str,
+) -> tuple[tuple[ContentRecord, ...], tuple[MetricPoint, ...], str]:
+    """只按已验证合同把一页作品 JSON 投影为公开模型。"""
+
+    if (
+        type(contract) is not DouyinCommentContract
+        or contract.verified is not True
+        or type(account_id) is not int
+        or account_id <= 0
+        or type(payload) is not dict
+    ):
+        _content_payload_invalid()
+    observed_day = _observed_day(observed_at)
+    rows = _content_rows(payload, contract.content_list_field)
+    has_more = _strict_path_value(payload, contract.content_has_more_field)
+    if type(has_more) is not bool:
+        _content_payload_invalid()
+    raw_cursor = _strict_path_value(payload, contract.content_cursor_field)
+    if has_more:
+        if (
+            type(raw_cursor) is not str
+            or not raw_cursor
+            or raw_cursor != raw_cursor.strip()
+        ):
+            _content_payload_invalid()
+        cursor = raw_cursor
+    else:
+        cursor = ""
+
+    records: dict[
+        str, tuple[ContentRecord, tuple[MetricPoint, ...]]
+    ] = {}
+    for row in rows:
+        content_id = _stable_content_id(
+            _row_field(
+                row, contract.content_list_field, contract.content_id_field
+            )
+        )
+        title = _optional_controlled_text(
+            _row_field(
+                row, contract.content_list_field, contract.content_title_field
+            )
+        )
+        cover_url = _optional_controlled_text(
+            _row_field(
+                row, contract.content_list_field, contract.content_cover_field
+            )
+        )
+        published_at = _optional_controlled_text(
+            _row_field(
+                row,
+                contract.content_list_field,
+                contract.content_published_at_field,
+            )
+        )
+        raw_status = _row_field(
+            row, contract.content_list_field, contract.content_status_field
+        )
+        content_status = (
+            raw_status
+            if type(raw_status) is str
+            and raw_status in ALLOWED_CONTENT_STATUSES
+            and raw_status != "unavailable"
+            else "unavailable"
+        )
+        if not title or not cover_url or not published_at:
+            content_status = "unavailable"
+        raw_type = _row_field(
+            row, contract.content_list_field, contract.content_type_field
+        )
+        content_type = (
+            raw_type
+            if type(raw_type) is str and raw_type in ALLOWED_CONTENT_TYPES
+            else "unavailable"
+        )
+        content = ContentRecord(
+            content_id=content_id,
+            title=title,
+            cover_url=cover_url,
+            published_at=published_at,
+            content_status=content_status,
+            content_type=content_type,
+        )
+        points: list[MetricPoint] = []
+        for metric_key, field in contract.content_metric_fields:
+            if metric_key not in ALLOWED_METRIC_KEYS:
+                continue
+            value = _row_field(row, contract.content_list_field, field)
+            if (
+                type(value) not in (int, float)
+                or not math.isfinite(float(value))
+            ):
+                continue
+            points.append(
+                MetricPoint(
+                    entity_type="content",
+                    entity_key=content_id,
+                    metric_key=metric_key,
+                    raw_metric_key=field,
+                    metric_value=value,
+                    metric_unit="count",
+                    metric_scope="lifetime_total",
+                    period_start=observed_day,
+                    period_end=observed_day,
+                    observed_at=observed_at,
+                )
+            )
+        if not points:
+            _content_payload_invalid()
+        candidate = (content, tuple(points))
+        existing = records.get(content_id)
+        if existing is not None:
+            if existing != candidate:
+                _content_payload_invalid()
+            continue
+        records[content_id] = candidate
+
+    contents = tuple(item[0] for item in records.values())
+    metrics = tuple(
+        point for _content, points in records.values() for point in points
+    )
+    return contents, metrics, cursor
+
+
 def _daily_point_identity(point: MetricPoint) -> tuple[str, str, str]:
     return point.metric_key, point.metric_scope, point.period_start
 
@@ -223,10 +433,16 @@ class DouyinDataCollector:
         *,
         session_factory: Callable[[], object] = requests.Session,
         playwright_factory: Callable[[], object] = _default_playwright_factory,
+        contract_loader: Callable[[], DouyinCommentContract] = load_verified_contract,
         browser_timeout_seconds: float = _BROWSER_TIMEOUT_SECONDS,
     ) -> None:
         self._session_factory = session_factory
         self._playwright_factory = playwright_factory
+        if not callable(contract_loader):
+            raise DouyinDataCollectionError(
+                "metric_payload_invalid", fallback_allowed=False
+            )
+        self._contract_loader = contract_loader
         if type(browser_timeout_seconds) not in (int, float):
             raise DouyinDataCollectionError(
                 "metric_payload_invalid", fallback_allowed=False
@@ -637,6 +853,251 @@ class DouyinDataCollector:
                 "metric_payload_empty", fallback_allowed=False
             )
         return result
+
+    async def _complete_content_data_async(
+        self,
+        account: dict,
+        account_batch: CollectionBatch,
+        contract: DouyinCommentContract,
+        report: Callable[[dict], None] | None,
+    ) -> CollectionBatch:
+        account_id, state_path = _required_account(account)
+        if (
+            type(account_batch) is not CollectionBatch
+            or account_batch.platform_type != 3
+            or account_batch.content_data_available
+            or any(
+                point.entity_type != "account"
+                or point.entity_key != f"account:{account_id}"
+                for point in account_batch.metrics
+            )
+            or type(contract) is not DouyinCommentContract
+            or contract.verified is not True
+            or contract.creator_host != "creator.douyin.com"
+            or "{content_id}" in contract.content_navigation_template
+        ):
+            _content_payload_invalid()
+
+        playwright = None
+        browser = None
+        context = None
+        page = None
+        worker: asyncio.Task | None = None
+        result: tuple[tuple[ContentRecord, ...], tuple[MetricPoint, ...]] | None = None
+        caught: BaseException | None = None
+        cleanup_errors: list[BaseException] = []
+        response_queue: asyncio.Queue[object] = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+        response_future: asyncio.Future = loop.create_future()
+        observed_at = _local_observation_timestamp()
+
+        def observe_response(response: object) -> None:
+            if not response_future.done():
+                response_queue.put_nowait(response)
+
+        async def consume_responses() -> None:
+            records: dict[
+                str, tuple[ContentRecord, tuple[MetricPoint, ...]]
+            ] = {}
+            seen_cursors: set[str] = set()
+            accepted_pages = 0
+            while not response_future.done():
+                response = await response_queue.get()
+                try:
+                    url = getattr(response, "url", "")
+                    parsed = urlparse(url if type(url) is str else "")
+                    request = getattr(response, "request", None)
+                    method = getattr(request, "method", None)
+                    if (
+                        parsed.scheme != "https"
+                        or parsed.hostname != contract.creator_host
+                        or parsed.path != contract.content_response_path
+                        or type(method) is not str
+                        or method != contract.content_response_method
+                    ):
+                        continue
+                    accepted_pages += 1
+                    if accepted_pages > _CONTENT_RESPONSE_LIMIT:
+                        _content_payload_invalid()
+                    payload = await response.json()
+                    contents, points, cursor = parse_verified_content_payload(
+                        contract,
+                        payload,
+                        account_id,
+                        observed_at,
+                    )
+                    points_by_id = {
+                        content.content_id: tuple(
+                            point
+                            for point in points
+                            if point.entity_key == content.content_id
+                        )
+                        for content in contents
+                    }
+                    for content in contents:
+                        candidate = (
+                            content,
+                            points_by_id[content.content_id],
+                        )
+                        existing = records.get(content.content_id)
+                        if existing is not None:
+                            if existing != candidate:
+                                _content_payload_invalid()
+                            continue
+                        records[content.content_id] = candidate
+                    if cursor:
+                        if cursor in seen_cursors:
+                            _content_payload_invalid()
+                        seen_cursors.add(cursor)
+                        continue
+                    completed = (
+                        tuple(item[0] for item in records.values()),
+                        tuple(
+                            point
+                            for _content, content_points in records.values()
+                            for point in content_points
+                        ),
+                    )
+                    if not response_future.done():
+                        response_future.set_result(completed)
+                    return
+                except DouyinDataCollectionError as exc:
+                    if not response_future.done():
+                        response_future.set_exception(exc)
+                    return
+                except (KeyboardInterrupt, SystemExit) as exc:
+                    if not response_future.done():
+                        response_future.set_exception(exc)
+                    return
+                except BaseException:
+                    if not response_future.done():
+                        response_future.set_exception(
+                            DouyinDataCollectionError(
+                                "content_payload_invalid",
+                                fallback_allowed=False,
+                            )
+                        )
+                    return
+
+        try:
+            starter = self._playwright_factory()
+            playwright = await starter.start()
+            browser = await playwright.chromium.launch(headless=True)
+            context = await browser.new_context(storage_state=str(state_path))
+            page = await context.new_page()
+            page.on("response", observe_response)
+            worker = asyncio.create_task(consume_responses())
+            navigation_url = (
+                f"https://{contract.creator_host}"
+                f"{contract.content_navigation_template}"
+            )
+            await page.goto(
+                navigation_url,
+                wait_until="domcontentloaded",
+                timeout=self._browser_timeout_seconds * 1000,
+            )
+            current_url = str(getattr(page, "url", "") or "").lower()
+            if "/verification" in current_url:
+                raise DouyinDataCollectionError(
+                    "verification_required", fallback_allowed=False
+                )
+            if "/login" in current_url or "passport." in current_url:
+                raise DouyinDataCollectionError(
+                    "login_required", fallback_allowed=False
+                )
+            if "/forbidden" in current_url:
+                raise DouyinDataCollectionError(
+                    "access_denied", fallback_allowed=False
+                )
+            try:
+                result = await asyncio.wait_for(
+                    response_future,
+                    timeout=self._browser_timeout_seconds,
+                )
+            except TimeoutError:
+                raise DouyinDataCollectionError(
+                    "content_list_unavailable", fallback_allowed=False
+                ) from None
+        except BaseException as exc:
+            caught = exc
+        finally:
+            if worker is not None and not worker.done():
+                worker.cancel()
+            if worker is not None:
+                await asyncio.gather(worker, return_exceptions=True)
+            for resource in (page, context, browser, playwright):
+                close_error = await self._close_resource(resource)
+                if close_error is not None:
+                    cleanup_errors.append(close_error)
+
+        if isinstance(caught, (KeyboardInterrupt, SystemExit)):
+            raise caught
+        for cleanup_error in cleanup_errors:
+            if isinstance(cleanup_error, (KeyboardInterrupt, SystemExit)):
+                raise cleanup_error
+        if cleanup_errors:
+            raise DouyinDataCollectionError(
+                "browser_cleanup_incomplete", fallback_allowed=False
+            ) from None
+        if isinstance(caught, DouyinDataCollectionError):
+            raise caught
+        if caught is not None:
+            raise DouyinDataCollectionError(
+                "content_payload_invalid", fallback_allowed=False
+            ) from None
+        if result is None:
+            raise DouyinDataCollectionError(
+                "content_list_unavailable", fallback_allowed=False
+            )
+        contents, content_points = result
+        return CollectionBatch(
+            platform_type=3,
+            source_mode="browser_signed",
+            metrics=account_batch.metrics + content_points,
+            contents=contents,
+            account_metrics_available=True,
+            content_data_available=True,
+            platform_observed_at=observed_at,
+            warning_code="",
+        )
+
+    def complete_content_data(
+        self,
+        account: dict,
+        account_batch: CollectionBatch,
+        report: Callable[[dict], None] | None = None,
+    ) -> CollectionBatch:
+        """仅在生产合同已验证时，以独立短会话补全本人作品列表。"""
+
+        try:
+            contract = self._contract_loader()
+        except CommentInsightFailure as exc:
+            if exc.error_code == "comment_content_unavailable":
+                return account_batch
+            raise DouyinDataCollectionError(
+                "content_list_unavailable", fallback_allowed=False
+            ) from None
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:
+            return account_batch
+        try:
+            return asyncio.run(
+                self._complete_content_data_async(
+                    account,
+                    account_batch,
+                    contract,
+                    report,
+                )
+            )
+        except DouyinDataCollectionError:
+            raise
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:
+            raise DouyinDataCollectionError(
+                "content_payload_invalid", fallback_allowed=False
+            ) from None
 
     def collect_browser_signed(
         self,

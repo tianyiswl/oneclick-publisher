@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -15,13 +16,91 @@ from app_core.douyin_data_collector import (
     DOUYIN_DATA_PAGE_URL,
     DouyinDataCollectionError,
     DouyinDataCollector,
+    parse_verified_content_payload,
 )
 from app_core.platform_data_collection_errors import PlatformDataCollectionError
 from app_core.platform_data_collectors import (
     collector_for_platform,
     registered_platform_types,
 )
-from app_core.platform_data_models import CollectionFailure
+from app_core.platform_data_comment_contract import DouyinCommentContract
+from app_core.platform_data_comment_models import CommentInsightFailure
+from app_core.platform_data_models import (
+    CollectionBatch,
+    CollectionFailure,
+    MetricPoint,
+)
+
+
+def verified_content_contract() -> DouyinCommentContract:
+    return DouyinCommentContract(
+        schema_version=1,
+        verified=True,
+        creator_host="creator.douyin.com",
+        content_response_method="GET",
+        comment_response_method="GET",
+        content_response_path="/verified/content/list",
+        content_navigation_template="/verified/content",
+        content_list_field="data.items[]",
+        content_id_field="data.items[].id",
+        content_title_field="data.items[].title",
+        content_cover_field="data.items[].cover",
+        content_published_at_field="data.items[].published_at",
+        content_status_field="data.items[].status",
+        content_type_field="data.items[].type",
+        content_metric_fields=(
+            ("views", "data.items[].metrics.views"),
+            ("likes", "data.items[].metrics.likes"),
+            ("comments", "data.items[].metrics.comments"),
+            ("shares", "data.items[].metrics.shares"),
+        ),
+        content_cursor_field="data.cursor",
+        content_has_more_field="data.has_more",
+        comment_response_path="/verified/comment/list",
+        comment_navigation_template="/verified/content/{content_id}/comments",
+        comment_list_field="data.comments[]",
+        comment_id_field="data.comments[].comment_id",
+        comment_content_id_field="data.comments[].content_id",
+        comment_parent_id_field="data.comments[].parent_id",
+        comment_body_field="data.comments[].text",
+        comment_like_count_field="data.comments[].like_count",
+        comment_reply_count_field="data.comments[].reply_count",
+        comment_commented_at_field="data.comments[].commented_at",
+        comment_cursor_field="data.cursor",
+        comment_has_more_field="data.has_more",
+        comment_pagination_trigger="click:verified-comment-load-more",
+    )
+
+
+def valid_content_payload(
+    content_id: str = "work-7",
+    *,
+    cursor: str = "",
+    has_more: bool = False,
+    **row_overrides: object,
+) -> dict:
+    row = {
+        "id": content_id,
+        "title": "作品七",
+        "cover": "https://creator.douyin.com/cover/work-7.jpg",
+        "published_at": "2026-08-20T12:00:00+08:00",
+        "status": "published",
+        "type": "video",
+        "metrics": {
+            "views": 400,
+            "likes": 30,
+            "comments": 8,
+            "shares": 5,
+        },
+    }
+    row.update(row_overrides)
+    return {
+        "data": {
+            "items": [row],
+            "cursor": cursor,
+            "has_more": has_more,
+        }
+    }
 
 
 class DouyinDataCollectorTests(unittest.TestCase):
@@ -500,6 +579,172 @@ class DouyinDirectCollectorTests(unittest.TestCase):
                 )
 
 
+class DouyinVerifiedContentParserTests(unittest.TestCase):
+    observed_at = "2026-08-23T10:21:00+08:00"
+
+    def test_verified_payload_preserves_stable_fields_and_cumulative_metrics(
+        self,
+    ) -> None:
+        """错读合同字段会丢作品稳定 ID，或把累计指标写成账号日增量。"""
+
+        contents, points, cursor = parse_verified_content_payload(
+            verified_content_contract(),
+            valid_content_payload(cursor="cursor-1", has_more=True),
+            account_id=12,
+            observed_at=self.observed_at,
+        )
+
+        self.assertEqual(cursor, "cursor-1")
+        self.assertEqual(
+            [
+                (
+                    item.content_id,
+                    item.title,
+                    item.cover_url,
+                    item.published_at,
+                    item.content_status,
+                    item.content_type,
+                )
+                for item in contents
+            ],
+            [
+                (
+                    "work-7",
+                    "作品七",
+                    "https://creator.douyin.com/cover/work-7.jpg",
+                    "2026-08-20T12:00:00+08:00",
+                    "published",
+                    "video",
+                )
+            ],
+        )
+        self.assertEqual(
+            [
+                (
+                    point.entity_type,
+                    point.entity_key,
+                    point.metric_key,
+                    point.raw_metric_key,
+                    point.metric_value,
+                    point.metric_scope,
+                )
+                for point in points
+            ],
+            [
+                ("content", "work-7", "views", "data.items[].metrics.views", 400, "lifetime_total"),
+                ("content", "work-7", "likes", "data.items[].metrics.likes", 30, "lifetime_total"),
+                ("content", "work-7", "comments", "data.items[].metrics.comments", 8, "lifetime_total"),
+                ("content", "work-7", "shares", "data.items[].metrics.shares", 5, "lifetime_total"),
+            ],
+        )
+        self.assertEqual({point.period_end for point in points}, {"2026-08-23"})
+        self.assertEqual({point.observed_at for point in points}, {self.observed_at})
+
+    def test_missing_or_unknown_values_remain_unknown_instead_of_zero(self) -> None:
+        """缺失元数据与未知指标不能被补成空业务事实或 0。"""
+
+        payload = valid_content_payload(
+            status="platform-specific-status",
+            type="platform-specific-type",
+            metrics={
+                "views": 9,
+                "likes": None,
+                "comments": "unknown",
+                "shares": True,
+                "private_metric": 999,
+            },
+        )
+        del payload["data"]["items"][0]["title"]
+        del payload["data"]["items"][0]["cover"]
+        del payload["data"]["items"][0]["published_at"]
+
+        contents, points, cursor = parse_verified_content_payload(
+            verified_content_contract(),
+            payload,
+            account_id=12,
+            observed_at=self.observed_at,
+        )
+
+        self.assertEqual(cursor, "")
+        self.assertEqual(len(contents), 1)
+        self.assertEqual(contents[0].title, "")
+        self.assertEqual(contents[0].cover_url, "")
+        self.assertEqual(contents[0].published_at, "")
+        self.assertEqual(contents[0].content_status, "unavailable")
+        self.assertEqual(contents[0].content_type, "unavailable")
+        self.assertEqual(
+            [(point.metric_key, point.metric_value) for point in points],
+            [("views", 9)],
+        )
+        self.assertNotIn(0, [point.metric_value for point in points])
+
+    def test_duplicate_content_ids_dedupe_identical_rows_and_reject_conflicts(
+        self,
+    ) -> None:
+        """同页重复 ID 只能合并完全相同记录，不能静默覆盖冲突作品。"""
+
+        payload = valid_content_payload()
+        payload["data"]["items"].append(
+            json.loads(json.dumps(payload["data"]["items"][0]))
+        )
+        contents, points, _cursor = parse_verified_content_payload(
+            verified_content_contract(),
+            payload,
+            account_id=12,
+            observed_at=self.observed_at,
+        )
+        self.assertEqual([item.content_id for item in contents], ["work-7"])
+        self.assertEqual(len(points), 4)
+
+        payload["data"]["items"][1]["title"] = "冲突标题"
+        with self.assertRaises(DouyinDataCollectionError) as raised:
+            parse_verified_content_payload(
+                verified_content_contract(),
+                payload,
+                account_id=12,
+                observed_at=self.observed_at,
+            )
+        self.assertEqual(raised.exception.error_code, "content_payload_invalid")
+
+    def test_more_pages_require_a_strict_nonempty_cursor(self) -> None:
+        """has_more 不能在没有合同游标时诱导采集器猜测下一页。"""
+
+        for cursor in (None, "", True, " cursor "):
+            with self.subTest(cursor=cursor):
+                with self.assertRaises(DouyinDataCollectionError) as raised:
+                    parse_verified_content_payload(
+                        verified_content_contract(),
+                        valid_content_payload(cursor=cursor, has_more=True),
+                        account_id=12,
+                        observed_at=self.observed_at,
+                    )
+                self.assertEqual(
+                    raised.exception.error_code, "content_payload_invalid"
+                )
+
+    def test_invalid_stable_id_or_custom_container_fails_closed(self) -> None:
+        """弱类型 ID 和自定义容器不能穿过已验证 JSON 合同。"""
+
+        class CustomDict(dict):
+            pass
+
+        for payload in (
+            valid_content_payload(content_id=True),
+            CustomDict(valid_content_payload()),
+        ):
+            with self.subTest(payload_type=type(payload).__name__):
+                with self.assertRaises(DouyinDataCollectionError) as raised:
+                    parse_verified_content_payload(
+                        verified_content_contract(),
+                        payload,
+                        account_id=12,
+                        observed_at=self.observed_at,
+                    )
+                self.assertEqual(
+                    raised.exception.error_code, "content_payload_invalid"
+                )
+
+
 class FakeBrowserResponse:
     def __init__(self, url: str, payload: object) -> None:
         self.url = url
@@ -601,6 +846,444 @@ class FakePlaywrightStarter:
 
     async def start(self) -> FakePlaywright:
         return self.playwright
+
+
+class FakeContentRequest:
+    def __init__(self, method: str) -> None:
+        self.method = method
+
+
+class FakeContentResponse:
+    def __init__(
+        self,
+        url: str,
+        payload: object,
+        *,
+        method: str = "GET",
+        delay: float = 0.0,
+    ) -> None:
+        self.url = url
+        self.request = FakeContentRequest(method)
+        self.payload = payload
+        self.delay = delay
+        self.json_calls = 0
+
+    async def json(self) -> object:
+        self.json_calls += 1
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        return self.payload
+
+
+class FakeContentPage:
+    def __init__(
+        self,
+        responses: tuple[FakeContentResponse, ...],
+        *,
+        final_url: str = "https://creator.douyin.com/verified/content",
+        close_error: BaseException | None = None,
+    ) -> None:
+        self.responses = responses
+        self.url = final_url
+        self.close_error = close_error
+        self.listeners: dict[str, object] = {}
+        self.goto_calls: list[tuple[str, str, float]] = []
+        self.closed = 0
+
+    def on(self, event: str, callback) -> None:
+        self.listeners[event] = callback
+
+    async def goto(
+        self,
+        url: str,
+        *,
+        wait_until: str,
+        timeout: float,
+    ) -> None:
+        if "response" not in self.listeners:
+            raise AssertionError("response listener must precede navigation")
+        self.goto_calls.append((url, wait_until, timeout))
+        for response in self.responses:
+            self.listeners["response"](response)
+            await asyncio.sleep(0)
+
+    async def close(self) -> None:
+        self.closed += 1
+        if self.close_error is not None:
+            raise self.close_error
+
+
+class FakeContentContext:
+    def __init__(
+        self,
+        page: FakeContentPage,
+        *,
+        close_error: BaseException | None = None,
+    ) -> None:
+        self.page = page
+        self.close_error = close_error
+        self.closed = 0
+
+    async def new_page(self) -> FakeContentPage:
+        return self.page
+
+    async def close(self) -> None:
+        self.closed += 1
+        if self.close_error is not None:
+            raise self.close_error
+
+
+class FakeContentBrowser:
+    def __init__(self, context: FakeContentContext) -> None:
+        self.context = context
+        self.storage_states: list[str] = []
+        self.closed = 0
+
+    async def new_context(self, *, storage_state: str) -> FakeContentContext:
+        self.storage_states.append(storage_state)
+        return self.context
+
+    async def close(self) -> None:
+        self.closed += 1
+
+
+class FakeContentChromium:
+    def __init__(self, browser: FakeContentBrowser) -> None:
+        self.browser = browser
+        self.launch_calls: list[dict] = []
+
+    async def launch(self, **options) -> FakeContentBrowser:
+        self.launch_calls.append(dict(options))
+        return self.browser
+
+
+class FakeContentPlaywright:
+    def __init__(self, browser: FakeContentBrowser) -> None:
+        self.chromium = FakeContentChromium(browser)
+        self.stopped = 0
+
+    async def stop(self) -> None:
+        self.stopped += 1
+
+
+class FakeContentStarter:
+    def __init__(self, playwright: FakeContentPlaywright) -> None:
+        self.playwright = playwright
+
+    async def start(self) -> FakeContentPlaywright:
+        return self.playwright
+
+
+class DouyinContentCompletionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.cookie_dir = Path(self.tempdir.name)
+        self.state_file = self.cookie_dir / "oneclick_3_test.json"
+        self.state_file.write_text(
+            json.dumps({"cookies": [], "origins": []}), encoding="utf-8"
+        )
+        self.account = {
+            "id": 12,
+            "type": 3,
+            "filePath": self.state_file.name,
+        }
+        self.cookie_patch = patch(
+            "app_core.douyin_data_collector.COOKIE_DIR", self.cookie_dir
+        )
+        self.cookie_patch.start()
+
+    def tearDown(self) -> None:
+        self.cookie_patch.stop()
+        self.tempdir.cleanup()
+
+    @staticmethod
+    def _account_batch(account_id: int = 12) -> CollectionBatch:
+        observed_at = "2026-08-23T10:20:00+08:00"
+        return CollectionBatch(
+            platform_type=3,
+            source_mode="direct_session",
+            metrics=(
+                MetricPoint(
+                    entity_type="account",
+                    entity_key=f"account:{account_id}",
+                    metric_key="views",
+                    raw_metric_key="play",
+                    metric_value=125,
+                    metric_unit="count",
+                    metric_scope="daily_increment",
+                    period_start="2026-08-22",
+                    period_end="2026-08-22",
+                    observed_at=observed_at,
+                ),
+            ),
+            contents=(),
+            account_metrics_available=True,
+            content_data_available=False,
+            platform_observed_at=observed_at,
+            warning_code="content_list_unavailable",
+        )
+
+    @staticmethod
+    def _browser_harness(
+        responses: tuple[FakeContentResponse, ...],
+        *,
+        context_close_error: BaseException | None = None,
+    ) -> tuple[
+        FakeContentStarter,
+        FakeContentPage,
+        FakeContentContext,
+        FakeContentBrowser,
+        FakeContentPlaywright,
+    ]:
+        page = FakeContentPage(responses)
+        context = FakeContentContext(page, close_error=context_close_error)
+        browser = FakeContentBrowser(context)
+        playwright = FakeContentPlaywright(browser)
+        return FakeContentStarter(playwright), page, context, browser, playwright
+
+    def test_no_manifest_returns_original_batch_without_starting_a_session(
+        self,
+    ) -> None:
+        """删掉无合同早退会额外打开浏览器，并伪造作品列表能力。"""
+
+        playwright_calls = 0
+
+        def missing_contract() -> DouyinCommentContract:
+            raise CommentInsightFailure("comment_content_unavailable")
+
+        def forbidden_playwright() -> object:
+            nonlocal playwright_calls
+            playwright_calls += 1
+            raise AssertionError("no verified contract, no browser")
+
+        collector = DouyinDataCollector(
+            contract_loader=missing_contract,
+            playwright_factory=forbidden_playwright,
+        )
+        original = self._account_batch()
+
+        completed = collector.complete_content_data(self.account, original)
+
+        self.assertIs(completed, original)
+        self.assertEqual(completed.warning_code, "content_list_unavailable")
+        self.assertEqual(playwright_calls, 0)
+
+    def test_verified_completion_matches_exact_response_and_ignores_comments(
+        self,
+    ) -> None:
+        """放宽 host/path/method 或读取评论响应，都会越过已验证作品合同。"""
+
+        ignored = (
+            FakeContentResponse(
+                "https://evil.example/verified/content/list",
+                valid_content_payload("evil-host"),
+            ),
+            FakeContentResponse(
+                "https://creator.douyin.com/unverified/content/list",
+                valid_content_payload("wrong-path"),
+            ),
+            FakeContentResponse(
+                "https://creator.douyin.com/verified/content/list",
+                valid_content_payload("wrong-method"),
+                method="POST",
+            ),
+            FakeContentResponse(
+                "https://creator.douyin.com/verified/comment/list",
+                {"data": {"comments": [{"text": "must-not-read"}]}},
+            ),
+        )
+        first_page = FakeContentResponse(
+            "https://creator.douyin.com/verified/content/list?cursor=private",
+            valid_content_payload("work-7", cursor="cursor-1", has_more=True),
+        )
+        second_page = FakeContentResponse(
+            "https://creator.douyin.com/verified/content/list?cursor=private-2",
+            valid_content_payload("work-8", has_more=False),
+        )
+        starter, page, context, browser, playwright = self._browser_harness(
+            (*ignored, first_page, second_page)
+        )
+        collector = DouyinDataCollector(
+            contract_loader=verified_content_contract,
+            playwright_factory=lambda: starter,
+            browser_timeout_seconds=0.2,
+        )
+
+        completed = collector.complete_content_data(
+            self.account, self._account_batch()
+        )
+
+        self.assertTrue(completed.content_data_available)
+        self.assertEqual(completed.warning_code, "")
+        self.assertEqual(completed.source_mode, "browser_signed")
+        self.assertEqual(
+            [item.content_id for item in completed.contents],
+            ["work-7", "work-8"],
+        )
+        self.assertEqual(
+            {
+                point.metric_key
+                for point in completed.metrics
+                if point.entity_type == "content"
+            },
+            {"views", "likes", "comments", "shares"},
+        )
+        self.assertEqual(
+            [response.json_calls for response in ignored], [0, 0, 0, 0]
+        )
+        self.assertEqual((first_page.json_calls, second_page.json_calls), (1, 1))
+        self.assertEqual(
+            page.goto_calls,
+            [
+                (
+                    "https://creator.douyin.com/verified/content",
+                    "domcontentloaded",
+                    200.0,
+                )
+            ],
+        )
+        self.assertEqual((page.closed, context.closed, browser.closed), (1, 1, 1))
+        self.assertEqual(playwright.stopped, 1)
+
+    def test_conflicting_duplicate_across_pages_fails_closed_and_cleans(
+        self,
+    ) -> None:
+        """后页同 ID 冲突不能覆盖前页，失败时仍要关闭四层资源。"""
+
+        first_page = FakeContentResponse(
+            "https://creator.douyin.com/verified/content/list",
+            valid_content_payload(cursor="cursor-1", has_more=True),
+        )
+        second_page = FakeContentResponse(
+            "https://creator.douyin.com/verified/content/list",
+            valid_content_payload(title="冲突标题"),
+        )
+        starter, page, context, browser, playwright = self._browser_harness(
+            (first_page, second_page)
+        )
+        collector = DouyinDataCollector(
+            contract_loader=verified_content_contract,
+            playwright_factory=lambda: starter,
+            browser_timeout_seconds=0.2,
+        )
+
+        with self.assertRaises(DouyinDataCollectionError) as raised:
+            collector.complete_content_data(self.account, self._account_batch())
+
+        self.assertEqual(raised.exception.error_code, "content_payload_invalid")
+        self.assertEqual((page.closed, context.closed, browser.closed), (1, 1, 1))
+        self.assertEqual(playwright.stopped, 1)
+
+    def test_cleanup_failure_overrides_apparent_content_success(self) -> None:
+        """短会话没有全部关闭时，刚读到的作品不能进入同步。"""
+
+        response = FakeContentResponse(
+            "https://creator.douyin.com/verified/content/list",
+            valid_content_payload(),
+        )
+        starter, page, context, browser, playwright = self._browser_harness(
+            (response,),
+            context_close_error=RuntimeError("private cleanup detail"),
+        )
+        collector = DouyinDataCollector(
+            contract_loader=verified_content_contract,
+            playwright_factory=lambda: starter,
+            browser_timeout_seconds=0.2,
+        )
+
+        with self.assertRaises(DouyinDataCollectionError) as raised:
+            collector.complete_content_data(self.account, self._account_batch())
+
+        self.assertEqual(
+            raised.exception.error_code, "browser_cleanup_incomplete"
+        )
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertEqual((page.closed, context.closed, browser.closed), (1, 1, 1))
+        self.assertEqual(playwright.stopped, 1)
+
+    def test_late_cross_account_results_stay_with_their_invocation(self) -> None:
+        """共用采集器的旧账号慢响应不能覆盖新账号的作品批次。"""
+
+        second_state = self.cookie_dir / "oneclick_3_second.json"
+        second_state.write_text(
+            json.dumps({"cookies": [], "origins": []}), encoding="utf-8"
+        )
+        second_account = {
+            "id": 13,
+            "type": 3,
+            "filePath": second_state.name,
+        }
+        first_starter, *_first_resources = self._browser_harness(
+            (
+                FakeContentResponse(
+                    "https://creator.douyin.com/verified/content/list",
+                    valid_content_payload("account-12-work"),
+                    delay=0.03,
+                ),
+            )
+        )
+        second_starter, *_second_resources = self._browser_harness(
+            (
+                FakeContentResponse(
+                    "https://creator.douyin.com/verified/content/list",
+                    valid_content_payload("account-13-work"),
+                ),
+            )
+        )
+        starters = {
+            "account-12": first_starter,
+            "account-13": second_starter,
+        }
+        collector = DouyinDataCollector(
+            contract_loader=verified_content_contract,
+            playwright_factory=lambda: starters[threading.current_thread().name],
+            browser_timeout_seconds=0.2,
+        )
+        results: dict[int, CollectionBatch] = {}
+        errors: list[BaseException] = []
+
+        def run(account: dict, batch: CollectionBatch) -> None:
+            try:
+                results[account["id"]] = collector.complete_content_data(
+                    account, batch
+                )
+            except BaseException as error:
+                errors.append(error)
+
+        first_thread = threading.Thread(
+            target=run,
+            args=(self.account, self._account_batch(12)),
+            name="account-12",
+        )
+        second_thread = threading.Thread(
+            target=run,
+            args=(second_account, self._account_batch(13)),
+            name="account-13",
+        )
+        first_thread.start()
+        second_thread.start()
+        first_thread.join(1)
+        second_thread.join(1)
+
+        self.assertFalse(first_thread.is_alive())
+        self.assertFalse(second_thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            [item.content_id for item in results[12].contents],
+            ["account-12-work"],
+        )
+        self.assertEqual(
+            [item.content_id for item in results[13].contents],
+            ["account-13-work"],
+        )
+        self.assertIn(
+            "account:12",
+            {point.entity_key for point in results[12].metrics},
+        )
+        self.assertNotIn(
+            "account:12",
+            {point.entity_key for point in results[13].metrics},
+        )
 
 
 class DouyinBrowserSignedCollectorTests(DouyinDirectCollectorTests):
