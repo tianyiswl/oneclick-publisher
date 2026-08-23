@@ -502,6 +502,57 @@ class DouyinLocationServiceTests(unittest.TestCase):
         self.assertEqual(result[0]["distance"], "6.1km")
         self.assertEqual(result[0]["address"], "北海市银海区")
 
+    def test_public_candidate_requires_complete_platform_identity(self) -> None:
+        """名称、完整地址或平台 POI 标识缺一项都不能进入选择与发布。"""
+
+        complete = {
+            "poi_id": "poi-complete",
+            "poi_name": "北海银滩景区",
+            "address": "广西壮族自治区北海市银海区银滩大道中段",
+        }
+        self.assertIsNotNone(
+            douyin_location_service.normalize_location_candidate(complete)
+        )
+        for missing_field in ("poi_id", "poi_name", "address"):
+            incomplete = dict(complete)
+            incomplete.pop(missing_field)
+            with self.subTest(missing_field=missing_field):
+                self.assertIsNone(
+                    douyin_location_service.normalize_location_candidate(incomplete)
+                )
+
+    def test_addressless_rows_do_not_hide_later_complete_candidates(self) -> None:
+        """缺地址候选不能占满 12 条上限，挡住后面的完整平台地点。"""
+
+        addressless = [
+            {
+                "poi_id": f"poi-addressless-{index}",
+                "poi_name": f"缺地址地点 {index}",
+            }
+            for index in range(douyin_location_service.MAX_RESULTS)
+        ]
+        complete = {
+            "poi_id": "poi-complete",
+            "poi_name": "北海银滩景区",
+            "address": "广西壮族自治区北海市银海区银滩大道中段",
+        }
+
+        result = douyin_location_service.normalize_location_response(
+            {
+                "status_code": 0,
+                "poi_list": [*addressless, complete],
+            }
+        )
+
+        self.assertEqual(result, [
+            {
+                "poiId": "poi-complete",
+                "name": "北海银滩景区",
+                "address": "广西壮族自治区北海市银海区银滩大道中段",
+                "distance": "",
+            }
+        ])
+
     def test_nonzero_platform_status_is_a_safe_error(self) -> None:
         with self.assertRaisesRegex(
             douyin_location_service.DouyinLocationSearchError,
