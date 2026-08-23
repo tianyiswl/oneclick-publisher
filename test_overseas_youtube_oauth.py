@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """Offline contract tests for the desktop YouTube OAuth authorization flow."""
 
+import inspect
+import threading
 import unittest
 from dataclasses import FrozenInstanceError
 from urllib.parse import parse_qs, urlparse
@@ -122,6 +124,69 @@ class YouTubeOAuthAuthorizationContractTests(unittest.TestCase):
 
         with self.assertRaisesRegex(OAuthAuthorizationError, "authorization response invalid"):
             verifier.consume(callback_url)
+
+    def test_malformed_callback_is_normalized_without_echoing_its_value(self) -> None:
+        request = build_authorization_request("desktop-client-id")
+        verifier = OAuthCallbackVerifier(request)
+        malformed_callback = "http://[::1"
+
+        with self.assertRaisesRegex(OAuthAuthorizationError, "authorization response invalid") as raised:
+            verifier.consume(malformed_callback)
+
+        self.assertNotIn(malformed_callback, str(raised.exception))
+        self.assertNotIn(request.state, str(raised.exception))
+
+    def test_simultaneous_callbacks_allow_exactly_one_consumer(self) -> None:
+        request = build_authorization_request("desktop-client-id")
+        verifier = OAuthCallbackVerifier(request)
+        callback_url = f"{request.callback_url}?code=code-secret&state={request.state}"
+        source_lines, source_start = inspect.getsourcelines(OAuthCallbackVerifier.consume)
+        consumed_write_line = next(
+            source_start + index
+            for index, line in enumerate(source_lines)
+            if line.strip() == "self._consumed = True"
+        )
+        synchronized_check = threading.Barrier(2)
+        start = threading.Barrier(3)
+        successes: list[object] = []
+        errors: list[Exception] = []
+
+        def synchronize_unsynchronized_write(frame, event, argument):
+            del argument
+            if (
+                event == "line"
+                and frame.f_code is OAuthCallbackVerifier.consume.__code__
+                and frame.f_lineno == consumed_write_line
+            ):
+                try:
+                    synchronized_check.wait(timeout=0.2)
+                except threading.BrokenBarrierError:
+                    pass
+            return synchronize_unsynchronized_write
+
+        def consume_callback() -> None:
+            start.wait()
+            try:
+                successes.append(verifier.consume(callback_url))
+            except Exception as error:
+                errors.append(error)
+
+        previous_trace = threading.gettrace()
+        threading.settrace(synchronize_unsynchronized_write)
+        try:
+            threads = [threading.Thread(target=consume_callback) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            start.wait()
+            for thread in threads:
+                thread.join()
+        finally:
+            threading.settrace(previous_trace)
+
+        self.assertEqual(len(successes), 1)
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], OAuthAuthorizationError)
+        self.assertEqual(str(errors[0]), "authorization response already consumed")
 
     def test_callback_can_only_be_consumed_once(self) -> None:
         request = build_authorization_request("desktop-client-id")

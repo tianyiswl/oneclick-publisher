@@ -6,6 +6,7 @@ import base64
 import hashlib
 import secrets
 import socket
+import threading
 from dataclasses import dataclass, field
 from urllib.parse import ParseResult, parse_qs, urlencode, urlparse, urlunparse
 
@@ -77,15 +78,20 @@ class OAuthCallbackVerifier:
     def __init__(self, request: OAuthAuthorizationRequest) -> None:
         self._request = request
         self._consumed = False
+        self._consume_lock = threading.Lock()
 
     def consume(self, callback_url: str) -> OAuthAuthorizationCallback:
         """Verify one loopback callback, rejecting every later callback safely."""
-        if self._consumed:
-            raise OAuthAuthorizationError("authorization response already consumed")
-        self._consumed = True
+        with self._consume_lock:
+            if self._consumed:
+                raise OAuthAuthorizationError("authorization response already consumed")
+            self._consumed = True
 
-        parsed = urlparse(callback_url)
-        expected = urlparse(self._request.callback_url)
+        try:
+            parsed = urlparse(callback_url)
+            expected = urlparse(self._request.callback_url)
+        except ValueError:
+            raise OAuthAuthorizationError("authorization response invalid") from None
         if not _matches_callback_endpoint(parsed, expected):
             raise OAuthAuthorizationError("authorization response invalid")
 
