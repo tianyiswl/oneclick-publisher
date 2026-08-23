@@ -462,11 +462,18 @@ class FakeMacSecurity:
             return self.NOT_FOUND
         if self.secret is None:
             return self.NOT_FOUND
-        value = self.secret if type(self.secret) is bytes else self.secret.encode("utf-8")
-        native = ctypes.create_string_buffer(value, len(value))
-        self.returned.append(native)
-        password_length_out._obj.value = len(value)
-        password_data_out._obj.value = ctypes.addressof(native)
+        if password_length_out is not None or password_data_out is not None:
+            assert password_length_out is not None
+            assert password_data_out is not None
+            value = (
+                self.secret
+                if type(self.secret) is bytes
+                else self.secret.encode("utf-8")
+            )
+            native = ctypes.create_string_buffer(value, len(value))
+            self.returned.append(native)
+            password_length_out._obj.value = len(value)
+            password_data_out._obj.value = ctypes.addressof(native)
         item_out._obj.value = 0x1234
         return 0
 
@@ -776,6 +783,105 @@ class CommentAiSettingsTests(unittest.TestCase):
 
 
 class CommentSecretStoreTests(unittest.TestCase):
+    def test_is_configured_checks_native_existence_without_copying_secret(self):
+        """Existence probes must never copy or decode the stored credential blob."""
+
+        for platform_name, native_attribute in (
+            ("darwin", "mac"),
+            ("win32", "windows"),
+        ):
+            native = FakeCtypes()
+            getattr(native, native_attribute).secret = "status-private-marker"
+            copied = []
+
+            def forbidden_string_at(*args):
+                copied.append(args)
+                raise AssertionError("existence probe must not copy credential bytes")
+
+            native.string_at = forbidden_string_at
+            store = CommentSecretStore(
+                platform_name=platform_name,
+                ctypes_module=native,
+            )
+
+            with self.subTest(platform=platform_name):
+                self.assertTrue(hasattr(store, "is_configured"))
+                self.assertTrue(store.is_configured())
+                self.assertEqual(copied, [])
+                if platform_name == "darwin":
+                    self.assertEqual(native.mac.returned, [])
+                    self.assertEqual(native.mac.freed, [])
+                    self.assertEqual(len(native.core.released), 1)
+                else:
+                    self.assertEqual(len(native.windows.read_refs), 1)
+                    self.assertEqual(len(native.windows.freed), 1)
+
+    def test_is_configured_returns_false_only_for_absent_native_credential(self):
+        """A missing item is a safe false result; unsupported/native errors are fixed failures."""
+
+        for platform_name in ("darwin", "win32"):
+            store = CommentSecretStore(
+                platform_name=platform_name,
+                ctypes_module=FakeCtypes(),
+            )
+            with self.subTest(platform=platform_name):
+                self.assertTrue(hasattr(store, "is_configured"))
+                self.assertFalse(store.is_configured())
+
+        failing = (
+            CommentSecretStore(platform_name="linux", ctypes_module=FakeCtypes()),
+            CommentSecretStore(
+                platform_name="darwin",
+                ctypes_module=FakeCtypes(mac_fail=-50),
+            ),
+            CommentSecretStore(
+                platform_name="win32",
+                ctypes_module=FakeCtypes(windows_fail=5),
+            ),
+        )
+        for store in failing:
+            with self.subTest(platform=store._platform):
+                self.assertTrue(hasattr(store, "is_configured"))
+                with self.assertRaises(CommentInsightFailure) as raised:
+                    store.is_configured()
+                self.assertEqual(
+                    raised.exception.error_code,
+                    "comment_ai_not_configured",
+                )
+                self.assertEqual(str(raised.exception), "comment_ai_not_configured")
+
+    def test_is_configured_preserves_safe_process_control_after_cleanup(self):
+        """Native process-control exceptions must be rebuilt only after owned handles close."""
+
+        cases = (
+            ("darwin", KeyboardInterrupt(), KeyboardInterrupt, None),
+            ("darwin", SystemExit(37), SystemExit, 37),
+            ("win32", KeyboardInterrupt(), KeyboardInterrupt, None),
+            ("win32", SystemExit("private-status-code"), SystemExit, 1),
+        )
+        for platform_name, control, expected, expected_code in cases:
+            kwargs = (
+                {"mac_fail": control}
+                if platform_name == "darwin"
+                else {"windows_fail": control}
+            )
+            native = FakeCtypes(**kwargs)
+            store = CommentSecretStore(
+                platform_name=platform_name,
+                ctypes_module=native,
+            )
+            with self.subTest(platform=platform_name, control=type(control).__name__):
+                self.assertTrue(hasattr(store, "is_configured"))
+                with self.assertRaises(expected) as raised:
+                    store.is_configured()
+                if expected is SystemExit:
+                    self.assertEqual(raised.exception.code, expected_code)
+                if platform_name == "darwin":
+                    self.assertEqual(native.mac.freed, [])
+                    self.assertEqual(native.core.released, [])
+                else:
+                    self.assertEqual(native.windows.freed, [])
+
     def test_macos_ctypes_backend_writes_reads_replaces_and_deletes(self):
         native = FakeCtypes()
         store = CommentSecretStore(platform_name="darwin", ctypes_module=native)

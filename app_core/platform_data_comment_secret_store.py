@@ -129,6 +129,33 @@ class CommentSecretStore:
         self = None
         _raise_clean_outcome(outcome)
 
+    def is_configured(self) -> bool:
+        """Return credential existence without reading or copying its value."""
+
+        outcome = self._configured_outcome()
+        if outcome[0] == _OUTCOME_OK:
+            return outcome[1]
+        self = None
+        _raise_clean_outcome(outcome)
+
+    def _configured_outcome(self):
+        value = None
+        try:
+            if self._platform == "darwin":
+                value = self._mac_is_configured()
+            elif self._platform == "win32":
+                value = self._windows_is_configured()
+            else:
+                raise _not_configured()
+            return (_OUTCOME_OK, value)
+        except _PROCESS_CONTROL as error:
+            return (_OUTCOME_CONTROL, _control_outcome_value(error))
+        except BaseException:
+            return (_OUTCOME_FAILURE, None)
+        finally:
+            self = None
+            value = None
+
     def _read_outcome(self):
         try:
             if self._platform == "darwin":
@@ -428,6 +455,49 @@ class CommentSecretStore:
         )
         return value
 
+    def _mac_is_configured(self) -> bool:
+        ctypes = self._ctypes
+        security, core = self._mac_libraries()
+        service, account = self._mac_names()
+        item_ref = ctypes.c_void_p()
+        status = None
+        outcome = None
+        error = None
+        try:
+            status = security.SecKeychainFindGenericPassword(
+                None,
+                len(SERVICE_NAME.encode("utf-8")),
+                ctypes.cast(service, ctypes.c_void_p),
+                len(ACCOUNT_NAME.encode("utf-8")),
+                ctypes.cast(account, ctypes.c_void_p),
+                None,
+                None,
+                ctypes.byref(item_ref),
+            )
+        except BaseException as error:
+            outcome = _first_outcome(outcome, _error_outcome(error))
+        release_outcome = self._mac_release_outcome(core, item_ref)
+        outcome = _first_outcome(outcome, release_outcome)
+        result = status == 0 and bool(item_ref.value)
+        missing = status == _MAC_NOT_FOUND and not item_ref.value
+        ctypes = None
+        security = None
+        core = None
+        service = None
+        account = None
+        item_ref = None
+        status = None
+        error = None
+        release_outcome = None
+        self = None
+        if outcome is not None:
+            _raise_clean_outcome(outcome)
+        if missing:
+            return False
+        if not result:
+            raise _not_configured()
+        return True
+
     def _mac_write(self, mutable: bytearray) -> None:
         ctypes = self._ctypes
         security, core = self._mac_libraries()
@@ -647,6 +717,54 @@ class CommentSecretStore:
         result = value
         value = None
         return result
+
+    def _windows_is_configured(self) -> bool:
+        ctypes = self._ctypes
+        credential_type, credential_pointer_type, wintypes = self._windows_types()
+        advapi = self._windows_library(
+            credential_type, credential_pointer_type, wintypes
+        )
+        credential_pointer = credential_pointer_type()
+        succeeded = None
+        last_error = None
+        outcome = None
+        error = None
+        try:
+            succeeded = advapi.CredReadW(
+                SERVICE_NAME,
+                _WINDOWS_CREDENTIAL_TYPE_GENERIC,
+                0,
+                ctypes.byref(credential_pointer),
+            )
+            if not succeeded:
+                last_error = ctypes.get_last_error()
+        except BaseException as error:
+            outcome = _first_outcome(outcome, _error_outcome(error))
+        cleanup_outcome = self._windows_free_outcome(
+            advapi,
+            credential_pointer,
+        )
+        outcome = _first_outcome(outcome, cleanup_outcome)
+        result = bool(succeeded) and bool(credential_pointer)
+        missing = not succeeded and last_error == _WINDOWS_NOT_FOUND
+        ctypes = None
+        credential_type = None
+        credential_pointer_type = None
+        wintypes = None
+        advapi = None
+        credential_pointer = None
+        succeeded = None
+        last_error = None
+        error = None
+        cleanup_outcome = None
+        self = None
+        if outcome is not None:
+            _raise_clean_outcome(outcome)
+        if missing:
+            return False
+        if not result:
+            raise _not_configured()
+        return True
 
     def _windows_write(self, mutable: bytearray) -> None:
         ctypes = self._ctypes

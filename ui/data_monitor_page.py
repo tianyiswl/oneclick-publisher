@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import asyncio
+from datetime import datetime
 import math
 import time
 
@@ -38,6 +40,8 @@ from app_core.platform_data_collection_errors import PUBLIC_PLATFORM_DATA_ERROR_
 from app_core.platform_data_comment_ai import OpenAiCompatibleCommentProvider
 from app_core.platform_data_comment_secret_store import CommentSecretStore
 from app_core.platform_data_comment_settings import (
+    BASE_URL_KEY,
+    MODEL_KEY,
     CommentAiSettings,
     load_ai_settings,
     save_ai_settings,
@@ -84,6 +88,16 @@ PROGRESS_TEXT = {
 
 COMMENT_LABELS = ("质疑", "认同", "真实经历", "追问", "选题建议", "其他")
 
+_COMMENT_AI_ERROR_CODES = frozenset(
+    {
+        "comment_ai_not_configured",
+        "comment_ai_timeout",
+        "comment_ai_service_unavailable",
+        "comment_ai_response_invalid",
+        "comment_ai_evidence_invalid",
+    }
+)
+
 COMMENT_ERROR_TEXT = {
     "comment_content_unavailable": "所选作品暂时无法同步评论",
     "comment_login_required": "抖音登录状态已失效",
@@ -98,6 +112,11 @@ COMMENT_ERROR_TEXT = {
     "comment_ai_response_invalid": "AI 洞察结果不合格",
     "comment_ai_evidence_invalid": "AI 洞察证据不合格",
 }
+
+_UI_OUTCOME_OK = "ok"
+_UI_OUTCOME_FAILURE = "failure"
+_UI_OUTCOME_CONTROL = "control"
+_UI_PROCESS_CONTROL = (asyncio.CancelledError, KeyboardInterrupt, SystemExit)
 
 ERROR_TEXT = PUBLIC_PLATFORM_DATA_ERROR_TEXT
 
@@ -193,6 +212,16 @@ def _valid_timestamp(value: object) -> bool:
     return QDateTime.fromString(value, Qt.DateFormat.ISODate).isValid()
 
 
+def _valid_comment_timestamp(value: object) -> bool:
+    if type(value) is not str or not value or value != value.strip():
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return False
+    return parsed.tzinfo is not None and parsed.utcoffset() is not None
+
+
 def _comment_error_text(value: object) -> str:
     code = value if type(value) is str else ""
     return COMMENT_ERROR_TEXT.get(code, "评论同步未完成")
@@ -214,6 +243,194 @@ def _build_comment_ai_provider():
         secret = None
 
 
+def _ui_control_value(error: BaseException) -> tuple[str, int | None]:
+    if isinstance(error, asyncio.CancelledError):
+        return "cancelled", None
+    if isinstance(error, KeyboardInterrupt):
+        return "keyboard_interrupt", None
+    code = error.code if isinstance(error, SystemExit) else None
+    if type(code) is not int or not -2_147_483_648 <= code <= 2_147_483_647:
+        code = 1
+    return "system_exit", code
+
+
+def _ui_error_outcome(error: BaseException):
+    if isinstance(error, _UI_PROCESS_CONTROL):
+        return _UI_OUTCOME_CONTROL, _ui_control_value(error)
+    return _UI_OUTCOME_FAILURE, None
+
+
+def _first_ui_outcome(current, candidate):
+    if candidate is None:
+        return current
+    if current is None:
+        return candidate
+    if current[0] != _UI_OUTCOME_CONTROL and candidate[0] == _UI_OUTCOME_CONTROL:
+        return candidate
+    return current
+
+
+def _raise_clean_ui_control(outcome) -> None:
+    control, code = outcome[1]
+    if control == "cancelled":
+        error = asyncio.CancelledError()
+    elif control == "keyboard_interrupt":
+        error = KeyboardInterrupt()
+    else:
+        error = SystemExit(code)
+    outcome = None
+    error.__traceback__ = None
+    error.__context__ = None
+    error.__cause__ = None
+    raise error from None
+
+
+def _zero_secret_buffer(value: bytearray) -> None:
+    for index in range(len(value)):
+        value[index] = 0
+
+
+def _take_secret_buffer(line_edit: QLineEdit):
+    raw = None
+    result = None
+    outcome = None
+    error = None
+    try:
+        raw = line_edit.text()
+        line_edit.clear()
+        result = bytearray(raw, "utf-8")
+    except BaseException as error:
+        outcome = _first_ui_outcome(outcome, _ui_error_outcome(error))
+    try:
+        line_edit.clear()
+    except BaseException as error:
+        outcome = _first_ui_outcome(outcome, _ui_error_outcome(error))
+    raw = None
+    line_edit = None
+    error = None
+    if outcome is not None:
+        if type(result) is bytearray:
+            _zero_secret_buffer(result)
+        result = None
+        return outcome
+    return _UI_OUTCOME_OK, result
+
+
+def _nonsecret_settings_snapshot(settings) -> tuple[tuple[bool, object], ...]:
+    return tuple(
+        (bool(settings.contains(key)), settings.value(key, None))
+        for key in (BASE_URL_KEY, MODEL_KEY)
+    )
+
+
+def _settings_sync_succeeded(settings) -> bool:
+    return settings.status() == QSettings.Status.NoError
+
+
+def _save_nonsecret_settings(settings, value: CommentAiSettings) -> None:
+    save_ai_settings(settings, value)
+    if not _settings_sync_succeeded(settings):
+        raise RuntimeError("settings sync failed")
+
+
+def _restore_nonsecret_settings(
+    settings,
+    snapshot: tuple[tuple[bool, object], ...],
+) -> None:
+    for key, (existed, value) in zip(
+        (BASE_URL_KEY, MODEL_KEY),
+        snapshot,
+        strict=True,
+    ):
+        if existed:
+            settings.setValue(key, value)
+        else:
+            settings.remove(key)
+    settings.sync()
+    if not _settings_sync_succeeded(settings):
+        raise RuntimeError("settings rollback failed")
+
+
+def _settings_value_outcome(base_input: QLineEdit, model_input: QLineEdit):
+    value = None
+    outcome = None
+    error = None
+    try:
+        value = CommentAiSettings(base_input.text(), model_input.text())
+    except BaseException as error:
+        outcome = _ui_error_outcome(error)
+    base_input = None
+    model_input = None
+    error = None
+    if outcome is not None:
+        value = None
+        return outcome
+    return _UI_OUTCOME_OK, value
+
+
+def _settings_snapshot_outcome(settings):
+    snapshot = None
+    outcome = None
+    error = None
+    try:
+        snapshot = _nonsecret_settings_snapshot(settings)
+    except BaseException as error:
+        outcome = _ui_error_outcome(error)
+    settings = None
+    error = None
+    if outcome is not None:
+        snapshot = None
+        return outcome
+    return _UI_OUTCOME_OK, snapshot
+
+
+def _save_nonsecret_settings_outcome(settings, value: CommentAiSettings):
+    outcome = None
+    error = None
+    try:
+        _save_nonsecret_settings(settings, value)
+    except BaseException as error:
+        outcome = _ui_error_outcome(error)
+    settings = None
+    value = None
+    error = None
+    return outcome or (_UI_OUTCOME_OK, None)
+
+
+def _restore_nonsecret_settings_outcome(settings, snapshot):
+    outcome = None
+    error = None
+    try:
+        _restore_nonsecret_settings(settings, snapshot)
+    except BaseException as error:
+        outcome = _ui_error_outcome(error)
+    settings = None
+    snapshot = None
+    error = None
+    return outcome or (_UI_OUTCOME_OK, None)
+
+
+def _write_secret_buffer_outcome(secret_store, mutable: bytearray):
+    secret_text = None
+    outcome = None
+    error = None
+    try:
+        if type(mutable) is not bytearray or not mutable:
+            raise ValueError("invalid secret buffer")
+        secret_text = mutable.decode("utf-8")
+        secret_store.write(secret_text)
+    except BaseException as error:
+        outcome = _ui_error_outcome(error)
+    finally:
+        secret_text = None
+        if type(mutable) is bytearray:
+            _zero_secret_buffer(mutable)
+        mutable = None
+        secret_store = None
+        error = None
+    return outcome or (_UI_OUTCOME_OK, None)
+
+
 class _CommentAiSettingsDialog(QDialog):
     """只编辑非秘密配置和一次性新密钥，从不读回旧密钥。"""
 
@@ -223,7 +440,6 @@ class _CommentAiSettingsDialog(QDialog):
         *,
         settings=None,
         secret_store=None,
-        secret_configured: bool | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("AI 设置")
@@ -233,11 +449,11 @@ class _CommentAiSettingsDialog(QDialog):
             secret_store if secret_store is not None else CommentSecretStore()
         )
         loaded = load_ai_settings(self._settings)
-        self._secret_configured = (
-            bool(secret_configured)
-            if type(secret_configured) is bool
-            else loaded is not None
-        )
+        try:
+            configured = self._secret_store.is_configured()
+        except Exception:
+            configured = False
+        self._secret_configured = configured if type(configured) is bool else False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 18, 20, 18)
@@ -285,22 +501,103 @@ class _CommentAiSettingsDialog(QDialog):
         self.secret_status_label.setText(f"密钥状态：{state}")
 
     def _save(self) -> None:
+        secret_buffer = None
+        take_outcome = None
+        settings_outcome = None
+        snapshot_outcome = None
+        save_outcome = None
+        secret_outcome = None
+        rollback_outcome = None
+        final_outcome = None
+        settings_value = None
+        snapshot = None
+        secret_replaced = False
         try:
-            value = CommentAiSettings(
-                self.base_url_input.text(),
-                self.model_input.text(),
-            )
-            new_secret = self.secret_input.text()
-            if new_secret:
-                self._secret_store.write(new_secret)
-                self._secret_configured = True
-            save_ai_settings(self._settings, value)
-        except Exception:
-            self.secret_input.clear()
+            take_outcome = _take_secret_buffer(self.secret_input)
+            if take_outcome[0] == _UI_OUTCOME_OK:
+                secret_buffer = take_outcome[1]
+            else:
+                final_outcome = take_outcome
+
+            if final_outcome is None:
+                settings_outcome = _settings_value_outcome(
+                    self.base_url_input,
+                    self.model_input,
+                )
+                if settings_outcome[0] == _UI_OUTCOME_OK:
+                    settings_value = settings_outcome[1]
+                else:
+                    final_outcome = settings_outcome
+
+            if final_outcome is None:
+                snapshot_outcome = _settings_snapshot_outcome(self._settings)
+                if snapshot_outcome[0] == _UI_OUTCOME_OK:
+                    snapshot = snapshot_outcome[1]
+                else:
+                    final_outcome = snapshot_outcome
+
+            if final_outcome is None:
+                save_outcome = _save_nonsecret_settings_outcome(
+                    self._settings,
+                    settings_value,
+                )
+                if save_outcome[0] != _UI_OUTCOME_OK:
+                    final_outcome = save_outcome
+
+            if (
+                final_outcome is None
+                and type(secret_buffer) is bytearray
+                and secret_buffer
+            ):
+                secret_outcome = _write_secret_buffer_outcome(
+                    self._secret_store,
+                    secret_buffer,
+                )
+                secret_buffer = None
+                if secret_outcome[0] == _UI_OUTCOME_OK:
+                    secret_replaced = True
+                else:
+                    rollback_outcome = _restore_nonsecret_settings_outcome(
+                        self._settings,
+                        snapshot,
+                    )
+                    final_outcome = _first_ui_outcome(
+                        secret_outcome,
+                        None
+                        if rollback_outcome[0] == _UI_OUTCOME_OK
+                        else rollback_outcome,
+                    )
+        finally:
+            try:
+                self.secret_input.clear()
+            except BaseException as error:
+                final_outcome = _first_ui_outcome(
+                    final_outcome,
+                    _ui_error_outcome(error),
+                )
+                error = None
+            if type(secret_buffer) is bytearray:
+                _zero_secret_buffer(secret_buffer)
+            secret_buffer = None
+            take_outcome = None
+            settings_outcome = None
+            snapshot_outcome = None
+            save_outcome = None
+            secret_outcome = None
+            rollback_outcome = None
+            settings_value = None
+            snapshot = None
+
+        if final_outcome is not None:
+            if final_outcome[0] == _UI_OUTCOME_CONTROL:
+                control_outcome = final_outcome
+                final_outcome = None
+                _raise_clean_ui_control(control_outcome)
             self.feedback_label.setText("设置未保存，请检查 HTTPS 地址、模型和密钥")
             self._render_secret_status()
             return
-        self.secret_input.clear()
+        if secret_replaced:
+            self._secret_configured = True
         self.feedback_label.setText("")
         self._render_secret_status()
         self.accept()
@@ -857,15 +1154,16 @@ class DataMonitorPage(QWidget):
             type(ref) is not str
             or len(ref) != 4
             or not ref.startswith("C")
-            or not ref[1:].isdigit()
+            or any(character < "0" or character > "9" for character in ref[1:])
             or type(body) is not str
-            or not body
+            or not body.strip()
             or type(likes) is not int
             or likes < 0
             or type(replies) is not int
             or replies < 0
-            or not _valid_timestamp(commented_at)
+            or not _valid_comment_timestamp(commented_at)
             or type(labels) is not list
+            or len(labels) > len(COMMENT_LABELS)
             or any(type(label) is not str or label not in COMMENT_LABELS for label in labels)
             or len(labels) != len(set(labels))
         ):
@@ -891,7 +1189,14 @@ class DataMonitorPage(QWidget):
             raise ValueError("invalid comment panel payload")
         raw_rows = payload.get("comments")
         raw_candidates = payload.get("candidates")
-        if type(raw_rows) is not list or type(raw_candidates) is not list:
+        title = payload.get("title")
+        if (
+            type(title) is not str
+            or type(raw_rows) is not list
+            or len(raw_rows) > 100
+            or type(raw_candidates) is not list
+            or len(raw_candidates) > 5
+        ):
             raise ValueError("invalid comment panel payload")
         rows = []
         by_ref: dict[str, dict] = {}
@@ -922,15 +1227,21 @@ class DataMonitorPage(QWidget):
                 or reason != reason.strip()
                 or type(evidence) is not list
                 or not evidence
+                or len(evidence) > 100
             ):
                 raise ValueError("invalid comment panel payload")
             canonical_evidence = []
             seen_refs = set()
             for raw_evidence in evidence:
-                if type(raw_evidence) is not dict:
+                projected = self._safe_comment_row(raw_evidence)
+                if projected is None:
                     raise ValueError("invalid comment panel payload")
-                ref = raw_evidence.get("ref")
-                if type(ref) is not str or ref in seen_refs or ref not in by_ref:
+                ref = projected["ref"]
+                if (
+                    ref in seen_refs
+                    or ref not in by_ref
+                    or projected != by_ref[ref]
+                ):
                     raise ValueError("invalid comment panel payload")
                 seen_refs.add(ref)
                 canonical_evidence.append(by_ref[ref])
@@ -943,11 +1254,24 @@ class DataMonitorPage(QWidget):
             )
 
         last_sync_at = payload.get("lastSyncAt")
-        if last_sync_at != "" and not _valid_timestamp(last_sync_at):
+        if last_sync_at != "" and not _valid_comment_timestamp(last_sync_at):
             raise ValueError("invalid comment panel payload")
         ai_status = payload.get("aiStatus")
         ai_error_code = payload.get("aiErrorCode")
-        if ai_status not in {"success", "failed", "skipped"} or type(ai_error_code) is not str:
+        if type(ai_status) is not str or type(ai_error_code) is not str:
+            raise ValueError("invalid comment panel payload")
+        if (
+            (ai_status == "success" and ai_error_code != "")
+            or (
+                ai_status == "failed"
+                and ai_error_code not in _COMMENT_AI_ERROR_CODES
+            )
+            or (
+                ai_status == "skipped"
+                and ai_error_code != "comment_ai_not_configured"
+            )
+            or ai_status not in {"success", "failed", "skipped"}
+        ):
             raise ValueError("invalid comment panel payload")
 
         self._comment_rows = tuple(rows)
@@ -955,7 +1279,11 @@ class DataMonitorPage(QWidget):
         self.comment_last_sync_label.setText(
             f"最近同步：{last_sync_at or '—'}"
         )
-        if ai_status == "success":
+        if not rows and not last_sync_at:
+            self.comment_status_label.setText("尚未同步评论")
+        elif not rows:
+            self.comment_status_label.setText("评论已同步，当前没有评论")
+        elif ai_status == "success":
             self.comment_status_label.setText("评论与洞察已从本地读取")
         elif ai_status == "skipped" and ai_error_code == "comment_ai_not_configured":
             self.comment_status_label.setText("评论已同步，AI 未配置")

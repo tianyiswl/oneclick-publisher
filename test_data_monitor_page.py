@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta
 import math
 import os
@@ -14,7 +15,7 @@ from zoneinfo import ZoneInfo
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QSettings, Qt
 from PyQt6.QtTest import QSignalSpy
 from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import (
@@ -305,12 +306,7 @@ def comment_panel_payload(content_id: str = "work-7") -> dict:
             {
                 "title": "回答这条质疑",
                 "reason": "解释读者关心的问题",
-                "evidence": [
-                    {
-                        **first,
-                        "body": "不得显示的伪造证据正文",
-                    }
-                ],
+                "evidence": [dict(first)],
             }
         ],
         "aiStatus": "success",
@@ -319,36 +315,120 @@ def comment_panel_payload(content_id: str = "work-7") -> dict:
 
 
 class FakeSettings:
-    def __init__(self, values: dict | None = None) -> None:
+    def __init__(
+        self,
+        values: dict | None = None,
+        *,
+        sync_failures: tuple[int, ...] = (),
+        sync_controls: dict[int, BaseException] | None = None,
+        statuses: tuple[QSettings.Status, ...] = (),
+        events: list[str] | None = None,
+    ) -> None:
         self.values = dict(values or {})
         self.synced = 0
+        self.sync_failures = sync_failures
+        self.sync_controls = dict(sync_controls or {})
+        self.statuses = statuses
+        self.events = events
 
     def value(self, key: str, default=None):
         return self.values.get(key, default)
 
     def setValue(self, key: str, value: object) -> None:  # noqa: N802
+        if self.events is not None:
+            self.events.append(f"settings:set:{key}")
         self.values[key] = value
+
+    def contains(self, key: str) -> bool:
+        return key in self.values
+
+    def remove(self, key: str) -> None:
+        if self.events is not None:
+            self.events.append(f"settings:remove:{key}")
+        self.values.pop(key, None)
 
     def sync(self) -> None:
         self.synced += 1
+        if self.events is not None:
+            self.events.append(f"settings:sync:{self.synced}")
+        if self.synced in self.sync_failures:
+            raise RuntimeError("private-settings-sync-error")
+        if self.synced in self.sync_controls:
+            raise self.sync_controls[self.synced]
+
+    def status(self) -> QSettings.Status:
+        if self.events is not None:
+            self.events.append(f"settings:status:{self.synced}")
+        if self.statuses:
+            index = min(max(self.synced - 1, 0), len(self.statuses) - 1)
+            return self.statuses[index]
+        return QSettings.Status.NoError
 
 
 class FakeSecretStore:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        configured: bool = False,
+        write_error: BaseException | None = None,
+        events: list[str] | None = None,
+    ) -> None:
         self.read_count = 0
+        self.status_count = 0
         self.writes: list[str] = []
         self.delete_count = 0
+        self.configured = configured
+        self.write_error = write_error
+        self.events = events
 
     def read(self):
         self.read_count += 1
         raise AssertionError("AI 设置对话框不得读回现有密钥")
 
+    def is_configured(self) -> bool:
+        self.status_count += 1
+        return self.configured
+
     def write(self, secret: str) -> None:
+        if self.events is not None:
+            self.events.append("secret:write")
+        if self.write_error is not None:
+            error = self.write_error
+            secret = None
+            raise error
         self.writes.append(secret)
+        self.configured = True
 
     def delete(self) -> None:
         self.delete_count += 1
+        self.configured = False
 
+
+def ui_exception_trace_text(error: BaseException) -> str:
+    """Project public frames must not retain a key after a failure escapes."""
+
+    pending = [error]
+    seen = set()
+    parts = []
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        parts.append(repr(current))
+        trace = current.__traceback__
+        while trace is not None:
+            filename = trace.tb_frame.f_code.co_filename.replace("\\", "/")
+            if "/ui/" in filename or "/app_core/" in filename:
+                parts.append(trace.tb_frame.f_code.co_name)
+                for name, value in trace.tb_frame.f_locals.items():
+                    parts.append(f"{name}={value!r}")
+            trace = trace.tb_next
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+    return "\n".join(parts)
 
 def failed_summary() -> dict:
     summary = period_summary(status="failed", error_code="login_required")
@@ -1832,7 +1912,7 @@ class DataMonitorPageTests(unittest.TestCase):
         )
 
     def test_comment_filter_and_candidate_evidence_use_canonical_local_rows(self) -> None:
-        """选题证据若直接信任候选对象，可能展示不在本地评论列表中的伪造正文。"""
+        """选题证据必须和当前本地评论的受控投影完全一致。"""
 
         page = self._page(contents=available_douyin_contents())
         with patch(
@@ -1852,7 +1932,130 @@ class DataMonitorPageTests(unittest.TestCase):
         )
         evidence = page.comment_candidate_tree.topLevelItem(0).child(0).text(0)
         self.assertIn("第一篇的质疑原文", evidence)
-        self.assertNotIn("不得显示的伪造证据正文", evidence)
+
+    def test_comment_panel_rejects_wrong_builtins_caps_and_status_pairs_as_a_whole(self) -> None:
+        """面板合同的标量、内建容器、数量上限和 AI 状态必须同时合法。"""
+
+        class CustomList(list):
+            pass
+
+        title_payload = comment_panel_payload()
+        title_payload["title"] = True
+
+        custom_payload = comment_panel_payload()
+        custom_payload["comments"] = CustomList(custom_payload["comments"])
+
+        oversized_comments = comment_panel_payload()
+        template = oversized_comments["comments"][0]
+        oversized_comments["comments"] = [
+            {**template, "ref": f"C{index:03d}"}
+            for index in range(1, 102)
+        ]
+
+        oversized_candidates = comment_panel_payload()
+        candidate = oversized_candidates["candidates"][0]
+        oversized_candidates["candidates"] = [
+            {
+                **candidate,
+                "title": f"候选 {index}",
+                "evidence": [dict(candidate["evidence"][0])],
+            }
+            for index in range(6)
+        ]
+
+        invalid_pair = comment_panel_payload()
+        invalid_pair["aiErrorCode"] = "comment_ai_not_configured"
+
+        cases = (
+            ("title-bool", title_payload),
+            ("custom-comments", custom_payload),
+            ("comments-over-100", oversized_comments),
+            ("candidates-over-5", oversized_candidates),
+            ("success-with-error", invalid_pair),
+        )
+        for name, payload in cases:
+            with self.subTest(case=name):
+                page = self._page(contents=available_douyin_contents())
+                with patch(
+                    "ui.data_monitor_page.platform_data_comment_service.comment_panel_payload",
+                    return_value=payload,
+                ):
+                    page.content_table.selectRow(0)
+                self.assertEqual(
+                    page.comment_status_label.text(),
+                    "评论数据暂未接通，请稍后再试",
+                )
+                self.assertEqual(page.comment_table.rowCount(), 0)
+                self.assertEqual(page.comment_candidate_tree.topLevelItemCount(), 0)
+
+    def test_comment_panel_rejects_forged_evidence_and_internal_ids_as_a_whole(self) -> None:
+        """候选证据不得携带内部 ID，也不得替换当前本地原文。"""
+
+        leaked = comment_panel_payload()
+        leaked["candidates"][0]["evidence"][0]["commentKey"] = (
+            "private-comment-key-marker"
+        )
+        forged = comment_panel_payload()
+        forged["candidates"][0]["evidence"][0]["body"] = (
+            "forged-evidence-body-marker"
+        )
+
+        for name, payload, marker in (
+            ("internal-id", leaked, "private-comment-key-marker"),
+            ("forged-body", forged, "forged-evidence-body-marker"),
+        ):
+            with self.subTest(case=name):
+                page = self._page(contents=available_douyin_contents())
+                with patch(
+                    "ui.data_monitor_page.platform_data_comment_service.comment_panel_payload",
+                    return_value=payload,
+                ):
+                    page.content_table.selectRow(0)
+                self.assertEqual(
+                    page.comment_status_label.text(),
+                    "评论数据暂未接通，请稍后再试",
+                )
+                self.assertEqual(page.comment_table.rowCount(), 0)
+                self.assertEqual(page.comment_candidate_tree.topLevelItemCount(), 0)
+                self.assertNotIn(marker, page.comment_status_label.text())
+
+    def test_comment_panel_distinguishes_never_synced_from_synced_empty(self) -> None:
+        """没有成功同步记录不能冒充成“已同步但没评论”。"""
+
+        never_synced = {
+            "title": "同名作品",
+            "lastSyncAt": "",
+            "comments": [],
+            "candidates": [],
+            "aiStatus": "skipped",
+            "aiErrorCode": "comment_ai_not_configured",
+        }
+        synced_empty = {
+            **never_synced,
+            "lastSyncAt": "2026-08-21T10:05:00+08:00",
+        }
+
+        cases = (
+            (never_synced, "尚未同步评论", "最近同步：—"),
+            (
+                synced_empty,
+                "评论已同步，当前没有评论",
+                "最近同步：2026-08-21T10:05:00+08:00",
+            ),
+        )
+        for payload, expected_status, expected_sync in cases:
+            with self.subTest(last_sync_at=payload["lastSyncAt"]):
+                page = self._page(contents=available_douyin_contents())
+                with patch(
+                    "ui.data_monitor_page.platform_data_comment_service.comment_panel_payload",
+                    return_value=payload,
+                ):
+                    page.content_table.selectRow(0)
+                self.assertEqual(page.comment_status_label.text(), expected_status)
+                self.assertEqual(page.comment_last_sync_label.text(), expected_sync)
+                if payload["lastSyncAt"] == "":
+                    self.assertNotIn("已同步", page.comment_status_label.text())
+                    self.assertNotIn("AI 未配置", page.comment_status_label.text())
 
     def test_comment_panel_has_no_platform_write_actions_or_identifiers(self) -> None:
         """评论洞察不是评论管理，不得出现任何平台写操作或内部标识。"""
@@ -1954,7 +2157,7 @@ class DataMonitorPageTests(unittest.TestCase):
                 MODEL_KEY: "model-old",
             }
         )
-        secret_store = FakeSecretStore()
+        secret_store = FakeSecretStore(configured=True)
         dialog = _CommentAiSettingsDialog(
             settings=settings,
             secret_store=secret_store,
@@ -1962,6 +2165,7 @@ class DataMonitorPageTests(unittest.TestCase):
         self.addCleanup(dialog.deleteLater)
 
         self.assertEqual(secret_store.read_count, 0)
+        self.assertEqual(secret_store.status_count, 1)
         self.assertEqual(dialog.secret_input.text(), "")
         self.assertEqual(
             dialog.secret_input.echoMode(), QLineEdit.EchoMode.Password
@@ -1977,15 +2181,216 @@ class DataMonitorPageTests(unittest.TestCase):
         self.assertEqual(settings.values[MODEL_KEY], "model-new")
         self.assertEqual(dialog.secret_input.text(), "")
 
+    def test_ai_settings_status_comes_only_from_native_existence(self) -> None:
+        """只有 base/model 而原生密钥不存在时，不得显示已配置。"""
+
+        settings = FakeSettings(
+            {
+                BASE_URL_KEY: "https://ai.example.com/v1",
+                MODEL_KEY: "model-old",
+            }
+        )
+        secret_store = FakeSecretStore(configured=False)
+        dialog = _CommentAiSettingsDialog(
+            settings=settings,
+            secret_store=secret_store,
+        )
+        self.addCleanup(dialog.deleteLater)
+
+        self.assertEqual(secret_store.read_count, 0)
+        self.assertEqual(secret_store.status_count, 1)
+        self.assertIn("未配置", dialog.secret_status_label.text())
+        self.assertEqual(
+            dialog.secret_input.echoMode(), QLineEdit.EchoMode.Password
+        )
+
+    def test_ai_settings_save_requires_clean_settings_status_before_secret_write(self) -> None:
+        """QSettings 未确认落盘成功时，新密钥绝不能进入原生存储。"""
+
+        cases = (
+            FakeSettings(sync_failures=(1,)),
+            FakeSettings(statuses=(QSettings.Status.AccessError,)),
+        )
+        for settings in cases:
+            secret_store = FakeSecretStore(configured=False)
+            dialog = _CommentAiSettingsDialog(
+                settings=settings,
+                secret_store=secret_store,
+            )
+            self.addCleanup(dialog.deleteLater)
+            dialog.base_url_input.setText("https://ai.example.com/v1")
+            dialog.model_input.setText("model-new")
+            dialog.secret_input.setText("settings-gate-private-marker")
+
+            with self.subTest(settings=type(settings).__name__, statuses=settings.statuses):
+                dialog.save_button.click()
+                self.assertEqual(secret_store.writes, [])
+                self.assertEqual(dialog.secret_input.text(), "")
+                self.assertEqual(dialog.result(), 0)
+                self.assertEqual(
+                    dialog.feedback_label.text(),
+                    "设置未保存，请检查 HTTPS 地址、模型和密钥",
+                )
+
+    def test_ai_settings_secret_failure_rolls_back_settings_existence_snapshot(self) -> None:
+        """原生密钥替换失败时，QSettings 必须恢复到原先的存在状态。"""
+
+        events: list[str] = []
+        settings = FakeSettings(
+            {BASE_URL_KEY: "https://old.example.com/v1"},
+            events=events,
+        )
+        secret_store = FakeSecretStore(
+            configured=True,
+            write_error=RuntimeError("private-native-write-error"),
+            events=events,
+        )
+        dialog = _CommentAiSettingsDialog(
+            settings=settings,
+            secret_store=secret_store,
+        )
+        self.addCleanup(dialog.deleteLater)
+        dialog.base_url_input.setText("https://new.example.com/v1")
+        dialog.model_input.setText("model-new")
+        dialog.secret_input.setText("rollback-private-marker")
+        dialog.save_button.click()
+
+        self.assertEqual(
+            settings.values,
+            {BASE_URL_KEY: "https://old.example.com/v1"},
+        )
+        self.assertEqual(settings.synced, 2)
+        self.assertEqual(secret_store.writes, [])
+        self.assertTrue(secret_store.configured)
+        self.assertLess(
+            events.index("settings:sync:1"),
+            events.index("secret:write"),
+        )
+        self.assertIn(f"settings:remove:{MODEL_KEY}", events)
+        self.assertEqual(dialog.result(), 0)
+        self.assertEqual(
+            dialog.feedback_label.text(),
+            "设置未保存，请检查 HTTPS 地址、模型和密钥",
+        )
+
+    def test_ai_settings_rollback_failure_never_reports_success(self) -> None:
+        """回滚也失败时只能给固定失败，不能关闭窗口冒充成功。"""
+
+        settings = FakeSettings(
+            {
+                BASE_URL_KEY: "https://old.example.com/v1",
+                MODEL_KEY: "model-old",
+            },
+            sync_failures=(2,),
+        )
+        secret_store = FakeSecretStore(
+            configured=True,
+            write_error=RuntimeError("private-native-write-error"),
+        )
+        dialog = _CommentAiSettingsDialog(
+            settings=settings,
+            secret_store=secret_store,
+        )
+        self.addCleanup(dialog.deleteLater)
+        dialog.base_url_input.setText("https://new.example.com/v1")
+        dialog.model_input.setText("model-new")
+        dialog.secret_input.setText("rollback-failure-private-marker")
+        dialog.save_button.click()
+
+        self.assertEqual(settings.synced, 2)
+        self.assertEqual(secret_store.writes, [])
+        self.assertEqual(dialog.result(), 0)
+        self.assertEqual(
+            dialog.feedback_label.text(),
+            "设置未保存，请检查 HTTPS 地址、模型和密钥",
+        )
+
+    def test_ai_settings_settings_control_is_rebuilt_after_secret_cleanup(self) -> None:
+        """设置落盘遇到进程控制时，应清理密钥后再重建等价中断。"""
+
+        marker = "settings-control-private-key-marker"
+        cases = (
+            (asyncio.CancelledError(), asyncio.CancelledError, None),
+            (KeyboardInterrupt(), KeyboardInterrupt, None),
+            (SystemExit(37), SystemExit, 37),
+        )
+        for original, expected, expected_code in cases:
+            settings = FakeSettings(sync_controls={1: original})
+            secret_store = FakeSecretStore(configured=False)
+            dialog = _CommentAiSettingsDialog(
+                settings=settings,
+                secret_store=secret_store,
+            )
+            self.addCleanup(dialog.deleteLater)
+            dialog.base_url_input.setText("https://ai.example.com/v1")
+            dialog.model_input.setText("model-new")
+            dialog.secret_input.setText(marker)
+
+            with self.subTest(control=expected.__name__):
+                with self.assertRaises(expected) as raised:
+                    dialog._save()
+                self.assertIsNot(raised.exception, original)
+                if expected is SystemExit:
+                    self.assertEqual(raised.exception.code, expected_code)
+                else:
+                    self.assertEqual(raised.exception.args, ())
+                self.assertEqual(dialog.secret_input.text(), "")
+                self.assertEqual(secret_store.writes, [])
+                self.assertNotIn(marker, ui_exception_trace_text(original))
+                self.assertNotIn(marker, ui_exception_trace_text(raised.exception))
+
+    def test_ai_settings_native_control_rolls_back_before_clean_rebuild(self) -> None:
+        """原生替换遇到进程控制时，先恢复设置再向上层传递。"""
+
+        marker = "native-control-private-key-marker"
+        old = {
+            BASE_URL_KEY: "https://old.example.com/v1",
+            MODEL_KEY: "model-old",
+        }
+        cases = (
+            (asyncio.CancelledError(), asyncio.CancelledError, None),
+            (KeyboardInterrupt(), KeyboardInterrupt, None),
+            (SystemExit("private-system-exit-code"), SystemExit, 1),
+        )
+        for original, expected, expected_code in cases:
+            settings = FakeSettings(old)
+            secret_store = FakeSecretStore(
+                configured=True,
+                write_error=original,
+            )
+            dialog = _CommentAiSettingsDialog(
+                settings=settings,
+                secret_store=secret_store,
+            )
+            self.addCleanup(dialog.deleteLater)
+            dialog.base_url_input.setText("https://new.example.com/v1")
+            dialog.model_input.setText("model-new")
+            dialog.secret_input.setText(marker)
+
+            with self.subTest(control=expected.__name__):
+                with self.assertRaises(expected) as raised:
+                    dialog._save()
+                self.assertIsNot(raised.exception, original)
+                if expected is SystemExit:
+                    self.assertEqual(raised.exception.code, expected_code)
+                else:
+                    self.assertEqual(raised.exception.args, ())
+                self.assertEqual(settings.values, old)
+                self.assertEqual(settings.synced, 2)
+                self.assertEqual(dialog.secret_input.text(), "")
+                self.assertEqual(secret_store.writes, [])
+                self.assertTrue(secret_store.configured)
+                self.assertNotIn(marker, ui_exception_trace_text(original))
+                self.assertNotIn(marker, ui_exception_trace_text(raised.exception))
+
     def test_ai_settings_clear_is_explicit_and_close_has_no_side_effect(self) -> None:
         """关闭对话框不能更改凭据；只有显式清除才能删除密钥。"""
 
         settings = FakeSettings()
-        secret_store = FakeSecretStore()
+        secret_store = FakeSecretStore(configured=False)
         dialog = _CommentAiSettingsDialog(
             settings=settings,
             secret_store=secret_store,
-            secret_configured=False,
         )
         self.addCleanup(dialog.deleteLater)
         dialog.reject()
@@ -1993,16 +2398,30 @@ class DataMonitorPageTests(unittest.TestCase):
         self.assertEqual(secret_store.delete_count, 0)
         self.assertEqual(settings.synced, 0)
 
+        secret_store.configured = True
+        settings.values.update(
+            {
+                BASE_URL_KEY: "https://ai.example.com/v1",
+                MODEL_KEY: "model-old",
+            }
+        )
         clear_dialog = _CommentAiSettingsDialog(
             settings=settings,
             secret_store=secret_store,
-            secret_configured=True,
         )
         self.addCleanup(clear_dialog.deleteLater)
         clear_dialog.clear_secret_button.click()
         self.assertEqual(secret_store.read_count, 0)
         self.assertEqual(secret_store.delete_count, 1)
         self.assertIn("未配置", clear_dialog.secret_status_label.text())
+
+        reopened = _CommentAiSettingsDialog(
+            settings=settings,
+            secret_store=secret_store,
+        )
+        self.addCleanup(reopened.deleteLater)
+        self.assertIn("未配置", reopened.secret_status_label.text())
+        self.assertEqual(secret_store.status_count, 3)
 
     def test_shutdown_collects_data_and_comment_task_prefixes(self) -> None:
         """客户端关闭时遗漏评论任务，会让浏览器会话留在后台。"""
