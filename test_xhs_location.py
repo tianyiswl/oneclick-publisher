@@ -1539,6 +1539,53 @@ class XhsLocationCandidateTests(unittest.TestCase):
             },
         )
 
+    def test_live_snake_case_response_keeps_official_full_address(self) -> None:
+        response = {
+            "code": 0,
+            "success": True,
+            "msg": "成功",
+            "data": {
+                "poi_list": [
+                    {
+                        "poi_id": "poi-1",
+                        "poi_type": 0,
+                        "name": "北海银滩",
+                        "address": "银滩大道",
+                        "full_address": "广西北海市银海区银滩大道",
+                    }
+                ]
+            },
+        }
+
+        self.assertEqual(
+            xhs_location_service.normalize_location_response(response),
+            [
+                {
+                    "poiId": "poi-1",
+                    "name": "北海银滩",
+                    "address": "广西北海市银海区银滩大道",
+                    "poiType": "0",
+                    "platform": "xiaohongshu",
+                }
+            ],
+        )
+        self.assertEqual(
+            xhs_location_service.normalize_location_response(
+                {
+                    "data": {
+                        "poi_list": [
+                            {
+                                "poi_id": "poi-1",
+                                "name": "只有普通地址的原始行",
+                                "address": "广西北海市银海区银滩大道",
+                            }
+                        ]
+                    }
+                }
+            ),
+            [],
+        )
+
     def test_candidate_requires_complete_platform_identity(self) -> None:
         complete = {
             "poiId": "poi-1",

@@ -66,14 +66,15 @@ def _normalize_location_candidate_fields(
     value: object,
     *,
     poi_id_fields: tuple[str, ...],
-    address_field: str,
+    address_fields: tuple[str, ...],
+    poi_type_fields: tuple[str, ...] = ("poiType",),
 ) -> dict[str, str] | None:
     if not isinstance(value, dict):
         return None
     poi_id = _candidate_field(value, *poi_id_fields)
     name = _candidate_field(value, "name")
-    address = _candidate_field(value, address_field)
-    poi_type = _candidate_field(value, "poiType")
+    address = _candidate_field(value, *address_fields)
+    poi_type = _candidate_field(value, *poi_type_fields)
     if not poi_id or not name or not address:
         return None
     return {
@@ -90,8 +91,9 @@ def normalize_official_location_candidate(value: object) -> dict[str, str] | Non
 
     return _normalize_location_candidate_fields(
         value,
-        poi_id_fields=("poiId", "newPoiId"),
-        address_field="fullAddress",
+        poi_id_fields=("poiId", "newPoiId", "poi_id", "new_poi_id"),
+        address_fields=("fullAddress", "full_address"),
+        poi_type_fields=("poiType", "poi_type"),
     )
 
 
@@ -103,7 +105,7 @@ def normalize_canonical_location_candidate(value: object) -> dict[str, str] | No
     return _normalize_location_candidate_fields(
         value,
         poi_id_fields=("poiId",),
-        address_field="address",
+        address_fields=("address",),
     )
 
 
@@ -111,8 +113,12 @@ def _poi_rows(value: object) -> list[object]:
     if not isinstance(value, dict):
         raise XhsLocationSearchError("小红书地点服务返回了无效数据")
     rows = value.get("poiList")
+    if rows is None:
+        rows = value.get("poi_list")
     if rows is None and isinstance(value.get("data"), dict):
         rows = value["data"].get("poiList")
+        if rows is None:
+            rows = value["data"].get("poi_list")
     if not isinstance(rows, list):
         raise XhsLocationSearchError("小红书地点服务返回了无效数据")
     return rows
