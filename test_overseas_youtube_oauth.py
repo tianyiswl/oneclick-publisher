@@ -5,17 +5,62 @@ import inspect
 import threading
 import unittest
 from dataclasses import FrozenInstanceError
+from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from app_core.overseas_youtube_oauth import (
     OAuthAuthorizationError,
     OAuthCallbackVerifier,
+    OAuthCredentialStore,
+    OAuthTokenError,
+    OAuthTokens,
+    YouTubeOAuthTokenClient,
     build_authorization_request,
     pkce_s256_challenge,
 )
 
 
 YOUTUBE_UPLOAD_SCOPE = "https://www.googleapis.com/auth/youtube.upload"
+
+
+class FakeTokenResponse:
+    def __init__(self, status_code: int, payload: dict[str, Any]) -> None:
+        self.status_code = status_code
+        self._payload = payload
+
+    def json(self) -> dict[str, Any]:
+        return self._payload
+
+
+class FakeTokenTransport:
+    def __init__(
+        self,
+        response: FakeTokenResponse | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        self._response = response
+        self._error = error
+        self.calls: list[tuple[str, dict[str, str], float]] = []
+
+    def post(self, url: str, *, data: dict[str, str], timeout: float) -> FakeTokenResponse:
+        self.calls.append((url, data, timeout))
+        if self._error is not None:
+            raise self._error
+        assert self._response is not None
+        return self._response
+
+
+class InMemoryCredentialStore:
+    """Test-only credential boundary; the production module provides no fallback."""
+
+    def __init__(self) -> None:
+        self._values: dict[str, str] = {}
+
+    def load_refresh_token(self, credential_reference: str) -> str | None:
+        return self._values.get(credential_reference)
+
+    def save_refresh_token(self, credential_reference: str, refresh_token: str) -> None:
+        self._values[credential_reference] = refresh_token
 
 
 class YouTubeOAuthAuthorizationContractTests(unittest.TestCase):
@@ -212,6 +257,175 @@ class YouTubeOAuthAuthorizationContractTests(unittest.TestCase):
             self.assertNotIn(request.code_verifier, value)
             self.assertNotIn(request.callback_url, value)
             self.assertNotIn("code-secret", value)
+
+
+class YouTubeOAuthTokenLifecycleTests(unittest.TestCase):
+    def _authorization_values(self):
+        request = build_authorization_request("desktop-client-id")
+        callback = OAuthCallbackVerifier(request).consume(
+            f"{request.callback_url}?code=authorization-code-secret&state={request.state}"
+        )
+        return request, callback
+
+    def test_code_exchange_uses_pkce_and_returns_redacted_token_expiry(self) -> None:
+        request, callback = self._authorization_values()
+        transport = FakeTokenTransport(
+            FakeTokenResponse(
+                200,
+                {
+                    "access_token": "access-token-secret",
+                    "refresh_token": "refresh-token-secret",
+                    "expires_in": 3600,
+                    "scope": YOUTUBE_UPLOAD_SCOPE,
+                    "token_type": "Bearer",
+                },
+            )
+        )
+        client = YouTubeOAuthTokenClient(transport, clock=lambda: 1000.0)
+
+        tokens = client.exchange_authorization_code(
+            client_id="desktop-client-id",
+            request=request,
+            callback=callback,
+        )
+
+        self.assertEqual(tokens.access_token, "access-token-secret")
+        self.assertEqual(tokens.refresh_token, "refresh-token-secret")
+        self.assertEqual(tokens.expires_at, 4600.0)
+        self.assertEqual(tokens.scope, YOUTUBE_UPLOAD_SCOPE)
+        self.assertNotIn("access-token-secret", repr(tokens))
+        self.assertNotIn("refresh-token-secret", str(tokens))
+        self.assertEqual(len(transport.calls), 1)
+        endpoint, data, timeout = transport.calls[0]
+        self.assertEqual(endpoint, "https://oauth2.googleapis.com/token")
+        self.assertEqual(timeout, 10.0)
+        self.assertEqual(
+            data,
+            {
+                "client_id": "desktop-client-id",
+                "code": "authorization-code-secret",
+                "code_verifier": request.code_verifier,
+                "grant_type": "authorization_code",
+                "redirect_uri": request.callback_url,
+            },
+        )
+
+    def test_refresh_preserves_existing_refresh_token_when_response_omits_it(self) -> None:
+        transport = FakeTokenTransport(
+            FakeTokenResponse(
+                200,
+                {
+                    "access_token": "replacement-access-token-secret",
+                    "expires_in": "120",
+                    "scope": YOUTUBE_UPLOAD_SCOPE,
+                    "token_type": "Bearer",
+                },
+            )
+        )
+        client = YouTubeOAuthTokenClient(transport, clock=lambda: 25.0)
+        existing = OAuthTokens(
+            access_token="old-access-token-secret",
+            refresh_token="existing-refresh-token-secret",
+            expires_at=30.0,
+            scope=YOUTUBE_UPLOAD_SCOPE,
+        )
+
+        refreshed = client.refresh_access_token(
+            client_id="desktop-client-id",
+            existing_tokens=existing,
+        )
+
+        self.assertEqual(refreshed.access_token, "replacement-access-token-secret")
+        self.assertEqual(refreshed.refresh_token, "existing-refresh-token-secret")
+        self.assertEqual(refreshed.expires_at, 145.0)
+        self.assertEqual(
+            transport.calls[0][1],
+            {
+                "client_id": "desktop-client-id",
+                "grant_type": "refresh_token",
+                "refresh_token": "existing-refresh-token-secret",
+            },
+        )
+
+    def test_invalid_grant_is_normalized_without_tokens_or_response_body(self) -> None:
+        transport = FakeTokenTransport(
+            FakeTokenResponse(
+                400,
+                {
+                    "error": "invalid_grant",
+                    "error_description": "refresh-token-secret was revoked",
+                },
+            )
+        )
+        client = YouTubeOAuthTokenClient(transport, clock=lambda: 0.0)
+        existing = OAuthTokens(
+            access_token="access-token-secret",
+            refresh_token="refresh-token-secret",
+            expires_at=1.0,
+            scope=YOUTUBE_UPLOAD_SCOPE,
+        )
+
+        with self.assertRaisesRegex(OAuthTokenError, "^authorization_invalid$") as raised:
+            client.refresh_access_token(
+                client_id="desktop-client-id",
+                existing_tokens=existing,
+            )
+
+        self.assertNotIn("refresh-token-secret", str(raised.exception))
+        self.assertNotIn("access-token-secret", str(raised.exception))
+        self.assertNotIn("was revoked", str(raised.exception))
+
+    def test_timeout_is_normalized_without_request_values(self) -> None:
+        request, callback = self._authorization_values()
+        transport = FakeTokenTransport(error=TimeoutError("timeout access-token-secret"))
+        client = YouTubeOAuthTokenClient(transport, clock=lambda: 0.0)
+
+        with self.assertRaisesRegex(OAuthTokenError, "^oauth_transport_unavailable$") as raised:
+            client.exchange_authorization_code(
+                client_id="desktop-client-id",
+                request=request,
+                callback=callback,
+            )
+
+        self.assertNotIn("access-token-secret", str(raised.exception))
+        self.assertNotIn(callback.authorization_code, str(raised.exception))
+        self.assertNotIn(request.code_verifier, str(raised.exception))
+        self.assertNotIn(request.callback_url, str(raised.exception))
+
+    def test_token_endpoint_rejection_hides_raw_response_body(self) -> None:
+        request, callback = self._authorization_values()
+        transport = FakeTokenTransport(
+            FakeTokenResponse(
+                500,
+                {
+                    "error": "server_error",
+                    "error_description": "authorization-code-secret and access-token-secret",
+                },
+            )
+        )
+        client = YouTubeOAuthTokenClient(transport, clock=lambda: 0.0)
+
+        with self.assertRaisesRegex(OAuthTokenError, "^oauth_token_rejected$") as raised:
+            client.exchange_authorization_code(
+                client_id="desktop-client-id",
+                request=request,
+                callback=callback,
+            )
+
+        self.assertNotIn("authorization-code-secret", str(raised.exception))
+        self.assertNotIn("access-token-secret", str(raised.exception))
+        self.assertNotIn("server_error", str(raised.exception))
+
+    def test_credential_store_is_an_injected_protocol_without_cleartext_fallback(self) -> None:
+        store = InMemoryCredentialStore()
+
+        self.assertIsInstance(store, OAuthCredentialStore)
+        self.assertIsNone(store.load_refresh_token("youtube:channel-1"))
+        store.save_refresh_token("youtube:channel-1", "refresh-token-secret")
+        self.assertEqual(
+            store.load_refresh_token("youtube:channel-1"),
+            "refresh-token-secret",
+        )
 
 
 if __name__ == "__main__":
