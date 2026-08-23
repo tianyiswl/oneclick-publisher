@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 import inspect
 from pathlib import Path
@@ -38,11 +38,22 @@ _MAX_QUEUED_RESPONSES = 8
 _MAX_RAW_ROWS = 256
 _MAX_REJECTED_ROWS = 128
 _MAX_PARSED_COMMENTS = 101
+_MAX_CONTAINER_KEYS = 64
+_MAX_CONTENT_ID_LENGTH = 512
+_MAX_STATE_FILE_PATH_LENGTH = 1_024
+_MAX_COMMENT_ID_LENGTH = 512
+_MAX_COMMENT_BODY_LENGTH = 20_000
+_MAX_COMMENT_TIME_LENGTH = 128
+_MAX_CURSOR_LENGTH = 2_048
 _DEFAULT_TOTAL_TIMEOUT_SECONDS = 30.0
 _REPORT_LOCK = threading.Lock()
 _REPORT_QUEUE: queue.Queue = queue.Queue(maxsize=1)
 _REPORT_WORKER: threading.Thread | None = None
 _REPORT_BUSY = False
+_PROJECTION_LOCK = threading.Lock()
+_PROJECTION_QUEUE: queue.Queue = queue.Queue(maxsize=1)
+_PROJECTION_WORKER: threading.Thread | None = None
+_PROJECTION_BUSY = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +62,25 @@ class _ParseOutcome:
     rejected_count: int = 0
     error_code: str = ""
     control_kind: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedPage:
+    rows: tuple[tuple[str, str, int, int, str], ...]
+    rejected_count: int
+    has_more: bool
+    next_cursor: str
+    platform_end: bool
+
+
+@dataclass(slots=True)
+class _ProjectionJob:
+    prepared: _PreparedPage | None
+    account_id: int
+    content_id: str
+    observed_at: str
+    completed: threading.Event = field(default_factory=threading.Event)
+    outcome: _ParseOutcome | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +97,10 @@ class _ParseDeadlineExceeded(RuntimeError):
 
 
 class _ContentBindingMismatch(RuntimeError):
+    pass
+
+
+class _OversizedInput(RuntimeError):
     pass
 
 
@@ -94,12 +128,39 @@ def _invalid() -> None:
     raise CommentInsightFailure("comment_payload_invalid")
 
 
+def _bounded_text(
+    value: object,
+    maximum: int,
+    *,
+    preserve_edges: bool = False,
+) -> str:
+    if type(value) is not str or len(value) < 1:
+        _invalid()
+    if len(value) > maximum:
+        raise _OversizedInput
+    stripped = value.strip()
+    if not stripped or (not preserve_edges and value != stripped):
+        _invalid()
+    return value
+
+
+def _bounded_count(value: object) -> int:
+    if type(value) is not int or value < 0:
+        _invalid()
+    return value
+
+
 def _strict_path(root: object, path: object) -> object:
     if type(root) is not dict or type(path) is not str or not path:
         _invalid()
     value = root
     for segment in path.split("."):
-        if not segment or segment.endswith("[]") or type(value) is not dict:
+        if (
+            not segment
+            or segment.endswith("[]")
+            or type(value) is not dict
+            or len(value) > _MAX_CONTAINER_KEYS
+        ):
             _invalid()
         if segment not in value:
             return _MISSING
@@ -129,7 +190,7 @@ def _row_value(row: object, list_field: str, field: object) -> object:
     return value
 
 
-def _parse_comment_page_unsafe(
+def _prepare_comment_page_unsafe(
     contract: DouyinCommentContract,
     payload: object,
     account_id: int,
@@ -137,57 +198,62 @@ def _parse_comment_page_unsafe(
     observed_at: str,
     *,
     deadline: float | None = None,
-) -> tuple[CommentPage, int]:
+) -> _PreparedPage:
     if (
         type(contract) is not DouyinCommentContract
         or contract.verified is not True
         or contract.creator_host != "creator.douyin.com"
         or type(account_id) is not int
         or account_id <= 0
-        or type(content_id) is not str
-        or not content_id.strip()
-        or content_id != content_id.strip()
-        or type(observed_at) is not str
     ):
         _invalid()
+    _bounded_text(content_id, _MAX_CONTENT_ID_LENGTH)
+    _bounded_text(observed_at, _MAX_COMMENT_TIME_LENGTH)
 
     rows = _comment_rows(payload, contract.comment_list_field)
+    if len(rows) > _MAX_RAW_ROWS:
+        raise _OversizedInput
     has_more = _strict_path(payload, contract.comment_has_more_field)
     raw_cursor = _strict_path(payload, contract.comment_cursor_field)
     if type(has_more) is not bool or raw_cursor is _MISSING:
         _invalid()
     if has_more:
-        if (
-            type(raw_cursor) is not str
-            or not raw_cursor
-            or raw_cursor != raw_cursor.strip()
-        ):
-            _invalid()
-        next_cursor: str | None = raw_cursor
+        next_cursor = _bounded_text(raw_cursor, _MAX_CURSOR_LENGTH)
     else:
-        if raw_cursor is not None and (
-            type(raw_cursor) is not str or raw_cursor != raw_cursor.strip()
-        ):
-            _invalid()
-        next_cursor = raw_cursor or ""
+        if raw_cursor is None:
+            next_cursor = ""
+        elif type(raw_cursor) is str and raw_cursor == "":
+            next_cursor = ""
+        else:
+            next_cursor = _bounded_text(raw_cursor, _MAX_CURSOR_LENGTH)
 
-    records: dict[str, CommentRecord] = {}
+    for raw_row in rows:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise _ParseDeadlineExceeded
+        try:
+            if type(raw_row) is not dict or len(raw_row) > _MAX_CONTAINER_KEYS:
+                raise _ContentBindingMismatch
+            row_content_id = _bounded_text(
+                _row_value(
+                    raw_row,
+                    contract.comment_list_field,
+                    contract.comment_content_id_field,
+                ),
+                _MAX_CONTENT_ID_LENGTH,
+            )
+        except (CommentInsightFailure, _OversizedInput):
+            raise _ContentBindingMismatch from None
+        if row_content_id != content_id:
+            raise _ContentBindingMismatch
+
+    projection_rows: list[tuple[str, str, int, int, str]] = []
     rejected_count = 0
     truncated_rows = False
     for index, raw_row in enumerate(rows):
         if deadline is not None and time.monotonic() >= deadline:
             raise _ParseDeadlineExceeded
-        if index >= _MAX_RAW_ROWS:
-            _invalid()
         try:
-            row_content_id = _row_value(
-                raw_row,
-                contract.comment_list_field,
-                contract.comment_content_id_field,
-            )
-            if type(row_content_id) is str and row_content_id != content_id:
-                raise _ContentBindingMismatch
-            if type(row_content_id) is not str:
+            if type(raw_row) is not dict or len(raw_row) > _MAX_CONTAINER_KEYS:
                 _invalid()
             parent_id = _row_value(
                 raw_row,
@@ -201,41 +267,102 @@ def _parse_comment_page_unsafe(
                 contract.comment_list_field,
                 contract.comment_id_field,
             )
-            if (
-                type(platform_comment_id) is not str
-                or not platform_comment_id.strip()
-                or platform_comment_id != platform_comment_id.strip()
-            ):
-                _invalid()
-            comment_key = derive_comment_key(
-                account_id, content_id, platform_comment_id
+            platform_comment_id = _bounded_text(
+                platform_comment_id, _MAX_COMMENT_ID_LENGTH
             )
-            del platform_comment_id
-            record = CommentRecord(
-                content_id=content_id,
-                comment_key=comment_key,
-                body=_row_value(
+            body = _bounded_text(
+                _row_value(
                     raw_row,
                     contract.comment_list_field,
                     contract.comment_body_field,
                 ),
-                like_count=_row_value(
+                _MAX_COMMENT_BODY_LENGTH,
+                preserve_edges=True,
+            )
+            like_count = _bounded_count(
+                _row_value(
                     raw_row,
                     contract.comment_list_field,
                     contract.comment_like_count_field,
-                ),
-                reply_count=_row_value(
+                )
+            )
+            reply_count = _bounded_count(
+                _row_value(
                     raw_row,
                     contract.comment_list_field,
                     contract.comment_reply_count_field,
-                ),
-                commented_at=_row_value(
+                )
+            )
+            commented_at = _bounded_text(
+                _row_value(
                     raw_row,
                     contract.comment_list_field,
                     contract.comment_commented_at_field,
                 ),
+                _MAX_COMMENT_TIME_LENGTH,
+            )
+            projection_rows.append(
+                (
+                    platform_comment_id,
+                    body,
+                    like_count,
+                    reply_count,
+                    commented_at,
+                )
+            )
+            platform_comment_id = None
+            body = None
+        except CommentInsightFailure:
+            rejected_count += 1
+            if rejected_count > _MAX_REJECTED_ROWS:
+                _invalid()
+            continue
+        if len(projection_rows) >= _MAX_PARSED_COMMENTS:
+            truncated_rows = index + 1 < len(rows)
+            break
+
+    platform_end = not has_more and not truncated_rows
+    if not projection_rows and not platform_end:
+        _invalid()
+    return _PreparedPage(
+        rows=tuple(projection_rows),
+        rejected_count=rejected_count,
+        has_more=has_more,
+        next_cursor=next_cursor,
+        platform_end=platform_end,
+    )
+
+
+def _project_prepared_page_unsafe(
+    prepared: _PreparedPage,
+    account_id: int,
+    content_id: str,
+    observed_at: str,
+) -> tuple[CommentPage, int]:
+    records: dict[str, CommentRecord] = {}
+    rejected_count = prepared.rejected_count
+    for (
+        platform_comment_id,
+        body,
+        like_count,
+        reply_count,
+        commented_at,
+    ) in prepared.rows:
+        try:
+            comment_key = derive_comment_key(
+                account_id, content_id, platform_comment_id
+            )
+            platform_comment_id = None
+            record = CommentRecord(
+                content_id=content_id,
+                comment_key=comment_key,
+                body=body,
+                like_count=like_count,
+                reply_count=reply_count,
+                commented_at=commented_at,
                 observed_at=observed_at,
             )
+            body = None
         except CommentInsightFailure:
             rejected_count += 1
             if rejected_count > _MAX_REJECTED_ROWS:
@@ -247,22 +374,66 @@ def _parse_comment_page_unsafe(
                 _invalid()
             continue
         records[record.comment_key] = record
-        if len(records) >= _MAX_PARSED_COMMENTS:
-            truncated_rows = index + 1 < len(rows)
-            break
 
-    platform_end = not has_more and not truncated_rows
-    if not records and not platform_end:
+    if not records and not prepared.platform_end:
         _invalid()
     return (
         CommentPage(
             comments=tuple(records.values()),
-            has_more=has_more,
-            next_cursor=next_cursor,
-            platform_end=platform_end,
+            has_more=prepared.has_more,
+            next_cursor=prepared.next_cursor,
+            platform_end=prepared.platform_end,
         ),
         rejected_count,
     )
+
+
+def _project_prepared_page_outcome(
+    prepared: _PreparedPage,
+    account_id: int,
+    content_id: str,
+    observed_at: str,
+) -> _ParseOutcome:
+    try:
+        page, rejected_count = _project_prepared_page_unsafe(
+            prepared, account_id, content_id, observed_at
+        )
+    except (asyncio.CancelledError, KeyboardInterrupt, SystemExit) as exc:
+        return _ParseOutcome(control_kind=_control_kind(exc))
+    except CommentInsightFailure as exc:
+        return _ParseOutcome(error_code=exc.error_code)
+    except BaseException:
+        return _ParseOutcome(error_code="comment_payload_invalid")
+    return _ParseOutcome(page=page, rejected_count=rejected_count)
+
+
+def _prepare_comment_page_outcome(
+    contract: DouyinCommentContract,
+    payload: object,
+    account_id: int,
+    content_id: str,
+    observed_at: str,
+    *,
+    deadline: float | None = None,
+) -> tuple[_PreparedPage | None, str, str]:
+    try:
+        prepared = _prepare_comment_page_unsafe(
+            contract,
+            payload,
+            account_id,
+            content_id,
+            observed_at,
+            deadline=deadline,
+        )
+    except (asyncio.CancelledError, KeyboardInterrupt, SystemExit) as exc:
+        return None, "", _control_kind(exc)
+    except CommentInsightFailure as exc:
+        return None, exc.error_code, ""
+    except _ParseDeadlineExceeded:
+        return None, "comment_sync_timeout", ""
+    except BaseException:
+        return None, "comment_payload_invalid", ""
+    return prepared, "", ""
 
 
 def _parse_comment_page_outcome(
@@ -276,26 +447,21 @@ def _parse_comment_page_outcome(
 ) -> _ParseOutcome:
     """在原始载荷边界内消化异常，只返回脱敏结果。"""
 
-    try:
-        page, rejected_count = _parse_comment_page_unsafe(
-            contract,
-            payload,
-            account_id,
-            content_id,
-            observed_at,
-            deadline=deadline,
-        )
-    except (asyncio.CancelledError, KeyboardInterrupt, SystemExit) as exc:
-        control_kind = _control_kind(exc)
+    prepared, error_code, control_kind = _prepare_comment_page_outcome(
+        contract,
+        payload,
+        account_id,
+        content_id,
+        observed_at,
+        deadline=deadline,
+    )
+    if control_kind:
         return _ParseOutcome(control_kind=control_kind)
-    except CommentInsightFailure as exc:
-        error_code = exc.error_code
-        return _ParseOutcome(error_code=error_code)
-    except _ParseDeadlineExceeded:
-        return _ParseOutcome(error_code="comment_sync_timeout")
-    except BaseException:
-        return _ParseOutcome(error_code="comment_payload_invalid")
-    return _ParseOutcome(page=page, rejected_count=rejected_count)
+    if error_code or prepared is None:
+        return _ParseOutcome(error_code=error_code or "comment_payload_invalid")
+    return _project_prepared_page_outcome(
+        prepared, account_id, content_id, observed_at
+    )
 
 
 def parse_comment_page(
@@ -324,6 +490,116 @@ def parse_comment_page(
     return outcome.page
 
 
+def _projection_worker_loop() -> None:
+    """单一投影 worker；任务完成后立即丢弃有界原始标量。"""
+
+    global _PROJECTION_BUSY
+    while True:
+        job = _PROJECTION_QUEUE.get()
+        prepared = job.prepared
+        job.prepared = None
+        if prepared is None:
+            outcome = _ParseOutcome(error_code="comment_payload_invalid")
+        else:
+            outcome = _project_prepared_page_outcome(
+                prepared,
+                job.account_id,
+                job.content_id,
+                job.observed_at,
+            )
+        prepared = None
+        job.outcome = outcome
+        outcome = None
+        with _PROJECTION_LOCK:
+            _PROJECTION_BUSY = False
+        job.completed.set()
+        job = None
+
+
+def _start_projection_job(
+    prepared: _PreparedPage,
+    account_id: int,
+    content_id: str,
+    observed_at: str,
+) -> tuple[_ProjectionJob | None, str]:
+    global _PROJECTION_BUSY, _PROJECTION_WORKER
+    job = _ProjectionJob(
+        prepared=prepared,
+        account_id=account_id,
+        content_id=content_id,
+        observed_at=observed_at,
+    )
+    with _PROJECTION_LOCK:
+        if _PROJECTION_BUSY:
+            job.prepared = None
+            return None, "busy"
+        worker = _PROJECTION_WORKER
+        if worker is None or not worker.is_alive():
+            worker = threading.Thread(
+                target=_projection_worker_loop,
+                name="douyin-comment-projector",
+                daemon=True,
+            )
+            _PROJECTION_WORKER = worker
+            try:
+                worker.start()
+            except BaseException:
+                _PROJECTION_WORKER = None
+                job.prepared = None
+                return None, "unavailable"
+        _PROJECTION_BUSY = True
+        try:
+            _PROJECTION_QUEUE.put_nowait(job)
+        except queue.Full:
+            _PROJECTION_BUSY = False
+            job.prepared = None
+            return None, "unavailable"
+    return job, ""
+
+
+def _projection_worker_is_busy() -> bool:
+    with _PROJECTION_LOCK:
+        return _PROJECTION_BUSY
+
+
+async def _project_prepared_page_bounded(
+    prepared: _PreparedPage,
+    account_id: int,
+    content_id: str,
+    observed_at: str,
+    deadline: float,
+) -> tuple[_ParseOutcome, _ProjectionJob | None, bool]:
+    job, start_error = _start_projection_job(
+        prepared, account_id, content_id, observed_at
+    )
+    prepared = None
+    if start_error == "busy":
+        return (
+            _ParseOutcome(error_code="comment_sync_timeout"),
+            None,
+            True,
+        )
+    if start_error or job is None:
+        return (
+            _ParseOutcome(error_code="comment_payload_invalid"),
+            None,
+            False,
+        )
+    while not job.completed.is_set():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return (
+                _ParseOutcome(error_code="comment_sync_timeout"),
+                job,
+                False,
+            )
+        await asyncio.sleep(min(0.001, remaining))
+    outcome = job.outcome
+    if outcome is None:
+        outcome = _ParseOutcome(error_code="comment_payload_invalid")
+    return outcome, None, False
+
+
 def _observed_at() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
@@ -348,14 +624,13 @@ def _required_inputs(
         or type(account.get("type")) is not int
         or account["type"] != 3
         or type(account.get("filePath")) is not str
-        or not account["filePath"].strip()
-        or account["filePath"] != account["filePath"].strip()
         or type(content_id) is not str
-        or not content_id.strip()
-        or content_id != content_id.strip()
         or type(known_keys) is not frozenset
+        or len(known_keys) > 10_000
         or not all(
-            type(key) is str and _KEY_RE.fullmatch(key) is not None
+            type(key) is str
+            and len(key) == 64
+            and _KEY_RE.fullmatch(key) is not None
             for key in known_keys
         )
         or type(limit) is not int
@@ -364,6 +639,8 @@ def _required_inputs(
         or (report is not None and not callable(report))
     ):
         _invalid()
+    _bounded_text(account["filePath"], _MAX_STATE_FILE_PATH_LENGTH)
+    _bounded_text(content_id, _MAX_CONTENT_ID_LENGTH)
     state_path = COOKIE_DIR / Path(account["filePath"]).name
     try:
         if state_path.is_symlink() or not state_path.is_file():
@@ -601,6 +878,8 @@ class DouyinCommentDataCollector:
         context = None
         page = None
         worker: asyncio.Task | None = None
+        projection_job: _ProjectionJob | None = None
+        projection_blocked_by_worker = False
         result: tuple[object, ...] | None = None
         caught: BaseException | None = None
         cleanup_errors: list[BaseException] = []
@@ -709,6 +988,7 @@ class DouyinCommentDataCollector:
 
         async def consume_responses() -> None:
             nonlocal rejected_count, page_count
+            nonlocal projection_job, projection_blocked_by_worker
             while not response_future.done():
                 response = await response_queue.get()
                 try:
@@ -736,16 +1016,43 @@ class DouyinCommentDataCollector:
                     if not callable(reader) or not inspect.iscoroutinefunction(reader):
                         _invalid()
                     payload = await await_operation(reader())
-                    parse_outcome = _parse_comment_page_outcome(
-                        contract,
-                        payload,
-                        account_id,
-                        content_id,
-                        observed_at,
-                        deadline=operation_deadline,
+                    prepared, prepare_error, prepare_control = (
+                        _prepare_comment_page_outcome(
+                            contract,
+                            payload,
+                            account_id,
+                            content_id,
+                            observed_at,
+                            deadline=operation_deadline,
+                        )
                     )
                     payload = None
                     response = None
+                    if prepare_control:
+                        response_future.set_result(
+                            ("control", prepare_control)
+                        )
+                        return
+                    if prepare_error or prepared is None:
+                        response_future.set_result(
+                            (
+                                "failure",
+                                prepare_error or "comment_payload_invalid",
+                            )
+                        )
+                        return
+                    (
+                        parse_outcome,
+                        projection_job,
+                        projection_blocked_by_worker,
+                    ) = await _project_prepared_page_bounded(
+                        prepared,
+                        account_id,
+                        content_id,
+                        observed_at,
+                        operation_deadline,
+                    )
+                    prepared = None
                     if parse_outcome.control_kind:
                         response_future.set_result(
                             ("control", parse_outcome.control_kind)
@@ -999,6 +1306,20 @@ class DouyinCommentDataCollector:
                 close_error = await close_bounded(resource)
                 if close_error is not None:
                     cleanup_errors.append(close_error)
+
+            projection_still_running = (
+                projection_job is not None
+                and not projection_job.completed.is_set()
+            ) or (
+                projection_blocked_by_worker
+                and _projection_worker_is_busy()
+            )
+            if projection_still_running:
+                cleanup_errors.append(
+                    RuntimeError("projection worker active")
+                )
+            projection_job = None
+            projection_blocked_by_worker = False
 
         cleanup = CleanupReceipt(
             closed=not cleanup_errors,

@@ -10,6 +10,7 @@ import gc
 import io
 import json
 from pathlib import Path
+import sys
 import tempfile
 import threading
 import time
@@ -141,6 +142,28 @@ def production_exception_artifacts(error: BaseException) -> tuple[str, tuple[obj
     return "\n".join(encoded), tuple(values)
 
 
+def production_thread_artifacts(thread_name: str) -> str:
+    """检查指定生产 worker 的全部当前栈帧，不扫测试线程。"""
+
+    frames = sys._current_frames()
+    encoded: list[str] = []
+    for thread in threading.enumerate():
+        if thread.name != thread_name or thread.ident is None:
+            continue
+        frame = frames.get(thread.ident)
+        while frame is not None:
+            if frame.f_code.co_filename.endswith(
+                "app_core/douyin_comment_data_collector.py"
+            ):
+                for value in frame.f_locals.values():
+                    try:
+                        encoded.append(repr(value))
+                    except BaseException:
+                        encoded.append("<repr-failed>")
+            frame = frame.f_back
+    return "\n".join(encoded)
+
+
 class DouyinCommentParserTests(unittest.TestCase):
     def test_parser_hashes_id_discards_author_and_keeps_only_top_level(self) -> None:
         """保留平台 ID、作者对象或子回复任一项都会泄露越界数据。"""
@@ -253,10 +276,16 @@ class DouyinCommentParserTests(unittest.TestCase):
         class CustomDict(dict):
             pass
 
+        class CustomString(str):
+            pass
+
         for payload in (
             comment_payload(comment_row(), cursor="", has_more=True),
             comment_payload(comment_row(), cursor=True, has_more=True),
             comment_payload(comment_row(), cursor=" cursor ", has_more=True),
+            comment_payload(
+                comment_row(), cursor=CustomString(""), has_more=False
+            ),
             CustomDict(comment_payload(comment_row())),
         ):
             with self.subTest(payload_type=type(payload).__name__):
@@ -270,6 +299,9 @@ class DouyinCommentParserTests(unittest.TestCase):
                     )
                 self.assertEqual(
                     raised.exception.error_code, "comment_payload_invalid"
+                )
+                self.assertEqual(
+                    str(raised.exception), "comment_payload_invalid"
                 )
 
 
@@ -856,6 +888,108 @@ class DouyinCommentCollectorTests(unittest.TestCase):
                 )
                 self._assert_closed(page, context, browser, playwright)
 
+    def test_missing_or_non_string_content_id_fails_the_entire_page(self) -> None:
+        """顶层或回复行缺失/弱类型作品 ID 都不是普通坏行。"""
+
+        missing_top = comment_row("missing-top")
+        missing_top.pop("content_id")
+        missing_reply = comment_row(
+            "missing-reply", parent_id="parent"
+        )
+        missing_reply.pop("content_id")
+        payloads = (
+            comment_payload(comment_row("valid-a"), missing_top),
+            comment_payload(
+                comment_row("valid-b"),
+                comment_row("integer-top", content_id=7),
+            ),
+            comment_payload(comment_row("valid-c"), missing_reply),
+            comment_payload(
+                comment_row("valid-d"),
+                comment_row(
+                    "integer-reply", content_id=7, parent_id="parent"
+                ),
+            ),
+        )
+        for payload in payloads:
+            with self.subTest(rows=payload["data"]["comments"][-1]):
+                response = FakeResponse(payload)
+                starter, page, context, browser, playwright = self._harness(
+                    ((response,),)
+                )
+
+                with self.assertRaises(CommentInsightFailure) as raised:
+                    self._collector(starter).collect(
+                        self.account, "work-7", frozenset()
+                    )
+
+                self.assertEqual(
+                    raised.exception.error_code, "comment_payload_invalid"
+                )
+                self._assert_closed(page, context, browser, playwright)
+
+    def test_wrong_content_in_row_102_fails_before_accepting_first_101(self) -> None:
+        """前 101 条可投影也不得掩盖第 102 条作品归属错误。"""
+
+        rows = [comment_row(f"bound-{index}") for index in range(101)]
+        rows.append(comment_row("wrong-102", content_id="work-8"))
+        response = FakeResponse(comment_payload(*rows))
+        starter, page, context, browser, playwright = self._harness(
+            ((response,),)
+        )
+
+        with self.assertRaises(CommentInsightFailure) as raised:
+            self._collector(starter).collect(
+                self.account, "work-7", frozenset()
+            )
+
+        self.assertEqual(
+            raised.exception.error_code, "comment_payload_invalid"
+        )
+        self._assert_closed(page, context, browser, playwright)
+
+    def test_wrong_content_well_after_projection_limit_fails_entire_page(self) -> None:
+        """投影上限之后很远的作品错误也必须被扫描到。"""
+
+        rows = [comment_row(f"deep-{index}") for index in range(199)]
+        rows.append(comment_row("wrong-200", content_id="work-8"))
+        response = FakeResponse(comment_payload(*rows))
+        starter, page, context, browser, playwright = self._harness(
+            ((response,),)
+        )
+
+        with self.assertRaises(CommentInsightFailure) as raised:
+            self._collector(starter).collect(
+                self.account, "work-7", frozenset()
+            )
+
+        self.assertEqual(
+            raised.exception.error_code, "comment_payload_invalid"
+        )
+        self._assert_closed(page, context, browser, playwright)
+
+    def test_oversized_raw_page_fails_before_partial_acceptance(self) -> None:
+        """超过安全检查上限的整页必须先失败，不返回前 100 条。"""
+
+        response = FakeResponse(
+            comment_payload(
+                *(comment_row(f"oversized-page-{index}") for index in range(257))
+            )
+        )
+        starter, page, context, browser, playwright = self._harness(
+            ((response,),)
+        )
+
+        with self.assertRaises(CommentInsightFailure) as raised:
+            self._collector(starter).collect(
+                self.account, "work-7", frozenset()
+            )
+
+        self.assertEqual(
+            raised.exception.error_code, "comment_payload_invalid"
+        )
+        self._assert_closed(page, context, browser, playwright)
+
     def test_verified_ui_pagination_dedupes_repeated_rows_and_reaches_end(self) -> None:
         """翻页必须仅用合同里的 UI 动作，重复评论在批次中只出现一次。"""
 
@@ -1107,7 +1241,38 @@ class DouyinCommentCollectorTests(unittest.TestCase):
                 self.assertEqual(
                     raised.exception.error_code, "comment_payload_invalid"
                 )
-                self.assertEqual(str(raised.exception), "comment_payload_invalid")
+                self.assertEqual(
+                    str(raised.exception), "comment_payload_invalid"
+                )
+        self.assertEqual(starts, 0)
+
+    def test_oversized_requested_content_id_fails_before_browser(self) -> None:
+        """请求参数的超长作品 ID 也必须在 strip、URL 编码和启动前拒绝。"""
+
+        starts = 0
+
+        def forbidden_factory() -> object:
+            nonlocal starts
+            starts += 1
+            raise AssertionError("oversized input must not start browser")
+
+        collector = DouyinCommentDataCollector(
+            contract_loader=verified_contract,
+            playwright_factory=forbidden_factory,
+            total_timeout_seconds=0.1,
+            observed_at_factory=lambda: OBSERVED_AT,
+        )
+
+        with self.assertRaises(CommentInsightFailure) as raised:
+            collector.collect(
+                self.account,
+                "x" * 513,
+                frozenset(),
+            )
+
+        self.assertEqual(
+            raised.exception.error_code, "comment_payload_invalid"
+        )
         self.assertEqual(starts, 0)
 
     def test_missing_manifest_fails_closed_without_starting_browser(self) -> None:
@@ -1461,6 +1626,185 @@ class DouyinCommentCollectorTests(unittest.TestCase):
         self.assertNotIn("raw-heavy", diagnostics)
         self._assert_closed(page, context, browser, playwright)
 
+    def test_single_slow_row_projection_obeys_deadline_and_audits_worker(self) -> None:
+        """单行投影卡住 60ms 也不得突破 20ms 公开总时限。"""
+
+        # 其他测试可能刚刚完成受审 worker 任务；本例需要独立提交慢任务。
+        time.sleep(0.08)
+        response = FakeResponse(
+            comment_payload(
+                comment_row(
+                    "raw-slow-projector-id",
+                    body="raw-slow-projector-body",
+                    author={
+                        "uid": "raw-slow-projector-uid",
+                        "nickname": "raw-slow-projector-name",
+                    },
+                )
+            )
+        )
+        starter, page, context, browser, playwright = self._harness(
+            ((response,),)
+        )
+
+        def slow_derive(*args) -> str:
+            time.sleep(0.06)
+            return derive_comment_key(*args)
+
+        with patch(
+            "app_core.douyin_comment_data_collector.derive_comment_key",
+            side_effect=slow_derive,
+        ):
+            outcome, elapsed, diagnostics, still_running = self._run_with_wall_limit(
+                lambda: self._collector(starter, timeout=0.02).collect(
+                    self.account, "work-7", frozenset()
+                ),
+                wall_limit=0.05,
+            )
+            time.sleep(0.08)
+
+        self.assertFalse(still_running)
+        self.assertLess(elapsed, 0.05)
+        error = outcome["error"]
+        self.assertIsInstance(error, CommentInsightFailure)
+        self.assertEqual(error.error_code, "comment_sync_cancelled")
+        self.assertFalse(error.cleanup_receipt.closed)
+        self.assertGreater(error.cleanup_receipt.alive_resource_count, 0)
+        encoded, values = production_exception_artifacts(error)
+        for forbidden in (
+            "raw-slow-projector-id",
+            "raw-slow-projector-body",
+            "raw-slow-projector-uid",
+            "raw-slow-projector-name",
+        ):
+            self.assertNotIn(forbidden, encoded)
+            self.assertNotIn(
+                forbidden,
+                production_thread_artifacts("douyin-comment-projector"),
+            )
+        self.assertNotIn(response, values)
+        self.assertEqual(diagnostics, "")
+        self._assert_closed(page, context, browser, playwright)
+
+    def test_repeated_slow_projections_use_one_bounded_worker(self) -> None:
+        """重复慢投影不得累积 worker 或未审计存活任务。"""
+
+        time.sleep(0.08)
+        harnesses = tuple(
+            self._harness(
+                ((FakeResponse(comment_payload(comment_row(f"slow-{index}"))),),)
+            )
+            for index in range(4)
+        )
+        outcomes: list[dict[str, object]] = []
+        still_running_values: list[bool] = []
+
+        def slow_derive(*args) -> str:
+            time.sleep(0.06)
+            return derive_comment_key(*args)
+
+        with patch(
+            "app_core.douyin_comment_data_collector.derive_comment_key",
+            side_effect=slow_derive,
+        ):
+            for starter, *_resources in harnesses:
+                outcome, elapsed, diagnostics, still_running = (
+                    self._run_with_wall_limit(
+                        lambda starter=starter: self._collector(
+                            starter, timeout=0.02
+                        ).collect(self.account, "work-7", frozenset()),
+                        wall_limit=0.05,
+                    )
+                )
+                outcomes.append(outcome)
+                still_running_values.append(still_running)
+                self.assertLess(elapsed, 0.05)
+                self.assertEqual(diagnostics, "")
+                time.sleep(0.08)
+            time.sleep(0.08)
+
+        self.assertEqual(still_running_values, [False] * 4)
+        self.assertEqual(
+            sum(
+                item.name == "douyin-comment-projector"
+                for item in threading.enumerate()
+            ),
+            1,
+        )
+        for outcome, resources in zip(outcomes, harnesses):
+            error = outcome["error"]
+            self.assertIsInstance(error, CommentInsightFailure)
+            self.assertIn(
+                error.error_code,
+                {"comment_sync_cancelled", "comment_sync_timeout"},
+            )
+            if error.error_code == "comment_sync_cancelled":
+                self.assertFalse(error.cleanup_receipt.closed)
+                self.assertGreater(
+                    error.cleanup_receipt.alive_resource_count, 0
+                )
+            else:
+                self.assertTrue(error.cleanup_receipt.closed)
+                self.assertEqual(
+                    error.cleanup_receipt.alive_resource_count, 0
+                )
+            self._assert_closed(*resources[1:])
+        thread_artifacts = production_thread_artifacts(
+            "douyin-comment-projector"
+        )
+        self.assertNotIn("slow-0", thread_artifacts)
+        self.assertNotIn("private-default", thread_artifacts)
+
+    def test_huge_builtin_comment_id_and_body_fail_before_heavy_work(self) -> None:
+        """80MB 内建字符串必须先用长度上限拒绝，不得哈希或投影。"""
+
+        for field in ("comment_id", "body"):
+            with self.subTest(field=field):
+                oversized = f"raw-oversized-{field}-" + (
+                    "x" * (80 * 1024 * 1024)
+                )
+                row = comment_row(
+                    oversized if field == "comment_id" else "small-id",
+                    body=oversized if field == "body" else "small-body",
+                    author={
+                        "uid": "raw-oversized-author-uid",
+                        "nickname": "raw-oversized-author-name",
+                    },
+                )
+                response = FakeResponse(comment_payload(row))
+                starter, page, context, browser, playwright = self._harness(
+                    ((response,),)
+                )
+
+                outcome, elapsed, diagnostics, still_running = (
+                    self._run_with_wall_limit(
+                        lambda: self._collector(
+                            starter, timeout=0.02
+                        ).collect(self.account, "work-7", frozenset()),
+                        wall_limit=0.05,
+                    )
+                )
+                if still_running:
+                    time.sleep(0.1)
+
+                self.assertFalse(still_running)
+                self.assertLess(elapsed, 0.05)
+                error = outcome["error"]
+                self.assertIsInstance(error, CommentInsightFailure)
+                self.assertEqual(
+                    error.error_code, "comment_payload_invalid"
+                )
+                self.assertTrue(error.cleanup_receipt.closed)
+                encoded, values = production_exception_artifacts(error)
+                self.assertNotIn(f"raw-oversized-{field}", encoded)
+                self.assertNotIn(response, values)
+                self.assertEqual(diagnostics, "")
+                self._assert_closed(
+                    page, context, browser, playwright
+                )
+                del oversized, row, response, outcome, error
+                gc.collect()
+
     def test_matching_response_flood_hits_bounded_queue_without_backlog(self) -> None:
         """大量精确匹配响应不得在内存中形成无界原始响应队列。"""
 
@@ -1587,7 +1931,11 @@ class DouyinCommentCollectorTests(unittest.TestCase):
     def test_cancellation_resistant_close_and_worker_cannot_hang_or_leak(self) -> None:
         """第三方协程吞掉取消时，公开入口仍须有界且不累积线程或警告。"""
 
-        initial_thread_count = threading.active_count()
+        initial_unrelated_threads = {
+            id(item)
+            for item in threading.enumerate()
+            if item.name != "douyin-comment-projector"
+        }
         for mode in ("close", "worker"):
             with self.subTest(mode=mode):
                 response = FakeResponse(
@@ -1623,7 +1971,21 @@ class DouyinCommentCollectorTests(unittest.TestCase):
                 self.assertEqual(page.listener_removals, 1)
                 self._assert_closed(page, context, browser, playwright)
                 self.assertEqual(diagnostics, "")
-        self.assertEqual(threading.active_count(), initial_thread_count)
+        self.assertEqual(
+            {
+                id(item)
+                for item in threading.enumerate()
+                if item.name != "douyin-comment-projector"
+            },
+            initial_unrelated_threads,
+        )
+        self.assertLessEqual(
+            sum(
+                item.name == "douyin-comment-projector"
+                for item in threading.enumerate()
+            ),
+            1,
+        )
 
     def test_process_control_from_navigation_and_cleanup_survives_all_closes(self) -> None:
         """CancelledError、KeyboardInterrupt 和 SystemExit 不能被业务错误覆盖。"""
