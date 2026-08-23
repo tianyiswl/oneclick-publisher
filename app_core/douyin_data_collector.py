@@ -899,12 +899,18 @@ class DouyinDataCollector:
         operation_deadline = total_deadline - cleanup_reservation
 
         async def await_operation(awaitable):
+            task = asyncio.ensure_future(awaitable)
             remaining = operation_deadline - loop.time()
-            if remaining <= 0:
-                if hasattr(awaitable, "close"):
-                    awaitable.close()
-                raise TimeoutError
-            return await asyncio.wait_for(awaitable, timeout=remaining)
+            if remaining > 0:
+                done, _pending = await asyncio.wait(
+                    (task,), timeout=remaining
+                )
+                if task in done:
+                    return task.result()
+            task.cancel()
+            if isinstance(task, asyncio.Task):
+                task._log_destroy_pending = False
+            raise TimeoutError
 
         def observe_response(response: object) -> None:
             if not response_future.done():
@@ -1048,14 +1054,20 @@ class DouyinDataCollector:
                 nonlocal cleanup_steps
                 try:
                     remaining = total_deadline - loop.time()
-                    if remaining <= 0:
-                        task = asyncio.ensure_future(awaitable)
+                    task = asyncio.ensure_future(awaitable)
+                    timeout = (
+                        remaining / cleanup_steps if remaining > 0 else 0
+                    )
+                    done, _pending = await asyncio.wait(
+                        (task,), timeout=timeout
+                    )
+                    if task not in done:
                         task.cancel()
-                        await asyncio.gather(task, return_exceptions=True)
+                        if isinstance(task, asyncio.Task):
+                            task._log_destroy_pending = False
                         return TimeoutError()
-                    timeout = remaining / cleanup_steps
                     try:
-                        await asyncio.wait_for(awaitable, timeout=timeout)
+                        task.result()
                     except BaseException as exc:
                         return exc
                     return None
@@ -1174,6 +1186,47 @@ class DouyinDataCollector:
             warning_code="",
         )
 
+    @staticmethod
+    def _run_content_completion(coroutine) -> CollectionBatch:
+        """在一次性事件循环中运行，不在退出时无界等待抗取消任务。"""
+
+        loop = asyncio.new_event_loop()
+        loop.set_exception_handler(lambda _loop, _context: None)
+        main_task: asyncio.Task | None = None
+        try:
+            main_task = loop.create_task(coroutine)
+            process_control: BaseException | None = None
+            while True:
+                try:
+                    result = loop.run_until_complete(main_task)
+                except (KeyboardInterrupt, SystemExit) as exc:
+                    if process_control is None:
+                        process_control = exc
+                    if main_task.done():
+                        raise
+                    continue
+                if process_control is not None:
+                    raise process_control
+                return result
+        finally:
+            pending_tasks = tuple(asyncio.all_tasks(loop))
+            for task in pending_tasks:
+                if task.done():
+                    try:
+                        task.exception()
+                    except asyncio.CancelledError:
+                        pass
+                    continue
+                task.cancel()
+                task._log_destroy_pending = False
+                try:
+                    task.get_coro().close()
+                except BaseException:
+                    pass
+            if main_task is None and hasattr(coroutine, "close"):
+                coroutine.close()
+            loop.close()
+
     def complete_content_data(
         self,
         account: dict,
@@ -1195,7 +1248,7 @@ class DouyinDataCollector:
         except BaseException:
             return account_batch
         try:
-            return asyncio.run(
+            return self._run_content_completion(
                 self._complete_content_data_async(
                     account,
                     account_batch,

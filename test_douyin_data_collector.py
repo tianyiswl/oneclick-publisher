@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import redirect_stderr
 from dataclasses import replace
 import gc
+import io
 import json
 import tempfile
 import threading
@@ -104,6 +106,17 @@ def valid_content_payload(
             "has_more": has_more,
         }
     }
+
+
+async def wait_forever_ignoring_cancellation() -> None:
+    """模拟不合作的第三方清理协程，取消后仍继续等待。"""
+
+    blocker = asyncio.Event()
+    while True:
+        try:
+            await blocker.wait()
+        except asyncio.CancelledError:
+            continue
 
 
 class DouyinDataCollectorTests(unittest.TestCase):
@@ -913,18 +926,22 @@ class FakeContentResponse:
         method: str = "GET",
         delay: float = 0.0,
         error: BaseException | None = None,
+        resist_cancellation: bool = False,
     ) -> None:
         self.url = url
         self.request = FakeContentRequest(method)
         self.payload = payload
         self.delay = delay
         self.error = error
+        self.resist_cancellation = resist_cancellation
         self.json_calls = 0
 
     async def json(self) -> object:
         self.json_calls += 1
         if self.delay:
             await asyncio.sleep(self.delay)
+        if self.resist_cancellation:
+            await wait_forever_ignoring_cancellation()
         if self.error is not None:
             raise self.error
         return self.payload
@@ -940,6 +957,7 @@ class FakeContentPage:
         goto_delay: float = 0.0,
         goto_error: BaseException | None = None,
         close_delay: float = 0.0,
+        close_resists_cancellation: bool = False,
     ) -> None:
         self.responses = responses
         self.url = final_url
@@ -947,6 +965,7 @@ class FakeContentPage:
         self.goto_delay = goto_delay
         self.goto_error = goto_error
         self.close_delay = close_delay
+        self.close_resists_cancellation = close_resists_cancellation
         self.listeners: dict[str, object] = {}
         self.listener_removals = 0
         self.goto_calls: list[tuple[str, str, float]] = []
@@ -982,6 +1001,8 @@ class FakeContentPage:
         self.closed += 1
         if self.close_delay:
             await asyncio.sleep(self.close_delay)
+        if self.close_resists_cancellation:
+            await wait_forever_ignoring_cancellation()
         if self.close_error is not None:
             raise self.close_error
 
@@ -1187,6 +1208,34 @@ class DouyinContentCompletionTests(unittest.TestCase):
         browser = FakeContentBrowser(context)
         playwright = FakeContentPlaywright(browser)
         return FakeContentStarter(playwright), page, context, browser, playwright
+
+    @staticmethod
+    def _run_public_call_with_wall_limit(
+        callback,
+        *,
+        wall_limit: float = 0.15,
+    ) -> tuple[dict[str, object], float, str, bool]:
+        outcome: dict[str, object] = {}
+
+        def run() -> None:
+            try:
+                outcome["value"] = callback()
+            except BaseException as exc:
+                outcome["error"] = exc
+
+        runner = threading.Thread(
+            target=run,
+            name="douyin-content-bounded-call",
+            daemon=True,
+        )
+        diagnostics = io.StringIO()
+        started_at = time.monotonic()
+        with redirect_stderr(diagnostics):
+            runner.start()
+            runner.join(wall_limit)
+            elapsed = time.monotonic() - started_at
+            gc.collect()
+        return outcome, elapsed, diagnostics.getvalue(), runner.is_alive()
 
     def test_no_manifest_returns_original_batch_without_starting_a_session(
         self,
@@ -1503,6 +1552,97 @@ class DouyinContentCompletionTests(unittest.TestCase):
         self.assertLess(elapsed, 0.08)
         self.assertEqual((page.closed, context.closed, browser.closed), (1, 1, 1))
         self.assertEqual(playwright.stopped, 1)
+
+    def test_cancellation_resistant_close_cannot_hang_public_call(self) -> None:
+        """关闭协程吞掉取消时，公开入口仍必须有界返回并继续尝试其他关闭。"""
+
+        response = FakeContentResponse(
+            "https://creator.douyin.com/verified/content/list",
+            valid_content_payload(),
+        )
+        starter, page, context, browser, playwright = self._browser_harness(
+            (response,)
+        )
+        page.close_resists_cancellation = True
+        collector = DouyinDataCollector(
+            contract_loader=verified_content_contract,
+            playwright_factory=lambda: starter,
+            browser_timeout_seconds=0.04,
+        )
+
+        outcome, elapsed, diagnostics, still_running = (
+            self._run_public_call_with_wall_limit(
+                lambda: collector.complete_content_data(
+                    self.account, self._account_batch()
+                )
+            )
+        )
+
+        self.assertFalse(still_running, "public call exceeded hard wall limit")
+        self.assertLess(elapsed, 0.15)
+        self.assertIsInstance(outcome.get("error"), DouyinDataCollectionError)
+        error = outcome["error"]
+        self.assertEqual(error.error_code, "browser_cleanup_incomplete")
+        self.assertEqual(str(error), "browser_cleanup_incomplete")
+        self.assertIsNone(error.__cause__)
+        self.assertEqual((page.closed, context.closed, browser.closed), (1, 1, 1))
+        self.assertEqual(playwright.stopped, 1)
+        self.assertEqual(diagnostics, "")
+
+    def test_cancellation_resistant_worker_is_bounded_without_thread_leaks(
+        self,
+    ) -> None:
+        """响应 worker 不承认取消时，重复公开调用不得挂起、泄漏路径或累积后台线程。"""
+
+        initial_thread_count = threading.active_count()
+        for invocation in range(3):
+            with self.subTest(invocation=invocation):
+                response = FakeContentResponse(
+                    "https://creator.douyin.com/verified/content/list",
+                    valid_content_payload(),
+                    resist_cancellation=True,
+                )
+                starter, page, context, browser, playwright = (
+                    self._browser_harness((response,))
+                )
+                page.url = "https://creator.douyin.com/login"
+                collector = DouyinDataCollector(
+                    contract_loader=verified_content_contract,
+                    playwright_factory=lambda starter=starter: starter,
+                    browser_timeout_seconds=0.04,
+                )
+
+                outcome, elapsed, diagnostics, still_running = (
+                    self._run_public_call_with_wall_limit(
+                        lambda collector=collector: collector.complete_content_data(
+                            self.account, self._account_batch()
+                        )
+                    )
+                )
+
+                self.assertFalse(
+                    still_running, "public call exceeded hard wall limit"
+                )
+                self.assertLess(elapsed, 0.15)
+                self.assertIsInstance(
+                    outcome.get("error"), DouyinDataCollectionError
+                )
+                error = outcome["error"]
+                self.assertEqual(
+                    error.error_code, "browser_cleanup_incomplete"
+                )
+                self.assertEqual(str(error), "browser_cleanup_incomplete")
+                self.assertIsNone(error.__cause__)
+                self.assertEqual(page.listener_removals, 1)
+                self.assertEqual(
+                    (page.closed, context.closed, browser.closed), (1, 1, 1)
+                )
+                self.assertEqual(playwright.stopped, 1)
+                self.assertNotIn(str(self.state_file), diagnostics)
+                self.assertNotIn("Traceback", diagnostics)
+                self.assertNotIn("Task was destroyed", diagnostics)
+
+        self.assertEqual(threading.active_count(), initial_thread_count)
 
     def test_navigation_process_control_exceptions_survive_cleanup(self) -> None:
         """CancelledError、KeyboardInterrupt 和 SystemExit 不能被改写为业务错误。"""
