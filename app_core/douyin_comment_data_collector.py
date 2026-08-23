@@ -36,7 +36,7 @@ _TRIGGER_RE = re.compile(r"^(click|scroll):([A-Za-z0-9_.:-]{1,200})$")
 _JSON_MEDIA_TYPE_RE = re.compile(
     r"^application/(?:json|[a-z0-9][a-z0-9!#$&^_.-]*\+json)$"
 )
-_CHARSET_RE = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
+_HTTP_TOKEN_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 _MAX_RESPONSE_PAGES = 50
 _MAX_QUEUED_RESPONSES = 8
 _MAX_RAW_ROWS = 256
@@ -52,6 +52,7 @@ _MAX_PAGINATION_TRIGGER_LENGTH = 207
 _MAX_RUNTIME_URL_LENGTH = 8_192
 _MAX_HEADER_NAME_LENGTH = 128
 _MAX_CONTENT_TYPE_LENGTH = 256
+_MAX_CHARSET_LENGTH = 64
 _MAX_CONTENT_ID_LENGTH = 512
 _MAX_STATE_FILE_PATH_LENGTH = 1_024
 _MAX_COMMENT_ID_LENGTH = 512
@@ -908,59 +909,137 @@ def _response_contract_status(
     return "ignore"
 
 
-def _response_content_type_status(response: object, deadline: float) -> str:
-    if time.monotonic() >= deadline:
-        return "timeout"
-    headers = getattr(response, "headers", None)
-    if type(headers) is not dict or len(headers) > _MAX_CONTAINER_KEYS:
+def _quoted_string_status(value: str, deadline: float) -> str:
+    if len(value) < 3 or value[0] != '"' or value[-1] != '"':
         return "invalid"
-    content_type: object = _MISSING
-    for name in headers:
+    index = 1
+    end = len(value) - 1
+    while index < end:
         if time.monotonic() >= deadline:
             return "timeout"
+        character = value[index]
+        if character == "\\":
+            index += 1
+            if index >= end:
+                return "invalid"
+            code_point = ord(value[index])
+            if not (
+                code_point == 9
+                or 32 <= code_point <= 126
+                or 128 <= code_point <= 255
+            ):
+                return "invalid"
+        else:
+            code_point = ord(character)
+            if not (
+                code_point == 9
+                or code_point == 32
+                or code_point == 33
+                or 35 <= code_point <= 91
+                or 93 <= code_point <= 126
+                or 128 <= code_point <= 255
+            ):
+                return "invalid"
+        index += 1
+    return "valid"
+
+
+def _content_type_value_status(value: object, deadline: float) -> str:
+    if (
+        type(value) is not str
+        or len(value) == 0
+        or len(value) > _MAX_CONTENT_TYPE_LENGTH
+    ):
+        return "invalid"
+    if time.monotonic() >= deadline:
+        return "timeout"
+    separator_index = value.find(";")
+    if separator_index < 0:
+        media_type = value.strip(" \t").lower()
+        parameter = ""
+    else:
+        media_type = value[:separator_index].strip(" \t").lower()
+        parameter = value[separator_index + 1 :].strip(" \t")
+    if _JSON_MEDIA_TYPE_RE.fullmatch(media_type) is None:
+        return "invalid"
+    if separator_index < 0:
+        return "valid"
+    name, separator, charset = parameter.partition("=")
+    if (
+        separator != "="
+        or name.lower() != "charset"
+        or not charset
+        or len(charset) > _MAX_CHARSET_LENGTH
+    ):
+        return "invalid"
+    if _HTTP_TOKEN_RE.fullmatch(name) is None:
+        return "invalid"
+    if _HTTP_TOKEN_RE.fullmatch(charset) is not None:
+        return "valid"
+    return _quoted_string_status(charset, deadline)
+
+
+def _raw_headers_content_type_status(
+    raw_headers: object,
+    deadline: float,
+) -> str:
+    if type(raw_headers) is not list or len(raw_headers) > _MAX_CONTAINER_KEYS:
+        return "invalid"
+    content_type: object = _MISSING
+    for entry in raw_headers:
+        if time.monotonic() >= deadline:
+            return "timeout"
+        if type(entry) is not dict or len(entry) != 2:
+            return "invalid"
+        for key in entry:
+            if (
+                type(key) is not str
+                or len(key) > _MAX_HEADER_NAME_LENGTH
+            ):
+                return "invalid"
+        if "name" not in entry or "value" not in entry:
+            return "invalid"
+        name = entry["name"]
+        value = entry["value"]
         if (
             type(name) is not str
             or len(name) > _MAX_HEADER_NAME_LENGTH
+            or type(value) is not str
         ):
             return "invalid"
         if name.lower() != "content-type":
             continue
         if content_type is not _MISSING:
             return "invalid"
-        content_type = headers[name]
-    if (
-        type(content_type) is not str
-        or len(content_type) == 0
-        or len(content_type) > _MAX_CONTENT_TYPE_LENGTH
-    ):
+        if len(value) > _MAX_CONTENT_TYPE_LENGTH:
+            return "invalid"
+        content_type = value
+    if content_type is _MISSING:
         return "invalid"
+    return _content_type_value_status(content_type, deadline)
+
+
+async def _response_content_type_status(
+    response: object,
+    deadline: float,
+    await_operation: Callable,
+) -> str:
     if time.monotonic() >= deadline:
         return "timeout"
-    parts = content_type.split(";")
-    if len(parts) not in (1, 2):
+    reader = getattr(response, "headers_array", None)
+    if not callable(reader) or not inspect.iscoroutinefunction(reader):
         return "invalid"
-    media_type = parts[0].strip().lower()
-    if _JSON_MEDIA_TYPE_RE.fullmatch(media_type) is None:
-        return "invalid"
-    if len(parts) == 2:
-        parameter = parts[1].strip()
-        if parameter.count("=") != 1:
-            return "invalid"
-        name, charset = parameter.split("=", 1)
-        if name.strip().lower() != "charset":
-            return "invalid"
-        charset = charset.strip()
-        if (
-            len(charset) >= 2
-            and charset.startswith('"')
-            and charset.endswith('"')
-        ):
-            charset = charset[1:-1]
-        if _CHARSET_RE.fullmatch(charset) is None:
-            return "invalid"
-    if time.monotonic() >= deadline:
+    try:
+        raw_headers = await await_operation(reader())
+    except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+        raise
+    except TimeoutError:
         return "timeout"
-    return "valid"
+    except BaseException:
+        return "invalid"
+    status = _raw_headers_content_type_status(raw_headers, deadline)
+    raw_headers = None
+    return status
 
 
 class DouyinCommentDataCollector:
@@ -1051,6 +1130,7 @@ class DouyinCommentDataCollector:
         loop = asyncio.get_running_loop()
         response_future: asyncio.Future = loop.create_future()
         operation_tasks: dict[asyncio.Future, str] = {}
+        header_tasks: set[asyncio.Task] = set()
         owned_resources: dict[str, object] = {}
         cleanup_reservation = min(
             2.0, self._total_timeout_seconds * 0.25
@@ -1083,6 +1163,60 @@ class DouyinCommentDataCollector:
             finally:
                 if task.done():
                     operation_tasks.pop(task, None)
+
+        async def validate_content_type_before_enqueue(
+            response: object,
+        ) -> None:
+            try:
+                content_type_status = await _response_content_type_status(
+                    response,
+                    operation_deadline,
+                    await_operation,
+                )
+                if response_future.done():
+                    return
+                if content_type_status == "timeout":
+                    response_future.set_result(("timeout",))
+                    return
+                if content_type_status != "valid":
+                    response_future.set_result(
+                        ("failure", "comment_payload_invalid")
+                    )
+                    return
+                try:
+                    response_queue.put_nowait(response)
+                except asyncio.QueueFull:
+                    response_future.set_result(
+                        ("failure", "comment_payload_invalid")
+                    )
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit) as exc:
+                if not response_future.done():
+                    response_future.set_result(
+                        ("control", _control_kind(exc))
+                    )
+            except BaseException:
+                if not response_future.done():
+                    response_future.set_result(
+                        ("failure", "comment_payload_invalid")
+                    )
+            finally:
+                response = None
+
+        def consume_header_task(task: asyncio.Task) -> None:
+            header_tasks.discard(task)
+            operation_tasks.pop(task, None)
+            try:
+                task.result()
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit) as exc:
+                if not response_future.done():
+                    response_future.set_result(
+                        ("control", _control_kind(exc))
+                    )
+            except BaseException:
+                if not response_future.done():
+                    response_future.set_result(
+                        ("failure", "comment_payload_invalid")
+                    )
 
         def observe_response(response: object) -> None:
             if response_future.done():
@@ -1117,17 +1251,17 @@ class DouyinCommentDataCollector:
                 if time.monotonic() >= operation_deadline:
                     response_future.set_result(("timeout",))
                     return
-                content_type_status = _response_content_type_status(
-                    response, operation_deadline
-                )
-                if content_type_status == "timeout":
-                    response_future.set_result(("timeout",))
-                    return
-                if content_type_status != "valid":
+                if len(header_tasks) >= _MAX_QUEUED_RESPONSES:
                     response_future.set_result(
                         ("failure", "comment_payload_invalid")
                     )
                     return
+                task = asyncio.create_task(
+                    validate_content_type_before_enqueue(response)
+                )
+                header_tasks.add(task)
+                operation_tasks[task] = ""
+                task.add_done_callback(consume_header_task)
             except (asyncio.CancelledError, KeyboardInterrupt, SystemExit) as exc:
                 response_future.set_result(("control", _control_kind(exc)))
                 return
@@ -1136,12 +1270,6 @@ class DouyinCommentDataCollector:
                     ("failure", "comment_payload_invalid")
                 )
                 return
-            try:
-                response_queue.put_nowait(response)
-            except asyncio.QueueFull:
-                response_future.set_result(
-                    ("failure", "comment_payload_invalid")
-                )
 
         def finish(
             comments: tuple[CommentRecord, ...],
@@ -1180,8 +1308,10 @@ class DouyinCommentDataCollector:
                         raise CommentInsightFailure("comment_access_denied")
                     if type(status) is not int or status < 200 or status >= 300:
                         _invalid()
-                    content_type_status = _response_content_type_status(
-                        response, operation_deadline
+                    content_type_status = await _response_content_type_status(
+                        response,
+                        operation_deadline,
+                        await_operation,
                     )
                     if content_type_status == "timeout":
                         raise TimeoutError

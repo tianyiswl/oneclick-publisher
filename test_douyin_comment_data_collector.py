@@ -322,6 +322,15 @@ class FakeRequest:
 _DEFAULT_RESPONSE_HEADERS = object()
 
 
+def fake_headers_array(value: object) -> object:
+    if type(value) is not dict:
+        return value
+    return [
+        {"name": name, "value": header_value}
+        for name, header_value in value.items()
+    ]
+
+
 class FakeResponse:
     def __init__(
         self,
@@ -335,6 +344,8 @@ class FakeResponse:
         resist_cancellation: bool = False,
         headers: object = _DEFAULT_RESPONSE_HEADERS,
         headers_after_first_read: object = _DEFAULT_RESPONSE_HEADERS,
+        raw_headers: object = _DEFAULT_RESPONSE_HEADERS,
+        raw_headers_after_first_read: object = _DEFAULT_RESPONSE_HEADERS,
     ) -> None:
         self.url = url
         self.request = FakeRequest(method)
@@ -346,6 +357,20 @@ class FakeResponse:
         )
         self._headers_after_first_read = headers_after_first_read
         self.header_reads = 0
+        self._raw_headers = (
+            fake_headers_array(self._headers)
+            if raw_headers is _DEFAULT_RESPONSE_HEADERS
+            else raw_headers
+        )
+        if raw_headers_after_first_read is _DEFAULT_RESPONSE_HEADERS:
+            self._raw_headers_after_first_read = (
+                _DEFAULT_RESPONSE_HEADERS
+                if headers_after_first_read is _DEFAULT_RESPONSE_HEADERS
+                else fake_headers_array(headers_after_first_read)
+            )
+        else:
+            self._raw_headers_after_first_read = raw_headers_after_first_read
+        self.header_array_reads = 0
         self.payload = payload
         self.delay = delay
         self.error = error
@@ -361,6 +386,16 @@ class FakeResponse:
         ):
             return self._headers_after_first_read
         return self._headers
+
+    async def headers_array(self) -> object:
+        self.header_array_reads += 1
+        if (
+            self.header_array_reads > 1
+            and self._raw_headers_after_first_read
+            is not _DEFAULT_RESPONSE_HEADERS
+        ):
+            return self._raw_headers_after_first_read
+        return self._raw_headers
 
     async def json(self) -> object:
         self.json_calls += 1
@@ -453,7 +488,12 @@ class FakePage:
             raise self.goto_error
         await self._emit_page(0)
         # 让响应 worker 真正进入 json() 再返回导航，避免测试只取消到空队列等待。
-        await asyncio.sleep(0)
+        for response in self.response_pages[0] if self.response_pages else ():
+            if response.resist_cancellation:
+                while response.json_calls == 0:
+                    await asyncio.sleep(0)
+            else:
+                await asyncio.sleep(0)
 
     def locator(self, target: str) -> FakeLocator:
         self.locator_calls.append(target)
@@ -998,9 +1038,117 @@ class DouyinCommentCollectorTests(unittest.TestCase):
             )
 
         self.assertEqual(raised.exception.error_code, "comment_payload_invalid")
-        self.assertEqual(response.header_reads, 2)
+        self.assertEqual(response.header_reads, 0)
+        self.assertEqual(response.header_array_reads, 2)
         self.assertEqual(response.json_calls, 0)
         self._assert_closed(page, context, browser, playwright)
+
+    def test_charset_requires_strict_token_or_quoted_string_syntax(self) -> None:
+        """charset 只能是无等号空格的 token 或完整合法 quoted-string。"""
+
+        cases = (
+            ("token", "application/json;charset=utf-8", True),
+            (
+                "legal_ows",
+                "application/json \t; \tcharset=utf-8 \t",
+                True,
+            ),
+            (
+                "quoted",
+                'application/problem+json; charset="utf-8"',
+                True,
+            ),
+            (
+                "quoted_pair",
+                'application/json; charset="utf\\-8"',
+                True,
+            ),
+            ("colon", "application/json; charset=utf:8", False),
+            ("space_before_equal", "application/json; charset =utf-8", False),
+            ("space_after_equal", "application/json; charset= utf-8", False),
+            (
+                "unterminated_quote",
+                'application/json; charset="utf-8',
+                False,
+            ),
+            (
+                "quote_with_suffix",
+                'application/json; charset="utf-8"x',
+                False,
+            ),
+            (
+                "quoted_control",
+                'application/json; charset="utf\n8"',
+                False,
+            ),
+        )
+        for name, content_type, accepted in cases:
+            with self.subTest(name=name):
+                response = FakeResponse(
+                    comment_payload(comment_row(f"charset-{name}")),
+                    headers={"content-type": content_type},
+                )
+                starter, page, context, browser, playwright = self._harness(
+                    ((response,),)
+                )
+
+                if accepted:
+                    try:
+                        batch = self._collector(starter).collect(
+                            self.account, "work-7", frozenset()
+                        )
+                    except CommentInsightFailure as exc:
+                        self.fail(
+                            f"valid charset syntax rejected: {exc.error_code}"
+                        )
+                    self.assertEqual(batch.accepted_count, 1)
+                    self.assertEqual(response.json_calls, 1)
+                else:
+                    with self.assertRaises(CommentInsightFailure) as raised:
+                        self._collector(starter).collect(
+                            self.account, "work-7", frozenset()
+                        )
+                    self.assertEqual(
+                        raised.exception.error_code,
+                        "comment_payload_invalid",
+                    )
+                    self.assertEqual(response.json_calls, 0)
+                self._assert_closed(page, context, browser, playwright)
+
+    def test_duplicate_raw_content_type_headers_fail_before_json(self) -> None:
+        """原始数组中第二条 Content-Type 即使同值也不能被折叠字典掩盖。"""
+
+        for name, second_value in (
+            ("same", "application/json"),
+            ("different", "text/html"),
+        ):
+            with self.subTest(name=name):
+                response = FakeResponse(
+                    comment_payload(comment_row(f"duplicate-raw-{name}")),
+                    headers={"content-type": "application/json"},
+                    raw_headers=[
+                        {
+                            "name": "Content-Type",
+                            "value": "application/json",
+                        },
+                        {"name": "content-type", "value": second_value},
+                    ],
+                )
+                starter, page, context, browser, playwright = self._harness(
+                    ((response,),)
+                )
+
+                with self.assertRaises(CommentInsightFailure) as raised:
+                    self._collector(starter).collect(
+                        self.account, "work-7", frozenset()
+                    )
+
+                self.assertEqual(
+                    raised.exception.error_code,
+                    "comment_payload_invalid",
+                )
+                self.assertEqual(response.json_calls, 0)
+                self._assert_closed(page, context, browser, playwright)
 
     def test_401_and_403_mapping_precedes_content_type_validation(self) -> None:
         """登录和权限状态必须在读正文前固定映射，不受响应类型干扰。"""
