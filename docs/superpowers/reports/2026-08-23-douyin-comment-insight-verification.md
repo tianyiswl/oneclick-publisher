@@ -6,7 +6,7 @@
 - 功能提交：`f69be4850533f0e4ac69a0b274c64bc153bb4f85`
 - 本记录只覆盖 data 分支本地门禁；未进入共享集成、真实平台或发布阶段。
 
-## 本地测试
+## 首次 data 分支门禁
 
 - `python -m unittest -v test_platform_data_comment_models`：13 项通过。
 - `python -m unittest -v test_platform_data_comment_store`：9 项通过。
@@ -22,10 +22,17 @@
 - `python -m unittest -v test_platform_data_service test_platform_data_sync test_data_monitor_page test_douyin_data_collector test_xiaohongshu_data_collector test_wechat_data_collector test_bilibili_data_collector test_kuaishou_data_collector`：301 项通过，0 项失败。
 - `git diff --check`：通过。
 
+## Fix round 1 当前候选
+
+- committed-secret、settings-only、clear finalize，以及既有 candidate、rollback、dirty settings、malformed revision 定点回归：15 项通过，0 项失败。
+- `python -m unittest -v test_data_monitor_page test_platform_data_comment_service test_platform_data_comment_ai`：204 项通过，0 项失败。
+- `python -m unittest -v test_platform_data_service test_platform_data_sync test_data_monitor_page test_douyin_data_collector test_xiaohongshu_data_collector test_wechat_data_collector test_bilibili_data_collector test_kuaishou_data_collector`：305 项通过，0 项失败。
+
 ## 范围检查
 
-- data 分支范围检查：通过。
-- 共识别 27 个变更文件，全部属于 data 分支允许范围；没有 shared 或 outside 文件。
+- 功能提交 `f69be4850533f0e4ac69a0b274c64bc153bb4f85` 的范围检查识别 27 个变更文件，全部属于 data 分支允许范围。
+- 报告提交 `a0ae47a7a0168301efaf3b86ac54788cfbf650aa` 加入验收记录后，当前候选的范围检查识别 28 个变更文件，仍全部属于 data 分支允许范围。
+- 两次范围检查均通过，没有 shared 或 outside 文件。
 
 ## 尚未执行的真实与集成验收
 

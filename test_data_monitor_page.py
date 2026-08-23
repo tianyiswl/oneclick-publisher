@@ -4288,6 +4288,201 @@ class DataMonitorPageTests(unittest.TestCase):
         )
         self.assertEqual(dialog.result(), 0)
 
+    def test_committed_secret_finalize_failure_poison_blocks_later_actions(
+        self,
+    ) -> None:
+        """密钥已提交但 pending 收尾失败后，旧窗口不得再碰设置或密钥。"""
+
+        settings = PersistentFakeSettings(
+            {
+                BASE_URL_KEY: "https://old.example.com/v1",
+                MODEL_KEY: "model-old",
+                CONFIG_REVISION_KEY: REVISION_A,
+            },
+            sync_failures=(4,),
+        )
+        secret_store = FakeSecretStore(configured=True)
+        dialog = _CommentAiSettingsDialog(
+            settings=settings,
+            secret_store=secret_store,
+            lock_factory=SharedConfigLockState().factory,
+        )
+        dialog._revision_factory = lambda: REVISION_C
+        self.addCleanup(dialog.deleteLater)
+        dialog.base_url_input.setText("https://new.example.com/v1")
+        dialog.model_input.setText("model-new")
+        dialog.secret_input.setText("committed-private-marker")
+
+        dialog._save()
+
+        self.assertTrue(dialog._settings_poisoned)
+        self.assertEqual(settings.synced, 4)
+        self.assertEqual(secret_store.writes, ["committed-private-marker"])
+        self.assertEqual(
+            settings.reopen().value(_AI_CONFIG_TRANSITION_KEY),
+            "pending-v1",
+        )
+        dialog.secret_input.setText("later-private-marker")
+        dialog._save()
+        dialog._clear_secret()
+
+        self.assertEqual(settings.synced, 4)
+        self.assertEqual(secret_store.writes, ["committed-private-marker"])
+        self.assertEqual(secret_store.delete_count, 0)
+        self.assertEqual(
+            settings.reopen().value(_AI_CONFIG_TRANSITION_KEY),
+            "pending-v1",
+        )
+        self.assertEqual(
+            dialog.feedback_label.text(),
+            "设置状态不确定，请关闭后重新打开",
+        )
+
+    def test_committed_secret_finalize_controls_poison_after_clean_rebuild(
+        self,
+    ) -> None:
+        """pending 收尾遇到三类进程控制，清敏感数据后仍要毒化旧窗口。"""
+
+        cases = (
+            (asyncio.CancelledError(), asyncio.CancelledError, None),
+            (KeyboardInterrupt(), KeyboardInterrupt, None),
+            (SystemExit(41), SystemExit, 41),
+        )
+        for original, expected, expected_code in cases:
+            settings = PersistentFakeSettings(
+                {
+                    BASE_URL_KEY: "https://old.example.com/v1",
+                    MODEL_KEY: "model-old",
+                    CONFIG_REVISION_KEY: REVISION_A,
+                },
+                sync_controls={4: original},
+            )
+            secret_store = FakeSecretStore(configured=True)
+            dialog = _CommentAiSettingsDialog(
+                settings=settings,
+                secret_store=secret_store,
+                lock_factory=SharedConfigLockState().factory,
+            )
+            dialog._revision_factory = lambda: REVISION_C
+            self.addCleanup(dialog.deleteLater)
+            dialog.base_url_input.setText("https://new.example.com/v1")
+            dialog.model_input.setText("model-new")
+            dialog.secret_input.setText("control-private-marker")
+
+            with self.subTest(control=expected.__name__):
+                with self.assertRaises(expected) as raised:
+                    dialog._save()
+                self.assertIsNot(raised.exception, original)
+                if expected is SystemExit:
+                    self.assertEqual(raised.exception.code, expected_code)
+                else:
+                    self.assertEqual(raised.exception.args, ())
+                self.assertEqual(dialog.secret_input.text(), "")
+                self.assertTrue(dialog._settings_poisoned)
+                self.assertEqual(settings.synced, 4)
+                self.assertEqual(secret_store.writes, ["control-private-marker"])
+                self.assertEqual(
+                    settings.reopen().value(_AI_CONFIG_TRANSITION_KEY),
+                    "pending-v1",
+                )
+                dialog.secret_input.setText("later-private-marker")
+                dialog._save()
+                dialog._clear_secret()
+                self.assertEqual(settings.synced, 4)
+                self.assertEqual(secret_store.writes, ["control-private-marker"])
+                self.assertEqual(secret_store.delete_count, 0)
+                self.assertEqual(
+                    dialog.feedback_label.text(),
+                    "设置状态不确定，请关闭后重新打开",
+                )
+
+    def test_settings_only_finalize_failure_poison_blocks_later_actions(
+        self,
+    ) -> None:
+        """只改非敏感设置的 pending 收尾失败后，同一窗口也必须停用。"""
+
+        settings = PersistentFakeSettings(
+            {
+                BASE_URL_KEY: "https://old.example.com/v1",
+                MODEL_KEY: "model-old",
+                CONFIG_REVISION_KEY: REVISION_A,
+            },
+            sync_failures=(4,),
+        )
+        secret_store = FakeSecretStore(configured=True)
+        dialog = _CommentAiSettingsDialog(
+            settings=settings,
+            secret_store=secret_store,
+            lock_factory=SharedConfigLockState().factory,
+        )
+        dialog._revision_factory = lambda: REVISION_C
+        self.addCleanup(dialog.deleteLater)
+        dialog.base_url_input.setText("https://new.example.com/v1")
+        dialog.model_input.setText("model-new")
+
+        dialog._save()
+
+        self.assertTrue(dialog._settings_poisoned)
+        self.assertEqual(settings.synced, 4)
+        self.assertEqual(
+            settings.reopen().value(_AI_CONFIG_TRANSITION_KEY),
+            "pending-v1",
+        )
+        dialog.secret_input.setText("later-private-marker")
+        dialog._save()
+        dialog._clear_secret()
+
+        self.assertEqual(settings.synced, 4)
+        self.assertEqual(secret_store.writes, [])
+        self.assertEqual(secret_store.delete_count, 0)
+        self.assertEqual(
+            dialog.feedback_label.text(),
+            "设置状态不确定，请关闭后重新打开",
+        )
+
+    def test_committed_clear_finalize_failure_poison_blocks_later_actions(
+        self,
+    ) -> None:
+        """密钥已清除但 pending 收尾失败后，同一窗口不得再同步或删密钥。"""
+
+        settings = PersistentFakeSettings(
+            {
+                BASE_URL_KEY: "https://old.example.com/v1",
+                MODEL_KEY: "model-old",
+                CONFIG_REVISION_KEY: REVISION_A,
+            },
+            sync_failures=(4,),
+        )
+        secret_store = FakeSecretStore(configured=True)
+        dialog = _CommentAiSettingsDialog(
+            settings=settings,
+            secret_store=secret_store,
+            lock_factory=SharedConfigLockState().factory,
+        )
+        dialog._revision_factory = lambda: REVISION_C
+        self.addCleanup(dialog.deleteLater)
+
+        dialog._clear_secret()
+
+        self.assertTrue(dialog._settings_poisoned)
+        self.assertEqual(settings.synced, 4)
+        self.assertEqual(secret_store.delete_count, 1)
+        self.assertEqual(
+            settings.reopen().value(_AI_CONFIG_TRANSITION_KEY),
+            "pending-v1",
+        )
+        dialog.secret_input.setText("later-private-marker")
+        dialog._save()
+        dialog._clear_secret()
+
+        self.assertEqual(settings.synced, 4)
+        self.assertEqual(secret_store.writes, [])
+        self.assertEqual(secret_store.delete_count, 1)
+        self.assertEqual(
+            dialog.feedback_label.text(),
+            "设置状态不确定，请关闭后重新打开",
+        )
+
     def test_ai_settings_committed_cleanup_control_keeps_new_pair_before_rebuild(self) -> None:
         """已提交后的清理中断必须保留新密钥与新端点这一对。"""
 

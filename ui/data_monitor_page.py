@@ -1053,6 +1053,8 @@ class _CommentAiSettingsDialog(QDialog):
                         transition_resolved = (
                             finish_outcome[0] == _UI_OUTCOME_OK
                         )
+                        if not transition_resolved:
+                            self._settings_poisoned = True
                         final_outcome = _first_ui_outcome(
                             receipt_outcome,
                             None
