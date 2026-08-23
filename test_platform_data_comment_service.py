@@ -13,6 +13,7 @@ import unittest
 
 from app_core import platform_data_comment_service as service
 from app_core import platform_data_comment_store as store
+from app_core.platform_data_comment_ai import OpenAiCompatibleCommentProvider
 from app_core.platform_data_collection_errors import CleanupReceipt
 from app_core.platform_data_comment_models import (
     CommentClassification,
@@ -22,6 +23,7 @@ from app_core.platform_data_comment_models import (
     InsightResult,
     TopicCandidate,
 )
+from app_core.platform_data_comment_settings import CommentAiSettings
 
 
 OBSERVED = "2026-08-23T10:21:00+08:00"
@@ -303,6 +305,87 @@ class CommentServiceTests(unittest.TestCase):
             "SELECT status, errorCode FROM comment_insight_runs"
         ).fetchone()
         self.assertEqual(tuple(insight_row), ("failed", "comment_ai_timeout"))
+
+    def test_real_provider_interface_is_injectable_after_comment_commit(self):
+        """真实 provider 合同必须能由工厂注入，且不把密钥或原响应落库。"""
+
+        secret = "sk-service-private"
+        raw_marker = "raw-provider-response-marker"
+        contract = {
+            "classifications": [
+                {"ref": "C001", "labels": ["真实经历"]},
+                {"ref": "C002", "labels": ["追问"]},
+            ],
+            "candidates": [
+                {
+                    "title": "解释原因",
+                    "reason": "回答原评论中的问题",
+                    "evidenceRefs": ["C002"],
+                }
+            ],
+        }
+        content = json.dumps(contract, ensure_ascii=False)
+        envelope = {
+            "id": raw_marker,
+            "object": "chat.completion",
+            "created": 1,
+            "model": "model-x",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": content},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+
+        class Response:
+            status_code = 200
+            headers = {"Content-Type": "application/json"}
+            content = json.dumps(envelope, ensure_ascii=False).encode("utf-8")
+
+            def iter_content(self, chunk_size):
+                for offset in range(0, len(self.content), chunk_size):
+                    yield self.content[offset : offset + chunk_size]
+
+            def close(self):
+                return None
+
+        class Session:
+            def __init__(self):
+                self.calls = 0
+
+            def post(self, _url, *, headers, json, timeout, stream):
+                self.calls += 1
+                self.assertions = (headers, json, timeout, stream)
+                return Response()
+
+            def close(self):
+                return None
+
+        session = Session()
+        provider = OpenAiCompatibleCommentProvider(
+            settings=CommentAiSettings("https://ai.example.com/v1", "model-x"),
+            secret=secret,
+            session_factory=lambda: session,
+        )
+
+        result = self._sync(
+            FixedCollector(valid_batch()),
+            ai_provider_factory=lambda: provider,
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["aiStatus"], "success")
+        self.assertEqual(result["aiErrorCode"], "")
+        self.assertEqual(session.calls, 1)
+        stored = "\n".join(self.conn.iterdump())
+        self.assertNotIn(secret, stored)
+        self.assertNotIn(raw_marker, stored)
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM platform_comments").fetchone()[0],
+            2,
+        )
 
     def test_collector_failure_preserves_old_comments_and_records_one_run(self):
         """采集失败不得清空旧评论，也不得暗中重试制造多条失败运行。"""
