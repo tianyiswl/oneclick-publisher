@@ -9,8 +9,11 @@ import hashlib
 import json
 from typing import Callable
 
+from PyQt6.QtCore import QLockFile
+
 from . import database
 from .douyin_comment_data_collector import DouyinCommentDataCollector
+from .paths import USER_DATA_DIR
 from .platform_data_collection_errors import CleanupReceipt
 from .platform_data_comment_models import (
     ALLOWED_COMMENT_ERROR_CODES,
@@ -70,6 +73,9 @@ _PUBLIC_RESULT_KEYS = (
 _DEFAULT_PROMPT_VERSION = "comment-insight-v1"
 _DEFAULT_SCHEMA_VERSION = 1
 _MAX_INSIGHT_JSON_BYTES = 1_000_000
+_MAX_CONTENT_ID_LENGTH = 512
+_COMMENT_SYNC_LEASE_WAIT_MS = 100
+_COMMENT_SYNC_LEASE_STALE_MS = 30_000
 _PROCESS_CONTROL = (asyncio.CancelledError, KeyboardInterrupt, SystemExit)
 
 
@@ -84,7 +90,12 @@ def _valid_account_id(value: object) -> int:
 
 
 def _valid_content_id(value: object) -> str:
-    if type(value) is not str or not value or value != value.strip():
+    if (
+        type(value) is not str
+        or not value
+        or len(value) > _MAX_CONTENT_ID_LENGTH
+        or value != value.strip()
+    ):
         raise _payload_failure()
     return value
 
@@ -99,6 +110,87 @@ def _valid_connect_factory(value: object):
     if not callable(value):
         raise _payload_failure()
     return value
+
+
+def _new_comment_sync_lease(account_id: int, content_id: str):
+    """使用匿名稳定路径创建跨进程评论同步租约。"""
+
+    root = USER_DATA_DIR / "locks"
+    root.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256()
+    digest.update(str(account_id).encode("ascii"))
+    digest.update(b"\x00")
+    digest.update(content_id.encode("utf-8"))
+    lock = QLockFile(str(root / f"comment-sync-{digest.hexdigest()}.lock"))
+    lock.setStaleLockTime(_COMMENT_SYNC_LEASE_STALE_MS)
+    return lock
+
+
+def _service_control(value: BaseException) -> tuple[str, int | None]:
+    if isinstance(value, asyncio.CancelledError):
+        return "cancelled", None
+    if isinstance(value, KeyboardInterrupt):
+        return "keyboard_interrupt", None
+    code = value.code if isinstance(value, SystemExit) else 1
+    if type(code) is not int or not -2_147_483_648 <= code <= 2_147_483_647:
+        code = 1
+    return "system_exit", code
+
+
+def _raise_service_control(control: tuple[str, int | None]) -> None:
+    kind, code = control
+    if kind == "cancelled":
+        raise asyncio.CancelledError() from None
+    if kind == "keyboard_interrupt":
+        raise KeyboardInterrupt() from None
+    raise SystemExit(code) from None
+
+
+def _release_comment_sync_lease(lock) -> tuple[str, object]:
+    try:
+        unlock = getattr(lock, "unlock", None)
+        if not callable(unlock):
+            raise RuntimeError("comment sync lease unavailable")
+        unlock()
+    except _PROCESS_CONTROL as exc:
+        control = _service_control(exc)
+        exc = None
+        return "control", control
+    except BaseException:
+        return "failure", None
+    return "ok", None
+
+
+def _acquire_comment_sync_lease(
+    lease_factory,
+    account_id: int,
+    content_id: str,
+):
+    lock = None
+    try:
+        lock = lease_factory(account_id, content_id)
+        try_lock = getattr(lock, "tryLock", None)
+        unlock = getattr(lock, "unlock", None)
+        if not callable(try_lock) or not callable(unlock):
+            raise RuntimeError("comment sync lease unavailable")
+        acquired = try_lock(_COMMENT_SYNC_LEASE_WAIT_MS)
+        if type(acquired) is not bool or not acquired:
+            return None
+        return lock
+    except _PROCESS_CONTROL as exc:
+        control = _service_control(exc)
+        exc = None
+        if lock is not None:
+            _release_comment_sync_lease(lock)
+        lock = None
+        _raise_service_control(control)
+    except BaseException:
+        if lock is not None:
+            release_outcome = _release_comment_sync_lease(lock)
+            lock = None
+            if release_outcome[0] == "control":
+                _raise_service_control(release_outcome[1])
+        return None
 
 
 def _emit(report: Callable[[dict], None] | None, stage: str) -> None:
@@ -548,7 +640,7 @@ def _run_optional_ai_after_commit(
     )
 
 
-def sync_comments(
+def _sync_comments_owned(
     account_id: int,
     content_id: str,
     report=None,
@@ -747,6 +839,88 @@ def sync_comments(
         ai_status=ai_receipt["status"],
         ai_error_code=ai_receipt["errorCode"],
     )
+
+
+def sync_comments(
+    account_id: int,
+    content_id: str,
+    report=None,
+    *,
+    collector_factory=DouyinCommentDataCollector,
+    ai_provider_factory=lambda: None,
+    connect_factory=database.connect,
+    lease_factory=_new_comment_sync_lease,
+) -> dict:
+    """在首次读库前为同一账号和作品取得跨进程单活租约。"""
+
+    try:
+        account_id = _valid_account_id(account_id)
+        content_id = _valid_content_id(content_id)
+        report = _valid_report(report)
+        if (
+            not callable(collector_factory)
+            or not callable(ai_provider_factory)
+            or not callable(lease_factory)
+        ):
+            raise _payload_failure()
+        connect_factory = _valid_connect_factory(connect_factory)
+    except CommentInsightFailure:
+        return _public_result(
+            status="failed",
+            error_code="comment_content_unavailable",
+            no_session=True,
+        )
+
+    lease = _acquire_comment_sync_lease(
+        lease_factory, account_id, content_id
+    )
+    if lease is None:
+        return _public_result(
+            status="failed",
+            error_code="comment_sync_timeout",
+            no_session=True,
+        )
+
+    result = None
+    operation_control = None
+    try:
+        try:
+            result = _sync_comments_owned(
+                account_id,
+                content_id,
+                report,
+                collector_factory=collector_factory,
+                ai_provider_factory=ai_provider_factory,
+                connect_factory=connect_factory,
+            )
+        except _PROCESS_CONTROL as exc:
+            operation_control = _service_control(exc)
+            exc = None
+        except BaseException:
+            result = _public_result(
+                status="failed",
+                error_code="comment_payload_invalid",
+            )
+    finally:
+        release_outcome = _release_comment_sync_lease(lease)
+        lease = None
+    if operation_control is not None:
+        result = None
+        _raise_service_control(operation_control)
+    if release_outcome[0] == "control":
+        result = None
+        _raise_service_control(release_outcome[1])
+    if release_outcome[0] != "ok":
+        return _public_result(
+            status="failed",
+            error_code="comment_sync_cancelled",
+        )
+    if type(result) is not dict:
+        return _public_result(
+            status="failed",
+            error_code="comment_payload_invalid",
+        )
+    return result
 
 
 def _safe_insight_payload(

@@ -760,6 +760,43 @@ class DouyinVerifiedContentParserTests(unittest.TestCase):
                     raised.exception.error_code, "content_payload_invalid"
                 )
 
+    def test_verified_payload_bounds_rows_containers_and_external_text(self) -> None:
+        """单页行数、容器宽度、ID、展示文本和游标都必须有硬上限。"""
+
+        too_many_rows = valid_content_payload()
+        row = too_many_rows["data"]["items"][0]
+        too_many_rows["data"]["items"] = [
+            json.loads(json.dumps(row)) for _index in range(257)
+        ]
+        wide_row = valid_content_payload()
+        wide_row["data"]["items"][0].update(
+            {f"extra_{index}": index for index in range(64)}
+        )
+        cases = (
+            too_many_rows,
+            wide_row,
+            valid_content_payload(content_id="x" * 513),
+            valid_content_payload(title="x" * 4_097),
+            valid_content_payload(cover="x" * 8_193),
+            valid_content_payload(published_at="x" * 129),
+            valid_content_payload(status="x" * 65),
+            valid_content_payload(type="x" * 65),
+            valid_content_payload(cursor="x" * 2_049, has_more=True),
+        )
+
+        for payload in cases:
+            with self.subTest(case_index=cases.index(payload)):
+                with self.assertRaises(DouyinDataCollectionError) as raised:
+                    parse_verified_content_payload(
+                        verified_content_contract(),
+                        payload,
+                        account_id=12,
+                        observed_at=self.observed_at,
+                    )
+                self.assertEqual(
+                    raised.exception.error_code, "content_payload_invalid"
+                )
+
     def test_negative_cumulative_content_metric_is_rejected(self) -> None:
         """累计作品指标不能接受有限负数并当作可信平台事实。"""
 
@@ -924,17 +961,68 @@ class FakeContentResponse:
         payload: object,
         *,
         method: str = "GET",
+        status: object = 200,
+        raw_headers: object = None,
+        raw_body: object = None,
+        header_delay: float = 0.0,
         delay: float = 0.0,
         error: BaseException | None = None,
         resist_cancellation: bool = False,
+        synchronous_metadata_only: bool = False,
     ) -> None:
-        self.url = url
-        self.request = FakeContentRequest(method)
+        self._url = url
+        self._request = FakeContentRequest(method)
+        self.status = status
+        self.raw_headers = (
+            [{"name": "content-type", "value": "application/json"}]
+            if raw_headers is None
+            else raw_headers
+        )
+        self.raw_body = raw_body
+        self.header_delay = header_delay
         self.payload = payload
         self.delay = delay
         self.error = error
         self.resist_cancellation = resist_cancellation
+        self.synchronous_metadata_only = synchronous_metadata_only
+        self.metadata_callback_active = False
+        self.header_calls = 0
+        self.body_calls = 0
         self.json_calls = 0
+
+    @property
+    def url(self) -> str:
+        if self.synchronous_metadata_only and not self.metadata_callback_active:
+            raise AssertionError("response URL must be filtered synchronously")
+        return self._url
+
+    @property
+    def request(self) -> FakeContentRequest:
+        if self.synchronous_metadata_only and not self.metadata_callback_active:
+            raise AssertionError("request method must be filtered synchronously")
+        return self._request
+
+    async def headers_array(self) -> object:
+        self.header_calls += 1
+        if self.header_delay:
+            await asyncio.sleep(self.header_delay)
+        return self.raw_headers
+
+    async def body(self) -> object:
+        self.body_calls += 1
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        if self.resist_cancellation:
+            await wait_forever_ignoring_cancellation()
+        if self.error is not None:
+            raise self.error
+        if self.raw_body is not None:
+            return self.raw_body
+        return json.dumps(
+            self.payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
 
     async def json(self) -> object:
         self.json_calls += 1
@@ -956,6 +1044,7 @@ class FakeContentPage:
         close_error: BaseException | None = None,
         goto_delay: float = 0.0,
         goto_error: BaseException | None = None,
+        after_responses_delay: float = 0.0,
         close_delay: float = 0.0,
         close_resists_cancellation: bool = False,
     ) -> None:
@@ -964,6 +1053,7 @@ class FakeContentPage:
         self.close_error = close_error
         self.goto_delay = goto_delay
         self.goto_error = goto_error
+        self.after_responses_delay = after_responses_delay
         self.close_delay = close_delay
         self.close_resists_cancellation = close_resists_cancellation
         self.listeners: dict[str, object] = {}
@@ -994,8 +1084,14 @@ class FakeContentPage:
         if self.goto_error is not None:
             raise self.goto_error
         for response in self.responses:
-            self.listeners["response"](response)
+            response.metadata_callback_active = True
+            try:
+                self.listeners["response"](response)
+            finally:
+                response.metadata_callback_active = False
             await asyncio.sleep(0)
+        if self.after_responses_delay:
+            await asyncio.sleep(self.after_responses_delay)
 
     async def close(self) -> None:
         self.closed += 1
@@ -1327,7 +1423,8 @@ class DouyinContentCompletionTests(unittest.TestCase):
         self.assertEqual(
             [response.json_calls for response in ignored], [0, 0, 0, 0]
         )
-        self.assertEqual((first_page.json_calls, second_page.json_calls), (1, 1))
+        self.assertEqual((first_page.json_calls, second_page.json_calls), (0, 0))
+        self.assertEqual((first_page.body_calls, second_page.body_calls), (1, 1))
         self.assertEqual(
             page.goto_calls,
             [
@@ -1338,6 +1435,362 @@ class DouyinContentCompletionTests(unittest.TestCase):
                 )
             ],
         )
+        self.assertEqual((page.closed, context.closed, browser.closed), (1, 1, 1))
+        self.assertEqual(playwright.stopped, 1)
+
+    def test_unmatched_response_flood_is_filtered_before_async_work(self) -> None:
+        """未命中响应如果被排队，大量广告或评论接口会挤占作品队列。"""
+
+        ignored = tuple(
+            FakeContentResponse(
+                f"https://creator.douyin.com/unmatched/{index}",
+                {"ignored": index},
+                synchronous_metadata_only=True,
+            )
+            for index in range(100)
+        )
+        accepted = FakeContentResponse(
+            "https://creator.douyin.com/verified/content/list",
+            valid_content_payload("official-work"),
+        )
+        starter, page, context, browser, playwright = self._browser_harness(
+            (*ignored, accepted)
+        )
+        collector = DouyinDataCollector(
+            contract_loader=verified_content_contract,
+            playwright_factory=lambda: starter,
+            browser_timeout_seconds=0.2,
+        )
+
+        completed = collector.complete_content_data(
+            self.account, self._account_batch()
+        )
+
+        self.assertEqual(
+            [content.content_id for content in completed.contents],
+            ["official-work"],
+        )
+        self.assertTrue(all(response.header_calls == 0 for response in ignored))
+        self.assertTrue(all(response.body_calls == 0 for response in ignored))
+        self.assertEqual(page.listener_removals, 1)
+        self.assertEqual((page.closed, context.closed, browser.closed), (1, 1, 1))
+        self.assertEqual(playwright.stopped, 1)
+
+    def test_matched_response_requires_builtin_2xx_status(self) -> None:
+        """非 2xx 或弱类型状态不得进入响应体解析。"""
+
+        for status in (199, 300, True, "200"):
+            with self.subTest(status=status):
+                response = FakeContentResponse(
+                    "https://creator.douyin.com/verified/content/list",
+                    valid_content_payload(),
+                    status=status,
+                )
+                starter, page, context, browser, playwright = (
+                    self._browser_harness((response,))
+                )
+                collector = DouyinDataCollector(
+                    contract_loader=verified_content_contract,
+                    playwright_factory=lambda starter=starter: starter,
+                    browser_timeout_seconds=0.2,
+                )
+
+                with self.assertRaises(DouyinDataCollectionError) as raised:
+                    collector.complete_content_data(
+                        self.account, self._account_batch()
+                    )
+
+                self.assertEqual(
+                    raised.exception.error_code, "content_payload_invalid"
+                )
+                self.assertEqual(response.body_calls, 0)
+                self.assertEqual(page.listener_removals, 1)
+                self.assertEqual(
+                    (page.closed, context.closed, browser.closed), (1, 1, 1)
+                )
+                self.assertEqual(playwright.stopped, 1)
+
+    def test_matched_response_requires_one_unfolded_json_content_type(self) -> None:
+        """缺失、非 JSON、重复或折行 Content-Type 都必须在读取 body 前失败。"""
+
+        cases = (
+            [],
+            [{"name": "content-type", "value": "text/html"}],
+            [
+                {"name": "content-type", "value": "application/json"},
+                {"name": "Content-Type", "value": "application/json"},
+            ],
+            [
+                {
+                    "name": "content-type",
+                    "value": "application/json\r\n application/json",
+                }
+            ],
+            [{"name": "content-type", "value": "application/json; charset"}],
+        )
+        for raw_headers in cases:
+            with self.subTest(raw_headers=raw_headers):
+                response = FakeContentResponse(
+                    "https://creator.douyin.com/verified/content/list",
+                    valid_content_payload(),
+                    raw_headers=raw_headers,
+                )
+                starter, page, context, browser, playwright = (
+                    self._browser_harness((response,))
+                )
+                collector = DouyinDataCollector(
+                    contract_loader=verified_content_contract,
+                    playwright_factory=lambda starter=starter: starter,
+                    browser_timeout_seconds=0.2,
+                )
+
+                with self.assertRaises(DouyinDataCollectionError) as raised:
+                    collector.complete_content_data(
+                        self.account, self._account_batch()
+                    )
+
+                self.assertEqual(
+                    raised.exception.error_code, "content_payload_invalid"
+                )
+                self.assertEqual(response.body_calls, 0)
+                self.assertEqual(page.listener_removals, 1)
+                self.assertEqual(
+                    (page.closed, context.closed, browser.closed), (1, 1, 1)
+                )
+                self.assertEqual(playwright.stopped, 1)
+
+    def test_header_and_matched_response_queues_fail_closed_on_overflow(self) -> None:
+        """头校验或已匹配 body 队列都不得无界积压。"""
+
+        cases = (
+            tuple(
+                FakeContentResponse(
+                    "https://creator.douyin.com/verified/content/list",
+                    valid_content_payload(f"header-{index}"),
+                    header_delay=0.05,
+                )
+                for index in range(9)
+            ),
+            tuple(
+                FakeContentResponse(
+                    "https://creator.douyin.com/verified/content/list",
+                    valid_content_payload(f"queue-{index}"),
+                    delay=0.05 if index == 0 else 0.0,
+                )
+                for index in range(10)
+            ),
+        )
+        for responses in cases:
+            with self.subTest(first_content_id=responses[0].payload["data"]["items"][0]["id"]):
+                starter, page, context, browser, playwright = (
+                    self._browser_harness(responses)
+                )
+                collector = DouyinDataCollector(
+                    contract_loader=verified_content_contract,
+                    playwright_factory=lambda starter=starter: starter,
+                    browser_timeout_seconds=0.2,
+                )
+
+                with self.assertRaises(DouyinDataCollectionError) as raised:
+                    collector.complete_content_data(
+                        self.account, self._account_batch()
+                    )
+
+                self.assertEqual(
+                    raised.exception.error_code, "content_payload_invalid"
+                )
+                self.assertEqual(page.listener_removals, 1)
+                self.assertEqual(
+                    (page.closed, context.closed, browser.closed), (1, 1, 1)
+                )
+                self.assertEqual(playwright.stopped, 1)
+
+    def test_response_body_and_cumulative_bytes_are_bounded(self) -> None:
+        """单个响应体和整次分页的原始字节都不得无界累积。"""
+
+        oversized_payload = valid_content_payload()
+        oversized_payload["padding"] = "x" * 1_048_576
+        oversized = (
+            FakeContentResponse(
+                "https://creator.douyin.com/verified/content/list",
+                oversized_payload,
+            ),
+        )
+        cumulative = tuple(
+            FakeContentResponse(
+                "https://creator.douyin.com/verified/content/list",
+                {
+                    **valid_content_payload(
+                        f"work-{index}",
+                        cursor=f"cursor-{index}" if index < 4 else "",
+                        has_more=index < 4,
+                    ),
+                    "padding": "x" * 900_000,
+                },
+            )
+            for index in range(5)
+        )
+
+        for responses in (oversized, cumulative):
+            with self.subTest(response_count=len(responses)):
+                starter, page, context, browser, playwright = (
+                    self._browser_harness(responses)
+                )
+                collector = DouyinDataCollector(
+                    contract_loader=verified_content_contract,
+                    playwright_factory=lambda starter=starter: starter,
+                    browser_timeout_seconds=0.5,
+                )
+
+                with self.assertRaises(DouyinDataCollectionError) as raised:
+                    collector.complete_content_data(
+                        self.account, self._account_batch()
+                    )
+
+                self.assertEqual(
+                    raised.exception.error_code, "content_payload_invalid"
+                )
+                self.assertEqual(page.listener_removals, 1)
+                self.assertEqual(
+                    (page.closed, context.closed, browser.closed), (1, 1, 1)
+                )
+                self.assertEqual(playwright.stopped, 1)
+
+    def test_cumulative_works_metrics_pages_and_cursors_are_bounded(self) -> None:
+        """即使每页合法，整次任务的作品、指标、页数和游标也必须有上限。"""
+
+        def rows_payload(
+            start: int,
+            count: int,
+            *,
+            cursor: str,
+            has_more: bool,
+        ) -> dict:
+            payload = valid_content_payload(
+                f"work-{start}", cursor=cursor, has_more=has_more
+            )
+            template = payload["data"]["items"][0]
+            rows = []
+            for index in range(start, start + count):
+                candidate = json.loads(json.dumps(template))
+                candidate["id"] = f"work-{index}"
+                rows.append(candidate)
+            payload["data"]["items"] = rows
+            return payload
+
+        one_metric_contract = replace(
+            verified_content_contract(),
+            content_metric_fields=(
+                ("views", "data.items[].metrics.views"),
+            ),
+        )
+        excessive_works = tuple(
+            FakeContentResponse(
+                "https://creator.douyin.com/verified/content/list",
+                rows_payload(
+                    start,
+                    count,
+                    cursor=cursor,
+                    has_more=has_more,
+                ),
+            )
+            for start, count, cursor, has_more in (
+                (0, 200, "works-1", True),
+                (200, 200, "works-2", True),
+                (400, 101, "", False),
+            )
+        )
+        excessive_metrics = tuple(
+            FakeContentResponse(
+                "https://creator.douyin.com/verified/content/list",
+                rows_payload(
+                    start,
+                    188,
+                    cursor="metrics-1" if start == 0 else "",
+                    has_more=start == 0,
+                ),
+            )
+            for start in (0, 188)
+        )
+        excessive_pages = tuple(
+            FakeContentResponse(
+                "https://creator.douyin.com/verified/content/list",
+                valid_content_payload(
+                    f"page-{index}",
+                    cursor=f"cursor-{index}",
+                    has_more=True,
+                ),
+            )
+            for index in range(51)
+        )
+
+        for contract, responses in (
+            (one_metric_contract, excessive_works),
+            (verified_content_contract(), excessive_metrics),
+            (verified_content_contract(), excessive_pages),
+        ):
+            with self.subTest(response_count=len(responses)):
+                starter, page, context, browser, playwright = (
+                    self._browser_harness(responses)
+                )
+                collector = DouyinDataCollector(
+                    contract_loader=lambda contract=contract: contract,
+                    playwright_factory=lambda starter=starter: starter,
+                    browser_timeout_seconds=1.0,
+                )
+
+                with self.assertRaises(DouyinDataCollectionError) as raised:
+                    collector.complete_content_data(
+                        self.account, self._account_batch()
+                    )
+
+                self.assertEqual(
+                    raised.exception.error_code, "content_payload_invalid"
+                )
+                self.assertEqual(page.listener_removals, 1)
+                self.assertEqual(
+                    (page.closed, context.closed, browser.closed), (1, 1, 1)
+                )
+                self.assertEqual(playwright.stopped, 1)
+
+    def test_synchronous_projection_cannot_escape_the_operation_deadline(self) -> None:
+        """解码、JSON 形状准备或模型投影卡住时，公开调用也必须按总时限返回。"""
+
+        response = FakeContentResponse(
+            "https://creator.douyin.com/verified/content/list",
+            valid_content_payload(),
+        )
+        starter, page, context, browser, playwright = self._browser_harness(
+            (response,)
+        )
+        collector = DouyinDataCollector(
+            contract_loader=verified_content_contract,
+            playwright_factory=lambda: starter,
+            browser_timeout_seconds=0.03,
+        )
+        real_parser = parse_verified_content_payload
+
+        def slow_parser(*args, **kwargs):
+            time.sleep(0.06)
+            return real_parser(*args, **kwargs)
+
+        started_at = time.monotonic()
+        with patch(
+            "app_core.douyin_data_collector.parse_verified_content_payload",
+            side_effect=slow_parser,
+        ):
+            with self.assertRaises(DouyinDataCollectionError) as raised:
+                collector.complete_content_data(
+                    self.account, self._account_batch()
+                )
+        elapsed = time.monotonic() - started_at
+
+        self.assertIn(
+            raised.exception.error_code,
+            {"content_list_unavailable", "browser_cleanup_incomplete"},
+        )
+        self.assertLess(elapsed, 0.06)
+        self.assertEqual(page.listener_removals, 1)
         self.assertEqual((page.closed, context.closed, browser.closed), (1, 1, 1))
         self.assertEqual(playwright.stopped, 1)
 
@@ -1606,6 +2059,7 @@ class DouyinContentCompletionTests(unittest.TestCase):
                     self._browser_harness((response,))
                 )
                 page.url = "https://creator.douyin.com/login"
+                page.after_responses_delay = 0.005
                 collector = DouyinDataCollector(
                     contract_loader=verified_content_contract,
                     playwright_factory=lambda starter=starter: starter,

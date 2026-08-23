@@ -5,11 +5,16 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import contextmanager
+from dataclasses import replace
 import hashlib
 import json
+from pathlib import Path
 import sqlite3
 import tempfile
+import threading
+import time
 import unittest
+from unittest.mock import patch
 
 from app_core import platform_data_comment_service as service
 from app_core import platform_data_comment_store as store
@@ -139,6 +144,67 @@ class FixedAi:
         return self.outcome
 
 
+class NoopLease:
+    def __init__(self) -> None:
+        self.acquired = False
+
+    def tryLock(self, timeout_ms: int) -> bool:  # noqa: N802
+        self.acquired = True
+        return True
+
+    def unlock(self) -> None:
+        if not self.acquired:
+            raise RuntimeError("lease not acquired")
+        self.acquired = False
+
+
+class SharedSyncLeaseState:
+    def __init__(self) -> None:
+        self.condition = threading.Condition()
+        self.owners: set[tuple[int, str]] = set()
+        self.try_control: BaseException | None = None
+        self.acquire_count = 0
+        self.release_count = 0
+
+    def factory(self, account_id: int, content_id: str):
+        return FakeSyncLease(self, (account_id, content_id))
+
+
+class FakeSyncLease:
+    def __init__(
+        self,
+        state: SharedSyncLeaseState,
+        key: tuple[int, str],
+    ) -> None:
+        self.state = state
+        self.key = key
+        self.acquired = False
+
+    def tryLock(self, timeout_ms: int) -> bool:  # noqa: N802
+        deadline = time.monotonic() + max(0, timeout_ms) / 1000.0
+        with self.state.condition:
+            while self.key in self.state.owners:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self.state.condition.wait(remaining)
+            self.state.owners.add(self.key)
+            self.state.acquire_count += 1
+            self.acquired = True
+            if self.state.try_control is not None:
+                raise self.state.try_control
+            return True
+
+    def unlock(self) -> None:
+        with self.state.condition:
+            if not self.acquired or self.key not in self.state.owners:
+                raise RuntimeError("lease ownership invalid")
+            self.acquired = False
+            self.state.owners.remove(self.key)
+            self.state.release_count += 1
+            self.state.condition.notify_all()
+
+
 class CommentServiceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.conn = sqlite3.connect(":memory:")
@@ -199,6 +265,7 @@ class CommentServiceTests(unittest.TestCase):
         self.conn.close()
 
     def _sync(self, collector, **kwargs):
+        kwargs.setdefault("lease_factory", lambda _account, _content: NoopLease())
         return service.sync_comments(
             12,
             "work-7",
@@ -214,6 +281,51 @@ class CommentServiceTests(unittest.TestCase):
                 12,
                 valid_batch(records=(record(),)),
             )
+
+    @staticmethod
+    def _batch_for_content(content_id: str) -> CommentCollectionBatch:
+        batch = valid_batch()
+        comments = tuple(
+            replace(item, content_id=content_id) for item in batch.comments
+        )
+        return replace(batch, content_id=content_id, comments=comments)
+
+    def _file_connect_factory(self):
+        tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tempdir.cleanup)
+        path = Path(tempdir.name) / "comments.db"
+        target = sqlite3.connect(path)
+        self.conn.backup(target)
+        target.executemany(
+            """
+            INSERT INTO platform_contents
+                (accountId, platformType, contentId, title)
+            VALUES (?, 3, ?, ?)
+            """,
+            (
+                (12, "work-8", "作品八"),
+                (99, "work-99", "作品九十九"),
+            ),
+        )
+        target.commit()
+        target.close()
+        stats = {"calls": 0}
+        stats_lock = threading.Lock()
+
+        @contextmanager
+        def connect():
+            with stats_lock:
+                stats["calls"] += 1
+            conn = sqlite3.connect(path, timeout=1.0)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys = ON")
+            try:
+                with conn:
+                    yield conn
+            finally:
+                conn.close()
+
+        return connect, stats, path
 
     def test_sync_requires_owned_douyin_content_id_and_never_uses_title(self):
         """若标题或跨账号作品能通过定位，采集器就会读取错误对象。"""
@@ -232,6 +344,7 @@ class CommentServiceTests(unittest.TestCase):
                 content_id,
                 collector_factory=lambda: collector,
                 connect_factory=self.connect,
+                lease_factory=lambda _account, _content: NoopLease(),
             )
             self.assertEqual(result["status"], "failed")
             self.assertEqual(result["errorCode"], "comment_content_unavailable")
@@ -475,6 +588,259 @@ class CommentServiceTests(unittest.TestCase):
             ).fetchone()[0],
             2,
         )
+
+    def test_same_identity_concurrent_calls_allow_exactly_one_collector(self):
+        """同一账号同一作品的第二个服务调用必须在读库和采集前失败。"""
+
+        connect, stats, database_path = self._file_connect_factory()
+        lease_state = SharedSyncLeaseState()
+        started = threading.Event()
+        release = threading.Event()
+        collector_calls = 0
+        ai_factory_calls = 0
+
+        class BlockingCollector:
+            def collect(self, account, content_id, known_keys, limit=100, report=None):
+                nonlocal collector_calls
+                collector_calls += 1
+                started.set()
+                if not release.wait(2.0):
+                    raise AssertionError("collector release timed out")
+                return CommentServiceTests._batch_for_content(content_id)
+
+        def ai_factory():
+            nonlocal ai_factory_calls
+            ai_factory_calls += 1
+            return None
+
+        first_result = {}
+
+        def run_first() -> None:
+            first_result.update(
+                service.sync_comments(
+                    12,
+                    "work-7",
+                    collector_factory=BlockingCollector,
+                    ai_provider_factory=ai_factory,
+                    connect_factory=connect,
+                    lease_factory=lease_state.factory,
+                )
+            )
+
+        first = threading.Thread(target=run_first, name="first-comment-sync")
+        first.start()
+        self.assertTrue(started.wait(1.0))
+        reads_before_second = stats["calls"]
+
+        rejected_collector = FixedCollector(valid_batch())
+        second = service.sync_comments(
+            12,
+            "work-7",
+            collector_factory=lambda: rejected_collector,
+            ai_provider_factory=ai_factory,
+            connect_factory=connect,
+            lease_factory=lease_state.factory,
+        )
+
+        self.assertEqual(second["status"], "failed")
+        self.assertEqual(second["errorCode"], "comment_sync_timeout")
+        self.assertEqual(stats["calls"], reads_before_second)
+        self.assertEqual(rejected_collector.calls, 0)
+        self.assertEqual(collector_calls, 1)
+        self.assertEqual(ai_factory_calls, 0)
+        self.assertEqual(set(second), PUBLIC_RESULT_KEYS)
+        for forbidden in (
+            "12",
+            "work-7",
+            str(database_path),
+            "private-owner-token",
+        ):
+            self.assertNotIn(forbidden, repr(second))
+
+        release.set()
+        first.join(2.0)
+        self.assertFalse(first.is_alive())
+        self.assertEqual(first_result["status"], "success")
+        self.assertEqual(ai_factory_calls, 1)
+        self.assertEqual(lease_state.acquire_count, 1)
+        self.assertEqual(lease_state.release_count, 1)
+
+    def test_different_work_identities_can_collect_concurrently(self) -> None:
+        """租约必须按账号和作品分片，不能把所有评论同步全局串行。"""
+
+        connect, _stats, _path = self._file_connect_factory()
+        lease_state = SharedSyncLeaseState()
+        condition = threading.Condition()
+        release = threading.Event()
+        started_count = 0
+
+        class ParallelCollector:
+            def collect(self, account, content_id, known_keys, limit=100, report=None):
+                nonlocal started_count
+                with condition:
+                    started_count += 1
+                    condition.notify_all()
+                if not release.wait(2.0):
+                    raise AssertionError("parallel collector release timed out")
+                return CommentServiceTests._batch_for_content(content_id)
+
+        results: dict[str, dict] = {}
+
+        def run(content_id: str) -> None:
+            results[content_id] = service.sync_comments(
+                12,
+                content_id,
+                collector_factory=ParallelCollector,
+                connect_factory=connect,
+                lease_factory=lease_state.factory,
+            )
+
+        threads = tuple(
+            threading.Thread(target=run, args=(content_id,))
+            for content_id in ("work-7", "work-8")
+        )
+        for thread in threads:
+            thread.start()
+        deadline = time.monotonic() + 1.0
+        with condition:
+            while started_count < 2 and time.monotonic() < deadline:
+                condition.wait(deadline - time.monotonic())
+        self.assertEqual(started_count, 2)
+
+        release.set()
+        for thread in threads:
+            thread.join(2.0)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(
+            {key: result["status"] for key, result in results.items()},
+            {"work-7": "success", "work-8": "success"},
+        )
+        self.assertEqual(lease_state.acquire_count, 2)
+        self.assertEqual(lease_state.release_count, 2)
+
+    def test_unavailable_lease_fails_before_database_or_collector(self) -> None:
+        """租约基础设施不可用时也不得读库或访问平台。"""
+
+        connect_calls = 0
+        collector = FixedCollector(valid_batch())
+
+        def connect():
+            nonlocal connect_calls
+            connect_calls += 1
+            raise AssertionError("database must not be opened")
+
+        def unavailable_lease(_account_id: int, _content_id: str):
+            raise RuntimeError("private lock path")
+
+        result = service.sync_comments(
+            12,
+            "work-7",
+            collector_factory=lambda: collector,
+            connect_factory=connect,
+            lease_factory=unavailable_lease,
+        )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["errorCode"], "comment_sync_timeout")
+        self.assertEqual(set(result), PUBLIC_RESULT_KEYS)
+        self.assertNotIn("work-7", repr(result))
+        self.assertNotIn("private lock path", repr(result))
+        self.assertEqual(connect_calls, 0)
+        self.assertEqual(collector.calls, 0)
+
+    def test_failure_and_process_control_always_release_the_lease(self) -> None:
+        """失败、取消、键盘中断和进程退出都不能把同一作品锁死。"""
+
+        cases = (
+            CommentInsightFailure("comment_access_denied"),
+            asyncio.CancelledError(),
+            KeyboardInterrupt(),
+            SystemExit(7),
+        )
+        for failure in cases:
+            with self.subTest(failure=type(failure).__name__):
+                lease_state = SharedSyncLeaseState()
+                if isinstance(failure, (KeyboardInterrupt, SystemExit)):
+                    with self.assertRaises(type(failure)):
+                        self._sync(
+                            FixedCollector(failure),
+                            lease_factory=lease_state.factory,
+                        )
+                else:
+                    result = self._sync(
+                        FixedCollector(failure),
+                        lease_factory=lease_state.factory,
+                    )
+                    self.assertEqual(result["status"], "failed")
+                retry = self._sync(
+                    FixedCollector(valid_batch()),
+                    lease_factory=lease_state.factory,
+                )
+                self.assertEqual(retry["status"], "success")
+                self.assertEqual(lease_state.acquire_count, 2)
+                self.assertEqual(lease_state.release_count, 2)
+
+    def test_acquire_control_after_locking_releases_before_propagation(self) -> None:
+        """tryLock 已拿到锁后抛出控制异常时，不得留下死锁。"""
+
+        lease_state = SharedSyncLeaseState()
+        lease_state.try_control = KeyboardInterrupt()
+        with self.assertRaises(KeyboardInterrupt):
+            self._sync(
+                FixedCollector(valid_batch()),
+                lease_factory=lease_state.factory,
+            )
+        self.assertEqual(lease_state.release_count, 1)
+        self.assertEqual(lease_state.owners, set())
+
+        lease_state.try_control = None
+        result = self._sync(
+            FixedCollector(valid_batch()),
+            lease_factory=lease_state.factory,
+        )
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(lease_state.release_count, 2)
+
+    def test_real_lock_instances_use_stable_hashed_independent_paths(self) -> None:
+        """真实 QLockFile 实例必须争用同一匿名身份，但不阻塞其他账号或作品。"""
+
+        with tempfile.TemporaryDirectory() as root, patch(
+            "app_core.platform_data_comment_service.USER_DATA_DIR",
+            Path(root),
+        ):
+            first = service._new_comment_sync_lease(12, "work-7")
+            same = service._new_comment_sync_lease(12, "work-7")
+            other_work = service._new_comment_sync_lease(12, "work-8")
+            other_account = service._new_comment_sync_lease(99, "work-7")
+
+            paths = tuple(
+                lock.fileName()
+                for lock in (first, same, other_work, other_account)
+            )
+            self.assertEqual(paths[0], paths[1])
+            self.assertEqual(len(set(paths)), 3)
+            self.assertTrue(all(str(Path(root) / "locks") in path for path in paths))
+            self.assertTrue(all("work-" not in path for path in paths))
+            for path in paths:
+                name = Path(path).name
+                self.assertTrue(name.startswith("comment-sync-"))
+                self.assertTrue(name.endswith(".lock"))
+                digest = name[len("comment-sync-") : -len(".lock")]
+                self.assertEqual(len(digest), 64)
+                self.assertTrue(all(char in "0123456789abcdef" for char in digest))
+            self.assertTrue(all(lock.staleLockTime() == 30_000 for lock in (
+                first, same, other_work, other_account
+            )))
+
+            self.assertTrue(first.tryLock(0))
+            self.assertFalse(same.tryLock(20))
+            self.assertTrue(other_work.tryLock(0))
+            self.assertTrue(other_account.tryLock(0))
+            first.unlock()
+            self.assertTrue(same.tryLock(20))
+            same.unlock()
+            other_work.unlock()
+            other_account.unlock()
 
     def test_unconfigured_ai_does_not_hide_or_rollback_comments(self):
         """未配置 AI 时，评论同步仍必须是成功并可立即读取。"""
@@ -928,6 +1294,7 @@ class CommentServiceTests(unittest.TestCase):
                             CommentInsightFailure("comment_ai_timeout")
                         ),
                         connect_factory=interrupting_connect,
+                        lease_factory=lambda _account, _content: NoopLease(),
                     )
 
         self.assertEqual(
