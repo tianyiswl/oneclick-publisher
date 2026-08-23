@@ -535,21 +535,25 @@ class FakeMacSecurity:
 
 
 class FakeCoreFoundation:
-    def __init__(self) -> None:
+    def __init__(self, *, fail=None) -> None:
+        self.fail = fail
         self.released = []
         self.CFRelease = FakeFunction(self._release)
 
     def _release(self, value):
         self.released.append(value.value if hasattr(value, "value") else value)
+        if self.fail is not None:
+            raise self.fail
 
 
 class FakeWindowsAdvapi:
     NOT_FOUND = 1168
 
-    def __init__(self, facade, *, fail=None) -> None:
+    def __init__(self, facade, *, fail=None, partial_read_error=None) -> None:
         self.facade = facade
         self.secret = None
         self.fail = fail
+        self.partial_read_error = partial_read_error
         self.last_error = 0
         self.mutable_views = []
         self.read_refs = []
@@ -587,15 +591,9 @@ class FakeWindowsAdvapi:
         self.last_error = 0
         return 1
 
-    def _read(self, target, _credential_type, _flags, credential_out):
-        if self._maybe_fail():
-            return 0
-        if target != "com.oneclickpublisher.comment-insight" or self.secret is None:
-            self.last_error = self.NOT_FOUND
-            return 0
+    def _install_read_pointer(self, credential_out, value: bytes) -> None:
         pointer_type = credential_out._obj
         credential_type = pointer_type._type_
-        value = self.secret if type(self.secret) is bytes else self.secret.encode("utf-8")
         blob = (ctypes.c_ubyte * len(value))(*value)
         credential = credential_type()
         credential.Type = 1
@@ -609,6 +607,22 @@ class FakeWindowsAdvapi:
         )
         out_pointer[0] = pointer
         self.read_refs.append((blob, credential, pointer))
+
+    def _read(self, target, _credential_type, _flags, credential_out):
+        if self._maybe_fail():
+            return 0
+        if self.partial_read_error is not None:
+            self._install_read_pointer(
+                credential_out,
+                b"partial-native-private-marker",
+            )
+            self.last_error = self.partial_read_error
+            return 0
+        if target != "com.oneclickpublisher.comment-insight" or self.secret is None:
+            self.last_error = self.NOT_FOUND
+            return 0
+        value = self.secret if type(self.secret) is bytes else self.secret.encode("utf-8")
+        self._install_read_pointer(credential_out, value)
         self.last_error = 0
         return 1
 
@@ -630,11 +644,22 @@ class FakeWindowsAdvapi:
 class FakeCtypes:
     """保留真实 ctypes 指针语义，只把动态库入口换成可观测假实现。"""
 
-    def __init__(self, *, mac_fail=None, windows_fail=None) -> None:
+    def __init__(
+        self,
+        *,
+        mac_fail=None,
+        core_fail=None,
+        windows_fail=None,
+        windows_partial_error=None,
+    ) -> None:
         self.mac = FakeMacSecurity(fail=mac_fail)
-        self.core = FakeCoreFoundation()
+        self.core = FakeCoreFoundation(fail=core_fail)
         self.last_error = 0
-        self.windows = FakeWindowsAdvapi(self, fail=windows_fail)
+        self.windows = FakeWindowsAdvapi(
+            self,
+            fail=windows_fail,
+            partial_read_error=windows_partial_error,
+        )
         for name in (
             "Structure",
             "POINTER",
@@ -783,6 +808,114 @@ class CommentAiSettingsTests(unittest.TestCase):
 
 
 class CommentSecretStoreTests(unittest.TestCase):
+    def test_mutation_receipts_distinguish_commit_from_cleanup_failure(self):
+        """A native commit followed by cleanup failure must stay marked committed."""
+
+        marker = "new-native-private-marker"
+        native = FakeCtypes(core_fail=RuntimeError("private-release-error"))
+        native.mac.secret = "old-native-private-marker"
+        store = CommentSecretStore(platform_name="darwin", ctypes_module=native)
+
+        self.assertTrue(hasattr(store, "write_with_receipt"))
+        receipt = store.write_with_receipt(marker)
+
+        self.assertTrue(receipt.committed)
+        self.assertEqual(receipt.status, "failed")
+        self.assertEqual(receipt.control, "")
+        self.assertIsNone(receipt.exit_code)
+        self.assertEqual(native.mac.secret, marker)
+        self.assertEqual(len(native.core.released), 1)
+        self.assertNotIn(marker, repr(receipt))
+        self.assertNotIn("private-release-error", repr(receipt))
+
+    def test_mutation_receipts_cover_add_write_delete_and_safe_control(self):
+        """Every native mutation reports whether the credential actually changed."""
+
+        probe = CommentSecretStore(
+            platform_name="darwin",
+            ctypes_module=FakeCtypes(),
+        )
+        self.assertTrue(hasattr(probe, "write_with_receipt"))
+        self.assertTrue(hasattr(probe, "delete_with_receipt"))
+
+        cases = []
+
+        mac_add = FakeCtypes()
+        cases.append(
+            (
+                "mac-add",
+                CommentSecretStore(platform_name="darwin", ctypes_module=mac_add),
+                "write_with_receipt",
+                "mac-add-private-marker",
+                mac_add,
+            )
+        )
+
+        windows_write = FakeCtypes()
+        cases.append(
+            (
+                "windows-write",
+                CommentSecretStore(platform_name="win32", ctypes_module=windows_write),
+                "write_with_receipt",
+                "windows-write-private-marker",
+                windows_write,
+            )
+        )
+
+        for name, store, method_name, secret, native in cases:
+            with self.subTest(case=name):
+                self.assertTrue(hasattr(store, method_name))
+                receipt = getattr(store, method_name)(secret)
+                self.assertTrue(receipt.committed)
+                self.assertEqual(receipt.status, "success")
+                self.assertNotIn(secret, repr(receipt))
+                backend = native.mac if name.startswith("mac") else native.windows
+                self.assertEqual(backend.secret, secret)
+
+        for platform_name, native_attribute in (("darwin", "mac"), ("win32", "windows")):
+            native = FakeCtypes()
+            getattr(native, native_attribute).secret = "delete-private-marker"
+            store = CommentSecretStore(
+                platform_name=platform_name,
+                ctypes_module=native,
+            )
+            with self.subTest(case=f"{platform_name}-delete"):
+                self.assertTrue(hasattr(store, "delete_with_receipt"))
+                receipt = store.delete_with_receipt()
+                self.assertTrue(receipt.committed)
+                self.assertEqual(receipt.status, "success")
+                self.assertIsNone(getattr(native, native_attribute).secret)
+                self.assertNotIn("delete-private-marker", repr(receipt))
+
+        controlled = FakeCtypes(core_fail=SystemExit("private-exit-code"))
+        controlled.mac.secret = "old-control-private-marker"
+        receipt = CommentSecretStore(
+            platform_name="darwin",
+            ctypes_module=controlled,
+        ).write_with_receipt("new-control-private-marker")
+        self.assertTrue(receipt.committed)
+        self.assertEqual(receipt.status, "control")
+        self.assertEqual(receipt.control, "system_exit")
+        self.assertEqual(receipt.exit_code, 1)
+        self.assertNotIn("private", repr(receipt))
+
+    def test_windows_not_found_with_partial_pointer_is_failure_after_free(self):
+        """NOT_FOUND is safe false only when CredReadW returned no credential pointer."""
+
+        native = FakeCtypes(windows_partial_error=1168)
+        store = CommentSecretStore(platform_name="win32", ctypes_module=native)
+
+        with self.assertRaises(CommentInsightFailure) as raised:
+            store.is_configured()
+
+        self.assertEqual(raised.exception.error_code, "comment_ai_not_configured")
+        self.assertEqual(len(native.windows.read_refs), 1)
+        self.assertEqual(len(native.windows.freed), 1)
+        self.assertNotIn(
+            "partial-native-private-marker",
+            exception_trace_text(raised.exception),
+        )
+
     def test_is_configured_checks_native_existence_without_copying_secret(self):
         """Existence probes must never copy or decode the stored credential blob."""
 

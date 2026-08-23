@@ -38,7 +38,10 @@ from app_core import (
 from app_core.platform_data_collectors import registered_platform_types
 from app_core.platform_data_collection_errors import PUBLIC_PLATFORM_DATA_ERROR_TEXT
 from app_core.platform_data_comment_ai import OpenAiCompatibleCommentProvider
-from app_core.platform_data_comment_secret_store import CommentSecretStore
+from app_core.platform_data_comment_secret_store import (
+    CommentSecretStore,
+    SecretMutationReceipt,
+)
 from app_core.platform_data_comment_settings import (
     BASE_URL_KEY,
     MODEL_KEY,
@@ -410,15 +413,22 @@ def _restore_nonsecret_settings_outcome(settings, snapshot):
     return outcome or (_UI_OUTCOME_OK, None)
 
 
-def _write_secret_buffer_outcome(secret_store, mutable: bytearray):
+def _write_secret_buffer_receipt(secret_store, mutable: bytearray):
     secret_text = None
+    receipt = None
     outcome = None
     error = None
     try:
         if type(mutable) is not bytearray or not mutable:
             raise ValueError("invalid secret buffer")
         secret_text = mutable.decode("utf-8")
-        secret_store.write(secret_text)
+        receipt = secret_store.write_with_receipt(secret_text)
+        if (
+            type(receipt) is not SecretMutationReceipt
+            or (receipt.status == "success" and not receipt.committed)
+        ):
+            receipt = None
+            raise ValueError("invalid secret mutation receipt")
     except BaseException as error:
         outcome = _ui_error_outcome(error)
     finally:
@@ -428,7 +438,21 @@ def _write_secret_buffer_outcome(secret_store, mutable: bytearray):
         mutable = None
         secret_store = None
         error = None
-    return outcome or (_UI_OUTCOME_OK, None)
+    if outcome is not None:
+        receipt = None
+        return outcome, None
+    return (_UI_OUTCOME_OK, None), receipt
+
+
+def _mutation_receipt_ui_outcome(receipt: SecretMutationReceipt):
+    if receipt.status == "success":
+        return None
+    if receipt.status == "control":
+        return (
+            _UI_OUTCOME_CONTROL,
+            (receipt.control, receipt.exit_code),
+        )
+    return (_UI_OUTCOME_FAILURE, None)
 
 
 class _CommentAiSettingsDialog(QDialog):
@@ -451,9 +475,15 @@ class _CommentAiSettingsDialog(QDialog):
         loaded = load_ai_settings(self._settings)
         try:
             configured = self._secret_store.is_configured()
-        except Exception:
-            configured = False
-        self._secret_configured = configured if type(configured) is bool else False
+        except _UI_PROCESS_CONTROL:
+            raise
+        except BaseException:
+            self._secret_state = "error"
+        else:
+            if type(configured) is not bool:
+                self._secret_state = "error"
+            else:
+                self._secret_state = "configured" if configured else "missing"
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 18, 20, 18)
@@ -497,7 +527,11 @@ class _CommentAiSettingsDialog(QDialog):
         self._render_secret_status()
 
     def _render_secret_status(self) -> None:
-        state = "已配置" if self._secret_configured else "未配置"
+        state = {
+            "configured": "已配置",
+            "missing": "未配置",
+            "error": "状态读取失败",
+        }.get(self._secret_state, "状态读取失败")
         self.secret_status_label.setText(f"密钥状态：{state}")
 
     def _save(self) -> None:
@@ -507,6 +541,8 @@ class _CommentAiSettingsDialog(QDialog):
         snapshot_outcome = None
         save_outcome = None
         secret_outcome = None
+        mutation_receipt = None
+        receipt_outcome = None
         rollback_outcome = None
         final_outcome = None
         settings_value = None
@@ -542,21 +578,28 @@ class _CommentAiSettingsDialog(QDialog):
                     settings_value,
                 )
                 if save_outcome[0] != _UI_OUTCOME_OK:
-                    final_outcome = save_outcome
+                    rollback_outcome = _restore_nonsecret_settings_outcome(
+                        self._settings,
+                        snapshot,
+                    )
+                    final_outcome = _first_ui_outcome(
+                        save_outcome,
+                        None
+                        if rollback_outcome[0] == _UI_OUTCOME_OK
+                        else rollback_outcome,
+                    )
 
             if (
                 final_outcome is None
                 and type(secret_buffer) is bytearray
                 and secret_buffer
             ):
-                secret_outcome = _write_secret_buffer_outcome(
+                secret_outcome, mutation_receipt = _write_secret_buffer_receipt(
                     self._secret_store,
                     secret_buffer,
                 )
                 secret_buffer = None
-                if secret_outcome[0] == _UI_OUTCOME_OK:
-                    secret_replaced = True
-                else:
+                if secret_outcome[0] != _UI_OUTCOME_OK:
                     rollback_outcome = _restore_nonsecret_settings_outcome(
                         self._settings,
                         snapshot,
@@ -567,6 +610,25 @@ class _CommentAiSettingsDialog(QDialog):
                         if rollback_outcome[0] == _UI_OUTCOME_OK
                         else rollback_outcome,
                     )
+                else:
+                    secret_replaced = mutation_receipt.committed
+                    receipt_outcome = _mutation_receipt_ui_outcome(
+                        mutation_receipt
+                    )
+                    if receipt_outcome is not None:
+                        rollback_outcome = None
+                        if not mutation_receipt.committed:
+                            rollback_outcome = _restore_nonsecret_settings_outcome(
+                                self._settings,
+                                snapshot,
+                            )
+                        final_outcome = _first_ui_outcome(
+                            receipt_outcome,
+                            None
+                            if rollback_outcome is None
+                            or rollback_outcome[0] == _UI_OUTCOME_OK
+                            else rollback_outcome,
+                        )
         finally:
             try:
                 self.secret_input.clear()
@@ -584,20 +646,29 @@ class _CommentAiSettingsDialog(QDialog):
             snapshot_outcome = None
             save_outcome = None
             secret_outcome = None
+            mutation_receipt = None
+            receipt_outcome = None
             rollback_outcome = None
             settings_value = None
             snapshot = None
 
         if final_outcome is not None:
+            if secret_replaced:
+                self._secret_state = "configured"
+                self._render_secret_status()
             if final_outcome[0] == _UI_OUTCOME_CONTROL:
                 control_outcome = final_outcome
                 final_outcome = None
                 _raise_clean_ui_control(control_outcome)
-            self.feedback_label.setText("设置未保存，请检查 HTTPS 地址、模型和密钥")
+            self.feedback_label.setText(
+                "设置已保存，但系统凭据清理未完成"
+                if secret_replaced
+                else "设置未保存，请检查 HTTPS 地址、模型和密钥"
+            )
             self._render_secret_status()
             return
         if secret_replaced:
-            self._secret_configured = True
+            self._secret_state = "configured"
         self.feedback_label.setText("")
         self._render_secret_status()
         self.accept()
@@ -608,7 +679,7 @@ class _CommentAiSettingsDialog(QDialog):
         except Exception:
             self.feedback_label.setText("密钥未清除，请稍后再试")
             return
-        self._secret_configured = False
+        self._secret_state = "missing"
         self.secret_input.clear()
         self.feedback_label.setText("")
         self._render_secret_status()
@@ -1200,9 +1271,13 @@ class DataMonitorPage(QWidget):
             raise ValueError("invalid comment panel payload")
         rows = []
         by_ref: dict[str, dict] = {}
-        for raw in raw_rows:
+        for index, raw in enumerate(raw_rows, start=1):
             row = self._safe_comment_row(raw)
-            if row is None or row["ref"] in by_ref:
+            if (
+                row is None
+                or row["ref"] != f"C{index:03d}"
+                or row["ref"] in by_ref
+            ):
                 raise ValueError("invalid comment panel payload")
             rows.append(row)
             by_ref[row["ref"]] = row
@@ -1272,6 +1347,11 @@ class DataMonitorPage(QWidget):
             )
             or ai_status not in {"success", "failed", "skipped"}
         ):
+            raise ValueError("invalid comment panel payload")
+        if ai_status == "success":
+            if any(not row["labels"] for row in rows):
+                raise ValueError("invalid comment panel payload")
+        elif candidates or any(row["labels"] for row in rows):
             raise ValueError("invalid comment panel payload")
 
         self._comment_rows = tuple(rows)

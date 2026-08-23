@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import ctypes as _ctypes
 from ctypes import wintypes as _native_wintypes
+from dataclasses import dataclass
 import sys
 import unicodedata
 
@@ -39,6 +40,69 @@ def _control_outcome_value(error: BaseException):
     if type(code) is not int or not -2_147_483_648 <= code <= 2_147_483_647:
         code = 1
     return ("system_exit", code)
+
+
+@dataclass(frozen=True, slots=True)
+class SecretMutationReceipt:
+    """Non-sensitive result of a native credential mutation.
+
+    ``committed`` reports whether the credential value was changed before a
+    later cleanup failure or process-control signal. The remaining fields are
+    fixed tokens and a sanitized integer exit code only.
+    """
+
+    committed: bool
+    status: str
+    control: str = ""
+    exit_code: int | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.committed) is not bool or self.status not in {
+            "success",
+            "failed",
+            "control",
+        }:
+            raise _not_configured()
+        if self.status in {"success", "failed"}:
+            if self.control != "" or self.exit_code is not None:
+                raise _not_configured()
+            return
+        if self.control not in {
+            "cancelled",
+            "keyboard_interrupt",
+            "system_exit",
+        }:
+            raise _not_configured()
+        if self.control == "system_exit":
+            if (
+                type(self.exit_code) is not int
+                or not -2_147_483_648 <= self.exit_code <= 2_147_483_647
+            ):
+                raise _not_configured()
+        elif self.exit_code is not None:
+            raise _not_configured()
+
+
+def _mutation_receipt(committed: bool, outcome) -> SecretMutationReceipt:
+    if outcome is None:
+        return SecretMutationReceipt(committed, "success")
+    if outcome[0] == _OUTCOME_CONTROL:
+        control, code = outcome[1]
+        return SecretMutationReceipt(
+            committed,
+            "control",
+            control,
+            code,
+        )
+    return SecretMutationReceipt(committed, "failed")
+
+
+def _receipt_outcome(receipt: SecretMutationReceipt):
+    if receipt.status == "success":
+        return None
+    if receipt.status == "control":
+        return (_OUTCOME_CONTROL, (receipt.control, receipt.exit_code))
+    return (_OUTCOME_FAILURE, None)
 
 
 def _error_outcome(error: BaseException):
@@ -174,56 +238,79 @@ class CommentSecretStore:
             value = None
 
     def write(self, secret: str) -> None:
-        outcome = self._write_outcome(secret)
+        receipt = self.write_with_receipt(secret)
         secret = None
-        if outcome[0] == _OUTCOME_OK:
+        outcome = _receipt_outcome(receipt)
+        receipt = None
+        if outcome is None:
             return
         self = None
         _raise_clean_outcome(outcome)
 
-    def _write_outcome(self, secret):
+    def write_with_receipt(self, secret: str) -> SecretMutationReceipt:
+        """Write a credential and report commit separately from cleanup."""
+
+        try:
+            return self._write_receipt(secret)
+        finally:
+            secret = None
+            self = None
+
+    def _write_receipt(self, secret) -> SecretMutationReceipt:
         mutable = None
+        committed = False
+        outcome = None
+        error = None
         try:
             mutable = _secret_buffer(secret)
             if self._platform == "darwin":
-                self._mac_write(mutable)
+                committed, outcome = self._mac_write(mutable)
             elif self._platform == "win32":
-                self._windows_write(mutable)
+                committed, outcome = self._windows_write(mutable)
             else:
                 raise _not_configured()
-            return (_OUTCOME_OK, None)
-        except _PROCESS_CONTROL as error:
-            return (_OUTCOME_CONTROL, _control_outcome_value(error))
-        except BaseException:
-            return (_OUTCOME_FAILURE, None)
+        except BaseException as error:
+            outcome = _first_outcome(outcome, _error_outcome(error))
         finally:
             secret = None
             if type(mutable) is bytearray:
                 _zero(mutable)
+            mutable = None
             self = None
+            error = None
+        return _mutation_receipt(committed, outcome)
 
     def delete(self) -> None:
-        outcome = self._delete_outcome()
-        if outcome[0] == _OUTCOME_OK:
+        receipt = self.delete_with_receipt()
+        outcome = _receipt_outcome(receipt)
+        receipt = None
+        if outcome is None:
             return
         self = None
         _raise_clean_outcome(outcome)
 
-    def _delete_outcome(self):
+    def delete_with_receipt(self) -> SecretMutationReceipt:
+        """Delete a credential and report commit separately from cleanup."""
+
+        return self._delete_receipt()
+
+    def _delete_receipt(self) -> SecretMutationReceipt:
+        committed = False
+        outcome = None
+        error = None
         try:
             if self._platform == "darwin":
-                self._mac_delete()
+                committed, outcome = self._mac_delete()
             elif self._platform == "win32":
-                self._windows_delete()
+                committed, outcome = self._windows_delete()
             else:
                 raise _not_configured()
-            return (_OUTCOME_OK, None)
-        except _PROCESS_CONTROL as error:
-            return (_OUTCOME_CONTROL, _control_outcome_value(error))
-        except BaseException:
-            return (_OUTCOME_FAILURE, None)
+        except BaseException as error:
+            outcome = _first_outcome(outcome, _error_outcome(error))
         finally:
             self = None
+            error = None
+        return _mutation_receipt(committed, outcome)
 
     def _mac_libraries(self):
         ctypes = self._ctypes
@@ -498,7 +585,7 @@ class CommentSecretStore:
             raise _not_configured()
         return True
 
-    def _mac_write(self, mutable: bytearray) -> None:
+    def _mac_write(self, mutable: bytearray):
         ctypes = self._ctypes
         security, core = self._mac_libraries()
         _existing, item_ref = self._mac_find(
@@ -509,6 +596,7 @@ class CommentSecretStore:
         service = None
         account = None
         status = None
+        committed = False
         outcome = None
         error = None
         try:
@@ -530,6 +618,7 @@ class CommentSecretStore:
                 )
             if status != 0:
                 raise _not_configured()
+            committed = True
         except BaseException as error:
             outcome = _first_outcome(outcome, _error_outcome(error))
         release_outcome = self._mac_release_outcome(core, item_ref)
@@ -548,23 +637,24 @@ class CommentSecretStore:
         error = None
         release_outcome = None
         self = None
-        if outcome is not None:
-            _raise_clean_outcome(outcome)
+        return committed, outcome
 
-    def _mac_delete(self) -> None:
+    def _mac_delete(self):
         security, core = self._mac_libraries()
         _existing, item_ref = self._mac_find(
             security, core, read_secret=False
         )
         if item_ref is None:
-            return
+            return False, None
         status = None
+        committed = False
         outcome = None
         error = None
         try:
             status = security.SecKeychainItemDelete(item_ref)
             if status != 0:
                 raise _not_configured()
+            committed = True
         except BaseException as error:
             outcome = _first_outcome(outcome, _error_outcome(error))
         release_outcome = self._mac_release_outcome(core, item_ref)
@@ -577,8 +667,7 @@ class CommentSecretStore:
         error = None
         release_outcome = None
         self = None
-        if outcome is not None:
-            _raise_clean_outcome(outcome)
+        return committed, outcome
 
     def _windows_types(self):
         ctypes = self._ctypes
@@ -746,7 +835,11 @@ class CommentSecretStore:
         )
         outcome = _first_outcome(outcome, cleanup_outcome)
         result = bool(succeeded) and bool(credential_pointer)
-        missing = not succeeded and last_error == _WINDOWS_NOT_FOUND
+        missing = (
+            not succeeded
+            and last_error == _WINDOWS_NOT_FOUND
+            and not bool(credential_pointer)
+        )
         ctypes = None
         credential_type = None
         credential_pointer_type = None
@@ -766,7 +859,7 @@ class CommentSecretStore:
             raise _not_configured()
         return True
 
-    def _windows_write(self, mutable: bytearray) -> None:
+    def _windows_write(self, mutable: bytearray):
         ctypes = self._ctypes
         credential_type, credential_pointer_type, wintypes = self._windows_types()
         advapi = self._windows_library(
@@ -789,14 +882,15 @@ class CommentSecretStore:
         credential.UserName = ACCOUNT_NAME
         if not advapi.CredWriteW(ctypes.byref(credential), 0):
             raise _not_configured()
+        return True, None
 
-    def _windows_delete(self) -> None:
+    def _windows_delete(self):
         credential_type, credential_pointer_type, wintypes = self._windows_types()
         advapi = self._windows_library(
             credential_type, credential_pointer_type, wintypes
         )
         if advapi.CredDeleteW(SERVICE_NAME, _WINDOWS_CREDENTIAL_TYPE_GENERIC, 0):
-            return
+            return True, None
         if self._ctypes.get_last_error() == _WINDOWS_NOT_FOUND:
-            return
+            return False, None
         raise _not_configured()
