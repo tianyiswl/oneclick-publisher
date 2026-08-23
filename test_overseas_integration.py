@@ -198,6 +198,89 @@ class OverseasPreflightTests(unittest.TestCase):
         self.assertFalse(calls[0][1]["notify_subscribers"])
         self.assertFalse(calls[0][1]["share_to_feed"])
 
+    def test_youtube_preflight_requires_verified_fields_and_reports_private_upload(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            video = root / "video.mp4"
+            video.write_bytes(b"video")
+            (root / "youtube.json").write_text("{}", encoding="utf-8")
+            payload = self._payload(video)
+            payload.update(
+                {
+                    "type": 7,
+                    "accountList": ["youtube.json"],
+                    "visibility": "private",
+                }
+            )
+            with (
+                patch.object(overseas_preflight, "COOKIE_DIR", root),
+                patch.dict(
+                    overseas_preflight.PREFLIGHT_HANDLERS,
+                    {7: lambda *_args, **_kwargs: [None]},
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    overseas_preflight.OverseasPreflightError,
+                    "逐字段回读",
+                ):
+                    overseas_preflight.run_overseas_preflight_sync(payload)
+
+            receipt = {
+                "status": "preflight_ready",
+                "evidence": "youtube_preflight_fields_verified",
+                "verifiedFields": [
+                    "video",
+                    "title",
+                    "description",
+                    "tags",
+                    "audience",
+                    "visibility",
+                ],
+                "visibility": "private",
+                "platformMutation": "private_upload",
+            }
+            with (
+                patch.object(overseas_preflight, "COOKIE_DIR", root),
+                patch.dict(
+                    overseas_preflight.PREFLIGHT_HANDLERS,
+                    {7: lambda *_args, **_kwargs: [receipt]},
+                ),
+            ):
+                result = overseas_preflight.run_overseas_preflight_sync(payload)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["platformMutation"], "private_upload")
+        self.assertEqual(result["visibility"], "private")
+        self.assertEqual(
+            set(result["verifiedFields"]),
+            {"video", "title", "description", "tags", "audience", "visibility"},
+        )
+
+    def test_youtube_preflight_is_limited_to_one_account_and_one_video(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            first = root / "first.mp4"
+            second = root / "second.mp4"
+            first.write_bytes(b"first")
+            second.write_bytes(b"second")
+            (root / "first.json").write_text("{}", encoding="utf-8")
+            (root / "second.json").write_text("{}", encoding="utf-8")
+            payload = self._payload(first)
+            payload.update(
+                {
+                    "type": 7,
+                    "fileList": [str(first), str(second)],
+                    "accountList": ["first.json", "second.json"],
+                }
+            )
+            with patch.object(overseas_preflight, "COOKIE_DIR", root):
+                checked = overseas_preflight.validate_overseas_preflight_payload(
+                    payload
+                )
+        self.assertFalse(checked["ok"])
+        self.assertTrue(any("一条视频" in item for item in checked["errors"]))
+        self.assertTrue(any("一个账号" in item for item in checked["errors"]))
+
     def test_browser_validation_blocks_silent_field_loss(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
