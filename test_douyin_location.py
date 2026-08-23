@@ -295,6 +295,45 @@ class DouyinLocationMatchingTests(unittest.TestCase):
         self.assertEqual(result, "")
         page.locator.assert_not_called()
 
+    def test_preflight_rejects_live_candidate_without_complete_address(self) -> None:
+        """预检重搜只回名称和 POI 标识时，不能点击缺地址候选。"""
+
+        page = MagicMock()
+        page.wait_for_timeout = AsyncMock()
+        selection_container = MagicMock()
+        selection_container.inner_text = AsyncMock(return_value="北海银滩景区")
+        option = MagicMock()
+        option.click = AsyncMock()
+        payload = {
+            "locationPoi": {
+                "poiId": "poi-1",
+                "name": "北海银滩景区",
+                "address": "广西壮族自治区北海市银海区银滩大道中段",
+            }
+        }
+        live_candidate = {
+            "poiId": "poi-1",
+            "name": "北海银滩景区",
+            "address": "",
+        }
+
+        with patch.object(
+            oneclick_preflight,
+            "_douyin_open_location_search",
+            new=AsyncMock(return_value=selection_container),
+        ), patch.object(
+            oneclick_preflight,
+            "_douyin_visible_location_options",
+            new=AsyncMock(return_value=([option], [live_candidate])),
+        ):
+            with self.assertRaisesRegex(
+                oneclick_preflight.PreflightError,
+                "没有唯一一致的 POI",
+            ):
+                asyncio.run(oneclick_preflight._douyin_set_location(page, payload))
+
+        option.click.assert_not_awaited()
+
 
 class DouyinLocationUiTests(unittest.TestCase):
     @classmethod
@@ -501,6 +540,57 @@ class DouyinLocationServiceTests(unittest.TestCase):
         self.assertEqual([item["poiId"] for item in result], ["poi-1", "poi-2"])
         self.assertEqual(result[0]["distance"], "6.1km")
         self.assertEqual(result[0]["address"], "北海市银海区")
+
+    def test_public_candidate_requires_complete_platform_identity(self) -> None:
+        """名称、完整地址或平台 POI 标识缺一项都不能进入选择与发布。"""
+
+        complete = {
+            "poi_id": "poi-complete",
+            "poi_name": "北海银滩景区",
+            "address": "广西壮族自治区北海市银海区银滩大道中段",
+        }
+        self.assertIsNotNone(
+            douyin_location_service.normalize_location_candidate(complete)
+        )
+        for missing_field in ("poi_id", "poi_name", "address"):
+            incomplete = dict(complete)
+            incomplete.pop(missing_field)
+            with self.subTest(missing_field=missing_field):
+                self.assertIsNone(
+                    douyin_location_service.normalize_location_candidate(incomplete)
+                )
+
+    def test_addressless_rows_do_not_hide_later_complete_candidates(self) -> None:
+        """缺地址候选不能占满 12 条上限，挡住后面的完整平台地点。"""
+
+        addressless = [
+            {
+                "poi_id": f"poi-addressless-{index}",
+                "poi_name": f"缺地址地点 {index}",
+            }
+            for index in range(douyin_location_service.MAX_RESULTS)
+        ]
+        complete = {
+            "poi_id": "poi-complete",
+            "poi_name": "北海银滩景区",
+            "address": "广西壮族自治区北海市银海区银滩大道中段",
+        }
+
+        result = douyin_location_service.normalize_location_response(
+            {
+                "status_code": 0,
+                "poi_list": [*addressless, complete],
+            }
+        )
+
+        self.assertEqual(result, [
+            {
+                "poiId": "poi-complete",
+                "name": "北海银滩景区",
+                "address": "广西壮族自治区北海市银海区银滩大道中段",
+                "distance": "",
+            }
+        ])
 
     def test_nonzero_platform_status_is_a_safe_error(self) -> None:
         with self.assertRaisesRegex(
