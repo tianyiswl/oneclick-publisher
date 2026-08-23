@@ -56,6 +56,12 @@ ACCOUNT = {
     "filePath": "oneclick_3_safe.json",
 }
 
+CONFIG_REVISION_KEY = "commentInsightAi/configRevision"
+REVISION_A = "a" * 32
+REVISION_B = "b" * 32
+REVISION_C = "c" * 32
+REVISION_D = "d" * 32
+
 ACCOUNT_B = {
     **ACCOUNT,
     "id": 14,
@@ -2826,6 +2832,8 @@ class DataMonitorPageTests(unittest.TestCase):
             model="model-second",
             secret="second-save-private-marker",
         )
+        first._revision_factory = lambda: REVISION_C
+        second._revision_factory = lambda: REVISION_D
         errors: list[BaseException] = []
 
         def run(dialog) -> None:
@@ -2853,6 +2861,7 @@ class DataMonitorPageTests(unittest.TestCase):
             {
                 BASE_URL_KEY: "https://first.example.com/v1",
                 MODEL_KEY: "model-first",
+                CONFIG_REVISION_KEY: REVISION_C,
             },
         )
         self.assertEqual(secret_store.secret, "first-save-private-marker")
@@ -2868,6 +2877,7 @@ class DataMonitorPageTests(unittest.TestCase):
         old = {
             BASE_URL_KEY: "https://old.example.com/v1",
             MODEL_KEY: "model-old",
+            CONFIG_REVISION_KEY: REVISION_A,
         }
         settings = PersistentFakeSettings(
             old,
@@ -2906,6 +2916,7 @@ class DataMonitorPageTests(unittest.TestCase):
         old = {
             BASE_URL_KEY: "https://old.example.com/v1",
             MODEL_KEY: "model-old",
+            CONFIG_REVISION_KEY: REVISION_A,
         }
         settings = PersistentFakeSettings(old, sync_failures=(3,))
         secret_store = FakeSecretStore(configured=True)
@@ -2915,6 +2926,7 @@ class DataMonitorPageTests(unittest.TestCase):
             secret_store=secret_store,
         )
         dialog._lock_factory = lock_state.factory
+        dialog._revision_factory = lambda: REVISION_C
         self.addCleanup(dialog.deleteLater)
         dialog.base_url_input.setText("https://new.example.com/v1")
         dialog.model_input.setText("model-new")
@@ -2947,6 +2959,7 @@ class DataMonitorPageTests(unittest.TestCase):
         backend = {
             BASE_URL_KEY: "https://old.example.com/v1",
             MODEL_KEY: "model-old",
+            CONFIG_REVISION_KEY: REVISION_A,
         }
         settings = IsolatedProcessSettings(backend)
         secret_store = FakeSecretStore(configured=True)
@@ -2967,6 +2980,7 @@ class DataMonitorPageTests(unittest.TestCase):
             {
                 BASE_URL_KEY: "https://old.example.com/v1",
                 MODEL_KEY: "model-old",
+                CONFIG_REVISION_KEY: REVISION_A,
                 _AI_CONFIG_TRANSITION_KEY: "pending-v1",
             },
         )
@@ -2981,6 +2995,7 @@ class DataMonitorPageTests(unittest.TestCase):
         backend = {
             BASE_URL_KEY: "https://old.example.com/v1",
             MODEL_KEY: "model-old",
+            CONFIG_REVISION_KEY: REVISION_A,
         }
         settings = IsolatedProcessSettings(backend)
         secret_store = FakeSecretStore(configured=True)
@@ -2992,10 +3007,55 @@ class DataMonitorPageTests(unittest.TestCase):
         self.addCleanup(dialog.deleteLater)
         backend.update(
             {
-                BASE_URL_KEY: "https://external.example.com/v1",
-                MODEL_KEY: "model-external",
+                CONFIG_REVISION_KEY: REVISION_B,
             }
         )
+        dialog.model_input.setText("model-local-edit")
+
+        dialog._save()
+
+        self.assertEqual(
+            backend,
+            {
+                BASE_URL_KEY: "https://old.example.com/v1",
+                MODEL_KEY: "model-old",
+                CONFIG_REVISION_KEY: REVISION_B,
+            },
+        )
+        self.assertEqual(secret_store.writes, [])
+        self.assertEqual(
+            dialog.feedback_label.text(),
+            "配置已在其他窗口更新，请关闭后重新打开",
+        )
+
+    def test_stale_secret_save_is_rejected_before_vault_write(self) -> None:
+        """旧窗口即使输入新密钥，也不得覆盖外部已完成的配置。"""
+
+        backend = {
+            BASE_URL_KEY: "https://old.example.com/v1",
+            MODEL_KEY: "model-old",
+            CONFIG_REVISION_KEY: REVISION_A,
+        }
+        settings = IsolatedProcessSettings(backend)
+        secret_store = VersionedSecretStore("old-private-marker")
+        dialog = _CommentAiSettingsDialog(
+            settings=settings,
+            secret_store=secret_store,
+            lock_factory=SharedConfigLockState().factory,
+        )
+        dialog._revision_factory = lambda: REVISION_C
+        self.addCleanup(dialog.deleteLater)
+        backend.update(
+            {
+                BASE_URL_KEY: "https://external.example.com/v1",
+                MODEL_KEY: "model-external",
+                CONFIG_REVISION_KEY: REVISION_B,
+            }
+        )
+        secret_store.secret = "external-private-marker"
+        dialog.base_url_input.setText("https://stale.example.com/v1")
+        dialog.model_input.setText("model-stale")
+        dialog.secret_input.setText("stale-window-private-marker")
 
         dialog._save()
 
@@ -3004,10 +3064,150 @@ class DataMonitorPageTests(unittest.TestCase):
             {
                 BASE_URL_KEY: "https://external.example.com/v1",
                 MODEL_KEY: "model-external",
+                CONFIG_REVISION_KEY: REVISION_B,
             },
         )
-        self.assertEqual(secret_store.writes, [])
-        self.assertIn("重新打开", dialog.feedback_label.text())
+        self.assertEqual(secret_store.secret, "external-private-marker")
+        self.assertEqual(secret_store.write_values, [])
+        self.assertEqual(
+            dialog.feedback_label.text(),
+            "配置已在其他窗口更新，请关闭后重新打开",
+        )
+
+    def test_stale_clear_is_rejected_before_vault_delete(self) -> None:
+        """旧窗口不得删除外部窗口刚保存的密钥。"""
+
+        backend = {
+            BASE_URL_KEY: "https://old.example.com/v1",
+            MODEL_KEY: "model-old",
+            CONFIG_REVISION_KEY: REVISION_A,
+        }
+        settings = IsolatedProcessSettings(backend)
+        secret_store = VersionedSecretStore("old-private-marker")
+        dialog = _CommentAiSettingsDialog(
+            settings=settings,
+            secret_store=secret_store,
+            lock_factory=SharedConfigLockState().factory,
+        )
+        dialog._revision_factory = lambda: REVISION_C
+        self.addCleanup(dialog.deleteLater)
+        backend.update(
+            {
+                BASE_URL_KEY: "https://external.example.com/v1",
+                MODEL_KEY: "model-external",
+                CONFIG_REVISION_KEY: REVISION_B,
+            }
+        )
+        secret_store.secret = "external-private-marker"
+
+        dialog._clear_secret()
+
+        self.assertEqual(secret_store.secret, "external-private-marker")
+        self.assertEqual(secret_store.delete_count, 0)
+        self.assertEqual(
+            backend,
+            {
+                BASE_URL_KEY: "https://external.example.com/v1",
+                MODEL_KEY: "model-external",
+                CONFIG_REVISION_KEY: REVISION_B,
+            },
+        )
+        self.assertEqual(
+            dialog.feedback_label.text(),
+            "配置已在其他窗口更新，请关闭后重新打开",
+        )
+
+    def test_two_windows_share_revision_then_second_save_and_clear_are_stale(
+        self,
+    ) -> None:
+        """同版本打开的两个窗口，第一个成功后第二个失效。"""
+
+        backend = {
+            BASE_URL_KEY: "https://old.example.com/v1",
+            MODEL_KEY: "model-old",
+            CONFIG_REVISION_KEY: REVISION_A,
+        }
+        secret_store = VersionedSecretStore("old-private-marker")
+        first = _CommentAiSettingsDialog(
+            settings=IsolatedProcessSettings(backend),
+            secret_store=secret_store,
+            lock_factory=SharedConfigLockState().factory,
+        )
+        second = _CommentAiSettingsDialog(
+            settings=IsolatedProcessSettings(backend),
+            secret_store=secret_store,
+            lock_factory=SharedConfigLockState().factory,
+        )
+        first._revision_factory = lambda: REVISION_C
+        second._revision_factory = lambda: REVISION_D
+        self.addCleanup(first.deleteLater)
+        self.addCleanup(second.deleteLater)
+        first.base_url_input.setText("https://first.example.com/v1")
+        first.model_input.setText("model-first")
+        first.secret_input.setText("first-private-marker")
+        second.base_url_input.setText("https://second.example.com/v1")
+        second.model_input.setText("model-second")
+        second.secret_input.setText("second-private-marker")
+
+        first._save()
+        second._save()
+        second._clear_secret()
+
+        self.assertEqual(
+            backend,
+            {
+                BASE_URL_KEY: "https://first.example.com/v1",
+                MODEL_KEY: "model-first",
+                CONFIG_REVISION_KEY: REVISION_C,
+            },
+        )
+        self.assertEqual(secret_store.secret, "first-private-marker")
+        self.assertEqual(secret_store.write_values, ["first-private-marker"])
+        self.assertEqual(secret_store.delete_count, 0)
+        self.assertEqual(
+            second.feedback_label.text(),
+            "配置已在其他窗口更新，请关闭后重新打开",
+        )
+
+    def test_legacy_windows_get_a_revision_then_the_other_becomes_stale(
+        self,
+    ) -> None:
+        """无 revision 的旧配置首次迁移后，其他旧窗口必须失效。"""
+
+        backend = {
+            BASE_URL_KEY: "https://old.example.com/v1",
+            MODEL_KEY: "model-old",
+        }
+        secret_store = VersionedSecretStore("old-private-marker")
+        first = _CommentAiSettingsDialog(
+            settings=IsolatedProcessSettings(backend),
+            secret_store=secret_store,
+            lock_factory=SharedConfigLockState().factory,
+        )
+        second = _CommentAiSettingsDialog(
+            settings=IsolatedProcessSettings(backend),
+            secret_store=secret_store,
+            lock_factory=SharedConfigLockState().factory,
+        )
+        first._revision_factory = lambda: REVISION_C
+        second._revision_factory = lambda: REVISION_D
+        self.addCleanup(first.deleteLater)
+        self.addCleanup(second.deleteLater)
+        first.base_url_input.setText("https://first.example.com/v1")
+        first.model_input.setText("model-first")
+        first.secret_input.setText("first-private-marker")
+
+        first._save()
+        second.secret_input.setText("second-private-marker")
+        second._save()
+
+        self.assertEqual(backend[CONFIG_REVISION_KEY], REVISION_C)
+        self.assertEqual(secret_store.secret, "first-private-marker")
+        self.assertEqual(secret_store.write_values, ["first-private-marker"])
+        self.assertEqual(
+            second.feedback_label.text(),
+            "配置已在其他窗口更新，请关闭后重新打开",
+        )
 
     def test_native_noncommit_restores_values_before_removing_durable_gate(self) -> None:
         """原生未提交时，先确认旧地址/模型，再移除 pending 解锁。"""
@@ -3027,6 +3227,7 @@ class DataMonitorPageTests(unittest.TestCase):
             settings=settings,
             secret_store=secret_store,
         )
+        dialog._revision_factory = lambda: REVISION_C
         dialog._lock_factory = SharedConfigLockState().factory
         self.addCleanup(dialog.deleteLater)
         dialog.base_url_input.setText("https://new.example.com/v1")
@@ -3041,6 +3242,91 @@ class DataMonitorPageTests(unittest.TestCase):
             events.index("settings:sync:4"),
             events.index(f"settings:remove:{_AI_CONFIG_TRANSITION_KEY}"),
         )
+
+    def test_noncommit_restores_old_revision_before_same_dialog_retries(self) -> None:
+        """原生未提交恢复旧 revision，同窗口仍可安全重试。"""
+
+        old = {
+            BASE_URL_KEY: "https://old.example.com/v1",
+            MODEL_KEY: "model-old",
+            CONFIG_REVISION_KEY: REVISION_A,
+        }
+        settings = FakeSettings(old)
+        secret_store = FakeSecretStore(
+            configured=True,
+            write_receipt=SecretMutationReceipt(False, "failed"),
+        )
+        dialog = _CommentAiSettingsDialog(
+            settings=settings,
+            secret_store=secret_store,
+            lock_factory=SharedConfigLockState().factory,
+        )
+        revisions = iter((REVISION_C, REVISION_D))
+        dialog._revision_factory = lambda: next(revisions)
+        self.addCleanup(dialog.deleteLater)
+        dialog.base_url_input.setText("https://new.example.com/v1")
+        dialog.model_input.setText("model-new")
+        dialog.secret_input.setText("first-attempt-private-marker")
+
+        dialog._save()
+
+        self.assertEqual(settings.values, old)
+        secret_store.write_receipt = SecretMutationReceipt(True, "success")
+        dialog.secret_input.setText("retry-private-marker")
+        dialog._save()
+
+        self.assertEqual(settings.values[BASE_URL_KEY], "https://new.example.com/v1")
+        self.assertEqual(settings.values[MODEL_KEY], "model-new")
+        self.assertEqual(settings.values[CONFIG_REVISION_KEY], REVISION_D)
+        self.assertNotIn(_AI_CONFIG_TRANSITION_KEY, settings.values)
+        self.assertEqual(secret_store.writes, ["retry-private-marker"])
+
+    def test_unknown_save_keeps_candidate_revision_and_same_dialog_can_retry(
+        self,
+    ) -> None:
+        """提交结果未知时保留新 revision 与 pending，本窗口可修复。"""
+
+        settings = FakeSettings(
+            {
+                BASE_URL_KEY: "https://old.example.com/v1",
+                MODEL_KEY: "model-old",
+                CONFIG_REVISION_KEY: REVISION_A,
+            }
+        )
+        secret_store = FakeSecretStore(
+            configured=True,
+            write_receipt=SecretMutationReceipt(
+                None,
+                "failed",
+                commit_state="unknown",
+            ),
+        )
+        dialog = _CommentAiSettingsDialog(
+            settings=settings,
+            secret_store=secret_store,
+            lock_factory=SharedConfigLockState().factory,
+        )
+        revisions = iter((REVISION_C, REVISION_D))
+        dialog._revision_factory = lambda: next(revisions)
+        self.addCleanup(dialog.deleteLater)
+        dialog.base_url_input.setText("https://new.example.com/v1")
+        dialog.model_input.setText("model-new")
+        dialog.secret_input.setText("unknown-private-marker")
+
+        dialog._save()
+
+        self.assertEqual(settings.values[CONFIG_REVISION_KEY], REVISION_C)
+        self.assertEqual(
+            settings.values[_AI_CONFIG_TRANSITION_KEY],
+            "pending-v1",
+        )
+        secret_store.write_receipt = SecretMutationReceipt(True, "success")
+        dialog.secret_input.setText("repair-private-marker")
+        dialog._save()
+
+        self.assertEqual(settings.values[CONFIG_REVISION_KEY], REVISION_D)
+        self.assertNotIn(_AI_CONFIG_TRANSITION_KEY, settings.values)
+        self.assertEqual(secret_store.writes, ["repair-private-marker"])
 
     def test_clear_writes_durable_gate_before_touching_native_secret(self) -> None:
         """pending 首次落盘失败时，清除操作不得调用系统凭据删除。"""
@@ -3070,6 +3356,35 @@ class DataMonitorPageTests(unittest.TestCase):
         self.assertEqual(secret_store.delete_count, 0)
         self.assertEqual(settings.persisted_values, old)
 
+    def test_clear_candidate_revision_sync_failure_never_touches_vault(self) -> None:
+        """清除操作的新 revision 未落盘时，不得删除密钥。"""
+
+        old = {
+            BASE_URL_KEY: "https://old.example.com/v1",
+            MODEL_KEY: "model-old",
+            CONFIG_REVISION_KEY: REVISION_A,
+        }
+        settings = PersistentFakeSettings(old, sync_failures=(3,))
+        secret_store = FakeSecretStore(configured=True)
+        dialog = _CommentAiSettingsDialog(
+            settings=settings,
+            secret_store=secret_store,
+            lock_factory=SharedConfigLockState().factory,
+        )
+        dialog._revision_factory = lambda: REVISION_C
+        self.addCleanup(dialog.deleteLater)
+
+        dialog._clear_secret()
+
+        self.assertEqual(secret_store.delete_count, 0)
+        self.assertEqual(
+            settings.persisted_values,
+            {
+                **old,
+                _AI_CONFIG_TRANSITION_KEY: "pending-v1",
+            },
+        )
+
     def test_unknown_clear_keeps_the_already_durable_gate_across_reopen(self) -> None:
         """删除结果未知后，即使后续同步失败，重开仍不得读取旧密钥。"""
 
@@ -3077,7 +3392,7 @@ class DataMonitorPageTests(unittest.TestCase):
             BASE_URL_KEY: "https://old.example.com/v1",
             MODEL_KEY: "model-old",
         }
-        settings = PersistentFakeSettings(old, sync_failures=(3,))
+        settings = PersistentFakeSettings(old, sync_failures=(4,))
         secret_store = FakeSecretStore(
             configured=True,
             delete_receipt=SecretMutationReceipt(
@@ -3091,6 +3406,7 @@ class DataMonitorPageTests(unittest.TestCase):
             settings=settings,
             secret_store=secret_store,
         )
+        dialog._revision_factory = lambda: REVISION_C
         dialog._lock_factory = lock_state.factory
         self.addCleanup(dialog.deleteLater)
 
@@ -3478,6 +3794,7 @@ class DataMonitorPageTests(unittest.TestCase):
             settings=settings,
             secret_store=secret_store,
         )
+        dialog._revision_factory = lambda: REVISION_C
         self.addCleanup(dialog.deleteLater)
         dialog.base_url_input.setText("https://new.example.com/v1")
         dialog.model_input.setText("model-new")
@@ -3490,6 +3807,7 @@ class DataMonitorPageTests(unittest.TestCase):
             {
                 BASE_URL_KEY: "https://new.example.com/v1",
                 MODEL_KEY: "model-new",
+                CONFIG_REVISION_KEY: REVISION_C,
             },
         )
         self.assertEqual(secret_store.writes, [marker])
@@ -3523,6 +3841,7 @@ class DataMonitorPageTests(unittest.TestCase):
             settings=settings,
             secret_store=secret_store,
         )
+        dialog._revision_factory = lambda: REVISION_C
         self.addCleanup(dialog.deleteLater)
         dialog.base_url_input.setText("https://new.example.com/v1")
         dialog.model_input.setText("model-new")
@@ -3536,6 +3855,7 @@ class DataMonitorPageTests(unittest.TestCase):
             {
                 BASE_URL_KEY: "https://new.example.com/v1",
                 MODEL_KEY: "model-new",
+                CONFIG_REVISION_KEY: REVISION_C,
             },
         )
         self.assertEqual(secret_store.writes, [marker])
@@ -3564,6 +3884,7 @@ class DataMonitorPageTests(unittest.TestCase):
                 ctypes_module=native,
             ),
         )
+        dialog._revision_factory = lambda: REVISION_C
         self.addCleanup(dialog.deleteLater)
         dialog.base_url_input.setText("https://new.example.com/v1")
         dialog.model_input.setText("model-new")
@@ -3577,6 +3898,7 @@ class DataMonitorPageTests(unittest.TestCase):
             {
                 BASE_URL_KEY: "https://new.example.com/v1",
                 MODEL_KEY: "model-new",
+                CONFIG_REVISION_KEY: REVISION_C,
             },
         )
         self.assertEqual(dialog.secret_status_label.text(), "密钥状态：已配置")

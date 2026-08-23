@@ -7,6 +7,7 @@ import asyncio
 from datetime import datetime
 import math
 import time
+from uuid import uuid4
 
 from PyQt6.QtCore import (
     QDate,
@@ -130,9 +131,11 @@ _UI_OUTCOME_CONTROL = "control"
 _UI_PROCESS_CONTROL = (asyncio.CancelledError, KeyboardInterrupt, SystemExit)
 _AI_CONFIG_TRANSITION_KEY = "commentInsightAi/configTransition"
 _AI_CONFIG_TRANSITION_VALUE = "pending-v1"
+_AI_CONFIG_REVISION_KEY = "commentInsightAi/configRevision"
+_AI_CONFIG_LEGACY_REVISION = "legacy"
 _AI_CONFIG_BLOCKED_TEXT = "AI 配置不可使用，请重新保存或清除密钥"
 _AI_CONFIG_BUSY_TEXT = "AI 配置正在使用，请稍后重试"
-_AI_CONFIG_CHANGED_TEXT = "AI 配置已被更新，请关闭后重新打开"
+_AI_CONFIG_CHANGED_TEXT = "配置已在其他窗口更新，请关闭后重新打开"
 _AI_CONFIG_LOCK_FILE = "oneclick-comment-ai-config.lock"
 _AI_CONFIG_LOCK_WAIT_MS = 100
 _AI_CONFIG_LOCK_STALE_MS = 30_000
@@ -420,12 +423,65 @@ def _take_secret_buffer(line_edit: QLineEdit):
 
 def _nonsecret_settings_snapshot(settings) -> tuple[tuple[bool, object], ...]:
     snapshot: list[tuple[bool, object]] = []
-    for key in (BASE_URL_KEY, MODEL_KEY, _AI_CONFIG_TRANSITION_KEY):
+    for key in (
+        BASE_URL_KEY,
+        MODEL_KEY,
+        _AI_CONFIG_TRANSITION_KEY,
+        _AI_CONFIG_REVISION_KEY,
+    ):
         present = settings.contains(key)
         if type(present) is not bool:
             raise RuntimeError("settings snapshot invalid")
         snapshot.append((present, settings.value(key, None)))
-    return tuple(snapshot)
+    result = tuple(snapshot)
+    _config_revision_from_snapshot(result)
+    return result
+
+
+def _valid_config_revision(value: object) -> bool:
+    return (
+        type(value) is str
+        and len(value) == 32
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _config_revision_from_snapshot(snapshot) -> str:
+    if type(snapshot) is not tuple or len(snapshot) != 4:
+        raise RuntimeError("settings revision invalid")
+    present, value = snapshot[3]
+    if type(present) is not bool:
+        raise RuntimeError("settings revision invalid")
+    if not present:
+        return _AI_CONFIG_LEGACY_REVISION
+    if not _valid_config_revision(value):
+        raise RuntimeError("settings revision invalid")
+    return value
+
+
+def _new_config_revision() -> str:
+    value = uuid4().hex
+    if not _valid_config_revision(value):
+        raise RuntimeError("settings revision unavailable")
+    return value
+
+
+def _new_config_revision_outcome(factory):
+    value = None
+    outcome = None
+    error = None
+    try:
+        value = factory()
+        if not _valid_config_revision(value):
+            raise RuntimeError("settings revision unavailable")
+    except BaseException as error:
+        outcome = _ui_error_outcome(error)
+    factory = None
+    error = None
+    if outcome is not None:
+        value = None
+        return outcome
+    return _UI_OUTCOME_OK, value
 
 
 def _settings_sync_succeeded(settings) -> bool:
@@ -459,18 +515,31 @@ def _begin_nonsecret_settings_transition(settings) -> None:
 
 def _write_nonsecret_settings_candidate(
     settings,
-    value: CommentAiSettings,
+    revision: str,
+    value: CommentAiSettings | None = None,
 ) -> None:
-    settings.setValue(BASE_URL_KEY, value.normalized_base_url)
-    settings.setValue(MODEL_KEY, value.model)
+    if not _valid_config_revision(revision):
+        raise RuntimeError("settings revision invalid")
+    if value is not None:
+        settings.setValue(BASE_URL_KEY, value.normalized_base_url)
+        settings.setValue(MODEL_KEY, value.model)
+    settings.setValue(_AI_CONFIG_REVISION_KEY, revision)
     settings.sync()
     if (
         not _settings_sync_succeeded(settings)
         or not _settings_transition_present(settings)
         or settings.value(_AI_CONFIG_TRANSITION_KEY, None)
         != _AI_CONFIG_TRANSITION_VALUE
-        or settings.value(BASE_URL_KEY, None) != value.normalized_base_url
-        or settings.value(MODEL_KEY, None) != value.model
+        or settings.value(_AI_CONFIG_REVISION_KEY, None) != revision
+        or (
+            value is not None
+            and settings.value(BASE_URL_KEY, None)
+            != value.normalized_base_url
+        )
+        or (
+            value is not None
+            and settings.value(MODEL_KEY, None) != value.model
+        )
     ):
         raise RuntimeError("settings candidate sync failed")
 
@@ -512,6 +581,7 @@ def _restore_nonsecret_settings(
         raise RuntimeError("settings rollback gate missing")
     _restore_settings_key(settings, BASE_URL_KEY, snapshot[0])
     _restore_settings_key(settings, MODEL_KEY, snapshot[1])
+    _restore_settings_key(settings, _AI_CONFIG_REVISION_KEY, snapshot[3])
     settings.sync()
     if not _settings_sync_succeeded(settings):
         raise RuntimeError("settings rollback failed")
@@ -523,6 +593,7 @@ def _restore_nonsecret_settings(
         raise RuntimeError("settings rollback gate missing")
     _verify_settings_key(settings, BASE_URL_KEY, snapshot[0])
     _verify_settings_key(settings, MODEL_KEY, snapshot[1])
+    _verify_settings_key(settings, _AI_CONFIG_REVISION_KEY, snapshot[3])
     _restore_transition_gate(settings, snapshot)
 
 
@@ -679,20 +750,20 @@ class _CommentAiSettingsDialog(QDialog):
             if callable(lock_factory)
             else _new_comment_ai_config_lock
         )
+        self._revision_factory = _new_config_revision
         loaded = load_ai_settings(self._settings)
-        self._initial_nonsecret_pair = (
-            (loaded.normalized_base_url, loaded.model)
-            if loaded is not None
-            else None
-        )
         try:
-            self._configuration_blocked = _settings_transition_present(
-                self._settings
+            initial_snapshot = _nonsecret_settings_snapshot(self._settings)
+            self._initial_config_revision = _config_revision_from_snapshot(
+                initial_snapshot
             )
+            self._configuration_blocked = bool(initial_snapshot[2][0])
         except _UI_PROCESS_CONTROL:
             raise
         except BaseException:
+            self._initial_config_revision = None
             self._configuration_blocked = True
+        initial_snapshot = None
         if self._configuration_blocked:
             self._secret_state = "error"
         else:
@@ -770,6 +841,7 @@ class _CommentAiSettingsDialog(QDialog):
         release_outcome = None
         refresh_outcome = None
         snapshot_outcome = None
+        revision_outcome = None
         pending_outcome = None
         candidate_outcome = None
         secret_outcome = None
@@ -781,6 +853,8 @@ class _CommentAiSettingsDialog(QDialog):
         final_outcome = None
         settings_value = None
         snapshot = None
+        current_revision = None
+        candidate_revision = None
         busy = False
         stale_configuration = False
         lock_cleanup_failed = False
@@ -828,33 +902,36 @@ class _CommentAiSettingsDialog(QDialog):
                 snapshot_outcome = _settings_snapshot_outcome(self._settings)
                 if snapshot_outcome[0] == _UI_OUTCOME_OK:
                     snapshot = snapshot_outcome[1]
+                    current_revision = _config_revision_from_snapshot(snapshot)
                     was_configuration_blocked = bool(snapshot[2][0])
                     self._configuration_blocked = was_configuration_blocked
                 else:
                     final_outcome = snapshot_outcome
 
             if final_outcome is None:
-                if self._configuration_blocked and not secret_buffer:
+                stale_configuration = current_revision != getattr(
+                    self,
+                    "_initial_config_revision",
+                    _AI_CONFIG_LEGACY_REVISION,
+                )
+                if stale_configuration:
                     final_outcome = (_UI_OUTCOME_FAILURE, None)
-                elif not secret_buffer:
-                    current_pair = (
-                        (snapshot[0][1], snapshot[1][1])
-                        if snapshot[0][0] and snapshot[1][0]
-                        else None
+                elif self._configuration_blocked and not secret_buffer:
+                    final_outcome = (_UI_OUTCOME_FAILURE, None)
+
+                if final_outcome is None:
+                    revision_outcome = _new_config_revision_outcome(
+                        getattr(
+                            self,
+                            "_revision_factory",
+                            _new_config_revision,
+                        )
                     )
-                    requested_pair = (
-                        settings_value.normalized_base_url,
-                        settings_value.model,
-                    )
-                    stale_configuration = (
-                        current_pair
-                        != getattr(self, "_initial_nonsecret_pair", None)
-                        and requested_pair != current_pair
-                    )
-                    current_pair = None
-                    requested_pair = None
-                    if stale_configuration:
-                        final_outcome = (_UI_OUTCOME_FAILURE, None)
+                    if revision_outcome[0] == _UI_OUTCOME_OK:
+                        candidate_revision = revision_outcome[1]
+                    else:
+                        final_outcome = revision_outcome
+
                 if final_outcome is None:
                     transition_attempted = True
                     pending_outcome = (
@@ -887,10 +964,13 @@ class _CommentAiSettingsDialog(QDialog):
                 candidate_outcome = _nonsecret_settings_action_outcome(
                     _write_nonsecret_settings_candidate,
                     self._settings,
+                    candidate_revision,
                     settings_value,
                 )
                 if candidate_outcome[0] != _UI_OUTCOME_OK:
                     final_outcome = candidate_outcome
+                else:
+                    self._initial_config_revision = candidate_revision
 
             if (
                 final_outcome is None
@@ -940,6 +1020,8 @@ class _CommentAiSettingsDialog(QDialog):
                             rollback_outcome[0] == _UI_OUTCOME_OK
                             and not was_configuration_blocked
                         )
+                        if rollback_outcome[0] == _UI_OUTCOME_OK:
+                            self._initial_config_revision = current_revision
                         final_outcome = _first_ui_outcome(
                             receipt_outcome
                             or (_UI_OUTCOME_FAILURE, None),
@@ -992,6 +1074,7 @@ class _CommentAiSettingsDialog(QDialog):
             release_outcome = None
             refresh_outcome = None
             snapshot_outcome = None
+            revision_outcome = None
             pending_outcome = None
             candidate_outcome = None
             secret_outcome = None
@@ -1002,6 +1085,8 @@ class _CommentAiSettingsDialog(QDialog):
             finish_outcome = None
             settings_value = None
             snapshot = None
+            current_revision = None
+            candidate_revision = None
 
         if transition_attempted:
             self._configuration_blocked = not transition_resolved
@@ -1046,7 +1131,9 @@ class _CommentAiSettingsDialog(QDialog):
         refresh_outcome = None
         snapshot_outcome = None
         snapshot = None
+        revision_outcome = None
         pending_outcome = None
+        candidate_outcome = None
         delete_outcome = None
         receipt = None
         receipt_outcome = None
@@ -1054,11 +1141,14 @@ class _CommentAiSettingsDialog(QDialog):
         gate_restore_outcome = None
         final_outcome = None
         busy = False
+        stale_configuration = False
         transition_attempted = False
         transition_resolved = False
         was_configuration_blocked = self._configuration_blocked
         deleted = False
         unknown = False
+        current_revision = None
+        candidate_revision = None
         try:
             lock_outcome, config_lock = _acquire_comment_ai_config_lock(
                 self._lock_factory
@@ -1082,10 +1172,33 @@ class _CommentAiSettingsDialog(QDialog):
                 snapshot_outcome = _settings_snapshot_outcome(self._settings)
                 if snapshot_outcome[0] == _UI_OUTCOME_OK:
                     snapshot = snapshot_outcome[1]
+                    current_revision = _config_revision_from_snapshot(snapshot)
                     was_configuration_blocked = bool(snapshot[2][0])
                     self._configuration_blocked = was_configuration_blocked
                 else:
                     final_outcome = snapshot_outcome
+
+            if final_outcome is None:
+                stale_configuration = current_revision != getattr(
+                    self,
+                    "_initial_config_revision",
+                    _AI_CONFIG_LEGACY_REVISION,
+                )
+                if stale_configuration:
+                    final_outcome = (_UI_OUTCOME_FAILURE, None)
+
+            if final_outcome is None:
+                revision_outcome = _new_config_revision_outcome(
+                    getattr(
+                        self,
+                        "_revision_factory",
+                        _new_config_revision,
+                    )
+                )
+                if revision_outcome[0] == _UI_OUTCOME_OK:
+                    candidate_revision = revision_outcome[1]
+                else:
+                    final_outcome = revision_outcome
 
             if final_outcome is None:
                 transition_attempted = True
@@ -1109,6 +1222,17 @@ class _CommentAiSettingsDialog(QDialog):
                         if gate_restore_outcome[0] == _UI_OUTCOME_OK
                         else gate_restore_outcome,
                     )
+
+            if final_outcome is None:
+                candidate_outcome = _nonsecret_settings_action_outcome(
+                    _write_nonsecret_settings_candidate,
+                    self._settings,
+                    candidate_revision,
+                )
+                if candidate_outcome[0] != _UI_OUTCOME_OK:
+                    final_outcome = candidate_outcome
+                else:
+                    self._initial_config_revision = candidate_revision
 
             if final_outcome is None:
                 delete_outcome, receipt = _delete_secret_receipt_outcome(
@@ -1148,7 +1272,7 @@ class _CommentAiSettingsDialog(QDialog):
                 transition_resolved = False
             elif receipt is not None:
                 gate_restore_outcome = _nonsecret_settings_action_outcome(
-                    _restore_transition_gate,
+                    _restore_nonsecret_settings,
                     self._settings,
                     snapshot,
                 )
@@ -1156,6 +1280,8 @@ class _CommentAiSettingsDialog(QDialog):
                     gate_restore_outcome[0] == _UI_OUTCOME_OK
                     and not was_configuration_blocked
                 )
+                if gate_restore_outcome[0] == _UI_OUTCOME_OK:
+                    self._initial_config_revision = current_revision
                 final_outcome = _first_ui_outcome(
                     final_outcome or (_UI_OUTCOME_FAILURE, None),
                     None
@@ -1184,12 +1310,16 @@ class _CommentAiSettingsDialog(QDialog):
             refresh_outcome = None
             snapshot_outcome = None
             snapshot = None
+            revision_outcome = None
             pending_outcome = None
+            candidate_outcome = None
             delete_outcome = None
             receipt = None
             receipt_outcome = None
             transition_outcome = None
             gate_restore_outcome = None
+            current_revision = None
+            candidate_revision = None
 
         if transition_attempted:
             self._configuration_blocked = not transition_resolved
@@ -1205,7 +1335,9 @@ class _CommentAiSettingsDialog(QDialog):
                 control_outcome = final_outcome
                 final_outcome = None
                 _raise_clean_ui_control(control_outcome)
-            if busy:
+            if stale_configuration:
+                self.feedback_label.setText(_AI_CONFIG_CHANGED_TEXT)
+            elif busy:
                 self.feedback_label.setText(_AI_CONFIG_BUSY_TEXT)
             elif self._configuration_blocked:
                 self.feedback_label.setText(_AI_CONFIG_BLOCKED_TEXT)
