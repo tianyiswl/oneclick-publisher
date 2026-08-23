@@ -7,6 +7,7 @@ import asyncio
 import json
 from pathlib import Path
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -149,9 +150,10 @@ class FakeResponse:
         content_type: str = "application/json; charset=utf-8",
         status: int = 200,
         body_error: BaseException | None = None,
+        method: str = "GET",
     ) -> None:
         self.url = url
-        self.request = FakeRequest()
+        self.request = FakeRequest(method)
         self.status = status
         self.headers = {"content-type": content_type}
         self._body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -171,12 +173,14 @@ class FakePage:
         goto_error: BaseException | None = None,
         final_url: str = "https://creator.douyin.com/",
         close_error: BaseException | None = None,
+        close_delay: float = 0.0,
         block_navigation: bool = False,
     ) -> None:
         self.responses = responses
         self.goto_error = goto_error
         self.url = final_url
         self.close_error = close_error
+        self.close_delay = close_delay
         self.block_navigation = block_navigation
         self.handlers: dict[str, object] = {}
         self.goto_calls: list[tuple[str, str, float]] = []
@@ -204,6 +208,8 @@ class FakePage:
 
     async def close(self) -> None:
         self.closed += 1
+        if self.close_delay:
+            await asyncio.sleep(self.close_delay)
         if self.close_error is not None:
             raise self.close_error
 
@@ -376,6 +382,77 @@ class ContractSanitizerTests(unittest.TestCase):
             {"responses": []},
         )
 
+    def test_concrete_identifier_segments_are_generalized_in_paths(self) -> None:
+        """真实作品 ID 不能留在报告路径，也不能被直接冻结为合同。"""
+
+        concrete_id = "7398123456789012345"
+        safe = sanitize_contract_observation(
+            {
+                "responses": [
+                    response_shape(
+                        url=(
+                            "https://creator.douyin.com/work/"
+                            f"{concrete_id}/comments?cursor=private"
+                        ),
+                        keys=("data.comments[].comment_id",),
+                        sample=None,
+                    )
+                ]
+            }
+        )
+
+        encoded = json.dumps(safe, ensure_ascii=False)
+        self.assertNotIn(concrete_id, encoded)
+        self.assertEqual(
+            safe["responses"][0]["path"],
+            "/work/{content_id}/comments",
+        )
+        with self.assertRaises(CommentInsightFailure):
+            contract_module.ContractResponseShape(
+                scheme="https",
+                host="creator.douyin.com",
+                path=f"/work/{concrete_id}/comments",
+                method="GET",
+                key_paths=("data.comments[].comment_id",),
+                field_types=(("data.comments[].comment_id", "str"),),
+                pagination_fields=(),
+            )
+
+    def test_nested_and_compound_identity_keys_fail_closed(self) -> None:
+        """嵌套、蛇形或驼峰身份字段不能绕过字段名脱敏。"""
+
+        keys = (
+            "data.comments[].author_detail.sec_user_id",
+            "data.comments[].reviewerProfile.avatarURI",
+            "data.comments[].owner_metadata.displayName",
+            "data.comments[].comment_id",
+            "data.comments[].content_id",
+            "data.comments[].reply_count",
+            "data.metrics.profile_visits",
+        )
+        safe = sanitize_contract_observation(
+            {
+                "responses": [
+                    response_shape(
+                        url="https://creator.douyin.com/comment/list",
+                        keys=keys,
+                        sample=None,
+                    )
+                ]
+            }
+        )
+
+        survived = safe["responses"][0]["keyPaths"]
+        self.assertEqual(
+            survived,
+            [
+                "data.comments[].comment_id",
+                "data.comments[].content_id",
+                "data.comments[].reply_count",
+                "data.metrics.profile_visits",
+            ],
+        )
+
 
 class ContractManifestTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -499,6 +576,41 @@ class ContractManifestTests(unittest.TestCase):
         )
         self.assertFalse(destination.exists())
 
+    def test_freeze_rejects_path_method_seen_with_partial_shape(self) -> None:
+        """同一路径的第二种方法即使字段不全，也必须判定为方法歧义。"""
+
+        original = valid_observation()
+        content = original.responses[0]
+        ambiguous = contract_module.ContractObservation(
+            verified=True,
+            responses=(
+                *original.responses,
+                contract_module.ContractResponseShape(
+                    scheme=content.scheme,
+                    host=content.host,
+                    path=content.path,
+                    method="POST",
+                    key_paths=("data.status",),
+                    field_types=(("data.status", "str"),),
+                    pagination_fields=(),
+                ),
+            ),
+            navigation_templates=original.navigation_templates,
+            pagination_triggers=original.pagination_triggers,
+            cleanup=original.cleanup,
+        )
+        destination = Path(self.tempdir.name) / "partial-method.json"
+
+        with self.assertRaises(CommentInsightFailure) as raised:
+            contract_module.freeze_verified_contract(
+                ambiguous, valid_selection(), destination
+            )
+
+        self.assertEqual(
+            raised.exception.error_code, "comment_content_unavailable"
+        )
+        self.assertFalse(destination.exists())
+
     def test_freeze_requires_exact_verified_bool_and_complete_cleanup(self) -> None:
         """整数 1 或未关闭资源都不能冒充真实合同已核验。"""
 
@@ -598,10 +710,12 @@ class PassiveObserverTests(unittest.TestCase):
             response.pagination_fields,
             ("data.cursor", "data.has_more"),
         )
-        self.assertEqual(
-            page.goto_calls,
-            [("https://creator.douyin.com", "domcontentloaded", 60000.0)],
-        )
+        self.assertEqual(len(page.goto_calls), 1)
+        goto_url, wait_until, goto_timeout = page.goto_calls[0]
+        self.assertEqual(goto_url, "https://creator.douyin.com")
+        self.assertEqual(wait_until, "domcontentloaded")
+        self.assertGreater(goto_timeout, 0)
+        self.assertLess(goto_timeout, 60000.0)
         self.assertEqual(harness.playwright.chromium.headless_values, [False])
         self.assertEqual(
             harness.browser.storage_states, [str(harness.state)]
@@ -625,6 +739,46 @@ class PassiveObserverTests(unittest.TestCase):
             "绝不进入报告",
         ):
             self.assertNotIn(forbidden, encoded)
+
+    def test_observer_generalizes_response_and_navigation_identifiers(self) -> None:
+        """被动监听得到的响应和导航路径都不能保留真实作品 ID。"""
+
+        concrete_id = "7398123456789012345"
+        page = FakePage(
+            (
+                FakeResponse(
+                    (
+                        "https://creator.douyin.com/work/"
+                        f"{concrete_id}/comments"
+                    ),
+                    {"data": {"comments": [{"comment_id": "private"}]}},
+                ),
+            ),
+            final_url=(
+                "https://creator.douyin.com/work/"
+                f"{concrete_id}/comments"
+            ),
+        )
+        harness = ObserverHarness(self.root, page)
+        reports: list[dict] = []
+        first_patch, second_patch = harness.patches()
+
+        with first_patch, second_patch:
+            observation = contract_module.observe_contract_responses(
+                harness.account, reports.append
+            )
+
+        self.assertEqual(
+            observation.responses[0].path,
+            "/work/{content_id}/comments",
+        )
+        self.assertEqual(
+            observation.navigation_templates,
+            ("/work/{content_id}/comments",),
+        )
+        self.assertNotIn(
+            concrete_id, json.dumps(reports, ensure_ascii=False)
+        )
 
     def test_cross_host_and_non_json_only_fail_closed_after_cleanup(self) -> None:
         """不合格响应不能被当合同，失败也必须先关闭全部资源。"""
@@ -747,6 +901,96 @@ class PassiveObserverTests(unittest.TestCase):
         )
         self.assertEqual(harness.playwright.stopped, 1)
 
+    def test_json_shape_honors_the_remaining_path_budget(self) -> None:
+        """字段结构枚举必须按剩余额度停止，不能先越过累计上限。"""
+
+        with self.assertRaises(CommentInsightFailure) as raised:
+            contract_module._json_shape(
+                {"first": 1, "second": 2}, max_paths=1
+            )
+
+        self.assertEqual(raised.exception.error_code, "comment_payload_invalid")
+
+    def test_concurrent_body_reads_are_reserved_before_starting(self) -> None:
+        """并发响应读取前必须先占用预算，不能同时越过总字节上限。"""
+
+        state = {"active": 0, "max_active": 0}
+
+        class DelayedResponse(FakeResponse):
+            async def body(self) -> bytes:
+                state["active"] += 1
+                state["max_active"] = max(
+                    state["max_active"], state["active"]
+                )
+                try:
+                    await asyncio.sleep(0.02)
+                    return await super().body()
+                finally:
+                    state["active"] -= 1
+
+        first = DelayedResponse(
+            "https://creator.douyin.com/first",
+            {"data": {"value": "first"}},
+        )
+        second = DelayedResponse(
+            "https://creator.douyin.com/second",
+            {"data": {"value": "second"}},
+        )
+        page = FakePage((first, second))
+        harness = ObserverHarness(self.root, page)
+        first_patch, second_patch = harness.patches()
+
+        with (
+            first_patch,
+            second_patch,
+            patch.object(
+                contract_module,
+                "_MAX_TOTAL_BYTES",
+                len(first._body),
+            ),
+            self.assertRaises(CommentInsightFailure) as raised,
+        ):
+            contract_module.observe_contract_responses(harness.account, None)
+
+        self.assertEqual(raised.exception.error_code, "comment_payload_invalid")
+        self.assertEqual(state["max_active"], 1)
+
+    def test_concurrent_shapes_receive_decreasing_remaining_path_budget(self) -> None:
+        """并发响应的结构提取必须共享同一份递减字段路径预算。"""
+
+        original_json_shape = contract_module._json_shape
+        seen_budgets: list[int] = []
+
+        def recording_shape(payload: object, *, max_paths: int):
+            seen_budgets.append(max_paths)
+            return original_json_shape(payload, max_paths=max_paths)
+
+        page = FakePage(
+            (
+                FakeResponse(
+                    "https://creator.douyin.com/first", {"first": 1}
+                ),
+                FakeResponse(
+                    "https://creator.douyin.com/second", {"second": 2}
+                ),
+            )
+        )
+        harness = ObserverHarness(self.root, page)
+        first_patch, second_patch = harness.patches()
+
+        with (
+            first_patch,
+            second_patch,
+            patch.object(contract_module, "_MAX_KEY_PATHS", 3),
+            patch.object(contract_module, "_json_shape", recording_shape),
+        ):
+            observation = contract_module.observe_contract_responses(
+                harness.account, None
+            )
+
+        self.assertEqual(len(observation.responses), 2)
+        self.assertEqual(seen_budgets, [3, 2])
+
     def test_total_timeout_uses_fixed_error_and_cleans_every_resource(self) -> None:
         """总时限到达后不能留下页面或把 asyncio 原始错误带出。"""
 
@@ -772,6 +1016,76 @@ class PassiveObserverTests(unittest.TestCase):
         )
         self.assertEqual(harness.playwright.stopped, 1)
         self.assertNotIn("TimeoutError", json.dumps(reports))
+
+    def test_hanging_close_obeys_total_deadline_and_exposes_cleanup_receipt(self) -> None:
+        """关闭动作卡住时也必须按总时限返回，并给出未关闭资源数。"""
+
+        page = FakePage(
+            (self.official_response(),),
+            close_delay=0.2,
+        )
+        harness = ObserverHarness(self.root, page)
+        reports: list[dict] = []
+        first_patch, second_patch = harness.patches()
+        started = time.monotonic()
+
+        with (
+            first_patch,
+            second_patch,
+            patch.object(contract_module, "_TOTAL_WALL_SECONDS", 0.03),
+            self.assertRaises(CommentInsightFailure) as raised,
+        ):
+            contract_module.observe_contract_responses(
+                harness.account, reports.append
+            )
+
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 0.15)
+        self.assertEqual(raised.exception.error_code, "comment_sync_cancelled")
+        receipt = raised.exception.cleanup_receipt
+        self.assertFalse(receipt.closed)
+        self.assertEqual(receipt.alive_resource_count, 1)
+        self.assertFalse(reports[-1]["cleanup"]["closed"])
+        self.assertEqual(
+            reports[-1]["cleanup"]["aliveResourceCount"], 1
+        )
+        self.assertEqual(
+            (harness.context.closed, harness.browser.closed), (1, 1)
+        )
+        self.assertEqual(harness.playwright.stopped, 1)
+
+    def test_blocking_report_callback_obeys_the_same_total_deadline(self) -> None:
+        """同步报告回调卡住时不能阻塞事件循环或突破总时限。"""
+
+        page = FakePage((self.official_response(),))
+        harness = ObserverHarness(self.root, page)
+        first_patch, second_patch = harness.patches()
+
+        def blocking_report(_payload: dict) -> None:
+            time.sleep(0.2)
+
+        started = time.monotonic()
+        with (
+            first_patch,
+            second_patch,
+            patch.object(contract_module, "_TOTAL_WALL_SECONDS", 0.03),
+            self.assertRaises(CommentInsightFailure) as raised,
+        ):
+            contract_module.observe_contract_responses(
+                harness.account, blocking_report
+            )
+
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 0.15)
+        self.assertEqual(raised.exception.error_code, "comment_sync_timeout")
+        receipt = raised.exception.cleanup_receipt
+        self.assertTrue(receipt.closed)
+        self.assertEqual(receipt.alive_resource_count, 0)
+        self.assertEqual(
+            (page.closed, harness.context.closed, harness.browser.closed),
+            (1, 1, 1),
+        )
+        self.assertEqual(harness.playwright.stopped, 1)
 
     def test_cleanup_failure_returns_only_fixed_error_and_receipt(self) -> None:
         """关闭失败的异常原文不能泄漏，且回执必须如实标明一个资源仍存活。"""

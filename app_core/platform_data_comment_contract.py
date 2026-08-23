@@ -5,13 +5,16 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+import inspect
 import json
 import os
 from pathlib import Path
 import re
 import tempfile
+import threading
+import time
 from typing import Callable
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from .paths import COOKIE_DIR
 from .platform_data_collection_errors import CleanupReceipt
@@ -56,6 +59,29 @@ _IDENTITY_SEGMENTS = frozenset(
         "username",
     }
 )
+_IDENTITY_ACTOR_TOKENS = frozenset(
+    {
+        "account",
+        "author",
+        "avatar",
+        "creator",
+        "nickname",
+        "openid",
+        "owner",
+        "reviewer",
+        "user",
+        "username",
+    }
+)
+_COMPACT_IDENTITY_RE = re.compile(
+    r"^(?:account|author|avatar|creator|nickname|openid|owner|reviewer|user)"
+    r"(?:detail|id|info|metadata|name|profile|uri|url)?$"
+)
+_PATH_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-"
+    r"[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+)
+_PATH_OPAQUE_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _KEY_PATH_RE = re.compile(r"^[A-Za-z0-9_$.-]+(?:\[\])?(?:\.[A-Za-z0-9_$-]+(?:\[\])?)*$")
 _METRIC_KEY_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 _PAGINATION_TRIGGER_RE = re.compile(
@@ -249,7 +275,7 @@ def _unavailable() -> None:
     raise CommentInsightFailure("comment_content_unavailable")
 
 
-def _is_fixed_path(value: object) -> bool:
+def _path_syntax_is_safe(value: object) -> bool:
     return (
         type(value) is str
         and value.startswith("/")
@@ -258,6 +284,41 @@ def _is_fixed_path(value: object) -> bool:
         and "\\" not in value
         and "//" not in value
     )
+
+
+def _is_concrete_identifier_segment(value: str) -> bool:
+    decoded = unquote(value)
+    if decoded == "{content_id}":
+        return False
+    if _PATH_UUID_RE.fullmatch(decoded) is not None:
+        return True
+    if decoded.isdecimal() and len(decoded) >= 6:
+        return True
+    return (
+        len(decoded) >= 12
+        and _PATH_OPAQUE_RE.fullmatch(decoded) is not None
+        and any(character.isdigit() for character in decoded)
+    )
+
+
+def _sanitize_path(value: object) -> str | None:
+    if not _path_syntax_is_safe(value):
+        return None
+    assert type(value) is str
+    segments = value.split("/")
+    safe_segments = [
+        "{content_id}" if _is_concrete_identifier_segment(item) else item
+        for item in segments
+    ]
+    sanitized = "/".join(safe_segments)
+    braces_removed = sanitized.replace("{content_id}", "")
+    if "{" in braces_removed or "}" in braces_removed:
+        return None
+    return sanitized
+
+
+def _is_fixed_path(value: object) -> bool:
+    return type(value) is str and _sanitize_path(value) == value
 
 
 def _is_navigation_template(value: object) -> bool:
@@ -277,9 +338,21 @@ def _is_pagination_trigger(value: object) -> bool:
 def _safe_key_path(value: object) -> str | None:
     if type(value) is not str or not value or _KEY_PATH_RE.fullmatch(value) is None:
         return None
-    segments = tuple(part.removesuffix("[]").lower() for part in value.split("."))
-    if any(segment in _IDENTITY_SEGMENTS for segment in segments):
-        return None
+    for part in value.split("."):
+        segment = part.removesuffix("[]")
+        snake_case = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", segment).lower()
+        tokens = tuple(
+            token for token in re.split(r"[^a-z0-9]+", snake_case) if token
+        )
+        normalized = "_".join(tokens)
+        compact = "".join(tokens)
+        if (
+            normalized in _IDENTITY_SEGMENTS
+            or any(token in _IDENTITY_ACTOR_TOKENS for token in tokens)
+            or _COMPACT_IDENTITY_RE.fullmatch(compact) is not None
+            or ("profile" in tokens and tokens != ("profile", "visits"))
+        ):
+            return None
     return value
 
 
@@ -318,10 +391,13 @@ def _safe_response(value: object) -> dict | None:
                 and type_name in _SAFE_TYPE_NAMES
             ):
                 field_types.append([key, type_name])
+    path = _sanitize_path(parsed.path or "/")
+    if path is None:
+        return None
     return {
         "scheme": "https",
         "host": _CREATOR_HOST,
-        "path": parsed.path or "/",
+        "path": path,
         "method": method,
         "keyPaths": list(dict.fromkeys(keys)),
         "fieldTypes": field_types,
@@ -409,9 +485,12 @@ def _builtin_type_name(value: object) -> str | None:
     return None
 
 
-def _json_shape(payload: object) -> tuple[
+def _json_shape(payload: object, *, max_paths: int | None = None) -> tuple[
     tuple[str, ...], tuple[tuple[str, str], ...], tuple[str, ...]
 ]:
+    path_limit = _MAX_KEY_PATHS if max_paths is None else max_paths
+    if type(path_limit) is not int or path_limit < 0:
+        raise CommentInsightFailure("comment_payload_invalid")
     paths: list[str] = []
     types: list[tuple[str, str]] = []
 
@@ -421,7 +500,7 @@ def _json_shape(payload: object) -> tuple[
         pair = (path, type_name)
         if pair not in types:
             types.append(pair)
-        if len(paths) > _MAX_KEY_PATHS:
+        if len(paths) > path_limit:
             raise CommentInsightFailure("comment_payload_invalid")
 
     def visit(value: object, path: str) -> None:
@@ -484,7 +563,9 @@ def _navigation_path(value: object) -> str | None:
     parsed = urlsplit(value)
     if parsed.scheme != "https" or parsed.hostname != _CREATOR_HOST:
         return None
-    path = parsed.path or "/"
+    path = _sanitize_path(parsed.path or "/")
+    if path is None:
+        return None
     return path if _is_navigation_template(path) else None
 
 
@@ -506,7 +587,25 @@ def _navigation_failure(value: object) -> str | None:
     return None
 
 
-async def _close_resource(resource: object | None) -> BaseException | None:
+def _remaining_seconds(deadline: float) -> float:
+    return max(0.0, deadline - time.monotonic())
+
+
+async def _await_before_deadline(value: object, deadline: float) -> object:
+    if not hasattr(value, "__await__"):
+        return value
+    remaining = _remaining_seconds(deadline)
+    if remaining <= 0:
+        close = getattr(value, "close", None)
+        if callable(close):
+            close()
+        raise TimeoutError
+    return await asyncio.wait_for(value, timeout=remaining)
+
+
+async def _close_resource(
+    resource: object | None, deadline: float
+) -> BaseException | None:
     if resource is None:
         return None
     close = getattr(resource, "close", None)
@@ -515,9 +614,34 @@ async def _close_resource(resource: object | None) -> BaseException | None:
     if close is None:
         return RuntimeError("close unavailable")
     try:
-        result = close()
+        if inspect.iscoroutinefunction(close):
+            result = close()
+        else:
+            completed = threading.Event()
+            outcome: list[object] = []
+
+            def invoke() -> None:
+                try:
+                    outcome.append(close())
+                except BaseException as exc:
+                    outcome.append(exc)
+                finally:
+                    completed.set()
+
+            worker = threading.Thread(
+                target=invoke,
+                name="douyin-comment-contract-close",
+                daemon=True,
+            )
+            worker.start()
+            worker.join(_remaining_seconds(deadline))
+            if not completed.is_set():
+                return TimeoutError()
+            result = outcome[0]
+            if isinstance(result, BaseException):
+                return result
         if hasattr(result, "__await__"):
-            await result
+            await _await_before_deadline(result, deadline)
     except BaseException as exc:
         return exc
     return None
@@ -526,15 +650,16 @@ async def _close_resource(resource: object | None) -> BaseException | None:
 def _emit_report(
     report: Callable[[dict], None] | None,
     *,
+    deadline: float,
     status: str,
     error_code: str,
     responses: tuple[ContractResponseShape, ...],
     navigation_templates: tuple[str, ...],
     pagination_triggers: tuple[str, ...],
     cleanup: CleanupReceipt,
-) -> None:
+) -> bool:
     if report is None:
-        return
+        return True
     field_names = sorted(
         {
             path
@@ -559,15 +684,41 @@ def _emit_report(
         "paginationTriggers": list(pagination_triggers),
         "cleanup": cleanup.public_payload(),
     }
-    try:
-        report(payload)
-    except Exception:
-        return
+    completed = threading.Event()
+
+    def invoke() -> None:
+        try:
+            report(payload)
+        except Exception:
+            pass
+        finally:
+            completed.set()
+
+    worker = threading.Thread(
+        target=invoke,
+        name="douyin-comment-contract-report",
+        daemon=True,
+    )
+    worker.start()
+    worker.join(_remaining_seconds(deadline))
+    return completed.is_set()
+
+
+def _failure_with_cleanup(
+    error_code: str,
+    cleanup: CleanupReceipt,
+    *,
+    retryable: bool = False,
+) -> CommentInsightFailure:
+    failure = CommentInsightFailure(error_code, retryable=retryable)
+    failure.cleanup_receipt = cleanup
+    return failure
 
 
 async def _observe_contract_responses_async(
     account: dict,
     report: Callable[[dict], None] | None,
+    hard_deadline: float,
 ) -> ContractObservation:
     state_path = _required_state(account)
     playwright = None
@@ -585,6 +736,12 @@ async def _observe_contract_responses_async(
     total_key_paths = 0
     fatal_error: BaseException | None = None
     limits_lock = asyncio.Lock()
+    body_budget_lock = asyncio.Lock()
+    shape_budget_lock = asyncio.Lock()
+    initial_remaining = _remaining_seconds(hard_deadline)
+    cleanup_reserve = min(5.0, initial_remaining * 0.25)
+    operation_deadline = hard_deadline - cleanup_reserve
+    cleanup_deadline = hard_deadline - (cleanup_reserve * 0.5)
 
     async def consume_response(response: object) -> None:
         nonlocal response_count, total_bytes, total_key_paths, fatal_error
@@ -615,33 +772,44 @@ async def _observe_contract_responses_async(
                 response_count += 1
                 if response_count > _MAX_RESPONSES:
                     raise CommentInsightFailure("comment_payload_invalid")
-            body_reader = getattr(response, "body", None)
-            if not callable(body_reader):
-                raise CommentInsightFailure("comment_payload_invalid")
-            body = body_reader()
-            if hasattr(body, "__await__"):
-                body = await body
-            if type(body) is not bytes or len(body) > _MAX_RESPONSE_BYTES:
-                raise CommentInsightFailure("comment_payload_invalid")
-            async with limits_lock:
-                total_bytes += len(body)
-                if total_bytes > _MAX_TOTAL_BYTES:
+            async with body_budget_lock:
+                body_reader = getattr(response, "body", None)
+                if not callable(body_reader):
                     raise CommentInsightFailure("comment_payload_invalid")
+                if total_bytes >= _MAX_TOTAL_BYTES:
+                    raise CommentInsightFailure("comment_payload_invalid")
+                body = body_reader()
+                if hasattr(body, "__await__"):
+                    body = await _await_before_deadline(
+                        body, operation_deadline
+                    )
+                remaining_bytes = _MAX_TOTAL_BYTES - total_bytes
+                if (
+                    type(body) is not bytes
+                    or len(body) > _MAX_RESPONSE_BYTES
+                    or len(body) > remaining_bytes
+                ):
+                    raise CommentInsightFailure("comment_payload_invalid")
+                total_bytes += len(body)
             try:
                 payload = json.loads(body)
             except BaseException as exc:
                 if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                     raise
                 raise CommentInsightFailure("comment_payload_invalid") from None
-            key_paths, field_types, pagination_fields = _json_shape(payload)
-            async with limits_lock:
+            async with shape_budget_lock:
+                remaining_paths = _MAX_KEY_PATHS - total_key_paths
+                key_paths, field_types, pagination_fields = _json_shape(
+                    payload, max_paths=remaining_paths
+                )
                 total_key_paths += len(key_paths)
-                if total_key_paths > _MAX_KEY_PATHS:
-                    raise CommentInsightFailure("comment_payload_invalid")
+            safe_path = _sanitize_path(parsed.path or "/")
+            if safe_path is None:
+                raise CommentInsightFailure("comment_payload_invalid")
             shape = ContractResponseShape(
                 scheme="https",
                 host=_CREATOR_HOST,
-                path=parsed.path or "/",
+                path=safe_path,
                 method=method,
                 key_paths=key_paths,
                 field_types=field_types,
@@ -668,16 +836,29 @@ async def _observe_contract_responses_async(
 
     try:
         starter = _PLAYWRIGHT_FACTORY()
-        playwright = await starter.start()
-        browser = await playwright.chromium.launch(headless=False)
-        context = await browser.new_context(storage_state=str(state_path))
-        page = await context.new_page()
+        playwright = await _await_before_deadline(
+            starter.start(), operation_deadline
+        )
+        browser = await _await_before_deadline(
+            playwright.chromium.launch(headless=False), operation_deadline
+        )
+        context = await _await_before_deadline(
+            browser.new_context(storage_state=str(state_path)),
+            operation_deadline,
+        )
+        page = await _await_before_deadline(
+            context.new_page(), operation_deadline
+        )
         page.on("response", observe_response)
         page.on("framenavigated", observe_navigation)
-        await page.goto(
-            _OFFICIAL_ROOT,
-            wait_until="domcontentloaded",
-            timeout=_TOTAL_WALL_SECONDS * 1000,
+        navigation_timeout_ms = _remaining_seconds(operation_deadline) * 1000
+        await _await_before_deadline(
+            page.goto(
+                _OFFICIAL_ROOT,
+                wait_until="domcontentloaded",
+                timeout=navigation_timeout_ms,
+            ),
+            operation_deadline,
         )
         navigation_error = _navigation_failure(getattr(page, "url", None))
         if navigation_error is not None:
@@ -691,9 +872,20 @@ async def _observe_contract_responses_async(
         wait_for_timeout = getattr(page, "wait_for_timeout", None)
         if not callable(wait_for_timeout):
             raise CommentInsightFailure("comment_content_unavailable")
-        await wait_for_timeout(_OBSERVATION_WINDOW_MS)
+        observation_ms = min(
+            _OBSERVATION_WINDOW_MS,
+            _remaining_seconds(operation_deadline) * 1000,
+        )
+        await _await_before_deadline(
+            wait_for_timeout(observation_ms), operation_deadline
+        )
         if listener_tasks:
-            await asyncio.gather(*tuple(listener_tasks), return_exceptions=True)
+            await _await_before_deadline(
+                asyncio.gather(
+                    *tuple(listener_tasks), return_exceptions=True
+                ),
+                operation_deadline,
+            )
         if fatal_error is not None:
             raise fatal_error
         if not responses:
@@ -705,9 +897,23 @@ async def _observe_contract_responses_async(
             if not task.done():
                 task.cancel()
         if listener_tasks:
-            await asyncio.gather(*tuple(listener_tasks), return_exceptions=True)
-        for resource in (page, context, browser, playwright):
-            close_error = await _close_resource(resource)
+            try:
+                await _await_before_deadline(
+                    asyncio.gather(
+                        *tuple(listener_tasks), return_exceptions=True
+                    ),
+                    cleanup_deadline,
+                )
+            except BaseException as exc:
+                if caught is None:
+                    caught = exc
+        resources = (page, context, browser, playwright)
+        for index, resource in enumerate(resources):
+            resource_count = len(resources) - index
+            close_deadline = time.monotonic() + (
+                _remaining_seconds(cleanup_deadline) / resource_count
+            )
+            close_error = await _close_resource(resource, close_deadline)
             if close_error is not None:
                 cleanup_errors.append(close_error)
 
@@ -725,8 +931,9 @@ async def _observe_contract_responses_async(
         if isinstance(cleanup_error, (KeyboardInterrupt, SystemExit)):
             raise cleanup_error
     if cleanup_errors:
-        _emit_report(
+        report_completed = _emit_report(
             report,
+            deadline=hard_deadline,
             status="failed",
             error_code="comment_sync_cancelled",
             responses=response_tuple,
@@ -734,10 +941,17 @@ async def _observe_contract_responses_async(
             pagination_triggers=pagination_tuple,
             cleanup=cleanup,
         )
-        raise CommentInsightFailure("comment_sync_cancelled") from None
+        if not report_completed:
+            raise _failure_with_cleanup(
+                "comment_sync_timeout", cleanup, retryable=True
+            ) from None
+        raise _failure_with_cleanup(
+            "comment_sync_cancelled", cleanup
+        ) from None
     if isinstance(caught, asyncio.CancelledError):
-        _emit_report(
+        report_completed = _emit_report(
             report,
+            deadline=hard_deadline,
             status="failed",
             error_code="comment_sync_cancelled",
             responses=response_tuple,
@@ -745,10 +959,31 @@ async def _observe_contract_responses_async(
             pagination_triggers=pagination_tuple,
             cleanup=cleanup,
         )
-        raise caught
-    if isinstance(caught, CommentInsightFailure):
+        if not report_completed:
+            raise _failure_with_cleanup(
+                "comment_sync_timeout", cleanup, retryable=True
+            ) from None
+        raise _failure_with_cleanup(
+            "comment_sync_cancelled", cleanup, retryable=True
+        ) from None
+    if isinstance(caught, TimeoutError):
         _emit_report(
             report,
+            deadline=hard_deadline,
+            status="failed",
+            error_code="comment_sync_timeout",
+            responses=response_tuple,
+            navigation_templates=navigation_tuple,
+            pagination_triggers=pagination_tuple,
+            cleanup=cleanup,
+        )
+        raise _failure_with_cleanup(
+            "comment_sync_timeout", cleanup, retryable=True
+        ) from None
+    if isinstance(caught, CommentInsightFailure):
+        report_completed = _emit_report(
+            report,
+            deadline=hard_deadline,
             status="failed",
             error_code=caught.error_code,
             responses=response_tuple,
@@ -756,10 +991,16 @@ async def _observe_contract_responses_async(
             pagination_triggers=pagination_tuple,
             cleanup=cleanup,
         )
+        if not report_completed:
+            raise _failure_with_cleanup(
+                "comment_sync_timeout", cleanup, retryable=True
+            ) from None
+        caught.cleanup_receipt = cleanup
         raise caught
     if caught is not None:
-        _emit_report(
+        report_completed = _emit_report(
             report,
+            deadline=hard_deadline,
             status="failed",
             error_code="comment_payload_invalid",
             responses=response_tuple,
@@ -767,7 +1008,13 @@ async def _observe_contract_responses_async(
             pagination_triggers=pagination_tuple,
             cleanup=cleanup,
         )
-        raise CommentInsightFailure("comment_payload_invalid") from None
+        if not report_completed:
+            raise _failure_with_cleanup(
+                "comment_sync_timeout", cleanup, retryable=True
+            ) from None
+        raise _failure_with_cleanup(
+            "comment_payload_invalid", cleanup
+        ) from None
     observation = ContractObservation(
         verified=False,
         responses=response_tuple,
@@ -775,8 +1022,9 @@ async def _observe_contract_responses_async(
         pagination_triggers=pagination_tuple,
         cleanup=cleanup,
     )
-    _emit_report(
+    report_completed = _emit_report(
         report,
+        deadline=hard_deadline,
         status="observed_unverified",
         error_code="comment_content_unavailable",
         responses=response_tuple,
@@ -784,6 +1032,10 @@ async def _observe_contract_responses_async(
         pagination_triggers=pagination_tuple,
         cleanup=cleanup,
     )
+    if not report_completed:
+        raise _failure_with_cleanup(
+            "comment_sync_timeout", cleanup, retryable=True
+        ) from None
     return observation
 
 
@@ -793,11 +1045,11 @@ def observe_contract_responses(
 ) -> ContractObservation:
     """用现有登录态被动观察官网 JSON；从不重放或合成平台请求。"""
 
+    hard_deadline = time.monotonic() + _TOTAL_WALL_SECONDS
     try:
         return asyncio.run(
-            asyncio.wait_for(
-                _observe_contract_responses_async(account, report),
-                timeout=_TOTAL_WALL_SECONDS,
+            _observe_contract_responses_async(
+                account, report, hard_deadline
             )
         )
     except CommentInsightFailure:
@@ -916,17 +1168,25 @@ def _matching_methods(
     fields: tuple[str, ...],
     pagination_fields: tuple[str, str],
 ) -> tuple[str, ...]:
-    required = set(fields)
-    required_pagination = set(pagination_fields)
-    return tuple(
+    path_methods = tuple(
         dict.fromkeys(
             response.method
             for response in observation.responses
             if response.path == response_path
-            and required.issubset(response.key_paths)
-            and required_pagination.issubset(response.pagination_fields)
         )
     )
+    if len(path_methods) != 1:
+        return path_methods
+    required = set(fields)
+    required_pagination = set(pagination_fields)
+    matched = any(
+        response.path == response_path
+        and response.method == path_methods[0]
+        and required.issubset(response.key_paths)
+        and required_pagination.issubset(response.pagination_fields)
+        for response in observation.responses
+    )
+    return path_methods if matched else ()
 
 
 def _contract_from_selection(

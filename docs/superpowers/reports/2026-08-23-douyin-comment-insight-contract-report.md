@@ -4,7 +4,6 @@
 
 - 状态：`observed_unverified`
 - 固定错误码：`comment_content_unavailable`
-- 账号选择：使用稳定顺序中的第一个可用 `type=3` 真实登录会话；未记录任何账号标识。
 - 官网 JSON 候选响应数：`41`
 - 脱敏结构字段名数量：`663`
 - 出现的分页候选字段名：`billboard_data.has_more`、`course_list[].offset`、`cursor`、`has_more`、`offset`
