@@ -961,9 +961,16 @@ class PassiveObserverTests(unittest.TestCase):
         original_json_shape = contract_module._json_shape
         seen_budgets: list[int] = []
 
-        def recording_shape(payload: object, *, max_paths: int):
+        def recording_shape(
+            payload: object,
+            *,
+            max_paths: int,
+            deadline: float | None = None,
+        ):
             seen_budgets.append(max_paths)
-            return original_json_shape(payload, max_paths=max_paths)
+            return original_json_shape(
+                payload, max_paths=max_paths, deadline=deadline
+            )
 
         page = FakePage(
             (
@@ -1081,6 +1088,93 @@ class PassiveObserverTests(unittest.TestCase):
         receipt = raised.exception.cleanup_receipt
         self.assertTrue(receipt.closed)
         self.assertEqual(receipt.alive_resource_count, 0)
+        self.assertEqual(
+            (page.closed, harness.context.closed, harness.browser.closed),
+            (1, 1, 1),
+        )
+        self.assertEqual(harness.playwright.stopped, 1)
+
+    def test_synchronous_body_reader_obeys_the_hard_total_deadline(self) -> None:
+        """同步 body() 卡住时不能占住观察线程并突破总时限。"""
+
+        class BlockingBodyResponse(FakeResponse):
+            def body(self) -> bytes:
+                time.sleep(0.2)
+                return self._body
+
+        page = FakePage(
+            (
+                BlockingBodyResponse(
+                    "https://creator.douyin.com/blocking-body",
+                    {"data": {"value": "private-body-value"}},
+                ),
+            )
+        )
+        harness = ObserverHarness(self.root, page)
+        reports: list[dict] = []
+        first_patch, second_patch = harness.patches()
+        started = time.monotonic()
+
+        with (
+            first_patch,
+            second_patch,
+            patch.object(contract_module, "_TOTAL_WALL_SECONDS", 0.03),
+            self.assertRaises(CommentInsightFailure) as raised,
+        ):
+            contract_module.observe_contract_responses(
+                harness.account, reports.append
+            )
+
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 0.15)
+        self.assertEqual(raised.exception.error_code, "comment_sync_timeout")
+        self.assertTrue(raised.exception.cleanup_receipt.closed)
+        self.assertEqual(
+            (page.closed, harness.context.closed, harness.browser.closed),
+            (1, 1, 1),
+        )
+        self.assertEqual(harness.playwright.stopped, 1)
+        self.assertNotIn(
+            "private-body-value", json.dumps(reports, ensure_ascii=False)
+        )
+
+    def test_cpu_heavy_json_shape_obeys_the_hard_total_deadline(self) -> None:
+        """大量数组元素的 JSON 解析和结构遍历也不能突破总时限。"""
+
+        response = FakeResponse(
+            "https://creator.douyin.com/heavy-json",
+            {"data": [0] * 500_000},
+        )
+        page = FakePage((response,))
+        harness = ObserverHarness(self.root, page)
+        reports: list[dict] = []
+        first_patch, second_patch = harness.patches()
+        started = time.monotonic()
+
+        with (
+            first_patch,
+            second_patch,
+            patch.object(contract_module, "_TOTAL_WALL_SECONDS", 0.03),
+            patch.object(
+                contract_module,
+                "_MAX_RESPONSE_BYTES",
+                len(response._body) + 1,
+            ),
+            patch.object(
+                contract_module,
+                "_MAX_TOTAL_BYTES",
+                len(response._body) + 1,
+            ),
+            self.assertRaises(CommentInsightFailure) as raised,
+        ):
+            contract_module.observe_contract_responses(
+                harness.account, reports.append
+            )
+
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 0.15)
+        self.assertEqual(raised.exception.error_code, "comment_sync_timeout")
+        self.assertTrue(raised.exception.cleanup_receipt.closed)
         self.assertEqual(
             (page.closed, harness.context.closed, harness.browser.closed),
             (1, 1, 1),

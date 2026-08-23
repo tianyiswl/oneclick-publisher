@@ -485,7 +485,12 @@ def _builtin_type_name(value: object) -> str | None:
     return None
 
 
-def _json_shape(payload: object, *, max_paths: int | None = None) -> tuple[
+def _json_shape(
+    payload: object,
+    *,
+    max_paths: int | None = None,
+    deadline: float | None = None,
+) -> tuple[
     tuple[str, ...], tuple[tuple[str, str], ...], tuple[str, ...]
 ]:
     path_limit = _MAX_KEY_PATHS if max_paths is None else max_paths
@@ -493,6 +498,10 @@ def _json_shape(payload: object, *, max_paths: int | None = None) -> tuple[
         raise CommentInsightFailure("comment_payload_invalid")
     paths: list[str] = []
     types: list[tuple[str, str]] = []
+
+    def check_deadline() -> None:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError
 
     def remember(path: str, type_name: str) -> None:
         if path not in paths:
@@ -504,6 +513,7 @@ def _json_shape(payload: object, *, max_paths: int | None = None) -> tuple[
             raise CommentInsightFailure("comment_payload_invalid")
 
     def visit(value: object, path: str) -> None:
+        check_deadline()
         type_name = _builtin_type_name(value)
         if type_name is None:
             raise CommentInsightFailure("comment_payload_invalid")
@@ -589,6 +599,60 @@ def _navigation_failure(value: object) -> str | None:
 
 def _remaining_seconds(deadline: float) -> float:
     return max(0.0, deadline - time.monotonic())
+
+
+def _run_sync_before_deadline(
+    operation: Callable[[], object], deadline: float
+) -> object:
+    completed = threading.Event()
+    outcome: list[object] = []
+
+    def invoke() -> None:
+        try:
+            result = operation()
+            if time.monotonic() >= deadline:
+                outcome.append(TimeoutError())
+            else:
+                outcome.append(result)
+        except BaseException as exc:
+            outcome.append(exc)
+        finally:
+            completed.set()
+
+    worker = threading.Thread(
+        target=invoke,
+        name="douyin-comment-contract-sync",
+        daemon=True,
+    )
+    worker.start()
+    worker.join(_remaining_seconds(deadline))
+    if not completed.is_set():
+        raise TimeoutError
+    result = outcome[0]
+    if isinstance(result, BaseException):
+        raise result
+    return result
+
+
+def _parse_json_shape_before_deadline(
+    body: bytes,
+    *,
+    max_paths: int,
+    deadline: float,
+) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...], tuple[str, ...]]:
+    try:
+        payload = json.loads(body)
+    except BaseException as exc:
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
+        raise CommentInsightFailure("comment_payload_invalid") from None
+    if time.monotonic() >= deadline:
+        raise TimeoutError
+    return _json_shape(
+        payload,
+        max_paths=max_paths,
+        deadline=deadline,
+    )
 
 
 async def _await_before_deadline(value: object, deadline: float) -> object:
@@ -739,9 +803,9 @@ async def _observe_contract_responses_async(
     body_budget_lock = asyncio.Lock()
     shape_budget_lock = asyncio.Lock()
     initial_remaining = _remaining_seconds(hard_deadline)
-    cleanup_reserve = min(5.0, initial_remaining * 0.25)
+    cleanup_reserve = min(5.0, initial_remaining * 0.5)
     operation_deadline = hard_deadline - cleanup_reserve
-    cleanup_deadline = hard_deadline - (cleanup_reserve * 0.5)
+    cleanup_deadline = hard_deadline - (cleanup_reserve / 3)
 
     async def consume_response(response: object) -> None:
         nonlocal response_count, total_bytes, total_key_paths, fatal_error
@@ -778,7 +842,12 @@ async def _observe_contract_responses_async(
                     raise CommentInsightFailure("comment_payload_invalid")
                 if total_bytes >= _MAX_TOTAL_BYTES:
                     raise CommentInsightFailure("comment_payload_invalid")
-                body = body_reader()
+                if inspect.iscoroutinefunction(body_reader):
+                    body = body_reader()
+                else:
+                    body = _run_sync_before_deadline(
+                        body_reader, operation_deadline
+                    )
                 if hasattr(body, "__await__"):
                     body = await _await_before_deadline(
                         body, operation_deadline
@@ -791,16 +860,17 @@ async def _observe_contract_responses_async(
                 ):
                     raise CommentInsightFailure("comment_payload_invalid")
                 total_bytes += len(body)
-            try:
-                payload = json.loads(body)
-            except BaseException as exc:
-                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
-                    raise
-                raise CommentInsightFailure("comment_payload_invalid") from None
             async with shape_budget_lock:
                 remaining_paths = _MAX_KEY_PATHS - total_key_paths
-                key_paths, field_types, pagination_fields = _json_shape(
-                    payload, max_paths=remaining_paths
+                key_paths, field_types, pagination_fields = (
+                    _run_sync_before_deadline(
+                        lambda: _parse_json_shape_before_deadline(
+                            body,
+                            max_paths=remaining_paths,
+                            deadline=operation_deadline,
+                        ),
+                        operation_deadline,
+                    )
                 )
                 total_key_paths += len(key_paths)
             safe_path = _sanitize_path(parsed.path or "/")
