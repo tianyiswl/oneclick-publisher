@@ -268,119 +268,57 @@ def _first_outcome(current, candidate):
     return current
 
 
-def _get_cleanup_attribute(obj, name, *, retry_errors=False):
-    value = None
-    outcome = None
-    error = None
-    try:
-        attempts = 2 if retry_errors else 1
-        for _index in range(attempts):
-            try:
-                value = getattr(obj, name)
-                break
-            except BaseException as error:
-                outcome = _first_outcome(
-                    outcome,
-                    _cleanup_error_outcome(error),
-                )
-        return value, outcome
-    finally:
-        obj = None
-        value = None
-        name = None
-        _index = None
-        error = None
+def _sanitize_owned_prepared_request(request):
+    """Clear only the exact PreparedRequest created and owned by this module."""
 
-
-def _sanitize_prepared_request(request):
     outcome = None
-    headers = None
-    sanitized_headers = None
+    state = None
+    safe_headers = None
     verified_headers = None
     verified_body = None
-    keys = ()
-    key = None
-    attribute = None
     error = None
     try:
         if request is None:
             return None
-        if not isinstance(request, requests.PreparedRequest):
-            return (_OUTCOME_FAILURE, "comment_ai_service_unavailable")
-        headers, current = _get_cleanup_attribute(
-            request,
-            "headers",
-            retry_errors=True,
-        )
-        outcome = _first_outcome(outcome, current)
-        if headers is None and type(request) is requests.PreparedRequest:
-            try:
-                headers = request.__dict__.get("headers")
-            except BaseException as error:
+        if type(request) is not requests.PreparedRequest:
+            outcome = (_OUTCOME_FAILURE, "comment_ai_service_unavailable")
+        try:
+            state = object.__getattribute__(request, "__dict__")
+            if type(state) is not dict:
+                raise TypeError("prepared request state unavailable")
+            state.clear()
+            safe_headers = requests.structures.CaseInsensitiveDict()
+            state["method"] = None
+            state["url"] = None
+            state["headers"] = safe_headers
+            state["body"] = None
+            state["hooks"] = {}
+            state["_body_position"] = None
+        except BaseException as error:
+            outcome = _first_outcome(outcome, _cleanup_error_outcome(error))
+
+        if type(state) is dict:
+            verified_headers = state.get("headers")
+            verified_body = state.get("body")
+        if (
+            type(verified_headers)
+            is not requests.structures.CaseInsensitiveDict
+            or len(verified_headers) != 0
+        ):
+            outcome = _first_outcome(
+                outcome,
+                (_OUTCOME_FAILURE, "comment_ai_service_unavailable"),
+            )
+        if verified_body is None:
+            pass
+        elif type(verified_body) is bytes:
+            if len(verified_body) != 0:
                 outcome = _first_outcome(
                     outcome,
-                    _cleanup_error_outcome(error),
+                    (_OUTCOME_FAILURE, "comment_ai_service_unavailable"),
                 )
-        if headers is not None:
-            try:
-                keys = tuple(headers.keys())
-            except BaseException as error:
-                outcome = _first_outcome(
-                    outcome,
-                    _cleanup_error_outcome(error),
-                )
-                keys = ()
-            for key in keys:
-                if type(key) is not str or key.lower() not in {
-                    "authorization",
-                    "proxy-authorization",
-                }:
-                    continue
-                for _index in range(2):
-                    try:
-                        headers.pop(key, None)
-                        break
-                    except BaseException as error:
-                        outcome = _first_outcome(
-                            outcome,
-                            _cleanup_error_outcome(error),
-                        )
-            try:
-                sanitized_headers = requests.structures.CaseInsensitiveDict(headers)
-                for key in tuple(sanitized_headers.keys()):
-                    if type(key) is str and key.lower() in {
-                        "authorization",
-                        "proxy-authorization",
-                    }:
-                        sanitized_headers.pop(key, None)
-            except BaseException as error:
-                outcome = _first_outcome(
-                    outcome,
-                    _cleanup_error_outcome(error),
-                )
-                sanitized_headers = None
-        if sanitized_headers is not None:
-            assigned = False
-            for _index in range(2):
-                try:
-                    request.headers = sanitized_headers
-                    assigned = True
-                    break
-                except BaseException as error:
-                    outcome = _first_outcome(
-                        outcome,
-                        _cleanup_error_outcome(error),
-                    )
-            if not assigned and type(request) is requests.PreparedRequest:
-                try:
-                    request.__dict__["headers"] = sanitized_headers
-                    assigned = True
-                except BaseException as error:
-                    outcome = _first_outcome(
-                        outcome,
-                        _cleanup_error_outcome(error),
-                    )
-            if not assigned:
+        elif type(verified_body) is str:
+            if len(verified_body) != 0:
                 outcome = _first_outcome(
                     outcome,
                     (_OUTCOME_FAILURE, "comment_ai_service_unavailable"),
@@ -390,135 +328,126 @@ def _sanitize_prepared_request(request):
                 outcome,
                 (_OUTCOME_FAILURE, "comment_ai_service_unavailable"),
             )
-        for attribute in ("body", "_body_position"):
-            cleared = False
-            for _index in range(2):
-                try:
-                    setattr(request, attribute, None)
-                    cleared = True
-                    break
-                except BaseException as error:
-                    outcome = _first_outcome(
-                        outcome,
-                        _cleanup_error_outcome(error),
-                    )
-            if not cleared and type(request) is requests.PreparedRequest:
-                try:
-                    request.__dict__[attribute] = None
-                    cleared = True
-                except BaseException as error:
-                    outcome = _first_outcome(
-                        outcome,
-                        _cleanup_error_outcome(error),
-                    )
-            if not cleared:
-                outcome = _first_outcome(
-                    outcome,
-                    (_OUTCOME_FAILURE, "comment_ai_service_unavailable"),
-                )
+        return outcome
+    except BaseException as error:
+        return _first_outcome(outcome, _cleanup_error_outcome(error))
+    finally:
+        request = None
+        state = None
+        safe_headers = None
+        verified_headers = None
+        verified_body = None
+        error = None
 
-        verified_headers, current = _get_cleanup_attribute(
-            request,
-            "headers",
-            retry_errors=True,
-        )
-        outcome = _first_outcome(outcome, current)
+
+def _sanitize_response_state(response, *, after_close):
+    outcome = None
+    state = None
+    error = None
+    try:
+        if response is None:
+            return None
         try:
-            unsafe_header = verified_headers is None or any(
-                type(current_key) is not str
-                or current_key.lower() in {"authorization", "proxy-authorization"}
-                for current_key in verified_headers.keys()
-            )
+            state = object.__getattribute__(response, "__dict__")
+            if type(state) is not dict:
+                raise TypeError("response state unavailable")
+            state["request"] = None
+            state["_content"] = None
+            state["content"] = None
+            if after_close:
+                state["raw"] = None
         except BaseException as error:
-            outcome = _first_outcome(
-                outcome,
-                _cleanup_error_outcome(error),
-            )
-            unsafe_header = True
-        if unsafe_header:
+            outcome = _first_outcome(outcome, _cleanup_error_outcome(error))
+        if type(state) is not dict:
             outcome = _first_outcome(
                 outcome,
                 (_OUTCOME_FAILURE, "comment_ai_service_unavailable"),
             )
-
-        verified_body, current = _get_cleanup_attribute(
-            request,
-            "body",
-            retry_errors=True,
-        )
-        outcome = _first_outcome(outcome, current)
-        if verified_body not in (None, b"", ""):
+        elif (
+            state.get("request") is not None
+            or state.get("_content") is not None
+            or (after_close and state.get("raw") is not None)
+        ):
             outcome = _first_outcome(
                 outcome,
                 (_OUTCOME_FAILURE, "comment_ai_service_unavailable"),
             )
         return outcome
+    except BaseException as error:
+        return _first_outcome(outcome, _cleanup_error_outcome(error))
     finally:
-        request = None
-        headers = None
-        if isinstance(sanitized_headers, dict):
-            sanitized_headers.clear()
-        sanitized_headers = None
-        verified_headers = None
-        verified_body = None
-        keys = None
-        key = None
-        attribute = None
+        response = None
+        state = None
+        after_close = None
         error = None
-        current = None
-        current_key = None
-        unsafe_header = None
-        assigned = None
-        cleared = None
-        _index = None
 
 
-def _sanitize_outbound_carriers(*, error=None, response=None):
+def _sanitize_session_state(session):
     outcome = None
-    requests_to_clear = []
-    responses_to_close = []
-    if isinstance(error, requests.exceptions.RequestException):
-        request, current = _get_cleanup_attribute(
-            error,
-            "request",
-            retry_errors=True,
-        )
-        outcome = _first_outcome(outcome, current)
-        requests_to_clear.append(request)
-        external_response, current = _get_cleanup_attribute(
-            error,
-            "response",
-            retry_errors=True,
-        )
-        outcome = _first_outcome(outcome, current)
-        if isinstance(external_response, requests.Response):
-            responses_to_close.append(external_response)
-    if isinstance(response, requests.Response):
-        responses_to_close.append(response)
-    for current_response in responses_to_close:
-        request, current = _get_cleanup_attribute(
-            current_response,
-            "request",
-            retry_errors=True,
-        )
-        outcome = _first_outcome(outcome, current)
-        requests_to_clear.append(request)
-    seen = set()
-    for request in requests_to_clear:
-        identity = id(request)
-        if identity in seen:
-            continue
-        seen.add(identity)
-        current = _sanitize_prepared_request(request)
-        outcome = _first_outcome(outcome, current)
+    state = None
+    verified_headers = None
+    verified_auth = None
+    verified_proxies = None
     error = None
+    try:
+        if session is None:
+            return None
+        try:
+            state = object.__getattribute__(session, "__dict__")
+            if type(state) is not dict:
+                raise TypeError("session state unavailable")
+            state["headers"] = requests.structures.CaseInsensitiveDict()
+            state["auth"] = None
+            state["proxies"] = {}
+        except BaseException as error:
+            outcome = _first_outcome(outcome, _cleanup_error_outcome(error))
+        if type(state) is dict:
+            verified_headers = state.get("headers")
+            verified_auth = state.get("auth")
+            verified_proxies = state.get("proxies")
+        if (
+            type(verified_headers)
+            is not requests.structures.CaseInsensitiveDict
+            or len(verified_headers) != 0
+            or verified_auth is not None
+            or type(verified_proxies) is not dict
+            or len(verified_proxies) != 0
+        ):
+            outcome = _first_outcome(
+                outcome,
+                (_OUTCOME_FAILURE, "comment_ai_service_unavailable"),
+            )
+        return outcome
+    except BaseException as error:
+        return _first_outcome(outcome, _cleanup_error_outcome(error))
+    finally:
+        session = None
+        state = None
+        verified_headers = None
+        verified_auth = None
+        verified_proxies = None
+        error = None
+
+
+def _request_exception_response(error):
+    outcome = None
+    state = None
     response = None
-    external_response = None
-    request = None
-    current = None
-    current_response = None
-    requests_to_clear.clear()
-    return outcome, tuple(responses_to_close)
+    caught = None
+    try:
+        try:
+            state = object.__getattribute__(error, "__dict__")
+            if type(state) is not dict:
+                raise TypeError("request exception state unavailable")
+            response = state.get("response")
+        except BaseException as caught:
+            outcome = _cleanup_error_outcome(caught)
+        return response, outcome
+    finally:
+        error = None
+        state = None
+        response = None
+        caught = None
 
 
 def _parse_json_outcome(raw_response):
@@ -547,24 +476,37 @@ def _parse_json_outcome(raw_response):
         decoded = None
 
 
-def _close_resource_outcome(resource):
+def _close_resource_outcome(resource, *, resource_kind):
     outcome = None
     close = None
     error = None
+    current = None
     try:
         if resource is None:
             return outcome
-        close = getattr(resource, "close", None)
-        if callable(close):
-            close()
-    except _PROCESS_CONTROL as error:
-        outcome = (_OUTCOME_CONTROL, _control_outcome_value(error))
-    except BaseException:
-        outcome = None
+        if resource_kind == "response":
+            current = _sanitize_response_state(resource, after_close=False)
+        else:
+            current = _sanitize_session_state(resource)
+        outcome = _first_outcome(outcome, current)
+        try:
+            close = getattr(resource, "close", None)
+            if callable(close):
+                close()
+        except BaseException as error:
+            outcome = _first_outcome(outcome, _cleanup_error_outcome(error))
     finally:
+        if resource is not None:
+            if resource_kind == "response":
+                current = _sanitize_response_state(resource, after_close=True)
+            else:
+                current = _sanitize_session_state(resource)
+            outcome = _first_outcome(outcome, current)
         resource = None
+        resource_kind = None
         close = None
         error = None
+        current = None
     return outcome
 
 
@@ -672,6 +614,7 @@ class OpenAiCompatibleCommentProvider:
     def _analyze_worker_outcome(self, title, comments):
         outcome = (_OUTCOME_FAILURE, "comment_ai_service_unavailable")
         session = None
+        prepared_request = None
         headers = None
         payload = None
         response = None
@@ -690,13 +633,16 @@ class OpenAiCompatibleCommentProvider:
         classifications = None
         candidates = None
         cleanup_outcome = None
-        cleanup_responses = ()
         try:
             refs, ref_to_key, request_comments = self._validate_input(title, comments)
             payload = self._request_payload(title, request_comments)
-            encoded_payload = json.dumps(
-                payload, ensure_ascii=False, separators=(",", ":")
-            ).encode("utf-8")
+            encoded_payload = bytearray(
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
             if len(encoded_payload) > _MAX_REQUEST_BYTES:
                 raise _response_invalid()
             if not any(self._secret):
@@ -712,10 +658,17 @@ class OpenAiCompatibleCommentProvider:
             }
             session = self._session_factory()
             session.trust_env = False
-            response = session.post(
-                f"{self._settings.normalized_base_url}/chat/completions",
+            prepared_request = requests.PreparedRequest()
+            prepared_request.prepare(
+                method="POST",
+                url=f"{self._settings.normalized_base_url}/chat/completions",
                 headers=headers,
-                json=payload,
+                data=encoded_payload,
+            )
+            if type(prepared_request) is not requests.PreparedRequest:
+                raise _failure("comment_ai_service_unavailable")
+            response = session.send(
+                prepared_request,
                 timeout=(10, 45),
                 stream=True,
                 allow_redirects=False,
@@ -772,28 +725,21 @@ class OpenAiCompatibleCommentProvider:
             outcome = (_OUTCOME_FAILURE, code)
         except (requests.exceptions.Timeout, TimeoutError) as error:
             if isinstance(error, requests.exceptions.RequestException):
-                current, cleanup_responses = _sanitize_outbound_carriers(
-                    error=error
-                )
+                error_response, current = _request_exception_response(error)
                 cleanup_outcome = _first_outcome(cleanup_outcome, current)
-                if cleanup_responses:
-                    error_response = cleanup_responses[0]
             outcome = (_OUTCOME_FAILURE, "comment_ai_timeout")
         except requests.exceptions.RequestException as error:
-            current, cleanup_responses = _sanitize_outbound_carriers(
-                error=error
-            )
+            error_response, current = _request_exception_response(error)
             cleanup_outcome = _first_outcome(cleanup_outcome, current)
-            if cleanup_responses:
-                error_response = cleanup_responses[0]
             outcome = (_OUTCOME_FAILURE, "comment_ai_service_unavailable")
         except BaseException:
             outcome = (_OUTCOME_FAILURE, "comment_ai_service_unavailable")
         finally:
-            current, cleanup_responses = _sanitize_outbound_carriers(
-                response=response
+            current = _sanitize_owned_prepared_request(prepared_request)
+            cleanup_outcome = _first_outcome(
+                cleanup_outcome,
+                current,
             )
-            cleanup_outcome = _first_outcome(cleanup_outcome, current)
             if type(headers) is dict:
                 headers.clear()
             if type(payload) is dict:
@@ -805,11 +751,27 @@ class OpenAiCompatibleCommentProvider:
                 request_comments.clear()
             if type(ref_to_key) is dict:
                 ref_to_key.clear()
+            if type(encoded_payload) is bytearray:
+                _zero_buffer(encoded_payload)
             if type(self._secret) is bytearray:
                 _zero_buffer(self._secret)
             final_cleanup = cleanup_outcome
-            for resource in (response, error_response, session):
-                current = _close_resource_outcome(resource)
+            closed_resource_ids = set()
+            for resource, resource_kind in (
+                (response, "response"),
+                (error_response, "response"),
+                (session, "session"),
+            ):
+                if resource is None:
+                    continue
+                resource_identity = id(resource)
+                if resource_identity in closed_resource_ids:
+                    continue
+                closed_resource_ids.add(resource_identity)
+                current = _close_resource_outcome(
+                    resource,
+                    resource_kind=resource_kind,
+                )
                 final_cleanup = _first_outcome(final_cleanup, current)
             if final_cleanup is not None:
                 outcome = _first_outcome(outcome, final_cleanup)
@@ -817,6 +779,7 @@ class OpenAiCompatibleCommentProvider:
             comments = None
             self = None
             session = None
+            prepared_request = None
             headers = None
             payload = None
             response = None
@@ -835,9 +798,12 @@ class OpenAiCompatibleCommentProvider:
             classifications = None
             candidates = None
             cleanup_outcome = None
-            cleanup_responses = None
             final_cleanup = None
+            closed_resource_ids.clear()
+            closed_resource_ids = None
             resource = None
+            resource_kind = None
+            resource_identity = None
             current = None
         return outcome
 

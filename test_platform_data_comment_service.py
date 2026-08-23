@@ -356,25 +356,17 @@ class CommentServiceTests(unittest.TestCase):
                 self.calls = 0
                 self.trust_env = True
 
-            def post(
-                self,
-                _url,
-                *,
-                headers,
-                json,
-                timeout,
-                stream,
-                allow_redirects,
-            ):
+            def send(self, request, *, timeout, stream, allow_redirects):
                 self.calls += 1
                 self.assertions = (
-                    headers,
-                    json,
+                    request,
                     timeout,
                     stream,
                     allow_redirects,
                 )
-                return Response()
+                response = Response()
+                response.request = request
+                return response
 
             def close(self):
                 return None
