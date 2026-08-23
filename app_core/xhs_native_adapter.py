@@ -523,6 +523,28 @@ class XhsNativeAdapter:
         if not isinstance(target, dict):
             return None
 
+        trigger_candidates = page.locator(
+            ".address-card-wrapper .address-card-select"
+        )
+        rendered_triggers = []
+        for index in range(await trigger_candidates.count()):
+            item = trigger_candidates.nth(index)
+            try:
+                if await item.is_visible():
+                    rendered_triggers.append(item)
+            except Exception:
+                continue
+        if len(rendered_triggers) != 1:
+            raise XhsNativeAdapterError(
+                "小红书地点选择控件无法唯一识别，"
+                f"可渲染候选={len(rendered_triggers)}"
+            )
+        try:
+            await rendered_triggers[0].scroll_into_view_if_needed(timeout=10_000)
+        except Exception as exc:
+            raise XhsNativeAdapterError("小红书地点选择控件无法滚动到可见区域") from exc
+        trigger = await _first_visible(trigger_candidates, "地点选择控件")
+
         disabled = page.locator(".address-card-wrapper .d-select.disabled")
         for index in range(await disabled.count()):
             item = disabled.nth(index)
@@ -556,13 +578,12 @@ class XhsNativeAdapter:
             except Exception:
                 continue
 
-        trigger = await _first_visible(
-            page.locator(".address-card-wrapper .address-card-select"),
-            "地点选择控件",
-        )
         await trigger.click(timeout=5_000)
         location_input = await _first_visible(
-            page.locator('.d-select-input-filter input[type="text"]'),
+            page.locator(
+                '.address-card-wrapper '
+                '.d-select-input-filter.show input[type="text"]'
+            ),
             "地点搜索输入框",
         )
         keyword = str(target["searchKeyword"])
@@ -613,8 +634,14 @@ class XhsNativeAdapter:
             ) from exc
 
         raw_rows = response_payload.get("poiList")
+        if raw_rows is None:
+            raw_rows = response_payload.get("poi_list")
         if raw_rows is None and isinstance(response_payload.get("data"), dict):
             raw_rows = response_payload["data"].get("poiList")
+            if raw_rows is None:
+                raw_rows = response_payload["data"].get("poi_list")
+        if not isinstance(raw_rows, list):
+            raise XhsNativeAdapterError("小红书地点服务返回了无效数据")
         raw_candidates = [
             candidate
             for candidate in (

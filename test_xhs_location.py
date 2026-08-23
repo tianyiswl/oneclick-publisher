@@ -888,6 +888,8 @@ class _FakeNode:
 
     async def evaluate(self, script: str, *args):
         if "getBoundingClientRect" in script:
+            if self.kind == "location-trigger":
+                return self._visible and self.page.location_in_viewport
             return await self.is_visible()
         if self.kind == "title" and args:
             self.page.title = str(args[0])
@@ -912,6 +914,12 @@ class _FakeNode:
             self.page.calls.append("topic-option-click")
         elif self.kind == "editor":
             self.page.calls.append("editor-click")
+
+    async def scroll_into_view_if_needed(self, **kwargs) -> None:
+        if self.kind != "location-trigger":
+            raise AssertionError(f"unexpected scroll on {self.kind}")
+        self.page.location_in_viewport = True
+        self.page.calls.append("location-trigger-scroll")
 
     async def fill(self, value: str, **kwargs) -> None:
         if self.kind != "location-input":
@@ -968,6 +976,8 @@ class _FakeXhsEditorPage:
         selected_name: str = "",
         disabled: bool = False,
         account_name: str = "海风",
+        location_in_viewport: bool = True,
+        extra_visible_location_input: bool = False,
         response_sequence: list[tuple[object, object]] | None = None,
     ) -> None:
         self.response_payload = response_payload
@@ -989,6 +999,8 @@ class _FakeXhsEditorPage:
         self.selected_name = selected_name
         self.disabled = disabled
         self.account_name = account_name
+        self.location_in_viewport = location_in_viewport
+        self.extra_visible_location_input = extra_visible_location_input
         self.dropdown_visible = False
         self.readback_override = ""
         self.calls: list[str] = []
@@ -1005,6 +1017,13 @@ class _FakeXhsEditorPage:
             nodes = [_FakeNode(self, "disabled")] if self.disabled else []
             return _FakeLocator(self, nodes)
         if selector == '.d-select-input-filter input[type="text"]':
+            nodes = [_FakeNode(self, "location-input")]
+            if self.extra_visible_location_input:
+                nodes.append(_FakeNode(self, "group-input"))
+            return _FakeLocator(self, nodes)
+        if selector == (
+            '.address-card-wrapper .d-select-input-filter.show input[type="text"]'
+        ):
             return _FakeLocator(self, [_FakeNode(self, "location-input")])
         if selector == ".loading-container":
             return _FakeLocator(self, [_FakeNode(self, "loading", visible=False)])
@@ -1252,6 +1271,61 @@ class XhsLocationEditorTests(unittest.IsolatedAsyncioTestCase):
             "location-option-click:北海银滩|广西北海市银海区银滩大道",
             page.calls,
         )
+
+    async def test_revalidates_live_snake_case_response(self) -> None:
+        response = {
+            "code": 0,
+            "success": True,
+            "msg": "成功",
+            "data": {
+                "poi_list": [
+                    {
+                        "poi_id": "poi-1",
+                        "poi_type": 0,
+                        "name": "北海银滩",
+                        "address": "银滩大道",
+                        "full_address": "广西北海市银海区银滩大道",
+                    }
+                ]
+            },
+        }
+        page = _FakeXhsEditorPage(
+            response,
+            [("北海银滩", "广西北海市银海区银滩大道")],
+        )
+
+        result = await XhsNativeAdapter(self._payload()).apply_location(page)
+
+        self.assertEqual(result["poiId"], "poi-1")
+        self.assertEqual(result["address"], "广西北海市银海区银滩大道")
+        self.assertEqual(result["editorNameReadback"], "北海银滩")
+
+    async def test_scrolls_unique_location_control_into_view_before_validation(self) -> None:
+        page = _FakeXhsEditorPage(
+            self._response(self._row()),
+            [("北海银滩", "广西北海市银海区银滩大道")],
+            location_in_viewport=False,
+        )
+
+        result = await XhsNativeAdapter(self._payload()).apply_location(page)
+
+        self.assertEqual(result["poiId"], "poi-1")
+        self.assertLess(
+            page.calls.index("location-trigger-scroll"),
+            page.calls.index("location-trigger-click"),
+        )
+
+    async def test_scopes_search_input_to_open_address_control(self) -> None:
+        page = _FakeXhsEditorPage(
+            self._response(self._row()),
+            [("北海银滩", "广西北海市银海区银滩大道")],
+            extra_visible_location_input=True,
+        )
+
+        result = await XhsNativeAdapter(self._payload()).apply_location(page)
+
+        self.assertEqual(result["poiId"], "poi-1")
+        self.assertIn("location-input-fill:北海银滩", page.calls)
 
     async def test_skips_same_endpoint_responses_until_full_keyword_request(self) -> None:
         wrong_response = self._response()
