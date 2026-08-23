@@ -1275,6 +1275,163 @@ class DouyinCommentCollectorTests(unittest.TestCase):
         )
         self.assertEqual(starts, 0)
 
+    def test_total_deadline_begins_before_contract_and_observation_work(self) -> None:
+        """合同与观测时间工作必须消耗同一个公开总时限。"""
+
+        for slow_stage in ("contract", "observed_at"):
+            with self.subTest(slow_stage=slow_stage):
+                starts = 0
+
+                def contract_loader() -> DouyinCommentContract:
+                    if slow_stage == "contract":
+                        time.sleep(0.008)
+                    return verified_contract()
+
+                def observed_at_factory() -> str:
+                    if slow_stage == "observed_at":
+                        time.sleep(0.008)
+                    return OBSERVED_AT
+
+                def forbidden_factory() -> object:
+                    nonlocal starts
+                    starts += 1
+                    raise AssertionError("expired call must not start browser")
+
+                collector = DouyinCommentDataCollector(
+                    contract_loader=contract_loader,
+                    playwright_factory=forbidden_factory,
+                    total_timeout_seconds=0.005,
+                    observed_at_factory=observed_at_factory,
+                )
+
+                started_at = time.monotonic()
+                with self.assertRaises(CommentInsightFailure) as raised:
+                    collector.collect(self.account, "work-7", frozenset())
+                elapsed = time.monotonic() - started_at
+
+                self.assertLess(elapsed, 0.03)
+                self.assertEqual(
+                    raised.exception.error_code, "comment_sync_timeout"
+                )
+                self.assertEqual(str(raised.exception), "comment_sync_timeout")
+                self.assertEqual(starts, 0)
+
+    def test_oversized_contract_strings_fail_before_transform_or_browser(self) -> None:
+        """64MB 合同值不得先正则、大小写转换或扫描再拒绝。"""
+
+        cases = (
+            ("comment_navigation_template", "/secret-contract-", "/{content_id}"),
+            ("comment_response_path", "/secret-contract-", ""),
+            ("comment_response_method", "secretcontract", ""),
+            ("comment_pagination_trigger", "click:secret-contract-", ""),
+            ("comment_list_field", "secret-contract.", "[]"),
+        )
+        target_size = 64 * 1024 * 1024
+        for field, prefix, suffix in cases:
+            with self.subTest(field=field):
+                oversized = prefix + (
+                    "x" * (target_size - len(prefix) - len(suffix))
+                ) + suffix
+                starts = 0
+                contract = verified_contract(**{field: oversized})
+
+                def forbidden_factory() -> object:
+                    nonlocal starts
+                    starts += 1
+                    raise AssertionError("oversized contract must not start browser")
+
+                collector = DouyinCommentDataCollector(
+                    contract_loader=lambda contract=contract: contract,
+                    playwright_factory=forbidden_factory,
+                    total_timeout_seconds=0.005,
+                    observed_at_factory=lambda: OBSERVED_AT,
+                )
+
+                started_at = time.monotonic()
+                with self.assertRaises(CommentInsightFailure) as raised:
+                    collector.collect(self.account, "work-7", frozenset())
+                elapsed = time.monotonic() - started_at
+
+                self.assertLess(elapsed, 0.03)
+                self.assertEqual(
+                    raised.exception.error_code,
+                    "comment_content_unavailable",
+                )
+                self.assertEqual(
+                    str(raised.exception), "comment_content_unavailable"
+                )
+                self.assertEqual(starts, 0)
+                artifacts, _values = production_exception_artifacts(
+                    raised.exception
+                )
+                self.assertNotIn("secret-contract-", artifacts)
+                self.assertIsNone(raised.exception.__cause__)
+                del collector, contract, oversized
+                gc.collect()
+
+    def test_oversized_page_and_response_metadata_are_bounded_and_private(self) -> None:
+        """64MB 页面/响应 URL 或方法不得越过总时限或进入 JSON。"""
+
+        target_size = 64 * 1024 * 1024
+        for metadata_kind in ("page_url", "response_url", "response_method"):
+            with self.subTest(metadata_kind=metadata_kind):
+                oversized = "secret-runtime-metadata-" + (
+                    "x" * (target_size - len("secret-runtime-metadata-"))
+                )
+                response = None
+                if metadata_kind == "page_url":
+                    response_pages: tuple[tuple[FakeResponse, ...], ...] = ()
+                    page_options = {"final_url": oversized}
+                else:
+                    response = FakeResponse(
+                        comment_payload(comment_row("must-not-read")),
+                        url=(
+                            oversized
+                            if metadata_kind == "response_url"
+                            else "https://creator.douyin.com/verified/comment/list"
+                        ),
+                        method=(
+                            oversized
+                            if metadata_kind == "response_method"
+                            else "GET"
+                        ),
+                    )
+                    response_pages = ((response,),)
+                    page_options = {}
+                starter, page, context, browser, playwright = self._harness(
+                    response_pages, **page_options
+                )
+
+                started_at = time.monotonic()
+                with self.assertRaises(CommentInsightFailure) as raised:
+                    self._collector(starter, timeout=0.005).collect(
+                        self.account, "work-7", frozenset()
+                    )
+                elapsed = time.monotonic() - started_at
+
+                self.assertLess(elapsed, 0.03)
+                self.assertEqual(
+                    raised.exception.error_code, "comment_payload_invalid"
+                )
+                self.assertEqual(str(raised.exception), "comment_payload_invalid")
+                self.assertTrue(raised.exception.cleanup_receipt.closed)
+                self.assertEqual(
+                    raised.exception.cleanup_receipt.alive_resource_count, 0
+                )
+                if response is not None:
+                    self.assertEqual(response.json_calls, 0)
+                self.assertEqual(page.locator_calls, [])
+                self.assertEqual(page.trigger_calls, [])
+                self._assert_closed(page, context, browser, playwright)
+                artifacts, values = production_exception_artifacts(
+                    raised.exception
+                )
+                self.assertNotIn("secret-runtime-metadata-", artifacts)
+                if response is not None:
+                    self.assertNotIn(response, values)
+                del oversized, starter, page, context, browser, playwright
+                gc.collect()
+
     def test_missing_manifest_fails_closed_without_starting_browser(self) -> None:
         """没有真实验证清单时不能猜路径、字段或选择器。"""
 
@@ -1627,7 +1784,7 @@ class DouyinCommentCollectorTests(unittest.TestCase):
         self._assert_closed(page, context, browser, playwright)
 
     def test_single_slow_row_projection_obeys_deadline_and_audits_worker(self) -> None:
-        """单行投影卡住 60ms 也不得突破 20ms 公开总时限。"""
+        """单行投影在公开时限内不返回也必须有界并如实审计。"""
 
         # 其他测试可能刚刚完成受审 worker 任务；本例需要独立提交慢任务。
         time.sleep(0.08)
@@ -1647,22 +1804,52 @@ class DouyinCommentCollectorTests(unittest.TestCase):
             ((response,),)
         )
 
-        def slow_derive(*args) -> str:
-            time.sleep(0.06)
-            return derive_comment_key(*args)
+        projection_started = threading.Event()
+        release_projection = threading.Event()
+        projection_finished = threading.Event()
 
+        def slow_derive(*args) -> str:
+            projection_started.set()
+            release_projection.wait()
+            try:
+                return derive_comment_key(*args)
+            finally:
+                projection_finished.set()
+
+        outcome: dict[str, object] = {}
+
+        def invoke() -> None:
+            try:
+                outcome["value"] = self._collector(
+                    starter, timeout=0.02
+                ).collect(self.account, "work-7", frozenset())
+            except BaseException as exc:
+                outcome["error"] = exc
+
+        diagnostics = io.StringIO()
+        runner = threading.Thread(
+            target=invoke,
+            name="douyin-comment-bounded-call",
+            daemon=True,
+        )
         with patch(
             "app_core.douyin_comment_data_collector.derive_comment_key",
             side_effect=slow_derive,
         ):
-            outcome, elapsed, diagnostics, still_running = self._run_with_wall_limit(
-                lambda: self._collector(starter, timeout=0.02).collect(
-                    self.account, "work-7", frozenset()
-                ),
-                wall_limit=0.05,
-            )
-            time.sleep(0.08)
+            started_at = time.monotonic()
+            with redirect_stderr(diagnostics):
+                runner.start()
+                projection_did_start = projection_started.wait(0.04)
+                runner.join(0.05)
+                elapsed = time.monotonic() - started_at
+                still_running = runner.is_alive()
+                release_projection.set()
+                if projection_did_start:
+                    projection_finished.wait(0.2)
+                runner.join(0.1)
+                gc.collect()
 
+        self.assertTrue(projection_did_start)
         self.assertFalse(still_running)
         self.assertLess(elapsed, 0.05)
         error = outcome["error"]
@@ -1683,7 +1870,7 @@ class DouyinCommentCollectorTests(unittest.TestCase):
                 production_thread_artifacts("douyin-comment-projector"),
             )
         self.assertNotIn(response, values)
-        self.assertEqual(diagnostics, "")
+        self.assertEqual(diagnostics.getvalue(), "")
         self._assert_closed(page, context, browser, playwright)
 
     def test_repeated_slow_projections_use_one_bounded_worker(self) -> None:
@@ -1837,18 +2024,18 @@ class DouyinCommentCollectorTests(unittest.TestCase):
     def _assert_late_creation_is_owned(self, stage: str) -> None:
         starter, page, context, browser, playwright = self._harness(())
         if stage == "playwright":
-            starter.start_delay = 0.04
-            starter.start_after_cancel_delay = 0.001
+            starter.start_delay = 0.2
+            starter.start_after_cancel_delay = 0.0
         elif stage == "browser":
-            playwright.chromium.launch_delay = 0.04
-            playwright.chromium.launch_after_cancel_delay = 0.001
+            playwright.chromium.launch_delay = 0.2
+            playwright.chromium.launch_after_cancel_delay = 0.0
         elif stage == "context":
-            browser.context_delay = 0.04
-            browser.context_after_cancel_delay = 0.001
+            browser.context_delay = 0.2
+            browser.context_after_cancel_delay = 0.0
         else:
-            context.page_delay = 0.04
-            context.page_after_cancel_delay = 0.001
-        collector = self._collector(starter, timeout=0.04)
+            context.page_delay = 0.2
+            context.page_after_cancel_delay = 0.0
+        collector = self._collector(starter, timeout=0.08)
 
         with self.assertRaises(CommentInsightFailure) as raised:
             collector.collect(self.account, "work-7", frozenset())

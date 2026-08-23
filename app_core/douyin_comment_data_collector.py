@@ -39,6 +39,13 @@ _MAX_RAW_ROWS = 256
 _MAX_REJECTED_ROWS = 128
 _MAX_PARSED_COMMENTS = 101
 _MAX_CONTAINER_KEYS = 64
+_MAX_HOST_LENGTH = 253
+_MAX_METHOD_LENGTH = 16
+_MAX_RESPONSE_PATH_LENGTH = 2_048
+_MAX_NAVIGATION_TEMPLATE_LENGTH = 4_096
+_MAX_CONTRACT_FIELD_LENGTH = 512
+_MAX_PAGINATION_TRIGGER_LENGTH = 207
+_MAX_RUNTIME_URL_LENGTH = 8_192
 _MAX_CONTENT_ID_LENGTH = 512
 _MAX_STATE_FILE_PATH_LENGTH = 1_024
 _MAX_COMMENT_ID_LENGTH = 512
@@ -150,8 +157,15 @@ def _bounded_count(value: object) -> int:
     return value
 
 
+def _is_bounded_builtin_text(value: object, maximum: int) -> bool:
+    return type(value) is str and 0 < len(value) <= maximum
+
+
 def _strict_path(root: object, path: object) -> object:
-    if type(root) is not dict or type(path) is not str or not path:
+    if (
+        type(root) is not dict
+        or not _is_bounded_builtin_text(path, _MAX_CONTRACT_FIELD_LENGTH)
+    ):
         _invalid()
     value = root
     for segment in path.split("."):
@@ -169,7 +183,12 @@ def _strict_path(root: object, path: object) -> object:
 
 
 def _comment_rows(payload: object, list_field: object) -> list:
-    if type(payload) is not dict or type(list_field) is not str:
+    if (
+        type(payload) is not dict
+        or not _is_bounded_builtin_text(
+            list_field, _MAX_CONTRACT_FIELD_LENGTH
+        )
+    ):
         _invalid()
     if not list_field.endswith("[]"):
         _invalid()
@@ -180,8 +199,18 @@ def _comment_rows(payload: object, list_field: object) -> list:
 
 
 def _row_value(row: object, list_field: str, field: object) -> object:
+    if (
+        type(row) is not dict
+        or not _is_bounded_builtin_text(
+            list_field, _MAX_CONTRACT_FIELD_LENGTH
+        )
+        or not _is_bounded_builtin_text(
+            field, _MAX_CONTRACT_FIELD_LENGTH
+        )
+    ):
+        _invalid()
     prefix = f"{list_field}."
-    if type(row) is not dict or type(field) is not str or not field.startswith(prefix):
+    if not field.startswith(prefix):
         _invalid()
     relative = field[len(prefix) :]
     value = _strict_path(row, relative)
@@ -655,19 +684,51 @@ def _required_inputs(
 def _required_contract(value: object) -> DouyinCommentContract:
     if type(value) is not DouyinCommentContract:
         raise CommentInsightFailure("comment_content_unavailable")
-    trigger = _TRIGGER_RE.fullmatch(value.comment_pagination_trigger)
+    comment_fields = (
+        value.comment_list_field,
+        value.comment_id_field,
+        value.comment_content_id_field,
+        value.comment_parent_id_field,
+        value.comment_body_field,
+        value.comment_like_count_field,
+        value.comment_reply_count_field,
+        value.comment_commented_at_field,
+        value.comment_cursor_field,
+        value.comment_has_more_field,
+    )
     navigation = value.comment_navigation_template
     response_path = value.comment_response_path
+    method = value.comment_response_method
+    trigger_value = value.comment_pagination_trigger
     if (
         value.verified is not True
+        or not _is_bounded_builtin_text(
+            value.creator_host, _MAX_HOST_LENGTH
+        )
         or value.creator_host != "creator.douyin.com"
-        or type(value.comment_response_method) is not str
-        or not value.comment_response_method
-        or value.comment_response_method != value.comment_response_method.upper()
-        or type(response_path) is not str
+        or not _is_bounded_builtin_text(method, _MAX_METHOD_LENGTH)
+        or not _is_bounded_builtin_text(
+            response_path, _MAX_RESPONSE_PATH_LENGTH
+        )
+        or not _is_bounded_builtin_text(
+            navigation, _MAX_NAVIGATION_TEMPLATE_LENGTH
+        )
+        or not _is_bounded_builtin_text(
+            trigger_value, _MAX_PAGINATION_TRIGGER_LENGTH
+        )
+        or any(
+            not _is_bounded_builtin_text(
+                field, _MAX_CONTRACT_FIELD_LENGTH
+            )
+            for field in comment_fields
+        )
+    ):
+        raise CommentInsightFailure("comment_content_unavailable")
+    trigger = _TRIGGER_RE.fullmatch(trigger_value)
+    if (
+        method != method.upper()
         or not response_path.startswith("/")
         or any(marker in response_path for marker in ("?", "#", "\\", "//"))
-        or type(navigation) is not str
         or navigation.count("{content_id}") != 1
         or "{" in navigation.replace("{content_id}", "")
         or "}" in navigation.replace("{content_id}", "")
@@ -789,6 +850,12 @@ def _emit_report(
 def _navigation_error(value: object, expected_path: str) -> str | None:
     if type(value) is not str:
         return "comment_login_required"
+    if len(value) > _MAX_RUNTIME_URL_LENGTH:
+        return "comment_payload_invalid"
+    if not _is_bounded_builtin_text(
+        expected_path, _MAX_NAVIGATION_TEMPLATE_LENGTH
+    ):
+        return "comment_payload_invalid"
     lowered = value.lower()
     if any(marker in lowered for marker in ("captcha", "verification", "verify")):
         return "comment_verification_required"
@@ -807,6 +874,29 @@ def _navigation_error(value: object, expected_path: str) -> str | None:
     if parsed.path != expected_path:
         return "comment_content_unavailable"
     return None
+
+
+def _response_contract_status(
+    response: object,
+    contract: DouyinCommentContract,
+) -> str:
+    raw_url = getattr(response, "url", None)
+    request = getattr(response, "request", None)
+    method = getattr(request, "method", None)
+    if (
+        not _is_bounded_builtin_text(raw_url, _MAX_RUNTIME_URL_LENGTH)
+        or not _is_bounded_builtin_text(method, _MAX_METHOD_LENGTH)
+    ):
+        return "invalid"
+    parsed = urlsplit(raw_url)
+    if (
+        parsed.scheme == "https"
+        and parsed.netloc == contract.creator_host
+        and parsed.path == contract.comment_response_path
+        and method == contract.comment_response_method
+    ):
+        return "match"
+    return "ignore"
 
 
 class DouyinCommentDataCollector:
@@ -837,7 +927,12 @@ class DouyinCommentDataCollector:
         contract: DouyinCommentContract,
         await_operation,
     ) -> None:
-        matched = _TRIGGER_RE.fullmatch(contract.comment_pagination_trigger)
+        trigger_value = contract.comment_pagination_trigger
+        if not _is_bounded_builtin_text(
+            trigger_value, _MAX_PAGINATION_TRIGGER_LENGTH
+        ):
+            _invalid()
+        matched = _TRIGGER_RE.fullmatch(trigger_value)
         if matched is None:
             _invalid()
         action, target = matched.groups()
@@ -929,17 +1024,15 @@ class DouyinCommentDataCollector:
             if response_future.done():
                 return
             try:
-                raw_url = getattr(response, "url", None)
-                parsed = urlsplit(raw_url if type(raw_url) is str else "")
-                request = getattr(response, "request", None)
-                method = getattr(request, "method", None)
-                if (
-                    parsed.scheme != "https"
-                    or parsed.netloc != contract.creator_host
-                    or parsed.path != contract.comment_response_path
-                    or type(method) is not str
-                    or method != contract.comment_response_method
-                ):
+                metadata_status = _response_contract_status(
+                    response, contract
+                )
+                if metadata_status == "invalid":
+                    response_future.set_result(
+                        ("failure", "comment_payload_invalid")
+                    )
+                    return
+                if metadata_status != "match":
                     return
                 status = getattr(response, "status", None)
             except BaseException:
@@ -992,17 +1085,12 @@ class DouyinCommentDataCollector:
             while not response_future.done():
                 response = await response_queue.get()
                 try:
-                    raw_url = getattr(response, "url", None)
-                    parsed = urlsplit(raw_url if type(raw_url) is str else "")
-                    request = getattr(response, "request", None)
-                    method = getattr(request, "method", None)
-                    if (
-                        parsed.scheme != "https"
-                        or parsed.netloc != contract.creator_host
-                        or parsed.path != contract.comment_response_path
-                        or type(method) is not str
-                        or method != contract.comment_response_method
-                    ):
+                    metadata_status = _response_contract_status(
+                        response, contract
+                    )
+                    if metadata_status == "invalid":
+                        _invalid()
+                    if metadata_status != "match":
                         continue
                     status = getattr(response, "status", None)
                     if status == 401:
@@ -1131,6 +1219,8 @@ class DouyinCommentDataCollector:
                     return
 
         try:
+            if time.monotonic() >= operation_deadline:
+                raise TimeoutError
             starter = self._playwright_factory()
             playwright = await await_operation(
                 starter.start(), owner="playwright"
@@ -1490,6 +1580,7 @@ class DouyinCommentDataCollector:
         limit: int = 100,
         report=None,
     ) -> CommentCollectionBatch:
+        total_deadline = time.monotonic() + self._total_timeout_seconds
         early_error = ""
         early_control = ""
         account_id = 0
@@ -1505,6 +1596,12 @@ class DouyinCommentDataCollector:
         except BaseException:
             early_error = "comment_payload_invalid"
         account = None
+        if (
+            not early_control
+            and not early_error
+            and time.monotonic() >= total_deadline
+        ):
+            early_error = "comment_sync_timeout"
         if early_control:
             report = None
             _raise_fresh_control(early_control)
@@ -1521,6 +1618,12 @@ class DouyinCommentDataCollector:
             early_error = exc.error_code
         except BaseException:
             early_error = "comment_content_unavailable"
+        if (
+            not early_control
+            and not early_error
+            and time.monotonic() >= total_deadline
+        ):
+            early_error = "comment_sync_timeout"
         if early_control:
             report = None
             contract = None
@@ -1533,10 +1636,19 @@ class DouyinCommentDataCollector:
         observed_at = ""
         try:
             observed_at = self._observed_at_factory()
+            observed_at = _bounded_text(
+                observed_at, _MAX_COMMENT_TIME_LENGTH
+            )
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit) as exc:
             early_control = _control_kind(exc)
         except BaseException:
             early_error = "comment_payload_invalid"
+        if (
+            not early_control
+            and not early_error
+            and time.monotonic() >= total_deadline
+        ):
+            early_error = "comment_sync_timeout"
         if early_control:
             report = None
             contract = None
@@ -1550,7 +1662,6 @@ class DouyinCommentDataCollector:
 
         assert state_path is not None
         assert contract is not None
-        total_deadline = time.monotonic() + self._total_timeout_seconds
         coroutine = self._collect_async(
             account_id=account_id,
             state_path=state_path,
