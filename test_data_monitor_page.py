@@ -9,6 +9,8 @@ import math
 import os
 from pathlib import Path
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
@@ -39,6 +41,7 @@ from app_core.platform_data_models import CollectionBatch, MetricPoint
 from ui.background_task import BackgroundTaskRunner
 from ui.data_monitor_page import (
     DataMonitorPage,
+    _AI_CONFIG_TRANSITION_KEY,
     _CommentAiSettingsDialog,
     _build_comment_ai_provider,
 )
@@ -488,6 +491,196 @@ class FakeSecretStore:
                 raise KeyboardInterrupt()
             raise SystemExit(receipt.exit_code)
         raise RuntimeError("fixed-native-delete-error")
+
+
+class SharedConfigLockState:
+    """Small cross-call lock double with finite waiting and owner tracking."""
+
+    def __init__(self) -> None:
+        self.condition = threading.Condition()
+        self.owner: int | None = None
+        self.try_control: BaseException | None = None
+        self.attempt_count = 0
+        self.acquire_count = 0
+        self.release_count = 0
+
+    def factory(self):
+        return FakeConfigLock(self)
+
+    def wait_for_attempts(self, count: int, timeout: float = 1.0) -> bool:
+        deadline = time.monotonic() + timeout
+        with self.condition:
+            while self.attempt_count < count:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self.condition.wait(remaining)
+            return True
+
+
+class FakeConfigLock:
+    def __init__(self, state: SharedConfigLockState) -> None:
+        self.state = state
+        self.acquired = False
+
+    def tryLock(self, timeout_ms: int) -> bool:  # noqa: N802
+        deadline = time.monotonic() + max(0, timeout_ms) / 1000.0
+        current = threading.get_ident()
+        with self.state.condition:
+            self.state.attempt_count += 1
+            self.state.condition.notify_all()
+            if self.state.owner == current:
+                return False
+            while self.state.owner is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self.state.condition.wait(remaining)
+            self.state.owner = current
+            self.state.acquire_count += 1
+            self.acquired = True
+            if self.state.try_control is not None:
+                raise self.state.try_control
+            return True
+
+    def unlock(self) -> None:
+        with self.state.condition:
+            if not self.acquired or self.state.owner != threading.get_ident():
+                raise RuntimeError("fake lock ownership invalid")
+            self.acquired = False
+            self.state.owner = None
+            self.state.release_count += 1
+            self.state.condition.notify_all()
+
+
+class VersionedSecretStore:
+    """Fake vault whose visible key changes only on a committed write."""
+
+    def __init__(self, secret: str, *, on_write=None) -> None:
+        self.secret = secret
+        self.on_write = on_write
+        self.read_count = 0
+        self.status_count = 0
+        self.write_values: list[str] = []
+        self.delete_count = 0
+
+    def read(self) -> str:
+        self.read_count += 1
+        return self.secret
+
+    def is_configured(self) -> bool:
+        self.status_count += 1
+        return bool(self.secret)
+
+    def write_with_receipt(self, secret: str) -> SecretMutationReceipt:
+        if self.on_write is not None:
+            self.on_write(secret)
+        self.secret = secret
+        self.write_values.append(secret)
+        return SecretMutationReceipt(True, "success")
+
+    def delete_with_receipt(self) -> SecretMutationReceipt:
+        self.delete_count += 1
+        self.secret = ""
+        return SecretMutationReceipt(True, "success")
+
+
+class IsolatedProcessSettings:
+    """QSettings double whose local cache refreshes only on sync()."""
+
+    _REMOVED = object()
+
+    def __init__(self, backend: dict[str, object]) -> None:
+        self.backend = backend
+        self.values = dict(backend)
+        self.pending: dict[str, object] = {}
+        self.synced = 0
+
+    def setValue(self, key: str, value) -> None:  # noqa: N802
+        self.values[key] = value
+        self.pending[key] = value
+
+    def remove(self, key: str) -> None:
+        self.values.pop(key, None)
+        self.pending[key] = self._REMOVED
+
+    def contains(self, key: str) -> bool:
+        return key in self.values
+
+    def value(self, key: str, default=None):
+        return self.values.get(key, default)
+
+    def sync(self) -> None:
+        self.synced += 1
+        for key, value in self.pending.items():
+            if value is self._REMOVED:
+                self.backend.pop(key, None)
+            else:
+                self.backend[key] = value
+        self.pending.clear()
+        self.values = dict(self.backend)
+
+    def status(self):
+        return QSettings.Status.NoError
+
+
+class PlainTextField:
+    def __init__(self, value: str = "") -> None:
+        self.value = value
+
+    def text(self) -> str:
+        return self.value
+
+    def clear(self) -> None:
+        self.value = ""
+
+
+class PlainTextLabel:
+    def __init__(self) -> None:
+        self.value = ""
+
+    def setText(self, value: str) -> None:  # noqa: N802
+        self.value = value
+
+    def text(self) -> str:
+        return self.value
+
+
+class PlainSaveDialog:
+    """Thread-safe shell for exercising the production save transaction."""
+
+    def __init__(
+        self,
+        *,
+        settings,
+        secret_store,
+        lock_factory,
+        base_url: str,
+        model: str,
+        secret: str,
+    ) -> None:
+        self._settings = settings
+        self._secret_store = secret_store
+        self._lock_factory = lock_factory
+        self._configuration_blocked = False
+        self._secret_state = "configured"
+        self.base_url_input = PlainTextField(base_url)
+        self.model_input = PlainTextField(model)
+        self.secret_input = PlainTextField(secret)
+        self.secret_status_label = PlainTextLabel()
+        self.feedback_label = PlainTextLabel()
+        self.accepted = False
+
+    def _render_secret_status(self) -> None:
+        state = {
+            "configured": "已配置",
+            "missing": "未配置",
+            "error": "状态读取失败",
+        }.get(self._secret_state, "状态读取失败")
+        self.secret_status_label.setText(f"密钥状态：{state}")
+
+    def accept(self) -> None:
+        self.accepted = True
 
 
 def ui_exception_trace_text(error: BaseException) -> str:
@@ -2331,6 +2524,37 @@ class DataMonitorPageTests(unittest.TestCase):
         self.assertTrue(page.comment_sync_button.isEnabled())
         self.assertTrue(page.comment_ai_settings_button.isEnabled())
 
+    def test_any_comment_task_blocks_ai_settings_even_after_switching_work(self) -> None:
+        """切到另一作品后，旧评论任务仍运行时不得绕开配置冻结。"""
+
+        pool = QueuedPool()
+        runner = BackgroundTaskRunner()
+        runner.pool = pool
+        page = self._page(contents=available_douyin_contents(), runner=runner)
+        with (
+            patch(
+                "ui.data_monitor_page.platform_data_comment_service.comment_panel_payload",
+                return_value=comment_panel_payload(),
+            ),
+            patch(
+                "ui.data_monitor_page.platform_data_comment_service.sync_comments",
+                return_value={"status": "success", "errorCode": ""},
+            ),
+        ):
+            page.content_table.selectRow(0)
+            page.comment_sync_button.click()
+            page.content_table.selectRow(1)
+
+            self.assertFalse(page.comment_ai_settings_button.isEnabled())
+            with patch("ui.data_monitor_page._CommentAiSettingsDialog") as dialog:
+                page._open_comment_ai_settings()
+            dialog.assert_not_called()
+
+            pool.tasks[0].run()
+            self.app.processEvents()
+
+        self.assertTrue(page.comment_ai_settings_button.isEnabled())
+
     def test_ai_settings_dialog_never_reads_existing_secret_and_uses_fake_native_store(self) -> None:
         """设置页若读回旧密钥，它就会进入可见控件和 UI 内存。"""
 
@@ -2404,6 +2628,491 @@ class DataMonitorPageTests(unittest.TestCase):
         self.assertEqual(dialog.secret_status_label.text(), "密钥状态：状态读取失败")
         self.assertNotIn("未配置", dialog.secret_status_label.text())
 
+    def test_provider_holds_config_lock_while_reading_settings_and_secret(self) -> None:
+        """provider 读完旧配置前，保存/清除都不得触碰密钥。"""
+
+        class InterleavingSettings(FakeSettings):
+            callback = None
+
+            def value(self, key: str, default=None):
+                result = super().value(key, default)
+                if key == MODEL_KEY and self.callback is not None:
+                    callback = self.callback
+                    self.callback = None
+                    callback()
+                return result
+
+        lock_state = SharedConfigLockState()
+        settings = InterleavingSettings(
+            {
+                BASE_URL_KEY: "https://old.example.com/v1",
+                MODEL_KEY: "model-old",
+            }
+        )
+        secret_store = VersionedSecretStore("old-provider-private-marker")
+        dialog = _CommentAiSettingsDialog(
+            settings=settings,
+            secret_store=secret_store,
+        )
+        dialog._lock_factory = lock_state.factory
+        self.addCleanup(dialog.deleteLater)
+        dialog.base_url_input.setText("https://new.example.com/v1")
+        dialog.model_input.setText("model-new")
+        dialog.secret_input.setText("new-provider-private-marker")
+        def attempt_mutations() -> None:
+            dialog._save()
+            dialog._clear_secret()
+
+        settings.callback = attempt_mutations
+
+        with (
+            patch("ui.data_monitor_page.QSettings", return_value=settings),
+            patch("ui.data_monitor_page.CommentSecretStore", return_value=secret_store),
+            patch(
+                "ui.data_monitor_page._new_comment_ai_config_lock",
+                side_effect=lock_state.factory,
+                create=True,
+            ),
+        ):
+            provider = _build_comment_ai_provider()
+
+        self.assertIsNotNone(provider)
+        self.assertEqual(provider.model_name, "model-old")
+        self.assertEqual(
+            provider._settings.normalized_base_url,
+            "https://old.example.com/v1",
+        )
+        self.assertEqual(
+            bytes(provider._secret).decode("utf-8"),
+            "old-provider-private-marker",
+        )
+        self.assertEqual(secret_store.write_values, [])
+        self.assertEqual(secret_store.delete_count, 0)
+        self.assertIn("配置正在使用", dialog.feedback_label.text())
+        self.assertEqual(lock_state.acquire_count, 1)
+        self.assertEqual(lock_state.release_count, 1)
+
+    def test_lock_acquire_control_releases_an_already_acquired_lock(self) -> None:
+        """tryLock 已拿到锁后中断，也不能把跨进程锁永久留下。"""
+
+        lock_state = SharedConfigLockState()
+        lock_state.try_control = KeyboardInterrupt()
+        with patch(
+            "ui.data_monitor_page._new_comment_ai_config_lock",
+            side_effect=lock_state.factory,
+            create=True,
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                _build_comment_ai_provider()
+
+        self.assertEqual(lock_state.acquire_count, 1)
+        self.assertEqual(lock_state.release_count, 1)
+
+    def test_provider_refreshes_the_locked_settings_before_secret_read(self) -> None:
+        """provider 必须在锁内看到另一进程刚落盘的 pending。"""
+
+        backend = {
+            BASE_URL_KEY: "https://old.example.com/v1",
+            MODEL_KEY: "model-old",
+        }
+        stale_settings = IsolatedProcessSettings(backend)
+        backend[_AI_CONFIG_TRANSITION_KEY] = "pending-v1"
+        secret_store = VersionedSecretStore("provider-private-marker")
+        lock_state = SharedConfigLockState()
+        with (
+            patch("ui.data_monitor_page.QSettings", return_value=stale_settings),
+            patch("ui.data_monitor_page.CommentSecretStore", return_value=secret_store),
+            patch(
+                "ui.data_monitor_page._new_comment_ai_config_lock",
+                side_effect=lock_state.factory,
+            ),
+        ):
+            provider = _build_comment_ai_provider()
+
+        self.assertIsNone(provider)
+        self.assertEqual(secret_store.read_count, 0)
+
+    def test_save_holds_config_lock_before_native_write_so_provider_fails_closed(
+        self,
+    ) -> None:
+        """save 正在改密钥时，provider 必须在 read 前因锁忙直接退出。"""
+
+        lock_state = SharedConfigLockState()
+        settings = FakeSettings(
+            {
+                BASE_URL_KEY: "https://old.example.com/v1",
+                MODEL_KEY: "model-old",
+            }
+        )
+        observed: dict[str, object] = {}
+        secret_store = VersionedSecretStore("old-save-private-marker")
+
+        def inspect_during_write(_secret: str) -> None:
+            with (
+                patch("ui.data_monitor_page.QSettings", return_value=settings),
+                patch(
+                    "ui.data_monitor_page.CommentSecretStore",
+                    return_value=secret_store,
+                ),
+                patch(
+                    "ui.data_monitor_page._new_comment_ai_config_lock",
+                    side_effect=lock_state.factory,
+                    create=True,
+                ),
+            ):
+                observed["provider"] = _build_comment_ai_provider()
+
+        secret_store.on_write = inspect_during_write
+        dialog = _CommentAiSettingsDialog(
+            settings=settings,
+            secret_store=secret_store,
+        )
+        dialog._lock_factory = lock_state.factory
+        self.addCleanup(dialog.deleteLater)
+        dialog.base_url_input.setText("https://new.example.com/v1")
+        dialog.model_input.setText("model-new")
+        dialog.secret_input.setText("new-save-private-marker")
+
+        dialog._save()
+
+        self.assertIsNone(observed["provider"])
+        self.assertEqual(secret_store.read_count, 0)
+        self.assertEqual(secret_store.secret, "new-save-private-marker")
+        self.assertEqual(settings.values[BASE_URL_KEY], "https://new.example.com/v1")
+        self.assertEqual(settings.values[MODEL_KEY], "model-new")
+        self.assertNotIn(_AI_CONFIG_TRANSITION_KEY, settings.values)
+        self.assertEqual(lock_state.acquire_count, 1)
+        self.assertEqual(lock_state.release_count, 1)
+
+    def test_two_overlapping_saves_serialize_to_one_complete_final_version(self) -> None:
+        """两个保存重叠时，最终地址、模型和密钥必须来自同一次保存。"""
+
+        lock_state = SharedConfigLockState()
+        backend = {
+            BASE_URL_KEY: "https://old.example.com/v1",
+            MODEL_KEY: "model-old",
+        }
+        first_settings = IsolatedProcessSettings(backend)
+        second_settings = IsolatedProcessSettings(backend)
+        first_native_entered = threading.Event()
+        release_first_native = threading.Event()
+
+        def pause_first_write(secret: str) -> None:
+            if secret == "first-save-private-marker":
+                first_native_entered.set()
+                if not release_first_native.wait(1.0):
+                    raise RuntimeError("first native write test timeout")
+
+        class SecondWriteFailsStore(VersionedSecretStore):
+            def write_with_receipt(self, secret: str) -> SecretMutationReceipt:
+                if secret == "second-save-private-marker":
+                    return SecretMutationReceipt(False, "failed")
+                return super().write_with_receipt(secret)
+
+        secret_store = SecondWriteFailsStore("old-private-marker", on_write=pause_first_write)
+        first = PlainSaveDialog(
+            settings=first_settings,
+            secret_store=secret_store,
+            lock_factory=lock_state.factory,
+            base_url="https://first.example.com/v1",
+            model="model-first",
+            secret="first-save-private-marker",
+        )
+        second = PlainSaveDialog(
+            settings=second_settings,
+            secret_store=secret_store,
+            lock_factory=lock_state.factory,
+            base_url="https://second.example.com/v1",
+            model="model-second",
+            secret="second-save-private-marker",
+        )
+        errors: list[BaseException] = []
+
+        def run(dialog) -> None:
+            try:
+                _CommentAiSettingsDialog._save(dialog)
+            except BaseException as error:
+                errors.append(error)
+
+        first_thread = threading.Thread(target=run, args=(first,))
+        second_thread = threading.Thread(target=run, args=(second,))
+        first_thread.start()
+        self.assertTrue(first_native_entered.wait(1.0))
+        second_thread.start()
+        second_attempted = lock_state.wait_for_attempts(2, 1.0)
+        release_first_native.set()
+        first_thread.join(2.0)
+        second_thread.join(2.0)
+
+        self.assertTrue(second_attempted)
+        self.assertFalse(first_thread.is_alive())
+        self.assertFalse(second_thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            backend,
+            {
+                BASE_URL_KEY: "https://first.example.com/v1",
+                MODEL_KEY: "model-first",
+            },
+        )
+        self.assertEqual(secret_store.secret, "first-save-private-marker")
+        self.assertEqual(lock_state.acquire_count, 2)
+        self.assertEqual(lock_state.release_count, 2)
+        self.assertTrue(first.accepted)
+        self.assertFalse(second.accepted)
+
+    def test_pending_gate_syncs_before_candidate_settings_or_native_secret(self) -> None:
+        """第一步 pending 落盘失败时，地址、模型和密钥都不能先变化。"""
+
+        events: list[str] = []
+        old = {
+            BASE_URL_KEY: "https://old.example.com/v1",
+            MODEL_KEY: "model-old",
+        }
+        settings = PersistentFakeSettings(
+            old,
+            sync_failures=(2,),
+            events=events,
+        )
+        secret_store = FakeSecretStore(configured=True, events=events)
+        dialog = _CommentAiSettingsDialog(
+            settings=settings,
+            secret_store=secret_store,
+        )
+        dialog._lock_factory = SharedConfigLockState().factory
+        self.addCleanup(dialog.deleteLater)
+        dialog.base_url_input.setText("https://new.example.com/v1")
+        dialog.model_input.setText("model-new")
+        dialog.secret_input.setText("pending-first-private-marker")
+
+        dialog._save()
+
+        pending_sync = events.index("settings:sync:2")
+        self.assertLess(
+            events.index(f"settings:set:{_AI_CONFIG_TRANSITION_KEY}"),
+            pending_sync,
+        )
+        self.assertNotIn(f"settings:set:{BASE_URL_KEY}", events[:pending_sync])
+        self.assertNotIn(f"settings:set:{MODEL_KEY}", events[:pending_sync])
+        self.assertNotIn("secret:write", events)
+        self.assertEqual(settings.persisted_values, old)
+        self.assertEqual(secret_store.writes, [])
+
+    def test_candidate_settings_failure_leaves_durable_gate_and_never_reads_secret(
+        self,
+    ) -> None:
+        """第二步地址/模型落盘失败时，pending 必须保留且不得碰密钥。"""
+
+        old = {
+            BASE_URL_KEY: "https://old.example.com/v1",
+            MODEL_KEY: "model-old",
+        }
+        settings = PersistentFakeSettings(old, sync_failures=(3,))
+        secret_store = FakeSecretStore(configured=True)
+        lock_state = SharedConfigLockState()
+        dialog = _CommentAiSettingsDialog(
+            settings=settings,
+            secret_store=secret_store,
+        )
+        dialog._lock_factory = lock_state.factory
+        self.addCleanup(dialog.deleteLater)
+        dialog.base_url_input.setText("https://new.example.com/v1")
+        dialog.model_input.setText("model-new")
+        dialog.secret_input.setText("candidate-failure-private-marker")
+
+        dialog._save()
+
+        self.assertEqual(secret_store.writes, [])
+        reopened = settings.reopen()
+        self.assertEqual(
+            reopened.value(_AI_CONFIG_TRANSITION_KEY),
+            "pending-v1",
+        )
+        with (
+            patch("ui.data_monitor_page.QSettings", return_value=reopened),
+            patch("ui.data_monitor_page.CommentSecretStore", return_value=secret_store),
+            patch(
+                "ui.data_monitor_page._new_comment_ai_config_lock",
+                side_effect=lock_state.factory,
+                create=True,
+            ),
+        ):
+            provider = _build_comment_ai_provider()
+        self.assertIsNone(provider)
+        self.assertEqual(secret_store.read_count, 0)
+
+    def test_save_rechecks_a_gate_created_by_another_process(self) -> None:
+        """对话框打开后别的进程留下 pending，无新密钥时不得解锁。"""
+
+        backend = {
+            BASE_URL_KEY: "https://old.example.com/v1",
+            MODEL_KEY: "model-old",
+        }
+        settings = IsolatedProcessSettings(backend)
+        secret_store = FakeSecretStore(configured=True)
+        dialog = _CommentAiSettingsDialog(
+            settings=settings,
+            secret_store=secret_store,
+            lock_factory=SharedConfigLockState().factory,
+        )
+        self.addCleanup(dialog.deleteLater)
+        backend[_AI_CONFIG_TRANSITION_KEY] = "pending-v1"
+        dialog.base_url_input.setText("https://new.example.com/v1")
+        dialog.model_input.setText("model-new")
+
+        dialog._save()
+
+        self.assertEqual(
+            backend,
+            {
+                BASE_URL_KEY: "https://old.example.com/v1",
+                MODEL_KEY: "model-old",
+                _AI_CONFIG_TRANSITION_KEY: "pending-v1",
+            },
+        )
+        self.assertEqual(secret_store.writes, [])
+        self.assertIn("配置不可使用", dialog.feedback_label.text())
+
+    def test_stale_settings_only_save_cannot_overwrite_a_new_secret_version(
+        self,
+    ) -> None:
+        """旧窗口不能用旧地址覆盖另一进程刚保存的新密钥版本。"""
+
+        backend = {
+            BASE_URL_KEY: "https://old.example.com/v1",
+            MODEL_KEY: "model-old",
+        }
+        settings = IsolatedProcessSettings(backend)
+        secret_store = FakeSecretStore(configured=True)
+        dialog = _CommentAiSettingsDialog(
+            settings=settings,
+            secret_store=secret_store,
+            lock_factory=SharedConfigLockState().factory,
+        )
+        self.addCleanup(dialog.deleteLater)
+        backend.update(
+            {
+                BASE_URL_KEY: "https://external.example.com/v1",
+                MODEL_KEY: "model-external",
+            }
+        )
+
+        dialog._save()
+
+        self.assertEqual(
+            backend,
+            {
+                BASE_URL_KEY: "https://external.example.com/v1",
+                MODEL_KEY: "model-external",
+            },
+        )
+        self.assertEqual(secret_store.writes, [])
+        self.assertIn("重新打开", dialog.feedback_label.text())
+
+    def test_native_noncommit_restores_values_before_removing_durable_gate(self) -> None:
+        """原生未提交时，先确认旧地址/模型，再移除 pending 解锁。"""
+
+        events: list[str] = []
+        old = {
+            BASE_URL_KEY: "https://old.example.com/v1",
+            MODEL_KEY: "model-old",
+        }
+        settings = FakeSettings(old, events=events)
+        secret_store = FakeSecretStore(
+            configured=True,
+            write_receipt=SecretMutationReceipt(False, "failed"),
+            events=events,
+        )
+        dialog = _CommentAiSettingsDialog(
+            settings=settings,
+            secret_store=secret_store,
+        )
+        dialog._lock_factory = SharedConfigLockState().factory
+        self.addCleanup(dialog.deleteLater)
+        dialog.base_url_input.setText("https://new.example.com/v1")
+        dialog.model_input.setText("model-new")
+        dialog.secret_input.setText("noncommit-private-marker")
+
+        dialog._save()
+
+        self.assertEqual(settings.values, old)
+        self.assertEqual(settings.synced, 5)
+        self.assertLess(
+            events.index("settings:sync:4"),
+            events.index(f"settings:remove:{_AI_CONFIG_TRANSITION_KEY}"),
+        )
+
+    def test_clear_writes_durable_gate_before_touching_native_secret(self) -> None:
+        """pending 首次落盘失败时，清除操作不得调用系统凭据删除。"""
+
+        old = {
+            BASE_URL_KEY: "https://old.example.com/v1",
+            MODEL_KEY: "model-old",
+        }
+        settings = PersistentFakeSettings(old, sync_failures=(2,))
+        secret_store = FakeSecretStore(
+            configured=True,
+            delete_receipt=SecretMutationReceipt(
+                None,
+                "failed",
+                commit_state="unknown",
+            ),
+        )
+        dialog = _CommentAiSettingsDialog(
+            settings=settings,
+            secret_store=secret_store,
+        )
+        dialog._lock_factory = SharedConfigLockState().factory
+        self.addCleanup(dialog.deleteLater)
+
+        dialog._clear_secret()
+
+        self.assertEqual(secret_store.delete_count, 0)
+        self.assertEqual(settings.persisted_values, old)
+
+    def test_unknown_clear_keeps_the_already_durable_gate_across_reopen(self) -> None:
+        """删除结果未知后，即使后续同步失败，重开仍不得读取旧密钥。"""
+
+        old = {
+            BASE_URL_KEY: "https://old.example.com/v1",
+            MODEL_KEY: "model-old",
+        }
+        settings = PersistentFakeSettings(old, sync_failures=(3,))
+        secret_store = FakeSecretStore(
+            configured=True,
+            delete_receipt=SecretMutationReceipt(
+                None,
+                "failed",
+                commit_state="unknown",
+            ),
+        )
+        lock_state = SharedConfigLockState()
+        dialog = _CommentAiSettingsDialog(
+            settings=settings,
+            secret_store=secret_store,
+        )
+        dialog._lock_factory = lock_state.factory
+        self.addCleanup(dialog.deleteLater)
+
+        dialog._clear_secret()
+        settings.setValue(MODEL_KEY, "unrelated-later-write")
+        with self.assertRaises(RuntimeError):
+            settings.sync()
+        reopened = settings.reopen()
+
+        with (
+            patch("ui.data_monitor_page.QSettings", return_value=reopened),
+            patch("ui.data_monitor_page.CommentSecretStore", return_value=secret_store),
+            patch(
+                "ui.data_monitor_page._new_comment_ai_config_lock",
+                side_effect=lock_state.factory,
+                create=True,
+            ),
+        ):
+            provider = _build_comment_ai_provider()
+        self.assertIsNone(provider)
+        self.assertEqual(secret_store.read_count, 0)
+
     def test_ai_settings_save_requires_clean_settings_status_before_secret_write(self) -> None:
         """QSettings 未确认落盘成功时，新密钥绝不能进入原生存储。"""
 
@@ -2414,7 +3123,7 @@ class DataMonitorPageTests(unittest.TestCase):
             ),
             (
                 FakeSettings(statuses=(QSettings.Status.AccessError,)),
-                "AI 配置不可使用，请重新保存或清除密钥",
+                "设置未保存，请检查 HTTPS 地址、模型和密钥",
             ),
         )
         for settings, expected_feedback in cases:
@@ -2466,7 +3175,7 @@ class DataMonitorPageTests(unittest.TestCase):
             with self.subTest(statuses=settings.statuses):
                 dialog.save_button.click()
                 self.assertEqual(settings.values, old)
-                self.assertEqual(settings.synced, 2)
+                self.assertEqual(settings.synced, 1)
                 self.assertEqual(secret_store.writes, [])
                 self.assertEqual(dialog.secret_input.text(), "")
                 self.assertEqual(
@@ -2499,7 +3208,7 @@ class DataMonitorPageTests(unittest.TestCase):
 
         self.assertIsNot(raised.exception, original)
         self.assertEqual(settings.values, old)
-        self.assertEqual(settings.synced, 2)
+        self.assertEqual(settings.synced, 1)
         self.assertEqual(secret_store.writes, [])
         self.assertEqual(dialog.secret_input.text(), "")
         self.assertNotIn(marker, ui_exception_trace_text(original))
@@ -2532,7 +3241,7 @@ class DataMonitorPageTests(unittest.TestCase):
             settings.values,
             {BASE_URL_KEY: "https://old.example.com/v1"},
         )
-        self.assertEqual(settings.synced, 2)
+        self.assertEqual(settings.synced, 5)
         self.assertEqual(secret_store.writes, [])
         self.assertTrue(secret_store.configured)
         self.assertLess(
@@ -2554,7 +3263,7 @@ class DataMonitorPageTests(unittest.TestCase):
                 BASE_URL_KEY: "https://old.example.com/v1",
                 MODEL_KEY: "model-old",
             },
-            sync_failures=(2,),
+            sync_failures=(4,),
         )
         secret_store = FakeSecretStore(
             configured=True,
@@ -2570,7 +3279,7 @@ class DataMonitorPageTests(unittest.TestCase):
         dialog.secret_input.setText("rollback-failure-private-marker")
         dialog.save_button.click()
 
-        self.assertEqual(settings.synced, 2)
+        self.assertEqual(settings.synced, 4)
         self.assertEqual(secret_store.writes, [])
         self.assertEqual(dialog.result(), 0)
         self.assertEqual(
@@ -2585,7 +3294,7 @@ class DataMonitorPageTests(unittest.TestCase):
             BASE_URL_KEY: "https://old.example.com/v1",
             MODEL_KEY: "model-old",
         }
-        settings = PersistentFakeSettings(old, sync_failures=(2,))
+        settings = PersistentFakeSettings(old, sync_failures=(4,))
         secret_store = FakeSecretStore(
             configured=True,
             write_error=RuntimeError("private-native-write-error"),
@@ -2947,7 +3656,7 @@ class DataMonitorPageTests(unittest.TestCase):
                 else:
                     self.assertEqual(raised.exception.args, ())
                 self.assertEqual(settings.values, old)
-                self.assertEqual(settings.synced, 2)
+                self.assertEqual(settings.synced, 5)
                 self.assertEqual(dialog.secret_input.text(), "")
                 self.assertEqual(secret_store.writes, [])
                 self.assertTrue(secret_store.configured)
@@ -3151,8 +3860,8 @@ class DataMonitorPageTests(unittest.TestCase):
 
         self.assertTrue(page.shutdown())
         self.assertEqual(
-            runner.prefixes,
-            [("platform-data-sync", "platform-comment-sync")],
+            runner.prefixes[-1],
+            ("platform-data-sync", "platform-comment-sync"),
         )
         self.assertEqual(
             runner.cancelled,
