@@ -8,6 +8,7 @@ from contextlib import contextmanager
 import hashlib
 import json
 import sqlite3
+import tempfile
 import unittest
 
 from app_core import platform_data_comment_service as service
@@ -454,6 +455,197 @@ class CommentServiceTests(unittest.TestCase):
             self.conn.execute("SELECT COUNT(*) FROM comment_insight_runs").fetchone()[0],
             0,
         )
+
+    def test_all_ai_outcomes_hold_one_real_sqlite_snapshot_transaction(self):
+        """文件数据库竞争写入不能插进评论快照校验与洞察写入之间。"""
+
+        key_a = "a" * 64
+        key_b = "b" * 64
+        fingerprint = hashlib.sha256(
+            (key_a + "\x1f为什么会这样？\x1e").encode("utf-8")
+        ).hexdigest()
+        insight = InsightResult(
+            classifications=(CommentClassification(key_a, ("追问",)),),
+            candidates=(TopicCandidate("回答追问", "真实评论证据", (key_a,)),),
+            known_comment_keys=frozenset({key_a}),
+        )
+        cases = (
+            ("success", insight, "", "test-model", ""),
+            ("failed", None, "comment_ai_timeout", "test-model", "comment_ai_timeout"),
+            (
+                "skipped",
+                None,
+                "comment_ai_not_configured",
+                "unconfigured",
+                "comment_ai_not_configured",
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            for expected_status, outcome, error_code, model_name, expected_error in cases:
+                with self.subTest(status=expected_status):
+                    path = f"{directory}/{expected_status}.sqlite3"
+                    setup = sqlite3.connect(path)
+                    setup.row_factory = sqlite3.Row
+                    setup.execute("PRAGMA foreign_keys = ON")
+                    setup.executescript(
+                        """
+                        CREATE TABLE user_info (
+                            id INTEGER PRIMARY KEY,
+                            type INTEGER NOT NULL,
+                            filePath TEXT NOT NULL
+                        );
+                        CREATE TABLE platform_contents (
+                            id INTEGER PRIMARY KEY,
+                            accountId INTEGER NOT NULL,
+                            platformType INTEGER NOT NULL,
+                            contentId TEXT NOT NULL,
+                            title TEXT NOT NULL DEFAULT '',
+                            UNIQUE(accountId, platformType, contentId)
+                        );
+                        INSERT INTO user_info (id, type, filePath)
+                        VALUES (12, 3, 'douyin-12.json');
+                        INSERT INTO platform_contents
+                            (accountId, platformType, contentId, title)
+                        VALUES (12, 3, 'work-7', '作品七');
+                        """
+                    )
+                    store.create_comment_schema(setup)
+                    with setup:
+                        store.persist_comment_batch(
+                            setup,
+                            12,
+                            valid_batch(records=(record(),)),
+                        )
+                    setup.close()
+
+                    transaction_states = []
+                    competing_commits = []
+
+                    def insert_competing_comment() -> None:
+                        competitor = sqlite3.connect(path, timeout=0.02)
+                        competitor.execute("PRAGMA foreign_keys = ON")
+                        try:
+                            with competitor:
+                                competitor.execute(
+                                    """
+                                    INSERT INTO platform_comments
+                                        (accountId, platformType, contentId,
+                                         commentKey, body, likeCount, replyCount,
+                                         commentedAt, firstSeenAt, lastSeenAt)
+                                    VALUES (12, 3, 'work-7', ?, '竞争评论', 0, 0,
+                                            ?, ?, ?)
+                                    """,
+                                    (key_b, OBSERVED, OBSERVED, OBSERVED),
+                                )
+                        except sqlite3.OperationalError as exc:
+                            if "locked" not in str(exc).lower():
+                                raise
+                            competing_commits.append(False)
+                        else:
+                            competing_commits.append(True)
+                        finally:
+                            competitor.close()
+
+                    class FetchHookCursor:
+                        def __init__(self, cursor, connection) -> None:
+                            self._cursor = cursor
+                            self._connection = connection
+                            self.description = cursor.description
+
+                        def fetchall(self):
+                            rows = self._cursor.fetchall()
+                            self._cursor.close()
+                            transaction_states.append(
+                                self._connection.in_transaction
+                            )
+                            insert_competing_comment()
+                            return rows
+
+                    class HookConnection(sqlite3.Connection):
+                        def execute(self, sql, parameters=()):
+                            cursor = super().execute(sql, parameters)
+                            if (
+                                "FROM platform_comments" in sql
+                                and "ORDER BY commentedAt DESC" in sql
+                            ):
+                                return FetchHookCursor(cursor, self)
+                            return cursor
+
+                    @contextmanager
+                    def racing_connect():
+                        conn = sqlite3.connect(
+                            path,
+                            timeout=0.1,
+                            factory=HookConnection,
+                        )
+                        conn.row_factory = sqlite3.Row
+                        conn.execute("PRAGMA foreign_keys = ON")
+                        try:
+                            with conn:
+                                yield conn
+                        finally:
+                            conn.close()
+
+                    @contextmanager
+                    def plain_connect():
+                        conn = sqlite3.connect(path, timeout=0.1)
+                        conn.row_factory = sqlite3.Row
+                        conn.execute("PRAGMA foreign_keys = ON")
+                        try:
+                            with conn:
+                                yield conn
+                        finally:
+                            conn.close()
+
+                    receipt = service.record_comment_ai_outcome(
+                        12,
+                        "work-7",
+                        result=outcome,
+                        error_code=error_code,
+                        model_name=model_name,
+                        prompt_version="comment-insight-v1",
+                        schema_version=1,
+                        input_fingerprint=fingerprint,
+                        comment_count=1,
+                        connect_factory=racing_connect,
+                    )
+
+                    self.assertEqual(
+                        (transaction_states, competing_commits),
+                        ([True], [False]),
+                    )
+                    self.assertEqual(receipt["status"], expected_status)
+                    self.assertEqual(receipt["errorCode"], expected_error)
+
+                    insert_competing_comment()
+                    self.assertEqual(competing_commits, [False, True])
+                    with plain_connect() as check:
+                        row = check.execute(
+                            """
+                            SELECT status, errorCode, commentCount
+                            FROM comment_insight_runs
+                            ORDER BY id DESC LIMIT 1
+                            """
+                        ).fetchone()
+                        count = check.execute(
+                            "SELECT COUNT(*) FROM platform_comments"
+                        ).fetchone()[0]
+                    self.assertEqual(
+                        tuple(row),
+                        (expected_status, expected_error, 1),
+                    )
+                    self.assertEqual(count, 2)
+                    panel = service.comment_panel_payload(
+                        12,
+                        "work-7",
+                        connect_factory=plain_connect,
+                    )
+                    self.assertEqual(panel["aiStatus"], "failed")
+                    self.assertEqual(
+                        panel["aiErrorCode"], "comment_ai_response_invalid"
+                    )
+                    self.assertEqual(panel["candidates"], [])
 
     def test_new_comments_record_current_skipped_and_hide_stale_success(self):
         """未配置 AI 也要覆盖旧成功，否则新评论会展示旧分类和旧选题。"""

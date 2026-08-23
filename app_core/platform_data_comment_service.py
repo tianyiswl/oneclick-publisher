@@ -368,6 +368,8 @@ def record_comment_ai_outcome(
         raise _payload_failure()
     try:
         with connect_factory() as conn:
+            if not conn.in_transaction:
+                conn.execute("BEGIN IMMEDIATE")
             if store.content_for_comment_sync(conn, account_id, content_id) is None:
                 raise CommentInsightFailure("comment_content_unavailable")
             rows = store.list_comment_rows(conn, account_id, content_id, limit=100)
