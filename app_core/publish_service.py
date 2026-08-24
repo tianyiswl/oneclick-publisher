@@ -28,6 +28,7 @@ from . import (
     overseas_video_publish,
     overseas_preflight,
     task_service,
+    wechat_location_service,
     wechat_publish_executor,
     wechat_publish_policy,
     xhs_location_service,
@@ -252,6 +253,33 @@ def _validate_payloads(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     )
                 except douyin_commerce_service.DouyinCommerceError as exc:
                     raise ValueError(str(exc)) from exc
+        wechat_location_keys = (
+            "wechatLocationKeyword",
+            "wechatLocationScope",
+            "wechatLocationPoi",
+        )
+        if platform_type == 10:
+            try:
+                wechat_location = (
+                    wechat_location_service.normalize_location_selection(payload)
+                )
+            except wechat_location_service.WechatLocationError as exc:
+                raise ValueError(str(exc)) from exc
+            if wechat_location is None:
+                payload["wechatLocationKeyword"] = ""
+                payload["wechatLocationScope"] = ""
+                payload["wechatLocationPoi"] = None
+            else:
+                payload["wechatLocationKeyword"] = str(
+                    wechat_location["searchKeyword"]
+                )
+                payload["wechatLocationScope"] = str(wechat_location["scope"])
+                payload["wechatLocationPoi"] = wechat_location
+        elif any(
+            bool(payload.get(key))
+            for key in wechat_location_keys
+        ):
+            raise ValueError("公众号正文地点字段不能用于其他平台")
         if runtime_mode == "preflight":
             if payload.get("debugDryRun") is not True:
                 raise ValueError("预发布检查必须保持 debugDryRun=true")

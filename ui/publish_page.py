@@ -56,6 +56,7 @@ from app_core import (
     publish_service,
     task_service,
     wechat_content_bundle,
+    wechat_location_service,
     wechat_publish_policy,
     oneclick_capabilities,
     xhs_location_service,
@@ -454,6 +455,8 @@ class PublishPage(QWidget):
             str,
             int,
         ] | None = None
+        self._wechat_selected_location: dict[str, object] = {}
+        self._wechat_location_context_signature: tuple[object, ...] | None = None
         self._douyin_selected_location: dict[str, object] = {}
         self._douyin_location_query = ""
         self._topic_tag_editors: list[TopicTagEditor] = []
@@ -1050,6 +1053,12 @@ class PublishPage(QWidget):
         self.xhs_location_results_title: QLabel | None = None
         self.xhs_location_results: QListWidget | None = None
         self.xhs_location_status: QLabel | None = None
+        self.wechat_location_panel: QFrame | None = None
+        self.wechat_location_keyword: QLineEdit | None = None
+        self.wechat_location_search_button: QPushButton | None = None
+        self.wechat_location_results_title: QLabel | None = None
+        self.wechat_location_results: QListWidget | None = None
+        self.wechat_location_status: QLabel | None = None
         self.wechat_group_notification: QCheckBox | None = None
         for platform_type in account_service.PLATFORM_ORDER:
             editor = self._build_platform_editor(platform_type)
@@ -1420,6 +1429,70 @@ class PublishPage(QWidget):
             )
             settings_layout.addRow("通知方式", self.wechat_group_notification)
             body_layout.addWidget(settings)
+
+            self.wechat_location_panel = QFrame()
+            self.wechat_location_panel.setObjectName("wechatLocationPanel")
+            self.wechat_location_panel.setProperty("subPanel", True)
+            location_layout = QFormLayout(self.wechat_location_panel)
+            location_layout.setContentsMargins(12, 10, 12, 10)
+            location_layout.setHorizontalSpacing(14)
+            location_layout.setVerticalSpacing(10)
+
+            self.wechat_location_keyword = QLineEdit()
+            self.wechat_location_keyword.setObjectName("wechatLocationKeyword")
+            self.wechat_location_keyword.setPlaceholderText(
+                "搜索公众号官方地点；留空不在正文插入地点"
+            )
+            self.wechat_location_keyword.setClearButtonEnabled(True)
+            self.wechat_location_keyword.setMaxLength(50)
+            self.wechat_location_keyword.textEdited.connect(
+                self._wechat_location_text_edited
+            )
+            self.wechat_location_search_button = button(
+                "搜索", variant="secondary", compact=True
+            )
+            self.wechat_location_keyword.returnPressed.connect(
+                self.search_wechat_locations
+            )
+            self.wechat_location_search_button.clicked.connect(
+                self.search_wechat_locations
+            )
+            search_row = QWidget()
+            search_layout = QHBoxLayout(search_row)
+            search_layout.setContentsMargins(0, 0, 0, 0)
+            search_layout.setSpacing(8)
+            search_layout.addWidget(self.wechat_location_keyword, 1)
+            search_layout.addWidget(self.wechat_location_search_button)
+            location_layout.addRow("正文地理位置", search_row)
+
+            self.wechat_location_results_title = QLabel(
+                "公众号候选 · 名称、完整地址与 POI ID"
+            )
+            self.wechat_location_results_title.setVisible(False)
+            location_layout.addRow(self.wechat_location_results_title)
+            self.wechat_location_results = QListWidget()
+            self.wechat_location_results.setObjectName("wechatLocationResults")
+            self.wechat_location_results.setHorizontalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+            )
+            self.wechat_location_results.setVerticalScrollMode(
+                QListWidget.ScrollMode.ScrollPerPixel
+            )
+            self.wechat_location_results.setFixedHeight(292)
+            self.wechat_location_results.itemClicked.connect(
+                self._select_wechat_location_item
+            )
+            self.wechat_location_results.setVisible(False)
+            location_layout.addRow(self.wechat_location_results)
+
+            self.wechat_location_status = QLabel(
+                "只在公众号正文插入地点卡片；需只保留一个公众号账号"
+            )
+            self.wechat_location_status.setProperty("role", "muted")
+            self.wechat_location_status.setWordWrap(True)
+            location_layout.addRow("", self.wechat_location_status)
+            self.wechat_location_panel.setVisible(False)
+            body_layout.addWidget(self.wechat_location_panel)
 
         body_layout.addStretch()
         editor_body_layout.addWidget(
@@ -1867,6 +1940,244 @@ class PublishPage(QWidget):
         self._set_xhs_location_status(
             f"已选择：{selection['name']}\n{selection['address']}\n"
             f"小红书 POI · {selection['poiId']}",
+            "success",
+        )
+
+    def _sync_wechat_location_visibility_and_context(self) -> None:
+        if self.wechat_location_panel is None:
+            return
+        accounts = self.selected_accounts()
+        signature = (
+            self.content_type,
+            tuple(
+                sorted(
+                    (int(account.get("id") or 0), int(account.get("type") or 0))
+                    for account in accounts
+                )
+            ),
+        )
+        if signature != self._wechat_location_context_signature:
+            self._wechat_location_context_signature = signature
+            self._invalidate_wechat_location()
+        visible = (
+            self.content_type in wechat_location_service.SUPPORTED_CONTENT_TYPES
+            and len(accounts) == 1
+            and int(accounts[0].get("type") or 0) == 10
+        )
+        self.wechat_location_panel.setVisible(visible)
+
+    def _invalidate_wechat_location(self) -> None:
+        self._wechat_selected_location = {}
+        if self.wechat_location_results is not None:
+            self.wechat_location_results.clear()
+            self.wechat_location_results.setVisible(False)
+        if self.wechat_location_results_title is not None:
+            self.wechat_location_results_title.setVisible(False)
+
+    def _wechat_location_text_edited(self, _value: str) -> None:
+        self._invalidate_wechat_location()
+        self._set_wechat_location_status("搜索词已变化，请重新搜索并选择")
+
+    def _set_wechat_location_status(self, text: str, role: str = "muted") -> None:
+        if self.wechat_location_status is None:
+            return
+        self.wechat_location_status.setText(text)
+        self.wechat_location_status.setProperty("role", role)
+        self.wechat_location_status.style().unpolish(self.wechat_location_status)
+        self.wechat_location_status.style().polish(self.wechat_location_status)
+
+    def search_wechat_locations(self) -> None:
+        if self.wechat_location_keyword is None:
+            return
+        try:
+            keyword = wechat_location_service.normalize_location_keyword(
+                self.wechat_location_keyword.text()
+            )
+        except wechat_location_service.WechatLocationError as exc:
+            self._set_wechat_location_status(str(exc), "warning")
+            return
+        accounts = self.selected_accounts()
+        if (
+            self.content_type not in wechat_location_service.SUPPORTED_CONTENT_TYPES
+            or len(accounts) != 1
+            or int(accounts[0].get("type") or 0) != 10
+        ):
+            self._invalidate_wechat_location()
+            self._sync_wechat_location_visibility_and_context()
+            self._set_wechat_location_status(
+                "请只保留一个公众号账号，并选择图文或文字发布",
+                "warning",
+            )
+            return
+        if self.location_tasks.is_running("wechat-location-search"):
+            self._set_wechat_location_status("上一次公众号地点搜索仍在进行")
+            return
+        account = dict(accounts[0])
+        source_account_id = int(account.get("id") or 0)
+        content_type = self.content_type
+        self.wechat_location_keyword.blockSignals(True)
+        self.wechat_location_keyword.setText(keyword)
+        self.wechat_location_keyword.blockSignals(False)
+        search_button = self.wechat_location_search_button
+
+        def on_started() -> None:
+            if search_button is not None:
+                search_button.setEnabled(False)
+                search_button.setText("搜索中")
+            self._set_wechat_location_status(f"正在搜索“{keyword}”…")
+
+        def is_current() -> bool:
+            if self.content_type != content_type:
+                return False
+            current_accounts = self.selected_accounts()
+            if len(current_accounts) != 1:
+                return False
+            if int(current_accounts[0].get("id") or 0) != source_account_id:
+                return False
+            if self.wechat_location_keyword is None:
+                return False
+            try:
+                current_keyword = wechat_location_service.normalize_location_keyword(
+                    self.wechat_location_keyword.text()
+                )
+            except wechat_location_service.WechatLocationError:
+                return False
+            return current_keyword == keyword
+
+        def on_success(rows: object) -> None:
+            if is_current():
+                self._show_wechat_location_results(
+                    rows if isinstance(rows, list) else [],
+                    source_account_id=source_account_id,
+                    search_keyword=keyword,
+                    content_type=content_type,
+                )
+
+        def on_error(message: str) -> None:
+            if is_current():
+                self._invalidate_wechat_location()
+                self._set_wechat_location_status(message, "danger")
+
+        def on_finished() -> None:
+            if search_button is not None:
+                search_button.setEnabled(True)
+                search_button.setText("搜索")
+
+        self.location_tasks.run(
+            "wechat-location-search",
+            lambda: wechat_location_service.search_wechat_locations(
+                account,
+                keyword,
+                wechat_location_service.ARTICLE_INLINE_SCOPE,
+                content_type,
+            ),
+            on_started=on_started,
+            on_success=on_success,
+            on_error=on_error,
+            on_finished=on_finished,
+        )
+
+    def _show_wechat_location_results(
+        self,
+        rows: list[object],
+        *,
+        source_account_id: int,
+        search_keyword: str,
+        content_type: str,
+    ) -> None:
+        if self.wechat_location_results is None:
+            return
+        keyword = wechat_location_service.normalize_location_keyword(search_keyword)
+        self.wechat_location_results.clear()
+        valid_rows = []
+        for value in rows:
+            candidate = wechat_location_service.normalize_canonical_location_candidate(value)
+            if candidate is None:
+                continue
+            selection = {
+                **candidate,
+                "sourceAccountId": source_account_id,
+                "platformType": 10,
+                "scope": wechat_location_service.ARTICLE_INLINE_SCOPE,
+                "contentType": content_type,
+                "searchKeyword": keyword,
+            }
+            valid_rows.append(selection)
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole, selection)
+            item.setSizeHint(QSize(0, 88))
+            self.wechat_location_results.addItem(item)
+            self.wechat_location_results.setItemWidget(
+                item,
+                self._wechat_location_candidate_widget(selection),
+            )
+        visible = bool(valid_rows)
+        self.wechat_location_results.setVisible(visible)
+        if self.wechat_location_results_title is not None:
+            self.wechat_location_results_title.setVisible(visible)
+        self._set_wechat_location_status(
+            f"找到 {len(valid_rows)} 个公众号官方地点，请选择一个"
+            if visible
+            else f"公众号没有返回“{keyword}”的完整地点候选",
+            "success" if visible else "warning",
+        )
+
+    @staticmethod
+    def _wechat_location_candidate_widget(candidate: dict[str, object]) -> QWidget:
+        card = QFrame()
+        card.setObjectName("wechatLocationCandidateCard")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(10, 7, 10, 7)
+        layout.setSpacing(3)
+        name = QLabel(str(candidate.get("name") or "未命名地点"))
+        name.setObjectName("wechatLocationName")
+        name.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        layout.addWidget(name)
+        address = QLabel(str(candidate.get("address") or ""))
+        address.setObjectName("wechatLocationAddress")
+        address.setWordWrap(True)
+        address.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        layout.addWidget(address)
+        poi = QLabel(f"公众号 POI · {candidate.get('poiId') or ''}")
+        poi.setObjectName("wechatLocationPoi")
+        poi.setProperty("role", "caption")
+        poi.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        layout.addWidget(poi)
+        return card
+
+    def _select_wechat_location_item(self, item: QListWidgetItem) -> None:
+        raw = item.data(Qt.ItemDataRole.UserRole)
+        candidate = wechat_location_service.normalize_canonical_location_candidate(raw)
+        if candidate is None or not isinstance(raw, dict):
+            self._set_wechat_location_status("公众号地点候选无效，请重新搜索", "danger")
+            return
+        payload = {
+            "type": 10,
+            "contentType": self.content_type,
+            "accountIds": [int(raw.get("sourceAccountId") or 0)],
+            "wechatLocationKeyword": raw.get("searchKeyword"),
+            "wechatLocationScope": raw.get("scope"),
+            "wechatLocationPoi": dict(raw),
+        }
+        try:
+            selection = wechat_location_service.normalize_location_selection(payload)
+        except wechat_location_service.WechatLocationError as exc:
+            self._invalidate_wechat_location()
+            self._set_wechat_location_status(str(exc), "danger")
+            return
+        if selection is None or self.wechat_location_keyword is None:
+            return
+        self._wechat_selected_location = selection
+        self.wechat_location_keyword.blockSignals(True)
+        self.wechat_location_keyword.setText(str(selection["searchKeyword"]))
+        self.wechat_location_keyword.blockSignals(False)
+        if self.wechat_location_results is not None:
+            self.wechat_location_results.setVisible(False)
+        if self.wechat_location_results_title is not None:
+            self.wechat_location_results_title.setVisible(False)
+        self._set_wechat_location_status(
+            f"已选择：{selection['name']}\n{selection['address']}\n"
+            f"公众号 POI · {selection['poiId']}",
             "success",
         )
 
@@ -2933,6 +3244,8 @@ class PublishPage(QWidget):
             self.refresh_platform_navigation()
         if hasattr(self, "xhs_location_panel"):
             self._sync_xhs_location_visibility_and_context()
+        if hasattr(self, "wechat_location_panel"):
+            self._sync_wechat_location_visibility_and_context()
         if account_count:
             QTimer.singleShot(300, self.check_selected_account_health)
 
@@ -3140,6 +3453,12 @@ class PublishPage(QWidget):
         if self.douyin_location_results_title is not None:
             self.douyin_location_results_title.setVisible(False)
         self._set_douyin_location_status("未添加定位")
+        if self.wechat_location_keyword is not None:
+            self.wechat_location_keyword.blockSignals(True)
+            self.wechat_location_keyword.clear()
+            self.wechat_location_keyword.blockSignals(False)
+        self._invalidate_wechat_location()
+        self._set_wechat_location_status("未在公众号正文插入地点")
         if self.wechat_group_notification:
             self.wechat_group_notification.setChecked(True)
         if self.youtube_made_for_kids:
@@ -3562,6 +3881,53 @@ class PublishPage(QWidget):
                     self.wechat_group_notification
                     and self.wechat_group_notification.isChecked()
                 )
+                payload.update(
+                    {
+                        "wechatLocationKeyword": "",
+                        "wechatLocationScope": "",
+                        "wechatLocationPoi": None,
+                    }
+                )
+                exact_wechat_context = (
+                    self.content_type
+                    in wechat_location_service.SUPPORTED_CONTENT_TYPES
+                    and len(accounts) == 1
+                    and len(selected) == 1
+                )
+                if exact_wechat_context and self.wechat_location_keyword is not None:
+                    raw_keyword = " ".join(
+                        self.wechat_location_keyword.text().split()
+                    )
+                    if raw_keyword:
+                        if not self._wechat_selected_location:
+                            raise ValueError(
+                                "请从公众号官方地点候选中选择，"
+                                "不能只填写正文地点关键词"
+                            )
+                        payload.update(
+                            {
+                                "wechatLocationKeyword": raw_keyword,
+                                "wechatLocationScope": (
+                                    wechat_location_service.ARTICLE_INLINE_SCOPE
+                                ),
+                                "wechatLocationPoi": dict(
+                                    self._wechat_selected_location
+                                ),
+                            }
+                        )
+                        try:
+                            selection = (
+                                wechat_location_service.normalize_location_selection(
+                                    payload
+                                )
+                            )
+                        except wechat_location_service.WechatLocationError as exc:
+                            raise ValueError(str(exc)) from exc
+                        payload["wechatLocationKeyword"] = str(
+                            selection["searchKeyword"]
+                        )
+                        payload["wechatLocationScope"] = str(selection["scope"])
+                        payload["wechatLocationPoi"] = selection
             if platform_type == 5:
                 payload.update(
                     {

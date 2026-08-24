@@ -14,7 +14,7 @@ from pathlib import Path
 import re
 from urllib.parse import parse_qs, urlparse
 
-from . import account_service
+from . import account_service, wechat_location_service
 from .paths import COOKIE_DIR
 
 
@@ -1714,6 +1714,21 @@ async def _wechat_preflight(
         inserted_images,
         image_anchors,
     )
+    try:
+        location_readback = await wechat_location_service.apply_wechat_location(
+            page,
+            payload,
+            expected_account_id=(
+                int(account.get("id") or 0) if isinstance(account, dict) else None
+            ),
+        )
+    except wechat_location_service.WechatLocationError as exc:
+        raise PreflightError(str(exc)) from exc
+    location_message = (
+        f"正文地点已重新搜索并回读：{location_readback['name']}；"
+        if location_readback is not None
+        else "未添加正文地点；"
+    )
     author_message = "未勾选原创，作者流程已完全跳过；"
     if _wechat_original_requested(payload):
         author_name = await _wechat_select_default_author(page)
@@ -1728,7 +1743,7 @@ async def _wechat_preflight(
     )
     return (
         f"公众号{content_label}封面已上传，标题和正文已回读，已套用{template_name}；"
-        f"{image_message}{author_message}"
+        f"{image_message}{location_message}{author_message}"
         "未保存草稿、未预览、未发表"
     )
 
