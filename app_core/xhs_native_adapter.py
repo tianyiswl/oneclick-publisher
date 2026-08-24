@@ -18,6 +18,8 @@ import re
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from . import xhs_location_service
+
 
 XHS_PUBLISH_URL = (
     "https://creator.xiaohongshu.com/publish/publish?source=official"
@@ -144,6 +146,25 @@ def build_native_contract(payload: dict[str, Any]) -> dict[str, Any]:
             "小红书只支持图文或视频，不支持纯文字发布"
         )
 
+    location_fields = (
+        "xhsLocationKeyword",
+        "xhsLocationScope",
+        "xhsLocationPoi",
+        "locationKeyword",
+        "locationScope",
+        "locationPoi",
+    )
+    has_location_fields = any(
+        bool(value) if isinstance(value, dict) else bool(_normalized(value))
+        for value in (payload.get(field) for field in location_fields)
+    )
+    location = None
+    if has_location_fields:
+        try:
+            location = xhs_location_service.normalize_location_selection(payload)
+        except xhs_location_service.XhsLocationSearchError as exc:
+            raise XhsNativeAdapterError(str(exc)) from exc
+
     files = [Path(str(value)).resolve() for value in payload.get("fileList") or []]
     if not files or any(not item.is_file() for item in files):
         raise XhsNativeAdapterError("小红书存在不可读取的本地素材")
@@ -193,7 +214,7 @@ def build_native_contract(payload: dict[str, Any]) -> dict[str, Any]:
         }
         for item in files
     ]
-    return {
+    contract = {
         "formType": "task",
         "contentType": content_type,
         "nativePublishType": "imageText" if content_type == "article" else "video",
@@ -207,7 +228,6 @@ def build_native_contract(payload: dict[str, Any]) -> dict[str, Any]:
         "visibleType": _visibility_code(payload.get("visibility")),
         "scheduledTime": _schedule_timestamp(payload),
         "topics": _topics(payload),
-        "locationKeyword": _normalized(payload.get("locationKeyword")),
         "collectionName": _normalized(payload.get("collectionName")),
         "aiDeclaration": payload.get("aiGenerated") is True,
         "originalDeclaration": payload.get("originalDeclaration") is True,
@@ -217,6 +237,9 @@ def build_native_contract(payload: dict[str, Any]) -> dict[str, Any]:
         "requiresYixiaoerGateway": False,
         "usesPrivateSignatureService": False,
     }
+    if location is not None:
+        contract["location"] = location
+    return contract
 
 
 async def _set_dom_value(locator, value: str) -> None:
@@ -492,6 +515,227 @@ class XhsNativeAdapter:
         if self.content_type != "video":
             raise XhsNativeAdapterError("当前任务不是小红书视频任务")
         return await self.fill_content(page)
+
+    async def apply_location(self, page) -> dict[str, Any] | None:
+        """在当前视频编辑页重新搜索并精确回读已选地点名。"""
+
+        target = self.contract.get("location")
+        if not isinstance(target, dict):
+            return None
+
+        trigger_candidates = page.locator(
+            ".address-card-wrapper .address-card-select"
+        )
+        rendered_triggers = []
+        for index in range(await trigger_candidates.count()):
+            item = trigger_candidates.nth(index)
+            try:
+                if await item.is_visible():
+                    rendered_triggers.append(item)
+            except Exception:
+                continue
+        if len(rendered_triggers) != 1:
+            raise XhsNativeAdapterError(
+                "小红书地点选择控件无法唯一识别，"
+                f"可渲染候选={len(rendered_triggers)}"
+            )
+        try:
+            await rendered_triggers[0].scroll_into_view_if_needed(timeout=10_000)
+        except Exception as exc:
+            raise XhsNativeAdapterError("小红书地点选择控件无法滚动到可见区域") from exc
+        trigger = await _first_visible(trigger_candidates, "地点选择控件")
+
+        disabled = page.locator(".address-card-wrapper .d-select.disabled")
+        for index in range(await disabled.count()):
+            item = disabled.nth(index)
+            try:
+                if await item.is_visible() and await _is_actual_viewport_visible(item):
+                    raise XhsNativeAdapterError("小红书地点控件已禁用，已安全停止")
+            except XhsNativeAdapterError:
+                raise
+            except Exception:
+                continue
+
+        descriptions = page.locator(
+            ".address-card-select .d-select-description"
+        )
+        for index in range(await descriptions.count()):
+            description = descriptions.nth(index)
+            try:
+                if (
+                    await description.is_visible()
+                    and await _is_actual_viewport_visible(description)
+                    and re.search(
+                        r"等\s*\d+\s*个地点",
+                        _normalized(await description.inner_text()),
+                    )
+                ):
+                    raise XhsNativeAdapterError(
+                        "小红书当前是多地点编辑状态，已安全停止"
+                    )
+            except XhsNativeAdapterError:
+                raise
+            except Exception:
+                continue
+
+        await trigger.click(timeout=5_000)
+        location_input = await _first_visible(
+            page.locator(
+                '.address-card-wrapper '
+                '.d-select-input-filter.show input[type="text"]'
+            ),
+            "地点搜索输入框",
+        )
+        keyword = str(target["searchKeyword"])
+
+        def _matches_current_location_response(response) -> bool:
+            try:
+                if (
+                    response.url
+                    != xhs_location_service.XHS_LOCATION_SEARCH_ENDPOINT
+                    or str(response.request.method).upper() != "POST"
+                ):
+                    return False
+                request_body = response.request.post_data_json
+            except Exception:
+                return False
+            if not isinstance(request_body, dict):
+                return False
+            return (
+                _normalized(request_body.get("keyword")) == keyword
+                and request_body.get("page") == 1
+                and not isinstance(request_body.get("page"), bool)
+                and request_body.get("size") == 50
+                and not isinstance(request_body.get("size"), bool)
+                and request_body.get("source") == "WEB"
+                and request_body.get("type") == 3
+                and not isinstance(request_body.get("type"), bool)
+            )
+
+        try:
+            async with page.expect_response(
+                _matches_current_location_response,
+                timeout=15_000,
+            ) as response_info:
+                await location_input.fill(keyword, timeout=5_000)
+            response = await response_info.value
+            response_payload = await response.json()
+            candidates = xhs_location_service.normalize_location_response(
+                response_payload,
+                limit=None,
+            )
+        except xhs_location_service.XhsLocationSearchError as exc:
+            raise XhsNativeAdapterError(str(exc)) from exc
+        except XhsNativeAdapterError:
+            raise
+        except Exception as exc:
+            raise XhsNativeAdapterError(
+                "小红书地点实时搜索响应读取失败"
+            ) from exc
+
+        raw_rows = response_payload.get("poiList")
+        if raw_rows is None:
+            raw_rows = response_payload.get("poi_list")
+        if raw_rows is None and isinstance(response_payload.get("data"), dict):
+            raw_rows = response_payload["data"].get("poiList")
+            if raw_rows is None:
+                raw_rows = response_payload["data"].get("poi_list")
+        if not isinstance(raw_rows, list):
+            raise XhsNativeAdapterError("小红书地点服务返回了无效数据")
+        raw_candidates = [
+            candidate
+            for candidate in (
+                xhs_location_service.normalize_official_location_candidate(row)
+                for row in raw_rows
+            )
+            if candidate is not None
+        ]
+        if len(
+            xhs_location_service.location_match_indexes(target, raw_candidates)
+        ) != 1:
+            raise XhsNativeAdapterError(
+                "小红书当次原始响应未返回唯一的目标地点三字段"
+            )
+
+        matched_indexes = xhs_location_service.location_match_indexes(
+            target,
+            candidates,
+        )
+        if len(matched_indexes) != 1:
+            raise XhsNativeAdapterError(
+                "小红书当次地点候选未按 POI ID、名称和完整地址唯一命中"
+            )
+        same_visible_identity_ids = {
+            str(candidate["poiId"])
+            for candidate in candidates
+            if candidate.get("name") == target.get("name")
+            and candidate.get("address") == target.get("address")
+        }
+        if same_visible_identity_ids != {str(target["poiId"])}:
+            raise XhsNativeAdapterError(
+                "小红书当次候选的名称和地址无法唯一对应目标 POI ID"
+            )
+
+        loading = page.locator(".loading-container")
+        for index in range(await loading.count()):
+            try:
+                await loading.nth(index).wait_for(state="hidden", timeout=10_000)
+            except Exception as exc:
+                raise XhsNativeAdapterError(
+                    "小红书地点候选加载未完成"
+                ) from exc
+
+        dropdown = await _first_visible(
+            page.locator(".custom-dropdown-44"),
+            "地点候选下拉框",
+        )
+        option_rows = dropdown.locator(".option-item")
+        matched_rows = []
+        for index in range(await option_rows.count()):
+            row = option_rows.nth(index)
+            try:
+                names = row.locator(".option-name")
+                addresses = row.locator(".option-subname")
+                if (
+                    await row.is_visible()
+                    and await _is_actual_viewport_visible(row)
+                    and await names.count() == 1
+                    and await addresses.count() == 1
+                    and _normalized(await names.nth(0).inner_text())
+                    == target["name"]
+                    and _normalized(await addresses.nth(0).inner_text())
+                    == target["address"]
+                ):
+                    matched_rows.append(row)
+            except Exception:
+                continue
+        if len(matched_rows) != 1:
+            raise XhsNativeAdapterError(
+                f"小红书页面未返回唯一的同名同地址候选行：{len(matched_rows)}"
+            )
+        await matched_rows[0].click(timeout=5_000)
+        try:
+            await dropdown.wait_for(state="hidden", timeout=10_000)
+        except Exception as exc:
+            raise XhsNativeAdapterError(
+                "小红书地点选择后下拉框未关闭"
+            ) from exc
+
+        selected_description = await _first_visible(
+            page.locator(".address-card-select .d-select-description"),
+            "已选地点名称回读",
+        )
+        editor_name = _normalized(await selected_description.inner_text())
+        if editor_name != target["name"]:
+            raise XhsNativeAdapterError(
+                f"小红书已选地点名称回读不一致："
+                f"目标={target['name']}，实际={editor_name or '空'}"
+            )
+        return {
+            **target,
+            "editorNameReadback": editor_name,
+            "poiIdEvidence": "creator-search-response",
+        }
 
     async def fill_official_topics(self, page) -> list[str]:
         topics = self.contract["topics"]

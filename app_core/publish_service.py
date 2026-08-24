@@ -28,8 +28,11 @@ from . import (
     overseas_video_publish,
     overseas_preflight,
     task_service,
+    video_channel_location_service,
+    wechat_location_service,
     wechat_publish_executor,
     wechat_publish_policy,
+    xhs_location_service,
     xhs_publish_executor,
 )
 from .paths import VIDEO_DIR
@@ -170,21 +173,102 @@ def _validate_payloads(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
             ]
         runtime_mode = str(payload.get("runtimeMode") or "preflight")
         platform_type = int(payload.get("type") or 0)
+        if platform_type == 1:
+            content_type = str(payload.get("contentType") or "").strip()
+            xhs_location_keys = (
+                "xhsLocationKeyword",
+                "xhsLocationScope",
+                "xhsLocationPoi",
+            )
+            generic_location_keys = (
+                "locationKeyword",
+                "locationScope",
+                "locationPoi",
+            )
+
+            def has_value(key: str) -> bool:
+                value = payload.get(key)
+                if isinstance(value, (dict, list, tuple, set)):
+                    return bool(value)
+                return bool(str(value or "").strip())
+
+            if content_type != "video":
+                if any(key in payload for key in xhs_location_keys):
+                    raise ValueError("小红书地点字段仅支持视频发布")
+                if any(has_value(key) for key in generic_location_keys):
+                    raise ValueError(
+                        "小红书非视频内容不得夹带通用地点字段"
+                    )
+            else:
+                try:
+                    location = xhs_location_service.normalize_location_selection(
+                        payload
+                    )
+                except xhs_location_service.XhsLocationSearchError as exc:
+                    raise ValueError(str(exc)) from exc
+                if location is None:
+                    payload["xhsLocationKeyword"] = ""
+                    payload["xhsLocationScope"] = ""
+                    payload["xhsLocationPoi"] = None
+                else:
+                    payload["xhsLocationKeyword"] = str(
+                        location["searchKeyword"]
+                    )
+                    payload["xhsLocationScope"] = str(location["scope"])
+                    payload["xhsLocationPoi"] = location
+            for key in generic_location_keys:
+                payload.pop(key, None)
+        video_channel_location_keys = (
+            "videoChannelLocationKeyword",
+            "videoChannelLocationScope",
+            "videoChannelLocationPoi",
+        )
+        if platform_type == 2:
+            if str(payload.get("contentType") or "").strip() != "video":
+                if any(bool(payload.get(key)) for key in video_channel_location_keys):
+                    raise ValueError("视频号位置字段仅支持视频发布")
+            else:
+                try:
+                    location = (
+                        video_channel_location_service.normalize_location_selection(
+                            payload
+                        )
+                    )
+                except video_channel_location_service.VideoChannelLocationError as exc:
+                    raise ValueError(str(exc)) from exc
+                if location is None:
+                    payload["videoChannelLocationKeyword"] = ""
+                    payload["videoChannelLocationScope"] = ""
+                    payload["videoChannelLocationPoi"] = None
+                else:
+                    payload["videoChannelLocationKeyword"] = str(
+                        location["searchKeyword"]
+                    )
+                    payload["videoChannelLocationScope"] = str(location["scope"])
+                    payload["videoChannelLocationPoi"] = location
+        elif any(bool(payload.get(key)) for key in video_channel_location_keys):
+            raise ValueError("视频号位置字段不能用于其他平台")
         if platform_type == 3:
             location_keyword = " ".join(
                 str(payload.get("locationKeyword") or "").split()
             )
-            location = douyin_location_service.normalize_location_candidate(
-                payload.get("locationPoi")
+            is_commerce = (
+                str(payload.get("workflow") or "").strip()
+                == "douyin-commerce"
             )
+            location_normalizer = (
+                douyin_location_service.normalize_location_candidate
+                if is_commerce
+                else douyin_location_service.normalize_publish_location_candidate
+            )
+            location = location_normalizer(payload.get("locationPoi"))
             if location_keyword:
                 if not location or location["name"] != location_keyword:
                     raise ValueError(
                         "抖音发布定位必须来自一键发官方地点候选，不能只传关键词"
                     )
                 if (
-                    str(payload.get("workflow") or "").strip()
-                    != "douyin-commerce"
+                    not is_commerce
                     and str(payload.get("locationScope") or "").strip()
                     != "local"
                 ):
@@ -194,18 +278,45 @@ def _validate_payloads(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     )
                 payload["locationKeyword"] = location["name"]
                 payload["locationPoi"] = location
-                if str(payload.get("workflow") or "").strip() != "douyin-commerce":
+                if not is_commerce:
                     payload["locationScope"] = "local"
             else:
                 payload["locationKeyword"] = ""
                 payload["locationPoi"] = {}
-            if str(payload.get("workflow") or "") == "douyin-commerce":
+            if is_commerce:
                 try:
                     payload.update(
                         douyin_commerce_service.validate_douyin_commerce_payload(payload)
                     )
                 except douyin_commerce_service.DouyinCommerceError as exc:
                     raise ValueError(str(exc)) from exc
+        wechat_location_keys = (
+            "wechatLocationKeyword",
+            "wechatLocationScope",
+            "wechatLocationPoi",
+        )
+        if platform_type == 10:
+            try:
+                wechat_location = (
+                    wechat_location_service.normalize_location_selection(payload)
+                )
+            except wechat_location_service.WechatLocationError as exc:
+                raise ValueError(str(exc)) from exc
+            if wechat_location is None:
+                payload["wechatLocationKeyword"] = ""
+                payload["wechatLocationScope"] = ""
+                payload["wechatLocationPoi"] = None
+            else:
+                payload["wechatLocationKeyword"] = str(
+                    wechat_location["searchKeyword"]
+                )
+                payload["wechatLocationScope"] = str(wechat_location["scope"])
+                payload["wechatLocationPoi"] = wechat_location
+        elif any(
+            bool(payload.get(key))
+            for key in wechat_location_keys
+        ):
+            raise ValueError("公众号正文地点字段不能用于其他平台")
         if runtime_mode == "preflight":
             if payload.get("debugDryRun") is not True:
                 raise ValueError("预发布检查必须保持 debugDryRun=true")

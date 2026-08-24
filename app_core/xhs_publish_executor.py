@@ -270,6 +270,10 @@ async def _wait_for_platform_result(
 async def run_xhs_publish(payload: dict, *, task_id: int) -> dict:
     _validate_payload(payload)
     account = oneclick_preflight._account_for_payload(payload)
+    try:
+        oneclick_preflight._validate_xhs_account_id(payload, account)
+    except oneclick_preflight.PreflightError as exc:
+        raise XhsPublishError(str(exc)) from exc
     expected_account = _normalized(account.get("userName"))
     target_schedule = _schedule_time(payload)
     schedule_text = (
@@ -309,6 +313,7 @@ async def run_xhs_publish(payload: dict, *, task_id: int) -> dict:
 
         helper = XhsNativeAdapter(payload)
         readback = await helper.fill_content(page)
+        location_readback = await helper.apply_location(page)
         await helper.fill_official_topics(page)
         topic_nodes = page.locator(".tiptap.ProseMirror a.tiptap-topic")
         topic_node_texts = [
@@ -343,6 +348,7 @@ async def run_xhs_publish(payload: dict, *, task_id: int) -> dict:
                 f"类型={'图文' if readback['contentType'] == 'article' else '视频'}；"
                 f"标题={readback['title']}；素材={readback['mediaCount']}；"
                 f"标签={len(readback['tags'])}；"
+                f"地点={location_readback['editorNameReadback'] if location_readback else '未设置'}；"
                 f"发布方式={schedule_text or '立即发布'}。"
                 "平台页已置于前台，等待点击最终发布按钮。"
             ),
@@ -380,6 +386,7 @@ async def run_xhs_publish(payload: dict, *, task_id: int) -> dict:
                 "videoCount": readback["videoCount"],
                 "tagCount": len(readback["tags"]),
                 "executionBackend": readback["executionBackend"],
+                "location": location_readback,
             }
         )
         return receipt

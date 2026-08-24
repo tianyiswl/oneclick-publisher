@@ -14,7 +14,11 @@ from pathlib import Path
 import re
 from urllib.parse import parse_qs, urlparse
 
-from . import account_service
+from . import (
+    account_service,
+    video_channel_location_service,
+    wechat_location_service,
+)
 from .paths import COOKIE_DIR
 
 
@@ -240,6 +244,24 @@ def _account_for_payload(payload: dict) -> dict:
         if int(account.get("type") or 0) == platform_type and Path(str(account.get("filePath") or "")).name in files:
             return account
     raise PreflightError("未找到一键发已登录账号，请先在账号管理中完成登录")
+
+
+def _validate_xhs_account_id(payload: dict, account: dict) -> int:
+    account_ids = payload.get("accountIds")
+    try:
+        actual_id = int(account.get("id") or 0)
+        selected_id = (
+            int(account_ids[0])
+            if isinstance(account_ids, list) and len(account_ids) == 1
+            else 0
+        )
+    except (TypeError, ValueError) as exc:
+        raise PreflightError("小红书当前账号 ID 无效") from exc
+    if actual_id <= 0 or selected_id <= 0 or actual_id != selected_id:
+        raise PreflightError(
+            "小红书当前账号与任务选中账号 ID 不一致"
+        )
+    return actual_id
 
 
 def _wechat_template_for_payload(payload: dict, account: dict | None = None) -> str:
@@ -643,6 +665,7 @@ async def _xhs_preflight(page, payload: dict) -> str:
     try:
         adapter = XhsNativeAdapter(payload)
         readback = await adapter.fill_content(page)
+        location_readback = await adapter.apply_location(page)
         topic_nodes = await adapter.fill_official_topics(page)
         await adapter.set_declarations(page)
         if payload.get("enableTimer") is True:
@@ -665,7 +688,13 @@ async def _xhs_preflight(page, payload: dict) -> str:
         f"小红书{label}素材已由平台回读{readback['mediaCount']}项，"
         f"标题、正文、{len(topic_nodes)}个官方话题、"
         f"声明配置和发布时间（{schedule_readback}）已回读；"
-        "未保存草稿、未预览、未发布"
+        + (
+            f"当次候选三字段已重新核验，编辑页已回读地点名"
+            f"“{location_readback['editorNameReadback']}”；"
+            if location_readback is not None
+            else "未设置地点；"
+        )
+        + "未主动保存草稿、未预览、未发布"
     )
 
 
@@ -1689,6 +1718,21 @@ async def _wechat_preflight(
         inserted_images,
         image_anchors,
     )
+    try:
+        location_readback = await wechat_location_service.apply_wechat_location(
+            page,
+            payload,
+            expected_account_id=(
+                int(account.get("id") or 0) if isinstance(account, dict) else None
+            ),
+        )
+    except wechat_location_service.WechatLocationError as exc:
+        raise PreflightError(str(exc)) from exc
+    location_message = (
+        f"正文地点已重新搜索并回读：{location_readback['name']}；"
+        if location_readback is not None
+        else "未添加正文地点；"
+    )
     author_message = "未勾选原创，作者流程已完全跳过；"
     if _wechat_original_requested(payload):
         author_name = await _wechat_select_default_author(page)
@@ -1703,7 +1747,7 @@ async def _wechat_preflight(
     )
     return (
         f"公众号{content_label}封面已上传，标题和正文已回读，已套用{template_name}；"
-        f"{image_message}{author_message}"
+        f"{image_message}{location_message}{author_message}"
         "未保存草稿、未预览、未发表"
     )
 
@@ -1787,8 +1831,32 @@ async def _video_channel_video_preflight(page, payload: dict) -> str:
     if not description_ok or not title_ok:
         missing = "视频描述" if not description_ok else "短标题"
         raise PreflightError(f"视频号{missing}字段未能回读测试值")
+    account_ids = payload.get("accountIds")
+    expected_account_id = (
+        int(account_ids[0])
+        if isinstance(account_ids, list) and len(account_ids) == 1
+        else None
+    )
+    try:
+        location_readback = (
+            await video_channel_location_service.apply_video_channel_location(
+                page,
+                payload,
+                expected_account_id=expected_account_id,
+            )
+        )
+    except video_channel_location_service.VideoChannelLocationError as exc:
+        raise PreflightError(str(exc)) from exc
+    location_message = (
+        f"位置已重新搜索并回读：{location_readback['name']}；"
+        if location_readback is not None
+        else "未添加位置；"
+    )
     # 安全边界：绝不定位或点击发表、预览、存草稿等按钮。
-    return "视频号视频素材已上传，视频描述和短标题已回读；未保存草稿、未预览、未发表"
+    return (
+        "视频号视频素材已上传，视频描述和短标题已回读；"
+        f"{location_message}未保存草稿、未预览、未发表"
+    )
 
 
 async def _video_channel_graphic_preflight(page, payload: dict) -> str:
@@ -2318,12 +2386,12 @@ async def _douyin_set_location(page, payload: dict) -> str:
     # 预检必须重新读取当前编辑页的完整地点身份。初次搜索或缓存中的
     # 地址不能替代本次页面回读；只有名称、完整地址和 POI 标识齐全的
     # 当前候选才有资格进入精确匹配与点击。
-    from .douyin_location_service import normalize_location_candidate
+    from .douyin_location_service import normalize_publish_location_candidate
 
     for _ in range(24):
         options, candidates = await _douyin_visible_location_options(page)
         complete_candidates = [
-            normalize_location_candidate(candidate) or {}
+            normalize_publish_location_candidate(candidate) or {}
             for candidate in candidates
         ]
         matched_indexes = _douyin_location_match_indexes(
@@ -2614,6 +2682,14 @@ async def run_preflight(payload: dict) -> dict:
     platform_type = int(account["type"])
     if platform_type not in {1, 2, 3, 4, 5, 10}:
         raise PreflightError("当前真实预检仅接入小红书、视频号、抖音、快手、B站与公众号")
+    if platform_type == 1:
+        _validate_xhs_account_id(payload, account)
+        from .xhs_native_adapter import XhsNativeAdapterError, build_native_contract
+
+        try:
+            build_native_contract(payload)
+        except XhsNativeAdapterError as exc:
+            raise PreflightError(str(exc)) from exc
     from playwright.async_api import async_playwright
 
     playwright = await async_playwright().start()

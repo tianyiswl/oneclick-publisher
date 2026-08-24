@@ -15,7 +15,10 @@ from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
 from . import account_service, douyin_commerce_service, douyin_music_service, task_service
-from .douyin_location_service import normalize_location_candidate
+from .douyin_location_service import (
+    normalize_location_candidate,
+    normalize_publish_location_candidate,
+)
 from .douyin_verification import verification_broker
 from .oneclick_preflight import _account_for_payload, _storage_state
 from utils.log import douyin_logger
@@ -332,7 +335,8 @@ def validate_douyin_publish_payload(payload: Mapping[str, Any]) -> dict[str, Any
     checked = dict(payload)
     if _is_commerce_batch_workflow(checked):
         raise DouyinPublishError("抖音带货批量任务请使用抖音带货批量执行器")
-    if _is_commerce_workflow(checked):
+    is_commerce = _is_commerce_workflow(checked)
+    if is_commerce:
         try:
             checked = douyin_commerce_service.validate_douyin_commerce_payload(checked)
         except douyin_commerce_service.DouyinCommerceError as exc:
@@ -362,7 +366,11 @@ def validate_douyin_publish_payload(payload: Mapping[str, Any]) -> dict[str, Any
         raise DouyinPublishError("抖音正式发布缺少作品描述")
 
     keyword = _normalized(checked.get("locationKeyword"))
-    location = normalize_location_candidate(checked.get("locationPoi"))
+    location = (
+        normalize_location_candidate(checked.get("locationPoi"))
+        if is_commerce
+        else normalize_publish_location_candidate(checked.get("locationPoi"))
+    )
     if keyword:
         if not location or location["name"] != keyword:
             raise DouyinPublishError(

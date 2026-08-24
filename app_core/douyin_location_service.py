@@ -121,7 +121,13 @@ def _normalize_location_candidate(
 
 
 def normalize_location_candidate(value: object) -> dict[str, str] | None:
-    """只返回名称、完整地址和平台 POI 标识齐全的公开地点。"""
+    """保持抖音带货既有解析合同：地址可由后续页面步骤补齐。"""
+
+    return _normalize_location_candidate(value, require_address=False)
+
+
+def normalize_publish_location_candidate(value: object) -> dict[str, str] | None:
+    """发布中心只接受名称、完整地址和平台 POI 标识齐全的地点。"""
 
     return _normalize_location_candidate(value, require_address=True)
 
