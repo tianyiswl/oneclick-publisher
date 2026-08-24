@@ -68,6 +68,21 @@ class DouyinPublishPayloadTests(unittest.TestCase):
         self.assertEqual(checked["locationKeyword"], "北海银滩景区")
         self.assertIsNone(checked["scheduleTime"])
 
+    def test_standard_publish_rejects_location_without_complete_address(self) -> None:
+        """普通发布的严格地点规则不能依赖带货共享解析器。"""
+
+        payload = dict(self.payload)
+        payload["locationPoi"] = {
+            "poiId": "6601124346666682376",
+            "name": "北海银滩景区",
+        }
+
+        with self.assertRaisesRegex(
+            douyin_publish_executor.DouyinPublishError,
+            "不能只传关键词",
+        ):
+            douyin_publish_executor.validate_douyin_publish_payload(payload)
+
     def test_normalizes_only_explicit_ai_generated_boolean(self) -> None:
         payload = dict(self.payload)
         payload["aiGenerated"] = True

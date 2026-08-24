@@ -2823,7 +2823,7 @@ class PublishPage(QWidget):
         self.douyin_location_results.clear()
         valid_rows = []
         for value in rows:
-            candidate = douyin_location_service.normalize_location_candidate(value)
+            candidate = douyin_location_service.normalize_publish_location_candidate(value)
             if not candidate:
                 continue
             candidate["sourceAccountId"] = source_account_id
@@ -2901,7 +2901,7 @@ class PublishPage(QWidget):
         return card
 
     def _select_douyin_location_item(self, item: QListWidgetItem) -> None:
-        candidate = douyin_location_service.normalize_location_candidate(
+        candidate = douyin_location_service.normalize_publish_location_candidate(
             item.data(Qt.ItemDataRole.UserRole)
         )
         if not candidate or not self.douyin_location_keyword:
@@ -4431,7 +4431,7 @@ class PublishPage(QWidget):
                     if self.douyin_location_keyword is not None
                     else ""
                 )
-                location = douyin_location_service.normalize_location_candidate(
+                location = douyin_location_service.normalize_publish_location_candidate(
                     self._douyin_selected_location
                 )
                 if location_text:
@@ -5589,7 +5589,7 @@ class PublishPage(QWidget):
                 else ""
             ),
             "douyinLocation": (
-                douyin_location_service.normalize_location_candidate(
+                douyin_location_service.normalize_publish_location_candidate(
                     self._douyin_selected_location
                 )
                 or {}
@@ -5911,7 +5911,7 @@ class PublishPage(QWidget):
             self._invalidate_video_channel_location()
             self._set_video_channel_location_status("未添加位置")
         if self.douyin_location_keyword is not None:
-            location = douyin_location_service.normalize_location_candidate(
+            location = douyin_location_service.normalize_publish_location_candidate(
                 payload.get("douyinLocation")
             )
             saved_scope = str(payload.get("douyinLocationScope") or "").strip()

@@ -252,17 +252,23 @@ def _validate_payloads(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
             location_keyword = " ".join(
                 str(payload.get("locationKeyword") or "").split()
             )
-            location = douyin_location_service.normalize_location_candidate(
-                payload.get("locationPoi")
+            is_commerce = (
+                str(payload.get("workflow") or "").strip()
+                == "douyin-commerce"
             )
+            location_normalizer = (
+                douyin_location_service.normalize_location_candidate
+                if is_commerce
+                else douyin_location_service.normalize_publish_location_candidate
+            )
+            location = location_normalizer(payload.get("locationPoi"))
             if location_keyword:
                 if not location or location["name"] != location_keyword:
                     raise ValueError(
                         "抖音发布定位必须来自一键发官方地点候选，不能只传关键词"
                     )
                 if (
-                    str(payload.get("workflow") or "").strip()
-                    != "douyin-commerce"
+                    not is_commerce
                     and str(payload.get("locationScope") or "").strip()
                     != "local"
                 ):
@@ -272,12 +278,12 @@ def _validate_payloads(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     )
                 payload["locationKeyword"] = location["name"]
                 payload["locationPoi"] = location
-                if str(payload.get("workflow") or "").strip() != "douyin-commerce":
+                if not is_commerce:
                     payload["locationScope"] = "local"
             else:
                 payload["locationKeyword"] = ""
                 payload["locationPoi"] = {}
-            if str(payload.get("workflow") or "") == "douyin-commerce":
+            if is_commerce:
                 try:
                     payload.update(
                         douyin_commerce_service.validate_douyin_commerce_payload(payload)

@@ -2386,12 +2386,12 @@ async def _douyin_set_location(page, payload: dict) -> str:
     # 预检必须重新读取当前编辑页的完整地点身份。初次搜索或缓存中的
     # 地址不能替代本次页面回读；只有名称、完整地址和 POI 标识齐全的
     # 当前候选才有资格进入精确匹配与点击。
-    from .douyin_location_service import normalize_location_candidate
+    from .douyin_location_service import normalize_publish_location_candidate
 
     for _ in range(24):
         options, candidates = await _douyin_visible_location_options(page)
         complete_candidates = [
-            normalize_location_candidate(candidate) or {}
+            normalize_publish_location_candidate(candidate) or {}
             for candidate in candidates
         ]
         matched_indexes = _douyin_location_match_indexes(
