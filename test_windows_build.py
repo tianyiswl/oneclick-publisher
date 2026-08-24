@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from unittest.mock import patch
 import zipfile
 from pathlib import Path
 
@@ -22,6 +23,27 @@ from app_core.branding import APP_EXECUTABLE_NAME
 
 
 class WindowsBuildTests(unittest.TestCase):
+    def test_controlled_publish_cli_routes_runtime_logs_to_stderr(self) -> None:
+        source = (Path(__file__).resolve().parent / "desktop_native_app.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("redirect_console_logger(sys.stderr)", source)
+        self.assertIn("_wait_for_controlled_task", source)
+        self.assertIn("DouyinVerificationDialog", source)
+        self.assertIn("douyin_verification_broker.request_for_task(task_id)", source)
+
+    def test_source_cli_can_explicitly_reuse_installed_user_data(self):
+        with patch.dict(
+            "os.environ",
+            {"YIJIANFA_USER_DATA_DIR": "/tmp/yijianfa-controlled-user-data"},
+        ):
+            data_dir = resolve_user_data_dir(
+                frozen=False,
+                platform_name="darwin",
+                source_dir=Path("/tmp/source"),
+            )
+        self.assertEqual(data_dir, Path("/tmp/yijianfa-controlled-user-data"))
     def test_frozen_windows_uses_local_app_data_outside_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

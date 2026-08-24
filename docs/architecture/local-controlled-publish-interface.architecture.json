@@ -1,0 +1,166 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "一键发本地受控发布接口",
+    "output": "local-controlled-publish-interface.architecture.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/tianyiswl/oneclick-publisher",
+      "revision": "f17db82118029fa533e0e19ea3302a82fa7846c6"
+    },
+    "views": [
+      {
+        "id": "create-task",
+        "label": "创建发布任务",
+        "focus": ["bundle", "cli", "request", "publish", "taskdb"],
+        "note": "内容任务只提交 manifest、账号 ID、模式和分平台时间。"
+      },
+      {
+        "id": "authorization",
+        "label": "正式发布授权",
+        "focus": ["desktop", "grant", "request", "publish"],
+        "note": "默认预检；正式模式只能消费客户端生成的一次性短期授权。"
+      },
+      {
+        "id": "status",
+        "label": "任务回读",
+        "focus": ["cli", "status", "taskdb", "executors", "platforms"],
+        "note": "调用方只轮询 taskId，读取分平台阶段、错误和平台回执。"
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "bundle",
+      "type": "external",
+      "label": "内容包 manifest",
+      "sublabel": "纯净平台字段与本地素材",
+      "pos": [30, 265],
+      "size": [150, 68],
+      "sources": [{"path": "app_core/content_bundle.py", "line": 361, "label": "现有读取合同"}]
+    },
+    {
+      "id": "desktop",
+      "type": "frontend",
+      "label": "一键发桌面 UI",
+      "sublabel": "人工确认与任务查看",
+      "pos": [780, 80],
+      "size": [180, 68],
+      "sources": [{"path": "ui/publish_page.py", "line": 4500, "label": "现有 UI 入口"}]
+    },
+    {
+      "id": "cli",
+      "type": "frontend",
+      "label": "本机 CLI",
+      "sublabel": "create / status，稳定 JSON",
+      "pos": [260, 265],
+      "size": [150, 68],
+      "tag": "新增"
+    },
+    {
+      "id": "grant",
+      "type": "security",
+      "label": "一次性发布授权",
+      "sublabel": "短期、单任务、消费即失效",
+      "pos": [500, 80],
+      "size": [180, 68],
+      "tag": "新增"
+    },
+    {
+      "id": "request",
+      "type": "backend",
+      "label": "受控请求校验器",
+      "sublabel": "账号、模式、时间、内容包迁移",
+      "pos": [500, 265],
+      "size": [180, 68],
+      "tag": "新增"
+    },
+    {
+      "id": "publish",
+      "type": "backend",
+      "label": "统一发布服务",
+      "sublabel": "UI 与 CLI 共用任务创建",
+      "pos": [780, 265],
+      "size": [180, 68],
+      "sources": [{"path": "app_core/publish_service.py", "line": 692, "label": "现有调度核心"}]
+    },
+    {
+      "id": "taskdb",
+      "type": "database",
+      "label": "SQLite 任务与事件",
+      "sublabel": "任务、分平台阶段、错误、回执",
+      "pos": [780, 440],
+      "size": [180, 68],
+      "sources": [{"path": "app_core/database.py", "line": 456, "label": "现有任务表"}]
+    },
+    {
+      "id": "status",
+      "type": "backend",
+      "label": "稳定状态投影",
+      "sublabel": "taskId → 分平台 JSON",
+      "pos": [260, 440],
+      "size": [150, 68],
+      "tag": "新增"
+    },
+    {
+      "id": "executors",
+      "type": "backend",
+      "label": "现有平台执行器",
+      "sublabel": "抖音 / 小红书，共用浏览器会话",
+      "pos": [1060, 265],
+      "size": [180, 68],
+      "sources": [
+        {"path": "app_core/xhs_publish_executor.py", "line": 1, "label": "小红书执行器"},
+        {"path": "uploader/douyin_uploader/main.py", "line": 459, "label": "抖音编辑器"}
+      ]
+    },
+    {
+      "id": "platforms",
+      "type": "external",
+      "label": "官方创作平台",
+      "sublabel": "预检、提交、回执、作品 ID",
+      "pos": [1340, 265],
+      "size": [160, 68]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "security-group",
+      "label": "仅本机进程边界：不接收 Cookie、密码或验证码",
+      "wraps": ["desktop", "cli", "grant", "request", "publish", "taskdb", "status", "executors"],
+      "pad": 22
+    }
+  ],
+  "connections": [
+    {"id": "bundle-cli", "from": "bundle", "to": "cli", "label": "manifest"},
+    {"id": "desktop-publish", "from": "desktop", "to": "publish", "label": "同一服务", "variant": "emphasis", "labelDy": 24},
+    {"id": "desktop-grant", "from": "desktop", "to": "grant", "label": "人工签发", "variant": "security"},
+    {"id": "cli-request", "from": "cli", "to": "request", "label": "create / status", "variant": "emphasis"},
+    {"id": "grant-request", "from": "grant", "to": "request", "label": "formal 授权", "variant": "security", "labelDy": 24},
+    {"id": "request-publish", "from": "request", "to": "publish", "label": "规范载荷", "variant": "emphasis"},
+    {"id": "publish-taskdb", "from": "publish", "to": "taskdb", "label": "任务与事件", "labelDy": 24},
+    {"id": "publish-executors", "from": "publish", "to": "executors", "label": "异步任务"},
+    {"id": "executors-platforms", "from": "executors", "to": "platforms", "label": "预检 / 提交"},
+    {"id": "executors-taskdb", "from": "executors", "to": "taskdb", "label": "阶段 / 错误 / 回执"},
+    {"id": "taskdb-status", "from": "taskdb", "to": "status", "label": "只读投影"},
+    {"id": "status-cli", "from": "status", "to": "cli", "label": "稳定 JSON"}
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "最小可用范围",
+      "items": ["CLI create/status 两个动作", "抖音立即与小红书分平台定时", "UI 与 CLI 复用 publish_service"]
+    },
+    {
+      "dot": "rose",
+      "title": "安全边界",
+      "items": ["默认只能 preflight", "formal 必须消费一次性短期授权", "参数和日志不保存敏感凭据"]
+    },
+    {
+      "dot": "amber",
+      "title": "本轮真实证据",
+      "items": ["008 内容包迁移与纯净字段回读", "抖音和小红书分别预检", "不触发公开发布"]
+    }
+  ]
+}

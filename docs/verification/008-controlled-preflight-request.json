@@ -1,0 +1,19 @@
+{
+  "manifestPath": "/Users/andy/Documents/Codex/2026-08-11/ai/硅基探索/production/008/发布包/一键发兼容_20260824/manifest.json",
+  "mode": "preflight",
+  "targets": [
+    {
+      "platform": "抖音",
+      "accountId": 4,
+      "schedule": null
+    },
+    {
+      "platform": "小红书",
+      "accountId": 6,
+      "schedule": {
+        "localTime": "2026-08-24 20:30",
+        "timezone": "Asia/Shanghai"
+      }
+    }
+  ]
+}

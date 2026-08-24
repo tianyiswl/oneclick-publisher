@@ -6,8 +6,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 from datetime import datetime
+import json
 import os
 import sys
+import time
 from io import BytesIO
 from pathlib import Path
 
@@ -28,6 +30,7 @@ from app_core import (
     media_service,
     publish_service,
     task_service,
+    controlled_publish,
 )
 from app_core.release_integrity import verify_release_artifact
 from app_core.branding import APP_ICON_RELATIVE_PATH, APP_TITLE, APP_VERSION, PRODUCT_NAME
@@ -120,6 +123,134 @@ def run_release_verification(
     )
 
 
+def _controlled_json(value: object) -> None:
+    print(json.dumps(value, ensure_ascii=False, separators=(",", ":")), flush=True)
+
+
+def _read_controlled_request(path_value: str) -> dict:
+    if path_value == "-":
+        raw = sys.stdin.read()
+    else:
+        path = Path(str(path_value or "")).expanduser().resolve()
+        if not path.is_file():
+            raise controlled_publish.ControlledPublishError(
+                "controlled_request_file_missing", "受控发布请求文件不存在"
+            )
+        raw = path.read_text(encoding="utf-8")
+    try:
+        value = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise controlled_publish.ControlledPublishError(
+            "controlled_request_json_invalid", "受控发布请求不是有效 UTF-8 JSON"
+        ) from exc
+    if not isinstance(value, dict):
+        raise controlled_publish.ControlledPublishError(
+            "controlled_request_invalid", "受控发布请求必须是 JSON 对象"
+        )
+    return value
+
+
+def _wait_for_controlled_task(task_id: int, *, interactive_verification: bool) -> None:
+    """等待任务完成；正式任务遇到抖音验证时只拉起本机原生窗口。"""
+
+    app = None
+    douyin_verification_broker = None
+    verification_dialog = None
+    if interactive_verification:
+        from app_core.douyin_verification import (
+            verification_broker as douyin_verification_broker,
+        )
+        from ui.douyin_verification_dialog import DouyinVerificationDialog
+
+        app = QApplication.instance() or QApplication([sys.argv[0]])
+        configure_application(app)
+        apply_style(app)
+        verification_dialog = DouyinVerificationDialog
+    while publish_service.is_task_running(task_id):
+        if app is not None:
+            app.processEvents()
+            request_id = douyin_verification_broker.request_for_task(task_id)
+            if request_id:
+                verification_dialog(
+                    request_id,
+                    broker=douyin_verification_broker,
+                ).exec()
+        time.sleep(0.25)
+
+
+def run_controlled_publish_cli(args: argparse.Namespace) -> int:
+    """本机 CLI：默认预检，标准输出只承诺稳定 JSON 状态。"""
+
+    # 平台执行器沿用桌面日志器；CLI 必须把这些运行日志移到 stderr，
+    # 给调用方保留只包含状态 JSON 的 stdout。
+    from utils.log import redirect_console_logger
+
+    redirect_console_logger(sys.stderr)
+    ensure_schema()
+    action = str(args.controlled_publish_action or "")
+    try:
+        if action == "status":
+            if not args.controlled_publish_task_id:
+                raise controlled_publish.ControlledPublishError(
+                    "controlled_task_id_required", "查询任务必须提供 taskId"
+                )
+            _controlled_json(
+                controlled_publish.task_status(args.controlled_publish_task_id)
+            )
+            return 0
+        if action == "authorize":
+            if not args.controlled_publish_task_id:
+                raise controlled_publish.ControlledPublishError(
+                    "controlled_task_id_required", "创建授权必须提供预检 taskId"
+                )
+            _controlled_json(
+                controlled_publish.authorize_completed_preflight(
+                    args.controlled_publish_task_id
+                )
+            )
+            return 0
+        if action == "create":
+            if not args.controlled_publish_request:
+                raise controlled_publish.ControlledPublishError(
+                    "controlled_request_file_required", "创建任务必须提供 JSON 请求文件"
+                )
+            request = _read_controlled_request(args.controlled_publish_request)
+            initial = controlled_publish.submit_request(request)
+            _controlled_json(initial)
+            task_id = int(initial["taskId"])
+            # CLI 进程保持到后台发布线程结束；Codex 可同时用 status 查询 taskId。
+            _wait_for_controlled_task(
+                task_id,
+                interactive_verification=(
+                    str(request.get("mode") or "preflight").strip().lower()
+                    == "formal"
+                ),
+            )
+            final = controlled_publish.task_status(task_id)
+            if final != initial:
+                _controlled_json(final)
+            return 0 if final["status"] == "success" else 2
+        raise controlled_publish.ControlledPublishError(
+            "controlled_action_invalid", "受控发布 action 只能是 create、status 或 authorize"
+        )
+    except controlled_publish.ControlledPublishError as exc:
+        _controlled_json(
+            {
+                "status": "rejected",
+                "errorCode": exc.error_code,
+                "errorText": exc.public_message,
+            }
+        )
+        return 2
+    except Exception as exc:
+        _controlled_json(
+            {
+                "status": "failed",
+                "errorCode": "controlled_internal_error",
+                "errorText": f"{type(exc).__name__}：{exc}",
+            }
+        )
+        return 2
 def start_authorized_wechat_schedule(
     window: MainWindow,
     manifest_path: str,
@@ -260,6 +391,21 @@ def main() -> int:
         "--wechat-account-name",
         default="硅基进化",
     )
+    parser.add_argument(
+        "--controlled-publish-action",
+        choices=("create", "status", "authorize"),
+        help="本机受控发布接口；默认只能由请求中的 preflight 模式启动预检。",
+    )
+    parser.add_argument(
+        "--controlled-publish-request",
+        metavar="JSON_OR_STDIN",
+        help="受控发布请求 JSON 文件；使用 - 从标准输入读取。",
+    )
+    parser.add_argument(
+        "--controlled-publish-task-id",
+        type=int,
+        metavar="TASK_ID",
+    )
     args = parser.parse_args()
     if args.self_test:
         run_self_test()
@@ -275,6 +421,8 @@ def main() -> int:
             parser.error("--verify-release 必须同时提供 --manifest 和 --signature")
         run_release_verification(args.verify_release, args.manifest, args.signature)
         return 0
+    if args.controlled_publish_action:
+        return run_controlled_publish_cli(args)
     app = QApplication(sys.argv)
     configure_application(app)
     install_runtime_log_capture()

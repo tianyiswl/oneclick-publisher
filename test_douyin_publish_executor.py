@@ -751,6 +751,32 @@ class DouyinPublishPayloadTests(unittest.TestCase):
         self.assertEqual(read_back.await_count, 4)
         self.assertEqual(page.keyboard.insert_text.await_count, 2)
 
+    def test_editor_body_uses_meta_select_all_on_macos(self) -> None:
+        video = DouYinVideo(
+            title="测试标题",
+            file_path="/tmp/demo.mp4",
+            tags=[],
+            publish_date=datetime.now(),
+            account_file="/tmp/account.json",
+            description="测试",
+        )
+        editor = MagicMock()
+        editor.fill = AsyncMock()
+        editor.click = AsyncMock()
+        page = MagicMock()
+        page.keyboard.press = AsyncMock()
+        page.keyboard.insert_text = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+        with patch("uploader.douyin_uploader.main.sys.platform", "darwin"), patch.object(
+            video,
+            "_read_raw_editor_text",
+            new_callable=AsyncMock,
+            side_effect=["", "测试"],
+        ):
+            asyncio.run(video._fill_editor_body(page, editor, "测试"))
+
+        self.assertEqual(page.keyboard.press.await_args_list[0].args, ("Meta+A",))
+
     def test_title_is_cleared_and_read_back_before_new_value_is_written(self) -> None:
         """独立标题必须先确认旧值已清空，再写入新标题并二次回读。"""
 

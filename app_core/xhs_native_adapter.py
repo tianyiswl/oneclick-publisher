@@ -32,7 +32,11 @@ MAX_TOPICS = 10
 
 _IMAGE_EXTENSIONS = {".avif", ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"}
 _VIDEO_EXTENSIONS = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".webm"}
-_AI_LABEL = "AI生成内容"
+_AI_LABELS = (
+    "笔记含AI合成内容",
+    "AI生成内容",
+    "含有AI生成内容",
+)
 
 
 class XhsNativeAdapterError(RuntimeError):
@@ -277,6 +281,53 @@ async def _first_visible(locator, label: str):
     return visible[0]
 
 
+async def _find_video_cover_trigger(
+    page,
+    *,
+    max_wait_ms: int = 30_000,
+    poll_interval_ms: int = 500,
+):
+    """按当前页面和旧版兼容顺序寻找唯一封面卡片。"""
+
+    selectors = (
+        ".cover-plugin-preview .upload-cover",
+        ".cover-plugin-preview .default.row",
+        ".cover-plugin-preview .cover",
+        ".cover-plugin-preview [class*='cover']",
+        ".cover-plugin-preview",
+    )
+    visible_total = 0
+    attempts = max(1, max_wait_ms // max(1, poll_interval_ms) + 1)
+    for attempt in range(attempts):
+        for selector in selectors:
+            locator = page.locator(selector)
+            visible = []
+            for index in range(await locator.count()):
+                item = locator.nth(index)
+                try:
+                    # 封面卡片通常在标题/正文下方，尚未滚入视口；Playwright
+                    # 点击会自动滚动。这里要求 CSS 可见和唯一，不把“当前不在
+                    # 视口”误判为入口不存在。
+                    if await item.is_visible():
+                        visible.append(item)
+                except Exception:
+                    continue
+            visible_total = max(visible_total, len(visible))
+            if len(visible) == 1:
+                return visible[0]
+        if attempt < attempts - 1:
+            await page.wait_for_timeout(poll_interval_ms)
+    error_code = (
+        "xhs_cover_trigger_missing"
+        if visible_total == 0
+        else "xhs_cover_trigger_ambiguous"
+    )
+    raise XhsNativeAdapterError(
+        "小红书视频封面入口无法唯一识别，"
+        f"可见候选={visible_total}（错误码 {error_code}）"
+    )
+
+
 class XhsNativeAdapter:
     """一键发自有的小红书图文/视频执行适配器。"""
 
@@ -424,12 +475,9 @@ class XhsNativeAdapter:
         if self.content_type != "video" or not cover_path:
             return False
 
-        # 页面标题和真正的可点击卡片都显示“设置封面”，不能按纯文字
-        # 匹配。真实交互入口是封面预览区内的 upload-cover 卡片。
-        trigger = await _first_visible(
-            page.locator(".cover-plugin-preview .upload-cover"),
-            "视频封面入口",
-        )
+        # 平台在不同账号灰度中使用 upload-cover 或 default row；按优先级
+        # 逐个查找，仍然要求最终只有一个可见卡片。
+        trigger = await _find_video_cover_trigger(page)
         await trigger.click(timeout=5_000)
 
         modal_candidates = page.locator(
@@ -785,21 +833,34 @@ class XhsNativeAdapter:
     async def _set_exact_declaration(
         self,
         page,
-        label: str,
+        label: str | tuple[str, ...],
         expected: bool,
     ) -> None:
         if not expected:
             return
-        trigger = await _first_visible(
-            page.get_by_text(label, exact=True),
-            f"声明控件“{label}”",
-        )
+        labels = (label,) if isinstance(label, str) else tuple(label)
+        matches = []
+        for candidate_label in labels:
+            candidates = page.get_by_text(candidate_label, exact=True)
+            for index in range(await candidates.count()):
+                item = candidates.nth(index)
+                try:
+                    if await item.is_visible() and await _is_actual_viewport_visible(item):
+                        matches.append((candidate_label, item))
+                except Exception:
+                    continue
+        if len(matches) != 1:
+            raise XhsNativeAdapterError(
+                "小红书声明控件无法唯一识别："
+                f"候选标签={'/'.join(labels)}，可见候选={len(matches)}"
+            )
+        actual_label, trigger = matches[0]
         await trigger.click(timeout=5_000)
         await page.wait_for_timeout(400)
-        if label not in _normalized(
+        if actual_label not in _normalized(
             await page.locator("body").inner_text(timeout=3_000)
         ):
-            raise XhsNativeAdapterError(f"小红书声明回读失败：{label}")
+            raise XhsNativeAdapterError(f"小红书声明回读失败：{actual_label}")
 
     async def set_declarations(self, page) -> None:
         if self.contract["aiDeclaration"]:
@@ -808,7 +869,7 @@ class XhsNativeAdapter:
                 "AI 声明入口",
             )
             await trigger.click(timeout=5_000)
-            await self._set_exact_declaration(page, _AI_LABEL, True)
+            await self._set_exact_declaration(page, _AI_LABELS, True)
         await self._set_exact_declaration(
             page,
             "原创声明",

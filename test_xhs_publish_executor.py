@@ -15,10 +15,91 @@ from app_core.xhs_publish_executor import (
 )
 from app_core.publish_service import _validate_payloads
 from app_core.xhs_native_adapter import (
+    _AI_LABELS,
     XhsNativeAdapterError,
+    _find_video_cover_trigger,
     _topic_candidate_matches,
     build_native_contract,
 )
+
+
+class _CoverItem:
+    async def evaluate(self, _script):
+        return True
+
+    async def is_visible(self):
+        return True
+
+
+class _CoverLocator:
+    def __init__(self, count):
+        self.items = [_CoverItem() for _ in range(count)]
+
+    async def count(self):
+        return len(self.items)
+
+    def nth(self, index):
+        return self.items[index]
+
+
+class _CoverPage:
+    def __init__(self, counts):
+        self.counts = counts
+        self.seen = []
+
+    def locator(self, selector):
+        self.seen.append(selector)
+        value = self.counts.get(selector, 0)
+        if isinstance(value, list):
+            count = value.pop(0) if value else 0
+        else:
+            count = value
+        return _CoverLocator(count)
+
+    async def wait_for_timeout(self, _milliseconds):
+        return None
+
+
+class XhsCoverTriggerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_falls_back_to_current_default_row_cover_card(self):
+        page = _CoverPage(
+            {
+                ".cover-plugin-preview .upload-cover": 0,
+                ".cover-plugin-preview .default.row": 1,
+            }
+        )
+        trigger = await _find_video_cover_trigger(page)
+        self.assertIsInstance(trigger, _CoverItem)
+        self.assertEqual(
+            page.seen[:2],
+            [
+                ".cover-plugin-preview .upload-cover",
+                ".cover-plugin-preview .default.row",
+            ],
+        )
+
+    async def test_waits_for_cover_card_after_video_processing(self):
+        page = _CoverPage(
+            {
+                ".cover-plugin-preview .upload-cover": [0, 0],
+                ".cover-plugin-preview .default.row": [0, 1],
+            }
+        )
+        trigger = await _find_video_cover_trigger(
+            page,
+            max_wait_ms=1000,
+            poll_interval_ms=1,
+        )
+        self.assertIsInstance(trigger, _CoverItem)
+
+    async def test_uses_unique_cover_preview_container_in_current_page(self):
+        page = _CoverPage({".cover-plugin-preview": 1})
+        trigger = await _find_video_cover_trigger(
+            page,
+            max_wait_ms=0,
+            poll_interval_ms=1,
+        )
+        self.assertIsInstance(trigger, _CoverItem)
 
 
 class XhsPublishExecutorTests(unittest.TestCase):
@@ -212,6 +293,9 @@ class XhsPublishExecutorTests(unittest.TestCase):
             )
         )
         self.assertFalse(_topic_candidate_matches("#AI工具箱", "AI工具"))
+
+    def test_current_ai_declaration_label_is_supported(self):
+        self.assertIn("笔记含AI合成内容", _AI_LABELS)
 
     def test_article_cover_is_first_image_without_duplication(self):
         second_image = Path(self.temporary.name) / "second.jpg"

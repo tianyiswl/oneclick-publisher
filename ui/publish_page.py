@@ -78,6 +78,46 @@ from .common import ROOT_DIR, button
 from .background_task import BackgroundTaskRunner
 from .login_dialog import LoginDialog
 from .media_context_menu import build_media_context_menu
+
+
+def _preflight_action_copy(payloads: list[dict]) -> dict[str, object]:
+    """根据任务真实平台生成下一步文案，国内任务绝不出现海外字样。"""
+
+    overseas_payloads = [
+        payload
+        for payload in payloads
+        if isinstance(payload, dict)
+        and int(payload.get("type", 0) or 0) in account_service.OVERSEAS_PLATFORM_TYPES
+    ]
+    unsupported_overseas = [
+        payload
+        for payload in overseas_payloads
+        if int(payload.get("type", 0) or 0) not in {6, 7, 8, 9}
+    ]
+    if unsupported_overseas:
+        return {
+            "formalReady": False,
+            "buttonText": "我已了解",
+            "actionHint": "所选海外平台尚未全部接入受控正式发布。",
+        }
+    if not overseas_payloads:
+        return {
+            "formalReady": True,
+            "buttonText": "继续正式发布",
+            "actionHint": "继续正式发布：使用同一配置重新上传并回读平台结果。",
+        }
+    meta_only = all(int(payload.get("type") or 0) in {8, 9} for payload in overseas_payloads)
+    if meta_only:
+        return {
+            "formalReady": True,
+            "buttonText": "继续 Meta 确认式发布",
+            "actionHint": "继续 Meta 确认式发布：将再显示一次独立确认，并在可见浏览器中执行。",
+        }
+    return {
+        "formalReady": True,
+        "buttonText": "继续海外平台正式发布",
+        "actionHint": "继续海外平台正式发布：使用同一配置重新上传，在可见浏览器中执行并回读结果。",
+    }
 from .platform_open import open_path, reveal_in_folder
 from .timer_dialog import TimerDialog
 from .topic_tag_editor import TopicTagEditor
@@ -5024,9 +5064,11 @@ class PublishPage(QWidget):
             if row.get("platformName") in preferred_platforms
             and oneclick_capabilities.supports(str(row.get("platformName") or ""), expected_type)
         }
-        self.common_title_input.setText(bundle["title"])
-        self.title_input.setPlainText(bundle["body"])
-        self.tags_input.setPlainText("\n".join(f"#{tag}" for tag in bundle["tags"]))
+        self.common_title_input.setText(bundle.get("commonTitle", bundle["title"]))
+        self.title_input.setPlainText(bundle.get("commonBody", bundle["body"]))
+        self.tags_input.setPlainText(
+            "\n".join(f"#{tag}" for tag in bundle.get("commonTags", bundle["tags"]))
+        )
         for platform_type in self.platform_titles:
             self.platform_titles[platform_type].clear()
             self.platform_texts[platform_type].clear()
@@ -5202,34 +5244,8 @@ class PublishPage(QWidget):
             payloads = json.loads(task.get("payloadJson") or "[]")
         except json.JSONDecodeError:
             payloads = []
-        contains_overseas = any(
-            int(payload.get("type", 0) or 0) in account_service.OVERSEAS_PLATFORM_TYPES
-            for payload in payloads
-            if isinstance(payload, dict)
-        )
-        overseas_payloads = [
-            payload
-            for payload in payloads
-            if isinstance(payload, dict)
-            and int(payload.get("type", 0) or 0)
-            in account_service.OVERSEAS_PLATFORM_TYPES
-        ]
-        browser_meta = [
-            payload
-            for payload in overseas_payloads
-            if int(payload.get("type") or 0) in {8, 9}
-        ]
-        tiktok_youtube = [
-            payload
-            for payload in overseas_payloads
-            if int(payload.get("type") or 0) in {6, 7}
-        ]
-        formal_overseas_ready = bool(overseas_payloads) and (
-            len(browser_meta) + len(tiktok_youtube) == len(overseas_payloads)
-        )
-        meta_browser_ready = bool(browser_meta) and (
-            len(browser_meta) == len(overseas_payloads)
-        )
+        copy = _preflight_action_copy(payloads)
+        formal_overseas_ready = bool(copy["formalReady"])
         box = QMessageBox(self)
         box.setWindowTitle("预发布检查完成")
         box.setIcon(QMessageBox.Icon.Information)
@@ -5239,7 +5255,7 @@ class PublishPage(QWidget):
             if self.active_task_background_mode
             else "前台检查会话已经结束；本次结果不是可恢复的平台草稿。"
         )
-        if contains_overseas and not formal_overseas_ready:
+        if not formal_overseas_ready:
             box.setInformativeText(
                 f"{self._finish_message(task, status_text)}\n\n"
                 "所选海外平台尚未全部接入受控正式发布。\n"
@@ -5249,24 +5265,14 @@ class PublishPage(QWidget):
             box.setDefaultButton(manual_btn)
             box.exec()
             return "manual"
-        action_hint = (
-            "继续 Meta 确认式发布：将再显示一次独立确认，"
-            "并在可见浏览器中执行。\n"
-            if meta_browser_ready
-            else "继续海外平台正式发布：使用同一配置重新上传，在可见浏览器中执行并回读结果。\n"
-        )
+        action_hint = str(copy["actionHint"]) + "\n"
         box.setInformativeText(
             f"{self._finish_message(task, status_text)}\n\n"
             f"{session_note}\n\n"
             f"请选择下一步操作：\n{action_hint}"
             "暂不发布：只保留本次预检结果。"
         )
-        formal_btn = box.addButton(
-            "继续 Meta 确认式发布"
-            if meta_browser_ready
-            else "继续海外平台正式发布",
-            QMessageBox.ButtonRole.AcceptRole,
-        )
+        formal_btn = box.addButton(str(copy["buttonText"]), QMessageBox.ButtonRole.AcceptRole)
         manual_btn = box.addButton("暂不发布", QMessageBox.ButtonRole.DestructiveRole)
         box.setDefaultButton(formal_btn)
         box.exec()

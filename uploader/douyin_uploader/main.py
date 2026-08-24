@@ -8,6 +8,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from playwright.async_api import Playwright, async_playwright, Page
 import os
+import sys
 import asyncio
 from PIL import Image
 
@@ -469,7 +470,7 @@ class DouYinVideo(object):
         for attempt in range(1, 4):
             await editor.fill("")
             await editor.click(force=True)
-            await page.keyboard.press("Control+A")
+            await page.keyboard.press("Meta+A" if sys.platform == "darwin" else "Control+A")
             await page.keyboard.press("Backspace")
             await page.wait_for_timeout(250)
 
