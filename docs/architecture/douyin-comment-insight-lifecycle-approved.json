@@ -1,0 +1,136 @@
+{
+  "schema_version": 1,
+  "diagram_type": "lifecycle",
+  "meta": {
+    "title": "抖音评论洞察运行状态",
+    "output": "docs/architecture/douyin-comment-insight-lifecycle-approved.html",
+    "viewBox": [1360, 760],
+    "animation": "none",
+    "quality_profile": "showcase"
+  },
+  "lanes": [
+    {"id": "main", "label": "人工同步主状态"},
+    {"id": "recovery", "label": "失败与人工恢复"},
+    {"id": "terminal", "label": "可用结果"}
+  ],
+  "states": [
+    {
+      "id": "idle",
+      "type": "start",
+      "label": "等待选择作品",
+      "sublabel": "无后台自动拉取",
+      "lane": "main",
+      "col": 0,
+      "step": "01",
+      "tag": "idle"
+    },
+    {
+      "id": "collecting",
+      "type": "active",
+      "label": "同步最新评论",
+      "sublabel": "短生命周期只读会话",
+      "lane": "main",
+      "col": 1,
+      "step": "02",
+      "tag": "running"
+    },
+    {
+      "id": "persisting",
+      "type": "decision",
+      "label": "校验并保存",
+      "sublabel": "匿名、去重、原子写入",
+      "lane": "main",
+      "col": 2,
+      "step": "03",
+      "tag": "comments saved"
+    },
+    {
+      "id": "analyzing",
+      "type": "active",
+      "label": "生成评论洞察",
+      "sublabel": "AI分类与证据引用校验",
+      "lane": "main",
+      "col": 3,
+      "step": "04",
+      "tag": "optional AI"
+    },
+    {
+      "id": "insight-ready",
+      "type": "success",
+      "label": "洞察可查看",
+      "sublabel": "原评论证据完整",
+      "lane": "main",
+      "col": 4,
+      "step": "05",
+      "tag": "ready"
+    },
+    {
+      "id": "sync-failed",
+      "type": "failure",
+      "label": "平台同步未完成",
+      "sublabel": "登录、验证或读取失败",
+      "lane": "recovery",
+      "col": 0,
+      "tag": "retryable"
+    },
+    {
+      "id": "ai-failed",
+      "type": "failure",
+      "label": "AI洞察未生成",
+      "sublabel": "未配置、超时或证据不符",
+      "lane": "recovery",
+      "col": 1,
+      "tag": "comments preserved"
+    },
+    {
+      "id": "comments-ready",
+      "type": "success",
+      "label": "评论可查看",
+      "sublabel": "没有AI也不影响同步结果",
+      "lane": "terminal",
+      "col": 2,
+      "tag": "read-only"
+    }
+  ],
+  "transitions": [
+    {
+      "id": "collect-failure",
+      "from": "collecting",
+      "to": "sync-failed",
+      "variant": "security",
+      "route": "drop"
+    },
+    {
+      "id": "retry-sync",
+      "from": "sync-failed",
+      "to": "collecting",
+      "label": "处理后人工重试",
+      "variant": "dashed",
+      "route": "bottom-channel"
+    },
+    {
+      "id": "analysis-failure",
+      "from": "analyzing",
+      "to": "ai-failed",
+      "variant": "security",
+      "route": "straight",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "retry-ai",
+      "from": "ai-failed",
+      "to": "analyzing",
+      "label": "人工重试AI",
+      "variant": "dashed",
+      "route": "bottom-channel"
+    },
+    {
+      "id": "degrade-to-comments",
+      "from": "ai-failed",
+      "to": "comments-ready",
+      "variant": "emphasis",
+      "route": "drop"
+    }
+  ]
+}

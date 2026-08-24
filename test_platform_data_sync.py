@@ -170,6 +170,27 @@ class FakeCollector:
         return self.browser_result
 
 
+class CompletingCollector(FakeCollector):
+    def __init__(self, direct_result: CollectionBatch, completed: CollectionBatch) -> None:
+        super().__init__(direct_result)
+        self.completed = completed
+        self.completion_calls: list[tuple[dict, CollectionBatch, object]] = []
+        self.comment_calls = 0
+
+    def complete_content_data(
+        self,
+        account: dict,
+        account_batch: CollectionBatch,
+        report=None,
+    ) -> CollectionBatch:
+        self.completion_calls.append((account, account_batch, report))
+        return self.completed
+
+    def collect_comments(self, *_args, **_kwargs):
+        self.comment_calls += 1
+        raise AssertionError("ordinary sync must never collect comment bodies")
+
+
 class DetailedXhsCollector(FakeCollector):
     def __init__(self, outcome: XiaohongshuCollectionOutcome) -> None:
         super().__init__(
@@ -292,6 +313,139 @@ class PlatformDataSyncTests(unittest.TestCase):
                 {"stage": "completed", "message": "数据同步完成"},
             ],
         )
+
+    def test_douyin_account_batch_uses_only_explicit_content_completion_hook(
+        self,
+    ) -> None:
+        """普通同步只能调用显式作品补全钩子，不能顺手读取评论正文。"""
+
+        account_batch = account_only_batch("direct_session")
+        completed_batch = valid_batch("browser_signed")
+        collector = CompletingCollector(account_batch, completed_batch)
+        progress: list[dict] = []
+        reporter = progress.append
+        with patch.object(
+            platform_data_sync.account_service,
+            "list_accounts",
+            return_value=[self.account],
+        ), patch.object(
+            platform_data_sync,
+            "collector_for_platform",
+            return_value=collector,
+        ), patch.object(
+            platform_data_sync.platform_data_service,
+            "record_collection_sync",
+            return_value={
+                "accountId": 12,
+                "status": "success",
+                "sourceMode": "browser_signed",
+                "errorCode": "",
+                "metricCount": 2,
+            },
+        ) as record_collection:
+            result = platform_data_sync.sync_account_data(
+                12, report=reporter
+            )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["sourceMode"], "browser_signed")
+        self.assertEqual(result["contentCount"], 1)
+        self.assertEqual(collector.direct_calls, 1)
+        self.assertEqual(collector.browser_calls, 0)
+        self.assertEqual(collector.comment_calls, 0)
+        self.assertEqual(len(collector.completion_calls), 1)
+        completed_account, original_batch, completion_report = (
+            collector.completion_calls[0]
+        )
+        self.assertEqual(completed_account, self.account)
+        self.assertIs(original_batch, account_batch)
+        self.assertIs(completion_report, reporter)
+        self.assertIs(record_collection.call_args.args[1], completed_batch)
+
+    def test_content_completion_hook_is_not_called_for_an_available_batch(
+        self,
+    ) -> None:
+        """已有作品的批次再打开短会话，会造成额外请求与数据覆盖。"""
+
+        batch = valid_batch("direct_session")
+        collector = CompletingCollector(batch, valid_batch("browser_signed"))
+        with patch.object(
+            platform_data_sync.account_service,
+            "list_accounts",
+            return_value=[self.account],
+        ), patch.object(
+            platform_data_sync,
+            "collector_for_platform",
+            return_value=collector,
+        ), patch.object(
+            platform_data_sync.platform_data_service,
+            "record_collection_sync",
+            return_value={
+                "accountId": 12,
+                "status": "success",
+                "sourceMode": "direct_session",
+                "errorCode": "",
+                "metricCount": 2,
+            },
+        ) as record_collection:
+            result = platform_data_sync.sync_account_data(12)
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(collector.completion_calls, [])
+        self.assertIs(record_collection.call_args.args[1], batch)
+
+    def test_content_completion_hook_is_douyin_only(self) -> None:
+        """平台类型门禁缺失会让其他平台误调拒绝的抖音补全钩子。"""
+
+        account = xhs_account()
+        account_batch = CollectionBatch(
+            platform_type=1,
+            source_mode="direct_session",
+            metrics=(
+                MetricPoint(
+                    entity_type="account",
+                    entity_key="account:21",
+                    metric_key="followers_total",
+                    raw_metric_key="fans_count",
+                    metric_value=125,
+                    metric_unit="count",
+                    metric_scope="lifetime_total",
+                    period_start="2026-08-20",
+                    period_end="2026-08-20",
+                    observed_at="2026-08-20T12:00:00+08:00",
+                ),
+            ),
+            contents=(),
+            account_metrics_available=True,
+            content_data_available=False,
+            platform_observed_at="2026-08-20T12:00:00+08:00",
+            warning_code="content_list_unavailable",
+        )
+        collector = CompletingCollector(account_batch, xhs_collection_batch())
+        with patch.object(
+            platform_data_sync.account_service,
+            "list_accounts",
+            return_value=[account],
+        ), patch.object(
+            platform_data_sync,
+            "collector_for_platform",
+            return_value=collector,
+        ), patch.object(
+            platform_data_sync.platform_data_service,
+            "record_collection_sync",
+            return_value={
+                "accountId": 21,
+                "status": "partial_success",
+                "sourceMode": "direct_session",
+                "errorCode": "content_list_unavailable",
+                "metricCount": 1,
+            },
+        ) as record_collection:
+            result = platform_data_sync.sync_account_data(21)
+
+        self.assertEqual(result["status"], "partial_success")
+        self.assertEqual(collector.completion_calls, [])
+        self.assertIs(record_collection.call_args.args[1], account_batch)
 
     def test_registry_syncs_a_collect_only_domestic_browser_collector(self) -> None:
         """统一注册表采集器只有 collect 时，同步编排也必须可持久化其批次。"""

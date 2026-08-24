@@ -1,0 +1,194 @@
+{
+  "schema_version": 1,
+  "diagram_type": "dataflow",
+  "meta": {
+    "title": "抖音评论洞察最小闭环",
+    "output": "docs/architecture/douyin-comment-insight-dataflow-approved.html",
+    "viewBox": [1540, 860],
+    "animation": "none",
+    "quality_profile": "showcase"
+  },
+  "stages": [
+    {"label": "人工触发"},
+    {"label": "平台只读"},
+    {"label": "校验与编排"},
+    {"label": "本地证据与AI"},
+    {"label": "洞察展示"}
+  ],
+  "nodes": [
+    {
+      "id": "selection-ui",
+      "type": "frontend",
+      "label": "作品选择与同步",
+      "sublabel": "数据监测页",
+      "stage": 0,
+      "row": 1,
+      "tag": "人工触发"
+    },
+    {
+      "id": "comment-collector",
+      "type": "backend",
+      "label": "抖音评论采集器",
+      "sublabel": "短生命周期登录会话",
+      "stage": 1,
+      "row": 1,
+      "tag": "只读"
+    },
+    {
+      "id": "douyin-official",
+      "type": "external",
+      "label": "抖音创作者后台",
+      "sublabel": "官方作品与评论响应",
+      "stage": 1,
+      "row": 4,
+      "tag": "外部平台"
+    },
+    {
+      "id": "contract-guard",
+      "type": "security",
+      "label": "合同与匿名校验",
+      "sublabel": "白名单字段与去身份",
+      "stage": 2,
+      "row": 1,
+      "tag": "无用户身份"
+    },
+    {
+      "id": "sync-orchestrator",
+      "type": "backend",
+      "label": "评论同步编排器",
+      "sublabel": "分页、去重、更新",
+      "stage": 2,
+      "row": 3,
+      "tag": "可重试"
+    },
+    {
+      "id": "comment-store",
+      "type": "database",
+      "label": "评论证据库",
+      "sublabel": "SQLite 原子保存",
+      "stage": 3,
+      "row": 0,
+      "tag": "本机"
+    },
+    {
+      "id": "ai-adapter",
+      "type": "backend",
+      "label": "AI兼容适配器",
+      "sublabel": "结构化请求与结果",
+      "stage": 3,
+      "row": 2,
+      "tag": "可配置"
+    },
+    {
+      "id": "external-ai",
+      "type": "external",
+      "label": "用户配置的AI服务",
+      "sublabel": "OpenAI兼容接口",
+      "stage": 3,
+      "row": 4,
+      "tag": "外部服务"
+    },
+    {
+      "id": "evidence-validator",
+      "type": "security",
+      "label": "原评论证据校验",
+      "sublabel": "拒绝虚构引用",
+      "stage": 4,
+      "row": 1,
+      "tag": "失败即丢弃洞察"
+    },
+    {
+      "id": "insight-ui",
+      "type": "frontend",
+      "label": "分类与选题候选",
+      "sublabel": "原评论可回看",
+      "stage": 4,
+      "row": 2,
+      "tag": "Andy最终决定"
+    }
+  ],
+  "flows": [
+    {
+      "id": "select-content",
+      "from": "selection-ui",
+      "to": "comment-collector",
+      "label": "作品ID与人工同步",
+      "classification": "用户动作",
+      "variant": "emphasis",
+      "route": "straight"
+    },
+    {
+      "id": "official-response",
+      "from": "douyin-official",
+      "to": "comment-collector",
+      "label": "作品与最新评论JSON",
+      "classification": "官方响应",
+      "variant": "default"
+    },
+    {
+      "id": "controlled-fields",
+      "from": "comment-collector",
+      "to": "contract-guard",
+      "label": "受控评论字段",
+      "classification": "正文、计数、时间",
+      "variant": "security",
+      "route": "straight"
+    },
+    {
+      "id": "anonymous-batch",
+      "from": "contract-guard",
+      "to": "sync-orchestrator",
+      "label": "匿名评论批次",
+      "classification": "不含头像昵称用户ID",
+      "variant": "emphasis"
+    },
+    {
+      "id": "atomic-persist",
+      "from": "sync-orchestrator",
+      "to": "comment-store",
+      "label": "原子去重与更新",
+      "classification": "评论证据",
+      "variant": "emphasis"
+    },
+    {
+      "id": "ai-input",
+      "from": "comment-store",
+      "to": "ai-adapter",
+      "label": "作品标题与评论正文",
+      "classification": "无身份文本",
+      "variant": "security"
+    },
+    {
+      "id": "model-request",
+      "from": "ai-adapter",
+      "to": "external-ai",
+      "label": "结构化分类请求",
+      "classification": "用户已授权",
+      "variant": "security"
+    },
+    {
+      "id": "validate-insight",
+      "from": "ai-adapter",
+      "to": "evidence-validator",
+      "label": "受控洞察结构",
+      "classification": "最多五个候选",
+      "variant": "security"
+    },
+    {
+      "id": "evidence-read",
+      "from": "comment-store",
+      "to": "evidence-validator",
+      "label": "真实评论键与原文",
+      "classification": "本地证据",
+      "variant": "default"
+    },
+    {
+      "id": "validated-insight",
+      "from": "evidence-validator",
+      "to": "insight-ui",
+      "label": "通过校验的洞察",
+      "classification": "证据可回看",
+      "variant": "emphasis"
+    }
+  ]
+}

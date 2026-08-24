@@ -5,10 +5,16 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
+from dataclasses import dataclass, field
 from datetime import datetime
+import inspect
 import json
 import math
 from pathlib import Path
+import queue
+import re
+import threading
+import time
 from typing import Callable
 from urllib.parse import urlparse
 
@@ -16,7 +22,18 @@ import requests
 
 from .paths import COOKIE_DIR
 from .platform_data_collection_errors import PlatformDataCollectionError
-from .platform_data_models import CollectionBatch, MetricPoint
+from .platform_data_comment_contract import (
+    DouyinCommentContract,
+    load_verified_contract,
+)
+from .platform_data_comment_models import CommentInsightFailure
+from .platform_data_models import (
+    ALLOWED_CONTENT_STATUSES,
+    ALLOWED_CONTENT_TYPES,
+    CollectionBatch,
+    ContentRecord,
+    MetricPoint,
+)
 
 
 DOUYIN_DASHBOARD_URL = (
@@ -32,6 +49,38 @@ _BROWSER_RESPONSE_PATHS = frozenset(
 _CONTENT_LIST_UNAVAILABLE_WARNING = "content_list_unavailable"
 _REQUEST_TIMEOUT_SECONDS = 20.0
 _BROWSER_TIMEOUT_SECONDS = 30.0
+_CONTENT_RESPONSE_LIMIT = 50
+_MAX_CONTENT_CURSORS = 50
+_MAX_QUEUED_CONTENT_RESPONSES = 8
+_MAX_RUNTIME_RESPONSE_URL_LENGTH = 8_192
+_MAX_RESPONSE_METHOD_LENGTH = 16
+_MAX_HEADER_ITEMS = 64
+_MAX_HEADER_NAME_LENGTH = 128
+_MAX_CONTENT_TYPE_LENGTH = 256
+_MAX_CHARSET_LENGTH = 64
+_MAX_CONTENT_RESPONSE_BYTES = 1024 * 1024
+_MAX_CONTENT_TOTAL_BYTES = 4 * 1024 * 1024
+_MAX_CONTENT_RAW_ROWS = 256
+_MAX_CONTENT_CONTAINER_KEYS = 64
+_MAX_CONTENT_CONTRACT_FIELD_LENGTH = 512
+_MAX_CONTENT_ID_LENGTH = 512
+_MAX_CONTENT_TITLE_LENGTH = 4_096
+_MAX_CONTENT_COVER_LENGTH = 8_192
+_MAX_CONTENT_TIME_LENGTH = 128
+_MAX_CONTENT_ENUM_LENGTH = 64
+_MAX_CONTENT_CURSOR_LENGTH = 2_048
+_MAX_CUMULATIVE_CONTENTS = 500
+_MAX_CUMULATIVE_CONTENT_METRICS = 1_500
+_CONTENT_METRIC_KEYS = frozenset({"views", "likes", "comments", "shares"})
+_JSON_MEDIA_TYPE_RE = re.compile(
+    r"^application/(?:json|[a-z0-9][a-z0-9!#$&^_.-]*\+json)$"
+)
+_HTTP_TOKEN_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+_MISSING = object()
+_CONTENT_PROJECTION_LOCK = threading.Lock()
+_CONTENT_PROJECTION_QUEUE: queue.Queue = queue.Queue(maxsize=1)
+_CONTENT_PROJECTION_WORKER: threading.Thread | None = None
+_CONTENT_PROJECTION_BUSY = False
 _RAW_METRIC_MAP = {
     "play": "views",
     "play_cnt": "views",
@@ -59,6 +108,30 @@ class DouyinDataCollectionError(PlatformDataCollectionError):
             fallback_allowed=fallback_allowed,
             retryable=fallback_allowed,
         )
+
+
+class _ContentDeadlineExceeded(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class _ContentProjectionOutcome:
+    contents: tuple[ContentRecord, ...] = ()
+    points: tuple[MetricPoint, ...] = ()
+    cursor: str = ""
+    error_code: str = ""
+    control_kind: str = ""
+
+
+@dataclass(slots=True)
+class _ContentProjectionJob:
+    raw_body: bytes | None
+    contract: DouyinCommentContract
+    account_id: int
+    observed_at: str
+    deadline: float
+    completed: threading.Event = field(default_factory=threading.Event)
+    outcome: _ContentProjectionOutcome | None = None
 
 
 def _is_douyin_cookie_domain(value: object) -> bool:
@@ -133,6 +206,624 @@ def _metric_number(value: object) -> int | float:
             "metric_payload_invalid", fallback_allowed=False
         )
     return value
+
+
+def _content_payload_invalid() -> None:
+    raise DouyinDataCollectionError(
+        "content_payload_invalid", fallback_allowed=False
+    )
+
+
+def _is_bounded_builtin_text(value: object, maximum: int) -> bool:
+    return type(value) is str and 0 < len(value) <= maximum
+
+
+def _content_response_contract_status(
+    response: object,
+    contract: DouyinCommentContract,
+) -> str:
+    raw_url = getattr(response, "url", None)
+    request = getattr(response, "request", None)
+    method = getattr(request, "method", None)
+    if (
+        not _is_bounded_builtin_text(
+            raw_url, _MAX_RUNTIME_RESPONSE_URL_LENGTH
+        )
+        or not _is_bounded_builtin_text(method, _MAX_RESPONSE_METHOD_LENGTH)
+    ):
+        return "invalid"
+    parsed = urlparse(raw_url)
+    if (
+        parsed.scheme == "https"
+        and parsed.netloc == contract.creator_host
+        and parsed.path == contract.content_response_path
+        and method == contract.content_response_method
+    ):
+        return "match"
+    return "ignore"
+
+
+def _quoted_header_value_status(value: str, deadline: float) -> str:
+    if len(value) < 3 or value[0] != '"' or value[-1] != '"':
+        return "invalid"
+    index = 1
+    end = len(value) - 1
+    while index < end:
+        if asyncio.get_running_loop().time() >= deadline:
+            return "timeout"
+        character = value[index]
+        if character == "\\":
+            index += 1
+            if index >= end:
+                return "invalid"
+            code_point = ord(value[index])
+            if not (
+                code_point == 9
+                or 32 <= code_point <= 126
+                or 128 <= code_point <= 255
+            ):
+                return "invalid"
+        else:
+            code_point = ord(character)
+            if not (
+                code_point == 9
+                or code_point == 32
+                or code_point == 33
+                or 35 <= code_point <= 91
+                or 93 <= code_point <= 126
+                or 128 <= code_point <= 255
+            ):
+                return "invalid"
+        index += 1
+    return "valid"
+
+
+def _content_type_value_status(value: object, deadline: float) -> str:
+    if (
+        type(value) is not str
+        or len(value) == 0
+        or len(value) > _MAX_CONTENT_TYPE_LENGTH
+    ):
+        return "invalid"
+    if asyncio.get_running_loop().time() >= deadline:
+        return "timeout"
+    separator_index = value.find(";")
+    if separator_index < 0:
+        media_type = value.strip(" \t").lower()
+        parameter = ""
+    else:
+        media_type = value[:separator_index].strip(" \t").lower()
+        parameter = value[separator_index + 1 :].strip(" \t")
+    if _JSON_MEDIA_TYPE_RE.fullmatch(media_type) is None:
+        return "invalid"
+    if separator_index < 0:
+        return "valid"
+    name, separator, charset = parameter.partition("=")
+    if (
+        separator != "="
+        or name.lower() != "charset"
+        or not charset
+        or len(charset) > _MAX_CHARSET_LENGTH
+        or _HTTP_TOKEN_RE.fullmatch(name) is None
+    ):
+        return "invalid"
+    if _HTTP_TOKEN_RE.fullmatch(charset) is not None:
+        return "valid"
+    return _quoted_header_value_status(charset, deadline)
+
+
+def _raw_headers_content_type_status(
+    raw_headers: object,
+    deadline: float,
+) -> str:
+    if type(raw_headers) is not list or len(raw_headers) > _MAX_HEADER_ITEMS:
+        return "invalid"
+    content_type: object = _MISSING
+    for entry in raw_headers:
+        if asyncio.get_running_loop().time() >= deadline:
+            return "timeout"
+        if type(entry) is not dict or len(entry) != 2:
+            return "invalid"
+        if "name" not in entry or "value" not in entry:
+            return "invalid"
+        name = entry["name"]
+        value = entry["value"]
+        if (
+            type(name) is not str
+            or len(name) > _MAX_HEADER_NAME_LENGTH
+            or type(value) is not str
+        ):
+            return "invalid"
+        if name.lower() != "content-type":
+            continue
+        if content_type is not _MISSING or len(value) > _MAX_CONTENT_TYPE_LENGTH:
+            return "invalid"
+        content_type = value
+    if content_type is _MISSING:
+        return "invalid"
+    return _content_type_value_status(content_type, deadline)
+
+
+async def _response_content_type_status(
+    response: object,
+    deadline: float,
+    await_operation: Callable,
+) -> str:
+    if asyncio.get_running_loop().time() >= deadline:
+        return "timeout"
+    reader = getattr(response, "headers_array", None)
+    if not callable(reader) or not inspect.iscoroutinefunction(reader):
+        return "invalid"
+    try:
+        raw_headers = await await_operation(reader())
+    except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+        raise
+    except TimeoutError:
+        return "timeout"
+    except BaseException:
+        return "invalid"
+    status = _raw_headers_content_type_status(raw_headers, deadline)
+    raw_headers = None
+    return status
+
+
+def _check_content_deadline(deadline: float | None) -> None:
+    if deadline is not None and time.monotonic() >= deadline:
+        raise _ContentDeadlineExceeded
+
+
+def _strict_path_value(
+    root: object,
+    path: object,
+    *,
+    deadline: float | None = None,
+) -> object:
+    if (
+        type(root) is not dict
+        or len(root) > _MAX_CONTENT_CONTAINER_KEYS
+        or not _is_bounded_builtin_text(
+            path, _MAX_CONTENT_CONTRACT_FIELD_LENGTH
+        )
+    ):
+        _content_payload_invalid()
+    value = root
+    for segment in path.split("."):
+        _check_content_deadline(deadline)
+        if (
+            not segment
+            or segment.endswith("[]")
+            or type(value) is not dict
+            or len(value) > _MAX_CONTENT_CONTAINER_KEYS
+        ):
+            _content_payload_invalid()
+        if segment not in value:
+            return _MISSING
+        value = value[segment]
+    return value
+
+
+def _content_rows(
+    payload: object,
+    list_field: object,
+    *,
+    deadline: float | None = None,
+) -> tuple[dict, ...]:
+    if (
+        not _is_bounded_builtin_text(
+            list_field, _MAX_CONTENT_CONTRACT_FIELD_LENGTH
+        )
+        or not list_field.endswith("[]")
+    ):
+        _content_payload_invalid()
+    value = _strict_path_value(
+        payload, list_field[:-2], deadline=deadline
+    )
+    if type(value) is not list or len(value) > _MAX_CONTENT_RAW_ROWS:
+        _content_payload_invalid()
+    if not all(
+        type(item) is dict and len(item) <= _MAX_CONTENT_CONTAINER_KEYS
+        for item in value
+    ):
+        _content_payload_invalid()
+    return tuple(value)
+
+
+def _row_field(
+    row: dict,
+    list_field: str,
+    field: object,
+    *,
+    deadline: float | None = None,
+) -> object:
+    prefix = f"{list_field}."
+    if (
+        not _is_bounded_builtin_text(
+            list_field, _MAX_CONTENT_CONTRACT_FIELD_LENGTH
+        )
+        or not _is_bounded_builtin_text(
+            field, _MAX_CONTENT_CONTRACT_FIELD_LENGTH
+        )
+        or not field.startswith(prefix)
+    ):
+        _content_payload_invalid()
+    relative_path = field[len(prefix) :]
+    return _strict_path_value(row, relative_path, deadline=deadline)
+
+
+def _stable_content_id(value: object) -> str:
+    if (
+        type(value) is not str
+        or not value
+        or len(value) > _MAX_CONTENT_ID_LENGTH
+        or value != value.strip()
+    ):
+        _content_payload_invalid()
+    return value
+
+
+def _optional_controlled_text(value: object, maximum: int) -> str:
+    if value is _MISSING or value is None:
+        return ""
+    if (
+        type(value) is not str
+        or len(value) > maximum
+        or value != value.strip()
+    ):
+        if type(value) is str and len(value) > maximum:
+            _content_payload_invalid()
+        return ""
+    return value
+
+
+def _observed_day(observed_at: object) -> str:
+    if (
+        type(observed_at) is not str
+        or len(observed_at) > _MAX_CONTENT_TIME_LENGTH
+        or observed_at != observed_at.strip()
+    ):
+        _content_payload_invalid()
+    try:
+        parsed = datetime.fromisoformat(observed_at)
+    except ValueError:
+        _content_payload_invalid()
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        _content_payload_invalid()
+    return parsed.date().isoformat()
+
+
+def parse_verified_content_payload(
+    contract: DouyinCommentContract,
+    payload: object,
+    account_id: int,
+    observed_at: str,
+    *,
+    deadline: float | None = None,
+) -> tuple[tuple[ContentRecord, ...], tuple[MetricPoint, ...], str]:
+    """只按已验证合同把一页作品 JSON 投影为公开模型。"""
+
+    if (
+        type(contract) is not DouyinCommentContract
+        or contract.verified is not True
+        or type(account_id) is not int
+        or account_id <= 0
+        or type(payload) is not dict
+    ):
+        _content_payload_invalid()
+    _check_content_deadline(deadline)
+    observed_day = _observed_day(observed_at)
+    rows = _content_rows(
+        payload, contract.content_list_field, deadline=deadline
+    )
+    has_more = _strict_path_value(
+        payload, contract.content_has_more_field, deadline=deadline
+    )
+    if type(has_more) is not bool:
+        _content_payload_invalid()
+    raw_cursor = _strict_path_value(
+        payload, contract.content_cursor_field, deadline=deadline
+    )
+    if has_more:
+        if (
+            type(raw_cursor) is not str
+            or not raw_cursor
+            or len(raw_cursor) > _MAX_CONTENT_CURSOR_LENGTH
+            or raw_cursor != raw_cursor.strip()
+        ):
+            _content_payload_invalid()
+        cursor = raw_cursor
+    else:
+        cursor = ""
+
+    records: dict[
+        str, tuple[ContentRecord, tuple[MetricPoint, ...]]
+    ] = {}
+    for row in rows:
+        _check_content_deadline(deadline)
+        content_id = _stable_content_id(
+            _row_field(
+                row,
+                contract.content_list_field,
+                contract.content_id_field,
+                deadline=deadline,
+            )
+        )
+        title = _optional_controlled_text(
+            _row_field(
+                row,
+                contract.content_list_field,
+                contract.content_title_field,
+                deadline=deadline,
+            ),
+            _MAX_CONTENT_TITLE_LENGTH,
+        )
+        cover_url = _optional_controlled_text(
+            _row_field(
+                row,
+                contract.content_list_field,
+                contract.content_cover_field,
+                deadline=deadline,
+            ),
+            _MAX_CONTENT_COVER_LENGTH,
+        )
+        published_at = _optional_controlled_text(
+            _row_field(
+                row,
+                contract.content_list_field,
+                contract.content_published_at_field,
+                deadline=deadline,
+            ),
+            _MAX_CONTENT_TIME_LENGTH,
+        )
+        raw_status = _row_field(
+            row,
+            contract.content_list_field,
+            contract.content_status_field,
+            deadline=deadline,
+        )
+        if type(raw_status) is str and len(raw_status) > _MAX_CONTENT_ENUM_LENGTH:
+            _content_payload_invalid()
+        content_status = (
+            raw_status
+            if type(raw_status) is str
+            and raw_status in ALLOWED_CONTENT_STATUSES
+            and raw_status != "unavailable"
+            else "unavailable"
+        )
+        if not title or not cover_url or not published_at:
+            content_status = "unavailable"
+        raw_type = _row_field(
+            row,
+            contract.content_list_field,
+            contract.content_type_field,
+            deadline=deadline,
+        )
+        if type(raw_type) is str and len(raw_type) > _MAX_CONTENT_ENUM_LENGTH:
+            _content_payload_invalid()
+        content_type = (
+            raw_type
+            if type(raw_type) is str and raw_type in ALLOWED_CONTENT_TYPES
+            else "unavailable"
+        )
+        content = ContentRecord(
+            content_id=content_id,
+            title=title,
+            cover_url=cover_url,
+            published_at=published_at,
+            content_status=content_status,
+            content_type=content_type,
+        )
+        points: list[MetricPoint] = []
+        if (
+            type(contract.content_metric_fields) is not tuple
+            or len(contract.content_metric_fields) > len(_CONTENT_METRIC_KEYS)
+        ):
+            _content_payload_invalid()
+        for metric_key, field in contract.content_metric_fields:
+            _check_content_deadline(deadline)
+            if metric_key not in _CONTENT_METRIC_KEYS:
+                _content_payload_invalid()
+            value = _row_field(
+                row,
+                contract.content_list_field,
+                field,
+                deadline=deadline,
+            )
+            if (
+                type(value) not in (int, float)
+                or not math.isfinite(float(value))
+            ):
+                continue
+            if value < 0:
+                _content_payload_invalid()
+            points.append(
+                MetricPoint(
+                    entity_type="content",
+                    entity_key=content_id,
+                    metric_key=metric_key,
+                    raw_metric_key=field,
+                    metric_value=value,
+                    metric_unit="count",
+                    metric_scope="lifetime_total",
+                    period_start=observed_day,
+                    period_end=observed_day,
+                    observed_at=observed_at,
+                )
+            )
+        if not points:
+            _content_payload_invalid()
+        candidate = (content, tuple(points))
+        existing = records.get(content_id)
+        if existing is not None:
+            if existing != candidate:
+                _content_payload_invalid()
+            continue
+        records[content_id] = candidate
+
+    _check_content_deadline(deadline)
+    contents = tuple(item[0] for item in records.values())
+    metrics = tuple(
+        point for _content, points in records.values() for point in points
+    )
+    return contents, metrics, cursor
+
+
+def _content_control_kind(value: BaseException) -> str:
+    if isinstance(value, KeyboardInterrupt):
+        return "keyboard_interrupt"
+    if isinstance(value, SystemExit):
+        return "system_exit"
+    return ""
+
+
+def _content_projection_worker_loop() -> None:
+    """单一投影 worker；每份任务最多持有一个受限 body。"""
+
+    global _CONTENT_PROJECTION_BUSY
+    while True:
+        job = _CONTENT_PROJECTION_QUEUE.get()
+        raw_body = job.raw_body
+        job.raw_body = None
+        outcome: _ContentProjectionOutcome
+        try:
+            if raw_body is None or time.monotonic() >= job.deadline:
+                raise _ContentDeadlineExceeded
+            payload = json.loads(raw_body)
+            raw_body = None
+            if time.monotonic() >= job.deadline:
+                raise _ContentDeadlineExceeded
+            contents, points, cursor = parse_verified_content_payload(
+                job.contract,
+                payload,
+                job.account_id,
+                job.observed_at,
+                deadline=job.deadline,
+            )
+            payload = None
+            if time.monotonic() >= job.deadline:
+                raise _ContentDeadlineExceeded
+            outcome = _ContentProjectionOutcome(
+                contents=contents,
+                points=points,
+                cursor=cursor,
+            )
+        except (KeyboardInterrupt, SystemExit) as exc:
+            outcome = _ContentProjectionOutcome(
+                control_kind=_content_control_kind(exc)
+            )
+        except _ContentDeadlineExceeded:
+            outcome = _ContentProjectionOutcome(
+                error_code="content_list_unavailable"
+            )
+        except DouyinDataCollectionError as exc:
+            outcome = _ContentProjectionOutcome(error_code=exc.error_code)
+        except BaseException:
+            outcome = _ContentProjectionOutcome(
+                error_code="content_payload_invalid"
+            )
+        raw_body = None
+        job.outcome = outcome
+        outcome = None
+        with _CONTENT_PROJECTION_LOCK:
+            _CONTENT_PROJECTION_BUSY = False
+        job.completed.set()
+        job = None
+
+
+def _start_content_projection_job(
+    raw_body: bytes,
+    contract: DouyinCommentContract,
+    account_id: int,
+    observed_at: str,
+    deadline: float,
+) -> tuple[_ContentProjectionJob | None, str]:
+    global _CONTENT_PROJECTION_BUSY, _CONTENT_PROJECTION_WORKER
+    job = _ContentProjectionJob(
+        raw_body=raw_body,
+        contract=contract,
+        account_id=account_id,
+        observed_at=observed_at,
+        deadline=deadline,
+    )
+    with _CONTENT_PROJECTION_LOCK:
+        if _CONTENT_PROJECTION_BUSY:
+            job.raw_body = None
+            return None, "busy"
+        worker = _CONTENT_PROJECTION_WORKER
+        if worker is None or not worker.is_alive():
+            worker = threading.Thread(
+                target=_content_projection_worker_loop,
+                name="douyin-content-projector",
+                daemon=True,
+            )
+            _CONTENT_PROJECTION_WORKER = worker
+            try:
+                worker.start()
+            except BaseException:
+                _CONTENT_PROJECTION_WORKER = None
+                job.raw_body = None
+                return None, "unavailable"
+        _CONTENT_PROJECTION_BUSY = True
+        try:
+            _CONTENT_PROJECTION_QUEUE.put_nowait(job)
+        except queue.Full:
+            _CONTENT_PROJECTION_BUSY = False
+            job.raw_body = None
+            return None, "unavailable"
+    return job, ""
+
+
+def _content_projection_worker_is_busy() -> bool:
+    with _CONTENT_PROJECTION_LOCK:
+        return _CONTENT_PROJECTION_BUSY
+
+
+async def _project_content_body_bounded(
+    raw_body: bytes,
+    contract: DouyinCommentContract,
+    account_id: int,
+    observed_at: str,
+    deadline: float,
+    own_job: Callable[[_ContentProjectionJob | None], None],
+) -> tuple[_ContentProjectionOutcome, _ContentProjectionJob | None, bool]:
+    job, start_error = _start_content_projection_job(
+        raw_body,
+        contract,
+        account_id,
+        observed_at,
+        deadline,
+    )
+    raw_body = b""
+    if start_error == "busy":
+        return (
+            _ContentProjectionOutcome(error_code="content_list_unavailable"),
+            None,
+            True,
+        )
+    if start_error or job is None:
+        return (
+            _ContentProjectionOutcome(error_code="content_payload_invalid"),
+            None,
+            False,
+        )
+    own_job(job)
+    while not job.completed.is_set():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return (
+                _ContentProjectionOutcome(
+                    error_code="content_list_unavailable"
+                ),
+                job,
+                False,
+            )
+        await asyncio.sleep(min(0.001, remaining))
+    outcome = job.outcome
+    own_job(None)
+    if outcome is None:
+        outcome = _ContentProjectionOutcome(
+            error_code="content_payload_invalid"
+        )
+    return outcome, None, False
 
 
 def _daily_point_identity(point: MetricPoint) -> tuple[str, str, str]:
@@ -223,10 +914,16 @@ class DouyinDataCollector:
         *,
         session_factory: Callable[[], object] = requests.Session,
         playwright_factory: Callable[[], object] = _default_playwright_factory,
+        contract_loader: Callable[[], DouyinCommentContract] = load_verified_contract,
         browser_timeout_seconds: float = _BROWSER_TIMEOUT_SECONDS,
     ) -> None:
         self._session_factory = session_factory
         self._playwright_factory = playwright_factory
+        if not callable(contract_loader):
+            raise DouyinDataCollectionError(
+                "metric_payload_invalid", fallback_allowed=False
+            )
+        self._contract_loader = contract_loader
         if type(browser_timeout_seconds) not in (int, float):
             raise DouyinDataCollectionError(
                 "metric_payload_invalid", fallback_allowed=False
@@ -637,6 +1334,657 @@ class DouyinDataCollector:
                 "metric_payload_empty", fallback_allowed=False
             )
         return result
+
+    async def _complete_content_data_async(
+        self,
+        account: dict,
+        account_batch: CollectionBatch,
+        contract: DouyinCommentContract,
+        report: Callable[[dict], None] | None,
+    ) -> CollectionBatch:
+        account_id, state_path = _required_account(account)
+        if (
+            type(account_batch) is not CollectionBatch
+            or account_batch.platform_type != 3
+            or account_batch.content_data_available
+            or any(
+                point.entity_type != "account"
+                or point.entity_key != f"account:{account_id}"
+                for point in account_batch.metrics
+            )
+            or type(contract) is not DouyinCommentContract
+            or contract.verified is not True
+            or contract.creator_host != "creator.douyin.com"
+            or "{content_id}" in contract.content_navigation_template
+        ):
+            _content_payload_invalid()
+
+        playwright = None
+        browser = None
+        context = None
+        page = None
+        worker: asyncio.Task | None = None
+        projection_job: _ContentProjectionJob | None = None
+        projection_blocked_by_worker = False
+        result: tuple[tuple[ContentRecord, ...], tuple[MetricPoint, ...]] | None = None
+        caught: BaseException | None = None
+        cleanup_errors: list[BaseException] = []
+        response_queue: asyncio.Queue[object] = asyncio.Queue(
+            maxsize=_MAX_QUEUED_CONTENT_RESPONSES
+        )
+        loop = asyncio.get_running_loop()
+        response_future: asyncio.Future = loop.create_future()
+        operation_tasks: set[asyncio.Future] = set()
+        header_tasks: set[asyncio.Task] = set()
+        observed_at = _local_observation_timestamp()
+        total_deadline = loop.time() + self._browser_timeout_seconds
+        cleanup_reservation = min(
+            2.0, self._browser_timeout_seconds * 0.25
+        )
+        operation_deadline = total_deadline - cleanup_reservation
+        cumulative_body_bytes = 0
+
+        async def await_operation(awaitable):
+            task = asyncio.ensure_future(awaitable)
+            operation_tasks.add(task)
+            try:
+                remaining = operation_deadline - loop.time()
+                if remaining > 0:
+                    done, _pending = await asyncio.wait(
+                        (task,), timeout=remaining
+                    )
+                    if task in done:
+                        return task.result()
+                task.cancel()
+                if isinstance(task, asyncio.Task):
+                    task._log_destroy_pending = False
+                raise TimeoutError
+            except BaseException:
+                if not task.done():
+                    task.cancel()
+                    if isinstance(task, asyncio.Task):
+                        task._log_destroy_pending = False
+                raise
+            finally:
+                if task.done():
+                    operation_tasks.discard(task)
+
+        async def validate_content_type_before_enqueue(
+            response: object,
+        ) -> None:
+            try:
+                content_type_status = await _response_content_type_status(
+                    response,
+                    operation_deadline,
+                    await_operation,
+                )
+                if response_future.done():
+                    return
+                if content_type_status == "timeout":
+                    response_future.set_exception(TimeoutError())
+                    return
+                if content_type_status != "valid":
+                    response_future.set_exception(
+                        DouyinDataCollectionError(
+                            "content_payload_invalid",
+                            fallback_allowed=False,
+                        )
+                    )
+                    return
+                try:
+                    response_queue.put_nowait(response)
+                except asyncio.QueueFull:
+                    response_future.set_exception(
+                        DouyinDataCollectionError(
+                            "content_payload_invalid",
+                            fallback_allowed=False,
+                        )
+                    )
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit) as exc:
+                if not response_future.done():
+                    response_future.set_exception(exc)
+            except BaseException:
+                if not response_future.done():
+                    response_future.set_exception(
+                        DouyinDataCollectionError(
+                            "content_payload_invalid",
+                            fallback_allowed=False,
+                        )
+                    )
+            finally:
+                response = None
+
+        def consume_header_task(task: asyncio.Task) -> None:
+            header_tasks.discard(task)
+            try:
+                task.result()
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit) as exc:
+                if not response_future.done():
+                    response_future.set_exception(exc)
+            except BaseException:
+                if not response_future.done():
+                    response_future.set_exception(
+                        DouyinDataCollectionError(
+                            "content_payload_invalid",
+                            fallback_allowed=False,
+                        )
+                    )
+
+        def observe_response(response: object) -> None:
+            if response_future.done():
+                return
+            try:
+                metadata_status = _content_response_contract_status(
+                    response, contract
+                )
+                if metadata_status == "invalid":
+                    _content_payload_invalid()
+                if metadata_status != "match":
+                    return
+                status = getattr(response, "status", None)
+                if status == 401:
+                    raise DouyinDataCollectionError(
+                        "login_required", fallback_allowed=False
+                    )
+                if status == 403:
+                    raise DouyinDataCollectionError(
+                        "access_denied", fallback_allowed=False
+                    )
+                if type(status) is not int or status < 200 or status >= 300:
+                    _content_payload_invalid()
+                if loop.time() >= operation_deadline:
+                    raise TimeoutError
+                if len(header_tasks) >= _MAX_QUEUED_CONTENT_RESPONSES:
+                    _content_payload_invalid()
+                task = asyncio.create_task(
+                    validate_content_type_before_enqueue(response)
+                )
+                header_tasks.add(task)
+                task.add_done_callback(consume_header_task)
+            except BaseException as exc:
+                if not response_future.done():
+                    response_future.set_exception(exc)
+
+        async def consume_responses() -> None:
+            nonlocal projection_job, projection_blocked_by_worker
+            nonlocal cumulative_body_bytes
+            records: dict[
+                str, tuple[ContentRecord, tuple[MetricPoint, ...]]
+            ] = {}
+            seen_cursors: set[str] = set()
+            accepted_pages = 0
+            accepted_metric_points = 0
+            while not response_future.done():
+                response = await response_queue.get()
+                try:
+                    metadata_status = _content_response_contract_status(
+                        response, contract
+                    )
+                    if metadata_status == "invalid":
+                        _content_payload_invalid()
+                    if metadata_status != "match":
+                        continue
+                    status = getattr(response, "status", None)
+                    if status == 401:
+                        raise DouyinDataCollectionError(
+                            "login_required", fallback_allowed=False
+                        )
+                    if status == 403:
+                        raise DouyinDataCollectionError(
+                            "access_denied", fallback_allowed=False
+                        )
+                    if type(status) is not int or status < 200 or status >= 300:
+                        _content_payload_invalid()
+                    content_type_status = await _response_content_type_status(
+                        response,
+                        operation_deadline,
+                        await_operation,
+                    )
+                    if content_type_status == "timeout":
+                        raise TimeoutError
+                    if content_type_status != "valid":
+                        _content_payload_invalid()
+                    accepted_pages += 1
+                    if accepted_pages > _CONTENT_RESPONSE_LIMIT:
+                        _content_payload_invalid()
+                    reader = getattr(response, "body", None)
+                    if not callable(reader) or not inspect.iscoroutinefunction(reader):
+                        _content_payload_invalid()
+                    raw_body = await await_operation(reader())
+                    if type(raw_body) is not bytes:
+                        _content_payload_invalid()
+                    body_bytes = len(raw_body)
+                    if (
+                        body_bytes > _MAX_CONTENT_RESPONSE_BYTES
+                        or cumulative_body_bytes
+                        > _MAX_CONTENT_TOTAL_BYTES - body_bytes
+                    ):
+                        _content_payload_invalid()
+                    cumulative_body_bytes += body_bytes
+
+                    def own_projection_job(
+                        value: _ContentProjectionJob | None,
+                    ) -> None:
+                        nonlocal projection_job
+                        projection_job = value
+
+                    (
+                        projection_outcome,
+                        returned_projection_job,
+                        projection_blocked_by_worker,
+                    ) = await _project_content_body_bounded(
+                        raw_body,
+                        contract,
+                        account_id,
+                        observed_at,
+                        operation_deadline,
+                        own_projection_job,
+                    )
+                    projection_job = returned_projection_job
+                    raw_body = None
+                    if projection_outcome.control_kind == "keyboard_interrupt":
+                        raise KeyboardInterrupt
+                    if projection_outcome.control_kind == "system_exit":
+                        raise SystemExit
+                    if projection_outcome.error_code:
+                        if (
+                            projection_outcome.error_code
+                            == "content_list_unavailable"
+                        ):
+                            raise TimeoutError
+                        raise DouyinDataCollectionError(
+                            projection_outcome.error_code,
+                            fallback_allowed=False,
+                        )
+                    contents = projection_outcome.contents
+                    points = projection_outcome.points
+                    cursor = projection_outcome.cursor
+                    points_by_id: dict[str, list[MetricPoint]] = {
+                        content.content_id: [] for content in contents
+                    }
+                    for point in points:
+                        _check_content_deadline(operation_deadline)
+                        content_points = points_by_id.get(point.entity_key)
+                        if content_points is None:
+                            _content_payload_invalid()
+                        content_points.append(point)
+                    for content in contents:
+                        _check_content_deadline(operation_deadline)
+                        candidate = (
+                            content,
+                            tuple(points_by_id[content.content_id]),
+                        )
+                        existing = records.get(content.content_id)
+                        if existing is not None:
+                            if existing != candidate:
+                                _content_payload_invalid()
+                            continue
+                        candidate_point_count = len(candidate[1])
+                        if (
+                            len(records) >= _MAX_CUMULATIVE_CONTENTS
+                            or accepted_metric_points
+                            > _MAX_CUMULATIVE_CONTENT_METRICS
+                            - candidate_point_count
+                        ):
+                            _content_payload_invalid()
+                        records[content.content_id] = candidate
+                        accepted_metric_points += candidate_point_count
+                    if cursor:
+                        if cursor in seen_cursors:
+                            _content_payload_invalid()
+                        if len(seen_cursors) >= _MAX_CONTENT_CURSORS:
+                            _content_payload_invalid()
+                        seen_cursors.add(cursor)
+                        continue
+                    completed_contents: list[ContentRecord] = []
+                    completed_points: list[MetricPoint] = []
+                    for content, content_points in records.values():
+                        _check_content_deadline(operation_deadline)
+                        completed_contents.append(content)
+                        for point in content_points:
+                            _check_content_deadline(operation_deadline)
+                            completed_points.append(point)
+                    completed = (
+                        tuple(completed_contents),
+                        tuple(completed_points),
+                    )
+                    if not response_future.done():
+                        response_future.set_result(completed)
+                    return
+                except DouyinDataCollectionError as exc:
+                    if not response_future.done():
+                        response_future.set_exception(exc)
+                    return
+                except asyncio.CancelledError as exc:
+                    if not response_future.done():
+                        response_future.set_exception(exc)
+                    raise
+                except (KeyboardInterrupt, SystemExit) as exc:
+                    if not response_future.done():
+                        response_future.set_exception(exc)
+                    return
+                except (_ContentDeadlineExceeded, TimeoutError) as exc:
+                    if not response_future.done():
+                        response_future.set_exception(TimeoutError())
+                    exc = None
+                    return
+                except BaseException:
+                    if not response_future.done():
+                        response_future.set_exception(
+                            DouyinDataCollectionError(
+                                "content_payload_invalid",
+                                fallback_allowed=False,
+                            )
+                        )
+                    return
+
+        try:
+            starter = self._playwright_factory()
+            playwright = await await_operation(starter.start())
+            browser = await await_operation(
+                playwright.chromium.launch(headless=True)
+            )
+            context = await await_operation(
+                browser.new_context(storage_state=str(state_path))
+            )
+            page = await await_operation(context.new_page())
+            page.on("response", observe_response)
+            worker = asyncio.create_task(consume_responses())
+            navigation_url = (
+                f"https://{contract.creator_host}"
+                f"{contract.content_navigation_template}"
+            )
+            await await_operation(
+                page.goto(
+                    navigation_url,
+                    wait_until="domcontentloaded",
+                    timeout=self._browser_timeout_seconds * 1000,
+                )
+            )
+            current_url = str(getattr(page, "url", "") or "").lower()
+            if "/verification" in current_url:
+                raise DouyinDataCollectionError(
+                    "verification_required", fallback_allowed=False
+                )
+            if "/login" in current_url or "passport." in current_url:
+                raise DouyinDataCollectionError(
+                    "login_required", fallback_allowed=False
+                )
+            if "/forbidden" in current_url:
+                raise DouyinDataCollectionError(
+                    "access_denied", fallback_allowed=False
+                )
+            result = await await_operation(response_future)
+        except TimeoutError:
+            caught = DouyinDataCollectionError(
+                "content_list_unavailable", fallback_allowed=False
+            )
+        except BaseException as exc:
+            caught = exc
+        finally:
+            cleanup_steps = 9
+
+            async def settle_cleanup(awaitable) -> BaseException | None:
+                nonlocal cleanup_steps
+                try:
+                    remaining = total_deadline - loop.time()
+                    task = asyncio.ensure_future(awaitable)
+                    timeout = (
+                        remaining / cleanup_steps if remaining > 0 else 0
+                    )
+                    done, _pending = await asyncio.wait(
+                        (task,), timeout=timeout
+                    )
+                    if task not in done:
+                        task.cancel()
+                        if isinstance(task, asyncio.Task):
+                            task._log_destroy_pending = False
+                        return TimeoutError()
+                    try:
+                        task.result()
+                    except BaseException as exc:
+                        return exc
+                    return None
+                finally:
+                    cleanup_steps -= 1
+
+            async def close_bounded(resource: object | None) -> BaseException | None:
+                nonlocal cleanup_steps
+                if resource is None:
+                    cleanup_steps -= 1
+                    return None
+                close = getattr(resource, "close", None)
+                if close is None:
+                    close = getattr(resource, "stop", None)
+                if close is None:
+                    cleanup_steps -= 1
+                    return RuntimeError("resource close unavailable")
+                try:
+                    close_result = close()
+                except BaseException as exc:
+                    cleanup_steps -= 1
+                    return exc
+                if hasattr(close_result, "__await__"):
+                    return await settle_cleanup(close_result)
+                cleanup_steps -= 1
+                return None
+
+            if page is not None:
+                remove_listener = getattr(page, "remove_listener", None)
+                if remove_listener is None:
+                    remove_listener = getattr(page, "off", None)
+                if remove_listener is not None:
+                    try:
+                        removal = remove_listener("response", observe_response)
+                    except BaseException as exc:
+                        cleanup_errors.append(exc)
+                        cleanup_steps -= 1
+                    else:
+                        if hasattr(removal, "__await__"):
+                            removal_error = await settle_cleanup(removal)
+                            if removal_error is not None:
+                                cleanup_errors.append(removal_error)
+                        else:
+                            cleanup_steps -= 1
+                else:
+                    cleanup_steps -= 1
+            else:
+                cleanup_steps -= 1
+
+            if not response_future.done():
+                response_future.cancel()
+            if response_future.done():
+                try:
+                    future_error = response_future.exception()
+                except asyncio.CancelledError:
+                    future_error = None
+                if isinstance(
+                    future_error,
+                    (asyncio.CancelledError, KeyboardInterrupt, SystemExit),
+                ):
+                    cleanup_errors.append(future_error)
+            cleanup_steps -= 1
+
+            pending_headers = tuple(
+                task for task in header_tasks if not task.done()
+            )
+            for task in pending_headers:
+                task.cancel()
+                task._log_destroy_pending = False
+            if pending_headers:
+                header_error = await settle_cleanup(
+                    asyncio.gather(*pending_headers, return_exceptions=True)
+                )
+                if header_error is not None:
+                    cleanup_errors.append(header_error)
+            else:
+                cleanup_steps -= 1
+
+            worker_cancelled_for_cleanup = False
+            if worker is not None and not worker.done():
+                worker.cancel()
+                worker_cancelled_for_cleanup = True
+            if worker is None:
+                cleanup_steps -= 1
+            else:
+                worker_error = await settle_cleanup(worker)
+                if worker_error is not None and not (
+                    worker_cancelled_for_cleanup
+                    and isinstance(worker_error, asyncio.CancelledError)
+                ):
+                    cleanup_errors.append(worker_error)
+
+            pending_operations = tuple(
+                task for task in operation_tasks if not task.done()
+            )
+            for task in pending_operations:
+                task.cancel()
+                if isinstance(task, asyncio.Task):
+                    task._log_destroy_pending = False
+            if pending_operations:
+                operation_error = await settle_cleanup(
+                    asyncio.gather(
+                        *pending_operations, return_exceptions=True
+                    )
+                )
+                if operation_error is not None:
+                    cleanup_errors.append(operation_error)
+            else:
+                cleanup_steps -= 1
+
+            for resource in (page, context, browser, playwright):
+                close_error = await close_bounded(resource)
+                if close_error is not None:
+                    cleanup_errors.append(close_error)
+
+            projection_still_running = (
+                projection_job is not None
+                and not projection_job.completed.is_set()
+            ) or (
+                projection_blocked_by_worker
+                and _content_projection_worker_is_busy()
+            )
+            if projection_still_running:
+                cleanup_errors.append(
+                    RuntimeError("content projection worker active")
+                )
+            projection_job = None
+            projection_blocked_by_worker = False
+
+        if isinstance(
+            caught, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)
+        ):
+            raise caught
+        for cleanup_error in cleanup_errors:
+            if isinstance(
+                cleanup_error,
+                (asyncio.CancelledError, KeyboardInterrupt, SystemExit),
+            ):
+                raise cleanup_error
+        if cleanup_errors:
+            raise DouyinDataCollectionError(
+                "browser_cleanup_incomplete", fallback_allowed=False
+            ) from None
+        if isinstance(caught, DouyinDataCollectionError):
+            raise caught
+        if caught is not None:
+            raise DouyinDataCollectionError(
+                "content_payload_invalid", fallback_allowed=False
+            ) from None
+        if result is None:
+            raise DouyinDataCollectionError(
+                "content_list_unavailable", fallback_allowed=False
+            )
+        contents, content_points = result
+        return CollectionBatch(
+            platform_type=3,
+            source_mode="browser_signed",
+            metrics=account_batch.metrics + content_points,
+            contents=contents,
+            account_metrics_available=True,
+            content_data_available=True,
+            platform_observed_at=observed_at,
+            warning_code="",
+        )
+
+    @staticmethod
+    def _run_content_completion(coroutine) -> CollectionBatch:
+        """在一次性事件循环中运行，不在退出时无界等待抗取消任务。"""
+
+        loop = asyncio.new_event_loop()
+        loop.set_exception_handler(lambda _loop, _context: None)
+        main_task: asyncio.Task | None = None
+        try:
+            main_task = loop.create_task(coroutine)
+            process_control: BaseException | None = None
+            while True:
+                try:
+                    result = loop.run_until_complete(main_task)
+                except (KeyboardInterrupt, SystemExit) as exc:
+                    if process_control is None:
+                        process_control = exc
+                    if main_task.done():
+                        raise
+                    continue
+                if process_control is not None:
+                    raise process_control
+                return result
+        finally:
+            pending_tasks = tuple(asyncio.all_tasks(loop))
+            for task in pending_tasks:
+                if task.done():
+                    try:
+                        task.exception()
+                    except asyncio.CancelledError:
+                        pass
+                    continue
+                task.cancel()
+                task._log_destroy_pending = False
+                try:
+                    task.get_coro().close()
+                except BaseException:
+                    pass
+            if main_task is None and hasattr(coroutine, "close"):
+                coroutine.close()
+            loop.close()
+
+    def complete_content_data(
+        self,
+        account: dict,
+        account_batch: CollectionBatch,
+        report: Callable[[dict], None] | None = None,
+    ) -> CollectionBatch:
+        """仅在生产合同已验证时，以独立短会话补全本人作品列表。"""
+
+        try:
+            contract = self._contract_loader()
+        except CommentInsightFailure as exc:
+            if exc.error_code == "comment_content_unavailable":
+                return account_batch
+            raise DouyinDataCollectionError(
+                "content_list_unavailable", fallback_allowed=False
+            ) from None
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:
+            return account_batch
+        try:
+            return self._run_content_completion(
+                self._complete_content_data_async(
+                    account,
+                    account_batch,
+                    contract,
+                    report,
+                )
+            )
+        except DouyinDataCollectionError:
+            raise
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:
+            raise DouyinDataCollectionError(
+                "content_payload_invalid", fallback_allowed=False
+            ) from None
 
     def collect_browser_signed(
         self,
