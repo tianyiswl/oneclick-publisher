@@ -86,6 +86,7 @@
 - SHA256：`a794b4e587d7cbd4f00801307a6574dba1750cd0c1b4d979647397ced57bf6cf`。
 - 应用内版本和构建版本均为 `0.5.3`；临时签名、离屏界面、内置浏览器、ZIP 完整性和敏感运行数据检查全部通过。
 - 包含本轮抖音话题回读、小红书封面/话题/正式按钮修复，以及受控发布任务终态收口。
+- 详情见 `docs/superpowers/reports/2026-08-24-oneclick-0.5.3-macos-build-verification.md`。
 
 ## Worktree 布局
 
