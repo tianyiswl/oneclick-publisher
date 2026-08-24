@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .paths import DB_PATH, ensure_runtime_dirs
+from .platform_data_comment_store import create_comment_schema
 
 
 @contextmanager
@@ -447,6 +448,7 @@ def ensure_schema() -> None:
             ON platform_contents(accountId, platformType, publishedAt DESC, id DESC)
             """
         )
+        create_comment_schema(conn)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS publish_tasks (
