@@ -172,7 +172,7 @@ class WindowsBuildTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Windows"):
             assert_windows_platform("darwin")
 
-    def test_windows_workflow_requires_manual_trigger_and_uploads_private_artifact(
+    def test_windows_workflow_requires_manual_trigger_and_supports_private_delivery(
         self,
     ) -> None:
         workflow = (
@@ -186,14 +186,18 @@ class WindowsBuildTests(unittest.TestCase):
         self.assertNotIn("push:", workflow)
         self.assertNotIn("codex/finalize-macos-feedback", workflow)
         self.assertIn("windows-latest", workflow)
-        self.assertIn("contents: read", workflow)
+        self.assertIn("contents: write", workflow)
         self.assertIn("验证 Windows 源码离屏界面", workflow)
         self.assertIn('"desktop_native_app.py", "--ui-test"', workflow)
         self.assertIn("python -m playwright install chromium", workflow)
         self.assertIn("tools/build_windows.py", workflow)
         self.assertIn("actions/upload-artifact@v4", workflow)
         self.assertIn("retention-days: 30", workflow)
-        self.assertNotIn("create-release", workflow.lower())
+        self.assertIn("default: artifact", workflow)
+        self.assertIn("inputs.delivery == 'artifact'", workflow)
+        self.assertIn("inputs.delivery == 'prerelease'", workflow)
+        self.assertIn("gh release create", workflow)
+        self.assertIn("--prerelease", workflow)
 
 
 if __name__ == "__main__":
