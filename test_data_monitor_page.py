@@ -873,6 +873,7 @@ class DataMonitorPageTests(unittest.TestCase):
         page = self._page(summary=period_summary())
 
         self.assertTrue(hasattr(page, "range_combo"))
+
         self.assertEqual(page.range_combo.currentData(), 7)
         self.assertEqual(page.metric_titles["views"].text(), "账号区间新增播放")
         self.assertEqual(
@@ -894,6 +895,17 @@ class DataMonitorPageTests(unittest.TestCase):
             page.local_synced_label.text(),
             "本地同步时间：2026-08-20T12:01:00+08:00",
         )
+
+    def test_monitor_is_split_into_three_focused_tabs_with_status_on_top(self) -> None:
+        page = self._page(summary=period_summary())
+
+        self.assertEqual(page.view_tabs.count(), 3)
+        self.assertEqual(
+            [page.view_tabs.tabText(index) for index in range(3)],
+            ["数据概览", "作品数据", "评论洞察"],
+        )
+        self.assertIs(page.status_panel.parentWidget(), page)
+        self.assertTrue(page.view_tabs.isTabEnabled(page.comment_tab_index))
 
     def test_mixed_contributing_sources_render_controlled_label(self) -> None:
         """多个可信来源参与区间汇总时，页面必须显式标记混合来源。"""
@@ -2008,7 +2020,7 @@ class DataMonitorPageTests(unittest.TestCase):
             "抖音作品列表尚未取得，暂时无法同步评论",
         )
 
-    def test_non_douyin_platform_hides_and_disables_comment_panel(self) -> None:
+    def test_non_douyin_platform_disables_comment_tab_and_explains_scope(self) -> None:
         """首版若在其他平台露出入口，会让不支持的平台冒充可用。"""
 
         page = self._page(
@@ -2018,6 +2030,11 @@ class DataMonitorPageTests(unittest.TestCase):
         )
 
         self.assertTrue(page.comment_panel.isHidden())
+        self.assertFalse(page.view_tabs.isTabEnabled(page.comment_tab_index))
+        self.assertEqual(
+            page.view_tabs.tabToolTip(page.comment_tab_index),
+            "评论洞察当前仅支持抖音",
+        )
         self.assertFalse(page.comment_sync_button.isEnabled())
         self.assertFalse(page.comment_ai_settings_button.isEnabled())
 

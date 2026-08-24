@@ -39,7 +39,7 @@ class XhsLocationUiTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
 
-    def test_location_panel_is_visible_only_for_one_total_xhs_video_account(self) -> None:
+    def test_location_panel_uses_only_selected_xhs_accounts(self) -> None:
         page = PublishPage()
         xhs = {"id": 11, "type": 1, "filePath": "xhs-11.json"}
         second_xhs = {"id": 12, "type": 1, "filePath": "xhs-12.json"}
@@ -47,14 +47,14 @@ class XhsLocationUiTests(unittest.TestCase):
         try:
             self.assertIsNot(page.xhs_location_keyword, page.douyin_location_keyword)
             cases = [
-                ("video", [], True),
-                ("video", [xhs], False),
-                ("video", [xhs, second_xhs], True),
-                ("video", [xhs, douyin], True),
-                ("video", [douyin], True),
-                ("article", [xhs], True),
+                ("video", [], True, False),
+                ("video", [xhs], False, True),
+                ("video", [xhs, second_xhs], False, False),
+                ("video", [xhs, douyin], False, True),
+                ("video", [douyin], True, False),
+                ("article", [xhs], True, False),
             ]
-            for content_type, accounts, expected_hidden in cases:
+            for content_type, accounts, expected_hidden, expected_enabled in cases:
                 with self.subTest(content_type=content_type, accounts=accounts):
                     page.content_type = content_type
                     with patch.object(page, "selected_accounts", return_value=accounts):
@@ -63,12 +63,24 @@ class XhsLocationUiTests(unittest.TestCase):
                         page.xhs_location_panel.isHidden(),
                         expected_hidden,
                     )
+                    self.assertEqual(
+                        page.xhs_location_keyword.isEnabledTo(
+                            page.xhs_location_panel
+                        ),
+                        expected_enabled,
+                    )
+                    if accounts == [xhs, second_xhs]:
+                        self.assertIn(
+                            "只保留一个小红书账号",
+                            page.xhs_location_status.text(),
+                        )
         finally:
             page.close()
 
-    def test_account_or_content_change_invalidates_selection_and_candidates(self) -> None:
+    def test_other_platform_change_keeps_selection_but_xhs_or_content_change_invalidates(self) -> None:
         page = PublishPage()
         xhs = {"id": 11, "type": 1, "filePath": "xhs-11.json"}
+        second_xhs = {"id": 12, "type": 1, "filePath": "xhs-12.json"}
         douyin = {"id": 31, "type": 3, "filePath": "douyin-31.json"}
         try:
             page.content_type = "video"
@@ -81,14 +93,19 @@ class XhsLocationUiTests(unittest.TestCase):
             with patch.object(page, "selected_accounts", return_value=[xhs, douyin]):
                 page.update_selected_labels()
 
-            self.assertTrue(page.xhs_location_panel.isHidden())
+            self.assertFalse(page.xhs_location_panel.isHidden())
+            self.assertEqual(page._xhs_selected_location, {"poiId": "poi-old"})
+            self.assertEqual(page.xhs_location_results.count(), 1)
+
+            with patch.object(page, "selected_accounts", return_value=[second_xhs, douyin]):
+                page.update_selected_labels()
             self.assertEqual(page._xhs_selected_location, {})
             self.assertEqual(page.xhs_location_results.count(), 0)
 
             page._xhs_selected_location = {"poiId": "poi-old-again"}
             page.xhs_location_results.addItem("另一个旧候选")
             page.content_type = "article"
-            with patch.object(page, "selected_accounts", return_value=[xhs]):
+            with patch.object(page, "selected_accounts", return_value=[second_xhs]):
                 page.update_selected_labels()
             self.assertEqual(page._xhs_selected_location, {})
             self.assertEqual(page.xhs_location_results.count(), 0)
@@ -175,9 +192,10 @@ class XhsLocationUiTests(unittest.TestCase):
     def test_search_uses_dedicated_async_key_and_exact_service_context(self) -> None:
         page = PublishPage()
         xhs = {"id": 11, "type": 1, "filePath": "xhs-11.json"}
+        douyin = {"id": 31, "type": 3, "filePath": "douyin-31.json"}
         try:
             page.xhs_location_keyword.setText("  北海  银滩  ")
-            with patch.object(page, "selected_accounts", return_value=[xhs]), patch.object(
+            with patch.object(page, "selected_accounts", return_value=[xhs, douyin]), patch.object(
                 page.location_tasks,
                 "run",
                 return_value=True,
@@ -253,9 +271,10 @@ class XhsLocationUiTests(unittest.TestCase):
         finally:
             page.close()
 
-    def test_stale_success_is_rejected_for_total_account_or_generation_change(self) -> None:
+    def test_stale_success_ignores_other_platform_but_rejects_xhs_or_generation_change(self) -> None:
         page = PublishPage()
         xhs = {"id": 11, "type": 1, "filePath": "xhs-11.json"}
+        second_xhs = {"id": 12, "type": 1, "filePath": "xhs-12.json"}
         douyin = {"id": 31, "type": 3, "filePath": "douyin-31.json"}
         row = {
             "poiId": "poi-1",
@@ -286,6 +305,23 @@ class XhsLocationUiTests(unittest.TestCase):
                 return_value=[xhs, douyin],
             ):
                 first_success([row])
+            self.assertEqual(page.xhs_location_results.count(), 1)
+
+            page._invalidate_xhs_location()
+            calls.clear()
+            with patch.object(page, "selected_accounts", return_value=[xhs]), patch.object(
+                page.location_tasks,
+                "run",
+                side_effect=capture,
+            ):
+                page.search_xhs_locations()
+            xhs_changed_success = calls[-1][1]["on_success"]
+            with patch.object(
+                page,
+                "selected_accounts",
+                return_value=[second_xhs, douyin],
+            ):
+                xhs_changed_success([row])
             self.assertEqual(page.xhs_location_results.count(), 0)
 
             calls.clear()
@@ -378,6 +414,29 @@ class XhsLocationPayloadTests(unittest.TestCase):
             page.xhs_location_keyword.setText("北海银滩")
             with self.assertRaisesRegex(ValueError, "不能只填写关键词"):
                 self._collect(page, [self._account()])
+        finally:
+            page.close()
+
+    def test_multi_platform_payload_keeps_single_xhs_location(self) -> None:
+        page = PublishPage()
+        xhs = self._account()
+        douyin = {
+            "id": 31,
+            "type": 3,
+            "platformName": "抖音",
+            "filePath": "douyin-31.json",
+        }
+        try:
+            page.common_title_input.setText("定位功能测试")
+            page.title_input.setPlainText("只做离线载荷测试")
+            page.xhs_location_keyword.setText("北海 银滩")
+            page._xhs_selected_location = self._selection()
+
+            payloads = self._collect(page, [xhs, douyin])
+            xhs_payload = next(row for row in payloads if row["type"] == 1)
+
+            self.assertEqual(xhs_payload["xhsLocationKeyword"], "北海 银滩")
+            self.assertEqual(xhs_payload["xhsLocationPoi"], self._selection())
         finally:
             page.close()
 

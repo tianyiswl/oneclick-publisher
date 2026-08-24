@@ -33,6 +33,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -1669,6 +1670,32 @@ class DataMonitorPage(QWidget):
         header.addWidget(self.sync_button)
         layout.addLayout(header)
 
+        self.status_panel = QFrame()
+        self.status_panel.setProperty("panel", True)
+        status_layout = QHBoxLayout(self.status_panel)
+        status_layout.setContentsMargins(14, 8, 14, 8)
+        self.status_label = QLabel("尚未同步")
+        self.status_label.setWordWrap(True)
+        status_layout.addWidget(self.status_label, 1)
+        self.relogin_button = button("重新登录", variant="secondary")
+        self.relogin_button.clicked.connect(self.request_account_management.emit)
+        self.relogin_button.hide()
+        status_layout.addWidget(self.relogin_button)
+        layout.addWidget(self.status_panel)
+
+        self.view_tabs = QTabWidget()
+        self.view_tabs.setObjectName("dataMonitorTabs")
+        overview_page = QWidget()
+        overview_layout = QVBoxLayout(overview_page)
+        overview_layout.setContentsMargins(12, 12, 12, 12)
+        overview_layout.setSpacing(12)
+        contents_page = QWidget()
+        contents_page_layout = QVBoxLayout(contents_page)
+        contents_page_layout.setContentsMargins(12, 12, 12, 12)
+        comment_page = QWidget()
+        comment_page_layout = QVBoxLayout(comment_page)
+        comment_page_layout.setContentsMargins(12, 12, 12, 12)
+
         grid = QGridLayout()
         grid.setHorizontalSpacing(12)
         grid.setVerticalSpacing(12)
@@ -1692,7 +1719,9 @@ class DataMonitorPage(QWidget):
             card.addWidget(value)
             card.addWidget(caption)
             grid.addWidget(panel, index // 4, index % 4)
-        layout.addLayout(grid)
+        metrics_container = QWidget()
+        metrics_container.setLayout(grid)
+        overview_layout.addWidget(metrics_container)
 
         freshness_panel = QFrame()
         freshness_panel.setProperty("panel", True)
@@ -1713,7 +1742,7 @@ class DataMonitorPage(QWidget):
         freshness_layout.addWidget(self.source_label, 0, 1)
         freshness_layout.addWidget(self.platform_observed_label, 1, 0)
         freshness_layout.addWidget(self.local_synced_label, 1, 1)
-        layout.addWidget(freshness_panel)
+        overview_layout.addWidget(freshness_panel)
 
         trend_panel = QFrame()
         trend_panel.setProperty("panel", True)
@@ -1731,7 +1760,8 @@ class DataMonitorPage(QWidget):
         trend_layout.addLayout(trend_header)
         self.trend_chart = _TrendChart()
         trend_layout.addWidget(self.trend_chart)
-        layout.addWidget(trend_panel)
+        overview_layout.addWidget(trend_panel)
+        overview_layout.addStretch(1)
 
         contents_panel = QFrame()
         contents_panel.setProperty("panel", True)
@@ -1760,7 +1790,8 @@ class DataMonitorPage(QWidget):
             self._comment_selection_changed
         )
         contents_layout.addWidget(self.content_table)
-        layout.addWidget(contents_panel)
+        contents_page_layout.addWidget(contents_panel)
+        contents_page_layout.addStretch(1)
 
         self.comment_panel = QFrame()
         self.comment_panel.setProperty("panel", True)
@@ -1829,21 +1860,13 @@ class DataMonitorPage(QWidget):
         self.comment_candidate_tree.setHeaderHidden(True)
         self.comment_candidate_tree.setMinimumHeight(120)
         comment_layout.addWidget(self.comment_candidate_tree)
-        layout.addWidget(self.comment_panel)
+        comment_page_layout.addWidget(self.comment_panel)
+        comment_page_layout.addStretch(1)
 
-        status_panel = QFrame()
-        status_panel.setProperty("panel", True)
-        status_layout = QHBoxLayout(status_panel)
-        status_layout.setContentsMargins(16, 14, 16, 14)
-        self.status_label = QLabel("尚未同步")
-        self.status_label.setWordWrap(True)
-        status_layout.addWidget(self.status_label, 1)
-        self.relogin_button = button("重新登录", variant="secondary")
-        self.relogin_button.clicked.connect(self.request_account_management.emit)
-        self.relogin_button.hide()
-        status_layout.addWidget(self.relogin_button)
-        layout.addWidget(status_panel)
-        layout.addStretch(1)
+        self.view_tabs.addTab(overview_page, "数据概览")
+        self.view_tabs.addTab(contents_page, "作品数据")
+        self.comment_tab_index = self.view_tabs.addTab(comment_page, "评论洞察")
+        layout.addWidget(self.view_tabs, 1)
 
     def _current_comment_identity(self) -> tuple[int, int, str] | None:
         subject = self._current_subject_identity()
@@ -1913,6 +1936,13 @@ class DataMonitorPage(QWidget):
 
     def _render_comment_panel(self) -> None:
         is_douyin = self._current_platform_type() == 3
+        self.view_tabs.setTabEnabled(self.comment_tab_index, is_douyin)
+        self.view_tabs.setTabToolTip(
+            self.comment_tab_index,
+            "" if is_douyin else "评论洞察当前仅支持抖音",
+        )
+        if not is_douyin and self.view_tabs.currentIndex() == self.comment_tab_index:
+            self.view_tabs.setCurrentIndex(0)
         self.comment_panel.setVisible(is_douyin)
         if not is_douyin:
             self._comment_panel_identity = None

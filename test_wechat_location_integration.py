@@ -32,17 +32,19 @@ class WechatLocationIntegrationTests(unittest.TestCase):
         self.assertIn("expected_account_id", source)
         self.assertIn("正文地点已重新搜索并回读", source)
 
-    def test_panel_is_only_visible_for_one_wechat_article_editor(self) -> None:
+    def test_panel_uses_only_selected_wechat_accounts(self) -> None:
         page = PublishPage()
         wechat = {"id": 27, "type": 10, "filePath": "wechat-27.json"}
         douyin = {"id": 31, "type": 3, "filePath": "douyin-31.json"}
+        second_wechat = {"id": 28, "type": 10, "filePath": "wechat-28.json"}
         try:
-            for content_type, accounts, expected_hidden in (
-                ("text", [wechat], False),
-                ("article", [wechat], False),
-                ("video", [wechat], True),
-                ("text", [wechat, douyin], True),
-                ("text", [douyin], True),
+            for content_type, accounts, expected_hidden, expected_enabled in (
+                ("text", [wechat], False, True),
+                ("article", [wechat], False, True),
+                ("video", [wechat], True, False),
+                ("text", [wechat, douyin], False, True),
+                ("text", [wechat, second_wechat], False, False),
+                ("text", [douyin], True, False),
             ):
                 with self.subTest(content_type=content_type, accounts=accounts):
                     page.content_type = content_type
@@ -52,12 +54,24 @@ class WechatLocationIntegrationTests(unittest.TestCase):
                         page.wechat_location_panel.isHidden(),
                         expected_hidden,
                     )
+                    self.assertEqual(
+                        page.wechat_location_keyword.isEnabledTo(
+                            page.wechat_location_panel
+                        ),
+                        expected_enabled,
+                    )
+                    if accounts == [wechat, second_wechat]:
+                        self.assertIn(
+                            "只保留一个公众号账号",
+                            page.wechat_location_status.text(),
+                        )
         finally:
             page.close()
 
     def test_candidate_card_and_selection_keep_full_context(self) -> None:
         page = PublishPage()
         wechat = {"id": 27, "type": 10, "filePath": "wechat-27.json"}
+        douyin = {"id": 31, "type": 3, "filePath": "douyin-31.json"}
         try:
             page.content_type = "text"
             page.wechat_location_keyword.setText("北海 银滩景区")
@@ -82,7 +96,7 @@ class WechatLocationIntegrationTests(unittest.TestCase):
                 card.findChild(QLabel, "wechatLocationName").text(),
                 "北海银滩国家旅游度假区",
             )
-            with patch.object(page, "selected_accounts", return_value=[wechat]):
+            with patch.object(page, "selected_accounts", return_value=[wechat, douyin]):
                 page._select_wechat_location_item(item)
             self.assertEqual(
                 page._wechat_selected_location["searchKeyword"],

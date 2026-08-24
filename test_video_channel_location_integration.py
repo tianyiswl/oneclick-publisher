@@ -111,16 +111,18 @@ class VideoChannelLocationIntegrationTest(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
 
-    def test_panel_is_only_visible_for_one_video_channel_video_account(self) -> None:
+    def test_panel_uses_only_selected_video_channel_accounts(self) -> None:
         page = PublishPage()
         video_channel = {"id": 5, "type": 2, "filePath": "video-channel.json"}
+        second_video_channel = {"id": 6, "type": 2, "filePath": "video-channel-2.json"}
         douyin = {"id": 8, "type": 3, "filePath": "douyin.json"}
         try:
-            for content_type, accounts, expected_hidden in (
-                ("video", [video_channel], False),
-                ("article", [video_channel], True),
-                ("video", [video_channel, douyin], True),
-                ("video", [douyin], True),
+            for content_type, accounts, expected_hidden, expected_enabled in (
+                ("video", [video_channel], False, True),
+                ("article", [video_channel], True, False),
+                ("video", [video_channel, douyin], False, True),
+                ("video", [video_channel, second_video_channel], False, False),
+                ("video", [douyin], True, False),
             ):
                 with self.subTest(content_type=content_type, accounts=accounts):
                     page.content_type = content_type
@@ -130,12 +132,24 @@ class VideoChannelLocationIntegrationTest(unittest.TestCase):
                         page.video_channel_location_panel.isHidden(),
                         expected_hidden,
                     )
+                    self.assertEqual(
+                        page.video_channel_location_keyword.isEnabledTo(
+                            page.video_channel_location_panel
+                        ),
+                        expected_enabled,
+                    )
+                    if accounts == [video_channel, second_video_channel]:
+                        self.assertIn(
+                            "只保留一个视频号账号",
+                            page.video_channel_location_status.text(),
+                        )
         finally:
             page.close()
 
     def test_candidate_card_and_selection_keep_full_platform_context(self) -> None:
         page = PublishPage()
         account = {"id": 5, "type": 2, "filePath": "video-channel.json"}
+        douyin = {"id": 8, "type": 3, "filePath": "douyin.json"}
         try:
             page.content_type = "video"
             page.video_channel_location_keyword.setText("长青公园")
@@ -155,7 +169,7 @@ class VideoChannelLocationIntegrationTest(unittest.TestCase):
                 card.findChild(QLabel, "videoChannelLocationAddress").text(),
                 "广西壮族自治区北海市海城区北京路以东,北海大道以北",
             )
-            with patch.object(page, "selected_accounts", return_value=[account]):
+            with patch.object(page, "selected_accounts", return_value=[account, douyin]):
                 page._select_video_channel_location_item(item)
             self.assertEqual(
                 page._video_channel_selected_location,

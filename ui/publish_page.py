@@ -1683,32 +1683,32 @@ class PublishPage(QWidget):
         ]
 
     def _sync_xhs_location_visibility_and_context(self) -> None:
-        """只在单一小红书视频账号上显示小红书专属定位。"""
+        """小红书定位只受小红书账号影响，不受其他平台勾选影响。"""
 
         if self.xhs_location_panel is None:
             return
-        accounts = self.selected_accounts()
+        accounts = self._platform_accounts(1)
         signature = (
             self.content_type,
-            tuple(
-                sorted(
-                    (
-                        int(account.get("id") or 0),
-                        int(account.get("type") or 0),
-                    )
-                    for account in accounts
-                )
-            ),
+            self._xhs_account_signature(accounts),
         )
-        if signature != self._xhs_location_context_signature:
+        context_changed = signature != self._xhs_location_context_signature
+        if context_changed:
             self._xhs_location_context_signature = signature
             self._invalidate_xhs_location()
-        visible = (
-            self.content_type == "video"
-            and len(accounts) == 1
-            and int(accounts[0].get("type") or 0) == 1
-        )
+        visible = self.content_type == "video" and bool(accounts)
+        controls_enabled = visible and len(accounts) == 1
         self.xhs_location_panel.setVisible(visible)
+        self.xhs_location_keyword.setEnabled(controls_enabled)
+        self.xhs_location_search_button.setEnabled(controls_enabled)
+        self.xhs_location_results.setEnabled(controls_enabled)
+        if visible and len(accounts) > 1:
+            self._set_xhs_location_status(
+                "已选多个小红书账号，请只保留一个小红书账号后搜索地点",
+                "warning",
+            )
+        elif visible and context_changed:
+            self._set_xhs_location_status("小红书视频可选；当前账号可搜索地点")
 
     def _invalidate_xhs_location(self) -> None:
         self._xhs_location_generation += 1
@@ -1761,7 +1761,7 @@ class PublishPage(QWidget):
             return False
         if self.content_type != content_type:
             return False
-        if self._xhs_account_signature(self.selected_accounts()) != account_signature:
+        if self._xhs_account_signature(self._platform_accounts(1)) != account_signature:
             return False
         if self.xhs_location_keyword is None:
             return False
@@ -1785,16 +1785,15 @@ class PublishPage(QWidget):
         except xhs_location_service.XhsLocationSearchError as exc:
             self._set_xhs_location_status(str(exc), "warning")
             return
-        accounts = self.selected_accounts()
+        accounts = self._platform_accounts(1)
         if (
             self.content_type != "video"
             or len(accounts) != 1
-            or int(accounts[0].get("type") or 0) != 1
         ):
             self._invalidate_xhs_location()
             self._sync_xhs_location_visibility_and_context()
             self._set_xhs_location_status(
-                "请仅保留一个小红书账号，并选择视频发布",
+                "请只保留一个小红书账号，并选择视频发布",
                 "warning",
             )
             return
@@ -1866,7 +1865,10 @@ class PublishPage(QWidget):
 
         def on_finished() -> None:
             if search_button is not None:
-                search_button.setEnabled(True)
+                search_button.setEnabled(
+                    self.content_type == "video"
+                    and len(self._platform_accounts(1)) == 1
+                )
                 search_button.setText("搜索")
             pending = self._xhs_pending_location_search
             self._xhs_pending_location_search = None
@@ -1984,12 +1986,11 @@ class PublishPage(QWidget):
 
     def _select_xhs_location_item(self, item: QListWidgetItem) -> None:
         raw = item.data(Qt.ItemDataRole.UserRole)
-        accounts = self.selected_accounts()
+        accounts = self._platform_accounts(1)
         if (
             not isinstance(raw, dict)
             or self.content_type != "video"
             or len(accounts) != 1
-            or int(accounts[0].get("type") or 0) != 1
         ):
             self._invalidate_xhs_location()
             self._set_xhs_location_status(
@@ -2027,11 +2028,11 @@ class PublishPage(QWidget):
         )
 
     def _sync_video_channel_location_visibility_and_context(self) -> None:
-        """只在单一视频号视频账号上显示视频号专属定位。"""
+        """视频号定位只受视频号账号影响。"""
 
         if self.video_channel_location_panel is None:
             return
-        accounts = self.selected_accounts()
+        accounts = self._platform_accounts(2)
         signature = (
             self.content_type,
             tuple(
@@ -2041,15 +2042,25 @@ class PublishPage(QWidget):
                 )
             ),
         )
-        if signature != self._video_channel_location_context_signature:
+        context_changed = signature != self._video_channel_location_context_signature
+        if context_changed:
             self._video_channel_location_context_signature = signature
             self._invalidate_video_channel_location()
-        visible = (
-            self.content_type == "video"
-            and len(accounts) == 1
-            and int(accounts[0].get("type") or 0) == 2
-        )
+        visible = self.content_type == "video" and bool(accounts)
+        controls_enabled = visible and len(accounts) == 1
         self.video_channel_location_panel.setVisible(visible)
+        self.video_channel_location_keyword.setEnabled(controls_enabled)
+        self.video_channel_location_search_button.setEnabled(controls_enabled)
+        self.video_channel_location_results.setEnabled(controls_enabled)
+        if visible and len(accounts) > 1:
+            self._set_video_channel_location_status(
+                "已选多个视频号账号，请只保留一个视频号账号后搜索位置",
+                "warning",
+            )
+        elif visible and context_changed:
+            self._set_video_channel_location_status(
+                "视频号视频可选；当前账号可搜索位置"
+            )
 
     def _invalidate_video_channel_location(self) -> None:
         self._video_channel_location_generation += 1
@@ -2089,16 +2100,15 @@ class PublishPage(QWidget):
         except video_channel_location_service.VideoChannelLocationError as exc:
             self._set_video_channel_location_status(str(exc), "warning")
             return
-        accounts = self.selected_accounts()
+        accounts = self._platform_accounts(2)
         if (
             self.content_type != "video"
             or len(accounts) != 1
-            or int(accounts[0].get("type") or 0) != 2
         ):
             self._invalidate_video_channel_location()
             self._sync_video_channel_location_visibility_and_context()
             self._set_video_channel_location_status(
-                "请仅保留一个视频号账号，并选择视频发布",
+                "请只保留一个视频号账号，并选择视频发布",
                 "warning",
             )
             return
@@ -2128,7 +2138,7 @@ class PublishPage(QWidget):
             current_signature = tuple(
                 sorted(
                     (int(row.get("id") or 0), int(row.get("type") or 0))
-                    for row in self.selected_accounts()
+                    for row in self._platform_accounts(2)
                 )
             )
             if current_signature != account_signature:
@@ -2165,7 +2175,10 @@ class PublishPage(QWidget):
 
         def on_finished() -> None:
             if button_widget is not None:
-                button_widget.setEnabled(True)
+                button_widget.setEnabled(
+                    self.content_type == "video"
+                    and len(self._platform_accounts(2)) == 1
+                )
                 button_widget.setText("搜索")
 
         self.location_tasks.run(
@@ -2269,12 +2282,11 @@ class PublishPage(QWidget):
 
     def _select_video_channel_location_item(self, item: QListWidgetItem) -> None:
         raw = item.data(Qt.ItemDataRole.UserRole)
-        accounts = self.selected_accounts()
+        accounts = self._platform_accounts(2)
         if (
             not isinstance(raw, dict)
             or self.content_type != "video"
             or len(accounts) != 1
-            or int(accounts[0].get("type") or 0) != 2
         ):
             self._invalidate_video_channel_location()
             self._set_video_channel_location_status(
@@ -2316,7 +2328,7 @@ class PublishPage(QWidget):
     def _sync_wechat_location_visibility_and_context(self) -> None:
         if self.wechat_location_panel is None:
             return
-        accounts = self.selected_accounts()
+        accounts = self._platform_accounts(10)
         signature = (
             self.content_type,
             tuple(
@@ -2326,15 +2338,28 @@ class PublishPage(QWidget):
                 )
             ),
         )
-        if signature != self._wechat_location_context_signature:
+        context_changed = signature != self._wechat_location_context_signature
+        if context_changed:
             self._wechat_location_context_signature = signature
             self._invalidate_wechat_location()
         visible = (
             self.content_type in wechat_location_service.SUPPORTED_CONTENT_TYPES
-            and len(accounts) == 1
-            and int(accounts[0].get("type") or 0) == 10
+            and bool(accounts)
         )
+        controls_enabled = visible and len(accounts) == 1
         self.wechat_location_panel.setVisible(visible)
+        self.wechat_location_keyword.setEnabled(controls_enabled)
+        self.wechat_location_search_button.setEnabled(controls_enabled)
+        self.wechat_location_results.setEnabled(controls_enabled)
+        if visible and len(accounts) > 1:
+            self._set_wechat_location_status(
+                "已选多个公众号账号，请只保留一个公众号账号后搜索地点",
+                "warning",
+            )
+        elif visible and context_changed:
+            self._set_wechat_location_status(
+                "当前公众号账号可搜索正文地理位置"
+            )
 
     def _invalidate_wechat_location(self) -> None:
         self._wechat_selected_location = {}
@@ -2366,11 +2391,10 @@ class PublishPage(QWidget):
         except wechat_location_service.WechatLocationError as exc:
             self._set_wechat_location_status(str(exc), "warning")
             return
-        accounts = self.selected_accounts()
+        accounts = self._platform_accounts(10)
         if (
             self.content_type not in wechat_location_service.SUPPORTED_CONTENT_TYPES
             or len(accounts) != 1
-            or int(accounts[0].get("type") or 0) != 10
         ):
             self._invalidate_wechat_location()
             self._sync_wechat_location_visibility_and_context()
@@ -2399,7 +2423,7 @@ class PublishPage(QWidget):
         def is_current() -> bool:
             if self.content_type != content_type:
                 return False
-            current_accounts = self.selected_accounts()
+            current_accounts = self._platform_accounts(10)
             if len(current_accounts) != 1:
                 return False
             if int(current_accounts[0].get("id") or 0) != source_account_id:
@@ -2430,7 +2454,11 @@ class PublishPage(QWidget):
 
         def on_finished() -> None:
             if search_button is not None:
-                search_button.setEnabled(True)
+                search_button.setEnabled(
+                    self.content_type
+                    in wechat_location_service.SUPPORTED_CONTENT_TYPES
+                    and len(self._platform_accounts(10)) == 1
+                )
                 search_button.setText("搜索")
 
         self.location_tasks.run(
@@ -2518,7 +2546,16 @@ class PublishPage(QWidget):
     def _select_wechat_location_item(self, item: QListWidgetItem) -> None:
         raw = item.data(Qt.ItemDataRole.UserRole)
         candidate = wechat_location_service.normalize_canonical_location_candidate(raw)
-        if candidate is None or not isinstance(raw, dict):
+        accounts = self._platform_accounts(10)
+        if (
+            candidate is None
+            or not isinstance(raw, dict)
+            or self.content_type
+            not in wechat_location_service.SUPPORTED_CONTENT_TYPES
+            or len(accounts) != 1
+            or int(accounts[0].get("id") or 0)
+            != int(raw.get("sourceAccountId") or 0)
+        ):
             self._set_wechat_location_status("公众号地点候选无效，请重新搜索", "danger")
             return
         payload = {
@@ -4263,7 +4300,6 @@ class PublishPage(QWidget):
                 exact_wechat_context = (
                     self.content_type
                     in wechat_location_service.SUPPORTED_CONTENT_TYPES
-                    and len(accounts) == 1
                     and len(selected) == 1
                 )
                 if exact_wechat_context and self.wechat_location_keyword is not None:
@@ -4332,8 +4368,7 @@ class PublishPage(QWidget):
                     }
                 )
                 exact_xhs_context = (
-                    len(accounts) == 1
-                    and len(selected) == 1
+                    len(selected) == 1
                     and int(selected[0].get("type") or 0) == 1
                 )
                 if exact_xhs_context and self.xhs_location_keyword is not None:
@@ -4379,8 +4414,7 @@ class PublishPage(QWidget):
                     }
                 )
                 exact_video_channel_context = (
-                    len(accounts) == 1
-                    and len(selected) == 1
+                    len(selected) == 1
                     and int(selected[0].get("type") or 0) == 2
                 )
                 if (
