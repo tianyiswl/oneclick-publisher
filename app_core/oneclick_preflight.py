@@ -14,7 +14,11 @@ from pathlib import Path
 import re
 from urllib.parse import parse_qs, urlparse
 
-from . import account_service, wechat_location_service
+from . import (
+    account_service,
+    video_channel_location_service,
+    wechat_location_service,
+)
 from .paths import COOKIE_DIR
 
 
@@ -1827,8 +1831,32 @@ async def _video_channel_video_preflight(page, payload: dict) -> str:
     if not description_ok or not title_ok:
         missing = "视频描述" if not description_ok else "短标题"
         raise PreflightError(f"视频号{missing}字段未能回读测试值")
+    account_ids = payload.get("accountIds")
+    expected_account_id = (
+        int(account_ids[0])
+        if isinstance(account_ids, list) and len(account_ids) == 1
+        else None
+    )
+    try:
+        location_readback = (
+            await video_channel_location_service.apply_video_channel_location(
+                page,
+                payload,
+                expected_account_id=expected_account_id,
+            )
+        )
+    except video_channel_location_service.VideoChannelLocationError as exc:
+        raise PreflightError(str(exc)) from exc
+    location_message = (
+        f"位置已重新搜索并回读：{location_readback['name']}；"
+        if location_readback is not None
+        else "未添加位置；"
+    )
     # 安全边界：绝不定位或点击发表、预览、存草稿等按钮。
-    return "视频号视频素材已上传，视频描述和短标题已回读；未保存草稿、未预览、未发表"
+    return (
+        "视频号视频素材已上传，视频描述和短标题已回读；"
+        f"{location_message}未保存草稿、未预览、未发表"
+    )
 
 
 async def _video_channel_graphic_preflight(page, payload: dict) -> str:

@@ -28,6 +28,7 @@ from . import (
     overseas_video_publish,
     overseas_preflight,
     task_service,
+    video_channel_location_service,
     wechat_location_service,
     wechat_publish_executor,
     wechat_publish_policy,
@@ -217,6 +218,36 @@ def _validate_payloads(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     payload["xhsLocationPoi"] = location
             for key in generic_location_keys:
                 payload.pop(key, None)
+        video_channel_location_keys = (
+            "videoChannelLocationKeyword",
+            "videoChannelLocationScope",
+            "videoChannelLocationPoi",
+        )
+        if platform_type == 2:
+            if str(payload.get("contentType") or "").strip() != "video":
+                if any(bool(payload.get(key)) for key in video_channel_location_keys):
+                    raise ValueError("视频号位置字段仅支持视频发布")
+            else:
+                try:
+                    location = (
+                        video_channel_location_service.normalize_location_selection(
+                            payload
+                        )
+                    )
+                except video_channel_location_service.VideoChannelLocationError as exc:
+                    raise ValueError(str(exc)) from exc
+                if location is None:
+                    payload["videoChannelLocationKeyword"] = ""
+                    payload["videoChannelLocationScope"] = ""
+                    payload["videoChannelLocationPoi"] = None
+                else:
+                    payload["videoChannelLocationKeyword"] = str(
+                        location["searchKeyword"]
+                    )
+                    payload["videoChannelLocationScope"] = str(location["scope"])
+                    payload["videoChannelLocationPoi"] = location
+        elif any(bool(payload.get(key)) for key in video_channel_location_keys):
+            raise ValueError("视频号位置字段不能用于其他平台")
         if platform_type == 3:
             location_keyword = " ".join(
                 str(payload.get("locationKeyword") or "").split()
