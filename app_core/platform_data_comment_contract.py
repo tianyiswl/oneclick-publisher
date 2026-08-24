@@ -1001,14 +1001,6 @@ async def _observe_contract_responses_async(
                     caught = exc
         resources = (page, context, browser, playwright)
         shape_workers = _active_shape_workers()
-        for index, worker in enumerate(shape_workers):
-            remaining_targets = len(shape_workers) - index + len(resources)
-            worker_deadline = time.monotonic() + (
-                _remaining_seconds(cleanup_deadline) / remaining_targets
-            )
-            worker.join(_remaining_seconds(worker_deadline))
-            if worker.is_alive():
-                cleanup_errors.append(TimeoutError())
         for index, resource in enumerate(resources):
             resource_count = len(resources) - index
             close_deadline = time.monotonic() + (
@@ -1017,6 +1009,11 @@ async def _observe_contract_responses_async(
             close_error = await _close_resource(resource, close_deadline)
             if close_error is not None:
                 cleanup_errors.append(close_error)
+        # 结构工作线程只持有已读取的字节；先关闭平台资源，避免它挤占浏览器清理预留时间。
+        for worker in shape_workers:
+            worker.join(_remaining_seconds(cleanup_deadline))
+            if worker.is_alive():
+                cleanup_errors.append(TimeoutError())
 
     cleanup = CleanupReceipt(
         closed=not cleanup_errors,

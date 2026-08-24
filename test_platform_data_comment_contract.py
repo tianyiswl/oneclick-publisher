@@ -1249,6 +1249,55 @@ class PassiveObserverTests(unittest.TestCase):
         )
         self.assertEqual(harness.playwright.stopped, 1)
 
+    def test_timeout_closes_browser_before_waiting_for_finite_shape_worker(
+        self,
+    ) -> None:
+        """有限结构解析已超时时，应先关闭浏览器再用剩余时间收口工作线程。"""
+
+        release = threading.Event()
+        entered = threading.Event()
+        original_loads = contract_module.json.loads
+
+        class ReleasingClosePage(FakePage):
+            async def close(self) -> None:
+                release.set()
+                await super().close()
+
+        def waits_for_browser_close(body: bytes) -> object:
+            entered.set()
+            if not release.wait(0.2):
+                raise AssertionError("browser resources were not closed first")
+            return original_loads(body)
+
+        page = ReleasingClosePage(
+            (
+                FakeResponse(
+                    "https://creator.douyin.com/finite-shape-timeout",
+                    {"data": [1]},
+                ),
+            )
+        )
+        harness = ObserverHarness(self.root, page)
+        first_patch, second_patch = harness.patches()
+
+        with (
+            first_patch,
+            second_patch,
+            patch.object(contract_module.json, "loads", waits_for_browser_close),
+            patch.object(contract_module, "_TOTAL_WALL_SECONDS", 0.03),
+            self.assertRaises(CommentInsightFailure) as raised,
+        ):
+            contract_module.observe_contract_responses(harness.account, None)
+
+        self.assertTrue(entered.is_set())
+        self.assertEqual(raised.exception.error_code, "comment_sync_timeout")
+        self.assertTrue(raised.exception.cleanup_receipt.closed)
+        self.assertEqual(
+            (page.closed, harness.context.closed, harness.browser.closed),
+            (1, 1, 1),
+        )
+        self.assertEqual(harness.playwright.stopped, 1)
+
     def test_repeated_cpu_timeouts_have_one_audited_worker_at_most(self) -> None:
         """重复 CPU 超时不能累计后台线程，存活线程必须进入清理回执。"""
 
