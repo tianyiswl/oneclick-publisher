@@ -167,6 +167,7 @@ def _wait_for_controlled_task(task_id: int, *, interactive_verification: bool) -
         apply_style(app)
         verification_dialog = DouyinVerificationDialog
     while publish_service.is_task_running(task_id):
+        task_service.touch_task_heartbeat(task_id)
         if app is not None:
             app.processEvents()
             request_id = douyin_verification_broker.request_for_task(task_id)
@@ -219,13 +220,24 @@ def run_controlled_publish_cli(args: argparse.Namespace) -> int:
             _controlled_json(initial)
             task_id = int(initial["taskId"])
             # CLI 进程保持到后台发布线程结束；Codex 可同时用 status 查询 taskId。
-            _wait_for_controlled_task(
-                task_id,
-                interactive_verification=(
-                    str(request.get("mode") or "preflight").strip().lower()
-                    == "formal"
-                ),
-            )
+            try:
+                _wait_for_controlled_task(
+                    task_id,
+                    interactive_verification=(
+                        str(request.get("mode") or "preflight").strip().lower()
+                        == "formal"
+                    ),
+                )
+            except KeyboardInterrupt:
+                task_service.fail_active_task(
+                    task_id,
+                    error_code="controlled_cli_interrupted",
+                    message="受控发布命令被中断，未取得最终回执的平台已安全停止",
+                    event_type="controlled_cli_interrupted",
+                )
+                final = controlled_publish.task_status(task_id)
+                _controlled_json(final)
+                return 130
             final = controlled_publish.task_status(task_id)
             if final != initial:
                 _controlled_json(final)

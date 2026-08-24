@@ -347,6 +347,20 @@ _ERROR_CODE_RE = re.compile(
     r"(?:错误码|error(?:Code)?)\s*[:：=]?\s*([a-z][a-z0-9_]{2,})",
     re.IGNORECASE,
 )
+_LEGACY_ERROR_CODES = (
+    ("没有返回任何可用的话题候选", "douyin_topic_candidates_unavailable"),
+    ("等待小红书平台成功回执超时", "xhs_receipt_timeout"),
+)
+
+
+def _projected_error_code(message: str) -> str:
+    match = _ERROR_CODE_RE.search(message)
+    if match:
+        return match.group(1)
+    return next(
+        (code for marker, code in _LEGACY_ERROR_CODES if marker in message),
+        "",
+    )
 
 
 def project_task(task: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -369,7 +383,6 @@ def project_task(task: Mapping[str, Any] | None) -> dict[str, Any]:
         if not isinstance(item, Mapping):
             continue
         message = " ".join(str(item.get("message") or "").split())
-        error_match = _ERROR_CODE_RE.search(message)
         status = str(item.get("status") or "pending")
         platform_type = int(item.get("platformType") or 0)
         related_payloads = payloads_by_type.get(platform_type, [])
@@ -405,7 +418,7 @@ def project_task(task: Mapping[str, Any] | None) -> dict[str, Any]:
                     or ""
                 ),
                 "status": status,
-                "errorCode": error_match.group(1) if error_match else "",
+                "errorCode": _projected_error_code(message),
                 "errorText": message if status == "failed" else "",
                 "receipt": receipt,
                 "contentId": str(item.get("platformPostId") or ""),
@@ -430,6 +443,7 @@ def project_task(task: Mapping[str, Any] | None) -> dict[str, Any]:
 def task_status(task_id: int) -> dict[str, Any]:
     from . import task_service
 
+    task_service.reconcile_stale_controlled_task(int(task_id))
     return project_task(task_service.get_task(int(task_id)))
 
 

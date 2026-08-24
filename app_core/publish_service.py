@@ -53,6 +53,24 @@ _DOUYIN_COMMERCE_BATCH_WORKFLOW = "douyin-commerce-batch"
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
+def _failure_message(
+    prefix: str,
+    exc: BaseException,
+    *,
+    platform_type: int,
+) -> str:
+    """为本地接口生成稳定错误码；原始异常文本仍完整保留。"""
+
+    error_code = str(getattr(exc, "error_code", "") or "").strip()
+    if not error_code:
+        error_code = {
+            1: "xhs_publish_failed",
+            3: "douyin_publish_failed",
+            10: "wechat_publish_failed",
+        }.get(int(platform_type), "platform_publish_failed")
+    return f"{prefix}：{type(exc).__name__}：{exc}（错误码 {error_code}）"
+
+
 def _is_douyin_commerce_batch_payload(payload: object) -> bool:
     """判断是否为必须交给批量执行器的批次信封。
 
@@ -482,6 +500,11 @@ def _run_preflight(task: dict, payloads: list[dict[str, Any]]) -> None:
             message="已有预检任务正在执行，请稍后重试",
             content_type=str(payloads[0].get("contentType") or ""),
         )
+        task_service.fail_active_task(
+            int(task["id"]),
+            error_code="controlled_publish_busy",
+            message="已有预检任务正在执行，其余平台未启动",
+        )
         _active_threads.pop(int(task["id"]), None)
         return
     try:
@@ -514,16 +537,25 @@ def _run_preflight(task: dict, payloads: list[dict[str, Any]]) -> None:
                     task["id"],
                     platform_type,
                     ok=False,
-                    message=f"预检任务异常：{type(exc).__name__}：{exc}",
+                    message=_failure_message(
+                        "预检任务异常", exc, platform_type=platform_type
+                    ),
                     content_type=str(payload.get("contentType") or ""),
                 )
     except Exception as exc:
         task_service.mark_platform_result(
             task["id"], int(payloads[0]["type"]), ok=False,
-            message=f"预检任务异常：{type(exc).__name__}：{exc}",
+            message=_failure_message(
+                "预检任务异常", exc, platform_type=int(payloads[0]["type"])
+            ),
             content_type=str(payloads[0].get("contentType") or ""),
         )
     finally:
+        task_service.fail_active_task(
+            int(task["id"]),
+            error_code="controlled_worker_ended_without_terminal_result",
+            message="预检进程结束，但仍有平台没有取得明确结果",
+        )
         _publish_lock.release()
         _active_threads.pop(int(task["id"]), None)
 
@@ -543,6 +575,11 @@ def _run_publish(task: dict, payloads: list[dict[str, Any]]) -> None:
             message="已有发布任务正在执行，请稍后重试",
             content_type=str(payloads[0].get("contentType") or ""),
             event_type="platform_publish",
+        )
+        task_service.fail_active_task(
+            int(task["id"]),
+            error_code="controlled_publish_busy",
+            message="已有发布任务正在执行，其余平台未启动",
         )
         _active_threads.pop(int(task["id"]), None)
         return
@@ -604,7 +641,9 @@ def _run_publish(task: dict, payloads: list[dict[str, Any]]) -> None:
                     task["id"],
                     platform_type,
                     ok=False,
-                    message=f"正式发布异常：{type(exc).__name__}：{exc}",
+                    message=_failure_message(
+                        "正式发布异常", exc, platform_type=platform_type
+                    ),
                     content_type=str(payload.get("contentType") or ""),
                     event_type="platform_publish",
                 )
@@ -613,11 +652,18 @@ def _run_publish(task: dict, payloads: list[dict[str, Any]]) -> None:
             task["id"],
             int(payloads[0]["type"]),
             ok=False,
-            message=f"正式发布异常：{type(exc).__name__}：{exc}",
+            message=_failure_message(
+                "正式发布异常", exc, platform_type=int(payloads[0]["type"])
+            ),
             content_type=str(payloads[0].get("contentType") or ""),
             event_type="platform_publish",
         )
     finally:
+        task_service.fail_active_task(
+            int(task["id"]),
+            error_code="controlled_worker_ended_without_terminal_result",
+            message="正式发布进程结束，但仍有平台没有取得最终回执",
+        )
         _publish_lock.release()
         _active_threads.pop(int(task["id"]), None)
 

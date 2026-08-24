@@ -165,6 +165,31 @@ class ControlledPublishTests(unittest.TestCase):
         self.assertEqual(projected["platforms"][1]["errorCode"], "xhs_cover_trigger_missing")
         self.assertEqual(projected["platforms"][1]["scheduledAt"], "2026-08-24 20:30")
 
+    def test_projection_maps_legacy_douyin_topic_failure_to_stable_code(self) -> None:
+        projected = project_task(
+            {
+                "id": 12,
+                "taskNo": "T12",
+                "mode": "oneclick_publish",
+                "status": "failed",
+                "payloadJson": "[]",
+                "items": [
+                    {
+                        "platformType": 3,
+                        "status": "failed",
+                        "message": (
+                            "正式发布异常：RuntimeError："
+                            "抖音没有返回任何可用的话题候选，已停止填写"
+                        ),
+                    }
+                ],
+            }
+        )
+        self.assertEqual(
+            projected["platforms"][0]["errorCode"],
+            "douyin_topic_candidates_unavailable",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

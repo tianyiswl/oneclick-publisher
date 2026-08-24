@@ -678,7 +678,9 @@ async def _xhs_preflight(page, payload: dict) -> str:
             await adapter.verify_immediate_publish(page)
             schedule_readback = "立即发布"
     except XhsNativeAdapterError as exc:
-        raise PreflightError(str(exc)) from exc
+        error_code = str(getattr(exc, "error_code", "") or "").strip()
+        suffix = f"（错误码 {error_code}）" if error_code else ""
+        raise PreflightError(f"{exc}{suffix}") from exc
 
     label = "图文" if readback["contentType"] == "article" else "视频"
     # 安全边界：预检允许回填并回读素材、文本、官方话题、声明与定时
@@ -2442,31 +2444,49 @@ async def _douyin_video_preflight(page, payload: dict) -> str:
     await upload.wait_for(state="attached", timeout=15_000)
     await upload.set_input_files(str(files[0]))
     await page.wait_for_url("**/creator-micro/content/post/video*", timeout=30_000)
-    await _douyin_fill_title_and_description(
-        page, title, description,
-        title_placeholder="填写作品标题，为作品获得更多流量", label="视频",
+    # 预检与正式发布必须使用同一套标题、正文、官方话题选择和页面回读。
+    # 旧预检只填写普通文本，导致“预检成功”不能证明正式阶段的话题可用。
+    from uploader.douyin_uploader.main import DouYinVideo
+
+    expected_topics = [
+        str(tag).strip().lstrip("#")
+        for tag in payload.get("tags") or []
+        if str(tag).strip().lstrip("#")
+    ]
+    editor_helper = DouYinVideo(
+        title=title,
+        file_path=str(files[0]),
+        tags=expected_topics,
+        publish_date=0,
+        account_file="",
+        dry_run=True,
+        dry_run_hold_browser=False,
+        description=description,
     )
+    try:
+        editor_readback = await editor_helper.sync_uploaded_editor_content(
+            page,
+            title=title,
+            description=description,
+            tags=expected_topics,
+        )
+    except Exception as exc:
+        error_code = str(getattr(exc, "error_code", "") or "")
+        suffix = f"（错误码 {error_code}）" if error_code else ""
+        raise PreflightError(
+            f"抖音标题、正文或平台话题未能按正式合同回读："
+            f"{_normalized_page_text(exc)[:220]}{suffix}"
+        ) from exc
+    confirmed_topics = list(editor_readback.get("tags") or [])
     location_name = await _douyin_set_location(page, payload)
     declaration_note = ""
     if payload.get("aiGenerated") is True:
         # 复用正式发布上传器已经过回归验证的自主声明选择逻辑。这里仅在
         # 编辑页选择并回读，不定位或点击发布、暂存、预览等结果性控件。
-        from uploader.douyin_uploader.main import DouYinVideo
-
-        declarer = DouYinVideo(
-            title=title,
-            file_path=str(files[0]),
-            tags=[],
-            publish_date=0,
-            account_file="",
-            dry_run=True,
-            dry_run_hold_browser=False,
-            description=description,
-        )
-        declarer.ai_generated = True
-        declarer.content_declaration = ""
+        editor_helper.ai_generated = True
+        editor_helper.content_declaration = ""
         try:
-            declaration = await declarer.set_ai_generated_declaration(page)
+            declaration = await editor_helper.set_ai_generated_declaration(page)
         except Exception as exc:
             raise PreflightError(
                 f"抖音 AI 生成内容声明未能写入并回读：{_normalized_page_text(exc)[:160]}"
@@ -2477,7 +2497,7 @@ async def _douyin_video_preflight(page, payload: dict) -> str:
     # 安全边界：绝不定位或点击“发布”“发布暂存离开”“预览”等按钮。
     location_note = f"，定位“{location_name}”已回读" if location_name else "，未添加定位"
     return (
-        f"抖音视频素材已上传，标题和描述已回读{location_note}"
+        f"抖音视频素材已上传，标题、正文和 {len(confirmed_topics)} 个平台话题已回读{location_note}"
         f"{declaration_note}；未保存草稿、未预览、未发布"
     )
 

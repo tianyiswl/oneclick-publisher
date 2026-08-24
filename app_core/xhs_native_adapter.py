@@ -42,6 +42,10 @@ _AI_LABELS = (
 class XhsNativeAdapterError(RuntimeError):
     """小红书字段、控件或回读不能被唯一确认时安全停止。"""
 
+    def __init__(self, message: str, *, error_code: str = "") -> None:
+        self.error_code = str(error_code or "")
+        super().__init__(message)
+
 
 def _normalized(value: object) -> str:
     return " ".join(str(value or "").replace("\u200b", "").split())
@@ -55,6 +59,51 @@ def _topic_candidate_matches(candidate_name: object, topic: str) -> bool:
     """
 
     return _normalized(candidate_name) == f"#{str(topic).strip().lstrip('#')}"
+
+
+async def _find_unique_official_topic_candidate(
+    page,
+    topic: str,
+    *,
+    max_wait_ms: int = 5_000,
+    poll_interval_ms: int = 400,
+):
+    """等待小红书异步话题联想稳定，并返回唯一精确官方候选。"""
+
+    attempts = max(1, max_wait_ms // max(1, poll_interval_ms) + 1)
+    last_match_count = 0
+    for attempt in range(attempts):
+        candidates = page.locator(".tippy-box .items .item")
+        matched = []
+        for index in range(await candidates.count()):
+            candidate = candidates.nth(index)
+            try:
+                names = candidate.locator(".name")
+                if (
+                    await candidate.is_visible()
+                    and await _is_actual_viewport_visible(candidate)
+                    and await names.count() == 1
+                    and _topic_candidate_matches(
+                        await names.first.inner_text(), topic
+                    )
+                ):
+                    matched.append(candidate)
+            except Exception:
+                continue
+        last_match_count = len(matched)
+        if last_match_count == 1:
+            return matched[0]
+        if attempt < attempts - 1:
+            await page.wait_for_timeout(poll_interval_ms)
+    error_code = (
+        "xhs_topic_candidate_missing"
+        if last_match_count == 0
+        else "xhs_topic_candidate_ambiguous"
+    )
+    raise XhsNativeAdapterError(
+        f"小红书未返回唯一官方话题候选：#{topic}，精确候选={last_match_count}",
+        error_code=error_code,
+    )
 
 
 async def _is_actual_viewport_visible(locator) -> bool:
@@ -324,7 +373,55 @@ async def _find_video_cover_trigger(
     )
     raise XhsNativeAdapterError(
         "小红书视频封面入口无法唯一识别，"
-        f"可见候选={visible_total}（错误码 {error_code}）"
+        f"可见候选={visible_total}（错误码 {error_code}）",
+        error_code=error_code,
+    )
+
+
+async def _find_video_cover_upload_input(
+    modal,
+    *,
+    max_wait_ms: int = 20_000,
+    poll_interval_ms: int = 400,
+):
+    """识别封面编辑器内的图片上传控件，兼容 MIME 与扩展名 accept。"""
+
+    attempts = max(1, max_wait_ms // max(1, poll_interval_ms) + 1)
+    last_total = 0
+    last_accepts: list[str] = []
+    for attempt in range(attempts):
+        inputs = modal.locator("input[type=file]")
+        last_total = await inputs.count()
+        candidates = []
+        accepts = []
+        for index in range(last_total):
+            item = inputs.nth(index)
+            try:
+                accept = str(await item.get_attribute("accept") or "").lower()
+            except Exception:
+                continue
+            accepts.append(accept)
+            is_image = "image/" in accept or any(
+                extension in accept for extension in _IMAGE_EXTENSIONS
+            )
+            if is_image and not any(
+                marker in accept for marker in ("video/", ".mp4", ".mov", ".webm")
+            ):
+                candidates.append(item)
+        last_accepts = accepts
+        if len(candidates) == 1:
+            return candidates[0]
+        if len(candidates) > 1:
+            raise XhsNativeAdapterError(
+                "小红书视频封面编辑器返回多个图片上传控件，已安全停止",
+                error_code="xhs_cover_upload_input_ambiguous",
+            )
+        if attempt < attempts - 1:
+            await modal.page.wait_for_timeout(poll_interval_ms)
+    raise XhsNativeAdapterError(
+        "小红书视频封面编辑器未返回图片上传控件："
+        f"文件控件={last_total}，accept={last_accepts}",
+        error_code="xhs_cover_upload_input_missing",
     )
 
 
@@ -485,18 +582,7 @@ class XhsNativeAdapter:
             "[aria-modal='true']:has-text('封面')"
         )
         modal = await _first_visible(modal_candidates, "视频封面编辑器")
-        image_inputs = modal.locator("input[type=file][accept*='image']")
-        try:
-            await image_inputs.first.wait_for(state="attached", timeout=20_000)
-        except Exception as exc:
-            raise XhsNativeAdapterError(
-                "小红书视频封面编辑器加载超时"
-            ) from exc
-        if await image_inputs.count() != 1:
-            raise XhsNativeAdapterError(
-                "小红书视频封面编辑器未返回唯一图片上传控件"
-            )
-        image_input = image_inputs.first
+        image_input = await _find_video_cover_upload_input(modal)
         await image_input.set_input_files(cover_path)
         selected_count = await image_input.evaluate(
             "node => node.files ? node.files.length : 0"
@@ -798,28 +884,8 @@ class XhsNativeAdapter:
             await page.keyboard.press("End")
             await page.keyboard.insert_text(f" #{topic}")
             await page.wait_for_timeout(700)
-            candidates = page.locator(".tippy-box .items .item")
-            matched = []
-            for index in range(await candidates.count()):
-                candidate = candidates.nth(index)
-                try:
-                    names = candidate.locator(".name")
-                    if (
-                        await candidate.is_visible()
-                        and await _is_actual_viewport_visible(candidate)
-                        and await names.count() == 1
-                        and _topic_candidate_matches(
-                            await names.first.inner_text(), topic
-                        )
-                    ):
-                        matched.append(candidate)
-                except Exception:
-                    continue
-            if len(matched) != 1:
-                raise XhsNativeAdapterError(
-                    f"小红书未返回唯一官方话题候选：#{topic}"
-                )
-            await matched[0].click(timeout=3_000)
+            candidate = await _find_unique_official_topic_candidate(page, topic)
+            await candidate.click(timeout=3_000)
             await page.wait_for_timeout(500)
         nodes = editor.locator("a.tiptap-topic")
         node_texts = [
@@ -963,4 +1029,20 @@ class XhsNativeAdapter:
         )
 
     async def submit_final_button(self, button) -> None:
+        tag_name = await button.evaluate("node => node.tagName")
+        if str(tag_name or "").upper() == "XHS-PUBLISH-BTN":
+            box = await button.bounding_box()
+            if not box:
+                raise XhsNativeAdapterError(
+                    "小红书最终发布按钮没有可点击区域",
+                    error_code="xhs_final_button_box_missing",
+                )
+            await button.click(
+                position={
+                    "x": box["width"] * 0.64,
+                    "y": box["height"] * 0.50,
+                },
+                timeout=10_000,
+            )
+            return
         await button.click(timeout=10_000)

@@ -20,6 +20,10 @@ from .xhs_native_adapter import XhsNativeAdapter, build_native_contract
 class XhsPublishError(RuntimeError):
     """小红书正式任务未获得可验证平台回执。"""
 
+    def __init__(self, message: str, *, error_code: str = "xhs_publish_failed") -> None:
+        self.error_code = str(error_code)
+        super().__init__(message)
+
 
 def _normalized(value: object) -> str:
     return " ".join(str(value or "").replace("\u200b", "").split())
@@ -204,7 +208,7 @@ async def _wait_for_platform_result(
     task_id: int,
     schedule_text: str | None,
     scheduled: bool,
-    timeout_seconds: int = 600,
+    timeout_seconds: int = 120,
 ) -> dict:
     """等待前台最终操作后的平台回执；不点击任何弹窗或确认按钮。"""
 
@@ -264,7 +268,11 @@ async def _wait_for_platform_result(
                     + marker[:700]
                 )
         await page.wait_for_timeout(500)
-    raise XhsPublishError("等待小红书平台成功回执超时，页面已保留至超时结束")
+    raise XhsPublishError(
+        f"点击小红书最终按钮后未在 {int(timeout_seconds)} 秒内获得平台成功回执；"
+        "不能确认是否已受理，请到平台作品管理页核对后再决定是否重试",
+        error_code="xhs_receipt_timeout",
+    )
 
 
 async def run_xhs_publish(payload: dict, *, task_id: int) -> dict:

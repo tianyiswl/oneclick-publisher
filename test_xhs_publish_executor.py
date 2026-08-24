@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 
 import unittest
+import asyncio
 from datetime import datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import AsyncMock, MagicMock
 
 from app_core.xhs_publish_executor import (
     XhsPublishError,
@@ -12,15 +14,49 @@ from app_core.xhs_publish_executor import (
     _schedule_time,
     _validate_declaration_policy,
     _validate_payload,
+    _wait_for_platform_result,
 )
 from app_core.publish_service import _validate_payloads
 from app_core.xhs_native_adapter import (
     _AI_LABELS,
+    XhsNativeAdapter,
     XhsNativeAdapterError,
+    _find_unique_official_topic_candidate,
+    _find_video_cover_upload_input,
     _find_video_cover_trigger,
     _topic_candidate_matches,
     build_native_contract,
 )
+
+
+class _FinalButton:
+    def __init__(self, tag="XHS-PUBLISH-BTN"):
+        self.tag = tag
+        self.click_kwargs = None
+
+    async def evaluate(self, _script):
+        return self.tag
+
+    async def bounding_box(self):
+        return {"x": 10, "y": 20, "width": 500, "height": 80}
+
+    async def click(self, **kwargs):
+        self.click_kwargs = kwargs
+
+
+class XhsFinalButtonTests(unittest.IsolatedAsyncioTestCase):
+    async def test_web_component_clicks_real_submit_area(self):
+        button = _FinalButton()
+
+        await XhsNativeAdapter.submit_final_button(None, button)
+
+        self.assertEqual(
+            button.click_kwargs,
+            {
+                "position": {"x": 320.0, "y": 40.0},
+                "timeout": 10_000,
+            },
+        )
 
 
 class _CoverItem:
@@ -40,6 +76,10 @@ class _CoverLocator:
 
     def nth(self, index):
         return self.items[index]
+
+    @property
+    def first(self):
+        return self.items[0]
 
 
 class _CoverPage:
@@ -78,6 +118,44 @@ class XhsCoverTriggerTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    async def test_accepts_extension_based_cover_upload_input(self):
+        image_input = _CoverItem()
+        image_input.get_attribute = AsyncMock(return_value=".jpg,.jpeg,.png")
+        locator = MagicMock()
+        locator.count = AsyncMock(return_value=1)
+        locator.nth = MagicMock(return_value=image_input)
+        modal = MagicMock()
+        modal.locator.return_value = locator
+
+        selected = await _find_video_cover_upload_input(
+            modal,
+            max_wait_ms=0,
+            poll_interval_ms=1,
+        )
+
+        self.assertIs(selected, image_input)
+
+    async def test_rejects_video_upload_input_inside_cover_editor(self):
+        video_input = _CoverItem()
+        video_input.get_attribute = AsyncMock(return_value="video/mp4")
+        locator = MagicMock()
+        locator.count = AsyncMock(return_value=1)
+        locator.nth = MagicMock(return_value=video_input)
+        modal = MagicMock()
+        modal.locator.return_value = locator
+
+        with self.assertRaises(XhsNativeAdapterError) as raised:
+            await _find_video_cover_upload_input(
+                modal,
+                max_wait_ms=0,
+                poll_interval_ms=1,
+            )
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "xhs_cover_upload_input_missing",
+        )
+
     async def test_waits_for_cover_card_after_video_processing(self):
         page = _CoverPage(
             {
@@ -101,6 +179,34 @@ class XhsCoverTriggerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsInstance(trigger, _CoverItem)
 
+
+class XhsTopicCandidateTests(unittest.IsolatedAsyncioTestCase):
+    async def test_waits_for_delayed_exact_official_topic_candidate(self):
+        name = MagicMock()
+        name.inner_text = AsyncMock(return_value="#AI编程")
+        names = MagicMock()
+        names.count = AsyncMock(return_value=1)
+        names.first = name
+        candidate = _CoverItem()
+        candidate.locator = MagicMock(return_value=names)
+        empty = MagicMock()
+        empty.count = AsyncMock(return_value=0)
+        available = MagicMock()
+        available.count = AsyncMock(return_value=1)
+        available.nth = MagicMock(return_value=candidate)
+        page = MagicMock()
+        page.locator = MagicMock(side_effect=[empty, available])
+        page.wait_for_timeout = AsyncMock()
+
+        selected = await _find_unique_official_topic_candidate(
+            page,
+            "AI编程",
+            max_wait_ms=1_000,
+            poll_interval_ms=1,
+        )
+
+        self.assertIs(selected, candidate)
+        page.wait_for_timeout.assert_awaited_once_with(1)
 
 class XhsPublishExecutorTests(unittest.TestCase):
     def setUp(self):
@@ -194,6 +300,45 @@ class XhsPublishExecutorTests(unittest.TestCase):
             _publish_button_label({"tag": "BUTTON", "text": "发布"}),
             "发布",
         )
+
+    def test_receipt_timeout_has_stable_error_code(self):
+        class Body:
+            async def inner_text(self, *, timeout):
+                del timeout
+                return "作品发布页"
+
+        class EmptyDialogs:
+            async def count(self):
+                return 0
+
+            def nth(self, _index):
+                raise AssertionError("没有弹窗时不应读取节点")
+
+        class Page:
+            url = "https://creator.xiaohongshu.com/publish/publish"
+
+            def is_closed(self):
+                return False
+
+            def locator(self, selector):
+                if selector == "body":
+                    return Body()
+                return EmptyDialogs()
+
+            async def wait_for_timeout(self, _milliseconds):
+                return None
+
+        with self.assertRaises(XhsPublishError) as raised:
+            asyncio.run(
+                _wait_for_platform_result(
+                    Page(),
+                    task_id=7,
+                    schedule_text="2026-08-24 22:00",
+                    scheduled=True,
+                    timeout_seconds=1,
+                )
+            )
+        self.assertEqual(raised.exception.error_code, "xhs_receipt_timeout")
 
     def test_ai_declaration_requires_evidence_and_authorization(self):
         payload = {

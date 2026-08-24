@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import uuid
 from datetime import datetime, timedelta
@@ -1357,14 +1358,142 @@ def mark_task_running(task_id: int, message: str) -> None:
     now = _now()
     with connect() as conn:
         conn.execute(
-            "UPDATE publish_tasks SET status = 'running', startedAt = COALESCE(startedAt, ?) WHERE id = ?",
-            (now, int(task_id)),
+            """
+            UPDATE publish_tasks
+            SET status = 'running', startedAt = COALESCE(startedAt, ?),
+                workerPid = ?, workerHeartbeatAt = ?
+            WHERE id = ?
+            """,
+            (now, os.getpid(), now, int(task_id)),
         )
         conn.execute(
             "INSERT INTO publish_task_events (taskId, level, eventType, message, createdAt) VALUES (?, 'info', 'running', ?, ?)",
             (int(task_id), message, now),
         )
         conn.commit()
+
+
+def touch_task_heartbeat(task_id: int) -> bool:
+    """续租受控发布进程；不改变已经结束的任务。"""
+
+    now = _now()
+    with connect() as conn:
+        updated = conn.execute(
+            """
+            UPDATE publish_tasks
+            SET workerPid = ?, workerHeartbeatAt = ?
+            WHERE id = ? AND status IN ('pending', 'running')
+            """,
+            (os.getpid(), now, int(task_id)),
+        )
+        conn.commit()
+    return updated.rowcount == 1
+
+
+def fail_active_task(
+    task_id: int,
+    *,
+    error_code: str,
+    message: str,
+    event_type: str = "controlled_task_aborted",
+) -> bool:
+    """把未取得终态回执的执行项一次性关闭，防止永久 pending。"""
+
+    code = str(error_code or "controlled_task_aborted").strip()
+    public_message = f"{str(message).strip()}（错误码 {code}）"
+    now = _now()
+    with connect() as conn:
+        updated = conn.execute(
+            """
+            UPDATE publish_task_items
+            SET status = 'failed', message = ?, attempts = attempts + 1,
+                startedAt = COALESCE(startedAt, ?), finishedAt = ?
+            WHERE taskId = ? AND status IN ('pending', 'running')
+            """,
+            (public_message, now, now, int(task_id)),
+        )
+        if updated.rowcount == 0:
+            return False
+        summary = conn.execute(
+            """
+            SELECT
+                SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS success,
+                SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed
+            FROM publish_task_items WHERE taskId = ?
+            """,
+            (int(task_id),),
+        ).fetchone()
+        success = int(summary["success"] or 0)
+        failed = int(summary["failed"] or 0)
+        status = "partial_failed" if success and failed else "failed" if failed else "success"
+        conn.execute(
+            """
+            UPDATE publish_tasks
+            SET status = ?, successCount = ?, failedCount = ?, lastError = ?,
+                finishedAt = ?, workerHeartbeatAt = ?
+            WHERE id = ?
+            """,
+            (status, success, failed, public_message, now, now, int(task_id)),
+        )
+        conn.execute(
+            """
+            INSERT INTO publish_task_events
+                (taskId, level, eventType, message, createdAt)
+            VALUES (?, 'error', ?, ?, ?)
+            """,
+            (int(task_id), str(event_type), public_message, now),
+        )
+        conn.commit()
+    return True
+
+
+def reconcile_stale_controlled_task(
+    task_id: int,
+    *,
+    lease_seconds: int = 30,
+    now: datetime | None = None,
+) -> bool:
+    """查询时收口失联的本机任务；仅处理受控发布模式。"""
+
+    current = now or datetime.now()
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT mode, status, workerPid, workerHeartbeatAt, startedAt, createdAt
+            FROM publish_tasks WHERE id = ?
+            """,
+            (int(task_id),),
+        ).fetchone()
+    if not row:
+        return False
+    if str(row["mode"] or "") not in {
+        "oneclick_preflight",
+        "oneclick_publish",
+        "oneclick_draft",
+    } or str(row["status"] or "") not in {"pending", "running"}:
+        return False
+    worker_pid = int(row["workerPid"] or 0) if "workerPid" in row.keys() else 0
+    if worker_pid > 0:
+        try:
+            os.kill(worker_pid, 0)
+            return False
+        except OSError:
+            pass
+    reference_text = str(
+        row["workerHeartbeatAt"] or row["startedAt"] or row["createdAt"] or ""
+    )
+    try:
+        reference = datetime.fromisoformat(reference_text)
+    except ValueError:
+        reference = current - timedelta(seconds=max(1, int(lease_seconds)) + 1)
+    if (current - reference).total_seconds() <= max(1, int(lease_seconds)):
+        return False
+    return fail_active_task(
+        int(task_id),
+        error_code="controlled_worker_lease_expired",
+        message="受控发布进程已失联，未取得平台最终回执",
+        event_type="controlled_worker_lease_expired",
+    )
 
 
 def mark_task_paused(task_id: int, message: str, *, pause_reason_code: str) -> None:

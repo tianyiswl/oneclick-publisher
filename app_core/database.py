@@ -485,6 +485,8 @@ def ensure_schema() -> None:
                 ("pauseReasonCode", "TEXT"),
                 ("resumeSourceTaskId", "INTEGER"),
                 ("revisionSourceTaskId", "INTEGER"),
+                ("workerPid", "INTEGER"),
+                ("workerHeartbeatAt", "TEXT"),
             ),
         )
         conn.execute(
