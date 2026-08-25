@@ -6,6 +6,7 @@ from app_core.douyin_location_search_plan import (
     advance_after_page,
     build_location_search_plan,
     plan_progress_text,
+    record_plan_error,
 )
 
 
@@ -43,6 +44,13 @@ class DouyinLocationSearchPlanTests(unittest.TestCase):
             ("joymark",),
         )
 
+    def test_city_suffix_wins_when_city_name_matches_a_province(self):
+        plan = build_location_search_plan("吉林市joymark")
+
+        self.assertEqual(plan.search_kind, "city")
+        self.assertEqual(plan.merchant_term, "joymark")
+        self.assertEqual(plan.subqueries, ("吉林市joymark",))
+
     def test_brand_phrase_is_not_misread_as_city_prefix(self):
         plan = build_location_search_plan("夜南香北京烤鸭")
 
@@ -61,7 +69,14 @@ class DouyinLocationSearchPlanTests(unittest.TestCase):
         )
 
     def test_every_supported_non_municipality_has_unique_city_names(self):
-        self.assertGreaterEqual(len(PROVINCE_CITIES), 27)
+        self.assertEqual(
+            set(PROVINCE_CITIES),
+            {
+                "河北", "山西", "辽宁", "吉林", "黑龙江", "江苏", "浙江", "安徽", "福建",
+                "江西", "山东", "河南", "湖北", "湖南", "广东", "海南", "四川", "贵州",
+                "云南", "陕西", "甘肃", "青海", "内蒙古", "广西", "西藏", "宁夏", "新疆",
+            },
+        )
         self.assertTrue(MUNICIPALITIES.isdisjoint(PROVINCE_CITIES))
         for province, cities in PROVINCE_CITIES.items():
             with self.subTest(province=province):
@@ -92,6 +107,31 @@ class DouyinLocationSearchPlanTests(unittest.TestCase):
 
         self.assertTrue(stopped.exhausted)
         self.assertEqual(stopped.completed_indices, tuple(range(len(stopped.subqueries))))
+
+    def test_recording_platform_error_preserves_retryable_position(self):
+        loaded = advance_after_page(
+            build_location_search_plan("广东joymark"),
+            has_more=True,
+            eligible_total=4,
+        )
+
+        errored = record_plan_error(
+            loaded,
+            "province_location_search_action_timeout",
+        )
+
+        self.assertEqual(errored.current_index, loaded.current_index)
+        self.assertEqual(errored.current_load_count, loaded.current_load_count)
+        self.assertEqual(errored.completed_indices, loaded.completed_indices)
+        self.assertEqual(
+            errored.last_error_code,
+            "province_location_search_action_timeout",
+        )
+        retried = advance_after_page(errored, has_more=True, eligible_total=4)
+        self.assertEqual(retried.current_index, loaded.current_index)
+        self.assertEqual(retried.current_load_count, loaded.current_load_count + 1)
+        self.assertEqual(retried.completed_indices, loaded.completed_indices)
+        self.assertEqual(retried.last_error_code, "")
 
     def test_progress_text_names_current_city_and_eligible_total(self):
         plan = advance_after_page(

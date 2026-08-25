@@ -75,6 +75,10 @@ def build_location_search_plan(keyword: object) -> LocationSearchPlan:
     """把开头的大陆省份词拆成确定顺序的城市搜索计划。"""
 
     normalized = _normalize_keyword(keyword)
+    city, city_merchant = _leading_city(normalized, include_bare=False)
+    if city and city_merchant:
+        return LocationSearchPlan(1, normalized, "city", "", city_merchant, (normalized,))
+
     province, merchant = _leading_region(normalized)
     if province and merchant:
         subqueries = (normalized,) + tuple(
@@ -82,7 +86,7 @@ def build_location_search_plan(keyword: object) -> LocationSearchPlan:
         )
         return LocationSearchPlan(1, normalized, "province", province, merchant, subqueries)
 
-    city, city_merchant = _leading_city(normalized)
+    city, city_merchant = _leading_city(normalized, include_bare=True)
     search_kind = "city" if city and city_merchant else "plain"
     return LocationSearchPlan(1, normalized, search_kind, "", city_merchant, (normalized,))
 
@@ -93,21 +97,36 @@ def advance_after_page(
     """记录当前平台页的结果；仅在平台明确耗尽时才前进到下一个子词。"""
 
     if plan.exhausted:
-        return plan
+        return replace(plan, last_error_code="")
     if eligible_total >= 100:
-        return replace(plan, completed_indices=tuple(range(len(plan.subqueries))))
+        return replace(
+            plan,
+            completed_indices=tuple(range(len(plan.subqueries))),
+            last_error_code="",
+        )
     if has_more:
-        return replace(plan, current_load_count=plan.current_load_count + 1)
+        return replace(
+            plan,
+            current_load_count=plan.current_load_count + 1,
+            last_error_code="",
+        )
 
     completed = tuple(sorted(set(plan.completed_indices + (plan.current_index,))))
     if len(completed) == len(plan.subqueries):
-        return replace(plan, completed_indices=completed)
+        return replace(plan, completed_indices=completed, last_error_code="")
     return replace(
         plan,
         current_index=plan.current_index + 1,
         current_load_count=0,
         completed_indices=completed,
+        last_error_code="",
     )
+
+
+def record_plan_error(plan: LocationSearchPlan, error_code: object) -> LocationSearchPlan:
+    """保存可重试的平台错误，绝不把当前子词标记为已耗尽。"""
+
+    return replace(plan, last_error_code=_normalize_keyword(error_code))
 
 
 def plan_progress_text(
@@ -147,13 +166,14 @@ def _leading_region(keyword: str) -> tuple[str, str]:
     return "", ""
 
 
-def _leading_city(keyword: str) -> tuple[str, str]:
+def _leading_city(keyword: str, *, include_bare: bool) -> tuple[str, str]:
     city_names = set(MUNICIPALITIES)
     city_names.update(city for cities in PROVINCE_CITIES.values() for city in cities)
     aliases: list[tuple[str, str]] = []
     for city in city_names:
         aliases.append((f"{city}市", city))
-        aliases.append((city, city))
+        if include_bare:
+            aliases.append((city, city))
     for alias, city in sorted(aliases, key=lambda item: len(item[0]), reverse=True):
         if keyword.startswith(alias) and keyword[len(alias) :]:
             return city, keyword[len(alias) :]
