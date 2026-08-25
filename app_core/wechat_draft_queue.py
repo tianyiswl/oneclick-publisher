@@ -25,6 +25,7 @@ from .silicon_evolution_draft_package import (
 HANDOFF_SCHEMA = "silicon-evolution-wechat-draft-handoff/v1"
 RECEIPT_SCHEMA = "silicon-evolution-wechat-draft-receipt/v1"
 TARGET_ACCOUNT = "硅基进化"
+TARGET_ARTICLE_TEMPLATE = "silicon-evolution-tech-v1"
 HANDOFF_INTENT = "wechat_draft_only"
 _ARTICLE_ID = re.compile(r"WX-\d{8}-\d{3}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -249,7 +250,7 @@ def _draft_payload(package: FrozenWechatDraftPackage, account: dict[str, Any]) -
         "scheduleTime": None,
         "originalDeclaration": True,
         "backgroundMode": False,
-        "wechatArticleTemplate": "silicon-evolution-tech-editorial-v1",
+        "wechatArticleTemplate": TARGET_ARTICLE_TEMPLATE,
         "articleId": package.article_id,
         "packageSha256": package.package_sha256,
     }

@@ -160,6 +160,10 @@ class WechatDraftQueueTests(unittest.TestCase):
             self.assertTrue(payloads[0]["frozenWechatDraftHtml"])
             self.assertEqual(payloads[0]["accountIds"], [6])
             self.assertEqual(payloads[0]["packageSha256"], digest)
+            self.assertEqual(
+                payloads[0]["wechatArticleTemplate"],
+                "silicon-evolution-tech-v1",
+            )
             receipt = json.loads(
                 (root / "receipts" / "WX-20260825-001.json").read_text(
                     encoding="utf-8"

@@ -76,13 +76,20 @@ def run_self_test() -> None:
     print("NATIVE_DESKTOP_SELF_TEST_OK")
 
 
+def create_main_window() -> MainWindow:
+    """创建并完成正常桌面端接线。"""
+
+    window = MainWindow()
+    window.publish.configure_wechat_draft_queue(WECHAT_DRAFT_BRIDGE_DIR)
+    return window
+
+
 def run_ui_test() -> None:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     app = QApplication([])
     configure_application(app)
     apply_style(app)
-    window = MainWindow()
-    window.publish.configure_wechat_draft_queue(WECHAT_DRAFT_BRIDGE_DIR)
+    window = create_main_window()
     window.show()
     app.processEvents()
     print("NATIVE_DESKTOP_UI_OK")
@@ -449,7 +456,7 @@ def main() -> int:
         dialog.exec()
         if not activation_service.license_status().get("accessAllowed"):
             return 0
-    window = MainWindow()
+    window = create_main_window()
     window.show()
     if args.page:
         # 窗口首次 show 后再应用启动页，避免 Qt 初始布局将

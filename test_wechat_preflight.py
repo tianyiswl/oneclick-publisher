@@ -249,6 +249,20 @@ class WechatPreflightTests(unittest.TestCase):
             self.assertEqual(anchors, ["导语内容", "论点内容"])
             self.assertEqual(visible_text, "导语内容 第一节 论点内容")
 
+    def test_frozen_html_visible_text_keeps_dom_block_boundaries(self) -> None:
+        html, files, anchors, visible_text = _wechat_prepare_frozen_html(
+            "<section><span>图注</span><h2>82% 说的是一项基准</h2>"
+            "<span>分组说明</span><p>用一项可回退的小任务</p></section>",
+            [],
+        )
+
+        self.assertEqual(files, [])
+        self.assertEqual(anchors, [])
+        self.assertEqual(
+            visible_text,
+            "图注 82% 说的是一项基准 分组说明 用一项可回退的小任务",
+        )
+
     def test_wechat_body_preserves_full_markdown_without_material_paths(self):
         body = (
             "第一段内容。\n\n"

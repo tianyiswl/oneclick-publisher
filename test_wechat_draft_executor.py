@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, patch
 
 from app_core.wechat_draft_executor import (
     WechatDraftError,
+    _find_unique_draft_save_button,
     _open_draft_list,
     _readback_saved_draft,
     _handle_draft_qr_verification,
@@ -46,6 +47,25 @@ class _SingleNodeLocator:
         return self.node
 
 
+class _EmptyLocator:
+    async def count(self) -> int:
+        return 0
+
+    def nth(self, _index: int):
+        raise AssertionError("empty locator has no nodes")
+
+
+class _DraftSavePage:
+    def __init__(self, labels: dict[str, _ClickableNode]) -> None:
+        self.labels = labels
+
+    def get_by_role(self, role: str, *, name: str, exact: bool):
+        assert role == "button"
+        assert exact is True
+        node = self.labels.get(name)
+        return _SingleNodeLocator(node) if node is not None else _EmptyLocator()
+
+
 class _DraftEntryPage:
     def __init__(self) -> None:
         self.url = "https://mp.weixin.qq.com/cgi-bin/appmsg?action=edit&type=10"
@@ -59,6 +79,34 @@ class _DraftEntryPage:
 
     async def wait_for_load_state(self, _state: str, **_kwargs) -> None:
         self.waited = True
+
+
+class _RecentDraftHomePage:
+    def __init__(self) -> None:
+        self.url = "https://mp.weixin.qq.com/cgi-bin/home?t=home/index"
+        self.node = _ClickableNode()
+
+    def get_by_text(self, text: str, *, exact: bool):
+        assert text == "近期草稿"
+        assert exact is True
+        return _SingleNodeLocator(self.node)
+
+
+class _CurrentDraftHomeReadbackPage:
+    async def evaluate(self, script: str, _title: str) -> list[dict]:
+        if (
+            ".weui-desktop-card.weui-desktop-publish" not in script
+            or "backgroundImage" not in script
+        ):
+            return []
+        return [
+            {
+                "title": "测试标题",
+                "text": "测试标题 更新于 09:01",
+                "savedAt": "",
+                "hasCover": True,
+            }
+        ]
 
 
 class WechatDraftExecutorTests(unittest.TestCase):
@@ -153,6 +201,33 @@ class WechatDraftExecutorTests(unittest.TestCase):
 
         self.assertTrue(page.node.clicked)
         self.assertTrue(page.waited)
+
+    def test_draft_readback_accepts_current_recent_drafts_home(self) -> None:
+        page = _RecentDraftHomePage()
+
+        __import__("asyncio").run(_open_draft_list(page))
+
+        self.assertFalse(page.node.clicked)
+
+    def test_draft_readback_supports_current_home_card_markup(self) -> None:
+        result = __import__("asyncio").run(
+            _readback_saved_draft(
+                _CurrentDraftHomeReadbackPage(),
+                "测试标题",
+                started_at=datetime(2026, 8, 25, 9, 0, 0),
+                timeout_seconds=0,
+            )
+        )
+
+        self.assertTrue(result["ok"])
+
+    def test_draft_save_control_accepts_current_platform_label(self) -> None:
+        current = _ClickableNode()
+        page = _DraftSavePage({"保存为草稿": current})
+
+        result = __import__("asyncio").run(_find_unique_draft_save_button(page))
+
+        self.assertIs(result, current)
 
     def test_draft_qr_verification_resumes_the_same_task(self) -> None:
         class Broker:

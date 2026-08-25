@@ -86,6 +86,29 @@ async def _unique_enabled_button(page, text: str):
     return visible[0]
 
 
+async def _find_unique_draft_save_button(page):
+    """兼容公众号后台的新旧草稿按钮文案，但绝不模糊匹配发表控件。"""
+
+    visible = []
+    for label in ("保存为草稿", "保存草稿"):
+        locator = page.get_by_role("button", name=label, exact=True)
+        for index in range(await locator.count()):
+            node = locator.nth(index)
+            if await node.is_visible() and await node.is_enabled():
+                visible.append(node)
+    if not visible:
+        raise WechatDraftError(
+            "公众号页面未找到可用的保存为草稿按钮",
+            error_code="save_control_ambiguous",
+        )
+    if len(visible) != 1:
+        raise WechatDraftError(
+            "公众号页面出现多个可用的保存为草稿按钮",
+            error_code="save_control_ambiguous",
+        )
+    return visible[0]
+
+
 async def _draft_verification_state(page) -> dict[str, Any]:
     """只识别当前可见扫码控件，不读取或持久化二维码内容。"""
 
@@ -271,6 +294,14 @@ async def _open_draft_list(page) -> None:
     current_url = str(getattr(page, "url", "") or "")
     if "action=list_card" in current_url or "action=list_ex" in current_url:
         return
+    if "cgi-bin/home" in current_url:
+        recent = page.get_by_text("近期草稿", exact=True)
+        visible = 0
+        for index in range(await recent.count()):
+            if await recent.nth(index).is_visible():
+                visible += 1
+        if visible == 1:
+            return
     try:
         entry = await _unique_enabled_button(page, "草稿箱")
     except WechatDraftError as exc:
@@ -376,6 +407,32 @@ async def _readback_saved_draft(
               const seen = new Set(); const rows = [];
               for (const node of document.querySelectorAll('a,p,span,div,h1,h2,h3')) {
                 if (!visible(node) || norm(node.innerText) !== expectedTitle) continue;
+                const currentCard = node.closest(
+                  '.weui-desktop-card.weui-desktop-publish'
+                );
+                const currentPanel = currentCard?.closest('.weui-desktop-panel');
+                const currentPanelTitle = norm(
+                  currentPanel?.querySelector('.weui-desktop-panel__title')?.innerText
+                );
+                if (currentCard && currentPanelTitle === '近期草稿') {
+                  const coverNodes = Array.from(currentCard.querySelectorAll(
+                    'img,[style*="background-image"],.weui-desktop-publish__cover__thumb'
+                  ));
+                  const hasCover = coverNodes.some(cover => {
+                    if (cover.tagName === 'IMG') return Boolean(cover.getAttribute('src'));
+                    return getComputedStyle(cover).backgroundImage !== 'none';
+                  });
+                  const found = {
+                    title: expectedTitle,
+                    text: norm(currentCard.innerText).slice(0, 500),
+                    hasCover,
+                    savedAt: '',
+                  };
+                  if (!seen.has(found.text)) {
+                    seen.add(found.text); rows.push(found);
+                  }
+                  continue;
+                }
                 let parent = node; let found = null;
                 for (let depth = 0; parent && depth < 8; depth += 1, parent = parent.parentElement) {
                   const text = norm(parent.innerText);
@@ -442,13 +499,7 @@ async def run_wechat_draft(payload: dict[str, Any], *, task_id: int) -> dict[str
                     error_code="account_mismatch",
                 )
             started_at = datetime.now()
-            try:
-                save_button = await _unique_enabled_button(page, "保存草稿")
-            except WechatDraftError as exc:
-                raise WechatDraftError(
-                    "公众号保存草稿控件不是唯一可用控件",
-                    error_code="save_control_ambiguous",
-                ) from exc
+            save_button = await _find_unique_draft_save_button(page)
             await save_button.click(timeout=10_000)
             await _handle_draft_verification_if_present(page, task_id)
             await _open_draft_list(page)

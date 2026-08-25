@@ -484,6 +484,11 @@ class _FrozenWechatHtmlParser(HTMLParser):
             return
         self.output.append(self.get_starttag_text() or f"<{tag}>")
         if lowered in self._BLOCKS:
+            # innerText 会在块级节点前产生可见换行；这里记为一个
+            # 空格，避免图注等行内节点与后续标题被误判为内容不一致。
+            self.visible_parts.append(" ")
+            for _tag, parts in self.blocks:
+                parts.append(" ")
             self.blocks.append((lowered, []))
 
     def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
