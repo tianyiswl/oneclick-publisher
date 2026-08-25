@@ -191,6 +191,27 @@ class DouyinLocationCacheTests(unittest.TestCase):
         self.assertEqual(get_cached_locations(province, excluded_identities=[])["total"], 1)
         self.assertEqual(get_cached_locations(city, excluded_identities=[])["total"], 1)
 
+    def test_province_cache_rejects_full_keyword_brand_match_from_other_province(
+        self,
+    ) -> None:
+        """省份词命中完整店名也不能把外省候选写进该省缓存。"""
+
+        province = LocationCacheQuery("7", "domestic", "广东joymark", "commission")
+        candidate = {
+            "poiId": "jiangsu-full-keyword-brand",
+            "name": "广东joymark南京店",
+            "address": "江苏省南京市鼓楼区测试路1号",
+            "commissionType": "commission",
+        }
+
+        merged = merge_platform_locations(province, [candidate])
+
+        self.assertEqual(merged["total"], 0)
+        self.assertEqual(
+            get_cached_locations(province, excluded_identities=[])["total"],
+            0,
+        )
+
     def test_qinghai_hainan_prefecture_cache_is_isolated_from_hainan_province(self) -> None:
         candidate = {
             "poiId": "qh-hainan-1",

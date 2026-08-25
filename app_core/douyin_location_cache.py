@@ -199,12 +199,14 @@ def filter_locations_for_search_keyword(
 ) -> list[Mapping[str, Any]]:
     """搜索词以省级地区开头时，排除其他地区的同名门店。
 
-    完整关键词已出现在门店名时保留候选，避免把“北京烤鸭”
-    这类品牌/品类词误判为只搜北京。
+    非省份搜索的完整关键词已出现在门店名时保留候选，避免把
+    “北京烤鸭”这类品牌/品类词误判为只搜北京。省份计划始终
+    先核对候选的顶级省份。
     """
 
     normalized_keyword = "".join(_optional_text(keyword).split()).casefold()
     parent_province = _province_name(province_context)
+    is_province_search = bool(parent_province)
     region = ""
     remainder = ""
     if parent_province:
@@ -217,6 +219,7 @@ def filter_locations_for_search_keyword(
     else:
         plan = build_location_search_plan(normalized_keyword)
         if plan.search_kind == "province":
+            is_province_search = True
             parent_province = plan.province
             region = plan.province
             remainder = plan.merchant_term
@@ -246,7 +249,11 @@ def filter_locations_for_search_keyword(
             _optional_text(candidate.get("address")).split()
         ).casefold()
         top_level = _top_level_province(address)
-        if normalized_keyword in name and not cross_level_collision:
+        if (
+            not is_province_search
+            and normalized_keyword in name
+            and not cross_level_collision
+        ):
             filtered.append(candidate)
             continue
         if (

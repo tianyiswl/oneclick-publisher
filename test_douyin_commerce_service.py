@@ -15322,6 +15322,43 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             ["hainan-province"],
         )
 
+    def test_province_platform_result_rejects_cross_province_brand_from_display_and_auto_fill(
+        self,
+    ) -> None:
+        """省份平台回包中的外省品牌全词候选既不展示也不自动填入。"""
+
+        self._install_province_fixture("广东joymark")
+        self.page.runner = self._ControlledLifecycleRunner()
+        cross_province = {
+            "poiId": "jiangsu-full-keyword-brand",
+            "name": "广东joymark南京店",
+            "address": "江苏省南京市鼓楼区测试路1号",
+            "commissionType": "commission",
+        }
+
+        with patch(
+            "ui.douyin_commerce_page.save_location_preset",
+            side_effect=lambda _account_id, candidate, scope: {
+                **candidate,
+                "scope": scope,
+            },
+        ) as save_preset:
+            self.page._batch_location_search_succeeded(
+                "domestic",
+                "广东joymark",
+                self._province_page([cross_province], has_more=False),
+                "commission",
+                request_token=self.page._batch_location_search_token,
+            )
+
+        state = self.page._batch_location_state()
+        self.assertEqual(state["candidates"], [])
+        self.assertNotIn(
+            "/tmp/province-location-test.mp4",
+            self.page._batch_locations,
+        )
+        save_preset.assert_not_called()
+
     def test_province_revalidation_cache_entry_uses_bounded_coordinator(self) -> None:
         """省份缓存重校对必须从真实入口进入三动作协调器。"""
 
