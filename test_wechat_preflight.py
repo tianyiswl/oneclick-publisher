@@ -27,10 +27,12 @@ from app_core.oneclick_preflight import (
     _wechat_payload_text,
     _wechat_original_requested,
     _wechat_dialog_is_in_viewport,
+    _wechat_fill_digest,
     _wechat_insert_anchored_body_images,
     _wechat_insert_body_images,
     _wechat_normalize_image_url,
     _wechat_place_body_image_anchor,
+    _wechat_prepare_frozen_html,
     _wechat_prepare_article_images,
     _wechat_remove_temporary_cover,
     _wechat_resolve_body_image_anchors,
@@ -181,6 +183,72 @@ class _AuthorPage:
 
 
 class WechatPreflightTests(unittest.TestCase):
+    def test_frozen_draft_digest_requires_unique_visible_readback(self) -> None:
+        class Node:
+            def __init__(self, visible: bool) -> None:
+                self.visible = visible
+                self.value = ""
+
+            async def is_visible(self) -> bool:
+                return self.visible
+
+            async def is_enabled(self) -> bool:
+                return True
+
+            async def fill(self, value: str, **_kwargs) -> None:
+                self.value = value
+
+            async def input_value(self) -> str:
+                return self.value
+
+        class Locator:
+            def __init__(self, nodes: list[Node]) -> None:
+                self.nodes = nodes
+
+            async def count(self) -> int:
+                return len(self.nodes)
+
+            def nth(self, index: int) -> Node:
+                return self.nodes[index]
+
+        class Page:
+            def __init__(self) -> None:
+                self.nodes = [Node(False), Node(True)]
+
+            def locator(self, _selector: str) -> Locator:
+                return Locator(self.nodes)
+
+        page = Page()
+
+        asyncio.run(_wechat_fill_digest(page, "冻结摘要"))
+
+        self.assertEqual(page.nodes[1].value, "冻结摘要")
+
+    def test_frozen_html_keeps_layout_and_extracts_body_image_anchors(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "01.png"
+            second = root / "02.png"
+            first.write_bytes(b"one")
+            second.write_bytes(b"two")
+            source = (
+                '<section style="color:#123"><p>导语内容</p>'
+                '<img src="assets/02.png" alt="第二张">'
+                '<h2>第一节</h2><p>论点内容</p>'
+                '<img src="assets/01.png" alt="第一张"></section>'
+            )
+
+            html, ordered_files, anchors, visible_text = _wechat_prepare_frozen_html(
+                source,
+                [first, second],
+            )
+
+            self.assertIn('style="color:#123"', html)
+            self.assertNotIn("<img", html)
+            self.assertEqual(ordered_files, [second, first])
+            self.assertEqual(anchors, ["导语内容", "论点内容"])
+            self.assertEqual(visible_text, "导语内容 第一节 论点内容")
+
     def test_wechat_body_preserves_full_markdown_without_material_paths(self):
         body = (
             "第一段内容。\n\n"

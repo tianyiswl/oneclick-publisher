@@ -236,6 +236,7 @@ def _draft_payload(package: FrozenWechatDraftPackage, account: dict[str, Any]) -
         "title": package.title,
         "description": package.content_html,
         "contentHtml": package.content_html,
+        "frozenWechatDraftHtml": True,
         "digest": package.digest,
         "coverPath": str(package.cover_path),
         "fileList": body_images,

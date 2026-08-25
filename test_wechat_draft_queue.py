@@ -157,6 +157,7 @@ class WechatDraftQueueTests(unittest.TestCase):
             self.assertEqual(second, [])
             self.assertEqual(len(payloads), 1)
             self.assertEqual(payloads[0]["runtimeMode"], "wechat_draft")
+            self.assertTrue(payloads[0]["frozenWechatDraftHtml"])
             self.assertEqual(payloads[0]["accountIds"], [6])
             self.assertEqual(payloads[0]["packageSha256"], digest)
             receipt = json.loads(
