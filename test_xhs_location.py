@@ -958,6 +958,15 @@ class _FakeNode:
             self.page.body = str(args[0])
             self.page.calls.append("body-write")
             return None
+        if self.kind == "editor" and "selectNodeContents" in script:
+            self.page.calls.append("topic-caret-end")
+            return None
+        if self.kind == "editor" and "plainTextAfterFirstTopic" in script:
+            return {
+                "prefixText": self.page.body,
+                "entityTopics": list(self.page.topics),
+                "plainTextAfterFirstTopic": "",
+            }
         return None
 
     async def click(self, **kwargs) -> None:

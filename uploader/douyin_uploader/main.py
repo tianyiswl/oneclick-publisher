@@ -32,6 +32,18 @@ class TopicCandidateUnavailable(RuntimeError):
     error_code = "douyin_topic_candidates_unavailable"
 
 
+class TopicEntityMissing(TopicCandidateUnavailable):
+    """官方话题候选未能形成平台实体，普通 #文字不算成功。"""
+
+    error_code = "douyin_topic_entity_missing"
+
+
+class RawMentionUnsupported(RuntimeError):
+    """正文内的原始 @文字不能冒充平台提及实体。"""
+
+    error_code = "douyin_raw_mention_unsupported"
+
+
 async def cookie_auth(account_file):
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=True)
@@ -396,6 +408,10 @@ class DouYinVideo(object):
             raise RuntimeError("抖音作品详情为空，已停止填写")
         if "#" in body:
             raise RuntimeError("抖音作品详情包含手写 # 文本，已停止填写")
+        if re.search(r"(?:^|\s)@[^\s@#]+", body):
+            raise RawMentionUnsupported(
+                "抖音作品详情包含未经平台候选回读的 @文本，已停止填写"
+            )
 
         await self._fill_editor_body(page, editor, body)
         expected_topics = [str(tag).strip().lstrip("#") for tag in self.tags if str(tag).strip().lstrip("#")]
@@ -409,8 +425,8 @@ class DouYinVideo(object):
             expected_topics,
         )
         if skipped_topics:
-            raise TopicCandidateUnavailable(
-                "抖音话题候选在有限重试后仍不可用，已停止填写："
+            raise TopicEntityMissing(
+                "抖音话题在有限重试后仍未形成平台实体，已停止填写："
                 + "、".join(skipped_topics)
             )
 
@@ -515,7 +531,7 @@ class DouYinVideo(object):
                 consecutive = 0
             if attempt < max(1, int(attempts)) - 1:
                 await page.wait_for_timeout(400)
-        error = TopicCandidateUnavailable(
+        error = TopicEntityMissing(
             f"抖音平台话题稳定回读不一致：期望={expected}，实际={last_topics}"
         )
         error.missing_topics = [topic for topic in expected if topic not in last_topics]
@@ -579,40 +595,18 @@ class DouYinVideo(object):
         return "".join(str(value or "").replace("\u200b", "").split()).lstrip("#")
 
     async def _read_topic_mentions(self, editor):
-        values = await editor.locator('[data-mention="#"]').all_text_contents()
+        # 普通官方话题是 ``#`` 实体；平台活动话题使用
+        # ``activity`` 实体。两者都是点选官方候选后的不可编辑
+        # 节点，而 ``span[data-string=true]`` 中的 #文字仍不纳入。
+        values = await editor.locator(
+            '[data-mention="#"], [data-mention="activity"]'
+        ).all_text_contents()
         return [self._normalize_topic_mention(value) for value in values if self._normalize_topic_mention(value)]
 
     async def _read_platform_topics(self, editor):
-        """回读当前编辑器中的话题。
+        """只回读平台已转换的话题实体，普通 #文字一律忽略。"""
 
-        旧版页面会把话题转成 ``data-mention="#"`` 组件；新版
-        页面通过“#添加话题”插入可发布的 ``#话题`` 文本，不再返回
-        候选弹层。两种形态都只在编辑器内回读，不使用页面上的账号
-        联想列表。
-        """
-
-        # 同一编辑器里可能同时存在普通 ``#话题`` 文本和平台自动
-        # 转换的 mention 组件。必须按 DOM 顺序读取，不能先收集组件再
-        # 收集文本，否则第二个话题被自动转换后会变成倒序。
-        nodes = editor.locator('span[data-string="true"], [data-mention="#"]')
-        topics = []
-        for index in range(await nodes.count()):
-            node = nodes.nth(index)
-            try:
-                mention_type = await node.get_attribute("data-mention")
-                value = await node.inner_text()
-            except Exception:
-                continue
-            if mention_type == "#":
-                normalized = self._normalize_topic_mention(value)
-                if normalized:
-                    topics.append(normalized)
-                continue
-            for raw_topic in re.findall(r"#([^\s#@]+)", str(value or "").replace("\u200b", "")):
-                normalized = self._normalize_topic_mention(raw_topic)
-                if normalized:
-                    topics.append(normalized)
-        return topics
+        return await self._read_topic_mentions(editor)
 
     @staticmethod
     def _strip_trailing_topic_text(value, expected_topics):
@@ -643,7 +637,9 @@ class DouYinVideo(object):
         return await editor.evaluate(
             """
             node => {
-              const mentions = [...node.querySelectorAll('[data-mention="#"]')];
+              const mentions = [...node.querySelectorAll(
+                '[data-mention="#"], [data-mention="activity"]'
+              )];
               const previous = mentions.map(item => item.style.display);
               try {
                 mentions.forEach(item => { item.style.display = 'none'; });
@@ -672,7 +668,9 @@ class DouYinVideo(object):
                 raise RuntimeError(f"抖音话题“{tag_name}”出现多个可见的精确候选，已停止选择")
             if attempt < self.TOPIC_CANDIDATE_WAIT_ATTEMPTS - 1:
                 await page.wait_for_timeout(500)
-        raise TopicCandidateUnavailable(f"抖音未返回话题“{tag_name}”的精确平台候选")
+        raise TopicEntityMissing(
+            f"抖音未返回话题“{tag_name}”的精确平台候选"
+        )
 
     async def _add_platform_topic(self, page, editor, tag_name):
         add_controls = await self._visible_enabled_items(page.get_by_text("#添加话题", exact=True))
@@ -683,10 +681,8 @@ class DouYinVideo(object):
         before_topics = await self._read_platform_topics(editor)
         await add_controls[0].click(timeout=5000)
         await editor.press_sequentially(tag_name, delay=50)
-        # 新版抖音不再返回旧的话题候选组件。空格用于结束当前
-        # 话题，然后从富文本编辑器本身回读。页面上可能同时出现同名
-        # @账号联想，这里绝不点击它们。
-        await editor.press("Space")
+        candidate = await self._find_unique_topic_candidate(page, tag_name)
+        await candidate.click(timeout=5000)
 
         for attempt in range(10):
             topics = await self._read_platform_topics(editor)
@@ -694,8 +690,8 @@ class DouYinVideo(object):
                 return
             if attempt < 9:
                 await page.wait_for_timeout(300)
-        raise TopicCandidateUnavailable(
-            f"抖音话题“{tag_name}”通过平台入口写入后回读不一致"
+        raise TopicEntityMissing(
+            f"抖音话题“{tag_name}”点选官方候选后未形成平台话题实体"
         )
 
     @staticmethod
@@ -714,7 +710,10 @@ class DouYinVideo(object):
         expected_body = self.description if self.description is not None else self.title
         expected_topics = [str(tag).strip().lstrip("#") for tag in self.tags if str(tag).strip().lstrip("#")]
         raw_text = await self._read_raw_editor_text(editor)
-        body_text = self._strip_trailing_topic_text(raw_text, expected_topics)
+        # ``_read_raw_editor_text`` 会隐藏已确认的话题实体。因此任何
+        # 剩余 #文字都是未转换成平台实体的原始文字，不能再从
+        # 尾部剥掉后当作成功。
+        body_text = raw_text
         if "#" in body_text:
             raise RuntimeError("抖音详情中仍存在手写 # 文本，不能保存草稿")
         expected_normalized = self._normalize_body_text(expected_body)
@@ -757,7 +756,7 @@ class DouYinVideo(object):
             "title_confirmed": title_confirmed,
             "detail_confirmed": True,
             "topics_confirmed": topics,
-            "topic_entry_method": "platform_toolbar_exact_text_readback",
+            "topic_entry_method": "platform_candidate_entity_readback",
             "covers_confirmed": list(expected_cover_ratios) if require_covers else [],
         }
 

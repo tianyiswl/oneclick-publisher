@@ -61,6 +61,14 @@ def _topic_candidate_matches(candidate_name: object, topic: str) -> bool:
     return _normalized(candidate_name) == f"#{str(topic).strip().lstrip('#')}"
 
 
+def _topic_entity_label(value: object) -> str:
+    """将小红书官方话题节点的无障碍标记还原为可见话题。"""
+
+    normalized = _normalized(value)
+    match = re.fullmatch(r"#(.+?)\[话题\]#", normalized)
+    return f"#{match.group(1)}" if match else normalized
+
+
 async def _find_unique_official_topic_candidate(
     page,
     topic: str,
@@ -881,20 +889,84 @@ class XhsNativeAdapter:
         )
         for topic in topics:
             await editor.click(timeout=3_000)
-            await page.keyboard.press("End")
+            # ``End`` 只会把光标移到当前行尾。真实富文本页面中，
+            # 它会把话题插到正文中间。直接用 DOM Range 折叠到
+            # 编辑器内容末尾，不依赖操作系统键盘快捷键。
+            await editor.evaluate(
+                """node => {
+                    node.focus();
+                    const range = document.createRange();
+                    range.selectNodeContents(node);
+                    range.collapse(false);
+                    const selection = window.getSelection();
+                    selection.removeAllRanges();
+                    selection.addRange(range);
+                }"""
+            )
             await page.keyboard.insert_text(f" #{topic}")
             await page.wait_for_timeout(700)
             candidate = await _find_unique_official_topic_candidate(page, topic)
             await candidate.click(timeout=3_000)
             await page.wait_for_timeout(500)
-        nodes = editor.locator("a.tiptap-topic")
-        node_texts = [
-            _normalized(await nodes.nth(index).inner_text())
-            for index in range(await nodes.count())
+        snapshot = await editor.evaluate(
+            r"""node => {
+                const result = {
+                    prefixText: '',
+                    entityTopics: [],
+                    plainTextAfterFirstTopic: '',
+                };
+                let sawTopic = false;
+                const walk = current => {
+                    if (current.nodeType === Node.TEXT_NODE) {
+                        if (sawTopic) result.plainTextAfterFirstTopic += current.nodeValue || '';
+                        else result.prefixText += current.nodeValue || '';
+                        return;
+                    }
+                    if (current.nodeType !== Node.ELEMENT_NODE) return;
+                    if (current.matches('a.tiptap-topic')) {
+                        sawTopic = true;
+                        result.entityTopics.push(current.innerText || current.textContent || '');
+                        return;
+                    }
+                    const isBlock = ['P', 'DIV', 'LI'].includes(current.tagName);
+                    if (isBlock) {
+                        if (sawTopic) result.plainTextAfterFirstTopic += '\n';
+                        else result.prefixText += '\n';
+                    }
+                    for (const child of current.childNodes) walk(child);
+                    if (isBlock) {
+                        if (sawTopic) result.plainTextAfterFirstTopic += '\n';
+                        else result.prefixText += '\n';
+                    }
+                };
+                for (const child of node.childNodes) walk(child);
+                return result;
+            }"""
+        )
+        expected_nodes = [f"#{topic}" for topic in topics]
+        actual_nodes = [
+            _topic_entity_label(value)
+            for value in (snapshot or {}).get("entityTopics", [])
         ]
-        if len(node_texts) < len(topics):
-            raise XhsNativeAdapterError("小红书官方话题节点回读不足")
-        return node_texts
+        prefix = _normalized((snapshot or {}).get("prefixText", ""))
+        trailing_plain = _normalized(
+            (snapshot or {}).get("plainTextAfterFirstTopic", "")
+        )
+        expected_prefix = _normalized(self.contract["description"])
+        prefix_matches = prefix == expected_prefix
+        if (
+            not prefix_matches
+            or actual_nodes != expected_nodes
+            or trailing_plain
+        ):
+            raise XhsNativeAdapterError(
+                "小红书官方话题未连续位于完整正文末尾，已停止提交；"
+                f"正文前缀匹配={prefix_matches}，"
+                f"话题实体={actual_nodes}，期望={expected_nodes}，"
+                f"话题后普通文字={len(trailing_plain)}字",
+                error_code="xhs_topic_insert_position_invalid",
+            )
+        return actual_nodes
 
     async def _set_exact_declaration(
         self,
@@ -928,14 +1000,97 @@ class XhsNativeAdapter:
         ):
             raise XhsNativeAdapterError(f"小红书声明回读失败：{actual_label}")
 
+    async def _set_ai_declaration(self, page) -> str:
+        """通过当前内容类型声明下拉框选择并回读 AI 声明。"""
+
+        wrappers = page.locator(
+            ".publish-page-content-setting-content "
+            ".d-select-wrapper.custom-select-44"
+        )
+        matched = []
+        allowed_values = {"添加内容类型声明", *_AI_LABELS}
+        for index in range(await wrappers.count()):
+            wrapper = wrappers.nth(index)
+            try:
+                text = _normalized(await wrapper.inner_text())
+                if await wrapper.is_visible() and text in allowed_values:
+                    matched.append((text, wrapper))
+            except Exception:
+                continue
+        if len(matched) != 1:
+            raise XhsNativeAdapterError(
+                "小红书AI 内容类型声明下拉框无法唯一识别："
+                f"可渲染候选={len(matched)}",
+                error_code="xhs_ai_declaration_control_missing",
+            )
+
+        current_text, trigger = matched[0]
+        try:
+            await trigger.scroll_into_view_if_needed(timeout=5_000)
+        except Exception as exc:
+            raise XhsNativeAdapterError(
+                "小红书AI 内容类型声明下拉框无法滚动到可见区域",
+                error_code="xhs_ai_declaration_control_missing",
+            ) from exc
+        if not await _is_actual_viewport_visible(trigger):
+            raise XhsNativeAdapterError(
+                "小红书AI 内容类型声明下拉框不在当前视口",
+                error_code="xhs_ai_declaration_control_missing",
+            )
+        if current_text in _AI_LABELS:
+            return current_text
+
+        await trigger.click(timeout=5_000)
+        await page.wait_for_timeout(300)
+        try:
+            dropdown = await _first_visible(
+                page.locator(".declaration-drop-down"),
+                "AI 内容类型声明选项框",
+            )
+        except XhsNativeAdapterError as exc:
+            raise XhsNativeAdapterError(
+                str(exc),
+                error_code="xhs_ai_declaration_control_missing",
+            ) from exc
+
+        matched_options = []
+        options = dropdown.locator(".d-option")
+        for index in range(await options.count()):
+            option = options.nth(index)
+            try:
+                names = option.locator(".d-option-name")
+                if (
+                    await option.is_visible()
+                    and await _is_actual_viewport_visible(option)
+                    and await names.count() == 1
+                ):
+                    label = _normalized(await names.first.inner_text())
+                    if label in _AI_LABELS:
+                        matched_options.append((label, option))
+            except Exception:
+                continue
+        if len(matched_options) != 1:
+            raise XhsNativeAdapterError(
+                "小红书AI 内容类型声明未返回唯一官方选项："
+                f"精确候选={len(matched_options)}",
+                error_code="xhs_ai_declaration_control_missing",
+            )
+
+        selected_label, option = matched_options[0]
+        await option.click(timeout=5_000)
+        await page.wait_for_timeout(300)
+        readback = _normalized(await trigger.inner_text())
+        if readback != selected_label:
+            raise XhsNativeAdapterError(
+                "小红书AI 内容类型声明回读不一致："
+                f"目标={selected_label}，实际={readback or '空'}",
+                error_code="xhs_ai_declaration_readback_mismatch",
+            )
+        return readback
+
     async def set_declarations(self, page) -> None:
         if self.contract["aiDeclaration"]:
-            trigger = await _first_visible(
-                page.get_by_text("添加内容类型声明", exact=True),
-                "AI 声明入口",
-            )
-            await trigger.click(timeout=5_000)
-            await self._set_exact_declaration(page, _AI_LABELS, True)
+            await self._set_ai_declaration(page)
         await self._set_exact_declaration(
             page,
             "原创声明",

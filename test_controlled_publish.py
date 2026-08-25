@@ -96,6 +96,32 @@ class ControlledPublishTests(unittest.TestCase):
                 )
         self.assertEqual(raised.exception.error_code, "controlled_authorization_required")
 
+    def test_douyin_body_raw_mention_is_not_treated_as_platform_mention(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest = self._bundle(Path(temporary))
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            data["platformOverrides"]["抖音"]["body"] = "正文\n@抖音科技"
+            manifest.write_text(
+                json.dumps(data, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            with self.assertRaises(ControlledPublishError) as raised:
+                build_controlled_payloads(
+                    {
+                        "manifestPath": str(manifest),
+                        "mode": "preflight",
+                        "targets": [
+                            {"platform": "抖音", "accountId": 31, "schedule": None}
+                        ],
+                    },
+                    accounts=self._accounts(),
+                )
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "controlled_mentions_unsupported",
+        )
+
     def test_authorization_is_bound_short_lived_and_single_use(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row

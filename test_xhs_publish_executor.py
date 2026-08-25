@@ -5,7 +5,7 @@ import asyncio
 from datetime import datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from app_core.xhs_publish_executor import (
     XhsPublishError,
@@ -207,6 +207,217 @@ class XhsTopicCandidateTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(selected, candidate)
         page.wait_for_timeout.assert_awaited_once_with(1)
+
+    async def test_rejects_official_topics_inserted_before_body_end(self):
+        """平台话题即使已是官方节点，插在正文中间也必须停止。"""
+
+        helper = object.__new__(XhsNativeAdapter)
+        helper.contract = {
+            "description": "谈预算。\n算。",
+            "topics": ["AI编程"],
+        }
+        topic_node = MagicMock()
+        topic_node.inner_text = AsyncMock(return_value="#AI编程")
+        topic_nodes = MagicMock()
+        topic_nodes.count = AsyncMock(return_value=1)
+        topic_nodes.nth = MagicMock(return_value=topic_node)
+        editor = MagicMock()
+        editor.click = AsyncMock()
+        editor.locator = MagicMock(return_value=topic_nodes)
+        editor.evaluate = AsyncMock(
+            side_effect=[
+                None,
+                {
+                    "prefixText": "谈预算。",
+                    "entityTopics": ["#AI编程"],
+                    "plainTextAfterFirstTopic": "算。",
+                },
+            ]
+        )
+        candidate = MagicMock()
+        candidate.click = AsyncMock()
+        page = MagicMock()
+        page.locator = MagicMock()
+        page.keyboard.press = AsyncMock()
+        page.keyboard.insert_text = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+
+        with patch(
+            "app_core.xhs_native_adapter._first_visible",
+            new_callable=AsyncMock,
+            return_value=editor,
+        ), patch(
+            "app_core.xhs_native_adapter._find_unique_official_topic_candidate",
+            new_callable=AsyncMock,
+            return_value=candidate,
+        ):
+            with self.assertRaises(XhsNativeAdapterError) as raised:
+                await helper.fill_official_topics(page)
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "xhs_topic_insert_position_invalid",
+        )
+
+    async def test_accepts_platform_topic_entity_marker_at_body_end(self):
+        helper = object.__new__(XhsNativeAdapter)
+        helper.contract = {
+            "description": "完整正文。",
+            "topics": ["硅基探索"],
+        }
+        editor = MagicMock()
+        editor.click = AsyncMock()
+        editor.evaluate = AsyncMock(
+            side_effect=[
+                None,
+                {
+                    "prefixText": "完整正文。",
+                    "entityTopics": ["#硅基探索[话题]#"],
+                    "plainTextAfterFirstTopic": "",
+                },
+            ]
+        )
+        candidate = MagicMock()
+        candidate.click = AsyncMock()
+        page = MagicMock()
+        page.locator = MagicMock()
+        page.keyboard.insert_text = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+
+        with patch(
+            "app_core.xhs_native_adapter._first_visible",
+            new_callable=AsyncMock,
+            return_value=editor,
+        ), patch(
+            "app_core.xhs_native_adapter._find_unique_official_topic_candidate",
+            new_callable=AsyncMock,
+            return_value=candidate,
+        ):
+            readback = await helper.fill_official_topics(page)
+
+        self.assertEqual(readback, ["#硅基探索"])
+
+
+class _DeclarationLocator:
+    def __init__(self, items):
+        self.items = list(items)
+
+    async def count(self):
+        return len(self.items)
+
+    def nth(self, index):
+        return self.items[index]
+
+    @property
+    def first(self):
+        return self.items[0]
+
+
+class _DeclarationItem:
+    def __init__(self, page, kind, text=""):
+        self.page = page
+        self.kind = kind
+        self.text = text
+        self.clicked = False
+
+    async def is_visible(self):
+        return self.kind != "dropdown" or self.page.opened
+
+    async def evaluate(self, _script):
+        return await self.is_visible()
+
+    async def inner_text(self, **_kwargs):
+        if self.kind == "trigger":
+            return self.page.selected or self.text
+        if self.kind == "selected-content":
+            return self.page.selected or "添加内容类型声明"
+        return self.text
+
+    async def scroll_into_view_if_needed(self, **_kwargs):
+        return None
+
+    async def click(self, **_kwargs):
+        self.clicked = True
+        if self.kind == "trigger":
+            self.page.opened = True
+        elif self.kind == "option":
+            self.page.selected = self.text
+            self.page.opened = False
+
+    def locator(self, selector):
+        if self.kind == "trigger" and selector == ".d-select-placeholder":
+            return _DeclarationLocator(
+                [_DeclarationItem(self.page, "placeholder", "添加内容类型声明")]
+            )
+        if self.kind == "trigger" and selector == ".d-select-content":
+            return _DeclarationLocator(
+                [_DeclarationItem(self.page, "selected-content")]
+            )
+        if self.kind == "dropdown" and selector == ".d-option":
+            return _DeclarationLocator(self.page.options)
+        if self.kind == "option" and selector == ".d-option-name":
+            return _DeclarationLocator(
+                [_DeclarationItem(self.page, "option-name", self.text)]
+            )
+        return _DeclarationLocator([])
+
+
+class _CurrentDeclarationPage:
+    """复现 2026-08-25 真实页面：同一句文字嵌套出现多次。"""
+
+    def __init__(self):
+        self.opened = False
+        self.selected = ""
+        self.trigger = _DeclarationItem(self, "trigger", "添加内容类型声明")
+        self.dropdown = _DeclarationItem(self, "dropdown")
+        self.options = [
+            _DeclarationItem(self, "option", "虚构演绎，仅供娱乐"),
+            _DeclarationItem(self, "option", "笔记含AI合成内容"),
+            _DeclarationItem(self, "option", "内容包含营销广告"),
+            _DeclarationItem(self, "option", "内容来源声明"),
+        ]
+
+    def locator(self, selector):
+        if selector == (
+            ".publish-page-content-setting-content "
+            ".d-select-wrapper.custom-select-44"
+        ):
+            return _DeclarationLocator([self.trigger])
+        if selector == ".declaration-drop-down":
+            return _DeclarationLocator([self.dropdown])
+        if selector == "body":
+            return _DeclarationItem(self, "body", self.selected)
+        return _DeclarationLocator([])
+
+    def get_by_text(self, text, exact=False):
+        del exact
+        # 旧实现从整页按文字取控件；真实页面会返回 wrapper、select、
+        # content、placeholder 等多个嵌套节点，无法唯一识别。
+        count = 6 if text == "添加内容类型声明" else 5
+        return _DeclarationLocator(
+            [_DeclarationItem(self, "nested-text", text) for _ in range(count)]
+        )
+
+    async def wait_for_timeout(self, _milliseconds):
+        return None
+
+
+class XhsDeclarationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_selects_ai_declaration_through_unique_current_dropdown(self):
+        """退回全页面文本匹配会因嵌套节点重复而再次失败。"""
+
+        helper = object.__new__(XhsNativeAdapter)
+        helper.contract = {
+            "aiDeclaration": True,
+            "originalDeclaration": False,
+        }
+        page = _CurrentDeclarationPage()
+
+        await helper.set_declarations(page)
+
+        self.assertTrue(page.trigger.clicked)
+        self.assertEqual(page.selected, "笔记含AI合成内容")
+        self.assertTrue(page.options[1].clicked)
 
 class XhsPublishExecutorTests(unittest.TestCase):
     def setUp(self):

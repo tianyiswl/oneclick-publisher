@@ -152,6 +152,11 @@ def build_controlled_payloads(
             raise ControlledPublishError(
                 "controlled_platform_fields_missing", f"{platform}缺少独立标题或正文"
             )
+        if platform_type == 3 and re.search(r"(?:^|\s)@[^\s@#]+", description):
+            raise ControlledPublishError(
+                "controlled_mentions_unsupported",
+                "抖音正文包含原始 @文字；当前内容包没有独立 mentions 字段和官方候选回读，不能冒充有效提及",
+            )
         enable_timer, schedule_time, schedule_timezone = _schedule(target.get("schedule"))
         covers = dict(bundle["coverPaths"])
         cover_path = _preferred_cover(platform_type, covers)

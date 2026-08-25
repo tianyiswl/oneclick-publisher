@@ -7,7 +7,7 @@ from __future__ import annotations
 PRODUCT_NAME = "一键发"
 PRODUCT_TAGLINE = "多平台内容发布工作台"
 APP_TITLE = f"{PRODUCT_NAME}· {PRODUCT_TAGLINE}"
-APP_VERSION = "0.5.3"
+APP_VERSION = "0.5.4"
 APP_ICON_RELATIVE_PATH = "ui/assets/fashetai-app-icon.png"
 TRIAL_DAYS = 7
 UPGRADE_STORE = "逆浪风"
