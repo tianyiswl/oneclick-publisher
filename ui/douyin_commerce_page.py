@@ -75,7 +75,10 @@ from app_core.douyin_location_preset_service import (
 )
 from app_core.douyin_location_search_plan import (
     LocationSearchPlan,
+    advance_after_page,
     build_location_search_plan,
+    plan_progress_text,
+    record_plan_error,
 )
 from app_core.douyin_commerce_location_commission import (
     DEFAULT_COMMISSION_FILTER,
@@ -105,6 +108,8 @@ _BATCH_RUN_KEY = "douyin_commerce_batch_run"
 _BATCH_REVISION_TASK_KEY = "douyin_commerce_batch_revision"
 _BATCH_SHARED_LOCATION_SEARCH_KEY = "__shared_location_search__"
 _BATCH_LOCATION_MAX_IDENTITIES = 100
+_PROVINCE_CLICK_MAX_ACTIONS = 3
+_PROVINCE_CLICK_MAX_SECONDS = 30.0
 
 COLLECTOR_ERROR_COPY = {
     "collector_start_failed": "采集器启动失败",
@@ -463,6 +468,7 @@ class DouyinCommercePage(QWidget):
     _LOCATION_CACHE_SEARCH_TASK_KEY = "douyin_commerce_location_cache_search"
     _LOCATION_CACHE_PAGE_TASK_KEY = "douyin_commerce_location_cache_page"
     _LOCATION_CACHE_MERGE_TASK_KEY = "douyin_commerce_location_cache_merge"
+    _LOCATION_CACHE_PROGRESS_TASK_KEY = "douyin_commerce_location_cache_progress"
     _LOCATION_CACHE_SELECTION_TASK_KEY = "douyin_commerce_location_cache_selection"
     _SETUP_GENERATION_TASK_KEY = "douyin_commerce_setup_generation"
     _SETUP_GENERATION_CLOSE_TASK_KEY = "douyin_commerce_setup_generation_close"
@@ -630,6 +636,9 @@ class DouyinCommercePage(QWidget):
         self._batch_location_handoff_queries: dict[
             tuple[int, str, str, str, str],
             douyin_location_cache.LocationCacheQuery,
+        ] = {}
+        self._province_location_click_handoffs: dict[
+            tuple[int, str, str, str, str], tuple[float, int]
         ] = {}
         self._batch_location_feedback = ""
         self._batch_item_rows_signature: tuple[object, ...] | None = None
@@ -1725,6 +1734,7 @@ class DouyinCommercePage(QWidget):
         self._batch_location_search_token += 1
         self._batch_location_searches = {}
         self._batch_location_handoff_queries.clear()
+        self._province_location_click_handoffs.clear()
         self._batch_item_rows_signature = None
         self._batch_location_feedback = ""
         if hasattr(self, "batch_item_settings_status"):
@@ -2003,6 +2013,9 @@ class DouyinCommercePage(QWidget):
         cls,
         state: Mapping[str, object],
     ) -> str:
+        plan = state.get("searchPlan")
+        if isinstance(plan, LocationSearchPlan) and plan.search_kind == "province":
+            return ""
         if int(state.get("platformLoadCount") or 0) >= 10:
             return "已达到平台加载上限（10 次）"
         if (
@@ -2118,6 +2131,7 @@ class DouyinCommercePage(QWidget):
         )
         self._batch_location_search_token += 1
         request_token = self._batch_location_search_token
+        self._province_location_click_handoffs.clear()
         try:
             cache_query = self._batch_location_cache_query(
                 normalized_scope,
@@ -2596,6 +2610,16 @@ class DouyinCommercePage(QWidget):
             ),
             "source": "platform",
         }
+        # A province plan may need to move to its first city even when the
+        # platform's root-keyword first page is empty.  Do not turn that empty
+        # first page into a global terminal state.
+        plan = state["searchPlan"]
+        if (
+            isinstance(plan, LocationSearchPlan)
+            and plan.search_kind == "province"
+            and not combined_identity_limit_reached
+        ):
+            state["hasMore"] = True
         self._batch_location_searches[_BATCH_SHARED_LOCATION_SEARCH_KEY] = state
         limit_feedback = self._batch_location_limit_status(state)
         if limit_feedback:
@@ -2809,6 +2833,375 @@ class DouyinCommercePage(QWidget):
         self._set_batch_location_feedback("地点缓存更新失败，已保留现有候选")
         self._sync_batch_location_controls()
 
+    @staticmethod
+    def _province_click_can_continue(*, started_at: float, actions_used: int) -> bool:
+        """每次用户点击的跨城市读取预算，绝不在 Qt 线程里等待。"""
+
+        return (
+            actions_used < _PROVINCE_CLICK_MAX_ACTIONS
+            and time.monotonic() - started_at < _PROVINCE_CLICK_MAX_SECONDS
+        )
+
+    def _continue_province_location_click(
+        self,
+        request_owner: tuple[int, str, str, str, str],
+        *,
+        started_at: float,
+        actions_used: int,
+    ) -> None:
+        """异步接力当前省份计划的一页；空页不会结束整个省份。"""
+
+        if not self._batch_location_owner_is_current(request_owner):
+            return
+        state = self._batch_location_state()
+        plan = state.get("searchPlan")
+        if not isinstance(plan, LocationSearchPlan):
+            self._finish_province_location_click(request_owner, terminal=False)
+            return
+        if plan.exhausted or int(state["eligibleIdentityCount"]) >= _BATCH_LOCATION_MAX_IDENTITIES:
+            self._finish_province_location_click(request_owner, terminal=True)
+            return
+        if not self._province_click_can_continue(
+            started_at=started_at, actions_used=actions_used
+        ):
+            self._finish_province_location_click(request_owner, terminal=False)
+            return
+        if self._run_current_location_action(
+            request_owner,
+            on_success=lambda rows: self._accept_province_location_page(
+                request_owner,
+                rows,
+                started_at=started_at,
+                actions_used=actions_used + 1,
+            ),
+        ):
+            return
+        # A real runner keeps its action key until its finished signal.  Save the
+        # continuation for that signal instead of blocking or spinning in Qt.
+        if self.runner.is_running(self._COLLECTOR_TASK_KEY) or self.runner.is_running(
+            self._IMMEDIATE_WRITE_KEY
+        ):
+            self._province_location_click_handoffs[request_owner] = (
+                started_at,
+                actions_used,
+            )
+            return
+        self._finish_province_location_click(request_owner, terminal=False)
+
+    def _continue_province_location_handoff(self) -> None:
+        """Resume one saved bounded click after the previous async action releases."""
+
+        for request_owner, (started_at, actions_used) in list(
+            self._province_location_click_handoffs.items()
+        ):
+            self._province_location_click_handoffs.pop(request_owner, None)
+            if self._batch_location_owner_is_current(request_owner):
+                self._continue_province_location_click(
+                    request_owner,
+                    started_at=started_at,
+                    actions_used=actions_used,
+                )
+            return
+
+    def _run_current_location_action(
+        self,
+        request_owner: tuple[int, str, str, str, str],
+        *,
+        on_success: Callable[[Mapping[str, object]], None],
+    ) -> bool:
+        """Run exactly one search or load-more action for the current city."""
+
+        if not self._batch_location_owner_is_current(request_owner):
+            return False
+        request_token, _account_id, scope, root_keyword, commission_filter = request_owner
+        state = self._batch_location_state()
+        active_keyword = _normalized(state["activeKeyword"] or root_keyword)
+        self._set_batch_location_pending("load_more", request_owner, True)
+        self._set_batch_location_feedback("正在加载更多地点…")
+        self._sync_batch_location_controls()
+
+        def accept(rows: object) -> None:
+            if not isinstance(rows, Mapping):
+                self._province_location_action_failed(
+                    "province_location_search_context_lost", request_token=request_token
+                )
+                return
+            page = dict(rows)
+            candidates = page.get("candidates")
+            if not isinstance(candidates, list):
+                self._province_location_action_failed(
+                    "province_location_search_context_lost", request_token=request_token
+                )
+                return
+            page.setdefault("platformResultCount", len(candidates))
+            page.setdefault("newCandidateCount", len(candidates))
+            page.setdefault("hasMore", bool(candidates))
+            page.setdefault(
+                "stopReason",
+                "loaded" if page["hasMore"] is True else "no_visible_load_more_control",
+            )
+            on_success(page)
+
+        def failed(message: object) -> None:
+            self._province_location_action_failed(message, request_token=request_token)
+
+        if self._setup_generation_id:
+            collector_type = (
+                "domestic_location"
+                if scope == douyin_commerce_service.LOCATION_SCOPE_DOMESTIC
+                else "local_location"
+            )
+            if state["platformContextReady"] is True:
+                work = (
+                    lambda: douyin_commerce_collectors.commerce_collector_manager.load_more_locations(
+                        self._setup_generation_id,
+                        active_keyword,
+                        scope,
+                        commission_filter=commission_filter,
+                        previous_candidates=[
+                            dict(item) for item in state["platformCandidates"]
+                        ],
+                    )
+                )
+            else:
+                work = (
+                    lambda: douyin_commerce_collectors.commerce_collector_manager.search_locations(
+                        self._setup_generation_id,
+                        active_keyword,
+                        scope,
+                        commission_filter=commission_filter,
+                        include_metadata=True,
+                    )
+                )
+            started = self._run_collector_action(
+                collector_type, work, accept, action_label="正在读取地点"
+            )
+        elif self._session_id:
+            if state["platformContextReady"] is True:
+                work = lambda: douyin_commerce_session.commerce_session_manager.load_more_locations(
+                    self._session_id,
+                    active_keyword,
+                    scope,
+                    commission_filter=commission_filter,
+                    previous_candidates=[dict(item) for item in state["platformCandidates"]],
+                )
+                kind = "batch_location_load_more"
+            else:
+                work = lambda: douyin_commerce_session.commerce_session_manager.search_locations(
+                    self._session_id,
+                    active_keyword,
+                    scope,
+                    commission_filter=commission_filter,
+                    include_metadata=True,
+                )
+                kind = "batch_location_search"
+            started = self._start_immediate_write(kind, work, accept, failed)
+        else:
+            started = False
+        if not started:
+            self._set_batch_location_pending("load_more", request_owner, False)
+        return started
+
+    def _save_province_location_progress(
+        self,
+        request_owner: tuple[int, str, str, str, str],
+        state: Mapping[str, object],
+        *,
+        on_saved: Callable[[], None],
+    ) -> bool:
+        """Persist each accepted page off the UI thread; errors leave its city retryable."""
+
+        plan = state.get("searchPlan")
+        if not isinstance(plan, LocationSearchPlan):
+            return False
+        request_token, account_id, scope, root_keyword, commission_filter = request_owner
+        query = douyin_location_cache.LocationCacheQuery(
+            account_id, scope, root_keyword, commission_filter
+        )
+        started = self.runner.run(
+            self._batch_location_request_task_key(
+                self._LOCATION_CACHE_PROGRESS_TASK_KEY, request_owner
+            ),
+            with_progress=lambda _report: douyin_location_cache.save_location_search_plan(
+                query, plan, eligible_total=int(state["eligibleIdentityCount"])
+            ),
+            on_success=lambda _result: on_saved(),
+            on_error=lambda _message: self._province_location_action_failed(
+                "province_location_search_progress_failed", request_token=request_token
+            ),
+        )
+        if not started:
+            self._province_location_action_failed(
+                "province_location_search_progress_failed", request_token=request_token
+            )
+        return started
+
+    def _accept_province_location_page(
+        self,
+        request_owner: tuple[int, str, str, str, str],
+        rows: Mapping[str, object],
+        *,
+        started_at: float,
+        actions_used: int,
+    ) -> None:
+        """Accept one page, persist its plan state, then stop on genuine new growth."""
+
+        if not self._batch_location_owner_is_current(request_owner):
+            return
+        candidates = rows.get("candidates")
+        has_more = rows.get("hasMore")
+        if not isinstance(candidates, list) or type(has_more) is not bool:
+            self._province_location_action_failed(
+                "province_location_search_context_lost", request_token=request_owner[0]
+            )
+            return
+        state = self._batch_location_state()
+        plan = state.get("searchPlan")
+        if not isinstance(plan, LocationSearchPlan):
+            self._province_location_action_failed(
+                "province_location_search_context_lost", request_token=request_owner[0]
+            )
+            return
+        before = {
+            self._batch_location_candidate_identity(item) for item in state["candidates"]
+        }
+        platform_rows = self._merge_batch_location_candidates(
+            [],
+            [dict(item) for item in candidates if isinstance(item, Mapping)],
+            identity_limit=None,
+        )
+        platform_snapshot = self._merge_batch_location_candidates(
+            state["platformCandidates"], platform_rows, identity_limit=None
+        )
+        regional = list(
+            douyin_location_cache.filter_locations_for_search_keyword(
+                state["rootKeyword"], platform_rows
+            )
+        )
+        raw_candidates = self._merge_batch_location_candidates(
+            state["rawCandidates"], regional, identity_limit=None
+        )
+        accepted = filter_location_candidates(raw_candidates, state["commissionFilter"])
+        accepted = self._merge_batch_location_candidates([], accepted)
+        eligible_total = len(accepted)
+        next_plan = advance_after_page(
+            plan, has_more=has_more, eligible_total=eligible_total
+        )
+        effective_growth = len(
+            {
+                self._batch_location_candidate_identity(item) for item in accepted
+            }
+            - before
+        )
+        city_advanced = next_plan.current_index != plan.current_index
+        terminal = next_plan.exhausted or eligible_total >= _BATCH_LOCATION_MAX_IDENTITIES
+        state.update(
+            {
+                "rawCandidates": raw_candidates,
+                "candidates": accepted,
+                "eligibleIdentityCount": eligible_total,
+                "searchPlan": next_plan,
+                "activeKeyword": (
+                    next_plan.current_keyword
+                    if not next_plan.exhausted
+                    else plan.current_keyword
+                ),
+                "platformResultCount": int(rows.get("platformResultCount") or len(platform_rows)),
+                "platformCandidates": [] if city_advanced else platform_snapshot,
+                "observedPlatformCandidates": [] if city_advanced else platform_snapshot,
+                "platformContextReady": False if city_advanced else True,
+                "platformLoadCount": 0 if city_advanced else int(state["platformLoadCount"]) + 1,
+                "zeroGrowthCount": int(state["zeroGrowthCount"])
+                + (1 if effective_growth == 0 else 0),
+                "hasMore": not terminal,
+                "source": "platform",
+            }
+        )
+        self._batch_location_searches[_BATCH_SHARED_LOCATION_SEARCH_KEY] = state
+        progress = plan_progress_text(
+            next_plan,
+            filter_label={
+                "all": "全部",
+                "commission": "返佣",
+                "no_commission": "无佣",
+            }[state["commissionFilter"]],
+            eligible_total=eligible_total,
+        )
+        self._set_batch_location_feedback(progress)
+        self._render_batch_item_rows()
+        self._sync_view()
+
+        def continue_after_save() -> None:
+            if not self._batch_location_owner_is_current(request_owner):
+                return
+            if terminal:
+                self._finish_province_location_click(request_owner, terminal=True)
+            elif effective_growth:
+                self._finish_province_location_click(request_owner, terminal=False)
+            else:
+                self._continue_province_location_click(
+                    request_owner, started_at=started_at, actions_used=actions_used
+                )
+
+        self._save_province_location_progress(
+            request_owner, state, on_saved=continue_after_save
+        )
+
+    def _province_location_action_failed(
+        self, message: object, *, request_token: int
+    ) -> None:
+        """Record a safe retryable failure without silently exhausting a city."""
+
+        if self._shutdown_requested.is_set() or request_token != self._batch_location_search_token:
+            return
+        diagnostic = _normalized(message)
+        lowered = diagnostic.lower()
+        if "timeout" in lowered:
+            code = "province_location_search_action_timeout"
+        elif any(token in lowered for token in ("context", "panel", "mismatch", "listbox")):
+            code = "province_location_search_context_lost"
+        elif diagnostic == "province_location_search_progress_failed":
+            code = diagnostic
+        else:
+            code = "province_location_search_context_lost"
+        state = self._batch_location_state()
+        plan = state.get("searchPlan")
+        if isinstance(plan, LocationSearchPlan):
+            state["searchPlan"] = record_plan_error(plan, code)
+        if code == "province_location_search_context_lost":
+            state["platformContextReady"] = False
+            state["platformCandidates"] = []
+            state["observedPlatformCandidates"] = []
+        state["hasMore"] = True
+        self._batch_location_searches[_BATCH_SHARED_LOCATION_SEARCH_KEY] = state
+        self._clear_batch_location_pending_for_token("load_more", request_token)
+        _LOGGER.warning("抖音带货省份地点读取失败：%s", diagnostic[:180])
+        self._set_batch_location_feedback(f"地点读取失败（错误码 {code}），可重试")
+        self._sync_batch_location_controls()
+
+    def _finish_province_location_click(
+        self,
+        request_owner: tuple[int, str, str, str, str],
+        *,
+        terminal: bool,
+    ) -> None:
+        if not self._batch_location_owner_is_current(request_owner):
+            return
+        self._province_location_click_handoffs.pop(request_owner, None)
+        self._set_batch_location_pending("load_more", request_owner, False)
+        state = self._batch_location_state()
+        if terminal:
+            state["hasMore"] = False
+            message = "已加载全部地址"
+        else:
+            state["hasMore"] = True
+            message = self._batch_location_feedback
+            if not message or "已找到" in message:
+                message = f"{message} · 本次未找到新的有效地点，仍可继续加载".strip(" ·")
+        self._batch_location_searches[_BATCH_SHARED_LOCATION_SEARCH_KEY] = state
+        self._set_batch_location_feedback(message)
+        self._sync_batch_location_controls()
+
     def _load_more_batch_locations(self) -> None:
         """先展示当前账号的本地下一页，耗尽后才请求平台。"""
 
@@ -2879,6 +3272,13 @@ class DouyinCommercePage(QWidget):
                 self._batch_location_cache_page_failed(
                     cache_query, request_token=request_token
                 )
+            return
+
+        search_plan = state.get("searchPlan")
+        if isinstance(search_plan, LocationSearchPlan) and search_plan.search_kind == "province":
+            self._continue_province_location_click(
+                request_owner, started_at=time.monotonic(), actions_used=0
+            )
             return
 
         if state["platformContextReady"] is not True:
@@ -5899,6 +6299,7 @@ class DouyinCommercePage(QWidget):
         self._sync_batch_location_controls()
         if kind in {"batch_location_search", "batch_location_load_more"}:
             self._continue_batch_location_platform_handoff()
+            self._continue_province_location_handoff()
         if (
             kind in {"music_read", "music_refresh"}
             and self._open_music_picker_after_load
@@ -8247,6 +8648,7 @@ class DouyinCommercePage(QWidget):
             self._batch_location_load_more_pending
             and not self._batch_location_merge_pending
             and not self._batch_location_handoff_queries
+            and not self._province_location_click_handoffs
             and generation_id == self._setup_generation_id
             and action_token == self._collector_action_tokens.get(collector_type)
         ):
@@ -8270,6 +8672,7 @@ class DouyinCommercePage(QWidget):
         self._sync_view()
         self._sync_batch_location_controls()
         self._continue_batch_location_platform_handoff()
+        self._continue_province_location_handoff()
 
     def _collector_action_succeeded(
         self,
@@ -8394,6 +8797,11 @@ class DouyinCommercePage(QWidget):
         status = {**status, "setupGenerationId": generation_id, "collectors": collectors, "collectorDetails": details}
         self._last_failed_collector_type = collector_type
         self._render_collector_status(status)
+        plan = self._batch_location_state().get("searchPlan")
+        if isinstance(plan, LocationSearchPlan) and plan.search_kind == "province":
+            self._province_location_action_failed(
+                code, request_token=self._batch_location_search_token
+            )
         _LOGGER.warning(
             "抖音设置采集失败 collector=%s errorCode=%s", collector_type, code
         )
@@ -9640,6 +10048,7 @@ class DouyinCommercePage(QWidget):
             self._LOCATION_CACHE_SEARCH_TASK_KEY,
             self._LOCATION_CACHE_PAGE_TASK_KEY,
             self._LOCATION_CACHE_MERGE_TASK_KEY,
+            self._LOCATION_CACHE_PROGRESS_TASK_KEY,
             self._LOCATION_CACHE_SELECTION_TASK_KEY,
         )
         active_keys = getattr(self.runner, "active_keys_with_prefixes", None)

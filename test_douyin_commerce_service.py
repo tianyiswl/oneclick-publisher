@@ -12,6 +12,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import AsyncMock, MagicMock, call, patch
 from zoneinfo import ZoneInfo
@@ -14559,6 +14560,217 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.page.close()
+
+    @staticmethod
+    def _province_candidate(
+        poi_id: str,
+        address: str = "广东省广州市测试路1号",
+        commission: str = "commission",
+    ) -> dict[str, object]:
+        return {
+            "poiId": poi_id,
+            "name": f"JOYMARK {poi_id}",
+            "address": address,
+            "commissionType": commission,
+        }
+
+    @staticmethod
+    def _province_page(
+        candidates: list[dict[str, object]], *, has_more: bool
+    ) -> dict[str, object]:
+        return {
+            "platformResultCount": len(candidates),
+            "candidates": list(candidates),
+            "newCandidateCount": len(candidates),
+            "hasMore": has_more,
+            "stopReason": "loaded" if has_more else "no_visible_load_more_control",
+        }
+
+    def _install_province_fixture(
+        self, keyword: str, *, at_last_subquery: bool = False
+    ) -> tuple[int, str, str, str, str]:
+        self._activate_cached_location_search(account_id=7)
+        self.page.runner = self._InlineRunner()
+        self.page.video_combo.addItem(
+            "地点测试.mp4",
+            {
+                "id": 7,
+                "storedPath": "/tmp/province-location-test.mp4",
+                "filename": "地点测试.mp4",
+            },
+        )
+        self.page._selected_video_indexes = [self.page.video_combo.count() - 1]
+        self.page.batch_location_keyword.setText(keyword)
+        plan = build_location_search_plan(keyword)
+        if at_last_subquery:
+            plan = replace(
+                plan,
+                current_index=len(plan.subqueries) - 1,
+                completed_indices=tuple(range(len(plan.subqueries) - 1)),
+            )
+        state = self.page._batch_location_state()
+        state.update(
+            {
+                "accountId": "7",
+                "scope": "domestic",
+                "keyword": keyword,
+                "rootKeyword": keyword,
+                "activeKeyword": plan.current_keyword,
+                "commissionFilter": "commission",
+                "searchPlan": plan,
+                "candidates": [],
+                "rawCandidates": [],
+                "platformCandidates": [],
+                "observedPlatformCandidates": [],
+                "platformContextReady": False,
+                "hasMore": True,
+            }
+        )
+        self.page._batch_location_searches["__shared_location_search__"] = state
+        self.page._render_batch_item_rows()
+        self.page._sync_batch_location_controls()
+        query = douyin_location_cache.LocationCacheQuery(
+            "7", "domestic", keyword, "commission"
+        )
+        return self.page._batch_location_request_owner(
+            query, self.page._batch_location_search_token
+        )
+
+    def test_one_click_skips_empty_city_batches_until_new_eligible_candidate(self) -> None:
+        self._install_province_fixture("广东joymark")
+        responses = [
+            self._province_page([], has_more=False),
+            self._province_page(
+                [
+                    self._province_candidate(
+                        "js-1", address="江苏省南京市测试路1号"
+                    )
+                ],
+                has_more=False,
+            ),
+            self._province_page([self._province_candidate("gz-1")], has_more=True),
+        ]
+
+        def dispatch(_owner, *, on_success):
+            on_success(responses.pop(0))
+            return True
+
+        with patch.object(
+            self.page, "_run_current_location_action", side_effect=dispatch
+        ):
+            self.page._load_more_batch_locations()
+
+        self.assertIn(
+            "gz-1",
+            [item["poiId"] for item in self.page._batch_location_state()["candidates"]],
+        )
+        self.assertTrue(self.page.batch_location_load_more_button.isEnabled())
+
+    def test_three_empty_actions_return_retryable_not_complete(self) -> None:
+        self._install_province_fixture("广东joymark")
+        calls = 0
+
+        def dispatch(_owner, *, on_success):
+            nonlocal calls
+            calls += 1
+            on_success(self._province_page([], has_more=False))
+            return True
+
+        with patch.object(
+            self.page, "_run_current_location_action", side_effect=dispatch
+        ):
+            self.page._load_more_batch_locations()
+
+        self.assertIn("仍可继续加载", self.page.batch_item_settings_status.text())
+        self.assertTrue(self.page.batch_location_load_more_button.isEnabled())
+        self.assertEqual(calls, 3)
+
+    def test_accepted_page_persists_advanced_plan_and_progress_text(self) -> None:
+        owner = self._install_province_fixture("广东joymark")
+        self.page.runner = self._InlineRunner()
+        with patch.object(douyin_location_cache, "save_location_search_plan") as save:
+            self.page._accept_province_location_page(
+                owner,
+                self._province_page([], has_more=False),
+                started_at=time.monotonic(),
+                actions_used=3,
+            )
+
+        state = self.page._batch_location_state()
+        self.assertEqual(state["searchPlan"].current_index, 1)
+        self.assertEqual(save.call_count, 1)
+        self.assertIn("广东已检查", self.page.batch_item_settings_status.text())
+
+    def test_hundred_eligible_candidates_is_terminal(self) -> None:
+        owner = self._install_province_fixture("广东joymark")
+        candidates = [
+            self._province_candidate(f"poi-{index:03d}") for index in range(100)
+        ]
+
+        self.page._accept_province_location_page(
+            owner,
+            self._province_page(candidates, has_more=True),
+            started_at=time.monotonic(),
+            actions_used=1,
+        )
+
+        self.assertEqual(self.page._batch_location_state()["eligibleIdentityCount"], 100)
+        self.assertFalse(self.page.batch_location_load_more_button.isEnabled())
+
+    def test_all_subqueries_exhausted_disables_button(self) -> None:
+        owner = self._install_province_fixture("广东joymark", at_last_subquery=True)
+
+        self.page._accept_province_location_page(
+            owner,
+            self._province_page([], has_more=False),
+            started_at=time.monotonic(),
+            actions_used=1,
+        )
+
+        self.assertIn("已加载全部地址", self.page.batch_item_settings_status.text())
+        self.assertFalse(self.page.batch_location_load_more_button.isEnabled())
+
+    def test_timeout_keeps_current_city_retryable(self) -> None:
+        self._install_province_fixture("广东joymark")
+        before = self.page._batch_location_state()["searchPlan"]
+
+        self.page._province_location_action_failed(
+            "province_location_search_action_timeout",
+            request_token=self.page._batch_location_search_token,
+        )
+
+        after = self.page._batch_location_state()["searchPlan"]
+        self.assertEqual(after.current_index, before.current_index)
+        self.assertTrue(self.page.batch_location_load_more_button.isEnabled())
+
+    def test_context_loss_does_not_mark_city_exhausted(self) -> None:
+        self._install_province_fixture("广东joymark")
+        current_index = self.page._batch_location_state()["searchPlan"].current_index
+
+        self.page._province_location_action_failed(
+            "collector_search_context_mismatch",
+            request_token=self.page._batch_location_search_token,
+        )
+
+        plan = self.page._batch_location_state()["searchPlan"]
+        self.assertEqual(plan.current_index, current_index)
+        self.assertNotIn(current_index, plan.completed_indices)
+
+    def test_stale_province_callback_cannot_mutate_plan(self) -> None:
+        owner = self._install_province_fixture("广东joymark")
+        self.page._batch_location_search_token += 1
+
+        self.page._accept_province_location_page(
+            owner,
+            self._province_page([self._province_candidate("late")], has_more=False),
+            started_at=time.monotonic(),
+            actions_used=1,
+        )
+
+        self.assertNotIn(
+            "late",
+            [item["poiId"] for item in self.page._batch_location_state()["candidates"]],
+        )
 
     def test_province_search_uses_root_keyword_first_and_restores_saved_plan(self) -> None:
         """恢复后仍以原词聚合，但平台从保存的城市继续。"""
