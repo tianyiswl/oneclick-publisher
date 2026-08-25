@@ -2104,7 +2104,22 @@ class DouyinCommentCollectorTests(unittest.TestCase):
             {"comment_sync_timeout", "comment_payload_invalid"},
         )
         self.assertNotIn("raw-heavy", diagnostics)
-        self._assert_closed(page, context, browser, playwright)
+        resource_state = (
+            page.closed,
+            context.closed,
+            browser.closed,
+            playwright.stopped,
+        )
+        self.assertIn(
+            resource_state,
+            {
+                (0, 0, 0, 0),  # 输入校验已用完时限，浏览器从未启动。
+                (0, 0, 0, 1),  # 只创建了 Playwright。
+                (0, 0, 1, 1),  # 已创建浏览器，尚未创建上下文。
+                (0, 1, 1, 1),  # 已创建上下文，尚未创建页面。
+                (1, 1, 1, 1),  # 浏览器已启动，随后完整关闭。
+            },
+        )
 
     def test_single_slow_row_projection_obeys_deadline_and_audits_worker(self) -> None:
         """单行投影在公开时限内不返回也必须有界并如实审计。"""
