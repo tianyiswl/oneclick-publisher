@@ -112,7 +112,10 @@ class FakeSessionManager:
         scope: object,
         *,
         commission_filter: object = "all",
+        include_metadata: bool = False,
+        deadline_monotonic: float | None = None,
     ) -> list[dict[str, Any]]:
+        del include_metadata, deadline_monotonic
         self.location_calls.append(
             (session_id, keyword, scope, commission_filter)
         )
@@ -148,7 +151,9 @@ class FakeSessionManager:
         *,
         commission_filter: object,
         previous_candidates: object,
+        deadline_monotonic: float | None = None,
     ) -> dict[str, object]:
+        del deadline_monotonic
         context = (str(keyword), str(scope), str(commission_filter))
         if context != self.location_search_context:
             raise RuntimeError("collector_search_context_mismatch")
@@ -429,6 +434,60 @@ class DouyinCommerceCollectorManagerTests(unittest.TestCase):
         self.assertEqual(event["candidateCount"], 1)
         self.assertEqual(event["outcome"], "success")
         self.assertEqual(event["errorCode"], "collector_unknown")
+
+    def test_metadata_empty_search_is_a_structured_terminal_page(self):
+        """明确空首屏是城市耗尽，不应令省份计划误判为采集上下文丢失。"""
+
+        generation_id = self.manager.begin_generation(self.upload_payload)[
+            "setupGenerationId"
+        ]
+        with mock.patch.object(
+            FakeSessionManager,
+            "search_locations",
+            return_value={"platformResultCount": 0, "candidates": []},
+        ):
+            result = self.manager.search_locations(
+                generation_id,
+                "广东 joymark",
+                "domestic",
+                commission_filter="commission",
+                include_metadata=True,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["setupGenerationId"], generation_id)
+        self.assertEqual(result["collectorType"], "domestic_location")
+        self.assertTrue(result["collectorInstanceId"])
+        self.assertEqual(result["platformResultCount"], 0)
+        self.assertEqual(result["candidates"], [])
+        self.assertEqual(result["newCandidateCount"], 0)
+        self.assertFalse(result["hasMore"])
+        self.assertEqual(result["stopReason"], "no_visible_load_more_control")
+
+    def test_location_search_forwards_optional_absolute_deadline(self):
+        generation_id = self.manager.begin_generation(self.upload_payload)[
+            "setupGenerationId"
+        ]
+        deadline = time.monotonic() + 5
+        with mock.patch.object(
+            FakeSessionManager,
+            "search_locations",
+            return_value=[{"poiId": "deadline", "name": "北海", "address": "广西北海"}],
+        ) as search:
+            self.manager.search_locations(
+                generation_id,
+                "北海",
+                "domestic",
+                deadline_monotonic=deadline,
+            )
+
+        self.assertEqual(search.call_args.kwargs["deadline_monotonic"], deadline)
+        self.assertEqual(
+            self.manager._classify_diagnostic_error(
+                RuntimeError("publish_location_load_more_limit")
+            ),
+            "province_location_search_action_timeout",
+        )
 
     def test_location_search_normalizes_and_passes_commission_filter_to_session_manager(self):
         """协调器必须在 POI 去重前把返佣筛选传给真实会话搜索边界。"""

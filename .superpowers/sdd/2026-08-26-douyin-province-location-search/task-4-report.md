@@ -15,6 +15,13 @@
 - Timeout/context failures retain the current city as retryable, use the required stable public error codes, and discard stale request-token callbacks.
 - Progress writes are included in shutdown cancellation. Existing single platform search/load-more methods remain single-action methods.
 
+## Review round 1 fixes
+
+- A collector metadata search with an explicitly empty first page now returns the normal public success envelope with a structured empty page. The province UI callback therefore advances that city; timeout and context failures still leave it retryable.
+- Province page handling snapshots the old UI state. The background worker first merges returned rows under both the root query and active-city query, then saves the full next plan. The UI publishes the city switch and clears its old platform snapshot only after both writes succeed. Start, merge, and save failures retain the old city for retry.
+- An explicit `eligibleIdentityCount: 0` is preserved. Province termination at 100 uses only fully identified candidates that pass the root-region and commission filter; 100 no-commission rows do not complete the plan.
+- The one-click deadline is passed as an absolute monotonic value to collector/session/service location calls. Every lower-layer wait uses remaining time, and an expired deadline returns a safe timeout without blocking Qt. Calls without that optional argument retain the previous behavior.
+
 ## Verification
 
 Focused command:
@@ -23,12 +30,12 @@ Focused command:
 QT_QPA_PLATFORM=offscreen ../../.venv/bin/python -m unittest -v test_douyin_commerce_service.DouyinCommerceBatchUiTests test_douyin_commerce_service.DouyinCommerceSessionContractTests test_douyin_commerce_collectors.DouyinCommerceCollectorManagerTests
 ```
 
-Result: `356` tests passed, `0` failed.
+Result: `366` tests passed, `0` failed.
 
 Additional checks:
 
 ```text
-../../.venv/bin/python -m py_compile ui/douyin_commerce_page.py test_douyin_commerce_service.py
+../../.venv/bin/python -m py_compile ui/douyin_commerce_page.py app_core/douyin_commerce_collectors.py app_core/douyin_commerce_session.py app_core/douyin_commerce_service.py test_douyin_commerce_service.py test_douyin_commerce_collectors.py
 git diff --check
 ```
 
@@ -40,6 +47,7 @@ Result: passed.
 - Confirmed all platform and SQLite work uses existing runner callbacks; no Qt-thread blocking wait was introduced.
 - Confirmed stale owners are rejected before state mutation and that retries do not add the current city to completed indices.
 - Confirmed the accepted-page save completes before a zero-growth continuation can start the next city.
+- Confirmed the real collector public empty-page response reaches the UI callback without patching the province action method; added start/merge/save failure, replay, 100-no-commission, and deadline tests.
 
 ## Concerns
 

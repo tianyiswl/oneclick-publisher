@@ -2583,6 +2583,7 @@ async def search_commerce_location_store_candidates(
     include_metadata: bool = False,
     timeout_ms: int = _LOCATION_RESULT_WAIT_TIMEOUT_MS,
     deadline: float | None = None,
+    deadline_monotonic: float | None = None,
 ) -> list[dict[str, Any]] | dict[str, Any]:
     """按“本地/国内”范围和返佣要求读取发布定位候选。
 
@@ -2592,6 +2593,12 @@ async def search_commerce_location_store_candidates(
     可见有效候选数，候选本身仍只包含过滤后的公开结构字段。
     """
 
+    if deadline_monotonic is not None:
+        deadline = (
+            deadline_monotonic
+            if deadline is None
+            else min(deadline, deadline_monotonic)
+        )
     selected_commission_filter = normalize_commission_filter(
         commission_filter,
         default="all",
@@ -3371,9 +3378,16 @@ async def load_more_commerce_location_candidates(
     commission_filter: object = "all",
     timeout_ms: int = _LOCATION_RESULT_WAIT_TIMEOUT_MS,
     deadline: float | None = None,
+    deadline_monotonic: float | None = None,
 ) -> dict[str, object]:
     """公开加载更多入口：所有内部失败只暴露固定错误码。"""
 
+    if deadline_monotonic is not None:
+        deadline = (
+            deadline_monotonic
+            if deadline is None
+            else min(deadline, deadline_monotonic)
+        )
     has_outer_deadline = deadline is not None
     try:
         return await _load_more_commerce_location_candidates_impl(

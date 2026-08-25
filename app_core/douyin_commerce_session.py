@@ -482,6 +482,7 @@ class DouyinCommerceSessionManager:
         *,
         commission_filter: object = "all",
         include_metadata: bool = False,
+        deadline_monotonic: float | None = None,
     ) -> list[dict[str, Any]] | dict[str, Any]:
         """在当前已上传编辑页搜索发布定位候选，不另开浏览器或使用私有请求。"""
 
@@ -499,13 +500,10 @@ class DouyinCommerceSessionManager:
         }
         if include_metadata is True:
             search_kwargs["include_metadata"] = True
+        if deadline_monotonic is not None:
+            search_kwargs["deadline_monotonic"] = deadline_monotonic
         return self._call(
-            self._search_locations(
-                session_id,
-                keyword,
-                scope,
-                **search_kwargs,
-            )
+            self._search_locations(session_id, keyword, scope, **search_kwargs)
         )
 
     def load_more_locations(
@@ -516,6 +514,7 @@ class DouyinCommerceSessionManager:
         *,
         commission_filter: object,
         previous_candidates: object,
+        deadline_monotonic: float | None = None,
     ) -> dict[str, object]:
         """为同一地点搜索上下文加载下一页公开候选。"""
 
@@ -539,13 +538,15 @@ class DouyinCommerceSessionManager:
             raise DouyinCommerceSessionError(
                 "publish_location_load_more_failed"
             ) from None
+        load_kwargs: dict[str, object] = {
+            "commission_filter": selected_commission_filter,
+            "previous_candidates": previous_snapshot,
+        }
+        if deadline_monotonic is not None:
+            load_kwargs["deadline_monotonic"] = deadline_monotonic
         return self._call(
             self._load_more_locations(
-                session_id,
-                _normalized(keyword),
-                selected_scope,
-                commission_filter=selected_commission_filter,
-                previous_candidates=previous_snapshot,
+                session_id, _normalized(keyword), selected_scope, **load_kwargs
             )
         )
 
@@ -1168,6 +1169,7 @@ class DouyinCommerceSessionManager:
         *,
         commission_filter: object = "all",
         include_metadata: bool = False,
+        deadline_monotonic: float | None = None,
     ) -> list[dict[str, Any]] | dict[str, Any]:
         session = await self._current(session_id)
         self._ensure_editor_not_blocked_by_music_picker(session)
@@ -1196,7 +1198,9 @@ class DouyinCommerceSessionManager:
             # 每次检索前先收口上一轮候选。地点候选与当前上传会话复用同一页面，
             # 若旧 listbox 仍展开，带货模式回读可能把菜单项误作当前值。
             try:
-                await douyin_commerce_service.close_commerce_store_selector(session.page)
+                await douyin_commerce_service.close_commerce_store_selector(
+                    session.page, deadline=deadline_monotonic
+                )
             except Exception as exc:
                 raise DouyinCommerceSessionError(
                     f"抖音上一次地点候选未能安全关闭：{_normalized(str(exc))[:220]}"
@@ -1208,6 +1212,8 @@ class DouyinCommerceSessionManager:
                 }
                 if include_metadata is True:
                     service_kwargs["include_metadata"] = True
+                if deadline_monotonic is not None:
+                    service_kwargs["deadline_monotonic"] = deadline_monotonic
                 search_result = await douyin_commerce_service.search_commerce_location_store_candidates(
                     session.page,
                     keyword,
@@ -1247,7 +1253,9 @@ class DouyinCommerceSessionManager:
                 # 搜索中途失败也尽量收口本次已展开的地点候选；清理失败不得覆盖
                 # 原始平台错误，下一次搜索仍会在入口处再次严格清理。
                 try:
-                    await douyin_commerce_service.close_commerce_store_selector(session.page)
+                    await douyin_commerce_service.close_commerce_store_selector(
+                        session.page, deadline=deadline_monotonic
+                    )
                 except Exception:
                     _LOGGER.warning("抖音地点搜索失败后候选浮层未能关闭", exc_info=True)
                 error_text = _normalized(str(exc))
@@ -1257,7 +1265,12 @@ class DouyinCommerceSessionManager:
                 )
                 if attempt == 0 and transient_scope_failure:
                     _LOGGER.info("抖音地点范围面板尚未挂载，有界等待后自动重试一次")
-                    await session.page.wait_for_timeout(1_500)
+                    if deadline_monotonic is not None:
+                        await douyin_commerce_service._wait_publish_location_timeout(
+                            session.page, 1_500, deadline=deadline_monotonic
+                        )
+                    else:
+                        await session.page.wait_for_timeout(1_500)
                     continue
                 raise DouyinCommerceSessionError(
                     f"抖音带货位置搜索失败：{error_text[:260]}"
@@ -1309,6 +1322,7 @@ class DouyinCommerceSessionManager:
         *,
         commission_filter: object,
         previous_candidates: object,
+        deadline_monotonic: float | None = None,
     ) -> dict[str, object]:
         session = await self._current(session_id)
         try:
@@ -1363,10 +1377,14 @@ class DouyinCommerceSessionManager:
             return _stopped_location_page(context, "candidate_identity_limit")
         self._ensure_editor_not_blocked_by_music_picker(session)
         try:
+            load_kwargs: dict[str, object] = {
+                "previous_candidates": context_snapshot,
+                "commission_filter": selected_commission_filter,
+            }
+            if deadline_monotonic is not None:
+                load_kwargs["deadline_monotonic"] = deadline_monotonic
             result = await douyin_commerce_service.load_more_commerce_location_candidates(
-                session.page,
-                previous_candidates=context_snapshot,
-                commission_filter=selected_commission_filter,
+                session.page, **load_kwargs
             )
             if not isinstance(result, Mapping):
                 raise TypeError("metadata_result_invalid")
