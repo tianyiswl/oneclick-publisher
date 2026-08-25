@@ -15,6 +15,7 @@ from app_core.douyin_location_cache import (
     LOCATION_CACHE_CAPACITY,
     DouyinLocationCacheError,
     LocationCacheQuery,
+    filter_locations_for_search_keyword,
     get_cached_locations,
     load_location_search_plan,
     location_requires_revalidation,
@@ -170,6 +171,16 @@ class DouyinLocationCacheTests(unittest.TestCase):
         restored = load_location_search_plan(cache_query)
         self.assertEqual(restored, plan)
 
+    def test_jilin_plan_round_trips_with_unique_city_queries(self) -> None:
+        cache_query = LocationCacheQuery("7", "domestic", "吉林joymark", "commission")
+        plan = build_location_search_plan("吉林joymark")
+
+        save_location_search_plan(cache_query, plan, eligible_total=0)
+
+        self.assertEqual(load_location_search_plan(cache_query), plan)
+        self.assertEqual(len(plan.subqueries), len(set(plan.subqueries)))
+        self.assertIn("吉林市joymark", plan.subqueries)
+
     def test_same_candidate_can_be_associated_with_province_and_city_queries(self) -> None:
         province = LocationCacheQuery("7", "domestic", "广东joymark", "commission")
         city = LocationCacheQuery("7", "domestic", "广州joymark", "commission")
@@ -179,6 +190,50 @@ class DouyinLocationCacheTests(unittest.TestCase):
         )
         self.assertEqual(get_cached_locations(province, excluded_identities=[])["total"], 1)
         self.assertEqual(get_cached_locations(city, excluded_identities=[])["total"], 1)
+
+    def test_qinghai_hainan_prefecture_cache_is_isolated_from_hainan_province(self) -> None:
+        candidate = {
+            "poiId": "qh-hainan-1",
+            "name": "JOYMARK 共和店",
+            "address": "青海省海南藏族自治州共和县测试路1号",
+            "commissionType": "commission",
+        }
+        qinghai_root = LocationCacheQuery(
+            "7", "domestic", "青海joymark", "commission"
+        )
+        qinghai_prefecture = LocationCacheQuery(
+            "7", "domestic", "海南joymark", "commission", province_context="青海"
+        )
+        hainan_root = LocationCacheQuery(
+            "7", "domestic", "海南joymark", "commission"
+        )
+
+        merge_platform_locations_for_queries(
+            [qinghai_root, qinghai_prefecture], [candidate]
+        )
+
+        self.assertEqual(
+            get_cached_locations(qinghai_root, excluded_identities=[])["total"], 1
+        )
+        self.assertEqual(
+            get_cached_locations(qinghai_prefecture, excluded_identities=[])["total"], 1
+        )
+        self.assertEqual(
+            get_cached_locations(hainan_root, excluded_identities=[])["total"], 0
+        )
+        self.assertEqual(
+            filter_locations_for_search_keyword(
+                "海南joymark",
+                [
+                    {
+                        **candidate,
+                        "poiId": "qh-hainan-without-province",
+                        "address": "海南藏族自治州共和县测试路2号",
+                    }
+                ],
+            ),
+            [],
+        )
 
     def test_progress_isolated_by_account_keyword_and_commission_filter(self) -> None:
         plan = build_location_search_plan("广东joymark")

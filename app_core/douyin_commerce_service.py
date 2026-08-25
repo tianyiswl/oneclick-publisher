@@ -2415,6 +2415,7 @@ async def _wait_for_fresh_commerce_location_results(
     expected_location: Mapping[str, Any] | None = None,
     commission_filter: object = "all",
     allow_filtered_empty: bool = False,
+    allow_platform_empty: bool = False,
     timeout_ms: int = _LOCATION_RESULT_WAIT_TIMEOUT_MS,
     stable_reads_required: int = _LOCATION_RESULT_STABLE_READS,
     deadline: float | None = None,
@@ -2428,7 +2429,9 @@ async def _wait_for_fresh_commerce_location_results(
 
     正式发布可传入 ``expected_location`` 和 ``commission_filter``。慢网络下
     即使先出现空列表、非目标候选或分批渲染的候选，也必须等符合返佣要求的
-    目标 POI 出现且列表连续稳定后才返回。
+    目标 POI 出现且列表连续稳定后才返回。``allow_platform_empty``
+    只供省份遍历的元数据搜索使用：候选面板已挂载且空列表连续稳定后，
+    返回真实零结果；普通搜索仍把空列表视为未完成。
     """
 
     selected_commission_filter = normalize_commission_filter(
@@ -2546,9 +2549,25 @@ async def _wait_for_fresh_commerce_location_results(
                 stable_signature = ""
                 stable_reads = 0
         else:
-            # 空列表只表示平台仍在加载，不能作为搜索完成或可点击状态。
-            stable_signature = ""
-            stable_reads = 0
+            # 元数据省份遍历允许确认平台真实零结果；仅有候选
+            # 面板已挂载且空快照连续稳定才接受，不把面板未挂载
+            # 或普通搜索的瞬时空列表误作完成。
+            if allow_platform_empty and expected is None and listbox is not None:
+                if stable_signature == "platform-empty":
+                    stable_reads += 1
+                else:
+                    stable_signature = "platform-empty"
+                    stable_reads = 1
+                if stable_reads >= required_reads:
+                    elapsed = monotonic() - started_at
+                    douyin_logger.info(
+                        f"抖音地点候选已稳定为空：关键词={keyword}，"
+                        f"耗时={elapsed:.1f} 秒"
+                    )
+                    return listbox, rows
+            else:
+                stable_signature = ""
+                stable_reads = 0
         await _wait_publish_location_timeout(
             page,
             _LOCATION_RESULT_POLL_INTERVAL_MS,
@@ -2844,6 +2863,7 @@ async def search_commerce_location_store_candidates(
         expected_location=expected_location,
         commission_filter=selected_commission_filter,
         allow_filtered_empty=include_metadata is True,
+        allow_platform_empty=include_metadata is True,
         timeout_ms=timeout_ms,
         deadline=deadline,
     )
@@ -2856,9 +2876,7 @@ async def search_commerce_location_store_candidates(
         rows,
         commission_filter=selected_commission_filter,
     )
-    if not candidates and not (
-        include_metadata is True and platform_result_count > 0
-    ):
+    if not candidates and include_metadata is not True:
         raise DouyinCommerceError(
             f"抖音未返回“{normalized_keyword}”的完整可选发布定位"
         )
@@ -2874,6 +2892,13 @@ async def search_commerce_location_store_candidates(
                 {
                     "hasMore": True,
                     "stopReason": "filtered_empty_may_have_more",
+                }
+            )
+        elif platform_result_count == 0:
+            result.update(
+                {
+                    "hasMore": False,
+                    "stopReason": "no_visible_load_more_control",
                 }
             )
         return result

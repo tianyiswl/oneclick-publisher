@@ -114,9 +114,10 @@ class FakeSessionManager:
         *,
         commission_filter: object = "all",
         include_metadata: bool = False,
+        province_mode: bool = False,
         deadline_monotonic: float | None = None,
     ) -> list[dict[str, Any]]:
-        del include_metadata, deadline_monotonic
+        del include_metadata, province_mode, deadline_monotonic
         self.location_calls.append(
             (session_id, keyword, scope, commission_filter)
         )
@@ -152,9 +153,10 @@ class FakeSessionManager:
         *,
         commission_filter: object,
         previous_candidates: object,
+        province_mode: bool = False,
         deadline_monotonic: float | None = None,
     ) -> dict[str, object]:
-        del deadline_monotonic
+        del province_mode, deadline_monotonic
         context = (str(keyword), str(scope), str(commission_filter))
         if context != self.location_search_context:
             raise RuntimeError("collector_search_context_mismatch")

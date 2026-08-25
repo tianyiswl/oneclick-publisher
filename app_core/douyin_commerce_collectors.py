@@ -664,6 +664,7 @@ class DouyinCommerceCollectorManager:
         *,
         commission_filter: object = "all",
         include_metadata: bool = False,
+        province_mode: bool = False,
         deadline_monotonic: float | None = None,
     ) -> dict[str, object]:
         """按固定范围将地点搜索路由到独立会话。"""
@@ -707,6 +708,7 @@ class DouyinCommerceCollectorManager:
                     action_instance_id,
                     selected_commission_filter,
                     include_metadata is True,
+                    province_mode is True,
                     deadline_monotonic,
                 ),
             )
@@ -736,6 +738,7 @@ class DouyinCommerceCollectorManager:
         *,
         commission_filter: object,
         previous_candidates: object,
+        province_mode: bool = False,
         deadline_monotonic: float | None = None,
     ) -> dict[str, object]:
         """在同一地点搜索会话中串行读取下一页候选。"""
@@ -801,6 +804,7 @@ class DouyinCommerceCollectorManager:
                         action_instance_id,
                         selected_commission_filter,
                         previous_snapshot,
+                        province_mode is True,
                         deadline_monotonic,
                     ),
                 )
@@ -1424,6 +1428,7 @@ class DouyinCommerceCollectorManager:
         action_instance_id: str,
         commission_filter: str,
         include_metadata: bool,
+        province_mode: bool,
         deadline_monotonic: float | None,
     ) -> dict[str, object]:
         started_at = monotonic()
@@ -1441,6 +1446,8 @@ class DouyinCommerceCollectorManager:
             }
             if include_metadata:
                 search_kwargs["include_metadata"] = True
+            if province_mode:
+                search_kwargs["province_mode"] = True
             if deadline_monotonic is not None:
                 search_kwargs["deadline_monotonic"] = deadline_monotonic
             result = collector.manager.search_locations(
@@ -1598,6 +1605,7 @@ class DouyinCommerceCollectorManager:
         action_instance_id: str,
         commission_filter: str,
         previous_candidates: list[dict[str, Any]],
+        province_mode: bool,
         deadline_monotonic: float | None,
     ) -> dict[str, object]:
         started_at = monotonic()
@@ -1616,6 +1624,8 @@ class DouyinCommerceCollectorManager:
                     previous_candidates
                 ),
             }
+            if province_mode:
+                load_kwargs["province_mode"] = True
             if deadline_monotonic is not None:
                 load_kwargs["deadline_monotonic"] = deadline_monotonic
             result = collector.manager.load_more_locations(

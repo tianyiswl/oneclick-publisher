@@ -2310,11 +2310,21 @@ class DouyinCommercePage(QWidget):
             or remaining
             or state["replayLoadsRemaining"] > 0
         ):
-            self._start_batch_location_platform_search(
-                cache_query,
-                request_token=request_token,
-                from_load_more=False,
-            )
+            if (
+                plan.search_kind == "province"
+                and int(state["replayLoadsRemaining"] or 0) > 0
+            ):
+                self._continue_province_location_click(
+                    request_owner,
+                    started_at=time.monotonic(),
+                    actions_used=0,
+                )
+            else:
+                self._start_batch_location_platform_search(
+                    cache_query,
+                    request_token=request_token,
+                    from_load_more=False,
+                )
         else:
             self._sync_batch_location_controls()
 
@@ -2365,6 +2375,10 @@ class DouyinCommercePage(QWidget):
         normalized_scope = state["scope"]
         normalized_keyword = state["activeKeyword"] or state["keyword"]
         commission_filter = state["commissionFilter"]
+        province_mode = (
+            isinstance(state.get("searchPlan"), LocationSearchPlan)
+            and state["searchPlan"].search_kind == "province"
+        )
         handoff_after_search = (
             from_load_more or state["requiresRevalidation"] is True
         )
@@ -2383,6 +2397,7 @@ class DouyinCommercePage(QWidget):
                     normalized_scope,
                     commission_filter=commission_filter,
                     include_metadata=True,
+                    **({"province_mode": True} if province_mode else {}),
                 ),
                 lambda rows: self._batch_location_search_succeeded(
                     normalized_scope,
@@ -2417,6 +2432,7 @@ class DouyinCommercePage(QWidget):
                 normalized_scope,
                 commission_filter=commission_filter,
                 include_metadata=True,
+                **({"province_mode": True} if province_mode else {}),
             ),
             lambda rows: self._batch_location_search_succeeded(
                 normalized_scope,
@@ -2734,11 +2750,18 @@ class DouyinCommercePage(QWidget):
         active_keyword = _normalized(state["activeKeyword"] or root_keyword)
         active_query = cache_query
         if active_keyword != root_keyword:
+            plan = state.get("searchPlan")
             active_query = douyin_location_cache.LocationCacheQuery(
                 cache_query.account_id,
                 cache_query.scope,
                 active_keyword,
                 cache_query.commission_filter,
+                province_context=(
+                    plan.province
+                    if isinstance(plan, LocationSearchPlan)
+                    and plan.search_kind == "province"
+                    else ""
+                ),
             )
         request_owner = self._batch_location_request_owner(
             cache_query, request_token
@@ -2877,6 +2900,14 @@ class DouyinCommercePage(QWidget):
         ):
             self._finish_province_location_click(request_owner, terminal=False)
             return
+        replay_remaining = int(state.get("replayLoadsRemaining") or 0)
+        action_kind = (
+            "replay_search"
+            if replay_remaining > 0 and state["platformContextReady"] is not True
+            else "replay_load"
+            if replay_remaining > 0
+            else "new_page"
+        )
         if self._run_current_location_action(
             request_owner,
             deadline_monotonic=started_at + _PROVINCE_CLICK_MAX_SECONDS,
@@ -2885,6 +2916,7 @@ class DouyinCommercePage(QWidget):
                 rows,
                 started_at=started_at,
                 actions_used=actions_used + 1,
+                action_kind=action_kind,
             ),
         ):
             return
@@ -2994,6 +3026,7 @@ class DouyinCommercePage(QWidget):
                         previous_candidates=[
                             dict(item) for item in state["platformCandidates"]
                         ],
+                        province_mode=True,
                         deadline_monotonic=deadline_monotonic,
                     )
                 )
@@ -3005,6 +3038,7 @@ class DouyinCommercePage(QWidget):
                         scope,
                         commission_filter=commission_filter,
                         include_metadata=True,
+                        province_mode=True,
                         deadline_monotonic=deadline_monotonic,
                     )
                 )
@@ -3019,6 +3053,7 @@ class DouyinCommercePage(QWidget):
                     scope,
                     commission_filter=commission_filter,
                     previous_candidates=[dict(item) for item in state["platformCandidates"]],
+                    province_mode=True,
                     deadline_monotonic=deadline_monotonic,
                 )
                 kind = "batch_location_load_more"
@@ -3029,6 +3064,7 @@ class DouyinCommercePage(QWidget):
                     scope,
                     commission_filter=commission_filter,
                     include_metadata=True,
+                    province_mode=True,
                     deadline_monotonic=deadline_monotonic,
                 )
                 kind = "batch_location_search"
@@ -3058,8 +3094,19 @@ class DouyinCommercePage(QWidget):
             account_id, scope, root_keyword, commission_filter
         )
         active_keyword = _normalized(previous_state.get("activeKeyword")) or root_keyword
+        previous_plan = previous_state.get("searchPlan")
         active_query = douyin_location_cache.LocationCacheQuery(
-            account_id, scope, active_keyword, commission_filter
+            account_id,
+            scope,
+            active_keyword,
+            commission_filter,
+            province_context=(
+                previous_plan.province
+                if isinstance(previous_plan, LocationSearchPlan)
+                and previous_plan.search_kind == "province"
+                and active_keyword != root_keyword
+                else ""
+            ),
         )
 
         def persist(_report: object) -> object:
@@ -3103,6 +3150,7 @@ class DouyinCommercePage(QWidget):
         *,
         started_at: float,
         actions_used: int,
+        action_kind: str = "new_page",
     ) -> None:
         """Accept one page, persist its plan state, then stop on genuine new growth."""
 
@@ -3136,7 +3184,9 @@ class DouyinCommercePage(QWidget):
         )
         regional = list(
             douyin_location_cache.filter_locations_for_search_keyword(
-                previous_state["rootKeyword"], platform_rows
+                previous_state["rootKeyword"],
+                platform_rows,
+                province_context=plan.province,
             )
         )
         raw_candidates = self._merge_batch_location_candidates(
@@ -3145,9 +3195,21 @@ class DouyinCommercePage(QWidget):
         accepted = filter_location_candidates(raw_candidates, previous_state["commissionFilter"])
         accepted = self._merge_batch_location_candidates([], accepted)
         eligible_total = len(accepted)
-        next_plan = advance_after_page(
-            plan, has_more=has_more, eligible_total=eligible_total
-        )
+        replay_action = action_kind in {"replay_search", "replay_load"}
+        replay_remaining = int(previous_state.get("replayLoadsRemaining") or 0)
+        shortened_replay = replay_action and has_more is False
+        if replay_action and not shortened_replay:
+            next_plan = plan
+            next_replay_remaining = (
+                max(0, replay_remaining - 1)
+                if action_kind == "replay_load"
+                else replay_remaining
+            )
+        else:
+            next_plan = advance_after_page(
+                plan, has_more=has_more, eligible_total=eligible_total
+            )
+            next_replay_remaining = 0 if shortened_replay else replay_remaining
         effective_growth = len(
             {
                 self._batch_location_candidate_identity(item) for item in accepted
@@ -3162,6 +3224,7 @@ class DouyinCommercePage(QWidget):
                 "rawCandidates": raw_candidates,
                 "candidates": accepted,
                 "eligibleIdentityCount": eligible_total,
+                "replayLoadsRemaining": next_replay_remaining,
                 "searchPlan": next_plan,
                 "activeKeyword": (
                     next_plan.current_keyword
@@ -3193,6 +3256,19 @@ class DouyinCommercePage(QWidget):
                 return
             if terminal:
                 self._finish_province_location_click(request_owner, terminal=True)
+            elif replay_action:
+                if next_replay_remaining > 0 and not shortened_replay:
+                    self._continue_province_location_click(
+                        request_owner,
+                        started_at=started_at,
+                        actions_used=actions_used,
+                    )
+                else:
+                    # 回放只重建已保存的平台游标；回放完毕后不在
+                    # 同一次自动恢复中顺手请求尚未保存的新页。
+                    self._finish_province_location_click(
+                        request_owner, terminal=False
+                    )
             elif effective_growth:
                 self._finish_province_location_click(request_owner, terminal=False)
             else:
@@ -3377,6 +3453,10 @@ class DouyinCommercePage(QWidget):
         ):
             return False
         state = self._batch_location_state()
+        province_mode = (
+            isinstance(state.get("searchPlan"), LocationSearchPlan)
+            and state["searchPlan"].search_kind == "province"
+        )
         limit_status = self._batch_location_limit_status(state)
         request_owner = self._batch_location_request_owner(
             cache_query, request_token
@@ -3411,6 +3491,7 @@ class DouyinCommercePage(QWidget):
                     state["scope"],
                     commission_filter=state["commissionFilter"],
                     previous_candidates=previous_candidates,
+                    **({"province_mode": True} if province_mode else {}),
                 ),
                 lambda rows: self._batch_location_load_more_succeeded(
                     cache_query, rows, request_token=request_token
@@ -3427,6 +3508,7 @@ class DouyinCommercePage(QWidget):
                     state["scope"],
                     commission_filter=state["commissionFilter"],
                     previous_candidates=previous_candidates,
+                    **({"province_mode": True} if province_mode else {}),
                 ),
                 lambda rows: self._batch_location_load_more_succeeded(
                     cache_query, rows, request_token=request_token

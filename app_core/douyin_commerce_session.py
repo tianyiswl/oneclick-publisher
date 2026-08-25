@@ -266,6 +266,7 @@ class _LocationSearchContext:
     scope: str
     commission_filter: str
     candidates: list[dict[str, Any]]
+    province_mode: bool = False
     load_more_count: int = 0
     zero_growth_count: int = 0
 
@@ -482,6 +483,7 @@ class DouyinCommerceSessionManager:
         *,
         commission_filter: object = "all",
         include_metadata: bool = False,
+        province_mode: bool = False,
         deadline_monotonic: float | None = None,
     ) -> list[dict[str, Any]] | dict[str, Any]:
         """在当前已上传编辑页搜索发布定位候选，不另开浏览器或使用私有请求。"""
@@ -500,6 +502,8 @@ class DouyinCommerceSessionManager:
         }
         if include_metadata is True:
             search_kwargs["include_metadata"] = True
+        if province_mode is True:
+            search_kwargs["province_mode"] = True
         if deadline_monotonic is not None:
             search_kwargs["deadline_monotonic"] = deadline_monotonic
         return self._call(
@@ -514,6 +518,7 @@ class DouyinCommerceSessionManager:
         *,
         commission_filter: object,
         previous_candidates: object,
+        province_mode: bool = False,
         deadline_monotonic: float | None = None,
     ) -> dict[str, object]:
         """为同一地点搜索上下文加载下一页公开候选。"""
@@ -542,6 +547,8 @@ class DouyinCommerceSessionManager:
             "commission_filter": selected_commission_filter,
             "previous_candidates": previous_snapshot,
         }
+        if province_mode is True:
+            load_kwargs["province_mode"] = True
         if deadline_monotonic is not None:
             load_kwargs["deadline_monotonic"] = deadline_monotonic
         return self._call(
@@ -1169,6 +1176,7 @@ class DouyinCommerceSessionManager:
         *,
         commission_filter: object = "all",
         include_metadata: bool = False,
+        province_mode: bool = False,
         deadline_monotonic: float | None = None,
     ) -> list[dict[str, Any]] | dict[str, Any]:
         session = await self._current(session_id)
@@ -1301,11 +1309,14 @@ class DouyinCommerceSessionManager:
                 raise DouyinCommerceSessionError(
                     f"抖音带货位置搜索失败：{error_text[:260]}"
                 ) from exc
-        unique_candidates = _unique_location_candidates(candidates)
-        identity_limit_reached = (
+        unique_candidates = _unique_location_candidates(
+            candidates,
+            limit=None if province_mode else _SETUP_LOCATION_MAX_IDENTITIES,
+        )
+        identity_limit_reached = not province_mode and (
             len(unique_candidates) >= _SETUP_LOCATION_MAX_IDENTITIES
         )
-        candidates = unique_candidates[:_SETUP_LOCATION_MAX_IDENTITIES]
+        candidates = unique_candidates
         # 新搜索结果会改变发布定位。任何此前的门店选择、预检或定时回读都
         # 必须失效，避免误把旧门店用于新地点。
         session.commerce_location_candidates = [dict(item) for item in candidates]
@@ -1314,6 +1325,7 @@ class DouyinCommerceSessionManager:
             scope=selected_scope,
             commission_filter=selected_commission_filter,
             candidates=[dict(item) for item in candidates],
+            province_mode=province_mode is True,
         )
         session.location = None
         session.location_scope = selected_scope
@@ -1355,6 +1367,7 @@ class DouyinCommerceSessionManager:
         *,
         commission_filter: object,
         previous_candidates: object,
+        province_mode: bool = False,
         deadline_monotonic: float | None = None,
     ) -> dict[str, object]:
         session = await self._current(session_id)
@@ -1375,10 +1388,12 @@ class DouyinCommerceSessionManager:
             context.keyword,
             context.scope,
             context.commission_filter,
+            context.province_mode,
         ) != (
             _normalized(keyword),
             selected_scope,
             selected_commission_filter,
+            province_mode is True,
         ):
             raise DouyinCommerceSessionError(
                 "collector_search_context_mismatch"
@@ -1401,12 +1416,18 @@ class DouyinCommerceSessionManager:
             ) from None
         unique_before = _unique_location_candidates(
             context_snapshot,
-            limit=_SETUP_LOCATION_MAX_IDENTITIES,
+            limit=None if province_mode else _SETUP_LOCATION_MAX_IDENTITIES,
         )
         before_identities = set(_location_candidate_identities(unique_before))
-        if context.load_more_count >= _SETUP_LOCATION_MAX_LOAD_MORE_CLICKS:
+        if (
+            not province_mode
+            and context.load_more_count >= _SETUP_LOCATION_MAX_LOAD_MORE_CLICKS
+        ):
             return _stopped_location_page(context, "load_more_click_limit")
-        if len(before_identities) >= _SETUP_LOCATION_MAX_IDENTITIES:
+        if (
+            not province_mode
+            and len(before_identities) >= _SETUP_LOCATION_MAX_IDENTITIES
+        ):
             return _stopped_location_page(context, "candidate_identity_limit")
         self._ensure_editor_not_blocked_by_music_picker(session)
         try:
@@ -1460,7 +1481,7 @@ class DouyinCommerceSessionManager:
             ) from None
         accumulated_candidates = _unique_location_candidates(
             context_snapshot + candidates,
-            limit=_SETUP_LOCATION_MAX_IDENTITIES,
+            limit=None if province_mode else _SETUP_LOCATION_MAX_IDENTITIES,
         )
         accumulated_identities = set(
             _location_candidate_identities(accumulated_candidates)
@@ -1476,10 +1497,16 @@ class DouyinCommerceSessionManager:
         )
         stop_reason = raw_stop_reason
         has_more = raw_has_more
-        if context.load_more_count >= _SETUP_LOCATION_MAX_LOAD_MORE_CLICKS:
+        if (
+            not province_mode
+            and context.load_more_count >= _SETUP_LOCATION_MAX_LOAD_MORE_CLICKS
+        ):
             stop_reason = "load_more_click_limit"
             has_more = False
-        elif len(accumulated_identities) >= _SETUP_LOCATION_MAX_IDENTITIES:
+        elif (
+            not province_mode
+            and len(accumulated_identities) >= _SETUP_LOCATION_MAX_IDENTITIES
+        ):
             stop_reason = "candidate_identity_limit"
             has_more = False
         return {

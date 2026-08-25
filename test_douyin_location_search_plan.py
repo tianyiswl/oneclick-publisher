@@ -83,6 +83,20 @@ class DouyinLocationSearchPlanTests(unittest.TestCase):
                 self.assertTrue(cities)
                 self.assertEqual(len(cities), len(set(cities)))
 
+    def test_every_province_plan_has_unique_platform_subqueries(self):
+        """省名与地级市同名时，根词与城市词也不得重复。"""
+
+        for province in PROVINCE_CITIES:
+            with self.subTest(province=province):
+                plan = build_location_search_plan(f"{province}joymark")
+                self.assertEqual(plan.search_kind, "province")
+                self.assertEqual(len(plan.subqueries), len(set(plan.subqueries)))
+
+        self.assertIn(
+            "吉林市joymark",
+            build_location_search_plan("吉林joymark").subqueries,
+        )
+
     def test_hubei_plan_contains_only_prefecture_level_regions(self):
         plan = build_location_search_plan("湖北joymark")
 

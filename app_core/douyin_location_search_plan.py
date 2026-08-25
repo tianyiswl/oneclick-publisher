@@ -82,7 +82,8 @@ def build_location_search_plan(keyword: object) -> LocationSearchPlan:
     province, merchant = _leading_region(normalized)
     if province and merchant:
         subqueries = (normalized,) + tuple(
-            f"{city}{merchant}" for city in PROVINCE_CITIES[province]
+            f"{city}{'市' if city == province else ''}{merchant}"
+            for city in PROVINCE_CITIES[province]
         )
         return LocationSearchPlan(1, normalized, "province", province, merchant, subqueries)
 
