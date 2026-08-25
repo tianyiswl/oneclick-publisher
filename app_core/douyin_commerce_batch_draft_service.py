@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime
 import json
+import re
 from typing import Any, Mapping
 
 from . import database
@@ -134,6 +135,20 @@ def _last_location_search(value: object) -> dict[str, str]:
     }
 
 
+def _location_assignment_source(value: object) -> str:
+    """只允许保存手动选择或带根搜索词的自动填充来源。"""
+
+    source = _text(value)
+    if source == "manual":
+        return source
+    if source.startswith("auto:"):
+        root_keyword = re.sub(r"[\s\u3000]+", "", source.removeprefix("auto:"))
+        if root_keyword:
+            return f"auto:{root_keyword}"
+    # 旧草稿没有来源字段；保守地保留为手动选择。
+    return "manual"
+
+
 def _items(value: object) -> list[dict[str, object]]:
     if not isinstance(value, list) or not 1 <= len(value) <= 20:
         raise DouyinCommerceBatchDraftError("批次草稿条目数量必须在 1 至 20 之间")
@@ -159,6 +174,9 @@ def _items(value: object) -> list[dict[str, object]]:
                 "mediaPath": media_path,
                 "locationPresetId": location_preset_id,
                 "locationPreset": location_preset,
+                "locationAssignmentSource": _location_assignment_source(
+                    item.get("locationAssignmentSource")
+                ),
                 # 旧草稿只保存每条 enableTimer。新草稿以批次 publishMode 为准；
                 # 这里仍保留兼容字段，不能用 bool("false") 把字符串误判为已定时。
                 "enableTimer": item.get("enableTimer") is True,

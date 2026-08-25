@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import datetime, timedelta
 import json
 import os
@@ -52,6 +53,7 @@ from app_core import (
 from uploader.douyin_uploader.main import DouYinVideo
 from app_core import douyin_verification
 from app_core.douyin_commerce_batch_executor import DouyinCommerceBatchExecutor
+from app_core.douyin_location_search_plan import build_location_search_plan
 from app_core.media_path import normalize_media_path
 from app_core.douyin_verification import DouyinVerificationBroker, VerificationChallenge
 from ui.background_task import BackgroundTask, BackgroundTaskRunner
@@ -14557,6 +14559,131 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.page.close()
+
+    def test_province_search_uses_root_keyword_first_and_restores_saved_plan(self) -> None:
+        """恢复后仍以原词聚合，但平台从保存的城市继续。"""
+
+        self._activate_cached_location_search(account_id=710)
+        saved = replace(
+            build_location_search_plan("广东joymark"),
+            current_index=2,
+            current_load_count=2,
+        )
+        with patch.object(
+            douyin_location_cache,
+            "load_location_search_plan",
+            return_value=saved,
+        ), patch.object(
+            self.page,
+            "_start_batch_location_platform_search",
+            return_value=True,
+        ) as start:
+            self.page._search_batch_locations("domestic", "广东 joymark")
+            self._finish_location_cache_search()
+
+        state = self.page._batch_location_state()
+        self.assertEqual(state["rootKeyword"], "广东joymark")
+        self.assertEqual(state["activeKeyword"], saved.subqueries[2])
+        self.assertEqual(state["replayLoadsRemaining"], 2)
+        start.assert_called_once()
+
+    def test_city_search_keeps_single_active_query_state(self) -> None:
+        """城市词不扇出，采集器只收到这一条完整城市搜索词。"""
+
+        self._activate_cached_location_search(account_id=711)
+        with patch.object(
+            douyin_location_cache,
+            "load_location_search_plan",
+            return_value=None,
+        ), patch.object(
+            self.page,
+            "_start_batch_location_platform_search",
+            return_value=True,
+        ):
+            self.page._search_batch_locations("domestic", "广州 joymark")
+            self._finish_location_cache_search()
+
+        state = self.page._batch_location_state()
+        self.assertEqual(state["rootKeyword"], "广州joymark")
+        self.assertEqual(state["activeKeyword"], "广州joymark")
+        self.assertEqual(state["searchPlan"].subqueries, ("广州joymark",))
+
+    def test_new_root_keyword_clears_old_auto_assignments_but_preserves_manual(self) -> None:
+        """换根词只能撤销系统上一次自动填入的地点。"""
+
+        self._activate_cached_location_search(account_id=712)
+        auto_path, manual_path = "/tmp/auto.mp4", "/tmp/manual.mp4"
+        self.page._batch_locations[auto_path] = {
+            "poiId": "old-auto", "name": "旧自动", "address": "广东旧地址"
+        }
+        self.page._batch_locations[manual_path] = {
+            "poiId": "manual", "name": "手动", "address": "用户手动地址"
+        }
+        self.page._batch_location_assignment_sources[auto_path] = "auto:广东joymark"
+        self.page._batch_location_assignment_sources[manual_path] = "manual"
+        self.page._batch_location_searches["__shared_location_search__"] = {
+            "scope": "domestic",
+            "keyword": "广东joymark",
+            "rootKeyword": "广东joymark",
+            "commissionFilter": "commission",
+        }
+
+        with patch.object(
+            self.page, "_start_batch_location_platform_search", return_value=True
+        ):
+            self.page._search_batch_locations("domestic", "广西joymark")
+
+        self.assertNotIn(auto_path, self.page._batch_locations)
+        self.assertNotIn(auto_path, self.page._batch_location_assignment_sources)
+        self.assertIn(manual_path, self.page._batch_locations)
+        self.assertEqual(
+            self.page._batch_location_assignment_sources[manual_path], "manual"
+        )
+
+    def test_active_city_candidates_merge_under_city_and_root_cache_keys(self) -> None:
+        """省计划里的城市结果必须同时归到城市和原始省份缓存。"""
+
+        self._activate_cached_location_search(account_id=713)
+        self.page.runner = self._InlineRunner()
+        candidate = {
+            "poiId": "gz-1",
+            "name": "JOYMARK 广州店",
+            "address": "广东省广州市测试路1号",
+            "commissionType": "commission",
+        }
+        self.page._batch_location_searches["__shared_location_search__"] = {
+            "accountId": "713",
+            "scope": "domestic",
+            "keyword": "广东joymark",
+            "rootKeyword": "广东joymark",
+            "activeKeyword": "广州joymark",
+            "searchPlan": build_location_search_plan("广东joymark"),
+            "commissionFilter": "commission",
+            "rawCandidates": [candidate],
+            "candidates": [candidate],
+        }
+        root_query = douyin_location_cache.LocationCacheQuery(
+            "713", "domestic", "广东joymark", "commission"
+        )
+
+        with patch.object(
+            douyin_location_cache,
+            "merge_platform_locations_for_queries",
+            return_value={"total": 1, "candidates": [candidate]},
+        ) as merge:
+            self.assertTrue(
+                self.page._start_batch_location_cache_merge(
+                    root_query,
+                    [candidate],
+                    request_token=self.page._batch_location_search_token,
+                )
+            )
+
+        merged_queries = merge.call_args.args[0]
+        self.assertEqual(
+            [query.keyword for query in merged_queries],
+            ["广东joymark", "广州joymark"],
+        )
 
     def test_platform_search_hides_same_name_candidates_outside_keyword_region(
         self,
