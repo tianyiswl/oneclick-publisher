@@ -103,6 +103,12 @@ def _optional_text(value: object) -> str:
     return " ".join(value.split()) if isinstance(value, str) else ""
 
 
+def _search_keyword(value: object) -> str:
+    """缓存键沿用地点搜索计划的空白规范化。"""
+
+    return re.sub(r"[\s\u3000]+", "", _text(value, "关键词"))
+
+
 def filter_locations_for_search_keyword(
     keyword: object,
     candidates: list[Mapping[str, Any]],
@@ -161,7 +167,7 @@ def _query(value: object) -> LocationCacheQuery:
     safe_query = LocationCacheQuery(
         account_id=_text(value.account_id, "账号"),
         scope=_text(value.scope, "范围"),
-        keyword=_text(value.keyword, "关键词"),
+        keyword=_search_keyword(value.keyword),
         commission_filter=_text(value.commission_filter, "返佣筛选"),
     )
     if safe_query.scope not in _LOCATION_SCOPES:

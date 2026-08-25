@@ -230,6 +230,24 @@ class DouyinLocationCacheTests(unittest.TestCase):
         with self.assertRaisesRegex(DouyinLocationCacheError, "关键词"):
             load_location_search_plan(cache_query)
 
+    def test_progress_plan_keyword_normalizes_whitespace_and_province_suffix(self) -> None:
+        cache_query = self.location_query(
+            "7",
+            " 广东省 joymark ",
+            "commission",
+        )
+        plan = build_location_search_plan(" 广东省 joymark ")
+
+        save_location_search_plan(cache_query, plan, eligible_total=4)
+
+        self.assertEqual(load_location_search_plan(cache_query), plan)
+        self.assertEqual(
+            load_location_search_plan(
+                self.location_query("7", "广东省joymark", "commission")
+            ),
+            plan,
+        )
+
     def test_multi_query_association_keeps_foshan_out_of_guangzhou(self) -> None:
         province = self.location_query("7", "广东joymark", "commission")
         guangzhou = self.location_query("7", "广州joymark", "commission")
