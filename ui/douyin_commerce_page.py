@@ -2280,9 +2280,15 @@ class DouyinCommercePage(QWidget):
         self._clear_stage_error("location")
         self._render_batch_item_rows()
         self._sync_view()
-        # 缓存先填当前仍为空的视频；只有缓存不足或需要重新校对时，
-        # 才继续查询平台。缓存刚好够用时不额外占用平台会话。
-        if requires_revalidation or not cached_candidates or remaining:
+        # 缓存先填当前仍为空的视频；只有缓存不足、需要重新校对或恢复
+        # 已保存的平台页数时，才继续查询平台。最后一种情况必须重建
+        # activeKeyword 的平台浮层，不能假定重启后还保留浏览器游标。
+        if (
+            requires_revalidation
+            or not cached_candidates
+            or remaining
+            or state["replayLoadsRemaining"] > 0
+        ):
             self._start_batch_location_platform_search(
                 cache_query,
                 request_token=request_token,

@@ -14608,6 +14608,74 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.assertEqual(state["activeKeyword"], "广州joymark")
         self.assertEqual(state["searchPlan"].subqueries, ("广州joymark",))
 
+    def test_cached_sufficient_restore_reopens_active_city_and_replays_saved_pages(self) -> None:
+        """缓存够用也必须重建城市浮层，并且只回放保存的页数。"""
+
+        self._activate_cached_location_search(account_id=714)
+        saved = replace(
+            build_location_search_plan("广东joymark"),
+            current_index=2,
+            current_load_count=2,
+        )
+        cached = [
+            {
+                "poiId": "gz-1",
+                "name": "JOYMARK 广州店",
+                "address": "广东省广州市测试路1号",
+                "commissionType": "commission",
+            }
+        ]
+        search_result = {
+            "ok": True,
+            "setupGenerationId": "generation-a",
+            "collectorType": "domestic_location",
+            "collectorInstanceId": "domestic-a",
+            "platformResultCount": 1,
+            "candidates": cached,
+        }
+        replay_result = {
+            **search_result,
+            "newCandidateCount": 0,
+            "hasMore": True,
+            "stopReason": "loaded",
+        }
+        with patch.object(
+            douyin_location_cache,
+            "get_cached_locations",
+            return_value=self._cache_page(cached),
+        ), patch.object(
+            douyin_location_cache,
+            "load_location_search_plan",
+            return_value=saved,
+        ), patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.search_locations",
+            return_value=search_result,
+        ) as search, patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.load_more_locations",
+            return_value=replay_result,
+        ) as load_more, patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.status",
+            return_value=self._collector_status(),
+        ):
+            self.page.batch_location_keyword.setText("广东joymark")
+            self.page._search_batch_locations("domestic", "广东joymark")
+            self._finish_location_cache_search()
+            self.page.runner.execute(self.page._COLLECTOR_TASK_KEY)
+            self.page.runner.finish(self.page._COLLECTOR_TASK_KEY)
+            self.page.runner.execute(self.page._COLLECTOR_TASK_KEY)
+            self.page.runner.finish(self.page._COLLECTOR_TASK_KEY)
+            self.page.runner.execute(self.page._COLLECTOR_TASK_KEY)
+            self.page.runner.finish(self.page._COLLECTOR_TASK_KEY)
+
+        active_keyword = saved.subqueries[2]
+        self.assertEqual(search.call_args.args[1], active_keyword)
+        self.assertEqual(load_more.call_count, 2)
+        self.assertEqual(
+            [item.args[1] for item in load_more.call_args_list],
+            [active_keyword, active_keyword],
+        )
+        self.assertEqual(self.page._batch_location_state()["replayLoadsRemaining"], 0)
+
     def test_new_root_keyword_clears_old_auto_assignments_but_preserves_manual(self) -> None:
         """换根词只能撤销系统上一次自动填入的地点。"""
 

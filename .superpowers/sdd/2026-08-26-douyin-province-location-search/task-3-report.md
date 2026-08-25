@@ -17,6 +17,9 @@
   root keyword.
 - Restored load counts are replayed through the existing asynchronous search
   and load-more handoff, with normal identity de-duplication.
+- Review round 1 fixed the cache-sufficient restore branch: a saved positive
+  load count now independently reopens the saved active city and replays only
+  that saved count before any user-requested new page.
 - City-origin platform candidates merge under both root and active cache keys.
 - Batch drafts persist `manual` or `auto:<normalized-root-keyword>` assignment
   provenance. Legacy missing provenance is treated as manual; a root-keyword
@@ -25,7 +28,7 @@
 ## Verification
 
 - `QT_QPA_PLATFORM=offscreen ../../.venv/bin/python -m unittest -v test_douyin_commerce_service.DouyinCommerceBatchUiTests`
-  - PASS: 187 tests.
+  - PASS: 188 tests.
 - `../../.venv/bin/python -m unittest -v test_douyin_commerce_batch_draft_service`
   - PASS: 9 tests.
 - `../../.venv/bin/python tools/check_workstream_scope.py --stream integration --base 8c3a1f5`
