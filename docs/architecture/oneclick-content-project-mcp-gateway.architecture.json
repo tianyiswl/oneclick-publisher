@@ -1,0 +1,167 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "五个内容项目统一调用一键发",
+    "output": "oneclick-content-project-mcp-gateway.architecture.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/tianyiswl/oneclick-publisher",
+      "revision": "aaba5b13a9c0df07dd74cee73f30e9eaa5d2dcc7"
+    },
+    "views": [
+      {
+        "id": "dialog-publish",
+        "label": "对话发布主路径",
+        "focus": ["projects", "bundle", "mcp", "profiles", "controlled", "publish", "executors", "platforms"],
+        "note": "内容项目只生成结构化发布包；本地 MCP 解析项目路由后调用现有受控发布服务。"
+      },
+      {
+        "id": "confirmation",
+        "label": "确认与异常处理",
+        "focus": ["mcp", "controlled", "desktop", "taskdb"],
+        "note": "默认只预检；正式发布消费一次性授权，只有登录失效、验证码或风控时显示客户端窗口。"
+      },
+      {
+        "id": "wechat-draft",
+        "label": "公众号草稿兼容通道",
+        "focus": ["bundle", "draftInbox", "publish", "taskdb"],
+        "note": "保留只保存草稿能力，但去掉硅基进化专名；它不是五个项目正常发布的主通道。"
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "projects",
+      "type": "external",
+      "label": "五个内容项目",
+      "sublabel": "Codex 对话与内容生产"
+      ,"pos": [30, 260], "size": [150, 68]
+    },
+    {
+      "id": "bundle",
+      "type": "external",
+      "label": "结构化发布包",
+      "sublabel": "标题、正文、话题、素材、平台覆盖",
+      "pos": [230, 260],
+      "size": [180, 68],
+      "sources": [{"path": "app_core/content_bundle.py", "label": "内容包合同"}]
+    },
+    {
+      "id": "mcp",
+      "type": "frontend",
+      "label": "一键发本地 MCP",
+      "sublabel": "stdio 工具：预检、授权、发布、查询",
+      "pos": [470, 260],
+      "size": [180, 68],
+      "tag": "0.5.9 新增"
+    },
+    {
+      "id": "profiles",
+      "type": "database",
+      "label": "项目发布档案",
+      "sublabel": "项目标识 → 平台与明确账号 ID",
+      "pos": [470, 80],
+      "size": [180, 68],
+      "tag": "本机保存"
+    },
+    {
+      "id": "controlled",
+      "type": "security",
+      "label": "受控发布服务",
+      "sublabel": "默认预检、一次性授权、稳定 JSON",
+      "pos": [730, 260],
+      "size": [180, 68],
+      "sources": [{"path": "app_core/controlled_publish.py", "line": 448, "label": "现有受控入口"}]
+    },
+    {
+      "id": "desktop",
+      "type": "frontend",
+      "label": "一键发桌面客户端",
+      "sublabel": "登录、账号维护、验证与异常处理",
+      "pos": [730, 80],
+      "size": [180, 68],
+      "sources": [{"path": "desktop_native_app.py", "line": 416, "label": "现有 CLI 入口"}]
+    },
+    {
+      "id": "publish",
+      "type": "backend",
+      "label": "统一发布服务",
+      "sublabel": "UI、CLI、MCP 共用执行逻辑",
+      "pos": [990, 260],
+      "size": [180, 68],
+      "sources": [{"path": "app_core/publish_service.py", "line": 727, "label": "发布服务"}]
+    },
+    {
+      "id": "taskdb",
+      "type": "database",
+      "label": "任务与回执数据库",
+      "sublabel": "taskId、阶段、错误、平台结果",
+      "pos": [990, 440],
+      "size": [180, 68]
+    },
+    {
+      "id": "executors",
+      "type": "backend",
+      "label": "各平台执行器",
+      "sublabel": "只在这里适配官方后台变化",
+      "pos": [1250, 260],
+      "size": [180, 68]
+    },
+    {
+      "id": "platforms",
+      "type": "external",
+      "label": "平台官方后台",
+      "sublabel": "预检、提交、定时与回执",
+      "pos": [1490, 260],
+      "size": [170, 68]
+    },
+    {
+      "id": "draftInbox",
+      "type": "messagebus",
+      "label": "公众号草稿收件箱",
+      "sublabel": "可选兼容通道，仅保存草稿",
+      "pos": [730, 440],
+      "size": [180, 68],
+      "sources": [{"path": "app_core/wechat_draft_queue.py", "line": 353, "label": "现有专用桥"}]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "security-group",
+      "label": "仅本机：不接收 Cookie、密码或验证码参数",
+      "wraps": ["mcp", "profiles", "controlled", "desktop", "publish", "taskdb", "draftInbox", "executors"],
+      "pad": 22
+    }
+  ],
+  "connections": [
+    {"id": "projects-bundle", "from": "projects", "to": "bundle", "label": "生成"},
+    {"id": "bundle-mcp", "from": "bundle", "to": "mcp", "label": "manifest", "variant": "emphasis"},
+    {"id": "profiles-mcp", "from": "profiles", "to": "mcp", "label": "解析明确账号", "variant": "security", "labelDy": 24},
+    {"id": "mcp-controlled", "from": "mcp", "to": "controlled", "label": "预检 / 授权 / 正式 / 查询", "variant": "emphasis", "labelDy": 58},
+    {"id": "desktop-controlled", "from": "desktop", "to": "controlled", "label": "同一安全边界", "variant": "security", "labelDy": 24},
+    {"id": "controlled-publish", "from": "controlled", "to": "publish", "label": "规范载荷", "variant": "emphasis"},
+    {"id": "publish-executors", "from": "publish", "to": "executors", "label": "平台任务"},
+    {"id": "executors-platforms", "from": "executors", "to": "platforms", "label": "浏览器受控操作", "labelDy": 58},
+    {"id": "publish-taskdb", "from": "publish", "to": "taskdb", "label": "任务与事件", "labelDy": 24},
+    {"id": "taskdb-controlled", "from": "taskdb", "to": "controlled", "label": "稳定状态投影"},
+    {"id": "bundle-draft", "from": "bundle", "to": "draftInbox", "label": "旧包可选只存草稿", "variant": "dashed"}
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "稳定边界",
+      "items": ["平台后台变化只修改对应执行器", "内容项目继续输出同一 manifest", "任务状态统一通过 taskId 回读"]
+    },
+    {
+      "dot": "rose",
+      "title": "发布安全",
+      "items": ["MCP 默认只能预检", "正式发布绑定全部成功的预检和一次性授权", "登录态与敏感验证只留在客户端"]
+    },
+    {
+      "dot": "amber",
+      "title": "公众号草稿桥处理",
+      "items": ["保留草稿执行器", "界面去除硅基进化专名", "不再作为五个项目正常发布主通道"]
+    }
+  ]
+}

@@ -633,22 +633,31 @@ class PublishPage(QWidget):
         draft_bridge_layout = QHBoxLayout(draft_bridge_bar)
         draft_bridge_layout.setContentsMargins(12, 7, 12, 7)
         draft_bridge_layout.setSpacing(10)
+        self.content_project_gateway_status = QLabel(
+            "内容项目主通道：本机受控接口（默认预检）"
+        )
+        self.content_project_gateway_status.setProperty("role", "countBadge")
+        self.content_project_gateway_status.setToolTip(
+            "Codex 内容项目使用同一本机发布服务；"
+            "正式提交仍必须经过全部成功的预检和当次一次性授权。"
+        )
+        draft_bridge_layout.addWidget(self.content_project_gateway_status)
+        draft_bridge_layout.addStretch()
         self.wechat_draft_queue_enabled = QCheckBox(
-            "启用硅基进化自动保存草稿（不会发表）"
+            "兼容通道：硅基进化公众号只保存草稿（不会发表）"
         )
         self.wechat_draft_queue_enabled.setChecked(False)
         self.wechat_draft_queue_enabled.setToolTip(
-            "只读取本机冻结内容包并保存到硅基进化公众号草稿箱；"
-            "不会发表、群发或设置定时发表。"
+            "仅兼容硅基进化 V1.2 冻结内容包，保存到指定公众号草稿箱；"
+            "不是五个内容项目的通用发布入口，也不会发表、群发或定时发表。"
         )
         self.wechat_draft_queue_enabled.toggled.connect(
             self._wechat_draft_queue_toggled
         )
         draft_bridge_layout.addWidget(self.wechat_draft_queue_enabled)
-        self.wechat_draft_queue_status = QLabel("草稿桥：未启用")
+        self.wechat_draft_queue_status = QLabel("兼容草稿桥：未启用")
         self.wechat_draft_queue_status.setProperty("role", "muted")
         draft_bridge_layout.addWidget(self.wechat_draft_queue_status)
-        draft_bridge_layout.addStretch()
         layout.addWidget(draft_bridge_bar)
 
         template_bar = QFrame()
@@ -739,8 +748,8 @@ class PublishPage(QWidget):
             if self._wechat_draft_bridge_root is None:
                 QMessageBox.warning(
                     self,
-                    "无法启用草稿桥",
-                    "本地草稿桥目录尚未配置，程序不会读取或提交任何内容。",
+                    "无法启用兼容草稿桥",
+                    "兼容草稿桥目录尚未配置，程序不会读取或提交任何内容。",
                 )
                 self.wechat_draft_queue_enabled.blockSignals(True)
                 self.wechat_draft_queue_enabled.setChecked(False)
@@ -749,8 +758,9 @@ class PublishPage(QWidget):
             if not self._wechat_draft_queue_confirmation_accepted:
                 answer = QMessageBox.question(
                     self,
-                    "启用硅基进化草稿桥",
-                    "启用后，一键发只会把已冻结内容保存到“硅基进化”公众号草稿箱，"
+                    "启用旧内容包兼容草稿桥",
+                    "这是硅基进化 V1.2 冻结包的旧兼容通道。启用后，"
+                    "一键发只会把已冻结内容保存到“硅基进化”公众号草稿箱，"
                     "不会发表、群发，也不会设置定时发表。\n\n"
                     "遇到扫码验证时任务会暂停，并只在一键发原生窗口等待扫码；"
                     "登录失效、取消验证、未知提示、账号或字段不一致时会安全停止。"
@@ -762,15 +772,15 @@ class PublishPage(QWidget):
                     self.wechat_draft_queue_enabled.blockSignals(True)
                     self.wechat_draft_queue_enabled.setChecked(False)
                     self.wechat_draft_queue_enabled.blockSignals(False)
-                    self.wechat_draft_queue_status.setText("草稿桥：未启用")
+                    self.wechat_draft_queue_status.setText("兼容草稿桥：未启用")
                     return
                 self._wechat_draft_queue_confirmation_accepted = True
-            self.wechat_draft_queue_status.setText("草稿桥：已启用，等待本地交接")
+            self.wechat_draft_queue_status.setText("兼容草稿桥：已启用，等待旧包交接")
             self.wechat_draft_queue_timer.start()
             self._poll_wechat_draft_queue()
             return
         self.wechat_draft_queue_timer.stop()
-        self.wechat_draft_queue_status.setText("草稿桥：未启用")
+        self.wechat_draft_queue_status.setText("兼容草稿桥：未启用")
 
     def _poll_wechat_draft_queue(self) -> None:
         if (
@@ -794,27 +804,27 @@ class PublishPage(QWidget):
 
         def on_success(results: list[wechat_draft_queue.DraftQueueResult]) -> None:
             if not results:
-                self.wechat_draft_queue_status.setText("草稿桥：已启用，等待本地交接")
+                self.wechat_draft_queue_status.setText("兼容草稿桥：已启用，等待旧包交接")
                 return
             latest = results[-1]
             if latest.status == "draft_readback_confirmed":
                 self.wechat_draft_queue_status.setText(
-                    f"草稿桥：{latest.article_id} 已由草稿列表回读"
+                    f"兼容草稿桥：{latest.article_id} 已由草稿列表回读"
                 )
             else:
                 self.wechat_draft_queue_status.setText(
-                    f"草稿桥：{latest.article_id} 已停止（{latest.error_code}）"
+                    f"兼容草稿桥：{latest.article_id} 已停止（{latest.error_code}）"
                 )
 
         self.wechat_draft_queue_tasks.run(
             "wechat_draft_queue",
             run_queue,
             on_started=lambda: self.wechat_draft_queue_status.setText(
-                "草稿桥：正在检查本地交接"
+                "兼容草稿桥：正在检查旧包交接"
             ),
             on_success=on_success,
             on_error=lambda message: self.wechat_draft_queue_status.setText(
-                f"草稿桥：本地检查失败（{message}）"
+                f"兼容草稿桥：本地检查失败（{message}）"
             ),
         )
 

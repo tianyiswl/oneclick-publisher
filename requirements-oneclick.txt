@@ -3,6 +3,7 @@ playwright==1.60.0
 xhs==0.2.13
 biliup==1.2.1
 loguru==0.7.3
+mcp==2.1.0
 qrcode==8.2
 zxing-cpp==3.0.0
 requests==2.34.2

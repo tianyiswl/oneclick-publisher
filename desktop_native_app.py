@@ -427,6 +427,11 @@ def main() -> int:
         type=int,
         metavar="TASK_ID",
     )
+    parser.add_argument(
+        "--mcp-server",
+        action="store_true",
+        help="通过本机 stdio 启动一键发 MCP 受控发布适配器。",
+    )
     args = parser.parse_args()
     if args.self_test:
         run_self_test()
@@ -444,6 +449,15 @@ def main() -> int:
         return 0
     if args.controlled_publish_action:
         return run_controlled_publish_cli(args)
+    if args.mcp_server:
+        # MCP 的 stdout 是协议信道；平台执行日志只能进入 stderr。
+        from utils.log import redirect_console_logger
+        from app_core.oneclick_mcp_server import run_stdio_server
+
+        redirect_console_logger(sys.stderr)
+        ensure_schema()
+        run_stdio_server()
+        return 0
     app = QApplication(sys.argv)
     configure_application(app)
     install_runtime_log_capture()

@@ -31,7 +31,11 @@ class PublishPageWechatDraftQueueTests(unittest.TestCase):
 
             self.assertEqual(
                 page.wechat_draft_queue_enabled.text(),
-                "启用硅基进化自动保存草稿（不会发表）",
+                "兼容通道：硅基进化公众号只保存草稿（不会发表）",
+            )
+            self.assertEqual(
+                page.content_project_gateway_status.text(),
+                "内容项目主通道：本机受控接口（默认预检）",
             )
             self.assertFalse(page.wechat_draft_queue_enabled.isChecked())
             self.assertFalse(page.wechat_draft_queue_timer.isActive())

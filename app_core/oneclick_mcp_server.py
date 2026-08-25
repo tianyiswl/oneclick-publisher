@@ -1,0 +1,140 @@
+# -*- coding: utf-8 -*-
+"""一键发本机 MCP 适配器。
+
+仅使用 stdio，不监听网络端口；不接受 Cookie、密码或验证码参数。
+"""
+
+from __future__ import annotations
+
+from typing import Any, Mapping, Sequence
+
+from mcp.server import MCPServer
+
+from .content_project_gateway import ContentProjectGateway
+
+
+def _error(exc: Exception) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "errorCode": str(getattr(exc, "error_code", "oneclick_mcp_internal_error")),
+        "errorText": str(getattr(exc, "public_message", f"{type(exc).__name__}：{exc}")),
+    }
+
+
+def _call(key: str, operation) -> dict[str, Any]:
+    try:
+        return {"ok": True, key: operation()}
+    except Exception as exc:
+        return _error(exc)
+
+
+def create_server(gateway: ContentProjectGateway | None = None) -> MCPServer:
+    gateway = gateway or ContentProjectGateway()
+    server = MCPServer(
+        name="yijianfa-local",
+        title="一键发本机受控发布",
+        description="让本机内容项目通过同一发布服务执行预检、授权、正式发布和任务查询。",
+        instructions=(
+            "默认先调用 oneclick_preflight_content。"
+            "只有用户对当次内容和目标明确确认正式发布后，"
+            "才能创建一次性授权并调用 oneclick_formal_publish。"
+        ),
+        version="1",
+    )
+
+    @server.tool(
+        name="oneclick_list_accounts",
+        description="只读列出本机一键发可选账号；返回值不含登录会话路径或凭据。",
+        structured_output=True,
+    )
+    def list_accounts() -> dict[str, Any]:
+        return _call("accounts", gateway.list_accounts)
+
+    @server.tool(
+        name="oneclick_list_publish_profiles",
+        description="只读列出内容项目与平台账号的本机映射。",
+        structured_output=True,
+    )
+    def list_publish_profiles() -> dict[str, Any]:
+        return _call("profiles", gateway.list_profiles)
+
+    @server.tool(
+        name="oneclick_save_publish_profile",
+        description="在本机保存内容项目到明确平台账号 ID 的映射；不会上传或发布。",
+        structured_output=True,
+    )
+    def save_publish_profile(
+        project_id: str,
+        display_name: str,
+        targets: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        return _call(
+            "profile",
+            lambda: gateway.save_profile(project_id, display_name, targets),
+        )
+
+    @server.tool(
+        name="oneclick_preflight_content",
+        description="对内容包和项目已配置账号执行预检；不做正式提交。",
+        structured_output=True,
+    )
+    def preflight_content(
+        project_id: str,
+        manifest_path: str,
+        schedules: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return _call(
+            "task",
+            lambda: gateway.preflight_content(project_id, manifest_path, schedules),
+        )
+
+    @server.tool(
+        name="oneclick_task_status",
+        description="按 taskId 只读查询阶段、平台状态、错误和回执。",
+        structured_output=True,
+    )
+    def task_status(task_id: int) -> dict[str, Any]:
+        return _call("task", lambda: gateway.task_status(task_id))
+
+    @server.tool(
+        name="oneclick_authorize_preflight",
+        description=(
+            "只能在用户已明确确认本次正式发布后调用；"
+            "为全部成功的预检生成短期、一次性授权，本工具本身不提交平台。"
+        ),
+        structured_output=True,
+    )
+    def authorize_preflight(task_id: int) -> dict[str, Any]:
+        return _call("authorization", lambda: gateway.authorize_preflight(task_id))
+
+    @server.tool(
+        name="oneclick_formal_publish",
+        description=(
+            "使用已全部成功的预检 taskId 和对应一次性授权正式提交；"
+            "不允许绕过用户确认。"
+        ),
+        structured_output=True,
+    )
+    def formal_publish(
+        project_id: str,
+        manifest_path: str,
+        confirmed_preflight_task_id: int,
+        authorization_id: str,
+        schedules: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return _call(
+            "task",
+            lambda: gateway.formal_publish(
+                project_id,
+                manifest_path,
+                confirmed_preflight_task_id=confirmed_preflight_task_id,
+                authorization_id=authorization_id,
+                schedules=schedules,
+            ),
+        )
+
+    return server
+
+
+def run_stdio_server() -> None:
+    create_server().run(transport="stdio")
