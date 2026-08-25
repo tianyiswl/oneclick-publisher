@@ -2863,10 +2863,20 @@ async def search_commerce_location_store_candidates(
             f"抖音未返回“{normalized_keyword}”的完整可选发布定位"
         )
     if include_metadata is True:
-        return {
+        result: dict[str, object] = {
             "platformResultCount": platform_result_count,
             "candidates": [dict(item) for item in candidates],
         }
+        if platform_result_count > 0 and not candidates:
+            # 首屏只能确认平台可见候选被返佣条件筛空，不能据此断言分页
+            # 已耗尽；省份遍历应保守尝试一次真实 load-more。
+            result.update(
+                {
+                    "hasMore": True,
+                    "stopReason": "filtered_empty_may_have_more",
+                }
+            )
+        return result
     return candidates
 
 

@@ -124,6 +124,7 @@ COLLECTOR_ERROR_COPY = {
     "publish_apply_mismatch": "正式页设置回读不一致",
     "collector_search_context_mismatch": "地点搜索上下文已失效",
     "publish_location_load_more_failed": "更多地点读取失败",
+    "province_location_search_action_timeout": "地点读取超时，可重试",
     "collector_unknown": "采集器发生未知错误",
 }
 
@@ -2953,10 +2954,24 @@ class DouyinCommercePage(QWidget):
                 return
             page.setdefault("platformResultCount", len(candidates))
             page.setdefault("newCandidateCount", len(candidates))
-            page.setdefault("hasMore", bool(candidates))
+            platform_result_count = page["platformResultCount"]
+            filtered_empty = (
+                type(platform_result_count) is int
+                and platform_result_count > 0
+                and not candidates
+            )
+            page.setdefault("hasMore", bool(candidates) or filtered_empty)
             page.setdefault(
                 "stopReason",
-                "loaded" if page["hasMore"] is True else "no_visible_load_more_control",
+                (
+                    "filtered_empty_may_have_more"
+                    if filtered_empty
+                    else (
+                        "loaded"
+                        if page["hasMore"] is True
+                        else "no_visible_load_more_control"
+                    )
+                ),
             )
             on_success(page)
 

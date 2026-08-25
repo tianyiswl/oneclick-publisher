@@ -22,6 +22,12 @@
 - An explicit `eligibleIdentityCount: 0` is preserved. Province termination at 100 uses only fully identified candidates that pass the root-region and commission filter; 100 no-commission rows do not complete the plan.
 - The one-click deadline is passed as an absolute monotonic value to collector/session/service location calls. Every lower-layer wait uses remaining time, and an expired deadline returns a safe timeout without blocking Qt. Calls without that optional argument retain the previous behavior.
 
+## Review round 2 fixes
+
+- Metadata searches now mark a non-empty platform page filtered to zero candidates as `hasMore=True / filtered_empty_may_have_more`. The session preserves that state, so the province driver performs the same-city load-more and can accept a later commission candidate.
+- `province_location_search_action_timeout` is now a fixed service/session/collector/UI code and user-facing retry message. Session load-more preserves the deadline limit instead of rewriting it to a generic pagination failure.
+- An expired queued collector action now atomically cancels and removes itself when its `Future` has not begun, preventing unreachable queue entries from accumulating.
+
 ## Verification
 
 Focused command:
@@ -30,7 +36,7 @@ Focused command:
 QT_QPA_PLATFORM=offscreen ../../.venv/bin/python -m unittest -v test_douyin_commerce_service.DouyinCommerceBatchUiTests test_douyin_commerce_service.DouyinCommerceSessionContractTests test_douyin_commerce_collectors.DouyinCommerceCollectorManagerTests
 ```
 
-Result: `366` tests passed, `0` failed.
+Result: `371` tests passed, `0` failed.
 
 Additional checks:
 
@@ -48,6 +54,7 @@ Result: passed.
 - Confirmed stale owners are rejected before state mutation and that retries do not add the current city to completed indices.
 - Confirmed the accepted-page save completes before a zero-growth continuation can start the next city.
 - Confirmed the real collector public empty-page response reaches the UI callback without patching the province action method; added start/merge/save failure, replay, 100-no-commission, and deadline tests.
+- Confirmed the filtered-empty first page retains a real session pagination context, deadline code reaches the retryable UI plan, and queued deadline cancellation returns the queue to zero.
 
 ## Concerns
 

@@ -1194,6 +1194,8 @@ class DouyinCommerceSessionManager:
 
         candidates: list[dict[str, Any]] = []
         platform_result_count = 0
+        metadata_has_more: bool | None = None
+        metadata_stop_reason: str | None = None
         for attempt in range(2):
             # 每次检索前先收口上一轮候选。地点候选与当前上传会话复用同一页面，
             # 若旧 listbox 仍展开，带货模式回读可能把菜单项误作当前值。
@@ -1202,6 +1204,10 @@ class DouyinCommerceSessionManager:
                     session.page, deadline=deadline_monotonic
                 )
             except Exception as exc:
+                if _normalized(str(exc)) == "publish_location_load_more_limit":
+                    raise DouyinCommerceSessionError(
+                        "province_location_search_action_timeout"
+                    ) from None
                 raise DouyinCommerceSessionError(
                     f"抖音上一次地点候选未能安全关闭：{_normalized(str(exc))[:220]}"
                 ) from exc
@@ -1226,6 +1232,8 @@ class DouyinCommerceSessionManager:
                         )
                     raw_count = search_result.get("platformResultCount")
                     raw_candidates = search_result.get("candidates")
+                    raw_has_more = search_result.get("hasMore")
+                    raw_stop_reason = search_result.get("stopReason")
                     if (
                         type(raw_count) is not int
                         or raw_count < 0
@@ -1246,6 +1254,20 @@ class DouyinCommerceSessionManager:
                             "抖音带货位置搜索失败：元数据回包无效"
                         )
                     platform_result_count = raw_count
+                    if (raw_has_more is None) != (raw_stop_reason is None):
+                        raise DouyinCommerceSessionError(
+                            "抖音带货位置搜索失败：元数据回包无效"
+                        )
+                    if raw_has_more is not None and (
+                        type(raw_has_more) is not bool
+                        or not isinstance(raw_stop_reason, str)
+                        or not raw_stop_reason
+                    ):
+                        raise DouyinCommerceSessionError(
+                            "抖音带货位置搜索失败：元数据回包无效"
+                        )
+                    metadata_has_more = raw_has_more
+                    metadata_stop_reason = raw_stop_reason
                 else:
                     candidates = [dict(item) for item in search_result]
                 break
@@ -1259,6 +1281,10 @@ class DouyinCommerceSessionManager:
                 except Exception:
                     _LOGGER.warning("抖音地点搜索失败后候选浮层未能关闭", exc_info=True)
                 error_text = _normalized(str(exc))
+                if error_text == "publish_location_load_more_limit":
+                    raise DouyinCommerceSessionError(
+                        "province_location_search_action_timeout"
+                    ) from None
                 transient_scope_failure = (
                     "pair-not-in-search-panel" in error_text
                     and "本地 0 个、国内 0 个" in error_text
@@ -1304,6 +1330,13 @@ class DouyinCommerceSessionManager:
                 "platformResultCount": platform_result_count,
                 "candidates": public_candidates,
             }
+            if metadata_has_more is not None:
+                result.update(
+                    {
+                        "hasMore": metadata_has_more,
+                        "stopReason": metadata_stop_reason,
+                    }
+                )
             if identity_limit_reached:
                 result.update(
                     {
@@ -1405,6 +1438,14 @@ class DouyinCommerceSessionManager:
             ):
                 raise TypeError("metadata_result_invalid")
             candidates = snapshot_location_candidates(raw_candidates)
+        except douyin_commerce_service.DouyinCommerceError as exc:
+            if str(exc) == "publish_location_load_more_limit":
+                raise DouyinCommerceSessionError(
+                    "province_location_search_action_timeout"
+                ) from None
+            raise DouyinCommerceSessionError(
+                "publish_location_load_more_failed"
+            ) from None
         except Exception:
             raise DouyinCommerceSessionError(
                 "publish_location_load_more_failed"

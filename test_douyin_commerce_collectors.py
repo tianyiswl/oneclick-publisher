@@ -17,6 +17,7 @@ from typing import Any, Mapping
 from unittest import mock
 
 from app_core import (
+    douyin_commerce_collectors,
     douyin_commerce_probe,
     douyin_commerce_service,
     douyin_commerce_session,
@@ -488,6 +489,20 @@ class DouyinCommerceCollectorManagerTests(unittest.TestCase):
             ),
             "province_location_search_action_timeout",
         )
+
+    def test_session_timeout_becomes_stable_collector_timeout_code(self):
+        generation_id = self.manager.begin_generation(self.upload_payload)[
+            "setupGenerationId"
+        ]
+        self.factory.instances[0].search_error = douyin_commerce_session.DouyinCommerceSessionError(
+            "province_location_search_action_timeout"
+        )
+
+        with self.assertRaisesRegex(
+            DouyinCommerceCollectorError,
+            "province_location_search_action_timeout",
+        ):
+            self.manager.search_locations(generation_id, "北海", "domestic")
 
     def test_location_search_normalizes_and_passes_commission_filter_to_session_manager(self):
         """协调器必须在 POI 去重前把返佣筛选传给真实会话搜索边界。"""
@@ -1000,6 +1015,8 @@ class DouyinCommerceCollectorManagerTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["platformResultCount"], 3)
         self.assertEqual(result["candidates"], [])
+        self.assertTrue(result["hasMore"])
+        self.assertEqual(result["stopReason"], "filtered_empty_may_have_more")
         self.assertNotIn("rawCandidates", result)
 
     def test_real_probe_builder_preserves_account_id_for_runtime_and_diagnostics(self):
@@ -1955,6 +1972,40 @@ class DouyinCommerceCollectorManagerTests(unittest.TestCase):
             self.manager.search_locations(generation_id, "夜南香", "local")
 
         self.assertEqual(self.factory.instances[0].location_calls, [])
+
+    def test_expired_queued_action_is_cancelled_and_removed_from_queue(self):
+        queue = douyin_commerce_collectors._CollectorActionQueue()
+        started = threading.Event()
+        release = threading.Event()
+        first = queue.submit(
+            "generation-a",
+            "first",
+            CollectorType.DOMESTIC_LOCATION,
+            lambda: (started.set(), release.wait(timeout=1), "first")[-1],
+        )
+        self.assertTrue(started.wait(timeout=1))
+        expired = queue.submit(
+            "generation-a",
+            "expired",
+            CollectorType.LOCAL_LOCATION,
+            lambda: "must-not-run",
+        )
+        try:
+            with self.assertRaisesRegex(
+                DouyinCommerceCollectorError,
+                "province_location_search_action_timeout",
+            ):
+                queue.wait(expired, deadline_monotonic=time.monotonic() - 0.01)
+            with queue._lock:
+                self.assertTrue(expired.cancelled)
+                self.assertNotIn(expired, queue._actions)
+                self.assertEqual(queue._actions, [first])
+        finally:
+            release.set()
+            self.assertEqual(queue.wait(first), "first")
+            queue._executor.shutdown(wait=True)
+        with queue._lock:
+            self.assertEqual(queue._actions, [])
 
     def test_all_platform_actions_use_one_serial_queue(self):
         generation_id = self.manager.begin_generation(self.upload_payload)[

@@ -198,10 +198,10 @@ class _CollectorActionQueue:
             else deadline_monotonic - monotonic()
         )
         if timeout is not None and timeout <= 0:
-            action.cancelled = True
+            self._cancel_queued_action(action)
             raise DouyinCommerceCollectorError("province_location_search_action_timeout") from None
         if not action.ready.wait(timeout):
-            action.cancelled = True
+            self._cancel_queued_action(action)
             raise DouyinCommerceCollectorError("province_location_search_action_timeout") from None
         if action.cancelled:
             raise DouyinCommerceCollectorError("stale_result_discarded") from None
@@ -215,14 +215,32 @@ class _CollectorActionQueue:
                 else deadline_monotonic - monotonic()
             )
             if timeout is not None and timeout <= 0:
-                future.cancel()
+                self._cancel_queued_action(action)
                 raise DouyinCommerceCollectorError("province_location_search_action_timeout") from None
             return future.result(timeout=timeout)
         except FutureTimeoutError:
-            future.cancel()
+            self._cancel_queued_action(action)
             raise DouyinCommerceCollectorError("province_location_search_action_timeout") from None
         except CancelledError:
             raise DouyinCommerceCollectorError("stale_result_discarded") from None
+
+    def _cancel_queued_action(self, action: _QueuedAction) -> bool:
+        """仅在 future 尚未启动时原子取消并回收队列项。"""
+
+        with self._lock:
+            future = action.future
+            if (
+                action is self._running
+                or future is None
+                or future.done()
+                or not future.cancel()
+            ):
+                return False
+            action.cancelled = True
+            if action in self._actions:
+                self._actions.remove(action)
+            action.ready.set()
+            return True
 
     def run(
         self,
@@ -1466,6 +1484,8 @@ class DouyinCommerceCollectorManager:
                 error_code, event_emitted=True
             ) from None
         platform_result_count: int | None = None
+        has_more: bool | None = None
+        stop_reason: str | None = None
         try:
             raw_candidates = result
             if include_metadata:
@@ -1473,10 +1493,21 @@ class DouyinCommerceCollectorManager:
                     raise TypeError("metadata_result_invalid")
                 platform_result_count = result.get("platformResultCount")
                 raw_candidates = result.get("candidates")
+                has_more = result.get("hasMore")
+                stop_reason = result.get("stopReason")
                 if (
                     type(platform_result_count) is not int
                     or platform_result_count < 0
                     or not isinstance(raw_candidates, list)
+                    or (has_more is None) != (stop_reason is None)
+                    or (
+                        has_more is not None
+                        and (
+                            type(has_more) is not bool
+                            or not isinstance(stop_reason, str)
+                            or not stop_reason
+                        )
+                    )
                 ):
                     raise TypeError("metadata_result_invalid")
             public_result = [dict(item) for item in raw_candidates]
@@ -1553,6 +1584,8 @@ class DouyinCommerceCollectorManager:
             collector.instance_id,
             candidates=public_result,
             platform_result_count=platform_result_count,
+            has_more=has_more,
+            stop_reason=stop_reason,
         )
 
     def _load_more_locations_action(
@@ -2409,6 +2442,7 @@ class DouyinCommerceCollectorManager:
                 "cleanup_incomplete",
                 "collector_search_context_mismatch",
                 "publish_location_load_more_failed",
+                "province_location_search_action_timeout",
                 "collector_start_failed",
                 "collector_unknown",
             }
