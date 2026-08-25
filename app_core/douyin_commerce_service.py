@@ -2406,6 +2406,61 @@ async def _visible_commerce_location_result_snapshot(
     return listbox, rows, _location_result_signature(rows)
 
 
+async def _commerce_location_empty_evidence(listbox) -> dict[str, bool | None]:
+    """读取平台明确空态或加载状态，不用空快照猜测完成。"""
+
+    try:
+        raw = await listbox.evaluate(
+            """node => {
+                const visible = item => {
+                    if (!(item instanceof HTMLElement)) return false;
+                    const style = getComputedStyle(item);
+                    const rect = item.getBoundingClientRect();
+                    return style.display !== 'none'
+                        && style.visibility !== 'hidden'
+                        && Number(style.opacity || '1') > 0
+                        && rect.width > 0 && rect.height > 0;
+                };
+                const root = node.closest(
+                    '[role="dialog"], [data-testid*="location" i], '
+                    + '[class*="location" i], [class*="select" i]'
+                ) || node.parentElement || node;
+                const emptyTokens = [
+                    '暂无数据', '暂无地点', '暂无相关地点', '无搜索结果',
+                    '未找到相关地点', '没有找到相关地点'
+                ];
+                const emptyNodes = Array.from(root.querySelectorAll(
+                    '[class*="empty" i], [data-testid*="empty" i], '
+                    + '[data-e2e*="empty" i], [role="status"], [role="alert"]'
+                )).filter(visible);
+                const explicitEmpty = emptyNodes.some(item => {
+                    const text = (item.innerText || item.textContent || '')
+                        .replace(/\\s+/g, '');
+                    return emptyTokens.some(token => text.includes(token));
+                });
+                const busyValues = [node, root]
+                    .map(item => item.getAttribute('aria-busy')
+                        ?? item.getAttribute('data-loading')
+                        ?? item.getAttribute('data-is-loading'))
+                    .filter(value => value !== null)
+                    .map(value => String(value).trim().toLowerCase());
+                const busy = busyValues.some(value => ['true', '1'].includes(value))
+                    ? true
+                    : busyValues.some(value => ['false', '0'].includes(value))
+                    ? false : null;
+                return { explicitEmpty, busy };
+            }"""
+        )
+    except Exception:
+        return {"explicitEmpty": False, "busy": None}
+    if not isinstance(raw, Mapping):
+        return {"explicitEmpty": False, "busy": None}
+    explicit_empty = raw.get("explicitEmpty") is True
+    busy_value = raw.get("busy")
+    busy = busy_value if type(busy_value) is bool else None
+    return {"explicitEmpty": explicit_empty, "busy": busy}
+
+
 async def _wait_for_fresh_commerce_location_results(
     page,
     *,
@@ -2430,8 +2485,9 @@ async def _wait_for_fresh_commerce_location_results(
     正式发布可传入 ``expected_location`` 和 ``commission_filter``。慢网络下
     即使先出现空列表、非目标候选或分批渲染的候选，也必须等符合返佣要求的
     目标 POI 出现且列表连续稳定后才返回。``allow_platform_empty``
-    只供省份遍历的元数据搜索使用：候选面板已挂载且空列表连续稳定后，
-    返回真实零结果；普通搜索仍把空列表视为未完成。
+    只供省份遍历的元数据搜索使用：必须连续读到平台明确
+    空态，或先观察到加载再读到完成状态，才返回真实零结果。
+    普通搜索和无证据空列表仍等待到受控超时。
     """
 
     selected_commission_filter = normalize_commission_filter(
@@ -2459,6 +2515,7 @@ async def _wait_for_fresh_commerce_location_results(
     first_complete_logged = False
     target_seen_logged = False
     commission_mismatch_seen = False
+    platform_loading_seen = False
     douyin_logger.info(
         f"抖音地点候选开始等待：关键词={keyword}，最长等待="
         f"{normalized_timeout_ms / 1000:.1f} 秒，稳定要求={required_reads} 次"
@@ -2549,19 +2606,37 @@ async def _wait_for_fresh_commerce_location_results(
                 stable_signature = ""
                 stable_reads = 0
         else:
-            # 元数据省份遍历允许确认平台真实零结果；仅有候选
-            # 面板已挂载且空快照连续稳定才接受，不把面板未挂载
-            # 或普通搜索的瞬时空列表误作完成。
+            # 空列表本身不证明请求已完成。只有省份模式且平台
+            # 给出明确空态，或可观察的 loading -> complete 转换，
+            # 才允许结构化零结果。
             if allow_platform_empty and expected is None and listbox is not None:
-                if stable_signature == "platform-empty":
+                evidence = await _await_publish_location_dom_action(
+                    lambda _timeout: _commerce_location_empty_evidence(listbox),
+                    deadline=deadline,
+                )
+                busy = evidence.get("busy")
+                if busy is True:
+                    platform_loading_seen = True
+                explicit_empty = evidence.get("explicitEmpty") is True
+                request_completed = platform_loading_seen and busy is False
+                if (
+                    (explicit_empty or request_completed)
+                    and stable_signature == "platform-empty-evidence"
+                ):
                     stable_reads += 1
-                else:
-                    stable_signature = "platform-empty"
+                elif explicit_empty or request_completed:
+                    stable_signature = "platform-empty-evidence"
                     stable_reads = 1
-                if stable_reads >= required_reads:
+                else:
+                    stable_signature = ""
+                    stable_reads = 0
+                if (
+                    (explicit_empty or request_completed)
+                    and stable_reads >= required_reads
+                ):
                     elapsed = monotonic() - started_at
                     douyin_logger.info(
-                        f"抖音地点候选已稳定为空：关键词={keyword}，"
+                        f"抖音地点候选已有明确空态：关键词={keyword}，"
                         f"耗时={elapsed:.1f} 秒"
                     )
                     return listbox, rows
@@ -2600,6 +2675,7 @@ async def search_commerce_location_store_candidates(
     expected_location: Mapping[str, Any] | None = None,
     commission_filter: object = "all",
     include_metadata: bool = False,
+    province_mode: bool = False,
     timeout_ms: int = _LOCATION_RESULT_WAIT_TIMEOUT_MS,
     deadline: float | None = None,
     deadline_monotonic: float | None = None,
@@ -2863,7 +2939,7 @@ async def search_commerce_location_store_candidates(
         expected_location=expected_location,
         commission_filter=selected_commission_filter,
         allow_filtered_empty=include_metadata is True,
-        allow_platform_empty=include_metadata is True,
+        allow_platform_empty=province_mode is True,
         timeout_ms=timeout_ms,
         deadline=deadline,
     )

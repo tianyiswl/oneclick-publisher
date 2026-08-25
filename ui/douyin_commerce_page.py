@@ -2312,7 +2312,10 @@ class DouyinCommercePage(QWidget):
         ):
             if (
                 plan.search_kind == "province"
-                and int(state["replayLoadsRemaining"] or 0) > 0
+                and (
+                    requires_revalidation
+                    or int(state["replayLoadsRemaining"] or 0) > 0
+                )
             ):
                 self._continue_province_location_click(
                     request_owner,
@@ -3792,9 +3795,17 @@ class DouyinCommercePage(QWidget):
         # no_visible_load_more_control 表示平台确实没有下一页，不再重建同一
         # 搜索上下文形成无效循环。
         effective_has_more = has_more
-        if platform_load_count >= 10:
+        plan = state.get("searchPlan")
+        is_province_plan = (
+            isinstance(plan, LocationSearchPlan)
+            and plan.search_kind == "province"
+        )
+        if not is_province_plan and platform_load_count >= 10:
             effective_has_more = False
-        elif len(display_raw) >= _BATCH_LOCATION_MAX_IDENTITIES:
+        elif (
+            not is_province_plan
+            and len(display_raw) >= _BATCH_LOCATION_MAX_IDENTITIES
+        ):
             effective_has_more = False
         state.update(
             {

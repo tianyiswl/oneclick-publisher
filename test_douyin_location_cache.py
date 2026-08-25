@@ -234,6 +234,20 @@ class DouyinLocationCacheTests(unittest.TestCase):
             ),
             [],
         )
+        self.assertEqual(
+            filter_locations_for_search_keyword(
+                "海南joymark",
+                [
+                    {
+                        **candidate,
+                        "poiId": "qh-context-without-province",
+                        "address": "海南藏族自治州共和县测试路3号",
+                    }
+                ],
+                province_context="青海",
+            ),
+            [],
+        )
 
     def test_progress_isolated_by_account_keyword_and_commission_filter(self) -> None:
         plan = build_location_search_plan("广东joymark")

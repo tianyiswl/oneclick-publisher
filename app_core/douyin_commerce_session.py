@@ -1226,6 +1226,8 @@ class DouyinCommerceSessionManager:
                 }
                 if include_metadata is True:
                     service_kwargs["include_metadata"] = True
+                if province_mode is True:
+                    service_kwargs["province_mode"] = True
                 if deadline_monotonic is not None:
                     service_kwargs["deadline_monotonic"] = deadline_monotonic
                 search_result = await douyin_commerce_service.search_commerce_location_store_candidates(

@@ -39,6 +39,16 @@ _LOCATION_COMMISSION_FILTERS = frozenset(
     {"all", "commission", "no_commission"}
 )
 _LOCATION_COMMISSION_TYPES = frozenset({"commission", "no_commission"})
+_CITY_PROVINCES: dict[str, tuple[str, ...]] = {
+    city: tuple(
+        province
+        for province, cities in PROVINCE_CITIES.items()
+        if city in cities
+    )
+    for city in {
+        city for cities in PROVINCE_CITIES.values() for city in cities
+    }
+}
 _LOCATION_REVALIDATION_ERROR_CODES = frozenset(
     {
         "publish_location_not_found_after_all_pages",
@@ -148,6 +158,21 @@ def _top_level_province(address: object) -> str:
                 ):
                     continue
             return province
+    # 平台有时省略省名，只从地址开头的唯一归属地级市
+    # 回推顶级省份。与其他省名发生跨层级冲突的短名
+    # （例如青海海南州）依然失败关闭。
+    city_aliases: list[tuple[str, str]] = []
+    for city, owners in _CITY_PROVINCES.items():
+        if len(owners) != 1 or (
+            city in PROVINCE_CITIES and owners[0] != city
+        ):
+            continue
+        city_aliases.append((f"{city}市", owners[0]))
+    for alias, province in sorted(
+        city_aliases, key=lambda item: len(item[0]), reverse=True
+    ):
+        if normalized.startswith(alias):
+            return province
     return ""
 
 
@@ -209,15 +234,24 @@ def filter_locations_for_search_keyword(
     if not region or not remainder:
         return list(candidates)
     filtered: list[Mapping[str, Any]] = []
+    cross_level_collision = bool(
+        region in PROVINCE_CITIES
+        and any(
+            owner != region for owner in _CITY_PROVINCES.get(region, ())
+        )
+    )
     for candidate in candidates:
         name = "".join(_optional_text(candidate.get("name")).split()).casefold()
         address = "".join(
             _optional_text(candidate.get("address")).split()
         ).casefold()
         top_level = _top_level_province(address)
+        if normalized_keyword in name and not cross_level_collision:
+            filtered.append(candidate)
+            continue
         if (
             top_level == parent_province
-            and region in address
+            and (region == parent_province or region in address)
             and remainder in f"{name}{address}"
         ):
             filtered.append(candidate)
@@ -242,7 +276,16 @@ def _query(value: object) -> LocationCacheQuery:
 
 
 def _storage_keyword(query: LocationCacheQuery) -> str:
-    if not query.province_context:
+    city, _remainder = _leading_city(query.keyword, query.province_context)
+    owners = _CITY_PROVINCES.get(city, ())
+    ambiguous_city = bool(
+        city
+        and (
+            len(owners) > 1
+            or (city in PROVINCE_CITIES and city != query.province_context)
+        )
+    )
+    if not query.province_context or not ambiguous_city:
         return query.keyword
     identity = json.dumps(
         [query.province_context, query.keyword],

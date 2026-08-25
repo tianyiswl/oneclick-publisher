@@ -242,6 +242,81 @@ class DouyinCommercePayloadTests(unittest.TestCase):
 
         self.assertEqual([item["poiId"] for item in result], ["guangzhou"])
 
+    def test_location_city_accepts_address_starting_with_unique_prefecture(self) -> None:
+        """省名被平台省略时，唯一归属的城市仍应匹配。"""
+
+        candidates = [
+            {
+                "poiId": "guangzhou-without-province",
+                "name": "JOYMARK 天河店",
+                "address": "广州市天河区测试路1号",
+                "commissionType": "commission",
+            },
+            {
+                "poiId": "wuhan",
+                "name": "JOYMARK 江岸店",
+                "address": "武汉市江岸区测试路2号",
+                "commissionType": "commission",
+            },
+        ]
+
+        result = douyin_location_cache.filter_locations_for_search_keyword(
+            "广州joymark", candidates
+        )
+
+        self.assertEqual(
+            [item["poiId"] for item in result],
+            ["guangzhou-without-province"],
+        )
+
+    def test_city_inference_does_not_treat_bare_district_name_as_prefecture(self) -> None:
+        """没有“市”或顶级省份时，“朝阳区”不能被猜成辽宁朝阳市。"""
+
+        candidate = {
+            "poiId": "ambiguous-chaoyang-district",
+            "name": "JOYMARK 朝阳店",
+            "address": "朝阳区测试路1号",
+            "commissionType": "commission",
+        }
+
+        result = douyin_location_cache.filter_locations_for_search_keyword(
+            "朝阳joymark", [candidate]
+        )
+
+        self.assertEqual(result, [])
+
+    def test_full_keyword_brand_name_remains_usable_outside_named_region(self) -> None:
+        """完整关键词就是品牌名时，不应把地域字样误当筛选。"""
+
+        candidate = {
+            "poiId": "beijing-duck-brand",
+            "name": "北京烤鸭",
+            "address": "上海市黄浦区测试路1号",
+            "commissionType": "commission",
+        }
+
+        result = douyin_location_cache.filter_locations_for_search_keyword(
+            "北京烤鸭", [candidate]
+        )
+
+        self.assertEqual(result, [candidate])
+
+    def test_brand_exception_does_not_reopen_hainan_cross_province_collision(self) -> None:
+        """省份根词即使出现在店名中，也不得绕过顶级省份隔离。"""
+
+        qinghai_candidate = {
+            "poiId": "qinghai-hainan-brand-collision",
+            "name": "海南joymark旗舰店",
+            "address": "青海省海南藏族自治州共和县测试路1号",
+            "commissionType": "commission",
+        }
+
+        result = douyin_location_cache.filter_locations_for_search_keyword(
+            "海南joymark", [qinghai_candidate]
+        )
+
+        self.assertEqual(result, [])
+
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
         self.video = Path(self.tempdir.name) / "commerce.mp4"
@@ -1029,6 +1104,12 @@ class DouyinCommercePayloadTests(unittest.TestCase):
         class Page:
             wait_for_timeout = AsyncMock()
 
+        class ExplicitEmptyListbox:
+            async def evaluate(self, _script: str) -> dict[str, object]:
+                return {"explicitEmpty": True, "busy": False}
+
+        listbox = ExplicitEmptyListbox()
+
         with patch.object(
             douyin_commerce_service,
             "_ensure_position_tag",
@@ -1052,7 +1133,7 @@ class DouyinCommercePayloadTests(unittest.TestCase):
             douyin_commerce_service,
             "_visible_commerce_location_result_snapshot",
             new_callable=AsyncMock,
-            return_value=(object(), [], "fresh-platform-zero"),
+            return_value=(listbox, [], "fresh-platform-zero"),
         ):
             result = asyncio.run(
                 douyin_commerce_service.search_commerce_location_store_candidates(
@@ -1061,6 +1142,7 @@ class DouyinCommercePayloadTests(unittest.TestCase):
                     scope="domestic",
                     commission_filter="commission",
                     include_metadata=True,
+                    province_mode=True,
                 )
             )
 
@@ -1073,6 +1155,119 @@ class DouyinCommercePayloadTests(unittest.TestCase):
                 "stopReason": "no_visible_load_more_control",
             },
         )
+
+    def test_metadata_wait_ignores_three_early_empty_snapshots_before_slow_rows(
+        self,
+    ) -> None:
+        """空列表未携平台完成证据时，第四次才到的候选不得被提前截断。"""
+
+        class PendingListbox:
+            async def evaluate(self, _script: str) -> dict[str, object]:
+                return {"explicitEmpty": False, "busy": None}
+
+        class Page:
+            wait_for_timeout = AsyncMock()
+
+        listbox = PendingListbox()
+        rows = [
+            {
+                "poiId": "slow-gz-1",
+                "name": "JOYMARK 天河店",
+                "address": "广东省广州市天河区测试路1号",
+            }
+        ]
+        signature = douyin_commerce_service._location_result_signature(rows)
+        snapshots = [
+            (listbox, [], ""),
+            (listbox, [], ""),
+            (listbox, [], ""),
+            (listbox, rows, signature),
+            (listbox, rows, signature),
+            (listbox, rows, signature),
+        ]
+
+        with patch.object(
+            douyin_commerce_service,
+            "_visible_commerce_location_result_snapshot",
+            new_callable=AsyncMock,
+            side_effect=snapshots,
+        ) as snapshot:
+            _listbox, result = asyncio.run(
+                douyin_commerce_service._wait_for_fresh_commerce_location_results(
+                    Page(),
+                    baseline_signature="",
+                    keyword="广州joymark",
+                    allow_stable_baseline_match=True,
+                    allow_platform_empty=True,
+                )
+            )
+
+        self.assertEqual(result, rows)
+        self.assertEqual(snapshot.await_count, len(snapshots))
+
+    def test_regular_metadata_search_does_not_enable_platform_empty_completion(
+        self,
+    ) -> None:
+        """普通和直接城市的 metadata 查询仍不接受无证据空页。"""
+
+        class SearchInput:
+            def __init__(self) -> None:
+                self.value = ""
+                self.scroll_into_view_if_needed = AsyncMock()
+                self.click = AsyncMock()
+
+            async def fill(self, value: str, **_kwargs) -> None:
+                self.value = value
+
+            async def evaluate(self, _script: str) -> str:
+                return self.value
+
+        class ExplicitEmptyListbox:
+            async def evaluate(self, _script: str) -> dict[str, object]:
+                return {"explicitEmpty": True, "busy": False}
+
+        class Page:
+            wait_for_timeout = AsyncMock()
+
+        with patch.object(
+            douyin_commerce_service,
+            "_ensure_position_tag",
+            new_callable=AsyncMock,
+        ), patch.object(
+            douyin_commerce_service,
+            "_ensure_local_group_buy_mode",
+            new_callable=AsyncMock,
+            return_value=object(),
+        ), patch.object(
+            douyin_commerce_service,
+            "_open_commerce_search_input",
+            new_callable=AsyncMock,
+            return_value=SearchInput(),
+        ), patch.object(
+            douyin_commerce_service,
+            "set_commerce_location_scope",
+            new_callable=AsyncMock,
+            return_value="国内",
+        ), patch.object(
+            douyin_commerce_service,
+            "_visible_commerce_location_result_snapshot",
+            new_callable=AsyncMock,
+            return_value=(ExplicitEmptyListbox(), [], ""),
+        ):
+            with self.assertRaisesRegex(
+                douyin_commerce_service.DouyinCommerceError,
+                "未返回.*最新完整发布定位",
+            ):
+                asyncio.run(
+                    douyin_commerce_service.search_commerce_location_store_candidates(
+                        Page(),
+                        "广州joymark",
+                        scope="domestic",
+                        commission_filter="commission",
+                        include_metadata=True,
+                        timeout_ms=700,
+                    )
+                )
 
     def test_location_search_stops_when_old_keyword_cannot_be_cleared(self) -> None:
         """平台仍回读旧关键词时，禁止继续输入新词或读取旧候选。"""
@@ -15127,6 +15322,149 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             ["hainan-province"],
         )
 
+    def test_province_revalidation_cache_entry_uses_bounded_coordinator(self) -> None:
+        """省份缓存重校对必须从真实入口进入三动作协调器。"""
+
+        owner = self._install_province_fixture("广东joymark")
+        cache_query = douyin_location_cache.LocationCacheQuery(
+            "7", "domestic", "广东joymark", "commission"
+        )
+        plan = build_location_search_plan("广东joymark")
+        calls = 0
+
+        def dispatch(_owner, *, on_success, deadline_monotonic=None):
+            nonlocal calls
+            calls += 1
+            self.assertEqual(_owner, owner)
+            self.assertGreater(deadline_monotonic, time.monotonic())
+            on_success(self._province_page([], has_more=True))
+            return True
+
+        with patch.object(
+            douyin_location_cache,
+            "load_location_search_plan",
+            return_value=plan,
+        ), patch.object(
+            douyin_location_cache,
+            "merge_platform_locations_for_queries",
+        ), patch.object(
+            douyin_location_cache,
+            "save_location_search_plan",
+        ), patch.object(
+            self.page,
+            "_run_current_location_action",
+            side_effect=dispatch,
+        ), patch.object(
+            self.page,
+            "_start_batch_location_platform_search",
+            return_value=True,
+        ) as legacy_start:
+            self.page._batch_location_cache_search_succeeded(
+                cache_query,
+                "domestic",
+                "广东joymark",
+                "commission",
+                self._cache_page([], requires_revalidation=True),
+                request_token=self.page._batch_location_search_token,
+            )
+
+        self.assertEqual(calls, 3)
+        legacy_start.assert_not_called()
+        state = self.page._batch_location_state()
+        self.assertFalse(state["searchPlan"].exhausted)
+        self.assertTrue(state["hasMore"])
+        self.assertTrue(self.page.batch_location_load_more_button.isEnabled())
+
+    def test_province_revalidation_tenth_page_does_not_apply_legacy_limit(self) -> None:
+        """省份计划在旧的第十次边界仍应由省份协调器决定是否继续。"""
+
+        self._install_province_fixture("广东joymark")
+        state = self.page._batch_location_state()
+        state.update(
+            {
+                "requiresRevalidation": True,
+                "platformContextReady": True,
+                "platformLoadCount": 9,
+            }
+        )
+        self.page._batch_location_searches["__shared_location_search__"] = state
+        cache_query = douyin_location_cache.LocationCacheQuery(
+            "7", "domestic", "广东joymark", "commission"
+        )
+
+        with patch.object(
+            self.page,
+            "_start_batch_location_cache_merge",
+            return_value=False,
+        ):
+            self.page._batch_location_load_more_succeeded(
+                cache_query,
+                self._province_page([], has_more=True),
+                request_token=self.page._batch_location_search_token,
+            )
+
+        current = self.page._batch_location_state()
+        self.assertEqual(current["platformLoadCount"], 10)
+        self.assertTrue(current["hasMore"])
+        self.assertFalse(current["searchPlan"].exhausted)
+        self.assertTrue(self.page.batch_location_load_more_button.isEnabled())
+
+    def test_ui_active_guangzhou_query_is_reused_by_direct_city_cache_search(
+        self,
+    ) -> None:
+        """省份计划写入的非歧义广州候选，直接搜广州应能读回。"""
+
+        temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_directory.cleanup)
+        database_patch = patch.object(
+            database,
+            "DB_PATH",
+            Path(temporary_directory.name) / "ui-active-city-cache.sqlite3",
+        )
+        database_patch.start()
+        self.addCleanup(database_patch.stop)
+        self._install_province_fixture("广东joymark")
+        get_cache_patcher, _merge_patcher = self._empty_location_cache_patchers
+        get_cache_patcher.stop()
+        plan = build_location_search_plan("广东joymark")
+        city_plan = replace(
+            plan,
+            current_index=1,
+            completed_indices=(0,),
+        )
+        candidate = self._province_candidate(
+            "guangzhou-direct-reuse",
+            address="广州市天河区测试路1号",
+        )
+        state = self.page._batch_location_state()
+        state.update(
+            {
+                "searchPlan": city_plan,
+                "activeKeyword": "广州joymark",
+                "rawCandidates": [candidate],
+                "candidates": [candidate],
+            }
+        )
+        self.page._batch_location_searches["__shared_location_search__"] = state
+        root_query = douyin_location_cache.LocationCacheQuery(
+            "7", "domestic", "广东joymark", "commission"
+        )
+
+        self.page._start_batch_location_cache_merge(
+            root_query,
+            [candidate],
+            request_token=self.page._batch_location_search_token,
+        )
+
+        direct_city = douyin_location_cache.get_cached_locations(
+            douyin_location_cache.LocationCacheQuery(
+                "7", "domestic", "广州joymark", "commission"
+            ),
+            excluded_identities=[],
+        )
+        self.assertEqual(direct_city["total"], 1)
+        self.assertEqual(direct_city["candidates"][0]["poiId"], candidate["poiId"])
+
     def test_restart_replay_uses_three_action_budget_and_keeps_remainder(self) -> None:
         owner = self._install_province_fixture("广东joymark")
         state = self.page._batch_location_state()
@@ -15274,7 +15612,12 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
                 self.is_closed = MagicMock(return_value=False)
                 self.wait_for_timeout = AsyncMock()
 
+        class ExplicitEmptyListbox:
+            async def evaluate(self, _script: str) -> dict[str, object]:
+                return {"explicitEmpty": True, "busy": False}
+
         platform_page = Page()
+        empty_listbox = ExplicitEmptyListbox()
         created: list[douyin_commerce_session.DouyinCommerceSessionManager] = []
 
         class OfflineSessionManager(
@@ -15358,7 +15701,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
                 douyin_commerce_service,
                 "_visible_commerce_location_result_snapshot",
                 new_callable=AsyncMock,
-                return_value=(object(), [], ""),
+                return_value=(empty_listbox, [], ""),
             ), patch.object(
                 douyin_commerce_service,
                 "close_commerce_store_selector",
