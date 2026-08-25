@@ -408,6 +408,9 @@ def _validate_payloads(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
             platform_name = _PLATFORM_NAMES[int(payload["type"])]
             raise ValueError(f"{platform_name}文字预检需要选择本地封面图片")
         validated.append(payload)
+    if any(item.get("runtimeMode") == "wechat_draft" for item in validated):
+        if len(validated) != 1 or int(validated[0].get("type") or 0) != 10:
+            raise ValueError("公众号草稿任务只能包含一个公众号账号")
     return validated
 
 
@@ -711,7 +714,10 @@ def _run_wechat_draft(task: dict, payloads: list[dict[str, Any]]) -> None:
     try:
         task_service.mark_task_running(task["id"], "一键发开始保存硅基进化公众号草稿")
         result = wechat_draft_executor.run_wechat_draft_sync(payload, task_id=int(task["id"]))
-        task_service.mark_platform_result(task["id"], 10, ok=bool(result.get("ok")), message=str(result.get("message") or "公众号草稿未取得回读"), content_type=str(payload.get("contentType") or ""), event_type="platform_draft")
+        message = str(result.get("message") or "公众号草稿未取得回读")
+        if not result.get("ok") and result.get("errorCode"):
+            message = f"{message}（错误码 {result['errorCode']}）"
+        task_service.mark_platform_result(task["id"], 10, ok=bool(result.get("ok")), message=message, content_type=str(payload.get("contentType") or ""), event_type="platform_draft")
     except Exception as exc:
         task_service.mark_platform_result(task["id"], 10, ok=False, message=_failure_message("公众号草稿异常", exc, platform_type=10), content_type=str(payload.get("contentType") or ""), event_type="platform_draft")
     finally:

@@ -8,7 +8,8 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
+import re
 from typing import Any
 
 from . import account_service, task_service
@@ -22,6 +23,10 @@ from .oneclick_preflight import (
 
 class WechatDraftError(RuntimeError):
     """公众号草稿任务没有满足只保存草稿的边界。"""
+
+    def __init__(self, message: str, *, error_code: str = "field_readback_mismatch") -> None:
+        super().__init__(message)
+        self.error_code = error_code
 
 
 _FORBIDDEN_PUBLISH_KEYS = (
@@ -77,12 +82,108 @@ async def _unique_enabled_button(page, text: str):
     return visible[0]
 
 
-async def _readback_saved_draft(page, title: str, *, started_at: datetime) -> dict[str, Any]:
-    """只把同标题且位于草稿上下文中的唯一可见记录视为成功。"""
-    del started_at
-    deadline = asyncio.get_running_loop().time() + 15
-    while asyncio.get_running_loop().time() < deadline:
-        matches = await page.evaluate(
+async def _open_draft_list(page) -> None:
+    """保存后只点击唯一的草稿箱入口，不猜测后台 URL。"""
+    current_url = str(getattr(page, "url", "") or "")
+    if "action=list_card" in current_url or "action=list_ex" in current_url:
+        return
+    try:
+        entry = await _unique_enabled_button(page, "草稿箱")
+    except WechatDraftError as exc:
+        raise WechatDraftError(
+            "公众号草稿箱入口不是唯一可用控件",
+            error_code="draft_readback_missing",
+        ) from exc
+    await entry.click(timeout=10_000)
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=15_000)
+    except Exception as exc:
+        raise WechatDraftError(
+            "公众号草稿列表未完成加载",
+            error_code="draft_readback_missing",
+        ) from exc
+
+
+def _candidate_saved_at(candidate: dict[str, Any], started_at: datetime) -> datetime | None:
+    raw = str(candidate.get("savedAt") or "").strip()
+    if raw:
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if parsed.tzinfo is not None and started_at.tzinfo is None:
+                parsed = parsed.replace(tzinfo=None)
+            elif parsed.tzinfo is None and started_at.tzinfo is not None:
+                parsed = parsed.replace(tzinfo=started_at.tzinfo)
+            return parsed
+        except ValueError:
+            pass
+    text = " ".join(str(candidate.get("text") or "").split())
+    if any(marker in text for marker in ("刚刚", "片刻前", "1分钟前")):
+        return started_at
+    time_match = re.search(r"(?:今天\s*)?(\d{1,2}):(\d{2})", text)
+    if "昨天" not in text and time_match:
+        return started_at.replace(
+            hour=int(time_match.group(1)),
+            minute=int(time_match.group(2)),
+            second=0,
+            microsecond=0,
+        )
+    date_match = re.search(
+        r"(\d{4})[年./-](\d{1,2})[月./-](\d{1,2})日?\s+(\d{1,2}):(\d{2})",
+        text,
+    )
+    if date_match:
+        try:
+            return started_at.replace(
+                year=int(date_match.group(1)),
+                month=int(date_match.group(2)),
+                day=int(date_match.group(3)),
+                hour=int(date_match.group(4)),
+                minute=int(date_match.group(5)),
+                second=0,
+                microsecond=0,
+            )
+        except ValueError:
+            return None
+    return None
+
+
+def _current_run_candidates(
+    candidates: object,
+    *,
+    title: str,
+    started_at: datetime,
+) -> list[dict[str, Any]]:
+    if not isinstance(candidates, list):
+        return []
+    earliest = started_at - timedelta(minutes=2)
+    latest = started_at + timedelta(minutes=15)
+    matches: list[dict[str, Any]] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        if " ".join(str(candidate.get("title") or "").split()) != title:
+            continue
+        if candidate.get("hasCover") is not True:
+            continue
+        saved_at = _candidate_saved_at(candidate, started_at)
+        if saved_at is not None and earliest <= saved_at <= latest:
+            matches.append(candidate)
+    return matches
+
+
+async def _readback_saved_draft(
+    page,
+    title: str,
+    *,
+    started_at: datetime,
+    timeout_seconds: float = 15,
+) -> dict[str, Any]:
+    """只把同标题且位于本次保存时间窗口的唯一草稿视为成功。"""
+    deadline = asyncio.get_running_loop().time() + max(0.0, float(timeout_seconds))
+    first_attempt = True
+    while first_attempt or asyncio.get_running_loop().time() < deadline:
+        first_attempt = False
+        candidates = await page.evaluate(
             """expectedTitle => {
               const norm = value => String(value || '').replace(/\\s+/g, ' ').trim();
               const visible = node => { const r = node.getBoundingClientRect();
@@ -91,21 +192,43 @@ async def _readback_saved_draft(page, title: str, *, started_at: datetime) -> di
               const seen = new Set(); const rows = [];
               for (const node of document.querySelectorAll('a,p,span,div,h1,h2,h3')) {
                 if (!visible(node) || norm(node.innerText) !== expectedTitle) continue;
-                let parent = node; let found = '';
+                let parent = node; let found = null;
                 for (let depth = 0; parent && depth < 8; depth += 1, parent = parent.parentElement) {
-                  const text = norm(parent.innerText); if (text.includes('草稿')) { found = text; break; }
+                  const text = norm(parent.innerText);
+                  if (!text.includes('草稿')) continue;
+                  const timeNode = parent.querySelector('time,[datetime],[data-time],[data-timestamp]');
+                  found = {
+                    title: expectedTitle,
+                    text: text.slice(0, 500),
+                    hasCover: Boolean(parent.querySelector('img')),
+                    savedAt: timeNode?.getAttribute('datetime')
+                      || timeNode?.getAttribute('data-time')
+                      || timeNode?.getAttribute('data-timestamp') || '',
+                  };
+                  break;
                 }
-                if (found && !seen.has(found)) { seen.add(found); rows.push(found.slice(0, 500)); }
+                if (found && !seen.has(found.text)) { seen.add(found.text); rows.push(found); }
               }
               return rows;
             }""",
             title,
         )
+        matches = _current_run_candidates(
+            candidates,
+            title=title,
+            started_at=started_at,
+        )
         if len(matches) == 1:
-            return {"ok": True, "message": "公众号草稿已由草稿列表回读", "draftTitle": title, "errorCode": None}
+            return {
+                "ok": True,
+                "message": "公众号草稿已由草稿列表回读",
+                "draftTitle": title,
+                "errorCode": None,
+            }
         if len(matches) > 1:
             return {"ok": False, "message": "公众号草稿列表出现多个同标题记录", "draftTitle": None, "errorCode": "draft_readback_ambiguous"}
-        await asyncio.sleep(0.5)
+        if asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.5)
     return {"ok": False, "message": "公众号草稿列表未回读到当前标题", "draftTitle": None, "errorCode": "draft_readback_missing"}
 
 
@@ -130,9 +253,31 @@ async def run_wechat_draft(payload: dict[str, Any], *, task_id: int) -> dict[str
             await _wechat_preflight(page, preflight_payload, account=account)
             editor_account = await account_service._detect_display_name(page, 10)
             if editor_account != expected_account:
-                raise WechatDraftError("公众号编辑器账号回读不一致")
-            await (await _unique_enabled_button(page, "保存草稿")).click(timeout=10_000)
-            result = await _readback_saved_draft(page, checked["title"].strip(), started_at=datetime.now())
+                raise WechatDraftError(
+                    "公众号编辑器账号回读不一致",
+                    error_code="account_mismatch",
+                )
+            started_at = datetime.now()
+            try:
+                save_button = await _unique_enabled_button(page, "保存草稿")
+            except WechatDraftError as exc:
+                raise WechatDraftError(
+                    "公众号保存草稿控件不是唯一可用控件",
+                    error_code="save_control_ambiguous",
+                ) from exc
+            await save_button.click(timeout=10_000)
+            await _open_draft_list(page)
+            list_account = await account_service._detect_display_name(page, 10)
+            if list_account != expected_account:
+                raise WechatDraftError(
+                    "公众号草稿列表账号回读不一致",
+                    error_code="account_mismatch",
+                )
+            result = await _readback_saved_draft(
+                page,
+                checked["title"].strip(),
+                started_at=started_at,
+            )
             task_service.record_task_event(task_id, "wechat_draft_readback", result["message"], level="info" if result["ok"] else "warning")
             return result
         except PreflightError as exc:
