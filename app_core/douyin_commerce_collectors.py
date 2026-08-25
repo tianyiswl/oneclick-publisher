@@ -18,8 +18,12 @@ from typing import Any, Callable, Mapping
 from uuid import uuid4
 
 from .douyin_commerce_location_commission import normalize_commission_filter
-from .douyin_commerce_probe import build_probe_upload_payload
+from .douyin_commerce_probe import (
+    DouyinCommerceProbeError,
+    build_probe_upload_payload,
+)
 from .douyin_commerce_session import (
+    DouyinCommerceSessionError,
     DouyinCommerceSessionManager,
     snapshot_location_candidates,
 )
@@ -369,6 +373,8 @@ _CLEANUP_MARKERS = (
     "清理失败",
 )
 _TRUSTED_DIAGNOSTIC_EXCEPTION_TYPES = (
+    DouyinCommerceProbeError,
+    DouyinCommerceSessionError,
     RuntimeError,
     ValueError,
     TypeError,
@@ -500,8 +506,9 @@ class DouyinCommerceCollectorManager:
             self._require_current_begin_flight(begin_flight)
             probe_payload = self._snapshot_probe_payload(built_payload)
             self._require_current_begin_flight(begin_flight)
-        except Exception:
+        except Exception as error:
             self._require_current_begin_flight(begin_flight)
+            self._log_diagnostic_failure("collector_start_failed", error)
             raise DouyinCommerceCollectorError("collector_start_failed") from None
 
         account_id = self._account_id(probe_payload)
@@ -1833,6 +1840,7 @@ class DouyinCommerceCollectorManager:
             ):
                 self._mark_failed(generation_id, collector)
                 raise DouyinCommerceCollectorError("login_required") from None
+            self._log_diagnostic_failure("collector_start_failed", error)
             if not self._mark_failed(generation_id, collector):
                 raise DouyinCommerceCollectorError(
                     "stale_result_discarded"
@@ -2299,7 +2307,17 @@ class DouyinCommerceCollectorManager:
     def _safe_diagnostic_detail(cls, error: object) -> str:
         """生成最多 180 字的本机开发摘要，不保留账号态或页面原文。"""
 
-        return _redact_diagnostic_text(error)
+        detail = _redact_diagnostic_text(error)
+        if detail != "<unavailable>":
+            return detail
+        error_type = type(error)
+        type_name = re.sub(
+            r"[^A-Za-z0-9_.]",
+            "",
+            f"{getattr(error_type, '__module__', '')}."
+            f"{getattr(error_type, '__name__', '')}",
+        ).strip(".")
+        return f"<{type_name or 'unavailable'}>"[:180]
 
     @classmethod
     def _log_diagnostic_failure(cls, error_code: str, error: object) -> None:
@@ -2316,6 +2334,7 @@ class DouyinCommerceCollectorManager:
                 "cleanup_incomplete",
                 "collector_search_context_mismatch",
                 "publish_location_load_more_failed",
+                "collector_start_failed",
                 "collector_unknown",
             }
             else "collector_unknown"

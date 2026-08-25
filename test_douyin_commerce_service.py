@@ -14594,6 +14594,122 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             ["guangdong"],
         )
 
+    def test_region_search_keeps_full_platform_snapshot_for_load_more_context(
+        self,
+    ) -> None:
+        """地区词只过滤展示候选，分页快照必须保留平台首屏全量身份。"""
+
+        self.page._batch_location_search_succeeded(
+            "domestic",
+            "广东joymark",
+            {
+                "platformResultCount": 2,
+                "candidates": [
+                    {
+                        "poiId": "guangdong",
+                        "name": "JOYMARK 广东门店",
+                        "address": "广东省广州市天河区测试路1号",
+                        "commissionType": "commission",
+                    },
+                    {
+                        "poiId": "jiangsu",
+                        "name": "JOYMARK 江苏门店",
+                        "address": "江苏省南京市玄武区测试路2号",
+                        "commissionType": "commission",
+                    },
+                ],
+            },
+            "commission",
+        )
+
+        state = self.page._batch_location_state()
+        self.assertEqual(
+            [item["poiId"] for item in state["candidates"]],
+            ["guangdong"],
+        )
+        self.assertEqual(
+            [item["poiId"] for item in state["platformCandidates"]],
+            ["guangdong", "jiangsu"],
+        )
+
+    def test_region_load_more_keeps_full_context_but_only_displays_region_matches(
+        self,
+    ) -> None:
+        """分页回包保留全量上下文，新增候选仍只展示目标地区。"""
+
+        first_page = [
+            {
+                "poiId": "gd-1",
+                "name": "JOYMARK 广东门店1",
+                "address": "广东省广州市天河区测试路1号",
+                "commissionType": "commission",
+            },
+            {
+                "poiId": "js-1",
+                "name": "JOYMARK 江苏门店1",
+                "address": "江苏省南京市玄武区测试路1号",
+                "commissionType": "commission",
+            },
+        ]
+        second_page = [
+            *first_page,
+            {
+                "poiId": "gd-2",
+                "name": "JOYMARK 广东门店2",
+                "address": "广东省深圳市南山区测试路2号",
+                "commissionType": "commission",
+            },
+            {
+                "poiId": "js-2",
+                "name": "JOYMARK 江苏门店2",
+                "address": "江苏省苏州市工业园区测试路2号",
+                "commissionType": "commission",
+            },
+        ]
+        self.page._batch_location_search_succeeded(
+            "domestic",
+            "广东joymark",
+            {"platformResultCount": 2, "candidates": first_page},
+            "commission",
+        )
+        query = douyin_location_cache.LocationCacheQuery(
+            account_id="test-account",
+            scope="domestic",
+            keyword="广东joymark",
+            commission_filter="commission",
+        )
+
+        with patch.object(
+            self.page,
+            "_batch_location_request_is_current",
+            return_value=True,
+        ), patch.object(
+            self.page,
+            "_start_batch_location_cache_merge",
+            return_value=False,
+        ):
+            self.page._batch_location_load_more_succeeded(
+                query,
+                {
+                    "platformResultCount": 4,
+                    "candidates": second_page,
+                    "newCandidateCount": 2,
+                    "hasMore": True,
+                    "stopReason": "loaded",
+                },
+                request_token=self.page._batch_location_search_token,
+            )
+
+        state = self.page._batch_location_state()
+        self.assertEqual(
+            [item["poiId"] for item in state["candidates"]],
+            ["gd-1", "gd-2"],
+        )
+        self.assertEqual(
+            [item["poiId"] for item in state["platformCandidates"]],
+            ["gd-1", "js-1", "gd-2", "js-2"],
+        )
+
     def _load_revision_ui_fixture(self) -> dict[str, object]:
         tempdir = tempfile.TemporaryDirectory()
         self.addCleanup(tempdir.cleanup)
@@ -17944,7 +18060,9 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
 
         def assert_bounded_before_auto_fill(scope, candidates, **kwargs):
             state = self.page._batch_location_state()
-            self.assertEqual(len(state["platformCandidates"]), 90)
+            # 平台分页快照与界面的 100 条组合展示上限分开；
+            # 它必须保留本次平台首屏的 100 个身份，以便后续严格校验分页上下文。
+            self.assertEqual(len(state["platformCandidates"]), 100)
             self.assertEqual(len(state["candidates"]), 100)
             self.assertEqual(len(state["rawCandidates"]), 100)
             self.assertEqual(len(candidates), 90)

@@ -16,7 +16,11 @@ import unittest
 from typing import Any, Mapping
 from unittest import mock
 
-from app_core import douyin_commerce_service, douyin_commerce_session
+from app_core import (
+    douyin_commerce_probe,
+    douyin_commerce_service,
+    douyin_commerce_session,
+)
 from app_core.douyin_commerce_collectors import (
     DouyinCommerceCollectorError,
     DouyinCommerceCollectorManager,
@@ -1092,6 +1096,29 @@ class DouyinCommerceCollectorManagerTests(unittest.TestCase):
         self.assertNotIn("token=", safe_detail.casefold())
         self.assertNotIn("dom=", safe_detail.casefold())
         self.assertNotIn("session", safe_detail.casefold())
+        session_detail = self.manager._safe_diagnostic_detail(
+            douyin_commerce_session.DouyinCommerceSessionError(
+                "抖音带货后台上传未完成：playwright driver unavailable"
+            )
+        )
+        self.assertIn("playwright driver unavailable", session_detail)
+        probe_detail = self.manager._safe_diagnostic_detail(
+            douyin_commerce_probe.DouyinCommerceProbeError(
+                "内置抖音带货探针不存在"
+            )
+        )
+        self.assertEqual(probe_detail, "内置抖音带货探针不存在")
+
+        class ThirdPartyDriverError(Exception):
+            def __str__(self):
+                return "Cookie=secret /Users/andy/private/account.json"
+
+        unknown_detail = self.manager._safe_diagnostic_detail(
+            ThirdPartyDriverError()
+        )
+        self.assertIn("ThirdPartyDriverError", unknown_detail)
+        self.assertNotIn("secret", unknown_detail)
+        self.assertNotIn("/Users/andy", unknown_detail)
 
     def test_reviewer_payloads_are_absent_from_safe_log_and_public_events(self):
         generation_id = self.manager.begin_generation(self.upload_payload)[
@@ -1773,6 +1800,61 @@ class DouyinCommerceCollectorManagerTests(unittest.TestCase):
         self.assertEqual(str(raised.exception), "collector_start_failed")
         self.assertIsNone(raised.exception.__cause__)
         self.assertEqual(self.factory.instances, [])
+
+    def test_collector_start_failure_keeps_safe_root_cause_in_local_log(self):
+        class FailingStartManager(FakeSessionManager):
+            def start_upload(self, payload, *, on_progress=None):
+                del payload, on_progress
+                raise RuntimeError(
+                    "playwright driver failed at /Users/andy/private/"
+                    "cookiesFile/account.json Cookie=secret"
+                )
+
+        manager = DouyinCommerceCollectorManager(
+            manager_factory=lambda: FailingStartManager(1),
+            probe_payload_builder=lambda payload: {
+                **dict(payload),
+                "fileList": ["probe.mp4"],
+                "runtimeMode": "preflight",
+                "debugDryRun": True,
+            },
+        )
+
+        with self.assertLogs(
+            "app_core.douyin_commerce_collectors", level="WARNING"
+        ) as captured, self.assertRaises(DouyinCommerceCollectorError) as raised:
+            manager.begin_generation(self.upload_payload)
+
+        self.assertEqual(raised.exception.code, "collector_start_failed")
+        combined = "\n".join(captured.output)
+        self.assertIn("collector_start_failed", combined)
+        self.assertIn("playwright driver failed", combined)
+        self.assertNotIn("/Users/andy/private", combined)
+        self.assertNotIn("cookiesFile/account.json", combined)
+        self.assertNotIn("secret", combined)
+
+    def test_probe_payload_failure_keeps_safe_root_cause_in_local_log(self):
+        def failing_builder(payload):
+            del payload
+            raise RuntimeError(
+                "frozen probe lookup failed at /Users/andy/private/"
+                "cookiesFile/account.json Cookie=secret"
+            )
+
+        self.manager._probe_payload_builder = failing_builder
+
+        with self.assertLogs(
+            "app_core.douyin_commerce_collectors", level="WARNING"
+        ) as captured, self.assertRaises(DouyinCommerceCollectorError) as raised:
+            self.manager.begin_generation(self.upload_payload)
+
+        self.assertEqual(raised.exception.code, "collector_start_failed")
+        combined = "\n".join(captured.output)
+        self.assertIn("collector_start_failed", combined)
+        self.assertIn("frozen probe lookup failed", combined)
+        self.assertNotIn("/Users/andy/private", combined)
+        self.assertNotIn("cookiesFile/account.json", combined)
+        self.assertNotIn("secret", combined)
 
     def test_domestic_and_local_keywords_never_share_a_session(self):
         generation_id = self.manager.begin_generation(self.upload_payload)[

@@ -1774,14 +1774,12 @@ class DouyinCommercePage(QWidget):
             "platformContextReady": (
                 (existing or {}).get("platformContextReady") is True
             ),
-            "platformCandidates": [
-                candidate
-                for candidate in self._merge_batch_location_candidates(
-                    [], (existing or {}).get("platformCandidates", [])
-                )
-                if self._batch_location_candidate_identity(candidate)
-                in accepted_identities
-            ],
+            # 平台分页上下文必须保留官方首屏的完整快照。
+            # rawCandidates/candidates 才是经地区词和返佣条件筛选后
+            # 给用户展示的候选；两者不能再共用一份列表。
+            "platformCandidates": self._merge_batch_location_candidates(
+                [], (existing or {}).get("platformCandidates", [])
+            ),
             "observedPlatformCandidates": observed_platform_candidates,
             "requiresRevalidation": (
                 (existing or {}).get("requiresRevalidation") is True
@@ -2387,16 +2385,20 @@ class DouyinCommercePage(QWidget):
         )
         structured_result = isinstance(rows, Mapping)
         row_values = rows.get("candidates") if structured_result else rows
+        platform_context_candidates = self._merge_batch_location_candidates(
+            [],
+            filter_location_candidates(
+                [dict(item) for item in row_values if isinstance(item, Mapping)]
+                if isinstance(row_values, list)
+                else [],
+                "all",
+            ),
+        )
         public_candidates = self._merge_batch_location_candidates(
             [],
             douyin_location_cache.filter_locations_for_search_keyword(
                 keyword,
-                filter_location_candidates(
-                    [dict(item) for item in row_values if isinstance(item, Mapping)]
-                    if isinstance(row_values, list)
-                    else [],
-                    "all",
-                ),
+                platform_context_candidates,
             ),
         )
         if structured_result:
@@ -2424,7 +2426,7 @@ class DouyinCommercePage(QWidget):
         )
         observed_platform_candidates = self._merge_batch_location_candidates(
             current["observedPlatformCandidates"] if same_search else [],
-            public_candidates,
+            platform_context_candidates,
             identity_limit=None,
         )
         public_candidates = self._accepted_batch_location_platform_candidates(
@@ -2464,7 +2466,9 @@ class DouyinCommercePage(QWidget):
             "rawCandidates": [dict(item) for item in display_raw],
             "candidates": candidates,
             "platformContextReady": True,
-            "platformCandidates": [dict(item) for item in public_candidates],
+            "platformCandidates": [
+                dict(item) for item in platform_context_candidates
+            ],
             "observedPlatformCandidates": [
                 dict(item) for item in observed_platform_candidates
             ],
@@ -3017,13 +3021,17 @@ class DouyinCommercePage(QWidget):
             )
             return
         state = self._batch_location_state()
+        platform_context_candidates = self._merge_batch_location_candidates(
+            [],
+            filter_location_candidates(
+                [dict(item) for item in row_values if isinstance(item, Mapping)],
+                "all",
+            ),
+        )
         public_candidates = list(
             douyin_location_cache.filter_locations_for_search_keyword(
                 state["keyword"],
-                filter_location_candidates(
-                    [dict(item) for item in row_values if isinstance(item, Mapping)],
-                    "all",
-                ),
+                platform_context_candidates,
             )
         )
         revalidation_was_pending = state["requiresRevalidation"] is True
@@ -3042,22 +3050,17 @@ class DouyinCommercePage(QWidget):
         }
         platform_candidate_pool = self._merge_batch_location_candidates(
             previous_platform_candidates,
-            public_candidates,
+            platform_context_candidates,
         )
         observed_platform_candidate_pool = self._merge_batch_location_candidates(
             previous_observed_platform_candidates,
-            public_candidates,
+            platform_context_candidates,
             identity_limit=None,
         )
         display_raw = self._merge_batch_location_candidates(
-            state["rawCandidates"], platform_candidate_pool
+            state["rawCandidates"], public_candidates
         )
-        accumulated_platform_candidates = (
-            self._accepted_batch_location_platform_candidates(
-                display_raw,
-                platform_candidate_pool,
-            )
-        )
+        accumulated_platform_candidates = platform_candidate_pool
         accumulated_platform_identities = {
             tuple(
                 _normalized(candidate.get(key))
@@ -3080,7 +3083,20 @@ class DouyinCommercePage(QWidget):
         )
         projected = filter_location_candidates(display_raw, selected_filter)
         platform_projected = filter_location_candidates(
-            accumulated_platform_candidates, selected_filter
+            list(
+                douyin_location_cache.filter_locations_for_search_keyword(
+                    state["keyword"], accumulated_platform_candidates
+                )
+            ),
+            selected_filter,
+        )
+        cache_platform_candidates = self._accepted_batch_location_platform_candidates(
+            display_raw,
+            list(
+                douyin_location_cache.filter_locations_for_search_keyword(
+                    state["keyword"], accumulated_platform_candidates
+                )
+            ),
         )
         new_candidates = [
             candidate
@@ -3169,7 +3185,7 @@ class DouyinCommercePage(QWidget):
                 (
                     observed_platform_candidate_pool
                     if confirmed_exhausted
-                    else accumulated_platform_candidates
+                    else cache_platform_candidates
                 ),
                 request_token=request_token,
                 confirmed_exhausted=confirmed_exhausted,
