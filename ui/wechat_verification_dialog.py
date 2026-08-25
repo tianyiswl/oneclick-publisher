@@ -54,7 +54,7 @@ class WechatVerificationDialog(QDialog):
 
         description = QLabel(
             "公众号后台需要管理员或运营者使用微信扫码确认。"
-            "验证成功后，一键发会继续当前发布会话。"
+            "验证成功后，一键发会继续当前任务。"
         )
         description.setWordWrap(True)
         description.setProperty("role", "muted")
@@ -137,9 +137,9 @@ class WechatVerificationDialog(QDialog):
             "waiting": "等待扫码",
             "verifying": "已扫码，正在验证",
             "expired": "二维码已过期",
-            "success": "验证成功，正在继续发布",
-            "cancelled": "验证已取消，发布已安全停止",
-            "failed": "验证失败，发布已安全停止",
+            "success": "验证成功，正在继续当前任务",
+            "cancelled": "验证已取消，当前任务已安全停止",
+            "failed": "验证失败，当前任务已安全停止",
         }
         countdown = (
             f" · {snapshot['expiresInSeconds']} 秒后过期"

@@ -2,11 +2,13 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 from app_core.wechat_draft_executor import (
     WechatDraftError,
     _open_draft_list,
     _readback_saved_draft,
+    _handle_draft_qr_verification,
     validate_wechat_draft_payload,
 )
 
@@ -151,3 +153,50 @@ class WechatDraftExecutorTests(unittest.TestCase):
 
         self.assertTrue(page.node.clicked)
         self.assertTrue(page.waited)
+
+    def test_draft_qr_verification_resumes_the_same_task(self) -> None:
+        class Broker:
+            def __init__(self) -> None:
+                self.succeeded = False
+                self.cleared = False
+
+            def create(self, **kwargs) -> str:
+                self.created = kwargs
+                return "request-1"
+
+            def snapshot(self, _request_id: str) -> dict:
+                return {"state": "waiting", "message": "等待扫码"}
+
+            def mark_verifying(self, _request_id: str) -> None:
+                pass
+
+            def succeed(self, _request_id: str) -> None:
+                self.succeeded = True
+
+            def fail(self, _request_id: str, _message: str) -> None:
+                pass
+
+            def clear(self, _request_id: str) -> None:
+                self.cleared = True
+
+        broker = Broker()
+        page = object()
+        with (
+            patch(
+                "app_core.wechat_draft_executor._wait_for_draft_qr_image",
+                AsyncMock(return_value=b"qr"),
+            ),
+            patch(
+                "app_core.wechat_draft_executor._draft_verification_state",
+                AsyncMock(return_value={"qrCount": 0, "qrText": [], "textTail": ""}),
+            ),
+            patch("app_core.wechat_draft_executor.verification_broker", broker),
+            patch("app_core.wechat_draft_executor.asyncio.sleep", AsyncMock()),
+            patch("app_core.wechat_draft_executor.task_service.record_task_event") as event,
+        ):
+            __import__("asyncio").run(_handle_draft_qr_verification(page, task_id=31))
+
+        self.assertEqual(broker.created["task_id"], 31)
+        self.assertTrue(broker.succeeded)
+        self.assertTrue(broker.cleared)
+        self.assertEqual(event.call_args_list[0].args[1], "wechat_verification_required")

@@ -19,6 +19,10 @@ from .oneclick_preflight import (
     _storage_state,
     _wechat_preflight,
 )
+from .wechat_verification import (
+    validate_qr_image_bytes,
+    verification_broker,
+)
 
 
 class WechatDraftError(RuntimeError):
@@ -80,6 +84,186 @@ async def _unique_enabled_button(page, text: str):
     if len(visible) != 1:
         raise WechatDraftError(f"{text} 不是唯一可用控件")
     return visible[0]
+
+
+async def _draft_verification_state(page) -> dict[str, Any]:
+    """只识别当前可见扫码控件，不读取或持久化二维码内容。"""
+
+    return await page.evaluate(
+        r"""() => {
+          const visible = node => { const r = node.getBoundingClientRect();
+            const s = getComputedStyle(node); return r.width > 0 && r.height > 0
+              && s.display !== 'none' && s.visibility !== 'hidden'; };
+          const nodes = Array.from(document.querySelectorAll(
+            'img,canvas,svg,[class*="qr"],[id*="qr"],[class*="scan"],[id*="scan"]'
+          )).filter(node => {
+            if (!visible(node)) return false;
+            const meta = [node.id || '', node.className || '',
+              node.getAttribute?.('src') || '', node.getAttribute?.('alt') || '',
+              node.getAttribute?.('aria-label') || ''].join(' ').toLowerCase();
+            return /(qrcode|qr_code|qr-|_qr|扫码|二维码|scan)/.test(meta);
+          });
+          nodes.forEach((node, index) =>
+            node.setAttribute('data-oneclick-wechat-draft-qr', String(index))
+          );
+          const containers = Array.from(document.querySelectorAll(
+            '[role="dialog"],.weui-desktop-dialog,.weui-desktop-dialog__wrp'
+          )).filter(visible);
+          const text = containers.map(node => String(node.innerText || ''))
+            .join(' ').replace(/\s+/g, ' ').trim();
+          return {
+            qrCount: nodes.length,
+            qrText: ['扫码', '二维码', '微信扫一扫', '身份验证']
+              .filter(marker => text.includes(marker)),
+            textTail: text.slice(-500),
+          };
+        }"""
+    )
+
+
+async def _capture_draft_qr_image(page) -> bytes:
+    candidates: list[tuple[int, bytes]] = []
+    seen: set[tuple[int, int, int, int]] = set()
+    for selector in (
+        "[data-oneclick-wechat-draft-qr] img",
+        "[data-oneclick-wechat-draft-qr] canvas",
+        "[data-oneclick-wechat-draft-qr] svg",
+        "[data-oneclick-wechat-draft-qr] *",
+        "[data-oneclick-wechat-draft-qr]",
+        "img",
+        "canvas",
+        "svg",
+    ):
+        locator = page.locator(selector)
+        for index in range(min(await locator.count(), 160)):
+            node = locator.nth(index)
+            try:
+                if not await node.is_visible():
+                    continue
+                box = await node.bounding_box()
+                if not box:
+                    continue
+                width = float(box.get("width") or 0)
+                height = float(box.get("height") or 0)
+                if min(width, height) < 120 or max(width, height) > 900:
+                    continue
+                if not 0.70 <= width / max(1.0, height) <= 1.42:
+                    continue
+                key = (
+                    round(float(box.get("x") or 0)),
+                    round(float(box.get("y") or 0)),
+                    round(width),
+                    round(height),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                image = await node.screenshot(type="png")
+                validate_qr_image_bytes(image)
+                candidates.append((round(width * height), image))
+            except Exception:
+                continue
+    if not candidates:
+        raise WechatDraftError(
+            "公众号保存草稿需要扫码，但没有找到可扫码二维码",
+            error_code="login_required",
+        )
+    candidates.sort(key=lambda item: item[0])
+    return candidates[0][1]
+
+
+async def _wait_for_draft_qr_image(page, *, timeout_seconds: float = 15) -> bytes:
+    deadline = asyncio.get_running_loop().time() + float(timeout_seconds)
+    last_error: WechatDraftError | None = None
+    while asyncio.get_running_loop().time() < deadline:
+        try:
+            return await _capture_draft_qr_image(page)
+        except WechatDraftError as exc:
+            last_error = exc
+            await asyncio.sleep(0.4)
+    raise last_error or WechatDraftError(
+        "公众号保存草稿二维码加载超时",
+        error_code="login_required",
+    )
+
+
+async def _handle_draft_qr_verification(page, task_id: int) -> None:
+    """在原生窗口等待扫码，并在同一浏览器会话中继续保存草稿。"""
+
+    qr_image = await _wait_for_draft_qr_image(page)
+    loop = asyncio.get_running_loop()
+
+    def refresh_qr() -> bytes:
+        future = asyncio.run_coroutine_threadsafe(
+            _wait_for_draft_qr_image(page, timeout_seconds=12),
+            loop,
+        )
+        return future.result(timeout=15)
+
+    def open_verification_page() -> None:
+        future = asyncio.run_coroutine_threadsafe(page.bring_to_front(), loop)
+        future.result(timeout=5)
+
+    request_id = verification_broker.create(
+        task_id=int(task_id),
+        qr_image=qr_image,
+        expires_in_seconds=120,
+        refresh_callback=refresh_qr,
+        open_page_callback=open_verification_page,
+    )
+    task_service.record_task_event(
+        int(task_id),
+        "wechat_verification_required",
+        "公众号保存草稿需要微信验证，请在一键发客户端扫码",
+        level="warning",
+    )
+    try:
+        deadline = asyncio.get_running_loop().time() + 600
+        while asyncio.get_running_loop().time() < deadline:
+            state = verification_broker.snapshot(request_id)
+            if state["state"] in {"cancelled", "failed"}:
+                raise WechatDraftError(
+                    str(state["message"]),
+                    error_code="login_required",
+                )
+            await asyncio.sleep(0.8)
+            try:
+                page_state = await _draft_verification_state(page)
+            except Exception:
+                continue
+            if page_state.get("qrCount") or page_state.get("qrText"):
+                if "已扫码" in str(page_state.get("textTail") or ""):
+                    verification_broker.mark_verifying(request_id)
+                continue
+            verification_broker.succeed(request_id)
+            task_service.record_task_event(
+                int(task_id),
+                "wechat_verification_succeeded",
+                "微信验证成功，继续同一公众号保存草稿任务",
+            )
+            await asyncio.sleep(1)
+            return
+        verification_broker.fail(request_id, "等待微信验证超时，保存草稿已安全停止")
+        raise WechatDraftError(
+            "等待微信验证超时，保存草稿已安全停止",
+            error_code="login_required",
+        )
+    finally:
+        verification_broker.clear(request_id)
+
+
+async def _handle_draft_verification_if_present(page, task_id: int) -> None:
+    """给平台少量时间呈现验证层；没有验证时继续草稿回读。"""
+
+    for _ in range(12):
+        await asyncio.sleep(0.25)
+        try:
+            state = await _draft_verification_state(page)
+        except Exception:
+            continue
+        if state.get("qrCount") or state.get("qrText"):
+            await _handle_draft_qr_verification(page, task_id)
+            return
 
 
 async def _open_draft_list(page) -> None:
@@ -266,6 +450,7 @@ async def run_wechat_draft(payload: dict[str, Any], *, task_id: int) -> dict[str
                     error_code="save_control_ambiguous",
                 ) from exc
             await save_button.click(timeout=10_000)
+            await _handle_draft_verification_if_present(page, task_id)
             await _open_draft_list(page)
             list_account = await account_service._detect_display_name(page, 10)
             if list_account != expected_account:

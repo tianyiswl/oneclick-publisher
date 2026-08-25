@@ -158,6 +158,18 @@ class WechatVerificationBroker:
         with self._lock:
             return self._task_requests.get(int(task_id))
 
+    def pending_task_ids(self) -> tuple[int, ...]:
+        """返回仍需前台处理的任务号，不暴露二维码或请求内容。"""
+
+        with self._lock:
+            pending = [
+                task_id
+                for task_id, request_id in self._task_requests.items()
+                if (request := self._requests.get(request_id)) is not None
+                and request.state not in TERMINAL_STATES
+            ]
+        return tuple(sorted(pending))
+
     def _get(self, request_id: str) -> VerificationRequest:
         with self._lock:
             request = self._requests.get(str(request_id))

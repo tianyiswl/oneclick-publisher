@@ -752,8 +752,9 @@ class PublishPage(QWidget):
                     "启用硅基进化草稿桥",
                     "启用后，一键发只会把已冻结内容保存到“硅基进化”公众号草稿箱，"
                     "不会发表、群发，也不会设置定时发表。\n\n"
-                    "遇到登录失效、扫码验证、未知提示、账号或字段不一致时，"
-                    "任务会停止，不会猜测或自动重试。是否启用？",
+                    "遇到扫码验证时任务会暂停，并只在一键发原生窗口等待扫码；"
+                    "登录失效、取消验证、未知提示、账号或字段不一致时会安全停止。"
+                    "是否启用？",
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                     QMessageBox.StandardButton.No,
                 )
@@ -775,8 +776,12 @@ class PublishPage(QWidget):
         if (
             not self.wechat_draft_queue_enabled.isChecked()
             or self._wechat_draft_bridge_root is None
-            or self.wechat_draft_queue_tasks.is_running("wechat_draft_queue")
         ):
+            return
+        if self.wechat_draft_queue_tasks.is_running("wechat_draft_queue"):
+            pending = wechat_verification_broker.pending_task_ids()
+            if pending:
+                self._show_wechat_verification_for_task(pending[0])
             return
         bridge_root = self._wechat_draft_bridge_root
 
@@ -5315,9 +5320,14 @@ class PublishPage(QWidget):
 
         if not self.active_task_id:
             return
-        request_id = wechat_verification_broker.request_for_task(self.active_task_id)
+        self._show_wechat_verification_for_task(self.active_task_id)
+
+    def _show_wechat_verification_for_task(self, task_id: int) -> None:
+        """为手动发布或本地草稿队列显示同一个原生扫码窗口。"""
+
+        request_id = wechat_verification_broker.request_for_task(int(task_id))
         if not request_id:
-            self.log.append("[error] 微信验证请求不存在，发布已保持暂停")
+            self.log.append("[error] 微信验证请求不存在，当前任务已保持暂停")
             return
         if self._wechat_verification_dialog:
             self._wechat_verification_dialog.raise_()
