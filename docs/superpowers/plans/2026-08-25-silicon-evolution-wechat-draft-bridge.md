@@ -97,13 +97,13 @@ def test_enqueue_writes_only_a_frozen_delivered_package(tmp_path):
 
 def test_receipt_requires_matching_article_and_sha(tmp_path):
     receipt = write_receipt(tmp_path, article_id="WX-other", package_sha256=frozen_sha256)
-    with pytest.raises(DraftBridgeError, match="文章 ID"):
+    with self.assertRaisesRegex(DraftBridgeError, "文章 ID"):
         record_wechat_draft_receipt(store, receipt, run_id="draft-readback:test")
 ```
 
 - [ ] **Step 2: Run the two tests and verify failure**
 
-Run: `tools/wechat_operator/.venv/bin/python -m pytest tools/wechat_operator/tests/test_draft_bridge.py -q`
+Run: `cd tools/wechat_operator && .venv/bin/python -m unittest discover -s tests -p 'test_draft_bridge.py'`
 
 Expected: import failure because `draft_bridge` does not exist.
 
@@ -137,7 +137,7 @@ wechat-operator --state-db data/runtime/v12-state.db record-wechat-draft-receipt
 
 - [ ] **Step 5: Run tests and commit only content-operator files**
 
-Run: `tools/wechat_operator/.venv/bin/python -m pytest tools/wechat_operator/tests/test_draft_bridge.py tools/wechat_operator/tests/test_cli_draft_bridge.py -q`
+Run: `cd tools/wechat_operator && .venv/bin/python -m unittest discover -s tests -p 'test_draft_bridge.py'`, then run `cd tools/wechat_operator && .venv/bin/python -m unittest discover -s tests -p 'test_cli_draft_bridge.py'`.
 
 Expected: PASS. Commit from the `tools/wechat_operator` repository only with `feat: add wechat draft bridge receipts`.
 
@@ -354,7 +354,7 @@ def test_matching_queue_receipt_records_draft_evidence_without_publication_state
 
 - [ ] **Step 2: Run test and verify failure until the task-1 interface is wired**
 
-Run: `tools/wechat_operator/.venv/bin/python -m pytest tools/wechat_operator/tests/test_draft_bridge.py -q`
+Run: `cd tools/wechat_operator && .venv/bin/python -m unittest discover -s tests -p 'test_draft_bridge.py'`
 
 Expected: FAIL until the daily orchestrator and receipt commands use the Task 1 interfaces.
 
@@ -368,7 +368,7 @@ Update both READMEs to say: `draft_readback_confirmed` proves only a backend dra
 
 - [ ] **Step 5: Run cross-project checks and commit separately**
 
-Run in content project: `tools/wechat_operator/.venv/bin/python -m pytest tools/wechat_operator/tests/test_draft_bridge.py tools/wechat_operator/tests/test_cli_draft_bridge.py -q`
+Run in content project: `cd tools/wechat_operator && .venv/bin/python -m unittest discover -s tests -p 'test_draft_bridge.py'`, then run `cd tools/wechat_operator && .venv/bin/python -m unittest discover -s tests -p 'test_cli_draft_bridge.py'`.
 
 Run in one-click integration worktree: `.venv/bin/python -m unittest -v test_silicon_evolution_draft_package test_wechat_draft_queue test_wechat_draft_executor test_wechat_publish_executor test_wechat_preflight test_publish_service`
 
