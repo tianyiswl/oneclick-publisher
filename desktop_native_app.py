@@ -35,6 +35,7 @@ from app_core import (
 from app_core.release_integrity import verify_release_artifact
 from app_core.branding import APP_ICON_RELATIVE_PATH, APP_TITLE, APP_VERSION, PRODUCT_NAME
 from app_core.database import ensure_schema
+from app_core.paths import WECHAT_DRAFT_BRIDGE_DIR
 from ui.common import apply_style
 from ui.main_window import LicenseDialog, MainWindow
 from ui.runtime_log import install_runtime_log_capture
@@ -81,6 +82,7 @@ def run_ui_test() -> None:
     configure_application(app)
     apply_style(app)
     window = MainWindow()
+    window.publish.configure_wechat_draft_queue(WECHAT_DRAFT_BRIDGE_DIR)
     window.show()
     app.processEvents()
     print("NATIVE_DESKTOP_UI_OK")

@@ -57,6 +57,7 @@ from app_core import (
     task_service,
     video_channel_location_service,
     wechat_content_bundle,
+    wechat_draft_queue,
     wechat_location_service,
     wechat_publish_policy,
     oneclick_capabilities,
@@ -486,6 +487,12 @@ class PublishPage(QWidget):
         self.collection_tasks = BackgroundTaskRunner(self)
         self.location_tasks = BackgroundTaskRunner(self)
         self.account_health_tasks = BackgroundTaskRunner(self)
+        self.wechat_draft_queue_tasks = BackgroundTaskRunner(self)
+        self._wechat_draft_bridge_root: Path | None = None
+        self._wechat_draft_queue_confirmation_accepted = False
+        self.wechat_draft_queue_timer = QTimer(self)
+        self.wechat_draft_queue_timer.setInterval(15_000)
+        self.wechat_draft_queue_timer.timeout.connect(self._poll_wechat_draft_queue)
         self._xhs_selected_location: dict[str, object] = {}
         self._xhs_location_generation = 0
         self._xhs_location_context_signature: tuple[object, ...] | None = None
@@ -621,6 +628,29 @@ class PublishPage(QWidget):
         mode_layout.addWidget(self.start_btn)
         layout.addWidget(mode_bar)
 
+        draft_bridge_bar = QFrame()
+        draft_bridge_bar.setProperty("toolbar", True)
+        draft_bridge_layout = QHBoxLayout(draft_bridge_bar)
+        draft_bridge_layout.setContentsMargins(12, 7, 12, 7)
+        draft_bridge_layout.setSpacing(10)
+        self.wechat_draft_queue_enabled = QCheckBox(
+            "启用硅基进化自动保存草稿（不会发表）"
+        )
+        self.wechat_draft_queue_enabled.setChecked(False)
+        self.wechat_draft_queue_enabled.setToolTip(
+            "只读取本机冻结内容包并保存到硅基进化公众号草稿箱；"
+            "不会发表、群发或设置定时发表。"
+        )
+        self.wechat_draft_queue_enabled.toggled.connect(
+            self._wechat_draft_queue_toggled
+        )
+        draft_bridge_layout.addWidget(self.wechat_draft_queue_enabled)
+        self.wechat_draft_queue_status = QLabel("草稿桥：未启用")
+        self.wechat_draft_queue_status.setProperty("role", "muted")
+        draft_bridge_layout.addWidget(self.wechat_draft_queue_status)
+        draft_bridge_layout.addStretch()
+        layout.addWidget(draft_bridge_bar)
+
         template_bar = QFrame()
         template_bar.setProperty("toolbar", True)
         template_layout = QHBoxLayout(template_bar)
@@ -698,6 +728,90 @@ class PublishPage(QWidget):
         self.restore_publish_content(show_message=False)
         self._sync_content_type_interface()
         self.workflow_stack.setCurrentWidget(self.type_selector_page)
+
+    def configure_wechat_draft_queue(self, bridge_root: Path) -> None:
+        """配置本地草稿桥目录；配置本身不启用扫描。"""
+
+        self._wechat_draft_bridge_root = Path(bridge_root)
+
+    def _wechat_draft_queue_toggled(self, enabled: bool) -> None:
+        if enabled:
+            if self._wechat_draft_bridge_root is None:
+                QMessageBox.warning(
+                    self,
+                    "无法启用草稿桥",
+                    "本地草稿桥目录尚未配置，程序不会读取或提交任何内容。",
+                )
+                self.wechat_draft_queue_enabled.blockSignals(True)
+                self.wechat_draft_queue_enabled.setChecked(False)
+                self.wechat_draft_queue_enabled.blockSignals(False)
+                return
+            if not self._wechat_draft_queue_confirmation_accepted:
+                answer = QMessageBox.question(
+                    self,
+                    "启用硅基进化草稿桥",
+                    "启用后，一键发只会把已冻结内容保存到“硅基进化”公众号草稿箱，"
+                    "不会发表、群发，也不会设置定时发表。\n\n"
+                    "遇到登录失效、扫码验证、未知提示、账号或字段不一致时，"
+                    "任务会停止，不会猜测或自动重试。是否启用？",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    self.wechat_draft_queue_enabled.blockSignals(True)
+                    self.wechat_draft_queue_enabled.setChecked(False)
+                    self.wechat_draft_queue_enabled.blockSignals(False)
+                    self.wechat_draft_queue_status.setText("草稿桥：未启用")
+                    return
+                self._wechat_draft_queue_confirmation_accepted = True
+            self.wechat_draft_queue_status.setText("草稿桥：已启用，等待本地交接")
+            self.wechat_draft_queue_timer.start()
+            self._poll_wechat_draft_queue()
+            return
+        self.wechat_draft_queue_timer.stop()
+        self.wechat_draft_queue_status.setText("草稿桥：未启用")
+
+    def _poll_wechat_draft_queue(self) -> None:
+        if (
+            not self.wechat_draft_queue_enabled.isChecked()
+            or self._wechat_draft_bridge_root is None
+            or self.wechat_draft_queue_tasks.is_running("wechat_draft_queue")
+        ):
+            return
+        bridge_root = self._wechat_draft_bridge_root
+
+        def run_queue():
+            return wechat_draft_queue.process_wechat_draft_inbox(
+                bridge_root / "inbox",
+                bridge_root / "receipts",
+                enabled=True,
+            )
+
+        def on_success(results: list[wechat_draft_queue.DraftQueueResult]) -> None:
+            if not results:
+                self.wechat_draft_queue_status.setText("草稿桥：已启用，等待本地交接")
+                return
+            latest = results[-1]
+            if latest.status == "draft_readback_confirmed":
+                self.wechat_draft_queue_status.setText(
+                    f"草稿桥：{latest.article_id} 已由草稿列表回读"
+                )
+            else:
+                self.wechat_draft_queue_status.setText(
+                    f"草稿桥：{latest.article_id} 已停止（{latest.error_code}）"
+                )
+
+        self.wechat_draft_queue_tasks.run(
+            "wechat_draft_queue",
+            run_queue,
+            on_started=lambda: self.wechat_draft_queue_status.setText(
+                "草稿桥：正在检查本地交接"
+            ),
+            on_success=on_success,
+            on_error=lambda message: self.wechat_draft_queue_status.setText(
+                f"草稿桥：本地检查失败（{message}）"
+            ),
+        )
 
     def _mark_ai_declaration_explicitly_confirmed(self, checked: bool) -> None:
         """只把用户亲自点击视为平台 AI 声明授权。"""
