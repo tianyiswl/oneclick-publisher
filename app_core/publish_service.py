@@ -30,6 +30,7 @@ from . import (
     task_service,
     video_channel_location_service,
     wechat_location_service,
+    wechat_draft_executor,
     wechat_publish_executor,
     wechat_publish_policy,
     xhs_location_service,
@@ -372,6 +373,10 @@ def _validate_payloads(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     raise ValueError("小红书已开启定时发布，但未设置发布时间")
             else:
                 wechat_publish_policy.normalize_wechat_publish_preferences(payload)
+        elif runtime_mode == "wechat_draft":
+            if platform_type != 10:
+                raise ValueError("公众号草稿任务只能包含一个公众号账号")
+            wechat_draft_executor.validate_wechat_draft_payload(payload)
         elif runtime_mode == "draft":
             if platform_type not in {2, 5}:
                 raise ValueError(
@@ -670,65 +675,48 @@ def _run_publish(task: dict, payloads: list[dict[str, Any]]) -> None:
 
 def _run_draft(task: dict, payloads: list[dict[str, Any]]) -> None:
     """执行已接入并可回读的国内平台草稿保存。"""
-
     if not _publish_lock.acquire(blocking=False):
-        task_service.mark_platform_result(
-            task["id"],
-            int(payloads[0]["type"]),
-            ok=False,
-            message="已有发布任务正在执行，请稍后重试",
-            content_type=str(payloads[0].get("contentType") or ""),
-            event_type="platform_draft",
-        )
+        task_service.mark_platform_result(task["id"], int(payloads[0]["type"]), ok=False, message="已有发布任务正在执行，请稍后重试", content_type=str(payloads[0].get("contentType") or ""), event_type="platform_draft")
         _active_threads.pop(int(task["id"]), None)
         return
     try:
-        task_service.mark_task_running(
-            task["id"], "一键发开始执行受控平台草稿保存"
-        )
+        task_service.mark_task_running(task["id"], "一键发开始执行受控平台草稿保存")
         results = post_video_batch_draft_tabs(payloads)
         by_platform: dict[int, list[dict[str, Any]]] = {}
         for result in results or []:
             try:
-                result_type = int(result.get("type") or 0)
+                by_platform.setdefault(int(result.get("type") or 0), []).append(result)
             except (AttributeError, TypeError, ValueError):
                 continue
-            by_platform.setdefault(result_type, []).append(result)
         for payload in payloads:
             platform_type = int(payload["type"])
-            platform_results = by_platform.get(platform_type, [])
-            failed = [
-                item for item in platform_results if item.get("ok") is False
-            ]
-            ok = bool(platform_results) and not failed
-            message = (
-                str(failed[0].get("message") or "平台草稿保存失败")
-                if failed
-                else "平台已返回可验证的草稿保存结果"
-                if ok
-                else "平台草稿执行器未返回可验证结果"
-            )
-            task_service.mark_platform_result(
-                task["id"],
-                platform_type,
-                ok=ok,
-                message=message,
-                content_type=str(payload.get("contentType") or ""),
-                event_type="platform_draft",
-            )
+            items = by_platform.get(platform_type, [])
+            failed = [item for item in items if item.get("ok") is False]
+            message = str(failed[0].get("message") or "平台草稿保存失败") if failed else "平台已返回可验证的草稿保存结果" if items else "平台草稿执行器未返回可验证结果"
+            task_service.mark_platform_result(task["id"], platform_type, ok=bool(items) and not failed, message=message, content_type=str(payload.get("contentType") or ""), event_type="platform_draft")
     except Exception as exc:
-        task_service.mark_platform_result(
-            task["id"],
-            int(payloads[0]["type"]),
-            ok=False,
-            message=f"平台草稿异常：{type(exc).__name__}：{exc}",
-            content_type=str(payloads[0].get("contentType") or ""),
-            event_type="platform_draft",
-        )
+        task_service.mark_platform_result(task["id"], int(payloads[0]["type"]), ok=False, message=f"平台草稿异常：{type(exc).__name__}：{exc}", content_type=str(payloads[0].get("contentType") or ""), event_type="platform_draft")
     finally:
         _publish_lock.release()
         _active_threads.pop(int(task["id"]), None)
 
+
+def _run_wechat_draft(task: dict, payloads: list[dict[str, Any]]) -> None:
+    """独立运行公众号草稿；绝不复用正式发表或通用草稿路径。"""
+    payload = payloads[0]
+    if not _publish_lock.acquire(blocking=False):
+        task_service.mark_platform_result(task["id"], 10, ok=False, message="已有发布任务正在执行，请稍后重试", content_type=str(payload.get("contentType") or ""), event_type="platform_draft")
+        _active_threads.pop(int(task["id"]), None)
+        return
+    try:
+        task_service.mark_task_running(task["id"], "一键发开始保存硅基进化公众号草稿")
+        result = wechat_draft_executor.run_wechat_draft_sync(payload, task_id=int(task["id"]))
+        task_service.mark_platform_result(task["id"], 10, ok=bool(result.get("ok")), message=str(result.get("message") or "公众号草稿未取得回读"), content_type=str(payload.get("contentType") or ""), event_type="platform_draft")
+    except Exception as exc:
+        task_service.mark_platform_result(task["id"], 10, ok=False, message=_failure_message("公众号草稿异常", exc, platform_type=10), content_type=str(payload.get("contentType") or ""), event_type="platform_draft")
+    finally:
+        _publish_lock.release()
+        _active_threads.pop(int(task["id"]), None)
 
 def start_desktop_publish(payloads: list[dict[str, Any]]) -> dict:
     """按载荷启动预检或已确认的公众号正式发布任务。"""
@@ -768,6 +756,7 @@ def start_desktop_publish(payloads: list[dict[str, Any]]) -> dict:
         raise ValueError("同一任务不能混合预检与正式发布")
     is_publish = runtime_mode == "publish"
     is_draft = runtime_mode == "draft"
+    is_wechat_draft = runtime_mode == "wechat_draft"
     task = task_service.create_pending_task(
         prepared,
         mode=(
@@ -775,15 +764,17 @@ def start_desktop_publish(payloads: list[dict[str, Any]]) -> dict:
             if is_publish
             else "oneclick_draft"
             if is_draft
+            else "oneclick_wechat_draft"
+            if is_wechat_draft
             else "oneclick_preflight"
         ),
     )
     worker = threading.Thread(
-        target=_run_publish if is_publish else _run_draft if is_draft else _run_preflight,
+        target=_run_publish if is_publish else _run_wechat_draft if is_wechat_draft else _run_draft if is_draft else _run_preflight,
         args=(task, prepared),
         daemon=True,
         name=(
-            f"oneclick-{'publish' if is_publish else 'draft' if is_draft else 'preflight'}-"
+            f"oneclick-{'publish' if is_publish else 'wechat-draft' if is_wechat_draft else 'draft' if is_draft else 'preflight'}-"
             f"{task['id']}"
         ),
     )
