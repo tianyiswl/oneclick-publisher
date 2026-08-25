@@ -17,7 +17,11 @@ import threading
 from typing import Any
 
 from . import database
-from .douyin_location_search_plan import LocationSearchPlan
+from .douyin_location_search_plan import (
+    MUNICIPALITIES,
+    PROVINCE_CITIES,
+    LocationSearchPlan,
+)
 
 
 LOCATION_STATUS_REUSABLE = "reusable"
@@ -42,6 +46,8 @@ _LOCATION_REGION_PREFIXES = tuple(
             "河南", "湖北", "湖南", "广东", "海南", "四川",
             "贵州", "云南", "陕西", "甘肃", "青海", "台湾",
             "内蒙古", "广西", "西藏", "宁夏", "新疆", "香港", "澳门",
+            *MUNICIPALITIES,
+            *(city for cities in PROVINCE_CITIES.values() for city in cities),
         },
         key=len,
         reverse=True,
@@ -328,8 +334,11 @@ def save_location_search_plan(
 
     safe_query = _query(query)
     safe_total = _eligible_total(eligible_total)
+    payload = _search_plan_payload(plan)
+    if payload["originalKeyword"] != safe_query.keyword:
+        raise DouyinLocationCacheError("地点搜索进度计划关键词不匹配")
     payload_json = json.dumps(
-        _search_plan_payload(plan),
+        payload,
         ensure_ascii=False,
         separators=(",", ":"),
         sort_keys=True,
@@ -385,7 +394,10 @@ def load_location_search_plan(query: LocationCacheQuery) -> LocationSearchPlan |
         payload = json.loads(row["planJson"])
     except (TypeError, json.JSONDecodeError) as error:
         raise DouyinLocationCacheError("地点搜索进度 JSON 无效") from error
-    return _plan_from_payload(payload)
+    plan = _plan_from_payload(payload)
+    if plan.original_keyword != safe_query.keyword:
+        raise DouyinLocationCacheError("地点搜索进度计划关键词不匹配")
+    return plan
 
 
 def location_requires_revalidation(row: object, *, now: datetime | None = None) -> bool:
@@ -934,8 +946,6 @@ def merge_platform_locations_for_queries(
     ):
         raise DouyinLocationCacheError("地点缓存查询账号或范围不一致")
     normalized = _normalize_candidates_for_query(root_query, candidates)
-    for query in safe_queries[1:]:
-        _validate_candidates_for_query(query, normalized)
     current = _now(None)
     with database.connect() as conn:
         location_ids = _merge_candidates_in_connection(
@@ -944,11 +954,22 @@ def merge_platform_locations_for_queries(
             normalized,
             now=current,
         )
+        location_ids_by_identity = {
+            _candidate_identity(candidate): location_id
+            for candidate, location_id in zip(normalized, location_ids, strict=True)
+        }
         for query in safe_queries:
+            query_candidates = list(
+                filter_locations_for_search_keyword(query.keyword, normalized)
+            )
+            _validate_candidates_for_query(query, query_candidates)
             _associate_keywords_in_connection(
                 conn,
                 query,
-                location_ids,
+                [
+                    location_ids_by_identity[_candidate_identity(candidate)]
+                    for candidate in query_candidates
+                ],
                 now=current,
             )
     return get_cached_locations(root_query, excluded_identities=[])

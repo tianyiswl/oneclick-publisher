@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import json
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -201,6 +202,49 @@ class DouyinLocationCacheTests(unittest.TestCase):
                 self.location_query("7", "广东joymark", "all")
             )
         )
+
+    def test_progress_plan_keyword_must_match_its_cache_key(self) -> None:
+        cache_query = self.location_query("7", "广东joymark", "commission")
+        with self.assertRaisesRegex(DouyinLocationCacheError, "关键词"):
+            save_location_search_plan(
+                cache_query,
+                build_location_search_plan("广西joymark"),
+                eligible_total=0,
+            )
+
+        save_location_search_plan(
+            cache_query,
+            build_location_search_plan("广东joymark"),
+            eligible_total=0,
+        )
+        with database.connect() as conn:
+            row = conn.execute(
+                "SELECT planJson FROM douyin_location_search_progress"
+            ).fetchone()
+            payload = json.loads(row["planJson"])
+            payload["originalKeyword"] = "广西joymark"
+            conn.execute(
+                "UPDATE douyin_location_search_progress SET planJson = ?",
+                (json.dumps(payload, ensure_ascii=False),),
+            )
+        with self.assertRaisesRegex(DouyinLocationCacheError, "关键词"):
+            load_location_search_plan(cache_query)
+
+    def test_multi_query_association_keeps_foshan_out_of_guangzhou(self) -> None:
+        province = self.location_query("7", "广东joymark", "commission")
+        guangzhou = self.location_query("7", "广州joymark", "commission")
+        beijing = self.location_query("7", "北京joymark", "commission")
+        foshan_candidate = self.commission_candidate("gd-fs-1")
+        foshan_candidate["address"] = "广东省佛山市测试路1号"
+
+        merge_platform_locations_for_queries(
+            [province, guangzhou, beijing],
+            [foshan_candidate],
+        )
+
+        self.assertEqual(get_cached_locations(province, excluded_identities=[])["total"], 1)
+        self.assertEqual(get_cached_locations(guangzhou, excluded_identities=[])["total"], 0)
+        self.assertEqual(get_cached_locations(beijing, excluded_identities=[])["total"], 0)
 
     def test_invalid_progress_json_is_reported_instead_of_marked_complete(self) -> None:
         with database.connect() as conn:
