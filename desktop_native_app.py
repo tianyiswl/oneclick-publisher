@@ -21,7 +21,7 @@ if os.name == "nt" and QT_BIN_DIR.exists():
 
 from PyQt6.QtCore import QDate, QTime, QTimer
 from PyQt6.QtGui import QIcon
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QMessageBox
 
 from app_core import (
     account_service,
@@ -35,7 +35,8 @@ from app_core import (
 from app_core.release_integrity import verify_release_artifact
 from app_core.branding import APP_ICON_RELATIVE_PATH, APP_TITLE, APP_VERSION, PRODUCT_NAME
 from app_core.database import ensure_schema
-from app_core.paths import WECHAT_DRAFT_BRIDGE_DIR
+from app_core.paths import USER_DATA_DIR, WECHAT_DRAFT_BRIDGE_DIR
+from app_core.source_live_runtime import installed_gui_block_reason
 from ui.common import apply_style
 from ui.main_window import LicenseDialog, MainWindow
 from ui.runtime_log import install_runtime_log_capture
@@ -458,6 +459,18 @@ def main() -> int:
         ensure_schema()
         run_stdio_server()
         return 0
+    source_live_conflict = installed_gui_block_reason(
+        os.environ, USER_DATA_DIR / "source-live-session.json"
+    )
+    if source_live_conflict:
+        app = QApplication(sys.argv)
+        configure_application(app)
+        QMessageBox.warning(
+            None,
+            "正式客户端暂不能打开",
+            source_live_conflict + "，再重新打开正式客户端。",
+        )
+        return 2
     app = QApplication(sys.argv)
     configure_application(app)
     install_runtime_log_capture()

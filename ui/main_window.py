@@ -33,6 +33,7 @@ from PyQt6.QtWidgets import (
 
 from app_core import account_browser_service, activation_service
 from app_core.branding import APP_ICON_RELATIVE_PATH, APP_TITLE, APP_VERSION, UPGRADE_STORE
+from app_core.source_live_runtime import source_live_data_active
 from app_core.paths import AVATAR_DIR, COOKIE_DIR, DB_PATH, LOG_DIR, ROOT_DIR, VIDEO_DIR
 
 from .background_task import BackgroundTaskRunner
@@ -338,7 +339,12 @@ class AboutDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle(APP_TITLE)
+        self.source_live_mode = source_live_data_active()
+        self.setWindowTitle(
+            f"{APP_TITLE}｜源码联调（正式账号数据）"
+            if self.source_live_mode
+            else APP_TITLE
+        )
         self.resize(*DEFAULT_MAIN_WINDOW_SIZE)
         self.setMinimumSize(1180, 720)
         self._apply_initial_window_geometry()
@@ -530,9 +536,15 @@ class MainWindow(QMainWindow):
         local_badge_layout = QVBoxLayout(local_badge)
         local_badge_layout.setContentsMargins(12, 10, 12, 10)
         local_badge_layout.setSpacing(2)
-        local_title = QLabel("安全预检模式")
+        local_title = QLabel(
+            "源码联调模式" if self.source_live_mode else "安全预检模式"
+        )
         local_title.setObjectName("localWorkspaceTitle")
-        local_version = QLabel("最终发布需人工确认")
+        local_version = QLabel(
+            "共用正式账号数据 · 发布仍需确认"
+            if self.source_live_mode
+            else "最终发布需人工确认"
+        )
         local_version.setObjectName("localWorkspaceVersion")
         local_badge_layout.addWidget(local_title)
         local_badge_layout.addWidget(local_version)

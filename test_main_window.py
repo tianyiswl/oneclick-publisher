@@ -10,7 +10,7 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtGui import QCloseEvent
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QLabel
 
 from ui.main_window import MainWindow
 
@@ -75,6 +75,21 @@ class MainWindowShutdownTests(unittest.TestCase):
         self.assertFalse(event.isAccepted())
         stop_auto_checking.assert_not_called()
         close_all.assert_not_called()
+
+    def test_source_live_mode_is_unmistakable_in_window_and_sidebar(self) -> None:
+        """共用正式账号时若没有醒目标识，用户会把源码联调误认成正式客户端。"""
+
+        with patch.dict(os.environ, {"YIJIANFA_SOURCE_LIVE_DATA": "1"}):
+            window = MainWindow()
+        try:
+            runtime_title = window.findChild(QLabel, "localWorkspaceTitle")
+            runtime_detail = window.findChild(QLabel, "localWorkspaceVersion")
+            self.assertIn("源码联调", window.windowTitle())
+            self.assertEqual(runtime_title.text(), "源码联调模式")
+            self.assertEqual(runtime_detail.text(), "共用正式账号数据 · 发布仍需确认")
+        finally:
+            window.accounts.stop_auto_checking()
+            window.deleteLater()
 
     def test_data_monitor_is_a_real_page_and_shutdown_precedes_global_cleanup(self) -> None:
         """数据监测不能继续留在开发中，且采集任务必须先于全局浏览器关闭。"""

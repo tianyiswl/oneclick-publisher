@@ -38,7 +38,13 @@ class ContentProjectGatewayTests(unittest.TestCase):
             },
         ]
 
-    def _gateway(self, root: Path, submitted: list[dict]) -> ContentProjectGateway:
+    def _gateway(
+        self,
+        root: Path,
+        submitted: list[dict],
+        *,
+        runtime_conflict_checker=lambda: False,
+    ) -> ContentProjectGateway:
         return ContentProjectGateway(
             profile_store=PublishProfileStore(root / "publish-profiles.json"),
             accounts_provider=self._accounts,
@@ -62,6 +68,7 @@ class ContentProjectGatewayTests(unittest.TestCase):
                 "expiresAt": "2026-08-25T12:10:00+00:00",
                 "singleUse": True,
             },
+            runtime_conflict_checker=runtime_conflict_checker,
         )
 
     def test_account_catalog_never_exposes_login_session_paths(self) -> None:
@@ -195,6 +202,26 @@ class ContentProjectGatewayTests(unittest.TestCase):
                 )
 
         self.assertEqual(raised.exception.error_code, "content_project_schedule_mismatch")
+
+    def test_installed_mcp_cannot_start_platform_work_while_source_live_is_active(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            submitted: list[dict] = []
+            gateway = self._gateway(
+                Path(directory), submitted, runtime_conflict_checker=lambda: True
+            )
+            gateway.save_profile(
+                "silicon-exploration",
+                "硅基探索",
+                [{"platform": "抖音", "accountId": 31}],
+            )
+
+            with self.assertRaises(ContentProjectGatewayError) as raised:
+                gateway.preflight_content(
+                    "silicon-exploration", "/content/manifest.json"
+                )
+
+        self.assertEqual(raised.exception.error_code, "source_live_session_active")
+        self.assertEqual(submitted, [])
 
 
 if __name__ == "__main__":

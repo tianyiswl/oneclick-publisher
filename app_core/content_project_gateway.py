@@ -12,6 +12,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from . import account_service, controlled_publish, oneclick_capabilities
 from .paths import USER_DATA_DIR
+from .source_live_runtime import source_live_data_active, source_live_session_active
 
 
 PROFILE_SCHEMA_VERSION = 1
@@ -21,6 +22,12 @@ _PLATFORM_TYPE_BY_NAME = {
     oneclick_capabilities.canonical_platform(name): platform_type
     for platform_type, name in account_service.PLATFORMS.items()
 }
+
+
+def _source_live_conflict() -> bool:
+    return not source_live_data_active() and source_live_session_active(
+        USER_DATA_DIR / "source-live-session.json"
+    )
 
 
 class ContentProjectGatewayError(ValueError):
@@ -124,6 +131,7 @@ class ContentProjectGateway:
         submitter: Callable[[Mapping[str, Any]], dict[str, Any]] | None = None,
         status_reader: Callable[[int], dict[str, Any]] = controlled_publish.task_status,
         authorizer: Callable[[int], dict[str, Any]] = controlled_publish.authorize_completed_preflight,
+        runtime_conflict_checker: Callable[[], bool] = _source_live_conflict,
     ) -> None:
         self.profile_store = profile_store or PublishProfileStore()
         self.accounts_provider = accounts_provider
@@ -134,6 +142,14 @@ class ContentProjectGateway:
         self.submitter = submitter
         self.status_reader = status_reader
         self.authorizer = authorizer
+        self.runtime_conflict_checker = runtime_conflict_checker
+
+    def _ensure_platform_work_available(self) -> None:
+        if self.runtime_conflict_checker():
+            raise ContentProjectGatewayError(
+                "source_live_session_active",
+                "源码联调客户端正在共用正式账号数据，请先关闭后再创建平台任务",
+            )
 
     def _account_rows(self) -> list[dict[str, Any]]:
         return [dict(row) for row in self.accounts_provider()]
@@ -272,6 +288,7 @@ class ContentProjectGateway:
         manifest_path: str,
         schedules: Mapping[str, object] | None = None,
     ) -> dict[str, Any]:
+        self._ensure_platform_work_available()
         return self.submitter(
             self._request(project_id, manifest_path, "preflight", schedules)
         )
@@ -285,6 +302,7 @@ class ContentProjectGateway:
         authorization_id: str,
         schedules: Mapping[str, object] | None = None,
     ) -> dict[str, Any]:
+        self._ensure_platform_work_available()
         if (
             type(confirmed_preflight_task_id) is not int
             or confirmed_preflight_task_id <= 0
