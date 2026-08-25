@@ -286,6 +286,21 @@ def ensure_schema() -> None:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS douyin_location_search_progress (
+                accountId TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                keyword TEXT NOT NULL,
+                commissionFilter TEXT NOT NULL,
+                planJson TEXT NOT NULL,
+                eligibleTotal INTEGER NOT NULL
+                    CHECK(eligibleTotal >= 0 AND eligibleTotal <= 100),
+                updatedAt TEXT NOT NULL,
+                PRIMARY KEY(accountId, scope, keyword, commissionFilter)
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS douyin_location_cache_keywords (
                 locationCacheId INTEGER NOT NULL,
                 accountId TEXT NOT NULL,
