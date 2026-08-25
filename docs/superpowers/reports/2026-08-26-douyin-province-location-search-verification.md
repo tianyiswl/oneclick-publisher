@@ -8,7 +8,7 @@
 
 ## 验证证据
 
-- 基线：`e10a69dd60716402f731ba5d97d502bbeab052a6`（修复了先前两条旧状态断言）。
+- 后修复验证基线：`ee53940b1edca45bf64c37ae1057ece1ce5b746b`（最终复审已批准合入）。
 - Source version: `0.5.10`。
 - Focused tests:
 
@@ -16,21 +16,21 @@
   QT_QPA_PLATFORM=offscreen ../../.venv/bin/python -m unittest -v test_douyin_location_search_plan test_douyin_location_cache test_douyin_commerce_service.DouyinCommerceBatchUiTests
   ```
 
-  结果：`245` 项，PASS（`15.645s`）。
+  结果：`259` 项，PASS（`16.392s`）。
 - Affected modules:
 
   ```text
   QT_QPA_PLATFORM=offscreen ../../.venv/bin/python -m unittest -v test_douyin_commerce_collectors test_douyin_commerce_setup_state test_douyin_commerce_batch_draft_service test_douyin_commerce_service test_douyin_location_cache
   ```
 
-  结果：`728` 项，PASS（`52.797s`）。
+  结果：`750` 项，PASS（`53.757s`）。
 - Full suite:
 
   ```text
   QT_QPA_PLATFORM=offscreen ../../.venv/bin/python -m unittest discover -v
   ```
 
-  结果：`1989` 项，PASS（`77.161s`）。
+  结果：`2012` 项，PASS（`77.989s`）。
 - Source client self-check:
 
   ```text
@@ -55,7 +55,7 @@
 
 - `APP_VERSION` 已从 `0.5.9` 递增为 `0.5.10`。
 - `SOURCE_OF_TRUTH.md` 已标明本轮仅有源码/本地离线证据，未把历史 `0.5.9` 安装包证据写成 `0.5.10` 打包证据。
-- 自检确认测试记录使用本轮实际计数，未复用历史 `1940/1940`；没有触碰真实账号、发布、打包或安装。
+- 自检确认测试记录使用后修复本轮实际计数，未复用历史 `1940/1940`；没有触碰真实账号、发布、打包或安装。
 
 ## 剩余真实检查
 
