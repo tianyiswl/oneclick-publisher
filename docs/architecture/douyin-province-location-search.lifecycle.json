@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "diagram_type": "lifecycle",
+  "meta": {
+    "title": "抖音省份地点搜索与加载更多生命周期",
+    "output": "docs/architecture/douyin-province-location-search.lifecycle.html",
+    "viewBox": [1320, 760],
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "main_search",
+        "label": "一次搜索",
+        "focus": ["request", "build_plan", "platform_query", "merge_candidates", "waiting_click"],
+        "note": "省份词先建立城市计划，再按需查询；城市词保持单城市搜索。"
+      },
+      {
+        "id": "load_more",
+        "label": "加载更多",
+        "focus": ["waiting_click", "platform_query", "merge_candidates", "retryable", "completed"],
+        "note": "每次点击持续推进，直到出现新有效地址、达到本次时限或全部完成。"
+      },
+      {
+        "id": "cache_resume",
+        "label": "缓存续跑",
+        "focus": ["build_plan", "platform_query", "merge_candidates", "waiting_click"],
+        "note": "缓存保存原始搜索词、子搜索词和进度，重启后从未完成位置继续。"
+      }
+    ]
+  },
+  "lanes": [
+    {"id": "main", "label": "省份搜索主流程"},
+    {"id": "recovery", "label": "无有效新增时继续"},
+    {"id": "terminal", "label": "明确结束"}
+  ],
+  "states": [
+    {"id": "request", "type": "start", "label": "输入搜索词", "sublabel": "省份、城市或普通店名", "lane": "main", "col": 0, "step": "01"},
+    {"id": "build_plan", "type": "active", "label": "建立查询计划", "sublabel": "识别层级并恢复缓存进度", "lane": "main", "col": 1, "step": "02"},
+    {"id": "platform_query", "type": "external", "label": "查询抖音地点", "sublabel": "当前子词与当前分页", "lane": "main", "col": 2, "step": "03"},
+    {"id": "merge_candidates", "type": "decision", "label": "过滤合并", "sublabel": "地区、返佣、身份去重", "lane": "main", "col": 3, "step": "04"},
+    {"id": "waiting_click", "type": "waiting", "label": "展示结果并等待", "sublabel": "保存候选、城市和分页进度", "lane": "main", "col": 4, "step": "05"},
+    {"id": "retryable", "type": "failure", "label": "当前批次无有效新增", "sublabel": "推进下一页或下一城市", "lane": "recovery", "col": 0, "tag": "可恢复"},
+    {"id": "completed", "type": "success", "label": "省份搜索完成", "sublabel": "全部城市或100个有效地点", "lane": "terminal", "col": 2, "tag": "终态"}
+  ],
+  "transitions": [
+    {"from": "request", "to": "build_plan", "variant": "emphasis", "route": "straight", "fromSide": "right", "toSide": "left"},
+    {"from": "build_plan", "to": "platform_query", "variant": "emphasis", "route": "straight", "fromSide": "right", "toSide": "left"},
+    {"from": "platform_query", "to": "merge_candidates", "variant": "emphasis", "route": "straight", "fromSide": "right", "toSide": "left"},
+    {"from": "merge_candidates", "to": "waiting_click", "label": "有新的有效地点", "variant": "emphasis", "route": "straight", "fromSide": "right", "toSide": "left", "labelAt": [633, 110]},
+    {"from": "merge_candidates", "to": "retryable", "label": "无新增但仍可继续", "variant": "dashed", "labelAt": [470, 202]},
+    {"from": "retryable", "to": "platform_query", "label": "下一页或下一城市", "variant": "emphasis", "labelDy": 20},
+    {"from": "merge_candidates", "to": "completed", "label": "全部完成或达到100个", "variant": "emphasis"},
+    {"from": "waiting_click", "to": "platform_query", "label": "点击加载更多", "variant": "emphasis", "fromSide": "top", "toSide": "top", "via": [[710, 80], [402, 80]], "labelAt": [556, 68]}
+  ],
+  "cards": [
+    {"dot": "cyan", "title": "省份与城市不同", "items": ["城市词只查询当前城市", "省份词生成覆盖全部地级市的子查询计划", "普通店名仍沿用全国文本搜索"]},
+    {"dot": "emerald", "title": "有效新增才算进度", "items": ["外省、无佣和重复地点不增加展示数量", "空批次只推进分页或城市，不终止整个省份搜索", "每次点击至少新增、超时返回或明确完成"]},
+    {"dot": "amber", "title": "缓存可恢复", "items": ["原始省份词和城市子词保持独立缓存", "同一地点可关联省份总缓存和来源城市缓存", "客户端重启后不重复从第一个城市开始"]}
+  ]
+}
