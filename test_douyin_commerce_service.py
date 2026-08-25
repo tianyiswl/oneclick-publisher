@@ -18785,9 +18785,112 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         ) as close_generation:
             self.page._start_setup_generation({"accountId": 31})
 
-        close_generation.assert_called_once_with(None, reason="operation_failed")
+        self.assertEqual(close_generation.call_count, 2)
+        close_generation.assert_called_with(None, reason="operation_failed")
         self.assertEqual(self.page._setup_generation_id, "")
         self.assertIn("collector_start_failed", self.page.platform_review_status.text())
+
+    def test_generation_start_failure_retries_once_after_strict_cleanup(self) -> None:
+        """瞬态启动失败在零存活回读后自动恢复，不要求用户重启客户端。"""
+
+        self.page.runner = self._InlineRunner()
+        started = self._collector_status()
+        with patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.begin_generation",
+            side_effect=[
+                douyin_commerce_collectors.DouyinCommerceCollectorError(
+                    "collector_start_failed"
+                ),
+                started,
+            ],
+        ) as begin_generation, patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.close_generation",
+            return_value={
+                "closed": True,
+                "setupGenerationId": "",
+                "aliveCollectorCount": 0,
+            },
+        ) as close_generation, patch.object(self.page, "_go_to_step") as go_to_step:
+            self.page._start_setup_generation({"accountId": 31})
+
+        self.assertEqual(begin_generation.call_count, 2)
+        close_generation.assert_called_once_with(None, reason="operation_failed")
+        self.assertEqual(self.page._setup_generation_id, "generation-a")
+        go_to_step.assert_called_once_with(1)
+
+    def test_generation_start_failure_stops_after_one_retry_with_visible_code(self) -> None:
+        """自动恢复仍失败时必须结束，且把固定错误码和执行日志交给用户。"""
+
+        self.page.runner = self._InlineRunner()
+        failure = douyin_commerce_collectors.DouyinCommerceCollectorError(
+            "collector_start_failed"
+        )
+        with patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.begin_generation",
+            side_effect=[failure, failure],
+        ) as begin_generation, patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.close_generation",
+            return_value={
+                "closed": True,
+                "setupGenerationId": "",
+                "aliveCollectorCount": 0,
+            },
+        ) as close_generation:
+            self.page._start_setup_generation({"accountId": 31})
+
+        self.assertEqual(begin_generation.call_count, 2)
+        self.assertEqual(close_generation.call_count, 2)
+        self.assertIn(
+            "collector_start_failed",
+            self.page._stage_error_labels["content"].text(),
+        )
+        self.assertNotIn(
+            "核对账号、视频和作品文案",
+            self.page._stage_error_labels["content"].text(),
+        )
+        self.assertFalse(self.page.content_execution_log.isHidden())
+
+    def test_generation_start_failure_never_retries_without_zero_alive_proof(self) -> None:
+        """关闭结果不完整时必须停止，不能在旧采集器可能存活时再启动。"""
+
+        self.page.runner = self._InlineRunner()
+        with patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.begin_generation",
+            side_effect=douyin_commerce_collectors.DouyinCommerceCollectorError(
+                "collector_start_failed"
+            ),
+        ) as begin_generation, patch(
+            "ui.douyin_commerce_page.douyin_commerce_collectors.commerce_collector_manager.close_generation",
+            return_value={
+                "closed": False,
+                "setupGenerationId": "generation-uncertain",
+                "aliveCollectorCount": 1,
+            },
+        ) as close_generation:
+            self.page._start_setup_generation({"accountId": 31})
+
+        self.assertEqual(begin_generation.call_count, 1)
+        self.assertEqual(close_generation.call_count, 1)
+        self.assertIn(
+            "cleanup_incomplete",
+            self.page._stage_error_labels["content"].text(),
+        )
+        self.assertIsNone(self.page._setup_retry_payload)
+
+    def test_clearing_content_error_hides_execution_log_again(self) -> None:
+        """内容阶段恢复后不长期占用页面空间。"""
+
+        self.page._set_stage_error("content", "cleanup_incomplete")
+
+        self.assertIn(
+            "cleanup_incomplete",
+            self.page._stage_error_labels["content"].text(),
+        )
+        self.assertFalse(self.page.content_execution_log.isHidden())
+
+        self.page._clear_stage_error("content")
+
+        self.assertTrue(self.page.content_execution_log.isHidden())
 
     def test_close_setup_generation_without_active_generation_is_already_closed(self) -> None:
         """无活动代际时关闭是幂等成功，不应调用平台协调器。"""
@@ -19186,7 +19289,7 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
                 operation.assert_not_called()
 
     def test_operation_failed_close_refreshes_only_after_runner_removes_active_key(self) -> None:
-        """异常关闭的 finished 刷新必须发生在 key 删除后，恢复被 busy 禁用的控件。"""
+        """关闭任务退出后才自动恢复；第二次失败收口后解除 busy。"""
 
         runner = self._ControlledLifecycleRunner()
         self.page.runner = runner
@@ -19205,6 +19308,16 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
 
             self.assertTrue(self.page._busy())
             self.assertFalse(self.page.save_content_button.isEnabled())
+            runner.finish(self.page._SETUP_GENERATION_CLOSE_TASK_KEY)
+
+            self.assertTrue(
+                runner.is_running(self.page._SETUP_GENERATION_TASK_KEY)
+            )
+            self.assertTrue(self.page._busy())
+            runner.execute(self.page._SETUP_GENERATION_TASK_KEY)
+            runner.finish(self.page._SETUP_GENERATION_TASK_KEY)
+            runner.execute(self.page._SETUP_GENERATION_CLOSE_TASK_KEY)
+            self.assertTrue(self.page._busy())
             runner.finish(self.page._SETUP_GENERATION_CLOSE_TASK_KEY)
 
         self.assertFalse(self.page._busy())

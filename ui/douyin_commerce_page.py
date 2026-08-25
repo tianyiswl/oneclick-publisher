@@ -513,6 +513,24 @@ class DouyinCommercePage(QWidget):
             "选择立即发表，或填写未来的北京时间。",
         ),
     }
+    _CONTENT_SETUP_ERROR_COPY = {
+        "collector_start_failed": (
+            "平台设置采集器启动失败（错误码 collector_start_failed）。",
+            "客户端已自动清理并重试一次；若仍失败，请复制下方执行日志反馈。",
+        ),
+        "cleanup_incomplete": (
+            "上一次平台设置会话未能完整关闭（错误码 cleanup_incomplete）。",
+            "不要继续重复上传；请复制下方执行日志反馈，重启客户端后再试。",
+        ),
+        "stale_result_discarded": (
+            "旧的平台设置结果已失效（错误码 stale_result_discarded）。",
+            "重新点击上传；若再次出现，请复制下方执行日志反馈。",
+        ),
+        "collector_unknown": (
+            "平台设置采集器遇到未识别错误（错误码 collector_unknown）。",
+            "请复制下方执行日志反馈。",
+        ),
+    }
 
     def __init__(self) -> None:
         super().__init__()
@@ -534,6 +552,11 @@ class DouyinCommercePage(QWidget):
         self._setup_close_token = 0
         self._setup_start_error_code = ""
         self._setup_close_error_code = ""
+        # 平台设置采集器偶发启动失败时，只允许在严格回读零存活实例后
+        # 自动恢复一次。保存的是本次内存快照，不落盘，也不改变用户内容。
+        self._setup_retry_payload: dict[str, object] | None = None
+        self._setup_active_payload: dict[str, object] | None = None
+        self._setup_recovery_attempted = False
         self._collector_action_tokens = {
             "domestic_location": 0,
             "favorite_music": 0,
@@ -5648,7 +5671,10 @@ class DouyinCommercePage(QWidget):
 
         if stage not in self._STAGE_ERROR_COPY:
             raise ValueError(f"未知的抖音带货错误阶段：{stage}")
+        diagnostic_code = _normalized(diagnostic)
         reason, next_action = self._STAGE_ERROR_COPY[stage]
+        if stage == "content" and diagnostic_code in self._CONTENT_SETUP_ERROR_COPY:
+            reason, next_action = self._CONTENT_SETUP_ERROR_COPY[diagnostic_code]
         _LOGGER.warning(
             "抖音带货阶段失败 stage=%s diagnostic=%s",
             stage,
@@ -5658,12 +5684,16 @@ class DouyinCommercePage(QWidget):
         if label is not None:
             label.setText(f"失败原因：{reason}\n下一步：{next_action}")
             label.setVisible(True)
+        if stage == "content":
+            self.content_execution_log.setVisible(True)
 
     def _clear_stage_error(self, stage: str) -> None:
         label = self._stage_error_labels.get(stage)
         if label is not None:
             label.clear()
             label.setVisible(False)
+        if stage == "content":
+            self.content_execution_log.setVisible(False)
 
     def _platform_action_error(self, stage: str, diagnostic: object) -> None:
         """把执行器错误留在本机日志，并把用户停在准确的恢复阶段。"""
@@ -7556,13 +7586,22 @@ class DouyinCommercePage(QWidget):
         self._clear_runtime_log_on_next_task = False
         bus.publish("新的抖音带货任务已开始，上一批客户端执行日志已清空")
 
-    def _start_setup_generation(self, payload: dict) -> None:
+    def _start_setup_generation(
+        self,
+        payload: dict,
+        *,
+        recovery: bool = False,
+    ) -> None:
         """关闭旧代际并建立本次平台设置代际；不创建正式发布会话。"""
 
         if self._shutdown_requested.is_set() or self.runner.is_running(
             self._SETUP_GENERATION_TASK_KEY
         ):
             return
+        if not recovery:
+            self._setup_retry_payload = None
+            self._setup_recovery_attempted = False
+        self._setup_active_payload = dict(payload)
         self._clear_runtime_log_for_new_task_if_needed()
         old_generation_id = self._setup_generation_id
         start_content_fingerprint = self._setup_content_fingerprint(payload)
@@ -7653,6 +7692,7 @@ class DouyinCommercePage(QWidget):
             start_token,
         )
         self._sync_view()
+        self._try_start_pending_setup_retry()
 
     def _accept_setup_generation_result(
         self,
@@ -7722,6 +7762,9 @@ class DouyinCommercePage(QWidget):
         self._session_id = ""
         self._render_collector_status(result)
         self._setup_start_error_code = ""
+        self._setup_retry_payload = None
+        self._setup_active_payload = None
+        self._setup_recovery_attempted = False
         self._clear_stage_error("content")
         self.content_notice.setVisible(False)
         self._go_to_step(1)
@@ -7738,6 +7781,29 @@ class DouyinCommercePage(QWidget):
         if code == "login_required":
             self._handle_login_required()
             return
+        if code == "collector_start_failed" and not self._setup_recovery_attempted:
+            self._setup_recovery_attempted = True
+            payload = self._setup_active_payload
+            if not isinstance(payload, Mapping):
+                try:
+                    payload = self.collect_upload_payload()
+                except (ValueError, douyin_commerce_service.DouyinCommerceError):
+                    payload = None
+            self._setup_retry_payload = dict(payload) if isinstance(payload, Mapping) else None
+            if self._setup_retry_payload is not None:
+                self.platform_review_status.setText(
+                    "平台设置启动未完成，正在清理后自动重试一次…"
+                )
+                if self._setup_generation_cleanup_required or self._setup_generation_id:
+                    self._dispatch_setup_generation_close(
+                        reason="operation_failed",
+                        completion="retry_start",
+                        silent=True,
+                    )
+                else:
+                    self._try_start_pending_setup_retry()
+                self._sync_view()
+                return
         self._setup_start_error_code = code
         self.platform_review_status.setText(f"平台设置采集器未就绪 · 错误码 {code}")
         self._set_stage_error("content", code)
@@ -7846,7 +7912,7 @@ class DouyinCommercePage(QWidget):
                 result,
             ),
             on_error=lambda _message: self._setup_generation_close_failed(close_token),
-            on_finished=self._sync_view,
+            on_finished=self._setup_generation_close_finished,
         )
         if not started:
             self._setup_generation_close_failed(close_token)
@@ -7876,18 +7942,43 @@ class DouyinCommercePage(QWidget):
             self._setup_start_error_code = "collector_start_failed"
         self._sync_view()
 
+    def _setup_generation_close_finished(self) -> None:
+        """关闭任务退出 active 后，才允许启动同一内容的一次恢复尝试。"""
+
+        self._sync_view()
+        self._try_start_pending_setup_retry()
+
+    def _try_start_pending_setup_retry(self) -> None:
+        """两条生命周期任务均已退出后，消费一次平台设置恢复快照。"""
+
+        if (
+            self._shutdown_requested.is_set()
+            or self._setup_retry_payload is None
+            or self._setup_generation_cleanup_required
+            or bool(self._setup_generation_id)
+            or self.runner.is_running(self._SETUP_GENERATION_TASK_KEY)
+            or self.runner.is_running(self._SETUP_GENERATION_CLOSE_TASK_KEY)
+        ):
+            return
+        payload = self._setup_retry_payload
+        self._setup_retry_payload = None
+        self.platform_review_status.setText("正在自动重试平台设置…")
+        self._start_setup_generation(dict(payload), recovery=True)
+
     def _finish_setup_generation_close(self, completion: str, silent: bool) -> None:
         if completion in {
             "abandoned",
             "content_changed",
             "login_required",
             "operation_failed",
+            "retry_start",
         }:
             self._reset_platform_settings_after_abandon(
                 clear_revision_state=completion == "abandoned"
             )
             self._uploaded_editor_payload = None
             self._pending_upload_payload = None
+            self._setup_active_payload = None
             self._refresh_saved_content_status()
             if completion == "abandoned" and not silent:
                 QMessageBox.information(
@@ -7905,6 +7996,7 @@ class DouyinCommercePage(QWidget):
         if close_token != self._setup_close_token:
             return
         code = "cleanup_incomplete"
+        self._setup_retry_payload = None
         self._setup_close_error_code = code
         self.platform_review_status.setText(
             f"平台设置采集器关闭未完成 · 错误码 {code}"
