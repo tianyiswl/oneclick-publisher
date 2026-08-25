@@ -1030,7 +1030,9 @@ class PassiveObserverTests(unittest.TestCase):
 
         page = FakePage(
             (self.official_response(),),
-            close_delay=0.2,
+            # 使用明显大于全量测试调度抖动的卡死时间。正确实现仍应在
+            # 约 0.03 秒的总时限内取消；若没有取消则会实际等待 1 秒。
+            close_delay=1.0,
         )
         harness = ObserverHarness(self.root, page)
         reports: list[dict] = []
@@ -1048,7 +1050,7 @@ class PassiveObserverTests(unittest.TestCase):
             )
 
         elapsed = time.monotonic() - started
-        self.assertLess(elapsed, 0.15)
+        self.assertLess(elapsed, 0.5)
         self.assertEqual(raised.exception.error_code, "comment_sync_cancelled")
         receipt = raised.exception.cleanup_receipt
         self.assertFalse(receipt.closed)
