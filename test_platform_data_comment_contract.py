@@ -1209,9 +1209,20 @@ class PassiveObserverTests(unittest.TestCase):
     def test_cpu_heavy_json_shape_obeys_the_hard_total_deadline(self) -> None:
         """大量数组元素的 JSON 解析和结构遍历也不能突破总时限。"""
 
+        original_loads = contract_module.json.loads
+
+        def finite_cpu_heavy_loads(body: bytes) -> object:
+            # 用可控的有限 CPU 工作模拟拥挤全量回归中的大 JSON 解析。
+            # 原来的 30ms + 50 万元素把线程首次获调度也算进断言，机器忙时
+            # 甚至来不及创建/关闭 fake 浏览器，测到的是调度器而非截止合同。
+            work_until = time.monotonic() + 0.25
+            while time.monotonic() < work_until:
+                pass
+            return original_loads(body)
+
         response = FakeResponse(
             "https://creator.douyin.com/heavy-json",
-            {"data": [0] * 500_000},
+            {"data": [0] * 1_000},
         )
         page = FakePage((response,))
         harness = ObserverHarness(self.root, page)
@@ -1222,7 +1233,8 @@ class PassiveObserverTests(unittest.TestCase):
         with (
             first_patch,
             second_patch,
-            patch.object(contract_module, "_TOTAL_WALL_SECONDS", 0.03),
+            patch.object(contract_module.json, "loads", finite_cpu_heavy_loads),
+            patch.object(contract_module, "_TOTAL_WALL_SECONDS", 0.4),
             patch.object(
                 contract_module,
                 "_MAX_RESPONSE_BYTES",
@@ -1240,7 +1252,7 @@ class PassiveObserverTests(unittest.TestCase):
             )
 
         elapsed = time.monotonic() - started
-        self.assertLess(elapsed, 0.15)
+        self.assertLess(elapsed, 0.8)
         self.assertEqual(raised.exception.error_code, "comment_sync_timeout")
         self.assertTrue(raised.exception.cleanup_receipt.closed)
         self.assertEqual(
