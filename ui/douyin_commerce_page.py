@@ -3197,6 +3197,11 @@ class DouyinCommercePage(QWidget):
         )
         accepted = filter_location_candidates(raw_candidates, previous_state["commissionFilter"])
         accepted = self._merge_batch_location_candidates([], accepted)
+        newly_accepted = [
+            item
+            for item in accepted
+            if self._batch_location_candidate_identity(item) not in before
+        ]
         eligible_total = len(accepted)
         replay_action = action_kind in {"replay_search", "replay_load"}
         replay_remaining = int(previous_state.get("replayLoadsRemaining") or 0)
@@ -3279,17 +3284,28 @@ class DouyinCommercePage(QWidget):
                     request_owner, started_at=started_at, actions_used=actions_used
                 )
 
+        def saved() -> None:
+            auto_filled, remaining = self._auto_fill_batch_location_candidates(
+                next_state["scope"],
+                newly_accepted,
+                commission_filter=next_state["commissionFilter"],
+            )
+            feedback = progress
+            if auto_filled:
+                feedback += f" · 自动填充 {auto_filled} 条"
+            if remaining:
+                feedback += f" · 还有 {remaining} 条待选择"
+            self._set_batch_location_feedback(feedback)
+            self._render_batch_item_rows()
+            self._sync_view()
+            continue_after_save()
+
         self._save_province_location_progress(
             request_owner,
             previous_state,
             next_state,
             platform_rows,
-            on_saved=lambda: (
-                self._set_batch_location_feedback(progress),
-                self._render_batch_item_rows(),
-                self._sync_view(),
-                continue_after_save(),
-            ),
+            on_saved=saved,
         )
 
     def _province_location_action_failed(

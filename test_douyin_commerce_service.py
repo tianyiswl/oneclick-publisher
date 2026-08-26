@@ -15231,6 +15231,74 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.assertEqual(save.call_count, 1)
         self.assertIn("广东已检查", self.page.batch_item_settings_status.text())
 
+    def test_new_province_page_candidates_auto_fill_remaining_videos(self) -> None:
+        """省份分页的新候选持久化后，应继续填充未选地点的视频。"""
+
+        owner = self._install_province_fixture("广东joymark")
+        first_path = "/tmp/province-location-test.mp4"
+        second_path = "/tmp/province-location-second.mp4"
+        third_path = "/tmp/province-location-third.mp4"
+        for index, path in enumerate((second_path, third_path), start=8):
+            self.page.video_combo.addItem(
+                Path(path).name,
+                {"id": index, "storedPath": path, "filename": Path(path).name},
+            )
+        self.page._selected_video_indexes = [
+            index
+            for index in range(self.page.video_combo.count())
+            if isinstance(self.page.video_combo.itemData(index), dict)
+            and self.page.video_combo.itemData(index).get("storedPath")
+            in {first_path, second_path, third_path}
+        ]
+        manual = {
+            "poiId": "manual-poi",
+            "name": "手动选择地点",
+            "address": "广东省广州市手动路1号",
+            "scope": "domestic",
+        }
+        self.page._batch_locations[first_path] = dict(manual)
+        self.page._batch_location_assignment_sources[first_path] = "manual"
+        candidates = [
+            self._province_candidate("guangdong-new-1"),
+            self._province_candidate(
+                "guangdong-new-2", address="广东省佛山市测试路2号"
+            ),
+        ]
+
+        with patch.object(
+            douyin_location_cache,
+            "merge_platform_locations_for_queries",
+            return_value={"candidates": candidates},
+        ), patch.object(
+            douyin_location_cache,
+            "save_location_search_plan",
+            return_value={"status": "saved"},
+        ), patch(
+            "ui.douyin_commerce_page.save_location_preset",
+            side_effect=lambda _account_id, candidate, scope: {
+                **candidate,
+                "scope": scope,
+            },
+        ), patch.object(
+            self.page,
+            "_record_batch_location_selection",
+        ):
+            self.page._accept_province_location_page(
+                owner,
+                self._province_page(candidates, has_more=True),
+                started_at=time.monotonic(),
+                actions_used=1,
+            )
+
+        self.assertEqual(self.page._batch_locations[first_path], manual)
+        self.assertEqual(
+            self.page._batch_locations[second_path]["poiId"], "guangdong-new-1"
+        )
+        self.assertEqual(
+            self.page._batch_locations[third_path]["poiId"], "guangdong-new-2"
+        )
+        self.assertIn("自动填充 2 条", self.page.batch_item_settings_status.text())
+
     def test_hundred_eligible_candidates_is_terminal(self) -> None:
         owner = self._install_province_fixture("广东joymark")
         candidates = [
@@ -17577,13 +17645,18 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         def run(
             self,
             _key: str,
+            fn=None,
             *,
-            with_progress,
+            with_progress=None,
             on_progress=None,
             on_success=None,
             on_error=None,
             on_finished=None,
         ) -> bool:
+            if with_progress is None:
+                if fn is None:
+                    raise ValueError("测试任务必须提供执行函数")
+                with_progress = lambda _report: fn()
             try:
                 result = with_progress(lambda event: on_progress(event) if on_progress else None)
                 if on_success:
