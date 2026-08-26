@@ -822,6 +822,70 @@ class WechatPreflightTests(unittest.TestCase):
         self.assertEqual(snapshot["usableControls"], ["完成"])
         self.assertEqual(page.waits, [25])
 
+    def test_cover_crop_accepts_unique_rendered_confirm_below_viewport(self):
+        page = _AuthorPage()
+        below_viewport = {
+            "dialogVisible": True,
+            "dialogCount": 1,
+            "loading": False,
+            "usableControls": [],
+            "renderedControls": ["确认"],
+            "hiddenControls": [],
+            "coverReady": False,
+            "editorVisible": True,
+        }
+        with patch(
+            "app_core.oneclick_preflight._wechat_cover_crop_snapshot",
+            new=AsyncMock(return_value=below_viewport),
+        ):
+            mode, snapshot = asyncio.run(
+                _wechat_wait_cover_crop_ready(
+                    page,
+                    attempts=1,
+                    interval_ms=25,
+                )
+            )
+        self.assertEqual(mode, "confirm")
+        self.assertEqual(snapshot["renderedControls"], ["确认"])
+        self.assertEqual(page.waits, [])
+
+    def test_cover_confirm_is_scrolled_into_view_before_click(self):
+        from app_core import oneclick_preflight as module
+
+        class ConfirmButton:
+            def __init__(self):
+                self.events = []
+
+            async def count(self):
+                return 1
+
+            async def scroll_into_view_if_needed(self, **_kwargs):
+                self.events.append("scroll")
+
+            async def is_visible(self):
+                return True
+
+            async def is_enabled(self):
+                return True
+
+            async def click(self, **_kwargs):
+                self.events.append("click")
+
+        class ConfirmPage:
+            def __init__(self):
+                self.button = ConfirmButton()
+
+            def locator(self, selector):
+                self.asserted_selector = selector
+                return self.button
+
+        click_confirm = getattr(module, "_wechat_click_cover_confirm", None)
+        self.assertIsNotNone(click_confirm)
+        page = ConfirmPage()
+        asyncio.run(click_confirm(page))
+        self.assertEqual(page.asserted_selector, '[data-oneclick-cover-confirm="1"]')
+        self.assertEqual(page.button.events, ["scroll", "click"])
+
     def test_cover_crop_accepts_verified_platform_auto_complete(self):
         page = _AuthorPage()
         complete = {

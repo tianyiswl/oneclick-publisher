@@ -1232,9 +1232,10 @@ async def _wechat_cover_crop_snapshot(page) -> dict:
             labels.includes(normalize(element.innerText || element.textContent))
           );
           const usable = matching.filter(element => visible(element) && enabled(element));
-          const hidden = matching.filter(element => !visible(element) || !enabled(element));
-          if (usable.length === 1) {
-            usable[0].setAttribute('data-oneclick-cover-confirm', '1');
+          const renderedControls = matching.filter(element => rendered(element) && enabled(element));
+          const hidden = matching.filter(element => !rendered(element) || !enabled(element));
+          if (renderedControls.length === 1) {
+            renderedControls[0].setAttribute('data-oneclick-cover-confirm', '1');
           }
           const loading = dialog
             ? Array.from(dialog.querySelectorAll(
@@ -1288,6 +1289,9 @@ async def _wechat_cover_crop_snapshot(page) -> dict:
             usableControls: usable.map(element =>
               normalize(element.innerText || element.textContent)
             ),
+            renderedControls: renderedControls.map(element =>
+              normalize(element.innerText || element.textContent)
+            ),
             hiddenControls: hidden.map(element =>
               normalize(element.innerText || element.textContent)
             ),
@@ -1312,7 +1316,11 @@ async def _wechat_wait_cover_crop_ready(
         last = await _wechat_cover_crop_snapshot(page)
         if int(last.get("dialogCount") or 0) > 1:
             raise PreflightError("公众号同时出现多个封面裁剪弹层，预检拒绝猜测")
-        controls = list(last.get("usableControls") or [])
+        controls = list(
+            last.get("renderedControls")
+            if "renderedControls" in last
+            else last.get("usableControls") or []
+        )
         if len(controls) > 1:
             raise PreflightError("公众号封面裁剪出现多个可用确认控件，预检拒绝猜测")
         if controls:
@@ -1329,6 +1337,18 @@ async def _wechat_wait_cover_crop_ready(
     if last.get("hiddenControls"):
         raise PreflightError("公众号封面裁剪完成控件存在但不可见或不可用")
     raise PreflightError("公众号封面裁剪弹层未显示真实可用的完成控件")
+
+
+async def _wechat_click_cover_confirm(page) -> None:
+    """滚动到唯一确认控件后点击，兼容高于浏览器视口的裁剪弹层。"""
+
+    finish_button = page.locator('[data-oneclick-cover-confirm="1"]')
+    if await finish_button.count() != 1:
+        raise PreflightError("公众号封面裁剪确认控件状态已变化")
+    await finish_button.scroll_into_view_if_needed(timeout=10_000)
+    if not await finish_button.is_visible() or not await finish_button.is_enabled():
+        raise PreflightError("公众号封面裁剪确认控件已变为不可用")
+    await finish_button.click(timeout=10_000)
 
 
 async def _wechat_wait_cover_return_to_editor(
@@ -1439,12 +1459,7 @@ async def _wechat_select_cover_from_content(page, editor, cover_image_index: int
     await next_button.click(timeout=10_000)
     completion_mode, _snapshot = await _wechat_wait_cover_crop_ready(page)
     if completion_mode == "confirm":
-        finish_button = page.locator('[data-oneclick-cover-confirm="1"]')
-        if await finish_button.count() != 1:
-            raise PreflightError("公众号封面裁剪确认控件状态已变化")
-        if not await finish_button.is_visible() or not await finish_button.is_enabled():
-            raise PreflightError("公众号封面裁剪确认控件已变为不可用")
-        await finish_button.click(timeout=10_000)
+        await _wechat_click_cover_confirm(page)
     await _wechat_wait_cover_return_to_editor(page)
 
 
