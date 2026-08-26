@@ -946,6 +946,109 @@ def close_matrix_parent(task_id: int) -> None:
         conn.commit()
 
 
+def pause_douyin_graphic_matrix(
+    task_id: int, *, current_item_id: int | None = None
+) -> None:
+    """只在下一次最终提交前暂停矩阵，尚未提交的当前账号回到 pending。"""
+
+    now = _now()
+    with connect() as conn:
+        source = conn.execute(
+            "SELECT mode, status FROM publish_tasks WHERE id = ?",
+            (int(task_id),),
+        ).fetchone()
+        if (
+            source is None
+            or str(source["mode"] or "") not in _MATRIX_TASK_MODES
+            or str(source["status"] or "") not in {"pending", "running"}
+        ):
+            raise ValueError("抖音图文矩阵当前不能暂停")
+        if current_item_id is not None:
+            updated = conn.execute(
+                """
+                UPDATE publish_task_items
+                SET status = 'pending', message = '用户已暂停，当前账号未执行最终提交',
+                    errorCode = '', finishedAt = NULL
+                WHERE id = ? AND taskId = ? AND status = 'running'
+                """,
+                (int(current_item_id), int(task_id)),
+            )
+            if updated.rowcount != 1:
+                raise ValueError("抖音图文矩阵当前账号无法安全回退")
+        conn.execute(
+            """
+            UPDATE publish_tasks
+            SET status = 'paused', pauseReasonCode = ?, workerHeartbeatAt = ?
+            WHERE id = ?
+            """,
+            (PAUSE_REASON_USER_REQUEST, now, int(task_id)),
+        )
+        conn.execute(
+            """
+            INSERT INTO publish_task_events
+                (taskId, itemId, level, eventType, message, createdAt)
+            VALUES (?, ?, 'warning', 'matrix_paused', '已按用户要求暂停，未开始后续账号', ?)
+            """,
+            (int(task_id), current_item_id, now),
+        )
+        conn.commit()
+
+
+def prepare_douyin_graphic_matrix_retry(task_id: int) -> dict[str, object]:
+    """生成仅包含失败或未开始账号的新本地检查快照。"""
+
+    source = get_task(int(task_id))
+    if not source or str(source.get("mode") or "") not in _MATRIX_TASK_MODES:
+        raise ValueError("来源不是抖音图文矩阵任务")
+    if str(source.get("status") or "") in {"pending", "running"}:
+        raise ValueError("抖音图文矩阵仍在执行，不能创建重试")
+    try:
+        rows = json.loads(str(source.get("payloadJson") or "[]"))
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("抖音图文矩阵快照无法读取") from exc
+    if (
+        not isinstance(rows, list)
+        or len(rows) != 1
+        or not isinstance(rows[0], dict)
+    ):
+        raise ValueError("抖音图文矩阵快照无法读取")
+    retry_indexes = [
+        int(item.get("batchItemIndex") or 0)
+        for item in source.get("items") or []
+        if isinstance(item, dict)
+        and str(item.get("status") or "") in {"failed", "pending"}
+        and int(item.get("batchItemIndex") or 0) > 0
+    ]
+    if not retry_indexes:
+        raise ValueError("抖音图文矩阵没有可重试的账号")
+    from .douyin_graphic_matrix_service import retry_matrix
+
+    matrix = retry_matrix(rows[0], retry_indexes)
+    matrix["runtimeMode"] = "local_check"
+    return {
+        "sourceTaskId": int(task_id),
+        "sourceTaskNo": str(source.get("taskNo") or ""),
+        "itemIndexes": retry_indexes,
+        "matrix": matrix,
+    }
+
+
+def create_douyin_graphic_matrix_retry(task_id: int) -> dict[str, object]:
+    prepared = prepare_douyin_graphic_matrix_retry(int(task_id))
+    with connect() as conn:
+        duplicate = conn.execute(
+            "SELECT id FROM publish_tasks WHERE revisionSourceTaskId = ? LIMIT 1",
+            (int(task_id),),
+        ).fetchone()
+    if duplicate is not None:
+        raise ValueError("该抖音图文矩阵任务已创建过重试")
+    return create_douyin_graphic_matrix_task(
+        dict(prepared["matrix"]),
+        mode="oneclick_matrix_local_check",
+        revision_source_task_id=int(task_id),
+    )
+
+
 def project_task_link(task_id: int) -> dict | None:
     """读取发布任务的非敏感内容项目归属。"""
 
@@ -1746,11 +1849,11 @@ def fail_active_task(
         updated = conn.execute(
             """
             UPDATE publish_task_items
-            SET status = 'failed', message = ?, attempts = attempts + 1,
+            SET status = 'failed', message = ?, errorCode = ?, attempts = attempts + 1,
                 startedAt = COALESCE(startedAt, ?), finishedAt = ?
             WHERE taskId = ? AND status IN ('pending', 'running')
             """,
-            (public_message, now, now, int(task_id)),
+            (public_message, code, now, now, int(task_id)),
         )
         if updated.rowcount == 0:
             return False
@@ -1810,6 +1913,9 @@ def reconcile_stale_controlled_task(
         "oneclick_preflight",
         "oneclick_publish",
         "oneclick_draft",
+        "oneclick_matrix_local_check",
+        "oneclick_matrix_preflight",
+        "oneclick_matrix_publish",
     } or str(row["status"] or "") not in {"pending", "running"}:
         return False
     worker_pid = int(row["workerPid"] or 0) if "workerPid" in row.keys() else 0

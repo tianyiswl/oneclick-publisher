@@ -9,12 +9,36 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
+import threading
 from typing import Any, AsyncContextManager, Callable, Mapping
 
 from . import account_service, task_service
 from .douyin_graphic_editor import DouyinGraphicEditor
 from .douyin_graphic_matrix_service import effective_item_payload
 from .paths import COOKIE_DIR
+
+
+_pause_requested_task_ids: set[int] = set()
+_pause_lock = threading.Lock()
+
+
+def request_pause(task_id: int) -> bool:
+    with _pause_lock:
+        normalized = int(task_id)
+        if normalized in _pause_requested_task_ids:
+            return False
+        _pause_requested_task_ids.add(normalized)
+        return True
+
+
+def _pause_requested(task_id: int) -> bool:
+    with _pause_lock:
+        return int(task_id) in _pause_requested_task_ids
+
+
+def _clear_pause(task_id: int) -> None:
+    with _pause_lock:
+        _pause_requested_task_ids.discard(int(task_id))
 
 
 class DouyinGraphicMatrixExecutorError(RuntimeError):
@@ -124,7 +148,12 @@ async def _run(
     account_resolver: Callable[[int], Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
+    paused = False
     for target in matrix.get("targets") or []:
+        if _pause_requested(int(task_id)):
+            task_service.pause_douyin_graphic_matrix(int(task_id))
+            paused = True
+            break
         item_index = int(target.get("itemIndex") or 0)
         item = task_service.matrix_item_for_index(int(task_id), item_index)
         # 成功、失败等终态都不会在同一任务内重新提交。重试由之后的
@@ -145,6 +174,12 @@ async def _run(
                     task_id=int(task_id), item_id=int(item["id"])
                 )
                 await editor.prepare(page, payload)
+                if _pause_requested(int(task_id)):
+                    task_service.pause_douyin_graphic_matrix(
+                        int(task_id), current_item_id=int(item["id"])
+                    )
+                    paused = True
+                    break
                 receipt = (
                     await editor.submit_and_read_receipt(page, payload)
                     if submit
@@ -181,7 +216,13 @@ async def _run(
                     error_text=text,
                 )
             )
-    task_service.close_matrix_parent(int(task_id))
+        finally:
+            task_service.touch_task_heartbeat(int(task_id))
+        if paused:
+            break
+    if not paused:
+        task_service.close_matrix_parent(int(task_id))
+    _clear_pause(int(task_id))
     return results
 
 

@@ -601,6 +601,20 @@ def start_douyin_graphic_matrix(
     return task
 
 
+def pause_douyin_graphic_matrix(task_id: int) -> bool:
+    """由客户端请求在下一个最终提交前暂停。"""
+
+    task = task_service.get_task(int(task_id))
+    if not task or str(task.get("mode") or "") not in {
+        "oneclick_matrix_preflight",
+        "oneclick_matrix_publish",
+    }:
+        return False
+    if str(task.get("status") or "") not in {"pending", "running"}:
+        return False
+    return douyin_graphic_matrix_executor.request_pause(int(task_id))
+
+
 def _run_douyin_commerce_batch_publish(
     task: dict,
     payloads: list[dict[str, Any]],

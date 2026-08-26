@@ -403,7 +403,20 @@ def project_task(task: Mapping[str, Any] | None) -> dict[str, Any]:
     if not isinstance(task, Mapping):
         raise ControlledPublishError("controlled_task_not_found", "任务不存在")
     mode = str(task.get("mode") or "")
-    phase = "preflight" if "preflight" in mode else "formal" if "publish" in mode else "unknown"
+    matrix_mode = mode in {
+        "oneclick_matrix_local_check",
+        "oneclick_matrix_preflight",
+        "oneclick_matrix_publish",
+    }
+    phase = (
+        "local_check"
+        if mode == "oneclick_matrix_local_check"
+        else "preflight"
+        if "preflight" in mode
+        else "formal"
+        if "publish" in mode
+        else "unknown"
+    )
     try:
         raw_payloads = json.loads(str(task.get("payloadJson") or "[]"))
     except json.JSONDecodeError:
@@ -421,7 +434,7 @@ def project_task(task: Mapping[str, Any] | None) -> dict[str, Any]:
         platform_type = int(item.get("platformType") or 0)
         related_payloads = payloads_by_type.get(platform_type, [])
         related_payload = related_payloads[0] if len(related_payloads) == 1 else {}
-        account_id = 0
+        account_id = int(item.get("accountId") or 0) if matrix_mode else 0
         account_files = list(related_payload.get("accountList") or [])
         account_ids = list(related_payload.get("accountIds") or [])
         item_account_file = str(item.get("accountFile") or "")
@@ -432,7 +445,13 @@ def project_task(task: Mapping[str, Any] | None) -> dict[str, Any]:
         elif len(account_ids) == 1:
             account_id = int(account_ids[0] or 0)
         receipt = None
-        if phase == "formal" and status == "success":
+        if matrix_mode and item.get("receiptJson"):
+            try:
+                loaded_receipt = json.loads(str(item.get("receiptJson") or ""))
+                receipt = loaded_receipt if isinstance(loaded_receipt, dict) else None
+            except json.JSONDecodeError:
+                receipt = None
+        elif phase == "formal" and status == "success":
             receipt = {
                 key: item.get(key)
                 for key in ("platformPostId", "postUrl", "publishedAt")
@@ -452,7 +471,11 @@ def project_task(task: Mapping[str, Any] | None) -> dict[str, Any]:
                     or ""
                 ),
                 "status": status,
-                "errorCode": _projected_error_code(message),
+                "errorCode": (
+                    str(item.get("errorCode") or "")
+                    if matrix_mode
+                    else _projected_error_code(message)
+                ),
                 "errorText": message if status == "failed" else "",
                 "receipt": receipt,
                 "contentId": str(item.get("platformPostId") or ""),

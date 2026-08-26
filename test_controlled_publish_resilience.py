@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from app_core import database, task_service
 from app_core.controlled_publish import project_task
+from app_core.douyin_graphic_matrix_service import prepare_matrix
 
 
 class ControlledPublishResilienceTests(unittest.TestCase):
@@ -48,6 +49,39 @@ class ControlledPublishResilienceTests(unittest.TestCase):
         task_service.mark_task_running(task["id"], "开始正式任务")
         return task
 
+    def _matrix_task(self) -> dict:
+        image = Path(self.temporary.name) / "matrix.jpg"
+        image.write_bytes(b"matrix")
+        matrix = prepare_matrix(
+            {
+                "schemaVersion": "oneclick-douyin-graphic-matrix/v1",
+                "workflow": "douyin-graphic-matrix",
+                "runtimeMode": "publish",
+                "content": {
+                    "images": [str(image)],
+                    "common": {
+                        "title": "矩阵标题",
+                        "body": "矩阵正文",
+                        "tags": ["图文矩阵"],
+                    },
+                },
+                "targets": [
+                    {"itemIndex": 1, "accountId": 31, "overrides": {}},
+                    {"itemIndex": 2, "accountId": 32, "overrides": {}},
+                ],
+            },
+            accounts=[
+                {"id": 31, "type": 3, "profileName": "账号一"},
+                {"id": 32, "type": 3, "profileName": "账号二"},
+            ],
+        )
+        task = task_service.create_douyin_graphic_matrix_task(
+            matrix, mode="oneclick_matrix_publish"
+        )
+        first = task_service.matrix_item_for_index(task["id"], 1)
+        task_service.start_matrix_item(task["id"], first["id"])
+        return task
+
     def test_fail_active_task_closes_pending_platform_and_task(self) -> None:
         task = self._task()
         task_service.mark_platform_result(
@@ -73,6 +107,31 @@ class ControlledPublishResilienceTests(unittest.TestCase):
             projected["platforms"][1]["errorCode"],
             "controlled_worker_ended_without_terminal_result",
         )
+
+    def test_stale_matrix_worker_never_remains_running_and_projects_codes(self) -> None:
+        task = self._matrix_task()
+        stale = datetime.now() - timedelta(minutes=2)
+        with database.connect() as conn:
+            conn.execute(
+                "UPDATE publish_tasks SET workerPid = 99999999, workerHeartbeatAt = ? WHERE id = ?",
+                (stale.strftime("%Y-%m-%d %H:%M:%S"), task["id"]),
+            )
+            conn.commit()
+
+        reconciled = task_service.reconcile_stale_controlled_task(
+            task["id"], lease_seconds=30, now=datetime.now()
+        )
+        projected = project_task(task_service.get_task(task["id"]))
+
+        self.assertTrue(reconciled)
+        self.assertIn(projected["status"], {"failed", "partial_failed"})
+        self.assertTrue(
+            all(
+                row["errorCode"] == "controlled_worker_lease_expired"
+                for row in projected["platforms"]
+            )
+        )
+        self.assertEqual([row["accountId"] for row in projected["platforms"]], [31, 32])
 
     def test_stale_controlled_task_is_reconciled_after_lease_expires(self) -> None:
         task = self._task()

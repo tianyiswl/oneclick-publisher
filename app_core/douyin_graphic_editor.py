@@ -276,6 +276,7 @@ class DouyinGraphicEditor:
 
     async def _submit_real_page(self, page: Any) -> None:
         from uploader.douyin_uploader.main import DouYinVideo
+        from .douyin_publish_executor import _handle_publish_verification
 
         helper = DouYinVideo(
             title="submit",
@@ -290,7 +291,15 @@ class DouyinGraphicEditor:
         try:
             button = await helper.wait_publish_button_ready(page)
             await button.click(timeout=10_000)
-            await helper._wait_formal_publish_result(page)
+            await helper._wait_formal_publish_result(
+                page,
+                on_verification=lambda challenge: _handle_publish_verification(
+                    helper,
+                    page,
+                    challenge,
+                    task_id=self.task_id,
+                ),
+            )
         except Exception as exc:
             raise DouyinGraphicEditorError(
                 str(getattr(exc, "error_code", "") or "douyin_graphic_submit_failed"),

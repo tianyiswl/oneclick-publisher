@@ -1780,6 +1780,53 @@ class DouyinGraphicMatrixTaskPersistenceTests(unittest.TestCase):
             saved["items"][1]["errorCode"], "douyin_graphic_account_session_expired"
         )
 
+    def test_retry_contains_failed_and_pending_accounts_only(self) -> None:
+        task = task_service.create_douyin_graphic_matrix_task(
+            self.matrix, mode="oneclick_matrix_publish"
+        )
+        first = task_service.matrix_item_for_index(task["id"], 1)
+        second = task_service.matrix_item_for_index(task["id"], 2)
+        task_service.start_matrix_item(task["id"], first["id"])
+        task_service.finish_matrix_item(
+            task["id"],
+            first["id"],
+            ok=True,
+            message="成功",
+            receipt={"platformPostId": "post-31"},
+        )
+        task_service.start_matrix_item(task["id"], second["id"])
+        task_service.finish_matrix_item(
+            task["id"],
+            second["id"],
+            ok=False,
+            message="账号登录失效",
+            error_code="douyin_graphic_account_session_expired",
+        )
+        task_service.close_matrix_parent(task["id"])
+
+        prepared = task_service.prepare_douyin_graphic_matrix_retry(task["id"])
+
+        self.assertEqual(prepared["itemIndexes"], [2])
+        self.assertEqual(
+            [row["accountId"] for row in prepared["matrix"]["targets"]], [32]
+        )
+        self.assertEqual(prepared["matrix"]["runtimeMode"], "local_check")
+
+    def test_pause_returns_current_running_item_to_pending_before_submit(self) -> None:
+        task = task_service.create_douyin_graphic_matrix_task(
+            self.matrix, mode="oneclick_matrix_publish"
+        )
+        first = task_service.matrix_item_for_index(task["id"], 1)
+        task_service.start_matrix_item(task["id"], first["id"])
+
+        task_service.pause_douyin_graphic_matrix(
+            task["id"], current_item_id=first["id"]
+        )
+
+        saved = task_service.get_task(task["id"])
+        self.assertEqual(saved["status"], "paused")
+        self.assertEqual([row["status"] for row in saved["items"]], ["pending", "pending"])
+
 
 if __name__ == "__main__":
     unittest.main()
