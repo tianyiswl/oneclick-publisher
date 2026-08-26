@@ -12,6 +12,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from . import account_service, controlled_publish, oneclick_capabilities
 from .paths import USER_DATA_DIR
+from .content_project_metrics import ContentProjectMetricsService
 from .source_live_runtime import source_live_data_active, source_live_session_active
 
 
@@ -133,6 +134,7 @@ class ContentProjectGateway:
         authorizer: Callable[[int], dict[str, Any]] = controlled_publish.authorize_completed_preflight,
         runtime_conflict_checker: Callable[[], bool] = _source_live_conflict,
         silicon_submitter: Callable[[Mapping[str, Any]], dict[str, Any]] | None = None,
+        metrics_service: ContentProjectMetricsService | None = None,
     ) -> None:
         self.profile_store = profile_store or PublishProfileStore()
         self.accounts_provider = accounts_provider
@@ -151,6 +153,7 @@ class ContentProjectGateway:
 
             silicon_submitter = submit_silicon_evolution_request_in_process
         self.silicon_submitter = silicon_submitter
+        self.metrics_service = metrics_service or ContentProjectMetricsService()
 
     def _ensure_platform_work_available(self) -> None:
         if self.runtime_conflict_checker():
@@ -262,7 +265,8 @@ class ContentProjectGateway:
         mode: str,
         schedules: Mapping[str, object] | None,
     ) -> dict[str, Any]:
-        profile = self.profile_store.get(str(project_id or "").strip().lower())
+        normalized_project_id = str(project_id or "").strip().lower()
+        profile = self.profile_store.get(normalized_project_id)
         normalized_schedules = {
             oneclick_capabilities.canonical_platform(str(platform)): schedule
             for platform, schedule in dict(schedules or {}).items()
@@ -285,10 +289,35 @@ class ContentProjectGateway:
             for target in profile.get("targets") or []
         ]
         return {
+            "projectId": normalized_project_id,
             "manifestPath": str(manifest_path or "").strip(),
             "mode": mode,
             "targets": targets,
         }
+
+    def _metrics_profile(self, project_id: str) -> tuple[str, dict[str, Any]]:
+        normalized = str(project_id or "").strip().lower()
+        if not _PROJECT_ID_RE.fullmatch(normalized):
+            raise ContentProjectGatewayError(
+                "content_project_id_invalid",
+                "项目标识必须是 2-64 位小写英文、数字、点、下划线或连字符",
+            )
+        return normalized, self.profile_store.get(normalized)
+
+    def sync_project_metrics(self, project_id: str) -> dict[str, Any]:
+        self._ensure_platform_work_available()
+        normalized, profile = self._metrics_profile(project_id)
+        return self.metrics_service.sync_project(normalized, profile)
+
+    def get_project_metrics(
+        self, project_id: str, days: int = 1
+    ) -> dict[str, Any]:
+        normalized, profile = self._metrics_profile(project_id)
+        return self.metrics_service.get_project_metrics(normalized, profile, days)
+
+    def metrics_sync_status(self, project_id: str) -> dict[str, Any]:
+        normalized, profile = self._metrics_profile(project_id)
+        return self.metrics_service.sync_status(normalized, profile)
 
     def preflight_content(
         self,

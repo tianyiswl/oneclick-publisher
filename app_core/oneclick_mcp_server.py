@@ -134,6 +134,41 @@ def create_server(gateway: ContentProjectGateway | None = None) -> MCPServer:
         )
 
     @server.tool(
+        name="oneclick_sync_project_metrics",
+        description=(
+            "按内容项目已配置账号执行一次只读数据同步；"
+            "同一账号当天成功后复用，近期失败处于冷却时不会重复访问平台。"
+        ),
+        structured_output=True,
+    )
+    def sync_project_metrics(project_id: str) -> dict[str, Any]:
+        return _call(
+            "sync", lambda: gateway.sync_project_metrics(project_id)
+        )
+
+    @server.tool(
+        name="oneclick_get_project_metrics",
+        description="读取项目账号汇总和该项目正式发布作品的数据；不会访问平台。",
+        structured_output=True,
+    )
+    def get_project_metrics(
+        project_id: str, days: int = 1
+    ) -> dict[str, Any]:
+        return _call(
+            "metrics", lambda: gateway.get_project_metrics(project_id, days)
+        )
+
+    @server.tool(
+        name="oneclick_metrics_sync_status",
+        description="只读查询项目账号最近同步、当日复用和失败冷却状态。",
+        structured_output=True,
+    )
+    def metrics_sync_status(project_id: str) -> dict[str, Any]:
+        return _call(
+            "status", lambda: gateway.metrics_sync_status(project_id)
+        )
+
+    @server.tool(
         name="oneclick_preflight_silicon_evolution_release",
         description="重验硅基进化 V1.2 冻结包并执行公众号预检；不会发表。",
         structured_output=True,

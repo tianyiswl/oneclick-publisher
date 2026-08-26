@@ -712,6 +712,7 @@ def submit_silicon_evolution_request(request: Mapping[str, Any]) -> dict[str, An
             mode="publish" if mode == "formal" else "preflight",
         )
         payload["accountList"] = [str(account.get("filePath") or "")]
+        payload["contentProjectId"] = "silicon-evolution"
     except (FrozenWechatPublishPackageError, SiliconEvolutionAutoPublishError) as exc:
         raise ControlledPublishError(
             "silicon_evolution_package_invalid", str(exc)

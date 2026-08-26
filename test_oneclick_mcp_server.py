@@ -44,6 +44,15 @@ class _Gateway:
     ):
         return {"taskId": 8, "phase": "formal", "status": "pending", "platforms": []}
 
+    def sync_project_metrics(self, project_id):
+        return {"projectId": project_id, "accounts": []}
+
+    def get_project_metrics(self, project_id, days=1):
+        return {"projectId": project_id, "days": days, "accounts": [], "contents": []}
+
+    def metrics_sync_status(self, project_id):
+        return {"projectId": project_id, "accounts": []}
+
     def preflight_silicon_evolution_release(
         self, article_id, package_path, package_sha256
     ):
@@ -106,6 +115,9 @@ class OneclickMcpServerTests(unittest.TestCase):
                 "oneclick_task_status",
                 "oneclick_authorize_preflight",
                 "oneclick_formal_publish",
+                "oneclick_sync_project_metrics",
+                "oneclick_get_project_metrics",
+                "oneclick_metrics_sync_status",
                 "oneclick_preflight_silicon_evolution_release",
                 "oneclick_auto_publish_silicon_evolution_release",
             },
@@ -121,6 +133,31 @@ class OneclickMcpServerTests(unittest.TestCase):
         ).lower()
         for forbidden in ("cookie", "password", "verification", "captcha"):
             self.assertNotIn(forbidden, all_schemas)
+
+    def test_metrics_tools_return_stable_project_envelopes(self) -> None:
+        server = create_server(_Gateway())
+        synced = asyncio.run(
+            server.call_tool(
+                "oneclick_sync_project_metrics",
+                {"project_id": "silicon-exploration"},
+            )
+        )
+        queried = asyncio.run(
+            server.call_tool(
+                "oneclick_get_project_metrics",
+                {"project_id": "silicon-exploration", "days": 7},
+            )
+        )
+        status = asyncio.run(
+            server.call_tool(
+                "oneclick_metrics_sync_status",
+                {"project_id": "silicon-exploration"},
+            )
+        )
+
+        self.assertEqual(synced.structured_content["sync"]["projectId"], "silicon-exploration")
+        self.assertEqual(queried.structured_content["metrics"]["days"], 7)
+        self.assertEqual(status.structured_content["status"]["projectId"], "silicon-exploration")
 
     def test_silicon_evolution_preflight_tool_keeps_frozen_identity(self) -> None:
         server = create_server(_Gateway())

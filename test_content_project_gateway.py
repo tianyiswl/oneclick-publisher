@@ -14,6 +14,23 @@ from app_core.content_project_gateway import (
 )
 
 
+class _MetricsService:
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+
+    def sync_project(self, project_id, profile):
+        self.calls.append(("sync", project_id, dict(profile)))
+        return {"projectId": project_id, "accounts": []}
+
+    def get_project_metrics(self, project_id, profile, days):
+        self.calls.append(("get", project_id, dict(profile), days))
+        return {"projectId": project_id, "days": days, "accounts": [], "contents": []}
+
+    def sync_status(self, project_id, profile):
+        self.calls.append(("status", project_id, dict(profile)))
+        return {"projectId": project_id, "accounts": []}
+
+
 class ContentProjectGatewayTests(unittest.TestCase):
     @staticmethod
     def _accounts() -> list[dict]:
@@ -54,6 +71,7 @@ class ContentProjectGatewayTests(unittest.TestCase):
         *,
         runtime_conflict_checker=lambda: False,
         silicon_submitted: list[dict] | None = None,
+        metrics_service: _MetricsService | None = None,
     ) -> ContentProjectGateway:
         return ContentProjectGateway(
             profile_store=PublishProfileStore(root / "publish-profiles.json"),
@@ -88,6 +106,7 @@ class ContentProjectGatewayTests(unittest.TestCase):
                 if silicon_submitted is not None
                 else None
             ),
+            metrics_service=metrics_service,
         )
 
     def test_account_catalog_never_exposes_login_session_paths(self) -> None:
@@ -185,6 +204,7 @@ class ContentProjectGatewayTests(unittest.TestCase):
             submitted,
             [
                 {
+                    "projectId": "silicon-exploration",
                     "manifestPath": "/content/manifest.json",
                     "mode": "preflight",
                     "targets": [
@@ -201,6 +221,51 @@ class ContentProjectGatewayTests(unittest.TestCase):
                 }
             ],
         )
+
+    def test_gateway_metrics_methods_resolve_saved_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            metrics = _MetricsService()
+            gateway = self._gateway(
+                Path(directory), [], metrics_service=metrics
+            )
+            gateway.save_profile(
+                "silicon-exploration",
+                "硅基探索",
+                [{"platform": "抖音", "accountId": 31}],
+            )
+
+            synced = gateway.sync_project_metrics("SILICON-EXPLORATION")
+            queried = gateway.get_project_metrics("silicon-exploration", 7)
+            status = gateway.metrics_sync_status("silicon-exploration")
+
+        self.assertEqual(synced["projectId"], "silicon-exploration")
+        self.assertEqual(queried["days"], 7)
+        self.assertEqual(status["projectId"], "silicon-exploration")
+        self.assertEqual([call[0] for call in metrics.calls], ["sync", "get", "status"])
+
+    def test_metrics_queries_are_read_only_during_source_live_session(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            metrics = _MetricsService()
+            gateway = self._gateway(
+                Path(directory),
+                [],
+                metrics_service=metrics,
+                runtime_conflict_checker=lambda: True,
+            )
+            gateway.save_profile(
+                "silicon-exploration",
+                "硅基探索",
+                [{"platform": "抖音", "accountId": 31}],
+            )
+
+            queried = gateway.get_project_metrics("silicon-exploration", 1)
+            status = gateway.metrics_sync_status("silicon-exploration")
+            with self.assertRaises(ContentProjectGatewayError) as raised:
+                gateway.sync_project_metrics("silicon-exploration")
+
+        self.assertEqual(queried["projectId"], "silicon-exploration")
+        self.assertEqual(status["projectId"], "silicon-exploration")
+        self.assertEqual(raised.exception.error_code, "source_live_session_active")
 
     def test_formal_publish_cannot_bypass_preflight_and_one_time_authorization(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
