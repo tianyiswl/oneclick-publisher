@@ -252,6 +252,37 @@ def run_controlled_publish_cli(args: argparse.Namespace) -> int:
             if final != initial:
                 _controlled_json(final)
             return 0 if final["status"] == "success" else 2
+        if action in {"silicon-preflight", "silicon-formal"}:
+            if not args.controlled_publish_request:
+                raise controlled_publish.ControlledPublishError(
+                    "controlled_request_file_required",
+                    "硅基进化自动直发必须提供 JSON 请求文件",
+                )
+            request = _read_controlled_request(args.controlled_publish_request)
+            request["mode"] = (
+                "preflight" if action == "silicon-preflight" else "formal"
+            )
+            initial = controlled_publish.submit_silicon_evolution_request(request)
+            _controlled_json(initial)
+            task_id = int(initial["taskId"])
+            try:
+                _wait_for_controlled_task(
+                    task_id,
+                    interactive_verification=(action == "silicon-formal"),
+                )
+            except KeyboardInterrupt:
+                task_service.fail_active_task(
+                    task_id,
+                    error_code="controlled_cli_interrupted",
+                    message="自动直发命令被中断，未取得最终回执的平台已安全停止",
+                    event_type="controlled_cli_interrupted",
+                )
+                _controlled_json(controlled_publish.task_status(task_id))
+                return 130
+            final = controlled_publish.task_status(task_id)
+            if final != initial:
+                _controlled_json(final)
+            return 0 if final["status"] == "success" else 2
         raise controlled_publish.ControlledPublishError(
             "controlled_action_invalid", "受控发布 action 只能是 create、status 或 authorize"
         )
@@ -415,7 +446,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--controlled-publish-action",
-        choices=("create", "status", "authorize"),
+        choices=("create", "status", "authorize", "silicon-preflight", "silicon-formal"),
         help="本机受控发布接口；默认只能由请求中的 preflight 模式启动预检。",
     )
     parser.add_argument(

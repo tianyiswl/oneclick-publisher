@@ -132,6 +132,7 @@ class ContentProjectGateway:
         status_reader: Callable[[int], dict[str, Any]] = controlled_publish.task_status,
         authorizer: Callable[[int], dict[str, Any]] = controlled_publish.authorize_completed_preflight,
         runtime_conflict_checker: Callable[[], bool] = _source_live_conflict,
+        silicon_submitter: Callable[[Mapping[str, Any]], dict[str, Any]] | None = None,
     ) -> None:
         self.profile_store = profile_store or PublishProfileStore()
         self.accounts_provider = accounts_provider
@@ -143,6 +144,13 @@ class ContentProjectGateway:
         self.status_reader = status_reader
         self.authorizer = authorizer
         self.runtime_conflict_checker = runtime_conflict_checker
+        if silicon_submitter is None:
+            from .controlled_publish_process import (
+                submit_silicon_evolution_request_in_process,
+            )
+
+            silicon_submitter = submit_silicon_evolution_request_in_process
+        self.silicon_submitter = silicon_submitter
 
     def _ensure_platform_work_available(self) -> None:
         if self.runtime_conflict_checker():
@@ -334,3 +342,93 @@ class ContentProjectGateway:
                 "content_project_task_id_invalid", "预检 taskId 必须是正整数"
             )
         return self.authorizer(task_id)
+
+    def _silicon_evolution_account_id(self) -> int:
+        profile = self.profile_store.get("silicon-evolution")
+        targets = list(profile.get("targets") or [])
+        if profile.get("displayName") != "硅基进化" or len(targets) != 1:
+            raise ContentProjectGatewayError(
+                "silicon_evolution_profile_invalid",
+                "硅基进化必须只绑定一个公众号账号",
+            )
+        target = dict(targets[0])
+        if oneclick_capabilities.canonical_platform(
+            str(target.get("platform") or "")
+        ) != oneclick_capabilities.canonical_platform("公众号"):
+            raise ContentProjectGatewayError(
+                "silicon_evolution_profile_invalid",
+                "硅基进化自动直发目标必须是公众号",
+            )
+        account_id = int(target.get("accountId") or 0)
+        matches = [
+            row
+            for row in self._account_rows()
+            if int(row.get("id") or 0) == account_id
+            and int(row.get("type") or 0) == 10
+            and str(row.get("profileName") or row.get("userName") or "")
+            == "硅基进化"
+        ]
+        if len(matches) != 1:
+            raise ContentProjectGatewayError(
+                "silicon_evolution_account_mismatch",
+                "硅基进化公众号账号无法唯一匹配",
+            )
+        return account_id
+
+    def _silicon_evolution_request(
+        self,
+        article_id: str,
+        package_path: str,
+        package_sha256: str,
+        *,
+        mode: str,
+        confirmed_preflight_task_id: int | None = None,
+    ) -> dict[str, Any]:
+        request: dict[str, Any] = {
+            "projectId": "silicon-evolution",
+            "articleId": str(article_id or "").strip(),
+            "packagePath": str(package_path or "").strip(),
+            "packageSha256": str(package_sha256 or "").strip(),
+            "accountId": self._silicon_evolution_account_id(),
+            "mode": mode,
+        }
+        if confirmed_preflight_task_id is not None:
+            request["confirmedPreflightTaskId"] = confirmed_preflight_task_id
+        return request
+
+    def preflight_silicon_evolution_release(
+        self, article_id: str, package_path: str, package_sha256: str
+    ) -> dict[str, Any]:
+        self._ensure_platform_work_available()
+        return self.silicon_submitter(
+            self._silicon_evolution_request(
+                article_id,
+                package_path,
+                package_sha256,
+                mode="preflight",
+            )
+        )
+
+    def auto_publish_silicon_evolution_release(
+        self,
+        article_id: str,
+        package_path: str,
+        package_sha256: str,
+        *,
+        confirmed_preflight_task_id: int,
+    ) -> dict[str, Any]:
+        self._ensure_platform_work_available()
+        if type(confirmed_preflight_task_id) is not int or confirmed_preflight_task_id <= 0:
+            raise ContentProjectGatewayError(
+                "silicon_evolution_preflight_required",
+                "自动直发必须绑定成功预检 taskId",
+            )
+        return self.silicon_submitter(
+            self._silicon_evolution_request(
+                article_id,
+                package_path,
+                package_sha256,
+                mode="formal",
+                confirmed_preflight_task_id=confirmed_preflight_task_id,
+            )
+        )

@@ -44,6 +44,33 @@ class _Gateway:
     ):
         return {"taskId": 8, "phase": "formal", "status": "pending", "platforms": []}
 
+    def preflight_silicon_evolution_release(
+        self, article_id, package_path, package_sha256
+    ):
+        return {
+            "taskId": 9,
+            "articleId": article_id,
+            "packageSha256": package_sha256,
+            "phase": "preflight",
+            "status": "pending",
+        }
+
+    def auto_publish_silicon_evolution_release(
+        self,
+        article_id,
+        package_path,
+        package_sha256,
+        *,
+        confirmed_preflight_task_id,
+    ):
+        return {
+            "taskId": 10,
+            "articleId": article_id,
+            "packageSha256": package_sha256,
+            "phase": "formal",
+            "status": "pending",
+        }
+
 
 class OneclickMcpServerTests(unittest.TestCase):
     def test_desktop_entrypoint_serves_mcp_over_stdio_without_opening_the_ui(self) -> None:
@@ -79,6 +106,8 @@ class OneclickMcpServerTests(unittest.TestCase):
                 "oneclick_task_status",
                 "oneclick_authorize_preflight",
                 "oneclick_formal_publish",
+                "oneclick_preflight_silicon_evolution_release",
+                "oneclick_auto_publish_silicon_evolution_release",
             },
         )
         preflight_schema = by_name["oneclick_preflight_content"].input_schema
@@ -92,6 +121,24 @@ class OneclickMcpServerTests(unittest.TestCase):
         ).lower()
         for forbidden in ("cookie", "password", "verification", "captcha"):
             self.assertNotIn(forbidden, all_schemas)
+
+    def test_silicon_evolution_preflight_tool_keeps_frozen_identity(self) -> None:
+        server = create_server(_Gateway())
+        result = asyncio.run(
+            server.call_tool(
+                "oneclick_preflight_silicon_evolution_release",
+                {
+                    "article_id": "WX-20260826-001",
+                    "package_path": "/content/WX-20260826-001",
+                    "package_sha256": "a" * 64,
+                },
+            )
+        )
+        self.assertTrue(result.structured_content["ok"])
+        self.assertEqual(
+            result.structured_content["task"]["articleId"],
+            "WX-20260826-001",
+        )
 
     def test_preflight_tool_returns_stable_json_envelope(self) -> None:
         server = create_server(_Gateway())

@@ -13,6 +13,16 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from . import account_service, content_bundle, oneclick_capabilities
+from .silicon_evolution_auto_publish import (
+    AutoPublishProfile,
+    SiliconEvolutionAutoPublishError,
+    build_silicon_evolution_payload,
+    require_matching_successful_preflight,
+)
+from .silicon_evolution_publish_package import (
+    FrozenWechatPublishPackageError,
+    load_frozen_wechat_publish_package,
+)
 
 
 _PLATFORM_TYPE_BY_NAME = {
@@ -435,14 +445,41 @@ def project_task(task: Mapping[str, Any] | None) -> dict[str, Any]:
                 ),
             }
         )
-    return {
+    result = {
         "taskId": int(task.get("id") or 0),
         "taskNo": str(task.get("taskNo") or ""),
         "mode": mode,
         "phase": phase,
         "status": str(task.get("status") or "pending"),
+        "occurredAt": str(
+            task.get("finishedAt")
+            or task.get("startedAt")
+            or task.get("createdAt")
+            or ""
+        ),
         "platforms": platforms,
     }
+    silicon_payloads = [
+        item
+        for rows in payloads_by_type.values()
+        for item in rows
+        if item.get("siliconEvolutionArticleId")
+    ]
+    if len(silicon_payloads) == 1:
+        payload = silicon_payloads[0]
+        account_ids = list(payload.get("accountIds") or [])
+        result.update(
+            {
+                "articleId": str(payload.get("siliconEvolutionArticleId") or ""),
+                "packageSha256": str(
+                    payload.get("siliconEvolutionPackageSha256") or ""
+                ),
+                "accountId": int(account_ids[0] or 0)
+                if len(account_ids) == 1
+                else 0,
+            }
+        )
+    return result
 
 
 def task_status(task_id: int) -> dict[str, Any]:
@@ -509,5 +546,116 @@ def submit_request(request: Mapping[str, Any]) -> dict[str, Any]:
                 payloads,
             )
     task = publish_service.start_desktop_publish(payloads)
+    stored = task_service.get_task(int(task["id"])) or task
+    return project_task(stored)
+
+
+_SILICON_REQUEST_KEYS = {
+    "projectId",
+    "articleId",
+    "packagePath",
+    "packageSha256",
+    "accountId",
+    "mode",
+    "confirmedPreflightTaskId",
+}
+
+
+def submit_silicon_evolution_request(request: Mapping[str, Any]) -> dict[str, Any]:
+    """从 V1.2 冻结包创建硅基进化公众号预检或自动正式任务。"""
+
+    from . import publish_service, task_service
+    from .database import connect
+
+    data = _require_mapping(
+        request,
+        "silicon_evolution_request_invalid",
+        "硅基进化自动直发请求必须是对象",
+    )
+    if set(data) - _SILICON_REQUEST_KEYS:
+        raise ControlledPublishError(
+            "silicon_evolution_request_invalid", "硅基进化自动直发包含不支持字段"
+        )
+    if str(data.get("projectId") or "") != "silicon-evolution":
+        raise ControlledPublishError(
+            "silicon_evolution_project_mismatch", "自动直发项目不是硅基进化"
+        )
+    mode = str(data.get("mode") or "")
+    if mode not in {"preflight", "formal"}:
+        raise ControlledPublishError(
+            "silicon_evolution_mode_invalid", "自动直发模式只能是 preflight 或 formal"
+        )
+    account_id = data.get("accountId")
+    if type(account_id) is not int or account_id <= 0:
+        raise ControlledPublishError(
+            "silicon_evolution_account_invalid", "自动直发公众号账号无效"
+        )
+    accounts = [
+        dict(row)
+        for row in account_service.list_accounts()
+        if int(row.get("id") or 0) == account_id
+    ]
+    if len(accounts) != 1 or int(accounts[0].get("type") or 0) != 10:
+        raise ControlledPublishError(
+            "silicon_evolution_account_mismatch", "自动直发账号不是唯一公众号账号"
+        )
+    account = accounts[0]
+    display_name = str(
+        account.get("profileName") or account.get("userName") or ""
+    ).strip()
+    if display_name != "硅基进化":
+        raise ControlledPublishError(
+            "silicon_evolution_account_mismatch", "自动直发账号不是硅基进化"
+        )
+    try:
+        package = load_frozen_wechat_publish_package(
+            Path(str(data.get("packagePath") or "")),
+            expected_sha256=str(data.get("packageSha256") or ""),
+        )
+        if package.article_id != str(data.get("articleId") or ""):
+            raise SiliconEvolutionAutoPublishError("自动直发文章编号与冻结包不匹配")
+        profile = AutoPublishProfile(
+            project_id="silicon-evolution",
+            account_id=account_id,
+            account_display_name=display_name,
+            enabled=True,
+        )
+        payload = build_silicon_evolution_payload(
+            package,
+            profile,
+            account_id=account_id,
+            mode="publish" if mode == "formal" else "preflight",
+        )
+        payload["accountList"] = [str(account.get("filePath") or "")]
+    except (FrozenWechatPublishPackageError, SiliconEvolutionAutoPublishError) as exc:
+        raise ControlledPublishError(
+            "silicon_evolution_package_invalid", str(exc)
+        ) from exc
+    if mode == "formal":
+        preflight_id = data.get("confirmedPreflightTaskId")
+        if type(preflight_id) is not int or preflight_id <= 0:
+            raise ControlledPublishError(
+                "silicon_evolution_preflight_required", "自动直发缺少成功预检 taskId"
+            )
+        preflight = task_service.get_task(preflight_id)
+        try:
+            preflight_payloads = require_matching_successful_preflight(
+                preflight,
+                package,
+                profile,
+            )
+        except SiliconEvolutionAutoPublishError as exc:
+            raise ControlledPublishError(
+                "silicon_evolution_preflight_mismatch", str(exc)
+            ) from exc
+        with connect() as conn:
+            grant = create_authorization(conn, preflight_id, preflight_payloads)
+            consume_authorization(
+                conn,
+                str(grant["authorizationId"]),
+                preflight_id,
+                [payload],
+            )
+    task = publish_service.start_desktop_publish([payload])
     stored = task_service.get_task(int(task["id"])) or task
     return project_task(stored)

@@ -29,6 +29,7 @@ from .wechat_publish_policy import (
     decide_group_notification_scope_confirmation,
     decide_wechat_publish_options,
     normalize_wechat_publish_preferences,
+    validate_silicon_evolution_auto_publish_readback,
 )
 from .wechat_verification import (
     TERMINAL_STATES,
@@ -40,6 +41,10 @@ from .wechat_verification import (
 
 class WechatPublishError(RuntimeError):
     """公众号正式发表无法安全继续。"""
+
+    def __init__(self, message: str, *, error_code: str = "wechat_publish_failed") -> None:
+        super().__init__(message)
+        self.error_code = error_code
 
 
 _NAVIGATION_TRANSIENT_MARKERS = (
@@ -1126,6 +1131,31 @@ async def run_wechat_publish(payload: dict[str, Any], *, task_id: int) -> dict[s
                 final_snapshot = await _final_options_snapshot(page)
                 if int(final_snapshot.get("dialogCount") or 0) == 1 and not final_clicked:
                     prepared = await _prepare_final_options(page, payload)
+                    if payload.get("siliconEvolutionArticleId"):
+                        silicon_state = {
+                            **dict(prepared["snapshot"]),
+                            "articleId": payload.get("siliconEvolutionArticleId"),
+                            "packageSha256": payload.get(
+                                "siliconEvolutionPackageSha256"
+                            ),
+                            "accountId": int(account["id"]),
+                            "accountDisplayName": editor_account,
+                            "preflightVerified": True,
+                        }
+                        silicon_decision = (
+                            validate_silicon_evolution_auto_publish_readback(
+                                payload,
+                                silicon_state,
+                            )
+                        )
+                        if not silicon_decision.get("allowed"):
+                            raise WechatPublishError(
+                                str(silicon_decision.get("reason") or "自动直发最终回读失败"),
+                                error_code=str(
+                                    silicon_decision.get("errorCode")
+                                    or "wechat_publish_options_mismatch"
+                                ),
+                            )
                     final_button = page.locator(
                         '[data-oneclick-final-publish="1"]'
                     )

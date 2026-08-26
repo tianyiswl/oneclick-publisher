@@ -133,6 +133,49 @@ def create_server(gateway: ContentProjectGateway | None = None) -> MCPServer:
             ),
         )
 
+    @server.tool(
+        name="oneclick_preflight_silicon_evolution_release",
+        description="重验硅基进化 V1.2 冻结包并执行公众号预检；不会发表。",
+        structured_output=True,
+    )
+    def preflight_silicon_evolution_release(
+        article_id: str,
+        package_path: str,
+        package_sha256: str,
+    ) -> dict[str, Any]:
+        return _call(
+            "task",
+            lambda: gateway.preflight_silicon_evolution_release(
+                article_id,
+                package_path,
+                package_sha256,
+            ),
+        )
+
+    @server.tool(
+        name="oneclick_auto_publish_silicon_evolution_release",
+        description=(
+            "只对硅基进化已冻结且同哈希预检成功的文章执行一次正式提交；"
+            "固定关闭群发通知和定时发表。"
+        ),
+        structured_output=True,
+    )
+    def auto_publish_silicon_evolution_release(
+        article_id: str,
+        package_path: str,
+        package_sha256: str,
+        confirmed_preflight_task_id: int,
+    ) -> dict[str, Any]:
+        return _call(
+            "task",
+            lambda: gateway.auto_publish_silicon_evolution_release(
+                article_id,
+                package_path,
+                package_sha256,
+                confirmed_preflight_task_id=confirmed_preflight_task_id,
+            ),
+        )
+
     return server
 
 

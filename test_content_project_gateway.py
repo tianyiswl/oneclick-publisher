@@ -36,6 +36,15 @@ class ContentProjectGatewayTests(unittest.TestCase):
                 "healthStatus": "normal",
                 "statusText": "正常",
             },
+            {
+                "id": 2,
+                "type": 10,
+                "filePath": "/private/wechat-session.json",
+                "profileName": "硅基进化",
+                "userName": "硅基进化",
+                "healthStatus": "normal",
+                "statusText": "正常",
+            },
         ]
 
     def _gateway(
@@ -44,6 +53,7 @@ class ContentProjectGatewayTests(unittest.TestCase):
         submitted: list[dict],
         *,
         runtime_conflict_checker=lambda: False,
+        silicon_submitted: list[dict] | None = None,
     ) -> ContentProjectGateway:
         return ContentProjectGateway(
             profile_store=PublishProfileStore(root / "publish-profiles.json"),
@@ -69,6 +79,15 @@ class ContentProjectGatewayTests(unittest.TestCase):
                 "singleUse": True,
             },
             runtime_conflict_checker=runtime_conflict_checker,
+            silicon_submitter=(
+                (lambda request: silicon_submitted.append(dict(request)) or {
+                    "taskId": 51,
+                    "phase": request["mode"],
+                    "status": "pending",
+                })
+                if silicon_submitted is not None
+                else None
+            ),
         )
 
     def test_account_catalog_never_exposes_login_session_paths(self) -> None:
@@ -95,9 +114,47 @@ class ContentProjectGatewayTests(unittest.TestCase):
                     "healthStatus": "normal",
                     "statusText": "正常",
                 },
+                {
+                    "accountId": 2,
+                    "platform": "公众号",
+                    "platformType": 10,
+                    "account": "硅基进化",
+                    "healthStatus": "normal",
+                    "statusText": "正常",
+                },
             ],
         )
         self.assertNotIn("filePath", json.dumps(catalog, ensure_ascii=False))
+
+    def test_silicon_evolution_route_uses_one_bound_wechat_account(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            submitted: list[dict] = []
+            gateway = self._gateway(
+                Path(directory), [], silicon_submitted=submitted
+            )
+            gateway.save_profile(
+                "silicon-evolution",
+                "硅基进化",
+                [{"platform": "公众号", "accountId": 2}],
+            )
+            result = gateway.preflight_silicon_evolution_release(
+                "WX-20260826-001",
+                "/content/WX-20260826-001",
+                "a" * 64,
+            )
+            formal = gateway.auto_publish_silicon_evolution_release(
+                "WX-20260826-001",
+                "/content/WX-20260826-001",
+                "a" * 64,
+                confirmed_preflight_task_id=51,
+            )
+
+        self.assertEqual(result["taskId"], 51)
+        self.assertEqual(formal["taskId"], 51)
+        self.assertEqual(submitted[0]["accountId"], 2)
+        self.assertEqual(submitted[0]["mode"], "preflight")
+        self.assertEqual(submitted[1]["mode"], "formal")
+        self.assertEqual(submitted[1]["confirmedPreflightTaskId"], 51)
 
     def test_project_profile_drives_preflight_with_explicit_accounts_and_schedules(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
