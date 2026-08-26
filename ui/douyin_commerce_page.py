@@ -1539,11 +1539,24 @@ class DouyinCommercePage(QWidget):
                 self.batch_location_keyword.text(),
             )
         )
+        self.batch_location_clear_auto_button = button(
+            "清空自动地址", variant="secondary", compact=True
+        )
+        self.batch_location_clear_auto_button.setObjectName(
+            "douyinCommerceBatchClearAutoLocations"
+        )
+        self.batch_location_clear_auto_button.setToolTip(
+            "清空系统自动填入的地址，保留手动选择的地址"
+        )
+        self.batch_location_clear_auto_button.clicked.connect(
+            self._clear_auto_batch_locations
+        )
         self.batch_location_keyword.returnPressed.connect(self.batch_location_search_button.click)
         title_row.addWidget(self.batch_location_commission_combo)
         title_row.addWidget(self.batch_location_scope_combo)
         title_row.addWidget(self.batch_location_keyword, 1)
         title_row.addWidget(self.batch_location_search_button)
+        title_row.addWidget(self.batch_location_clear_auto_button)
         layout.addLayout(title_row)
         self.batch_item_rows = QScrollArea()
         self.batch_item_rows.setObjectName("douyinCommerceBatchItemRows")
@@ -1706,6 +1719,27 @@ class DouyinCommercePage(QWidget):
         self._staged_location_confirmed = bool(self._batch_locations)
         self._batch_preflight_fingerprint = ""
         self._render_batch_item_rows()
+        self._sync_view()
+
+    def _clear_auto_batch_locations(self) -> None:
+        """清除本批次的自动地点，保留手动选择并终止旧搜索回写。"""
+
+        auto_paths = {
+            path
+            for path, source in self._batch_location_assignment_sources.items()
+            if source.startswith("auto:")
+        }
+        cleared_count = sum(path in self._batch_locations for path in auto_paths)
+        for path in auto_paths:
+            self._batch_locations.pop(path, None)
+            self._batch_location_assignment_sources.pop(path, None)
+        self._staged_location_confirmed = bool(self._batch_locations)
+        self._batch_preflight_fingerprint = ""
+        self._invalidate_batch_location_search_round()
+        self._set_batch_location_feedback(
+            f"已清空 {cleared_count} 条自动填入地址；手动选择的地址已保留，"
+            "可以输入新地点重新搜索"
+        )
         self._sync_view()
 
     def _batch_location_selection_changed(
@@ -4272,6 +4306,18 @@ class DouyinCommercePage(QWidget):
             and not self._batch_location_cache_pending
             and not self._batch_location_merge_pending
         )
+        if hasattr(self, "batch_location_clear_auto_button"):
+            has_auto_locations = any(
+                source.startswith("auto:") and path in self._batch_locations
+                for path, source in self._batch_location_assignment_sources.items()
+            )
+            self.batch_location_clear_auto_button.setEnabled(
+                can_search
+                and has_auto_locations
+                and not self._batch_location_load_more_pending
+                and not self._batch_location_cache_pending
+                and not self._batch_location_merge_pending
+            )
         if hasattr(self, "batch_location_load_more_button"):
             state_exists = (
                 _BATCH_SHARED_LOCATION_SEARCH_KEY

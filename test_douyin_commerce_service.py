@@ -16217,6 +16217,50 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
             self.page._batch_location_assignment_sources[manual_path], "manual"
         )
 
+    def test_clear_auto_locations_button_preserves_manual_and_invalidates_search(self) -> None:
+        """一键清理只撤销自动地点，并使上一轮搜索回包失效。"""
+
+        self._activate_cached_location_search(account_id=716)
+        auto_path, manual_path = "/tmp/auto.mp4", "/tmp/manual.mp4"
+        self.page._batch_locations[auto_path] = {
+            "poiId": "old-auto",
+            "name": "旧自动",
+            "address": "广东旧地址",
+        }
+        self.page._batch_locations[manual_path] = {
+            "poiId": "manual",
+            "name": "手动",
+            "address": "用户手动地址",
+        }
+        self.page._batch_location_assignment_sources[auto_path] = "auto:广州门店"
+        self.page._batch_location_assignment_sources[manual_path] = "manual"
+        self.page._batch_location_searches["__shared_location_search__"] = {
+            "scope": "domestic",
+            "keyword": "广州门店",
+            "rootKeyword": "广州门店",
+            "commissionFilter": "commission",
+        }
+        old_token = self.page._batch_location_search_token
+        self.page._sync_batch_location_controls()
+
+        self.assertTrue(self.page.batch_location_clear_auto_button.isEnabled())
+        self.page.batch_location_clear_auto_button.click()
+
+        self.assertNotIn(auto_path, self.page._batch_locations)
+        self.assertNotIn(auto_path, self.page._batch_location_assignment_sources)
+        self.assertEqual(
+            self.page._batch_locations[manual_path]["poiId"],
+            "manual",
+        )
+        self.assertEqual(
+            self.page._batch_location_assignment_sources[manual_path],
+            "manual",
+        )
+        self.assertGreater(self.page._batch_location_search_token, old_token)
+        self.assertEqual(self.page._batch_location_searches, {})
+        self.assertIn("已清空 1 条自动填入地址", self.page.batch_item_settings_status.text())
+        self.assertFalse(self.page.batch_location_clear_auto_button.isEnabled())
+
     def test_active_city_candidates_merge_under_city_and_root_cache_keys(self) -> None:
         """省计划里的城市结果必须同时归到城市和原始省份缓存。"""
 
