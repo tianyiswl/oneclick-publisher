@@ -1600,6 +1600,39 @@ class DouyinCommerceBatchTaskTests(unittest.TestCase):
             "pending",
         )
 
+    def test_generic_publish_result_persists_verified_public_receipt(self) -> None:
+        task = task_service.create_pending_task(
+            [
+                {
+                    "type": 10,
+                    "contentType": "text",
+                    "title": "公众号回执测试",
+                    "accountList": ["wechat.json"],
+                    "accountIds": [2],
+                    "fileList": [],
+                    "debugDryRun": False,
+                }
+            ],
+            mode="oneclick_publish",
+        )
+
+        task_service.mark_platform_result(
+            task["id"],
+            10,
+            ok=True,
+            message="公众号已正式发表并由首页回读确认",
+            content_type="text",
+            event_type="platform_publish",
+            readback={
+                "postUrl": "https://mp.weixin.qq.com/s/verified",
+                "publishedAt": "2026-08-26 17:43",
+            },
+        )
+
+        item = task_service.get_task(task["id"])["items"][0]
+        self.assertEqual(item["postUrl"], "https://mp.weixin.qq.com/s/verified")
+        self.assertEqual(item["publishedAt"], "2026-08-26 17:43")
+
     def test_public_batch_module_does_not_expose_a_dict_to_success_bridge(self) -> None:
         task = task_service.create_douyin_batch_task(self.batch)
         task_id = task["id"]

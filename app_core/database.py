@@ -550,6 +550,9 @@ def ensure_schema() -> None:
                 ("batchItemIndex", "INTEGER"),
                 ("locationSummary", "TEXT"),
                 ("scheduleSummary", "TEXT"),
+                ("platformPostId", "TEXT"),
+                ("postUrl", "TEXT"),
+                ("publishedAt", "TEXT"),
             ),
         )
         conn.execute(

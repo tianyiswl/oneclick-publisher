@@ -521,6 +521,32 @@ def authorize_completed_preflight(
         )
 
 
+def _find_successful_formal_scope_task(
+    tasks: Iterable[Mapping[str, Any]],
+    payloads: Iterable[Mapping[str, Any]],
+) -> dict[str, Any] | None:
+    """查找同一账号、内容与排期已有的正式成功任务。"""
+
+    expected = scope_fingerprint(payloads)
+    for raw_task in tasks:
+        if (
+            str(raw_task.get("mode") or "") != "oneclick_publish"
+            or str(raw_task.get("status") or "") != "success"
+        ):
+            continue
+        try:
+            stored = json.loads(str(raw_task.get("payloadJson") or "[]"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(stored, list) or not all(
+            isinstance(item, Mapping) for item in stored
+        ):
+            continue
+        if scope_fingerprint(stored) == expected:
+            return dict(raw_task)
+    return None
+
+
 def submit_request(request: Mapping[str, Any]) -> dict[str, Any]:
     """创建预检或经一次性授权的正式任务。"""
 
@@ -530,6 +556,18 @@ def submit_request(request: Mapping[str, Any]) -> dict[str, Any]:
     payloads = build_controlled_payloads(request)
     mode = str(request.get("mode") or "preflight").strip().lower()
     if mode == "formal":
+        existing = _find_successful_formal_scope_task(
+            task_service.list_tasks(limit=500),
+            payloads,
+        )
+        if existing:
+            raise ControlledPublishError(
+                "controlled_already_published",
+                (
+                    "同一账号、内容与排期已有正式成功回执，"
+                    f"已阻止重复发布；taskId={int(existing.get('id') or 0)}"
+                ),
+            )
         preflight_id = int(request["confirmedPreflightTaskId"])
         preflight = task_service.get_task(preflight_id)
         if not preflight or str(preflight.get("mode") or "") != "oneclick_preflight":
@@ -548,6 +586,42 @@ def submit_request(request: Mapping[str, Any]) -> dict[str, Any]:
     task = publish_service.start_desktop_publish(payloads)
     stored = task_service.get_task(int(task["id"])) or task
     return project_task(stored)
+
+
+def _find_successful_silicon_formal_task(
+    tasks: Iterable[Mapping[str, Any]],
+    *,
+    article_id: str,
+    package_sha256: str,
+    account_id: int,
+) -> dict[str, Any] | None:
+    """查找同一冻结文章已有的正式成功回执，防止重复发表。"""
+
+    for raw_task in tasks:
+        if (
+            str(raw_task.get("mode") or "") != "oneclick_publish"
+            or str(raw_task.get("status") or "") != "success"
+        ):
+            continue
+        try:
+            payloads = json.loads(str(raw_task.get("payloadJson") or "[]"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(payloads, list):
+            continue
+        for payload in payloads:
+            if not isinstance(payload, Mapping):
+                continue
+            if (
+                int(payload.get("type") or 0) == 10
+                and payload.get("accountIds") == [account_id]
+                and str(payload.get("siliconEvolutionArticleId") or "")
+                == article_id
+                and str(payload.get("siliconEvolutionPackageSha256") or "")
+                == package_sha256
+            ):
+                return dict(raw_task)
+    return None
 
 
 _SILICON_REQUEST_KEYS = {
@@ -632,6 +706,20 @@ def submit_silicon_evolution_request(request: Mapping[str, Any]) -> dict[str, An
             "silicon_evolution_package_invalid", str(exc)
         ) from exc
     if mode == "formal":
+        existing = _find_successful_silicon_formal_task(
+            task_service.list_tasks(limit=500),
+            article_id=package.article_id,
+            package_sha256=package.package_sha256,
+            account_id=account_id,
+        )
+        if existing:
+            raise ControlledPublishError(
+                "silicon_evolution_already_published",
+                (
+                    "同一冻结文章已有正式成功回执，已阻止重复发表；"
+                    f"taskId={int(existing.get('id') or 0)}"
+                ),
+            )
         preflight_id = data.get("confirmedPreflightTaskId")
         if type(preflight_id) is not int or preflight_id <= 0:
             raise ControlledPublishError(

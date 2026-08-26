@@ -643,6 +643,19 @@ def _run_publish(task: dict, payloads: list[dict[str, Any]]) -> None:
                     ),
                     content_type=str(payload.get("contentType") or ""),
                     event_type="platform_publish",
+                    readback={
+                        "postUrl": str(
+                            next(
+                                (
+                                    link.get("href")
+                                    for link in result.get("links") or []
+                                    if isinstance(link, dict) and link.get("href")
+                                ),
+                                "",
+                            )
+                        ),
+                        "publishedAt": str(result.get("publishedAt") or ""),
+                    },
                 )
             except Exception as exc:
                 task_service.mark_platform_result(
