@@ -15215,6 +15215,36 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.assertTrue(self.page.batch_location_load_more_button.isEnabled())
         self.assertEqual(calls, 3)
 
+    def test_third_zero_growth_page_advances_to_next_province_city(self) -> None:
+        """同一子词连续三页无合格新增时，应换城市而非困在原词。"""
+
+        owner = self._install_province_fixture("江苏joymark")
+        state = self.page._batch_location_state()
+        state["zeroGrowthCount"] = 2
+        self.page._batch_location_searches["__shared_location_search__"] = state
+
+        self.page._accept_province_location_page(
+            owner,
+            self._province_page(
+                [
+                    self._province_candidate(
+                        "outside-jiangsu",
+                        address="广东省广州市测试路1号",
+                    )
+                ],
+                has_more=True,
+            ),
+            started_at=time.monotonic(),
+            actions_used=3,
+        )
+
+        advanced = self.page._batch_location_state()
+        self.assertEqual(advanced["searchPlan"].current_index, 1)
+        self.assertEqual(advanced["activeKeyword"], "南京joymark")
+        self.assertEqual(advanced["zeroGrowthCount"], 0)
+        self.assertTrue(advanced["hasMore"])
+        self.assertTrue(self.page.batch_location_load_more_button.isEnabled())
+
     def test_accepted_page_persists_advanced_plan_and_progress_text(self) -> None:
         owner = self._install_province_fixture("广东joymark")
         self.page.runner = self._InlineRunner()
@@ -16038,6 +16068,31 @@ class DouyinCommerceBatchUiTests(unittest.TestCase):
         self.assertEqual(state["activeKeyword"], saved.subqueries[2])
         self.assertEqual(state["replayLoadsRemaining"], 2)
         continue_click.assert_called_once()
+
+    def test_empty_cached_plan_at_page_limit_resumes_from_next_city(self) -> None:
+        """旧版已在省份词空转多页时，恢复后不得再回放原地。"""
+
+        self._activate_cached_location_search(account_id=715)
+        stuck = replace(
+            build_location_search_plan("江苏joymark"),
+            current_load_count=9,
+        )
+        with patch.object(
+            douyin_location_cache,
+            "load_location_search_plan",
+            return_value=stuck,
+        ), patch.object(
+            self.page,
+            "_start_batch_location_platform_search",
+            return_value=True,
+        ):
+            self.page._search_batch_locations("domestic", "江苏joymark")
+            self._finish_location_cache_search()
+
+        state = self.page._batch_location_state()
+        self.assertEqual(state["searchPlan"].current_index, 1)
+        self.assertEqual(state["activeKeyword"], "南京joymark")
+        self.assertEqual(state["replayLoadsRemaining"], 0)
 
     def test_city_search_keeps_single_active_query_state(self) -> None:
         """城市词不扇出，采集器只收到这一条完整城市搜索词。"""

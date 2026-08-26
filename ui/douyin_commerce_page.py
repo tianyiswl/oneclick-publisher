@@ -110,6 +110,7 @@ _BATCH_SHARED_LOCATION_SEARCH_KEY = "__shared_location_search__"
 _BATCH_LOCATION_MAX_IDENTITIES = 100
 _PROVINCE_CLICK_MAX_ACTIONS = 3
 _PROVINCE_CLICK_MAX_SECONDS = 30.0
+_PROVINCE_ZERO_GROWTH_PAGE_LIMIT = 3
 
 COLLECTOR_ERROR_COPY = {
     "collector_start_failed": "采集器启动失败",
@@ -2253,6 +2254,20 @@ class DouyinCommercePage(QWidget):
             return
         if plan is None:
             plan = build_location_search_plan(cache_query.keyword)
+        if (
+            plan.search_kind == "province"
+            and not plan.exhausted
+            and not cached_candidates
+            and plan.current_load_count >= _PROVINCE_ZERO_GROWTH_PAGE_LIMIT
+        ):
+            # 0.5.10 可能把“平台仍有无关下一页”记成同一
+            # 省份/城市词的无限回放。根词没有任何合格缓存且
+            # 已连续读取三页时，恢复到下一城市，不再回放旧空页。
+            plan = advance_after_page(
+                plan,
+                has_more=False,
+                eligible_total=0,
+            )
         state = {
             "accountId": cache_query.account_id,
             "scope": normalized_scope,
@@ -3203,9 +3218,29 @@ class DouyinCommercePage(QWidget):
             if self._batch_location_candidate_identity(item) not in before
         ]
         eligible_total = len(accepted)
+        effective_growth = len(
+            {
+                self._batch_location_candidate_identity(item) for item in accepted
+            }
+            - before
+        )
         replay_action = action_kind in {"replay_search", "replay_load"}
         replay_remaining = int(previous_state.get("replayLoadsRemaining") or 0)
         shortened_replay = replay_action and has_more is False
+        if replay_action:
+            next_zero_growth_count = int(
+                previous_state.get("zeroGrowthCount") or 0
+            )
+        elif effective_growth:
+            next_zero_growth_count = 0
+        else:
+            next_zero_growth_count = (
+                int(previous_state.get("zeroGrowthCount") or 0) + 1
+            )
+        bounded_has_more = (
+            has_more
+            and next_zero_growth_count < _PROVINCE_ZERO_GROWTH_PAGE_LIMIT
+        )
         if replay_action and not shortened_replay:
             next_plan = plan
             next_replay_remaining = (
@@ -3215,16 +3250,14 @@ class DouyinCommercePage(QWidget):
             )
         else:
             next_plan = advance_after_page(
-                plan, has_more=has_more, eligible_total=eligible_total
+                plan,
+                has_more=bounded_has_more,
+                eligible_total=eligible_total,
             )
             next_replay_remaining = 0 if shortened_replay else replay_remaining
-        effective_growth = len(
-            {
-                self._batch_location_candidate_identity(item) for item in accepted
-            }
-            - before
-        )
         city_advanced = next_plan.current_index != plan.current_index
+        if city_advanced:
+            next_zero_growth_count = 0
         terminal = next_plan.exhausted or eligible_total >= _BATCH_LOCATION_MAX_IDENTITIES
         next_state = dict(previous_state)
         next_state.update(
@@ -3244,8 +3277,7 @@ class DouyinCommercePage(QWidget):
                 "observedPlatformCandidates": [] if city_advanced else platform_snapshot,
                 "platformContextReady": False if city_advanced else True,
                 "platformLoadCount": 0 if city_advanced else int(previous_state["platformLoadCount"]) + 1,
-                "zeroGrowthCount": int(previous_state["zeroGrowthCount"])
-                + (1 if effective_growth == 0 else 0),
+                "zeroGrowthCount": next_zero_growth_count,
                 "hasMore": not terminal,
                 "source": "platform",
             }
