@@ -2684,26 +2684,24 @@ async def _douyin_video_preflight(page, payload: dict) -> str:
 
 
 async def _douyin_graphic_preflight(page, payload: dict) -> str:
-    """抖音图文预检：上传图片序列、填写、回读，不创建草稿。"""
+    """抖音图文预检与矩阵正式发布共用同一填写、话题和定时回读合同。"""
 
-    files = [Path(str(item)).resolve() for item in payload.get("fileList") or []]
-    if not files or not all(path.is_file() for path in files):
-        raise PreflightError("抖音图文预检缺少可读取的图片素材")
-    if len(files) > 35:
-        raise PreflightError("抖音图文一次最多可上传 35 张图片")
-    title, description = _payload_text(payload, "抖音图文预检")
-    await page.goto(f"{_DOUYIN_UPLOAD_URL}?default-tab=3", wait_until="domcontentloaded", timeout=45_000)
-    upload = page.locator('input[type=file]').first
-    await upload.wait_for(state="attached", timeout=15_000)
-    await upload.set_input_files([str(path) for path in files])
-    await page.wait_for_url("**/creator-micro/content/post/image*", timeout=30_000)
-    await _douyin_fill_title_and_description(
-        page, title, description, title_placeholder="添加作品标题", label="图文",
+    from .douyin_graphic_editor import DouyinGraphicEditor, DouyinGraphicEditorError
+
+    try:
+        readback = await DouyinGraphicEditor().prepare(page, payload)
+    except DouyinGraphicEditorError as exc:
+        raise PreflightError(f"{exc}（错误码 {exc.error_code}）") from exc
+    schedule_note = (
+        f"，定时 {readback.scheduled_at} 已回读"
+        if readback.scheduled_at
+        else "，立即发布状态已回读"
     )
-    location_name = await _douyin_set_location(page, payload)
-    # 安全边界：不定位或点击预览、暂存、发布等会产生平台内容结果的控件。
-    location_note = f"，定位“{location_name}”已回读" if location_name else "，未添加定位"
-    return f"抖音图文已上传 {len(files)} 张图片，标题和描述已回读{location_note}；未保存草稿、未预览、未发布"
+    return (
+        f"抖音图文已上传 {readback.image_count} 张图片，"
+        f"标题、正文和 {len(readback.tags)} 个官方话题已回读{schedule_note}；"
+        "未保存草稿、未预览、未点击最终发布"
+    )
 
 
 async def _douyin_text_preflight(page, payload: dict) -> str:

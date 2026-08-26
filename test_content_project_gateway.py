@@ -71,6 +71,7 @@ class ContentProjectGatewayTests(unittest.TestCase):
         *,
         runtime_conflict_checker=lambda: False,
         silicon_submitted: list[dict] | None = None,
+        matrix_submitted: list[dict] | None = None,
         metrics_service: _MetricsService | None = None,
     ) -> ContentProjectGateway:
         return ContentProjectGateway(
@@ -106,8 +107,56 @@ class ContentProjectGatewayTests(unittest.TestCase):
                 if silicon_submitted is not None
                 else None
             ),
+            matrix_submitter=(
+                (lambda request: matrix_submitted.append(dict(request)) or {
+                    "taskId": 61,
+                    "taskNo": "T61",
+                    "phase": (
+                        "formal"
+                        if request.get("runtimeMode") == "publish"
+                        else "local_check"
+                    ),
+                    "status": "pending",
+                    "platforms": [],
+                })
+                if matrix_submitted is not None
+                else None
+            ),
             metrics_service=metrics_service,
         )
+
+    @staticmethod
+    def _article_bundle(root: Path) -> Path:
+        (root / "01.png").write_bytes(b"first-image")
+        (root / "02.png").write_bytes(b"second-image")
+        (root / "正文.md").write_text("通用正文", encoding="utf-8")
+        manifest = root / "manifest.json"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": "oneclick-content/v1",
+                    "contentType": "article",
+                    "title": "通用标题",
+                    "bodyFile": "正文.md",
+                    "tags": ["通用话题"],
+                    "assets": ["01.png", "02.png"],
+                    "covers": {"3:4": "01.png"},
+                    "preferredPlatforms": ["抖音"],
+                    "platformOverrides": {
+                        "抖音": {
+                            "title": "抖音标题",
+                            "body": "抖音正文",
+                            "tags": ["抖音话题"],
+                        }
+                    },
+                    "debugDryRun": True,
+                    "publishAllowed": False,
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        return manifest
 
     def test_account_catalog_never_exposes_login_session_paths(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -221,6 +270,66 @@ class ContentProjectGatewayTests(unittest.TestCase):
                 }
             ],
         )
+
+    def test_matrix_gateway_forwards_explicit_per_account_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = self._article_bundle(root)
+            submitted: list[dict] = []
+            gateway = self._gateway(
+                root,
+                [],
+                matrix_submitted=submitted,
+            )
+
+            result = gateway.check_douyin_graphic_matrix(
+                str(manifest),
+                [
+                    {
+                        "accountId": 31,
+                        "title": "账号一标题",
+                        "body": None,
+                        "tags": None,
+                        "schedule": {
+                            "localTime": "2026-08-27 18:00",
+                            "timezone": "Asia/Shanghai",
+                        },
+                    }
+                ],
+            )
+
+        self.assertEqual(result["phase"], "local_check")
+        self.assertEqual(submitted[0]["workflow"], "douyin-graphic-matrix")
+        self.assertEqual(submitted[0]["runtimeMode"], "local_check")
+        self.assertEqual(submitted[0]["content"]["common"]["title"], "抖音标题")
+        self.assertEqual(submitted[0]["content"]["common"]["body"], "抖音正文")
+        self.assertEqual(submitted[0]["targets"][0]["overrides"]["title"], "账号一标题")
+        self.assertIsNone(submitted[0]["targets"][0]["overrides"]["body"])
+        self.assertEqual(
+            submitted[0]["targets"][0]["scheduleTime"],
+            "2026-08-27 18:00",
+        )
+
+    def test_matrix_formal_requires_check_and_forwards_one_time_authorization(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = self._article_bundle(root)
+            submitted: list[dict] = []
+            gateway = self._gateway(root, [], matrix_submitted=submitted)
+
+            authorization = gateway.authorize_douyin_graphic_matrix(61)
+            result = gateway.publish_douyin_graphic_matrix(
+                str(manifest),
+                [{"accountId": 31}],
+                confirmed_check_task_id=61,
+                authorization_id="one-time-grant",
+            )
+
+        self.assertEqual(authorization["authorizationId"], "one-time-grant")
+        self.assertEqual(result["phase"], "formal")
+        self.assertEqual(submitted[0]["runtimeMode"], "publish")
+        self.assertEqual(submitted[0]["confirmedCheckTaskId"], 61)
+        self.assertEqual(submitted[0]["authorizationId"], "one-time-grant")
 
     def test_gateway_metrics_methods_resolve_saved_profile(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -235,7 +235,7 @@ def run_controlled_publish_cli(args: argparse.Namespace) -> int:
                     "controlled_task_id_required", "创建授权必须提供预检 taskId"
                 )
             _controlled_json(
-                controlled_publish.authorize_completed_preflight(
+                controlled_publish.authorize_completed_check(
                     args.controlled_publish_task_id
                 )
             )
@@ -267,6 +267,40 @@ def run_controlled_publish_cli(args: argparse.Namespace) -> int:
                 )
                 final = controlled_publish.task_status(task_id)
                 _controlled_json(final)
+                return 130
+            final = controlled_publish.task_status(task_id)
+            if final != initial:
+                _controlled_json(final)
+            return 0 if final["status"] == "success" else 2
+        if action == "matrix":
+            if not args.controlled_publish_request:
+                raise controlled_publish.ControlledPublishError(
+                    "controlled_request_file_required",
+                    "抖音图文矩阵必须提供 JSON 请求文件",
+                )
+            request = _read_controlled_request(args.controlled_publish_request)
+            runtime_mode = str(request.get("runtimeMode") or "local_check")
+            initial_task = publish_service.start_douyin_graphic_matrix(
+                request,
+                authorization_id=str(request.get("authorizationId") or ""),
+                checked_task_id=int(request.get("confirmedCheckTaskId") or 0),
+            )
+            initial = controlled_publish.project_task(initial_task)
+            _controlled_json(initial)
+            task_id = int(initial["taskId"])
+            try:
+                _wait_for_controlled_task(
+                    task_id,
+                    interactive_verification=(runtime_mode == "publish"),
+                )
+            except KeyboardInterrupt:
+                task_service.fail_active_task(
+                    task_id,
+                    error_code="controlled_cli_interrupted",
+                    message="图文矩阵命令被中断，未取得最终回执的账号已安全停止",
+                    event_type="controlled_cli_interrupted",
+                )
+                _controlled_json(controlled_publish.task_status(task_id))
                 return 130
             final = controlled_publish.task_status(task_id)
             if final != initial:
@@ -477,6 +511,7 @@ def main() -> int:
             "authorize",
             "silicon-preflight",
             "silicon-formal",
+            "matrix",
             "metrics-sync",
             "metrics-get",
             "metrics-status",

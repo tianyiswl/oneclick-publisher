@@ -185,6 +185,20 @@ class DouyinVerificationDialogTests(unittest.TestCase):
         self.assertNotIn("验证码", dialog.item_context_label.text())
         dialog.close()
 
+    def test_matrix_verification_context_names_the_exact_account(self):
+        request_id = self.broker.create_sms(task_id=159, message="需要短信验证")
+        dialog = DouyinVerificationDialog(
+            request_id,
+            broker=self.broker,
+            item_index=2,
+            item_total=8,
+            item_label="主体二 · 账号二",
+            item_kind="账号",
+        )
+        self.assertEqual(dialog.item_context_label.text(), "第 2/8 个账号：主体二 · 账号二")
+        self.assertNotIn("登录文件", dialog.item_context_label.text())
+        dialog.close()
+
     def test_window_close_cancels_waiting_but_not_processing_request(self):
         waiting_id = self.broker.create_sms(task_id=54, message="需要短信验证")
         waiting_dialog = DouyinVerificationDialog(waiting_id, broker=self.broker)

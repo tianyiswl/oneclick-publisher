@@ -18,6 +18,14 @@ from tools.build_macos import (
 
 
 class MacOSBuildTests(unittest.TestCase):
+    def test_packaged_entrypoint_includes_matrix_controlled_action(self) -> None:
+        source = (Path(__file__).resolve().parent / "desktop_native_app.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('action == "matrix"', source)
+        self.assertIn("start_douyin_graphic_matrix", source)
+
     def test_customer_archive_rejects_seller_license_material(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             archive = Path(temp_dir) / "unsafe.zip"

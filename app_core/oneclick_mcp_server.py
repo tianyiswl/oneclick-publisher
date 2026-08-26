@@ -134,6 +134,61 @@ def create_server(gateway: ContentProjectGateway | None = None) -> MCPServer:
         )
 
     @server.tool(
+        name="oneclick_check_douyin_graphic_matrix",
+        description=(
+            "读取结构化图文内容包并逐账号执行本地字段检查；"
+            "不会打开抖音，也不会提交平台。"
+        ),
+        structured_output=True,
+    )
+    def check_douyin_graphic_matrix(
+        manifest_path: str,
+        targets: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        return _call(
+            "task",
+            lambda: gateway.check_douyin_graphic_matrix(manifest_path, targets),
+        )
+
+    @server.tool(
+        name="oneclick_authorize_douyin_graphic_matrix",
+        description=(
+            "只能在用户明确确认当次正式发布后调用；"
+            "为全部成功的图文矩阵本地检查创建短期一次性授权。"
+        ),
+        structured_output=True,
+    )
+    def authorize_douyin_graphic_matrix(task_id: int) -> dict[str, Any]:
+        return _call(
+            "authorization",
+            lambda: gateway.authorize_douyin_graphic_matrix(task_id),
+        )
+
+    @server.tool(
+        name="oneclick_publish_douyin_graphic_matrix",
+        description=(
+            "按本地检查中的相同内容、账号顺序和排期执行抖音图文矩阵正式发布；"
+            "必须携带对应的一次性授权。"
+        ),
+        structured_output=True,
+    )
+    def publish_douyin_graphic_matrix(
+        manifest_path: str,
+        targets: Sequence[Mapping[str, Any]],
+        confirmed_check_task_id: int,
+        authorization_id: str,
+    ) -> dict[str, Any]:
+        return _call(
+            "task",
+            lambda: gateway.publish_douyin_graphic_matrix(
+                manifest_path,
+                targets,
+                confirmed_check_task_id=confirmed_check_task_id,
+                authorization_id=authorization_id,
+            ),
+        )
+
+    @server.tool(
         name="oneclick_sync_project_metrics",
         description=(
             "按内容项目已配置账号执行一次只读数据同步；"

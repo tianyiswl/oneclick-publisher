@@ -7,10 +7,12 @@ import json
 import os
 import re
 import tempfile
+import hashlib
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from . import account_service, controlled_publish, oneclick_capabilities
+from . import account_service, content_bundle, controlled_publish, oneclick_capabilities
 from .paths import USER_DATA_DIR
 from .content_project_metrics import ContentProjectMetricsService
 from .source_live_runtime import source_live_data_active, source_live_session_active
@@ -134,6 +136,7 @@ class ContentProjectGateway:
         authorizer: Callable[[int], dict[str, Any]] = controlled_publish.authorize_completed_preflight,
         runtime_conflict_checker: Callable[[], bool] = _source_live_conflict,
         silicon_submitter: Callable[[Mapping[str, Any]], dict[str, Any]] | None = None,
+        matrix_submitter: Callable[[Mapping[str, Any]], dict[str, Any]] | None = None,
         metrics_service: ContentProjectMetricsService | None = None,
     ) -> None:
         self.profile_store = profile_store or PublishProfileStore()
@@ -153,6 +156,13 @@ class ContentProjectGateway:
 
             silicon_submitter = submit_silicon_evolution_request_in_process
         self.silicon_submitter = silicon_submitter
+        if matrix_submitter is None:
+            from .controlled_publish_process import (
+                submit_douyin_graphic_matrix_request_in_process,
+            )
+
+            matrix_submitter = submit_douyin_graphic_matrix_request_in_process
+        self.matrix_submitter = matrix_submitter
         self.metrics_service = metrics_service or ContentProjectMetricsService()
 
     def _ensure_platform_work_available(self) -> None:
@@ -371,6 +381,193 @@ class ContentProjectGateway:
                 "content_project_task_id_invalid", "预检 taskId 必须是正整数"
             )
         return self.authorizer(task_id)
+
+    @staticmethod
+    def _matrix_schedule(value: object) -> str:
+        if value is None:
+            return ""
+        schedule = _mapping(
+            value,
+            "douyin_graphic_matrix_schedule_invalid",
+            "抖音图文账号排期必须是对象",
+        )
+        if set(schedule) - {"localTime", "timezone"}:
+            raise ContentProjectGatewayError(
+                "douyin_graphic_matrix_schedule_invalid",
+                "抖音图文账号排期包含不支持字段",
+            )
+        timezone = str(schedule.get("timezone") or "Asia/Shanghai").strip()
+        if timezone != "Asia/Shanghai":
+            raise ContentProjectGatewayError(
+                "douyin_graphic_matrix_schedule_invalid",
+                "抖音图文矩阵只使用北京时间 Asia/Shanghai",
+            )
+        local_time = str(schedule.get("localTime") or "").strip()
+        try:
+            parsed = datetime.strptime(local_time, "%Y-%m-%d %H:%M")
+        except ValueError as exc:
+            raise ContentProjectGatewayError(
+                "douyin_graphic_matrix_schedule_invalid",
+                "抖音图文发布时间必须使用 YYYY-MM-DD HH:MM",
+            ) from exc
+        return parsed.strftime("%Y-%m-%d %H:%M")
+
+    def _douyin_graphic_matrix(
+        self,
+        manifest_path: str,
+        targets: Sequence[Mapping[str, Any]],
+        *,
+        runtime_mode: str,
+    ) -> dict[str, Any]:
+        try:
+            bundle = content_bundle.load_content_bundle(
+                manifest_path,
+                expected_type="article",
+            )
+        except content_bundle.ContentBundleError as exc:
+            raise ContentProjectGatewayError(
+                "douyin_graphic_matrix_bundle_invalid",
+                str(exc),
+            ) from exc
+        if not isinstance(targets, Sequence) or isinstance(targets, (str, bytes)):
+            raise ContentProjectGatewayError(
+                "douyin_graphic_matrix_targets_invalid",
+                "抖音图文矩阵账号必须是有序列表",
+            )
+        if not 1 <= len(targets) <= 20:
+            raise ContentProjectGatewayError(
+                "douyin_graphic_matrix_targets_invalid",
+                "抖音图文矩阵账号数量必须为 1 至 20 个",
+            )
+
+        override = dict(bundle.get("platformOverrides", {}).get("抖音") or {})
+        common = {
+            "title": str(override.get("title") or bundle.get("commonTitle") or "").strip(),
+            "body": str(override.get("body") or bundle.get("commonBody") or "").strip(),
+            "tags": list(
+                override.get("tags")
+                if "tags" in override
+                else bundle.get("commonTags") or []
+            ),
+        }
+        if not common["title"] or not common["body"]:
+            raise ContentProjectGatewayError(
+                "douyin_graphic_matrix_content_invalid",
+                "内容包必须提供可用于抖音的纯净标题和正文",
+            )
+
+        allowed = {"accountId", "title", "body", "tags", "schedule"}
+        normalized_targets: list[dict[str, Any]] = []
+        seen_accounts: set[int] = set()
+        for position, raw_target in enumerate(targets, start=1):
+            target = _mapping(
+                raw_target,
+                "douyin_graphic_matrix_target_invalid",
+                "抖音图文账号配置必须是对象",
+            )
+            if set(target) - allowed:
+                raise ContentProjectGatewayError(
+                    "douyin_graphic_matrix_target_invalid",
+                    "抖音图文账号配置包含不支持字段",
+                )
+            account_id = target.get("accountId")
+            if type(account_id) is not int or account_id <= 0 or account_id in seen_accounts:
+                raise ContentProjectGatewayError(
+                    "douyin_graphic_matrix_target_invalid",
+                    "抖音图文 accountId 必须是唯一正整数",
+                )
+            seen_accounts.add(account_id)
+            tags = target.get("tags")
+            if tags is not None and (
+                not isinstance(tags, Sequence)
+                or isinstance(tags, (str, bytes))
+                or not all(isinstance(tag, str) for tag in tags)
+            ):
+                raise ContentProjectGatewayError(
+                    "douyin_graphic_matrix_target_invalid",
+                    "抖音图文账号话题必须是字符串列表",
+                )
+            schedule_time = self._matrix_schedule(target.get("schedule"))
+            normalized_targets.append(
+                {
+                    "itemIndex": position,
+                    "accountId": account_id,
+                    "overrides": {
+                        "title": target.get("title"),
+                        "body": target.get("body"),
+                        "tags": None if tags is None else list(tags),
+                    },
+                    "scheduleTime": schedule_time,
+                    "scheduleOverridden": bool(schedule_time),
+                }
+            )
+
+        manifest = Path(str(bundle["sourcePath"]))
+        return {
+            "schemaVersion": "oneclick-douyin-graphic-matrix/v1",
+            "workflow": "douyin-graphic-matrix",
+            "runtimeMode": runtime_mode,
+            "content": {
+                "manifestPath": str(manifest),
+                "manifestSha256": hashlib.sha256(manifest.read_bytes()).hexdigest(),
+                "images": list(bundle.get("assetPaths") or []),
+                "common": common,
+            },
+            "targets": normalized_targets,
+        }
+
+    def check_douyin_graphic_matrix(
+        self,
+        manifest_path: str,
+        targets: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        self._ensure_platform_work_available()
+        return self.matrix_submitter(
+            self._douyin_graphic_matrix(
+                manifest_path,
+                targets,
+                runtime_mode="local_check",
+            )
+        )
+
+    def authorize_douyin_graphic_matrix(self, task_id: int) -> dict[str, Any]:
+        if type(task_id) is not int or task_id <= 0:
+            raise ContentProjectGatewayError(
+                "content_project_task_id_invalid",
+                "本地检查 taskId 必须是正整数",
+            )
+        return self.authorizer(task_id)
+
+    def publish_douyin_graphic_matrix(
+        self,
+        manifest_path: str,
+        targets: Sequence[Mapping[str, Any]],
+        *,
+        confirmed_check_task_id: int,
+        authorization_id: str,
+    ) -> dict[str, Any]:
+        self._ensure_platform_work_available()
+        if (
+            type(confirmed_check_task_id) is not int
+            or confirmed_check_task_id <= 0
+            or not str(authorization_id or "").strip()
+        ):
+            raise ContentProjectGatewayError(
+                "content_project_authorization_required",
+                "图文矩阵正式发布必须绑定成功的本地检查和一次性授权",
+            )
+        matrix = self._douyin_graphic_matrix(
+            manifest_path,
+            targets,
+            runtime_mode="publish",
+        )
+        matrix.update(
+            {
+                "confirmedCheckTaskId": confirmed_check_task_id,
+                "authorizationId": str(authorization_id).strip(),
+            }
+        )
+        return self.matrix_submitter(matrix)
 
     def _silicon_evolution_account_id(self) -> int:
         profile = self.profile_store.get("silicon-evolution")

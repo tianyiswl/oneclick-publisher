@@ -160,6 +160,20 @@ def submit_silicon_evolution_request_in_process(
     )
 
 
+def submit_douyin_graphic_matrix_request_in_process(
+    request: Mapping[str, Any],
+    *,
+    startup_timeout_seconds: float = 20,
+) -> dict[str, Any]:
+    """在独立 CLI 进程中启动图文矩阵本地检查或正式任务。"""
+
+    return _submit_action_in_process(
+        "matrix",
+        request,
+        startup_timeout_seconds=startup_timeout_seconds,
+    )
+
+
 def _submit_action_in_process(
     action: str,
     request: Mapping[str, Any],

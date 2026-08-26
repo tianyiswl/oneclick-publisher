@@ -10693,7 +10693,8 @@ class DouyinCommerceUiTests(unittest.TestCase):
         window = MainWindow()
         try:
             labels = [label for label, _page, _icon in window.page_definitions]
-            self.assertEqual(labels[4], "抖音带货")
+            self.assertEqual(labels[4], "抖音图文矩阵")
+            self.assertEqual(labels[5], "抖音带货")
             window.set_current_page_by_key("commerce")
             self.assertIs(window.tabs.currentWidget(), window.douyin_commerce)
         finally:

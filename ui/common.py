@@ -153,6 +153,29 @@ def apply_style(app: QApplication) -> None:
             border: 0;
             border-right: 1px solid #24344D;
         }
+        QLabel#douyinGraphicStep {
+            background: #FFFFFF;
+            border: 1px solid #DCE3EA;
+            border-radius: 8px;
+            color: #667085;
+            font-weight: 600;
+            padding: 8px 12px;
+        }
+        QLabel#douyinGraphicStep[active="true"] {
+            background: #E8F5F3;
+            border-color: #0B766E;
+            color: #0B766E;
+            font-weight: 700;
+        }
+        QFrame#douyinGraphicPanel, QFrame#douyinGraphicAccountRow {
+            background: #FFFFFF;
+            border: 1px solid #DCE3EA;
+            border-radius: 8px;
+        }
+        QLabel#douyinGraphicAccountName {
+            color: #172033;
+            font-weight: 700;
+        }
         QFrame#brandBlock { background: transparent; border: 0; }
         QLabel#brandIcon { background: transparent; }
         QLabel#brandTitle {

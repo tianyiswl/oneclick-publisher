@@ -17,9 +17,11 @@ from zoneinfo import ZoneInfo
 from myUtils.postVideo import post_video_batch_draft_tabs
 
 from . import (
+    account_service,
     douyin_commerce_batch_executor,
     douyin_commerce_batch_service,
     douyin_commerce_service,
+    douyin_graphic_matrix_executor,
     douyin_location_service,
     douyin_publish_executor,
     oneclick_capabilities,
@@ -36,6 +38,7 @@ from . import (
     xhs_location_service,
     xhs_publish_executor,
 )
+from .douyin_graphic_matrix_service import prepare_matrix
 from .paths import VIDEO_DIR
 
 
@@ -456,6 +459,160 @@ def _run_douyin_commerce_batch_preflight(
     finally:
         _publish_lock.release()
         _active_threads.pop(int(task["id"]), None)
+
+
+def run_local_check(matrix: dict[str, Any]) -> list[dict[str, Any]]:
+    """返回逐账号的本地检查结果；此函数不导入或调用任何浏览器执行器。"""
+
+    results: list[dict[str, Any]] = []
+    for target in matrix.get("targets") or []:
+        effective = target.get("effective") if isinstance(target, dict) else None
+        ok = (
+            isinstance(effective, dict)
+            and bool(str(effective.get("title") or "").strip())
+            and bool(str(effective.get("description") or "").strip())
+            and bool(effective.get("fileList"))
+            and int(target.get("accountId") or 0) > 0
+        )
+        results.append(
+            {
+                "itemIndex": int(target.get("itemIndex") or 0),
+                "accountId": int(target.get("accountId") or 0),
+                "status": "success" if ok else "failed",
+                "errorCode": "" if ok else "douyin_graphic_matrix_invalid",
+                "errorText": "" if ok else "本地字段检查未通过",
+                "receipt": None,
+            }
+        )
+    return results
+
+
+def _run_matrix_local_check(task: dict, matrix: dict[str, Any]) -> None:
+    try:
+        for result in run_local_check(matrix):
+            item = task_service.matrix_item_for_index(
+                int(task["id"]), int(result["itemIndex"])
+            )
+            task_service.start_matrix_item(int(task["id"]), int(item["id"]))
+            task_service.finish_matrix_item(
+                int(task["id"]),
+                int(item["id"]),
+                ok=result["status"] == "success",
+                message=(
+                    "本地批量检查通过，尚未打开抖音"
+                    if result["status"] == "success"
+                    else str(result["errorText"])
+                ),
+                error_code=str(result["errorCode"]),
+            )
+        task_service.close_matrix_parent(int(task["id"]))
+    except Exception as exc:
+        task_service.fail_active_task(
+            int(task["id"]),
+            error_code=str(
+                getattr(exc, "error_code", "douyin_graphic_matrix_local_check_failed")
+            ),
+            message=f"抖音图文矩阵本地检查异常：{exc}",
+        )
+    finally:
+        _active_threads.pop(int(task["id"]), None)
+
+
+def _run_matrix_platform_task(
+    task: dict[str, Any], matrix: dict[str, Any], *, submit: bool
+) -> None:
+    if not _publish_lock.acquire(blocking=False):
+        task_service.fail_active_task(
+            int(task["id"]),
+            error_code="controlled_publish_busy",
+            message="已有平台任务正在执行，抖音图文矩阵未启动",
+        )
+        _active_threads.pop(int(task["id"]), None)
+        return
+    try:
+        runner = (
+            douyin_graphic_matrix_executor.run_matrix_sync
+            if submit
+            else douyin_graphic_matrix_executor.run_matrix_preflight_sync
+        )
+        runner(matrix, task_id=int(task["id"]))
+    except Exception as exc:
+        task_service.fail_active_task(
+            int(task["id"]),
+            error_code=str(
+                getattr(
+                    exc,
+                    "error_code",
+                    "douyin_graphic_matrix_worker_failed",
+                )
+            ),
+            message=f"抖音图文矩阵执行异常：{exc}",
+        )
+    finally:
+        _publish_lock.release()
+        _active_threads.pop(int(task["id"]), None)
+
+
+def start_douyin_graphic_matrix(
+    matrix: dict[str, Any],
+    *,
+    authorization_id: str = "",
+    checked_task_id: int = 0,
+) -> dict:
+    """启动独立图文矩阵，不进入通用文件×账号扩展路径。"""
+
+    prepared = prepare_matrix(matrix, accounts=account_service.list_accounts())
+    runtime_mode = str(prepared.get("runtimeMode") or "")
+    if runtime_mode not in {"local_check", "preflight", "publish"}:
+        raise ValueError("抖音图文矩阵运行模式无效")
+    if runtime_mode == "publish":
+        if not str(authorization_id or "").strip() or int(checked_task_id or 0) <= 0:
+            raise ValueError("抖音图文矩阵正式发布需要一次性授权")
+        from .controlled_publish import consume_matrix_authorization
+
+        consume_matrix_authorization(
+            str(authorization_id), int(checked_task_id), prepared
+        )
+    mode = {
+        "local_check": "oneclick_matrix_local_check",
+        "preflight": "oneclick_matrix_preflight",
+        "publish": "oneclick_matrix_publish",
+    }[runtime_mode]
+    task = task_service.create_douyin_graphic_matrix_task(
+        prepared, mode=mode
+    )
+    worker = threading.Thread(
+        target=(
+            _run_matrix_local_check
+            if runtime_mode == "local_check"
+            else _run_matrix_platform_task
+        ),
+        args=(task, prepared),
+        kwargs=(
+            {}
+            if runtime_mode == "local_check"
+            else {"submit": runtime_mode == "publish"}
+        ),
+        daemon=True,
+        name=f"oneclick-douyin-graphic-matrix-{runtime_mode}-{task['id']}",
+    )
+    _active_threads[int(task["id"])] = worker
+    worker.start()
+    return task
+
+
+def pause_douyin_graphic_matrix(task_id: int) -> bool:
+    """由客户端请求在下一个最终提交前暂停。"""
+
+    task = task_service.get_task(int(task_id))
+    if not task or str(task.get("mode") or "") not in {
+        "oneclick_matrix_preflight",
+        "oneclick_matrix_publish",
+    }:
+        return False
+    if str(task.get("status") or "") not in {"pending", "running"}:
+        return False
+    return douyin_graphic_matrix_executor.request_pause(int(task_id))
 
 
 def _run_douyin_commerce_batch_publish(
