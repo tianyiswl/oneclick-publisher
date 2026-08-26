@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
-from app_core import database
+from app_core import database, task_service
 from app_core.content_project_metrics import ContentProjectMetricsService
 
 
@@ -101,6 +101,84 @@ class ContentProjectMetricsTests(unittest.TestCase):
             "contentCount": 0 if failed else 2,
         }
 
+    def _create_project_task(
+        self,
+        project_id: str,
+        *,
+        phase: str,
+        status: str,
+        platform_post_id: str | None,
+    ) -> int:
+        mode = "oneclick_publish" if phase == "formal" else "oneclick_preflight"
+        task = task_service.create_pending_task(
+            [
+                {
+                    "type": 3,
+                    "contentType": "video",
+                    "title": f"{project_id}-{phase}",
+                    "fileList": [f"/{project_id}-{phase}.mp4"],
+                    "accountList": ["douyin.json"],
+                    "debugDryRun": phase == "preflight",
+                    "contentProjectId": project_id,
+                }
+            ],
+            mode=mode,
+        )
+        with database.connect() as conn:
+            conn.execute(
+                "UPDATE publish_tasks SET status = ?, finishedAt = ? WHERE id = ?",
+                (status, self.now.isoformat(), task["id"]),
+            )
+            conn.execute(
+                """
+                UPDATE publish_task_items
+                SET status = ?, platformPostId = ?, publishedAt = ?, finishedAt = ?
+                WHERE taskId = ?
+                """,
+                (
+                    status,
+                    platform_post_id,
+                    self.now.isoformat() if platform_post_id else None,
+                    self.now.isoformat(),
+                    task["id"],
+                ),
+            )
+        return int(task["id"])
+
+    def _insert_content_metric(self, content_id: str, views: int) -> None:
+        observed = self.now.isoformat()
+        with database.connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO platform_data_sync_runs
+                    (accountId, platformType, sourceMode, status, errorCode,
+                     metricCount, startedAt, finishedAt)
+                VALUES (31, 3, 'direct_session', 'success', '', 1, ?, ?)
+                """,
+                (observed, observed),
+            )
+            run_id = int(cursor.lastrowid)
+            conn.execute(
+                """
+                INSERT INTO platform_contents
+                    (accountId, platformType, contentId, title, coverUrl,
+                     publishedAt, contentStatus, contentType, firstSeenAt, lastSeenAt)
+                VALUES (31, 3, ?, ?, '', ?, 'published', 'video', ?, ?)
+                """,
+                (content_id, f"作品-{content_id}", observed, observed, observed),
+            )
+            conn.execute(
+                """
+                INSERT INTO platform_metric_snapshots
+                    (syncRunId, accountId, platformType, entityType, entityKey,
+                     metricKey, rawMetricKey, metricValue, metricUnit,
+                     metricScope, periodStart, periodEnd, observedAt, createdAt)
+                VALUES (?, 31, 3, 'content', ?, 'views', 'play_count', ?, 'count',
+                        'lifetime_total', '2026-08-26', '2026-08-26', ?, ?)
+                """,
+                (run_id, content_id, views, observed, observed),
+            )
+
     def test_two_projects_reuse_same_account_success_on_same_beijing_day(self) -> None:
         first = self.service.sync_project("project-a", self.profile)
         second = self.service.sync_project("project-b", self.profile)
@@ -154,6 +232,53 @@ class ContentProjectMetricsTests(unittest.TestCase):
 
         self.assertEqual(result["accounts"][0]["action"], "reused")
         self.assertEqual(self.calls, [])
+
+    def test_project_query_never_returns_other_projects_content(self) -> None:
+        self._create_project_task(
+            "project-a", phase="formal", status="success", platform_post_id="work-a"
+        )
+        self._create_project_task(
+            "project-b", phase="formal", status="success", platform_post_id="work-b"
+        )
+        self._insert_content_metric("work-a", 123)
+        self._insert_content_metric("work-b", 456)
+
+        result = self.service.get_project_metrics("project-a", self.profile, 7)
+
+        self.assertEqual([item["contentId"] for item in result["contents"]], ["work-a"])
+        self.assertEqual(result["contents"][0]["metrics"]["views"], 123)
+        self.assertEqual(result["accounts"][0]["scope"], "account")
+
+    def test_success_item_without_platform_id_is_missing_not_published(self) -> None:
+        task_id = self._create_project_task(
+            "project-a", phase="formal", status="success", platform_post_id=None
+        )
+
+        result = self.service.get_project_metrics("project-a", self.profile, 1)
+
+        item = next(row for row in result["contents"] if row["taskId"] == task_id)
+        self.assertIsNone(item["contentId"])
+        self.assertEqual(item["availability"], "missing")
+        self.assertTrue(all(value is None for value in item["metrics"].values()))
+
+    def test_preflight_and_failed_tasks_do_not_enter_project_contents(self) -> None:
+        preflight_task = self._create_project_task(
+            "project-a", phase="preflight", status="success", platform_post_id="preflight"
+        )
+        failed_task = self._create_project_task(
+            "project-a", phase="formal", status="failed", platform_post_id="failed"
+        )
+        success_task = self._create_project_task(
+            "project-a", phase="formal", status="success", platform_post_id="work-a"
+        )
+        self._insert_content_metric("work-a", 123)
+
+        result = self.service.get_project_metrics("project-a", self.profile, 1)
+        task_ids = {row["taskId"] for row in result["contents"]}
+
+        self.assertNotIn(preflight_task, task_ids)
+        self.assertNotIn(failed_task, task_ids)
+        self.assertEqual(task_ids, {success_task})
 
 
 if __name__ == "__main__":

@@ -8,13 +8,21 @@ from datetime import datetime, timedelta
 from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo
 
-from . import database, platform_data_sync
+from . import account_service, database, platform_data_service, platform_data_sync
 
 
 _BEIJING = ZoneInfo("Asia/Shanghai")
 _FAILURE_COOLDOWN = timedelta(minutes=30)
 _ACCOUNT_LOCKS: dict[int, threading.Lock] = {}
 _ACCOUNT_LOCKS_GUARD = threading.Lock()
+_PUBLIC_CONTENT_METRICS = (
+    "views",
+    "likes",
+    "comments",
+    "shares",
+    "favorites",
+    "downloads",
+)
 
 
 class ContentProjectMetricsError(ValueError):
@@ -267,4 +275,200 @@ class ContentProjectMetricsService:
                 )
                 for target in _targets(profile)
             ],
+        }
+
+    @staticmethod
+    def _content_metrics(
+        account_id: int,
+        platform_type: int,
+        content_id: str,
+    ) -> tuple[dict[str, int | float | None], str | None, str | None]:
+        metrics: dict[str, int | float | None] = {
+            key: None for key in _PUBLIC_CONTENT_METRICS
+        }
+        try:
+            with database.connect() as conn:
+                rows = conn.execute(
+                    """
+                    WITH ranked AS (
+                        SELECT snapshots.metricKey, snapshots.metricValue,
+                               snapshots.observedAt, runs.finishedAt,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY snapshots.metricKey
+                                   ORDER BY snapshots.periodEnd DESC,
+                                            snapshots.id DESC
+                               ) AS rowNumber
+                        FROM platform_metric_snapshots AS snapshots
+                        JOIN platform_data_sync_runs AS runs
+                          ON runs.id = snapshots.syncRunId
+                        WHERE snapshots.accountId = ?
+                          AND snapshots.platformType = ?
+                          AND snapshots.entityType = 'content'
+                          AND snapshots.entityKey = ?
+                          AND snapshots.metricScope = 'lifetime_total'
+                          AND runs.status IN ('success', 'partial_success')
+                    )
+                    SELECT metricKey, metricValue, observedAt, finishedAt
+                    FROM ranked
+                    WHERE rowNumber = 1
+                    ORDER BY metricKey
+                    """,
+                    (account_id, platform_type, content_id),
+                ).fetchall()
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as exc:
+            raise ContentProjectMetricsError(
+                "sync_persist_failed", "项目作品指标无法读取"
+            ) from exc
+        observed: list[str] = []
+        synced: list[str] = []
+        for row in rows:
+            key = str(row["metricKey"])
+            if key not in metrics:
+                continue
+            value = float(row["metricValue"])
+            metrics[key] = int(value) if value.is_integer() else value
+            if str(row["observedAt"] or ""):
+                observed.append(str(row["observedAt"]))
+            if str(row["finishedAt"] or ""):
+                synced.append(str(row["finishedAt"]))
+        return metrics, (max(observed) if observed else None), (max(synced) if synced else None)
+
+    @staticmethod
+    def _content_details(
+        account_id: int,
+        platform_type: int,
+        content_id: str,
+    ) -> dict[str, Any] | None:
+        try:
+            with database.connect() as conn:
+                row = conn.execute(
+                    """
+                    SELECT title, publishedAt, contentStatus, contentType
+                    FROM platform_contents
+                    WHERE accountId = ? AND platformType = ? AND contentId = ?
+                    LIMIT 1
+                    """,
+                    (account_id, platform_type, content_id),
+                ).fetchone()
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as exc:
+            raise ContentProjectMetricsError(
+                "sync_persist_failed", "项目作品资料无法读取"
+            ) from exc
+        return dict(row) if row is not None else None
+
+    def _project_contents(
+        self,
+        project_id: str,
+        profile: Mapping[str, Any],
+    ) -> list[dict[str, Any]]:
+        allowed = {
+            (int(target["accountId"]), str(target["platform"]))
+            for target in _targets(profile)
+        }
+        try:
+            with database.connect() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT links.taskId, items.platformType, items.platformPostId,
+                           items.publishedAt, items.finishedAt,
+                           tasks.title AS taskTitle,
+                           accounts.id AS accountId
+                    FROM content_project_task_links AS links
+                    JOIN publish_tasks AS tasks ON tasks.id = links.taskId
+                    JOIN publish_task_items AS items ON items.taskId = tasks.id
+                    LEFT JOIN user_info AS accounts
+                      ON accounts.filePath = items.accountFile
+                     AND accounts.type = items.platformType
+                    WHERE links.projectId = ?
+                      AND links.phase = 'formal'
+                      AND tasks.mode = 'oneclick_publish'
+                      AND tasks.status = 'success'
+                      AND items.status = 'success'
+                    ORDER BY links.taskId DESC, items.id
+                    """,
+                    (project_id,),
+                ).fetchall()
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as exc:
+            raise ContentProjectMetricsError(
+                "sync_persist_failed", "项目发布作品归属无法读取"
+            ) from exc
+
+        contents: list[dict[str, Any]] = []
+        for row in rows:
+            account_id = int(row["accountId"] or 0)
+            platform_type = int(row["platformType"] or 0)
+            platform = account_service.PLATFORMS.get(
+                platform_type, f"平台{platform_type}"
+            )
+            if (account_id, platform) not in allowed:
+                continue
+            content_id = str(row["platformPostId"] or "").strip()
+            metrics = {key: None for key in _PUBLIC_CONTENT_METRICS}
+            observed_at = None
+            local_synced_at = None
+            details = None
+            if content_id:
+                metrics, observed_at, local_synced_at = self._content_metrics(
+                    account_id, platform_type, content_id
+                )
+                details = self._content_details(
+                    account_id, platform_type, content_id
+                )
+            contents.append(
+                {
+                    "taskId": int(row["taskId"]),
+                    "platform": platform,
+                    "accountId": account_id,
+                    "contentId": content_id or None,
+                    "title": str((details or {}).get("title") or row["taskTitle"] or ""),
+                    "publishedAt": (
+                        str((details or {}).get("publishedAt") or row["publishedAt"] or "")
+                        or None
+                    ),
+                    "metrics": metrics,
+                    "availability": (
+                        "available"
+                        if content_id and any(value is not None for value in metrics.values())
+                        else "missing"
+                    ),
+                    "platformObservedAt": observed_at,
+                    "localSyncedAt": local_synced_at,
+                }
+            )
+        return contents
+
+    def get_project_metrics(
+        self,
+        project_id: str,
+        profile: Mapping[str, Any],
+        days: int = 1,
+    ) -> dict[str, Any]:
+        if type(days) is not int or days not in {1, 7, 30}:
+            raise ContentProjectMetricsError(
+                "metric_payload_invalid", "days 只允许 1、7、30"
+            )
+        accounts = []
+        for target in _targets(profile):
+            summary = platform_data_service.account_period_summary(
+                int(target["accountId"]), days
+            )
+            accounts.append(
+                {
+                    "scope": "account",
+                    "platform": str(target["platform"]),
+                    "accountId": int(target["accountId"]),
+                    "summary": summary,
+                }
+            )
+        return {
+            "projectId": str(project_id),
+            "days": days,
+            "accounts": accounts,
+            "contents": self._project_contents(str(project_id), profile),
         }
