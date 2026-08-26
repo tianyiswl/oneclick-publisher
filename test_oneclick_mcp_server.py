@@ -44,6 +44,22 @@ class _Gateway:
     ):
         return {"taskId": 8, "phase": "formal", "status": "pending", "platforms": []}
 
+    def check_douyin_graphic_matrix(self, manifest_path, targets):
+        return {"taskId": 61, "phase": "local_check", "status": "pending", "platforms": []}
+
+    def authorize_douyin_graphic_matrix(self, task_id):
+        return {"preflightTaskId": task_id, "authorizationId": "matrix-grant", "singleUse": True}
+
+    def publish_douyin_graphic_matrix(
+        self,
+        manifest_path,
+        targets,
+        *,
+        confirmed_check_task_id,
+        authorization_id,
+    ):
+        return {"taskId": 62, "phase": "formal", "status": "pending", "platforms": []}
+
     def sync_project_metrics(self, project_id):
         return {"projectId": project_id, "accounts": []}
 
@@ -120,6 +136,9 @@ class OneclickMcpServerTests(unittest.TestCase):
                 "oneclick_metrics_sync_status",
                 "oneclick_preflight_silicon_evolution_release",
                 "oneclick_auto_publish_silicon_evolution_release",
+                "oneclick_check_douyin_graphic_matrix",
+                "oneclick_authorize_douyin_graphic_matrix",
+                "oneclick_publish_douyin_graphic_matrix",
             },
         )
         preflight_schema = by_name["oneclick_preflight_content"].input_schema
@@ -131,8 +150,40 @@ class OneclickMcpServerTests(unittest.TestCase):
             {name: tool.input_schema for name, tool in by_name.items()},
             ensure_ascii=False,
         ).lower()
-        for forbidden in ("cookie", "password", "verification", "captcha"):
+        for forbidden in (
+            "cookie",
+            "password",
+            "verification_code",
+            "captcha",
+            "storage_state",
+        ):
             self.assertNotIn(forbidden, all_schemas)
+
+    def test_matrix_tools_keep_local_check_and_formal_publish_separate(self) -> None:
+        server = create_server(_Gateway())
+        checked = asyncio.run(
+            server.call_tool(
+                "oneclick_check_douyin_graphic_matrix",
+                {
+                    "manifest_path": "/content/manifest.json",
+                    "targets": [{"accountId": 31}],
+                },
+            )
+        )
+        published = asyncio.run(
+            server.call_tool(
+                "oneclick_publish_douyin_graphic_matrix",
+                {
+                    "manifest_path": "/content/manifest.json",
+                    "targets": [{"accountId": 31}],
+                    "confirmed_check_task_id": 61,
+                    "authorization_id": "matrix-grant",
+                },
+            )
+        )
+
+        self.assertEqual(checked.structured_content["task"]["phase"], "local_check")
+        self.assertEqual(published.structured_content["task"]["phase"], "formal")
 
     def test_metrics_tools_return_stable_project_envelopes(self) -> None:
         server = create_server(_Gateway())

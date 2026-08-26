@@ -32,6 +32,8 @@ class WindowsBuildTests(unittest.TestCase):
         self.assertIn("_wait_for_controlled_task", source)
         self.assertIn("DouyinVerificationDialog", source)
         self.assertIn("douyin_verification_broker.request_for_task(task_id)", source)
+        self.assertIn('action == "matrix"', source)
+        self.assertIn("start_douyin_graphic_matrix", source)
 
     def test_source_cli_can_explicitly_reuse_installed_user_data(self):
         with patch.dict(
