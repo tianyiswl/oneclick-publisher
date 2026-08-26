@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "diagram_type": "lifecycle",
+  "meta": {
+    "title": "抖音图文矩阵发布生命周期",
+    "output": "docs/architecture/douyin-graphic-matrix.lifecycle.html",
+    "viewBox": [980, 566],
+    "animation": "none",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "main_flow",
+        "label": "主发布流程",
+        "focus": ["draft", "local_check", "awaiting_confirmation", "account_execution", "completed"],
+        "note": "从图文配置到全部账号取得明确结果。"
+      },
+      {
+        "id": "human_gates",
+        "label": "人工确认与验证",
+        "focus": ["awaiting_confirmation", "verification_wait", "manual_pause", "account_execution"],
+        "note": "整批正式发布只确认一次，验证和暂停只中断当前账号。"
+      },
+      {
+        "id": "failure_recovery",
+        "label": "失败与恢复",
+        "focus": ["account_execution", "account_failed", "completed"],
+        "note": "单账号失败不阻塞后续账号，进程异常也不留下永久运行任务。"
+      }
+    ]
+  },
+  "lanes": [
+    {"id": "main", "label": "主流程"},
+    {"id": "waiting", "label": "等待与验证"},
+    {"id": "recovery", "label": "失败恢复"}
+  ],
+  "states": [
+    {"id": "draft", "type": "start", "label": "配置图文矩阵", "sublabel": "图片、通用内容、账号覆盖", "lane": "main", "col": 0, "step": "01", "tag": "草稿"},
+    {"id": "local_check", "type": "active", "label": "本地批量检查", "sublabel": "素材、字段与定时", "lane": "main", "col": 1, "step": "02", "tag": "不打开平台"},
+    {"id": "awaiting_confirmation", "type": "decision", "label": "整批正式确认", "sublabel": "账号、内容与时间快照", "lane": "main", "col": 2, "step": "03", "tag": "人工边界"},
+    {"id": "account_execution", "type": "active", "label": "单账号串行执行", "sublabel": "页面检查、填写回读、提交", "lane": "main", "col": 3, "step": "04", "tag": "一次会话"},
+    {"id": "completed", "type": "success", "label": "批次已结束", "sublabel": "每个账号均有明确结果", "lane": "main", "col": 4, "step": "05", "tag": "结果明细"},
+    {"id": "verification_wait", "type": "waiting", "label": "等待验证", "sublabel": "验证码可见；冷却后继续", "lane": "waiting", "col": 0, "tag": "当前账号"},
+    {"id": "manual_pause", "type": "waiting", "label": "手动暂停", "sublabel": "停在下一账号前", "lane": "waiting", "col": 1, "tag": "可继续"},
+    {"id": "account_failed", "type": "failure", "label": "账号或进程失败", "sublabel": "保存错误码与原文", "lane": "recovery", "col": 2, "tag": "继续后续"}
+  ],
+  "transitions": [
+    {"id": "draft_to_check", "from": "draft", "to": "local_check", "route": "straight"},
+    {"id": "check_to_confirm", "from": "local_check", "to": "awaiting_confirmation", "route": "straight"},
+    {"id": "check_to_draft", "from": "local_check", "to": "draft", "variant": "emphasis"},
+    {"id": "confirm_to_execute", "from": "awaiting_confirmation", "to": "account_execution", "variant": "security", "route": "straight"},
+    {"id": "execute_to_completed", "from": "account_execution", "to": "completed", "route": "straight"},
+    {"id": "execute_to_verification", "from": "account_execution", "to": "verification_wait", "variant": "security"},
+    {"id": "verification_to_execute", "from": "verification_wait", "to": "account_execution", "variant": "emphasis"},
+    {"id": "execute_to_pause", "from": "account_execution", "to": "manual_pause"},
+    {"id": "pause_to_execute", "from": "manual_pause", "to": "account_execution", "variant": "emphasis"},
+    {"id": "execute_to_failed", "from": "account_execution", "to": "account_failed", "variant": "security"},
+    {"id": "failed_to_execute", "from": "account_failed", "to": "account_execution", "variant": "emphasis"}
+  ]
+}
