@@ -16,6 +16,7 @@ from app_core.wechat_publish_policy import (
     decide_wechat_author_readback,
     decide_wechat_publish_options,
     normalize_wechat_publish_preferences,
+    validate_silicon_evolution_auto_publish_readback,
 )
 
 
@@ -72,6 +73,39 @@ def _group_scope_state() -> dict:
 
 
 class WechatPublishPolicyTests(unittest.TestCase):
+    def test_auto_publish_stops_when_group_notification_is_on(self):
+        payload = {
+            "type": 10,
+            "title": "测试标题",
+            "contentHtml": "<p>正文</p>",
+            "coverPath": "/tmp/cover.png",
+            "fileList": ["/tmp/01.png"],
+            "accountIds": [2],
+            "accountDisplayNames": ["硅基进化"],
+            "wechatGroupNotification": False,
+            "enableTimer": False,
+            "scheduleTime": None,
+            "siliconEvolutionArticleId": "WX-20260826-001",
+            "siliconEvolutionPackageSha256": "a" * 64,
+        }
+        state = {
+            "articleId": "WX-20260826-001",
+            "packageSha256": "a" * 64,
+            "accountId": 2,
+            "accountDisplayName": "硅基进化",
+            "preflightVerified": True,
+            "options": {
+                "groupNotification": {"available": True, "enabled": True},
+                "groupedNotification": {"available": True, "enabled": True},
+                "scheduledPublish": {"available": True, "enabled": False},
+            },
+            "publishButtonCount": 1,
+            "buttons": ["发表", "取消"],
+        }
+        decision = validate_silicon_evolution_auto_publish_readback(payload, state)
+        self.assertFalse(decision["allowed"])
+        self.assertEqual(decision["errorCode"], "wechat_publish_options_mismatch")
+
     def test_matching_ai_image_declaration_is_allowed(self):
         decision = decide_ai_source_declaration(_policy(), _state())
         self.assertTrue(decision["allowed"])

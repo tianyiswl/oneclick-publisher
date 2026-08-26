@@ -16,7 +16,12 @@ import unittest
 from typing import Any, Mapping
 from unittest import mock
 
-from app_core import douyin_commerce_service, douyin_commerce_session
+from app_core import (
+    douyin_commerce_collectors,
+    douyin_commerce_probe,
+    douyin_commerce_service,
+    douyin_commerce_session,
+)
 from app_core.douyin_commerce_collectors import (
     DouyinCommerceCollectorError,
     DouyinCommerceCollectorManager,
@@ -108,7 +113,11 @@ class FakeSessionManager:
         scope: object,
         *,
         commission_filter: object = "all",
+        include_metadata: bool = False,
+        province_mode: bool = False,
+        deadline_monotonic: float | None = None,
     ) -> list[dict[str, Any]]:
+        del include_metadata, province_mode, deadline_monotonic
         self.location_calls.append(
             (session_id, keyword, scope, commission_filter)
         )
@@ -144,7 +153,10 @@ class FakeSessionManager:
         *,
         commission_filter: object,
         previous_candidates: object,
+        province_mode: bool = False,
+        deadline_monotonic: float | None = None,
     ) -> dict[str, object]:
+        del province_mode, deadline_monotonic
         context = (str(keyword), str(scope), str(commission_filter))
         if context != self.location_search_context:
             raise RuntimeError("collector_search_context_mismatch")
@@ -425,6 +437,74 @@ class DouyinCommerceCollectorManagerTests(unittest.TestCase):
         self.assertEqual(event["candidateCount"], 1)
         self.assertEqual(event["outcome"], "success")
         self.assertEqual(event["errorCode"], "collector_unknown")
+
+    def test_metadata_empty_search_is_a_structured_terminal_page(self):
+        """明确空首屏是城市耗尽，不应令省份计划误判为采集上下文丢失。"""
+
+        generation_id = self.manager.begin_generation(self.upload_payload)[
+            "setupGenerationId"
+        ]
+        with mock.patch.object(
+            FakeSessionManager,
+            "search_locations",
+            return_value={"platformResultCount": 0, "candidates": []},
+        ):
+            result = self.manager.search_locations(
+                generation_id,
+                "广东 joymark",
+                "domestic",
+                commission_filter="commission",
+                include_metadata=True,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["setupGenerationId"], generation_id)
+        self.assertEqual(result["collectorType"], "domestic_location")
+        self.assertTrue(result["collectorInstanceId"])
+        self.assertEqual(result["platformResultCount"], 0)
+        self.assertEqual(result["candidates"], [])
+        self.assertEqual(result["newCandidateCount"], 0)
+        self.assertFalse(result["hasMore"])
+        self.assertEqual(result["stopReason"], "no_visible_load_more_control")
+
+    def test_location_search_forwards_optional_absolute_deadline(self):
+        generation_id = self.manager.begin_generation(self.upload_payload)[
+            "setupGenerationId"
+        ]
+        deadline = time.monotonic() + 5
+        with mock.patch.object(
+            FakeSessionManager,
+            "search_locations",
+            return_value=[{"poiId": "deadline", "name": "北海", "address": "广西北海"}],
+        ) as search:
+            self.manager.search_locations(
+                generation_id,
+                "北海",
+                "domestic",
+                deadline_monotonic=deadline,
+            )
+
+        self.assertEqual(search.call_args.kwargs["deadline_monotonic"], deadline)
+        self.assertEqual(
+            self.manager._classify_diagnostic_error(
+                RuntimeError("publish_location_load_more_limit")
+            ),
+            "province_location_search_action_timeout",
+        )
+
+    def test_session_timeout_becomes_stable_collector_timeout_code(self):
+        generation_id = self.manager.begin_generation(self.upload_payload)[
+            "setupGenerationId"
+        ]
+        self.factory.instances[0].search_error = douyin_commerce_session.DouyinCommerceSessionError(
+            "province_location_search_action_timeout"
+        )
+
+        with self.assertRaisesRegex(
+            DouyinCommerceCollectorError,
+            "province_location_search_action_timeout",
+        ):
+            self.manager.search_locations(generation_id, "北海", "domestic")
 
     def test_location_search_normalizes_and_passes_commission_filter_to_session_manager(self):
         """协调器必须在 POI 去重前把返佣筛选传给真实会话搜索边界。"""
@@ -937,6 +1017,8 @@ class DouyinCommerceCollectorManagerTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["platformResultCount"], 3)
         self.assertEqual(result["candidates"], [])
+        self.assertTrue(result["hasMore"])
+        self.assertEqual(result["stopReason"], "filtered_empty_may_have_more")
         self.assertNotIn("rawCandidates", result)
 
     def test_real_probe_builder_preserves_account_id_for_runtime_and_diagnostics(self):
@@ -1092,6 +1174,29 @@ class DouyinCommerceCollectorManagerTests(unittest.TestCase):
         self.assertNotIn("token=", safe_detail.casefold())
         self.assertNotIn("dom=", safe_detail.casefold())
         self.assertNotIn("session", safe_detail.casefold())
+        session_detail = self.manager._safe_diagnostic_detail(
+            douyin_commerce_session.DouyinCommerceSessionError(
+                "抖音带货后台上传未完成：playwright driver unavailable"
+            )
+        )
+        self.assertIn("playwright driver unavailable", session_detail)
+        probe_detail = self.manager._safe_diagnostic_detail(
+            douyin_commerce_probe.DouyinCommerceProbeError(
+                "内置抖音带货探针不存在"
+            )
+        )
+        self.assertEqual(probe_detail, "内置抖音带货探针不存在")
+
+        class ThirdPartyDriverError(Exception):
+            def __str__(self):
+                return "Cookie=secret /Users/andy/private/account.json"
+
+        unknown_detail = self.manager._safe_diagnostic_detail(
+            ThirdPartyDriverError()
+        )
+        self.assertIn("ThirdPartyDriverError", unknown_detail)
+        self.assertNotIn("secret", unknown_detail)
+        self.assertNotIn("/Users/andy", unknown_detail)
 
     def test_reviewer_payloads_are_absent_from_safe_log_and_public_events(self):
         generation_id = self.manager.begin_generation(self.upload_payload)[
@@ -1774,6 +1879,61 @@ class DouyinCommerceCollectorManagerTests(unittest.TestCase):
         self.assertIsNone(raised.exception.__cause__)
         self.assertEqual(self.factory.instances, [])
 
+    def test_collector_start_failure_keeps_safe_root_cause_in_local_log(self):
+        class FailingStartManager(FakeSessionManager):
+            def start_upload(self, payload, *, on_progress=None):
+                del payload, on_progress
+                raise RuntimeError(
+                    "playwright driver failed at /Users/andy/private/"
+                    "cookiesFile/account.json Cookie=secret"
+                )
+
+        manager = DouyinCommerceCollectorManager(
+            manager_factory=lambda: FailingStartManager(1),
+            probe_payload_builder=lambda payload: {
+                **dict(payload),
+                "fileList": ["probe.mp4"],
+                "runtimeMode": "preflight",
+                "debugDryRun": True,
+            },
+        )
+
+        with self.assertLogs(
+            "app_core.douyin_commerce_collectors", level="WARNING"
+        ) as captured, self.assertRaises(DouyinCommerceCollectorError) as raised:
+            manager.begin_generation(self.upload_payload)
+
+        self.assertEqual(raised.exception.code, "collector_start_failed")
+        combined = "\n".join(captured.output)
+        self.assertIn("collector_start_failed", combined)
+        self.assertIn("playwright driver failed", combined)
+        self.assertNotIn("/Users/andy/private", combined)
+        self.assertNotIn("cookiesFile/account.json", combined)
+        self.assertNotIn("secret", combined)
+
+    def test_probe_payload_failure_keeps_safe_root_cause_in_local_log(self):
+        def failing_builder(payload):
+            del payload
+            raise RuntimeError(
+                "frozen probe lookup failed at /Users/andy/private/"
+                "cookiesFile/account.json Cookie=secret"
+            )
+
+        self.manager._probe_payload_builder = failing_builder
+
+        with self.assertLogs(
+            "app_core.douyin_commerce_collectors", level="WARNING"
+        ) as captured, self.assertRaises(DouyinCommerceCollectorError) as raised:
+            self.manager.begin_generation(self.upload_payload)
+
+        self.assertEqual(raised.exception.code, "collector_start_failed")
+        combined = "\n".join(captured.output)
+        self.assertIn("collector_start_failed", combined)
+        self.assertIn("frozen probe lookup failed", combined)
+        self.assertNotIn("/Users/andy/private", combined)
+        self.assertNotIn("cookiesFile/account.json", combined)
+        self.assertNotIn("secret", combined)
+
     def test_domestic_and_local_keywords_never_share_a_session(self):
         generation_id = self.manager.begin_generation(self.upload_payload)[
             "setupGenerationId"
@@ -1814,6 +1974,40 @@ class DouyinCommerceCollectorManagerTests(unittest.TestCase):
             self.manager.search_locations(generation_id, "夜南香", "local")
 
         self.assertEqual(self.factory.instances[0].location_calls, [])
+
+    def test_expired_queued_action_is_cancelled_and_removed_from_queue(self):
+        queue = douyin_commerce_collectors._CollectorActionQueue()
+        started = threading.Event()
+        release = threading.Event()
+        first = queue.submit(
+            "generation-a",
+            "first",
+            CollectorType.DOMESTIC_LOCATION,
+            lambda: (started.set(), release.wait(timeout=1), "first")[-1],
+        )
+        self.assertTrue(started.wait(timeout=1))
+        expired = queue.submit(
+            "generation-a",
+            "expired",
+            CollectorType.LOCAL_LOCATION,
+            lambda: "must-not-run",
+        )
+        try:
+            with self.assertRaisesRegex(
+                DouyinCommerceCollectorError,
+                "province_location_search_action_timeout",
+            ):
+                queue.wait(expired, deadline_monotonic=time.monotonic() - 0.01)
+            with queue._lock:
+                self.assertTrue(expired.cancelled)
+                self.assertNotIn(expired, queue._actions)
+                self.assertEqual(queue._actions, [first])
+        finally:
+            release.set()
+            self.assertEqual(queue.wait(first), "first")
+            queue._executor.shutdown(wait=True)
+        with queue._lock:
+            self.assertEqual(queue._actions, [])
 
     def test_all_platform_actions_use_one_serial_queue(self):
         generation_id = self.manager.begin_generation(self.upload_payload)[

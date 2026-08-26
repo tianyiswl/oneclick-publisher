@@ -424,6 +424,64 @@ def decide_wechat_publish_options(
     }
 
 
+def validate_silicon_evolution_auto_publish_readback(
+    payload: Mapping[str, Any],
+    page_state: Mapping[str, Any],
+) -> dict[str, Any]:
+    """在硅基进化自动直发最终点击前复核冻结身份、账号和发布选项。"""
+
+    def rejected(reason: str) -> dict[str, Any]:
+        return {
+            "allowed": False,
+            "reason": reason,
+            "errorCode": "wechat_publish_options_mismatch",
+        }
+
+    article_id = str(payload.get("siliconEvolutionArticleId") or "").strip()
+    package_sha256 = str(
+        payload.get("siliconEvolutionPackageSha256") or ""
+    ).strip()
+    account_ids = payload.get("accountIds")
+    account_names = payload.get("accountDisplayNames")
+    if not article_id or re.fullmatch(r"[0-9a-f]{64}", package_sha256) is None:
+        return rejected("自动直发缺少可核验的文章编号或冻结哈希")
+    if (
+        not isinstance(account_ids, list)
+        or len(account_ids) != 1
+        or type(account_ids[0]) is not int
+        or not isinstance(account_names, list)
+        or len(account_names) != 1
+        or not str(account_names[0]).strip()
+    ):
+        return rejected("自动直发账号绑定不唯一")
+    expected = {
+        "articleId": article_id,
+        "packageSha256": package_sha256,
+        "accountId": account_ids[0],
+        "accountDisplayName": str(account_names[0]).strip(),
+    }
+    for key, value in expected.items():
+        if page_state.get(key) != value:
+            return rejected(f"自动直发回读不一致：{key}")
+    if page_state.get("preflightVerified") is not True:
+        return rejected("自动直发没有复用成功的字段预检")
+    if (
+        payload.get("wechatGroupNotification") is not False
+        or payload.get("enableTimer") is not False
+        or payload.get("scheduleTime") is not None
+    ):
+        return rejected("自动直发必须关闭群发通知和定时发表")
+    options = decide_wechat_publish_options(payload, page_state)
+    if not options.get("allowed"):
+        return rejected(str(options.get("reason") or "发布选项回读失败"))
+    return {
+        "allowed": True,
+        "reason": "冻结文章、公众号账号和最终发布选项均已回读一致",
+        "errorCode": "",
+        "expectedAction": "发表",
+    }
+
+
 def decide_immediate_publish_options(snapshot: Mapping[str, Any]) -> dict[str, Any]:
     """兼容旧调用：按新默认值核对“群发开启、立即发表”。"""
 

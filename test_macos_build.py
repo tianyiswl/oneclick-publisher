@@ -103,6 +103,10 @@ class MacOSBuildTests(unittest.TestCase):
             spec = spec_path.read_text(encoding="utf-8")
 
         self.assertIn('"ui/assets"', spec)
+        self.assertIn(
+            '"mcp", filter_submodules=lambda name: not name.startswith("mcp.cli")',
+            spec,
+        )
         self.assertNotIn("demo-runtime", spec)
 
 

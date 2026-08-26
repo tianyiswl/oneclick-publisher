@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import shutil
+import sys
 from pathlib import Path
 
 from conf import BASE_DIR as CONFIGURED_USER_DATA_DIR
@@ -13,6 +14,11 @@ from conf import RESOURCE_DIR
 ROOT_DIR = Path(RESOURCE_DIR)
 LEGACY_RUNTIME_ROOT = Path(__file__).resolve().parent.parent
 USER_DATA_DIR = Path(CONFIGURED_USER_DATA_DIR)
+WECHAT_DRAFT_BRIDGE_DIR = (
+    Path.home() / "Library" / "Application Support" / "一键发" / "wechat-draft-bridge"
+    if sys.platform == "darwin"
+    else USER_DATA_DIR / "wechat-draft-bridge"
+)
 DB_PATH = USER_DATA_DIR / "db" / "database.db"
 VIDEO_DIR = USER_DATA_DIR / "videoFile"
 COOKIE_DIR = USER_DATA_DIR / "cookiesFile"

@@ -13,6 +13,16 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from . import account_service, content_bundle, oneclick_capabilities
+from .silicon_evolution_auto_publish import (
+    AutoPublishProfile,
+    SiliconEvolutionAutoPublishError,
+    build_silicon_evolution_payload,
+    require_matching_successful_preflight,
+)
+from .silicon_evolution_publish_package import (
+    FrozenWechatPublishPackageError,
+    load_frozen_wechat_publish_package,
+)
 
 
 _PLATFORM_TYPE_BY_NAME = {
@@ -20,6 +30,7 @@ _PLATFORM_TYPE_BY_NAME = {
     for platform_type, name in account_service.PLATFORMS.items()
 }
 _REQUEST_KEYS = {
+    "projectId",
     "manifestPath",
     "mode",
     "targets",
@@ -27,6 +38,7 @@ _REQUEST_KEYS = {
     "authorizationId",
 }
 _TARGET_KEYS = {"platform", "accountId", "schedule"}
+_PROJECT_ID_RE = re.compile(r"[a-z0-9][a-z0-9._-]{1,63}")
 
 
 class ControlledPublishError(ValueError):
@@ -96,6 +108,13 @@ def build_controlled_payloads(
                 "controlled_authorization_required",
                 "正式发布必须携带已完成预检和一次性本地授权",
             )
+
+    project_id = str(request.get("projectId") or "").strip().lower()
+    if project_id and not _PROJECT_ID_RE.fullmatch(project_id):
+        raise ControlledPublishError(
+            "content_project_id_invalid",
+            "项目标识必须是 2-64 位小写英文、数字、点、下划线或连字符",
+        )
 
     manifest_path = str(request.get("manifestPath") or "").strip()
     if not manifest_path:
@@ -195,6 +214,8 @@ def build_controlled_payloads(
             "timeJitterMinutes": 0,
             "controlledManifestPath": str(Path(manifest_path).expanduser().resolve()),
         }
+        if project_id:
+            payload["contentProjectId"] = project_id
         if platform_type == 1:
             payload.update(
                 {
@@ -435,14 +456,41 @@ def project_task(task: Mapping[str, Any] | None) -> dict[str, Any]:
                 ),
             }
         )
-    return {
+    result = {
         "taskId": int(task.get("id") or 0),
         "taskNo": str(task.get("taskNo") or ""),
         "mode": mode,
         "phase": phase,
         "status": str(task.get("status") or "pending"),
+        "occurredAt": str(
+            task.get("finishedAt")
+            or task.get("startedAt")
+            or task.get("createdAt")
+            or ""
+        ),
         "platforms": platforms,
     }
+    silicon_payloads = [
+        item
+        for rows in payloads_by_type.values()
+        for item in rows
+        if item.get("siliconEvolutionArticleId")
+    ]
+    if len(silicon_payloads) == 1:
+        payload = silicon_payloads[0]
+        account_ids = list(payload.get("accountIds") or [])
+        result.update(
+            {
+                "articleId": str(payload.get("siliconEvolutionArticleId") or ""),
+                "packageSha256": str(
+                    payload.get("siliconEvolutionPackageSha256") or ""
+                ),
+                "accountId": int(account_ids[0] or 0)
+                if len(account_ids) == 1
+                else 0,
+            }
+        )
+    return result
 
 
 def task_status(task_id: int) -> dict[str, Any]:
@@ -484,6 +532,32 @@ def authorize_completed_preflight(
         )
 
 
+def _find_successful_formal_scope_task(
+    tasks: Iterable[Mapping[str, Any]],
+    payloads: Iterable[Mapping[str, Any]],
+) -> dict[str, Any] | None:
+    """查找同一账号、内容与排期已有的正式成功任务。"""
+
+    expected = scope_fingerprint(payloads)
+    for raw_task in tasks:
+        if (
+            str(raw_task.get("mode") or "") != "oneclick_publish"
+            or str(raw_task.get("status") or "") != "success"
+        ):
+            continue
+        try:
+            stored = json.loads(str(raw_task.get("payloadJson") or "[]"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(stored, list) or not all(
+            isinstance(item, Mapping) for item in stored
+        ):
+            continue
+        if scope_fingerprint(stored) == expected:
+            return dict(raw_task)
+    return None
+
+
 def submit_request(request: Mapping[str, Any]) -> dict[str, Any]:
     """创建预检或经一次性授权的正式任务。"""
 
@@ -493,6 +567,18 @@ def submit_request(request: Mapping[str, Any]) -> dict[str, Any]:
     payloads = build_controlled_payloads(request)
     mode = str(request.get("mode") or "preflight").strip().lower()
     if mode == "formal":
+        existing = _find_successful_formal_scope_task(
+            task_service.list_tasks(limit=500),
+            payloads,
+        )
+        if existing:
+            raise ControlledPublishError(
+                "controlled_already_published",
+                (
+                    "同一账号、内容与排期已有正式成功回执，"
+                    f"已阻止重复发布；taskId={int(existing.get('id') or 0)}"
+                ),
+            )
         preflight_id = int(request["confirmedPreflightTaskId"])
         preflight = task_service.get_task(preflight_id)
         if not preflight or str(preflight.get("mode") or "") != "oneclick_preflight":
@@ -509,5 +595,167 @@ def submit_request(request: Mapping[str, Any]) -> dict[str, Any]:
                 payloads,
             )
     task = publish_service.start_desktop_publish(payloads)
+    stored = task_service.get_task(int(task["id"])) or task
+    return project_task(stored)
+
+
+def _find_successful_silicon_formal_task(
+    tasks: Iterable[Mapping[str, Any]],
+    *,
+    article_id: str,
+    package_sha256: str,
+    account_id: int,
+) -> dict[str, Any] | None:
+    """查找同一冻结文章已有的正式成功回执，防止重复发表。"""
+
+    for raw_task in tasks:
+        if (
+            str(raw_task.get("mode") or "") != "oneclick_publish"
+            or str(raw_task.get("status") or "") != "success"
+        ):
+            continue
+        try:
+            payloads = json.loads(str(raw_task.get("payloadJson") or "[]"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(payloads, list):
+            continue
+        for payload in payloads:
+            if not isinstance(payload, Mapping):
+                continue
+            if (
+                int(payload.get("type") or 0) == 10
+                and payload.get("accountIds") == [account_id]
+                and str(payload.get("siliconEvolutionArticleId") or "")
+                == article_id
+                and str(payload.get("siliconEvolutionPackageSha256") or "")
+                == package_sha256
+            ):
+                return dict(raw_task)
+    return None
+
+
+_SILICON_REQUEST_KEYS = {
+    "projectId",
+    "articleId",
+    "packagePath",
+    "packageSha256",
+    "accountId",
+    "mode",
+    "confirmedPreflightTaskId",
+}
+
+
+def submit_silicon_evolution_request(request: Mapping[str, Any]) -> dict[str, Any]:
+    """从 V1.2 冻结包创建硅基进化公众号预检或自动正式任务。"""
+
+    from . import publish_service, task_service
+    from .database import connect
+
+    data = _require_mapping(
+        request,
+        "silicon_evolution_request_invalid",
+        "硅基进化自动直发请求必须是对象",
+    )
+    if set(data) - _SILICON_REQUEST_KEYS:
+        raise ControlledPublishError(
+            "silicon_evolution_request_invalid", "硅基进化自动直发包含不支持字段"
+        )
+    if str(data.get("projectId") or "") != "silicon-evolution":
+        raise ControlledPublishError(
+            "silicon_evolution_project_mismatch", "自动直发项目不是硅基进化"
+        )
+    mode = str(data.get("mode") or "")
+    if mode not in {"preflight", "formal"}:
+        raise ControlledPublishError(
+            "silicon_evolution_mode_invalid", "自动直发模式只能是 preflight 或 formal"
+        )
+    account_id = data.get("accountId")
+    if type(account_id) is not int or account_id <= 0:
+        raise ControlledPublishError(
+            "silicon_evolution_account_invalid", "自动直发公众号账号无效"
+        )
+    accounts = [
+        dict(row)
+        for row in account_service.list_accounts()
+        if int(row.get("id") or 0) == account_id
+    ]
+    if len(accounts) != 1 or int(accounts[0].get("type") or 0) != 10:
+        raise ControlledPublishError(
+            "silicon_evolution_account_mismatch", "自动直发账号不是唯一公众号账号"
+        )
+    account = accounts[0]
+    display_name = str(
+        account.get("profileName") or account.get("userName") or ""
+    ).strip()
+    if display_name != "硅基进化":
+        raise ControlledPublishError(
+            "silicon_evolution_account_mismatch", "自动直发账号不是硅基进化"
+        )
+    try:
+        package = load_frozen_wechat_publish_package(
+            Path(str(data.get("packagePath") or "")),
+            expected_sha256=str(data.get("packageSha256") or ""),
+        )
+        if package.article_id != str(data.get("articleId") or ""):
+            raise SiliconEvolutionAutoPublishError("自动直发文章编号与冻结包不匹配")
+        profile = AutoPublishProfile(
+            project_id="silicon-evolution",
+            account_id=account_id,
+            account_display_name=display_name,
+            enabled=True,
+        )
+        payload = build_silicon_evolution_payload(
+            package,
+            profile,
+            account_id=account_id,
+            mode="publish" if mode == "formal" else "preflight",
+        )
+        payload["accountList"] = [str(account.get("filePath") or "")]
+        payload["contentProjectId"] = "silicon-evolution"
+    except (FrozenWechatPublishPackageError, SiliconEvolutionAutoPublishError) as exc:
+        raise ControlledPublishError(
+            "silicon_evolution_package_invalid", str(exc)
+        ) from exc
+    if mode == "formal":
+        existing = _find_successful_silicon_formal_task(
+            task_service.list_tasks(limit=500),
+            article_id=package.article_id,
+            package_sha256=package.package_sha256,
+            account_id=account_id,
+        )
+        if existing:
+            raise ControlledPublishError(
+                "silicon_evolution_already_published",
+                (
+                    "同一冻结文章已有正式成功回执，已阻止重复发表；"
+                    f"taskId={int(existing.get('id') or 0)}"
+                ),
+            )
+        preflight_id = data.get("confirmedPreflightTaskId")
+        if type(preflight_id) is not int or preflight_id <= 0:
+            raise ControlledPublishError(
+                "silicon_evolution_preflight_required", "自动直发缺少成功预检 taskId"
+            )
+        preflight = task_service.get_task(preflight_id)
+        try:
+            preflight_payloads = require_matching_successful_preflight(
+                preflight,
+                package,
+                profile,
+            )
+        except SiliconEvolutionAutoPublishError as exc:
+            raise ControlledPublishError(
+                "silicon_evolution_preflight_mismatch", str(exc)
+            ) from exc
+        with connect() as conn:
+            grant = create_authorization(conn, preflight_id, preflight_payloads)
+            consume_authorization(
+                conn,
+                str(grant["authorizationId"]),
+                preflight_id,
+                [payload],
+            )
+    task = publish_service.start_desktop_publish([payload])
     stored = task_service.get_task(int(task["id"])) or task
     return project_task(stored)

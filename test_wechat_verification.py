@@ -156,6 +156,17 @@ class WechatVerificationTests(unittest.TestCase):
         with self.assertRaises(WechatVerificationError):
             broker.create(task_id=13, qr_image=b"")
 
+    def test_pending_task_ids_exposes_only_active_in_memory_requests(self):
+        broker = WechatVerificationBroker()
+        first = broker.create(task_id=21, qr_image=_qr_bytes("first"))
+        second = broker.create(task_id=22, qr_image=_qr_bytes("second"))
+        self.assertEqual(broker.pending_task_ids(), (21, 22))
+
+        broker.succeed(first)
+        self.assertEqual(broker.pending_task_ids(), (22,))
+        broker.clear(second)
+        self.assertEqual(broker.pending_task_ids(), ())
+
     def test_qr_pixel_validation_never_decodes_or_logs_payload(self):
         data = _qr_bytes("sensitive-local-only-payload")
         self.assertEqual(validate_qr_image_bytes(data), data)

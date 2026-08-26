@@ -496,6 +496,22 @@ def _insert_pending_task(
     resume_source_task_id: int | None = None,
     revision_source_task_id: int | None = None,
 ) -> dict:
+    project_ids = {
+        str(payload.get("contentProjectId") or "").strip().lower()
+        for payload in payloads
+    }
+    project_identity: tuple[str, str] | None = None
+    if project_ids != {""}:
+        if (
+            len(project_ids) != 1
+            or not re.fullmatch(r"[a-z0-9][a-z0-9._-]{1,63}", next(iter(project_ids)))
+            or mode not in {"oneclick_preflight", "oneclick_publish"}
+        ):
+            raise ValueError("内容项目任务归属无效")
+        project_identity = (
+            next(iter(project_ids)),
+            "formal" if mode == "oneclick_publish" else "preflight",
+        )
     account_files = sorted({a for payload in payloads for a in payload.get("accountList", [])})
     account_meta = {}
     if account_files:
@@ -574,6 +590,15 @@ def _insert_pending_task(
         ),
     )
     task_id = cursor.lastrowid
+    if project_identity is not None:
+        conn.execute(
+            """
+            INSERT INTO content_project_task_links
+                (projectId, taskId, phase, createdAt)
+            VALUES (?, ?, ?, ?)
+            """,
+            (project_identity[0], task_id, project_identity[1], _now()),
+        )
     for item in items:
         cursor.execute(
             """
@@ -622,6 +647,24 @@ def create_pending_task(
         )
         conn.commit()
     return task
+
+
+def project_task_link(task_id: int) -> dict | None:
+    """读取发布任务的非敏感内容项目归属。"""
+
+    if type(task_id) is not int or task_id <= 0:
+        return None
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT projectId, taskId, phase
+            FROM content_project_task_links
+            WHERE taskId = ?
+            LIMIT 1
+            """,
+            (task_id,),
+        ).fetchone()
+    return dict(row) if row is not None else None
 
 
 def _require_linkable_revision_source(
@@ -1557,11 +1600,17 @@ def mark_platform_result(
     message: str,
     content_type: str | None = None,
     event_type: str = "platform_preflight",
+    readback: dict | None = None,
 ) -> None:
     """按平台与内容类型回填结果；事件类型必须准确表达预检或正式提交。"""
 
     now = _now()
     status = "success" if ok else "failed"
+    public_readback = _batch_readback_projection(readback)
+    receipt_values = {
+        key: str(public_readback.get(key) or "")
+        for key in ("platformPostId", "postUrl", "publishedAt")
+    }
     with connect() as conn:
         batch_item = conn.execute(
             """
@@ -1588,10 +1637,19 @@ def mark_platform_result(
                 """
                 UPDATE publish_task_items
                 SET status = ?, message = ?, attempts = attempts + 1,
-                    startedAt = COALESCE(startedAt, ?), finishedAt = ?
+                    startedAt = COALESCE(startedAt, ?), finishedAt = ?,
+                    platformPostId = CASE WHEN ? THEN ? ELSE platformPostId END,
+                    postUrl = CASE WHEN ? THEN ? ELSE postUrl END,
+                    publishedAt = CASE WHEN ? THEN ? ELSE publishedAt END
                 WHERE taskId = ? AND platformType = ? AND contentType = ?
                 """,
-                (status, message, now, now, int(task_id), int(platform_type), str(content_type)),
+                (
+                    status, message, now, now,
+                    bool(ok and receipt_values["platformPostId"]), receipt_values["platformPostId"],
+                    bool(ok and receipt_values["postUrl"]), receipt_values["postUrl"],
+                    bool(ok and receipt_values["publishedAt"]), receipt_values["publishedAt"],
+                    int(task_id), int(platform_type), str(content_type),
+                ),
             )
         else:
             # 兼容旧调用与历史任务。新预检调用都会传入 content_type。
@@ -1599,10 +1657,19 @@ def mark_platform_result(
                 """
                 UPDATE publish_task_items
                 SET status = ?, message = ?, attempts = attempts + 1,
-                    startedAt = COALESCE(startedAt, ?), finishedAt = ?
+                    startedAt = COALESCE(startedAt, ?), finishedAt = ?,
+                    platformPostId = CASE WHEN ? THEN ? ELSE platformPostId END,
+                    postUrl = CASE WHEN ? THEN ? ELSE postUrl END,
+                    publishedAt = CASE WHEN ? THEN ? ELSE publishedAt END
                 WHERE taskId = ? AND platformType = ?
                 """,
-                (status, message, now, now, int(task_id), int(platform_type)),
+                (
+                    status, message, now, now,
+                    bool(ok and receipt_values["platformPostId"]), receipt_values["platformPostId"],
+                    bool(ok and receipt_values["postUrl"]), receipt_values["postUrl"],
+                    bool(ok and receipt_values["publishedAt"]), receipt_values["publishedAt"],
+                    int(task_id), int(platform_type),
+                ),
             )
         summary = conn.execute(
             """

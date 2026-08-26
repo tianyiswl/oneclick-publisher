@@ -6,7 +6,9 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from app_core import douyin_commerce_probe
 from app_core.douyin_commerce_probe import (
     DOUYIN_COMMERCE_PROBE_RELATIVE_PATH,
     DouyinCommerceProbeError,
@@ -125,6 +127,32 @@ class DouyinCommerceProbeTests(unittest.TestCase):
         self.assertGreaterEqual(probe.stat().st_size, 1_024)
         self.assertLessEqual(probe.stat().st_size, 512 * 1024)
         self.assertNotIn("demo-runtime", probe.parts)
+
+    def test_frozen_macos_resolves_probe_from_bundle_resources(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            contents = Path(temp_dir) / "一键发.app" / "Contents"
+            resources = contents / "Resources"
+            frameworks = contents / "Frameworks"
+            executable = contents / "MacOS" / "一键发"
+            frameworks.mkdir(parents=True)
+            executable.parent.mkdir(parents=True)
+            executable.touch()
+            probe = self._write_probe(resources)
+            (frameworks / "ui").symlink_to(Path("../Resources/ui"))
+
+            with (
+                mock.patch.object(douyin_commerce_probe, "RESOURCE_DIR", frameworks),
+                mock.patch.object(douyin_commerce_probe.sys, "frozen", True, create=True),
+                mock.patch.object(douyin_commerce_probe.sys, "platform", "darwin"),
+                mock.patch.object(
+                    douyin_commerce_probe.sys,
+                    "executable",
+                    str(executable),
+                ),
+            ):
+                resolved = resolve_douyin_commerce_probe()
+
+        self.assertEqual(resolved, probe)
 
 
 if __name__ == "__main__":

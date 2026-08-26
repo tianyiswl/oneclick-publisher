@@ -13,6 +13,8 @@ from app_core.controlled_publish import (
     consume_authorization,
     create_authorization,
     create_authorization_schema,
+    _find_successful_silicon_formal_task,
+    _find_successful_formal_scope_task,
     project_task,
     scope_fingerprint,
 )
@@ -81,6 +83,41 @@ class ControlledPublishTests(unittest.TestCase):
         self.assertTrue(payloads[1]["enableTimer"])
         self.assertEqual(payloads[1]["scheduleTime"], "2026-08-24 20:30")
         self.assertTrue(all(item["debugDryRun"] is True for item in payloads))
+
+    def test_controlled_payload_carries_valid_project_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest = self._bundle(Path(temporary))
+            payload = build_controlled_payloads(
+                {
+                    "projectId": "silicon-exploration",
+                    "manifestPath": str(manifest),
+                    "mode": "preflight",
+                    "targets": [
+                        {"platform": "抖音", "accountId": 31, "schedule": None}
+                    ],
+                },
+                accounts=self._accounts(),
+            )[0]
+
+        self.assertEqual(payload["contentProjectId"], "silicon-exploration")
+
+    def test_controlled_payload_rejects_invalid_project_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest = self._bundle(Path(temporary))
+            with self.assertRaises(ControlledPublishError) as raised:
+                build_controlled_payloads(
+                    {
+                        "projectId": "../other-project",
+                        "manifestPath": str(manifest),
+                        "mode": "preflight",
+                        "targets": [
+                            {"platform": "抖音", "accountId": 31, "schedule": None}
+                        ],
+                    },
+                    accounts=self._accounts(),
+                )
+
+        self.assertEqual(raised.exception.error_code, "content_project_id_invalid")
 
     def test_formal_requires_preflight_and_authorization_fields(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -214,6 +251,96 @@ class ControlledPublishTests(unittest.TestCase):
         self.assertEqual(
             projected["platforms"][0]["errorCode"],
             "douyin_topic_candidates_unavailable",
+        )
+
+    def test_successful_silicon_formal_task_blocks_same_article_republish(self) -> None:
+        matching_payload = json.dumps(
+            [
+                {
+                    "type": 10,
+                    "accountIds": [2],
+                    "siliconEvolutionArticleId": "WX-20260826-001",
+                    "siliconEvolutionPackageSha256": "a" * 64,
+                }
+            ]
+        )
+        match = _find_successful_silicon_formal_task(
+            [
+                {
+                    "id": 50,
+                    "mode": "oneclick_preflight",
+                    "status": "success",
+                    "payloadJson": matching_payload,
+                },
+                {
+                    "id": 51,
+                    "mode": "oneclick_publish",
+                    "status": "success",
+                    "payloadJson": matching_payload,
+                },
+            ],
+            article_id="WX-20260826-001",
+            package_sha256="a" * 64,
+            account_id=2,
+        )
+
+        self.assertEqual(match["id"], 51)
+        self.assertIsNone(
+            _find_successful_silicon_formal_task(
+                [
+                    {
+                        "id": 52,
+                        "mode": "oneclick_publish",
+                        "status": "failed",
+                        "payloadJson": matching_payload,
+                    }
+                ],
+                article_id="WX-20260826-001",
+                package_sha256="a" * 64,
+                account_id=2,
+            )
+        )
+
+    def test_successful_generic_formal_scope_blocks_same_manifest_republish(self) -> None:
+        payloads = [
+            {
+                "type": 10,
+                "accountIds": [2],
+                "contentType": "article",
+                "title": "已发表文章",
+                "description": "正文",
+                "tags": [],
+                "fileList": [],
+                "coverPath": "",
+                "scheduleTime": "",
+                "scheduleTimezone": "Asia/Shanghai",
+            }
+        ]
+        match = _find_successful_formal_scope_task(
+            [
+                {
+                    "id": 51,
+                    "mode": "oneclick_publish",
+                    "status": "success",
+                    "payloadJson": json.dumps(payloads, ensure_ascii=False),
+                }
+            ],
+            payloads,
+        )
+
+        self.assertEqual(match["id"], 51)
+        self.assertIsNone(
+            _find_successful_formal_scope_task(
+                [
+                    {
+                        "id": 52,
+                        "mode": "oneclick_publish",
+                        "status": "failed",
+                        "payloadJson": json.dumps(payloads, ensure_ascii=False),
+                    }
+                ],
+                payloads,
+            )
         )
 
 

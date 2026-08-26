@@ -67,6 +67,14 @@ class WindowsBuildTests(unittest.TestCase):
             "YiJianFa_0.4.1_Windows_x64_20260805.zip",
         )
 
+    def test_windows_spec_bundles_official_mcp_runtime(self) -> None:
+        spec = render_spec(Path("C:/oneclick"))
+
+        self.assertIn(
+            '"mcp", filter_submodules=lambda name: not name.startswith("mcp.cli")',
+            spec,
+        )
+
     def test_resolve_required_playwright_browser_dirs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

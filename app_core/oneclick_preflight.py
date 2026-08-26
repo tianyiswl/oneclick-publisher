@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime
 from html import escape, unescape
+from html.parser import HTMLParser
 from pathlib import Path
 import re
 from urllib.parse import parse_qs, urlparse
@@ -456,6 +457,116 @@ def _wechat_payload_text(payload: dict) -> tuple[str, str]:
     return title[:64], description
 
 
+class _FrozenWechatHtmlParser(HTMLParser):
+    _BLOCKS = frozenset({"p", "h1", "h2", "h3", "li", "blockquote"})
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.output: list[str] = []
+        self.blocks: list[tuple[str, list[str]]] = []
+        self.visible_parts: list[str] = []
+        self.last_block = ""
+        self.images: list[tuple[str, str]] = []
+
+    def _append_text(self, value: str) -> None:
+        if not value:
+            return
+        self.visible_parts.append(value)
+        for _tag, parts in self.blocks:
+            parts.append(value)
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        lowered = tag.lower()
+        if lowered == "img":
+            source = next((value or "" for name, value in attrs if name.lower() == "src"), "")
+            current = " ".join(self.blocks[-1][1]).strip() if self.blocks else ""
+            self.images.append((source, " ".join((current or self.last_block).split())))
+            return
+        self.output.append(self.get_starttag_text() or f"<{tag}>")
+        if lowered in self._BLOCKS:
+            # innerText 会在块级节点前产生可见换行；这里记为一个
+            # 空格，避免图注等行内节点与后续标题被误判为内容不一致。
+            self.visible_parts.append(" ")
+            for _tag, parts in self.blocks:
+                parts.append(" ")
+            self.blocks.append((lowered, []))
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() == "img":
+            self.handle_starttag(tag, attrs)
+            return
+        self.output.append(self.get_starttag_text() or f"<{tag}/>")
+
+    def handle_endtag(self, tag: str) -> None:
+        lowered = tag.lower()
+        self.output.append(f"</{tag}>")
+        if lowered not in self._BLOCKS:
+            return
+        for index in range(len(self.blocks) - 1, -1, -1):
+            block_tag, parts = self.blocks[index]
+            if block_tag != lowered:
+                continue
+            self.last_block = " ".join(unescape("".join(parts)).split())
+            del self.blocks[index]
+            self.visible_parts.append(" ")
+            break
+
+    def handle_data(self, data: str) -> None:
+        self.output.append(data)
+        self._append_text(data)
+
+    def handle_entityref(self, name: str) -> None:
+        value = f"&{name};"
+        self.output.append(value)
+        self._append_text(unescape(value))
+
+    def handle_charref(self, name: str) -> None:
+        value = f"&#{name};"
+        self.output.append(value)
+        self._append_text(unescape(value))
+
+    def handle_comment(self, data: str) -> None:
+        self.output.append(f"<!--{data}-->")
+
+
+def _wechat_prepare_frozen_html(
+    content_html: str,
+    files: list[Path],
+) -> tuple[str, list[Path], list[str], str]:
+    """保留冻结排版，只移出本地图片供平台工具栏逐张上传。"""
+
+    parser = _FrozenWechatHtmlParser()
+    try:
+        parser.feed(str(content_html or ""))
+        parser.close()
+    except Exception as exc:
+        raise PreflightError("公众号冻结 HTML 无法安全解析") from exc
+    available: dict[str, Path] = {}
+    for path in files:
+        name = Path(path).name
+        if name in available:
+            raise PreflightError("公众号冻结 HTML 正文图片文件名不唯一")
+        available[name] = Path(path)
+    ordered_files: list[Path] = []
+    anchors: list[str] = []
+    for source, anchor in parser.images:
+        name = Path(source).name
+        path = available.get(name)
+        if path is None:
+            raise PreflightError(f"公众号冻结 HTML 图片未在发布包中找到：{name or source}")
+        ordered_files.append(path)
+        anchors.append(anchor)
+    if len(ordered_files) != len(files) or {path.resolve() for path in ordered_files} != {
+        path.resolve() for path in files
+    }:
+        raise PreflightError("公众号冻结 HTML 与正文图片清单不一致")
+    sanitized = "".join(parser.output).strip()
+    visible_text = " ".join(unescape("".join(parser.visible_parts)).split())
+    if not sanitized or not visible_text:
+        raise PreflightError("公众号冻结 HTML 正文为空")
+    return sanitized, ordered_files, anchors, visible_text
+
+
 def _wechat_original_requested(payload: dict) -> bool:
     """只有表单明确传入布尔值 true 时才允许进入作者流程。"""
 
@@ -638,6 +749,29 @@ async def _wechat_fill_rich_text(
         html,
     )
     return _wechat_markdown_visible_text(markdown_text)
+
+
+async def _wechat_fill_digest(page, digest: str) -> None:
+    """填写并回读唯一可见摘要字段；找不到时不把正文回读冒充摘要。"""
+
+    expected = str(digest or "").strip()
+    if not expected:
+        raise PreflightError("公众号冻结包摘要不能为空")
+    locator = page.locator(
+        'textarea[placeholder*="摘要"],input[placeholder*="摘要"],'
+        'textarea[name*="digest" i],input[name*="digest" i]'
+    )
+    visible = []
+    for index in range(await locator.count()):
+        node = locator.nth(index)
+        if await node.is_visible() and await node.is_enabled():
+            visible.append(node)
+    if len(visible) != 1:
+        raise PreflightError("公众号摘要字段不是唯一可用控件")
+    await visible[0].fill(expected, timeout=10_000)
+    actual = " ".join((await visible[0].input_value()).split())
+    if actual != " ".join(expected.split()):
+        raise PreflightError("公众号摘要字段回读不一致")
 
 
 async def _set_dom_value(locator, value: str) -> None:
@@ -1098,9 +1232,10 @@ async def _wechat_cover_crop_snapshot(page) -> dict:
             labels.includes(normalize(element.innerText || element.textContent))
           );
           const usable = matching.filter(element => visible(element) && enabled(element));
-          const hidden = matching.filter(element => !visible(element) || !enabled(element));
-          if (usable.length === 1) {
-            usable[0].setAttribute('data-oneclick-cover-confirm', '1');
+          const renderedControls = matching.filter(element => rendered(element) && enabled(element));
+          const hidden = matching.filter(element => !rendered(element) || !enabled(element));
+          if (renderedControls.length === 1) {
+            renderedControls[0].setAttribute('data-oneclick-cover-confirm', '1');
           }
           const loading = dialog
             ? Array.from(dialog.querySelectorAll(
@@ -1154,6 +1289,9 @@ async def _wechat_cover_crop_snapshot(page) -> dict:
             usableControls: usable.map(element =>
               normalize(element.innerText || element.textContent)
             ),
+            renderedControls: renderedControls.map(element =>
+              normalize(element.innerText || element.textContent)
+            ),
             hiddenControls: hidden.map(element =>
               normalize(element.innerText || element.textContent)
             ),
@@ -1178,7 +1316,11 @@ async def _wechat_wait_cover_crop_ready(
         last = await _wechat_cover_crop_snapshot(page)
         if int(last.get("dialogCount") or 0) > 1:
             raise PreflightError("公众号同时出现多个封面裁剪弹层，预检拒绝猜测")
-        controls = list(last.get("usableControls") or [])
+        controls = list(
+            last.get("renderedControls")
+            if "renderedControls" in last
+            else last.get("usableControls") or []
+        )
         if len(controls) > 1:
             raise PreflightError("公众号封面裁剪出现多个可用确认控件，预检拒绝猜测")
         if controls:
@@ -1195,6 +1337,18 @@ async def _wechat_wait_cover_crop_ready(
     if last.get("hiddenControls"):
         raise PreflightError("公众号封面裁剪完成控件存在但不可见或不可用")
     raise PreflightError("公众号封面裁剪弹层未显示真实可用的完成控件")
+
+
+async def _wechat_click_cover_confirm(page) -> None:
+    """滚动到唯一确认控件后点击，兼容高于浏览器视口的裁剪弹层。"""
+
+    finish_button = page.locator('[data-oneclick-cover-confirm="1"]')
+    if await finish_button.count() != 1:
+        raise PreflightError("公众号封面裁剪确认控件状态已变化")
+    await finish_button.scroll_into_view_if_needed(timeout=10_000)
+    if not await finish_button.is_visible() or not await finish_button.is_enabled():
+        raise PreflightError("公众号封面裁剪确认控件已变为不可用")
+    await finish_button.click(timeout=10_000)
 
 
 async def _wechat_wait_cover_return_to_editor(
@@ -1305,12 +1459,7 @@ async def _wechat_select_cover_from_content(page, editor, cover_image_index: int
     await next_button.click(timeout=10_000)
     completion_mode, _snapshot = await _wechat_wait_cover_crop_ready(page)
     if completion_mode == "confirm":
-        finish_button = page.locator('[data-oneclick-cover-confirm="1"]')
-        if await finish_button.count() != 1:
-            raise PreflightError("公众号封面裁剪确认控件状态已变化")
-        if not await finish_button.is_visible() or not await finish_button.is_enabled():
-            raise PreflightError("公众号封面裁剪确认控件已变为不可用")
-        await finish_button.click(timeout=10_000)
+        await _wechat_click_cover_confirm(page)
     await _wechat_wait_cover_return_to_editor(page)
 
 
@@ -1692,21 +1841,49 @@ async def _wechat_preflight(
     title_editor = editors.nth(0)
     editor = editors.nth(1)
     await title_editor.fill(title, force=True, timeout=10_000)
-    visible_description = await _wechat_fill_rich_text(
-        editor,
-        description,
-        template_id,
-    )
+    frozen_html_mode = payload.get("frozenWechatDraftHtml") is True
+    frozen_image_anchors: list[str] | None = None
+    if frozen_html_mode:
+        sanitized_html, files, frozen_image_anchors, visible_description = (
+            _wechat_prepare_frozen_html(
+                str(payload.get("contentHtml") or ""),
+                files,
+            )
+        )
+        await editor.evaluate(
+            """(element, value) => {
+                element.innerHTML = value;
+                element.dispatchEvent(new InputEvent('input', {
+                    bubbles: true,
+                    inputType: 'insertText',
+                    data: null,
+                }));
+            }""",
+            sanitized_html,
+        )
+    else:
+        visible_description = await _wechat_fill_rich_text(
+            editor,
+            description,
+            template_id,
+        )
     if _normalized_page_text(await title_editor.inner_text()) != _normalized_page_text(title):
         raise PreflightError("公众号标题字段未能回读测试值")
     if _normalized_page_text(await editor.inner_text()) != _normalized_page_text(visible_description):
         raise PreflightError("公众号正文字段未能回读测试值")
+    digest = str(payload.get("digest") or "").strip()
+    if frozen_html_mode:
+        await _wechat_fill_digest(page, digest)
     # 当前公众号封面没有独立本地文件输入：指定封面需先进入正文图片链路，
     # 再经“从正文选择”设为封面。全程不触碰草稿、预览或发表控件。
-    image_anchors = _wechat_resolve_body_image_anchors(
-        description,
-        files,
-        list(payload.get("imagePlacements") or []),
+    image_anchors = (
+        frozen_image_anchors
+        if frozen_image_anchors is not None
+        else _wechat_resolve_body_image_anchors(
+            description,
+            files,
+            list(payload.get("imagePlacements") or []),
+        )
     )
     inserted_images = await _wechat_prepare_article_images(
         page,
@@ -1740,7 +1917,11 @@ async def _wechat_preflight(
         author_name = await _wechat_select_default_author(page)
         author_message = f"原创作者已选择并回读：{author_name}；"
     content_label = "图文" if content_type == "article" else "文字"
-    template_name = _WECHAT_MOBILE_TEMPLATES[template_id]["name"]
+    template_name = (
+        "冻结包原始排版"
+        if frozen_html_mode
+        else _WECHAT_MOBILE_TEMPLATES[template_id]["name"]
+    )
     # 安全边界：不点击“保存为草稿”“预览”“发表”。
     image_message = (
         f"正文图片已插入并完成最终位置回读 {inserted_images} 张；"

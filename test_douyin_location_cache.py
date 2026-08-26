@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import json
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -12,13 +13,22 @@ from unittest.mock import patch
 
 from app_core.douyin_location_cache import (
     LOCATION_CACHE_CAPACITY,
+    DouyinLocationCacheError,
     LocationCacheQuery,
+    filter_locations_for_search_keyword,
     get_cached_locations,
+    load_location_search_plan,
     location_requires_revalidation,
+    merge_platform_locations_for_queries,
     merge_platform_locations,
     reconcile_platform_locations,
     record_location_selection,
     record_location_publish_result,
+    save_location_search_plan,
+)
+from app_core.douyin_location_search_plan import (
+    advance_after_page,
+    build_location_search_plan,
 )
 from app_core import database
 
@@ -116,6 +126,28 @@ def cached_revalidation_failures(
 
 
 class DouyinLocationCacheTests(unittest.TestCase):
+    @staticmethod
+    def commission_candidate(poi_id: str) -> dict[str, object]:
+        return {
+            "poiId": poi_id,
+            "name": f"JOYMARK {poi_id}",
+            "address": "广东省广州市测试路1号",
+            "commissionType": "commission",
+        }
+
+    @staticmethod
+    def location_query(
+        account_id: str,
+        keyword: str,
+        commission_filter: str,
+    ) -> LocationCacheQuery:
+        return LocationCacheQuery(
+            account_id,
+            "domestic",
+            keyword,
+            commission_filter,
+        )
+
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.database_patch = patch(
@@ -127,6 +159,221 @@ class DouyinLocationCacheTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.database_patch.stop()
         self.temporary_directory.cleanup()
+
+    def test_location_search_progress_round_trips_atomically(self) -> None:
+        cache_query = LocationCacheQuery("7", "domestic", "广东joymark", "commission")
+        plan = advance_after_page(
+            build_location_search_plan("广东joymark"),
+            has_more=False,
+            eligible_total=4,
+        )
+        save_location_search_plan(cache_query, plan, eligible_total=4)
+        restored = load_location_search_plan(cache_query)
+        self.assertEqual(restored, plan)
+
+    def test_jilin_plan_round_trips_with_unique_city_queries(self) -> None:
+        cache_query = LocationCacheQuery("7", "domestic", "吉林joymark", "commission")
+        plan = build_location_search_plan("吉林joymark")
+
+        save_location_search_plan(cache_query, plan, eligible_total=0)
+
+        self.assertEqual(load_location_search_plan(cache_query), plan)
+        self.assertEqual(len(plan.subqueries), len(set(plan.subqueries)))
+        self.assertIn("吉林市joymark", plan.subqueries)
+
+    def test_same_candidate_can_be_associated_with_province_and_city_queries(self) -> None:
+        province = LocationCacheQuery("7", "domestic", "广东joymark", "commission")
+        city = LocationCacheQuery("7", "domestic", "广州joymark", "commission")
+        merge_platform_locations_for_queries(
+            [province, city],
+            [self.commission_candidate("gd-1")],
+        )
+        self.assertEqual(get_cached_locations(province, excluded_identities=[])["total"], 1)
+        self.assertEqual(get_cached_locations(city, excluded_identities=[])["total"], 1)
+
+    def test_province_cache_rejects_full_keyword_brand_match_from_other_province(
+        self,
+    ) -> None:
+        """省份词命中完整店名也不能把外省候选写进该省缓存。"""
+
+        province = LocationCacheQuery("7", "domestic", "广东joymark", "commission")
+        candidate = {
+            "poiId": "jiangsu-full-keyword-brand",
+            "name": "广东joymark南京店",
+            "address": "江苏省南京市鼓楼区测试路1号",
+            "commissionType": "commission",
+        }
+
+        merged = merge_platform_locations(province, [candidate])
+
+        self.assertEqual(merged["total"], 0)
+        self.assertEqual(
+            get_cached_locations(province, excluded_identities=[])["total"],
+            0,
+        )
+
+    def test_qinghai_hainan_prefecture_cache_is_isolated_from_hainan_province(self) -> None:
+        candidate = {
+            "poiId": "qh-hainan-1",
+            "name": "JOYMARK 共和店",
+            "address": "青海省海南藏族自治州共和县测试路1号",
+            "commissionType": "commission",
+        }
+        qinghai_root = LocationCacheQuery(
+            "7", "domestic", "青海joymark", "commission"
+        )
+        qinghai_prefecture = LocationCacheQuery(
+            "7", "domestic", "海南joymark", "commission", province_context="青海"
+        )
+        hainan_root = LocationCacheQuery(
+            "7", "domestic", "海南joymark", "commission"
+        )
+
+        merge_platform_locations_for_queries(
+            [qinghai_root, qinghai_prefecture], [candidate]
+        )
+
+        self.assertEqual(
+            get_cached_locations(qinghai_root, excluded_identities=[])["total"], 1
+        )
+        self.assertEqual(
+            get_cached_locations(qinghai_prefecture, excluded_identities=[])["total"], 1
+        )
+        self.assertEqual(
+            get_cached_locations(hainan_root, excluded_identities=[])["total"], 0
+        )
+        self.assertEqual(
+            filter_locations_for_search_keyword(
+                "海南joymark",
+                [
+                    {
+                        **candidate,
+                        "poiId": "qh-hainan-without-province",
+                        "address": "海南藏族自治州共和县测试路2号",
+                    }
+                ],
+            ),
+            [],
+        )
+        self.assertEqual(
+            filter_locations_for_search_keyword(
+                "海南joymark",
+                [
+                    {
+                        **candidate,
+                        "poiId": "qh-context-without-province",
+                        "address": "海南藏族自治州共和县测试路3号",
+                    }
+                ],
+                province_context="青海",
+            ),
+            [],
+        )
+
+    def test_progress_isolated_by_account_keyword_and_commission_filter(self) -> None:
+        plan = build_location_search_plan("广东joymark")
+        save_location_search_plan(
+            self.location_query("7", "广东joymark", "commission"),
+            plan,
+            eligible_total=4,
+        )
+        self.assertIsNone(
+            load_location_search_plan(
+                self.location_query("8", "广东joymark", "commission")
+            )
+        )
+        self.assertIsNone(
+            load_location_search_plan(
+                self.location_query("7", "广西joymark", "commission")
+            )
+        )
+        self.assertIsNone(
+            load_location_search_plan(
+                self.location_query("7", "广东joymark", "all")
+            )
+        )
+
+    def test_progress_plan_keyword_must_match_its_cache_key(self) -> None:
+        cache_query = self.location_query("7", "广东joymark", "commission")
+        with self.assertRaisesRegex(DouyinLocationCacheError, "关键词"):
+            save_location_search_plan(
+                cache_query,
+                build_location_search_plan("广西joymark"),
+                eligible_total=0,
+            )
+
+        save_location_search_plan(
+            cache_query,
+            build_location_search_plan("广东joymark"),
+            eligible_total=0,
+        )
+        with database.connect() as conn:
+            row = conn.execute(
+                "SELECT planJson FROM douyin_location_search_progress"
+            ).fetchone()
+            payload = json.loads(row["planJson"])
+            payload["originalKeyword"] = "广西joymark"
+            conn.execute(
+                "UPDATE douyin_location_search_progress SET planJson = ?",
+                (json.dumps(payload, ensure_ascii=False),),
+            )
+        with self.assertRaisesRegex(DouyinLocationCacheError, "关键词"):
+            load_location_search_plan(cache_query)
+
+    def test_progress_plan_keyword_normalizes_whitespace_and_province_suffix(self) -> None:
+        cache_query = self.location_query(
+            "7",
+            " 广东省 joymark ",
+            "commission",
+        )
+        plan = build_location_search_plan(" 广东省 joymark ")
+
+        save_location_search_plan(cache_query, plan, eligible_total=4)
+
+        self.assertEqual(load_location_search_plan(cache_query), plan)
+        self.assertEqual(
+            load_location_search_plan(
+                self.location_query("7", "广东省joymark", "commission")
+            ),
+            plan,
+        )
+
+    def test_multi_query_association_keeps_foshan_out_of_guangzhou(self) -> None:
+        province = self.location_query("7", "广东joymark", "commission")
+        guangzhou = self.location_query("7", "广州joymark", "commission")
+        beijing = self.location_query("7", "北京joymark", "commission")
+        foshan_candidate = self.commission_candidate("gd-fs-1")
+        foshan_candidate["address"] = "广东省佛山市测试路1号"
+
+        merge_platform_locations_for_queries(
+            [province, guangzhou, beijing],
+            [foshan_candidate],
+        )
+
+        self.assertEqual(get_cached_locations(province, excluded_identities=[])["total"], 1)
+        self.assertEqual(get_cached_locations(guangzhou, excluded_identities=[])["total"], 0)
+        self.assertEqual(get_cached_locations(beijing, excluded_identities=[])["total"], 0)
+
+    def test_invalid_progress_json_is_reported_instead_of_marked_complete(self) -> None:
+        with database.connect() as conn:
+            conn.execute(
+                "INSERT INTO douyin_location_search_progress "
+                "(accountId, scope, keyword, commissionFilter, planJson, eligibleTotal, updatedAt) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "7",
+                    "domestic",
+                    "广东joymark",
+                    "commission",
+                    "{broken",
+                    0,
+                    "2026-08-26T00:00:00+00:00",
+                ),
+            )
+        with self.assertRaisesRegex(DouyinLocationCacheError, "进度"):
+            load_location_search_plan(
+                self.location_query("7", "广东joymark", "commission")
+            )
 
     def test_cache_is_account_scoped_and_pages_ten_rows(self) -> None:
         """账号条件或十行分页丢失时，本测试必须失败。"""

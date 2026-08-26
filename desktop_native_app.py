@@ -21,7 +21,7 @@ if os.name == "nt" and QT_BIN_DIR.exists():
 
 from PyQt6.QtCore import QDate, QTime, QTimer
 from PyQt6.QtGui import QIcon
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QMessageBox
 
 from app_core import (
     account_service,
@@ -35,6 +35,8 @@ from app_core import (
 from app_core.release_integrity import verify_release_artifact
 from app_core.branding import APP_ICON_RELATIVE_PATH, APP_TITLE, APP_VERSION, PRODUCT_NAME
 from app_core.database import ensure_schema
+from app_core.paths import USER_DATA_DIR, WECHAT_DRAFT_BRIDGE_DIR
+from app_core.source_live_runtime import installed_gui_block_reason
 from ui.common import apply_style
 from ui.main_window import LicenseDialog, MainWindow
 from ui.runtime_log import install_runtime_log_capture
@@ -75,12 +77,20 @@ def run_self_test() -> None:
     print("NATIVE_DESKTOP_SELF_TEST_OK")
 
 
+def create_main_window() -> MainWindow:
+    """创建并完成正常桌面端接线。"""
+
+    window = MainWindow()
+    window.publish.configure_wechat_draft_queue(WECHAT_DRAFT_BRIDGE_DIR)
+    return window
+
+
 def run_ui_test() -> None:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     app = QApplication([])
     configure_application(app)
     apply_style(app)
-    window = MainWindow()
+    window = create_main_window()
     window.show()
     app.processEvents()
     print("NATIVE_DESKTOP_UI_OK")
@@ -190,6 +200,26 @@ def run_controlled_publish_cli(args: argparse.Namespace) -> int:
     ensure_schema()
     action = str(args.controlled_publish_action or "")
     try:
+        if action in {"metrics-sync", "metrics-get", "metrics-status"}:
+            from app_core.content_project_gateway import ContentProjectGateway
+
+            project_id = str(args.content_project_id or "").strip()
+            if not project_id:
+                raise controlled_publish.ControlledPublishError(
+                    "content_project_id_required",
+                    "项目数据操作必须提供 content project id",
+                )
+            gateway = ContentProjectGateway()
+            if action == "metrics-sync":
+                result = gateway.sync_project_metrics(project_id)
+            elif action == "metrics-get":
+                result = gateway.get_project_metrics(
+                    project_id, int(args.metrics_days)
+                )
+            else:
+                result = gateway.metrics_sync_status(project_id)
+            _controlled_json(result)
+            return 0
         if action == "status":
             if not args.controlled_publish_task_id:
                 raise controlled_publish.ControlledPublishError(
@@ -242,8 +272,40 @@ def run_controlled_publish_cli(args: argparse.Namespace) -> int:
             if final != initial:
                 _controlled_json(final)
             return 0 if final["status"] == "success" else 2
+        if action in {"silicon-preflight", "silicon-formal"}:
+            if not args.controlled_publish_request:
+                raise controlled_publish.ControlledPublishError(
+                    "controlled_request_file_required",
+                    "硅基进化自动直发必须提供 JSON 请求文件",
+                )
+            request = _read_controlled_request(args.controlled_publish_request)
+            request["mode"] = (
+                "preflight" if action == "silicon-preflight" else "formal"
+            )
+            initial = controlled_publish.submit_silicon_evolution_request(request)
+            _controlled_json(initial)
+            task_id = int(initial["taskId"])
+            try:
+                _wait_for_controlled_task(
+                    task_id,
+                    interactive_verification=(action == "silicon-formal"),
+                )
+            except KeyboardInterrupt:
+                task_service.fail_active_task(
+                    task_id,
+                    error_code="controlled_cli_interrupted",
+                    message="自动直发命令被中断，未取得最终回执的平台已安全停止",
+                    event_type="controlled_cli_interrupted",
+                )
+                _controlled_json(controlled_publish.task_status(task_id))
+                return 130
+            final = controlled_publish.task_status(task_id)
+            if final != initial:
+                _controlled_json(final)
+            return 0 if final["status"] == "success" else 2
         raise controlled_publish.ControlledPublishError(
-            "controlled_action_invalid", "受控发布 action 只能是 create、status 或 authorize"
+            "controlled_action_invalid",
+            "受控 action 不受支持",
         )
     except controlled_publish.ControlledPublishError as exc:
         _controlled_json(
@@ -258,8 +320,12 @@ def run_controlled_publish_cli(args: argparse.Namespace) -> int:
         _controlled_json(
             {
                 "status": "failed",
-                "errorCode": "controlled_internal_error",
-                "errorText": f"{type(exc).__name__}：{exc}",
+                "errorCode": str(
+                    getattr(exc, "error_code", "controlled_internal_error")
+                ),
+                "errorText": str(
+                    getattr(exc, "public_message", f"{type(exc).__name__}：{exc}")
+                ),
             }
         )
         return 2
@@ -405,7 +471,16 @@ def main() -> int:
     )
     parser.add_argument(
         "--controlled-publish-action",
-        choices=("create", "status", "authorize"),
+        choices=(
+            "create",
+            "status",
+            "authorize",
+            "silicon-preflight",
+            "silicon-formal",
+            "metrics-sync",
+            "metrics-get",
+            "metrics-status",
+        ),
         help="本机受控发布接口；默认只能由请求中的 preflight 模式启动预检。",
     )
     parser.add_argument(
@@ -417,6 +492,23 @@ def main() -> int:
         "--controlled-publish-task-id",
         type=int,
         metavar="TASK_ID",
+    )
+    parser.add_argument(
+        "--content-project-id",
+        metavar="PROJECT_ID",
+        help="内容项目数据同步或查询使用的本机项目标识。",
+    )
+    parser.add_argument(
+        "--metrics-days",
+        type=int,
+        choices=(1, 7, 30),
+        default=1,
+        help="项目数据查询窗口，只允许 1、7、30 天。",
+    )
+    parser.add_argument(
+        "--mcp-server",
+        action="store_true",
+        help="通过本机 stdio 启动一键发 MCP 受控发布适配器。",
     )
     args = parser.parse_args()
     if args.self_test:
@@ -435,6 +527,27 @@ def main() -> int:
         return 0
     if args.controlled_publish_action:
         return run_controlled_publish_cli(args)
+    if args.mcp_server:
+        # MCP 的 stdout 是协议信道；平台执行日志只能进入 stderr。
+        from utils.log import redirect_console_logger
+        from app_core.oneclick_mcp_server import run_stdio_server
+
+        redirect_console_logger(sys.stderr)
+        ensure_schema()
+        run_stdio_server()
+        return 0
+    source_live_conflict = installed_gui_block_reason(
+        os.environ, USER_DATA_DIR / "source-live-session.json"
+    )
+    if source_live_conflict:
+        app = QApplication(sys.argv)
+        configure_application(app)
+        QMessageBox.warning(
+            None,
+            "正式客户端暂不能打开",
+            source_live_conflict + "，再重新打开正式客户端。",
+        )
+        return 2
     app = QApplication(sys.argv)
     configure_application(app)
     install_runtime_log_capture()
@@ -447,7 +560,7 @@ def main() -> int:
         dialog.exec()
         if not activation_service.license_status().get("accessAllowed"):
             return 0
-    window = MainWindow()
+    window = create_main_window()
     window.show()
     if args.page:
         # 窗口首次 show 后再应用启动页，避免 Qt 初始布局将

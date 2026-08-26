@@ -83,6 +83,31 @@ class DouyinCommerceBatchTaskTests(unittest.TestCase):
         self.db_patch.stop()
         self.tempdir.cleanup()
 
+    def test_task_creation_atomically_records_project_phase(self) -> None:
+        task = task_service.create_pending_task(
+            [
+                {
+                    "type": 3,
+                    "contentType": "video",
+                    "title": "项目归属测试",
+                    "fileList": [],
+                    "accountList": [],
+                    "debugDryRun": False,
+                    "contentProjectId": "silicon-exploration",
+                }
+            ],
+            mode="oneclick_publish",
+        )
+
+        self.assertEqual(
+            task_service.project_task_link(task["id"]),
+            {
+                "projectId": "silicon-exploration",
+                "taskId": task["id"],
+                "phase": "formal",
+            },
+        )
+
     def _create_paused_douyin_batch_source(self) -> dict:
         """创建一条用户主动暂停、仅后两条待续发的本地来源任务。"""
 
@@ -1599,6 +1624,39 @@ class DouyinCommerceBatchTaskTests(unittest.TestCase):
             task_service.get_task(generic_task["id"])["items"][0]["status"],
             "pending",
         )
+
+    def test_generic_publish_result_persists_verified_public_receipt(self) -> None:
+        task = task_service.create_pending_task(
+            [
+                {
+                    "type": 10,
+                    "contentType": "text",
+                    "title": "公众号回执测试",
+                    "accountList": ["wechat.json"],
+                    "accountIds": [2],
+                    "fileList": [],
+                    "debugDryRun": False,
+                }
+            ],
+            mode="oneclick_publish",
+        )
+
+        task_service.mark_platform_result(
+            task["id"],
+            10,
+            ok=True,
+            message="公众号已正式发表并由首页回读确认",
+            content_type="text",
+            event_type="platform_publish",
+            readback={
+                "postUrl": "https://mp.weixin.qq.com/s/verified",
+                "publishedAt": "2026-08-26 17:43",
+            },
+        )
+
+        item = task_service.get_task(task["id"])["items"][0]
+        self.assertEqual(item["postUrl"], "https://mp.weixin.qq.com/s/verified")
+        self.assertEqual(item["publishedAt"], "2026-08-26 17:43")
 
     def test_public_batch_module_does_not_expose_a_dict_to_success_bridge(self) -> None:
         task = task_service.create_douyin_batch_task(self.batch)

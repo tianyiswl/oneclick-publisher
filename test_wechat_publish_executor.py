@@ -21,6 +21,7 @@ from app_core.wechat_publish_executor import (
     _page_state_after_navigation,
     _platform_date_label,
     _recover_post_submit_result,
+    _resolve_verified_submit_result,
     _safe_dialog_report,
     _scheduled_home_readback,
 )
@@ -335,6 +336,8 @@ class WechatQrCaptureTests(unittest.IsolatedAsyncioTestCase):
             ai_accepted=False,
             preflight_message="本地预检完成",
             execution_record={},
+            attempts=1,
+            settle_seconds=0,
         )
         self.assertTrue(result["ok"])
         self.assertTrue(result["actuallyPublished"])
@@ -377,6 +380,69 @@ class WechatQrCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["scheduled"])
         self.assertFalse(result["actuallyPublished"])
         self.assertEqual(result["scheduledAt"], preferences["scheduleLocal"])
+
+    async def test_verified_submit_immediately_resolves_exact_home_readback(self):
+        title = "验证成功后立即回读"
+
+        class HomePage:
+            def __init__(self):
+                self.goto_calls = 0
+
+            async def goto(self, _url, *, wait_until, timeout):
+                self.goto_calls += 1
+
+            async def evaluate(self, _script, expected_title):
+                return {
+                    "publishedCards": [f"今天 17:43 已发表 {expected_title}"],
+                    "links": [
+                        {
+                            "text": expected_title,
+                            "href": "https://mp.weixin.qq.com/s/verified",
+                        }
+                    ],
+                    "successMarkers": [],
+                }
+
+        page = HomePage()
+        result = await _resolve_verified_submit_result(
+            page,
+            title=title,
+            preferences={"scheduledPublish": False, "scheduleLocal": ""},
+            ai_accepted=False,
+            preflight_message="本地预检完成",
+            execution_record={},
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["links"][0]["href"], "https://mp.weixin.qq.com/s/verified")
+        self.assertEqual(page.goto_calls, 1)
+
+    async def test_verified_submit_without_exact_readback_stops_republish(self):
+        class EmptyHomePage:
+            async def goto(self, _url, *, wait_until, timeout):
+                return None
+
+            async def evaluate(self, _script, expected_title):
+                return {
+                    "publishedCards": [],
+                    "links": [],
+                    "successMarkers": [],
+                }
+
+        with self.assertRaises(WechatPublishError) as raised:
+            await _resolve_verified_submit_result(
+                EmptyHomePage(),
+                title="结果不明测试",
+                preferences={"scheduledPublish": False, "scheduleLocal": ""},
+                ai_accepted=False,
+                preflight_message="本地预检完成",
+                execution_record={},
+                attempts=1,
+                settle_seconds=0,
+            )
+
+        self.assertEqual(raised.exception.error_code, "wechat_publish_result_unknown")
+        self.assertIn("禁止自动重发", str(raised.exception))
 
     async def test_cleanup_failure_cannot_override_a_verified_publish_result(self):
         class BrokenCloser:
