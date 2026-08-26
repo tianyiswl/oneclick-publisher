@@ -235,7 +235,7 @@ def run_controlled_publish_cli(args: argparse.Namespace) -> int:
                     "controlled_task_id_required", "创建授权必须提供预检 taskId"
                 )
             _controlled_json(
-                controlled_publish.authorize_completed_preflight(
+                controlled_publish.authorize_completed_check(
                     args.controlled_publish_task_id
                 )
             )

@@ -243,8 +243,16 @@ def _file_identity(value: object) -> str:
 def scope_fingerprint(payloads: Iterable[Mapping[str, Any]]) -> str:
     """只对发布对象和内容做指纹；不把 Cookie 或会话文件写入授权。"""
 
+    payload_rows = [dict(payload) for payload in payloads]
+    if (
+        len(payload_rows) == 1
+        and str(payload_rows[0].get("workflow") or "") == "douyin-graphic-matrix"
+    ):
+        from .douyin_graphic_matrix_service import matrix_scope_fingerprint
+
+        return matrix_scope_fingerprint(payload_rows[0])
     normalized = []
-    for payload in payloads:
+    for payload in payload_rows:
         normalized.append(
             {
                 "type": int(payload.get("type") or 0),
@@ -500,19 +508,20 @@ def task_status(task_id: int) -> dict[str, Any]:
     return project_task(task_service.get_task(int(task_id)))
 
 
-def authorize_completed_preflight(
+def authorize_completed_check(
     task_id: int,
     *,
     ttl_seconds: int = 600,
 ) -> dict[str, Any]:
-    """在用户于对话中确认后，为已成功预检创建一次性授权。"""
+    """为成功的平台预检或图文矩阵本地检查创建一次性授权。"""
 
     from . import task_service
     from .database import connect
 
     task = task_service.get_task(int(task_id))
-    if not task or str(task.get("mode") or "") != "oneclick_preflight":
-        raise ControlledPublishError("controlled_preflight_required", "授权对象不是受控预检任务")
+    accepted_modes = {"oneclick_preflight", "oneclick_matrix_local_check"}
+    if not task or str(task.get("mode") or "") not in accepted_modes:
+        raise ControlledPublishError("controlled_preflight_required", "授权对象不是受控检查任务")
     if str(task.get("status") or "") != "success":
         raise ControlledPublishError(
             "controlled_preflight_not_successful", "只有全部平台预检成功才能授权正式发布"
@@ -529,6 +538,39 @@ def authorize_completed_preflight(
             int(task_id),
             [dict(item) for item in payloads if isinstance(item, dict)],
             ttl_seconds=ttl_seconds,
+        )
+
+
+def authorize_completed_preflight(
+    task_id: int,
+    *,
+    ttl_seconds: int = 600,
+) -> dict[str, Any]:
+    """兼容旧调用名称；授权规则由 ``authorize_completed_check`` 统一处理。"""
+
+    return authorize_completed_check(task_id, ttl_seconds=ttl_seconds)
+
+
+def consume_matrix_authorization(
+    authorization_id: str,
+    checked_task_id: int,
+    matrix: Mapping[str, Any],
+    *,
+    now: datetime | None = None,
+) -> None:
+    if str(matrix.get("workflow") or "") != "douyin-graphic-matrix":
+        raise ControlledPublishError(
+            "controlled_authorization_scope_mismatch", "授权内容不是抖音图文矩阵"
+        )
+    from .database import connect
+
+    with connect() as conn:
+        consume_authorization(
+            conn,
+            authorization_id,
+            int(checked_task_id),
+            [matrix],
+            now=now,
         )
 
 

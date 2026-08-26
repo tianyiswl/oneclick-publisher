@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from app_core.controlled_publish import (
     ControlledPublishError,
@@ -18,6 +19,8 @@ from app_core.controlled_publish import (
     project_task,
     scope_fingerprint,
 )
+from app_core import database, task_service
+from app_core.douyin_graphic_matrix_service import prepare_matrix
 
 
 class ControlledPublishTests(unittest.TestCase):
@@ -343,6 +346,85 @@ class ControlledPublishTests(unittest.TestCase):
             )
         )
 
+
+class DouyinGraphicMatrixAuthorizationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.db_patch = patch.object(
+            database, "DB_PATH", Path(self.tempdir.name) / "database.db"
+        )
+        self.db_patch.start()
+        database.ensure_schema()
+        image = Path(self.tempdir.name) / "matrix.jpg"
+        image.write_bytes(b"matrix")
+        self.matrix = prepare_matrix(
+            {
+                "schemaVersion": "oneclick-douyin-graphic-matrix/v1",
+                "workflow": "douyin-graphic-matrix",
+                "runtimeMode": "local_check",
+                "content": {
+                    "images": [str(image)],
+                    "common": {
+                        "title": "矩阵标题",
+                        "body": "矩阵正文",
+                        "tags": ["图文矩阵"],
+                    },
+                },
+                "targets": [
+                    {"itemIndex": 1, "accountId": 31, "overrides": {}}
+                ],
+            },
+            accounts=[{"id": 31, "type": 3, "profileName": "账号一"}],
+            now=datetime(2026, 8, 26, 9, 0, tzinfo=timezone.utc),
+        )
+        self.task = task_service.create_douyin_graphic_matrix_task(
+            self.matrix, mode="oneclick_matrix_local_check"
+        )
+        item = task_service.matrix_item_for_index(self.task["id"], 1)
+        task_service.start_matrix_item(self.task["id"], item["id"])
+        task_service.finish_matrix_item(
+            self.task["id"], item["id"], ok=True, message="本地批量检查通过"
+        )
+        task_service.close_matrix_parent(self.task["id"])
+
+    def tearDown(self) -> None:
+        self.db_patch.stop()
+        self.tempdir.cleanup()
+
+    def test_matrix_authorization_binds_exact_snapshot_and_is_single_use(self) -> None:
+        from app_core.controlled_publish import (
+            authorize_completed_check,
+            consume_matrix_authorization,
+        )
+
+        authorization = authorize_completed_check(self.task["id"], ttl_seconds=600)
+        consume_matrix_authorization(
+            authorization["authorizationId"], self.task["id"], self.matrix
+        )
+        with self.assertRaises(ControlledPublishError) as consumed:
+            consume_matrix_authorization(
+                authorization["authorizationId"], self.task["id"], self.matrix
+            )
+        self.assertEqual(
+            consumed.exception.error_code, "controlled_authorization_consumed"
+        )
+
+    def test_matrix_authorization_rejects_changed_effective_title(self) -> None:
+        from app_core.controlled_publish import (
+            authorize_completed_check,
+            consume_matrix_authorization,
+        )
+
+        authorization = authorize_completed_check(self.task["id"])
+        changed = json.loads(json.dumps(self.matrix, ensure_ascii=False))
+        changed["targets"][0]["effective"]["title"] = "被修改"
+        with self.assertRaises(ControlledPublishError) as mismatch:
+            consume_matrix_authorization(
+                authorization["authorizationId"], self.task["id"], changed
+            )
+        self.assertEqual(
+            mismatch.exception.error_code, "controlled_authorization_scope_mismatch"
+        )
 
 if __name__ == "__main__":
     unittest.main()
