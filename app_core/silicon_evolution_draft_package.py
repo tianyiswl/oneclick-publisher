@@ -128,7 +128,9 @@ def load_frozen_wechat_draft_package(
     if not content_html.strip():
         raise FrozenWechatDraftPackageError("content.html 不能为空")
     body_image_paths = tuple(
-        path for relative_name, path in verified.items() if relative_name.startswith("assets/")
+        path
+        for relative_name, path in verified.items()
+        if relative_name.startswith(("assets/", "images/"))
     )
     return FrozenWechatDraftPackage(
         article_id=article_id,

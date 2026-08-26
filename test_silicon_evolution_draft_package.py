@@ -11,13 +11,13 @@ from app_core.silicon_evolution_draft_package import (
 
 
 class FrozenWechatDraftPackageTests(unittest.TestCase):
-    def _write_package(self, root: Path) -> tuple[Path, str]:
+    def _write_package(self, root: Path, *, image_root: str = "assets") -> tuple[Path, str]:
         package = root / "WX-20260825-001"
-        (package / "assets").mkdir(parents=True)
+        (package / image_root).mkdir(parents=True)
         files = {
             "content.html": b"<p>\xe6\xad\xa3\xe6\x96\x87</p>",
             "cover-master.png": b"cover",
-            "assets/01.png": b"image",
+            f"{image_root}/01.png": b"image",
             "publication.json": json.dumps(
                 {
                     "article_id": "WX-20260825-001",
@@ -55,6 +55,12 @@ class FrozenWechatDraftPackageTests(unittest.TestCase):
         self.assertEqual(loaded.article_id, "WX-20260825-001")
         self.assertEqual(loaded.title, "测试标题")
         self.assertEqual(loaded.cover_path.name, "cover-master.png")
+        self.assertEqual([path.name for path in loaded.body_image_paths], ["01.png"])
+
+    def test_loads_body_images_from_images_directory_too(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            package, digest = self._write_package(Path(directory), image_root="images")
+            loaded = load_frozen_wechat_draft_package(package, expected_sha256=digest)
         self.assertEqual([path.name for path in loaded.body_image_paths], ["01.png"])
 
     def test_rejects_changed_asset_and_publish_enabled_manifest(self) -> None:
