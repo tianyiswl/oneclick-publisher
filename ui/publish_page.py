@@ -659,6 +659,7 @@ class PublishPage(QWidget):
         self.wechat_draft_queue_status.setProperty("role", "muted")
         draft_bridge_layout.addWidget(self.wechat_draft_queue_status)
         layout.addWidget(draft_bridge_bar)
+        draft_bridge_bar.hide()
 
         template_bar = QFrame()
         template_bar.setProperty("toolbar", True)

@@ -56,6 +56,15 @@ class PublishPageWechatDraftQueueTests(unittest.TestCase):
             self.assertFalse(page.wechat_draft_queue_timer.isActive())
             self._dispose_page(page)
 
+    def test_compatibility_gateway_bar_is_hidden_from_publish_center(self) -> None:
+        page = PublishPage()
+
+        gateway_bar = page.content_project_gateway_status.parentWidget()
+
+        self.assertIsNotNone(gateway_bar)
+        self.assertTrue(gateway_bar.isHidden())
+        self._dispose_page(page)
+
     def test_running_draft_queue_surfaces_pending_native_wechat_verification(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             page = PublishPage()
