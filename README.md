@@ -32,6 +32,25 @@ python desktop_native_app.py --page publish
 QT_QPA_PLATFORM=offscreen python desktop_native_app.py --ui-test
 ```
 
+## 内容项目数据回收
+
+内容项目默认通过一键发本机 stdio MCP 调用以下只读数据工具：
+
+- `oneclick_sync_project_metrics`：按项目账号执行当日去重的数据同步；
+- `oneclick_get_project_metrics`：读取项目账号汇总和该项目正式发布作品的数据；
+- `oneclick_metrics_sync_status`：只读查询最近同步、当日复用和失败冷却状态。
+
+平台登录资料始终由一键发管理，内容项目不读取 Cookie 或一键发数据库。CLI
+仅用于排错和自动化兼容，并与 MCP 共用同一个项目网关：
+
+```bash
+python desktop_native_app.py --controlled-publish-action metrics-get \
+  --content-project-id silicon-exploration --metrics-days 7
+```
+
+`metrics-sync` 会访问项目已经绑定的平台账号；`metrics-get` 和
+`metrics-status` 只读取本机快照，不启动浏览器。
+
 ## 源码联调（复用正式账号）
 
 需要验证当前源码时，先退出已安装的“一键发”客户端和正在执行的发布任务，再打开项目中的 `开发版客户端/一键发开发版.app`。开发版会运行当前工作树源码，并直接复用正式客户端已经登录的账号会话，因此日常修改后只需重新打开开发版，不必先打包正式客户端。

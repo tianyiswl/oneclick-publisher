@@ -200,6 +200,26 @@ def run_controlled_publish_cli(args: argparse.Namespace) -> int:
     ensure_schema()
     action = str(args.controlled_publish_action or "")
     try:
+        if action in {"metrics-sync", "metrics-get", "metrics-status"}:
+            from app_core.content_project_gateway import ContentProjectGateway
+
+            project_id = str(args.content_project_id or "").strip()
+            if not project_id:
+                raise controlled_publish.ControlledPublishError(
+                    "content_project_id_required",
+                    "项目数据操作必须提供 content project id",
+                )
+            gateway = ContentProjectGateway()
+            if action == "metrics-sync":
+                result = gateway.sync_project_metrics(project_id)
+            elif action == "metrics-get":
+                result = gateway.get_project_metrics(
+                    project_id, int(args.metrics_days)
+                )
+            else:
+                result = gateway.metrics_sync_status(project_id)
+            _controlled_json(result)
+            return 0
         if action == "status":
             if not args.controlled_publish_task_id:
                 raise controlled_publish.ControlledPublishError(
@@ -284,7 +304,8 @@ def run_controlled_publish_cli(args: argparse.Namespace) -> int:
                 _controlled_json(final)
             return 0 if final["status"] == "success" else 2
         raise controlled_publish.ControlledPublishError(
-            "controlled_action_invalid", "受控发布 action 只能是 create、status 或 authorize"
+            "controlled_action_invalid",
+            "受控 action 不受支持",
         )
     except controlled_publish.ControlledPublishError as exc:
         _controlled_json(
@@ -299,8 +320,12 @@ def run_controlled_publish_cli(args: argparse.Namespace) -> int:
         _controlled_json(
             {
                 "status": "failed",
-                "errorCode": "controlled_internal_error",
-                "errorText": f"{type(exc).__name__}：{exc}",
+                "errorCode": str(
+                    getattr(exc, "error_code", "controlled_internal_error")
+                ),
+                "errorText": str(
+                    getattr(exc, "public_message", f"{type(exc).__name__}：{exc}")
+                ),
             }
         )
         return 2
@@ -446,7 +471,16 @@ def main() -> int:
     )
     parser.add_argument(
         "--controlled-publish-action",
-        choices=("create", "status", "authorize", "silicon-preflight", "silicon-formal"),
+        choices=(
+            "create",
+            "status",
+            "authorize",
+            "silicon-preflight",
+            "silicon-formal",
+            "metrics-sync",
+            "metrics-get",
+            "metrics-status",
+        ),
         help="本机受控发布接口；默认只能由请求中的 preflight 模式启动预检。",
     )
     parser.add_argument(
@@ -458,6 +492,18 @@ def main() -> int:
         "--controlled-publish-task-id",
         type=int,
         metavar="TASK_ID",
+    )
+    parser.add_argument(
+        "--content-project-id",
+        metavar="PROJECT_ID",
+        help="内容项目数据同步或查询使用的本机项目标识。",
+    )
+    parser.add_argument(
+        "--metrics-days",
+        type=int,
+        choices=(1, 7, 30),
+        default=1,
+        help="项目数据查询窗口，只允许 1、7、30 天。",
     )
     parser.add_argument(
         "--mcp-server",
