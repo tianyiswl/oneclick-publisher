@@ -20,6 +20,7 @@ from app_core import (
     publish_runtime,
     task_service,
 )
+from app_core.douyin_graphic_matrix_service import prepare_matrix
 from utils import publish_tasks
 
 
@@ -1670,6 +1671,114 @@ class DouyinCommerceBatchTaskTests(unittest.TestCase):
             )
         )
         self.assertEqual(task_service.get_task(task_id)["items"][0]["status"], "pending")
+
+
+class DouyinGraphicMatrixTaskPersistenceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.tempdir.name) / "database.db"
+        self.db_patch = patch.object(database, "DB_PATH", self.db_path)
+        self.db_patch.start()
+        database.ensure_schema()
+        image = Path(self.tempdir.name) / "matrix.jpg"
+        image.write_bytes(b"matrix")
+        self.matrix = prepare_matrix(
+            {
+                "schemaVersion": "oneclick-douyin-graphic-matrix/v1",
+                "workflow": "douyin-graphic-matrix",
+                "runtimeMode": "local_check",
+                "content": {
+                    "images": [str(image)],
+                    "common": {
+                        "title": "矩阵标题",
+                        "body": "矩阵正文",
+                        "tags": ["图文矩阵"],
+                    },
+                },
+                "targets": [
+                    {"itemIndex": 1, "accountId": 31, "overrides": {}},
+                    {"itemIndex": 2, "accountId": 32, "overrides": {}},
+                ],
+            },
+            accounts=[
+                {"id": 31, "type": 3, "profileName": "账号一"},
+                {"id": 32, "type": 3, "profileName": "账号二"},
+            ],
+            now=datetime(2026, 8, 26, 9, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+
+    def tearDown(self) -> None:
+        self.db_patch.stop()
+        self.tempdir.cleanup()
+
+    def test_matrix_task_creates_one_item_per_account_not_per_image(self) -> None:
+        task = task_service.create_douyin_graphic_matrix_task(
+            self.matrix, mode="oneclick_matrix_local_check"
+        )
+        saved = task_service.get_task(task["id"])
+
+        self.assertEqual(saved["itemCount"], 2)
+        self.assertEqual([item["accountId"] for item in saved["items"]], [31, 32])
+        self.assertEqual(
+            [item["batchItemIndex"] for item in saved["items"]], [1, 2]
+        )
+        self.assertTrue(
+            all(item["filePath"].endswith("matrix.jpg") for item in saved["items"])
+        )
+        self.assertEqual(saved["workflow"], "douyin-graphic-matrix")
+
+    def test_matrix_item_stores_stable_error_and_safe_receipt_json(self) -> None:
+        task = task_service.create_douyin_graphic_matrix_task(
+            self.matrix, mode="oneclick_matrix_publish"
+        )
+        item = task_service.matrix_item_for_index(task["id"], 1)
+        task_service.start_matrix_item(task["id"], item["id"])
+
+        task_service.finish_matrix_item(
+            task["id"],
+            item["id"],
+            ok=True,
+            message="已回读平台定时结果",
+            receipt={
+                "platformPostId": "post-31",
+                "scheduledAt": "2026-08-27 18:00",
+                "cookie": "must-not-persist",
+            },
+        )
+        saved_item = task_service.get_task(task["id"])["items"][0]
+        receipt = json.loads(saved_item["receiptJson"])
+        self.assertEqual(receipt["platformPostId"], "post-31")
+        self.assertNotIn("cookie", receipt)
+        self.assertEqual(saved_item["errorCode"], "")
+
+    def test_parent_closes_partial_failed_after_each_account_has_terminal_state(self) -> None:
+        task = task_service.create_douyin_graphic_matrix_task(
+            self.matrix, mode="oneclick_matrix_publish"
+        )
+        first = task_service.matrix_item_for_index(task["id"], 1)
+        second = task_service.matrix_item_for_index(task["id"], 2)
+        task_service.start_matrix_item(task["id"], first["id"])
+        task_service.finish_matrix_item(
+            task["id"], first["id"], ok=True, message="成功", receipt={"platformPostId": "1"}
+        )
+        self.assertEqual(task_service.get_task(task["id"])["status"], "running")
+        task_service.start_matrix_item(task["id"], second["id"])
+        task_service.finish_matrix_item(
+            task["id"],
+            second["id"],
+            ok=False,
+            message="账号登录失效",
+            error_code="douyin_graphic_account_session_expired",
+        )
+        task_service.close_matrix_parent(task["id"])
+
+        saved = task_service.get_task(task["id"])
+        self.assertEqual(saved["status"], "partial_failed")
+        self.assertEqual(saved["successCount"], 1)
+        self.assertEqual(saved["failedCount"], 1)
+        self.assertEqual(
+            saved["items"][1]["errorCode"], "douyin_graphic_account_session_expired"
+        )
 
 
 if __name__ == "__main__":

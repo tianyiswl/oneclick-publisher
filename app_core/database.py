@@ -572,6 +572,10 @@ def ensure_schema() -> None:
                 ("platformPostId", "TEXT"),
                 ("postUrl", "TEXT"),
                 ("publishedAt", "TEXT"),
+                ("accountId", "INTEGER"),
+                ("errorCode", "TEXT NOT NULL DEFAULT ''"),
+                ("receiptJson", "TEXT NOT NULL DEFAULT ''"),
+                ("authorizationSnapshotHash", "TEXT NOT NULL DEFAULT ''"),
             ),
         )
         conn.execute(

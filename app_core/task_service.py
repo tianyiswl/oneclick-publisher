@@ -9,6 +9,7 @@ import re
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Mapping
 from zoneinfo import ZoneInfo
 
 from .account_service import PLATFORMS
@@ -45,6 +46,7 @@ CONTENT_TYPE_LABELS = {
 WORKFLOW_LABELS = {
     "douyin-commerce": "抖音带货",
     "douyin-commerce-batch": "抖音带货批量",
+    "douyin-graphic-matrix": "抖音图文矩阵",
 }
 
 _BATCH_READBACK_FIELDS = {
@@ -56,6 +58,23 @@ _BATCH_READBACK_FIELDS = {
     "cooldownStartedAt",
     "cooldownSeconds",
 }
+_MATRIX_RECEIPT_FIELDS = frozenset(
+    {
+        "platformPostId",
+        "postUrl",
+        "publishedAt",
+        "scheduledAt",
+        "scheduleTime",
+        "timezone",
+    }
+)
+_MATRIX_TASK_MODES = frozenset(
+    {
+        "oneclick_matrix_local_check",
+        "oneclick_matrix_preflight",
+        "oneclick_matrix_publish",
+    }
+)
 _LOCATION_DIAGNOSTIC_ERROR_CODES = frozenset({
     "publish_location_candidate_missing",
     "publish_location_candidate_ambiguous",
@@ -647,6 +666,284 @@ def create_pending_task(
         )
         conn.commit()
     return task
+
+
+def _unique_task_no(conn) -> str:
+    for _ in range(8):
+        candidate = f"T{datetime.now():%m%d%H%M}-{uuid.uuid4().hex[:4].upper()}"
+        if not conn.execute(
+            "SELECT 1 FROM publish_tasks WHERE taskNo = ?", (candidate,)
+        ).fetchone():
+            return candidate
+    raise RuntimeError("无法生成唯一任务号，请重试")
+
+
+def create_douyin_graphic_matrix_task(
+    matrix: dict,
+    *,
+    mode: str,
+    revision_source_task_id: int | None = None,
+) -> dict:
+    """创建每个账号一条明细的抖音图文矩阵任务。"""
+
+    from .douyin_graphic_matrix_service import WORKFLOW, matrix_scope_fingerprint
+
+    if mode not in _MATRIX_TASK_MODES:
+        raise ValueError("抖音图文矩阵任务模式无效")
+    if str(matrix.get("workflow") or "") != WORKFLOW:
+        raise ValueError("抖音图文矩阵任务快照无效")
+    targets = matrix.get("targets")
+    content = matrix.get("content")
+    if not isinstance(targets, list) or not targets or not isinstance(content, dict):
+        raise ValueError("抖音图文矩阵任务快照无效")
+    images = content.get("images")
+    if not isinstance(images, list) or not images:
+        raise ValueError("抖音图文矩阵任务缺少图片")
+    snapshot_hash = matrix_scope_fingerprint(matrix)
+    matrix_snapshot = json.loads(json.dumps(matrix, ensure_ascii=False))
+    matrix_snapshot["scopeFingerprint"] = snapshot_hash
+    common = content.get("common") if isinstance(content.get("common"), dict) else {}
+    title = str(common.get("title") or "抖音图文矩阵")
+    now = _now()
+    with connect() as conn:
+        task_no = _unique_task_no(conn)
+        cursor = conn.execute(
+            """
+            INSERT INTO publish_tasks (
+                taskNo, mode, title, status, dryRun, platformCount, itemCount,
+                contentType, payloadJson, accountSummary, platformSummary,
+                revisionSourceTaskId, createdAt
+            ) VALUES (?, ?, ?, 'pending', ?, 1, ?, 'article', ?, ?, '抖音', ?, ?)
+            """,
+            (
+                task_no,
+                mode,
+                title,
+                0 if mode == "oneclick_matrix_publish" else 1,
+                len(targets),
+                json.dumps([matrix_snapshot], ensure_ascii=False),
+                "；".join(str(row.get("accountLabel") or "") for row in targets),
+                revision_source_task_id,
+                now,
+            ),
+        )
+        task_id = int(cursor.lastrowid)
+        first_image = str(images[0])
+        for target in targets:
+            conn.execute(
+                """
+                INSERT INTO publish_task_items (
+                    taskId, platformType, platformName, accountId, accountLabel,
+                    contentType, filePath, fileName, batchItemIndex,
+                    scheduleSummary, authorizationSnapshotHash, createdAt
+                ) VALUES (?, 3, '抖音', ?, ?, 'article', ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    int(target.get("accountId") or 0),
+                    str(target.get("accountLabel") or ""),
+                    first_image,
+                    Path(first_image).name,
+                    int(target.get("itemIndex") or 0),
+                    str(target.get("scheduleTime") or ""),
+                    snapshot_hash,
+                    now,
+                ),
+            )
+        conn.execute(
+            """
+            INSERT INTO publish_task_events
+                (taskId, level, eventType, message, createdAt)
+            VALUES (?, 'info', 'matrix_created', ?, ?)
+            """,
+            (task_id, "已创建抖音图文矩阵逐账号任务", now),
+        )
+        conn.commit()
+    return {"id": task_id, "taskNo": task_no, "itemCount": len(targets)}
+
+
+def matrix_item_for_index(task_id: int, item_index: int) -> dict:
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM publish_task_items
+            WHERE taskId = ? AND batchItemIndex = ?
+            LIMIT 1
+            """,
+            (int(task_id), int(item_index)),
+        ).fetchone()
+    if row is None:
+        raise ValueError("抖音图文矩阵账号明细不存在")
+    return dict(row)
+
+
+def _matrix_parent_counts(conn, task_id: int) -> tuple[str, int, int, int]:
+    row = conn.execute(
+        """
+        SELECT
+            SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS success,
+            SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
+            SUM(CASE WHEN status IN ('pending', 'running') THEN 1 ELSE 0 END) AS active
+        FROM publish_task_items WHERE taskId = ?
+        """,
+        (int(task_id),),
+    ).fetchone()
+    success = int(row["success"] or 0)
+    failed = int(row["failed"] or 0)
+    active = int(row["active"] or 0)
+    if active:
+        status = "running"
+    elif success and failed:
+        status = "partial_failed"
+    elif failed:
+        status = "failed"
+    else:
+        status = "success"
+    return status, success, failed, active
+
+
+def start_matrix_item(task_id: int, item_id: int) -> None:
+    now = _now()
+    with connect() as conn:
+        updated = conn.execute(
+            """
+            UPDATE publish_task_items
+            SET status = 'running', attempts = attempts + 1,
+                startedAt = COALESCE(startedAt, ?), message = ''
+            WHERE id = ? AND taskId = ? AND status = 'pending'
+            """,
+            (now, int(item_id), int(task_id)),
+        )
+        if updated.rowcount != 1:
+            raise ValueError("抖音图文矩阵账号明细不能开始执行")
+        conn.execute(
+            """
+            UPDATE publish_tasks
+            SET status = 'running', startedAt = COALESCE(startedAt, ?),
+                workerPid = ?, workerHeartbeatAt = ?
+            WHERE id = ? AND mode IN (?, ?, ?)
+            """,
+            (
+                now,
+                os.getpid(),
+                now,
+                int(task_id),
+                *_MATRIX_TASK_MODES,
+            ),
+        )
+        conn.commit()
+
+
+def _matrix_receipt(receipt: object) -> dict[str, str]:
+    if not isinstance(receipt, Mapping):
+        return {}
+    return {
+        key: str(value).strip()
+        for key, value in receipt.items()
+        if key in _MATRIX_RECEIPT_FIELDS and str(value or "").strip()
+    }
+
+
+def finish_matrix_item(
+    task_id: int,
+    item_id: int,
+    *,
+    ok: bool,
+    message: str,
+    error_code: str = "",
+    receipt: Mapping[str, object] | None = None,
+) -> None:
+    projected = _matrix_receipt(receipt)
+    now = _now()
+    status = "success" if ok else "failed"
+    safe_error = "" if ok else str(error_code or "douyin_graphic_matrix_item_failed")
+    receipt_json = (
+        json.dumps(projected, ensure_ascii=False, sort_keys=True) if projected else ""
+    )
+    with connect() as conn:
+        updated = conn.execute(
+            """
+            UPDATE publish_task_items
+            SET status = ?, message = ?, errorCode = ?, receiptJson = ?,
+                platformPostId = ?, postUrl = ?, publishedAt = ?, finishedAt = ?
+            WHERE id = ? AND taskId = ? AND status = 'running'
+            """,
+            (
+                status,
+                str(message or ""),
+                safe_error,
+                receipt_json,
+                projected.get("platformPostId", ""),
+                projected.get("postUrl", ""),
+                projected.get("publishedAt", ""),
+                now,
+                int(item_id),
+                int(task_id),
+            ),
+        )
+        if updated.rowcount != 1:
+            existing = conn.execute(
+                "SELECT status FROM publish_task_items WHERE id = ? AND taskId = ?",
+                (int(item_id), int(task_id)),
+            ).fetchone()
+            if existing is not None and existing["status"] == "success":
+                return
+            raise ValueError("抖音图文矩阵账号明细无法写入终态")
+        parent_status, success, failed, active = _matrix_parent_counts(conn, int(task_id))
+        conn.execute(
+            """
+            UPDATE publish_tasks
+            SET status = ?, successCount = ?, failedCount = ?,
+                lastError = ?, workerHeartbeatAt = ?,
+                finishedAt = CASE WHEN ? = 0 THEN ? ELSE NULL END
+            WHERE id = ?
+            """,
+            (
+                parent_status,
+                success,
+                failed,
+                "" if ok else str(message or ""),
+                now,
+                active,
+                now,
+                int(task_id),
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO publish_task_events
+                (taskId, itemId, level, eventType, message, detailJson, createdAt)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(task_id),
+                int(item_id),
+                "info" if ok else "error",
+                "matrix_item_success" if ok else "matrix_item_failed",
+                str(message or ""),
+                receipt_json,
+                now,
+            ),
+        )
+        conn.commit()
+
+
+def close_matrix_parent(task_id: int) -> None:
+    now = _now()
+    with connect() as conn:
+        status, success, failed, active = _matrix_parent_counts(conn, int(task_id))
+        if active:
+            raise ValueError("抖音图文矩阵仍有账号没有结束")
+        conn.execute(
+            """
+            UPDATE publish_tasks
+            SET status = ?, successCount = ?, failedCount = ?,
+                finishedAt = COALESCE(finishedAt, ?), workerHeartbeatAt = ?
+            WHERE id = ?
+            """,
+            (status, success, failed, now, now, int(task_id)),
+        )
+        conn.commit()
 
 
 def project_task_link(task_id: int) -> dict | None:
