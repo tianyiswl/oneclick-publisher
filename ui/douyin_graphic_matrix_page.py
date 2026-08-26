@@ -33,7 +33,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from app_core import account_service, publish_service
+from app_core import account_service, publish_service, task_service
 from app_core.douyin_graphic_matrix_service import SCHEMA_VERSION, WORKFLOW
 
 from .common import button
@@ -421,6 +421,62 @@ class DouyinGraphicMatrixPage(QWidget):
     def _emit_open_task(self) -> None:
         if self._current_task_id > 0:
             self.open_task_detail.emit(self._current_task_id)
+
+    def open_failed_retry(self, task_id: int) -> None:
+        """只读加载失败/未开始账号，返回界面重新确认。"""
+
+        try:
+            prepared = task_service.prepare_douyin_graphic_matrix_retry(int(task_id))
+            matrix = dict(prepared["matrix"])
+            content = dict(matrix.get("content") or {})
+            common = dict(content.get("common") or {})
+            targets = [dict(target) for target in matrix.get("targets") or []]
+            account_ids = [int(target.get("accountId") or 0) for target in targets]
+            self.set_images(content.get("images") or [])
+            self.set_common_content(
+                str(common.get("title") or ""),
+                str(common.get("body") or ""),
+                list(common.get("tags") or []),
+            )
+            self.select_account_ids(account_ids)
+            selected = [
+                account
+                for account in self._available_accounts
+                if int(account.get("id") or 0) in account_ids
+            ]
+            self.account_table.set_accounts(selected)
+            self._common_changed()
+            target_by_account = {
+                int(target.get("accountId") or 0): target for target in targets
+            }
+            for account_id in account_ids:
+                row = self.account_table.row_for(account_id)
+                target = target_by_account[account_id]
+                overrides = dict(target.get("overrides") or {})
+                for field in ("title", "body", "tags"):
+                    value = overrides.get(field)
+                    if value is None:
+                        continue
+                    text = (
+                        " ".join(f"#{str(tag).lstrip('#')}" for tag in value)
+                        if field == "tags" and isinstance(value, list)
+                        else str(value)
+                    )
+                    row.set_field(field, text, overridden=True)
+                schedule_text = str(target.get("scheduleTime") or "").strip()
+                if schedule_text:
+                    row.set_schedule(
+                        datetime.strptime(schedule_text, "%Y-%m-%d %H:%M"),
+                        overridden=bool(target.get("scheduleOverridden")),
+                    )
+            self._refresh_summary()
+            self.status_label.setText(
+                f"已从任务 {prepared.get('sourceTaskNo') or task_id} 加载 "
+                f"{len(targets)} 个失败或未开始账号；请重新核对后再做本地检查。"
+            )
+            self._set_step(2)
+        except Exception as exc:
+            QMessageBox.warning(self, "重试图文矩阵", str(exc))
 
     def _set_step(self, index: int) -> None:
         self._step = max(0, min(int(index), 2))

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -53,6 +54,7 @@ class TaskDetailDialog(QDialog):
     """任务记录明细弹窗。"""
 
     resume_douyin_batch_requested = pyqtSignal(int)
+    retry_douyin_graphic_matrix_requested = pyqtSignal(int)
 
     def __init__(self, task: dict, parent=None) -> None:
         super().__init__(parent)
@@ -91,9 +93,15 @@ class TaskDetailDialog(QDialog):
             ("完成时间", task.get("finishedAt"), 4, 2, 1),
         ]
         next_summary_row = 5
-        if self._is_batch_task():
+        if self._is_batch_task() or self._is_matrix_task():
             summary_values.append(
-                ("批量结果", self._batch_result_summary(), next_summary_row, 0, 5)
+                (
+                    "账号结果" if self._is_matrix_task() else "批量结果",
+                    self._matrix_result_summary() if self._is_matrix_task() else self._batch_result_summary(),
+                    next_summary_row,
+                    0,
+                    5,
+                )
             )
             next_summary_row += 1
         elif task.get("commerceSummary"):
@@ -125,7 +133,7 @@ class TaskDetailDialog(QDialog):
             label.setProperty("role", "caption")
             value_label = QLabel(str(value or ""))
             value_label.setWordWrap(True)
-            if label_text == "批量结果":
+            if label_text in {"批量结果", "账号结果"}:
                 value_label.setObjectName("batchResultSummary")
             summary.addWidget(label, row, column)
             summary.addWidget(value_label, row, column + 1, 1, span)
@@ -135,7 +143,9 @@ class TaskDetailDialog(QDialog):
 
         tabs = QTabWidget()
         tabs.setObjectName("taskDetailTabs")
-        if self._is_batch_task():
+        if self._is_matrix_task():
+            tabs.addTab(self._matrix_items_tab(), f"账号结果（{len(self._ordered_matrix_items())}）")
+        elif self._is_batch_task():
             tabs.addTab(self._batch_items_tab(), f"视频结果（{len(self._ordered_batch_items())}）")
         else:
             tabs.addTab(self._items_tab(), "执行项")
@@ -157,6 +167,21 @@ class TaskDetailDialog(QDialog):
                 self.resume_batch_button.setText(f"继续未开始的 {int(plan['pendingCount'])} 条")
                 self.resume_batch_button.setVisible(True)
         actions.addWidget(self.resume_batch_button)
+        self.retry_matrix_button = button("重试失败或未开始账号", variant="primary")
+        self.retry_matrix_button.setObjectName("douyinGraphicMatrixRetry")
+        self.retry_matrix_button.setVisible(
+            self._is_matrix_task()
+            and str(self.task.get("status") or "") not in {"pending", "running", "success"}
+            and any(
+                str(item.get("status") or "") in {"failed", "pending"}
+                for item in self.task.get("items") or []
+                if isinstance(item, dict)
+            )
+        )
+        self.retry_matrix_button.clicked.connect(
+            lambda: self.retry_douyin_graphic_matrix_requested.emit(int(self.task["id"]))
+        )
+        actions.addWidget(self.retry_matrix_button)
         close_button = button("关闭", variant="secondary")
         close_button.clicked.connect(self.accept)
         actions.addWidget(close_button)
@@ -169,6 +194,156 @@ class TaskDetailDialog(QDialog):
 
     def _is_batch_task(self) -> bool:
         return self.task.get("workflow") == "douyin-commerce-batch"
+
+    def _is_matrix_task(self) -> bool:
+        return self.task.get("workflow") == "douyin-graphic-matrix"
+
+    def _ordered_matrix_items(self) -> list[dict]:
+        rows = [dict(row) for row in self.task.get("items") or [] if isinstance(row, dict)]
+        return sorted(
+            rows,
+            key=lambda row: int(row.get("batchItemIndex") or 999999),
+        )
+
+    def _matrix_result_summary(self) -> str:
+        rows = self._ordered_matrix_items()
+        success_count = sum(row.get("status") == "success" for row in rows)
+        failed_count = sum(row.get("status") == "failed" for row in rows)
+        unfinished_count = len(rows) - success_count - failed_count
+        return (
+            f"共 {len(rows)} 个账号 · 成功 {success_count} · "
+            f"失败 {failed_count} · 未完成 {unfinished_count}"
+        )
+
+    def _matrix_snapshot(self) -> dict:
+        try:
+            payloads = json.loads(str(self.task.get("payloadJson") or "[]"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        if isinstance(payloads, list) and len(payloads) == 1 and isinstance(payloads[0], dict):
+            return dict(payloads[0])
+        return {}
+
+    def _matrix_targets(self) -> dict[int, dict]:
+        result: dict[int, dict] = {}
+        for target in self._matrix_snapshot().get("targets") or []:
+            if not isinstance(target, dict):
+                continue
+            try:
+                result[int(target.get("itemIndex") or 0)] = target
+            except (TypeError, ValueError):
+                continue
+        return result
+
+    def _matrix_phase_label(self) -> str:
+        return {
+            "oneclick_matrix_local_check": "本地检查",
+            "oneclick_matrix_preflight": "平台预检",
+            "oneclick_matrix_publish": "正式提交",
+        }.get(str(self.task.get("mode") or ""), "执行")
+
+    @staticmethod
+    def _matrix_receipt_text(row: dict) -> str:
+        try:
+            receipt = json.loads(str(row.get("receiptJson") or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            receipt = {}
+        if not isinstance(receipt, dict):
+            receipt = {}
+        labels = (
+            ("platformPostId", "作品ID"),
+            ("scheduledAt", "定时"),
+            ("publishedAt", "发布时间"),
+            ("postUrl", "作品链接"),
+        )
+        values = [f"{label}：{receipt[key]}" for key, label in labels if str(receipt.get(key) or "").strip()]
+        return "；".join(values) or "—"
+
+    def _matrix_items_tab(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 8, 0, 0)
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("状态"))
+        self.matrix_status_filter = QComboBox()
+        self.matrix_status_filter.setObjectName("matrixStatusFilter")
+        filter_row.addWidget(self.matrix_status_filter)
+        filter_row.addStretch()
+        layout.addLayout(filter_row)
+
+        self.matrix_result_table = QTableWidget(0, 9)
+        self.matrix_result_table.setObjectName("douyinGraphicMatrixResultTable")
+        self.matrix_result_table.setHorizontalHeaderLabels(
+            ["序号", "账号", "内容摘要", "定时时间", "阶段", "状态", "错误码", "结果说明", "平台回执"]
+        )
+        self.matrix_result_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.matrix_result_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.matrix_result_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.matrix_result_table.verticalHeader().setVisible(False)
+        layout.addWidget(self.matrix_result_table)
+
+        rows = self._ordered_matrix_items()
+        counts = {
+            status: sum(str(row.get("status") or "") == status for row in rows)
+            for status in ("success", "failed", "running", "pending")
+        }
+        for label, status, count in (
+            ("全部", None, len(rows)),
+            ("成功", "success", counts["success"]),
+            ("失败", "failed", counts["failed"]),
+            ("执行中", "running", counts["running"]),
+            ("未开始", "pending", counts["pending"]),
+        ):
+            self.matrix_status_filter.addItem(f"{label}（{count}）", status)
+        self.matrix_status_filter.currentIndexChanged.connect(self._render_matrix_items)
+        self._render_matrix_items()
+        return panel
+
+    def _render_matrix_items(self) -> None:
+        selected = self.matrix_status_filter.currentData()
+        rows = [
+            row
+            for row in self._ordered_matrix_items()
+            if selected is None or str(row.get("status") or "") == selected
+        ]
+        targets = self._matrix_targets()
+        table = self.matrix_result_table
+        table.setRowCount(len(rows))
+        for row_index, row in enumerate(rows):
+            item_index = int(row.get("batchItemIndex") or row_index + 1)
+            target = targets.get(item_index, {})
+            effective = target.get("effective") if isinstance(target.get("effective"), dict) else {}
+            title = str(effective.get("title") or "").strip() or "—"
+            image_count = len((self._matrix_snapshot().get("content") or {}).get("images") or [])
+            content_summary = f"{title} · {image_count} 张图片"
+            status = str(row.get("status") or "")
+            values = (
+                item_index,
+                row.get("accountLabel") or target.get("accountLabel") or f"账号{row.get('accountId') or ''}",
+                content_summary,
+                target.get("scheduleTime") or "—",
+                self._matrix_phase_label(),
+                BATCH_STATUS_LABELS.get(status, STATUS_LABELS.get(status, status or "—")),
+                row.get("errorCode") or "—",
+                row.get("message") or "—",
+                self._matrix_receipt_text(row),
+            )
+            for column, value in enumerate(values):
+                item = table_item(value, STATUS_COLORS.get(status) if column == 5 else None)
+                item.setToolTip(str(value))
+                if status == "failed":
+                    item.setBackground(QColor(BATCH_FAILED_BACKGROUND_COLOR))
+                    if column in (5, 6, 7):
+                        item.setForeground(QColor(BATCH_FAILED_TEXT_COLOR))
+                table.setItem(row_index, column, item)
+        failed_row = next(
+            (index for index in range(table.rowCount()) if table.item(index, 5).text() == "失败"),
+            0,
+        )
+        if table.rowCount():
+            table.setCurrentCell(failed_row, 0)
+            table.clearSelection()
+            table.scrollToItem(table.item(failed_row, 0))
 
     def _ordered_batch_items(self) -> list[dict]:
         rows = self.task.get("items") or []
@@ -375,6 +550,7 @@ class TaskDetailDialog(QDialog):
 
 class TaskPage(QWidget):
     resume_douyin_batch_requested = pyqtSignal(int)
+    retry_douyin_graphic_matrix_requested = pyqtSignal(int)
 
     def __init__(self) -> None:
         super().__init__()
@@ -716,4 +892,7 @@ class TaskPage(QWidget):
             return
         dialog = TaskDetailDialog(task, self)
         dialog.resume_douyin_batch_requested.connect(self.resume_douyin_batch_requested.emit)
+        dialog.retry_douyin_graphic_matrix_requested.connect(
+            self.retry_douyin_graphic_matrix_requested.emit
+        )
         dialog.exec()

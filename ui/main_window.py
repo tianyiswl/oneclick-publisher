@@ -364,6 +364,12 @@ class MainWindow(QMainWindow):
         )
         self.tasks = TaskPage()
         self.tasks.resume_douyin_batch_requested.connect(self._open_douyin_batch_resume)
+        self.tasks.retry_douyin_graphic_matrix_requested.connect(
+            self._open_douyin_graphic_matrix_retry
+        )
+        self.douyin_graphic_matrix.open_task_detail.connect(
+            self.tasks.open_detail_by_id
+        )
         self.data_monitor = DataMonitorPage()
         self.data_monitor.request_account_management.connect(
             lambda: self._set_current_page(1)
@@ -422,6 +428,17 @@ class MainWindow(QMainWindow):
         )
         self._set_current_page(douyin_index)
         self.douyin_commerce.open_batch_resume(int(task_id))
+
+    def _open_douyin_graphic_matrix_retry(self, task_id: int) -> None:
+        """返回图文矩阵页面核对失败账号，不在明细弹窗直接重发。"""
+
+        matrix_index = next(
+            index
+            for index, (label, _page, _icon) in enumerate(self.page_definitions)
+            if label == "抖音图文矩阵"
+        )
+        self._set_current_page(matrix_index)
+        self.douyin_graphic_matrix.open_failed_retry(int(task_id))
 
     def _build_shell(self) -> QWidget:
         shell = QWidget()

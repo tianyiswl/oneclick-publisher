@@ -29,6 +29,7 @@ class DouyinVerificationDialog(QDialog):
         item_index: int | None = None,
         item_total: int | None = None,
         item_label: str = "",
+        item_kind: str = "条",
     ) -> None:
         super().__init__(parent)
         self.request_id = str(request_id)
@@ -52,9 +53,11 @@ class DouyinVerificationDialog(QDialog):
         self.item_context_label.setWordWrap(True)
         self.item_context_label.setProperty("role", "caption")
         safe_label = str(item_label or "").replace("\n", " ").strip()
+        safe_kind = "个账号" if str(item_kind or "").strip() == "账号" else "条"
         if isinstance(item_index, int) and item_index >= 1 and isinstance(item_total, int) and item_total >= item_index:
             self.item_context_label.setText(
-                f"第 {item_index}/{item_total} 条：{safe_label or '当前视频'}"
+                f"第 {item_index}/{item_total} {safe_kind}："
+                f"{safe_label or ('当前账号' if safe_kind == '个账号' else '当前视频')}"
             )
             layout.addWidget(self.item_context_label)
         else:

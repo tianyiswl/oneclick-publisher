@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import json
 import unittest
 from unittest.mock import patch
 
@@ -61,6 +62,73 @@ class TaskDetailDialogTests(unittest.TestCase):
             ],
             "events": [],
             "payloadJson": "{}",
+        }
+
+    def _matrix_task(self) -> dict:
+        matrix = {
+            "schemaVersion": "oneclick-douyin-graphic-matrix/v1",
+            "workflow": "douyin-graphic-matrix",
+            "content": {
+                "images": ["/tmp/matrix-a.jpg", "/tmp/matrix-b.jpg"],
+                "common": {"title": "通用标题", "body": "通用正文", "tags": ["矩阵"]},
+            },
+            "targets": [
+                {
+                    "itemIndex": 1,
+                    "accountId": 31,
+                    "accountLabel": "账号一",
+                    "effective": {"title": "通用标题", "tags": ["矩阵"]},
+                    "scheduleTime": "2026-08-27 18:00",
+                },
+                {
+                    "itemIndex": 2,
+                    "accountId": 32,
+                    "accountLabel": "账号二",
+                    "effective": {"title": "账号二标题", "tags": ["账号二"]},
+                    "scheduleTime": "2026-08-27 18:30",
+                },
+            ],
+        }
+        return {
+            "id": 77,
+            "taskNo": "T08261800-MATRIX",
+            "taskNoDisplay": "T08261800-MATRIX",
+            "mode": "oneclick_matrix_publish",
+            "contentTypeLabel": "图文",
+            "workflow": "douyin-graphic-matrix",
+            "workflowLabel": "抖音图文矩阵",
+            "status": "partial_failed",
+            "title": "通用标题",
+            "accountSummary": "账号一；账号二",
+            "platformSummary": "抖音",
+            "createdAt": "2026-08-26 18:00:00",
+            "finishedAt": "2026-08-26 18:05:00",
+            "lastError": "账号二话题实体缺失",
+            "payloadJson": json.dumps([matrix], ensure_ascii=False),
+            "items": [
+                {
+                    "batchItemIndex": 1,
+                    "accountId": 31,
+                    "accountLabel": "账号一",
+                    "status": "success",
+                    "message": "定时回执已确认",
+                    "errorCode": "",
+                    "receiptJson": json.dumps(
+                        {"platformPostId": "post-31", "scheduledAt": "2026-08-27 18:00"},
+                        ensure_ascii=False,
+                    ),
+                },
+                {
+                    "batchItemIndex": 2,
+                    "accountId": 32,
+                    "accountLabel": "账号二",
+                    "status": "failed",
+                    "message": "没有回读到官方话题实体",
+                    "errorCode": "douyin_topic_entity_missing",
+                    "receiptJson": "",
+                },
+            ],
+            "events": [],
         }
 
     def test_batch_task_uses_compact_six_column_result_table(self) -> None:
@@ -186,6 +254,26 @@ class TaskDetailDialogTests(unittest.TestCase):
         ]
         self.assertEqual(len(generic_tables), 1)
         self.assertIsNone(dialog.findChild(QComboBox, "batchStatusFilter"))
+
+    def test_matrix_detail_identifies_exact_failed_account_and_receipt(self) -> None:
+        dialog = TaskDetailDialog(self._matrix_task())
+        self.addCleanup(dialog.close)
+        table = dialog.findChild(QTableWidget, "douyinGraphicMatrixResultTable")
+        self.assertIsNotNone(table)
+        self.assertEqual(table.columnCount(), 9)
+        self.assertEqual(table.item(1, 1).text(), "账号二")
+        self.assertEqual(table.item(1, 6).text(), "douyin_topic_entity_missing")
+        self.assertIn("作品ID", table.item(0, 8).text())
+        self.assertEqual(table.currentRow(), 1)
+
+    def test_matrix_retry_button_emits_source_task_only(self) -> None:
+        dialog = TaskDetailDialog(self._matrix_task())
+        self.addCleanup(dialog.close)
+        emitted: list[int] = []
+        dialog.retry_douyin_graphic_matrix_requested.connect(emitted.append)
+        self.assertFalse(dialog.retry_matrix_button.isHidden())
+        dialog.retry_matrix_button.click()
+        self.assertEqual(emitted, [77])
 
     def test_resume_button_is_visible_only_for_allowed_batch_and_only_emits_task_id(self) -> None:
         """若详情页绕过资格判断创建任务，或不可续发任务仍显示按钮，该测试必须失败。"""
