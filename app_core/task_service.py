@@ -496,6 +496,22 @@ def _insert_pending_task(
     resume_source_task_id: int | None = None,
     revision_source_task_id: int | None = None,
 ) -> dict:
+    project_ids = {
+        str(payload.get("contentProjectId") or "").strip().lower()
+        for payload in payloads
+    }
+    project_identity: tuple[str, str] | None = None
+    if project_ids != {""}:
+        if (
+            len(project_ids) != 1
+            or not re.fullmatch(r"[a-z0-9][a-z0-9._-]{1,63}", next(iter(project_ids)))
+            or mode not in {"oneclick_preflight", "oneclick_publish"}
+        ):
+            raise ValueError("内容项目任务归属无效")
+        project_identity = (
+            next(iter(project_ids)),
+            "formal" if mode == "oneclick_publish" else "preflight",
+        )
     account_files = sorted({a for payload in payloads for a in payload.get("accountList", [])})
     account_meta = {}
     if account_files:
@@ -574,6 +590,15 @@ def _insert_pending_task(
         ),
     )
     task_id = cursor.lastrowid
+    if project_identity is not None:
+        conn.execute(
+            """
+            INSERT INTO content_project_task_links
+                (projectId, taskId, phase, createdAt)
+            VALUES (?, ?, ?, ?)
+            """,
+            (project_identity[0], task_id, project_identity[1], _now()),
+        )
     for item in items:
         cursor.execute(
             """
@@ -622,6 +647,24 @@ def create_pending_task(
         )
         conn.commit()
     return task
+
+
+def project_task_link(task_id: int) -> dict | None:
+    """读取发布任务的非敏感内容项目归属。"""
+
+    if type(task_id) is not int or task_id <= 0:
+        return None
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT projectId, taskId, phase
+            FROM content_project_task_links
+            WHERE taskId = ?
+            LIMIT 1
+            """,
+            (task_id,),
+        ).fetchone()
+    return dict(row) if row is not None else None
 
 
 def _require_linkable_revision_source(

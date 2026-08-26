@@ -83,6 +83,31 @@ class DouyinCommerceBatchTaskTests(unittest.TestCase):
         self.db_patch.stop()
         self.tempdir.cleanup()
 
+    def test_task_creation_atomically_records_project_phase(self) -> None:
+        task = task_service.create_pending_task(
+            [
+                {
+                    "type": 3,
+                    "contentType": "video",
+                    "title": "项目归属测试",
+                    "fileList": [],
+                    "accountList": [],
+                    "debugDryRun": False,
+                    "contentProjectId": "silicon-exploration",
+                }
+            ],
+            mode="oneclick_publish",
+        )
+
+        self.assertEqual(
+            task_service.project_task_link(task["id"]),
+            {
+                "projectId": "silicon-exploration",
+                "taskId": task["id"],
+                "phase": "formal",
+            },
+        )
+
     def _create_paused_douyin_batch_source(self) -> dict:
         """创建一条用户主动暂停、仅后两条待续发的本地来源任务。"""
 

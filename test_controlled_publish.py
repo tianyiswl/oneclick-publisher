@@ -84,6 +84,41 @@ class ControlledPublishTests(unittest.TestCase):
         self.assertEqual(payloads[1]["scheduleTime"], "2026-08-24 20:30")
         self.assertTrue(all(item["debugDryRun"] is True for item in payloads))
 
+    def test_controlled_payload_carries_valid_project_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest = self._bundle(Path(temporary))
+            payload = build_controlled_payloads(
+                {
+                    "projectId": "silicon-exploration",
+                    "manifestPath": str(manifest),
+                    "mode": "preflight",
+                    "targets": [
+                        {"platform": "抖音", "accountId": 31, "schedule": None}
+                    ],
+                },
+                accounts=self._accounts(),
+            )[0]
+
+        self.assertEqual(payload["contentProjectId"], "silicon-exploration")
+
+    def test_controlled_payload_rejects_invalid_project_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest = self._bundle(Path(temporary))
+            with self.assertRaises(ControlledPublishError) as raised:
+                build_controlled_payloads(
+                    {
+                        "projectId": "../other-project",
+                        "manifestPath": str(manifest),
+                        "mode": "preflight",
+                        "targets": [
+                            {"platform": "抖音", "accountId": 31, "schedule": None}
+                        ],
+                    },
+                    accounts=self._accounts(),
+                )
+
+        self.assertEqual(raised.exception.error_code, "content_project_id_invalid")
+
     def test_formal_requires_preflight_and_authorization_fields(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             manifest = self._bundle(Path(temporary))

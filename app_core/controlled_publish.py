@@ -30,6 +30,7 @@ _PLATFORM_TYPE_BY_NAME = {
     for platform_type, name in account_service.PLATFORMS.items()
 }
 _REQUEST_KEYS = {
+    "projectId",
     "manifestPath",
     "mode",
     "targets",
@@ -37,6 +38,7 @@ _REQUEST_KEYS = {
     "authorizationId",
 }
 _TARGET_KEYS = {"platform", "accountId", "schedule"}
+_PROJECT_ID_RE = re.compile(r"[a-z0-9][a-z0-9._-]{1,63}")
 
 
 class ControlledPublishError(ValueError):
@@ -106,6 +108,13 @@ def build_controlled_payloads(
                 "controlled_authorization_required",
                 "正式发布必须携带已完成预检和一次性本地授权",
             )
+
+    project_id = str(request.get("projectId") or "").strip().lower()
+    if project_id and not _PROJECT_ID_RE.fullmatch(project_id):
+        raise ControlledPublishError(
+            "content_project_id_invalid",
+            "项目标识必须是 2-64 位小写英文、数字、点、下划线或连字符",
+        )
 
     manifest_path = str(request.get("manifestPath") or "").strip()
     if not manifest_path:
@@ -205,6 +214,8 @@ def build_controlled_payloads(
             "timeJitterMinutes": 0,
             "controlledManifestPath": str(Path(manifest_path).expanduser().resolve()),
         }
+        if project_id:
+            payload["contentProjectId"] = project_id
         if platform_type == 1:
             payload.update(
                 {

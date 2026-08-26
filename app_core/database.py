@@ -506,6 +506,25 @@ def ensure_schema() -> None:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS content_project_task_links (
+                projectId TEXT NOT NULL,
+                taskId INTEGER NOT NULL,
+                phase TEXT NOT NULL CHECK(phase IN ('preflight', 'formal')),
+                createdAt TEXT NOT NULL,
+                PRIMARY KEY(projectId, taskId),
+                UNIQUE(taskId),
+                FOREIGN KEY(taskId) REFERENCES publish_tasks(id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_content_project_task_links_project
+            ON content_project_task_links(projectId, phase, taskId DESC)
+            """
+        )
+        conn.execute(
+            """
             CREATE UNIQUE INDEX IF NOT EXISTS idx_publish_tasks_resume_source
             ON publish_tasks(resumeSourceTaskId)
             WHERE resumeSourceTaskId IS NOT NULL
