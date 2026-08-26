@@ -21,6 +21,7 @@ from . import (
     douyin_commerce_batch_executor,
     douyin_commerce_batch_service,
     douyin_commerce_service,
+    douyin_graphic_matrix_executor,
     douyin_location_service,
     douyin_publish_executor,
     oneclick_capabilities,
@@ -517,21 +518,83 @@ def _run_matrix_local_check(task: dict, matrix: dict[str, Any]) -> None:
         _active_threads.pop(int(task["id"]), None)
 
 
-def start_douyin_graphic_matrix(matrix: dict[str, Any]) -> dict:
-    """启动独立图文矩阵；首阶段仅开放完全离线的本地批量检查。"""
+def _run_matrix_platform_task(
+    task: dict[str, Any], matrix: dict[str, Any], *, submit: bool
+) -> None:
+    if not _publish_lock.acquire(blocking=False):
+        task_service.fail_active_task(
+            int(task["id"]),
+            error_code="controlled_publish_busy",
+            message="已有平台任务正在执行，抖音图文矩阵未启动",
+        )
+        _active_threads.pop(int(task["id"]), None)
+        return
+    try:
+        runner = (
+            douyin_graphic_matrix_executor.run_matrix_sync
+            if submit
+            else douyin_graphic_matrix_executor.run_matrix_preflight_sync
+        )
+        runner(matrix, task_id=int(task["id"]))
+    except Exception as exc:
+        task_service.fail_active_task(
+            int(task["id"]),
+            error_code=str(
+                getattr(
+                    exc,
+                    "error_code",
+                    "douyin_graphic_matrix_worker_failed",
+                )
+            ),
+            message=f"抖音图文矩阵执行异常：{exc}",
+        )
+    finally:
+        _publish_lock.release()
+        _active_threads.pop(int(task["id"]), None)
+
+
+def start_douyin_graphic_matrix(
+    matrix: dict[str, Any],
+    *,
+    authorization_id: str = "",
+    checked_task_id: int = 0,
+) -> dict:
+    """启动独立图文矩阵，不进入通用文件×账号扩展路径。"""
 
     prepared = prepare_matrix(matrix, accounts=account_service.list_accounts())
     runtime_mode = str(prepared.get("runtimeMode") or "")
-    if runtime_mode != "local_check":
-        raise ValueError("抖音图文矩阵平台预检和正式执行器尚未接入")
+    if runtime_mode not in {"local_check", "preflight", "publish"}:
+        raise ValueError("抖音图文矩阵运行模式无效")
+    if runtime_mode == "publish":
+        if not str(authorization_id or "").strip() or int(checked_task_id or 0) <= 0:
+            raise ValueError("抖音图文矩阵正式发布需要一次性授权")
+        from .controlled_publish import consume_matrix_authorization
+
+        consume_matrix_authorization(
+            str(authorization_id), int(checked_task_id), prepared
+        )
+    mode = {
+        "local_check": "oneclick_matrix_local_check",
+        "preflight": "oneclick_matrix_preflight",
+        "publish": "oneclick_matrix_publish",
+    }[runtime_mode]
     task = task_service.create_douyin_graphic_matrix_task(
-        prepared, mode="oneclick_matrix_local_check"
+        prepared, mode=mode
     )
     worker = threading.Thread(
-        target=_run_matrix_local_check,
+        target=(
+            _run_matrix_local_check
+            if runtime_mode == "local_check"
+            else _run_matrix_platform_task
+        ),
         args=(task, prepared),
+        kwargs=(
+            {}
+            if runtime_mode == "local_check"
+            else {"submit": runtime_mode == "publish"}
+        ),
         daemon=True,
-        name=f"oneclick-douyin-graphic-matrix-local-check-{task['id']}",
+        name=f"oneclick-douyin-graphic-matrix-{runtime_mode}-{task['id']}",
     )
     _active_threads[int(task["id"])] = worker
     worker.start()
