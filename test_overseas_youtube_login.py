@@ -13,8 +13,10 @@ from app_core.overseas_youtube_credentials import (
     OAuthCredentialError,
 )
 from app_core.overseas_youtube_login import (
+    YouTubeAuthorizedSession,
     YouTubeOAuthLoginError,
     YouTubeOAuthLoginSession,
+    authorize_saved_youtube_account,
     validate_saved_youtube_oauth_account,
 )
 from app_core.overseas_youtube_oauth import (
@@ -275,6 +277,7 @@ class YouTubeOAuthLoginSessionTests(unittest.TestCase):
                     "channel_id": "UC-current",
                     "display_name": "当前频道",
                     "record_id": None,
+                    "oauth_scope_version": 2,
                 }
             ],
         )
@@ -310,6 +313,72 @@ class YouTubeOAuthLoginSessionTests(unittest.TestCase):
         self.assertEqual(str(caught.exception), "channel_identity_mismatch")
         self.assertEqual(store.values["youtube-oauth:existing"], "old-refresh-token")
         self.assertEqual(evidence["saved"], [])
+
+    def test_publish_authorization_rejects_legacy_scope_before_loading_secret(self) -> None:
+        store = InMemoryCredentialStore()
+        store.values["youtube-oauth:legacy-ref"] = "legacy-refresh-secret"
+        token_client = FakeTokenClient()
+        channel_client = FakeChannelClient(
+            YouTubeChannelIdentity(channel_id="UC-legacy", display_name="旧频道")
+        )
+        account = {
+            "id": 12,
+            "type": 7,
+            "authMode": "youtube_oauth",
+            "filePath": "youtube-oauth:legacy-ref",
+            "accountReference": "UC-legacy",
+            "oauthScopeVersion": 1,
+        }
+
+        with self.assertRaises(YouTubeOAuthLoginError) as caught:
+            authorize_saved_youtube_account(
+                account,
+                client_id="desktop-client.apps.googleusercontent.com",
+                credential_store=store,
+                client_secret_store=InMemoryClientSecretStore(),
+                token_client=token_client,
+                channel_client=channel_client,
+                require_publish_scope=True,
+            )
+
+        self.assertEqual(
+            str(caught.exception),
+            "youtube_oauth_scope_upgrade_required",
+        )
+        self.assertEqual(token_client.refresh_calls, [])
+        self.assertEqual(channel_client.access_tokens, [])
+
+    def test_publish_authorization_returns_redacted_session_for_scope_v2(self) -> None:
+        store = InMemoryCredentialStore()
+        store.values["youtube-oauth:v2-ref"] = "saved-refresh-secret"
+        token_client = FakeTokenClient()
+        channel_client = FakeChannelClient(
+            YouTubeChannelIdentity(channel_id="UC-v2", display_name="发布频道")
+        )
+        account = {
+            "id": 13,
+            "type": 7,
+            "authMode": "youtube_oauth",
+            "filePath": "youtube-oauth:v2-ref",
+            "accountReference": "UC-v2",
+            "oauthScopeVersion": 2,
+        }
+
+        authorized = authorize_saved_youtube_account(
+            account,
+            client_id="desktop-client.apps.googleusercontent.com",
+            credential_store=store,
+            client_secret_store=InMemoryClientSecretStore(),
+            token_client=token_client,
+            channel_client=channel_client,
+            require_publish_scope=True,
+        )
+
+        self.assertIsInstance(authorized, YouTubeAuthorizedSession)
+        self.assertEqual(authorized.identity.channel_id, "UC-v2")
+        self.assertEqual(authorized.access_token, "refreshed-access-secret")
+        self.assertNotIn("refreshed-access-secret", repr(authorized))
+        self.assertNotIn("saved-refresh-secret", repr(authorized))
 
     def test_new_login_rolls_back_keyring_when_account_persistence_fails(self) -> None:
         store = InMemoryCredentialStore()

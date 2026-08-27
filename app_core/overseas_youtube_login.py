@@ -8,6 +8,7 @@ import time
 import uuid
 import webbrowser
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from typing import Protocol
 
 import requests
@@ -28,6 +29,7 @@ from .overseas_youtube_oauth import (
     OAuthTokens,
     OAuthTokenError,
     YOUTUBE_OAUTH_SCOPE,
+    YOUTUBE_OAUTH_SCOPE_VERSION,
     YouTubeOAuthTokenClient,
     start_authorization_session,
 )
@@ -35,6 +37,15 @@ from .overseas_youtube_oauth import (
 
 DEFAULT_CALLBACK_TIMEOUT_SECONDS = 180.0
 YOUTUBE_OAUTH_AUTH_MODE = "youtube_oauth"
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class YouTubeAuthorizedSession:
+    """Short-lived official API authority without a printable access token."""
+
+    access_token: str = field(repr=False)
+    identity: YouTubeChannelIdentity
+    credential_reference: str
 
 
 class YouTubeOAuthLoginError(Exception):
@@ -50,6 +61,7 @@ class _AccountSaver(Protocol):
         channel_id: str,
         display_name: str | None,
         record_id: int | None,
+        oauth_scope_version: int,
     ) -> int: ...
 
 
@@ -220,6 +232,7 @@ class YouTubeOAuthLoginSession:
                 channel_id=identity.channel_id,
                 display_name=identity.display_name,
                 record_id=self.record_id if self.update_mode else None,
+                oauth_scope_version=YOUTUBE_OAUTH_SCOPE_VERSION,
             )
         except Exception:
             self._rollback_credential(reference, previous_token)
@@ -274,7 +287,7 @@ class YouTubeOAuthLoginSession:
             pass
 
 
-def validate_saved_youtube_oauth_account(
+def authorize_saved_youtube_account(
     account: Mapping[str, object],
     *,
     client_id: str,
@@ -282,8 +295,9 @@ def validate_saved_youtube_oauth_account(
     client_secret_store=None,
     token_client=None,
     channel_client=None,
-) -> YouTubeChannelIdentity:
-    """Refresh one saved credential and require the same stable channel ID."""
+    require_publish_scope: bool = False,
+) -> YouTubeAuthorizedSession:
+    """Refresh one credential, bind it to the saved channel and hide its token."""
     normalized_client_id = str(client_id or "").strip()
     if not normalized_client_id:
         raise YouTubeOAuthLoginError("youtube_oauth_client_not_configured")
@@ -293,6 +307,12 @@ def validate_saved_youtube_oauth_account(
         or str(account.get("authMode") or "") != YOUTUBE_OAUTH_AUTH_MODE
     ):
         raise YouTubeOAuthLoginError("authorization_invalid")
+    if (
+        require_publish_scope
+        and int(account.get("oauthScopeVersion") or 1)
+        < YOUTUBE_OAUTH_SCOPE_VERSION
+    ):
+        raise YouTubeOAuthLoginError("youtube_oauth_scope_upgrade_required")
     reference = str(account.get("filePath") or "").strip()
     expected_channel = str(account.get("accountReference") or "").strip()
     if not reference or not expected_channel:
@@ -332,7 +352,11 @@ def validate_saved_youtube_oauth_account(
             raise YouTubeOAuthLoginError("channel_identity_mismatch")
         if refreshed.refresh_token != refresh_token:
             store.save_refresh_token(reference, refreshed.refresh_token)
-        return identity
+        return YouTubeAuthorizedSession(
+            access_token=refreshed.access_token,
+            identity=identity,
+            credential_reference=reference,
+        )
     except YouTubeOAuthLoginError:
         raise
     except OAuthCredentialError:
@@ -344,3 +368,25 @@ def validate_saved_youtube_oauth_account(
         raise YouTubeOAuthLoginError("channel_identity_unavailable") from None
     except Exception:
         raise YouTubeOAuthLoginError("channel_identity_unavailable") from None
+
+
+def validate_saved_youtube_oauth_account(
+    account: Mapping[str, object],
+    *,
+    client_id: str,
+    credential_store=None,
+    client_secret_store=None,
+    token_client=None,
+    channel_client=None,
+) -> YouTubeChannelIdentity:
+    """Perform the existing read-only identity check, including legacy scopes."""
+
+    return authorize_saved_youtube_account(
+        account,
+        client_id=client_id,
+        credential_store=credential_store,
+        client_secret_store=client_secret_store,
+        token_client=token_client,
+        channel_client=channel_client,
+        require_publish_scope=False,
+    ).identity

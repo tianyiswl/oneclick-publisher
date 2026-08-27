@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 import conf
 from app_core import (
     account_service,
+    database as app_database,
     login_service,
     overseas_preflight,
     overseas_youtube_credentials,
@@ -104,7 +105,8 @@ class YouTubeOAuthAccountPersistenceTests(unittest.TestCase):
                 lastCheckedAt TEXT,
                 lastLoginAt TEXT,
                 authMode TEXT NOT NULL DEFAULT 'browser',
-                accountReference TEXT
+                accountReference TEXT,
+                oauthScopeVersion INTEGER NOT NULL DEFAULT 1
             )
             """
         )
@@ -148,6 +150,45 @@ class YouTubeOAuthAccountPersistenceTests(unittest.TestCase):
             channel_id="UC123",
             display_name="测试频道",
         )
+
+    def test_legacy_oauth_row_migrates_to_scope_version_one(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            legacy_database = Path(raw) / "legacy.db"
+            connection = sqlite3.connect(legacy_database)
+            connection.execute(
+                """
+                CREATE TABLE user_info (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    type INTEGER NOT NULL,
+                    filePath TEXT NOT NULL,
+                    userName TEXT NOT NULL,
+                    status INTEGER DEFAULT 0,
+                    authMode TEXT NOT NULL DEFAULT 'browser',
+                    accountReference TEXT
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO user_info
+                    (type, filePath, userName, status, authMode, accountReference)
+                VALUES (7, 'youtube-oauth:legacy', '旧频道', 1,
+                        'youtube_oauth', 'UC-legacy')
+                """
+            )
+            connection.commit()
+            connection.close()
+
+            with patch.object(app_database, "DB_PATH", legacy_database):
+                app_database.ensure_schema()
+
+            connection = sqlite3.connect(legacy_database)
+            value = connection.execute(
+                "SELECT oauthScopeVersion FROM user_info WHERE id = 1"
+            ).fetchone()[0]
+            connection.close()
+
+        self.assertEqual(value, 1)
 
     def test_oauth_account_is_managed_but_excluded_from_publish_facing_accounts(self) -> None:
         account_id = self._save_oauth_account()

@@ -17,10 +17,12 @@ GOOGLE_AUTHORIZATION_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
 YOUTUBE_READONLY_SCOPE = "https://www.googleapis.com/auth/youtube.readonly"
 YOUTUBE_UPLOAD_SCOPE = "https://www.googleapis.com/auth/youtube.upload"
+YOUTUBE_FORCE_SSL_SCOPE = "https://www.googleapis.com/auth/youtube.force-ssl"
 YOUTUBE_REQUIRED_SCOPES = frozenset(
-    {YOUTUBE_READONLY_SCOPE, YOUTUBE_UPLOAD_SCOPE}
+    {YOUTUBE_READONLY_SCOPE, YOUTUBE_UPLOAD_SCOPE, YOUTUBE_FORCE_SSL_SCOPE}
 )
-YOUTUBE_OAUTH_SCOPE = f"{YOUTUBE_READONLY_SCOPE} {YOUTUBE_UPLOAD_SCOPE}"
+YOUTUBE_OAUTH_SCOPE = " ".join(sorted(YOUTUBE_REQUIRED_SCOPES))
+YOUTUBE_OAUTH_SCOPE_VERSION = 2
 TOKEN_REQUEST_TIMEOUT_SECONDS = 10.0
 
 

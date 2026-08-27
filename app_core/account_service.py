@@ -234,7 +234,8 @@ def _list_accounts(*, include_youtube_oauth: bool) -> list[dict]:
             f"""
             SELECT id, type, filePath, userName, status, profileName, avatarPath,
                    avatarUpdatedAt, remark, lastCheckedAt, lastLoginAt,
-                   COALESCE(authMode, 'browser') AS authMode, accountReference
+                   COALESCE(authMode, 'browser') AS authMode, accountReference,
+                   COALESCE(oauthScopeVersion, 1) AS oauthScopeVersion
             FROM user_info
             WHERE COALESCE(authMode, 'browser') IN ({placeholders})
             ORDER BY profileName COLLATE NOCASE, type
@@ -331,17 +332,20 @@ def save_youtube_oauth_account(
     channel_id: str,
     display_name: str | None,
     record_id: int | None = None,
+    oauth_scope_version: int = 1,
 ) -> int:
     """Persist public YouTube identity without storing OAuth tokens in SQLite."""
 
     profile_name = str(profile_name or "").strip()
     credential_reference = str(credential_reference or "").strip()
     channel_id = str(channel_id or "").strip()
+    oauth_scope_version = int(oauth_scope_version)
     user_name = str(display_name or "").strip() or "YouTube 频道"
     if (
         not profile_name
         or not credential_reference.startswith("youtube-oauth:")
         or not channel_id
+        or oauth_scope_version not in {1, 2}
     ):
         raise ValueError("YouTube OAuth 账号信息不完整")
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -365,7 +369,8 @@ def save_youtube_oauth_account(
                 UPDATE user_info
                 SET type = 7, filePath = ?, userName = ?, status = 1,
                     profileName = ?, remark = '', lastLoginAt = ?,
-                    lastCheckedAt = ?, authMode = ?, accountReference = ?
+                    lastCheckedAt = ?, authMode = ?, accountReference = ?,
+                    oauthScopeVersion = ?
                 WHERE id = ?
                 """,
                 (
@@ -376,6 +381,7 @@ def save_youtube_oauth_account(
                     now,
                     AUTH_MODE_YOUTUBE_OAUTH,
                     channel_id,
+                    oauth_scope_version,
                     int(record_id),
                 ),
             )
@@ -384,8 +390,9 @@ def save_youtube_oauth_account(
             """
             INSERT INTO user_info
                 (type, filePath, userName, status, profileName, remark,
-                 lastLoginAt, lastCheckedAt, authMode, accountReference)
-            VALUES (7, ?, ?, 1, ?, '', ?, ?, ?, ?)
+                 lastLoginAt, lastCheckedAt, authMode, accountReference,
+                 oauthScopeVersion)
+            VALUES (7, ?, ?, 1, ?, '', ?, ?, ?, ?, ?)
             """,
             (
                 credential_reference,
@@ -395,6 +402,7 @@ def save_youtube_oauth_account(
                 now,
                 AUTH_MODE_YOUTUBE_OAUTH,
                 channel_id,
+                oauth_scope_version,
             ),
         )
         return int(cursor.lastrowid)

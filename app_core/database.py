@@ -142,6 +142,7 @@ def ensure_schema() -> None:
                 ("lastLoginAt", "TEXT"),
                 ("authMode", "TEXT NOT NULL DEFAULT 'browser'"),
                 ("accountReference", "TEXT"),
+                ("oauthScopeVersion", "INTEGER NOT NULL DEFAULT 1"),
             ),
         )
         conn.execute(

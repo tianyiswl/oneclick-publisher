@@ -23,7 +23,16 @@ from app_core.overseas_youtube_oauth import (
 
 YOUTUBE_UPLOAD_SCOPE = "https://www.googleapis.com/auth/youtube.upload"
 YOUTUBE_READONLY_SCOPE = "https://www.googleapis.com/auth/youtube.readonly"
-YOUTUBE_REQUIRED_SCOPE = f"{YOUTUBE_READONLY_SCOPE} {YOUTUBE_UPLOAD_SCOPE}"
+YOUTUBE_FORCE_SSL_SCOPE = "https://www.googleapis.com/auth/youtube.force-ssl"
+YOUTUBE_REQUIRED_SCOPE = " ".join(
+    sorted(
+        {
+            YOUTUBE_READONLY_SCOPE,
+            YOUTUBE_UPLOAD_SCOPE,
+            YOUTUBE_FORCE_SSL_SCOPE,
+        }
+    )
+)
 
 
 class FakeTokenResponse:
@@ -234,7 +243,11 @@ class YouTubeOAuthAuthorizationContractTests(unittest.TestCase):
         self.assertEqual(query["response_type"], ["code"])
         self.assertEqual(
             set(query["scope"][0].split()),
-            {YOUTUBE_READONLY_SCOPE, YOUTUBE_UPLOAD_SCOPE},
+            {
+                YOUTUBE_READONLY_SCOPE,
+                YOUTUBE_UPLOAD_SCOPE,
+                YOUTUBE_FORCE_SSL_SCOPE,
+            },
         )
         self.assertEqual(query["access_type"], ["offline"])
         self.assertEqual(query["prompt"], ["consent"])
@@ -250,6 +263,14 @@ class YouTubeOAuthAuthorizationContractTests(unittest.TestCase):
             query["code_challenge"],
             [pkce_s256_challenge(request.code_verifier)],
         )
+
+    def test_required_scopes_include_force_ssl_for_status_updates(self) -> None:
+        self.assertTrue(hasattr(youtube_oauth, "YOUTUBE_FORCE_SSL_SCOPE"))
+        self.assertIn(
+            "https://www.googleapis.com/auth/youtube.force-ssl",
+            youtube_oauth.YOUTUBE_REQUIRED_SCOPES,
+        )
+        self.assertEqual(youtube_oauth.YOUTUBE_OAUTH_SCOPE_VERSION, 2)
 
     def test_authorization_requests_have_distinct_callback_and_secret_values(self) -> None:
         first = self._start_session().request
