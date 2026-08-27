@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "diagram_type": "lifecycle",
+  "meta": {
+    "title": "YouTube 受控发布生命周期",
+    "output": "docs/architecture/youtube-official-publish.lifecycle.html",
+    "quality_profile": "showcase",
+    "viewBox": [1060, 700],
+    "views": [
+      {
+        "id": "main_rail",
+        "label": "正式发布主线",
+        "focus": ["ready", "preflight", "authorized", "staging", "completed"],
+        "note": "正式发布先完成本地预检和一次性授权，再私密上传、设置封面与目标状态，最后精确回读。"
+      },
+      {
+        "id": "safe_failures",
+        "label": "恢复与防重复",
+        "focus": ["staging", "resume", "manual_check", "failed"],
+        "note": "只有已知分片偏移允许恢复；结果不明或后置设置失败时停止重试并转 Studio 只读核对。"
+      }
+    ]
+  },
+  "lanes": [
+    {"id": "main", "label": "主发布阶段"},
+    {"id": "recovery", "label": "恢复与安全停止"},
+    {"id": "terminal", "label": "最终结果"}
+  ],
+  "states": [
+    {"id": "ready", "type": "start", "label": "请求就绪", "sublabel": "内容包 + 明确账号", "lane": "main", "col": 0, "step": "01"},
+    {"id": "preflight", "type": "decision", "label": "本地预检", "sublabel": "文件、字段、账号、时间", "lane": "main", "col": 1, "step": "02"},
+    {"id": "authorized", "type": "waiting", "label": "等待正式授权", "sublabel": "一次性短期凭证", "lane": "main", "col": 2, "step": "03"},
+    {"id": "staging", "type": "active", "label": "私密暂存与设置", "sublabel": "上传 → 封面 → 目标状态", "lane": "main", "col": 3, "step": "04"},
+    {"id": "completed", "type": "success", "label": "发布结果已确认", "sublabel": "视频 ID + 状态 + 时间", "lane": "main", "col": 4, "step": "05"},
+    {"id": "failed", "type": "failure", "label": "未创建平台内容", "sublabel": "预检或授权失败", "lane": "terminal", "col": 1, "tag": "terminal"},
+    {"id": "resume", "type": "failure", "label": "分片传输中断", "sublabel": "已知偏移可恢复", "lane": "recovery", "col": 0, "tag": "可恢复"},
+    {"id": "manual_check", "type": "neutral", "label": "等待人工核对", "sublabel": "保持私密，禁止重发", "lane": "terminal", "col": 2, "tag": "terminal"}
+  ],
+  "transitions": [
+    {"id": "ready_preflight", "from": "ready", "to": "preflight", "variant": "emphasis"},
+    {"id": "preflight_auth", "from": "preflight", "to": "authorized"},
+    {"id": "auth_staging", "from": "authorized", "to": "staging", "label": "消费授权", "variant": "security", "labelDy": -26},
+    {"id": "staging_completed", "from": "staging", "to": "completed", "label": "精确回读匹配", "variant": "emphasis", "labelDy": -26},
+    {"id": "preflight_failed", "from": "preflight", "to": "failed", "variant": "security", "route": "bottom-channel"},
+    {"id": "staging_resume", "from": "staging", "to": "resume", "route": "left-channel", "fromSide": "left", "toSide": "right", "channelX": 480},
+    {"id": "resume_staging", "from": "resume", "to": "staging", "variant": "emphasis", "route": "right-channel", "fromSide": "right", "toSide": "left", "channelX": 488},
+    {"id": "staging_manual", "from": "staging", "to": "manual_check", "variant": "security", "route": "bottom-channel", "fromSide": "bottom", "toSide": "top", "channelY": 420}
+  ],
+  "cards": [
+    {"dot": "emerald", "title": "正常完成", "items": ["预检不会写入平台", "正式发布先保持私密", "封面和目标状态完成后才确认成功"]},
+    {"dot": "amber", "title": "安全恢复", "items": ["只在平台明确返回分片偏移时继续", "恢复使用同一个上传会话", "不会创建第二条视频"]},
+    {"dot": "rose", "title": "防重复边界", "items": ["取得视频 ID 后的错误保留私密内容", "结果不明时停止自动重试", "任务只提示到 Studio 只读核对"]}
+  ]
+}

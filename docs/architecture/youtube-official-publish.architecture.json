@@ -1,0 +1,181 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "YouTube 官方发布通道架构",
+    "output": "docs/architecture/youtube-official-publish.architecture.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/tianyiswl/oneclick-publisher.git",
+      "revision": "8be898ec9fe4f2c4e1152dc10871f1e6fe80f69f"
+    },
+    "viewBox": [1240, 720],
+    "views": [
+      {
+        "id": "account_identity",
+        "label": "账号与头像",
+        "focus": ["desktop_ui", "account_service", "credential_store", "avatar_store", "youtube_platform"],
+        "note": "OAuth 账号由官方频道接口回读身份和头像，后台按钮只打开系统浏览器。"
+      },
+      {
+        "id": "safe_publish",
+        "label": "安全发布主路径",
+        "focus": ["content_projects", "publish_gateway", "authorization_gate", "upload_orchestrator", "youtube_platform", "task_store"],
+        "note": "所有入口共用同一服务：先私密上传，再设置封面，最后切换目标可见性并回读。"
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "content_projects",
+      "type": "external",
+      "label": "内容项目",
+      "sublabel": "CLI / MCP + manifest",
+      "pos": [40, 400],
+      "size": [150, 68],
+      "sources": [
+        {"path": "app_core/content_project_gateway.py", "label": "内容项目入口"},
+        {"path": "app_core/content_bundle.py", "label": "内容包校验"}
+      ]
+    },
+    {
+      "id": "desktop_ui",
+      "type": "frontend",
+      "label": "一键发桌面端",
+      "sublabel": "账号管理 + 发布中心",
+      "pos": [40, 130],
+      "size": [150, 68],
+      "sources": [
+        {"path": "ui/account_page.py", "label": "账号页面"},
+        {"path": "ui/publish_page.py", "label": "发布页面"}
+      ]
+    },
+    {
+      "id": "account_service",
+      "type": "backend",
+      "label": "YouTube 账号服务",
+      "sublabel": "频道身份、头像、打开 Studio",
+      "pos": [270, 130],
+      "size": [170, 68],
+      "sources": [
+        {"path": "app_core/account_service.py", "label": "账号持久化"},
+        {"path": "app_core/overseas_youtube_login.py", "label": "OAuth 校验"}
+      ]
+    },
+    {
+      "id": "credential_store",
+      "type": "security",
+      "label": "系统凭据库",
+      "sublabel": "只保存刷新令牌",
+      "tag": "Keychain / Credential Locker",
+      "pos": [520, 40],
+      "size": [180, 68],
+      "sources": [
+        {"path": "app_core/overseas_youtube_credentials.py", "label": "凭据边界"}
+      ]
+    },
+    {
+      "id": "avatar_store",
+      "type": "database",
+      "label": "本地头像缓存",
+      "sublabel": "校验图片后原子替换",
+      "pos": [520, 160],
+      "size": [180, 68],
+      "sources": [
+        {"path": "app_core/account_service.py", "label": "头像记录"}
+      ]
+    },
+    {
+      "id": "publish_gateway",
+      "type": "backend",
+      "label": "统一受控发布服务",
+      "sublabel": "UI / CLI / MCP 共用",
+      "pos": [270, 400],
+      "size": [170, 68],
+      "sources": [
+        {"path": "app_core/controlled_publish.py", "label": "请求与范围"},
+        {"path": "app_core/publish_service.py", "label": "任务执行"}
+      ]
+    },
+    {
+      "id": "authorization_gate",
+      "type": "security",
+      "label": "一次性发布授权",
+      "sublabel": "内容、账号、时间绑定",
+      "pos": [520, 400],
+      "size": [180, 68],
+      "sources": [
+        {"path": "app_core/controlled_publish.py", "label": "授权指纹"}
+      ]
+    },
+    {
+      "id": "upload_orchestrator",
+      "type": "backend",
+      "label": "YouTube 发布编排器",
+      "sublabel": "私密上传 → 封面 → 目标状态",
+      "tag": "精确 ID 回读",
+      "pos": [770, 400],
+      "size": [190, 76],
+      "sources": [
+        {"path": "app_core/overseas_youtube_api.py", "label": "官方 API 适配器"}
+      ]
+    },
+    {
+      "id": "task_store",
+      "type": "database",
+      "label": "任务与平台回执",
+      "sublabel": "阶段、视频 ID、错误码",
+      "pos": [770, 555],
+      "size": [190, 68],
+      "sources": [
+        {"path": "app_core/task_service.py", "label": "任务记录"}
+      ]
+    },
+    {
+      "id": "youtube_platform",
+      "type": "external",
+      "label": "Google OAuth + YouTube API",
+      "sublabel": "channels / videos / thumbnails",
+      "pos": [1010, 330],
+      "size": [190, 76]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "security-group",
+      "label": "本机可信边界：不传 Cookie、密码和令牌",
+      "wraps": ["desktop_ui", "account_service", "credential_store", "avatar_store", "publish_gateway", "authorization_gate", "upload_orchestrator", "task_store"],
+      "pad": 20
+    }
+  ],
+  "connections": [
+    {"id": "ui_account", "from": "desktop_ui", "to": "account_service", "label": "刷新频道信息"},
+    {"id": "account_credentials", "from": "account_service", "to": "credential_store", "label": "读取凭据引用", "variant": "security"},
+    {"id": "account_avatar", "from": "account_service", "to": "avatar_store", "label": "保存头像"},
+    {"id": "account_channel", "from": "account_service", "to": "youtube_platform", "label": "channels.list", "variant": "security"},
+    {"id": "project_gateway", "from": "content_projects", "to": "publish_gateway", "label": "结构化发布请求", "variant": "emphasis"},
+    {"id": "ui_gateway", "from": "desktop_ui", "to": "publish_gateway", "variant": "emphasis", "fromSide": "bottom", "toSide": "top", "via": [[115, 300], [355, 300]]},
+    {"id": "gateway_gate", "from": "publish_gateway", "to": "authorization_gate", "label": "校验账号与内容指纹", "variant": "security", "labelAt": [480, 382]},
+    {"id": "gate_upload", "from": "authorization_gate", "to": "upload_orchestrator", "label": "消费一次性授权", "variant": "security", "labelAt": [735, 382]},
+    {"id": "upload_api", "from": "upload_orchestrator", "to": "youtube_platform", "label": "可恢复上传与精确回读", "variant": "emphasis", "labelAt": [985, 490]},
+    {"id": "upload_receipt", "from": "upload_orchestrator", "to": "task_store", "label": "阶段与回执", "labelAt": [865, 515]},
+    {"id": "gateway_task", "from": "publish_gateway", "to": "task_store", "label": "创建和查询 taskId", "variant": "dashed"}
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "安全发布顺序",
+      "items": ["视频始终先以私密状态上传", "封面成功后才切换公开、不公开或定时", "每一步都回读同一个视频 ID"]
+    },
+    {
+      "dot": "amber",
+      "title": "人工边界",
+      "items": ["预检不会上传任何视频", "正式动作必须消费短期一次性授权", "结果不明时只核对，不自动重发"]
+    },
+    {
+      "dot": "rose",
+      "title": "平台限制",
+      "items": ["未审核 Google API 项目可能强制保持私密", "扩大 OAuth 权限后现有账号需重新授权一次", "真实首验只使用无害私密测试视频"]
+    }
+  ]
+}
