@@ -88,8 +88,12 @@ def _distance_text(value: object) -> str:
     return _normalized(value)
 
 
-def normalize_location_candidate(value: object) -> dict[str, str] | None:
-    """只保留客户端选择与发布回读所需的非敏感 POI 字段。"""
+def _normalize_location_candidate(
+    value: object,
+    *,
+    require_address: bool,
+) -> dict[str, str] | None:
+    """规范化平台 POI；原始响应合并时可暂时容纳缺失地址。"""
 
     if not isinstance(value, dict):
         return None
@@ -106,7 +110,7 @@ def normalize_location_candidate(value: object) -> dict[str, str] | None:
         address = ""
     address = _normalized(value.get("address") or value.get("poiAddress") or address)
     distance = _distance_text(value.get("distance"))
-    if not poi_id or not name:
+    if not poi_id or not name or (require_address and not address):
         return None
     return {
         "poiId": poi_id,
@@ -114,6 +118,18 @@ def normalize_location_candidate(value: object) -> dict[str, str] | None:
         "address": address,
         "distance": distance,
     }
+
+
+def normalize_location_candidate(value: object) -> dict[str, str] | None:
+    """保持抖音带货既有解析合同：地址可由后续页面步骤补齐。"""
+
+    return _normalize_location_candidate(value, require_address=False)
+
+
+def normalize_publish_location_candidate(value: object) -> dict[str, str] | None:
+    """发布中心只接受名称、完整地址和平台 POI 标识齐全的地点。"""
+
+    return _normalize_location_candidate(value, require_address=True)
 
 
 def normalize_location_response(value: object) -> list[dict[str, str]]:
@@ -139,7 +155,7 @@ def normalize_location_response(value: object) -> list[dict[str, str]]:
     result: list[dict[str, str]] = []
     by_poi_id: dict[str, dict[str, str]] = {}
     for row in rows:
-        candidate = normalize_location_candidate(row)
+        candidate = _normalize_location_candidate(row, require_address=False)
         if not candidate:
             continue
         existing = by_poi_id.get(candidate["poiId"])
@@ -151,9 +167,7 @@ def normalize_location_response(value: object) -> list[dict[str, str]]:
             continue
         by_poi_id[candidate["poiId"]] = candidate
         result.append(candidate)
-        if len(result) >= MAX_RESULTS:
-            break
-    return result
+    return [candidate for candidate in result if candidate["address"]][:MAX_RESULTS]
 
 
 def _account_identity(account: dict) -> int:

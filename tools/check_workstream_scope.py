@@ -24,6 +24,9 @@ SHARED_EXACT = {
     "app_core/database.py",
     "app_core/paths.py",
     "app_core/publish_service.py",
+    "app_core/oneclick_preflight.py",
+    "app_core/xhs_native_adapter.py",
+    "app_core/xhs_publish_executor.py",
     "app_core/oneclick_authorization.py",
     "app_core/oneclick_capabilities.py",
     "app_core/branding.py",
@@ -99,9 +102,13 @@ def is_overseas_owned(path: str) -> bool:
 def is_location_owned(path: str) -> bool:
     if path.startswith(("app_core/douyin_location", "app_core/douyin_commerce", "app_core/_douyin_commerce")):
         return True
+    if path.startswith("app_core/xhs_location"):
+        return True
     if path == "ui/douyin_commerce_page.py":
         return True
     if path.startswith("test_douyin_location") or path.startswith("test_douyin_commerce"):
+        return True
+    if path.startswith("test_xhs_location"):
         return True
     lowered = path.lower()
     if path.startswith("docs/") and (
@@ -109,6 +116,9 @@ def is_location_owned(path: str) -> bool:
         or "douyin-commerce" in lowered
         or "douyin_location" in lowered
         or "douyin-location" in lowered
+        or "xhs-video-location" in lowered
+        or "xhs-location" in lowered
+        or "xhs_location" in lowered
     ):
         return True
     return False

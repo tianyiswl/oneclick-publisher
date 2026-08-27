@@ -18,7 +18,7 @@ from PIL import Image
 
 from app_core import douyin_publish_executor
 from app_core.douyin_verification import VerificationChallenge, verification_broker
-from uploader.douyin_uploader.main import DouYinVideo
+from uploader.douyin_uploader.main import DouYinVideo, TopicCandidateUnavailable
 
 try:
     from app_core import publish_service
@@ -67,6 +67,21 @@ class DouyinPublishPayloadTests(unittest.TestCase):
         self.assertEqual(checked["locationPoi"]["poiId"], "6601124346666682376")
         self.assertEqual(checked["locationKeyword"], "北海银滩景区")
         self.assertIsNone(checked["scheduleTime"])
+
+    def test_standard_publish_rejects_location_without_complete_address(self) -> None:
+        """普通发布的严格地点规则不能依赖带货共享解析器。"""
+
+        payload = dict(self.payload)
+        payload["locationPoi"] = {
+            "poiId": "6601124346666682376",
+            "name": "北海银滩景区",
+        }
+
+        with self.assertRaisesRegex(
+            douyin_publish_executor.DouyinPublishError,
+            "不能只传关键词",
+        ):
+            douyin_publish_executor.validate_douyin_publish_payload(payload)
 
     def test_normalizes_only_explicit_ai_generated_boolean(self) -> None:
         payload = dict(self.payload)
@@ -249,6 +264,401 @@ class DouyinPublishPayloadTests(unittest.TestCase):
             wait_result.await_args.kwargs["on_verification"],
             callback,
         )
+
+    def test_topic_contract_retries_whole_set_after_transient_empty_candidates(self) -> None:
+        video = DouYinVideo(
+            title="测试",
+            file_path=str(self.video),
+            tags=["AI工具", "个人项目"],
+            publish_date=0,
+            account_file="offline.json",
+            description="正文",
+        )
+        add_topic = AsyncMock(
+            side_effect=[
+                TopicCandidateUnavailable("抖音未返回话题“AI工具”的精确平台候选"),
+                None,
+                None,
+            ]
+        )
+        with patch.object(video, "_add_platform_topic", add_topic), patch.object(
+            video, "_fill_editor_body", new_callable=AsyncMock
+        ) as refill, patch.object(
+            video,
+            "_wait_platform_topics_stable",
+            new_callable=AsyncMock,
+            return_value=["AI工具", "个人项目"],
+        ):
+            page = MagicMock()
+            page.wait_for_timeout = AsyncMock()
+            confirmed, missing = asyncio.run(
+                video._apply_platform_topics(
+                    page, MagicMock(), "正文", ["AI工具", "个人项目"]
+                )
+            )
+
+        self.assertEqual(confirmed, ["AI工具", "个人项目"])
+        self.assertEqual(missing, [])
+        self.assertEqual(add_topic.await_count, 3)
+        refill.assert_awaited_once()
+
+    def test_topic_contract_rebuilds_when_last_topic_disappears_after_first_readback(self) -> None:
+        video = DouYinVideo(
+            title="测试",
+            file_path=str(self.video),
+            tags=["AI工具", "抖音前沿科技首发计划"],
+            publish_date=0,
+            account_file="offline.json",
+            description="正文",
+        )
+        delayed_drop = TopicCandidateUnavailable(
+            "抖音平台话题稳定回读不一致：期望=['AI工具', '抖音前沿科技首发计划']，"
+            "实际=['AI工具']"
+        )
+        with patch.object(
+            video, "_add_platform_topic", new_callable=AsyncMock
+        ) as add_topic, patch.object(
+            video, "_fill_editor_body", new_callable=AsyncMock
+        ) as refill, patch.object(
+            video,
+            "_wait_platform_topics_stable",
+            new_callable=AsyncMock,
+            side_effect=[delayed_drop, ["AI工具", "抖音前沿科技首发计划"]],
+        ) as stable_readback:
+            page = MagicMock()
+            page.wait_for_timeout = AsyncMock()
+            confirmed, missing = asyncio.run(
+                video._apply_platform_topics(
+                    page,
+                    MagicMock(),
+                    "正文",
+                    ["AI工具", "抖音前沿科技首发计划"],
+                )
+            )
+
+        self.assertEqual(confirmed, ["AI工具", "抖音前沿科技首发计划"])
+        self.assertEqual(missing, [])
+        self.assertEqual(add_topic.await_count, 4)
+        self.assertEqual(stable_readback.await_count, 2)
+        refill.assert_awaited_once()
+
+    def test_topic_contract_reports_delayed_missing_topic_after_both_rounds(self) -> None:
+        video = DouYinVideo(
+            title="测试",
+            file_path=str(self.video),
+            tags=["AI工具", "抖音前沿科技首发计划"],
+            publish_date=0,
+            account_file="offline.json",
+            description="正文",
+        )
+        delayed_drop = TopicCandidateUnavailable("稳定回读丢失最后一个话题")
+        delayed_drop.missing_topics = ["抖音前沿科技首发计划"]
+        with patch.object(
+            video, "_add_platform_topic", new_callable=AsyncMock
+        ), patch.object(
+            video, "_fill_editor_body", new_callable=AsyncMock
+        ), patch.object(
+            video,
+            "_wait_platform_topics_stable",
+            new_callable=AsyncMock,
+            side_effect=[delayed_drop, delayed_drop],
+        ):
+            page = MagicMock()
+            page.wait_for_timeout = AsyncMock()
+            confirmed, missing = asyncio.run(
+                video._apply_platform_topics(
+                    page,
+                    MagicMock(),
+                    "正文",
+                    ["AI工具", "抖音前沿科技首发计划"],
+                )
+            )
+
+        self.assertEqual(confirmed, [])
+        self.assertEqual(missing, ["抖音前沿科技首发计划"])
+
+    def test_topic_stability_rejects_single_success_followed_by_delayed_drop(self) -> None:
+        video = DouYinVideo(
+            title="测试",
+            file_path=str(self.video),
+            tags=["AI工具", "抖音前沿科技首发计划"],
+            publish_date=0,
+            account_file="offline.json",
+            description="正文",
+        )
+        page = MagicMock()
+        page.wait_for_timeout = AsyncMock()
+        with patch.object(
+            video,
+            "_read_platform_topics",
+            new_callable=AsyncMock,
+            side_effect=[
+                ["AI工具", "抖音前沿科技首发计划"],
+                ["AI工具"],
+                ["AI工具"],
+                ["AI工具"],
+                ["AI工具"],
+                ["AI工具"],
+            ],
+        ):
+            with self.assertRaises(TopicCandidateUnavailable) as raised:
+                asyncio.run(
+                    video._wait_platform_topics_stable(
+                        page,
+                        MagicMock(),
+                        ["AI工具", "抖音前沿科技首发计划"],
+                        attempts=6,
+                        stable_reads=3,
+                    )
+                )
+
+        self.assertIn("实际=['AI工具']", str(raised.exception))
+        self.assertEqual(
+            raised.exception.error_code,
+            "douyin_topic_entity_missing",
+        )
+
+    def test_topic_contract_returns_stable_error_after_bounded_retries(self) -> None:
+        video = DouYinVideo(
+            title="测试",
+            file_path=str(self.video),
+            tags=["AI工具"],
+            publish_date=0,
+            account_file="offline.json",
+            description="正文",
+        )
+        unavailable = TopicCandidateUnavailable(
+            "抖音未返回话题“AI工具”的精确平台候选"
+        )
+        with patch.object(
+            video,
+            "_add_platform_topic",
+            new_callable=AsyncMock,
+            side_effect=[unavailable, unavailable],
+        ), patch.object(video, "_fill_editor_body", new_callable=AsyncMock):
+            page = MagicMock()
+            page.wait_for_timeout = AsyncMock()
+            confirmed, missing = asyncio.run(
+                video._apply_platform_topics(
+                    page, MagicMock(), "正文", ["AI工具"]
+                )
+            )
+
+        self.assertEqual(confirmed, [])
+        self.assertEqual(missing, ["AI工具"])
+        self.assertEqual(
+            unavailable.error_code, "douyin_topic_candidates_unavailable"
+        )
+
+    def test_topic_entry_selects_exact_official_candidate_and_entity(self) -> None:
+        """话题只有点选精确官方候选并形成实体才算成功。"""
+
+        video = DouYinVideo(
+            title="测试",
+            file_path=str(self.video),
+            tags=["硅基探索"],
+            publish_date=0,
+            account_file="offline.json",
+            description="正文",
+        )
+        control = MagicMock()
+        control.click = AsyncMock()
+        editor = MagicMock()
+        editor.press_sequentially = AsyncMock()
+        editor.press = AsyncMock()
+        candidate = MagicMock()
+        candidate.click = AsyncMock()
+        page = MagicMock()
+        page.get_by_text = MagicMock(return_value=MagicMock())
+        page.wait_for_timeout = AsyncMock()
+
+        with patch.object(
+            video,
+            "_visible_enabled_items",
+            new_callable=AsyncMock,
+            return_value=[control],
+        ), patch.object(
+            video,
+            "_read_platform_topics",
+            new_callable=AsyncMock,
+            side_effect=[[], ["硅基探索"]],
+        ), patch.object(
+            video,
+            "_find_unique_topic_candidate",
+            new_callable=AsyncMock,
+            return_value=candidate,
+        ) as candidate_lookup:
+            asyncio.run(video._add_platform_topic(page, editor, "硅基探索"))
+
+        control.click.assert_awaited_once()
+        editor.press_sequentially.assert_awaited_once_with("硅基探索", delay=50)
+        candidate_lookup.assert_awaited_once_with(page, "硅基探索")
+        candidate.click.assert_awaited_once_with(timeout=5000)
+        editor.press.assert_not_awaited()
+
+    def test_topic_readback_excludes_plain_hash_text(self) -> None:
+        """普通 #文字不得冒充平台话题实体。"""
+
+        video = DouYinVideo(
+            title="测试",
+            file_path=str(self.video),
+            tags=["硅基探索", "AI开发"],
+            publish_date=0,
+            account_file="offline.json",
+            description="正文",
+        )
+        raw_node = MagicMock()
+        raw_node.get_attribute = AsyncMock(return_value=None)
+        raw_node.inner_text = AsyncMock(return_value="正文#硅基探索 ")
+        mention_node = MagicMock()
+        mention_node.get_attribute = AsyncMock(return_value="#")
+        mention_node.inner_text = AsyncMock(return_value=" #AI开发 ")
+        nodes = MagicMock()
+        nodes.count = AsyncMock(return_value=2)
+        nodes.nth = MagicMock(side_effect=[raw_node, mention_node])
+        mention_values = MagicMock()
+        mention_values.all_text_contents = AsyncMock(return_value=[" #AI开发 "])
+        editor = MagicMock()
+        editor.locator = MagicMock(
+            side_effect=lambda selector: (
+                mention_values
+                if 'data-mention="#"' in selector
+                else nodes
+            )
+        )
+
+        topics = asyncio.run(video._read_platform_topics(editor))
+
+        self.assertEqual(topics, ["AI开发"])
+
+    def test_topic_readback_accepts_official_activity_entity(self) -> None:
+        video = DouYinVideo(
+            title="测试",
+            file_path=str(self.video),
+            tags=["抖音前沿科技首发计划"],
+            publish_date=0,
+            account_file="offline.json",
+            description="正文",
+        )
+        empty_mentions = MagicMock()
+        empty_mentions.all_text_contents = AsyncMock(return_value=[])
+        platform_entities = MagicMock()
+        platform_entities.all_text_contents = AsyncMock(
+            return_value=["抖音前沿科技首发计划"]
+        )
+        editor = MagicMock()
+        editor.locator = MagicMock(
+            side_effect=lambda selector: (
+                platform_entities
+                if 'data-mention="activity"' in selector
+                else empty_mentions
+            )
+        )
+
+        topics = asyncio.run(video._read_platform_topics(editor))
+
+        self.assertEqual(topics, ["抖音前沿科技首发计划"])
+
+    def test_missing_topic_entity_uses_stable_error_code(self) -> None:
+        video = DouYinVideo(
+            title="测试",
+            file_path=str(self.video),
+            tags=["硅基探索"],
+            publish_date=0,
+            account_file="offline.json",
+            description="正文",
+        )
+        page = MagicMock()
+        editor = MagicMock()
+        editor.wait_for = AsyncMock()
+        page.locator.return_value.first = editor
+        with patch.object(
+            video, "_fill_editor_body", new_callable=AsyncMock
+        ), patch.object(
+            video,
+            "_apply_platform_topics",
+            new_callable=AsyncMock,
+            return_value=([], ["硅基探索"]),
+        ):
+            with self.assertRaises(TopicCandidateUnavailable) as raised:
+                asyncio.run(video.fill_description_and_topics(page))
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "douyin_topic_entity_missing",
+        )
+
+    def test_raw_body_mention_is_rejected_before_editor_write(self) -> None:
+        video = DouYinVideo(
+            title="测试",
+            file_path=str(self.video),
+            tags=["AI开发"],
+            publish_date=0,
+            account_file="offline.json",
+            description="正文\n@抖音科技",
+        )
+        editor = MagicMock()
+        editor.wait_for = AsyncMock()
+        page = MagicMock()
+        page.locator.return_value.first = editor
+
+        with patch.object(
+            video, "_fill_editor_body", new_callable=AsyncMock
+        ), patch.object(
+            video,
+            "_apply_platform_topics",
+            new_callable=AsyncMock,
+            return_value=(["AI开发"], []),
+        ), patch.object(
+            video,
+            "verify_prepublish_form",
+            new_callable=AsyncMock,
+            return_value={},
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                asyncio.run(video.fill_description_and_topics(page))
+
+        self.assertEqual(
+            getattr(raised.exception, "error_code", ""),
+            "douyin_raw_mention_unsupported",
+        )
+
+    def test_verify_form_accepts_exact_toolbar_topic_text_and_keeps_body_clean(self) -> None:
+        video = DouYinVideo(
+            title="测试标题",
+            file_path=str(self.video),
+            tags=["AI工具", "个人项目"],
+            publish_date=0,
+            account_file="offline.json",
+            description="测试正文",
+        )
+        editor = MagicMock()
+        editor.wait_for = AsyncMock()
+        page = MagicMock()
+        page.locator.return_value.first = editor
+        title_input = MagicMock()
+        title_input.input_value = AsyncMock(return_value="测试标题")
+
+        with patch.object(
+            video,
+            "_read_raw_editor_text",
+            new_callable=AsyncMock,
+            return_value="测试正文",
+        ), patch.object(
+            video,
+            "_read_platform_topics",
+            new_callable=AsyncMock,
+            return_value=["AI工具", "个人项目"],
+        ), patch.object(
+            video,
+            "_visible_title_inputs",
+            new_callable=AsyncMock,
+            return_value=[title_input],
+        ):
+            result = asyncio.run(video.verify_prepublish_form(page, require_covers=False))
+
+        self.assertEqual(result["topics_confirmed"], ["AI工具", "个人项目"])
+        self.assertEqual(result["topic_entry_method"], "platform_candidate_entity_readback")
 
     def test_rejects_plain_location_keyword(self) -> None:
         payload = dict(self.payload)
@@ -736,6 +1146,32 @@ class DouyinPublishPayloadTests(unittest.TestCase):
         self.assertEqual(read_back.await_count, 4)
         self.assertEqual(page.keyboard.insert_text.await_count, 2)
 
+    def test_editor_body_uses_meta_select_all_on_macos(self) -> None:
+        video = DouYinVideo(
+            title="测试标题",
+            file_path="/tmp/demo.mp4",
+            tags=[],
+            publish_date=datetime.now(),
+            account_file="/tmp/account.json",
+            description="测试",
+        )
+        editor = MagicMock()
+        editor.fill = AsyncMock()
+        editor.click = AsyncMock()
+        page = MagicMock()
+        page.keyboard.press = AsyncMock()
+        page.keyboard.insert_text = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+        with patch("uploader.douyin_uploader.main.sys.platform", "darwin"), patch.object(
+            video,
+            "_read_raw_editor_text",
+            new_callable=AsyncMock,
+            side_effect=["", "测试"],
+        ):
+            asyncio.run(video._fill_editor_body(page, editor, "测试"))
+
+        self.assertEqual(page.keyboard.press.await_args_list[0].args, ("Meta+A",))
+
     def test_title_is_cleared_and_read_back_before_new_value_is_written(self) -> None:
         """独立标题必须先确认旧值已清空，再写入新标题并二次回读。"""
 
@@ -761,6 +1197,33 @@ class DouyinPublishPayloadTests(unittest.TestCase):
         self.assertEqual(title_input.fill.await_args_list[0].args, ("",))
         self.assertEqual(title_input.fill.await_args_list[1].args, ("新标题",))
         self.assertEqual(title_input.input_value.await_count, 2)
+
+    def test_title_waits_for_editor_fields_after_upload_redirect(self) -> None:
+        video = DouYinVideo(
+            title="测试标题",
+            file_path=str(self.video),
+            tags=[],
+            publish_date=0,
+            account_file="offline.json",
+            description="测试正文",
+        )
+        title_input = MagicMock()
+        title_input.fill = AsyncMock()
+        title_input.input_value = AsyncMock(side_effect=["", "测试标题"])
+        page = MagicMock()
+        page.wait_for_timeout = AsyncMock()
+
+        with patch.object(
+            video,
+            "_visible_title_inputs",
+            new_callable=AsyncMock,
+            side_effect=[[], [], [title_input]],
+        ) as visible_inputs:
+            asyncio.run(video.clear_platform_title(page))
+
+        self.assertEqual(visible_inputs.await_count, 3)
+        self.assertEqual(page.wait_for_timeout.await_count, 2)
+        self.assertEqual(title_input.fill.await_count, 2)
 
     def test_headless_sms_challenge_waits_for_native_code_without_revealing_page(self) -> None:
         """验证码应只在同一无头页面填写，不能转为前台浏览器。"""

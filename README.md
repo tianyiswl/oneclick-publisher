@@ -32,10 +32,42 @@ python desktop_native_app.py --page publish
 QT_QPA_PLATFORM=offscreen python desktop_native_app.py --ui-test
 ```
 
+## 内容项目数据回收
+
+内容项目默认通过一键发本机 stdio MCP 调用以下只读数据工具：
+
+- `oneclick_sync_project_metrics`：按项目账号执行当日去重的数据同步；
+- `oneclick_get_project_metrics`：读取项目账号汇总和该项目正式发布作品的数据；
+- `oneclick_metrics_sync_status`：只读查询最近同步、当日复用和失败冷却状态。
+
+平台登录资料始终由一键发管理，内容项目不读取 Cookie 或一键发数据库。CLI
+仅用于排错和自动化兼容，并与 MCP 共用同一个项目网关：
+
+```bash
+python desktop_native_app.py --controlled-publish-action metrics-get \
+  --content-project-id silicon-exploration --metrics-days 7
+```
+
+`metrics-sync` 会访问项目已经绑定的平台账号；`metrics-get` 和
+`metrics-status` 只读取本机快照，不启动浏览器。
+
+## 源码联调（复用正式账号）
+
+需要验证当前源码时，先退出已安装的“一键发”客户端和正在执行的发布任务，再打开项目中的 `开发版客户端/一键发开发版.app`。开发版会运行当前工作树源码，并直接复用正式客户端已经登录的账号会话，因此日常修改后只需重新打开开发版，不必先打包正式客户端。
+
+开发版启动时会自动完成以下保护：
+
+- 将正式账号数据库和发布资料备份到 `~/Library/Application Support/一键发开发版/backups/`，只保留最近 5 份；
+- 创建本机独占标记，拒绝与已安装客户端或受控发布任务同时运行；
+- 在窗口标题和侧边栏明确显示“源码联调（正式账号数据）”；
+- 保留原有预检、一次性授权和最终发布确认，复用登录态不等于获得发布授权。
+
+联调结束后正常退出开发版即可。不要同时手动打开已安装客户端；若开发版异常退出，下一次启动会自动清理失效标记。正式交付仍应在阶段性验收完成后统一升级版本、打包并安装，不能把源码联调结果当成安装包验收结果。
+
 ## 卖家激活码管理器
 
 离线激活码由独立卖家工具签发，客户包只保存验签公钥。卖家端的使用、构建和私钥边界见 `docs/SELLER_LICENSE_MANAGER.md`；在线授权管理平台仍不属于当前交付范围。
 
 ## 数据边界
 
-本仓库不会提交账号资料、登录会话、Cookie、数据库、素材、头像、日志或授权状态。浏览器会话与业务运行数据位于 `demo-runtime/`，不会进入 Git 或应用安装包。
+本仓库不会提交账号资料、登录会话、Cookie、数据库、素材、头像、日志或授权状态。普通开发和测试数据位于 `demo-runtime/`；源码联调模式只在本机显式复用 `~/Library/Application Support/一键发/`，其数据和备份均不会进入 Git 或应用安装包。

@@ -17,9 +17,11 @@ from zoneinfo import ZoneInfo
 from myUtils.postVideo import post_video_batch_draft_tabs
 
 from . import (
+    account_service,
     douyin_commerce_batch_executor,
     douyin_commerce_batch_service,
     douyin_commerce_service,
+    douyin_graphic_matrix_executor,
     douyin_location_service,
     douyin_publish_executor,
     oneclick_capabilities,
@@ -28,10 +30,15 @@ from . import (
     overseas_video_publish,
     overseas_preflight,
     task_service,
+    video_channel_location_service,
+    wechat_location_service,
+    wechat_draft_executor,
     wechat_publish_executor,
     wechat_publish_policy,
+    xhs_location_service,
     xhs_publish_executor,
 )
+from .douyin_graphic_matrix_service import prepare_matrix
 from .paths import VIDEO_DIR
 
 
@@ -48,6 +55,24 @@ _PLATFORM_NAMES = {
 
 _DOUYIN_COMMERCE_BATCH_WORKFLOW = "douyin-commerce-batch"
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
+
+
+def _failure_message(
+    prefix: str,
+    exc: BaseException,
+    *,
+    platform_type: int,
+) -> str:
+    """为本地接口生成稳定错误码；原始异常文本仍完整保留。"""
+
+    error_code = str(getattr(exc, "error_code", "") or "").strip()
+    if not error_code:
+        error_code = {
+            1: "xhs_publish_failed",
+            3: "douyin_publish_failed",
+            10: "wechat_publish_failed",
+        }.get(int(platform_type), "platform_publish_failed")
+    return f"{prefix}：{type(exc).__name__}：{exc}（错误码 {error_code}）"
 
 
 def _is_douyin_commerce_batch_payload(payload: object) -> bool:
@@ -170,21 +195,102 @@ def _validate_payloads(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
             ]
         runtime_mode = str(payload.get("runtimeMode") or "preflight")
         platform_type = int(payload.get("type") or 0)
+        if platform_type == 1:
+            content_type = str(payload.get("contentType") or "").strip()
+            xhs_location_keys = (
+                "xhsLocationKeyword",
+                "xhsLocationScope",
+                "xhsLocationPoi",
+            )
+            generic_location_keys = (
+                "locationKeyword",
+                "locationScope",
+                "locationPoi",
+            )
+
+            def has_value(key: str) -> bool:
+                value = payload.get(key)
+                if isinstance(value, (dict, list, tuple, set)):
+                    return bool(value)
+                return bool(str(value or "").strip())
+
+            if content_type != "video":
+                if any(key in payload for key in xhs_location_keys):
+                    raise ValueError("小红书地点字段仅支持视频发布")
+                if any(has_value(key) for key in generic_location_keys):
+                    raise ValueError(
+                        "小红书非视频内容不得夹带通用地点字段"
+                    )
+            else:
+                try:
+                    location = xhs_location_service.normalize_location_selection(
+                        payload
+                    )
+                except xhs_location_service.XhsLocationSearchError as exc:
+                    raise ValueError(str(exc)) from exc
+                if location is None:
+                    payload["xhsLocationKeyword"] = ""
+                    payload["xhsLocationScope"] = ""
+                    payload["xhsLocationPoi"] = None
+                else:
+                    payload["xhsLocationKeyword"] = str(
+                        location["searchKeyword"]
+                    )
+                    payload["xhsLocationScope"] = str(location["scope"])
+                    payload["xhsLocationPoi"] = location
+            for key in generic_location_keys:
+                payload.pop(key, None)
+        video_channel_location_keys = (
+            "videoChannelLocationKeyword",
+            "videoChannelLocationScope",
+            "videoChannelLocationPoi",
+        )
+        if platform_type == 2:
+            if str(payload.get("contentType") or "").strip() != "video":
+                if any(bool(payload.get(key)) for key in video_channel_location_keys):
+                    raise ValueError("视频号位置字段仅支持视频发布")
+            else:
+                try:
+                    location = (
+                        video_channel_location_service.normalize_location_selection(
+                            payload
+                        )
+                    )
+                except video_channel_location_service.VideoChannelLocationError as exc:
+                    raise ValueError(str(exc)) from exc
+                if location is None:
+                    payload["videoChannelLocationKeyword"] = ""
+                    payload["videoChannelLocationScope"] = ""
+                    payload["videoChannelLocationPoi"] = None
+                else:
+                    payload["videoChannelLocationKeyword"] = str(
+                        location["searchKeyword"]
+                    )
+                    payload["videoChannelLocationScope"] = str(location["scope"])
+                    payload["videoChannelLocationPoi"] = location
+        elif any(bool(payload.get(key)) for key in video_channel_location_keys):
+            raise ValueError("视频号位置字段不能用于其他平台")
         if platform_type == 3:
             location_keyword = " ".join(
                 str(payload.get("locationKeyword") or "").split()
             )
-            location = douyin_location_service.normalize_location_candidate(
-                payload.get("locationPoi")
+            is_commerce = (
+                str(payload.get("workflow") or "").strip()
+                == "douyin-commerce"
             )
+            location_normalizer = (
+                douyin_location_service.normalize_location_candidate
+                if is_commerce
+                else douyin_location_service.normalize_publish_location_candidate
+            )
+            location = location_normalizer(payload.get("locationPoi"))
             if location_keyword:
                 if not location or location["name"] != location_keyword:
                     raise ValueError(
                         "抖音发布定位必须来自一键发官方地点候选，不能只传关键词"
                     )
                 if (
-                    str(payload.get("workflow") or "").strip()
-                    != "douyin-commerce"
+                    not is_commerce
                     and str(payload.get("locationScope") or "").strip()
                     != "local"
                 ):
@@ -194,18 +300,45 @@ def _validate_payloads(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     )
                 payload["locationKeyword"] = location["name"]
                 payload["locationPoi"] = location
-                if str(payload.get("workflow") or "").strip() != "douyin-commerce":
+                if not is_commerce:
                     payload["locationScope"] = "local"
             else:
                 payload["locationKeyword"] = ""
                 payload["locationPoi"] = {}
-            if str(payload.get("workflow") or "") == "douyin-commerce":
+            if is_commerce:
                 try:
                     payload.update(
                         douyin_commerce_service.validate_douyin_commerce_payload(payload)
                     )
                 except douyin_commerce_service.DouyinCommerceError as exc:
                     raise ValueError(str(exc)) from exc
+        wechat_location_keys = (
+            "wechatLocationKeyword",
+            "wechatLocationScope",
+            "wechatLocationPoi",
+        )
+        if platform_type == 10:
+            try:
+                wechat_location = (
+                    wechat_location_service.normalize_location_selection(payload)
+                )
+            except wechat_location_service.WechatLocationError as exc:
+                raise ValueError(str(exc)) from exc
+            if wechat_location is None:
+                payload["wechatLocationKeyword"] = ""
+                payload["wechatLocationScope"] = ""
+                payload["wechatLocationPoi"] = None
+            else:
+                payload["wechatLocationKeyword"] = str(
+                    wechat_location["searchKeyword"]
+                )
+                payload["wechatLocationScope"] = str(wechat_location["scope"])
+                payload["wechatLocationPoi"] = wechat_location
+        elif any(
+            bool(payload.get(key))
+            for key in wechat_location_keys
+        ):
+            raise ValueError("公众号正文地点字段不能用于其他平台")
         if runtime_mode == "preflight":
             if payload.get("debugDryRun") is not True:
                 raise ValueError("预发布检查必须保持 debugDryRun=true")
@@ -243,6 +376,10 @@ def _validate_payloads(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     raise ValueError("小红书已开启定时发布，但未设置发布时间")
             else:
                 wechat_publish_policy.normalize_wechat_publish_preferences(payload)
+        elif runtime_mode == "wechat_draft":
+            if platform_type != 10:
+                raise ValueError("公众号草稿任务只能包含一个公众号账号")
+            wechat_draft_executor.validate_wechat_draft_payload(payload)
         elif runtime_mode == "draft":
             if platform_type not in {2, 5}:
                 raise ValueError(
@@ -274,6 +411,9 @@ def _validate_payloads(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
             platform_name = _PLATFORM_NAMES[int(payload["type"])]
             raise ValueError(f"{platform_name}文字预检需要选择本地封面图片")
         validated.append(payload)
+    if any(item.get("runtimeMode") == "wechat_draft" for item in validated):
+        if len(validated) != 1 or int(validated[0].get("type") or 0) != 10:
+            raise ValueError("公众号草稿任务只能包含一个公众号账号")
     return validated
 
 
@@ -319,6 +459,160 @@ def _run_douyin_commerce_batch_preflight(
     finally:
         _publish_lock.release()
         _active_threads.pop(int(task["id"]), None)
+
+
+def run_local_check(matrix: dict[str, Any]) -> list[dict[str, Any]]:
+    """返回逐账号的本地检查结果；此函数不导入或调用任何浏览器执行器。"""
+
+    results: list[dict[str, Any]] = []
+    for target in matrix.get("targets") or []:
+        effective = target.get("effective") if isinstance(target, dict) else None
+        ok = (
+            isinstance(effective, dict)
+            and bool(str(effective.get("title") or "").strip())
+            and bool(str(effective.get("description") or "").strip())
+            and bool(effective.get("fileList"))
+            and int(target.get("accountId") or 0) > 0
+        )
+        results.append(
+            {
+                "itemIndex": int(target.get("itemIndex") or 0),
+                "accountId": int(target.get("accountId") or 0),
+                "status": "success" if ok else "failed",
+                "errorCode": "" if ok else "douyin_graphic_matrix_invalid",
+                "errorText": "" if ok else "本地字段检查未通过",
+                "receipt": None,
+            }
+        )
+    return results
+
+
+def _run_matrix_local_check(task: dict, matrix: dict[str, Any]) -> None:
+    try:
+        for result in run_local_check(matrix):
+            item = task_service.matrix_item_for_index(
+                int(task["id"]), int(result["itemIndex"])
+            )
+            task_service.start_matrix_item(int(task["id"]), int(item["id"]))
+            task_service.finish_matrix_item(
+                int(task["id"]),
+                int(item["id"]),
+                ok=result["status"] == "success",
+                message=(
+                    "本地批量检查通过，尚未打开抖音"
+                    if result["status"] == "success"
+                    else str(result["errorText"])
+                ),
+                error_code=str(result["errorCode"]),
+            )
+        task_service.close_matrix_parent(int(task["id"]))
+    except Exception as exc:
+        task_service.fail_active_task(
+            int(task["id"]),
+            error_code=str(
+                getattr(exc, "error_code", "douyin_graphic_matrix_local_check_failed")
+            ),
+            message=f"抖音图文矩阵本地检查异常：{exc}",
+        )
+    finally:
+        _active_threads.pop(int(task["id"]), None)
+
+
+def _run_matrix_platform_task(
+    task: dict[str, Any], matrix: dict[str, Any], *, submit: bool
+) -> None:
+    if not _publish_lock.acquire(blocking=False):
+        task_service.fail_active_task(
+            int(task["id"]),
+            error_code="controlled_publish_busy",
+            message="已有平台任务正在执行，抖音图文矩阵未启动",
+        )
+        _active_threads.pop(int(task["id"]), None)
+        return
+    try:
+        runner = (
+            douyin_graphic_matrix_executor.run_matrix_sync
+            if submit
+            else douyin_graphic_matrix_executor.run_matrix_preflight_sync
+        )
+        runner(matrix, task_id=int(task["id"]))
+    except Exception as exc:
+        task_service.fail_active_task(
+            int(task["id"]),
+            error_code=str(
+                getattr(
+                    exc,
+                    "error_code",
+                    "douyin_graphic_matrix_worker_failed",
+                )
+            ),
+            message=f"抖音图文矩阵执行异常：{exc}",
+        )
+    finally:
+        _publish_lock.release()
+        _active_threads.pop(int(task["id"]), None)
+
+
+def start_douyin_graphic_matrix(
+    matrix: dict[str, Any],
+    *,
+    authorization_id: str = "",
+    checked_task_id: int = 0,
+) -> dict:
+    """启动独立图文矩阵，不进入通用文件×账号扩展路径。"""
+
+    prepared = prepare_matrix(matrix, accounts=account_service.list_accounts())
+    runtime_mode = str(prepared.get("runtimeMode") or "")
+    if runtime_mode not in {"local_check", "preflight", "publish"}:
+        raise ValueError("抖音图文矩阵运行模式无效")
+    if runtime_mode == "publish":
+        if not str(authorization_id or "").strip() or int(checked_task_id or 0) <= 0:
+            raise ValueError("抖音图文矩阵正式发布需要一次性授权")
+        from .controlled_publish import consume_matrix_authorization
+
+        consume_matrix_authorization(
+            str(authorization_id), int(checked_task_id), prepared
+        )
+    mode = {
+        "local_check": "oneclick_matrix_local_check",
+        "preflight": "oneclick_matrix_preflight",
+        "publish": "oneclick_matrix_publish",
+    }[runtime_mode]
+    task = task_service.create_douyin_graphic_matrix_task(
+        prepared, mode=mode
+    )
+    worker = threading.Thread(
+        target=(
+            _run_matrix_local_check
+            if runtime_mode == "local_check"
+            else _run_matrix_platform_task
+        ),
+        args=(task, prepared),
+        kwargs=(
+            {}
+            if runtime_mode == "local_check"
+            else {"submit": runtime_mode == "publish"}
+        ),
+        daemon=True,
+        name=f"oneclick-douyin-graphic-matrix-{runtime_mode}-{task['id']}",
+    )
+    _active_threads[int(task["id"])] = worker
+    worker.start()
+    return task
+
+
+def pause_douyin_graphic_matrix(task_id: int) -> bool:
+    """由客户端请求在下一个最终提交前暂停。"""
+
+    task = task_service.get_task(int(task_id))
+    if not task or str(task.get("mode") or "") not in {
+        "oneclick_matrix_preflight",
+        "oneclick_matrix_publish",
+    }:
+        return False
+    if str(task.get("status") or "") not in {"pending", "running"}:
+        return False
+    return douyin_graphic_matrix_executor.request_pause(int(task_id))
 
 
 def _run_douyin_commerce_batch_publish(
@@ -371,6 +665,11 @@ def _run_preflight(task: dict, payloads: list[dict[str, Any]]) -> None:
             message="已有预检任务正在执行，请稍后重试",
             content_type=str(payloads[0].get("contentType") or ""),
         )
+        task_service.fail_active_task(
+            int(task["id"]),
+            error_code="controlled_publish_busy",
+            message="已有预检任务正在执行，其余平台未启动",
+        )
         _active_threads.pop(int(task["id"]), None)
         return
     try:
@@ -403,16 +702,25 @@ def _run_preflight(task: dict, payloads: list[dict[str, Any]]) -> None:
                     task["id"],
                     platform_type,
                     ok=False,
-                    message=f"预检任务异常：{type(exc).__name__}：{exc}",
+                    message=_failure_message(
+                        "预检任务异常", exc, platform_type=platform_type
+                    ),
                     content_type=str(payload.get("contentType") or ""),
                 )
     except Exception as exc:
         task_service.mark_platform_result(
             task["id"], int(payloads[0]["type"]), ok=False,
-            message=f"预检任务异常：{type(exc).__name__}：{exc}",
+            message=_failure_message(
+                "预检任务异常", exc, platform_type=int(payloads[0]["type"])
+            ),
             content_type=str(payloads[0].get("contentType") or ""),
         )
     finally:
+        task_service.fail_active_task(
+            int(task["id"]),
+            error_code="controlled_worker_ended_without_terminal_result",
+            message="预检进程结束，但仍有平台没有取得明确结果",
+        )
         _publish_lock.release()
         _active_threads.pop(int(task["id"]), None)
 
@@ -432,6 +740,11 @@ def _run_publish(task: dict, payloads: list[dict[str, Any]]) -> None:
             message="已有发布任务正在执行，请稍后重试",
             content_type=str(payloads[0].get("contentType") or ""),
             event_type="platform_publish",
+        )
+        task_service.fail_active_task(
+            int(task["id"]),
+            error_code="controlled_publish_busy",
+            message="已有发布任务正在执行，其余平台未启动",
         )
         _active_threads.pop(int(task["id"]), None)
         return
@@ -487,13 +800,28 @@ def _run_publish(task: dict, payloads: list[dict[str, Any]]) -> None:
                     ),
                     content_type=str(payload.get("contentType") or ""),
                     event_type="platform_publish",
+                    readback={
+                        "postUrl": str(
+                            next(
+                                (
+                                    link.get("href")
+                                    for link in result.get("links") or []
+                                    if isinstance(link, dict) and link.get("href")
+                                ),
+                                "",
+                            )
+                        ),
+                        "publishedAt": str(result.get("publishedAt") or ""),
+                    },
                 )
             except Exception as exc:
                 task_service.mark_platform_result(
                     task["id"],
                     platform_type,
                     ok=False,
-                    message=f"正式发布异常：{type(exc).__name__}：{exc}",
+                    message=_failure_message(
+                        "正式发布异常", exc, platform_type=platform_type
+                    ),
                     content_type=str(payload.get("contentType") or ""),
                     event_type="platform_publish",
                 )
@@ -502,76 +830,69 @@ def _run_publish(task: dict, payloads: list[dict[str, Any]]) -> None:
             task["id"],
             int(payloads[0]["type"]),
             ok=False,
-            message=f"正式发布异常：{type(exc).__name__}：{exc}",
+            message=_failure_message(
+                "正式发布异常", exc, platform_type=int(payloads[0]["type"])
+            ),
             content_type=str(payloads[0].get("contentType") or ""),
             event_type="platform_publish",
         )
     finally:
+        task_service.fail_active_task(
+            int(task["id"]),
+            error_code="controlled_worker_ended_without_terminal_result",
+            message="正式发布进程结束，但仍有平台没有取得最终回执",
+        )
         _publish_lock.release()
         _active_threads.pop(int(task["id"]), None)
 
 
 def _run_draft(task: dict, payloads: list[dict[str, Any]]) -> None:
     """执行已接入并可回读的国内平台草稿保存。"""
-
     if not _publish_lock.acquire(blocking=False):
-        task_service.mark_platform_result(
-            task["id"],
-            int(payloads[0]["type"]),
-            ok=False,
-            message="已有发布任务正在执行，请稍后重试",
-            content_type=str(payloads[0].get("contentType") or ""),
-            event_type="platform_draft",
-        )
+        task_service.mark_platform_result(task["id"], int(payloads[0]["type"]), ok=False, message="已有发布任务正在执行，请稍后重试", content_type=str(payloads[0].get("contentType") or ""), event_type="platform_draft")
         _active_threads.pop(int(task["id"]), None)
         return
     try:
-        task_service.mark_task_running(
-            task["id"], "一键发开始执行受控平台草稿保存"
-        )
+        task_service.mark_task_running(task["id"], "一键发开始执行受控平台草稿保存")
         results = post_video_batch_draft_tabs(payloads)
         by_platform: dict[int, list[dict[str, Any]]] = {}
         for result in results or []:
             try:
-                result_type = int(result.get("type") or 0)
+                by_platform.setdefault(int(result.get("type") or 0), []).append(result)
             except (AttributeError, TypeError, ValueError):
                 continue
-            by_platform.setdefault(result_type, []).append(result)
         for payload in payloads:
             platform_type = int(payload["type"])
-            platform_results = by_platform.get(platform_type, [])
-            failed = [
-                item for item in platform_results if item.get("ok") is False
-            ]
-            ok = bool(platform_results) and not failed
-            message = (
-                str(failed[0].get("message") or "平台草稿保存失败")
-                if failed
-                else "平台已返回可验证的草稿保存结果"
-                if ok
-                else "平台草稿执行器未返回可验证结果"
-            )
-            task_service.mark_platform_result(
-                task["id"],
-                platform_type,
-                ok=ok,
-                message=message,
-                content_type=str(payload.get("contentType") or ""),
-                event_type="platform_draft",
-            )
+            items = by_platform.get(platform_type, [])
+            failed = [item for item in items if item.get("ok") is False]
+            message = str(failed[0].get("message") or "平台草稿保存失败") if failed else "平台已返回可验证的草稿保存结果" if items else "平台草稿执行器未返回可验证结果"
+            task_service.mark_platform_result(task["id"], platform_type, ok=bool(items) and not failed, message=message, content_type=str(payload.get("contentType") or ""), event_type="platform_draft")
     except Exception as exc:
-        task_service.mark_platform_result(
-            task["id"],
-            int(payloads[0]["type"]),
-            ok=False,
-            message=f"平台草稿异常：{type(exc).__name__}：{exc}",
-            content_type=str(payloads[0].get("contentType") or ""),
-            event_type="platform_draft",
-        )
+        task_service.mark_platform_result(task["id"], int(payloads[0]["type"]), ok=False, message=f"平台草稿异常：{type(exc).__name__}：{exc}", content_type=str(payloads[0].get("contentType") or ""), event_type="platform_draft")
     finally:
         _publish_lock.release()
         _active_threads.pop(int(task["id"]), None)
 
+
+def _run_wechat_draft(task: dict, payloads: list[dict[str, Any]]) -> None:
+    """独立运行公众号草稿；绝不复用正式发表或通用草稿路径。"""
+    payload = payloads[0]
+    if not _publish_lock.acquire(blocking=False):
+        task_service.mark_platform_result(task["id"], 10, ok=False, message="已有发布任务正在执行，请稍后重试", content_type=str(payload.get("contentType") or ""), event_type="platform_draft")
+        _active_threads.pop(int(task["id"]), None)
+        return
+    try:
+        task_service.mark_task_running(task["id"], "一键发开始保存硅基进化公众号草稿")
+        result = wechat_draft_executor.run_wechat_draft_sync(payload, task_id=int(task["id"]))
+        message = str(result.get("message") or "公众号草稿未取得回读")
+        if not result.get("ok") and result.get("errorCode"):
+            message = f"{message}（错误码 {result['errorCode']}）"
+        task_service.mark_platform_result(task["id"], 10, ok=bool(result.get("ok")), message=message, content_type=str(payload.get("contentType") or ""), event_type="platform_draft")
+    except Exception as exc:
+        task_service.mark_platform_result(task["id"], 10, ok=False, message=_failure_message("公众号草稿异常", exc, platform_type=10), content_type=str(payload.get("contentType") or ""), event_type="platform_draft")
+    finally:
+        _publish_lock.release()
+        _active_threads.pop(int(task["id"]), None)
 
 def start_desktop_publish(payloads: list[dict[str, Any]]) -> dict:
     """按载荷启动预检或已确认的公众号正式发布任务。"""
@@ -611,6 +932,7 @@ def start_desktop_publish(payloads: list[dict[str, Any]]) -> dict:
         raise ValueError("同一任务不能混合预检与正式发布")
     is_publish = runtime_mode == "publish"
     is_draft = runtime_mode == "draft"
+    is_wechat_draft = runtime_mode == "wechat_draft"
     task = task_service.create_pending_task(
         prepared,
         mode=(
@@ -618,15 +940,17 @@ def start_desktop_publish(payloads: list[dict[str, Any]]) -> dict:
             if is_publish
             else "oneclick_draft"
             if is_draft
+            else "oneclick_wechat_draft"
+            if is_wechat_draft
             else "oneclick_preflight"
         ),
     )
     worker = threading.Thread(
-        target=_run_publish if is_publish else _run_draft if is_draft else _run_preflight,
+        target=_run_publish if is_publish else _run_wechat_draft if is_wechat_draft else _run_draft if is_draft else _run_preflight,
         args=(task, prepared),
         daemon=True,
         name=(
-            f"oneclick-{'publish' if is_publish else 'draft' if is_draft else 'preflight'}-"
+            f"oneclick-{'publish' if is_publish else 'wechat-draft' if is_wechat_draft else 'draft' if is_draft else 'preflight'}-"
             f"{task['id']}"
         ),
     )

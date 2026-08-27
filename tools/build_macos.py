@@ -151,6 +151,12 @@ for package in ("playwright", "xhs", "biliup"):
     datas += package_data
     binaries += package_binaries
     hiddenimports += package_hidden
+mcp_data, mcp_binaries, mcp_hidden = collect_all(
+    "mcp", filter_submodules=lambda name: not name.startswith("mcp.cli")
+)
+datas += mcp_data
+binaries += mcp_binaries
+hiddenimports += mcp_hidden
 
 a = Analysis(
     [{str(ROOT / "desktop_native_app.py")!r}],

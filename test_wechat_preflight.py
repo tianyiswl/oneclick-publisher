@@ -27,10 +27,12 @@ from app_core.oneclick_preflight import (
     _wechat_payload_text,
     _wechat_original_requested,
     _wechat_dialog_is_in_viewport,
+    _wechat_fill_digest,
     _wechat_insert_anchored_body_images,
     _wechat_insert_body_images,
     _wechat_normalize_image_url,
     _wechat_place_body_image_anchor,
+    _wechat_prepare_frozen_html,
     _wechat_prepare_article_images,
     _wechat_remove_temporary_cover,
     _wechat_resolve_body_image_anchors,
@@ -181,6 +183,86 @@ class _AuthorPage:
 
 
 class WechatPreflightTests(unittest.TestCase):
+    def test_frozen_draft_digest_requires_unique_visible_readback(self) -> None:
+        class Node:
+            def __init__(self, visible: bool) -> None:
+                self.visible = visible
+                self.value = ""
+
+            async def is_visible(self) -> bool:
+                return self.visible
+
+            async def is_enabled(self) -> bool:
+                return True
+
+            async def fill(self, value: str, **_kwargs) -> None:
+                self.value = value
+
+            async def input_value(self) -> str:
+                return self.value
+
+        class Locator:
+            def __init__(self, nodes: list[Node]) -> None:
+                self.nodes = nodes
+
+            async def count(self) -> int:
+                return len(self.nodes)
+
+            def nth(self, index: int) -> Node:
+                return self.nodes[index]
+
+        class Page:
+            def __init__(self) -> None:
+                self.nodes = [Node(False), Node(True)]
+
+            def locator(self, _selector: str) -> Locator:
+                return Locator(self.nodes)
+
+        page = Page()
+
+        asyncio.run(_wechat_fill_digest(page, "冻结摘要"))
+
+        self.assertEqual(page.nodes[1].value, "冻结摘要")
+
+    def test_frozen_html_keeps_layout_and_extracts_body_image_anchors(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "01.png"
+            second = root / "02.png"
+            first.write_bytes(b"one")
+            second.write_bytes(b"two")
+            source = (
+                '<section style="color:#123"><p>导语内容</p>'
+                '<img src="assets/02.png" alt="第二张">'
+                '<h2>第一节</h2><p>论点内容</p>'
+                '<img src="assets/01.png" alt="第一张"></section>'
+            )
+
+            html, ordered_files, anchors, visible_text = _wechat_prepare_frozen_html(
+                source,
+                [first, second],
+            )
+
+            self.assertIn('style="color:#123"', html)
+            self.assertNotIn("<img", html)
+            self.assertEqual(ordered_files, [second, first])
+            self.assertEqual(anchors, ["导语内容", "论点内容"])
+            self.assertEqual(visible_text, "导语内容 第一节 论点内容")
+
+    def test_frozen_html_visible_text_keeps_dom_block_boundaries(self) -> None:
+        html, files, anchors, visible_text = _wechat_prepare_frozen_html(
+            "<section><span>图注</span><h2>82% 说的是一项基准</h2>"
+            "<span>分组说明</span><p>用一项可回退的小任务</p></section>",
+            [],
+        )
+
+        self.assertEqual(files, [])
+        self.assertEqual(anchors, [])
+        self.assertEqual(
+            visible_text,
+            "图注 82% 说的是一项基准 分组说明 用一项可回退的小任务",
+        )
+
     def test_wechat_body_preserves_full_markdown_without_material_paths(self):
         body = (
             "第一段内容。\n\n"
@@ -739,6 +821,70 @@ class WechatPreflightTests(unittest.TestCase):
         self.assertEqual(mode, "confirm")
         self.assertEqual(snapshot["usableControls"], ["完成"])
         self.assertEqual(page.waits, [25])
+
+    def test_cover_crop_accepts_unique_rendered_confirm_below_viewport(self):
+        page = _AuthorPage()
+        below_viewport = {
+            "dialogVisible": True,
+            "dialogCount": 1,
+            "loading": False,
+            "usableControls": [],
+            "renderedControls": ["确认"],
+            "hiddenControls": [],
+            "coverReady": False,
+            "editorVisible": True,
+        }
+        with patch(
+            "app_core.oneclick_preflight._wechat_cover_crop_snapshot",
+            new=AsyncMock(return_value=below_viewport),
+        ):
+            mode, snapshot = asyncio.run(
+                _wechat_wait_cover_crop_ready(
+                    page,
+                    attempts=1,
+                    interval_ms=25,
+                )
+            )
+        self.assertEqual(mode, "confirm")
+        self.assertEqual(snapshot["renderedControls"], ["确认"])
+        self.assertEqual(page.waits, [])
+
+    def test_cover_confirm_is_scrolled_into_view_before_click(self):
+        from app_core import oneclick_preflight as module
+
+        class ConfirmButton:
+            def __init__(self):
+                self.events = []
+
+            async def count(self):
+                return 1
+
+            async def scroll_into_view_if_needed(self, **_kwargs):
+                self.events.append("scroll")
+
+            async def is_visible(self):
+                return True
+
+            async def is_enabled(self):
+                return True
+
+            async def click(self, **_kwargs):
+                self.events.append("click")
+
+        class ConfirmPage:
+            def __init__(self):
+                self.button = ConfirmButton()
+
+            def locator(self, selector):
+                self.asserted_selector = selector
+                return self.button
+
+        click_confirm = getattr(module, "_wechat_click_cover_confirm", None)
+        self.assertIsNotNone(click_confirm)
+        page = ConfirmPage()
+        asyncio.run(click_confirm(page))
+        self.assertEqual(page.asserted_selector, '[data-oneclick-cover-confirm="1"]')
+        self.assertEqual(page.button.events, ["scroll", "click"])
 
     def test_cover_crop_accepts_verified_platform_auto_complete(self):
         page = _AuthorPage()

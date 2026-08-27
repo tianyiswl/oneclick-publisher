@@ -2406,6 +2406,61 @@ async def _visible_commerce_location_result_snapshot(
     return listbox, rows, _location_result_signature(rows)
 
 
+async def _commerce_location_empty_evidence(listbox) -> dict[str, bool | None]:
+    """读取平台明确空态或加载状态，不用空快照猜测完成。"""
+
+    try:
+        raw = await listbox.evaluate(
+            """node => {
+                const visible = item => {
+                    if (!(item instanceof HTMLElement)) return false;
+                    const style = getComputedStyle(item);
+                    const rect = item.getBoundingClientRect();
+                    return style.display !== 'none'
+                        && style.visibility !== 'hidden'
+                        && Number(style.opacity || '1') > 0
+                        && rect.width > 0 && rect.height > 0;
+                };
+                const root = node.closest(
+                    '[role="dialog"], [data-testid*="location" i], '
+                    + '[class*="location" i], [class*="select" i]'
+                ) || node.parentElement || node;
+                const emptyTokens = [
+                    '暂无数据', '暂无地点', '暂无相关地点', '无搜索结果',
+                    '未找到相关地点', '没有找到相关地点'
+                ];
+                const emptyNodes = Array.from(root.querySelectorAll(
+                    '[class*="empty" i], [data-testid*="empty" i], '
+                    + '[data-e2e*="empty" i], [role="status"], [role="alert"]'
+                )).filter(visible);
+                const explicitEmpty = emptyNodes.some(item => {
+                    const text = (item.innerText || item.textContent || '')
+                        .replace(/\\s+/g, '');
+                    return emptyTokens.some(token => text.includes(token));
+                });
+                const busyValues = [node, root]
+                    .map(item => item.getAttribute('aria-busy')
+                        ?? item.getAttribute('data-loading')
+                        ?? item.getAttribute('data-is-loading'))
+                    .filter(value => value !== null)
+                    .map(value => String(value).trim().toLowerCase());
+                const busy = busyValues.some(value => ['true', '1'].includes(value))
+                    ? true
+                    : busyValues.some(value => ['false', '0'].includes(value))
+                    ? false : null;
+                return { explicitEmpty, busy };
+            }"""
+        )
+    except Exception:
+        return {"explicitEmpty": False, "busy": None}
+    if not isinstance(raw, Mapping):
+        return {"explicitEmpty": False, "busy": None}
+    explicit_empty = raw.get("explicitEmpty") is True
+    busy_value = raw.get("busy")
+    busy = busy_value if type(busy_value) is bool else None
+    return {"explicitEmpty": explicit_empty, "busy": busy}
+
+
 async def _wait_for_fresh_commerce_location_results(
     page,
     *,
@@ -2415,6 +2470,7 @@ async def _wait_for_fresh_commerce_location_results(
     expected_location: Mapping[str, Any] | None = None,
     commission_filter: object = "all",
     allow_filtered_empty: bool = False,
+    allow_platform_empty: bool = False,
     timeout_ms: int = _LOCATION_RESULT_WAIT_TIMEOUT_MS,
     stable_reads_required: int = _LOCATION_RESULT_STABLE_READS,
     deadline: float | None = None,
@@ -2428,7 +2484,10 @@ async def _wait_for_fresh_commerce_location_results(
 
     正式发布可传入 ``expected_location`` 和 ``commission_filter``。慢网络下
     即使先出现空列表、非目标候选或分批渲染的候选，也必须等符合返佣要求的
-    目标 POI 出现且列表连续稳定后才返回。
+    目标 POI 出现且列表连续稳定后才返回。``allow_platform_empty``
+    只供省份遍历的元数据搜索使用：必须连续读到平台明确
+    空态，或先观察到加载再读到完成状态，才返回真实零结果。
+    普通搜索和无证据空列表仍等待到受控超时。
     """
 
     selected_commission_filter = normalize_commission_filter(
@@ -2456,6 +2515,7 @@ async def _wait_for_fresh_commerce_location_results(
     first_complete_logged = False
     target_seen_logged = False
     commission_mismatch_seen = False
+    platform_loading_seen = False
     douyin_logger.info(
         f"抖音地点候选开始等待：关键词={keyword}，最长等待="
         f"{normalized_timeout_ms / 1000:.1f} 秒，稳定要求={required_reads} 次"
@@ -2546,9 +2606,43 @@ async def _wait_for_fresh_commerce_location_results(
                 stable_signature = ""
                 stable_reads = 0
         else:
-            # 空列表只表示平台仍在加载，不能作为搜索完成或可点击状态。
-            stable_signature = ""
-            stable_reads = 0
+            # 空列表本身不证明请求已完成。只有省份模式且平台
+            # 给出明确空态，或可观察的 loading -> complete 转换，
+            # 才允许结构化零结果。
+            if allow_platform_empty and expected is None and listbox is not None:
+                evidence = await _await_publish_location_dom_action(
+                    lambda _timeout: _commerce_location_empty_evidence(listbox),
+                    deadline=deadline,
+                )
+                busy = evidence.get("busy")
+                if busy is True:
+                    platform_loading_seen = True
+                explicit_empty = evidence.get("explicitEmpty") is True
+                request_completed = platform_loading_seen and busy is False
+                if (
+                    (explicit_empty or request_completed)
+                    and stable_signature == "platform-empty-evidence"
+                ):
+                    stable_reads += 1
+                elif explicit_empty or request_completed:
+                    stable_signature = "platform-empty-evidence"
+                    stable_reads = 1
+                else:
+                    stable_signature = ""
+                    stable_reads = 0
+                if (
+                    (explicit_empty or request_completed)
+                    and stable_reads >= required_reads
+                ):
+                    elapsed = monotonic() - started_at
+                    douyin_logger.info(
+                        f"抖音地点候选已有明确空态：关键词={keyword}，"
+                        f"耗时={elapsed:.1f} 秒"
+                    )
+                    return listbox, rows
+            else:
+                stable_signature = ""
+                stable_reads = 0
         await _wait_publish_location_timeout(
             page,
             _LOCATION_RESULT_POLL_INTERVAL_MS,
@@ -2581,8 +2675,10 @@ async def search_commerce_location_store_candidates(
     expected_location: Mapping[str, Any] | None = None,
     commission_filter: object = "all",
     include_metadata: bool = False,
+    province_mode: bool = False,
     timeout_ms: int = _LOCATION_RESULT_WAIT_TIMEOUT_MS,
     deadline: float | None = None,
+    deadline_monotonic: float | None = None,
 ) -> list[dict[str, Any]] | dict[str, Any]:
     """按“本地/国内”范围和返佣要求读取发布定位候选。
 
@@ -2592,6 +2688,12 @@ async def search_commerce_location_store_candidates(
     可见有效候选数，候选本身仍只包含过滤后的公开结构字段。
     """
 
+    if deadline_monotonic is not None:
+        deadline = (
+            deadline_monotonic
+            if deadline is None
+            else min(deadline, deadline_monotonic)
+        )
     selected_commission_filter = normalize_commission_filter(
         commission_filter,
         default="all",
@@ -2837,6 +2939,7 @@ async def search_commerce_location_store_candidates(
         expected_location=expected_location,
         commission_filter=selected_commission_filter,
         allow_filtered_empty=include_metadata is True,
+        allow_platform_empty=province_mode is True,
         timeout_ms=timeout_ms,
         deadline=deadline,
     )
@@ -2849,17 +2952,32 @@ async def search_commerce_location_store_candidates(
         rows,
         commission_filter=selected_commission_filter,
     )
-    if not candidates and not (
-        include_metadata is True and platform_result_count > 0
-    ):
+    if not candidates and include_metadata is not True:
         raise DouyinCommerceError(
             f"抖音未返回“{normalized_keyword}”的完整可选发布定位"
         )
     if include_metadata is True:
-        return {
+        result: dict[str, object] = {
             "platformResultCount": platform_result_count,
             "candidates": [dict(item) for item in candidates],
         }
+        if platform_result_count > 0 and not candidates:
+            # 首屏只能确认平台可见候选被返佣条件筛空，不能据此断言分页
+            # 已耗尽；省份遍历应保守尝试一次真实 load-more。
+            result.update(
+                {
+                    "hasMore": True,
+                    "stopReason": "filtered_empty_may_have_more",
+                }
+            )
+        elif platform_result_count == 0:
+            result.update(
+                {
+                    "hasMore": False,
+                    "stopReason": "no_visible_load_more_control",
+                }
+            )
+        return result
     return candidates
 
 
@@ -3371,9 +3489,16 @@ async def load_more_commerce_location_candidates(
     commission_filter: object = "all",
     timeout_ms: int = _LOCATION_RESULT_WAIT_TIMEOUT_MS,
     deadline: float | None = None,
+    deadline_monotonic: float | None = None,
 ) -> dict[str, object]:
     """公开加载更多入口：所有内部失败只暴露固定错误码。"""
 
+    if deadline_monotonic is not None:
+        deadline = (
+            deadline_monotonic
+            if deadline is None
+            else min(deadline, deadline_monotonic)
+        )
     has_outer_deadline = deadline is not None
     try:
         return await _load_more_commerce_location_candidates_impl(

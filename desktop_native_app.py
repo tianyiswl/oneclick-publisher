@@ -6,8 +6,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 from datetime import datetime
+import json
 import os
 import sys
+import time
 from io import BytesIO
 from pathlib import Path
 
@@ -19,7 +21,7 @@ if os.name == "nt" and QT_BIN_DIR.exists():
 
 from PyQt6.QtCore import QDate, QTime, QTimer
 from PyQt6.QtGui import QIcon
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QMessageBox
 
 from app_core import (
     account_service,
@@ -28,10 +30,13 @@ from app_core import (
     media_service,
     publish_service,
     task_service,
+    controlled_publish,
 )
 from app_core.release_integrity import verify_release_artifact
 from app_core.branding import APP_ICON_RELATIVE_PATH, APP_TITLE, APP_VERSION, PRODUCT_NAME
 from app_core.database import ensure_schema
+from app_core.paths import USER_DATA_DIR, WECHAT_DRAFT_BRIDGE_DIR
+from app_core.source_live_runtime import installed_gui_block_reason
 from ui.common import apply_style
 from ui.main_window import LicenseDialog, MainWindow
 from ui.runtime_log import install_runtime_log_capture
@@ -72,12 +77,20 @@ def run_self_test() -> None:
     print("NATIVE_DESKTOP_SELF_TEST_OK")
 
 
+def create_main_window() -> MainWindow:
+    """创建并完成正常桌面端接线。"""
+
+    window = MainWindow()
+    window.publish.configure_wechat_draft_queue(WECHAT_DRAFT_BRIDGE_DIR)
+    return window
+
+
 def run_ui_test() -> None:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     app = QApplication([])
     configure_application(app)
     apply_style(app)
-    window = MainWindow()
+    window = create_main_window()
     window.show()
     app.processEvents()
     print("NATIVE_DESKTOP_UI_OK")
@@ -120,6 +133,236 @@ def run_release_verification(
     )
 
 
+def _controlled_json(value: object) -> None:
+    print(json.dumps(value, ensure_ascii=False, separators=(",", ":")), flush=True)
+
+
+def _read_controlled_request(path_value: str) -> dict:
+    if path_value == "-":
+        raw = sys.stdin.read()
+    else:
+        path = Path(str(path_value or "")).expanduser().resolve()
+        if not path.is_file():
+            raise controlled_publish.ControlledPublishError(
+                "controlled_request_file_missing", "受控发布请求文件不存在"
+            )
+        raw = path.read_text(encoding="utf-8")
+    try:
+        value = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise controlled_publish.ControlledPublishError(
+            "controlled_request_json_invalid", "受控发布请求不是有效 UTF-8 JSON"
+        ) from exc
+    if not isinstance(value, dict):
+        raise controlled_publish.ControlledPublishError(
+            "controlled_request_invalid", "受控发布请求必须是 JSON 对象"
+        )
+    return value
+
+
+def _wait_for_controlled_task(task_id: int, *, interactive_verification: bool) -> None:
+    """等待任务完成；正式任务遇到抖音验证时只拉起本机原生窗口。"""
+
+    app = None
+    douyin_verification_broker = None
+    verification_dialog = None
+    if interactive_verification:
+        from app_core.douyin_verification import (
+            verification_broker as douyin_verification_broker,
+        )
+        from ui.douyin_verification_dialog import DouyinVerificationDialog
+
+        app = QApplication.instance() or QApplication([sys.argv[0]])
+        configure_application(app)
+        apply_style(app)
+        verification_dialog = DouyinVerificationDialog
+    while publish_service.is_task_running(task_id):
+        task_service.touch_task_heartbeat(task_id)
+        if app is not None:
+            app.processEvents()
+            request_id = douyin_verification_broker.request_for_task(task_id)
+            if request_id:
+                verification_dialog(
+                    request_id,
+                    broker=douyin_verification_broker,
+                ).exec()
+        time.sleep(0.25)
+
+
+def run_controlled_publish_cli(args: argparse.Namespace) -> int:
+    """本机 CLI：默认预检，标准输出只承诺稳定 JSON 状态。"""
+
+    # 平台执行器沿用桌面日志器；CLI 必须把这些运行日志移到 stderr，
+    # 给调用方保留只包含状态 JSON 的 stdout。
+    from utils.log import redirect_console_logger
+
+    redirect_console_logger(sys.stderr)
+    ensure_schema()
+    action = str(args.controlled_publish_action or "")
+    try:
+        if action in {"metrics-sync", "metrics-get", "metrics-status"}:
+            from app_core.content_project_gateway import ContentProjectGateway
+
+            project_id = str(args.content_project_id or "").strip()
+            if not project_id:
+                raise controlled_publish.ControlledPublishError(
+                    "content_project_id_required",
+                    "项目数据操作必须提供 content project id",
+                )
+            gateway = ContentProjectGateway()
+            if action == "metrics-sync":
+                result = gateway.sync_project_metrics(project_id)
+            elif action == "metrics-get":
+                result = gateway.get_project_metrics(
+                    project_id, int(args.metrics_days)
+                )
+            else:
+                result = gateway.metrics_sync_status(project_id)
+            _controlled_json(result)
+            return 0
+        if action == "status":
+            if not args.controlled_publish_task_id:
+                raise controlled_publish.ControlledPublishError(
+                    "controlled_task_id_required", "查询任务必须提供 taskId"
+                )
+            _controlled_json(
+                controlled_publish.task_status(args.controlled_publish_task_id)
+            )
+            return 0
+        if action == "authorize":
+            if not args.controlled_publish_task_id:
+                raise controlled_publish.ControlledPublishError(
+                    "controlled_task_id_required", "创建授权必须提供预检 taskId"
+                )
+            _controlled_json(
+                controlled_publish.authorize_completed_check(
+                    args.controlled_publish_task_id
+                )
+            )
+            return 0
+        if action == "create":
+            if not args.controlled_publish_request:
+                raise controlled_publish.ControlledPublishError(
+                    "controlled_request_file_required", "创建任务必须提供 JSON 请求文件"
+                )
+            request = _read_controlled_request(args.controlled_publish_request)
+            initial = controlled_publish.submit_request(request)
+            _controlled_json(initial)
+            task_id = int(initial["taskId"])
+            # CLI 进程保持到后台发布线程结束；Codex 可同时用 status 查询 taskId。
+            try:
+                _wait_for_controlled_task(
+                    task_id,
+                    interactive_verification=(
+                        str(request.get("mode") or "preflight").strip().lower()
+                        == "formal"
+                    ),
+                )
+            except KeyboardInterrupt:
+                task_service.fail_active_task(
+                    task_id,
+                    error_code="controlled_cli_interrupted",
+                    message="受控发布命令被中断，未取得最终回执的平台已安全停止",
+                    event_type="controlled_cli_interrupted",
+                )
+                final = controlled_publish.task_status(task_id)
+                _controlled_json(final)
+                return 130
+            final = controlled_publish.task_status(task_id)
+            if final != initial:
+                _controlled_json(final)
+            return 0 if final["status"] == "success" else 2
+        if action == "matrix":
+            if not args.controlled_publish_request:
+                raise controlled_publish.ControlledPublishError(
+                    "controlled_request_file_required",
+                    "抖音图文矩阵必须提供 JSON 请求文件",
+                )
+            request = _read_controlled_request(args.controlled_publish_request)
+            runtime_mode = str(request.get("runtimeMode") or "local_check")
+            initial_task = publish_service.start_douyin_graphic_matrix(
+                request,
+                authorization_id=str(request.get("authorizationId") or ""),
+                checked_task_id=int(request.get("confirmedCheckTaskId") or 0),
+            )
+            initial = controlled_publish.project_task(initial_task)
+            _controlled_json(initial)
+            task_id = int(initial["taskId"])
+            try:
+                _wait_for_controlled_task(
+                    task_id,
+                    interactive_verification=(runtime_mode == "publish"),
+                )
+            except KeyboardInterrupt:
+                task_service.fail_active_task(
+                    task_id,
+                    error_code="controlled_cli_interrupted",
+                    message="图文矩阵命令被中断，未取得最终回执的账号已安全停止",
+                    event_type="controlled_cli_interrupted",
+                )
+                _controlled_json(controlled_publish.task_status(task_id))
+                return 130
+            final = controlled_publish.task_status(task_id)
+            if final != initial:
+                _controlled_json(final)
+            return 0 if final["status"] == "success" else 2
+        if action in {"silicon-preflight", "silicon-formal"}:
+            if not args.controlled_publish_request:
+                raise controlled_publish.ControlledPublishError(
+                    "controlled_request_file_required",
+                    "硅基进化自动直发必须提供 JSON 请求文件",
+                )
+            request = _read_controlled_request(args.controlled_publish_request)
+            request["mode"] = (
+                "preflight" if action == "silicon-preflight" else "formal"
+            )
+            initial = controlled_publish.submit_silicon_evolution_request(request)
+            _controlled_json(initial)
+            task_id = int(initial["taskId"])
+            try:
+                _wait_for_controlled_task(
+                    task_id,
+                    interactive_verification=(action == "silicon-formal"),
+                )
+            except KeyboardInterrupt:
+                task_service.fail_active_task(
+                    task_id,
+                    error_code="controlled_cli_interrupted",
+                    message="自动直发命令被中断，未取得最终回执的平台已安全停止",
+                    event_type="controlled_cli_interrupted",
+                )
+                _controlled_json(controlled_publish.task_status(task_id))
+                return 130
+            final = controlled_publish.task_status(task_id)
+            if final != initial:
+                _controlled_json(final)
+            return 0 if final["status"] == "success" else 2
+        raise controlled_publish.ControlledPublishError(
+            "controlled_action_invalid",
+            "受控 action 不受支持",
+        )
+    except controlled_publish.ControlledPublishError as exc:
+        _controlled_json(
+            {
+                "status": "rejected",
+                "errorCode": exc.error_code,
+                "errorText": exc.public_message,
+            }
+        )
+        return 2
+    except Exception as exc:
+        _controlled_json(
+            {
+                "status": "failed",
+                "errorCode": str(
+                    getattr(exc, "error_code", "controlled_internal_error")
+                ),
+                "errorText": str(
+                    getattr(exc, "public_message", f"{type(exc).__name__}：{exc}")
+                ),
+            }
+        )
+        return 2
 def start_authorized_wechat_schedule(
     window: MainWindow,
     manifest_path: str,
@@ -260,6 +503,48 @@ def main() -> int:
         "--wechat-account-name",
         default="硅基进化",
     )
+    parser.add_argument(
+        "--controlled-publish-action",
+        choices=(
+            "create",
+            "status",
+            "authorize",
+            "silicon-preflight",
+            "silicon-formal",
+            "matrix",
+            "metrics-sync",
+            "metrics-get",
+            "metrics-status",
+        ),
+        help="本机受控发布接口；默认只能由请求中的 preflight 模式启动预检。",
+    )
+    parser.add_argument(
+        "--controlled-publish-request",
+        metavar="JSON_OR_STDIN",
+        help="受控发布请求 JSON 文件；使用 - 从标准输入读取。",
+    )
+    parser.add_argument(
+        "--controlled-publish-task-id",
+        type=int,
+        metavar="TASK_ID",
+    )
+    parser.add_argument(
+        "--content-project-id",
+        metavar="PROJECT_ID",
+        help="内容项目数据同步或查询使用的本机项目标识。",
+    )
+    parser.add_argument(
+        "--metrics-days",
+        type=int,
+        choices=(1, 7, 30),
+        default=1,
+        help="项目数据查询窗口，只允许 1、7、30 天。",
+    )
+    parser.add_argument(
+        "--mcp-server",
+        action="store_true",
+        help="通过本机 stdio 启动一键发 MCP 受控发布适配器。",
+    )
     args = parser.parse_args()
     if args.self_test:
         run_self_test()
@@ -275,6 +560,29 @@ def main() -> int:
             parser.error("--verify-release 必须同时提供 --manifest 和 --signature")
         run_release_verification(args.verify_release, args.manifest, args.signature)
         return 0
+    if args.controlled_publish_action:
+        return run_controlled_publish_cli(args)
+    if args.mcp_server:
+        # MCP 的 stdout 是协议信道；平台执行日志只能进入 stderr。
+        from utils.log import redirect_console_logger
+        from app_core.oneclick_mcp_server import run_stdio_server
+
+        redirect_console_logger(sys.stderr)
+        ensure_schema()
+        run_stdio_server()
+        return 0
+    source_live_conflict = installed_gui_block_reason(
+        os.environ, USER_DATA_DIR / "source-live-session.json"
+    )
+    if source_live_conflict:
+        app = QApplication(sys.argv)
+        configure_application(app)
+        QMessageBox.warning(
+            None,
+            "正式客户端暂不能打开",
+            source_live_conflict + "，再重新打开正式客户端。",
+        )
+        return 2
     app = QApplication(sys.argv)
     configure_application(app)
     install_runtime_log_capture()
@@ -287,7 +595,7 @@ def main() -> int:
         dialog.exec()
         if not activation_service.license_status().get("accessAllowed"):
             return 0
-    window = MainWindow()
+    window = create_main_window()
     window.show()
     if args.page:
         # 窗口首次 show 后再应用启动页，避免 Qt 初始布局将

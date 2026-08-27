@@ -29,6 +29,7 @@ from .wechat_publish_policy import (
     decide_group_notification_scope_confirmation,
     decide_wechat_publish_options,
     normalize_wechat_publish_preferences,
+    validate_silicon_evolution_auto_publish_readback,
 )
 from .wechat_verification import (
     TERMINAL_STATES,
@@ -40,6 +41,10 @@ from .wechat_verification import (
 
 class WechatPublishError(RuntimeError):
     """公众号正式发表无法安全继续。"""
+
+    def __init__(self, message: str, *, error_code: str = "wechat_publish_failed") -> None:
+        super().__init__(message)
+        self.error_code = error_code
 
 
 _NAVIGATION_TRANSIENT_MARKERS = (
@@ -410,6 +415,8 @@ async def _recover_post_submit_result(
     ai_accepted: bool,
     preflight_message: str,
     execution_record: dict[str, Any],
+    attempts: int = 6,
+    settle_seconds: float = 2.0,
 ) -> dict[str, Any] | None:
     """提交已发生后，仅以首页精确回读恢复导航瞬断的真实结果。
 
@@ -422,8 +429,8 @@ async def _recover_post_submit_result(
             page,
             title,
             preferences,
-            attempts=6,
-            settle_seconds=2.0,
+            attempts=attempts,
+            settle_seconds=settle_seconds,
         )
         readback = dict(home_result.get("readback") or {})
         if not readback.get("ok"):
@@ -447,8 +454,8 @@ async def _recover_post_submit_result(
     home_result = await _readback_immediate_publish_from_home(
         page,
         title,
-        attempts=6,
-        settle_seconds=2.0,
+        attempts=attempts,
+        settle_seconds=settle_seconds,
     )
     readback = dict(home_result.get("readback") or {})
     if not readback.get("ok"):
@@ -467,6 +474,42 @@ async def _recover_post_submit_result(
         "executionRecord": execution_record,
         "recoveredAfterNavigation": True,
     }
+
+
+async def _resolve_verified_submit_result(
+    page,
+    *,
+    title: str,
+    preferences: dict[str, Any],
+    ai_accepted: bool,
+    preflight_message: str,
+    execution_record: dict[str, Any],
+    attempts: int = 6,
+    settle_seconds: float = 2.0,
+) -> dict[str, Any]:
+    """微信验证成功后立即以公众号首页确认最终结果。
+
+    最终提交已经发生时，页面残留的“身份验证”文字不能再被当作
+    第二个二维码。首页没有精确回读时保留“结果不明”，绝不重发。
+    """
+
+    recovered = await _recover_post_submit_result(
+        page,
+        title=title,
+        preferences=preferences,
+        ai_accepted=ai_accepted,
+        preflight_message=preflight_message,
+        execution_record=execution_record,
+        attempts=attempts,
+        settle_seconds=settle_seconds,
+    )
+    if recovered:
+        return recovered
+    raise WechatPublishError(
+        "最终提交和微信验证已发生，但公众号首页尚未取得唯一回执；"
+        "当前结果不明，已停止且禁止自动重发",
+        error_code="wechat_publish_result_unknown",
+    )
 
 
 async def _close_publish_session(context, browser) -> None:
@@ -1121,11 +1164,51 @@ async def run_wechat_publish(payload: dict[str, Any], *, task_id: int) -> dict[s
 
                 if last_state.get("qrCount") or last_state.get("qrText"):
                     await _handle_qr_verification(page, task_id)
+                    if final_clicked:
+                        recovered = await _resolve_verified_submit_result(
+                            page,
+                            title=title,
+                            preferences=preferences,
+                            ai_accepted=ai_accepted,
+                            preflight_message=preflight_message,
+                            execution_record=execution_record,
+                        )
+                        task_service.record_task_event(
+                            task_id,
+                            "wechat_post_verification_home_readback",
+                            "微信验证成功后已由公众号首页精确回读最终结果",
+                        )
+                        return recovered
                     continue
 
                 final_snapshot = await _final_options_snapshot(page)
                 if int(final_snapshot.get("dialogCount") or 0) == 1 and not final_clicked:
                     prepared = await _prepare_final_options(page, payload)
+                    if payload.get("siliconEvolutionArticleId"):
+                        silicon_state = {
+                            **dict(prepared["snapshot"]),
+                            "articleId": payload.get("siliconEvolutionArticleId"),
+                            "packageSha256": payload.get(
+                                "siliconEvolutionPackageSha256"
+                            ),
+                            "accountId": int(account["id"]),
+                            "accountDisplayName": editor_account,
+                            "preflightVerified": True,
+                        }
+                        silicon_decision = (
+                            validate_silicon_evolution_auto_publish_readback(
+                                payload,
+                                silicon_state,
+                            )
+                        )
+                        if not silicon_decision.get("allowed"):
+                            raise WechatPublishError(
+                                str(silicon_decision.get("reason") or "自动直发最终回读失败"),
+                                error_code=str(
+                                    silicon_decision.get("errorCode")
+                                    or "wechat_publish_options_mismatch"
+                                ),
+                            )
                     final_button = page.locator(
                         '[data-oneclick-final-publish="1"]'
                     )

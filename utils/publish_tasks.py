@@ -156,6 +156,8 @@ CREATE TABLE IF NOT EXISTS publish_task_items (
         (
             ("accountSummary", "TEXT"),
             ("platformSummary", "TEXT"),
+            ("workerPid", "INTEGER"),
+            ("workerHeartbeatAt", "TEXT"),
         ),
     )
     _add_columns(

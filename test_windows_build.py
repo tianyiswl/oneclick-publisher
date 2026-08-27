@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from unittest.mock import patch
 import zipfile
 from pathlib import Path
 
@@ -22,6 +23,29 @@ from app_core.branding import APP_EXECUTABLE_NAME
 
 
 class WindowsBuildTests(unittest.TestCase):
+    def test_controlled_publish_cli_routes_runtime_logs_to_stderr(self) -> None:
+        source = (Path(__file__).resolve().parent / "desktop_native_app.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("redirect_console_logger(sys.stderr)", source)
+        self.assertIn("_wait_for_controlled_task", source)
+        self.assertIn("DouyinVerificationDialog", source)
+        self.assertIn("douyin_verification_broker.request_for_task(task_id)", source)
+        self.assertIn('action == "matrix"', source)
+        self.assertIn("start_douyin_graphic_matrix", source)
+
+    def test_source_cli_can_explicitly_reuse_installed_user_data(self):
+        with patch.dict(
+            "os.environ",
+            {"YIJIANFA_USER_DATA_DIR": "/tmp/yijianfa-controlled-user-data"},
+        ):
+            data_dir = resolve_user_data_dir(
+                frozen=False,
+                platform_name="darwin",
+                source_dir=Path("/tmp/source"),
+            )
+        self.assertEqual(data_dir, Path("/tmp/yijianfa-controlled-user-data"))
     def test_frozen_windows_uses_local_app_data_outside_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -43,6 +67,14 @@ class WindowsBuildTests(unittest.TestCase):
         self.assertEqual(
             archive_filename("20260805", "0.4.1"),
             "YiJianFa_0.4.1_Windows_x64_20260805.zip",
+        )
+
+    def test_windows_spec_bundles_official_mcp_runtime(self) -> None:
+        spec = render_spec(Path("C:/oneclick"))
+
+        self.assertIn(
+            '"mcp", filter_submodules=lambda name: not name.startswith("mcp.cli")',
+            spec,
         )
 
     def test_resolve_required_playwright_browser_dirs(self) -> None:
@@ -172,7 +204,7 @@ class WindowsBuildTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Windows"):
             assert_windows_platform("darwin")
 
-    def test_windows_workflow_requires_manual_trigger_and_uploads_private_artifact(
+    def test_windows_workflow_requires_manual_trigger_and_supports_private_delivery(
         self,
     ) -> None:
         workflow = (
@@ -186,14 +218,18 @@ class WindowsBuildTests(unittest.TestCase):
         self.assertNotIn("push:", workflow)
         self.assertNotIn("codex/finalize-macos-feedback", workflow)
         self.assertIn("windows-latest", workflow)
-        self.assertIn("contents: read", workflow)
+        self.assertIn("contents: write", workflow)
         self.assertIn("验证 Windows 源码离屏界面", workflow)
         self.assertIn('"desktop_native_app.py", "--ui-test"', workflow)
         self.assertIn("python -m playwright install chromium", workflow)
         self.assertIn("tools/build_windows.py", workflow)
         self.assertIn("actions/upload-artifact@v4", workflow)
         self.assertIn("retention-days: 30", workflow)
-        self.assertNotIn("create-release", workflow.lower())
+        self.assertIn("default: artifact", workflow)
+        self.assertIn("inputs.delivery == 'artifact'", workflow)
+        self.assertIn("inputs.delivery == 'prerelease'", workflow)
+        self.assertIn("gh release create", workflow)
+        self.assertIn("--prerelease", workflow)
 
 
 if __name__ == "__main__":

@@ -266,6 +266,7 @@ class _LocationSearchContext:
     scope: str
     commission_filter: str
     candidates: list[dict[str, Any]]
+    province_mode: bool = False
     load_more_count: int = 0
     zero_growth_count: int = 0
 
@@ -482,6 +483,8 @@ class DouyinCommerceSessionManager:
         *,
         commission_filter: object = "all",
         include_metadata: bool = False,
+        province_mode: bool = False,
+        deadline_monotonic: float | None = None,
     ) -> list[dict[str, Any]] | dict[str, Any]:
         """在当前已上传编辑页搜索发布定位候选，不另开浏览器或使用私有请求。"""
 
@@ -499,13 +502,12 @@ class DouyinCommerceSessionManager:
         }
         if include_metadata is True:
             search_kwargs["include_metadata"] = True
+        if province_mode is True:
+            search_kwargs["province_mode"] = True
+        if deadline_monotonic is not None:
+            search_kwargs["deadline_monotonic"] = deadline_monotonic
         return self._call(
-            self._search_locations(
-                session_id,
-                keyword,
-                scope,
-                **search_kwargs,
-            )
+            self._search_locations(session_id, keyword, scope, **search_kwargs)
         )
 
     def load_more_locations(
@@ -516,6 +518,8 @@ class DouyinCommerceSessionManager:
         *,
         commission_filter: object,
         previous_candidates: object,
+        province_mode: bool = False,
+        deadline_monotonic: float | None = None,
     ) -> dict[str, object]:
         """为同一地点搜索上下文加载下一页公开候选。"""
 
@@ -539,13 +543,17 @@ class DouyinCommerceSessionManager:
             raise DouyinCommerceSessionError(
                 "publish_location_load_more_failed"
             ) from None
+        load_kwargs: dict[str, object] = {
+            "commission_filter": selected_commission_filter,
+            "previous_candidates": previous_snapshot,
+        }
+        if province_mode is True:
+            load_kwargs["province_mode"] = True
+        if deadline_monotonic is not None:
+            load_kwargs["deadline_monotonic"] = deadline_monotonic
         return self._call(
             self._load_more_locations(
-                session_id,
-                _normalized(keyword),
-                selected_scope,
-                commission_filter=selected_commission_filter,
-                previous_candidates=previous_snapshot,
+                session_id, _normalized(keyword), selected_scope, **load_kwargs
             )
         )
 
@@ -1168,6 +1176,8 @@ class DouyinCommerceSessionManager:
         *,
         commission_filter: object = "all",
         include_metadata: bool = False,
+        province_mode: bool = False,
+        deadline_monotonic: float | None = None,
     ) -> list[dict[str, Any]] | dict[str, Any]:
         session = await self._current(session_id)
         self._ensure_editor_not_blocked_by_music_picker(session)
@@ -1192,12 +1202,20 @@ class DouyinCommerceSessionManager:
 
         candidates: list[dict[str, Any]] = []
         platform_result_count = 0
+        metadata_has_more: bool | None = None
+        metadata_stop_reason: str | None = None
         for attempt in range(2):
             # 每次检索前先收口上一轮候选。地点候选与当前上传会话复用同一页面，
             # 若旧 listbox 仍展开，带货模式回读可能把菜单项误作当前值。
             try:
-                await douyin_commerce_service.close_commerce_store_selector(session.page)
+                await douyin_commerce_service.close_commerce_store_selector(
+                    session.page, deadline=deadline_monotonic
+                )
             except Exception as exc:
+                if _normalized(str(exc)) == "publish_location_load_more_limit":
+                    raise DouyinCommerceSessionError(
+                        "province_location_search_action_timeout"
+                    ) from None
                 raise DouyinCommerceSessionError(
                     f"抖音上一次地点候选未能安全关闭：{_normalized(str(exc))[:220]}"
                 ) from exc
@@ -1208,6 +1226,10 @@ class DouyinCommerceSessionManager:
                 }
                 if include_metadata is True:
                     service_kwargs["include_metadata"] = True
+                if province_mode is True:
+                    service_kwargs["province_mode"] = True
+                if deadline_monotonic is not None:
+                    service_kwargs["deadline_monotonic"] = deadline_monotonic
                 search_result = await douyin_commerce_service.search_commerce_location_store_candidates(
                     session.page,
                     keyword,
@@ -1220,6 +1242,8 @@ class DouyinCommerceSessionManager:
                         )
                     raw_count = search_result.get("platformResultCount")
                     raw_candidates = search_result.get("candidates")
+                    raw_has_more = search_result.get("hasMore")
+                    raw_stop_reason = search_result.get("stopReason")
                     if (
                         type(raw_count) is not int
                         or raw_count < 0
@@ -1240,6 +1264,20 @@ class DouyinCommerceSessionManager:
                             "抖音带货位置搜索失败：元数据回包无效"
                         )
                     platform_result_count = raw_count
+                    if (raw_has_more is None) != (raw_stop_reason is None):
+                        raise DouyinCommerceSessionError(
+                            "抖音带货位置搜索失败：元数据回包无效"
+                        )
+                    if raw_has_more is not None and (
+                        type(raw_has_more) is not bool
+                        or not isinstance(raw_stop_reason, str)
+                        or not raw_stop_reason
+                    ):
+                        raise DouyinCommerceSessionError(
+                            "抖音带货位置搜索失败：元数据回包无效"
+                        )
+                    metadata_has_more = raw_has_more
+                    metadata_stop_reason = raw_stop_reason
                 else:
                     candidates = [dict(item) for item in search_result]
                 break
@@ -1247,26 +1285,40 @@ class DouyinCommerceSessionManager:
                 # 搜索中途失败也尽量收口本次已展开的地点候选；清理失败不得覆盖
                 # 原始平台错误，下一次搜索仍会在入口处再次严格清理。
                 try:
-                    await douyin_commerce_service.close_commerce_store_selector(session.page)
+                    await douyin_commerce_service.close_commerce_store_selector(
+                        session.page, deadline=deadline_monotonic
+                    )
                 except Exception:
                     _LOGGER.warning("抖音地点搜索失败后候选浮层未能关闭", exc_info=True)
                 error_text = _normalized(str(exc))
+                if error_text == "publish_location_load_more_limit":
+                    raise DouyinCommerceSessionError(
+                        "province_location_search_action_timeout"
+                    ) from None
                 transient_scope_failure = (
                     "pair-not-in-search-panel" in error_text
                     and "本地 0 个、国内 0 个" in error_text
                 )
                 if attempt == 0 and transient_scope_failure:
                     _LOGGER.info("抖音地点范围面板尚未挂载，有界等待后自动重试一次")
-                    await session.page.wait_for_timeout(1_500)
+                    if deadline_monotonic is not None:
+                        await douyin_commerce_service._wait_publish_location_timeout(
+                            session.page, 1_500, deadline=deadline_monotonic
+                        )
+                    else:
+                        await session.page.wait_for_timeout(1_500)
                     continue
                 raise DouyinCommerceSessionError(
                     f"抖音带货位置搜索失败：{error_text[:260]}"
                 ) from exc
-        unique_candidates = _unique_location_candidates(candidates)
-        identity_limit_reached = (
+        unique_candidates = _unique_location_candidates(
+            candidates,
+            limit=None if province_mode else _SETUP_LOCATION_MAX_IDENTITIES,
+        )
+        identity_limit_reached = not province_mode and (
             len(unique_candidates) >= _SETUP_LOCATION_MAX_IDENTITIES
         )
-        candidates = unique_candidates[:_SETUP_LOCATION_MAX_IDENTITIES]
+        candidates = unique_candidates
         # 新搜索结果会改变发布定位。任何此前的门店选择、预检或定时回读都
         # 必须失效，避免误把旧门店用于新地点。
         session.commerce_location_candidates = [dict(item) for item in candidates]
@@ -1275,6 +1327,7 @@ class DouyinCommerceSessionManager:
             scope=selected_scope,
             commission_filter=selected_commission_filter,
             candidates=[dict(item) for item in candidates],
+            province_mode=province_mode is True,
         )
         session.location = None
         session.location_scope = selected_scope
@@ -1291,6 +1344,13 @@ class DouyinCommerceSessionManager:
                 "platformResultCount": platform_result_count,
                 "candidates": public_candidates,
             }
+            if metadata_has_more is not None:
+                result.update(
+                    {
+                        "hasMore": metadata_has_more,
+                        "stopReason": metadata_stop_reason,
+                    }
+                )
             if identity_limit_reached:
                 result.update(
                     {
@@ -1309,6 +1369,8 @@ class DouyinCommerceSessionManager:
         *,
         commission_filter: object,
         previous_candidates: object,
+        province_mode: bool = False,
+        deadline_monotonic: float | None = None,
     ) -> dict[str, object]:
         session = await self._current(session_id)
         try:
@@ -1328,10 +1390,12 @@ class DouyinCommerceSessionManager:
             context.keyword,
             context.scope,
             context.commission_filter,
+            context.province_mode,
         ) != (
             _normalized(keyword),
             selected_scope,
             selected_commission_filter,
+            province_mode is True,
         ):
             raise DouyinCommerceSessionError(
                 "collector_search_context_mismatch"
@@ -1354,19 +1418,29 @@ class DouyinCommerceSessionManager:
             ) from None
         unique_before = _unique_location_candidates(
             context_snapshot,
-            limit=_SETUP_LOCATION_MAX_IDENTITIES,
+            limit=None if province_mode else _SETUP_LOCATION_MAX_IDENTITIES,
         )
         before_identities = set(_location_candidate_identities(unique_before))
-        if context.load_more_count >= _SETUP_LOCATION_MAX_LOAD_MORE_CLICKS:
+        if (
+            not province_mode
+            and context.load_more_count >= _SETUP_LOCATION_MAX_LOAD_MORE_CLICKS
+        ):
             return _stopped_location_page(context, "load_more_click_limit")
-        if len(before_identities) >= _SETUP_LOCATION_MAX_IDENTITIES:
+        if (
+            not province_mode
+            and len(before_identities) >= _SETUP_LOCATION_MAX_IDENTITIES
+        ):
             return _stopped_location_page(context, "candidate_identity_limit")
         self._ensure_editor_not_blocked_by_music_picker(session)
         try:
+            load_kwargs: dict[str, object] = {
+                "previous_candidates": context_snapshot,
+                "commission_filter": selected_commission_filter,
+            }
+            if deadline_monotonic is not None:
+                load_kwargs["deadline_monotonic"] = deadline_monotonic
             result = await douyin_commerce_service.load_more_commerce_location_candidates(
-                session.page,
-                previous_candidates=context_snapshot,
-                commission_filter=selected_commission_filter,
+                session.page, **load_kwargs
             )
             if not isinstance(result, Mapping):
                 raise TypeError("metadata_result_invalid")
@@ -1387,6 +1461,14 @@ class DouyinCommerceSessionManager:
             ):
                 raise TypeError("metadata_result_invalid")
             candidates = snapshot_location_candidates(raw_candidates)
+        except douyin_commerce_service.DouyinCommerceError as exc:
+            if str(exc) == "publish_location_load_more_limit":
+                raise DouyinCommerceSessionError(
+                    "province_location_search_action_timeout"
+                ) from None
+            raise DouyinCommerceSessionError(
+                "publish_location_load_more_failed"
+            ) from None
         except Exception:
             raise DouyinCommerceSessionError(
                 "publish_location_load_more_failed"
@@ -1401,7 +1483,7 @@ class DouyinCommerceSessionManager:
             ) from None
         accumulated_candidates = _unique_location_candidates(
             context_snapshot + candidates,
-            limit=_SETUP_LOCATION_MAX_IDENTITIES,
+            limit=None if province_mode else _SETUP_LOCATION_MAX_IDENTITIES,
         )
         accumulated_identities = set(
             _location_candidate_identities(accumulated_candidates)
@@ -1417,10 +1499,16 @@ class DouyinCommerceSessionManager:
         )
         stop_reason = raw_stop_reason
         has_more = raw_has_more
-        if context.load_more_count >= _SETUP_LOCATION_MAX_LOAD_MORE_CLICKS:
+        if (
+            not province_mode
+            and context.load_more_count >= _SETUP_LOCATION_MAX_LOAD_MORE_CLICKS
+        ):
             stop_reason = "load_more_click_limit"
             has_more = False
-        elif len(accumulated_identities) >= _SETUP_LOCATION_MAX_IDENTITIES:
+        elif (
+            not province_mode
+            and len(accumulated_identities) >= _SETUP_LOCATION_MAX_IDENTITIES
+        ):
             stop_reason = "candidate_identity_limit"
             has_more = False
         return {

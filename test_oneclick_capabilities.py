@@ -7,6 +7,28 @@ from app_core import oneclick_capabilities as adapter
 
 
 class OneClickCapabilityTests(unittest.TestCase):
+    def test_location_capability_is_explicit_and_preserves_existing_douyin_support(self) -> None:
+        supported = {
+            ("小红书", "video"),
+            ("抖音", "video"),
+            ("抖音", "article"),
+            ("抖音", "text"),
+        }
+        unsupported = {
+            ("小红书", "article"),
+            ("小红书", "text"),
+            ("视频号", "video"),
+            ("快手", "video"),
+            ("B站", "video"),
+            ("公众号", "article"),
+        }
+        for platform, content_type in supported:
+            with self.subTest(platform=platform, content_type=content_type):
+                self.assertTrue(adapter.supports_location(platform, content_type))
+        for platform, content_type in unsupported:
+            with self.subTest(platform=platform, content_type=content_type):
+                self.assertFalse(adapter.supports_location(platform, content_type))
+
     def test_six_platform_matrix_matches_recovered_schemas(self) -> None:
         expected_supported = {
             ("小红书", "video"), ("小红书", "article"),

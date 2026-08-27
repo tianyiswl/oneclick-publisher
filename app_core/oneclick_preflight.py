@@ -10,11 +10,16 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime
 from html import escape, unescape
+from html.parser import HTMLParser
 from pathlib import Path
 import re
 from urllib.parse import parse_qs, urlparse
 
-from . import account_service
+from . import (
+    account_service,
+    video_channel_location_service,
+    wechat_location_service,
+)
 from .paths import COOKIE_DIR
 
 
@@ -242,6 +247,24 @@ def _account_for_payload(payload: dict) -> dict:
     raise PreflightError("未找到一键发已登录账号，请先在账号管理中完成登录")
 
 
+def _validate_xhs_account_id(payload: dict, account: dict) -> int:
+    account_ids = payload.get("accountIds")
+    try:
+        actual_id = int(account.get("id") or 0)
+        selected_id = (
+            int(account_ids[0])
+            if isinstance(account_ids, list) and len(account_ids) == 1
+            else 0
+        )
+    except (TypeError, ValueError) as exc:
+        raise PreflightError("小红书当前账号 ID 无效") from exc
+    if actual_id <= 0 or selected_id <= 0 or actual_id != selected_id:
+        raise PreflightError(
+            "小红书当前账号与任务选中账号 ID 不一致"
+        )
+    return actual_id
+
+
 def _wechat_template_for_payload(payload: dict, account: dict | None = None) -> str:
     """根据明确内容包标记或账号身份选择公众号正文模板。"""
 
@@ -434,6 +457,116 @@ def _wechat_payload_text(payload: dict) -> tuple[str, str]:
     return title[:64], description
 
 
+class _FrozenWechatHtmlParser(HTMLParser):
+    _BLOCKS = frozenset({"p", "h1", "h2", "h3", "li", "blockquote"})
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.output: list[str] = []
+        self.blocks: list[tuple[str, list[str]]] = []
+        self.visible_parts: list[str] = []
+        self.last_block = ""
+        self.images: list[tuple[str, str]] = []
+
+    def _append_text(self, value: str) -> None:
+        if not value:
+            return
+        self.visible_parts.append(value)
+        for _tag, parts in self.blocks:
+            parts.append(value)
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        lowered = tag.lower()
+        if lowered == "img":
+            source = next((value or "" for name, value in attrs if name.lower() == "src"), "")
+            current = " ".join(self.blocks[-1][1]).strip() if self.blocks else ""
+            self.images.append((source, " ".join((current or self.last_block).split())))
+            return
+        self.output.append(self.get_starttag_text() or f"<{tag}>")
+        if lowered in self._BLOCKS:
+            # innerText 会在块级节点前产生可见换行；这里记为一个
+            # 空格，避免图注等行内节点与后续标题被误判为内容不一致。
+            self.visible_parts.append(" ")
+            for _tag, parts in self.blocks:
+                parts.append(" ")
+            self.blocks.append((lowered, []))
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() == "img":
+            self.handle_starttag(tag, attrs)
+            return
+        self.output.append(self.get_starttag_text() or f"<{tag}/>")
+
+    def handle_endtag(self, tag: str) -> None:
+        lowered = tag.lower()
+        self.output.append(f"</{tag}>")
+        if lowered not in self._BLOCKS:
+            return
+        for index in range(len(self.blocks) - 1, -1, -1):
+            block_tag, parts = self.blocks[index]
+            if block_tag != lowered:
+                continue
+            self.last_block = " ".join(unescape("".join(parts)).split())
+            del self.blocks[index]
+            self.visible_parts.append(" ")
+            break
+
+    def handle_data(self, data: str) -> None:
+        self.output.append(data)
+        self._append_text(data)
+
+    def handle_entityref(self, name: str) -> None:
+        value = f"&{name};"
+        self.output.append(value)
+        self._append_text(unescape(value))
+
+    def handle_charref(self, name: str) -> None:
+        value = f"&#{name};"
+        self.output.append(value)
+        self._append_text(unescape(value))
+
+    def handle_comment(self, data: str) -> None:
+        self.output.append(f"<!--{data}-->")
+
+
+def _wechat_prepare_frozen_html(
+    content_html: str,
+    files: list[Path],
+) -> tuple[str, list[Path], list[str], str]:
+    """保留冻结排版，只移出本地图片供平台工具栏逐张上传。"""
+
+    parser = _FrozenWechatHtmlParser()
+    try:
+        parser.feed(str(content_html or ""))
+        parser.close()
+    except Exception as exc:
+        raise PreflightError("公众号冻结 HTML 无法安全解析") from exc
+    available: dict[str, Path] = {}
+    for path in files:
+        name = Path(path).name
+        if name in available:
+            raise PreflightError("公众号冻结 HTML 正文图片文件名不唯一")
+        available[name] = Path(path)
+    ordered_files: list[Path] = []
+    anchors: list[str] = []
+    for source, anchor in parser.images:
+        name = Path(source).name
+        path = available.get(name)
+        if path is None:
+            raise PreflightError(f"公众号冻结 HTML 图片未在发布包中找到：{name or source}")
+        ordered_files.append(path)
+        anchors.append(anchor)
+    if len(ordered_files) != len(files) or {path.resolve() for path in ordered_files} != {
+        path.resolve() for path in files
+    }:
+        raise PreflightError("公众号冻结 HTML 与正文图片清单不一致")
+    sanitized = "".join(parser.output).strip()
+    visible_text = " ".join(unescape("".join(parser.visible_parts)).split())
+    if not sanitized or not visible_text:
+        raise PreflightError("公众号冻结 HTML 正文为空")
+    return sanitized, ordered_files, anchors, visible_text
+
+
 def _wechat_original_requested(payload: dict) -> bool:
     """只有表单明确传入布尔值 true 时才允许进入作者流程。"""
 
@@ -618,6 +751,29 @@ async def _wechat_fill_rich_text(
     return _wechat_markdown_visible_text(markdown_text)
 
 
+async def _wechat_fill_digest(page, digest: str) -> None:
+    """填写并回读唯一可见摘要字段；找不到时不把正文回读冒充摘要。"""
+
+    expected = str(digest or "").strip()
+    if not expected:
+        raise PreflightError("公众号冻结包摘要不能为空")
+    locator = page.locator(
+        'textarea[placeholder*="摘要"],input[placeholder*="摘要"],'
+        'textarea[name*="digest" i],input[name*="digest" i]'
+    )
+    visible = []
+    for index in range(await locator.count()):
+        node = locator.nth(index)
+        if await node.is_visible() and await node.is_enabled():
+            visible.append(node)
+    if len(visible) != 1:
+        raise PreflightError("公众号摘要字段不是唯一可用控件")
+    await visible[0].fill(expected, timeout=10_000)
+    actual = " ".join((await visible[0].input_value()).split())
+    if actual != " ".join(expected.split()):
+        raise PreflightError("公众号摘要字段回读不一致")
+
+
 async def _set_dom_value(locator, value: str) -> None:
     """兼容平台编辑器的受控输入框，只派发输入事件、不提交表单。"""
 
@@ -643,6 +799,7 @@ async def _xhs_preflight(page, payload: dict) -> str:
     try:
         adapter = XhsNativeAdapter(payload)
         readback = await adapter.fill_content(page)
+        location_readback = await adapter.apply_location(page)
         topic_nodes = await adapter.fill_official_topics(page)
         await adapter.set_declarations(page)
         if payload.get("enableTimer") is True:
@@ -655,7 +812,9 @@ async def _xhs_preflight(page, payload: dict) -> str:
             await adapter.verify_immediate_publish(page)
             schedule_readback = "立即发布"
     except XhsNativeAdapterError as exc:
-        raise PreflightError(str(exc)) from exc
+        error_code = str(getattr(exc, "error_code", "") or "").strip()
+        suffix = f"（错误码 {error_code}）" if error_code else ""
+        raise PreflightError(f"{exc}{suffix}") from exc
 
     label = "图文" if readback["contentType"] == "article" else "视频"
     # 安全边界：预检允许回填并回读素材、文本、官方话题、声明与定时
@@ -665,7 +824,13 @@ async def _xhs_preflight(page, payload: dict) -> str:
         f"小红书{label}素材已由平台回读{readback['mediaCount']}项，"
         f"标题、正文、{len(topic_nodes)}个官方话题、"
         f"声明配置和发布时间（{schedule_readback}）已回读；"
-        "未保存草稿、未预览、未发布"
+        + (
+            f"当次候选三字段已重新核验，编辑页已回读地点名"
+            f"“{location_readback['editorNameReadback']}”；"
+            if location_readback is not None
+            else "未设置地点；"
+        )
+        + "未主动保存草稿、未预览、未发布"
     )
 
 
@@ -1067,9 +1232,10 @@ async def _wechat_cover_crop_snapshot(page) -> dict:
             labels.includes(normalize(element.innerText || element.textContent))
           );
           const usable = matching.filter(element => visible(element) && enabled(element));
-          const hidden = matching.filter(element => !visible(element) || !enabled(element));
-          if (usable.length === 1) {
-            usable[0].setAttribute('data-oneclick-cover-confirm', '1');
+          const renderedControls = matching.filter(element => rendered(element) && enabled(element));
+          const hidden = matching.filter(element => !rendered(element) || !enabled(element));
+          if (renderedControls.length === 1) {
+            renderedControls[0].setAttribute('data-oneclick-cover-confirm', '1');
           }
           const loading = dialog
             ? Array.from(dialog.querySelectorAll(
@@ -1123,6 +1289,9 @@ async def _wechat_cover_crop_snapshot(page) -> dict:
             usableControls: usable.map(element =>
               normalize(element.innerText || element.textContent)
             ),
+            renderedControls: renderedControls.map(element =>
+              normalize(element.innerText || element.textContent)
+            ),
             hiddenControls: hidden.map(element =>
               normalize(element.innerText || element.textContent)
             ),
@@ -1147,7 +1316,11 @@ async def _wechat_wait_cover_crop_ready(
         last = await _wechat_cover_crop_snapshot(page)
         if int(last.get("dialogCount") or 0) > 1:
             raise PreflightError("公众号同时出现多个封面裁剪弹层，预检拒绝猜测")
-        controls = list(last.get("usableControls") or [])
+        controls = list(
+            last.get("renderedControls")
+            if "renderedControls" in last
+            else last.get("usableControls") or []
+        )
         if len(controls) > 1:
             raise PreflightError("公众号封面裁剪出现多个可用确认控件，预检拒绝猜测")
         if controls:
@@ -1164,6 +1337,18 @@ async def _wechat_wait_cover_crop_ready(
     if last.get("hiddenControls"):
         raise PreflightError("公众号封面裁剪完成控件存在但不可见或不可用")
     raise PreflightError("公众号封面裁剪弹层未显示真实可用的完成控件")
+
+
+async def _wechat_click_cover_confirm(page) -> None:
+    """滚动到唯一确认控件后点击，兼容高于浏览器视口的裁剪弹层。"""
+
+    finish_button = page.locator('[data-oneclick-cover-confirm="1"]')
+    if await finish_button.count() != 1:
+        raise PreflightError("公众号封面裁剪确认控件状态已变化")
+    await finish_button.scroll_into_view_if_needed(timeout=10_000)
+    if not await finish_button.is_visible() or not await finish_button.is_enabled():
+        raise PreflightError("公众号封面裁剪确认控件已变为不可用")
+    await finish_button.click(timeout=10_000)
 
 
 async def _wechat_wait_cover_return_to_editor(
@@ -1274,12 +1459,7 @@ async def _wechat_select_cover_from_content(page, editor, cover_image_index: int
     await next_button.click(timeout=10_000)
     completion_mode, _snapshot = await _wechat_wait_cover_crop_ready(page)
     if completion_mode == "confirm":
-        finish_button = page.locator('[data-oneclick-cover-confirm="1"]')
-        if await finish_button.count() != 1:
-            raise PreflightError("公众号封面裁剪确认控件状态已变化")
-        if not await finish_button.is_visible() or not await finish_button.is_enabled():
-            raise PreflightError("公众号封面裁剪确认控件已变为不可用")
-        await finish_button.click(timeout=10_000)
+        await _wechat_click_cover_confirm(page)
     await _wechat_wait_cover_return_to_editor(page)
 
 
@@ -1661,21 +1841,49 @@ async def _wechat_preflight(
     title_editor = editors.nth(0)
     editor = editors.nth(1)
     await title_editor.fill(title, force=True, timeout=10_000)
-    visible_description = await _wechat_fill_rich_text(
-        editor,
-        description,
-        template_id,
-    )
+    frozen_html_mode = payload.get("frozenWechatDraftHtml") is True
+    frozen_image_anchors: list[str] | None = None
+    if frozen_html_mode:
+        sanitized_html, files, frozen_image_anchors, visible_description = (
+            _wechat_prepare_frozen_html(
+                str(payload.get("contentHtml") or ""),
+                files,
+            )
+        )
+        await editor.evaluate(
+            """(element, value) => {
+                element.innerHTML = value;
+                element.dispatchEvent(new InputEvent('input', {
+                    bubbles: true,
+                    inputType: 'insertText',
+                    data: null,
+                }));
+            }""",
+            sanitized_html,
+        )
+    else:
+        visible_description = await _wechat_fill_rich_text(
+            editor,
+            description,
+            template_id,
+        )
     if _normalized_page_text(await title_editor.inner_text()) != _normalized_page_text(title):
         raise PreflightError("公众号标题字段未能回读测试值")
     if _normalized_page_text(await editor.inner_text()) != _normalized_page_text(visible_description):
         raise PreflightError("公众号正文字段未能回读测试值")
+    digest = str(payload.get("digest") or "").strip()
+    if frozen_html_mode:
+        await _wechat_fill_digest(page, digest)
     # 当前公众号封面没有独立本地文件输入：指定封面需先进入正文图片链路，
     # 再经“从正文选择”设为封面。全程不触碰草稿、预览或发表控件。
-    image_anchors = _wechat_resolve_body_image_anchors(
-        description,
-        files,
-        list(payload.get("imagePlacements") or []),
+    image_anchors = (
+        frozen_image_anchors
+        if frozen_image_anchors is not None
+        else _wechat_resolve_body_image_anchors(
+            description,
+            files,
+            list(payload.get("imagePlacements") or []),
+        )
     )
     inserted_images = await _wechat_prepare_article_images(
         page,
@@ -1689,12 +1897,31 @@ async def _wechat_preflight(
         inserted_images,
         image_anchors,
     )
+    try:
+        location_readback = await wechat_location_service.apply_wechat_location(
+            page,
+            payload,
+            expected_account_id=(
+                int(account.get("id") or 0) if isinstance(account, dict) else None
+            ),
+        )
+    except wechat_location_service.WechatLocationError as exc:
+        raise PreflightError(str(exc)) from exc
+    location_message = (
+        f"正文地点已重新搜索并回读：{location_readback['name']}；"
+        if location_readback is not None
+        else "未添加正文地点；"
+    )
     author_message = "未勾选原创，作者流程已完全跳过；"
     if _wechat_original_requested(payload):
         author_name = await _wechat_select_default_author(page)
         author_message = f"原创作者已选择并回读：{author_name}；"
     content_label = "图文" if content_type == "article" else "文字"
-    template_name = _WECHAT_MOBILE_TEMPLATES[template_id]["name"]
+    template_name = (
+        "冻结包原始排版"
+        if frozen_html_mode
+        else _WECHAT_MOBILE_TEMPLATES[template_id]["name"]
+    )
     # 安全边界：不点击“保存为草稿”“预览”“发表”。
     image_message = (
         f"正文图片已插入并完成最终位置回读 {inserted_images} 张；"
@@ -1703,7 +1930,7 @@ async def _wechat_preflight(
     )
     return (
         f"公众号{content_label}封面已上传，标题和正文已回读，已套用{template_name}；"
-        f"{image_message}{author_message}"
+        f"{image_message}{location_message}{author_message}"
         "未保存草稿、未预览、未发表"
     )
 
@@ -1787,8 +2014,32 @@ async def _video_channel_video_preflight(page, payload: dict) -> str:
     if not description_ok or not title_ok:
         missing = "视频描述" if not description_ok else "短标题"
         raise PreflightError(f"视频号{missing}字段未能回读测试值")
+    account_ids = payload.get("accountIds")
+    expected_account_id = (
+        int(account_ids[0])
+        if isinstance(account_ids, list) and len(account_ids) == 1
+        else None
+    )
+    try:
+        location_readback = (
+            await video_channel_location_service.apply_video_channel_location(
+                page,
+                payload,
+                expected_account_id=expected_account_id,
+            )
+        )
+    except video_channel_location_service.VideoChannelLocationError as exc:
+        raise PreflightError(str(exc)) from exc
+    location_message = (
+        f"位置已重新搜索并回读：{location_readback['name']}；"
+        if location_readback is not None
+        else "未添加位置；"
+    )
     # 安全边界：绝不定位或点击发表、预览、存草稿等按钮。
-    return "视频号视频素材已上传，视频描述和短标题已回读；未保存草稿、未预览、未发表"
+    return (
+        "视频号视频素材已上传，视频描述和短标题已回读；"
+        f"{location_message}未保存草稿、未预览、未发表"
+    )
 
 
 async def _video_channel_graphic_preflight(page, payload: dict) -> str:
@@ -2315,9 +2566,21 @@ async def _douyin_set_location(page, payload: dict) -> str:
     options: list = []
     candidates: list[dict[str, str]] = []
     matched_indexes = []
+    # 预检必须重新读取当前编辑页的完整地点身份。初次搜索或缓存中的
+    # 地址不能替代本次页面回读；只有名称、完整地址和 POI 标识齐全的
+    # 当前候选才有资格进入精确匹配与点击。
+    from .douyin_location_service import normalize_publish_location_candidate
+
     for _ in range(24):
         options, candidates = await _douyin_visible_location_options(page)
-        matched_indexes = _douyin_location_match_indexes(selected_poi, candidates)
+        complete_candidates = [
+            normalize_publish_location_candidate(candidate) or {}
+            for candidate in candidates
+        ]
+        matched_indexes = _douyin_location_match_indexes(
+            selected_poi,
+            complete_candidates,
+        )
         if len(matched_indexes) == 1:
             break
         await page.wait_for_timeout(250)
@@ -2362,31 +2625,49 @@ async def _douyin_video_preflight(page, payload: dict) -> str:
     await upload.wait_for(state="attached", timeout=15_000)
     await upload.set_input_files(str(files[0]))
     await page.wait_for_url("**/creator-micro/content/post/video*", timeout=30_000)
-    await _douyin_fill_title_and_description(
-        page, title, description,
-        title_placeholder="填写作品标题，为作品获得更多流量", label="视频",
+    # 预检与正式发布必须使用同一套标题、正文、官方话题选择和页面回读。
+    # 旧预检只填写普通文本，导致“预检成功”不能证明正式阶段的话题可用。
+    from uploader.douyin_uploader.main import DouYinVideo
+
+    expected_topics = [
+        str(tag).strip().lstrip("#")
+        for tag in payload.get("tags") or []
+        if str(tag).strip().lstrip("#")
+    ]
+    editor_helper = DouYinVideo(
+        title=title,
+        file_path=str(files[0]),
+        tags=expected_topics,
+        publish_date=0,
+        account_file="",
+        dry_run=True,
+        dry_run_hold_browser=False,
+        description=description,
     )
+    try:
+        editor_readback = await editor_helper.sync_uploaded_editor_content(
+            page,
+            title=title,
+            description=description,
+            tags=expected_topics,
+        )
+    except Exception as exc:
+        error_code = str(getattr(exc, "error_code", "") or "")
+        suffix = f"（错误码 {error_code}）" if error_code else ""
+        raise PreflightError(
+            f"抖音标题、正文或平台话题未能按正式合同回读："
+            f"{_normalized_page_text(exc)[:220]}{suffix}"
+        ) from exc
+    confirmed_topics = list(editor_readback.get("tags") or [])
     location_name = await _douyin_set_location(page, payload)
     declaration_note = ""
     if payload.get("aiGenerated") is True:
         # 复用正式发布上传器已经过回归验证的自主声明选择逻辑。这里仅在
         # 编辑页选择并回读，不定位或点击发布、暂存、预览等结果性控件。
-        from uploader.douyin_uploader.main import DouYinVideo
-
-        declarer = DouYinVideo(
-            title=title,
-            file_path=str(files[0]),
-            tags=[],
-            publish_date=0,
-            account_file="",
-            dry_run=True,
-            dry_run_hold_browser=False,
-            description=description,
-        )
-        declarer.ai_generated = True
-        declarer.content_declaration = ""
+        editor_helper.ai_generated = True
+        editor_helper.content_declaration = ""
         try:
-            declaration = await declarer.set_ai_generated_declaration(page)
+            declaration = await editor_helper.set_ai_generated_declaration(page)
         except Exception as exc:
             raise PreflightError(
                 f"抖音 AI 生成内容声明未能写入并回读：{_normalized_page_text(exc)[:160]}"
@@ -2397,32 +2678,30 @@ async def _douyin_video_preflight(page, payload: dict) -> str:
     # 安全边界：绝不定位或点击“发布”“发布暂存离开”“预览”等按钮。
     location_note = f"，定位“{location_name}”已回读" if location_name else "，未添加定位"
     return (
-        f"抖音视频素材已上传，标题和描述已回读{location_note}"
+        f"抖音视频素材已上传，标题、正文和 {len(confirmed_topics)} 个平台话题已回读{location_note}"
         f"{declaration_note}；未保存草稿、未预览、未发布"
     )
 
 
 async def _douyin_graphic_preflight(page, payload: dict) -> str:
-    """抖音图文预检：上传图片序列、填写、回读，不创建草稿。"""
+    """抖音图文预检与矩阵正式发布共用同一填写、话题和定时回读合同。"""
 
-    files = [Path(str(item)).resolve() for item in payload.get("fileList") or []]
-    if not files or not all(path.is_file() for path in files):
-        raise PreflightError("抖音图文预检缺少可读取的图片素材")
-    if len(files) > 35:
-        raise PreflightError("抖音图文一次最多可上传 35 张图片")
-    title, description = _payload_text(payload, "抖音图文预检")
-    await page.goto(f"{_DOUYIN_UPLOAD_URL}?default-tab=3", wait_until="domcontentloaded", timeout=45_000)
-    upload = page.locator('input[type=file]').first
-    await upload.wait_for(state="attached", timeout=15_000)
-    await upload.set_input_files([str(path) for path in files])
-    await page.wait_for_url("**/creator-micro/content/post/image*", timeout=30_000)
-    await _douyin_fill_title_and_description(
-        page, title, description, title_placeholder="添加作品标题", label="图文",
+    from .douyin_graphic_editor import DouyinGraphicEditor, DouyinGraphicEditorError
+
+    try:
+        readback = await DouyinGraphicEditor().prepare(page, payload)
+    except DouyinGraphicEditorError as exc:
+        raise PreflightError(f"{exc}（错误码 {exc.error_code}）") from exc
+    schedule_note = (
+        f"，定时 {readback.scheduled_at} 已回读"
+        if readback.scheduled_at
+        else "，立即发布状态已回读"
     )
-    location_name = await _douyin_set_location(page, payload)
-    # 安全边界：不定位或点击预览、暂存、发布等会产生平台内容结果的控件。
-    location_note = f"，定位“{location_name}”已回读" if location_name else "，未添加定位"
-    return f"抖音图文已上传 {len(files)} 张图片，标题和描述已回读{location_note}；未保存草稿、未预览、未发布"
+    return (
+        f"抖音图文已上传 {readback.image_count} 张图片，"
+        f"标题、正文和 {len(readback.tags)} 个官方话题已回读{schedule_note}；"
+        "未保存草稿、未预览、未点击最终发布"
+    )
 
 
 async def _douyin_text_preflight(page, payload: dict) -> str:
@@ -2602,6 +2881,14 @@ async def run_preflight(payload: dict) -> dict:
     platform_type = int(account["type"])
     if platform_type not in {1, 2, 3, 4, 5, 10}:
         raise PreflightError("当前真实预检仅接入小红书、视频号、抖音、快手、B站与公众号")
+    if platform_type == 1:
+        _validate_xhs_account_id(payload, account)
+        from .xhs_native_adapter import XhsNativeAdapterError, build_native_contract
+
+        try:
+            build_native_contract(payload)
+        except XhsNativeAdapterError as exc:
+            raise PreflightError(str(exc)) from exc
     from playwright.async_api import async_playwright
 
     playwright = await async_playwright().start()

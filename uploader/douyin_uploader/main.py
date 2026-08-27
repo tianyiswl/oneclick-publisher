@@ -8,6 +8,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from playwright.async_api import Playwright, async_playwright, Page
 import os
+import sys
 import asyncio
 from PIL import Image
 
@@ -26,7 +27,21 @@ from utils.publish_limits import normalize_publish_tags
 
 
 class TopicCandidateUnavailable(RuntimeError):
-    """抖音未返回某个话题的精确候选。"""
+    """抖音话题入口或写入回读在有限重试后仍不可用。"""
+
+    error_code = "douyin_topic_candidates_unavailable"
+
+
+class TopicEntityMissing(TopicCandidateUnavailable):
+    """官方话题候选未能形成平台实体，普通 #文字不算成功。"""
+
+    error_code = "douyin_topic_entity_missing"
+
+
+class RawMentionUnsupported(RuntimeError):
+    """正文内的原始 @文字不能冒充平台提及实体。"""
+
+    error_code = "douyin_raw_mention_unsupported"
 
 
 async def cookie_auth(account_file):
@@ -357,7 +372,13 @@ class DouYinVideo(object):
         return []
 
     async def clear_platform_title(self, page):
-        title_inputs = await self._visible_title_inputs(page)
+        title_inputs = []
+        for attempt in range(30):
+            title_inputs = await self._visible_title_inputs(page)
+            if title_inputs:
+                break
+            if attempt < 29:
+                await page.wait_for_timeout(500)
         if len(title_inputs) != 1:
             raise RuntimeError(
                 f"抖音独立标题输入框数量异常：{len(title_inputs)}，已停止填写"
@@ -387,6 +408,10 @@ class DouYinVideo(object):
             raise RuntimeError("抖音作品详情为空，已停止填写")
         if "#" in body:
             raise RuntimeError("抖音作品详情包含手写 # 文本，已停止填写")
+        if re.search(r"(?:^|\s)@[^\s@#]+", body):
+            raise RawMentionUnsupported(
+                "抖音作品详情包含未经平台候选回读的 @文本，已停止填写"
+            )
 
         await self._fill_editor_body(page, editor, body)
         expected_topics = [str(tag).strip().lstrip("#") for tag in self.tags if str(tag).strip().lstrip("#")]
@@ -400,16 +425,13 @@ class DouYinVideo(object):
             expected_topics,
         )
         if skipped_topics:
-            if not confirmed_topics:
-                raise RuntimeError("抖音没有返回任何可用的话题候选，已停止填写")
-            self.tags = confirmed_topics
-            douyin_logger.warning(
-                f"抖音未返回精确候选，已跳过单个话题：{skipped_topics}；"
-                f"保留话题：{confirmed_topics}"
+            raise TopicEntityMissing(
+                "抖音话题在有限重试后仍未形成平台实体，已停止填写："
+                + "、".join(skipped_topics)
             )
 
         self.form_verification = await self.verify_prepublish_form(page, require_covers=False)
-        douyin_logger.info(f"抖音作品详情已写入，并确认{len(confirmed_topics)}个候选话题组件")
+        douyin_logger.info(f"抖音作品详情已写入，并回读确认{len(confirmed_topics)}个平台话题")
 
     async def sync_uploaded_editor_content(
         self,
@@ -443,18 +465,77 @@ class DouYinVideo(object):
         }
 
     async def _apply_platform_topics(self, page, editor, body, expected_topics):
-        confirmed_topics = []
-        skipped_topics = []
-        for tag_name in expected_topics:
-            try:
-                await self._add_platform_topic(page, editor, tag_name)
-                confirmed_topics.append(tag_name)
-            except TopicCandidateUnavailable:
-                skipped_topics.append(tag_name)
+        if not expected_topics:
+            return [], []
+        last_missing = list(expected_topics)
+        # 平台话题接口偶尔会短暂返回空列表。预检与正式发布共用这里的两轮
+        # 有限重试；每轮都先清空编辑器再完整重建，绝不保留半套话题组件。
+        for attempt in range(2):
+            if attempt:
+                await page.wait_for_timeout(1_000)
                 await self._fill_editor_body(page, editor, body)
-                for confirmed_tag in confirmed_topics:
-                    await self._add_platform_topic(page, editor, confirmed_tag)
-        return confirmed_topics, skipped_topics
+            confirmed_topics = []
+            try:
+                for tag_name in expected_topics:
+                    await self._add_platform_topic(page, editor, tag_name)
+                    confirmed_topics.append(tag_name)
+                await self._wait_platform_topics_stable(
+                    page,
+                    editor,
+                    expected_topics,
+                )
+                return confirmed_topics, []
+            except TopicCandidateUnavailable as exc:
+                failed_tag = str(exc).split("“", 1)[-1].split("”", 1)[0]
+                failed_index = len(confirmed_topics)
+                explicit_missing = getattr(exc, "missing_topics", None)
+                if explicit_missing is not None:
+                    last_missing = list(explicit_missing)
+                elif failed_index < len(expected_topics):
+                    last_missing = list(expected_topics[failed_index:])
+                else:
+                    # 所有话题都曾短暂写入，但稳定回读阶段又被平台移除。
+                    # 此时不能把缺失列表误算为空并继续进入后续表单验证。
+                    last_missing = list(expected_topics)
+                douyin_logger.warning(
+                    f"抖音话题写入第 {attempt + 1}/2 轮未完整回读："
+                    f"{failed_tag or last_missing[0]}"
+                )
+        await self._fill_editor_body(page, editor, body)
+        return [], last_missing
+
+    async def _wait_platform_topics_stable(
+        self,
+        page,
+        editor,
+        expected_topics,
+        *,
+        attempts=8,
+        stable_reads=3,
+    ):
+        """等待平台完成话题异步转换，避免一次成功回读掩盖随后丢失。"""
+
+        expected = list(expected_topics)
+        consecutive = 0
+        last_topics = []
+        # 新版编辑器会在输入结束后异步重排或移除不接受的话题。先给平台
+        # 一个结算窗口，再要求连续回读一致，预检与正式发布共用此合同。
+        await page.wait_for_timeout(700)
+        for attempt in range(max(1, int(attempts))):
+            last_topics = await self._read_platform_topics(editor)
+            if last_topics == expected:
+                consecutive += 1
+                if consecutive >= max(1, int(stable_reads)):
+                    return last_topics
+            else:
+                consecutive = 0
+            if attempt < max(1, int(attempts)) - 1:
+                await page.wait_for_timeout(400)
+        error = TopicEntityMissing(
+            f"抖音平台话题稳定回读不一致：期望={expected}，实际={last_topics}"
+        )
+        error.missing_topics = [topic for topic in expected if topic not in last_topics]
+        raise error
 
     async def _fill_editor_body(self, page, editor, body):
         """清空后写入作品文案，并确认编辑器没有保留旧内容。
@@ -469,7 +550,7 @@ class DouYinVideo(object):
         for attempt in range(1, 4):
             await editor.fill("")
             await editor.click(force=True)
-            await page.keyboard.press("Control+A")
+            await page.keyboard.press("Meta+A" if sys.platform == "darwin" else "Control+A")
             await page.keyboard.press("Backspace")
             await page.wait_for_timeout(250)
 
@@ -514,8 +595,40 @@ class DouYinVideo(object):
         return "".join(str(value or "").replace("\u200b", "").split()).lstrip("#")
 
     async def _read_topic_mentions(self, editor):
-        values = await editor.locator('[data-mention="#"]').all_text_contents()
+        # 普通官方话题是 ``#`` 实体；平台活动话题使用
+        # ``activity`` 实体。两者都是点选官方候选后的不可编辑
+        # 节点，而 ``span[data-string=true]`` 中的 #文字仍不纳入。
+        values = await editor.locator(
+            '[data-mention="#"], [data-mention="activity"]'
+        ).all_text_contents()
         return [self._normalize_topic_mention(value) for value in values if self._normalize_topic_mention(value)]
+
+    async def _read_platform_topics(self, editor):
+        """只回读平台已转换的话题实体，普通 #文字一律忽略。"""
+
+        return await self._read_topic_mentions(editor)
+
+    @staticmethod
+    def _strip_trailing_topic_text(value, expected_topics):
+        """从编辑器回读中只移除由本轮写入的尾部话题。"""
+
+        text = str(value or "").replace("\u200b", "")
+        alternatives = "|".join(
+            sorted(
+                (re.escape(str(topic)) for topic in expected_topics if str(topic)),
+                key=len,
+                reverse=True,
+            )
+        )
+        if not alternatives:
+            return text.rstrip()
+        pattern = re.compile(rf"\s*#(?:{alternatives})\s*$")
+        while True:
+            match = pattern.search(text)
+            if match is None:
+                break
+            text = text[: match.start()]
+        return text.rstrip()
 
     async def _read_raw_editor_text(self, editor):
         span_values = await editor.locator('span[data-string="true"]').all_text_contents()
@@ -524,7 +637,9 @@ class DouYinVideo(object):
         return await editor.evaluate(
             """
             node => {
-              const mentions = [...node.querySelectorAll('[data-mention="#"]')];
+              const mentions = [...node.querySelectorAll(
+                '[data-mention="#"], [data-mention="activity"]'
+              )];
               const previous = mentions.map(item => item.style.display);
               try {
                 mentions.forEach(item => { item.style.display = 'none'; });
@@ -553,7 +668,9 @@ class DouYinVideo(object):
                 raise RuntimeError(f"抖音话题“{tag_name}”出现多个可见的精确候选，已停止选择")
             if attempt < self.TOPIC_CANDIDATE_WAIT_ATTEMPTS - 1:
                 await page.wait_for_timeout(500)
-        raise TopicCandidateUnavailable(f"抖音未返回话题“{tag_name}”的精确平台候选")
+        raise TopicEntityMissing(
+            f"抖音未返回话题“{tag_name}”的精确平台候选"
+        )
 
     async def _add_platform_topic(self, page, editor, tag_name):
         add_controls = await self._visible_enabled_items(page.get_by_text("#添加话题", exact=True))
@@ -561,19 +678,21 @@ class DouYinVideo(object):
             raise RuntimeError(
                 f"抖音“#添加话题”入口数量异常：{len(add_controls)}，已停止选择“{tag_name}”"
             )
-        before_mentions = await self._read_topic_mentions(editor)
+        before_topics = await self._read_platform_topics(editor)
         await add_controls[0].click(timeout=5000)
         await editor.press_sequentially(tag_name, delay=50)
         candidate = await self._find_unique_topic_candidate(page, tag_name)
         await candidate.click(timeout=5000)
 
         for attempt in range(10):
-            mentions = await self._read_topic_mentions(editor)
-            if len(mentions) == len(before_mentions) + 1 and mentions[-1] == tag_name:
+            topics = await self._read_platform_topics(editor)
+            if topics == [*before_topics, tag_name]:
                 return
             if attempt < 9:
                 await page.wait_for_timeout(300)
-        raise RuntimeError(f"抖音话题“{tag_name}”点击候选后未形成平台话题组件")
+        raise TopicEntityMissing(
+            f"抖音话题“{tag_name}”点选官方候选后未形成平台话题实体"
+        )
 
     @staticmethod
     def _normalize_body_text(value):
@@ -589,22 +708,26 @@ class DouYinVideo(object):
         editor = page.locator(".zone-container").first
         await editor.wait_for(state="visible", timeout=15000)
         expected_body = self.description if self.description is not None else self.title
+        expected_topics = [str(tag).strip().lstrip("#") for tag in self.tags if str(tag).strip().lstrip("#")]
         raw_text = await self._read_raw_editor_text(editor)
-        if "#" in raw_text:
+        # ``_read_raw_editor_text`` 会隐藏已确认的话题实体。因此任何
+        # 剩余 #文字都是未转换成平台实体的原始文字，不能再从
+        # 尾部剥掉后当作成功。
+        body_text = raw_text
+        if "#" in body_text:
             raise RuntimeError("抖音详情中仍存在手写 # 文本，不能保存草稿")
         expected_normalized = self._normalize_body_text(expected_body)
-        actual_normalized = self._normalize_body_text(raw_text)
+        actual_normalized = self._normalize_body_text(body_text)
         if expected_normalized != actual_normalized:
             raise RuntimeError(
                 "抖音详情回读与发布包不一致，不能保存草稿；"
                 f"期望={expected_normalized!r}，实际={actual_normalized!r}"
             )
 
-        expected_topics = [str(tag).strip().lstrip("#") for tag in self.tags if str(tag).strip().lstrip("#")]
-        mentions = await self._read_topic_mentions(editor)
-        if mentions != expected_topics:
+        topics = await self._read_platform_topics(editor)
+        if topics != expected_topics:
             raise RuntimeError(
-                f"抖音平台话题组件不一致：期望={expected_topics}，实际={mentions}"
+                f"抖音平台话题回读不一致：期望={expected_topics}，实际={topics}"
             )
 
         expected_cover_ratios = [ratio for ratio in ("4:3", "3:4") if self.thumbnail_paths.get(ratio)]
@@ -632,8 +755,8 @@ class DouYinVideo(object):
         return {
             "title_confirmed": title_confirmed,
             "detail_confirmed": True,
-            "topics_confirmed": mentions,
-            "topic_entry_method": "platform_candidate_selection",
+            "topics_confirmed": topics,
+            "topic_entry_method": "platform_candidate_entity_readback",
             "covers_confirmed": list(expected_cover_ratios) if require_covers else [],
         }
 

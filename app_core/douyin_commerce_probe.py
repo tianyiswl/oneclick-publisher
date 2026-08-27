@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 from typing import Any, Mapping
 
 from conf import RESOURCE_DIR
@@ -21,7 +22,16 @@ class DouyinCommerceProbeError(RuntimeError):
 def resolve_douyin_commerce_probe(resource_dir: Path | None = None) -> Path:
     """解析并校验只读资源目录中的固定探针视频。"""
 
-    root = Path(resource_dir or RESOURCE_DIR).resolve()
+    root = Path(resource_dir or RESOURCE_DIR)
+    if (
+        resource_dir is None
+        and getattr(sys, "frozen", False)
+        and sys.platform == "darwin"
+    ):
+        bundle_resources = Path(sys.executable).resolve().parent.parent / "Resources"
+        if bundle_resources.is_dir():
+            root = bundle_resources
+    root = root.resolve()
     probe = (root / DOUYIN_COMMERCE_PROBE_RELATIVE_PATH).resolve()
     if not probe.is_relative_to(root):
         raise DouyinCommerceProbeError("探针路径不在资源目录内")

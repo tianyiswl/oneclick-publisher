@@ -33,6 +33,7 @@ from PyQt6.QtWidgets import (
 
 from app_core import account_browser_service, activation_service
 from app_core.branding import APP_ICON_RELATIVE_PATH, APP_TITLE, APP_VERSION, UPGRADE_STORE
+from app_core.source_live_runtime import source_live_data_active
 from app_core.paths import AVATAR_DIR, COOKIE_DIR, DB_PATH, LOG_DIR, ROOT_DIR, VIDEO_DIR
 
 from .background_task import BackgroundTaskRunner
@@ -41,6 +42,7 @@ from .account_page import AccountPage
 from .dashboard_page import DashboardPage
 from .data_monitor_page import DataMonitorPage
 from .douyin_commerce_page import DouyinCommercePage
+from .douyin_graphic_matrix_page import DouyinGraphicMatrixPage
 from .help_dialog import HelpDialog
 from .media_page import MediaPage
 from .publish_page import PublishPage
@@ -338,7 +340,12 @@ class AboutDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle(APP_TITLE)
+        self.source_live_mode = source_live_data_active()
+        self.setWindowTitle(
+            f"{APP_TITLE}｜源码联调（正式账号数据）"
+            if self.source_live_mode
+            else APP_TITLE
+        )
         self.resize(*DEFAULT_MAIN_WINDOW_SIZE)
         self.setMinimumSize(1180, 720)
         self._apply_initial_window_geometry()
@@ -347,12 +354,22 @@ class MainWindow(QMainWindow):
         self.accounts = AccountPage()
         self.media = MediaPage()
         self.publish = PublishPage()
+        self.douyin_graphic_matrix = DouyinGraphicMatrixPage()
+        self.douyin_graphic_matrix.request_account_management.connect(
+            lambda: self._set_current_page(1)
+        )
         self.douyin_commerce = DouyinCommercePage()
         self.douyin_commerce.request_account_management.connect(
             lambda: self._set_current_page(1)
         )
         self.tasks = TaskPage()
         self.tasks.resume_douyin_batch_requested.connect(self._open_douyin_batch_resume)
+        self.tasks.retry_douyin_graphic_matrix_requested.connect(
+            self._open_douyin_graphic_matrix_retry
+        )
+        self.douyin_graphic_matrix.open_task_detail.connect(
+            self.tasks.open_detail_by_id
+        )
         self.data_monitor = DataMonitorPage()
         self.data_monitor.request_account_management.connect(
             lambda: self._set_current_page(1)
@@ -362,6 +379,7 @@ class MainWindow(QMainWindow):
             ("账号管理", self.accounts, "ui/assets/nav-accounts.svg"),
             ("素材管理", self.media, "ui/assets/nav-media.svg"),
             ("发布中心", self.publish, "ui/assets/nav-publish.svg"),
+            ("抖音图文矩阵", self.douyin_graphic_matrix, "ui/assets/nav-publish.svg"),
             ("抖音带货", self.douyin_commerce, "ui/assets/nav-publish.svg"),
             ("任务记录", self.tasks, "ui/assets/nav-tasks.svg"),
             ("数据监测", self.data_monitor, "ui/assets/nav-dashboard.svg"),
@@ -410,6 +428,17 @@ class MainWindow(QMainWindow):
         )
         self._set_current_page(douyin_index)
         self.douyin_commerce.open_batch_resume(int(task_id))
+
+    def _open_douyin_graphic_matrix_retry(self, task_id: int) -> None:
+        """返回图文矩阵页面核对失败账号，不在明细弹窗直接重发。"""
+
+        matrix_index = next(
+            index
+            for index, (label, _page, _icon) in enumerate(self.page_definitions)
+            if label == "抖音图文矩阵"
+        )
+        self._set_current_page(matrix_index)
+        self.douyin_graphic_matrix.open_failed_retry(int(task_id))
 
     def _build_shell(self) -> QWidget:
         shell = QWidget()
@@ -530,9 +559,15 @@ class MainWindow(QMainWindow):
         local_badge_layout = QVBoxLayout(local_badge)
         local_badge_layout.setContentsMargins(12, 10, 12, 10)
         local_badge_layout.setSpacing(2)
-        local_title = QLabel("安全预检模式")
+        local_title = QLabel(
+            "源码联调模式" if self.source_live_mode else "安全预检模式"
+        )
         local_title.setObjectName("localWorkspaceTitle")
-        local_version = QLabel("最终发布需人工确认")
+        local_version = QLabel(
+            "共用正式账号数据 · 发布仍需确认"
+            if self.source_live_mode
+            else "最终发布需人工确认"
+        )
         local_version.setObjectName("localWorkspaceVersion")
         local_badge_layout.addWidget(local_title)
         local_badge_layout.addWidget(local_version)
@@ -644,9 +679,10 @@ class MainWindow(QMainWindow):
             "accounts": 1,
             "media": 2,
             "publish": 3,
-            "commerce": 4,
-            "tasks": 5,
-            "data": 6,
+            "douyin_graphic_matrix": 4,
+            "commerce": 5,
+            "tasks": 6,
+            "data": 7,
         }
         try:
             index = page_indexes[str(page_key)]

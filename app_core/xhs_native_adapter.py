@@ -18,6 +18,8 @@ import re
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from . import xhs_location_service
+
 
 XHS_PUBLISH_URL = (
     "https://creator.xiaohongshu.com/publish/publish?source=official"
@@ -30,11 +32,19 @@ MAX_TOPICS = 10
 
 _IMAGE_EXTENSIONS = {".avif", ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"}
 _VIDEO_EXTENSIONS = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".webm"}
-_AI_LABEL = "AI生成内容"
+_AI_LABELS = (
+    "笔记含AI合成内容",
+    "AI生成内容",
+    "含有AI生成内容",
+)
 
 
 class XhsNativeAdapterError(RuntimeError):
     """小红书字段、控件或回读不能被唯一确认时安全停止。"""
+
+    def __init__(self, message: str, *, error_code: str = "") -> None:
+        self.error_code = str(error_code or "")
+        super().__init__(message)
 
 
 def _normalized(value: object) -> str:
@@ -49,6 +59,59 @@ def _topic_candidate_matches(candidate_name: object, topic: str) -> bool:
     """
 
     return _normalized(candidate_name) == f"#{str(topic).strip().lstrip('#')}"
+
+
+def _topic_entity_label(value: object) -> str:
+    """将小红书官方话题节点的无障碍标记还原为可见话题。"""
+
+    normalized = _normalized(value)
+    match = re.fullmatch(r"#(.+?)\[话题\]#", normalized)
+    return f"#{match.group(1)}" if match else normalized
+
+
+async def _find_unique_official_topic_candidate(
+    page,
+    topic: str,
+    *,
+    max_wait_ms: int = 5_000,
+    poll_interval_ms: int = 400,
+):
+    """等待小红书异步话题联想稳定，并返回唯一精确官方候选。"""
+
+    attempts = max(1, max_wait_ms // max(1, poll_interval_ms) + 1)
+    last_match_count = 0
+    for attempt in range(attempts):
+        candidates = page.locator(".tippy-box .items .item")
+        matched = []
+        for index in range(await candidates.count()):
+            candidate = candidates.nth(index)
+            try:
+                names = candidate.locator(".name")
+                if (
+                    await candidate.is_visible()
+                    and await _is_actual_viewport_visible(candidate)
+                    and await names.count() == 1
+                    and _topic_candidate_matches(
+                        await names.first.inner_text(), topic
+                    )
+                ):
+                    matched.append(candidate)
+            except Exception:
+                continue
+        last_match_count = len(matched)
+        if last_match_count == 1:
+            return matched[0]
+        if attempt < attempts - 1:
+            await page.wait_for_timeout(poll_interval_ms)
+    error_code = (
+        "xhs_topic_candidate_missing"
+        if last_match_count == 0
+        else "xhs_topic_candidate_ambiguous"
+    )
+    raise XhsNativeAdapterError(
+        f"小红书未返回唯一官方话题候选：#{topic}，精确候选={last_match_count}",
+        error_code=error_code,
+    )
 
 
 async def _is_actual_viewport_visible(locator) -> bool:
@@ -144,6 +207,25 @@ def build_native_contract(payload: dict[str, Any]) -> dict[str, Any]:
             "小红书只支持图文或视频，不支持纯文字发布"
         )
 
+    location_fields = (
+        "xhsLocationKeyword",
+        "xhsLocationScope",
+        "xhsLocationPoi",
+        "locationKeyword",
+        "locationScope",
+        "locationPoi",
+    )
+    has_location_fields = any(
+        bool(value) if isinstance(value, dict) else bool(_normalized(value))
+        for value in (payload.get(field) for field in location_fields)
+    )
+    location = None
+    if has_location_fields:
+        try:
+            location = xhs_location_service.normalize_location_selection(payload)
+        except xhs_location_service.XhsLocationSearchError as exc:
+            raise XhsNativeAdapterError(str(exc)) from exc
+
     files = [Path(str(value)).resolve() for value in payload.get("fileList") or []]
     if not files or any(not item.is_file() for item in files):
         raise XhsNativeAdapterError("小红书存在不可读取的本地素材")
@@ -193,7 +275,7 @@ def build_native_contract(payload: dict[str, Any]) -> dict[str, Any]:
         }
         for item in files
     ]
-    return {
+    contract = {
         "formType": "task",
         "contentType": content_type,
         "nativePublishType": "imageText" if content_type == "article" else "video",
@@ -207,7 +289,6 @@ def build_native_contract(payload: dict[str, Any]) -> dict[str, Any]:
         "visibleType": _visibility_code(payload.get("visibility")),
         "scheduledTime": _schedule_timestamp(payload),
         "topics": _topics(payload),
-        "locationKeyword": _normalized(payload.get("locationKeyword")),
         "collectionName": _normalized(payload.get("collectionName")),
         "aiDeclaration": payload.get("aiGenerated") is True,
         "originalDeclaration": payload.get("originalDeclaration") is True,
@@ -217,6 +298,9 @@ def build_native_contract(payload: dict[str, Any]) -> dict[str, Any]:
         "requiresYixiaoerGateway": False,
         "usesPrivateSignatureService": False,
     }
+    if location is not None:
+        contract["location"] = location
+    return contract
 
 
 async def _set_dom_value(locator, value: str) -> None:
@@ -252,6 +336,101 @@ async def _first_visible(locator, label: str):
             f"小红书{label}无法唯一识别，可见候选={len(visible)}"
         )
     return visible[0]
+
+
+async def _find_video_cover_trigger(
+    page,
+    *,
+    max_wait_ms: int = 30_000,
+    poll_interval_ms: int = 500,
+):
+    """按当前页面和旧版兼容顺序寻找唯一封面卡片。"""
+
+    selectors = (
+        ".cover-plugin-preview .upload-cover",
+        ".cover-plugin-preview .default.row",
+        ".cover-plugin-preview .cover",
+        ".cover-plugin-preview [class*='cover']",
+        ".cover-plugin-preview",
+    )
+    visible_total = 0
+    attempts = max(1, max_wait_ms // max(1, poll_interval_ms) + 1)
+    for attempt in range(attempts):
+        for selector in selectors:
+            locator = page.locator(selector)
+            visible = []
+            for index in range(await locator.count()):
+                item = locator.nth(index)
+                try:
+                    # 封面卡片通常在标题/正文下方，尚未滚入视口；Playwright
+                    # 点击会自动滚动。这里要求 CSS 可见和唯一，不把“当前不在
+                    # 视口”误判为入口不存在。
+                    if await item.is_visible():
+                        visible.append(item)
+                except Exception:
+                    continue
+            visible_total = max(visible_total, len(visible))
+            if len(visible) == 1:
+                return visible[0]
+        if attempt < attempts - 1:
+            await page.wait_for_timeout(poll_interval_ms)
+    error_code = (
+        "xhs_cover_trigger_missing"
+        if visible_total == 0
+        else "xhs_cover_trigger_ambiguous"
+    )
+    raise XhsNativeAdapterError(
+        "小红书视频封面入口无法唯一识别，"
+        f"可见候选={visible_total}（错误码 {error_code}）",
+        error_code=error_code,
+    )
+
+
+async def _find_video_cover_upload_input(
+    modal,
+    *,
+    max_wait_ms: int = 20_000,
+    poll_interval_ms: int = 400,
+):
+    """识别封面编辑器内的图片上传控件，兼容 MIME 与扩展名 accept。"""
+
+    attempts = max(1, max_wait_ms // max(1, poll_interval_ms) + 1)
+    last_total = 0
+    last_accepts: list[str] = []
+    for attempt in range(attempts):
+        inputs = modal.locator("input[type=file]")
+        last_total = await inputs.count()
+        candidates = []
+        accepts = []
+        for index in range(last_total):
+            item = inputs.nth(index)
+            try:
+                accept = str(await item.get_attribute("accept") or "").lower()
+            except Exception:
+                continue
+            accepts.append(accept)
+            is_image = "image/" in accept or any(
+                extension in accept for extension in _IMAGE_EXTENSIONS
+            )
+            if is_image and not any(
+                marker in accept for marker in ("video/", ".mp4", ".mov", ".webm")
+            ):
+                candidates.append(item)
+        last_accepts = accepts
+        if len(candidates) == 1:
+            return candidates[0]
+        if len(candidates) > 1:
+            raise XhsNativeAdapterError(
+                "小红书视频封面编辑器返回多个图片上传控件，已安全停止",
+                error_code="xhs_cover_upload_input_ambiguous",
+            )
+        if attempt < attempts - 1:
+            await modal.page.wait_for_timeout(poll_interval_ms)
+    raise XhsNativeAdapterError(
+        "小红书视频封面编辑器未返回图片上传控件："
+        f"文件控件={last_total}，accept={last_accepts}",
+        error_code="xhs_cover_upload_input_missing",
+    )
 
 
 class XhsNativeAdapter:
@@ -401,12 +580,9 @@ class XhsNativeAdapter:
         if self.content_type != "video" or not cover_path:
             return False
 
-        # 页面标题和真正的可点击卡片都显示“设置封面”，不能按纯文字
-        # 匹配。真实交互入口是封面预览区内的 upload-cover 卡片。
-        trigger = await _first_visible(
-            page.locator(".cover-plugin-preview .upload-cover"),
-            "视频封面入口",
-        )
+        # 平台在不同账号灰度中使用 upload-cover 或 default row；按优先级
+        # 逐个查找，仍然要求最终只有一个可见卡片。
+        trigger = await _find_video_cover_trigger(page)
         await trigger.click(timeout=5_000)
 
         modal_candidates = page.locator(
@@ -414,18 +590,7 @@ class XhsNativeAdapter:
             "[aria-modal='true']:has-text('封面')"
         )
         modal = await _first_visible(modal_candidates, "视频封面编辑器")
-        image_inputs = modal.locator("input[type=file][accept*='image']")
-        try:
-            await image_inputs.first.wait_for(state="attached", timeout=20_000)
-        except Exception as exc:
-            raise XhsNativeAdapterError(
-                "小红书视频封面编辑器加载超时"
-            ) from exc
-        if await image_inputs.count() != 1:
-            raise XhsNativeAdapterError(
-                "小红书视频封面编辑器未返回唯一图片上传控件"
-            )
-        image_input = image_inputs.first
+        image_input = await _find_video_cover_upload_input(modal)
         await image_input.set_input_files(cover_path)
         selected_count = await image_input.evaluate(
             "node => node.files ? node.files.length : 0"
@@ -493,6 +658,227 @@ class XhsNativeAdapter:
             raise XhsNativeAdapterError("当前任务不是小红书视频任务")
         return await self.fill_content(page)
 
+    async def apply_location(self, page) -> dict[str, Any] | None:
+        """在当前视频编辑页重新搜索并精确回读已选地点名。"""
+
+        target = self.contract.get("location")
+        if not isinstance(target, dict):
+            return None
+
+        trigger_candidates = page.locator(
+            ".address-card-wrapper .address-card-select"
+        )
+        rendered_triggers = []
+        for index in range(await trigger_candidates.count()):
+            item = trigger_candidates.nth(index)
+            try:
+                if await item.is_visible():
+                    rendered_triggers.append(item)
+            except Exception:
+                continue
+        if len(rendered_triggers) != 1:
+            raise XhsNativeAdapterError(
+                "小红书地点选择控件无法唯一识别，"
+                f"可渲染候选={len(rendered_triggers)}"
+            )
+        try:
+            await rendered_triggers[0].scroll_into_view_if_needed(timeout=10_000)
+        except Exception as exc:
+            raise XhsNativeAdapterError("小红书地点选择控件无法滚动到可见区域") from exc
+        trigger = await _first_visible(trigger_candidates, "地点选择控件")
+
+        disabled = page.locator(".address-card-wrapper .d-select.disabled")
+        for index in range(await disabled.count()):
+            item = disabled.nth(index)
+            try:
+                if await item.is_visible() and await _is_actual_viewport_visible(item):
+                    raise XhsNativeAdapterError("小红书地点控件已禁用，已安全停止")
+            except XhsNativeAdapterError:
+                raise
+            except Exception:
+                continue
+
+        descriptions = page.locator(
+            ".address-card-select .d-select-description"
+        )
+        for index in range(await descriptions.count()):
+            description = descriptions.nth(index)
+            try:
+                if (
+                    await description.is_visible()
+                    and await _is_actual_viewport_visible(description)
+                    and re.search(
+                        r"等\s*\d+\s*个地点",
+                        _normalized(await description.inner_text()),
+                    )
+                ):
+                    raise XhsNativeAdapterError(
+                        "小红书当前是多地点编辑状态，已安全停止"
+                    )
+            except XhsNativeAdapterError:
+                raise
+            except Exception:
+                continue
+
+        await trigger.click(timeout=5_000)
+        location_input = await _first_visible(
+            page.locator(
+                '.address-card-wrapper '
+                '.d-select-input-filter.show input[type="text"]'
+            ),
+            "地点搜索输入框",
+        )
+        keyword = str(target["searchKeyword"])
+
+        def _matches_current_location_response(response) -> bool:
+            try:
+                if (
+                    response.url
+                    != xhs_location_service.XHS_LOCATION_SEARCH_ENDPOINT
+                    or str(response.request.method).upper() != "POST"
+                ):
+                    return False
+                request_body = response.request.post_data_json
+            except Exception:
+                return False
+            if not isinstance(request_body, dict):
+                return False
+            return (
+                _normalized(request_body.get("keyword")) == keyword
+                and request_body.get("page") == 1
+                and not isinstance(request_body.get("page"), bool)
+                and request_body.get("size") == 50
+                and not isinstance(request_body.get("size"), bool)
+                and request_body.get("source") == "WEB"
+                and request_body.get("type") == 3
+                and not isinstance(request_body.get("type"), bool)
+            )
+
+        try:
+            async with page.expect_response(
+                _matches_current_location_response,
+                timeout=15_000,
+            ) as response_info:
+                await location_input.fill(keyword, timeout=5_000)
+            response = await response_info.value
+            response_payload = await response.json()
+            candidates = xhs_location_service.normalize_location_response(
+                response_payload,
+                limit=None,
+            )
+        except xhs_location_service.XhsLocationSearchError as exc:
+            raise XhsNativeAdapterError(str(exc)) from exc
+        except XhsNativeAdapterError:
+            raise
+        except Exception as exc:
+            raise XhsNativeAdapterError(
+                "小红书地点实时搜索响应读取失败"
+            ) from exc
+
+        raw_rows = response_payload.get("poiList")
+        if raw_rows is None:
+            raw_rows = response_payload.get("poi_list")
+        if raw_rows is None and isinstance(response_payload.get("data"), dict):
+            raw_rows = response_payload["data"].get("poiList")
+            if raw_rows is None:
+                raw_rows = response_payload["data"].get("poi_list")
+        if not isinstance(raw_rows, list):
+            raise XhsNativeAdapterError("小红书地点服务返回了无效数据")
+        raw_candidates = [
+            candidate
+            for candidate in (
+                xhs_location_service.normalize_official_location_candidate(row)
+                for row in raw_rows
+            )
+            if candidate is not None
+        ]
+        if len(
+            xhs_location_service.location_match_indexes(target, raw_candidates)
+        ) != 1:
+            raise XhsNativeAdapterError(
+                "小红书当次原始响应未返回唯一的目标地点三字段"
+            )
+
+        matched_indexes = xhs_location_service.location_match_indexes(
+            target,
+            candidates,
+        )
+        if len(matched_indexes) != 1:
+            raise XhsNativeAdapterError(
+                "小红书当次地点候选未按 POI ID、名称和完整地址唯一命中"
+            )
+        same_visible_identity_ids = {
+            str(candidate["poiId"])
+            for candidate in candidates
+            if candidate.get("name") == target.get("name")
+            and candidate.get("address") == target.get("address")
+        }
+        if same_visible_identity_ids != {str(target["poiId"])}:
+            raise XhsNativeAdapterError(
+                "小红书当次候选的名称和地址无法唯一对应目标 POI ID"
+            )
+
+        loading = page.locator(".loading-container")
+        for index in range(await loading.count()):
+            try:
+                await loading.nth(index).wait_for(state="hidden", timeout=10_000)
+            except Exception as exc:
+                raise XhsNativeAdapterError(
+                    "小红书地点候选加载未完成"
+                ) from exc
+
+        dropdown = await _first_visible(
+            page.locator(".custom-dropdown-44"),
+            "地点候选下拉框",
+        )
+        option_rows = dropdown.locator(".option-item")
+        matched_rows = []
+        for index in range(await option_rows.count()):
+            row = option_rows.nth(index)
+            try:
+                names = row.locator(".option-name")
+                addresses = row.locator(".option-subname")
+                if (
+                    await row.is_visible()
+                    and await _is_actual_viewport_visible(row)
+                    and await names.count() == 1
+                    and await addresses.count() == 1
+                    and _normalized(await names.nth(0).inner_text())
+                    == target["name"]
+                    and _normalized(await addresses.nth(0).inner_text())
+                    == target["address"]
+                ):
+                    matched_rows.append(row)
+            except Exception:
+                continue
+        if len(matched_rows) != 1:
+            raise XhsNativeAdapterError(
+                f"小红书页面未返回唯一的同名同地址候选行：{len(matched_rows)}"
+            )
+        await matched_rows[0].click(timeout=5_000)
+        try:
+            await dropdown.wait_for(state="hidden", timeout=10_000)
+        except Exception as exc:
+            raise XhsNativeAdapterError(
+                "小红书地点选择后下拉框未关闭"
+            ) from exc
+
+        selected_description = await _first_visible(
+            page.locator(".address-card-select .d-select-description"),
+            "已选地点名称回读",
+        )
+        editor_name = _normalized(await selected_description.inner_text())
+        if editor_name != target["name"]:
+            raise XhsNativeAdapterError(
+                f"小红书已选地点名称回读不一致："
+                f"目标={target['name']}，实际={editor_name or '空'}"
+            )
+        return {
+            **target,
+            "editorNameReadback": editor_name,
+            "poiIdEvidence": "creator-search-response",
+        }
+
     async def fill_official_topics(self, page) -> list[str]:
         topics = self.contract["topics"]
         if not topics:
@@ -503,68 +889,208 @@ class XhsNativeAdapter:
         )
         for topic in topics:
             await editor.click(timeout=3_000)
-            await page.keyboard.press("End")
+            # ``End`` 只会把光标移到当前行尾。真实富文本页面中，
+            # 它会把话题插到正文中间。直接用 DOM Range 折叠到
+            # 编辑器内容末尾，不依赖操作系统键盘快捷键。
+            await editor.evaluate(
+                """node => {
+                    node.focus();
+                    const range = document.createRange();
+                    range.selectNodeContents(node);
+                    range.collapse(false);
+                    const selection = window.getSelection();
+                    selection.removeAllRanges();
+                    selection.addRange(range);
+                }"""
+            )
             await page.keyboard.insert_text(f" #{topic}")
             await page.wait_for_timeout(700)
-            candidates = page.locator(".tippy-box .items .item")
-            matched = []
-            for index in range(await candidates.count()):
-                candidate = candidates.nth(index)
-                try:
-                    names = candidate.locator(".name")
-                    if (
-                        await candidate.is_visible()
-                        and await _is_actual_viewport_visible(candidate)
-                        and await names.count() == 1
-                        and _topic_candidate_matches(
-                            await names.first.inner_text(), topic
-                        )
-                    ):
-                        matched.append(candidate)
-                except Exception:
-                    continue
-            if len(matched) != 1:
-                raise XhsNativeAdapterError(
-                    f"小红书未返回唯一官方话题候选：#{topic}"
-                )
-            await matched[0].click(timeout=3_000)
+            candidate = await _find_unique_official_topic_candidate(page, topic)
+            await candidate.click(timeout=3_000)
             await page.wait_for_timeout(500)
-        nodes = editor.locator("a.tiptap-topic")
-        node_texts = [
-            _normalized(await nodes.nth(index).inner_text())
-            for index in range(await nodes.count())
+        snapshot = await editor.evaluate(
+            r"""node => {
+                const result = {
+                    prefixText: '',
+                    entityTopics: [],
+                    plainTextAfterFirstTopic: '',
+                };
+                let sawTopic = false;
+                const walk = current => {
+                    if (current.nodeType === Node.TEXT_NODE) {
+                        if (sawTopic) result.plainTextAfterFirstTopic += current.nodeValue || '';
+                        else result.prefixText += current.nodeValue || '';
+                        return;
+                    }
+                    if (current.nodeType !== Node.ELEMENT_NODE) return;
+                    if (current.matches('a.tiptap-topic')) {
+                        sawTopic = true;
+                        result.entityTopics.push(current.innerText || current.textContent || '');
+                        return;
+                    }
+                    const isBlock = ['P', 'DIV', 'LI'].includes(current.tagName);
+                    if (isBlock) {
+                        if (sawTopic) result.plainTextAfterFirstTopic += '\n';
+                        else result.prefixText += '\n';
+                    }
+                    for (const child of current.childNodes) walk(child);
+                    if (isBlock) {
+                        if (sawTopic) result.plainTextAfterFirstTopic += '\n';
+                        else result.prefixText += '\n';
+                    }
+                };
+                for (const child of node.childNodes) walk(child);
+                return result;
+            }"""
+        )
+        expected_nodes = [f"#{topic}" for topic in topics]
+        actual_nodes = [
+            _topic_entity_label(value)
+            for value in (snapshot or {}).get("entityTopics", [])
         ]
-        if len(node_texts) < len(topics):
-            raise XhsNativeAdapterError("小红书官方话题节点回读不足")
-        return node_texts
+        prefix = _normalized((snapshot or {}).get("prefixText", ""))
+        trailing_plain = _normalized(
+            (snapshot or {}).get("plainTextAfterFirstTopic", "")
+        )
+        expected_prefix = _normalized(self.contract["description"])
+        prefix_matches = prefix == expected_prefix
+        if (
+            not prefix_matches
+            or actual_nodes != expected_nodes
+            or trailing_plain
+        ):
+            raise XhsNativeAdapterError(
+                "小红书官方话题未连续位于完整正文末尾，已停止提交；"
+                f"正文前缀匹配={prefix_matches}，"
+                f"话题实体={actual_nodes}，期望={expected_nodes}，"
+                f"话题后普通文字={len(trailing_plain)}字",
+                error_code="xhs_topic_insert_position_invalid",
+            )
+        return actual_nodes
 
     async def _set_exact_declaration(
         self,
         page,
-        label: str,
+        label: str | tuple[str, ...],
         expected: bool,
     ) -> None:
         if not expected:
             return
-        trigger = await _first_visible(
-            page.get_by_text(label, exact=True),
-            f"声明控件“{label}”",
-        )
+        labels = (label,) if isinstance(label, str) else tuple(label)
+        matches = []
+        for candidate_label in labels:
+            candidates = page.get_by_text(candidate_label, exact=True)
+            for index in range(await candidates.count()):
+                item = candidates.nth(index)
+                try:
+                    if await item.is_visible() and await _is_actual_viewport_visible(item):
+                        matches.append((candidate_label, item))
+                except Exception:
+                    continue
+        if len(matches) != 1:
+            raise XhsNativeAdapterError(
+                "小红书声明控件无法唯一识别："
+                f"候选标签={'/'.join(labels)}，可见候选={len(matches)}"
+            )
+        actual_label, trigger = matches[0]
         await trigger.click(timeout=5_000)
         await page.wait_for_timeout(400)
-        if label not in _normalized(
+        if actual_label not in _normalized(
             await page.locator("body").inner_text(timeout=3_000)
         ):
-            raise XhsNativeAdapterError(f"小红书声明回读失败：{label}")
+            raise XhsNativeAdapterError(f"小红书声明回读失败：{actual_label}")
+
+    async def _set_ai_declaration(self, page) -> str:
+        """通过当前内容类型声明下拉框选择并回读 AI 声明。"""
+
+        wrappers = page.locator(
+            ".publish-page-content-setting-content "
+            ".d-select-wrapper.custom-select-44"
+        )
+        matched = []
+        allowed_values = {"添加内容类型声明", *_AI_LABELS}
+        for index in range(await wrappers.count()):
+            wrapper = wrappers.nth(index)
+            try:
+                text = _normalized(await wrapper.inner_text())
+                if await wrapper.is_visible() and text in allowed_values:
+                    matched.append((text, wrapper))
+            except Exception:
+                continue
+        if len(matched) != 1:
+            raise XhsNativeAdapterError(
+                "小红书AI 内容类型声明下拉框无法唯一识别："
+                f"可渲染候选={len(matched)}",
+                error_code="xhs_ai_declaration_control_missing",
+            )
+
+        current_text, trigger = matched[0]
+        try:
+            await trigger.scroll_into_view_if_needed(timeout=5_000)
+        except Exception as exc:
+            raise XhsNativeAdapterError(
+                "小红书AI 内容类型声明下拉框无法滚动到可见区域",
+                error_code="xhs_ai_declaration_control_missing",
+            ) from exc
+        if not await _is_actual_viewport_visible(trigger):
+            raise XhsNativeAdapterError(
+                "小红书AI 内容类型声明下拉框不在当前视口",
+                error_code="xhs_ai_declaration_control_missing",
+            )
+        if current_text in _AI_LABELS:
+            return current_text
+
+        await trigger.click(timeout=5_000)
+        await page.wait_for_timeout(300)
+        try:
+            dropdown = await _first_visible(
+                page.locator(".declaration-drop-down"),
+                "AI 内容类型声明选项框",
+            )
+        except XhsNativeAdapterError as exc:
+            raise XhsNativeAdapterError(
+                str(exc),
+                error_code="xhs_ai_declaration_control_missing",
+            ) from exc
+
+        matched_options = []
+        options = dropdown.locator(".d-option")
+        for index in range(await options.count()):
+            option = options.nth(index)
+            try:
+                names = option.locator(".d-option-name")
+                if (
+                    await option.is_visible()
+                    and await _is_actual_viewport_visible(option)
+                    and await names.count() == 1
+                ):
+                    label = _normalized(await names.first.inner_text())
+                    if label in _AI_LABELS:
+                        matched_options.append((label, option))
+            except Exception:
+                continue
+        if len(matched_options) != 1:
+            raise XhsNativeAdapterError(
+                "小红书AI 内容类型声明未返回唯一官方选项："
+                f"精确候选={len(matched_options)}",
+                error_code="xhs_ai_declaration_control_missing",
+            )
+
+        selected_label, option = matched_options[0]
+        await option.click(timeout=5_000)
+        await page.wait_for_timeout(300)
+        readback = _normalized(await trigger.inner_text())
+        if readback != selected_label:
+            raise XhsNativeAdapterError(
+                "小红书AI 内容类型声明回读不一致："
+                f"目标={selected_label}，实际={readback or '空'}",
+                error_code="xhs_ai_declaration_readback_mismatch",
+            )
+        return readback
 
     async def set_declarations(self, page) -> None:
         if self.contract["aiDeclaration"]:
-            trigger = await _first_visible(
-                page.get_by_text("添加内容类型声明", exact=True),
-                "AI 声明入口",
-            )
-            await trigger.click(timeout=5_000)
-            await self._set_exact_declaration(page, _AI_LABEL, True)
+            await self._set_ai_declaration(page)
         await self._set_exact_declaration(
             page,
             "原创声明",
@@ -658,4 +1184,20 @@ class XhsNativeAdapter:
         )
 
     async def submit_final_button(self, button) -> None:
+        tag_name = await button.evaluate("node => node.tagName")
+        if str(tag_name or "").upper() == "XHS-PUBLISH-BTN":
+            box = await button.bounding_box()
+            if not box:
+                raise XhsNativeAdapterError(
+                    "小红书最终发布按钮没有可点击区域",
+                    error_code="xhs_final_button_box_missing",
+                )
+            await button.click(
+                position={
+                    "x": box["width"] * 0.64,
+                    "y": box["height"] * 0.50,
+                },
+                timeout=10_000,
+            )
+            return
         await button.click(timeout=10_000)

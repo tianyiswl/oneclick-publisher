@@ -295,6 +295,45 @@ class DouyinLocationMatchingTests(unittest.TestCase):
         self.assertEqual(result, "")
         page.locator.assert_not_called()
 
+    def test_preflight_rejects_live_candidate_without_complete_address(self) -> None:
+        """预检重搜只回名称和 POI 标识时，不能点击缺地址候选。"""
+
+        page = MagicMock()
+        page.wait_for_timeout = AsyncMock()
+        selection_container = MagicMock()
+        selection_container.inner_text = AsyncMock(return_value="北海银滩景区")
+        option = MagicMock()
+        option.click = AsyncMock()
+        payload = {
+            "locationPoi": {
+                "poiId": "poi-1",
+                "name": "北海银滩景区",
+                "address": "广西壮族自治区北海市银海区银滩大道中段",
+            }
+        }
+        live_candidate = {
+            "poiId": "poi-1",
+            "name": "北海银滩景区",
+            "address": "",
+        }
+
+        with patch.object(
+            oneclick_preflight,
+            "_douyin_open_location_search",
+            new=AsyncMock(return_value=selection_container),
+        ), patch.object(
+            oneclick_preflight,
+            "_douyin_visible_location_options",
+            new=AsyncMock(return_value=([option], [live_candidate])),
+        ):
+            with self.assertRaisesRegex(
+                oneclick_preflight.PreflightError,
+                "没有唯一一致的 POI",
+            ):
+                asyncio.run(oneclick_preflight._douyin_set_location(page, payload))
+
+        option.click.assert_not_awaited()
+
 
 class DouyinLocationUiTests(unittest.TestCase):
     @classmethod
@@ -372,6 +411,24 @@ class DouyinLocationUiTests(unittest.TestCase):
             "6601124346666682376",
         )
         self.assertEqual(template["douyinLocationScope"], "local")
+        page.close()
+
+    def test_publish_center_hides_addressless_location_candidate(self) -> None:
+        """带货共享解析保持兼容时，发布中心仍不能展示缺地址候选。"""
+
+        page = PublishPage()
+        page._show_douyin_location_results(
+            [
+                {
+                    "poiId": "poi-addressless",
+                    "name": "缺地址地点",
+                }
+            ],
+            source_account_id=3,
+        )
+
+        self.assertEqual(page.douyin_location_results.count(), 0)
+        self.assertTrue(page.douyin_location_results.isHidden())
         page.close()
 
     def test_standard_douyin_location_search_is_local_only(self) -> None:
@@ -502,6 +559,77 @@ class DouyinLocationServiceTests(unittest.TestCase):
         self.assertEqual(result[0]["distance"], "6.1km")
         self.assertEqual(result[0]["address"], "北海市银海区")
 
+    def test_publish_candidate_requires_complete_platform_identity(self) -> None:
+        """发布中心只接受名称、完整地址和平台 POI 标识都齐全的地点。"""
+
+        complete = {
+            "poi_id": "poi-complete",
+            "poi_name": "北海银滩景区",
+            "address": "广西壮族自治区北海市银海区银滩大道中段",
+        }
+        self.assertIsNotNone(
+            douyin_location_service.normalize_publish_location_candidate(complete)
+        )
+        for missing_field in ("poi_id", "poi_name", "address"):
+            incomplete = dict(complete)
+            incomplete.pop(missing_field)
+            with self.subTest(missing_field=missing_field):
+                self.assertIsNone(
+                    douyin_location_service.normalize_publish_location_candidate(
+                        incomplete
+                    )
+                )
+
+    def test_shared_candidate_normalizer_preserves_commerce_behavior(self) -> None:
+        """发布中心的严格校验不能改变带货流程原有的共享解析结果。"""
+
+        self.assertEqual(
+            douyin_location_service.normalize_location_candidate(
+                {
+                    "poi_id": "poi-commerce",
+                    "poi_name": "带货页面中间候选",
+                }
+            ),
+            {
+                "poiId": "poi-commerce",
+                "name": "带货页面中间候选",
+                "address": "",
+                "distance": "",
+            },
+        )
+
+    def test_addressless_rows_do_not_hide_later_complete_candidates(self) -> None:
+        """缺地址候选不能占满 12 条上限，挡住后面的完整平台地点。"""
+
+        addressless = [
+            {
+                "poi_id": f"poi-addressless-{index}",
+                "poi_name": f"缺地址地点 {index}",
+            }
+            for index in range(douyin_location_service.MAX_RESULTS)
+        ]
+        complete = {
+            "poi_id": "poi-complete",
+            "poi_name": "北海银滩景区",
+            "address": "广西壮族自治区北海市银海区银滩大道中段",
+        }
+
+        result = douyin_location_service.normalize_location_response(
+            {
+                "status_code": 0,
+                "poi_list": [*addressless, complete],
+            }
+        )
+
+        self.assertEqual(result, [
+            {
+                "poiId": "poi-complete",
+                "name": "北海银滩景区",
+                "address": "广西壮族自治区北海市银海区银滩大道中段",
+                "distance": "",
+            }
+        ])
+
     def test_nonzero_platform_status_is_a_safe_error(self) -> None:
         with self.assertRaisesRegex(
             douyin_location_service.DouyinLocationSearchError,
@@ -534,6 +662,33 @@ class DouyinLocationServiceTests(unittest.TestCase):
             validated = _validate_payloads([payload])[0]
             self.assertEqual(validated["locationPoi"]["poiId"], "poi-1")
             self.assertEqual(validated["locationPoi"]["address"], "北海市银海区")
+
+    def test_standard_task_rejects_location_without_complete_address(self) -> None:
+        """发布中心不能因恢复带货解析合同而接受缺地址地点。"""
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            video = Path(temporary_directory) / "offline.mp4"
+            video.write_bytes(b"offline")
+            with self.assertRaisesRegex(ValueError, "不能只传关键词"):
+                _validate_payloads(
+                    [
+                        {
+                            "type": 3,
+                            "contentType": "video",
+                            "title": "离线测试",
+                            "description": "离线测试",
+                            "fileList": [str(video)],
+                            "runtimeMode": "preflight",
+                            "debugDryRun": True,
+                            "locationKeyword": "北海银滩景区",
+                            "locationScope": "local",
+                            "locationPoi": {
+                                "poiId": "poi-1",
+                                "name": "北海银滩景区",
+                            },
+                        }
+                    ]
+                )
 
     def test_standard_task_rejects_location_without_local_scope(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

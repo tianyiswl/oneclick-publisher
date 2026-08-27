@@ -11,11 +11,19 @@ from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import hashlib
+import json
 import re
 import threading
 from typing import Any
 
 from . import database
+from .douyin_location_search_plan import (
+    MUNICIPALITIES,
+    PROVINCE_CITIES,
+    LocationSearchPlan,
+    build_location_search_plan,
+)
 
 
 LOCATION_STATUS_REUSABLE = "reusable"
@@ -31,21 +39,16 @@ _LOCATION_COMMISSION_FILTERS = frozenset(
     {"all", "commission", "no_commission"}
 )
 _LOCATION_COMMISSION_TYPES = frozenset({"commission", "no_commission"})
-_LOCATION_REGION_PREFIXES = tuple(
-    sorted(
-        {
-            "北京", "天津", "上海", "重庆",
-            "河北", "山西", "辽宁", "吉林", "黑龙江",
-            "江苏", "浙江", "安徽", "福建", "江西", "山东",
-            "河南", "湖北", "湖南", "广东", "海南", "四川",
-            "贵州", "云南", "陕西", "甘肃", "青海", "台湾",
-            "内蒙古", "广西", "西藏", "宁夏", "新疆", "香港", "澳门",
-        },
-        key=len,
-        reverse=True,
+_CITY_PROVINCES: dict[str, tuple[str, ...]] = {
+    city: tuple(
+        province
+        for province, cities in PROVINCE_CITIES.items()
+        if city in cities
     )
-)
-
+    for city in {
+        city for cities in PROVINCE_CITIES.values() for city in cities
+    }
+}
 _LOCATION_REVALIDATION_ERROR_CODES = frozenset(
     {
         "publish_location_not_found_after_all_pages",
@@ -76,6 +79,11 @@ class LocationCacheQuery:
     scope: str
     keyword: str
     commission_filter: str
+    province_context: str = ""
+
+
+_LOCATION_SEARCH_PLAN_SCHEMA_VERSION = 1
+_LOCATION_SEARCH_PLAN_KINDS = frozenset({"plain", "city", "province"})
 
 
 def _text(value: object, field: str) -> str:
@@ -91,53 +99,167 @@ def _optional_text(value: object) -> str:
     return " ".join(value.split()) if isinstance(value, str) else ""
 
 
+def _search_keyword(value: object) -> str:
+    """缓存键沿用地点搜索计划的空白规范化。"""
+
+    return re.sub(r"[\s\u3000]+", "", _text(value, "关键词"))
+
+
+def _province_name(value: object) -> str:
+    normalized = re.sub(r"[\s\u3000]+", "", _optional_text(value))
+    for province in PROVINCE_CITIES:
+        if normalized in {
+            province,
+            f"{province}省",
+            f"{province}自治区",
+            f"{province}壮族自治区",
+            f"{province}回族自治区",
+            f"{province}维吾尔自治区",
+        }:
+            return province
+    return ""
+
+
+def _top_level_province(address: object) -> str:
+    """只从地址开头解析顶层省级地区，不用中间子串猜省份。"""
+
+    normalized = re.sub(r"[\s\u3000]+", "", _optional_text(address))
+    aliases: list[tuple[str, str]] = []
+    for province in PROVINCE_CITIES:
+        aliases.extend(
+            (
+                (f"{province}省", province),
+                (f"{province}壮族自治区", province),
+                (f"{province}回族自治区", province),
+                (f"{province}维吾尔自治区", province),
+                (f"{province}自治区", province),
+                (province, province),
+            )
+        )
+    for municipality in MUNICIPALITIES:
+        aliases.extend(((f"{municipality}市", municipality), (municipality, municipality)))
+    aliases.extend(
+        (
+            ("香港特别行政区", "香港"),
+            ("澳门特别行政区", "澳门"),
+            ("台湾省", "台湾"),
+        )
+    )
+    for alias, province in sorted(aliases, key=lambda item: len(item[0]), reverse=True):
+        if normalized.startswith(alias):
+            # 无“省/自治区”后缀时，只有紧跟该省的已知地级区
+            # 才能证明这是顶层省名。这会把“海南藏族自治州”留为
+            # 顶层省份未知，而不是猜成海南省。
+            if alias == province and province in PROVINCE_CITIES:
+                remainder = normalized[len(alias) :]
+                if not any(
+                    remainder.startswith(city)
+                    for city in PROVINCE_CITIES[province]
+                ):
+                    continue
+            return province
+    # 平台有时省略省名，只从地址开头的唯一归属地级市
+    # 回推顶级省份。与其他省名发生跨层级冲突的短名
+    # （例如青海海南州）依然失败关闭。
+    city_aliases: list[tuple[str, str]] = []
+    for city, owners in _CITY_PROVINCES.items():
+        if len(owners) != 1 or (
+            city in PROVINCE_CITIES and owners[0] != city
+        ):
+            continue
+        city_aliases.append((f"{city}市", owners[0]))
+    for alias, province in sorted(
+        city_aliases, key=lambda item: len(item[0]), reverse=True
+    ):
+        if normalized.startswith(alias):
+            return province
+    return ""
+
+
+def _leading_city(keyword: str, province_context: str = "") -> tuple[str, str]:
+    city_names = (
+        PROVINCE_CITIES.get(province_context, ())
+        if province_context
+        else tuple(MUNICIPALITIES)
+        + tuple(city for cities in PROVINCE_CITIES.values() for city in cities)
+    )
+    aliases = [(f"{city}市", city) for city in city_names]
+    aliases.extend((city, city) for city in city_names)
+    for alias, city in sorted(aliases, key=lambda item: len(item[0]), reverse=True):
+        if keyword.startswith(alias) and keyword[len(alias) :]:
+            return city, keyword[len(alias) :]
+    return "", ""
+
+
 def filter_locations_for_search_keyword(
     keyword: object,
     candidates: list[Mapping[str, Any]],
+    *,
+    province_context: object = "",
 ) -> list[Mapping[str, Any]]:
     """搜索词以省级地区开头时，排除其他地区的同名门店。
 
-    完整关键词已出现在门店名时保留候选，避免把“北京烤鸭”
-    这类品牌/品类词误判为只搜北京。
+    非省份搜索的完整关键词已出现在门店名时保留候选，避免把
+    “北京烤鸭”这类品牌/品类词误判为只搜北京。省份计划始终
+    先核对候选的顶级省份。
     """
 
     normalized_keyword = "".join(_optional_text(keyword).split()).casefold()
-    region_prefixes = set(_LOCATION_REGION_PREFIXES)
-    for candidate in candidates:
-        address = "".join(
-            _optional_text(candidate.get("address")).split()
-        ).casefold()
-        for match in re.finditer(r"([一-鿿]{2,8})市", address):
-            city = match.group(1)
-            for separator in ("特别行政区", "自治区", "省"):
-                if separator in city:
-                    city = city.rsplit(separator, 1)[-1]
-            if 2 <= len(city) <= 8:
-                region_prefixes.add(city)
-    region = next(
-        (
-            item
-            for item in sorted(region_prefixes, key=len, reverse=True)
-            if normalized_keyword.startswith(item)
-            and len(normalized_keyword) > len(item)
-        ),
-        "",
-    )
-    if not region:
+    parent_province = _province_name(province_context)
+    is_province_search = bool(parent_province)
+    region = ""
+    remainder = ""
+    if parent_province:
+        region, remainder = _leading_city(normalized_keyword, parent_province)
+        if not region:
+            plan = build_location_search_plan(normalized_keyword)
+            if plan.search_kind == "province" and plan.province == parent_province:
+                region = parent_province
+                remainder = plan.merchant_term
+    else:
+        plan = build_location_search_plan(normalized_keyword)
+        if plan.search_kind == "province":
+            is_province_search = True
+            parent_province = plan.province
+            region = plan.province
+            remainder = plan.merchant_term
+        elif plan.search_kind == "city":
+            region, remainder = _leading_city(normalized_keyword)
+            if region:
+                parent_province = next(
+                    (
+                        province
+                        for province, cities in PROVINCE_CITIES.items()
+                        if region in cities
+                    ),
+                    region if region in MUNICIPALITIES else "",
+                )
+    if not region or not remainder:
         return list(candidates)
-    remainder = normalized_keyword[len(region) :]
-    for suffix in ("特别行政区", "壮族自治区", "回族自治区", "维吾尔自治区", "自治区", "省", "市"):
-        if remainder.startswith(suffix):
-            remainder = remainder[len(suffix) :]
-            break
     filtered: list[Mapping[str, Any]] = []
+    cross_level_collision = bool(
+        region in PROVINCE_CITIES
+        and any(
+            owner != region for owner in _CITY_PROVINCES.get(region, ())
+        )
+    )
     for candidate in candidates:
         name = "".join(_optional_text(candidate.get("name")).split()).casefold()
         address = "".join(
             _optional_text(candidate.get("address")).split()
         ).casefold()
-        if normalized_keyword in name or (
-            region in address and remainder and remainder in f"{name}{address}"
+        top_level = _top_level_province(address)
+        if (
+            not is_province_search
+            and normalized_keyword in name
+            and not cross_level_collision
+        ):
+            filtered.append(candidate)
+            continue
+        if (
+            top_level == parent_province
+            and (region == parent_province or region in address)
+            and remainder in f"{name}{address}"
         ):
             filtered.append(candidate)
     return filtered
@@ -149,14 +271,35 @@ def _query(value: object) -> LocationCacheQuery:
     safe_query = LocationCacheQuery(
         account_id=_text(value.account_id, "账号"),
         scope=_text(value.scope, "范围"),
-        keyword=_text(value.keyword, "关键词"),
+        keyword=_search_keyword(value.keyword),
         commission_filter=_text(value.commission_filter, "返佣筛选"),
+        province_context=_province_name(value.province_context),
     )
     if safe_query.scope not in _LOCATION_SCOPES:
         raise DouyinLocationCacheError("地点缓存范围无效")
     if safe_query.commission_filter not in _LOCATION_COMMISSION_FILTERS:
         raise DouyinLocationCacheError("地点缓存返佣筛选无效")
     return safe_query
+
+
+def _storage_keyword(query: LocationCacheQuery) -> str:
+    city, _remainder = _leading_city(query.keyword, query.province_context)
+    owners = _CITY_PROVINCES.get(city, ())
+    ambiguous_city = bool(
+        city
+        and (
+            len(owners) > 1
+            or (city in PROVINCE_CITIES and city != query.province_context)
+        )
+    )
+    if not query.province_context or not ambiguous_city:
+        return query.keyword
+    identity = json.dumps(
+        [query.province_context, query.keyword],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "province-context:" + hashlib.sha256(identity).hexdigest()
 
 
 def _now(value: datetime | None) -> datetime:
@@ -225,6 +368,167 @@ def _pagination(value: object, field: str, *, minimum: int) -> int:
     if type(value) is not int or value < minimum:
         raise DouyinLocationCacheError(f"地点缓存{field}必须是内置整数")
     return value
+
+
+def _eligible_total(value: object) -> int:
+    if type(value) is not int or not 0 <= value <= LOCATION_CACHE_CAPACITY:
+        raise DouyinLocationCacheError("地点搜索进度有效地址数无效")
+    return value
+
+
+def _plan_optional_text(value: object, field: str) -> str:
+    if not isinstance(value, str):
+        raise DouyinLocationCacheError(f"地点搜索进度{field}无效")
+    return " ".join(value.replace("\u200b", " ").split())
+
+
+def _search_plan_payload(plan: object) -> dict[str, object]:
+    if not isinstance(plan, LocationSearchPlan):
+        raise DouyinLocationCacheError("地点搜索进度计划无效")
+    payload = {
+        "schemaVersion": plan.schema_version,
+        "originalKeyword": plan.original_keyword,
+        "searchKind": plan.search_kind,
+        "province": plan.province,
+        "merchantTerm": plan.merchant_term,
+        "subqueries": list(plan.subqueries),
+        "currentIndex": plan.current_index,
+        "currentLoadCount": plan.current_load_count,
+        "completedIndices": list(plan.completed_indices),
+        "lastErrorCode": plan.last_error_code,
+    }
+    _plan_from_payload(payload)
+    return payload
+
+
+def _plan_from_payload(payload: object) -> LocationSearchPlan:
+    if not isinstance(payload, Mapping):
+        raise DouyinLocationCacheError("地点搜索进度格式无效")
+    schema_version = payload.get("schemaVersion")
+    if (
+        type(schema_version) is not int
+        or schema_version != _LOCATION_SEARCH_PLAN_SCHEMA_VERSION
+    ):
+        raise DouyinLocationCacheError("地点搜索进度版本无效")
+    try:
+        original_keyword = _text(payload["originalKeyword"], "搜索进度原始关键词")
+        search_kind = _text(payload["searchKind"], "搜索进度类型")
+        province = _plan_optional_text(payload["province"], "省份")
+        merchant_term = _plan_optional_text(payload["merchantTerm"], "商户词")
+        subqueries_value = payload["subqueries"]
+        current_index = payload["currentIndex"]
+        current_load_count = payload["currentLoadCount"]
+        completed_value = payload["completedIndices"]
+        last_error_code = _plan_optional_text(payload["lastErrorCode"], "错误码")
+    except KeyError as error:
+        raise DouyinLocationCacheError("地点搜索进度字段缺失") from error
+    if search_kind not in _LOCATION_SEARCH_PLAN_KINDS:
+        raise DouyinLocationCacheError("地点搜索进度类型无效")
+    if not isinstance(subqueries_value, list) or not subqueries_value:
+        raise DouyinLocationCacheError("地点搜索进度子词无效")
+    subqueries = tuple(_text(item, "搜索进度子词") for item in subqueries_value)
+    if len(set(subqueries)) != len(subqueries):
+        raise DouyinLocationCacheError("地点搜索进度子词重复")
+    if type(current_index) is not int or not 0 <= current_index < len(subqueries):
+        raise DouyinLocationCacheError("地点搜索进度当前下标无效")
+    if type(current_load_count) is not int or current_load_count < 0:
+        raise DouyinLocationCacheError("地点搜索进度加载次数无效")
+    if not isinstance(completed_value, list) or any(
+        type(index) is not int or not 0 <= index < len(subqueries)
+        for index in completed_value
+    ):
+        raise DouyinLocationCacheError("地点搜索进度已完成子词无效")
+    completed_indices = tuple(completed_value)
+    if completed_indices != tuple(sorted(set(completed_indices))):
+        raise DouyinLocationCacheError("地点搜索进度已完成子词无效")
+    return LocationSearchPlan(
+        schema_version=schema_version,
+        original_keyword=original_keyword,
+        search_kind=search_kind,
+        province=province,
+        merchant_term=merchant_term,
+        subqueries=subqueries,
+        current_index=current_index,
+        current_load_count=current_load_count,
+        completed_indices=completed_indices,
+        last_error_code=last_error_code,
+    )
+
+
+def save_location_search_plan(
+    query: LocationCacheQuery,
+    plan: LocationSearchPlan,
+    *,
+    eligible_total: int,
+) -> None:
+    """将一个完整计划 JSON 与累计有效地点数原子写入缓存。"""
+
+    safe_query = _query(query)
+    safe_total = _eligible_total(eligible_total)
+    payload = _search_plan_payload(plan)
+    if payload["originalKeyword"] != safe_query.keyword:
+        raise DouyinLocationCacheError("地点搜索进度计划关键词不匹配")
+    payload_json = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    with database.connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO douyin_location_search_progress (
+                accountId, scope, keyword, commissionFilter, planJson,
+                eligibleTotal, updatedAt
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(accountId, scope, keyword, commissionFilter)
+            DO UPDATE SET
+                planJson = excluded.planJson,
+                eligibleTotal = excluded.eligibleTotal,
+                updatedAt = excluded.updatedAt
+            """,
+            (
+                safe_query.account_id,
+                safe_query.scope,
+                safe_query.keyword,
+                safe_query.commission_filter,
+                payload_json,
+                safe_total,
+                _timestamp(None),
+            ),
+        )
+
+
+def load_location_search_plan(query: LocationCacheQuery) -> LocationSearchPlan | None:
+    """读取完整计划；损坏或未知版本绝不降级为已完成。"""
+
+    safe_query = _query(query)
+    with database.connect() as conn:
+        row = conn.execute(
+            """
+            SELECT planJson, eligibleTotal
+            FROM douyin_location_search_progress
+            WHERE accountId = ? AND scope = ? AND keyword = ?
+              AND commissionFilter = ?
+            """,
+            (
+                safe_query.account_id,
+                safe_query.scope,
+                safe_query.keyword,
+                safe_query.commission_filter,
+            ),
+        ).fetchone()
+    if row is None:
+        return None
+    _eligible_total(row["eligibleTotal"])
+    try:
+        payload = json.loads(row["planJson"])
+    except (TypeError, json.JSONDecodeError) as error:
+        raise DouyinLocationCacheError("地点搜索进度 JSON 无效") from error
+    plan = _plan_from_payload(payload)
+    if plan.original_keyword != safe_query.keyword:
+        raise DouyinLocationCacheError("地点搜索进度计划关键词不匹配")
+    return plan
 
 
 def location_requires_revalidation(row: object, *, now: datetime | None = None) -> bool:
@@ -426,7 +730,7 @@ def _evict_excess_locations(
         (
             query.account_id,
             query.scope,
-            query.keyword,
+            _storage_keyword(query),
             query.commission_filter,
         ),
     ).fetchall()
@@ -492,7 +796,7 @@ def _evict_excess_locations(
         (
             query.account_id,
             query.scope,
-            query.keyword,
+            _storage_keyword(query),
             query.commission_filter,
             *ids,
         ),
@@ -569,7 +873,7 @@ def get_cached_locations(
             (
                 safe_query.account_id,
                 safe_query.scope,
-                safe_query.keyword,
+                _storage_keyword(safe_query),
                 safe_query.commission_filter,
             ),
         ).fetchall()
@@ -577,6 +881,7 @@ def get_cached_locations(
         filter_locations_for_search_keyword(
             safe_query.keyword,
             [_public(row) for row in rows],
+            province_context=safe_query.province_context,
         )
     )
     reusable = [
@@ -611,6 +916,124 @@ def get_cached_locations(
     }
 
 
+def _normalize_candidates_for_query(
+    query: LocationCacheQuery,
+    candidates: object,
+) -> list[dict[str, Any]]:
+    if not isinstance(candidates, list):
+        raise DouyinLocationCacheError("地点缓存候选列表无效")
+    normalized = [
+        dict(candidate)
+        for candidate in filter_locations_for_search_keyword(
+            query.keyword,
+            [_candidate(candidate) for candidate in candidates],
+            province_context=query.province_context,
+        )
+    ]
+    _validate_candidates_for_query(query, normalized)
+    identities = {_candidate_identity(candidate) for candidate in normalized}
+    if len(identities) != len(normalized):
+        raise DouyinLocationCacheError("地点缓存候选出现重复完整身份")
+    return normalized
+
+
+def _merge_candidates_in_connection(
+    conn: Any,
+    query: LocationCacheQuery,
+    candidates: list[Mapping[str, Any]],
+    *,
+    now: datetime,
+) -> list[int]:
+    timestamp = now.isoformat()
+    location_ids: list[int] = []
+    for candidate in candidates:
+        conn.execute(
+            """
+            INSERT INTO douyin_location_cache (
+                accountId, scope, poiId, name, address, commissionType, distance,
+                source, productCount, commissionProductCount, commissionLabel, status,
+                verifiedAt, firstSeenAt, lastSeenAt, revalidationFailures
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+            ON CONFLICT(accountId, scope, poiId, name, address, commissionType)
+            DO UPDATE SET
+                distance = excluded.distance,
+                source = excluded.source,
+                productCount = excluded.productCount,
+                commissionProductCount = excluded.commissionProductCount,
+                commissionLabel = excluded.commissionLabel,
+                status = excluded.status,
+                verifiedAt = excluded.verifiedAt,
+                lastSeenAt = excluded.lastSeenAt,
+                lastErrorCode = '',
+                revalidationFailures = 0
+            """,
+            (
+                query.account_id,
+                query.scope,
+                candidate["poiId"],
+                candidate["name"],
+                candidate["address"],
+                candidate["commissionType"],
+                candidate["distance"],
+                candidate["source"],
+                candidate["productCount"],
+                candidate["commissionProductCount"],
+                candidate["commissionLabel"],
+                LOCATION_STATUS_REUSABLE,
+                timestamp,
+                timestamp,
+                timestamp,
+            ),
+        )
+        cache_row = conn.execute(
+            """
+            SELECT id FROM douyin_location_cache
+            WHERE accountId = ? AND scope = ? AND poiId = ? AND name = ?
+              AND address = ? AND commissionType = ?
+            """,
+            (
+                query.account_id,
+                query.scope,
+                candidate["poiId"],
+                candidate["name"],
+                candidate["address"],
+                candidate["commissionType"],
+            ),
+        ).fetchone()
+        location_ids.append(int(cache_row["id"]))
+    return location_ids
+
+
+def _associate_keywords_in_connection(
+    conn: Any,
+    query: LocationCacheQuery,
+    location_ids: list[int],
+    *,
+    now: datetime,
+) -> None:
+    for position, location_id in enumerate(location_ids):
+        conn.execute(
+            """
+            INSERT INTO douyin_location_cache_keywords (
+                locationCacheId, accountId, scope, keyword, commissionFilter, position
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(locationCacheId, keyword, commissionFilter) DO UPDATE SET
+                accountId = excluded.accountId,
+                scope = excluded.scope,
+                position = excluded.position
+            """,
+            (
+                location_id,
+                query.account_id,
+                query.scope,
+                _storage_keyword(query),
+                query.commission_filter,
+                position,
+            ),
+        )
+    _evict_excess_locations(conn, query, now=now)
+
+
 def merge_platform_locations(
     query: LocationCacheQuery,
     candidates: object,
@@ -620,105 +1043,73 @@ def merge_platform_locations(
     """原子合并一次平台地点读回，并更新当前关键词的关联顺序。"""
 
     safe_query = _query(query)
-    if not isinstance(candidates, list):
-        raise DouyinLocationCacheError("地点缓存候选列表无效")
-    normalized = [
-        dict(candidate)
-        for candidate in filter_locations_for_search_keyword(
-            safe_query.keyword,
-            [_candidate(candidate) for candidate in candidates],
-        )
-    ]
-    _validate_candidates_for_query(safe_query, normalized)
-    identities = {
-        (
-            candidate["poiId"],
-            candidate["name"],
-            candidate["address"],
-            candidate["commissionType"],
-        )
-        for candidate in normalized
-    }
-    if len(identities) != len(normalized):
-        raise DouyinLocationCacheError("地点缓存候选出现重复完整身份")
+    normalized = _normalize_candidates_for_query(safe_query, candidates)
     current = _now(verified_at)
-    timestamp = current.isoformat()
     with database.connect() as conn:
-        for position, candidate in enumerate(normalized):
-            conn.execute(
-                """
-                INSERT INTO douyin_location_cache (
-                    accountId, scope, poiId, name, address, commissionType, distance,
-                    source, productCount, commissionProductCount, commissionLabel, status,
-                    verifiedAt, firstSeenAt, lastSeenAt, revalidationFailures
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
-                ON CONFLICT(accountId, scope, poiId, name, address, commissionType)
-                DO UPDATE SET
-                    distance = excluded.distance,
-                    source = excluded.source,
-                    productCount = excluded.productCount,
-                    commissionProductCount = excluded.commissionProductCount,
-                    commissionLabel = excluded.commissionLabel,
-                    status = excluded.status,
-                    verifiedAt = excluded.verifiedAt,
-                    lastSeenAt = excluded.lastSeenAt,
-                    lastErrorCode = '',
-                    revalidationFailures = 0
-                """,
-                (
-                    safe_query.account_id,
-                    safe_query.scope,
-                    candidate["poiId"],
-                    candidate["name"],
-                    candidate["address"],
-                    candidate["commissionType"],
-                    candidate["distance"],
-                    candidate["source"],
-                    candidate["productCount"],
-                    candidate["commissionProductCount"],
-                    candidate["commissionLabel"],
-                    LOCATION_STATUS_REUSABLE,
-                    timestamp,
-                    timestamp,
-                    timestamp,
-                ),
-            )
-            cache_row = conn.execute(
-                """
-                SELECT id FROM douyin_location_cache
-                WHERE accountId = ? AND scope = ? AND poiId = ? AND name = ?
-                  AND address = ? AND commissionType = ?
-                """,
-                (
-                    safe_query.account_id,
-                    safe_query.scope,
-                    candidate["poiId"],
-                    candidate["name"],
-                    candidate["address"],
-                    candidate["commissionType"],
-                ),
-            ).fetchone()
-            conn.execute(
-                """
-                INSERT INTO douyin_location_cache_keywords (
-                    locationCacheId, accountId, scope, keyword, commissionFilter, position
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(locationCacheId, keyword, commissionFilter) DO UPDATE SET
-                    accountId = excluded.accountId,
-                    scope = excluded.scope,
-                    position = excluded.position
-                """,
-                (
-                    cache_row["id"],
-                    safe_query.account_id,
-                    safe_query.scope,
-                    safe_query.keyword,
-                    safe_query.commission_filter,
-                    position,
-                ),
-            )
-        _evict_excess_locations(conn, safe_query, now=current)
+        location_ids = _merge_candidates_in_connection(
+            conn,
+            safe_query,
+            normalized,
+            now=current,
+        )
+        _associate_keywords_in_connection(
+            conn,
+            safe_query,
+            location_ids,
+            now=current,
+        )
     return get_cached_locations(safe_query, now=current)
+
+
+def merge_platform_locations_for_queries(
+    queries: list[LocationCacheQuery],
+    candidates: list[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """将同一平台页的候选原子关联到省份词和实际城市词。"""
+
+    if not isinstance(queries, list):
+        raise DouyinLocationCacheError("地点缓存查询列表无效")
+    safe_queries = [_query(item) for item in queries]
+    if not safe_queries:
+        raise DouyinLocationCacheError("地点缓存查询不能为空")
+    root_query = safe_queries[0]
+    if any(
+        query.account_id != root_query.account_id or query.scope != root_query.scope
+        for query in safe_queries[1:]
+    ):
+        raise DouyinLocationCacheError("地点缓存查询账号或范围不一致")
+    normalized = _normalize_candidates_for_query(root_query, candidates)
+    current = _now(None)
+    with database.connect() as conn:
+        location_ids = _merge_candidates_in_connection(
+            conn,
+            root_query,
+            normalized,
+            now=current,
+        )
+        location_ids_by_identity = {
+            _candidate_identity(candidate): location_id
+            for candidate, location_id in zip(normalized, location_ids, strict=True)
+        }
+        for query in safe_queries:
+            query_candidates = list(
+                filter_locations_for_search_keyword(
+                    query.keyword,
+                    normalized,
+                    province_context=query.province_context,
+                )
+            )
+            _validate_candidates_for_query(query, query_candidates)
+            _associate_keywords_in_connection(
+                conn,
+                query,
+                [
+                    location_ids_by_identity[_candidate_identity(candidate)]
+                    for candidate in query_candidates
+                ],
+                now=current,
+            )
+    return get_cached_locations(root_query, excluded_identities=[])
 
 
 def reconcile_platform_locations(
@@ -740,6 +1131,7 @@ def reconcile_platform_locations(
         for candidate in filter_locations_for_search_keyword(
             safe_query.keyword,
             [_candidate(candidate) for candidate in candidates],
+            province_context=safe_query.province_context,
         )
     ]
     _validate_candidates_for_query(safe_query, normalized)
@@ -820,7 +1212,7 @@ def reconcile_platform_locations(
                     cache_row["id"],
                     safe_query.account_id,
                     safe_query.scope,
-                    safe_query.keyword,
+                    _storage_keyword(safe_query),
                     safe_query.commission_filter,
                     position,
                 ),
@@ -843,7 +1235,7 @@ def reconcile_platform_locations(
                 (
                     safe_query.account_id,
                     safe_query.scope,
-                    safe_query.keyword,
+                    _storage_keyword(safe_query),
                     safe_query.commission_filter,
                     LOCATION_STATUS_NEEDS_REVALIDATION,
                     LOCATION_STATUS_REUSABLE,
@@ -958,7 +1350,7 @@ def record_location_selection(
             (
                 safe_query.account_id,
                 safe_query.scope,
-                safe_query.keyword,
+                _storage_keyword(safe_query),
                 safe_query.commission_filter,
             ),
         ).fetchone()["position"]
@@ -975,7 +1367,7 @@ def record_location_selection(
                 cache_row["id"],
                 safe_query.account_id,
                 safe_query.scope,
-                safe_query.keyword,
+                _storage_keyword(safe_query),
                 safe_query.commission_filter,
                 position,
             ),
@@ -1084,7 +1476,7 @@ def record_location_publish_result(
                     cache_row["id"],
                     safe_query.account_id,
                     safe_query.scope,
-                    safe_query.keyword,
+                    _storage_keyword(safe_query),
                     safe_query.commission_filter,
                 ),
             )

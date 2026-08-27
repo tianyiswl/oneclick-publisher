@@ -178,6 +178,60 @@ class ContentBundleTests(unittest.TestCase):
             with self.assertRaisesRegex(ContentBundleError, "必须列出"):
                 load_content_bundle(manifest)
 
+    def test_platform_preview_markdown_is_not_exposed_as_common_publish_text(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = self._write_bundle(root)
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            data["preferredPlatforms"] = ["抖音", "小红书"]
+            data["tags"] = ["错误通用话题"]
+            data["platformOverrides"] = {
+                "抖音": {
+                    "title": "抖音标题",
+                    "body": "纯净抖音正文\n@抖音科技",
+                    "tags": ["人工智能"],
+                },
+                "小红书": {
+                    "title": "小红书标题",
+                    "body": "纯净小红书正文",
+                    "tags": ["AI工具"],
+                },
+            }
+            (root / "正文.md").write_text(
+                "# 硅基探索 008\n\n## 抖音\n标题：抖音标题\n\n## 小红书\n标题：小红书标题",
+                encoding="utf-8",
+            )
+            manifest.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+            bundle = load_content_bundle(manifest)
+
+        self.assertTrue(bundle["bodyIsPreview"])
+        self.assertEqual(bundle["commonTitle"], "")
+        self.assertEqual(bundle["commonBody"], "")
+        self.assertEqual(bundle["commonTags"], [])
+        self.assertEqual(bundle["platformOverrides"]["抖音"]["body"], "纯净抖音正文\n@抖音科技")
+
+    def test_legacy_ai_disclosure_is_migrated_explicitly(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = self._write_bundle(root)
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            data["aiDisclosure"] = {
+                "text": False,
+                "image": False,
+                "video": True,
+                "audio": True,
+            }
+            data["allowPlatformAutoDeclaration"] = False
+            manifest.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+            bundle = load_content_bundle(manifest)
+
+        self.assertTrue(bundle["aiDisclosure"]["containsAiGeneratedContent"])
+        self.assertEqual(bundle["aiDisclosure"]["contentKinds"], ["video", "audio"])
+        self.assertFalse(bundle["aiDisclosure"]["allowPlatformAutoDeclaration"])
+        self.assertEqual(bundle["migrationWarnings"], ["legacy_ai_disclosure_migrated"])
+
     def test_loads_explicit_local_publish_schedule(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

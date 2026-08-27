@@ -8,7 +8,12 @@
 from __future__ import annotations
 
 from collections import deque
-from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
+from concurrent.futures import (
+    CancelledError,
+    Future,
+    ThreadPoolExecutor,
+    TimeoutError as FutureTimeoutError,
+)
 from dataclasses import dataclass, field
 import logging
 import re
@@ -18,8 +23,12 @@ from typing import Any, Callable, Mapping
 from uuid import uuid4
 
 from .douyin_commerce_location_commission import normalize_commission_filter
-from .douyin_commerce_probe import build_probe_upload_payload
+from .douyin_commerce_probe import (
+    DouyinCommerceProbeError,
+    build_probe_upload_payload,
+)
 from .douyin_commerce_session import (
+    DouyinCommerceSessionError,
     DouyinCommerceSessionManager,
     snapshot_location_candidates,
 )
@@ -177,17 +186,61 @@ class _CollectorActionQueue:
             action.future = self._executor.submit(self._execute, action)
             action.ready.set()
 
-    def wait(self, action: _QueuedAction) -> Any:
-        action.ready.wait()
+    def wait(
+        self,
+        action: _QueuedAction,
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> Any:
+        timeout = (
+            None
+            if deadline_monotonic is None
+            else deadline_monotonic - monotonic()
+        )
+        if timeout is not None and timeout <= 0:
+            self._cancel_queued_action(action)
+            raise DouyinCommerceCollectorError("province_location_search_action_timeout") from None
+        if not action.ready.wait(timeout):
+            self._cancel_queued_action(action)
+            raise DouyinCommerceCollectorError("province_location_search_action_timeout") from None
         if action.cancelled:
             raise DouyinCommerceCollectorError("stale_result_discarded") from None
         future = action.future
         if future is None:
             raise DouyinCommerceCollectorError("collector_unknown")
         try:
-            return future.result()
+            timeout = (
+                None
+                if deadline_monotonic is None
+                else deadline_monotonic - monotonic()
+            )
+            if timeout is not None and timeout <= 0:
+                self._cancel_queued_action(action)
+                raise DouyinCommerceCollectorError("province_location_search_action_timeout") from None
+            return future.result(timeout=timeout)
+        except FutureTimeoutError:
+            self._cancel_queued_action(action)
+            raise DouyinCommerceCollectorError("province_location_search_action_timeout") from None
         except CancelledError:
             raise DouyinCommerceCollectorError("stale_result_discarded") from None
+
+    def _cancel_queued_action(self, action: _QueuedAction) -> bool:
+        """仅在 future 尚未启动时原子取消并回收队列项。"""
+
+        with self._lock:
+            future = action.future
+            if (
+                action is self._running
+                or future is None
+                or future.done()
+                or not future.cancel()
+            ):
+                return False
+            action.cancelled = True
+            if action in self._actions:
+                self._actions.remove(action)
+            action.ready.set()
+            return True
 
     def run(
         self,
@@ -369,6 +422,8 @@ _CLEANUP_MARKERS = (
     "清理失败",
 )
 _TRUSTED_DIAGNOSTIC_EXCEPTION_TYPES = (
+    DouyinCommerceProbeError,
+    DouyinCommerceSessionError,
     RuntimeError,
     ValueError,
     TypeError,
@@ -500,8 +555,9 @@ class DouyinCommerceCollectorManager:
             self._require_current_begin_flight(begin_flight)
             probe_payload = self._snapshot_probe_payload(built_payload)
             self._require_current_begin_flight(begin_flight)
-        except Exception:
+        except Exception as error:
             self._require_current_begin_flight(begin_flight)
+            self._log_diagnostic_failure("collector_start_failed", error)
             raise DouyinCommerceCollectorError("collector_start_failed") from None
 
         account_id = self._account_id(probe_payload)
@@ -608,6 +664,8 @@ class DouyinCommerceCollectorManager:
         *,
         commission_filter: object = "all",
         include_metadata: bool = False,
+        province_mode: bool = False,
+        deadline_monotonic: float | None = None,
     ) -> dict[str, object]:
         """按固定范围将地点搜索路由到独立会话。"""
 
@@ -650,6 +708,8 @@ class DouyinCommerceCollectorManager:
                     action_instance_id,
                     selected_commission_filter,
                     include_metadata is True,
+                    province_mode is True,
+                    deadline_monotonic,
                 ),
             )
         self._action_queue.start(action)
@@ -663,6 +723,7 @@ class DouyinCommerceCollectorManager:
                 action_instance_id=action_instance_id,
                 scope=normalized_scope,
                 keyword=normalized_keyword,
+                deadline_monotonic=deadline_monotonic,
             )
         except DouyinCommerceCollectorError as error:
             raise self._contextual_action_error(
@@ -677,6 +738,8 @@ class DouyinCommerceCollectorManager:
         *,
         commission_filter: object,
         previous_candidates: object,
+        province_mode: bool = False,
+        deadline_monotonic: float | None = None,
     ) -> dict[str, object]:
         """在同一地点搜索会话中串行读取下一页候选。"""
 
@@ -741,6 +804,8 @@ class DouyinCommerceCollectorManager:
                         action_instance_id,
                         selected_commission_filter,
                         previous_snapshot,
+                        province_mode is True,
+                        deadline_monotonic,
                     ),
                 )
         except DouyinCommerceCollectorError as error:
@@ -761,6 +826,7 @@ class DouyinCommerceCollectorManager:
                 action_instance_id=action_instance_id,
                 scope=normalized_scope,
                 keyword=normalized_keyword,
+                deadline_monotonic=deadline_monotonic,
             )
         except DouyinCommerceCollectorError as error:
             raise self._contextual_action_error(
@@ -1362,6 +1428,8 @@ class DouyinCommerceCollectorManager:
         action_instance_id: str,
         commission_filter: str,
         include_metadata: bool,
+        province_mode: bool,
+        deadline_monotonic: float | None,
     ) -> dict[str, object]:
         started_at = monotonic()
         collector = self._ensure_collector(
@@ -1378,6 +1446,10 @@ class DouyinCommerceCollectorManager:
             }
             if include_metadata:
                 search_kwargs["include_metadata"] = True
+            if province_mode:
+                search_kwargs["province_mode"] = True
+            if deadline_monotonic is not None:
+                search_kwargs["deadline_monotonic"] = deadline_monotonic
             result = collector.manager.search_locations(
                 collector.session_id,
                 keyword,
@@ -1419,6 +1491,8 @@ class DouyinCommerceCollectorManager:
                 error_code, event_emitted=True
             ) from None
         platform_result_count: int | None = None
+        has_more: bool | None = None
+        stop_reason: str | None = None
         try:
             raw_candidates = result
             if include_metadata:
@@ -1426,10 +1500,21 @@ class DouyinCommerceCollectorManager:
                     raise TypeError("metadata_result_invalid")
                 platform_result_count = result.get("platformResultCount")
                 raw_candidates = result.get("candidates")
+                has_more = result.get("hasMore")
+                stop_reason = result.get("stopReason")
                 if (
                     type(platform_result_count) is not int
                     or platform_result_count < 0
                     or not isinstance(raw_candidates, list)
+                    or (has_more is None) != (stop_reason is None)
+                    or (
+                        has_more is not None
+                        and (
+                            type(has_more) is not bool
+                            or not isinstance(stop_reason, str)
+                            or not stop_reason
+                        )
+                    )
                 ):
                     raise TypeError("metadata_result_invalid")
             public_result = [dict(item) for item in raw_candidates]
@@ -1466,6 +1551,27 @@ class DouyinCommerceCollectorManager:
             and platform_result_count is not None
             and platform_result_count > 0
         ):
+            if include_metadata:
+                # 省份计划把明确的首屏空结果当作该城市耗尽，而不是采集器
+                # 故障；保留旧的非元数据 candidate_empty 契约。
+                self._accept_or_discard(
+                    generation_id,
+                    collector,
+                    request_id=request_id,
+                    action="search_locations",
+                    scope=scope,
+                    keyword=keyword,
+                )
+                return self._public_action_result(
+                    generation_id,
+                    collector_type,
+                    collector.instance_id,
+                    candidates=[],
+                    platform_result_count=0,
+                    new_candidate_count=0,
+                    has_more=False,
+                    stop_reason="no_visible_load_more_control",
+                )
             if not self._mark_failed(generation_id, collector):
                 raise DouyinCommerceCollectorError(
                     "stale_result_discarded"
@@ -1485,6 +1591,8 @@ class DouyinCommerceCollectorManager:
             collector.instance_id,
             candidates=public_result,
             platform_result_count=platform_result_count,
+            has_more=has_more,
+            stop_reason=stop_reason,
         )
 
     def _load_more_locations_action(
@@ -1497,6 +1605,8 @@ class DouyinCommerceCollectorManager:
         action_instance_id: str,
         commission_filter: str,
         previous_candidates: list[dict[str, Any]],
+        province_mode: bool,
+        deadline_monotonic: float | None,
     ) -> dict[str, object]:
         started_at = monotonic()
         collector = self._ensure_collector(
@@ -1508,14 +1618,18 @@ class DouyinCommerceCollectorManager:
             raise DouyinCommerceCollectorError("collector_scope_mismatch")
         self._validate_active_collector(generation_id, collector)
         try:
-            result = collector.manager.load_more_locations(
-                collector.session_id,
-                keyword,
-                scope,
-                commission_filter=commission_filter,
-                previous_candidates=self._snapshot_location_candidates(
+            load_kwargs: dict[str, object] = {
+                "commission_filter": commission_filter,
+                "previous_candidates": self._snapshot_location_candidates(
                     previous_candidates
                 ),
+            }
+            if province_mode:
+                load_kwargs["province_mode"] = True
+            if deadline_monotonic is not None:
+                load_kwargs["deadline_monotonic"] = deadline_monotonic
+            result = collector.manager.load_more_locations(
+                collector.session_id, keyword, scope, **load_kwargs
             )
         except Exception as error:
             error_code = self._classify_diagnostic_error(error)
@@ -1833,6 +1947,7 @@ class DouyinCommerceCollectorManager:
             ):
                 self._mark_failed(generation_id, collector)
                 raise DouyinCommerceCollectorError("login_required") from None
+            self._log_diagnostic_failure("collector_start_failed", error)
             if not self._mark_failed(generation_id, collector):
                 raise DouyinCommerceCollectorError(
                     "stale_result_discarded"
@@ -2024,10 +2139,16 @@ class DouyinCommerceCollectorManager:
         action_instance_id: str,
         scope: str = "",
         keyword: str = "",
+        deadline_monotonic: float | None = None,
     ) -> Any:
         started_at = monotonic()
         try:
-            result = self._action_queue.wait(queued_action)
+            if deadline_monotonic is None:
+                result = self._action_queue.wait(queued_action)
+            else:
+                result = self._action_queue.wait(
+                    queued_action, deadline_monotonic=deadline_monotonic
+                )
         except DouyinCommerceCollectorError as error:
             if not error.event_emitted:
                 self._emit_event(
@@ -2270,6 +2391,11 @@ class DouyinCommerceCollectorManager:
             "publish_location_load_more_failed",
         }:
             return detail
+        if detail in {
+            "province_location_search_action_timeout",
+            "publish_location_load_more_limit",
+        }:
+            return "province_location_search_action_timeout"
         if any(marker in detail for marker in _LOGIN_MARKERS):
             return "login_required"
         if any(marker in detail for marker in _SCOPE_MARKERS) or (
@@ -2299,7 +2425,17 @@ class DouyinCommerceCollectorManager:
     def _safe_diagnostic_detail(cls, error: object) -> str:
         """生成最多 180 字的本机开发摘要，不保留账号态或页面原文。"""
 
-        return _redact_diagnostic_text(error)
+        detail = _redact_diagnostic_text(error)
+        if detail != "<unavailable>":
+            return detail
+        error_type = type(error)
+        type_name = re.sub(
+            r"[^A-Za-z0-9_.]",
+            "",
+            f"{getattr(error_type, '__module__', '')}."
+            f"{getattr(error_type, '__name__', '')}",
+        ).strip(".")
+        return f"<{type_name or 'unavailable'}>"[:180]
 
     @classmethod
     def _log_diagnostic_failure(cls, error_code: str, error: object) -> None:
@@ -2316,6 +2452,8 @@ class DouyinCommerceCollectorManager:
                 "cleanup_incomplete",
                 "collector_search_context_mismatch",
                 "publish_location_load_more_failed",
+                "province_location_search_action_timeout",
+                "collector_start_failed",
                 "collector_unknown",
             }
             else "collector_unknown"

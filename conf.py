@@ -15,6 +15,13 @@ def resolve_user_data_dir(
 ) -> Path:
     """返回运行数据目录；冻结客户端绝不写入安装包目录。"""
 
+    explicit_dir = str(os.environ.get("YIJIANFA_USER_DATA_DIR") or "").strip()
+    if explicit_dir:
+        explicit_path = Path(explicit_dir).expanduser()
+        if not explicit_path.is_absolute():
+            raise ValueError("YIJIANFA_USER_DATA_DIR 必须是绝对路径")
+        return explicit_path
+
     is_frozen = getattr(sys, "frozen", False) if frozen is None else frozen
     current_platform = sys.platform if platform_name is None else platform_name
     current_home = Path.home() if home is None else Path(home)

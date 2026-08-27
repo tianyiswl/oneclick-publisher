@@ -23,7 +23,7 @@ class DevLauncherTests(unittest.TestCase):
         source = LAUNCHER_SOURCE.read_text(encoding="utf-8")
         self.assertIn("Process()", source)
         self.assertIn("process.processIdentifier", source)
-        self.assertIn("desktop_native_app.py", source)
+        self.assertIn("run_source_live.py", source)
         self.assertIn('"--page", "commerce"', source)
         root_resolution = source.split("let python", 1)[0]
         self.assertEqual(root_resolution.count(".deletingLastPathComponent()"), 5)

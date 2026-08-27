@@ -337,6 +337,15 @@ def sync_account_data(
             batch = collect(account)
         if type(batch) is not CollectionBatch:
             raise CollectionFailure("metric_payload_invalid")
+        complete_content = getattr(collector, "complete_content_data", None)
+        if (
+            batch.platform_type == 3
+            and not batch.content_data_available
+            and callable(complete_content)
+        ):
+            batch = complete_content(account, batch, report=report)
+            if type(batch) is not CollectionBatch:
+                raise CollectionFailure("metric_payload_invalid")
         source_mode = batch.source_mode
         _report_stage(report, "account_metrics")
         _report_stage(report, "content_list")

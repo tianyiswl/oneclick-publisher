@@ -20,6 +20,10 @@ from .xhs_native_adapter import XhsNativeAdapter, build_native_contract
 class XhsPublishError(RuntimeError):
     """小红书正式任务未获得可验证平台回执。"""
 
+    def __init__(self, message: str, *, error_code: str = "xhs_publish_failed") -> None:
+        self.error_code = str(error_code)
+        super().__init__(message)
+
 
 def _normalized(value: object) -> str:
     return " ".join(str(value or "").replace("\u200b", "").split())
@@ -204,7 +208,7 @@ async def _wait_for_platform_result(
     task_id: int,
     schedule_text: str | None,
     scheduled: bool,
-    timeout_seconds: int = 600,
+    timeout_seconds: int = 120,
 ) -> dict:
     """等待前台最终操作后的平台回执；不点击任何弹窗或确认按钮。"""
 
@@ -264,12 +268,20 @@ async def _wait_for_platform_result(
                     + marker[:700]
                 )
         await page.wait_for_timeout(500)
-    raise XhsPublishError("等待小红书平台成功回执超时，页面已保留至超时结束")
+    raise XhsPublishError(
+        f"点击小红书最终按钮后未在 {int(timeout_seconds)} 秒内获得平台成功回执；"
+        "不能确认是否已受理，请到平台作品管理页核对后再决定是否重试",
+        error_code="xhs_receipt_timeout",
+    )
 
 
 async def run_xhs_publish(payload: dict, *, task_id: int) -> dict:
     _validate_payload(payload)
     account = oneclick_preflight._account_for_payload(payload)
+    try:
+        oneclick_preflight._validate_xhs_account_id(payload, account)
+    except oneclick_preflight.PreflightError as exc:
+        raise XhsPublishError(str(exc)) from exc
     expected_account = _normalized(account.get("userName"))
     target_schedule = _schedule_time(payload)
     schedule_text = (
@@ -309,6 +321,7 @@ async def run_xhs_publish(payload: dict, *, task_id: int) -> dict:
 
         helper = XhsNativeAdapter(payload)
         readback = await helper.fill_content(page)
+        location_readback = await helper.apply_location(page)
         await helper.fill_official_topics(page)
         topic_nodes = page.locator(".tiptap.ProseMirror a.tiptap-topic")
         topic_node_texts = [
@@ -343,6 +356,7 @@ async def run_xhs_publish(payload: dict, *, task_id: int) -> dict:
                 f"类型={'图文' if readback['contentType'] == 'article' else '视频'}；"
                 f"标题={readback['title']}；素材={readback['mediaCount']}；"
                 f"标签={len(readback['tags'])}；"
+                f"地点={location_readback['editorNameReadback'] if location_readback else '未设置'}；"
                 f"发布方式={schedule_text or '立即发布'}。"
                 "平台页已置于前台，等待点击最终发布按钮。"
             ),
@@ -380,6 +394,7 @@ async def run_xhs_publish(payload: dict, *, task_id: int) -> dict:
                 "videoCount": readback["videoCount"],
                 "tagCount": len(readback["tags"]),
                 "executionBackend": readback["executionBackend"],
+                "location": location_readback,
             }
         )
         return receipt

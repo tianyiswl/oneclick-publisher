@@ -1,0 +1,173 @@
+{
+  "schema_version": 1,
+  "diagram_type": "dataflow",
+  "meta": {
+    "title": "一键发内容项目数据回收通道",
+    "output": "docs/architecture/oneclick-content-project-metrics-dataflow.html",
+    "viewBox": [1180, 610],
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "sync-path",
+        "label": "每日同步",
+        "focus": ["automation", "mcp", "sync", "platforms", "metricsdb"],
+        "note": "固定时间由内容自动化发起；一键发按账号去重、采集并保存可信快照。"
+      },
+      {
+        "id": "read-path",
+        "label": "项目读取",
+        "focus": ["projects", "mcp", "links", "metricsdb", "query"],
+        "note": "项目只按自己的发布任务读取作品指标，不直接访问平台或数据库。"
+      }
+    ]
+  },
+  "stages": [
+    {"label": "触发方"},
+    {"label": "本机接口"},
+    {"label": "同步与校验"},
+    {"label": "可信存储"},
+    {"label": "结果消费"}
+  ],
+  "nodes": [
+    {
+      "id": "projects",
+      "type": "frontend",
+      "label": "五个内容项目",
+      "sublabel": "projectId + 发布 taskId",
+      "stage": 0,
+      "row": 0,
+      "tag": "无登录凭据"
+    },
+    {
+      "id": "automation",
+      "type": "backend",
+      "label": "固定时间自动化",
+      "sublabel": "每天一次触发",
+      "stage": 0,
+      "row": 2,
+      "tag": "北京时间"
+    },
+    {
+      "id": "mcp",
+      "type": "security",
+      "label": "一键发本机 MCP",
+      "sublabel": "stdio 只读数据工具",
+      "stage": 1,
+      "row": 1,
+      "tag": "稳定 JSON"
+    },
+    {
+      "id": "sync",
+      "type": "backend",
+      "label": "同步编排与平台采集器",
+      "sublabel": "当日去重、失败冷却、逐账号读取",
+      "stage": 2,
+      "row": 2,
+      "width": 172,
+      "tag": "单账号串行"
+    },
+    {
+      "id": "platforms",
+      "type": "external",
+      "label": "国内平台官方后台",
+      "sublabel": "抖音、小红书、快手、B站、公众号",
+      "stage": 0,
+      "row": 3,
+      "width": 144,
+      "tag": "只读"
+    },
+    {
+      "id": "links",
+      "type": "database",
+      "label": "项目发布关联",
+      "sublabel": "projectId ↔ taskId ↔ 作品 ID",
+      "stage": 3,
+      "row": 0,
+      "tag": "严格归属"
+    },
+    {
+      "id": "metricsdb",
+      "type": "database",
+      "label": "SQLite 指标快照",
+      "sublabel": "批次、来源、日期、缺失状态",
+      "stage": 3,
+      "row": 3,
+      "tag": "保留历史"
+    },
+    {
+      "id": "query",
+      "type": "backend",
+      "label": "项目指标查询",
+      "sublabel": "账号概览 + 作品数据 + 新鲜度",
+      "stage": 4,
+      "row": 1,
+      "tag": "只返回本项目"
+    }
+  ],
+  "flows": [
+    {
+      "id": "project-read",
+      "from": "projects",
+      "to": "mcp",
+      "label": "按项目读取最新快照",
+      "classification": "只读请求",
+      "variant": "default"
+    },
+    {
+      "id": "daily-trigger",
+      "from": "automation",
+      "to": "mcp",
+      "label": "每日同步请求",
+      "classification": "本机调用",
+      "variant": "emphasis"
+    },
+    {
+      "id": "sync-policy",
+      "from": "mcp",
+      "to": "sync",
+      "label": "校验项目账号并决定同步",
+      "classification": "去重与冷却",
+      "variant": "security"
+    },
+    {
+      "id": "official-read",
+      "from": "platforms",
+      "to": "sync",
+      "label": "读取官方账号与作品数据",
+      "classification": "已登录只读会话",
+      "variant": "security"
+    },
+    {
+      "id": "normalized-batch",
+      "from": "sync",
+      "to": "metricsdb",
+      "label": "归一化指标批次",
+      "classification": "可信快照",
+      "variant": "emphasis"
+    },
+    {
+      "id": "task-ownership",
+      "from": "mcp",
+      "to": "links",
+      "label": "登记正式发布任务归属",
+      "classification": "不含正文与凭据",
+      "variant": "security"
+    },
+    {
+      "id": "authorized-query",
+      "from": "links",
+      "to": "query",
+      "label": "限定项目作品集合",
+      "classification": "归属过滤",
+      "variant": "security"
+    },
+    {
+      "id": "metric-query",
+      "from": "metricsdb",
+      "to": "query",
+      "label": "最新可信指标与同步状态",
+      "classification": "只读",
+      "variant": "default"
+    }
+  ]
+}

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping
@@ -99,7 +100,11 @@ def _platforms(value: Any) -> list[str]:
     return list(dict.fromkeys(aliases.get(item.strip(), item.strip()) for item in value))
 
 
-def _ai_disclosure(data: Mapping[str, Any], root: Path) -> dict[str, Any]:
+def _ai_disclosure(
+    data: Mapping[str, Any],
+    root: Path,
+    migration_warnings: list[str],
+) -> dict[str, Any]:
     """读取显式 AI 来源标记；缺省时一律不得自动接受平台声明。"""
 
     value = data.get("aiDisclosure")
@@ -112,6 +117,29 @@ def _ai_disclosure(data: Mapping[str, Any], root: Path) -> dict[str, Any]:
         }
     if not isinstance(value, Mapping):
         raise ContentBundleError("aiDisclosure 必须是对象")
+    legacy_keys = {"text", "image", "video", "audio"}
+    if set(value).issubset(legacy_keys) and set(value):
+        for key in legacy_keys:
+            if key in value:
+                _bool(value[key], f"aiDisclosure.{key}")
+        kinds = [
+            key for key in ("text", "image", "video", "audio")
+            if value.get(key) is True
+        ]
+        allow_auto = data.get("allowPlatformAutoDeclaration", False)
+        _bool(allow_auto, "allowPlatformAutoDeclaration")
+        migration_warnings.append("legacy_ai_disclosure_migrated")
+        if "image" in kinds:
+            raise ContentBundleError(
+                "旧 aiDisclosure 声明了 AI 图片，但没有 aiDisclosure.assetPaths；"
+                "请迁移为当前结构后重新导入"
+            )
+        return {
+            "containsAiGeneratedContent": bool(kinds),
+            "contentKinds": kinds,
+            "assetPaths": [],
+            "allowPlatformAutoDeclaration": bool(allow_auto),
+        }
     unexpected = set(value) - {
         "containsAiGeneratedContent",
         "contentKinds",
@@ -306,6 +334,33 @@ def _overrides(value: Any) -> dict[str, dict[str, Any]]:
     return result
 
 
+_PLATFORM_PREVIEW_HEADING = re.compile(
+    r"(?m)^\s*#{1,3}\s*(抖音|小红书|微信公众号|公众号|视频号|快手|哔哩哔哩|B站)\s*$"
+)
+
+
+def _is_platform_preview(body: str) -> bool:
+    """识别给人看的多平台预览文档，避免把它当成发布正文。"""
+
+    return len(_PLATFORM_PREVIEW_HEADING.findall(str(body or ""))) >= 1
+
+
+def _has_complete_platform_overrides(
+    preferred_platforms: list[str],
+    overrides: Mapping[str, Mapping[str, Any]],
+) -> bool:
+    aliases = {"公众号": "微信公众号", "B站": "哔哩哔哩"}
+    by_platform = {
+        aliases.get(str(name).strip(), str(name).strip()): value
+        for name, value in overrides.items()
+    }
+    return bool(preferred_platforms) and all(
+        bool(by_platform.get(platform, {}).get("title"))
+        and bool(by_platform.get(platform, {}).get("body"))
+        for platform in preferred_platforms
+    )
+
+
 def _publish_schedule(value: Any) -> dict[str, Any]:
     """读取可选的本地定时设置；这里只校验格式，不触发平台动作。"""
 
@@ -387,6 +442,17 @@ def load_content_bundle(manifest_path: str | Path, *, expected_type: str | None 
     root = path.parent.resolve()
     asset_paths, article_images = _assets(data, root, content_type)
     preferred_platforms = _platforms(data.get("preferredPlatforms"))
+    overrides = _overrides(data.get("platformOverrides"))
+    body = _body(data, root)
+    body_is_preview = _is_platform_preview(body)
+    if body_is_preview and not _has_complete_platform_overrides(
+        preferred_platforms, overrides
+    ):
+        raise ContentBundleError(
+            "bodyFile 是多平台预览文档，但没有为全部目标平台提供独立 title/body；"
+            "请迁移为结构化 platformOverrides"
+        )
+    migration_warnings: list[str] = []
     wechat_article_template = _wechat_article_template(
         data.get("wechatArticleTemplate")
     )
@@ -399,18 +465,26 @@ def load_content_bundle(manifest_path: str | Path, *, expected_type: str | None 
             raise ContentBundleError(
                 "wechatArticleTemplate 仅支持公众号图文或文字内容包"
             )
+    common_title = "" if body_is_preview else _text(data.get("title"), "title")
+    common_body = "" if body_is_preview else body
+    common_tags = [] if body_is_preview else _tags(data.get("tags"))
     return {
         "schemaVersion": SCHEMA_VERSION,
         "contentType": content_type,
         "title": _text(data.get("title"), "title"),
-        "body": _body(data, root),
+        "body": body,
         "tags": _tags(data.get("tags")),
+        "commonTitle": common_title,
+        "commonBody": common_body,
+        "commonTags": common_tags,
+        "bodyIsPreview": body_is_preview,
         "assetPaths": asset_paths,
         "articleImages": article_images,
         "coverPaths": _covers(data, root),
         "preferredPlatforms": preferred_platforms,
-        "platformOverrides": _overrides(data.get("platformOverrides")),
-        "aiDisclosure": _ai_disclosure(data, root),
+        "platformOverrides": overrides,
+        "aiDisclosure": _ai_disclosure(data, root, migration_warnings),
+        "migrationWarnings": migration_warnings,
         "originalDeclaration": _original_declaration(
             data.get("originalDeclaration")
         ),

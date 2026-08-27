@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .paths import DB_PATH, ensure_runtime_dirs
+from .platform_data_comment_store import create_comment_schema
 
 
 @contextmanager
@@ -285,6 +286,21 @@ def ensure_schema() -> None:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS douyin_location_search_progress (
+                accountId TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                keyword TEXT NOT NULL,
+                commissionFilter TEXT NOT NULL,
+                planJson TEXT NOT NULL,
+                eligibleTotal INTEGER NOT NULL
+                    CHECK(eligibleTotal >= 0 AND eligibleTotal <= 100),
+                updatedAt TEXT NOT NULL,
+                PRIMARY KEY(accountId, scope, keyword, commissionFilter)
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS douyin_location_cache_keywords (
                 locationCacheId INTEGER NOT NULL,
                 accountId TEXT NOT NULL,
@@ -447,6 +463,7 @@ def ensure_schema() -> None:
             ON platform_contents(accountId, platformType, publishedAt DESC, id DESC)
             """
         )
+        create_comment_schema(conn)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS publish_tasks (
@@ -483,7 +500,28 @@ def ensure_schema() -> None:
                 ("pauseReasonCode", "TEXT"),
                 ("resumeSourceTaskId", "INTEGER"),
                 ("revisionSourceTaskId", "INTEGER"),
+                ("workerPid", "INTEGER"),
+                ("workerHeartbeatAt", "TEXT"),
             ),
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS content_project_task_links (
+                projectId TEXT NOT NULL,
+                taskId INTEGER NOT NULL,
+                phase TEXT NOT NULL CHECK(phase IN ('preflight', 'formal')),
+                createdAt TEXT NOT NULL,
+                PRIMARY KEY(projectId, taskId),
+                UNIQUE(taskId),
+                FOREIGN KEY(taskId) REFERENCES publish_tasks(id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_content_project_task_links_project
+            ON content_project_task_links(projectId, phase, taskId DESC)
+            """
         )
         conn.execute(
             """
@@ -531,6 +569,13 @@ def ensure_schema() -> None:
                 ("batchItemIndex", "INTEGER"),
                 ("locationSummary", "TEXT"),
                 ("scheduleSummary", "TEXT"),
+                ("platformPostId", "TEXT"),
+                ("postUrl", "TEXT"),
+                ("publishedAt", "TEXT"),
+                ("accountId", "INTEGER"),
+                ("errorCode", "TEXT NOT NULL DEFAULT ''"),
+                ("receiptJson", "TEXT NOT NULL DEFAULT ''"),
+                ("authorizationSnapshotHash", "TEXT NOT NULL DEFAULT ''"),
             ),
         )
         conn.execute(

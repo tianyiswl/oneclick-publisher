@@ -7,9 +7,17 @@ on:
         description: 构建日期（YYYYMMDD，留空则使用 Runner 当天日期）
         required: false
         type: string
+      delivery:
+        description: 构建包保存方式（临时包额度不足时选择私有候选版本）
+        required: true
+        default: artifact
+        type: choice
+        options:
+          - artifact
+          - prerelease
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build-windows-x64:
@@ -69,6 +77,7 @@ jobs:
           }
 
       - name: 上传 Windows 客户端
+        if: ${{ inputs.delivery == 'artifact' }}
         uses: actions/upload-artifact@v4
         with:
           name: 一键发-Windows-x64-${{ github.run_number }}
@@ -77,6 +86,36 @@ jobs:
             release/YiJianFa_*_Windows_x64_*.zip.sha256
           if-no-files-found: error
           retention-days: 30
+
+      - name: 保存到私有候选版本
+        if: ${{ inputs.delivery == 'prerelease' }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $buildDate = '${{ inputs.build_date }}'.Trim()
+          if ([string]::IsNullOrWhiteSpace($buildDate)) {
+            $buildDate = Get-Date -Format "yyyyMMdd"
+          }
+          $version = (python -c "from app_core.branding import APP_VERSION; print(APP_VERSION)").Trim()
+          $tag = "v$version-candidate-$buildDate"
+          $zip = Get-ChildItem release/YiJianFa_*_Windows_x64_*.zip | Select-Object -First 1
+          if (-not $zip) {
+            throw "没有找到 Windows 客户端 ZIP"
+          }
+          $shaFile = "$($zip.FullName).sha256"
+          if (-not (Test-Path $shaFile)) {
+            throw "没有找到 Windows 客户端校验文件"
+          }
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $zip.FullName $shaFile --clobber
+          } else {
+            gh release create $tag $zip.FullName $shaFile --target $env:GITHUB_SHA --title "一键发 $version 候选客户端" --notes "国内定位与数据监测/分析候选版；海外功能未包含。" --prerelease
+          }
+          if ($LASTEXITCODE -ne 0) {
+            throw "保存私有候选版本失败"
+          }
 
       - name: 写入构建摘要
         if: success()
@@ -88,4 +127,4 @@ jobs:
           Add-Content $env:GITHUB_STEP_SUMMARY ""
           Add-Content $env:GITHUB_STEP_SUMMARY "- 文件：$($zip.Name)"
           Add-Content $env:GITHUB_STEP_SUMMARY "- 校验：``$sha``"
-          Add-Content $env:GITHUB_STEP_SUMMARY "- 分发：GitHub Actions Artifact，保留 30 天"
+          Add-Content $env:GITHUB_STEP_SUMMARY "- 分发：${{ inputs.delivery }}"

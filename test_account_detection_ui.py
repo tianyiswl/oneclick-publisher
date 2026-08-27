@@ -124,6 +124,18 @@ class AccountDetectionUiTests(unittest.TestCase):
         self.assertEqual(window.current_workspace_label.text(), "发布中心")
         window.close()
 
+    def test_douyin_graphic_matrix_is_independent_navigation_page(self) -> None:
+        window = MainWindow()
+        try:
+            labels = [label for label, _page, _icon in window.page_definitions]
+            self.assertEqual(labels[3:6], ["发布中心", "抖音图文矩阵", "抖音带货"])
+            window.set_current_page_by_key("douyin_graphic_matrix")
+            self.assertIs(window.tabs.currentWidget(), window.douyin_graphic_matrix)
+            self.assertEqual(window.current_workspace_label.text(), "抖音图文矩阵")
+        finally:
+            window.accounts.stop_auto_checking()
+            window.deleteLater()
+
 
 if __name__ == "__main__":
     unittest.main()

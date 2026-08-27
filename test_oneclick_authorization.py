@@ -2,9 +2,12 @@
 """一键发授权执行器的离线测试：不启动浏览器，不访问平台。"""
 
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import AsyncMock, patch
 
 from app_core.oneclick_authorization import (
+    AuthorizationPlan,
     AuthorizationSession,
     authorization_browser_launch_options,
     authorization_plan,
@@ -44,6 +47,105 @@ class _WechatHomePage:
         if "login__type__container__scan" in selector:
             return _NodeList([])
         return _NodeList([True])
+
+
+class _KuaishouLoginLink:
+    def __init__(self, page) -> None:
+        self.page = page
+        self.clicked = False
+
+    async def is_visible(self, timeout: int = 0) -> bool:
+        del timeout
+        return True
+
+    async def inner_text(self) -> str:
+        return "立即登录"
+
+    async def get_attribute(self, name: str) -> str | None:
+        return "/rest/infra/logout" if name == "href" else None
+
+    async def click(self, timeout: int = 0) -> None:
+        del timeout
+        self.clicked = True
+        self.page.url = "https://passport.kuaishou.com/pc/account/login/?sid=test"
+
+
+class _KuaishouLoginNodes:
+    def __init__(self, link: _KuaishouLoginLink) -> None:
+        self.link = link
+
+    async def count(self) -> int:
+        return 1
+
+    def nth(self, index: int) -> _KuaishouLoginLink:
+        if index != 0:
+            raise IndexError(index)
+        return self.link
+
+
+class _KuaishouAuthorizationPage:
+    def __init__(self) -> None:
+        self.url = "about:blank"
+        self.login_link = _KuaishouLoginLink(self)
+        self.goto_urls: list[str] = []
+
+    def on(self, *_args) -> None:
+        return None
+
+    async def goto(self, url: str, **_kwargs) -> None:
+        self.goto_urls.append(url)
+        self.url = "https://cp.kuaishou.com/profile"
+
+    def locator(self, selector: str) -> _KuaishouLoginNodes:
+        self.last_selector = selector
+        return _KuaishouLoginNodes(self.login_link)
+
+    async def wait_for_url(self, _pattern, timeout: int = 0) -> None:
+        del timeout
+        return None
+
+    def is_closed(self) -> bool:
+        return False
+
+
+class _KuaishouAuthorizationContext:
+    def __init__(self, page: _KuaishouAuthorizationPage) -> None:
+        self.pages = [page]
+        self.closed = False
+
+    def on(self, *_args) -> None:
+        return None
+
+    async def new_page(self):
+        return self.pages[0]
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class _KuaishouAuthorizationChromium:
+    def __init__(self, context: _KuaishouAuthorizationContext) -> None:
+        self.context = context
+
+    async def launch_persistent_context(self, **_kwargs):
+        return self.context
+
+
+class _KuaishouAuthorizationPlaywright:
+    def __init__(self, context: _KuaishouAuthorizationContext) -> None:
+        self.chromium = _KuaishouAuthorizationChromium(context)
+        self.stopped = False
+
+    async def stop(self) -> None:
+        self.stopped = True
+
+
+class _KuaishouAuthorizationManager:
+    def __init__(self, playwright: _KuaishouAuthorizationPlaywright) -> None:
+        self.playwright = playwright
+
+    async def start(self):
+        return self.playwright
 
 
 class OneClickAuthorizationTests(unittest.TestCase):
@@ -210,6 +312,40 @@ class OneClickWechatAuthorizationAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(session._save_requested.is_set())
         self.assertEqual(session._detected_display_name, "硅基进化")
         self.assertEqual(session.queue.get_nowait(), "LOGIN_DETECTED")
+
+
+class OneClickKuaishouAuthorizationAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_portal_login_automatically_enters_official_passport_page(self) -> None:
+        """快手授权不能停在仍需人工二次点击的创作者门户页。"""
+
+        page = _KuaishouAuthorizationPage()
+        context = _KuaishouAuthorizationContext(page)
+        playwright = _KuaishouAuthorizationPlaywright(context)
+        session = AuthorizationSession(4, "快手测试主体")
+        # 只验证打开页面的第一阶段；进入登录页后立刻结束离线会话。
+        session._cancel_requested.set()
+        with TemporaryDirectory() as temporary, patch(
+            "app_core.oneclick_authorization.authorization_plan",
+            return_value=AuthorizationPlan(
+                4,
+                "快手",
+                "https://cp.kuaishou.com/profile",
+                Path(temporary),
+            ),
+        ), patch(
+            "playwright.async_api.async_playwright",
+            return_value=_KuaishouAuthorizationManager(playwright),
+        ):
+            await session._run()
+
+        self.assertEqual(page.goto_urls, ["https://cp.kuaishou.com/profile"])
+        self.assertTrue(page.login_link.clicked)
+        self.assertEqual(
+            page.url,
+            "https://passport.kuaishou.com/pc/account/login/?sid=test",
+        )
+        self.assertTrue(context.closed)
+        self.assertTrue(playwright.stopped)
 
 
 if __name__ == "__main__":

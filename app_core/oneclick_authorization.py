@@ -14,7 +14,7 @@ import threading
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 from . import account_service
 from .paths import COOKIE_DIR, USER_DATA_DIR, ensure_runtime_dirs
@@ -32,7 +32,7 @@ _DOMESTIC_LOGIN_URLS = {
     1: "https://creator.xiaohongshu.com/",
     2: "https://channels.weixin.qq.com/platform/",
     3: "https://creator.douyin.com/",
-    4: "https://cp.kuaishou.com/",
+    4: "https://cp.kuaishou.com/profile",
     5: "https://member.bilibili.com/platform/home",
     10: "https://mp.weixin.qq.com/",
 }
@@ -138,6 +138,81 @@ def wechat_authorization_page_confirms(
         and not login_visible
         and account_service._is_display_name(display_name)
     )
+
+
+def kuaishou_passport_page_confirms(current_url: object) -> bool:
+    """确认快手门户已经跳到官方账号登录页。"""
+
+    parsed = urlsplit(str(current_url or ""))
+    return bool(
+        parsed.scheme == "https"
+        and parsed.hostname == "passport.kuaishou.com"
+        and parsed.path.rstrip("/") == "/pc/account/login"
+    )
+
+
+async def _enter_kuaishou_login_page(page, platform_type: int) -> bool:
+    """从快手创作者门户进入官方登录页，不写死易变化的回跳参数。
+
+    快手当前的未登录门户会渲染一个“立即登录”链接。它的官方入口负责
+    生成 ``sid`` 和 ``callback``，因此这里只点击门户自己的链接，并校验
+    最终域名和路径；已有登录态或门户不再显示入口时不做任何操作。
+    """
+
+    if int(platform_type) != 4:
+        return False
+    if kuaishou_passport_page_confirms(getattr(page, "url", "")):
+        return False
+
+    current = urlsplit(str(getattr(page, "url", "") or ""))
+    if current.scheme != "https" or current.hostname != "cp.kuaishou.com":
+        raise RuntimeError("快手授权入口不是官方创作者中心，已停止自动跳转。")
+
+    login_link = None
+    for _attempt in range(12):
+        candidates = page.locator('a[href*="/rest/infra/logout"]')
+        visible_matches = []
+        for index in range(min(await candidates.count(), 8)):
+            candidate = candidates.nth(index)
+            try:
+                if not await candidate.is_visible(timeout=250):
+                    continue
+                text = "".join((await candidate.inner_text()).split())
+            except Exception:
+                continue
+            if text in {"登录", "立即登录"}:
+                visible_matches.append(candidate)
+        if len(visible_matches) > 1:
+            raise RuntimeError("快手门户出现多个可见登录入口，已停止自动点击。")
+        if visible_matches:
+            login_link = visible_matches[0]
+            break
+        # 已登录会话可能在等待期间由门户自行跳转，不能再点击旧入口。
+        current = urlsplit(str(getattr(page, "url", "") or ""))
+        if current.hostname != "cp.kuaishou.com":
+            return False
+        await asyncio.sleep(0.25)
+
+    if login_link is None:
+        return False
+
+    href = await login_link.get_attribute("href")
+    target = urlsplit(urljoin(str(page.url), str(href or "")))
+    if not (
+        target.scheme == "https"
+        and target.hostname == "cp.kuaishou.com"
+        and target.path.rstrip("/") == "/rest/infra/logout"
+    ):
+        raise RuntimeError("快手门户登录入口不是预期的官方链接，已停止自动点击。")
+
+    await login_link.click(timeout=5_000)
+    await page.wait_for_url(
+        re.compile(r"^https://passport\.kuaishou\.com/pc/account/login(?:/|\?|$)"),
+        timeout=15_000,
+    )
+    if not kuaishou_passport_page_confirms(page.url):
+        raise RuntimeError("快手门户没有进入官方账号登录页，已停止授权。")
+    return True
 
 
 def _safe_fragment(value: str) -> str:
@@ -269,6 +344,8 @@ class AuthorizationSession:
 
             context.on("page", observe_new_page)
             await page.goto(plan.login_url, wait_until="domcontentloaded", timeout=45_000)
+            if await _enter_kuaishou_login_page(page, self.platform_type):
+                self.queue.put("已自动进入快手官方登录页。")
             self.queue.put("BROWSER_OPENED")
             self.queue.put("请在官方页面完成登录；一键发检测到身份回执后会自动保存账号。")
 
