@@ -11,11 +11,20 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from app_core.overseas_youtube_api import YOUTUBE_VIDEOS_ENDPOINT
+from app_core.overseas_youtube_api import (
+    YOUTUBE_VIDEOS_ENDPOINT,
+    YouTubeChannelIdentity,
+    YouTubeUploadError,
+)
+from app_core.overseas_youtube_login import YouTubeAuthorizedSession
 from app_core.overseas_youtube_publish import (
     YOUTUBE_THUMBNAILS_UPLOAD_ENDPOINT,
     YouTubeOfficialPublishError,
+    YouTubePublishDependencies,
     YouTubeVideoManagementClient,
+    YouTubeVideoStatus,
+    run_youtube_preflight_sync,
+    run_youtube_publish_sync,
     validate_youtube_publish_payload,
 )
 
@@ -269,6 +278,204 @@ class YouTubeVideoManagementClientTests(unittest.TestCase):
                 "access-secret",
                 video_id="video-1",
             )
+
+
+class FakePublishDependencies:
+    def __init__(
+        self,
+        *,
+        final_visibility: str = "private",
+        thumbnail_error: str | None = None,
+        upload_error: str | None = None,
+    ) -> None:
+        self.operations: list[str] = []
+        self.upload_attempts = 0
+        self.final_visibility = final_visibility
+        self.thumbnail_error = thumbnail_error
+        self.upload_error = upload_error
+        self.read_count = 0
+        self.video_client = self
+        self.session = YouTubeAuthorizedSession(
+            access_token="access-secret",
+            identity=YouTubeChannelIdentity("UC-test", "测试频道"),
+            credential_reference="youtube-oauth:test-reference",
+        )
+
+    def authorize(self, _checked):
+        self.operations.append("authorize")
+        return self.session
+
+    def upload_private(self, _upload, _session):
+        self.operations.append("upload_private")
+        self.upload_attempts += 1
+        if self.upload_error:
+            raise YouTubeUploadError(self.upload_error)
+        return "video-1"
+
+    def _status(self, visibility: str, publish_at: str | None = None):
+        return YouTubeVideoStatus(
+            video_id="video-1",
+            privacy_status=visibility,
+            publish_at=publish_at,
+            made_for_kids=False,
+            upload_status="processed",
+            processing_status="succeeded",
+            channel_id="UC-test",
+            title="测试标题",
+        )
+
+    def read_status(self, _token, *, video_id):
+        self.read_count += 1
+        if self.read_count == 1:
+            self.operations.append("read_private")
+            return self._status("private")
+        self.operations.append("read_final")
+        return self._status(self.final_visibility)
+
+    def set_thumbnail(self, _token, *, video_id, path):
+        self.operations.append("set_thumbnail")
+        if self.thumbnail_error:
+            raise YouTubeOfficialPublishError(self.thumbnail_error)
+
+    def apply_visibility(
+        self,
+        _token,
+        *,
+        video_id,
+        target_visibility,
+        publish_at,
+        made_for_kids,
+    ):
+        self.operations.append(f"apply_{target_visibility}")
+        return self._status(
+            "private" if target_visibility == "scheduled_public" else target_visibility,
+            publish_at,
+        )
+
+    def dependencies(self) -> YouTubePublishDependencies:
+        return YouTubePublishDependencies(
+            authorize=self.authorize,
+            upload_private=self.upload_private,
+            video_client=self,
+        )
+
+
+class YouTubeOfficialPublishServiceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.video = self.root / "video.mp4"
+        self.video.write_bytes(b"video")
+        self.cover = self.root / "cover.png"
+        self.cover.write_bytes(VALID_PNG)
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def _payload(self, **changes: object) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "type": 7,
+            "youtubeOfficialApi": True,
+            "fileList": [str(self.video)],
+            "title": "测试标题",
+            "description": "测试正文",
+            "tags": ["oneclick"],
+            "accountIds": [71],
+            "accountList": ["youtube-oauth:test-reference"],
+            "youtubeExpectedChannelId": "UC-test",
+            "visibility": "private",
+            "madeForKids": False,
+            "notifySubscribers": True,
+            "enableTimer": False,
+            "scheduleTime": None,
+            "scheduleTimezone": "Asia/Shanghai",
+            "coverPath": "",
+        }
+        payload.update(changes)
+        return payload
+
+    def test_preflight_authorizes_read_only_and_never_constructs_a_video(self) -> None:
+        fake = FakePublishDependencies()
+
+        result = run_youtube_preflight_sync(
+            self._payload(),
+            dependencies=fake.dependencies(),
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["receipt"]["platformMutation"], "none")
+        self.assertEqual(fake.operations, ["authorize"])
+        self.assertEqual(fake.upload_attempts, 0)
+
+    def test_uploads_private_then_thumbnail_then_unlisted_and_reads_back(self) -> None:
+        fake = FakePublishDependencies(final_visibility="unlisted")
+
+        result = run_youtube_publish_sync(
+            self._payload(visibility="unlisted", coverPath=str(self.cover)),
+            task_id=41,
+            dependencies=fake.dependencies(),
+        )
+
+        self.assertEqual(
+            fake.operations,
+            [
+                "authorize",
+                "upload_private",
+                "read_private",
+                "set_thumbnail",
+                "apply_unlisted",
+                "read_final",
+            ],
+        )
+        self.assertEqual(result["receipt"]["videoId"], "video-1")
+        self.assertEqual(result["receipt"]["visibility"], "unlisted")
+        self.assertTrue(result["receipt"]["thumbnailApplied"])
+
+    def test_thumbnail_failure_leaves_private_and_never_applies_visibility(self) -> None:
+        fake = FakePublishDependencies(
+            final_visibility="public",
+            thumbnail_error="youtube_thumbnail_forbidden",
+        )
+
+        with self.assertRaises(YouTubeOfficialPublishError) as raised:
+            run_youtube_publish_sync(
+                self._payload(visibility="public", coverPath=str(self.cover)),
+                dependencies=fake.dependencies(),
+            )
+
+        self.assertEqual(raised.exception.error_code, "youtube_thumbnail_forbidden")
+        self.assertEqual(raised.exception.receipt["videoId"], "video-1")
+        self.assertNotIn("apply_public", fake.operations)
+
+    def test_unknown_upload_outcome_never_starts_second_upload(self) -> None:
+        fake = FakePublishDependencies(upload_error="outcome_unknown")
+
+        with self.assertRaises(YouTubeOfficialPublishError) as raised:
+            run_youtube_publish_sync(
+                self._payload(),
+                dependencies=fake.dependencies(),
+            )
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "youtube_upload_outcome_unknown",
+        )
+        self.assertEqual(fake.upload_attempts, 1)
+
+    def test_public_request_reading_back_private_is_not_reported_successful(self) -> None:
+        fake = FakePublishDependencies(final_visibility="private")
+
+        with self.assertRaises(YouTubeOfficialPublishError) as raised:
+            run_youtube_publish_sync(
+                self._payload(visibility="public"),
+                dependencies=fake.dependencies(),
+            )
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "youtube_api_project_private_only",
+        )
+        self.assertEqual(raised.exception.receipt["videoId"], "video-1")
 
 
 if __name__ == "__main__":

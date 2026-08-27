@@ -6,7 +6,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from PIL import Image, UnidentifiedImageError
@@ -14,9 +14,16 @@ from PIL import Image, UnidentifiedImageError
 from .overseas_youtube_api import (
     YOUTUBE_VIDEOS_ENDPOINT,
     ValidatedYouTubeUpload,
+    YouTubePrivateUploadAdapter,
     YouTubePreflightError,
+    YouTubeUploadError,
     YouTubeUploadRequest,
     local_preflight,
+)
+from .overseas_youtube_login import (
+    YouTubeAuthorizedSession,
+    YouTubeOAuthLoginError,
+    authorize_saved_youtube_account,
 )
 
 
@@ -96,6 +103,35 @@ class YouTubeManagementTransport(Protocol):
     def put(self, url: str, **kwargs: object) -> _ManagementResponse: ...
 
     def post(self, url: str, **kwargs: object) -> _ManagementResponse: ...
+
+
+class YouTubeVideoClient(Protocol):
+    def read_status(
+        self, access_token: str, *, video_id: str
+    ) -> YouTubeVideoStatus: ...
+
+    def set_thumbnail(
+        self, access_token: str, *, video_id: str, path: Path
+    ) -> None: ...
+
+    def apply_visibility(
+        self,
+        access_token: str,
+        *,
+        video_id: str,
+        target_visibility: str,
+        publish_at: str | None,
+        made_for_kids: bool,
+    ) -> YouTubeVideoStatus: ...
+
+
+@dataclass(frozen=True, slots=True)
+class YouTubePublishDependencies:
+    authorize: Callable[[ValidatedYouTubePublish], YouTubeAuthorizedSession]
+    upload_private: Callable[
+        [ValidatedYouTubeUpload, YouTubeAuthorizedSession], str
+    ]
+    video_client: YouTubeVideoClient
 
 
 def validate_youtube_publish_payload(
@@ -509,3 +545,276 @@ def _parse_exact_video_status(
         title=title if isinstance(title, str) else None,
         preserved_status=preserved,
     )
+
+
+def build_default_youtube_publish_dependencies() -> YouTubePublishDependencies:
+    """Build the production dependency boundary without exposing credentials."""
+
+    import requests
+
+    from conf import YOUTUBE_OAUTH_CLIENT_ID
+
+    from . import account_service
+
+    transport = requests.Session()
+    video_client = YouTubeVideoManagementClient(transport)
+
+    def authorize(checked: ValidatedYouTubePublish) -> YouTubeAuthorizedSession:
+        account = account_service.get_managed_account(checked.account_id)
+        if (
+            not account
+            or int(account.get("type") or 0) != 7
+            or str(account.get("filePath") or "")
+            != checked.credential_reference
+            or str(account.get("accountReference") or "")
+            != checked.expected_channel_id
+            or int(account.get("status") or 0) != 1
+        ):
+            raise YouTubeOfficialPublishError("youtube_account_invalid")
+        try:
+            return authorize_saved_youtube_account(
+                account,
+                client_id=YOUTUBE_OAUTH_CLIENT_ID,
+                require_publish_scope=True,
+            )
+        except YouTubeOAuthLoginError as exc:
+            reason = str(exc)
+            if reason in {
+                "youtube_oauth_scope_upgrade_required",
+                "youtube_channel_identity_mismatch",
+            }:
+                error_code = reason
+            elif reason == "channel_identity_mismatch":
+                error_code = "youtube_channel_identity_mismatch"
+            else:
+                error_code = "credential_unavailable"
+            raise YouTubeOfficialPublishError(error_code) from None
+
+    def upload_private(
+        upload: ValidatedYouTubeUpload,
+        session: YouTubeAuthorizedSession,
+    ) -> str:
+        adapter = YouTubePrivateUploadAdapter(transport)
+        plan = adapter.create_confirmed_upload_plan(
+            upload,
+            credential_reference=session.credential_reference,
+            expected_channel=session.identity,
+            access_token=session.access_token,
+            confirmed_current=True,
+        )
+        upload_session = adapter.initiate_resumable_upload(plan)
+        while True:
+            receipt = adapter.upload_or_resume(upload_session)
+            if receipt.state != "upload_started":
+                break
+        if receipt.state == "outcome_unknown":
+            raise YouTubeUploadError("outcome_unknown")
+        verified = adapter.verify_exact_readback(receipt)
+        if not verified.video_id:
+            raise YouTubeUploadError("outcome_unknown")
+        return verified.video_id
+
+    return YouTubePublishDependencies(
+        authorize=authorize,
+        upload_private=upload_private,
+        video_client=video_client,
+    )
+
+
+def run_youtube_preflight_sync(
+    payload: Mapping[str, Any],
+    *,
+    dependencies: YouTubePublishDependencies | None = None,
+) -> dict[str, Any]:
+    """Validate local inputs and current OAuth identity without creating a video."""
+
+    checked = validate_youtube_publish_payload(payload)
+    deps = dependencies or build_default_youtube_publish_dependencies()
+    session = _authorized_session(deps, checked)
+    return {
+        "ok": True,
+        "message": "YouTube 本地与只读账号检查通过，未创建视频",
+        "receipt": {
+            "channelId": session.identity.channel_id,
+            "visibility": checked.settings.visibility,
+            "scheduledAt": checked.settings.publish_at,
+            "platformMutation": "none",
+        },
+    }
+
+
+def run_youtube_publish_sync(
+    payload: Mapping[str, Any],
+    *,
+    task_id: int = 0,
+    progress: Callable[[str, Mapping[str, object]], None] | None = None,
+    dependencies: YouTubePublishDependencies | None = None,
+) -> dict[str, Any]:
+    """Upload private first, then mutate only the exact returned video ID."""
+
+    checked = validate_youtube_publish_payload(payload)
+    deps = dependencies or build_default_youtube_publish_dependencies()
+    session = _authorized_session(deps, checked)
+    _emit(progress, "uploading_private", {"taskId": int(task_id or 0)})
+    try:
+        video_id = deps.upload_private(checked.private_upload, session)
+        video_id = _validated_video_id(video_id)
+    except YouTubeUploadError as exc:
+        error_code = (
+            "youtube_upload_outcome_unknown"
+            if str(exc) == "outcome_unknown"
+            else "youtube_upload_failed"
+        )
+        raise YouTubeOfficialPublishError(error_code) from None
+    except YouTubeOfficialPublishError:
+        raise
+    except Exception:
+        raise YouTubeOfficialPublishError("youtube_upload_failed") from None
+
+    receipt: dict[str, object] = {
+        "videoId": video_id,
+        "visibility": "private",
+        "targetVisibility": checked.settings.visibility,
+        "scheduledAt": checked.settings.publish_at,
+        "thumbnailApplied": False,
+        "channelId": checked.expected_channel_id,
+        "studioUrl": f"https://studio.youtube.com/video/{video_id}/edit",
+    }
+    _emit(progress, "uploaded_private", receipt)
+    try:
+        private_status = deps.video_client.read_status(
+            session.access_token,
+            video_id=video_id,
+        )
+        _require_private_status(private_status, checked, video_id=video_id)
+        if checked.settings.thumbnail_path is not None:
+            _emit(progress, "setting_thumbnail", receipt)
+            deps.video_client.set_thumbnail(
+                session.access_token,
+                video_id=video_id,
+                path=checked.settings.thumbnail_path,
+            )
+            receipt["thumbnailApplied"] = True
+        _emit(progress, "applying_visibility", receipt)
+        deps.video_client.apply_visibility(
+            session.access_token,
+            video_id=video_id,
+            target_visibility=checked.settings.visibility,
+            publish_at=checked.settings.publish_at,
+            made_for_kids=checked.settings.made_for_kids,
+        )
+        _emit(progress, "verifying", receipt)
+        final = deps.video_client.read_status(
+            session.access_token,
+            video_id=video_id,
+        )
+        _require_expected_final_status(final, checked, video_id=video_id)
+    except YouTubeOfficialPublishError as exc:
+        merged = {**receipt, **exc.receipt}
+        raise YouTubeOfficialPublishError(
+            exc.error_code,
+            receipt=merged,
+        ) from None
+    except Exception:
+        raise YouTubeOfficialPublishError(
+            "youtube_manual_reconciliation_required",
+            receipt=receipt,
+        ) from None
+
+    receipt.update(
+        {
+            "visibility": checked.settings.visibility,
+            "processingStatus": final.processing_status,
+            "uploadStatus": final.upload_status,
+        }
+    )
+    _emit(progress, "success", receipt)
+    return {
+        "ok": True,
+        "message": "YouTube 视频已按精确视频 ID 回读确认",
+        "receipt": receipt,
+    }
+
+
+def _authorized_session(
+    dependencies: YouTubePublishDependencies,
+    checked: ValidatedYouTubePublish,
+) -> YouTubeAuthorizedSession:
+    try:
+        session = dependencies.authorize(checked)
+    except YouTubeOfficialPublishError:
+        raise
+    except YouTubeOAuthLoginError as exc:
+        reason = str(exc)
+        if reason == "channel_identity_mismatch":
+            reason = "youtube_channel_identity_mismatch"
+        raise YouTubeOfficialPublishError(reason) from None
+    except Exception:
+        raise YouTubeOfficialPublishError("credential_unavailable") from None
+    if (
+        not isinstance(session, YouTubeAuthorizedSession)
+        or session.identity.channel_id != checked.expected_channel_id
+        or session.credential_reference != checked.credential_reference
+    ):
+        raise YouTubeOfficialPublishError("youtube_channel_identity_mismatch")
+    return session
+
+
+def _require_private_status(
+    status: YouTubeVideoStatus,
+    checked: ValidatedYouTubePublish,
+    *,
+    video_id: str,
+) -> None:
+    if (
+        status.video_id != video_id
+        or status.privacy_status != "private"
+        or status.channel_id != checked.expected_channel_id
+        or status.title != checked.private_upload.title
+        or (
+            status.made_for_kids is not None
+            and status.made_for_kids != checked.settings.made_for_kids
+        )
+    ):
+        raise YouTubeOfficialPublishError("youtube_readback_mismatch")
+
+
+def _require_expected_final_status(
+    status: YouTubeVideoStatus,
+    checked: ValidatedYouTubePublish,
+    *,
+    video_id: str,
+) -> None:
+    target = checked.settings.visibility
+    if status.video_id != video_id or status.channel_id != checked.expected_channel_id:
+        raise YouTubeOfficialPublishError("youtube_readback_mismatch")
+    if status.title != checked.private_upload.title:
+        raise YouTubeOfficialPublishError("youtube_readback_mismatch")
+    if (
+        status.made_for_kids is not None
+        and status.made_for_kids != checked.settings.made_for_kids
+    ):
+        raise YouTubeOfficialPublishError("youtube_readback_mismatch")
+    if target in {"public", "unlisted"} and status.privacy_status == "private":
+        raise YouTubeOfficialPublishError("youtube_api_project_private_only")
+    if target == "scheduled_public":
+        if (
+            status.privacy_status != "private"
+            or status.publish_at != checked.settings.publish_at
+        ):
+            raise YouTubeOfficialPublishError("youtube_readback_mismatch")
+    elif status.privacy_status != target or status.publish_at is not None:
+        raise YouTubeOfficialPublishError("youtube_readback_mismatch")
+
+
+def _emit(
+    progress: Callable[[str, Mapping[str, object]], None] | None,
+    stage: str,
+    data: Mapping[str, object],
+) -> None:
+    if progress is None:
+        return
+    try:
+        progress(stage, dict(data))
+    except Exception:
+        pass
