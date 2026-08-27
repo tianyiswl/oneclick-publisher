@@ -12,12 +12,14 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QApplication, QLabel, QPushButton
+from PyQt6.QtGui import QInputMethodEvent
+from PyQt6.QtWidgets import QApplication, QLabel, QPushButton, QWidget
 
 from app_core import database
 from ui.douyin_graphic_matrix_page import (
     DouyinGraphicMatrixPage,
     DouyinGraphicMediaPicker,
+    ImeAwarePlainTextEdit,
 )
 
 
@@ -86,6 +88,35 @@ class DouyinGraphicMatrixPageTests(unittest.TestCase):
         self.assertGreater(self.page.width(), 0)
         self.assertIsNotNone(self.page.findChild(QPushButton, "douyinGraphicNextButton"))
         self.assertIsNotNone(self.page.findChild(QPushButton, "douyinGraphicLocalCheckButton"))
+
+    def test_content_preparation_uses_three_columns_and_global_next_action(self) -> None:
+        panels = [
+            self.page.findChild(QWidget, object_name)
+            for object_name in (
+                "douyinGraphicMediaPanel",
+                "douyinGraphicCommonPanel",
+                "douyinGraphicAccountsPanel",
+            )
+        ]
+        self.assertTrue(all(panel is not None for panel in panels))
+        self.assertLess(panels[0].geometry().x(), panels[1].geometry().x())
+        self.assertLess(panels[1].geometry().x(), panels[2].geometry().x())
+        self.assertGreater(panels[1].width(), panels[0].width())
+        self.assertGreater(panels[0].width(), panels[2].width())
+        next_button = self.page.findChild(QPushButton, "douyinGraphicNextButton")
+        self.assertGreater(next_button.geometry().y(), panels[0].geometry().y())
+
+    def test_local_add_and_image_bulk_actions_share_the_picker_action_row(self) -> None:
+        self.assertEqual(self.page.select_all_images_button.text(), "全选")
+        self.assertIs(self.page.add_local_images_button.parentWidget(), self.page.media_picker)
+        self.assertIs(
+            self.page.select_all_images_button.parentWidget(),
+            self.page.media_picker,
+        )
+        self.assertIs(
+            self.page.deselect_all_images_button.parentWidget(),
+            self.page.media_picker,
+        )
 
     def test_account_select_all_and_cancel_all_respect_twenty_account_limit(self) -> None:
         self.page.set_available_accounts(_accounts(23))
@@ -224,6 +255,25 @@ class DouyinGraphicMediaPickerTests(unittest.TestCase):
 
         self.dialog.deselect_all_button.click()
         self.assertEqual(self.dialog.selected_paths(), [])
+
+
+class ImeAwarePlainTextEditTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_placeholder_is_hidden_while_chinese_input_method_is_composing(self) -> None:
+        editor = ImeAwarePlainTextEdit()
+        editor.setPlaceholderText("输入所有账号默认使用的正文")
+
+        QApplication.sendEvent(editor, QInputMethodEvent("词", []))
+        self.assertEqual(editor.placeholderText(), "")
+
+        committed = QInputMethodEvent("", [])
+        committed.setCommitString("词")
+        QApplication.sendEvent(editor, committed)
+        self.assertEqual(editor.placeholderText(), "输入所有账号默认使用的正文")
+        self.assertEqual(editor.toPlainText(), "词")
 
 
 class DouyinGraphicMatrixDraftPageTests(unittest.TestCase):

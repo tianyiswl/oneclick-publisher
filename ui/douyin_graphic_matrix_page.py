@@ -51,10 +51,37 @@ from .topic_tag_editor import TopicTagEditor
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
+class ImeAwarePlainTextEdit(QPlainTextEdit):
+    """组词期间隐藏占位提示，避免与系统输入法候选文字重叠。"""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._configured_placeholder = ""
+        self._ime_composing = False
+
+    def setPlaceholderText(self, placeholder_text: str) -> None:  # noqa: N802
+        self._configured_placeholder = str(placeholder_text)
+        if not self._ime_composing:
+            super().setPlaceholderText(self._configured_placeholder)
+
+    def inputMethodEvent(self, event) -> None:  # noqa: N802
+        self._ime_composing = bool(event.preeditString())
+        super().setPlaceholderText(
+            "" if self._ime_composing else self._configured_placeholder
+        )
+        super().inputMethodEvent(event)
+
+    def focusOutEvent(self, event) -> None:  # noqa: N802
+        self._ime_composing = False
+        super().setPlaceholderText(self._configured_placeholder)
+        super().focusOutEvent(event)
+
+
 class DouyinGraphicMediaPicker(QWidget):
     """直接展示素材管理图片；筛选不会丢失既有勾选。"""
 
     selection_changed = pyqtSignal()
+    add_local_requested = pyqtSignal()
 
     def __init__(
         self,
@@ -93,12 +120,21 @@ class DouyinGraphicMediaPicker(QWidget):
         selection_row = QHBoxLayout()
         self.selection_status = QLabel()
         self.selection_status.setProperty("role", "caption")
-        selection_row.addWidget(self.selection_status)
+        layout.addWidget(self.selection_status)
         selection_row.addStretch()
-        self.select_all_button = button("全选当前筛选", variant="secondary")
+        self.add_local_button = button(
+            "从本机添加", variant="primary", compact=True
+        )
+        self.add_local_button.clicked.connect(self.add_local_requested.emit)
+        self.select_all_button = button(
+            "全选", variant="secondary", compact=True
+        )
         self.select_all_button.clicked.connect(self._select_visible)
-        self.deselect_all_button = button("取消全选", variant="secondary")
+        self.deselect_all_button = button(
+            "取消全选", variant="secondary", compact=True
+        )
         self.deselect_all_button.clicked.connect(self._deselect_all)
+        selection_row.addWidget(self.add_local_button)
         selection_row.addWidget(self.select_all_button)
         selection_row.addWidget(self.deselect_all_button)
         layout.addLayout(selection_row)
@@ -339,11 +375,14 @@ class DouyinGraphicMatrixPage(QWidget):
 
     def _build_content_step(self) -> QWidget:
         page = QWidget()
-        layout = QHBoxLayout(page)
+        layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
+        columns = QHBoxLayout()
+        columns.setSpacing(12)
 
         media, media_layout = self._panel()
+        media.setObjectName("douyinGraphicMediaPanel")
         media_title = QLabel("图片素材（1–35 张）")
         media_title.setObjectName("sectionTitle")
         media_layout.addWidget(media_title)
@@ -354,17 +393,14 @@ class DouyinGraphicMatrixPage(QWidget):
         self.image_category_combo = self.media_picker.category_combo
         self.select_all_images_button = self.media_picker.select_all_button
         self.deselect_all_images_button = self.media_picker.deselect_all_button
+        self.add_local_images_button = self.media_picker.add_local_button
         self.image_selection_status = self.media_picker.selection_status
+        self.media_picker.add_local_requested.connect(self._choose_images)
         media_layout.addWidget(self.media_picker, 1)
-        image_actions = QHBoxLayout()
-        choose = button("从本机添加", variant="primary")
-        choose.clicked.connect(self._choose_images)
-        image_actions.addWidget(choose)
-        image_actions.addStretch()
-        media_layout.addLayout(image_actions)
-        layout.addWidget(media, 3)
+        columns.addWidget(media, 4)
 
         content, content_layout = self._panel()
+        content.setObjectName("douyinGraphicCommonPanel")
         content_title = QLabel("通用内容")
         content_title.setObjectName("sectionTitle")
         content_layout.addWidget(content_title)
@@ -374,36 +410,45 @@ class DouyinGraphicMatrixPage(QWidget):
         self.common_title.textChanged.connect(self._common_changed)
         content_layout.addWidget(self.common_title)
         content_layout.addWidget(QLabel("正文"))
-        self.common_body = QPlainTextEdit()
+        self.common_body = ImeAwarePlainTextEdit()
         self.common_body.setPlaceholderText("输入所有账号默认使用的正文")
-        self.common_body.setMaximumHeight(130)
         self.common_body.textChanged.connect(self._common_changed)
-        content_layout.addWidget(self.common_body)
+        content_layout.addWidget(self.common_body, 1)
         self.common_tags = TopicTagEditor(placeholder="例如：AI工具、效率提升", history_rows=1)
         self.common_tags.input.textChanged.connect(lambda _text: None)
         content_layout.addWidget(self.common_tags)
-        account_header = QHBoxLayout()
-        account_header.addWidget(QLabel("选择抖音账号（1–20 个）"))
-        account_header.addStretch()
+        columns.addWidget(content, 5)
+
+        accounts, accounts_layout = self._panel()
+        accounts.setObjectName("douyinGraphicAccountsPanel")
+        account_title = QLabel("账号选择（1–20 个）")
+        account_title.setObjectName("sectionTitle")
+        accounts_layout.addWidget(account_title)
+        account_controls = QHBoxLayout()
         self.account_selection_status = QLabel("已选择 0 个")
         self.account_selection_status.setProperty("role", "caption")
-        account_header.addWidget(self.account_selection_status)
+        account_controls.addWidget(self.account_selection_status)
+        account_controls.addStretch()
         self.select_all_accounts_button = button("全选", variant="ghost", compact=True)
         self.select_all_accounts_button.clicked.connect(self._select_all_accounts)
-        account_header.addWidget(self.select_all_accounts_button)
+        account_controls.addWidget(self.select_all_accounts_button)
         self.deselect_all_accounts_button = button("取消全选", variant="ghost", compact=True)
         self.deselect_all_accounts_button.clicked.connect(self._deselect_all_accounts)
-        account_header.addWidget(self.deselect_all_accounts_button)
-        content_layout.addLayout(account_header)
+        account_controls.addWidget(self.deselect_all_accounts_button)
+        accounts_layout.addLayout(account_controls)
         self.account_list = QListWidget()
-        self.account_list.setMaximumHeight(142)
         self.account_list.itemChanged.connect(self._account_item_changed)
-        content_layout.addWidget(self.account_list)
+        accounts_layout.addWidget(self.account_list, 1)
+        columns.addWidget(accounts, 3)
+        layout.addLayout(columns, 1)
+
+        actions = QHBoxLayout()
+        actions.addStretch()
         next_button = button("下一步：账号设置", variant="primary")
         next_button.setObjectName("douyinGraphicNextButton")
         next_button.clicked.connect(self._go_account_step)
-        content_layout.addWidget(next_button)
-        layout.addWidget(content, 5)
+        actions.addWidget(next_button)
+        layout.addLayout(actions)
         return page
 
     def _build_account_step(self) -> QWidget:
