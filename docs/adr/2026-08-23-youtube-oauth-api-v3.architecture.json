@@ -24,10 +24,16 @@
         "note": "未经正式审核时只验证私密上传，并按本次 video ID 回读频道、标题和可见性。"
       },
       {
+        "id": "restart-check",
+        "label": "重启检测",
+        "focus": ["account_ui", "account_store", "token_vault", "oauth_adapter", "youtube_api"],
+        "note": "数据库只保存凭据引用和频道 ID；重启后从系统凭据库刷新令牌并重新读取同一频道。"
+      },
+      {
         "id": "ownership",
-        "label": "工作线边界",
-        "focus": ["account_ui", "loopback", "token_vault", "publish_core", "oauth_adapter", "youtube_adapter"],
-        "note": "海外分支实现回调、OAuth、凭据库接口与 API adapter；账号 UI 和全局路由由集成线接入。"
+        "label": "阶段边界",
+        "focus": ["account_ui", "account_store", "token_vault", "publish_core", "oauth_adapter", "youtube_adapter"],
+        "note": "第一阶段只接账号登录与重启检测；OAuth 账号在官方发布路由接通前不进入发布目标。"
       }
     ]
   },
@@ -112,7 +118,7 @@
       "id": "token_vault",
       "type": "security",
       "label": "本机令牌安全存储",
-      "sublabel": "海外分支｜OS 凭据库接口",
+      "sublabel": "keyring｜Keychain / Credential Locker",
       "tag": "token reference",
       "pos": [1275, 430],
       "size": [190, 80],
@@ -126,11 +132,28 @@
       ]
     },
     {
+      "id": "account_store",
+      "type": "database",
+      "label": "账号记录",
+      "sublabel": "SQLite｜无令牌",
+      "tag": "credential ref + channel ID",
+      "pos": [1020, 430],
+      "size": [190, 80],
+      "sources": [
+        {
+          "path": "app_core/database.py",
+          "line": 142,
+          "end_line": 143,
+          "label": "账号授权字段"
+        }
+      ]
+    },
+    {
       "id": "publish_core",
       "type": "backend",
       "label": "发布确认与任务路由",
       "sublabel": "共享核心｜集成线",
-      "tag": "当次明确授权",
+      "tag": "第二阶段接线",
       "pos": [250, 580],
       "size": [190, 80],
       "sources": [
@@ -147,7 +170,7 @@
       "type": "backend",
       "label": "YouTube Data API adapter",
       "sublabel": "海外分支",
-      "tag": "私密优先",
+      "tag": "当前不对 UI 开放",
       "pos": [550, 580],
       "size": [200, 80],
       "sources": [
@@ -195,10 +218,32 @@
       "id": "adapter-vault",
       "from": "oauth_adapter",
       "to": "token_vault",
+      "label": "保存 / 读取刷新令牌",
       "variant": "security",
       "fromSide": "bottom",
       "toSide": "top",
+      "route": "straight",
+      "labelAt": [1370, 385]
+    },
+    {
+      "id": "account-vault",
+      "from": "account_store",
+      "to": "token_vault",
+      "label": "凭据引用",
+      "variant": "security",
+      "fromSide": "right",
+      "toSide": "left",
       "route": "straight"
+    },
+    {
+      "id": "oauth-channel",
+      "from": "oauth_adapter",
+      "to": "youtube_api",
+      "label": "channels.list",
+      "variant": "security",
+      "fromSide": "right",
+      "toSide": "bottom",
+      "via": [[1500, 300], [1500, 720], [945, 720]]
     },
     {"id": "publish-adapter", "from": "publish_core", "to": "youtube_adapter", "label": "已确认载荷", "variant": "emphasis"},
     {
@@ -236,7 +281,15 @@
       "title": "首个可验证结果",
       "items": [
         "系统浏览器 OAuth 后客户端重启仍识别同一频道",
-        "私密测试视频按本次 video ID 完成 API 回读"
+        "第一阶段不上传视频；私密上传与 video ID 回读留到第二阶段"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "发布隔离",
+      "items": [
+        "OAuth 账号先只在账号管理显示，不进入发布中心",
+        "官方发布路由接通并单独验证后才开放选择"
       ]
     }
   ]
