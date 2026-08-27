@@ -2,7 +2,8 @@
 """海外平台视频预发布检查。
 
 本模块只调用已恢复的蚁小二 TikTok、YouTube 和 Meta 浏览器执行器。
-它强制 ``debugDryRun=true`` 并停在最终按钮前，不会保存草稿或发布。
+它强制 ``debugDryRun=true`` 并停在最终按钮前，不会点击最终发布动作。
+YouTube 在上传后可能由平台保留私密内容，必须在结果中明确标记。
 """
 
 from __future__ import annotations
@@ -105,6 +106,8 @@ def validate_overseas_preflight_payload(payload: dict[str, Any]) -> dict[str, An
         missing_files = [path.name for path in files if not path.is_file()]
         if missing_files:
             errors.append("视频素材不存在：" + "、".join(missing_files))
+    if platform_type == 7 and len(files) != 1:
+        errors.append("YouTube 预检每次必须精确选择一条视频")
 
     account_files = [Path(str(item)).name for item in payload.get("accountList") or []]
     if not account_files:
@@ -115,6 +118,8 @@ def validate_overseas_preflight_payload(payload: dict[str, Any]) -> dict[str, An
         ]
         if missing_accounts:
             errors.append("一键发本地登录会话不存在，请重新登录")
+    if platform_type == 7 and len(account_files) != 1:
+        errors.append("YouTube 预检每次必须精确选择一个账号")
 
     return {
         "ok": not errors,
@@ -137,7 +142,7 @@ def run_overseas_preflight_sync(payload: dict[str, Any]) -> dict[str, Any]:
     handler = PREFLIGHT_HANDLERS[platform_type]
     background_mode = bool(payload.get("backgroundMode", True))
     with publish_context(mode="preflight", background_mode=background_mode):
-        handler(
+        results = handler(
             str(payload.get("title") or ""),
             checked["fileList"],
             list(payload.get("tags") or []),
@@ -163,6 +168,55 @@ def run_overseas_preflight_sync(payload: dict[str, Any]) -> dict[str, Any]:
             notify_subscribers=bool(payload.get("notifySubscribers", True)),
             share_to_feed=bool(payload.get("shareToFeed", True)),
         )
+    if platform_type == 7:
+        raw_results = [results] if isinstance(results, dict) else list(results or [])
+        receipts = [item for item in raw_results if isinstance(item, dict)]
+        required_fields = {"video", "title", "audience", "visibility"}
+        if str(payload.get("description") or "").strip():
+            required_fields.add("description")
+        if any(str(item).strip() for item in payload.get("tags") or []):
+            required_fields.add("tags")
+        if str(payload.get("coverPath") or "").strip() or any(
+            str(item).strip()
+            for item in (payload.get("coverPaths") or {}).values()
+        ):
+            required_fields.add("thumbnail")
+        if str(payload.get("collectionName") or "").strip():
+            required_fields.add("playlist")
+        if payload.get("aiGenerated") is True:
+            required_fields.add("aiGenerated")
+
+        receipt = receipts[0] if len(receipts) == 1 else {}
+        verified_fields = {
+            str(item) for item in receipt.get("verifiedFields") or [] if str(item)
+        }
+        requested_visibility = str(payload.get("visibility") or "private").lower()
+        receipt_is_valid = (
+            receipt.get("status") == "preflight_ready"
+            and bool(receipt.get("evidence"))
+            and receipt.get("platformMutation") == "private_upload"
+            and str(receipt.get("visibility") or "").lower()
+            == requested_visibility
+            and required_fields.issubset(verified_fields)
+        )
+        if not receipt_is_valid:
+            missing = sorted(required_fields - verified_fields)
+            detail = "、".join(missing) if missing else "平台预检回执"
+            raise OverseasPreflightError(
+                f"YouTube 未取得完整逐字段回读：{detail}；未执行最终 SAVE/Publish"
+            )
+        return {
+            "type": platform_type,
+            "ok": True,
+            "evidence": str(receipt["evidence"]),
+            "verifiedFields": sorted(verified_fields),
+            "visibility": requested_visibility,
+            "platformMutation": "private_upload",
+            "message": (
+                "YouTube 已上传测试视频并完成逐字段回读，停在最终 SAVE/Publish 前；"
+                "YouTube 可能把未完成的上传保留为私密内容，本次未公开发布。"
+            ),
+        }
     return {
         "type": platform_type,
         "ok": True,

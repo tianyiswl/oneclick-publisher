@@ -162,7 +162,10 @@ class LoginDialog(QDialog):
         if self.session and self.timer.isActive():
             return
         self.qr_label.clear()
-        self.qr_label.setText("请点击下方“开始登录”在一键发独立会话中打开官方页面")
+        if int(self.platform_combo.currentData() or 0) == 7:
+            self.qr_label.setText("请点击下方“开始登录”在系统默认浏览器中授权 YouTube")
+        else:
+            self.qr_label.setText("请点击下方“开始登录”在一键发独立会话中打开官方页面")
 
     def start_login(self) -> None:
         profile = self.profile_input.currentText().strip()
@@ -187,6 +190,9 @@ class LoginDialog(QDialog):
             update_mode=bool(self.account),
             record_id=self.account["id"] if self.account else None,
             background_mode=background_login,
+        )
+        self.save_btn.setEnabled(
+            bool(getattr(self.session, "manual_save_supported", True))
         )
         self.timer.start()
 
@@ -266,7 +272,9 @@ class LoginDialog(QDialog):
             if msg == "BROWSER_OPENED":
                 self.qr_label.setText("官方登录页面已打开，完成登录后将自动保存账号")
                 self.log.append("官方登录页面已由一键发打开。")
-                self.save_btn.setEnabled(True)
+                self.save_btn.setEnabled(
+                    bool(getattr(self.session, "manual_save_supported", True))
+                )
                 continue
             if msg == "LOGIN_DETECTED":
                 self.save_btn.setEnabled(False)
@@ -306,7 +314,17 @@ class LoginDialog(QDialog):
                 self.reject()
                 return
             if msg.startswith("ERROR:"):
-                self.lifecycle_message = msg.replace("ERROR:", "登录失败：", 1)
+                reason = msg.split(":", 1)[1]
+                message = {
+                    "youtube_oauth_client_not_configured": "尚未配置 Google 测试项目，当前不能开始 YouTube 官方登录。",
+                    "authorization_denied": "你已拒绝 Google 授权，账号没有发生变化。",
+                    "authorization_invalid": "Google 授权回调无效，请重新发起登录。",
+                    "system_browser_open_failed": "系统默认浏览器未能打开 Google 授权页。",
+                    "credential_unavailable": "系统凭据库不可用，未保存 YouTube 登录凭据。",
+                    "channel_identity_mismatch": "本次授权频道与原账号不一致，未覆盖原账号。",
+                    "channel_identity_unavailable": "Google 未返回唯一 YouTube 频道，未保存账号。",
+                }.get(reason, "YouTube 官方登录未完成，账号没有发生变化。")
+                self.lifecycle_message = f"登录失败：{message}"
                 self.log.append(self.lifecycle_message)
                 self.timer.stop()
                 self.reject()

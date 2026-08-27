@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from app_core import overseas_video_publish
+from uploader.youtube_uploader import main as youtube_uploader
 from uploader.tk_uploader.main import (
     TiktokVideo,
     tiktok_publish_success_signal,
@@ -17,9 +18,99 @@ from uploader.tk_uploader.main import (
 )
 from uploader.youtube_uploader.main import (
     YouTubeVideo,
+    youtube_content_list_receipt,
+    youtube_preflight_receipt,
     youtube_publish_success_signal,
     youtube_security_intervention_reason,
 )
+
+
+class FakeContentLeaf:
+    def __init__(
+        self,
+        *,
+        text: str | None = None,
+        href: str | None = None,
+        visible: bool = True,
+    ) -> None:
+        self.text = text
+        self.href = href
+        self.visible = visible
+
+    @property
+    def first(self):
+        return self
+
+    async def count(self) -> int:
+        return int(self.text is not None or self.href is not None)
+
+    async def is_visible(self) -> bool:
+        return self.visible
+
+    async def inner_text(self, timeout: int = 0) -> str:
+        del timeout
+        if self.text is None:
+            raise RuntimeError("field unreadable")
+        return self.text
+
+    async def get_attribute(self, name: str) -> str | None:
+        return self.href if name == "href" else None
+
+
+class FakeContentRow:
+    def __init__(
+        self,
+        *,
+        video_id: str,
+        title: str | None,
+        visibility: str | None,
+        visible: bool = True,
+    ) -> None:
+        self.visible = visible
+        self.title = FakeContentLeaf(
+            text=title,
+            href=f"/video/{video_id}" if video_id else None,
+        )
+        self.visibility = FakeContentLeaf(text=visibility)
+
+    async def is_visible(self) -> bool:
+        return self.visible
+
+    def locator(self, selector: str) -> FakeContentLeaf:
+        if selector == "#video-title":
+            return self.title
+        return self.visibility
+
+
+class FakeContentRows:
+    def __init__(self, rows: list[FakeContentRow]) -> None:
+        self.rows = rows
+
+    async def count(self) -> int:
+        return len(self.rows)
+
+    def nth(self, index: int) -> FakeContentRow:
+        return self.rows[index]
+
+
+class FakeContentPage:
+    def __init__(
+        self,
+        rows: list[FakeContentRow],
+        *,
+        empty_state_visible: bool = False,
+    ) -> None:
+        self.url = "https://studio.youtube.com/channel/test/videos/"
+        self.rows = FakeContentRows(rows)
+        self.empty_state_visible = empty_state_visible
+
+    def locator(self, selector: str):
+        if selector == "ytcp-video-row":
+            return self.rows
+        return FakeContentLeaf(
+            text="No videos" if self.empty_state_visible else None,
+            visible=self.empty_state_visible,
+        )
 
 
 class OverseasVideoPublishPolicyTests(unittest.TestCase):
@@ -113,7 +204,7 @@ class OverseasVideoPublishPolicyTests(unittest.TestCase):
                         7: lambda *_args, **_kwargs: [
                             {
                                 "status": "published",
-                                "evidence": "studio_upload_dialog_closed:public",
+                                "evidence": "studio_content_list:new-id:public",
                             }
                         ]
                     },
@@ -142,6 +233,59 @@ class OverseasVideoPublishPolicyTests(unittest.TestCase):
                 ):
                     overseas_video_publish.run_overseas_video_publish_sync(payload)
 
+    def test_youtube_private_save_is_not_reported_as_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            payload = self._payload(root, 7)
+            payload["visibility"] = "private"
+            with (
+                patch.object(overseas_video_publish, "COOKIE_DIR", root),
+                patch.dict(
+                    overseas_video_publish.HANDLERS,
+                    {
+                        7: lambda *_args, **_kwargs: [
+                            {
+                                "status": "saved",
+                                "evidence": "studio_content_list:new-id:private",
+                            }
+                        ]
+                    },
+                ),
+            ):
+                result = overseas_video_publish.run_overseas_video_publish_sync(
+                    payload
+                )
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["saved"])
+        self.assertFalse(result["published"])
+        self.assertEqual(result["visibility"], "private")
+
+    def test_youtube_dialog_closed_without_receipt_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            payload = self._payload(root, 7)
+            with (
+                patch.object(overseas_video_publish, "COOKIE_DIR", root),
+                patch.dict(
+                    overseas_video_publish.HANDLERS,
+                    {
+                        7: lambda *_args, **_kwargs: [
+                            {
+                                "status": "published",
+                                "evidence": "studio_upload_dialog_closed:public",
+                            }
+                        ]
+                    },
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    overseas_video_publish.OverseasVideoPublishError,
+                    "平台成功回执",
+                ):
+                    overseas_video_publish.run_overseas_video_publish_sync(
+                        payload
+                    )
+
 
 class OverseasVideoPublishSignalTests(unittest.TestCase):
     def test_tiktok_success_and_security_signals_are_specific(self) -> None:
@@ -168,6 +312,15 @@ class OverseasVideoPublishSignalTests(unittest.TestCase):
         self.assertIsNotNone(
             youtube_publish_success_signal(
                 url="https://studio.youtube.com/channel/test/videos/upload",
+                feedback_text="Video saved",
+                upload_dialog_visible=False,
+                final_button_visible=False,
+                visibility="public",
+            )
+        )
+        self.assertIsNone(
+            youtube_publish_success_signal(
+                url="https://studio.youtube.com/channel/test/videos/upload",
                 feedback_text="",
                 upload_dialog_visible=False,
                 final_button_visible=False,
@@ -189,6 +342,254 @@ class OverseasVideoPublishSignalTests(unittest.TestCase):
                 "",
             )
         )
+        self.assertNotIn(
+            "登录状态已失效",
+            youtube_security_intervention_reason(
+                "https://accounts.google.com/signin/v2/challenge/pwd",
+                "",
+            ),
+        )
+        rejected = youtube_security_intervention_reason(
+            "https://accounts.google.com/v3/signin/rejected",
+            "此浏览器或应用可能不安全。请尝试使用其他浏览器。",
+        )
+        self.assertIn("拒绝当前浏览器", rejected)
+
+    def test_youtube_content_list_receipt_requires_new_matching_video(self) -> None:
+        rows = [
+            {"videoId": "old-id", "title": "目标视频", "visibility": "private"},
+            {"videoId": "new-id", "title": "目标视频", "visibility": "private"},
+        ]
+        self.assertEqual(
+            youtube_content_list_receipt(
+                rows,
+                title="目标视频",
+                visibility="private",
+                preexisting_video_ids={"old-id"},
+            ),
+            "studio_content_list:new-id:private",
+        )
+        self.assertIsNone(
+            youtube_content_list_receipt(
+                rows,
+                title="目标视频",
+                visibility="public",
+                preexisting_video_ids={"old-id"},
+            )
+        )
+        self.assertIsNone(
+            youtube_content_list_receipt(
+                rows,
+                title="目标视频",
+                visibility="private",
+                preexisting_video_ids=None,
+            )
+        )
+        signal = youtube_publish_success_signal(
+            url="https://studio.youtube.com/channel/test/videos/upload",
+            feedback_text="",
+            upload_dialog_visible=False,
+            final_button_visible=False,
+            visibility="private",
+            content_list_receipt="studio_content_list:new-id:private",
+        )
+        self.assertEqual(signal, "studio_content_list:new-id:private")
+
+    def test_incomplete_content_baseline_is_unknown_instead_of_a_partial_id_set(self) -> None:
+        app = YouTubeVideo("目标视频", "/not/used.mp4", [], "/not/used.json")
+        page = FakeContentPage(
+            [
+                FakeContentRow(
+                    video_id="old-id",
+                    title="目标视频",
+                    visibility="private",
+                ),
+                FakeContentRow(
+                    video_id="unreadable-id",
+                    title="其他视频",
+                    visibility=None,
+                ),
+            ]
+        )
+
+        baseline = asyncio.run(app._content_list_video_ids(page))
+
+        self.assertIsNone(baseline)
+
+    def test_content_baseline_accepts_only_an_explicit_empty_state(self) -> None:
+        app = YouTubeVideo("目标视频", "/not/used.mp4", [], "/not/used.json")
+
+        explicit_empty = asyncio.run(
+            app._content_list_video_ids(
+                FakeContentPage([], empty_state_visible=True)
+            )
+        )
+        unrecognized_empty = asyncio.run(
+            app._content_list_video_ids(FakeContentPage([]))
+        )
+
+        self.assertEqual(explicit_empty, set())
+        self.assertIsNone(unrecognized_empty)
+
+    def test_incomplete_after_save_snapshot_cannot_generate_content_success(self) -> None:
+        app = YouTubeVideo("目标视频", "/not/used.mp4", [], "/not/used.json")
+        app.preexisting_video_ids = {"old-id"}
+        page = FakeContentPage(
+            [
+                FakeContentRow(
+                    video_id="new-id",
+                    title="目标视频",
+                    visibility="private",
+                ),
+                FakeContentRow(
+                    video_id="unreadable-id",
+                    title=None,
+                    visibility="private",
+                ),
+            ]
+        )
+
+        receipt = asyncio.run(app._content_list_receipt(page))
+
+        self.assertIsNone(receipt)
+
+    def test_complete_before_and_after_snapshots_accept_only_new_matching_id(self) -> None:
+        app = YouTubeVideo("目标视频", "/not/used.mp4", [], "/not/used.json")
+        before = FakeContentPage(
+            [
+                FakeContentRow(
+                    video_id="old-id",
+                    title="目标视频",
+                    visibility="private",
+                )
+            ]
+        )
+        app.preexisting_video_ids = asyncio.run(app._content_list_video_ids(before))
+        after = FakeContentPage(
+            [
+                FakeContentRow(
+                    video_id="old-id",
+                    title="目标视频",
+                    visibility="private",
+                ),
+                FakeContentRow(
+                    video_id="new-id",
+                    title="目标视频",
+                    visibility="private",
+                ),
+            ]
+        )
+
+        receipt = asyncio.run(app._content_list_receipt(after))
+
+        self.assertEqual(receipt, "studio_content_list:new-id:private")
+
+    def test_content_baseline_is_captured_before_upload_route_and_file_selection(self) -> None:
+        app = YouTubeVideo("目标视频", "/offline/video.mp4", [], "/not/used.json")
+        self.assertTrue(
+            hasattr(app, "_prepare_upload_mutation"),
+            "Content baseline preparation boundary is not implemented",
+        )
+        events: list[object] = []
+
+        class FileInput:
+            @property
+            def first(self):
+                return self
+
+            async def wait_for(self, *, state: str, timeout: int) -> None:
+                events.append(("file_ready", state, timeout))
+
+            async def set_input_files(self, path: str) -> None:
+                events.append(("file_selected", path))
+
+        class Page:
+            url = "about:blank"
+
+            async def goto(self, url: str, **kwargs: object) -> None:
+                events.append(("goto", url, kwargs))
+                self.url = url
+
+            async def wait_for_timeout(self, milliseconds: int) -> None:
+                events.append(("wait", milliseconds))
+
+            def locator(self, selector: str):
+                self.selector = selector
+                return FileInput()
+
+        async def capture(_page) -> set[str]:
+            events.append("baseline_complete")
+            return {"old-id"}
+
+        app._content_list_video_ids = capture
+        app._wait_for_manual_intervention = AsyncMock(return_value=None)
+        with patch.object(
+            youtube_uploader,
+            "reveal_page_window",
+            new=AsyncMock(return_value=None),
+        ):
+            asyncio.run(app._prepare_upload_mutation(Page()))
+
+        baseline_index = events.index("baseline_complete")
+        upload_index = next(
+            index
+            for index, event in enumerate(events)
+            if isinstance(event, tuple)
+            and event[:2] == ("goto", youtube_uploader.UPLOAD_URL)
+        )
+        file_index = next(
+            index
+            for index, event in enumerate(events)
+            if isinstance(event, tuple) and event[0] == "file_selected"
+        )
+        self.assertLess(baseline_index, upload_index)
+        self.assertLess(upload_index, file_index)
+
+    def test_youtube_preflight_receipt_requires_every_requested_field(self) -> None:
+        required = {"video", "title", "description", "tags", "audience", "visibility"}
+        receipt = youtube_preflight_receipt(
+            verified_fields=required,
+            required_fields=required,
+            visibility="private",
+        )
+        self.assertEqual(receipt["status"], "preflight_ready")
+        self.assertEqual(receipt["platformMutation"], "private_upload")
+        self.assertEqual(set(receipt["verifiedFields"]), required)
+        with self.assertRaisesRegex(RuntimeError, "逐字段回读"):
+            youtube_preflight_receipt(
+                verified_fields=required - {"tags"},
+                required_fields=required,
+                visibility="private",
+            )
+
+    def test_youtube_security_challenge_stops_without_auto_resume(self) -> None:
+        class Page:
+            def __init__(self) -> None:
+                self.url_reads = 0
+
+            @property
+            def url(self) -> str:
+                self.url_reads += 1
+                if self.url_reads == 1:
+                    return "https://accounts.google.com/signin/v2/challenge/pwd"
+                return "https://studio.youtube.com/channel/test/videos/upload"
+
+        app = YouTubeVideo("测试", "/not/used.mp4", [], "/not/used.json")
+        sleep = AsyncMock(return_value=None)
+        with (
+            patch.object(youtube_uploader, "_body_text", new=AsyncMock(return_value="")),
+            patch.object(
+                youtube_uploader,
+                "reveal_page_window",
+                new=AsyncMock(return_value=None),
+            ),
+            patch.object(youtube_uploader.asyncio, "sleep", new=sleep),
+        ):
+            with self.assertRaises(
+                youtube_uploader.YouTubeManualInterventionRequired
+            ):
+                asyncio.run(app._wait_for_manual_intervention(Page()))
+        sleep.assert_not_awaited()
 
     def test_tiktok_final_button_is_clicked_once_then_verified(self) -> None:
         app = TiktokVideo("测试", "/not/used.mp4", [], 0, "/not/used.json")
@@ -215,7 +616,7 @@ class OverseasVideoPublishSignalTests(unittest.TestCase):
         )
         result = asyncio.run(app._publish_formally(AsyncMock()))
         button.click.assert_awaited_once()
-        self.assertEqual(result["status"], "published")
+        self.assertEqual(result["status"], "saved")
 
 
 if __name__ == "__main__":

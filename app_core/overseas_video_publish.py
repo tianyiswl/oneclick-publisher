@@ -151,18 +151,35 @@ def run_overseas_video_publish_sync(payload: dict[str, Any]) -> dict[str, Any]:
             notify_subscribers=bool(payload.get("notifySubscribers", True)),
         )
     normalized = [item for item in (results or []) if isinstance(item, dict)]
+    expected_status = (
+        "saved"
+        if platform_type == 7 and checked["visibility"] != "public"
+        else "published"
+    )
+
+    def receipt_is_valid(item: dict[str, Any]) -> bool:
+        evidence = str(item.get("evidence") or "")
+        if not evidence:
+            return False
+        if platform_type == 7 and not evidence.startswith(
+            ("platform_feedback:", "studio_content_list:")
+        ):
+            return False
+        return item.get("status") == expected_status
+
     verified = bool(normalized) and all(
-        item.get("status") == "published" and item.get("evidence")
-        for item in normalized
+        receipt_is_valid(item) for item in normalized
     )
     if not verified:
         raise OverseasVideoPublishError(
             f"{checked['platform']} 最终按钮已处理，但没有得到可验证的平台成功回执"
         )
     references = [str(item.get("evidence") or "") for item in normalized]
+    published = platform_type == 6 or checked["visibility"] == "public"
+    saved = platform_type == 7
     if platform_type == 7:
         message = (
-            f"YouTube 已回读完成，视频可见性："
+            f"YouTube 已从明确平台提示或 Content 页回读完成，视频可见性："
             f"{VISIBILITY_LABELS[checked['visibility']]}"
         )
     else:
@@ -171,7 +188,8 @@ def run_overseas_video_publish_sync(payload: dict[str, Any]) -> dict[str, Any]:
         "ok": True,
         "platformType": platform_type,
         "platform": checked["platform"],
-        "published": True,
+        "published": published,
+        "saved": saved,
         "visibility": checked["visibility"],
         "operationReferences": references,
         "message": message,

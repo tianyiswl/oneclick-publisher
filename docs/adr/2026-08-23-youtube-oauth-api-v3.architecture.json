@@ -1,0 +1,296 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "一键发 YouTube OAuth/API 架构",
+    "output": "2026-08-23-youtube-oauth-api-v3.architecture.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/tianyiswl/oneclick-publisher.git",
+      "revision": "b08a29b016ac633b7335b463250d4e690b49160c"
+    },
+    "viewBox": [1580, 830],
+    "views": [
+      {
+        "id": "oauth-flow",
+        "label": "登录授权",
+        "focus": ["user", "account_ui", "loopback", "system_browser", "google_oauth", "oauth_adapter", "token_vault"],
+        "note": "系统浏览器授权，state 与 PKCE 校验后只通过安全存储接口保存刷新令牌。"
+      },
+      {
+        "id": "upload-flow",
+        "label": "私密上传与回读",
+        "focus": ["publish_core", "youtube_adapter", "youtube_api", "receipt_gate"],
+        "note": "未经正式审核时只验证私密上传，并按本次 video ID 回读频道、标题和可见性。"
+      },
+      {
+        "id": "restart-check",
+        "label": "重启检测",
+        "focus": ["account_ui", "account_store", "token_vault", "oauth_adapter", "youtube_api"],
+        "note": "数据库只保存凭据引用和频道 ID；重启后从系统凭据库刷新令牌并重新读取同一频道。"
+      },
+      {
+        "id": "ownership",
+        "label": "阶段边界",
+        "focus": ["account_ui", "account_store", "token_vault", "publish_core", "oauth_adapter", "youtube_adapter"],
+        "note": "第一阶段只接账号登录与重启检测；OAuth 账号在官方发布路由接通前不进入发布目标。"
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "user",
+      "type": "external",
+      "label": "用户",
+      "sublabel": "专用 YouTube 测试账号",
+      "pos": [40, 260],
+      "size": [150, 72]
+    },
+    {
+      "id": "account_ui",
+      "type": "frontend",
+      "label": "账号绑定入口",
+      "sublabel": "共享核心｜集成线",
+      "tag": "绑定 / 断开",
+      "pos": [250, 260],
+      "size": [170, 76],
+      "sources": [
+        {
+          "path": "QUALITY_GATES.md",
+          "line": 45,
+          "end_line": 57,
+          "label": "共享 UI 边界"
+        }
+      ]
+    },
+    {
+      "id": "loopback",
+      "type": "security",
+      "label": "本机回调协调器",
+      "sublabel": "海外分支｜127.0.0.1 随机端口",
+      "tag": "state + PKCE",
+      "pos": [1020, 260],
+      "size": [180, 80],
+      "sources": [
+        {
+          "path": "QUALITY_GATES.md",
+          "line": 15,
+          "end_line": 22,
+          "label": "海外专属范围"
+        }
+      ]
+    },
+    {
+      "id": "system_browser",
+      "type": "external",
+      "label": "系统默认浏览器",
+      "sublabel": "用户可见 Google 授权页",
+      "pos": [500, 260],
+      "size": [180, 76]
+    },
+    {
+      "id": "google_oauth",
+      "type": "external",
+      "label": "Google OAuth 2.0",
+      "sublabel": "授权与令牌端点",
+      "tag": "Desktop app",
+      "pos": [760, 260],
+      "size": [180, 76]
+    },
+    {
+      "id": "oauth_adapter",
+      "type": "backend",
+      "label": "YouTube OAuth adapter",
+      "sublabel": "海外分支",
+      "tag": "最小 scope",
+      "pos": [1280, 260],
+      "size": [180, 80],
+      "sources": [
+        {
+          "path": "docs/OVERSEAS_PLATFORM_STATUS.md",
+          "line": 39,
+          "end_line": 45,
+          "label": "旧登录路线已阻断"
+        }
+      ]
+    },
+    {
+      "id": "token_vault",
+      "type": "security",
+      "label": "本机令牌安全存储",
+      "sublabel": "keyring｜Keychain / Credential Locker",
+      "tag": "token reference",
+      "pos": [1275, 430],
+      "size": [190, 80],
+      "sources": [
+        {
+          "path": "docs/OVERSEAS_PLATFORM_STATUS.md",
+          "line": 57,
+          "end_line": 61,
+          "label": "凭据安全边界"
+        }
+      ]
+    },
+    {
+      "id": "account_store",
+      "type": "database",
+      "label": "账号记录",
+      "sublabel": "SQLite｜无令牌",
+      "tag": "credential ref + channel ID",
+      "pos": [1020, 430],
+      "size": [190, 80],
+      "sources": [
+        {
+          "path": "app_core/database.py",
+          "line": 142,
+          "end_line": 143,
+          "label": "账号授权字段"
+        }
+      ]
+    },
+    {
+      "id": "publish_core",
+      "type": "backend",
+      "label": "发布确认与任务路由",
+      "sublabel": "共享核心｜集成线",
+      "tag": "第二阶段接线",
+      "pos": [250, 580],
+      "size": [190, 80],
+      "sources": [
+        {
+          "path": "QUALITY_GATES.md",
+          "line": 122,
+          "end_line": 128,
+          "label": "真实验收门槛"
+        }
+      ]
+    },
+    {
+      "id": "youtube_adapter",
+      "type": "backend",
+      "label": "YouTube Data API adapter",
+      "sublabel": "海外分支",
+      "tag": "当前不对 UI 开放",
+      "pos": [550, 580],
+      "size": [200, 80],
+      "sources": [
+        {
+          "path": "app_core/overseas_preflight.py",
+          "line": 128,
+          "end_line": 211,
+          "label": "现有预检回执合同"
+        }
+      ]
+    },
+    {
+      "id": "youtube_api",
+      "type": "external",
+      "label": "YouTube Data API v3",
+      "sublabel": "channels / videos / uploads",
+      "pos": [850, 580],
+      "size": [190, 80]
+    },
+    {
+      "id": "receipt_gate",
+      "type": "security",
+      "label": "结果回读门",
+      "sublabel": "video ID + channel + 标题 + 可见性",
+      "tag": "不明确即失败",
+      "pos": [1150, 580],
+      "size": [220, 80],
+      "sources": [
+        {
+          "path": "app_core/overseas_video_publish.py",
+          "line": 141,
+          "end_line": 191,
+          "label": "成功回执合同"
+        }
+      ]
+    }
+  ],
+  "connections": [
+    {"id": "user-bind", "from": "user", "to": "account_ui", "label": "绑定", "variant": "emphasis"},
+    {"id": "ui-browser", "from": "account_ui", "to": "system_browser", "label": "打开授权页", "variant": "emphasis"},
+    {"id": "browser-consent", "from": "system_browser", "to": "google_oauth", "label": "用户同意"},
+    {"id": "oauth-callback", "from": "google_oauth", "to": "loopback", "label": "code + state", "variant": "security"},
+    {"id": "callback-adapter", "from": "loopback", "to": "oauth_adapter", "label": "校验并交换", "variant": "security"},
+    {
+      "id": "adapter-vault",
+      "from": "oauth_adapter",
+      "to": "token_vault",
+      "label": "保存 / 读取刷新令牌",
+      "variant": "security",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "route": "straight",
+      "labelAt": [1370, 385]
+    },
+    {
+      "id": "account-vault",
+      "from": "account_store",
+      "to": "token_vault",
+      "label": "凭据引用",
+      "variant": "security",
+      "fromSide": "right",
+      "toSide": "left",
+      "route": "straight"
+    },
+    {
+      "id": "oauth-channel",
+      "from": "oauth_adapter",
+      "to": "youtube_api",
+      "label": "channels.list",
+      "variant": "security",
+      "fromSide": "right",
+      "toSide": "bottom",
+      "via": [[1500, 300], [1500, 720], [945, 720]]
+    },
+    {"id": "publish-adapter", "from": "publish_core", "to": "youtube_adapter", "label": "已确认载荷", "variant": "emphasis"},
+    {
+      "id": "vault-api",
+      "from": "token_vault",
+      "to": "youtube_adapter",
+      "label": "短期凭据",
+      "variant": "security",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "via": [[1370, 535], [650, 535]]
+    },
+    {"id": "api-call", "from": "youtube_adapter", "to": "youtube_api", "label": "上传 / 查询", "variant": "emphasis"},
+    {"id": "api-receipt", "from": "youtube_api", "to": "receipt_gate", "label": "按 ID 回读"}
+  ],
+  "cards": [
+    {
+      "dot": "rose",
+      "title": "安全停止",
+      "items": [
+        "state 错配、拒绝授权、令牌失效或频道歧义立即停止",
+        "令牌、授权码、Cookie 和账号资料不进入 Git 或长期日志"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "外部动作边界",
+      "items": [
+        "预检只校验本地字段、授权与频道，不创建视频",
+        "videos.insert 即真实写入，必须获得大帅当次明确授权"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "首个可验证结果",
+      "items": [
+        "系统浏览器 OAuth 后客户端重启仍识别同一频道",
+        "第一阶段不上传视频；私密上传与 video ID 回读留到第二阶段"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "发布隔离",
+      "items": [
+        "OAuth 账号先只在账号管理显示，不进入发布中心",
+        "官方发布路由接通并单独验证后才开放选择"
+      ]
+    }
+  ]
+}
