@@ -71,6 +71,11 @@ class RecordingDownloader:
         return self.file_name
 
 
+class FailingDownloader:
+    def download(self, url: str, *, account_id: int, avatar_dir: Path) -> str:
+        raise YouTubeProfileError("youtube_avatar_download_failed")
+
+
 def youtube_account(account_id: int = 7) -> dict[str, object]:
     return {
         "id": account_id,
@@ -202,6 +207,38 @@ class YouTubeProfileTests(unittest.TestCase):
                 )
 
         self.assertEqual(downloader.calls, [])
+
+    def test_refresh_normalizes_remote_avatar_failure_to_stable_public_code(self) -> None:
+        with tempfile.TemporaryDirectory() as raw, patch(
+            "app_core.overseas_youtube_profile.validate_saved_youtube_oauth_account",
+            return_value=YouTubeChannelIdentity(
+                "UC_safe",
+                "Safe Channel",
+                "https://yt3.ggpht.com/avatar",
+            ),
+        ):
+            with self.assertRaisesRegex(
+                YouTubeProfileError, "^youtube_avatar_fetch_failed$"
+            ):
+                refresh_youtube_oauth_profile(
+                    youtube_account(),
+                    avatar_dir=Path(raw),
+                    downloader=FailingDownloader(),
+                )
+
+    def test_refresh_missing_remote_avatar_uses_stable_public_code(self) -> None:
+        with tempfile.TemporaryDirectory() as raw, patch(
+            "app_core.overseas_youtube_profile.validate_saved_youtube_oauth_account",
+            return_value=YouTubeChannelIdentity("UC_safe", "Safe Channel", None),
+        ):
+            with self.assertRaisesRegex(
+                YouTubeProfileError, "^youtube_avatar_fetch_failed$"
+            ):
+                refresh_youtube_oauth_profile(
+                    youtube_account(),
+                    avatar_dir=Path(raw),
+                    downloader=RecordingDownloader(),
+                )
 
 
 if __name__ == "__main__":

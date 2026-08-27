@@ -279,13 +279,20 @@ def refresh_youtube_oauth_profile(
     if identity.channel_id != expected_channel_id:
         raise YouTubeProfileError("youtube_channel_identity_mismatch")
     if not identity.avatar_url:
-        raise YouTubeProfileError("youtube_avatar_unavailable")
+        raise YouTubeProfileError("youtube_avatar_fetch_failed")
 
-    file_name = (downloader or YouTubeAvatarDownloader()).download(
-        identity.avatar_url,
-        account_id=account_id,
-        avatar_dir=Path(avatar_dir),
-    )
+    try:
+        file_name = (downloader or YouTubeAvatarDownloader()).download(
+            identity.avatar_url,
+            account_id=account_id,
+            avatar_dir=Path(avatar_dir),
+        )
+    except YouTubeProfileError as exc:
+        if str(exc) == "youtube_avatar_write_failed":
+            raise
+        raise YouTubeProfileError("youtube_avatar_fetch_failed") from None
+    except Exception:
+        raise YouTubeProfileError("youtube_avatar_fetch_failed") from None
     display_name = str(identity.display_name or "").strip()
     if not display_name:
         display_name = str(account.get("userName") or "YouTube 频道").strip()

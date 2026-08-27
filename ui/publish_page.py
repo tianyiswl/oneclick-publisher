@@ -5705,11 +5705,28 @@ class PublishPage(QWidget):
             "draft": "保存平台草稿",
             "publish": "正式发布",
         }
+        youtube_official_only = bool(payloads) and all(
+            int(payload.get("type") or 0) == 7
+            and payload.get("youtubeOfficialApi") is True
+            for payload in payloads
+        )
+        execution_line = (
+            "执行方式：YouTube 官方 API 后台处理"
+            if youtube_official_only
+            else (
+                "浏览器模式："
+                + (
+                    "无窗口后台运行"
+                    if self.background_mode.isChecked()
+                    else "前台显示"
+                )
+            )
+        )
         accounts = self.selected_accounts()
         media = self.selected_media()
         lines = [
             f"执行模式：{mode_labels.get(runtime_mode, runtime_mode)}",
-            f"浏览器模式：{'无窗口后台运行' if self.background_mode.isChecked() else '前台显示'}",
+            execution_line,
         ]
         if runtime_mode == "draft":
             lines.append("安全边界：只保存平台草稿，不点击最终发布按钮")

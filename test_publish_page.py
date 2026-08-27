@@ -258,6 +258,8 @@ class PublishPageYouTubeSettingsTests(unittest.TestCase):
 
         summary = page.build_publish_summary(payloads, "publish")
 
+        self.assertIn("执行方式：YouTube 官方 API 后台处理", summary)
+        self.assertNotIn("浏览器模式", summary)
         self.assertIn("YouTube 执行通道：官方 API 后台处理", summary)
         self.assertIn(
             "YouTube 测试频道 | YouTube | YouTube 测试频道 | 官方 OAuth 频道",
