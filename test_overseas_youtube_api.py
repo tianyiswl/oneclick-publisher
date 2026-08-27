@@ -383,6 +383,59 @@ class YouTubeChannelIdentityTests(unittest.TestCase):
         with self.assertRaises(FrozenInstanceError):
             identity.channel_id = "changed"  # type: ignore[misc]
 
+    def test_lookup_keeps_largest_https_channel_avatar(self) -> None:
+        client, _transport = self._lookup(
+            {
+                "items": [
+                    {
+                        "id": "UC_stable_channel",
+                        "snippet": {
+                            "title": "Channel Name",
+                            "thumbnails": {
+                                "default": {
+                                    "url": "https://yt3.ggpht.com/small",
+                                    "width": 88,
+                                },
+                                "high": {
+                                    "url": "https://yt3.ggpht.com/high",
+                                    "width": 800,
+                                },
+                            },
+                        },
+                    }
+                ]
+            }
+        )
+
+        identity = client.lookup_authenticated_channel("access-token-secret")
+
+        self.assertEqual(identity.avatar_url, "https://yt3.ggpht.com/high")
+
+    def test_lookup_ignores_non_https_or_malformed_avatar_candidates(self) -> None:
+        client, _transport = self._lookup(
+            {
+                "items": [
+                    {
+                        "id": "UC_stable_channel",
+                        "snippet": {
+                            "title": "Channel Name",
+                            "thumbnails": {
+                                "default": {
+                                    "url": "http://example.test/avatar",
+                                    "width": 88,
+                                },
+                                "high": {"url": 123, "width": 800},
+                            },
+                        },
+                    }
+                ]
+            }
+        )
+
+        identity = client.lookup_authenticated_channel("access-token-secret")
+
+        self.assertIsNone(identity.avatar_url)
+
     def test_lookup_rejects_empty_or_ambiguous_channel_results_without_echoing_provider_body(self) -> None:
         cases = (
             ({"items": [], "detail": "raw-provider-body"}, "channel_not_found"),

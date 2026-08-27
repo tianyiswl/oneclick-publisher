@@ -114,6 +114,7 @@ class YouTubeChannelIdentity:
 
     channel_id: str
     display_name: str | None = None
+    avatar_url: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -299,6 +300,7 @@ class YouTubeChannelIdentityClient:
         return YouTubeChannelIdentity(
             channel_id=normalized_channel_id,
             display_name=_channel_display_name(item),
+            avatar_url=_channel_avatar_url(item),
         )
 
 
@@ -966,3 +968,27 @@ def _channel_display_name(item: Mapping[str, object]) -> str | None:
         return None
     title_ok, title = _mapping_value(snippet, "title")
     return title if title_ok and isinstance(title, str) and title else None
+
+
+def _channel_avatar_url(item: Mapping[str, object]) -> str | None:
+    snippet_ok, snippet = _mapping_value(item, "snippet")
+    if not snippet_ok or not isinstance(snippet, Mapping):
+        return None
+    thumbnails_ok, thumbnails = _mapping_value(snippet, "thumbnails")
+    if not thumbnails_ok or not isinstance(thumbnails, Mapping):
+        return None
+
+    candidates: list[tuple[int, str]] = []
+    for raw_thumbnail in thumbnails.values():
+        if not isinstance(raw_thumbnail, Mapping):
+            continue
+        url_ok, raw_url = _mapping_value(raw_thumbnail, "url")
+        if not url_ok or not isinstance(raw_url, str) or not raw_url.startswith("https://"):
+            continue
+        _width_ok, raw_width = _mapping_value(raw_thumbnail, "width")
+        _height_ok, raw_height = _mapping_value(raw_thumbnail, "height")
+        width = raw_width if type(raw_width) is int and raw_width > 0 else 0
+        height = raw_height if type(raw_height) is int and raw_height > 0 else 0
+        candidates.append((max(width, height), raw_url))
+
+    return max(candidates, default=(0, ""))[1] or None
