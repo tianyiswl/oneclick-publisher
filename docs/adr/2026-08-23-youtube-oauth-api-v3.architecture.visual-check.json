@@ -1,13 +1,13 @@
 {
   "schemaVersion": 1,
-  "ok": true,
+  "ok": false,
   "command": "visual-check",
-  "status": "pass",
+  "status": "fail",
   "visualReview": "pending",
   "artifact": {
     "path": "/Users/andy/Documents/Codex/2026-07-28/new-chat/outputs/一键发桌面UI基座/.worktrees/overseas-login-publish-v2/docs/adr/2026-08-23-youtube-oauth-api-v3.architecture.html",
-    "sha256": "056eb071ca88c6b4698c7edb4daf8afe38e57a4787a4062a685df3edc4799684",
-    "bytes": 645752
+    "sha256": "9593aecd25098df8da87098732f7344aadcb2ea4e99981179af0a91ed60bd864",
+    "bytes": 650399
   },
   "state": {
     "detail": "read",
@@ -18,7 +18,7 @@
     "executable": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
   },
   "containment": {
-    "status": "pass",
+    "status": "fail",
     "viewports": [
       {
         "width": 1440,
@@ -27,10 +27,10 @@
         "innerWidth": 1440,
         "innerHeight": 900,
         "scrollWidth": 1440,
-        "scrollHeight": 900,
+        "scrollHeight": 999,
         "overflowX": false,
-        "overflowY": false,
-        "ok": true,
+        "overflowY": true,
+        "ok": false,
         "resolvedTheme": "light"
       },
       {
@@ -84,10 +84,10 @@
         "innerWidth": 1440,
         "innerHeight": 900,
         "scrollWidth": 1440,
-        "scrollHeight": 900,
+        "scrollHeight": 999,
         "overflowX": false,
-        "overflowY": false,
-        "ok": true,
+        "overflowY": true,
+        "ok": false,
         "resolvedTheme": "light",
         "file": "2026-08-23-youtube-oauth-api-v3.architecture.visual-check.1440x900.light.png"
       },
@@ -98,10 +98,10 @@
         "innerWidth": 1440,
         "innerHeight": 900,
         "scrollWidth": 1440,
-        "scrollHeight": 900,
+        "scrollHeight": 999,
         "overflowX": false,
-        "overflowY": false,
-        "ok": true,
+        "overflowY": true,
+        "ok": false,
         "resolvedTheme": "dark",
         "file": "2026-08-23-youtube-oauth-api-v3.architecture.visual-check.1440x900.dark.png"
       },

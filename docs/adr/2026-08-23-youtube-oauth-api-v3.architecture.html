@@ -4869,8 +4869,8 @@
       </div>
     </div>
 
-    <script id="archify-guided-views-data" type="application/json">[{"id":"oauth-flow","label":"登录授权","focus":["user","account_ui","loopback","system_browser","google_oauth","oauth_adapter","token_vault"],"note":"系统浏览器授权，state 与 PKCE 校验后只通过安全存储接口保存刷新令牌。"},{"id":"upload-flow","label":"私密上传与回读","focus":["publish_core","youtube_adapter","youtube_api","receipt_gate"],"note":"未经正式审核时只验证私密上传，并按本次 video ID 回读频道、标题和可见性。"},{"id":"ownership","label":"工作线边界","focus":["account_ui","loopback","token_vault","publish_core","oauth_adapter","youtube_adapter"],"note":"海外分支实现回调、OAuth、凭据库接口与 API adapter；账号 UI 和全局路由由集成线接入。"}]</script>
-    <script id="archify-source-evidence-data" type="application/json">{"schemaVersion":1,"verified":true,"repository":{"url":"https://github.com/tianyiswl/oneclick-publisher","revision":"bf1935aa8683cf4e54cd753ffe9250d597e3fae2","shortRevision":"bf1935a"},"referenceCount":7,"nodes":{"account_ui":[{"path":"QUALITY_GATES.md","line":45,"endLine":57,"label":"共享 UI 边界","href":"https://github.com/tianyiswl/oneclick-publisher/blob/bf1935aa8683cf4e54cd753ffe9250d597e3fae2/QUALITY_GATES.md#L45-L57"}],"loopback":[{"path":"QUALITY_GATES.md","line":15,"endLine":22,"label":"海外专属范围","href":"https://github.com/tianyiswl/oneclick-publisher/blob/bf1935aa8683cf4e54cd753ffe9250d597e3fae2/QUALITY_GATES.md#L15-L22"}],"oauth_adapter":[{"path":"docs/OVERSEAS_PLATFORM_STATUS.md","line":39,"endLine":45,"label":"旧登录路线已阻断","href":"https://github.com/tianyiswl/oneclick-publisher/blob/bf1935aa8683cf4e54cd753ffe9250d597e3fae2/docs/OVERSEAS_PLATFORM_STATUS.md#L39-L45"}],"token_vault":[{"path":"docs/OVERSEAS_PLATFORM_STATUS.md","line":57,"endLine":61,"label":"凭据安全边界","href":"https://github.com/tianyiswl/oneclick-publisher/blob/bf1935aa8683cf4e54cd753ffe9250d597e3fae2/docs/OVERSEAS_PLATFORM_STATUS.md#L57-L61"}],"publish_core":[{"path":"QUALITY_GATES.md","line":122,"endLine":128,"label":"真实验收门槛","href":"https://github.com/tianyiswl/oneclick-publisher/blob/bf1935aa8683cf4e54cd753ffe9250d597e3fae2/QUALITY_GATES.md#L122-L128"}],"youtube_adapter":[{"path":"app_core/overseas_preflight.py","line":128,"endLine":211,"label":"现有预检回执合同","href":"https://github.com/tianyiswl/oneclick-publisher/blob/bf1935aa8683cf4e54cd753ffe9250d597e3fae2/app_core/overseas_preflight.py#L128-L211"}],"receipt_gate":[{"path":"app_core/overseas_video_publish.py","line":141,"endLine":191,"label":"成功回执合同","href":"https://github.com/tianyiswl/oneclick-publisher/blob/bf1935aa8683cf4e54cd753ffe9250d597e3fae2/app_core/overseas_video_publish.py#L141-L191"}]}}</script>
+    <script id="archify-guided-views-data" type="application/json">[{"id":"oauth-flow","label":"登录授权","focus":["user","account_ui","loopback","system_browser","google_oauth","oauth_adapter","token_vault"],"note":"系统浏览器授权，state 与 PKCE 校验后只通过安全存储接口保存刷新令牌。"},{"id":"upload-flow","label":"私密上传与回读","focus":["publish_core","youtube_adapter","youtube_api","receipt_gate"],"note":"未经正式审核时只验证私密上传，并按本次 video ID 回读频道、标题和可见性。"},{"id":"restart-check","label":"重启检测","focus":["account_ui","account_store","token_vault","oauth_adapter","youtube_api"],"note":"数据库只保存凭据引用和频道 ID；重启后从系统凭据库刷新令牌并重新读取同一频道。"},{"id":"ownership","label":"阶段边界","focus":["account_ui","account_store","token_vault","publish_core","oauth_adapter","youtube_adapter"],"note":"第一阶段只接账号登录与重启检测；OAuth 账号在官方发布路由接通前不进入发布目标。"}]</script>
+    <script id="archify-source-evidence-data" type="application/json">{"schemaVersion":1,"verified":true,"repository":{"url":"https://github.com/tianyiswl/oneclick-publisher","revision":"b08a29b016ac633b7335b463250d4e690b49160c","shortRevision":"b08a29b"},"referenceCount":8,"nodes":{"account_ui":[{"path":"QUALITY_GATES.md","line":45,"endLine":57,"label":"共享 UI 边界","href":"https://github.com/tianyiswl/oneclick-publisher/blob/b08a29b016ac633b7335b463250d4e690b49160c/QUALITY_GATES.md#L45-L57"}],"loopback":[{"path":"QUALITY_GATES.md","line":15,"endLine":22,"label":"海外专属范围","href":"https://github.com/tianyiswl/oneclick-publisher/blob/b08a29b016ac633b7335b463250d4e690b49160c/QUALITY_GATES.md#L15-L22"}],"oauth_adapter":[{"path":"docs/OVERSEAS_PLATFORM_STATUS.md","line":39,"endLine":45,"label":"旧登录路线已阻断","href":"https://github.com/tianyiswl/oneclick-publisher/blob/b08a29b016ac633b7335b463250d4e690b49160c/docs/OVERSEAS_PLATFORM_STATUS.md#L39-L45"}],"token_vault":[{"path":"docs/OVERSEAS_PLATFORM_STATUS.md","line":57,"endLine":61,"label":"凭据安全边界","href":"https://github.com/tianyiswl/oneclick-publisher/blob/b08a29b016ac633b7335b463250d4e690b49160c/docs/OVERSEAS_PLATFORM_STATUS.md#L57-L61"}],"account_store":[{"path":"app_core/database.py","line":142,"endLine":143,"label":"账号授权字段","href":"https://github.com/tianyiswl/oneclick-publisher/blob/b08a29b016ac633b7335b463250d4e690b49160c/app_core/database.py#L142-L143"}],"publish_core":[{"path":"QUALITY_GATES.md","line":122,"endLine":128,"label":"真实验收门槛","href":"https://github.com/tianyiswl/oneclick-publisher/blob/b08a29b016ac633b7335b463250d4e690b49160c/QUALITY_GATES.md#L122-L128"}],"youtube_adapter":[{"path":"app_core/overseas_preflight.py","line":128,"endLine":211,"label":"现有预检回执合同","href":"https://github.com/tianyiswl/oneclick-publisher/blob/b08a29b016ac633b7335b463250d4e690b49160c/app_core/overseas_preflight.py#L128-L211"}],"receipt_gate":[{"path":"app_core/overseas_video_publish.py","line":141,"endLine":191,"label":"成功回执合同","href":"https://github.com/tianyiswl/oneclick-publisher/blob/b08a29b016ac633b7335b463250d4e690b49160c/app_core/overseas_video_publish.py#L141-L191"}]}}</script>
     <div class="guided-views no-print" id="guided-views" hidden aria-label="Guided diagram views">
       <button id="guided-view-prev" type="button" aria-label="Previous guided view" title="Previous guided view ([)">&#8592;</button>
       <div class="guided-view-copy">
@@ -4946,11 +4946,13 @@
         <path data-edge-from="system_browser" data-edge-to="google_oauth" data-edge-label="用户同意" data-edge-key="2" data-edge-id="browser-consent" data-composition-points="680,298;760,298" d="M 680 298 L 760 298" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
         <path data-edge-from="google_oauth" data-edge-to="loopback" data-edge-label="code + state" data-edge-key="3" data-edge-id="oauth-callback" data-composition-points="940,298;1020,298" d="M 940 298 L 1020 298" class="a-security" stroke-width="1.5" marker-end="url(#arrowhead-security)"/>
         <path data-edge-from="loopback" data-edge-to="oauth_adapter" data-edge-label="校验并交换" data-edge-key="4" data-edge-id="callback-adapter" data-composition-points="1200,300;1280,300" d="M 1200 300 L 1280 300" class="a-security" stroke-width="1.5" marker-end="url(#arrowhead-security)"/>
-        <path data-edge-from="oauth_adapter" data-edge-to="token_vault" data-edge-key="5" data-edge-id="adapter-vault" data-composition-points="1370,340;1370,430" d="M 1370 340 L 1370 430" class="a-security" stroke-width="1.5" marker-end="url(#arrowhead-security)"/>
-        <path data-edge-from="publish_core" data-edge-to="youtube_adapter" data-edge-label="已确认载荷" data-edge-key="6" data-edge-id="publish-adapter" data-composition-points="440,620;550,620" d="M 440 620 L 550 620" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
-        <path data-edge-from="token_vault" data-edge-to="youtube_adapter" data-edge-label="短期凭据" data-edge-key="7" data-edge-id="vault-api" data-composition-points="1370,510;1370,535;650,535;650,580" d="M 1370 510 L 1370 527 Q 1370 535 1362 535 L 658 535 Q 650 535 650 543 L 650 580" class="a-security" stroke-width="1.5" marker-end="url(#arrowhead-security)"/>
-        <path data-edge-from="youtube_adapter" data-edge-to="youtube_api" data-edge-label="上传 / 查询" data-edge-key="8" data-edge-id="api-call" data-composition-points="750,620;850,620" d="M 750 620 L 850 620" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
-        <path data-edge-from="youtube_api" data-edge-to="receipt_gate" data-edge-label="按 ID 回读" data-edge-key="9" data-edge-id="api-receipt" data-composition-points="1040,620;1150,620" d="M 1040 620 L 1150 620" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+        <path data-edge-from="oauth_adapter" data-edge-to="token_vault" data-edge-label="保存 / 读取刷新令牌" data-edge-key="5" data-edge-id="adapter-vault" data-composition-points="1370,340;1370,430" d="M 1370 340 L 1370 430" class="a-security" stroke-width="1.5" marker-end="url(#arrowhead-security)"/>
+        <path data-edge-from="account_store" data-edge-to="token_vault" data-edge-label="凭据引用" data-edge-key="6" data-edge-id="account-vault" data-composition-points="1210,470;1275,470" d="M 1210 470 L 1275 470" class="a-security" stroke-width="1.5" marker-end="url(#arrowhead-security)"/>
+        <path data-edge-from="oauth_adapter" data-edge-to="youtube_api" data-edge-label="channels.list" data-edge-key="7" data-edge-id="oauth-channel" data-composition-points="1460,300;1500,300;1500,720;945,720;945,660" d="M 1460 300 L 1492 300 Q 1500 300 1500 308 L 1500 712 Q 1500 720 1492 720 L 953 720 Q 945 720 945 712 L 945 660" class="a-security" stroke-width="1.5" marker-end="url(#arrowhead-security)"/>
+        <path data-edge-from="publish_core" data-edge-to="youtube_adapter" data-edge-label="已确认载荷" data-edge-key="8" data-edge-id="publish-adapter" data-composition-points="440,620;550,620" d="M 440 620 L 550 620" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
+        <path data-edge-from="token_vault" data-edge-to="youtube_adapter" data-edge-label="短期凭据" data-edge-key="9" data-edge-id="vault-api" data-composition-points="1370,510;1370,535;650,535;650,580" d="M 1370 510 L 1370 527 Q 1370 535 1362 535 L 658 535 Q 650 535 650 543 L 650 580" class="a-security" stroke-width="1.5" marker-end="url(#arrowhead-security)"/>
+        <path data-edge-from="youtube_adapter" data-edge-to="youtube_api" data-edge-label="上传 / 查询" data-edge-key="10" data-edge-id="api-call" data-composition-points="750,620;850,620" d="M 750 620 L 850 620" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
+        <path data-edge-from="youtube_api" data-edge-to="receipt_gate" data-edge-label="按 ID 回读" data-edge-key="11" data-edge-id="api-receipt" data-composition-points="1040,620;1150,620" d="M 1040 620 L 1150 620" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
 
         <!-- Components -->
         <g id="node-user" data-node-id="user" data-node-label="用户" tabindex="0" role="button" aria-label="Focus 用户, 专用 YouTube 测试账号, Architecture component" aria-pressed="false" data-node-kind="external" data-node-sublabel="专用 YouTube 测试账号" data-node-context="Architecture component">
@@ -5030,8 +5032,8 @@
         <text data-detail="fine" x="1370" y="332" class="t-backend" font-size="7" text-anchor="middle">最小 scope</text>
         </g>
 
-        <g id="node-token_vault" data-node-id="token_vault" data-node-label="本机令牌安全存储" tabindex="0" role="button" aria-label="Focus 本机令牌安全存储, 海外分支｜OS 凭据库接口, Architecture component" aria-pressed="false" data-node-kind="security" data-node-sublabel="海外分支｜OS 凭据库接口" data-node-tag="token reference" data-node-context="Architecture component">
-          <title>本机令牌安全存储 · 海外分支｜OS 凭据库接口 · Architecture component · token reference</title>
+        <g id="node-token_vault" data-node-id="token_vault" data-node-label="本机令牌安全存储" tabindex="0" role="button" aria-label="Focus 本机令牌安全存储, keyring｜Keychain / Credential Locker, Architecture component" aria-pressed="false" data-node-kind="security" data-node-sublabel="keyring｜Keychain / Credential Locker" data-node-tag="token reference" data-node-context="Architecture component">
+          <title>本机令牌安全存储 · keyring｜Keychain / Credential Locker · Architecture component · token reference</title>
           <rect x="1275" y="430" width="190" height="80" rx="6" class="c-mask"/>
           <rect x="1275" y="430" width="190" height="80" rx="6" class="c-security" stroke-width="1.5"/>
           <g aria-hidden="true" data-semantic-sigil="security" class="semantic-sigil s-security" transform="translate(1281 436) scale(0.6875)">
@@ -5039,12 +5041,25 @@
             <path d="m5.8 8 1.5 1.5 3-3"/>
           </g>
           <text data-detail-anchor x="1370" y="468" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">本机令牌安全存储</text>
-        <text data-detail="context" x="1370" y="484" class="t-muted" font-size="9" text-anchor="middle">海外分支｜OS 凭据库接口</text>
+        <text data-detail="context" x="1370" y="484" class="t-muted" font-size="8.1" text-anchor="middle">keyring｜Keychain / Credential Locker</text>
         <text data-detail="fine" x="1370" y="502" class="t-security" font-size="7" text-anchor="middle">token reference</text>
         </g>
 
-        <g id="node-publish_core" data-node-id="publish_core" data-node-label="发布确认与任务路由" tabindex="0" role="button" aria-label="Focus 发布确认与任务路由, 共享核心｜集成线, Architecture component" aria-pressed="false" data-node-kind="backend" data-node-sublabel="共享核心｜集成线" data-node-tag="当次明确授权" data-node-context="Architecture component">
-          <title>发布确认与任务路由 · 共享核心｜集成线 · Architecture component · 当次明确授权</title>
+        <g id="node-account_store" data-node-id="account_store" data-node-label="账号记录" tabindex="0" role="button" aria-label="Focus 账号记录, SQLite｜无令牌, Architecture component" aria-pressed="false" data-node-kind="database" data-node-sublabel="SQLite｜无令牌" data-node-tag="credential ref + channel ID" data-node-context="Architecture component">
+          <title>账号记录 · SQLite｜无令牌 · Architecture component · credential ref + channel ID</title>
+          <rect x="1020" y="430" width="190" height="80" rx="6" class="c-mask"/>
+          <rect x="1020" y="430" width="190" height="80" rx="6" class="c-database" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="database" class="semantic-sigil s-database" transform="translate(1026 436) scale(0.6875)">
+            <ellipse cx="8" cy="4" rx="5" ry="2"/>
+            <path d="M3 4v8c0 1.1 2.2 2 5 2s5-.9 5-2V4M3 8c0 1.1 2.2 2 5 2s5-.9 5-2"/>
+          </g>
+          <text data-detail-anchor x="1115" y="468" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">账号记录</text>
+        <text data-detail="context" x="1115" y="484" class="t-muted" font-size="9" text-anchor="middle">SQLite｜无令牌</text>
+        <text data-detail="fine" x="1115" y="502" class="t-database" font-size="7" text-anchor="middle">credential ref + channel ID</text>
+        </g>
+
+        <g id="node-publish_core" data-node-id="publish_core" data-node-label="发布确认与任务路由" tabindex="0" role="button" aria-label="Focus 发布确认与任务路由, 共享核心｜集成线, Architecture component" aria-pressed="false" data-node-kind="backend" data-node-sublabel="共享核心｜集成线" data-node-tag="第二阶段接线" data-node-context="Architecture component">
+          <title>发布确认与任务路由 · 共享核心｜集成线 · Architecture component · 第二阶段接线</title>
           <rect x="250" y="580" width="190" height="80" rx="6" class="c-mask"/>
           <rect x="250" y="580" width="190" height="80" rx="6" class="c-backend" stroke-width="1.5"/>
           <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(256 586) scale(0.6875)">
@@ -5052,11 +5067,11 @@
           </g>
           <text data-detail-anchor x="345" y="618" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">发布确认与任务路由</text>
         <text data-detail="context" x="345" y="634" class="t-muted" font-size="9" text-anchor="middle">共享核心｜集成线</text>
-        <text data-detail="fine" x="345" y="652" class="t-backend" font-size="7" text-anchor="middle">当次明确授权</text>
+        <text data-detail="fine" x="345" y="652" class="t-backend" font-size="7" text-anchor="middle">第二阶段接线</text>
         </g>
 
-        <g id="node-youtube_adapter" data-node-id="youtube_adapter" data-node-label="YouTube Data API adapter" tabindex="0" role="button" aria-label="Focus YouTube Data API adapter, 海外分支, Architecture component" aria-pressed="false" data-node-kind="backend" data-node-sublabel="海外分支" data-node-tag="私密优先" data-node-context="Architecture component">
-          <title>YouTube Data API adapter · 海外分支 · Architecture component · 私密优先</title>
+        <g id="node-youtube_adapter" data-node-id="youtube_adapter" data-node-label="YouTube Data API adapter" tabindex="0" role="button" aria-label="Focus YouTube Data API adapter, 海外分支, Architecture component" aria-pressed="false" data-node-kind="backend" data-node-sublabel="海外分支" data-node-tag="当前不对 UI 开放" data-node-context="Architecture component">
+          <title>YouTube Data API adapter · 海外分支 · Architecture component · 当前不对 UI 开放</title>
           <rect x="550" y="580" width="200" height="80" rx="6" class="c-mask"/>
           <rect x="550" y="580" width="200" height="80" rx="6" class="c-backend" stroke-width="1.5"/>
           <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(556 586) scale(0.6875)">
@@ -5064,7 +5079,7 @@
           </g>
           <text data-detail-anchor x="650" y="618" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">YouTube Data API adapter</text>
         <text data-detail="context" x="650" y="634" class="t-muted" font-size="9" text-anchor="middle">海外分支</text>
-        <text data-detail="fine" x="650" y="652" class="t-backend" font-size="7" text-anchor="middle">私密优先</text>
+        <text data-detail="fine" x="650" y="652" class="t-backend" font-size="7" text-anchor="middle">当前不对 UI 开放</text>
         </g>
 
         <g id="node-youtube_api" data-node-id="youtube_api" data-node-label="YouTube Data API v3" tabindex="0" role="button" aria-label="Focus YouTube Data API v3, channels / videos / uploads, Architecture component" aria-pressed="false" data-node-kind="external" data-node-sublabel="channels / videos / uploads" data-node-context="Architecture component">
@@ -5113,20 +5128,31 @@
           <rect x="1211" y="280" width="58" height="14" rx="3" class="c-mask"/>
           <text x="1240" y="290" class="t-security" font-size="8" text-anchor="middle">校验并交换</text>
         </g>
-
-        <g data-detail="context" data-edge-from="publish_core" data-edge-to="youtube_adapter" data-edge-label="已确认载荷" data-edge-key="6" data-edge-id="publish-adapter">
+        <g data-detail="context" data-edge-from="oauth_adapter" data-edge-to="token_vault" data-edge-label="保存 / 读取刷新令牌" data-edge-key="5" data-edge-id="adapter-vault">
+          <rect x="1319.4" y="375" width="101.2" height="14" rx="3" class="c-mask"/>
+          <text x="1370" y="385" class="t-security" font-size="8" text-anchor="middle">保存 / 读取刷新令牌</text>
+        </g>
+        <g data-detail="context" data-edge-from="account_store" data-edge-to="token_vault" data-edge-label="凭据引用" data-edge-key="6" data-edge-id="account-vault">
+          <rect x="1218.3" y="450" width="48.4" height="14" rx="3" class="c-mask"/>
+          <text x="1242.5" y="460" class="t-security" font-size="8" text-anchor="middle">凭据引用</text>
+        </g>
+        <g data-detail="context" data-edge-from="oauth_adapter" data-edge-to="youtube_api" data-edge-label="channels.list" data-edge-key="7" data-edge-id="oauth-channel">
+          <rect x="1463.8" y="490" width="72.4" height="14" rx="3" class="c-mask"/>
+          <text x="1500" y="500" class="t-security" font-size="8" text-anchor="middle">channels.list</text>
+        </g>
+        <g data-detail="context" data-edge-from="publish_core" data-edge-to="youtube_adapter" data-edge-label="已确认载荷" data-edge-key="8" data-edge-id="publish-adapter">
           <rect x="466" y="600" width="58" height="14" rx="3" class="c-mask"/>
           <text x="495" y="610" class="t-backend" font-size="8" text-anchor="middle">已确认载荷</text>
         </g>
-        <g data-detail="context" data-edge-from="token_vault" data-edge-to="youtube_adapter" data-edge-label="短期凭据" data-edge-key="7" data-edge-id="vault-api">
+        <g data-detail="context" data-edge-from="token_vault" data-edge-to="youtube_adapter" data-edge-label="短期凭据" data-edge-key="9" data-edge-id="vault-api">
           <rect x="985.8" y="515" width="48.4" height="14" rx="3" class="c-mask"/>
           <text x="1010" y="525" class="t-security" font-size="8" text-anchor="middle">短期凭据</text>
         </g>
-        <g data-detail="context" data-edge-from="youtube_adapter" data-edge-to="youtube_api" data-edge-label="上传 / 查询" data-edge-key="8" data-edge-id="api-call">
+        <g data-detail="context" data-edge-from="youtube_adapter" data-edge-to="youtube_api" data-edge-label="上传 / 查询" data-edge-key="10" data-edge-id="api-call">
           <rect x="768.6" y="600" width="62.8" height="14" rx="3" class="c-mask"/>
           <text x="800" y="610" class="t-backend" font-size="8" text-anchor="middle">上传 / 查询</text>
         </g>
-        <g data-detail="context" data-edge-from="youtube_api" data-edge-to="receipt_gate" data-edge-label="按 ID 回读" data-edge-key="9" data-edge-id="api-receipt">
+        <g data-detail="context" data-edge-from="youtube_api" data-edge-to="receipt_gate" data-edge-label="按 ID 回读" data-edge-key="11" data-edge-id="api-receipt">
           <rect x="1066" y="600" width="58" height="14" rx="3" class="c-mask"/>
           <text x="1095" y="610" class="t-muted" font-size="8" text-anchor="middle">按 ID 回读</text>
         </g>
@@ -5142,13 +5168,17 @@
             <rect x="145" y="805" width="16" height="10" rx="2.5" class="c-backend" stroke-width="1"/>
             <text x="167" y="814" class="t-muted" font-size="10" font-weight="500">Backend</text>
           </g>
-          <g data-legend-semantic-kind="security" data-legend-kind="security" data-legend-label="Security" data-legend-x="245" data-legend-baseline="814" data-legend-width="83">
-            <rect x="245" y="805" width="16" height="10" rx="2.5" class="c-security" stroke-width="1"/>
-            <text x="267" y="814" class="t-muted" font-size="10" font-weight="500">Security</text>
+          <g data-legend-semantic-kind="database" data-legend-kind="database" data-legend-label="Database" data-legend-x="245" data-legend-baseline="814" data-legend-width="83">
+            <rect x="245" y="805" width="16" height="10" rx="2.5" class="c-database" stroke-width="1"/>
+            <text x="267" y="814" class="t-muted" font-size="10" font-weight="500">Database</text>
           </g>
-          <g data-legend-semantic-kind="external" data-legend-kind="external" data-legend-label="External" data-legend-x="350" data-legend-baseline="814" data-legend-width="83">
-            <rect x="350" y="805" width="16" height="10" rx="2.5" class="c-external" stroke-width="1"/>
-            <text x="372" y="814" class="t-muted" font-size="10" font-weight="500">External</text>
+          <g data-legend-semantic-kind="security" data-legend-kind="security" data-legend-label="Security" data-legend-x="350" data-legend-baseline="814" data-legend-width="83">
+            <rect x="350" y="805" width="16" height="10" rx="2.5" class="c-security" stroke-width="1"/>
+            <text x="372" y="814" class="t-muted" font-size="10" font-weight="500">Security</text>
+          </g>
+          <g data-legend-semantic-kind="external" data-legend-kind="external" data-legend-label="External" data-legend-x="455" data-legend-baseline="814" data-legend-width="83">
+            <rect x="455" y="805" width="16" height="10" rx="2.5" class="c-external" stroke-width="1"/>
+            <text x="477" y="814" class="t-muted" font-size="10" font-weight="500">External</text>
           </g>
         </g>
       </svg>
@@ -5364,7 +5394,18 @@
         </div>
         <ul>
           <li>&bull; 系统浏览器 OAuth 后客户端重启仍识别同一频道</li>
-          <li>&bull; 私密测试视频按本次 video ID 完成 API 回读</li>
+          <li>&bull; 第一阶段不上传视频；私密上传与 video ID 回读留到第二阶段</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-dot cyan"></div>
+          <h3>发布隔离</h3>
+        </div>
+        <ul>
+          <li>&bull; OAuth 账号先只在账号管理显示，不进入发布中心</li>
+          <li>&bull; 官方发布路由接通并单独验证后才开放选择</li>
         </ul>
       </div>
     </div>
