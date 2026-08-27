@@ -8143,47 +8143,54 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
                 '<div style="pointer-events:none"><button id="load-more">加载更多</button></div>',
             ),
         )
-        for case, control_html in cases:
-            with self.subTest(case=case):
-                html = f"""
-                <div id="location-results" role="listbox">
-                  <div role="option"><span data-store-name>首屏地点</span>
-                    <span data-store-address>广西北海市测试路 5 号</span></div>
-                </div>
-                {control_html}
-                <script>
-                  window.loadMoreClicks = 0;
-                  document.querySelector('#load-more').addEventListener('click', () => {{
-                    window.loadMoreClicks += 1;
-                  }});
-                </script>
-                """
-                async with async_playwright() as playwright:
-                    browser = await playwright.chromium.launch(headless=True)
-                    try:
+        # Reuse one browser for both independent pages. Starting a second
+        # Chromium process inside the same test only exercises process startup
+        # and can time out under full-suite load before the DOM rule is reached.
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                for case, control_html in cases:
+                    with self.subTest(case=case):
                         page = await browser.new_page()
-                        await page.set_content(html)
-                        previous = douyin_commerce_service.normalize_commerce_location_candidates(
-                            await douyin_commerce_service._store_option_descriptors(
-                                page.locator("#location-results")
+                        try:
+                            html = f"""
+                            <div id="location-results" role="listbox">
+                              <div role="option"><span data-store-name>首屏地点</span>
+                                <span data-store-address>广西北海市测试路 5 号</span></div>
+                            </div>
+                            {control_html}
+                            <script>
+                              window.loadMoreClicks = 0;
+                              document.querySelector('#load-more').addEventListener('click', () => {{
+                                window.loadMoreClicks += 1;
+                              }});
+                            </script>
+                            """
+                            await page.set_content(html)
+                            previous = douyin_commerce_service.normalize_commerce_location_candidates(
+                                await douyin_commerce_service._store_option_descriptors(
+                                    page.locator("#location-results")
+                                )
                             )
-                        )
+                            result = await douyin_commerce_service.load_more_commerce_location_candidates(
+                                page,
+                                previous_candidates=previous,
+                                # Chromium shares resources with the rest of the full
+                                # regression suite. Keep a bounded deadline, but do not
+                                # make scheduler load decide whether the read-only DOM
+                                # inspection reaches its first snapshot.
+                                timeout_ms=1_500,
+                            )
 
-                        result = await douyin_commerce_service.load_more_commerce_location_candidates(
-                            page,
-                            previous_candidates=previous,
-                            # Chromium shares resources with the rest of the full
-                            # regression suite. Keep a bounded deadline, but do not
-                            # make scheduler load decide whether the read-only DOM
-                            # inspection reaches its first snapshot.
-                            timeout_ms=1_500,
-                        )
-
-                        self.assertFalse(result["hasMore"])
-                        self.assertEqual(result["newCandidateCount"], 0)
-                        self.assertEqual(await page.evaluate("window.loadMoreClicks"), 0)
-                    finally:
-                        await browser.close()
+                            self.assertFalse(result["hasMore"])
+                            self.assertEqual(result["newCandidateCount"], 0)
+                            self.assertEqual(
+                                await page.evaluate("window.loadMoreClicks"), 0
+                            )
+                        finally:
+                            await page.close()
+            finally:
+                await browser.close()
 
 
 class DouyinCommerceMusicRuleTests(unittest.TestCase):
