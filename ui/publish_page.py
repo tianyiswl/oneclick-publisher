@@ -1210,7 +1210,7 @@ class PublishPage(QWidget):
         self.platform_cover_34: dict[int, QComboBox] = {}
         self.platform_cover_43: dict[int, QComboBox] = {}
         self.platform_cover_previews: dict[tuple[int, str], CoverPreviewCanvas] = {}
-        self.youtube_made_for_kids: QCheckBox | None = None
+        self.youtube_made_for_kids: QComboBox | None = None
         self.youtube_notify_subscribers: QCheckBox | None = None
         self.instagram_share_to_feed: QCheckBox | None = None
         self.douyin_sync_toutiao: QCheckBox | None = None
@@ -1357,7 +1357,7 @@ class PublishPage(QWidget):
         schedule_time.setEnabled(False)
         schedule_enabled.toggled.connect(schedule_date.setEnabled)
         schedule_enabled.toggled.connect(schedule_time.setEnabled)
-        if platform_type in {6, 7}:
+        if platform_type == 6:
             schedule_enabled.setEnabled(False)
             schedule_enabled.setToolTip(
                 f"{name} 首版只开放立即发布，定时发布将在真实账号回读验收后开放。"
@@ -1639,23 +1639,30 @@ class PublishPage(QWidget):
             settings_layout = QFormLayout(settings)
             settings_layout.setContentsMargins(12, 10, 12, 10)
             visibility = QComboBox()
-            visibility.addItem("使用通用设置", "")
-            visibility.addItem("公开", "public")
-            visibility.addItem("私密", "private")
+            visibility.addItem("私密（推荐）", "private")
             visibility.addItem("不公开", "unlisted")
+            visibility.addItem("公开", "public")
+            visibility.addItem("定时公开", "scheduled_public")
             self.platform_visibility[platform_type] = visibility
             settings_layout.addRow("可见性", visibility)
-            self.youtube_made_for_kids = QCheckBox("内容面向儿童")
+            self.youtube_made_for_kids = QComboBox()
+            self.youtube_made_for_kids.addItem("请选择", None)
+            self.youtube_made_for_kids.addItem("不面向儿童", False)
+            self.youtube_made_for_kids.addItem("面向儿童", True)
             self.youtube_made_for_kids.setToolTip(
-                "仅在内容确实面向儿童时开启，会写入 YouTube 官方受众字段。"
+                "正式发布前必须主动选择，程序不会猜测是否面向儿童。"
             )
             settings_layout.addRow("受众", self.youtube_made_for_kids)
             self.youtube_notify_subscribers = QCheckBox("通知订阅者")
             self.youtube_notify_subscribers.setChecked(True)
             self.youtube_notify_subscribers.setToolTip(
-                "首版必须保持开启；关闭通知尚未接入可靠回读，提交时会安全阻断。"
+                "开启后平台可能通知订阅者；取消则通过 YouTube 官方 API 关闭通知。"
             )
             settings_layout.addRow("通知", self.youtube_notify_subscribers)
+            visibility.currentIndexChanged.connect(
+                self._sync_youtube_schedule_controls
+            )
+            self._sync_youtube_schedule_controls()
             body_layout.addWidget(settings)
         elif platform_type == 8:
             settings = QFrame()
@@ -3349,7 +3356,7 @@ class PublishPage(QWidget):
         self._refresh_topic_histories(history)
 
     def refresh_accounts(self) -> None:
-        accounts = account_service.list_accounts()
+        accounts = account_service.list_publishable_accounts()
         self._account_rows = accounts
         valid_ids = {int(item["id"]) for item in accounts}
         self._selected_account_ids.intersection_update(valid_ids)
@@ -3398,12 +3405,20 @@ class PublishPage(QWidget):
             if remark:
                 display_parts.append(f"备注：{remark}")
             text = " · ".join(display_parts)
+            is_youtube_oauth = (
+                int(account.get("type") or 0) == 7
+                and str(account.get("authMode") or "") == "youtube_oauth"
+            )
             tooltip_lines = [
                 f"平台：{account['platformName']}",
                 f"主体：{account['profileName']}",
                 f"账号名：{account['userName'] or '未命名账号'}",
                 f"状态：{account['statusText']}",
-                "通道：一键发本地浏览器会话",
+                (
+                    "通道：YouTube 官方 API"
+                    if is_youtube_oauth
+                    else "通道：一键发本地浏览器会话"
+                ),
             ]
             if remark:
                 tooltip_lines.append(f"备注：{remark}")
@@ -4041,7 +4056,7 @@ class PublishPage(QWidget):
         if self.wechat_group_notification:
             self.wechat_group_notification.setChecked(True)
         if self.youtube_made_for_kids:
-            self.youtube_made_for_kids.setChecked(False)
+            self.youtube_made_for_kids.setCurrentIndex(0)
         if self.youtube_notify_subscribers:
             self.youtube_notify_subscribers.setChecked(True)
         if self.instagram_share_to_feed:
@@ -4204,6 +4219,28 @@ class PublishPage(QWidget):
         date_text = self.platform_schedule_dates[platform_type].date().toString("yyyy-MM-dd")
         time_text = self.platform_schedule_times[platform_type].time().toString("HH:mm")
         return f"{date_text} {time_text}"
+
+    def _sync_youtube_schedule_controls(self, *_args) -> None:
+        """YouTube 只在选择“定时公开”时启用自己的时间控件。"""
+
+        visibility = self.platform_visibility.get(7)
+        enabled = self.platform_schedule_enabled.get(7)
+        schedule_date = self.platform_schedule_dates.get(7)
+        schedule_time = self.platform_schedule_times.get(7)
+        if not all((visibility, enabled, schedule_date, schedule_time)):
+            return
+        scheduled_public = visibility.currentData() == "scheduled_public"
+        if not scheduled_public:
+            enabled.setChecked(False)
+        enabled.setEnabled(scheduled_public)
+        enabled.setToolTip(
+            "勾选后设置 YouTube 定时公开时间"
+            if scheduled_public
+            else "只有选择“定时公开”后才能设置"
+        )
+        date_time_enabled = scheduled_public and enabled.isChecked()
+        schedule_date.setEnabled(date_time_enabled)
+        schedule_time.setEnabled(date_time_enabled)
 
     def _platform_collection_name(self, platform_type: int) -> str:
         combo = self.platform_collections[platform_type]
@@ -4378,14 +4415,29 @@ class PublishPage(QWidget):
             if platform_type == 6:
                 # TikTok 网页端首版不承诺本地自定义封面；平台卡片已明确展示该边界。
                 cover_paths = {}
-            schedule_time = (
-                self._validated_schedule_time(
-                    self._platform_schedule_time(platform_type),
-                    platform_name,
+            if platform_type == 7:
+                youtube_visibility = str(
+                    self.platform_visibility[7].currentData() or "private"
                 )
-                if has_platform_schedule
-                else common_schedule_time
-            )
+                if youtube_visibility == "scheduled_public":
+                    if not has_platform_schedule:
+                        raise ValueError("YouTube 定时公开必须设置发布时间")
+                    schedule_time = self._validated_schedule_time(
+                        self._platform_schedule_time(7), "YouTube"
+                    )
+                else:
+                    # YouTube 的私密/不公开/公开都是立即模式，
+                    # 不得继承通用定时。
+                    schedule_time = ""
+            else:
+                schedule_time = (
+                    self._validated_schedule_time(
+                        self._platform_schedule_time(platform_type),
+                        platform_name,
+                    )
+                    if has_platform_schedule
+                    else common_schedule_time
+                )
             if runtime_mode == "draft":
                 schedule_time = ""
             preferred_cover = self._preferred_cover_path(platform_type, cover_paths)
@@ -4516,13 +4568,47 @@ class PublishPage(QWidget):
                     }
                 )
             if platform_type == 7:
-                payload["madeForKids"] = bool(
-                    self.youtube_made_for_kids
-                    and self.youtube_made_for_kids.isChecked()
+                if len(selected) != 1:
+                    raise ValueError("YouTube 官方通道一次只能选择一个频道")
+                youtube_account = selected[0]
+                if str(youtube_account.get("authMode") or "") != "youtube_oauth":
+                    raise ValueError(
+                        "YouTube 发布必须选择官方 OAuth 频道，"
+                        "请到账号管理重新登录"
+                    )
+                if (
+                    runtime_mode == "publish"
+                    and int(youtube_account.get("oauthScopeVersion") or 1) < 2
+                ):
+                    raise ValueError(
+                        "YouTube 账号需要升级发布权限，请在账号管理中重新授权"
+                    )
+                audience = (
+                    self.youtube_made_for_kids.currentData()
+                    if self.youtube_made_for_kids is not None
+                    else None
                 )
-                payload["notifySubscribers"] = bool(
-                    self.youtube_notify_subscribers is None
-                    or self.youtube_notify_subscribers.isChecked()
+                if runtime_mode == "publish" and type(audience) is not bool:
+                    raise ValueError("YouTube 正式发布必须明确选择是否面向儿童")
+                payload.update(
+                    {
+                        "youtubeOfficialApi": True,
+                        "youtubeExpectedChannelId": str(
+                            youtube_account.get("accountReference") or ""
+                        ),
+                        "visibility": youtube_visibility,
+                        "madeForKids": audience,
+                        "notifySubscribers": bool(
+                            self.youtube_notify_subscribers is None
+                            or self.youtube_notify_subscribers.isChecked()
+                        ),
+                        "enableTimer": bool(schedule_time),
+                        "scheduleTime": schedule_time or None,
+                        "scheduleTimezone": "Asia/Shanghai",
+                        "backgroundMode": True,
+                        "debugDryRunHoldBrowser": False,
+                        "collectionName": "",
+                    }
                 )
             if platform_type == 8:
                 payload["shareToFeed"] = bool(
@@ -4685,9 +4771,12 @@ class PublishPage(QWidget):
             return
         if runtime_mode == "publish":
             for payload in payloads:
-                if int(payload.get("type") or 0) in {6, 7}:
+                if int(payload.get("type") or 0) == 6 or (
+                    int(payload.get("type") or 0) == 7
+                    and payload.get("youtubeOfficialApi") is not True
+                ):
                     payload["overseasVideoPublishConfirmed"] = True
-                    # TikTok/YouTube 的登录验证与风控必须在可见窗口处理。
+                    # 仅旧浏览器通道需要可见窗口处理风控。
                     payload["backgroundMode"] = False
         meta_browser_payloads = [
             payload
@@ -4726,8 +4815,17 @@ class PublishPage(QWidget):
                 if int(payload.get("type", 0))
                 in account_service.OVERSEAS_PLATFORM_TYPES
             ]
-            contains_tiktok_youtube = any(
-                int(payload.get("type", 0)) in {6, 7}
+            contains_visible_browser = any(
+                int(payload.get("type", 0)) == 6
+                or (
+                    int(payload.get("type", 0)) == 7
+                    and payload.get("youtubeOfficialApi") is not True
+                )
+                for payload in overseas_payloads
+            )
+            contains_youtube_official = any(
+                int(payload.get("type", 0)) == 7
+                and payload.get("youtubeOfficialApi") is True
                 for payload in overseas_payloads
             )
             contains_meta_browser = any(
@@ -4738,8 +4836,10 @@ class PublishPage(QWidget):
                 message = "任务已开始。上传和表单检查将在无窗口后台完成，预检结束后自动关闭会话。"
             else:
                 message = "任务已开始。程序会显示发布页面并停在最终发布前，检查完成后请关闭自动化浏览器。"
-            if contains_tiktok_youtube:
-                message += "完成后可选择 TikTok/YouTube 可见浏览器正式发布。"
+            if contains_visible_browser:
+                message += "完成后可选择 TikTok 可见浏览器正式发布。"
+            elif contains_youtube_official:
+                message += "YouTube 官方 API 只做账号与本地字段检查，不会创建视频。"
             elif contains_meta_browser:
                 message += "完成后可选择 Meta 可见浏览器确认式发布。"
             else:
@@ -5190,7 +5290,7 @@ class PublishPage(QWidget):
         preferred_platforms = set(bundle["preferredPlatforms"])
         self._selected_account_ids = {
             int(row["id"])
-            for row in account_service.list_accounts()
+            for row in account_service.list_publishable_accounts()
             if row.get("platformName") in preferred_platforms
             and oneclick_capabilities.supports(str(row.get("platformName") or ""), expected_type)
         }
@@ -5420,7 +5520,10 @@ class PublishPage(QWidget):
                 payload["runtimeMode"] = "publish"
                 payload["debugDryRun"] = False
                 payload["debugDryRunHoldBrowser"] = False
-                if int(payload.get("type") or 0) in {6, 7}:
+                if int(payload.get("type") or 0) == 6 or (
+                    int(payload.get("type") or 0) == 7
+                    and payload.get("youtubeOfficialApi") is not True
+                ):
                     payload["overseasVideoPublishConfirmed"] = True
                     payload["backgroundMode"] = False
             meta_browser_payloads = [
@@ -5622,9 +5725,15 @@ class PublishPage(QWidget):
         lines.append(f"账号数量：{len(accounts)}")
         for account in accounts:
             remark = f" | {account.get('remark')}" if account.get("remark") else ""
+            account_channel = (
+                "官方 OAuth 频道"
+                if int(account.get("type") or 0) == 7
+                and str(account.get("authMode") or "") == "youtube_oauth"
+                else "浏览器会话"
+            )
             lines.append(
                 f"- {account['profileName']} | {account['platformName']} | "
-                f"{account['userName']} | 浏览器会话{remark}"
+                f"{account['userName']} | {account_channel}{remark}"
             )
 
         lines.append("")
@@ -5647,9 +5756,18 @@ class PublishPage(QWidget):
             lines.append(f"  文案：{description} / {tags}")
             lines.append(f"  合集：{payload.get('collectionName') or '不选择'}")
             lines.append(f"  发布时间：{payload.get('scheduleTime') or '立即发布'}")
-            if int(payload.get("type") or 0) in account_service.OVERSEAS_PLATFORM_TYPES:
+            if int(payload.get("type") or 0) == 7 and payload.get(
+                "youtubeOfficialApi"
+            ) is True:
+                lines.append("  YouTube 执行通道：官方 API 后台处理")
+            elif int(payload.get("type") or 0) in account_service.OVERSEAS_PLATFORM_TYPES:
                 lines.append("  海外执行通道：一键发受控浏览器")
-            visibility_labels = {"public": "公开", "private": "私密", "unlisted": "不公开"}
+            visibility_labels = {
+                "public": "公开",
+                "private": "私密",
+                "unlisted": "不公开",
+                "scheduled_public": "定时公开",
+            }
             lines.append(f"  谁可以看：{visibility_labels.get(payload.get('visibility'), '公开')}")
             if int(payload.get("type")) == 5:
                 lines.append(f"  B站分区：{payload.get('biliPartition') or '未设置'}，类型：{payload.get('biliType') or '未设置'}")
@@ -5661,7 +5779,13 @@ class PublishPage(QWidget):
             if int(payload.get("type")) == 7:
                 lines.append(
                     "  YouTube 受众："
-                    + ("面向儿童" if payload.get("madeForKids") else "不面向儿童")
+                    + (
+                        "面向儿童"
+                        if payload.get("madeForKids") is True
+                        else "不面向儿童"
+                        if payload.get("madeForKids") is False
+                        else "尚未选择（正式发布前必填）"
+                    )
                 )
                 lines.append(
                     "  订阅者通知："
@@ -5742,9 +5866,15 @@ class PublishPage(QWidget):
             "biliPartition": self.bili_partition.currentText(),
             "biliType": self.bili_type.currentText(),
             "platformVisibility": {str(k): v.currentData() for k, v in self.platform_visibility.items()},
-            "youtubeMadeForKids": bool(
-                self.youtube_made_for_kids
-                and self.youtube_made_for_kids.isChecked()
+            "youtubeVisibility": (
+                self.platform_visibility[7].currentData()
+                if 7 in self.platform_visibility
+                else "private"
+            ),
+            "youtubeMadeForKids": (
+                self.youtube_made_for_kids.currentData()
+                if self.youtube_made_for_kids is not None
+                else None
             ),
             "youtubeNotifySubscribers": bool(
                 self.youtube_notify_subscribers is None
@@ -6054,14 +6184,23 @@ class PublishPage(QWidget):
             if combo:
                 index = combo.findData(value)
                 combo.setCurrentIndex(index if index >= 0 else 0)
+        if 7 in self.platform_visibility and payload.get("youtubeVisibility"):
+            youtube_visibility = self.platform_visibility[7]
+            index = youtube_visibility.findData(payload.get("youtubeVisibility"))
+            youtube_visibility.setCurrentIndex(index if index >= 0 else 0)
         if self.youtube_made_for_kids:
-            self.youtube_made_for_kids.setChecked(
-                bool(payload.get("youtubeMadeForKids", False))
+            audience = (
+                payload.get("youtubeMadeForKids")
+                if "youtubeMadeForKids" in payload
+                else None
             )
+            index = self.youtube_made_for_kids.findData(audience)
+            self.youtube_made_for_kids.setCurrentIndex(index if index >= 0 else 0)
         if self.youtube_notify_subscribers:
             self.youtube_notify_subscribers.setChecked(
                 bool(payload.get("youtubeNotifySubscribers", True))
             )
+        self._sync_youtube_schedule_controls()
         if self.instagram_share_to_feed:
             self.instagram_share_to_feed.setChecked(
                 bool(payload.get("instagramShareToFeed", True))

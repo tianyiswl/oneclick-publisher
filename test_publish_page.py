@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PyQt6.QtCore import QDate, QTime
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
 from app_core.wechat_verification import verification_broker
@@ -81,6 +82,193 @@ class PublishPageWechatDraftQueueTests(unittest.TestCase):
             show.assert_called_once_with(41)
             self._dispose_page(page)
 
+
+class PublishPageYouTubeSettingsTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.video = Path(self.temporary.name) / "youtube.mp4"
+        self.video.write_bytes(b"youtube-offline-video")
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def _dispose_page(self, page: PublishPage) -> None:
+        page.wechat_draft_queue_timer.stop()
+        page.task_timer.stop()
+        page.close()
+        page.deleteLater()
+        self.app.processEvents()
+
+    @staticmethod
+    def _account() -> dict:
+        return {
+            "id": 71,
+            "type": 7,
+            "platformName": "YouTube",
+            "filePath": "youtube-oauth:test-reference",
+            "profileName": "YouTube 测试频道",
+            "userName": "YouTube 测试频道",
+            "statusText": "正常",
+            "healthStatus": "normal",
+            "remark": "",
+            "authMode": "youtube_oauth",
+            "oauthScopeVersion": 2,
+            "accountReference": "UC-test-channel",
+        }
+
+    def _ready_page(self) -> PublishPage:
+        page = PublishPage()
+        page.content_type = "video"
+        page._account_rows = [self._account()]
+        page._selected_account_ids = {71}
+        page._media_rows = [
+            {
+                "id": 1,
+                "typeText": "视频",
+                "filename": self.video.name,
+                "file_path": str(self.video),
+                "storedPath": str(self.video),
+                "filesize": self.video.stat().st_size,
+                "remark": "",
+                "mediaCategory": "默认",
+            }
+        ]
+        page._selected_media_ids = {1}
+        page.common_title_input.setText("YouTube 测试标题")
+        page.title_input.setPlainText("YouTube 测试正文")
+        return page
+
+    def test_youtube_defaults_private_and_requires_explicit_audience(self) -> None:
+        page = PublishPage()
+
+        self.assertEqual(page.platform_visibility[7].currentData(), "private")
+        self.assertIsNone(page.youtube_made_for_kids.currentData())
+        self._dispose_page(page)
+
+    def test_youtube_scheduled_public_requires_own_schedule(self) -> None:
+        page = self._ready_page()
+        visibility = page.platform_visibility[7]
+        visibility.setCurrentIndex(visibility.findData("scheduled_public"))
+        audience = page.youtube_made_for_kids
+        audience.setCurrentIndex(audience.findData(False))
+
+        with self.assertRaisesRegex(
+            ValueError, "YouTube 定时公开必须设置发布时间"
+        ):
+            page.collect_payloads(runtime_mode="publish")
+        self._dispose_page(page)
+
+    def test_youtube_formal_publish_requires_explicit_audience(self) -> None:
+        page = self._ready_page()
+
+        with self.assertRaisesRegex(
+            ValueError, "YouTube 正式发布必须明确选择是否面向儿童"
+        ):
+            page.collect_payloads(runtime_mode="publish")
+        self._dispose_page(page)
+
+    def test_youtube_preflight_allows_audience_to_remain_unselected(self) -> None:
+        page = self._ready_page()
+
+        payload = page.collect_payloads(runtime_mode="preflight")[0]
+
+        self.assertIsNone(payload["madeForKids"])
+        self.assertTrue(payload["youtubeOfficialApi"])
+        self.assertTrue(payload["debugDryRun"])
+        self._dispose_page(page)
+
+    def test_youtube_private_does_not_inherit_common_schedule(self) -> None:
+        page = self._ready_page()
+        page.common_schedule_enabled.setChecked(True)
+        page.common_schedule_date.setDate(QDate.currentDate().addDays(1))
+        page.common_schedule_time.setTime(QTime(9, 0))
+        audience = page.youtube_made_for_kids
+        audience.setCurrentIndex(audience.findData(False))
+
+        payload = page.collect_payloads(runtime_mode="publish")[0]
+
+        self.assertEqual(payload["visibility"], "private")
+        self.assertFalse(payload["enableTimer"])
+        self.assertIsNone(payload["scheduleTime"])
+        self.assertTrue(payload["youtubeOfficialApi"])
+        self.assertTrue(payload["backgroundMode"])
+        self.assertEqual(payload["youtubeExpectedChannelId"], "UC-test-channel")
+        self._dispose_page(page)
+
+    def test_refresh_accounts_includes_publishable_oauth_channel(self) -> None:
+        account = self._account()
+        with (
+            patch(
+                "ui.publish_page.account_service.list_publishable_accounts",
+                return_value=[account],
+            ) as publishable,
+            patch(
+                "ui.publish_page.account_service.list_accounts",
+                return_value=[],
+            ),
+        ):
+            page = PublishPage()
+            page.refresh_accounts()
+
+        publishable.assert_called()
+        self.assertEqual([row["id"] for row in page._account_rows], [71])
+        self._dispose_page(page)
+
+    def test_youtube_settings_save_and_restore_without_guessing_audience(self) -> None:
+        page = PublishPage()
+        visibility = page.platform_visibility[7]
+        visibility.setCurrentIndex(visibility.findData("scheduled_public"))
+        page.platform_schedule_enabled[7].setChecked(True)
+        page.platform_schedule_dates[7].setDate(QDate.currentDate().addDays(2))
+        page.platform_schedule_times[7].setTime(QTime(9, 30))
+        page.youtube_notify_subscribers.setChecked(False)
+
+        saved = page.payload_for_template()
+
+        restored = PublishPage()
+        restored._apply_content_payload(saved)
+        self.assertEqual(
+            restored.platform_visibility[7].currentData(), "scheduled_public"
+        )
+        self.assertIsNone(restored.youtube_made_for_kids.currentData())
+        self.assertFalse(restored.youtube_notify_subscribers.isChecked())
+        self.assertTrue(restored.platform_schedule_enabled[7].isChecked())
+        self.assertEqual(
+            restored.platform_schedule_times[7].time().toString("HH:mm"),
+            "09:30",
+        )
+        self._dispose_page(restored)
+        self._dispose_page(page)
+
+    def test_youtube_summary_names_official_api_and_exact_settings(self) -> None:
+        page = self._ready_page()
+        visibility = page.platform_visibility[7]
+        visibility.setCurrentIndex(visibility.findData("scheduled_public"))
+        audience = page.youtube_made_for_kids
+        audience.setCurrentIndex(audience.findData(False))
+        page.youtube_notify_subscribers.setChecked(False)
+        page.platform_schedule_enabled[7].setChecked(True)
+        page.platform_schedule_dates[7].setDate(QDate.currentDate().addDays(2))
+        page.platform_schedule_times[7].setTime(QTime(9, 30))
+        payloads = page.collect_payloads(runtime_mode="publish")
+
+        summary = page.build_publish_summary(payloads, "publish")
+
+        self.assertIn("YouTube 执行通道：官方 API 后台处理", summary)
+        self.assertIn(
+            "YouTube 测试频道 | YouTube | YouTube 测试频道 | 官方 OAuth 频道",
+            summary,
+        )
+        self.assertNotIn("YouTube 测试频道 | 浏览器会话", summary)
+        self.assertIn("谁可以看：定时公开", summary)
+        self.assertIn("YouTube 受众：不面向儿童", summary)
+        self.assertIn("订阅者通知：关闭", summary)
+        self.assertIn("发布时间：", summary)
+        self._dispose_page(page)
 
 if __name__ == "__main__":
     unittest.main()
