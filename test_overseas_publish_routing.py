@@ -94,6 +94,91 @@ class PublishServiceRoutingTests(unittest.TestCase):
         self.assertTrue(mark.call_args.kwargs["ok"])
         self.assertEqual(mark.call_args.args[1], 7)
 
+    def test_youtube_official_preflight_never_routes_to_browser(self) -> None:
+        payload = _video_payload(self.video, 7, "preflight")
+        payload["youtubeOfficialApi"] = True
+        result = {
+            "ok": True,
+            "message": "YouTube 只读检查通过",
+            "receipt": {
+                "visibility": "private",
+                "platformMutation": "none",
+            },
+        }
+        with (
+            patch.object(
+                publish_service.overseas_youtube_publish,
+                "run_youtube_preflight_sync",
+                return_value=result,
+            ) as official,
+            patch.object(
+                publish_service.overseas_preflight,
+                "run_overseas_preflight_sync",
+            ) as browser,
+            patch.object(publish_service.task_service, "mark_task_running"),
+            patch.object(publish_service.task_service, "record_task_event"),
+            patch.object(publish_service.task_service, "mark_platform_result") as mark,
+            patch.object(publish_service.task_service, "fail_active_task"),
+        ):
+            publish_service._run_preflight({"id": 104}, [payload])
+
+        official.assert_called_once_with(payload)
+        browser.assert_not_called()
+        self.assertEqual(mark.call_args.kwargs["receipt"], result["receipt"])
+        self.assertEqual(mark.call_args.kwargs["error_code"], "")
+
+    def test_youtube_official_publish_records_private_id_before_final_result(self) -> None:
+        payload = _video_payload(self.video, 7, "publish")
+        payload.update(
+            {
+                "debugDryRun": False,
+                "youtubeOfficialApi": True,
+            }
+        )
+        private_receipt = {
+            "videoId": "yt-private-1",
+            "studioUrl": "https://studio.youtube.com/video/yt-private-1/edit",
+            "watchUrl": "https://www.youtube.com/watch?v=yt-private-1",
+            "visibility": "private",
+        }
+        final_receipt = {**private_receipt, "visibility": "unlisted"}
+
+        def run_official(current_payload, *, task_id, progress):
+            progress("uploaded_private", private_receipt)
+            return {
+                "ok": True,
+                "message": "YouTube 精确回读成功",
+                "receipt": final_receipt,
+            }
+
+        with (
+            patch.object(
+                publish_service.overseas_youtube_publish,
+                "run_youtube_publish_sync",
+                side_effect=run_official,
+            ) as official,
+            patch.object(
+                publish_service.overseas_video_publish,
+                "run_overseas_video_publish_sync",
+            ) as browser,
+            patch.object(publish_service.task_service, "mark_task_running"),
+            patch.object(publish_service.task_service, "record_task_event"),
+            patch.object(
+                publish_service.task_service,
+                "record_platform_progress",
+            ) as progress,
+            patch.object(publish_service.task_service, "mark_platform_result") as mark,
+            patch.object(publish_service.task_service, "fail_active_task"),
+        ):
+            publish_service._run_publish({"id": 105}, [payload])
+
+        official.assert_called_once()
+        self.assertEqual(official.call_args.kwargs["task_id"], 105)
+        browser.assert_not_called()
+        self.assertEqual(progress.call_args.kwargs["receipt"], private_receipt)
+        self.assertEqual(progress.call_args.kwargs["event_type"], "youtube_uploaded_private")
+        self.assertEqual(mark.call_args.kwargs["receipt"], final_receipt)
+
     def test_meta_browser_routes_only_after_confirmation_contract(self) -> None:
         payload = _video_payload(self.video, 8, "publish")
         payload["debugDryRun"] = False

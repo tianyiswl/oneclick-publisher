@@ -152,6 +152,54 @@ class ControlledPublishResilienceTests(unittest.TestCase):
         self.assertEqual(detail["status"], "failed")
         self.assertTrue(all(item["status"] == "failed" for item in detail["items"]))
 
+    def test_stale_youtube_worker_with_known_video_requires_reconciliation(self) -> None:
+        task = task_service.create_pending_task(
+            [
+                {
+                    "type": 7,
+                    "contentType": "video",
+                    "title": "YouTube 失联测试",
+                    "accountList": ["youtube-oauth:test"],
+                    "accountIds": [71],
+                    "fileList": ["video.mp4"],
+                    "youtubeOfficialApi": True,
+                }
+            ],
+            mode="oneclick_publish",
+        )
+        task_service.mark_task_running(task["id"], "YouTube 正式任务")
+        stale = (datetime.now() - timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
+        with database.connect() as conn:
+            conn.execute(
+                """
+                UPDATE publish_task_items
+                SET platformPostId = ?, receiptJson = ?
+                WHERE taskId = ? AND platformType = 7
+                """,
+                (
+                    "yt-known-2",
+                    '{"videoId":"yt-known-2","visibility":"private"}',
+                    task["id"],
+                ),
+            )
+            conn.execute(
+                "UPDATE publish_tasks SET workerPid = ?, workerHeartbeatAt = ? WHERE id = ?",
+                (999_999_999, stale, task["id"]),
+            )
+            conn.commit()
+
+        changed = task_service.reconcile_stale_controlled_task(
+            task["id"], lease_seconds=30
+        )
+        projected = project_task(task_service.get_task(task["id"]))
+
+        self.assertTrue(changed)
+        self.assertEqual(
+            projected["platforms"][0]["errorCode"],
+            "youtube_manual_reconciliation_required",
+        )
+        self.assertEqual(projected["platforms"][0]["contentId"], "yt-known-2")
+
     def test_live_worker_pid_is_not_reconciled_during_native_verification(self) -> None:
         task = self._task()
         stale = (datetime.now() - timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")

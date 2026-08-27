@@ -788,7 +788,7 @@ def project_task(task: Mapping[str, Any] | None) -> dict[str, Any]:
         elif len(account_ids) == 1:
             account_id = int(account_ids[0] or 0)
         receipt = None
-        if matrix_mode and item.get("receiptJson"):
+        if item.get("receiptJson"):
             try:
                 loaded_receipt = json.loads(str(item.get("receiptJson") or ""))
                 receipt = loaded_receipt if isinstance(loaded_receipt, dict) else None
@@ -816,14 +816,14 @@ def project_task(task: Mapping[str, Any] | None) -> dict[str, Any]:
                 "status": status,
                 "errorCode": (
                     str(item.get("errorCode") or "")
-                    if matrix_mode
-                    else _projected_error_code(message)
+                    or _projected_error_code(message)
                 ),
                 "errorText": message if status == "failed" else "",
                 "receipt": receipt,
                 "contentId": str(item.get("platformPostId") or ""),
                 "scheduledAt": str(
-                    item.get("scheduleTime")
+                    (receipt or {}).get("scheduledAt")
+                    or item.get("scheduleTime")
                     or item.get("scheduleSummary")
                     or related_payload.get("scheduleTime")
                     or ""

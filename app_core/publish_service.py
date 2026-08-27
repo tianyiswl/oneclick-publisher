@@ -28,6 +28,7 @@ from . import (
     oneclick_preflight,
     overseas_browser_publish,
     overseas_video_publish,
+    overseas_youtube_publish,
     overseas_preflight,
     task_service,
     video_channel_location_service,
@@ -57,6 +58,18 @@ _DOUYIN_COMMERCE_BATCH_WORKFLOW = "douyin-commerce-batch"
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
+def _failure_error_code(exc: BaseException, *, platform_type: int) -> str:
+    error_code = str(getattr(exc, "error_code", "") or "").strip()
+    if error_code:
+        return error_code
+    return {
+        1: "xhs_publish_failed",
+        3: "douyin_publish_failed",
+        7: "youtube_publish_failed",
+        10: "wechat_publish_failed",
+    }.get(int(platform_type), "platform_publish_failed")
+
+
 def _failure_message(
     prefix: str,
     exc: BaseException,
@@ -65,13 +78,7 @@ def _failure_message(
 ) -> str:
     """为本地接口生成稳定错误码；原始异常文本仍完整保留。"""
 
-    error_code = str(getattr(exc, "error_code", "") or "").strip()
-    if not error_code:
-        error_code = {
-            1: "xhs_publish_failed",
-            3: "douyin_publish_failed",
-            10: "wechat_publish_failed",
-        }.get(int(platform_type), "platform_publish_failed")
+    error_code = _failure_error_code(exc, platform_type=platform_type)
     return f"{prefix}：{type(exc).__name__}：{exc}（错误码 {error_code}）"
 
 
@@ -339,6 +346,11 @@ def _validate_payloads(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
             for key in wechat_location_keys
         ):
             raise ValueError("公众号正文地点字段不能用于其他平台")
+        is_youtube_official = (
+            platform_type == 7 and payload.get("youtubeOfficialApi") is True
+        )
+        if is_youtube_official:
+            overseas_youtube_publish.validate_youtube_publish_payload(payload)
         if runtime_mode == "preflight":
             if payload.get("debugDryRun") is not True:
                 raise ValueError("预发布检查必须保持 debugDryRun=true")
@@ -355,6 +367,10 @@ def _validate_payloads(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 payload.update(
                     douyin_publish_executor.validate_douyin_publish_payload(payload)
                 )
+            elif is_youtube_official:
+                # OAuth 官方通道不依赖可见浏览器，但仍只能由
+                # 受控任务服务在一次性授权后启动。
+                payload["backgroundMode"] = True
             elif platform_type in {6, 7}:
                 checked = overseas_video_publish.validate_overseas_video_publish_payload(
                     payload
@@ -686,6 +702,13 @@ def _run_preflight(task: dict, payloads: list[dict[str, Any]]) -> None:
                         payload,
                         task_id=int(task["id"]),
                     )
+                elif (
+                    platform_type == 7
+                    and payload.get("youtubeOfficialApi") is True
+                ):
+                    result = overseas_youtube_publish.run_youtube_preflight_sync(
+                        payload
+                    )
                 elif platform_type in {6, 7, 8, 9}:
                     result = overseas_preflight.run_overseas_preflight_sync(payload)
                 else:
@@ -696,6 +719,12 @@ def _run_preflight(task: dict, payloads: list[dict[str, Any]]) -> None:
                     ok=bool(result.get("ok")),
                     message=str(result.get("message") or "预发布检查结束"),
                     content_type=str(payload.get("contentType") or ""),
+                    error_code=str(result.get("errorCode") or ""),
+                    receipt=(
+                        dict(result.get("receipt"))
+                        if isinstance(result.get("receipt"), dict)
+                        else None
+                    ),
                 )
             except Exception as exc:
                 task_service.mark_platform_result(
@@ -706,6 +735,14 @@ def _run_preflight(task: dict, payloads: list[dict[str, Any]]) -> None:
                         "预检任务异常", exc, platform_type=platform_type
                     ),
                     content_type=str(payload.get("contentType") or ""),
+                    error_code=_failure_error_code(
+                        exc, platform_type=platform_type
+                    ),
+                    receipt=(
+                        dict(getattr(exc, "receipt", {}))
+                        if isinstance(getattr(exc, "receipt", None), dict)
+                        else None
+                    ),
                 )
     except Exception as exc:
         task_service.mark_platform_result(
@@ -714,6 +751,14 @@ def _run_preflight(task: dict, payloads: list[dict[str, Any]]) -> None:
                 "预检任务异常", exc, platform_type=int(payloads[0]["type"])
             ),
             content_type=str(payloads[0].get("contentType") or ""),
+            error_code=_failure_error_code(
+                exc, platform_type=int(payloads[0]["type"])
+            ),
+            receipt=(
+                dict(getattr(exc, "receipt", {}))
+                if isinstance(getattr(exc, "receipt", None), dict)
+                else None
+            ),
         )
     finally:
         task_service.fail_active_task(
@@ -723,6 +768,38 @@ def _run_preflight(task: dict, payloads: list[dict[str, Any]]) -> None:
         )
         _publish_lock.release()
         _active_threads.pop(int(task["id"]), None)
+
+
+def _record_youtube_publish_progress(
+    task_id: int,
+    payload: dict[str, Any],
+    stage: str,
+    receipt: object,
+) -> None:
+    """记录不含凭据的 YouTube 进展；视频 ID 一经返回立即落库。"""
+
+    task_service.touch_task_heartbeat(int(task_id))
+    if stage == "uploaded_private" and isinstance(receipt, dict):
+        task_service.record_platform_progress(
+            int(task_id),
+            7,
+            message="YouTube 已创建私密视频，正在核对封面与可见性",
+            content_type=str(payload.get("contentType") or ""),
+            event_type="youtube_uploaded_private",
+            receipt=dict(receipt),
+        )
+        return
+    event_messages = {
+        "uploading_private": "YouTube 正在创建私密视频",
+        "setting_thumbnail": "YouTube 正在设置精确视频封面",
+        "applying_visibility": "YouTube 正在应用目标可见性",
+        "verifying": "YouTube 正在按视频 ID 读回核对",
+    }
+    message = event_messages.get(stage)
+    if message:
+        task_service.record_task_event(
+            int(task_id), f"youtube_{stage}", message
+        )
 
 
 def _run_publish(task: dict, payloads: list[dict[str, Any]]) -> None:
@@ -774,6 +851,17 @@ def _run_publish(task: dict, payloads: list[dict[str, Any]]) -> None:
                         payload,
                         task_id=int(task["id"]),
                     )
+                elif (
+                    platform_type == 7
+                    and payload.get("youtubeOfficialApi") is True
+                ):
+                    result = overseas_youtube_publish.run_youtube_publish_sync(
+                        payload,
+                        task_id=int(task["id"]),
+                        progress=lambda stage, receipt: _record_youtube_publish_progress(
+                            int(task["id"]), payload, stage, receipt
+                        ),
+                    )
                 elif platform_type in {6, 7}:
                     result = overseas_video_publish.run_overseas_video_publish_sync(
                         payload
@@ -813,6 +901,12 @@ def _run_publish(task: dict, payloads: list[dict[str, Any]]) -> None:
                         ),
                         "publishedAt": str(result.get("publishedAt") or ""),
                     },
+                    error_code=str(result.get("errorCode") or ""),
+                    receipt=(
+                        dict(result.get("receipt"))
+                        if isinstance(result.get("receipt"), dict)
+                        else None
+                    ),
                 )
             except Exception as exc:
                 task_service.mark_platform_result(
@@ -824,6 +918,14 @@ def _run_publish(task: dict, payloads: list[dict[str, Any]]) -> None:
                     ),
                     content_type=str(payload.get("contentType") or ""),
                     event_type="platform_publish",
+                    error_code=_failure_error_code(
+                        exc, platform_type=platform_type
+                    ),
+                    receipt=(
+                        dict(getattr(exc, "receipt", {}))
+                        if isinstance(getattr(exc, "receipt", None), dict)
+                        else None
+                    ),
                 )
     except Exception as exc:
         task_service.mark_platform_result(
@@ -835,6 +937,14 @@ def _run_publish(task: dict, payloads: list[dict[str, Any]]) -> None:
             ),
             content_type=str(payloads[0].get("contentType") or ""),
             event_type="platform_publish",
+            error_code=_failure_error_code(
+                exc, platform_type=int(payloads[0]["type"])
+            ),
+            receipt=(
+                dict(getattr(exc, "receipt", {}))
+                if isinstance(getattr(exc, "receipt", None), dict)
+                else None
+            ),
         )
     finally:
         task_service.fail_active_task(

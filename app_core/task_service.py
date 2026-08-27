@@ -68,6 +68,18 @@ _MATRIX_RECEIPT_FIELDS = frozenset(
         "timezone",
     }
 )
+_YOUTUBE_RECEIPT_FIELDS = frozenset(
+    {
+        "videoId",
+        "studioUrl",
+        "watchUrl",
+        "visibility",
+        "scheduledAt",
+        "processingStatus",
+        "thumbnailApplied",
+        "platformMutation",
+    }
+)
 _MATRIX_TASK_MODES = frozenset(
     {
         "oneclick_matrix_local_check",
@@ -186,6 +198,56 @@ def _batch_readback_projection(readback: object) -> dict[str, str | int]:
         if type(value) is int and minimum <= value <= maximum:
             projected[key] = value
     return projected
+
+
+def _youtube_receipt_projection(receipt: object) -> dict[str, object]:
+    """只保留可用于精确视频核对的非敏感字段。"""
+
+    if not isinstance(receipt, dict):
+        return {}
+    projected: dict[str, object] = {}
+    for key in _YOUTUBE_RECEIPT_FIELDS:
+        value = receipt.get(key)
+        if key == "thumbnailApplied":
+            if type(value) is bool:
+                projected[key] = value
+            continue
+        if not isinstance(value, str):
+            continue
+        normalized = value.strip()
+        if not normalized or len(normalized) > 500:
+            continue
+        projected[key] = normalized
+
+    video_id = str(projected.get("videoId") or "")
+    if video_id and not re.fullmatch(r"[A-Za-z0-9_-]{6,64}", video_id):
+        projected.pop("videoId", None)
+        video_id = ""
+    if "studioUrl" in projected and (
+        not video_id
+        or projected["studioUrl"]
+        != f"https://studio.youtube.com/video/{video_id}/edit"
+    ):
+        projected.pop("studioUrl", None)
+    if "watchUrl" in projected and (
+        not video_id
+        or projected["watchUrl"]
+        != f"https://www.youtube.com/watch?v={video_id}"
+    ):
+        projected.pop("watchUrl", None)
+    if projected.get("visibility") not in {
+        "private",
+        "unlisted",
+        "public",
+        "scheduled_public",
+    }:
+        projected.pop("visibility", None)
+    return projected
+
+
+def _stable_error_code(value: object) -> str:
+    code = str(value or "").strip()
+    return code if re.fullmatch(r"[a-z][a-z0-9_]{2,80}", code) else ""
 
 
 def content_type_from_payload_json(payload_json: object) -> str:
@@ -1902,8 +1964,15 @@ def reconcile_stale_controlled_task(
     with connect() as conn:
         row = conn.execute(
             """
-            SELECT mode, status, workerPid, workerHeartbeatAt, startedAt, createdAt
-            FROM publish_tasks WHERE id = ?
+            SELECT task.mode, task.status, task.workerPid,
+                   task.workerHeartbeatAt, task.startedAt, task.createdAt,
+                   EXISTS(
+                       SELECT 1 FROM publish_task_items AS item
+                       WHERE item.taskId = task.id
+                         AND item.platformType = 7
+                         AND COALESCE(item.platformPostId, '') <> ''
+                   ) AS youtubeHasKnownVideo
+            FROM publish_tasks AS task WHERE task.id = ?
             """,
             (int(task_id),),
         ).fetchone()
@@ -1934,11 +2003,25 @@ def reconcile_stale_controlled_task(
         reference = current - timedelta(seconds=max(1, int(lease_seconds)) + 1)
     if (current - reference).total_seconds() <= max(1, int(lease_seconds)):
         return False
+    youtube_has_known_video = bool(row["youtubeHasKnownVideo"])
     return fail_active_task(
         int(task_id),
-        error_code="controlled_worker_lease_expired",
-        message="受控发布进程已失联，未取得平台最终回执",
-        event_type="controlled_worker_lease_expired",
+        error_code=(
+            "youtube_manual_reconciliation_required"
+            if youtube_has_known_video
+            else "controlled_worker_lease_expired"
+        ),
+        message=(
+            "YouTube 已取得精确视频 ID，但发布进程失联；"
+            "必须先核对该视频，禁止自动重传"
+            if youtube_has_known_video
+            else "受控发布进程已失联，未取得平台最终回执"
+        ),
+        event_type=(
+            "youtube_manual_reconciliation_required"
+            if youtube_has_known_video
+            else "controlled_worker_lease_expired"
+        ),
     )
 
 
@@ -1995,6 +2078,76 @@ def record_task_event(task_id: int, event_type: str, message: str, *, level: str
         conn.commit()
 
 
+def record_platform_progress(
+    task_id: int,
+    platform_type: int,
+    *,
+    message: str,
+    content_type: str | None = None,
+    event_type: str,
+    receipt: dict | None = None,
+) -> None:
+    """保存不代表成功的平台中间回执，防止已上传视频被重复提交。"""
+
+    if int(platform_type) != 7:
+        raise ValueError("当前仅 YouTube 官方通道支持中间回执")
+    safe_receipt = _youtube_receipt_projection(receipt)
+    video_id = str(safe_receipt.get("videoId") or "")
+    if not video_id:
+        raise ValueError("YouTube 中间回执缺少精确视频 ID")
+    receipt_json = json.dumps(
+        safe_receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    watch_url = str(safe_receipt.get("watchUrl") or "")
+    now = _now()
+    content_clause = ""
+    params: list[object] = [
+        str(message),
+        now,
+        receipt_json,
+        video_id,
+        watch_url,
+        watch_url,
+        int(task_id),
+        int(platform_type),
+    ]
+    if content_type:
+        content_clause = " AND contentType = ?"
+        params.append(str(content_type))
+    with connect() as conn:
+        updated = conn.execute(
+            f"""
+            UPDATE publish_task_items
+            SET status = CASE WHEN status = 'pending' THEN 'running' ELSE status END,
+                message = ?, startedAt = COALESCE(startedAt, ?),
+                receiptJson = ?, platformPostId = ?,
+                postUrl = CASE WHEN ? <> '' THEN ? ELSE postUrl END
+            WHERE taskId = ? AND platformType = ?
+              AND status IN ('pending', 'running'){content_clause}
+            """,
+            tuple(params),
+        )
+        if updated.rowcount < 1:
+            raise ValueError("YouTube 任务条目不存在或已结束")
+        conn.execute(
+            """
+            UPDATE publish_tasks
+            SET status = 'running', workerPid = ?, workerHeartbeatAt = ?
+            WHERE id = ? AND status IN ('pending', 'running')
+            """,
+            (os.getpid(), now, int(task_id)),
+        )
+        conn.execute(
+            """
+            INSERT INTO publish_task_events
+                (taskId, level, eventType, message, createdAt)
+            VALUES (?, 'info', ?, ?, ?)
+            """,
+            (int(task_id), str(event_type), str(message), now),
+        )
+        conn.commit()
+
+
 def mark_platform_result(
     task_id: int,
     platform_type: int,
@@ -2004,16 +2157,38 @@ def mark_platform_result(
     content_type: str | None = None,
     event_type: str = "platform_preflight",
     readback: dict | None = None,
+    error_code: str = "",
+    receipt: dict | None = None,
 ) -> None:
     """按平台与内容类型回填结果；事件类型必须准确表达预检或正式提交。"""
 
     now = _now()
     status = "success" if ok else "failed"
     public_readback = _batch_readback_projection(readback)
+    public_receipt = (
+        _youtube_receipt_projection(receipt if receipt is not None else readback)
+        if int(platform_type) == 7
+        else public_readback
+    )
+    receipt_json = (
+        json.dumps(
+            public_receipt,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if public_receipt
+        else ""
+    )
+    stable_error_code = "" if ok else _stable_error_code(error_code)
     receipt_values = {
         key: str(public_readback.get(key) or "")
         for key in ("platformPostId", "postUrl", "publishedAt")
     }
+    if int(platform_type) == 7:
+        receipt_values["platformPostId"] = str(public_receipt.get("videoId") or "")
+        receipt_values["postUrl"] = str(public_receipt.get("watchUrl") or "")
+    keep_identifiers = bool(ok or int(platform_type) == 7)
     with connect() as conn:
         batch_item = conn.execute(
             """
@@ -2041,6 +2216,8 @@ def mark_platform_result(
                 UPDATE publish_task_items
                 SET status = ?, message = ?, attempts = attempts + 1,
                     startedAt = COALESCE(startedAt, ?), finishedAt = ?,
+                    errorCode = ?,
+                    receiptJson = CASE WHEN ? <> '' THEN ? ELSE receiptJson END,
                     platformPostId = CASE WHEN ? THEN ? ELSE platformPostId END,
                     postUrl = CASE WHEN ? THEN ? ELSE postUrl END,
                     publishedAt = CASE WHEN ? THEN ? ELSE publishedAt END
@@ -2048,8 +2225,9 @@ def mark_platform_result(
                 """,
                 (
                     status, message, now, now,
-                    bool(ok and receipt_values["platformPostId"]), receipt_values["platformPostId"],
-                    bool(ok and receipt_values["postUrl"]), receipt_values["postUrl"],
+                    stable_error_code, receipt_json, receipt_json,
+                    bool(keep_identifiers and receipt_values["platformPostId"]), receipt_values["platformPostId"],
+                    bool(keep_identifiers and receipt_values["postUrl"]), receipt_values["postUrl"],
                     bool(ok and receipt_values["publishedAt"]), receipt_values["publishedAt"],
                     int(task_id), int(platform_type), str(content_type),
                 ),
@@ -2061,6 +2239,8 @@ def mark_platform_result(
                 UPDATE publish_task_items
                 SET status = ?, message = ?, attempts = attempts + 1,
                     startedAt = COALESCE(startedAt, ?), finishedAt = ?,
+                    errorCode = ?,
+                    receiptJson = CASE WHEN ? <> '' THEN ? ELSE receiptJson END,
                     platformPostId = CASE WHEN ? THEN ? ELSE platformPostId END,
                     postUrl = CASE WHEN ? THEN ? ELSE postUrl END,
                     publishedAt = CASE WHEN ? THEN ? ELSE publishedAt END
@@ -2068,8 +2248,9 @@ def mark_platform_result(
                 """,
                 (
                     status, message, now, now,
-                    bool(ok and receipt_values["platformPostId"]), receipt_values["platformPostId"],
-                    bool(ok and receipt_values["postUrl"]), receipt_values["postUrl"],
+                    stable_error_code, receipt_json, receipt_json,
+                    bool(keep_identifiers and receipt_values["platformPostId"]), receipt_values["platformPostId"],
+                    bool(keep_identifiers and receipt_values["postUrl"]), receipt_values["postUrl"],
                     bool(ok and receipt_values["publishedAt"]), receipt_values["publishedAt"],
                     int(task_id), int(platform_type),
                 ),

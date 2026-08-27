@@ -1659,6 +1659,106 @@ class DouyinCommerceBatchTaskTests(unittest.TestCase):
         self.assertEqual(item["postUrl"], "https://mp.weixin.qq.com/s/verified")
         self.assertEqual(item["publishedAt"], "2026-08-26 17:43")
 
+    def test_youtube_failure_retains_only_safe_exact_video_receipt(self) -> None:
+        task = task_service.create_pending_task(
+            [
+                {
+                    "type": 7,
+                    "contentType": "video",
+                    "title": "YouTube 回执测试",
+                    "accountList": ["youtube-oauth:test"],
+                    "accountIds": [71],
+                    "fileList": ["video.mp4"],
+                    "youtubeOfficialApi": True,
+                    "debugDryRun": False,
+                }
+            ],
+            mode="oneclick_publish",
+        )
+
+        task_service.mark_platform_result(
+            task["id"],
+            7,
+            ok=False,
+            message="YouTube 精确回读失败",
+            content_type="video",
+            event_type="platform_publish",
+            error_code="youtube_readback_mismatch",
+            receipt={
+                "videoId": "yt-known-1",
+                "studioUrl": "https://studio.youtube.com/video/yt-known-1/edit",
+                "watchUrl": "https://www.youtube.com/watch?v=yt-known-1",
+                "visibility": "private",
+                "scheduledAt": "",
+                "processingStatus": "processing",
+                "thumbnailApplied": False,
+                "platformMutation": "private_upload_created",
+                "targetVisibility": "public",
+                "accessToken": "must-not-persist",
+            },
+        )
+
+        item = task_service.get_task(task["id"])["items"][0]
+        receipt = json.loads(item["receiptJson"])
+        self.assertEqual(item["errorCode"], "youtube_readback_mismatch")
+        self.assertEqual(item["platformPostId"], "yt-known-1")
+        self.assertEqual(
+            item["postUrl"], "https://www.youtube.com/watch?v=yt-known-1"
+        )
+        self.assertEqual(
+            set(receipt),
+            {
+                "videoId",
+                "studioUrl",
+                "watchUrl",
+                "visibility",
+                "processingStatus",
+                "thumbnailApplied",
+                "platformMutation",
+            },
+        )
+        self.assertNotIn("accessToken", item["receiptJson"])
+        self.assertNotIn("targetVisibility", item["receiptJson"])
+
+    def test_youtube_private_upload_progress_persists_id_without_success(self) -> None:
+        task = task_service.create_pending_task(
+            [
+                {
+                    "type": 7,
+                    "contentType": "video",
+                    "title": "YouTube 私密上传进展",
+                    "accountList": ["youtube-oauth:test"],
+                    "accountIds": [71],
+                    "fileList": ["video.mp4"],
+                    "youtubeOfficialApi": True,
+                    "debugDryRun": False,
+                }
+            ],
+            mode="oneclick_publish",
+        )
+
+        task_service.record_platform_progress(
+            task["id"],
+            7,
+            message="YouTube 已创建私密视频",
+            content_type="video",
+            event_type="youtube_uploaded_private",
+            receipt={
+                "videoId": "yt-known-3",
+                "studioUrl": "https://studio.youtube.com/video/yt-known-3/edit",
+                "watchUrl": "https://www.youtube.com/watch?v=yt-known-3",
+                "visibility": "private",
+                "platformMutation": "private_upload_created",
+            },
+        )
+
+        detail = task_service.get_task(task["id"])
+        item = detail["items"][0]
+        self.assertEqual(detail["status"], "running")
+        self.assertEqual(item["status"], "running")
+        self.assertEqual(item["platformPostId"], "yt-known-3")
+        self.assertEqual(detail["events"][-1]["eventType"], "youtube_uploaded_private")
+
     def test_public_batch_module_does_not_expose_a_dict_to_success_bridge(self) -> None:
         task = task_service.create_douyin_batch_task(self.batch)
         task_id = task["id"]

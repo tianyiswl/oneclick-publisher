@@ -679,6 +679,8 @@ def run_youtube_publish_sync(
         "thumbnailApplied": False,
         "channelId": checked.expected_channel_id,
         "studioUrl": f"https://studio.youtube.com/video/{video_id}/edit",
+        "watchUrl": f"https://www.youtube.com/watch?v={video_id}",
+        "platformMutation": "private_upload_created",
     }
     _emit(progress, "uploaded_private", receipt)
     try:
@@ -726,6 +728,7 @@ def run_youtube_publish_sync(
             "visibility": checked.settings.visibility,
             "processingStatus": final.processing_status,
             "uploadStatus": final.upload_status,
+            "platformMutation": "visibility_applied",
         }
     )
     _emit(progress, "success", receipt)

@@ -563,6 +563,41 @@ class ControlledPublishTests(unittest.TestCase):
         self.assertEqual(projected["platforms"][1]["errorCode"], "xhs_cover_trigger_missing")
         self.assertEqual(projected["platforms"][1]["scheduledAt"], "2026-08-24 20:30")
 
+    def test_task_projection_exposes_stored_youtube_receipt_in_every_phase(self) -> None:
+        projected = project_task(
+            {
+                "id": 43,
+                "taskNo": "T43",
+                "mode": "oneclick_preflight",
+                "status": "failed",
+                "payloadJson": json.dumps(
+                    [{"type": 7, "accountIds": [71]}], ensure_ascii=False
+                ),
+                "items": [
+                    {
+                        "platformType": 7,
+                        "status": "failed",
+                        "message": "YouTube 检查失败",
+                        "errorCode": "youtube_channel_mismatch",
+                        "receiptJson": json.dumps(
+                            {
+                                "visibility": "private",
+                                "platformMutation": "none",
+                            }
+                        ),
+                    }
+                ],
+            }
+        )
+
+        platform = projected["platforms"][0]
+        self.assertEqual(platform["accountId"], 71)
+        self.assertEqual(platform["errorCode"], "youtube_channel_mismatch")
+        self.assertEqual(
+            platform["receipt"],
+            {"visibility": "private", "platformMutation": "none"},
+        )
+
     def test_task_projection_exposes_safe_verification_wait_state(self) -> None:
         projected = project_task(
             {
