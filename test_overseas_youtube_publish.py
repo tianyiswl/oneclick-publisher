@@ -196,6 +196,15 @@ class YouTubePublishValidationTests(unittest.TestCase):
         ):
             validate_youtube_publish_payload(self._payload(madeForKids=None))
 
+    def test_preflight_validation_may_defer_audience_without_mutation_fields(self) -> None:
+        checked = validate_youtube_publish_payload(
+            self._payload(madeForKids=None),
+            require_audience=False,
+        )
+
+        self.assertIs(checked.settings.made_for_kids, False)
+        self.assertEqual(checked.private_upload.visibility, "private")
+
 
 class YouTubeVideoManagementClientTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -399,6 +408,19 @@ class YouTubeOfficialPublishServiceTests(unittest.TestCase):
 
         result = run_youtube_preflight_sync(
             self._payload(),
+            dependencies=fake.dependencies(),
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["receipt"]["platformMutation"], "none")
+        self.assertEqual(fake.operations, ["authorize"])
+        self.assertEqual(fake.upload_attempts, 0)
+
+    def test_preflight_may_leave_audience_unselected_and_still_never_uploads(self) -> None:
+        fake = FakePublishDependencies()
+
+        result = run_youtube_preflight_sync(
+            self._payload(madeForKids=None),
             dependencies=fake.dependencies(),
         )
 

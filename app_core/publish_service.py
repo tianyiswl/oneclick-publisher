@@ -350,7 +350,10 @@ def _validate_payloads(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
             platform_type == 7 and payload.get("youtubeOfficialApi") is True
         )
         if is_youtube_official:
-            overseas_youtube_publish.validate_youtube_publish_payload(payload)
+            overseas_youtube_publish.validate_youtube_publish_payload(
+                payload,
+                require_audience=runtime_mode != "preflight",
+            )
         if runtime_mode == "preflight":
             if payload.get("debugDryRun") is not True:
                 raise ValueError("预发布检查必须保持 debugDryRun=true")

@@ -138,6 +138,7 @@ def validate_youtube_publish_payload(
     payload: Mapping[str, object],
     *,
     now: datetime | None = None,
+    require_audience: bool = True,
 ) -> ValidatedYouTubePublish:
     """Validate an official target while retaining a private-only upload request."""
 
@@ -176,8 +177,11 @@ def validate_youtube_publish_payload(
     if visibility not in _YOUTUBE_TARGET_VISIBILITIES:
         raise YouTubeOfficialPublishError("youtube_visibility_invalid")
     made_for_kids = payload.get("madeForKids")
-    if type(made_for_kids) is not bool:
+    if type(made_for_kids) is not bool and require_audience:
         raise YouTubeOfficialPublishError("youtube_audience_required")
+    if made_for_kids is not None and type(made_for_kids) is not bool:
+        raise YouTubeOfficialPublishError("youtube_audience_invalid")
+    validated_audience = made_for_kids if type(made_for_kids) is bool else False
     notify_subscribers = payload.get("notifySubscribers", True)
     if type(notify_subscribers) is not bool:
         raise YouTubeOfficialPublishError("youtube_notify_invalid")
@@ -186,14 +190,14 @@ def validate_youtube_publish_payload(
     thumbnail_path = _validated_thumbnail_path(payload.get("coverPath"))
     private_upload = _validated_private_upload(
         payload,
-        made_for_kids=made_for_kids,
+        made_for_kids=validated_audience,
         notify_subscribers=notify_subscribers,
     )
     return ValidatedYouTubePublish(
         private_upload=private_upload,
         settings=YouTubePublishSettings(
             visibility=visibility,
-            made_for_kids=made_for_kids,
+            made_for_kids=validated_audience,
             notify_subscribers=notify_subscribers,
             publish_at=publish_at,
             thumbnail_path=thumbnail_path,
@@ -628,7 +632,7 @@ def run_youtube_preflight_sync(
 ) -> dict[str, Any]:
     """Validate local inputs and current OAuth identity without creating a video."""
 
-    checked = validate_youtube_publish_payload(payload)
+    checked = validate_youtube_publish_payload(payload, require_audience=False)
     deps = dependencies or build_default_youtube_publish_dependencies()
     session = _authorized_session(deps, checked)
     return {
