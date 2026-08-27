@@ -107,6 +107,37 @@ class AccountDetectionUiTests(unittest.TestCase):
         self.assertTrue(refresh.isEnabled())
         page.close()
 
+    def test_legacy_youtube_oauth_action_is_named_as_permission_upgrade(self) -> None:
+        account = {
+            "id": 71,
+            "type": 7,
+            "platformName": "YouTube",
+            "profileName": "海外主体",
+            "userName": "OAuth 测试频道",
+            "status": 1,
+            "healthStatus": "pending",
+            "statusText": "需要升级发布权限",
+            "remark": "",
+            "authMode": "youtube_oauth",
+            "oauthScopeVersion": 1,
+            "filePath": "youtube-oauth:opaque-reference",
+            "accountReference": "UC_safe",
+        }
+        page = AccountPage()
+
+        actions = page._actions(account)
+        menu_actions = [
+            action
+            for menu in actions.findChildren(QMenu)
+            for action in menu.actions()
+        ]
+
+        self.assertTrue(
+            any(action.text() == "升级 YouTube 发布权限" for action in menu_actions)
+        )
+        self.assertFalse(any(action.text() == "重新登录" for action in menu_actions))
+        page.close()
+
     def test_youtube_oauth_backend_uses_system_browser_and_saved_channel_id(self) -> None:
         account = {
             "id": 71,
@@ -195,6 +226,29 @@ class AccountDetectionUiTests(unittest.TestCase):
         message = str(warning.call_args.args[2])
         self.assertIn("只更新账号状态", message)
         self.assertIn("重新登录", message)
+        page.close()
+
+    def test_youtube_channel_mismatch_prompt_is_not_reported_as_generic_logout(self) -> None:
+        page = AccountPage()
+        account = {
+            "id": 71,
+            "type": 7,
+            "platformName": "YouTube",
+            "profileName": "海外主体",
+            "userName": "OAuth 测试频道",
+            "authMode": "youtube_oauth",
+            "authIssueCode": "youtube_channel_identity_mismatch",
+        }
+
+        with patch.object(QMessageBox, "warning") as warning:
+            shown = page._present_validation_intervention(
+                {"interventionRequired": [account]}
+            )
+
+        self.assertTrue(shown)
+        message = warning.call_args.args[2]
+        self.assertIn("频道身份不一致", message)
+        self.assertIn("重新授权原频道", message)
         page.close()
 
     def test_publish_account_check_never_opens_login_page(self) -> None:

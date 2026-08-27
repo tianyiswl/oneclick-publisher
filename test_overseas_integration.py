@@ -212,6 +212,16 @@ class YouTubeOAuthAccountPersistenceTests(unittest.TestCase):
         self.assertNotIn("refresh", stored.lower())
         self.assertNotIn("access-token", stored)
 
+    def test_legacy_oauth_scope_is_shown_as_publish_permission_upgrade(self) -> None:
+        account_id = self._save_oauth_account()
+
+        managed = account_service.list_managed_accounts()
+
+        self.assertEqual([row["id"] for row in managed], [account_id])
+        self.assertTrue(managed[0]["needsPublishScopeUpgrade"])
+        self.assertEqual(managed[0]["statusText"], "需要升级发布权限")
+        self.assertFalse(managed[0]["isHealthy"])
+
     def test_restart_validation_uses_official_channel_check_for_oauth_account(self) -> None:
         account_id = self._save_oauth_account()
         identity = YouTubeChannelIdentity(
@@ -241,6 +251,63 @@ class YouTubeOAuthAccountPersistenceTests(unittest.TestCase):
             validate.call_args.kwargs["client_id"],
             "desktop-client.apps.googleusercontent.com",
         )
+
+    def test_successful_oauth_validation_returns_the_fresh_database_status(self) -> None:
+        account_id = self._save_oauth_account()
+        connection = sqlite3.connect(self.database)
+        connection.execute(
+            "UPDATE user_info SET status = 0 WHERE id = ?",
+            (account_id,),
+        )
+        connection.commit()
+        connection.close()
+        identity = YouTubeChannelIdentity(
+            channel_id="UC123",
+            display_name="重启后频道",
+        )
+        with (
+            patch.object(
+                conf,
+                "YOUTUBE_OAUTH_CLIENT_ID",
+                "desktop-client.apps.googleusercontent.com",
+                create=True,
+            ),
+            patch.object(
+                overseas_youtube_login,
+                "validate_saved_youtube_oauth_account",
+                return_value=identity,
+            ),
+        ):
+            result = account_service.validate_accounts([account_id])
+
+        self.assertEqual([row["id"] for row in result["normal"]], [account_id])
+        self.assertEqual(result["checked"][0]["status"], 1)
+
+    def test_oauth_channel_mismatch_is_returned_as_a_distinct_safe_issue(self) -> None:
+        account_id = self._save_oauth_account()
+        with (
+            patch.object(
+                conf,
+                "YOUTUBE_OAUTH_CLIENT_ID",
+                "desktop-client.apps.googleusercontent.com",
+                create=True,
+            ),
+            patch.object(
+                overseas_youtube_login,
+                "validate_saved_youtube_oauth_account",
+                side_effect=overseas_youtube_login.YouTubeOAuthLoginError(
+                    "channel_identity_mismatch"
+                ),
+            ),
+        ):
+            result = account_service.validate_accounts([account_id])
+
+        self.assertEqual(
+            result["checked"][0]["authIssueCode"],
+            "youtube_channel_identity_mismatch",
+        )
+        self.assertIn("频道身份不一致", result["failures"][0])
+        self.assertEqual([row["id"] for row in result["abnormal"]], [account_id])
 
     def test_oauth_profile_refresh_updates_only_public_name_and_local_avatar(self) -> None:
         account_id = self._save_oauth_account()

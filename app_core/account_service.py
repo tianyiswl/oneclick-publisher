@@ -197,10 +197,18 @@ def estimated_login_expiry(
 def _row_to_dict(row) -> dict:
     data = dict(row)
     raw_status = int(data.get("status") or 0)
+    needs_publish_scope_upgrade = (
+        int(data.get("type") or 0) == 7
+        and str(data.get("authMode") or AUTH_MODE_BROWSER)
+        == AUTH_MODE_YOUTUBE_OAUTH
+        and int(data.get("oauthScopeVersion") or 1) < 2
+    )
     if raw_status == 2:
         health_status = "pending"
     elif raw_status != 1:
         health_status = "abnormal"
+    elif needs_publish_scope_upgrade:
+        health_status = "pending"
     elif check_is_fresh(data.get("lastCheckedAt")):
         health_status = "normal"
     else:
@@ -208,7 +216,12 @@ def _row_to_dict(row) -> dict:
     data["platformName"] = PLATFORMS.get(data.get("type"), f"平台{data.get('type')}")
     data["healthStatus"] = health_status
     data["isHealthy"] = health_status == "normal"
-    data["statusText"] = HEALTH_STATUS_TEXT[health_status]
+    data["needsPublishScopeUpgrade"] = needs_publish_scope_upgrade
+    data["statusText"] = (
+        "需要升级发布权限"
+        if raw_status == 1 and needs_publish_scope_upgrade
+        else HEALTH_STATUS_TEXT[health_status]
+    )
     data["remark"] = data.get("remark") or ""
     data["profileName"] = data.get("profileName") or data.get("userName") or "未命名主体"
     data.update(
@@ -557,6 +570,7 @@ def validate_accounts(
     wanted = {int(item) for item in account_ids or []}
     selected = [row for row in accounts if not wanted or row["id"] in wanted]
     failures: list[str] = []
+    auth_issues: dict[int, str] = {}
 
     def report(event: dict) -> None:
         if progress_callback is None:
@@ -590,7 +604,37 @@ def validate_accounts(
                 valid = verify_saved_session(row)
         except Exception as exc:
             valid = False
-            failures.append(f"{row['platformName']}：检测失败（{type(exc).__name__}）。")
+            reason = str(exc)
+            if (
+                str(row.get("authMode") or AUTH_MODE_BROWSER)
+                == AUTH_MODE_YOUTUBE_OAUTH
+                and reason in {
+                    "channel_identity_mismatch",
+                    "youtube_channel_identity_mismatch",
+                }
+            ):
+                auth_issues[int(row["id"])] = (
+                    "youtube_channel_identity_mismatch"
+                )
+                failures.append(
+                    "YouTube：频道身份不一致，已停止并保留原账号绑定。"
+                )
+            elif (
+                str(row.get("authMode") or AUTH_MODE_BROWSER)
+                == AUTH_MODE_YOUTUBE_OAUTH
+                and reason
+                in {
+                    "credential_unavailable",
+                    "authorization_invalid",
+                    "channel_identity_unavailable",
+                }
+            ):
+                auth_issues[int(row["id"])] = "youtube_authorization_invalid"
+                failures.append("YouTube：官方授权已失效，请重新授权。")
+            else:
+                failures.append(
+                    f"{row['platformName']}：检测失败（{type(exc).__name__}）。"
+                )
         else:
             if not valid:
                 failures.append(f"{row['platformName']}：未确认当前登录状态，请重新登录。")
@@ -601,8 +645,12 @@ def validate_accounts(
                 (1 if valid else int(invalid_status), now, int(row["id"])),
             )
         report({**base_event, "phase": "checked", "valid": valid})
-    refreshed_map = {row["id"]: row for row in list_accounts()}
+    refreshed_map = {row["id"]: row for row in list_managed_accounts()}
     checked = [refreshed_map.get(row["id"], row) for row in selected]
+    for checked_row in checked:
+        issue_code = auth_issues.get(int(checked_row.get("id") or 0))
+        if issue_code:
+            checked_row["authIssueCode"] = issue_code
     return {
         "failures": failures,
         "checked": checked,

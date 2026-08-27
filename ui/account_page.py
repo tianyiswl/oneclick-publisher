@@ -393,14 +393,23 @@ class AccountPage(QWidget):
         layout.setContentsMargins(4, 5, 4, 5)
         layout.setSpacing(4)
         menu = QMenu(box)
+        is_youtube_oauth = (
+            row.get("authMode") == account_service.AUTH_MODE_YOUTUBE_OAUTH
+        )
+        needs_youtube_scope_upgrade = (
+            is_youtube_oauth
+            and int(row.get("oauthScopeVersion") or 1) < 2
+        )
         menu.addAction("检测登录状态", lambda _checked=False, r=row: self.check_one(r))
-        menu.addAction("重新登录", lambda _checked=False, r=row: self.relogin(r))
+        menu.addAction(
+            "升级 YouTube 发布权限"
+            if needs_youtube_scope_upgrade
+            else "重新登录",
+            lambda _checked=False, r=row: self.relogin(r),
+        )
         refresh_action = menu.addAction(
             "刷新账号信息",
             lambda _checked=False, r=row: self.refresh_avatar(r),
-        )
-        is_youtube_oauth = (
-            row.get("authMode") == account_service.AUTH_MODE_YOUTUBE_OAUTH
         )
         refresh_action.setToolTip(
             "从 YouTube 官方 API 刷新频道名和头像"
@@ -444,11 +453,20 @@ class AccountPage(QWidget):
         if not row:
             return
         menu = QMenu(self)
-        menu.addAction("重新登录", lambda: self.relogin(row))
-        open_action = menu.addAction("打开后台", lambda: self.open_backend(row))
         is_youtube_oauth = (
             row.get("authMode") == account_service.AUTH_MODE_YOUTUBE_OAUTH
         )
+        needs_youtube_scope_upgrade = (
+            is_youtube_oauth
+            and int(row.get("oauthScopeVersion") or 1) < 2
+        )
+        menu.addAction(
+            "升级 YouTube 发布权限"
+            if needs_youtube_scope_upgrade
+            else "重新登录",
+            lambda: self.relogin(row),
+        )
+        open_action = menu.addAction("打开后台", lambda: self.open_backend(row))
         open_action.setToolTip(
             "使用系统默认浏览器打开该频道的 YouTube Studio"
             if is_youtube_oauth
@@ -630,13 +648,28 @@ class AccountPage(QWidget):
             if len(rows) > 1
             else ""
         )
+        issue_code = str(first.get("authIssueCode") or "")
+        if issue_code == "youtube_channel_identity_mismatch":
+            detail = (
+                "当前授权返回的 YouTube 频道身份不一致，"
+                "已停止替换原账号。\n"
+                "请在该账号的操作菜单中重新授权原频道。"
+            )
+        elif issue_code == "youtube_authorization_invalid":
+            detail = (
+                "YouTube 官方授权已失效。\n"
+                "请在该账号的操作菜单中重新授权。"
+            )
+        else:
+            detail = (
+                "本次检测只更新账号状态，不会打开平台登录页。\n"
+                "如需恢复会话，请在该账号的操作菜单中点击“重新登录”。"
+            )
         QMessageBox.warning(
             self,
             "登录状态需处理",
             f"{platform} | {account_name} 的会话未通过静默检测。"
-            f"{remaining}\n\n"
-            "本次检测只更新账号状态，不会打开平台登录页。\n"
-            "如需恢复会话，请在该账号的操作菜单中点击“重新登录”。",
+            f"{remaining}\n\n{detail}",
         )
         return True
 
