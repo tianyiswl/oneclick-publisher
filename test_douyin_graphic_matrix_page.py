@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import QApplication, QLabel, QPushButton
 from app_core import database
 from ui.douyin_graphic_matrix_page import (
     DouyinGraphicMatrixPage,
-    DouyinGraphicMediaDialog,
+    DouyinGraphicMediaPicker,
 )
 
 
@@ -109,8 +109,60 @@ class DouyinGraphicMatrixPageTests(unittest.TestCase):
             Qt.CheckState.Unchecked,
         )
 
+    def test_media_management_images_are_visible_and_selectable_on_main_page(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            rows: list[dict] = []
+            for index in range(1, 4):
+                path = root / f"material-{index}.jpg"
+                path.write_bytes(b"image")
+                rows.append(
+                    {
+                        "id": index,
+                        "filename": path.name,
+                        "storedPath": str(path),
+                        "typeText": "图片",
+                        "mediaCategory": "默认素材",
+                        "remark": f"素材{index}",
+                    }
+                )
+            video = root / "ignored.mp4"
+            video.write_bytes(b"video")
+            rows.append(
+                {
+                    "id": 99,
+                    "filename": video.name,
+                    "storedPath": str(video),
+                    "typeText": "视频",
+                    "mediaCategory": "默认素材",
+                    "remark": "视频不应显示",
+                }
+            )
+            with patch(
+                "ui.douyin_graphic_matrix_page.media_service.list_media",
+                return_value=rows,
+            ):
+                page = DouyinGraphicMatrixPage(accounts=_accounts(1))
+            try:
+                self.assertEqual(page.image_list.count(), 3)
+                page.select_all_images_button.click()
+                self.assertEqual(
+                    page.image_paths(),
+                    [str((root / f"material-{index}.jpg").resolve()) for index in range(1, 4)],
+                )
+                page.image_list.item(0).setCheckState(Qt.CheckState.Unchecked)
+                self.assertEqual(
+                    page.image_paths(),
+                    [str((root / f"material-{index}.jpg").resolve()) for index in range(2, 4)],
+                )
+                buttons = [item.text() for item in page.findChildren(QPushButton)]
+                self.assertNotIn("从素材管理选择", buttons)
+            finally:
+                page.close()
+                page.deleteLater()
 
-class DouyinGraphicMediaDialogTests(unittest.TestCase):
+
+class DouyinGraphicMediaPickerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
@@ -144,7 +196,7 @@ class DouyinGraphicMediaDialogTests(unittest.TestCase):
                 "remark": "不应显示",
             }
         )
-        self.dialog = DouyinGraphicMediaDialog(self.rows)
+        self.dialog = DouyinGraphicMediaPicker(self.rows)
 
     def tearDown(self) -> None:
         self.dialog.close()

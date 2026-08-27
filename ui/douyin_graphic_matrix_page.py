@@ -14,8 +14,6 @@ from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDateEdit,
-    QDialog,
-    QDialogButtonBox,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -53,8 +51,10 @@ from .topic_tag_editor import TopicTagEditor
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
-class DouyinGraphicMediaDialog(QDialog):
-    """从素材管理中选择本批图文图片，筛选不会丢失既有勾选。"""
+class DouyinGraphicMediaPicker(QWidget):
+    """直接展示素材管理图片；筛选不会丢失既有勾选。"""
+
+    selection_changed = pyqtSignal()
 
     def __init__(
         self,
@@ -63,14 +63,8 @@ class DouyinGraphicMediaDialog(QDialog):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("从素材管理选择图片")
-        self.resize(760, 580)
-        self._rows = [
-            dict(row)
-            for row in media_rows
-            if str(row.get("typeText") or "") == "图片"
-            and Path(str(row.get("storedPath") or "")).is_file()
-        ]
+        self._source_rows: list[dict] = []
+        self._rows: list[dict] = []
         self._selected_paths = list(
             dict.fromkeys(
                 str(Path(path).expanduser().resolve())
@@ -85,15 +79,7 @@ class DouyinGraphicMediaDialog(QDialog):
         self.search_input.setPlaceholderText("搜索图片名称或备注")
         self.search_input.textChanged.connect(self._render_rows)
         self.category_combo = QComboBox()
-        categories = list(
-            dict.fromkeys(
-                str(row.get("mediaCategory") or "其他").strip() or "其他"
-                for row in self._rows
-            )
-        )
         self.category_combo.addItem("全部分类", "全部")
-        for category in categories:
-            self.category_combo.addItem(category, category)
         self.category_combo.currentIndexChanged.connect(self._render_rows)
         filters.addWidget(self.search_input, 1)
         filters.addWidget(self.category_combo)
@@ -117,16 +103,74 @@ class DouyinGraphicMediaDialog(QDialog):
         selection_row.addWidget(self.deselect_all_button)
         layout.addLayout(selection_row)
 
-        actions = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Cancel
-            | QDialogButtonBox.StandardButton.Ok
+        self.set_media_rows(media_rows)
+
+    @staticmethod
+    def _material_rows(media_rows: Iterable[Mapping[str, object]]) -> list[dict]:
+        result: list[dict] = []
+        for row in media_rows:
+            path = Path(str(row.get("storedPath") or "")).expanduser()
+            if str(row.get("typeText") or "") != "图片" or not path.is_file():
+                continue
+            normalized = dict(row)
+            normalized["storedPath"] = str(path.resolve())
+            normalized["mediaCategory"] = (
+                str(row.get("mediaCategory") or "其他").strip() or "其他"
+            )
+            result.append(normalized)
+        return result
+
+    def set_media_rows(
+        self, media_rows: Iterable[Mapping[str, object]]
+    ) -> None:
+        self._source_rows = self._material_rows(media_rows)
+        self._rebuild_rows()
+
+    def _rebuild_rows(self) -> None:
+        material_rows = [dict(row) for row in self._source_rows]
+        known_paths = {
+            str(row.get("storedPath") or "") for row in material_rows
+        }
+        for path in self._selected_paths:
+            if path in known_paths:
+                continue
+            material_rows.append(
+                {
+                    "id": 0,
+                    "filename": Path(path).name,
+                    "storedPath": path,
+                    "typeText": "图片",
+                    "mediaCategory": "本机添加",
+                    "remark": "",
+                }
+            )
+        self._rows = material_rows
+        current_category = self.category_combo.currentData()
+        self.category_combo.blockSignals(True)
+        self.category_combo.clear()
+        self.category_combo.addItem("全部分类", "全部")
+        categories = list(
+            dict.fromkeys(
+                str(row.get("mediaCategory") or "其他").strip() or "其他"
+                for row in self._rows
+            )
         )
-        actions.button(QDialogButtonBox.StandardButton.Ok).setText("使用所选图片")
-        actions.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
-        actions.accepted.connect(self.accept)
-        actions.rejected.connect(self.reject)
-        layout.addWidget(actions)
+        for category in categories:
+            self.category_combo.addItem(category, category)
+        target_index = self.category_combo.findData(current_category)
+        self.category_combo.setCurrentIndex(max(0, target_index))
+        self.category_combo.blockSignals(False)
         self._render_rows()
+
+    def set_selected_paths(self, paths: Iterable[str]) -> None:
+        self._selected_paths = list(
+            dict.fromkeys(
+                str(Path(path).expanduser().resolve())
+                for path in paths
+                if str(path).strip()
+            )
+        )[:35]
+        self._rebuild_rows()
 
     def _filtered_rows(self) -> list[dict]:
         keyword = self.search_input.text().strip().lower()
@@ -182,6 +226,7 @@ class DouyinGraphicMediaDialog(QDialog):
         elif path in self._selected_paths:
             self._selected_paths.remove(path)
         self._refresh_status()
+        self.selection_changed.emit()
 
     def _select_visible(self) -> None:
         for row in self._filtered_rows():
@@ -191,10 +236,12 @@ class DouyinGraphicMediaDialog(QDialog):
                     break
                 self._selected_paths.append(path)
         self._render_rows()
+        self.selection_changed.emit()
 
     def _deselect_all(self) -> None:
         self._selected_paths = []
         self._render_rows()
+        self.selection_changed.emit()
 
     def _refresh_status(self) -> None:
         suffix = "，已达到单批上限" if len(self._selected_paths) >= 35 else ""
@@ -300,20 +347,19 @@ class DouyinGraphicMatrixPage(QWidget):
         media_title = QLabel("图片素材（1–35 张）")
         media_title.setObjectName("sectionTitle")
         media_layout.addWidget(media_title)
-        self.image_list = QListWidget()
-        self.image_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.image_list.setAlternatingRowColors(True)
-        media_layout.addWidget(self.image_list, 1)
+        self.media_picker = DouyinGraphicMediaPicker(media_service.list_media())
+        self.media_picker.selection_changed.connect(self._sync_images_from_picker)
+        self.image_list = self.media_picker.media_list
+        self.image_search_input = self.media_picker.search_input
+        self.image_category_combo = self.media_picker.category_combo
+        self.select_all_images_button = self.media_picker.select_all_button
+        self.deselect_all_images_button = self.media_picker.deselect_all_button
+        self.image_selection_status = self.media_picker.selection_status
+        media_layout.addWidget(self.media_picker, 1)
         image_actions = QHBoxLayout()
-        choose_material = button("从素材管理选择", variant="primary")
-        choose_material.clicked.connect(self._choose_material_images)
-        choose = button("从本机添加", variant="secondary")
+        choose = button("从本机添加", variant="primary")
         choose.clicked.connect(self._choose_images)
-        remove = button("移除选中", variant="secondary")
-        remove.clicked.connect(self._remove_selected_images)
-        image_actions.addWidget(choose_material)
         image_actions.addWidget(choose)
-        image_actions.addWidget(remove)
         image_actions.addStretch()
         media_layout.addLayout(image_actions)
         layout.addWidget(media, 3)
@@ -452,6 +498,7 @@ class DouyinGraphicMatrixPage(QWidget):
         return page
 
     def refresh(self) -> None:
+        self.media_picker.set_media_rows(media_service.list_media())
         self.set_available_accounts(account_service.list_accounts())
 
     def set_available_accounts(self, accounts: Iterable[Mapping[str, object]]) -> None:
@@ -523,12 +570,17 @@ class DouyinGraphicMatrixPage(QWidget):
         self._set_image_paths(values)
 
     def _set_image_paths(self, image_paths: Iterable[str]) -> None:
-        self._images = list(dict.fromkeys(str(path) for path in image_paths))[:35]
-        self.image_list.clear()
-        for index, path in enumerate(self._images, start=1):
-            item = QListWidgetItem(f"{index}. {Path(path).name}")
-            item.setToolTip(path)
-            self.image_list.addItem(item)
+        self._images = list(
+            dict.fromkeys(
+                str(Path(path).expanduser().resolve())
+                for path in image_paths
+                if str(path).strip()
+            )
+        )[:35]
+        self.media_picker.set_selected_paths(self._images)
+
+    def _sync_images_from_picker(self) -> None:
+        self._images = self.media_picker.selected_paths()
 
     def image_paths(self) -> list[str]:
         return list(self._images)
@@ -544,21 +596,9 @@ class DouyinGraphicMatrixPage(QWidget):
         if not paths:
             return
         try:
-            self.set_images(paths)
+            self.set_images([*self._images, *paths])
         except ValueError as exc:
             QMessageBox.warning(self, "图片素材", str(exc))
-
-    def _choose_material_images(self) -> None:
-        dialog = DouyinGraphicMediaDialog(
-            media_service.list_media(), self._images, self
-        )
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            self._set_image_paths(dialog.selected_paths())
-
-    def _remove_selected_images(self) -> None:
-        indexes = {index.row() for index in self.image_list.selectedIndexes()}
-        remaining = [path for index, path in enumerate(self._images) if index not in indexes]
-        self._set_image_paths(remaining)
 
     def _common_changed(self) -> None:
         if hasattr(self, "account_table"):
