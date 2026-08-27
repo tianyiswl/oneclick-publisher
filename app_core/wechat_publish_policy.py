@@ -145,7 +145,7 @@ def decide_group_notification_scope_confirmation(
     except ValueError as exc:
         return {"allowed": False, "reason": str(exc)}
     if not preferences["groupNotification"]:
-        return {"allowed": False, "reason": "用户未开启群发通知"}
+        return decide_no_group_notification_confirmation(page_state)
     if page_state.get("qrElements") or page_state.get("qrText") or page_state.get("qrCount"):
         return {"allowed": False, "reason": "页面出现二维码或身份验证提示"}
     dialogs = _unique_semantic_dialogs(page_state)

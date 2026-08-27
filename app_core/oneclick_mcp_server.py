@@ -33,11 +33,12 @@ def create_server(gateway: ContentProjectGateway | None = None) -> MCPServer:
     server = MCPServer(
         name="yijianfa-local",
         title="一键发本机受控发布",
-        description="让本机内容项目通过同一发布服务执行预检、授权、正式发布和任务查询。",
+        description="让本机内容项目通过同一发布服务执行后台直发、手动诊断预检和任务查询。",
         instructions=(
-            "默认先调用 oneclick_preflight_content。"
-            "只有用户对当次内容和目标明确确认正式发布后，"
-            "才能创建一次性授权并调用 oneclick_formal_publish。"
+            "用户对当次内容、账号和排期明确说‘发布’后，"
+            "默认调用 oneclick_direct_publish_content；该工具在本机内部创建并立即消费一次性授权。"
+            "oneclick_preflight_content 只用于用户明确要求的平台诊断，不是默认发布前置步骤。"
+            "扫码、验证码或未知平台弹窗由任务状态返回给用户，不得传入本工具。"
         ),
         version="1",
     )
@@ -86,6 +87,28 @@ def create_server(gateway: ContentProjectGateway | None = None) -> MCPServer:
         return _call(
             "task",
             lambda: gateway.preflight_content(project_id, manifest_path, schedules),
+        )
+
+    @server.tool(
+        name="oneclick_direct_publish_content",
+        description=(
+            "仅在用户已对当次内容、账号和排期明确确认发布后调用；"
+            "后台只运行一次正式浏览器会话，不先创建独立平台预检。"
+        ),
+        structured_output=True,
+    )
+    def direct_publish_content(
+        project_id: str,
+        manifest_path: str,
+        schedules: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return _call(
+            "task",
+            lambda: gateway.direct_publish_content(
+                project_id,
+                manifest_path,
+                schedules,
+            ),
         )
 
     @server.tool(
@@ -245,8 +268,8 @@ def create_server(gateway: ContentProjectGateway | None = None) -> MCPServer:
     @server.tool(
         name="oneclick_auto_publish_silicon_evolution_release",
         description=(
-            "只对硅基进化已冻结且同哈希预检成功的文章执行一次正式提交；"
-            "固定关闭群发通知和定时发表。"
+            "用户明确确认后，对硅基进化已冻结文章执行一次后台正式提交；"
+            "默认不要求独立平台预检，传入 confirmed_preflight_task_id 时仅作旧流程兼容。"
         ),
         structured_output=True,
     )
@@ -254,7 +277,7 @@ def create_server(gateway: ContentProjectGateway | None = None) -> MCPServer:
         article_id: str,
         package_path: str,
         package_sha256: str,
-        confirmed_preflight_task_id: int,
+        confirmed_preflight_task_id: int | None = None,
     ) -> dict[str, Any]:
         return _call(
             "task",

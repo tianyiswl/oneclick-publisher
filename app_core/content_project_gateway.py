@@ -134,8 +134,14 @@ class ContentProjectGateway:
         submitter: Callable[[Mapping[str, Any]], dict[str, Any]] | None = None,
         status_reader: Callable[[int], dict[str, Any]] = controlled_publish.task_status,
         authorizer: Callable[[int], dict[str, Any]] = controlled_publish.authorize_completed_preflight,
+        direct_authorizer: Callable[
+            [Mapping[str, Any]], dict[str, Any]
+        ] = controlled_publish.authorize_direct_request,
         runtime_conflict_checker: Callable[[], bool] = _source_live_conflict,
         silicon_submitter: Callable[[Mapping[str, Any]], dict[str, Any]] | None = None,
+        silicon_direct_authorizer: Callable[
+            [Mapping[str, Any]], dict[str, Any]
+        ] = controlled_publish.authorize_silicon_evolution_direct_request,
         matrix_submitter: Callable[[Mapping[str, Any]], dict[str, Any]] | None = None,
         metrics_service: ContentProjectMetricsService | None = None,
     ) -> None:
@@ -148,6 +154,7 @@ class ContentProjectGateway:
         self.submitter = submitter
         self.status_reader = status_reader
         self.authorizer = authorizer
+        self.direct_authorizer = direct_authorizer
         self.runtime_conflict_checker = runtime_conflict_checker
         if silicon_submitter is None:
             from .controlled_publish_process import (
@@ -156,6 +163,7 @@ class ContentProjectGateway:
 
             silicon_submitter = submit_silicon_evolution_request_in_process
         self.silicon_submitter = silicon_submitter
+        self.silicon_direct_authorizer = silicon_direct_authorizer
         if matrix_submitter is None:
             from .controlled_publish_process import (
                 submit_douyin_graphic_matrix_request_in_process,
@@ -366,6 +374,30 @@ class ContentProjectGateway:
                 "authorizationId": str(authorization_id).strip(),
             }
         )
+        return self.submitter(request)
+
+    def direct_publish_content(
+        self,
+        project_id: str,
+        manifest_path: str,
+        schedules: Mapping[str, object] | None = None,
+    ) -> dict[str, Any]:
+        """用当次对话授权直接创建隐藏的正式发布任务。
+
+        这里不创建独立平台预检任务，但各平台执行器仍必须
+        在同一正式会话中完成字段写入、回读和提交前检查。
+        """
+
+        self._ensure_platform_work_available()
+        request = self._request(project_id, manifest_path, "direct", schedules)
+        grant = self.direct_authorizer(request)
+        authorization_id = str(grant.get("authorizationId") or "").strip()
+        if not authorization_id:
+            raise ContentProjectGatewayError(
+                "content_project_direct_authorization_failed",
+                "本机没有生成可用的后台直发授权",
+            )
+        request["directAuthorizationId"] = authorization_id
         return self.submitter(request)
 
     def task_status(self, task_id: int) -> dict[str, Any]:
@@ -641,20 +673,40 @@ class ContentProjectGateway:
         package_path: str,
         package_sha256: str,
         *,
-        confirmed_preflight_task_id: int,
+        confirmed_preflight_task_id: int | None = None,
     ) -> dict[str, Any]:
         self._ensure_platform_work_available()
-        if type(confirmed_preflight_task_id) is not int or confirmed_preflight_task_id <= 0:
-            raise ContentProjectGatewayError(
-                "silicon_evolution_preflight_required",
-                "自动直发必须绑定成功预检 taskId",
+        if confirmed_preflight_task_id is not None:
+            if (
+                type(confirmed_preflight_task_id) is not int
+                or confirmed_preflight_task_id <= 0
+            ):
+                raise ContentProjectGatewayError(
+                    "silicon_evolution_preflight_required",
+                    "兼容模式的预检 taskId 无效",
+                )
+            return self.silicon_submitter(
+                self._silicon_evolution_request(
+                    article_id,
+                    package_path,
+                    package_sha256,
+                    mode="formal",
+                    confirmed_preflight_task_id=confirmed_preflight_task_id,
+                )
             )
-        return self.silicon_submitter(
-            self._silicon_evolution_request(
-                article_id,
-                package_path,
-                package_sha256,
-                mode="formal",
-                confirmed_preflight_task_id=confirmed_preflight_task_id,
-            )
+
+        request = self._silicon_evolution_request(
+            article_id,
+            package_path,
+            package_sha256,
+            mode="direct",
         )
+        grant = self.silicon_direct_authorizer(request)
+        authorization_id = str(grant.get("authorizationId") or "").strip()
+        if not authorization_id:
+            raise ContentProjectGatewayError(
+                "silicon_evolution_direct_authorization_failed",
+                "本机没有生成可用的硅基进化直发授权",
+            )
+        request["directAuthorizationId"] = authorization_id
+        return self.silicon_submitter(request)

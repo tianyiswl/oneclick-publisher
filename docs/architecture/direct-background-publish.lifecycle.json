@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "diagram_type": "lifecycle",
+  "meta": {
+    "title": "一键发单会话后台直发生命周期",
+    "output": "docs/architecture/direct-background-publish.lifecycle.html",
+    "viewBox": [1180, 700],
+    "quality_profile": "showcase"
+  },
+  "lanes": [
+    {"id": "main", "label": "一次授权后的单会话主流程"},
+    {"id": "gate", "label": "仅在必要时打断用户"},
+    {"id": "terminal", "label": "结果核对与安全终态"}
+  ],
+  "states": [
+    {"id": "authorized", "type": "start", "label": "聊天框确认发布", "sublabel": "绑定内容包、账号和时间", "lane": "main", "col": 0, "step": "01", "tag": "一次性授权"},
+    {"id": "local_validation", "type": "active", "label": "本地检查", "sublabel": "不登录、不打开浏览器", "lane": "main", "col": 1, "step": "02", "tag": "快速"},
+    {"id": "single_session", "type": "active", "label": "隐藏浏览器填写", "sublabel": "只打开一次平台发布页", "lane": "main", "col": 2, "step": "03", "tag": "单会话"},
+    {"id": "field_readback", "type": "decision", "label": "同页字段回读", "sublabel": "账号、正文、素材和时间一致", "lane": "main", "col": 3, "step": "04", "tag": "提交前门禁"},
+    {"id": "submitting", "type": "active", "label": "正式提交", "sublabel": "自动处理已识别普通确认", "lane": "main", "col": 4, "step": "05", "tag": "已授权"},
+    {"id": "pre_submit_challenge", "type": "waiting", "label": "填写阶段等待验证", "sublabel": "提醒用户，完成后沿用原页面", "lane": "gate", "col": 0, "tag": "非终态"},
+    {"id": "post_submit_challenge", "type": "waiting", "label": "提交阶段等待验证", "sublabel": "验证完成后只读核对结果", "lane": "gate", "col": 1, "tag": "非终态"},
+    {"id": "safe_stop", "type": "failure", "label": "安全停止", "sublabel": "提交前报错；提交后防重", "lane": "terminal", "col": 0, "tag": "不自动重发"},
+    {"id": "reconciling", "type": "active", "label": "只读核对平台结果", "sublabel": "内容列表、作品 ID 或公开链接", "lane": "terminal", "col": 2, "tag": "禁止重发"},
+    {"id": "success", "type": "success", "label": "平台成功回读", "sublabel": "返回任务、作品和发布时间", "lane": "terminal", "col": 1, "tag": "明确成功"}
+  ],
+  "transitions": [
+    {"id": "authorize_validate", "from": "authorized", "to": "local_validation", "variant": "security"},
+    {"id": "validate_session", "from": "local_validation", "to": "single_session", "variant": "emphasis"},
+    {"id": "session_readback", "from": "single_session", "to": "field_readback", "variant": "default", "fromSide": "right", "toSide": "left", "route": "straight"},
+    {"id": "session_challenge", "from": "single_session", "to": "pre_submit_challenge", "variant": "security", "fromSide": "bottom", "toSide": "top", "route": "straight"},
+    {"id": "challenge_resume", "from": "pre_submit_challenge", "to": "field_readback", "variant": "emphasis"},
+    {"id": "readback_submit", "from": "field_readback", "to": "submitting", "variant": "emphasis", "fromSide": "right", "toSide": "left", "route": "straight"},
+    {"id": "readback_failed", "from": "field_readback", "to": "safe_stop", "variant": "security", "fromSide": "top", "toSide": "left", "via": [[556, 80], [24, 80], [24, 479]]},
+    {"id": "submit_reconcile", "from": "submitting", "to": "reconciling", "variant": "security", "fromSide": "bottom", "toSide": "top", "route": "straight"},
+    {"id": "submit_challenge", "from": "submitting", "to": "post_submit_challenge", "variant": "security"},
+    {"id": "post_challenge_reconcile", "from": "post_submit_challenge", "to": "reconciling", "variant": "emphasis"},
+    {"id": "reconcile_success", "from": "reconciling", "to": "success", "variant": "emphasis", "fromSide": "left", "toSide": "right", "route": "straight"},
+    {"id": "reconcile_ambiguous", "from": "reconciling", "to": "safe_stop", "variant": "security", "fromSide": "bottom", "toSide": "right", "route": "bottom-channel"}
+  ]
+}

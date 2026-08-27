@@ -145,11 +145,17 @@ def submit_silicon_evolution_request_in_process(
     """在独立进程中启动 V1.2 冻结包的公众号任务。"""
 
     mode = str(request.get("mode") or "")
-    if mode not in {"preflight", "formal"}:
+    if mode not in {"preflight", "formal", "direct"}:
         raise ControlledPublishError(
             "silicon_evolution_mode_invalid", "自动直发模式无效"
         )
-    action = "silicon-preflight" if mode == "preflight" else "silicon-formal"
+    action = (
+        "silicon-preflight"
+        if mode == "preflight"
+        else "silicon-direct"
+        if mode == "direct"
+        else "silicon-formal"
+    )
     prepared = dict(request)
     prepared.pop("mode", None)
     prepared["mode"] = mode

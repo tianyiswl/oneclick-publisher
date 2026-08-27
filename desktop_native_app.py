@@ -161,11 +161,13 @@ def _read_controlled_request(path_value: str) -> dict:
 
 
 def _wait_for_controlled_task(task_id: int, *, interactive_verification: bool) -> None:
-    """等待任务完成；正式任务遇到抖音验证时只拉起本机原生窗口。"""
+    """等待任务完成；平台要求验证时才拉起本机原生窗口。"""
 
     app = None
     douyin_verification_broker = None
-    verification_dialog = None
+    douyin_verification_dialog = None
+    wechat_verification_broker = None
+    wechat_verification_dialog = None
     if interactive_verification:
         from app_core.douyin_verification import (
             verification_broker as douyin_verification_broker,
@@ -175,16 +177,28 @@ def _wait_for_controlled_task(task_id: int, *, interactive_verification: bool) -
         app = QApplication.instance() or QApplication([sys.argv[0]])
         configure_application(app)
         apply_style(app)
-        verification_dialog = DouyinVerificationDialog
+        from app_core.wechat_verification import (
+            verification_broker as wechat_verification_broker,
+        )
+        from ui.wechat_verification_dialog import WechatVerificationDialog
+
+        douyin_verification_dialog = DouyinVerificationDialog
+        wechat_verification_dialog = WechatVerificationDialog
     while publish_service.is_task_running(task_id):
         task_service.touch_task_heartbeat(task_id)
         if app is not None:
             app.processEvents()
             request_id = douyin_verification_broker.request_for_task(task_id)
             if request_id:
-                verification_dialog(
+                douyin_verification_dialog(
                     request_id,
                     broker=douyin_verification_broker,
+                ).exec()
+            wechat_request_id = wechat_verification_broker.request_for_task(task_id)
+            if wechat_request_id:
+                wechat_verification_dialog(
+                    wechat_request_id,
+                    broker=wechat_verification_broker,
                 ).exec()
         time.sleep(0.25)
 
@@ -255,7 +269,7 @@ def run_controlled_publish_cli(args: argparse.Namespace) -> int:
                     task_id,
                     interactive_verification=(
                         str(request.get("mode") or "preflight").strip().lower()
-                        == "formal"
+                        in {"formal", "direct"}
                     ),
                 )
             except KeyboardInterrupt:
@@ -306,23 +320,27 @@ def run_controlled_publish_cli(args: argparse.Namespace) -> int:
             if final != initial:
                 _controlled_json(final)
             return 0 if final["status"] == "success" else 2
-        if action in {"silicon-preflight", "silicon-formal"}:
+        if action in {"silicon-preflight", "silicon-formal", "silicon-direct"}:
             if not args.controlled_publish_request:
                 raise controlled_publish.ControlledPublishError(
                     "controlled_request_file_required",
                     "硅基进化自动直发必须提供 JSON 请求文件",
                 )
             request = _read_controlled_request(args.controlled_publish_request)
-            request["mode"] = (
-                "preflight" if action == "silicon-preflight" else "formal"
-            )
+            request["mode"] = {
+                "silicon-preflight": "preflight",
+                "silicon-formal": "formal",
+                "silicon-direct": "direct",
+            }[action]
             initial = controlled_publish.submit_silicon_evolution_request(request)
             _controlled_json(initial)
             task_id = int(initial["taskId"])
             try:
                 _wait_for_controlled_task(
                     task_id,
-                    interactive_verification=(action == "silicon-formal"),
+                    interactive_verification=(
+                        action in {"silicon-formal", "silicon-direct"}
+                    ),
                 )
             except KeyboardInterrupt:
                 task_service.fail_active_task(
@@ -511,12 +529,16 @@ def main() -> int:
             "authorize",
             "silicon-preflight",
             "silicon-formal",
+            "silicon-direct",
             "matrix",
             "metrics-sync",
             "metrics-get",
             "metrics-status",
         ),
-        help="本机受控发布接口；默认只能由请求中的 preflight 模式启动预检。",
+        help=(
+            "本机受控发布接口；direct 模式必须携带由内容项目网关"
+            "生成的当次一次性授权。"
+        ),
     )
     parser.add_argument(
         "--controlled-publish-request",
