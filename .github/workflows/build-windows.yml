@@ -111,7 +111,7 @@ jobs:
           if ($LASTEXITCODE -eq 0) {
             gh release upload $tag $zip.FullName $shaFile --clobber
           } else {
-            gh release create $tag $zip.FullName $shaFile --target $env:GITHUB_SHA --title "一键发 $version 候选客户端" --notes "国内定位与数据监测/分析候选版；海外功能未包含。" --prerelease
+            gh release create $tag $zip.FullName $shaFile --target $env:GITHUB_SHA --title "一键发 $version 候选客户端" --notes "包含国内定位、数据监测/分析和 YouTube 官方 OAuth 私密优先发布；公开、不公开与定时公开尚未完成真实平台验收。" --prerelease
           }
           if ($LASTEXITCODE -ne 0) {
             throw "保存私有候选版本失败"
