@@ -9,6 +9,7 @@ from typing import Iterable, Mapping
 from zoneinfo import ZoneInfo
 
 from PyQt6.QtCore import QDate, QTime, Qt, pyqtSignal
+from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -43,7 +44,7 @@ from app_core import (
 )
 from app_core.douyin_graphic_matrix_service import SCHEMA_VERSION, WORKFLOW
 
-from .common import button
+from .common import COLORS, button
 from .douyin_graphic_matrix_table import DouyinGraphicAccountTable
 from .topic_tag_editor import TopicTagEditor
 
@@ -555,6 +556,14 @@ class DouyinGraphicMatrixPage(QWidget):
             label = str(account.get("profileName") or account.get("userName") or f"账号{account_id}")
             user = str(account.get("userName") or "").strip()
             item = QListWidgetItem(f"{label} · {user}" if user and user != label else label)
+            health_status = str(account.get("healthStatus") or "").strip()
+            is_normal = (
+                health_status == "normal"
+                if health_status
+                else int(account.get("status") or 0) == 1
+            )
+            if not is_normal:
+                item.setForeground(QColor(COLORS["danger"]))
             item.setData(Qt.ItemDataRole.UserRole, account_id)
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(Qt.CheckState.Checked if account_id in selected else Qt.CheckState.Unchecked)

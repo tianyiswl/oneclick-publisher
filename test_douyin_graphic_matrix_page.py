@@ -12,7 +12,7 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QInputMethodEvent
+from PyQt6.QtGui import QColor, QInputMethodEvent
 from PyQt6.QtWidgets import QApplication, QLabel, QPushButton, QWidget
 
 from app_core import database
@@ -127,6 +127,26 @@ class DouyinGraphicMatrixPageTests(unittest.TestCase):
 
         self.page.deselect_all_accounts_button.click()
         self.assertEqual(self.page.selected_account_ids(), [])
+
+    def test_non_normal_accounts_use_red_text_without_changing_selection(self) -> None:
+        accounts = _accounts(4)
+        for account, health_status in zip(
+            accounts,
+            ("normal", "pending", "stale", "abnormal"),
+        ):
+            account["healthStatus"] = health_status
+        self.page.set_available_accounts(accounts)
+
+        danger = QColor("#B42318")
+        self.assertNotEqual(self.page.account_list.item(0).foreground().color(), danger)
+        for index in range(1, 4):
+            self.assertEqual(
+                self.page.account_list.item(index).foreground().color(),
+                danger,
+            )
+
+        self.page.select_all_accounts_button.click()
+        self.assertEqual(self.page.selected_account_ids(), [1, 2, 3, 4])
 
     def test_manual_account_selection_cannot_exceed_twenty(self) -> None:
         self.page.set_available_accounts(_accounts(21))
