@@ -15,7 +15,12 @@ from urllib.parse import ParseResult, parse_qs, urlencode, urlparse, urlunparse
 
 GOOGLE_AUTHORIZATION_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
+YOUTUBE_READONLY_SCOPE = "https://www.googleapis.com/auth/youtube.readonly"
 YOUTUBE_UPLOAD_SCOPE = "https://www.googleapis.com/auth/youtube.upload"
+YOUTUBE_REQUIRED_SCOPES = frozenset(
+    {YOUTUBE_READONLY_SCOPE, YOUTUBE_UPLOAD_SCOPE}
+)
+YOUTUBE_OAUTH_SCOPE = f"{YOUTUBE_READONLY_SCOPE} {YOUTUBE_UPLOAD_SCOPE}"
 TOKEN_REQUEST_TIMEOUT_SECONDS = 10.0
 
 
@@ -105,20 +110,24 @@ class YouTubeOAuthTokenClient:
         self,
         *,
         client_id: str,
+        client_secret: str | None = None,
         request: OAuthAuthorizationRequest,
         callback: OAuthAuthorizationCallback,
     ) -> OAuthTokens:
         """Exchange one verified authorization callback for renewable OAuth tokens."""
         if not client_id or not callback.authorized:
             raise OAuthTokenError("authorization_invalid")
+        data = {
+            "client_id": client_id,
+            "code": callback.authorization_code,
+            "code_verifier": request.code_verifier,
+            "grant_type": "authorization_code",
+            "redirect_uri": request.callback_url,
+        }
+        if client_secret:
+            data["client_secret"] = client_secret
         return self._request_tokens(
-            {
-                "client_id": client_id,
-                "code": callback.authorization_code,
-                "code_verifier": request.code_verifier,
-                "grant_type": "authorization_code",
-                "redirect_uri": request.callback_url,
-            },
+            data,
             fallback_refresh_token=None,
             fallback_scope=None,
         )
@@ -127,6 +136,7 @@ class YouTubeOAuthTokenClient:
         self,
         *,
         client_id: str,
+        client_secret: str | None = None,
         existing_tokens: OAuthTokens,
     ) -> OAuthTokens:
         """Refresh an access token while retaining an omitted refresh token."""
@@ -136,12 +146,15 @@ class YouTubeOAuthTokenClient:
             scope=existing_tokens.scope,
             token_type=existing_tokens.token_type,
         )
+        data = {
+            "client_id": client_id,
+            "grant_type": "refresh_token",
+            "refresh_token": existing_tokens.refresh_token,
+        }
+        if client_secret:
+            data["client_secret"] = client_secret
         return self._request_tokens(
-            {
-                "client_id": client_id,
-                "grant_type": "refresh_token",
-                "refresh_token": existing_tokens.refresh_token,
-            },
+            data,
             fallback_refresh_token=existing_tokens.refresh_token,
             fallback_scope=existing_tokens.scope,
         )
@@ -341,7 +354,7 @@ def _authorization_request(
             "client_id": client_id,
             "redirect_uri": callback_url,
             "response_type": "code",
-            "scope": YOUTUBE_UPLOAD_SCOPE,
+            "scope": YOUTUBE_OAUTH_SCOPE,
             "state": state,
             "code_challenge": pkce_s256_challenge(code_verifier),
             "code_challenge_method": "S256",
@@ -534,7 +547,7 @@ def _tokens_from_payload(
 def _validate_token_authority(*, scope: object, token_type: object) -> None:
     if (
         not isinstance(scope, str)
-        or set(scope.split()) != {YOUTUBE_UPLOAD_SCOPE}
+        or set(scope.split()) != YOUTUBE_REQUIRED_SCOPES
         or not isinstance(token_type, str)
         or token_type.casefold() != "bearer"
     ):

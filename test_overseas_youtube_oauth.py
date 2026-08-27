@@ -22,6 +22,8 @@ from app_core.overseas_youtube_oauth import (
 
 
 YOUTUBE_UPLOAD_SCOPE = "https://www.googleapis.com/auth/youtube.upload"
+YOUTUBE_READONLY_SCOPE = "https://www.googleapis.com/auth/youtube.readonly"
+YOUTUBE_REQUIRED_SCOPE = f"{YOUTUBE_READONLY_SCOPE} {YOUTUBE_UPLOAD_SCOPE}"
 
 
 class FakeTokenResponse:
@@ -39,7 +41,7 @@ class RaisingStatusTokenResponse:
             "access_token": "access-token-secret",
             "refresh_token": "refresh-token-secret",
             "expires_in": 3600,
-            "scope": YOUTUBE_UPLOAD_SCOPE,
+            "scope": YOUTUBE_REQUIRED_SCOPE,
         }
 
     @property
@@ -53,7 +55,7 @@ class OAuthErrorStatusTokenResponse:
             "access_token": "access-token-secret",
             "refresh_token": "refresh-token-secret",
             "expires_in": 3600,
-            "scope": YOUTUBE_UPLOAD_SCOPE,
+            "scope": YOUTUBE_REQUIRED_SCOPE,
         }
 
     @property
@@ -69,7 +71,7 @@ class InvalidStatusTokenResponse:
             "access_token": "access-token-secret",
             "refresh_token": "refresh-token-secret",
             "expires_in": 3600,
-            "scope": YOUTUBE_UPLOAD_SCOPE,
+            "scope": YOUTUBE_REQUIRED_SCOPE,
         }
 
 
@@ -218,7 +220,7 @@ class YouTubeOAuthAuthorizationContractTests(unittest.TestCase):
             [],
         )
 
-    def test_authorization_request_uses_loopback_pkce_and_minimum_google_parameters(self) -> None:
+    def test_authorization_request_uses_loopback_pkce_and_required_google_scopes(self) -> None:
         request = self._start_session().request
         parsed = urlparse(request.authorization_url)
         query = parse_qs(parsed.query)
@@ -230,7 +232,10 @@ class YouTubeOAuthAuthorizationContractTests(unittest.TestCase):
         )
         self.assertEqual(query["client_id"], ["desktop-client-id"])
         self.assertEqual(query["response_type"], ["code"])
-        self.assertEqual(query["scope"], [YOUTUBE_UPLOAD_SCOPE])
+        self.assertEqual(
+            set(query["scope"][0].split()),
+            {YOUTUBE_READONLY_SCOPE, YOUTUBE_UPLOAD_SCOPE},
+        )
         self.assertEqual(query["access_type"], ["offline"])
         self.assertEqual(query["prompt"], ["consent"])
         self.assertEqual(query["code_challenge_method"], ["S256"])
@@ -411,7 +416,7 @@ class YouTubeOAuthTokenLifecycleTests(unittest.TestCase):
                     "access_token": "access-token-secret",
                     "refresh_token": "refresh-token-secret",
                     "expires_in": 3600,
-                    "scope": YOUTUBE_UPLOAD_SCOPE,
+                    "scope": YOUTUBE_REQUIRED_SCOPE,
                     "token_type": "Bearer",
                 },
             )
@@ -420,6 +425,7 @@ class YouTubeOAuthTokenLifecycleTests(unittest.TestCase):
 
         tokens = client.exchange_authorization_code(
             client_id="desktop-client-id",
+            client_secret="desktop-client-secret",
             request=request,
             callback=callback,
         )
@@ -427,7 +433,7 @@ class YouTubeOAuthTokenLifecycleTests(unittest.TestCase):
         self.assertEqual(tokens.access_token, "access-token-secret")
         self.assertEqual(tokens.refresh_token, "refresh-token-secret")
         self.assertEqual(tokens.expires_at, 4600.0)
-        self.assertEqual(tokens.scope, YOUTUBE_UPLOAD_SCOPE)
+        self.assertEqual(tokens.scope, YOUTUBE_REQUIRED_SCOPE)
         self.assertNotIn("access-token-secret", repr(tokens))
         self.assertNotIn("refresh-token-secret", str(tokens))
         self.assertEqual(len(transport.calls), 1)
@@ -438,6 +444,7 @@ class YouTubeOAuthTokenLifecycleTests(unittest.TestCase):
             data,
             {
                 "client_id": "desktop-client-id",
+                "client_secret": "desktop-client-secret",
                 "code": "authorization-code-secret",
                 "code_verifier": request.code_verifier,
                 "grant_type": "authorization_code",
@@ -452,7 +459,7 @@ class YouTubeOAuthTokenLifecycleTests(unittest.TestCase):
                 {
                     "access_token": "replacement-access-token-secret",
                     "expires_in": "120",
-                    "scope": YOUTUBE_UPLOAD_SCOPE,
+                    "scope": YOUTUBE_REQUIRED_SCOPE,
                     "token_type": "Bearer",
                 },
             )
@@ -462,11 +469,12 @@ class YouTubeOAuthTokenLifecycleTests(unittest.TestCase):
             access_token="old-access-token-secret",
             refresh_token="existing-refresh-token-secret",
             expires_at=30.0,
-            scope=YOUTUBE_UPLOAD_SCOPE,
+            scope=YOUTUBE_REQUIRED_SCOPE,
         )
 
         refreshed = client.refresh_access_token(
             client_id="desktop-client-id",
+            client_secret="desktop-client-secret",
             existing_tokens=existing,
         )
 
@@ -474,9 +482,14 @@ class YouTubeOAuthTokenLifecycleTests(unittest.TestCase):
         self.assertEqual(refreshed.refresh_token, "existing-refresh-token-secret")
         self.assertEqual(refreshed.expires_at, 145.0)
         self.assertEqual(
+            transport.calls[0][1]["client_secret"],
+            "desktop-client-secret",
+        )
+        self.assertEqual(
             transport.calls[0][1],
             {
                 "client_id": "desktop-client-id",
+                "client_secret": "desktop-client-secret",
                 "grant_type": "refresh_token",
                 "refresh_token": "existing-refresh-token-secret",
             },
@@ -492,8 +505,8 @@ class YouTubeOAuthTokenLifecycleTests(unittest.TestCase):
             ({"expires_in": 0}, "zero-expiry"),
             ({"expires_in": -1}, "negative-expiry"),
             ({"token_type": "MAC"}, "non-bearer"),
-            ({"scope": f"{YOUTUBE_UPLOAD_SCOPE} profile"}, "expanded-scope"),
-            ({"scope": "profile"}, "different-scope"),
+            ({"scope": f"{YOUTUBE_REQUIRED_SCOPE} profile"}, "expanded-scope"),
+            ({"scope": YOUTUBE_UPLOAD_SCOPE}, "missing-readonly-scope"),
         )
         for changes, label in cases:
             with self.subTest(label=label):
@@ -501,7 +514,7 @@ class YouTubeOAuthTokenLifecycleTests(unittest.TestCase):
                     "access_token": "access-token-secret",
                     "refresh_token": "refresh-token-secret",
                     "expires_in": 3600,
-                    "scope": YOUTUBE_UPLOAD_SCOPE,
+                    "scope": YOUTUBE_REQUIRED_SCOPE,
                     "token_type": "Bearer",
                 }
                 payload.update(changes)
@@ -523,7 +536,7 @@ class YouTubeOAuthTokenLifecycleTests(unittest.TestCase):
             access_token="old-access-token-secret",
             refresh_token="existing-refresh-token-secret",
             expires_at=30.0,
-            scope=YOUTUBE_UPLOAD_SCOPE,
+            scope=YOUTUBE_REQUIRED_SCOPE,
         )
         omitted_scope_transport = FakeTokenTransport(
             FakeTokenResponse(
@@ -545,7 +558,7 @@ class YouTubeOAuthTokenLifecycleTests(unittest.TestCase):
             )
         except OAuthTokenError as error:
             self.fail(f"provider omitted scope should preserve the exact prior scope: {error}")
-        self.assertEqual(refreshed.scope, YOUTUBE_UPLOAD_SCOPE)
+        self.assertEqual(refreshed.scope, YOUTUBE_REQUIRED_SCOPE)
 
         expanded_scope_transport = FakeTokenTransport(
             FakeTokenResponse(
@@ -553,7 +566,7 @@ class YouTubeOAuthTokenLifecycleTests(unittest.TestCase):
                 {
                     "access_token": "replacement-access-token-secret",
                     "expires_in": 120,
-                    "scope": f"{YOUTUBE_UPLOAD_SCOPE} profile",
+                    "scope": f"{YOUTUBE_REQUIRED_SCOPE} profile",
                     "token_type": "Bearer",
                 },
             )
@@ -577,7 +590,7 @@ class YouTubeOAuthTokenLifecycleTests(unittest.TestCase):
             access_token="old-access-token-secret",
             refresh_token="existing-refresh-token-secret",
             expires_at=30.0,
-            scope=f"{YOUTUBE_UPLOAD_SCOPE} profile",
+            scope=f"{YOUTUBE_REQUIRED_SCOPE} profile",
         )
         with self.assertRaisesRegex(
             OAuthTokenError,
@@ -607,7 +620,7 @@ class YouTubeOAuthTokenLifecycleTests(unittest.TestCase):
             access_token="access-token-secret",
             refresh_token="refresh-token-secret",
             expires_at=1.0,
-            scope=YOUTUBE_UPLOAD_SCOPE,
+            scope=YOUTUBE_REQUIRED_SCOPE,
         )
 
         with self.assertRaisesRegex(OAuthTokenError, "^authorization_invalid$") as raised:

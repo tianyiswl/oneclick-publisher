@@ -18,6 +18,7 @@ from .overseas_youtube_api import (
     YouTubeChannelLookupError,
 )
 from .overseas_youtube_credentials import (
+    KeyringOAuthClientSecretStore,
     KeyringOAuthCredentialStore,
     OAuthCredentialError,
 )
@@ -26,7 +27,7 @@ from .overseas_youtube_oauth import (
     OAuthLoopbackAuthorizationSession,
     OAuthTokens,
     OAuthTokenError,
-    YOUTUBE_UPLOAD_SCOPE,
+    YOUTUBE_OAUTH_SCOPE,
     YouTubeOAuthTokenClient,
     start_authorization_session,
 )
@@ -71,6 +72,7 @@ class YouTubeOAuthLoginSession:
         existing_account: Mapping[str, object] | None,
         account_saver: _AccountSaver,
         credential_store=None,
+        client_secret_store=None,
         browser_opener: Callable[[str], object] = webbrowser.open,
         authorization_session_factory: Callable[
             [str], OAuthLoopbackAuthorizationSession
@@ -88,6 +90,9 @@ class YouTubeOAuthLoginSession:
         self.queue: queue.Queue[str] = queue.Queue()
         self._account_saver = account_saver
         self._credential_store = credential_store or KeyringOAuthCredentialStore()
+        self._client_secret_store = (
+            client_secret_store or KeyringOAuthClientSecretStore()
+        )
         self._browser_opener = browser_opener
         self._authorization_session_factory = authorization_session_factory
         transport = requests.Session()
@@ -141,6 +146,16 @@ class YouTubeOAuthLoginSession:
             raise YouTubeOAuthLoginError("profile_name_required")
         if self._cancel_requested.is_set():
             raise YouTubeOAuthLoginError("authorization_cancelled")
+        try:
+            client_secret = self._client_secret_store.load_client_secret(
+                self.client_id
+            )
+        except OAuthCredentialError:
+            raise YouTubeOAuthLoginError("credential_unavailable") from None
+        if not client_secret:
+            raise YouTubeOAuthLoginError(
+                "youtube_oauth_client_secret_not_configured"
+            )
 
         try:
             authorization = self._authorization_session_factory(self.client_id)
@@ -159,6 +174,7 @@ class YouTubeOAuthLoginSession:
                 raise YouTubeOAuthLoginError("authorization_cancelled")
             tokens = self._token_client.exchange_authorization_code(
                 client_id=self.client_id,
+                client_secret=client_secret,
                 request=authorization.request,
                 callback=callback,
             )
@@ -263,6 +279,7 @@ def validate_saved_youtube_oauth_account(
     *,
     client_id: str,
     credential_store=None,
+    client_secret_store=None,
     token_client=None,
     channel_client=None,
 ) -> YouTubeChannelIdentity:
@@ -282,6 +299,7 @@ def validate_saved_youtube_oauth_account(
         raise YouTubeOAuthLoginError("credential_unavailable")
 
     store = credential_store or KeyringOAuthCredentialStore()
+    secret_store = client_secret_store or KeyringOAuthClientSecretStore()
     transport = requests.Session()
     token_service = token_client or YouTubeOAuthTokenClient(
         transport,
@@ -292,13 +310,19 @@ def validate_saved_youtube_oauth_account(
         refresh_token = store.load_refresh_token(reference)
         if not refresh_token:
             raise YouTubeOAuthLoginError("credential_unavailable")
+        client_secret = secret_store.load_client_secret(normalized_client_id)
+        if not client_secret:
+            raise YouTubeOAuthLoginError(
+                "youtube_oauth_client_secret_not_configured"
+            )
         refreshed = token_service.refresh_access_token(
             client_id=normalized_client_id,
+            client_secret=client_secret,
             existing_tokens=OAuthTokens(
                 access_token="refresh_pending",
                 refresh_token=refresh_token,
                 expires_at=0.0,
-                scope=YOUTUBE_UPLOAD_SCOPE,
+                scope=YOUTUBE_OAUTH_SCOPE,
             ),
         )
         identity = channel_service.lookup_authenticated_channel(

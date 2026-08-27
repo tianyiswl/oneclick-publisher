@@ -8,6 +8,7 @@ import unittest
 
 from app_core.overseas_youtube_api import YouTubeChannelIdentity
 from app_core.overseas_youtube_credentials import (
+    KeyringOAuthClientSecretStore,
     KeyringOAuthCredentialStore,
     OAuthCredentialError,
 )
@@ -20,7 +21,7 @@ from app_core.overseas_youtube_oauth import (
     OAuthAuthorizationCallback,
     OAuthAuthorizationRequest,
     OAuthTokens,
-    YOUTUBE_UPLOAD_SCOPE,
+    YOUTUBE_OAUTH_SCOPE,
 )
 
 
@@ -50,6 +51,21 @@ class FakeKeyring:
 
 
 class YouTubeCredentialStoreTests(unittest.TestCase):
+    def test_keyring_client_secret_store_round_trips_without_plaintext_fallback(self) -> None:
+        backend = FakeKeyring()
+        store = KeyringOAuthClientSecretStore(
+            backend=backend,
+            service_name="com.hellomobai.yijianfa.youtube.client.test",
+        )
+        client_id = "desktop-client.apps.googleusercontent.com"
+        client_secret = "desktop-client-secret-must-stay-private"
+
+        store.save_client_secret(client_id, client_secret)
+        self.assertEqual(store.load_client_secret(client_id), client_secret)
+
+        self.assertNotIn(client_secret, repr(store))
+        self.assertFalse(any(client_secret in repr(call) for call in backend.calls))
+
     def test_keyring_store_round_trips_and_deletes_without_plaintext_fallback(self) -> None:
         backend = FakeKeyring()
         store = KeyringOAuthCredentialStore(
@@ -132,7 +148,7 @@ class FakeTokenClient:
             access_token="access-token-secret",
             refresh_token="refresh-token-secret",
             expires_at=3600.0,
-            scope=YOUTUBE_UPLOAD_SCOPE,
+            scope=YOUTUBE_OAUTH_SCOPE,
         )
 
     def refresh_access_token(self, **kwargs) -> OAuthTokens:
@@ -141,7 +157,7 @@ class FakeTokenClient:
             access_token="refreshed-access-secret",
             refresh_token=kwargs["existing_tokens"].refresh_token,
             expires_at=7200.0,
-            scope=YOUTUBE_UPLOAD_SCOPE,
+            scope=YOUTUBE_OAUTH_SCOPE,
         )
 
 
@@ -171,6 +187,16 @@ class InMemoryCredentialStore:
         self.values.pop(credential_reference, None)
 
 
+class InMemoryClientSecretStore:
+    def __init__(self, secret: str | None = "desktop-client-secret") -> None:
+        self.secret = secret
+        self.loaded_client_ids: list[str] = []
+
+    def load_client_secret(self, client_id: str) -> str | None:
+        self.loaded_client_ids.append(client_id)
+        return self.secret
+
+
 class YouTubeOAuthLoginSessionTests(unittest.TestCase):
     def _session(self, **overrides) -> tuple[YouTubeOAuthLoginSession, dict]:
         authorization_session = FakeAuthorizationSession()
@@ -179,6 +205,7 @@ class YouTubeOAuthLoginSessionTests(unittest.TestCase):
             YouTubeChannelIdentity(channel_id="UC-current", display_name="当前频道")
         )
         credential_store = InMemoryCredentialStore()
+        client_secret_store = InMemoryClientSecretStore()
         saved: list[dict] = []
         opened: list[str] = []
 
@@ -194,6 +221,7 @@ class YouTubeOAuthLoginSessionTests(unittest.TestCase):
             "existing_account": None,
             "account_saver": account_saver,
             "credential_store": credential_store,
+            "client_secret_store": client_secret_store,
             "browser_opener": lambda url: opened.append(url) or True,
             "authorization_session_factory": lambda _client_id: authorization_session,
             "token_client": token_client,
@@ -208,6 +236,7 @@ class YouTubeOAuthLoginSessionTests(unittest.TestCase):
             "token_client": token_client,
             "channel_client": channel_client,
             "credential_store": credential_store,
+            "client_secret_store": client_secret_store,
             "saved": saved,
             "opened": opened,
         }
@@ -229,6 +258,10 @@ class YouTubeOAuthLoginSessionTests(unittest.TestCase):
             ["https://accounts.google.com/o/oauth2/v2/auth?redacted=1"],
         )
         self.assertEqual(evidence["authorization_session"].receive_calls, [30.0])
+        self.assertEqual(
+            evidence["token_client"].exchange_calls[0]["client_secret"],
+            "desktop-client-secret",
+        )
         self.assertEqual(
             evidence["credential_store"].values,
             {"youtube-oauth:new-reference": "refresh-token-secret"},
@@ -310,6 +343,23 @@ class YouTubeOAuthLoginSessionTests(unittest.TestCase):
         self.assertEqual(factory_calls, [])
         self.assertEqual(evidence["opened"], [])
 
+    def test_missing_client_secret_stops_before_browser_or_callback_listener(self) -> None:
+        factory_calls: list[str] = []
+        session, evidence = self._session(
+            client_secret_store=InMemoryClientSecretStore(None),
+            authorization_session_factory=lambda client_id: factory_calls.append(client_id),
+        )
+
+        with self.assertRaises(YouTubeOAuthLoginError) as caught:
+            session.run()
+
+        self.assertEqual(
+            str(caught.exception),
+            "youtube_oauth_client_secret_not_configured",
+        )
+        self.assertEqual(factory_calls, [])
+        self.assertEqual(evidence["opened"], [])
+
     def test_restart_validation_refreshes_token_and_requires_the_same_channel(self) -> None:
         store = InMemoryCredentialStore()
         store.values["youtube-oauth:restart-ref"] = "saved-refresh-secret"
@@ -329,6 +379,7 @@ class YouTubeOAuthLoginSessionTests(unittest.TestCase):
             account,
             client_id="desktop-client.apps.googleusercontent.com",
             credential_store=store,
+            client_secret_store=InMemoryClientSecretStore(),
             token_client=token_client,
             channel_client=channel_client,
         )
@@ -336,6 +387,10 @@ class YouTubeOAuthLoginSessionTests(unittest.TestCase):
         self.assertEqual(identity.channel_id, "UC-restart")
         self.assertEqual(channel_client.access_tokens, ["refreshed-access-secret"])
         self.assertEqual(len(token_client.refresh_calls), 1)
+        self.assertEqual(
+            token_client.refresh_calls[0]["client_secret"],
+            "desktop-client-secret",
+        )
         existing = token_client.refresh_calls[0]["existing_tokens"]
         self.assertEqual(existing.refresh_token, "saved-refresh-secret")
         self.assertNotIn("saved-refresh-secret", repr(identity))
@@ -349,6 +404,7 @@ class YouTubeOAuthLoginSessionTests(unittest.TestCase):
                 account,
                 client_id="desktop-client.apps.googleusercontent.com",
                 credential_store=store,
+                client_secret_store=InMemoryClientSecretStore(),
                 token_client=token_client,
                 channel_client=channel_client,
             )

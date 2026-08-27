@@ -7,7 +7,13 @@ from typing import Protocol
 
 
 YOUTUBE_OAUTH_KEYRING_SERVICE = "com.hellomobai.yijianfa.youtube.oauth"
+YOUTUBE_OAUTH_CLIENT_KEYRING_SERVICE = (
+    "com.hellomobai.yijianfa.youtube.oauth.client"
+)
 _CREDENTIAL_REFERENCE = re.compile(r"^youtube-oauth:[A-Za-z0-9_-]{4,96}$")
+_CLIENT_ID = re.compile(
+    r"^[A-Za-z0-9._-]{8,192}\.apps\.googleusercontent\.com$"
+)
 
 
 class OAuthCredentialError(Exception):
@@ -37,6 +43,72 @@ def _valid_reference(value: object) -> str | None:
     if normalized != value or not _CREDENTIAL_REFERENCE.fullmatch(normalized):
         return None
     return normalized
+
+
+def _valid_client_id(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if normalized != value or not _CLIENT_ID.fullmatch(normalized):
+        return None
+    return normalized
+
+
+class KeyringOAuthClientSecretStore:
+    """Store the Google desktop client secret only in the system credential store."""
+
+    def __init__(
+        self,
+        *,
+        backend: _KeyringBackend | None = None,
+        service_name: str = YOUTUBE_OAUTH_CLIENT_KEYRING_SERVICE,
+    ) -> None:
+        if not isinstance(service_name, str) or not service_name.strip():
+            raise OAuthCredentialError("credential_unavailable")
+        self._backend = backend
+        self._service_name = service_name.strip()
+
+    def __repr__(self) -> str:
+        return "KeyringOAuthClientSecretStore(<system credential store>)"
+
+    def _keyring(self) -> _KeyringBackend:
+        if self._backend is None:
+            self._backend = _default_keyring_backend()
+        return self._backend
+
+    def load_client_secret(self, client_id: str) -> str | None:
+        normalized_client_id = _valid_client_id(client_id)
+        if normalized_client_id is None:
+            raise OAuthCredentialError("credential_unavailable")
+        try:
+            secret = self._keyring().get_password(
+                self._service_name,
+                normalized_client_id,
+            )
+        except Exception:
+            raise OAuthCredentialError("credential_unavailable") from None
+        if secret is None:
+            return None
+        if not isinstance(secret, str) or not secret:
+            raise OAuthCredentialError("credential_unavailable")
+        return secret
+
+    def save_client_secret(self, client_id: str, client_secret: str) -> None:
+        normalized_client_id = _valid_client_id(client_id)
+        if (
+            normalized_client_id is None
+            or not isinstance(client_secret, str)
+            or not client_secret
+        ):
+            raise OAuthCredentialError("credential_unavailable")
+        try:
+            self._keyring().set_password(
+                self._service_name,
+                normalized_client_id,
+                client_secret,
+            )
+        except Exception:
+            raise OAuthCredentialError("credential_unavailable") from None
 
 
 class KeyringOAuthCredentialStore:
