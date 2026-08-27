@@ -905,6 +905,22 @@ class YouTubePrivateResumableUploadTests(unittest.TestCase):
         with self.assertRaises(FrozenInstanceError):
             verified.state = "public"  # type: ignore[misc]
 
+    def test_successful_private_upload_accepts_google_200_completion_response(self) -> None:
+        transport = FakeYouTubeUploadTransport(
+            post_responses=[self._session_response()],
+            put_responses=[FakeUploadResponse(200, {"id": "video_exact"})],
+            get_responses=[FakeUploadResponse(200, {"items": [self._matching_item()]})],
+        )
+        adapter = self._adapter(transport)
+
+        uploaded = adapter.upload_or_resume(self._begin(adapter))
+
+        self.assertEqual(uploaded, self._receipt())
+        self.assertEqual(
+            adapter.verify_exact_readback(uploaded),
+            self._receipt(state="processed_private"),
+        )
+
     def test_308_continues_the_same_session_without_a_second_insert(self) -> None:
         self.video.write_bytes(b"abcdefgh")
         self.validated = local_preflight(

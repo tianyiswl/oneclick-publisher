@@ -547,7 +547,7 @@ class YouTubePrivateUploadAdapter:
             state.next_byte = next_byte
             self._phase = "session_ready"
             return YouTubeUploadReceipt(state="upload_started", video_id=None)
-        if status_code == 201:
+        if status_code in {200, 201}:
             payload = _upload_payload(response)
             payload_ok, video_id = _mapping_value(payload, "id")
             normalized_video_id = _normalized_nonempty_string(video_id)
