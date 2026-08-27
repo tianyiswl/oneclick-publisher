@@ -237,6 +237,19 @@ def build_controlled_payloads(
                     "youtube_oauth_required",
                     "YouTube 发布必须使用官方 OAuth 账号",
                 )
+            if int(account.get("status") or 0) != 1:
+                raise ControlledPublishError(
+                    "youtube_account_invalid",
+                    "YouTube OAuth 账号当前不是正常状态",
+                )
+            expected_channel_id = str(
+                account.get("accountReference") or ""
+            ).strip()
+            if not expected_channel_id:
+                raise ControlledPublishError(
+                    "youtube_account_invalid",
+                    "YouTube OAuth 账号缺少已确认频道身份",
+                )
             if (
                 mode in {"formal", "direct"}
                 and int(account.get("oauthScopeVersion") or 1) < 2
@@ -330,6 +343,7 @@ def build_controlled_payloads(
             payload.update(
                 {
                     "youtubeOfficialApi": True,
+                    "youtubeExpectedChannelId": expected_channel_id,
                     "backgroundMode": True,
                 }
             )
@@ -375,6 +389,10 @@ def scope_fingerprint(payloads: Iterable[Mapping[str, Any]]) -> str:
                 "visibility": str(payload.get("visibility") or ""),
                 "madeForKids": payload.get("madeForKids"),
                 "notifySubscribers": payload.get("notifySubscribers"),
+                "youtubeExpectedChannelId": str(
+                    payload.get("youtubeExpectedChannelId") or ""
+                ),
+                "youtubeOfficialApi": bool(payload.get("youtubeOfficialApi")),
             }
         )
     encoded = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))

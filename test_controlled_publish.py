@@ -267,6 +267,8 @@ class ControlledPublishTests(unittest.TestCase):
                         "profileName": "YouTube 测试",
                         "authMode": "youtube_oauth",
                         "oauthScopeVersion": 2,
+                        "accountReference": "UC-test",
+                        "status": 1,
                     }
                 ],
             )[0]
@@ -307,6 +309,8 @@ class ControlledPublishTests(unittest.TestCase):
                             "filePath": "youtube-oauth:test",
                             "authMode": "youtube_oauth",
                             "oauthScopeVersion": 2,
+                            "accountReference": "UC-test",
+                            "status": 1,
                         }
                     ],
                 )
@@ -342,6 +346,8 @@ class ControlledPublishTests(unittest.TestCase):
                             "filePath": "youtube-oauth:test",
                             "authMode": "youtube_oauth",
                             "oauthScopeVersion": 1,
+                            "accountReference": "UC-test",
+                            "status": 1,
                         }
                     ],
                 )
