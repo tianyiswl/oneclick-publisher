@@ -12,12 +12,18 @@ from app_core.controlled_publish import (
     ControlledPublishError,
     build_controlled_payloads,
     consume_authorization,
+    consume_direct_authorization,
     create_authorization,
     create_authorization_schema,
+    create_direct_authorization,
+    create_direct_authorization_schema,
+    _find_blocking_formal_scope_task,
+    authorize_direct_request,
     _find_successful_silicon_formal_task,
     _find_successful_formal_scope_task,
     project_task,
     scope_fingerprint,
+    submit_request,
 )
 from app_core import database, task_service
 from app_core.douyin_graphic_matrix_service import prepare_matrix
@@ -136,6 +142,46 @@ class ControlledPublishTests(unittest.TestCase):
                 )
         self.assertEqual(raised.exception.error_code, "controlled_authorization_required")
 
+    def test_direct_publish_is_hidden_and_does_not_require_preflight_task(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest = self._bundle(Path(temporary))
+            payloads = build_controlled_payloads(
+                {
+                    "manifestPath": str(manifest),
+                    "mode": "direct",
+                    "directAuthorizationId": "direct-grant",
+                    "targets": [
+                        {"platform": "抖音", "accountId": 31, "schedule": None}
+                    ],
+                },
+                accounts=self._accounts(),
+            )
+
+        self.assertEqual(len(payloads), 1)
+        self.assertEqual(payloads[0]["runtimeMode"], "publish")
+        self.assertFalse(payloads[0]["debugDryRun"])
+        self.assertTrue(payloads[0]["backgroundMode"])
+
+    def test_direct_publish_requires_one_time_authorization_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest = self._bundle(Path(temporary))
+            with self.assertRaises(ControlledPublishError) as raised:
+                build_controlled_payloads(
+                    {
+                        "manifestPath": str(manifest),
+                        "mode": "direct",
+                        "targets": [
+                            {"platform": "抖音", "accountId": 31, "schedule": None}
+                        ],
+                    },
+                    accounts=self._accounts(),
+                )
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "controlled_direct_authorization_required",
+        )
+
     def test_douyin_body_raw_mention_is_not_treated_as_platform_mention(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             manifest = self._bundle(Path(temporary))
@@ -192,6 +238,123 @@ class ControlledPublishTests(unittest.TestCase):
             scope_fingerprint(payloads), scope_fingerprint(declaration_changed)
         )
 
+    def test_direct_authorization_is_bound_short_lived_and_single_use(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        create_direct_authorization_schema(conn)
+        payloads = [
+            {
+                "type": 10,
+                "accountIds": [6],
+                "title": "标题",
+                "description": "正文",
+                "scheduleTime": "2026-08-28 09:00",
+                "scheduleTimezone": "Asia/Shanghai",
+            }
+        ]
+        now = datetime(2026, 8, 27, 1, 0, tzinfo=timezone.utc)
+        grant = create_direct_authorization(
+            conn,
+            payloads,
+            source="content-project-gateway",
+            now=now,
+            ttl_seconds=60,
+        )
+
+        consume_direct_authorization(
+            conn,
+            grant["authorizationId"],
+            payloads,
+            now=now + timedelta(seconds=1),
+        )
+        with self.assertRaises(ControlledPublishError) as replayed:
+            consume_direct_authorization(
+                conn,
+                grant["authorizationId"],
+                payloads,
+                now=now + timedelta(seconds=2),
+            )
+        self.assertEqual(
+            replayed.exception.error_code,
+            "controlled_direct_authorization_consumed",
+        )
+
+        changed = [{**payloads[0], "accountIds": [7]}]
+        second = create_direct_authorization(
+            conn,
+            payloads,
+            source="content-project-gateway",
+            now=now,
+            ttl_seconds=60,
+        )
+        with self.assertRaises(ControlledPublishError) as mismatch:
+            consume_direct_authorization(
+                conn,
+                second["authorizationId"],
+                changed,
+                now=now + timedelta(seconds=1),
+            )
+        self.assertEqual(
+            mismatch.exception.error_code,
+            "controlled_direct_authorization_scope_mismatch",
+        )
+
+    def test_direct_request_authorizes_and_consumes_before_starting_task(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = self._bundle(root)
+            db_patch = patch.object(database, "DB_PATH", root / "database.db")
+            request = {
+                "manifestPath": str(manifest),
+                "mode": "direct",
+                "targets": [
+                    {"platform": "抖音", "accountId": 31, "schedule": None}
+                ],
+            }
+            captured: list[list[dict]] = []
+
+            def start(payloads):
+                rows = [dict(item) for item in payloads]
+                captured.append(rows)
+                return {
+                    "id": 91,
+                    "taskNo": "T91",
+                    "mode": "oneclick_publish",
+                    "status": "pending",
+                    "payloadJson": json.dumps(rows, ensure_ascii=False),
+                    "items": [],
+                    "events": [],
+                }
+
+            with db_patch, patch(
+                "app_core.account_service.list_accounts",
+                return_value=self._accounts(),
+            ), patch(
+                "app_core.task_service.list_tasks", return_value=[]
+            ), patch(
+                "app_core.task_service.get_task", return_value=None
+            ), patch(
+                "app_core.publish_service.start_desktop_publish",
+                side_effect=start,
+            ):
+                database.ensure_schema()
+                grant = authorize_direct_request(request)
+                authorized = {
+                    **request,
+                    "directAuthorizationId": grant["authorizationId"],
+                }
+                result = submit_request(authorized)
+                with self.assertRaises(ControlledPublishError) as replayed:
+                    submit_request(authorized)
+
+        self.assertEqual(result["taskId"], 91)
+        self.assertEqual(result["stage"], "preparing")
+        self.assertTrue(captured[0][0]["backgroundMode"])
+        self.assertEqual(
+            replayed.exception.error_code,
+            "controlled_direct_authorization_consumed",
+        )
+
     def test_task_projection_keeps_preflight_distinct_from_publish_receipt(self) -> None:
         projected = project_task(
             {
@@ -230,6 +393,62 @@ class ControlledPublishTests(unittest.TestCase):
         self.assertEqual(projected["platforms"][0]["accountId"], 31)
         self.assertEqual(projected["platforms"][1]["errorCode"], "xhs_cover_trigger_missing")
         self.assertEqual(projected["platforms"][1]["scheduledAt"], "2026-08-24 20:30")
+
+    def test_task_projection_exposes_safe_verification_wait_state(self) -> None:
+        projected = project_task(
+            {
+                "id": 54,
+                "taskNo": "T54",
+                "mode": "oneclick_publish",
+                "status": "running",
+                "payloadJson": json.dumps(
+                    [{"type": 10, "accountIds": [2]}],
+                    ensure_ascii=False,
+                ),
+                "items": [
+                    {
+                        "platformType": 10,
+                        "status": "running",
+                        "message": "正在等待微信验证",
+                    }
+                ],
+                "events": [
+                    {
+                        "eventType": "wechat_final_submit_clicked",
+                        "message": "已提交公众号立即发表",
+                    },
+                    {
+                        "eventType": "wechat_verification_required",
+                        "message": "公众号发表需要微信验证，请在一键发客户端扫码",
+                    },
+                ],
+            }
+        )
+
+        self.assertEqual(projected["stage"], "waiting_verification")
+        self.assertEqual(projected["userAction"]["type"], "wechat_qr")
+        self.assertNotIn("qrImage", projected["userAction"])
+        self.assertNotIn("verificationCode", projected["userAction"])
+
+    def test_task_projection_moves_to_reconciliation_after_verification(self) -> None:
+        projected = project_task(
+            {
+                "id": 55,
+                "taskNo": "T55",
+                "mode": "oneclick_publish",
+                "status": "running",
+                "payloadJson": "[]",
+                "items": [],
+                "events": [
+                    {"eventType": "wechat_final_submit_clicked", "message": ""},
+                    {"eventType": "wechat_verification_required", "message": ""},
+                    {"eventType": "wechat_verification_succeeded", "message": ""},
+                ],
+            }
+        )
+
+        self.assertEqual(projected["stage"], "reconciling")
+        self.assertIsNone(projected["userAction"])
 
     def test_projection_maps_legacy_douyin_topic_failure_to_stable_code(self) -> None:
         projected = project_task(
@@ -345,6 +564,39 @@ class ControlledPublishTests(unittest.TestCase):
                 payloads,
             )
         )
+
+    def test_post_submit_ambiguous_scope_blocks_automatic_republish(self) -> None:
+        payloads = [
+            {
+                "type": 10,
+                "accountIds": [2],
+                "contentType": "article",
+                "title": "可能已发表的文章",
+                "description": "正文",
+                "tags": [],
+                "fileList": [],
+                "coverPath": "",
+                "scheduleTime": "",
+                "scheduleTimezone": "Asia/Shanghai",
+            }
+        ]
+        match = _find_blocking_formal_scope_task(
+            [
+                {
+                    "id": 53,
+                    "mode": "oneclick_publish",
+                    "status": "running",
+                    "payloadJson": json.dumps(payloads, ensure_ascii=False),
+                    "events": [
+                        {"eventType": "wechat_final_submit_clicked"},
+                        {"eventType": "wechat_publish_user_action_required"},
+                    ],
+                }
+            ],
+            payloads,
+        )
+
+        self.assertEqual(match["id"], 53)
 
 
 class DouyinGraphicMatrixAuthorizationTests(unittest.TestCase):

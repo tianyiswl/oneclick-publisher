@@ -48,6 +48,18 @@ class SiliconEvolutionAutoPublishTests(unittest.TestCase):
         self.assertEqual(payload["contentHtml"], "<p>正文</p>")
         self.assertEqual(payload["digest"], "测试摘要")
 
+    def test_direct_payload_is_formal_but_hidden(self) -> None:
+        payload = build_silicon_evolution_payload(
+            self.package,
+            self.profile,
+            account_id=11,
+            mode="direct",
+        )
+        self.assertEqual(payload["runtimeMode"], "publish")
+        self.assertFalse(payload["debugDryRun"])
+        self.assertTrue(payload["backgroundMode"])
+        self.assertTrue(payload["aiDeclarationExplicitlyConfirmed"])
+
     def test_rejects_account_mismatch_or_disabled_profile(self) -> None:
         with self.assertRaisesRegex(SiliconEvolutionAutoPublishError, "账号"):
             build_silicon_evolution_payload(

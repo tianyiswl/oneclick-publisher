@@ -33,15 +33,16 @@ def build_silicon_evolution_payload(
     profile: AutoPublishProfile,
     *,
     account_id: int,
-    mode: Literal["preflight", "publish"],
+    mode: Literal["preflight", "publish", "direct"],
 ) -> dict[str, Any]:
     """由已冻结包生成执行器载荷；发布策略固定为不群发、不定时。"""
     if not profile.enabled:
         raise SiliconEvolutionAutoPublishError("自动直发档案未启用")
     if account_id != profile.account_id:
         raise SiliconEvolutionAutoPublishError("自动直发账号与档案不一致")
-    if mode not in {"preflight", "publish"}:
+    if mode not in {"preflight", "publish", "direct"}:
         raise SiliconEvolutionAutoPublishError("自动直发模式无效")
+    formal = mode in {"publish", "direct"}
     return {
         "type": 10,
         "contentType": "article",
@@ -54,7 +55,7 @@ def build_silicon_evolution_payload(
         "accountIds": [profile.account_id],
         "accountDisplayNames": [profile.account_display_name],
         "coverPath": str(package.cover_path),
-        "runtimeMode": mode,
+        "runtimeMode": "publish" if formal else "preflight",
         "debugDryRun": mode == "preflight",
         "saveDraftOnly": False,
         "wechatGroupNotification": False,
@@ -62,9 +63,9 @@ def build_silicon_evolution_payload(
         "scheduleTime": None,
         "scheduleTimezone": "Asia/Shanghai",
         "originalDeclaration": False,
-        "backgroundMode": mode == "preflight",
+        "backgroundMode": mode in {"preflight", "direct"},
         "aiGenerated": True,
-        "aiDeclarationExplicitlyConfirmed": mode == "publish",
+        "aiDeclarationExplicitlyConfirmed": formal,
         "aiDisclosure": dict(package.ai_disclosure),
         "siliconEvolutionArticleId": package.article_id,
         "siliconEvolutionPackageSha256": package.package_sha256,

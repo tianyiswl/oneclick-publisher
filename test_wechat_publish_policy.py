@@ -348,13 +348,42 @@ class WechatPublishPolicyTests(unittest.TestCase):
         self.assertTrue(decision["allowed"])
         self.assertEqual(decision["expectedAction"], "继续发表")
 
-    def test_group_notification_scope_requires_enabled_group_notification(self):
+    def test_group_notification_scope_routes_exact_disabled_notice(self):
+        state = {
+            "dialogs": [
+                {
+                    "title": "发表",
+                    "body": (
+                        "未开启群发通知 内容将展示在公众号主页，"
+                        "若允许平台推荐，内容有可能被推荐至看一看或其他推荐场景。"
+                    ),
+                    "text": (
+                        "发表 未开启群发通知 内容将展示在公众号主页，"
+                        "若允许平台推荐，内容有可能被推荐至看一看或其他推荐场景。"
+                    ),
+                    "buttons": ["查看详情", "继续发表", "取消"],
+                }
+            ],
+            "qrElements": [],
+            "qrText": [],
+            "qrCount": 0,
+            "decisionMarkers": [],
+        }
         decision = decide_group_notification_scope_confirmation(
             {"wechatGroupNotification": False},
-            _group_scope_state(),
+            state,
         )
-        self.assertFalse(decision["allowed"])
-        self.assertIn("未开启", decision["reason"])
+        self.assertTrue(decision["allowed"])
+        self.assertEqual(decision["expectedAction"], "继续发表")
+
+        state["dialogs"][0]["body"] += "还需管理员验证。"
+        state["dialogs"][0]["text"] += "还需管理员验证。"
+        self.assertFalse(
+            decide_group_notification_scope_confirmation(
+                {"wechatGroupNotification": False},
+                state,
+            )["allowed"]
+        )
 
     def test_group_notification_scope_blocks_changed_copy_or_buttons(self):
         state = _group_scope_state()

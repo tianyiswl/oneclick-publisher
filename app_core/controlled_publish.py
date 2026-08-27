@@ -36,6 +36,7 @@ _REQUEST_KEYS = {
     "targets",
     "confirmedPreflightTaskId",
     "authorizationId",
+    "directAuthorizationId",
 }
 _TARGET_KEYS = {"platform", "accountId", "schedule"}
 _PROJECT_ID_RE = re.compile(r"[a-z0-9][a-z0-9._-]{1,63}")
@@ -96,9 +97,10 @@ def build_controlled_payloads(
             "controlled_request_invalid", "受控发布请求包含不支持字段"
         )
     mode = str(request.get("mode") or "preflight").strip().lower()
-    if mode not in {"preflight", "formal"}:
+    if mode not in {"preflight", "formal", "direct"}:
         raise ControlledPublishError(
-            "controlled_mode_invalid", "执行模式只能是 preflight 或 formal"
+            "controlled_mode_invalid",
+            "执行模式只能是 preflight、formal 或 direct",
         )
     if mode == "formal":
         if type(request.get("confirmedPreflightTaskId")) is not int or not str(
@@ -108,6 +110,13 @@ def build_controlled_payloads(
                 "controlled_authorization_required",
                 "正式发布必须携带已完成预检和一次性本地授权",
             )
+    if mode == "direct" and not str(
+        request.get("directAuthorizationId") or ""
+    ).strip():
+        raise ControlledPublishError(
+            "controlled_direct_authorization_required",
+            "后台直发必须携带绑定当次内容的一次性授权",
+        )
 
     project_id = str(request.get("projectId") or "").strip().lower()
     if project_id and not _PROJECT_ID_RE.fullmatch(project_id):
@@ -193,15 +202,16 @@ def build_controlled_payloads(
             "accountDisplayNames": [display_name],
             "coverPath": cover_path,
             "coverPaths": covers,
-            "runtimeMode": "publish" if mode == "formal" else "preflight",
+            "runtimeMode": "publish" if mode in {"formal", "direct"} else "preflight",
             "debugDryRun": mode == "preflight",
             "saveDraftOnly": False,
             "debugDryRunHoldBrowser": False,
-            "backgroundMode": mode == "preflight",
+            "backgroundMode": mode in {"preflight", "direct"},
             "originalDeclaration": bool(bundle.get("originalDeclaration")),
             "aiGenerated": bool(disclosure.get("containsAiGeneratedContent")),
             "aiDeclarationExplicitlyConfirmed": bool(
-                mode == "formal" and disclosure.get("containsAiGeneratedContent")
+                mode in {"formal", "direct"}
+                and disclosure.get("containsAiGeneratedContent")
             ),
             "visibility": "public",
             "collectionName": "",
@@ -377,6 +387,173 @@ def consume_authorization(
     conn.commit()
 
 
+def create_direct_authorization_schema(conn: sqlite3.Connection) -> None:
+    """创建对话直发的一次性授权表。
+
+    表内只保存不可逆的发布范围指纹和时间，不保存正文、
+    Cookie、验证码或其他会话数据。
+    """
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS controlled_direct_publish_authorizations (
+            authorizationId TEXT PRIMARY KEY,
+            scopeFingerprint TEXT NOT NULL,
+            source TEXT NOT NULL,
+            createdAt TEXT NOT NULL,
+            expiresAt TEXT NOT NULL,
+            consumedAt TEXT
+        )
+        """
+    )
+    conn.commit()
+
+
+def create_direct_authorization(
+    conn: sqlite3.Connection,
+    payloads: Iterable[Mapping[str, Any]],
+    *,
+    source: str,
+    now: datetime | None = None,
+    ttl_seconds: int = 60,
+) -> dict[str, Any]:
+    """为当次对话中已明确确认的发布对象创建短期授权。"""
+
+    normalized_source = str(source or "").strip()
+    if normalized_source not in {"content-project-gateway", "desktop-client"}:
+        raise ControlledPublishError(
+            "controlled_direct_authorization_source_invalid",
+            "后台直发授权来源无效",
+        )
+    if not 1 <= int(ttl_seconds) <= 300:
+        raise ControlledPublishError(
+            "controlled_direct_authorization_ttl_invalid",
+            "后台直发授权有效期不正确",
+        )
+    rows = [dict(item) for item in payloads]
+    if not rows:
+        raise ControlledPublishError(
+            "controlled_direct_authorization_scope_invalid",
+            "后台直发授权没有可绑定的内容",
+        )
+    create_direct_authorization_schema(conn)
+    created = _utc(now)
+    expires = created + timedelta(seconds=int(ttl_seconds))
+    authorization_id = uuid.uuid4().hex
+    conn.execute(
+        """
+        INSERT INTO controlled_direct_publish_authorizations
+            (authorizationId, scopeFingerprint, source, createdAt, expiresAt, consumedAt)
+        VALUES (?, ?, ?, ?, ?, NULL)
+        """,
+        (
+            authorization_id,
+            scope_fingerprint(rows),
+            normalized_source,
+            created.isoformat(),
+            expires.isoformat(),
+        ),
+    )
+    conn.commit()
+    return {
+        "authorizationId": authorization_id,
+        "expiresAt": expires.isoformat(),
+        "singleUse": True,
+        "source": normalized_source,
+    }
+
+
+def consume_direct_authorization(
+    conn: sqlite3.Connection,
+    authorization_id: str,
+    payloads: Iterable[Mapping[str, Any]],
+    *,
+    now: datetime | None = None,
+) -> None:
+    """原子消费与内容、账号和排期精确绑定的直发授权。"""
+
+    create_direct_authorization_schema(conn)
+    current = _utc(now)
+    normalized_id = str(authorization_id or "").strip()
+    row = conn.execute(
+        """
+        SELECT * FROM controlled_direct_publish_authorizations
+        WHERE authorizationId = ?
+        """,
+        (normalized_id,),
+    ).fetchone()
+    if row is None:
+        raise ControlledPublishError(
+            "controlled_direct_authorization_invalid",
+            "后台直发一次性授权不存在",
+        )
+    data = dict(row)
+    if data.get("consumedAt"):
+        raise ControlledPublishError(
+            "controlled_direct_authorization_consumed",
+            "后台直发一次性授权已经使用",
+        )
+    expires = datetime.fromisoformat(str(data["expiresAt"])).astimezone(
+        timezone.utc
+    )
+    if current >= expires:
+        raise ControlledPublishError(
+            "controlled_direct_authorization_expired",
+            "后台直发一次性授权已经过期",
+        )
+    if str(data.get("scopeFingerprint") or "") != scope_fingerprint(payloads):
+        raise ControlledPublishError(
+            "controlled_direct_authorization_scope_mismatch",
+            "后台直发的内容、账号或排期已经变化",
+        )
+    cursor = conn.execute(
+        """
+        UPDATE controlled_direct_publish_authorizations
+        SET consumedAt = ?
+        WHERE authorizationId = ? AND consumedAt IS NULL
+        """,
+        (current.isoformat(), normalized_id),
+    )
+    if cursor.rowcount != 1:
+        conn.rollback()
+        raise ControlledPublishError(
+            "controlled_direct_authorization_consumed",
+            "后台直发一次性授权已经使用",
+        )
+    conn.commit()
+
+
+def authorize_direct_request(
+    request: Mapping[str, Any],
+    *,
+    source: str = "content-project-gateway",
+    ttl_seconds: int = 60,
+) -> dict[str, Any]:
+    """为已获得当次对话明确授权的请求签发一次性凭证。"""
+
+    from .database import connect
+
+    data = dict(
+        _require_mapping(
+            request,
+            "controlled_request_invalid",
+            "受控发布请求必须是 JSON 对象",
+        )
+    )
+    data["mode"] = "direct"
+    # 只用于生成被授权的精确载荷；真实 ID 在返回后才由
+    # 网关加入请求，外部调用者不能自行伪造一个可消费的记录。
+    data["directAuthorizationId"] = "pending-local-authorization"
+    payloads = build_controlled_payloads(data)
+    with connect() as conn:
+        return create_direct_authorization(
+            conn,
+            payloads,
+            source=source,
+            ttl_seconds=ttl_seconds,
+        )
+
+
 _ERROR_CODE_RE = re.compile(
     r"(?:错误码|error(?:Code)?)\s*[:：=]?\s*([a-z][a-z0-9_]{2,})",
     re.IGNORECASE,
@@ -417,6 +594,58 @@ def project_task(task: Mapping[str, Any] | None) -> dict[str, Any]:
         if "publish" in mode
         else "unknown"
     )
+    events = [
+        dict(event)
+        for event in task.get("events") or []
+        if isinstance(event, Mapping)
+    ]
+    event_types = [str(event.get("eventType") or "") for event in events]
+
+    def _latest_event_index(*types: str) -> int:
+        accepted = set(types)
+        return max(
+            (index for index, value in enumerate(event_types) if value in accepted),
+            default=-1,
+        )
+
+    task_status_value = str(task.get("status") or "pending")
+    user_action: dict[str, Any] | None = None
+    if task_status_value == "success":
+        stage = "succeeded"
+    elif task_status_value in {"failed", "partial_failed"}:
+        stage = "failed"
+    elif phase == "preflight":
+        stage = "checking"
+    elif phase == "local_check":
+        stage = "local_check"
+    else:
+        verification_required_index = _latest_event_index(
+            "wechat_verification_required",
+            "wechat_publish_qr_required",
+        )
+        verification_succeeded_index = _latest_event_index(
+            "wechat_verification_succeeded"
+        )
+        user_confirmation_index = _latest_event_index(
+            "wechat_publish_user_action_required"
+        )
+        final_submit_index = _latest_event_index("wechat_final_submit_clicked")
+        if verification_required_index > verification_succeeded_index:
+            stage = "waiting_verification"
+            user_action = {
+                "type": "wechat_qr",
+                "message": "公众号发表需要微信验证，请在一键发客户端完成扫码",
+            }
+        elif user_confirmation_index >= 0:
+            stage = "waiting_confirmation"
+            user_action = {
+                "type": "platform_confirmation",
+                "message": "平台出现未知确认弹窗，请在一键发客户端处理",
+            }
+        elif final_submit_index >= 0:
+            stage = "reconciling"
+        else:
+            stage = "preparing"
     try:
         raw_payloads = json.loads(str(task.get("payloadJson") or "[]"))
     except json.JSONDecodeError:
@@ -492,7 +721,9 @@ def project_task(task: Mapping[str, Any] | None) -> dict[str, Any]:
         "taskNo": str(task.get("taskNo") or ""),
         "mode": mode,
         "phase": phase,
-        "status": str(task.get("status") or "pending"),
+        "status": task_status_value,
+        "stage": stage,
+        "userAction": user_action,
         "occurredAt": str(
             task.get("finishedAt")
             or task.get("startedAt")
@@ -623,6 +854,42 @@ def _find_successful_formal_scope_task(
     return None
 
 
+def _find_blocking_formal_scope_task(
+    tasks: Iterable[Mapping[str, Any]],
+    payloads: Iterable[Mapping[str, Any]],
+) -> dict[str, Any] | None:
+    """查找同一发布范围已成功或已进入最终提交的任务。
+
+    最终按钮点击后即使 CLI 回读失败，平台也可能已经接受内容。
+    这种情况只能做只读核对，不得自动重发。
+    """
+
+    expected = scope_fingerprint(payloads)
+    for raw_task in tasks:
+        if str(raw_task.get("mode") or "") != "oneclick_publish":
+            continue
+        try:
+            stored = json.loads(str(raw_task.get("payloadJson") or "[]"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(stored, list) or not all(
+            isinstance(item, Mapping) for item in stored
+        ):
+            continue
+        if scope_fingerprint(stored) != expected:
+            continue
+        if str(raw_task.get("status") or "") == "success":
+            return dict(raw_task)
+        event_types = {
+            str(event.get("eventType") or "")
+            for event in raw_task.get("events") or []
+            if isinstance(event, Mapping)
+        }
+        if "wechat_final_submit_clicked" in event_types:
+            return dict(raw_task)
+    return None
+
+
 def submit_request(request: Mapping[str, Any]) -> dict[str, Any]:
     """创建预检或经一次性授权的正式任务。"""
 
@@ -631,19 +898,41 @@ def submit_request(request: Mapping[str, Any]) -> dict[str, Any]:
 
     payloads = build_controlled_payloads(request)
     mode = str(request.get("mode") or "preflight").strip().lower()
-    if mode == "formal":
-        existing = _find_successful_formal_scope_task(
-            task_service.list_tasks(limit=500),
-            payloads,
-        )
+    if mode in {"formal", "direct"}:
+        recent = task_service.list_tasks(limit=500)
+        detailed = [
+            task_service.get_task(int(row.get("id") or 0)) or dict(row)
+            for row in recent
+            if int(row.get("id") or 0) > 0
+        ]
+        existing = _find_blocking_formal_scope_task(detailed, payloads)
         if existing:
-            raise ControlledPublishError(
-                "controlled_already_published",
-                (
-                    "同一账号、内容与排期已有正式成功回执，"
-                    f"已阻止重复发布；taskId={int(existing.get('id') or 0)}"
-                ),
+            event_types = {
+                str(event.get("eventType") or "")
+                for event in existing.get("events") or []
+                if isinstance(event, Mapping)
+            }
+            ambiguous = (
+                str(existing.get("status") or "") != "success"
+                and "wechat_final_submit_clicked" in event_types
             )
+            existing_task_id = int(existing.get("id") or 0)
+            message = (
+                "同一账号、内容与排期已点击最终发布，"
+                "结果需要先做只读核对，已阻止自动重发；"
+                if ambiguous
+                else "同一账号、内容与排期已有正式成功回执，"
+                "已阻止重复发布；"
+            )
+            raise ControlledPublishError(
+                (
+                    "controlled_publish_outcome_ambiguous"
+                    if ambiguous
+                    else "controlled_already_published"
+                ),
+                f"{message}taskId={existing_task_id}",
+            )
+    if mode == "formal":
         preflight_id = int(request["confirmedPreflightTaskId"])
         preflight = task_service.get_task(preflight_id)
         if not preflight or str(preflight.get("mode") or "") != "oneclick_preflight":
@@ -657,6 +946,13 @@ def submit_request(request: Mapping[str, Any]) -> dict[str, Any]:
                 conn,
                 str(request["authorizationId"]),
                 preflight_id,
+                payloads,
+            )
+    elif mode == "direct":
+        with connect() as conn:
+            consume_direct_authorization(
+                conn,
+                str(request["directAuthorizationId"]),
                 payloads,
             )
     task = publish_service.start_desktop_publish(payloads)
@@ -708,33 +1004,17 @@ _SILICON_REQUEST_KEYS = {
     "accountId",
     "mode",
     "confirmedPreflightTaskId",
+    "directAuthorizationId",
 }
 
 
-def submit_silicon_evolution_request(request: Mapping[str, Any]) -> dict[str, Any]:
-    """从 V1.2 冻结包创建硅基进化公众号预检或自动正式任务。"""
+def _prepare_silicon_evolution_request(
+    data: Mapping[str, Any],
+    *,
+    mode: str,
+) -> tuple[Any, AutoPublishProfile, dict[str, Any], int]:
+    """校验冻结包和公众号主体，生成唯一执行器载荷。"""
 
-    from . import publish_service, task_service
-    from .database import connect
-
-    data = _require_mapping(
-        request,
-        "silicon_evolution_request_invalid",
-        "硅基进化自动直发请求必须是对象",
-    )
-    if set(data) - _SILICON_REQUEST_KEYS:
-        raise ControlledPublishError(
-            "silicon_evolution_request_invalid", "硅基进化自动直发包含不支持字段"
-        )
-    if str(data.get("projectId") or "") != "silicon-evolution":
-        raise ControlledPublishError(
-            "silicon_evolution_project_mismatch", "自动直发项目不是硅基进化"
-        )
-    mode = str(data.get("mode") or "")
-    if mode not in {"preflight", "formal"}:
-        raise ControlledPublishError(
-            "silicon_evolution_mode_invalid", "自动直发模式只能是 preflight 或 formal"
-        )
     account_id = data.get("accountId")
     if type(account_id) is not int or account_id <= 0:
         raise ControlledPublishError(
@@ -774,7 +1054,7 @@ def submit_silicon_evolution_request(request: Mapping[str, Any]) -> dict[str, An
             package,
             profile,
             account_id=account_id,
-            mode="publish" if mode == "formal" else "preflight",
+            mode="direct" if mode == "direct" else "publish" if mode == "formal" else "preflight",
         )
         payload["accountList"] = [str(account.get("filePath") or "")]
         payload["contentProjectId"] = "silicon-evolution"
@@ -782,9 +1062,88 @@ def submit_silicon_evolution_request(request: Mapping[str, Any]) -> dict[str, An
         raise ControlledPublishError(
             "silicon_evolution_package_invalid", str(exc)
         ) from exc
-    if mode == "formal":
+    return package, profile, payload, account_id
+
+
+def authorize_silicon_evolution_direct_request(
+    request: Mapping[str, Any],
+    *,
+    ttl_seconds: int = 60,
+) -> dict[str, Any]:
+    """为已确认的硅基进化冻结包直发请求签发一次性授权。"""
+
+    from .database import connect
+
+    data = dict(
+        _require_mapping(
+            request,
+            "silicon_evolution_request_invalid",
+            "硅基进化自动直发请求必须是对象",
+        )
+    )
+    data["mode"] = "direct"
+    if str(data.get("projectId") or "") != "silicon-evolution":
+        raise ControlledPublishError(
+            "silicon_evolution_project_mismatch", "自动直发项目不是硅基进化"
+        )
+    _, _, payload, _ = _prepare_silicon_evolution_request(data, mode="direct")
+    with connect() as conn:
+        return create_direct_authorization(
+            conn,
+            [payload],
+            source="content-project-gateway",
+            ttl_seconds=ttl_seconds,
+        )
+
+
+def submit_silicon_evolution_request(request: Mapping[str, Any]) -> dict[str, Any]:
+    """从 V1.2 冻结包创建硅基进化公众号预检或自动正式任务。"""
+
+    from . import publish_service, task_service
+    from .database import connect
+
+    data = _require_mapping(
+        request,
+        "silicon_evolution_request_invalid",
+        "硅基进化自动直发请求必须是对象",
+    )
+    if set(data) - _SILICON_REQUEST_KEYS:
+        raise ControlledPublishError(
+            "silicon_evolution_request_invalid", "硅基进化自动直发包含不支持字段"
+        )
+    if str(data.get("projectId") or "") != "silicon-evolution":
+        raise ControlledPublishError(
+            "silicon_evolution_project_mismatch", "自动直发项目不是硅基进化"
+        )
+    mode = str(data.get("mode") or "")
+    if mode not in {"preflight", "formal", "direct"}:
+        raise ControlledPublishError(
+            "silicon_evolution_mode_invalid",
+            "自动直发模式只能是 preflight、formal 或 direct",
+        )
+    package, profile, payload, account_id = _prepare_silicon_evolution_request(
+        data,
+        mode=mode,
+    )
+    if mode in {"formal", "direct"}:
+        recent_tasks = task_service.list_tasks(limit=500)
+        detailed_tasks = [
+            task_service.get_task(int(row.get("id") or 0)) or dict(row)
+            for row in recent_tasks
+            if int(row.get("id") or 0) > 0
+        ]
+        blocking = _find_blocking_formal_scope_task(detailed_tasks, [payload])
+        if blocking and str(blocking.get("status") or "") != "success":
+            raise ControlledPublishError(
+                "silicon_evolution_publish_outcome_ambiguous",
+                (
+                    "同一冻结文章已点击最终发表，结果需先做只读核对，"
+                    "已阻止自动重发；"
+                    f"taskId={int(blocking.get('id') or 0)}"
+                ),
+            )
         existing = _find_successful_silicon_formal_task(
-            task_service.list_tasks(limit=500),
+            recent_tasks,
             article_id=package.article_id,
             package_sha256=package.package_sha256,
             account_id=account_id,
@@ -797,6 +1156,7 @@ def submit_silicon_evolution_request(request: Mapping[str, Any]) -> dict[str, An
                     f"taskId={int(existing.get('id') or 0)}"
                 ),
             )
+    if mode == "formal":
         preflight_id = data.get("confirmedPreflightTaskId")
         if type(preflight_id) is not int or preflight_id <= 0:
             raise ControlledPublishError(
@@ -821,6 +1181,15 @@ def submit_silicon_evolution_request(request: Mapping[str, Any]) -> dict[str, An
                 preflight_id,
                 [payload],
             )
+    elif mode == "direct":
+        authorization_id = str(data.get("directAuthorizationId") or "").strip()
+        if not authorization_id:
+            raise ControlledPublishError(
+                "silicon_evolution_direct_authorization_required",
+                "自动直发缺少绑定冻结包的一次性授权",
+            )
+        with connect() as conn:
+            consume_direct_authorization(conn, authorization_id, [payload])
     task = publish_service.start_desktop_publish([payload])
     stored = task_service.get_task(int(task["id"])) or task
     return project_task(stored)

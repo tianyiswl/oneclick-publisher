@@ -73,6 +73,8 @@ class ContentProjectGatewayTests(unittest.TestCase):
         silicon_submitted: list[dict] | None = None,
         matrix_submitted: list[dict] | None = None,
         metrics_service: _MetricsService | None = None,
+        direct_authorizer=None,
+        silicon_direct_authorizer=None,
     ) -> ContentProjectGateway:
         return ContentProjectGateway(
             profile_store=PublishProfileStore(root / "publish-profiles.json"),
@@ -97,6 +99,16 @@ class ContentProjectGatewayTests(unittest.TestCase):
                 "expiresAt": "2026-08-25T12:10:00+00:00",
                 "singleUse": True,
             },
+            direct_authorizer=(
+                direct_authorizer
+                or (
+                    lambda request: {
+                        "authorizationId": "direct-one-time-grant",
+                        "expiresAt": "2026-08-27T12:01:00+00:00",
+                        "singleUse": True,
+                    }
+                )
+            ),
             runtime_conflict_checker=runtime_conflict_checker,
             silicon_submitter=(
                 (lambda request: silicon_submitted.append(dict(request)) or {
@@ -106,6 +118,16 @@ class ContentProjectGatewayTests(unittest.TestCase):
                 })
                 if silicon_submitted is not None
                 else None
+            ),
+            silicon_direct_authorizer=(
+                silicon_direct_authorizer
+                or (
+                    lambda request: {
+                        "authorizationId": "silicon-direct-one-time-grant",
+                        "expiresAt": "2026-08-27T12:01:00+00:00",
+                        "singleUse": True,
+                    }
+                )
             ),
             matrix_submitter=(
                 (lambda request: matrix_submitted.append(dict(request)) or {
@@ -223,6 +245,43 @@ class ContentProjectGatewayTests(unittest.TestCase):
         self.assertEqual(submitted[0]["mode"], "preflight")
         self.assertEqual(submitted[1]["mode"], "formal")
         self.assertEqual(submitted[1]["confirmedPreflightTaskId"], 51)
+
+    def test_silicon_evolution_direct_route_does_not_require_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            submitted: list[dict] = []
+            authorized: list[dict] = []
+            gateway = self._gateway(
+                Path(directory),
+                [],
+                silicon_submitted=submitted,
+                silicon_direct_authorizer=lambda request: authorized.append(
+                    dict(request)
+                )
+                or {
+                    "authorizationId": "silicon-direct-one-time-grant",
+                    "expiresAt": "2026-08-27T12:01:00+00:00",
+                    "singleUse": True,
+                },
+            )
+            gateway.save_profile(
+                "silicon-evolution",
+                "硅基进化",
+                [{"platform": "公众号", "accountId": 2}],
+            )
+            result = gateway.auto_publish_silicon_evolution_release(
+                "WX-20260827-001",
+                "/content/WX-20260827-001",
+                "b" * 64,
+            )
+
+        self.assertEqual(result["taskId"], 51)
+        self.assertEqual(authorized[0]["mode"], "direct")
+        self.assertNotIn("confirmedPreflightTaskId", authorized[0])
+        self.assertEqual(submitted[0]["mode"], "direct")
+        self.assertEqual(
+            submitted[0]["directAuthorizationId"],
+            "silicon-direct-one-time-grant",
+        )
 
     def test_project_profile_drives_preflight_with_explicit_accounts_and_schedules(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -404,6 +463,40 @@ class ContentProjectGatewayTests(unittest.TestCase):
         self.assertEqual(submitted[0]["mode"], "formal")
         self.assertEqual(submitted[0]["confirmedPreflightTaskId"], 41)
         self.assertEqual(submitted[0]["authorizationId"], "one-time-grant")
+
+    def test_direct_publish_creates_bound_authorization_without_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            submitted: list[dict] = []
+            authorized: list[dict] = []
+            gateway = self._gateway(
+                Path(directory),
+                submitted,
+                direct_authorizer=lambda request: authorized.append(dict(request))
+                or {
+                    "authorizationId": "direct-one-time-grant",
+                    "expiresAt": "2026-08-27T12:01:00+00:00",
+                    "singleUse": True,
+                },
+            )
+            gateway.save_profile(
+                "silicon-exploration",
+                "硅基探索",
+                [{"platform": "抖音", "accountId": 31}],
+            )
+            result = gateway.direct_publish_content(
+                "silicon-exploration",
+                "/content/manifest.json",
+                {"抖音": None},
+            )
+
+        self.assertEqual(result["taskId"], 42)
+        self.assertEqual(authorized[0]["mode"], "direct")
+        self.assertNotIn("confirmedPreflightTaskId", authorized[0])
+        self.assertEqual(submitted[0]["mode"], "direct")
+        self.assertEqual(
+            submitted[0]["directAuthorizationId"],
+            "direct-one-time-grant",
+        )
 
     def test_profile_rejects_account_that_belongs_to_another_platform(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

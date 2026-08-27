@@ -44,6 +44,16 @@ class _Gateway:
     ):
         return {"taskId": 8, "phase": "formal", "status": "pending", "platforms": []}
 
+    def direct_publish_content(
+        self, project_id, manifest_path, schedules=None
+    ):
+        return {
+            "taskId": 11,
+            "phase": "formal",
+            "status": "pending",
+            "platforms": [],
+        }
+
     def check_douyin_graphic_matrix(self, manifest_path, targets):
         return {"taskId": 61, "phase": "local_check", "status": "pending", "platforms": []}
 
@@ -86,7 +96,7 @@ class _Gateway:
         package_path,
         package_sha256,
         *,
-        confirmed_preflight_task_id,
+        confirmed_preflight_task_id=None,
     ):
         return {
             "taskId": 10,
@@ -131,6 +141,7 @@ class OneclickMcpServerTests(unittest.TestCase):
                 "oneclick_task_status",
                 "oneclick_authorize_preflight",
                 "oneclick_formal_publish",
+                "oneclick_direct_publish_content",
                 "oneclick_sync_project_metrics",
                 "oneclick_get_project_metrics",
                 "oneclick_metrics_sync_status",
@@ -146,6 +157,12 @@ class OneclickMcpServerTests(unittest.TestCase):
         self.assertNotIn("mode", preflight_schema.get("properties", {}))
         self.assertIn("confirmed_preflight_task_id", formal_schema["properties"])
         self.assertIn("authorization_id", formal_schema["properties"])
+        direct_schema = by_name["oneclick_direct_publish_content"].input_schema
+        self.assertNotIn(
+            "confirmed_preflight_task_id",
+            direct_schema.get("properties", {}),
+        )
+        self.assertNotIn("authorization_id", direct_schema.get("properties", {}))
         all_schemas = json.dumps(
             {name: tool.input_schema for name, tool in by_name.items()},
             ensure_ascii=False,
@@ -244,6 +261,22 @@ class OneclickMcpServerTests(unittest.TestCase):
         self.assertEqual(result.structured_content["ok"], True)
         self.assertEqual(result.structured_content["task"]["taskId"], 7)
         self.assertEqual(result.structured_content["task"]["phase"], "preflight")
+
+    def test_direct_publish_tool_uses_chat_authorization_without_preflight_args(self) -> None:
+        server = create_server(_Gateway())
+        result = asyncio.run(
+            server.call_tool(
+                "oneclick_direct_publish_content",
+                {
+                    "project_id": "silicon-exploration",
+                    "manifest_path": "/content/manifest.json",
+                },
+            )
+        )
+
+        self.assertFalse(result.is_error)
+        self.assertEqual(result.structured_content["task"]["taskId"], 11)
+        self.assertEqual(result.structured_content["task"]["phase"], "formal")
 
 
 if __name__ == "__main__":
