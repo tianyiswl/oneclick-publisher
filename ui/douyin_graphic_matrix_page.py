@@ -12,7 +12,10 @@ from PyQt6.QtCore import QDate, QTime, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
+    QComboBox,
     QDateEdit,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -33,7 +36,13 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from app_core import account_service, publish_service, task_service
+from app_core import (
+    account_service,
+    douyin_graphic_matrix_draft_service,
+    media_service,
+    publish_service,
+    task_service,
+)
 from app_core.douyin_graphic_matrix_service import SCHEMA_VERSION, WORKFLOW
 
 from .common import button
@@ -42,6 +51,159 @@ from .topic_tag_editor import TopicTagEditor
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+
+
+class DouyinGraphicMediaDialog(QDialog):
+    """从素材管理中选择本批图文图片，筛选不会丢失既有勾选。"""
+
+    def __init__(
+        self,
+        media_rows: Iterable[Mapping[str, object]],
+        selected_paths: Iterable[str] = (),
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("从素材管理选择图片")
+        self.resize(760, 580)
+        self._rows = [
+            dict(row)
+            for row in media_rows
+            if str(row.get("typeText") or "") == "图片"
+            and Path(str(row.get("storedPath") or "")).is_file()
+        ]
+        self._selected_paths = list(
+            dict.fromkeys(
+                str(Path(path).expanduser().resolve())
+                for path in selected_paths
+                if str(path).strip()
+            )
+        )[:35]
+
+        layout = QVBoxLayout(self)
+        filters = QHBoxLayout()
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("搜索图片名称或备注")
+        self.search_input.textChanged.connect(self._render_rows)
+        self.category_combo = QComboBox()
+        categories = list(
+            dict.fromkeys(
+                str(row.get("mediaCategory") or "其他").strip() or "其他"
+                for row in self._rows
+            )
+        )
+        self.category_combo.addItem("全部分类", "全部")
+        for category in categories:
+            self.category_combo.addItem(category, category)
+        self.category_combo.currentIndexChanged.connect(self._render_rows)
+        filters.addWidget(self.search_input, 1)
+        filters.addWidget(self.category_combo)
+        layout.addLayout(filters)
+
+        self.media_list = QListWidget()
+        self.media_list.setAlternatingRowColors(True)
+        self.media_list.itemChanged.connect(self._item_changed)
+        layout.addWidget(self.media_list, 1)
+
+        selection_row = QHBoxLayout()
+        self.selection_status = QLabel()
+        self.selection_status.setProperty("role", "caption")
+        selection_row.addWidget(self.selection_status)
+        selection_row.addStretch()
+        self.select_all_button = button("全选当前筛选", variant="secondary")
+        self.select_all_button.clicked.connect(self._select_visible)
+        self.deselect_all_button = button("取消全选", variant="secondary")
+        self.deselect_all_button.clicked.connect(self._deselect_all)
+        selection_row.addWidget(self.select_all_button)
+        selection_row.addWidget(self.deselect_all_button)
+        layout.addLayout(selection_row)
+
+        actions = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel
+            | QDialogButtonBox.StandardButton.Ok
+        )
+        actions.button(QDialogButtonBox.StandardButton.Ok).setText("使用所选图片")
+        actions.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        actions.accepted.connect(self.accept)
+        actions.rejected.connect(self.reject)
+        layout.addWidget(actions)
+        self._render_rows()
+
+    def _filtered_rows(self) -> list[dict]:
+        keyword = self.search_input.text().strip().lower()
+        category = self.category_combo.currentData()
+        return [
+            row
+            for row in self._rows
+            if (category in (None, "全部") or row.get("mediaCategory") == category)
+            and (
+                not keyword
+                or keyword
+                in f"{row.get('filename') or ''} {row.get('remark') or ''}".lower()
+            )
+        ]
+
+    def _render_rows(self) -> None:
+        self.media_list.blockSignals(True)
+        self.media_list.clear()
+        selected = set(self._selected_paths)
+        for row in self._filtered_rows():
+            row = dict(row)
+            path = str(Path(str(row.get("storedPath") or "")).resolve())
+            remark = str(row.get("remark") or "").strip()
+            label = str(row.get("filename") or Path(path).name)
+            if remark:
+                label += f" · {remark}"
+            item = QListWidgetItem(label)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.CheckState.Checked
+                if path in selected
+                else Qt.CheckState.Unchecked
+            )
+            row["storedPath"] = path
+            item.setData(Qt.ItemDataRole.UserRole, row)
+            item.setToolTip(path)
+            self.media_list.addItem(item)
+        self.media_list.blockSignals(False)
+        self._refresh_status()
+
+    def _item_changed(self, item: QListWidgetItem) -> None:
+        row = item.data(Qt.ItemDataRole.UserRole) or {}
+        path = str(row.get("storedPath") or "")
+        if not path:
+            return
+        if item.checkState() == Qt.CheckState.Checked:
+            if path not in self._selected_paths and len(self._selected_paths) >= 35:
+                self.media_list.blockSignals(True)
+                item.setCheckState(Qt.CheckState.Unchecked)
+                self.media_list.blockSignals(False)
+            elif path not in self._selected_paths:
+                self._selected_paths.append(path)
+        elif path in self._selected_paths:
+            self._selected_paths.remove(path)
+        self._refresh_status()
+
+    def _select_visible(self) -> None:
+        for row in self._filtered_rows():
+            path = str(Path(str(row.get("storedPath") or "")).resolve())
+            if path not in self._selected_paths:
+                if len(self._selected_paths) >= 35:
+                    break
+                self._selected_paths.append(path)
+        self._render_rows()
+
+    def _deselect_all(self) -> None:
+        self._selected_paths = []
+        self._render_rows()
+
+    def _refresh_status(self) -> None:
+        suffix = "，已达到单批上限" if len(self._selected_paths) >= 35 else ""
+        self.selection_status.setText(
+            f"已选择 {len(self._selected_paths)} / 35 张{suffix}"
+        )
+
+    def selected_paths(self) -> list[str]:
+        return list(self._selected_paths)
 
 
 class DouyinGraphicMatrixPage(QWidget):
@@ -79,7 +241,20 @@ class DouyinGraphicMatrixPage(QWidget):
         manage = button("管理抖音账号", variant="secondary")
         manage.clicked.connect(self.request_account_management.emit)
         heading_row.addWidget(manage)
+        self.save_draft_button = button("保存当前内容", variant="primary")
+        self.save_draft_button.clicked.connect(self._save_matrix_draft_clicked)
+        heading_row.addWidget(self.save_draft_button)
+        self.restore_draft_button = button("恢复保存内容", variant="secondary")
+        self.restore_draft_button.clicked.connect(self._restore_matrix_draft_clicked)
+        heading_row.addWidget(self.restore_draft_button)
+        self.clear_content_button = button("清空当前填写", variant="danger")
+        self.clear_content_button.clicked.connect(self._clear_matrix_clicked)
+        heading_row.addWidget(self.clear_content_button)
         root.addLayout(heading_row)
+
+        self.draft_status = QLabel("图文矩阵内容尚未保存")
+        self.draft_status.setProperty("role", "caption")
+        root.addWidget(self.draft_status)
 
         self.step_labels: list[QLabel] = []
         step_row = QHBoxLayout()
@@ -104,6 +279,7 @@ class DouyinGraphicMatrixPage(QWidget):
             accounts = account_service.list_accounts()
         self.set_available_accounts(accounts)
         self._set_step(0)
+        self._refresh_draft_status()
 
     def _panel(self) -> tuple[QFrame, QVBoxLayout]:
         panel = QFrame()
@@ -129,10 +305,13 @@ class DouyinGraphicMatrixPage(QWidget):
         self.image_list.setAlternatingRowColors(True)
         media_layout.addWidget(self.image_list, 1)
         image_actions = QHBoxLayout()
-        choose = button("选择图片", variant="primary")
+        choose_material = button("从素材管理选择", variant="primary")
+        choose_material.clicked.connect(self._choose_material_images)
+        choose = button("从本机添加", variant="secondary")
         choose.clicked.connect(self._choose_images)
         remove = button("移除选中", variant="secondary")
         remove.clicked.connect(self._remove_selected_images)
+        image_actions.addWidget(choose_material)
         image_actions.addWidget(choose)
         image_actions.addWidget(remove)
         image_actions.addStretch()
@@ -157,9 +336,22 @@ class DouyinGraphicMatrixPage(QWidget):
         self.common_tags = TopicTagEditor(placeholder="例如：AI工具、效率提升", history_rows=1)
         self.common_tags.input.textChanged.connect(lambda _text: None)
         content_layout.addWidget(self.common_tags)
-        content_layout.addWidget(QLabel("选择抖音账号（1–20 个）"))
+        account_header = QHBoxLayout()
+        account_header.addWidget(QLabel("选择抖音账号（1–20 个）"))
+        account_header.addStretch()
+        self.account_selection_status = QLabel("已选择 0 个")
+        self.account_selection_status.setProperty("role", "caption")
+        account_header.addWidget(self.account_selection_status)
+        self.select_all_accounts_button = button("全选", variant="ghost", compact=True)
+        self.select_all_accounts_button.clicked.connect(self._select_all_accounts)
+        account_header.addWidget(self.select_all_accounts_button)
+        self.deselect_all_accounts_button = button("取消全选", variant="ghost", compact=True)
+        self.deselect_all_accounts_button.clicked.connect(self._deselect_all_accounts)
+        account_header.addWidget(self.deselect_all_accounts_button)
+        content_layout.addLayout(account_header)
         self.account_list = QListWidget()
         self.account_list.setMaximumHeight(142)
+        self.account_list.itemChanged.connect(self._account_item_changed)
         content_layout.addWidget(self.account_list)
         next_button = button("下一步：账号设置", variant="primary")
         next_button.setObjectName("douyinGraphicNextButton")
@@ -275,6 +467,7 @@ class DouyinGraphicMatrixPage(QWidget):
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(Qt.CheckState.Checked if account_id in selected else Qt.CheckState.Unchecked)
             self.account_list.addItem(item)
+        self._refresh_account_selection_status()
 
     def available_accounts(self) -> list[dict]:
         return list(self._available_accounts)
@@ -297,17 +490,48 @@ class DouyinGraphicMatrixPage(QWidget):
         for index in range(self.account_list.count()):
             item = self.account_list.item(index)
             item.setCheckState(Qt.CheckState.Checked if int(item.data(Qt.ItemDataRole.UserRole)) in selected else Qt.CheckState.Unchecked)
+        self._refresh_account_selection_status()
+
+    def _select_all_accounts(self) -> None:
+        self.select_account_ids(
+            int(self.account_list.item(index).data(Qt.ItemDataRole.UserRole))
+            for index in range(min(self.account_list.count(), 20))
+        )
+
+    def _deselect_all_accounts(self) -> None:
+        self.select_account_ids([])
+
+    def _account_item_changed(self, item: QListWidgetItem) -> None:
+        if (
+            item.checkState() == Qt.CheckState.Checked
+            and len(self.selected_account_ids()) > 20
+        ):
+            self.account_list.blockSignals(True)
+            item.setCheckState(Qt.CheckState.Unchecked)
+            self.account_list.blockSignals(False)
+        self._refresh_account_selection_status()
+
+    def _refresh_account_selection_status(self) -> None:
+        count = len(self.selected_account_ids())
+        suffix = "，已达到单批上限" if count >= 20 else ""
+        self.account_selection_status.setText(f"已选择 {count} 个{suffix}")
 
     def set_images(self, image_paths: Iterable[str]) -> None:
         values = [str(Path(path).expanduser().resolve()) for path in image_paths]
         if not 1 <= len(values) <= 35:
             raise ValueError("抖音图文图片数量必须为 1 至 35 张")
-        self._images = values
+        self._set_image_paths(values)
+
+    def _set_image_paths(self, image_paths: Iterable[str]) -> None:
+        self._images = list(dict.fromkeys(str(path) for path in image_paths))[:35]
         self.image_list.clear()
-        for index, path in enumerate(values, start=1):
+        for index, path in enumerate(self._images, start=1):
             item = QListWidgetItem(f"{index}. {Path(path).name}")
             item.setToolTip(path)
             self.image_list.addItem(item)
+
+    def image_paths(self) -> list[str]:
+        return list(self._images)
 
     def set_common_content(self, title: str, body: str, tags: Iterable[str]) -> None:
         self.common_title.setText(str(title or ""))
@@ -324,13 +548,17 @@ class DouyinGraphicMatrixPage(QWidget):
         except ValueError as exc:
             QMessageBox.warning(self, "图片素材", str(exc))
 
+    def _choose_material_images(self) -> None:
+        dialog = DouyinGraphicMediaDialog(
+            media_service.list_media(), self._images, self
+        )
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._set_image_paths(dialog.selected_paths())
+
     def _remove_selected_images(self) -> None:
         indexes = {index.row() for index in self.image_list.selectedIndexes()}
         remaining = [path for index, path in enumerate(self._images) if index not in indexes]
-        self._images = remaining
-        self.image_list.clear()
-        for index, path in enumerate(remaining, start=1):
-            self.image_list.addItem(f"{index}. {Path(path).name}")
+        self._set_image_paths(remaining)
 
     def _common_changed(self) -> None:
         if hasattr(self, "account_table"):
@@ -404,6 +632,258 @@ class DouyinGraphicMatrixPage(QWidget):
             },
             "targets": self.account_table.targets(),
         }
+
+    def _draft_payload(self) -> dict:
+        media_ids: dict[str, int] = {}
+        for row in media_service.list_media():
+            path = str(row.get("storedPath") or "").strip()
+            if path:
+                media_ids[str(Path(path).expanduser().resolve())] = int(
+                    row.get("id") or 0
+                )
+        selected_ids = set(self.selected_account_ids())
+        targets = [
+            target
+            for target in self.account_table.targets()
+            if int(target.get("accountId") or 0) in selected_ids
+        ]
+        return {
+            "schemaVersion": douyin_graphic_matrix_draft_service.DRAFT_SCHEMA,
+            "images": [
+                {"mediaId": media_ids.get(path, 0), "path": path}
+                for path in self._images
+            ],
+            "accounts": [
+                {
+                    "accountId": int(account.get("id") or 0),
+                    "filePath": str(account.get("filePath") or ""),
+                }
+                for account in self._available_accounts
+                if int(account.get("id") or 0) in selected_ids
+            ],
+            "common": {
+                "title": self.common_title.text(),
+                "body": self.common_body.toPlainText(),
+                "tags": self.common_tags.tags(),
+            },
+            "schedule": {
+                "startDate": self.start_date.date().toString("yyyy-MM-dd"),
+                "startTime": self.start_time.time().toString("HH:mm"),
+                "intervalMinutes": self.interval.value(),
+            },
+            "targets": targets,
+            "currentStep": self._step,
+        }
+
+    def save_matrix_draft(self) -> dict:
+        saved = douyin_graphic_matrix_draft_service.save_draft(
+            self._draft_payload()
+        )
+        self.draft_status.setText(f"已保存 {saved.get('updatedAt') or ''}".strip())
+        self.draft_status.setProperty("role", "success")
+        self.restore_draft_button.setEnabled(True)
+        return saved
+
+    def _save_matrix_draft_clicked(self) -> None:
+        try:
+            self.save_matrix_draft()
+        except douyin_graphic_matrix_draft_service.DouyinGraphicMatrixDraftError as exc:
+            QMessageBox.warning(self, "保存图文矩阵", str(exc))
+            return
+        QMessageBox.information(
+            self,
+            "保存图文矩阵",
+            "图片、账号、通用内容、逐账号设置和排期已保存在本机。\n"
+            "该操作不会打开抖音，也不会提交内容。",
+        )
+
+    def _refresh_draft_status(self) -> None:
+        try:
+            draft = douyin_graphic_matrix_draft_service.load_draft()
+        except douyin_graphic_matrix_draft_service.DouyinGraphicMatrixDraftError as exc:
+            self.draft_status.setText(str(exc))
+            self.draft_status.setProperty("role", "danger")
+            self.restore_draft_button.setEnabled(False)
+            return
+        self.restore_draft_button.setEnabled(bool(draft))
+        if draft:
+            self.draft_status.setText(
+                f"已保存 {draft.get('updatedAt') or ''}".strip()
+            )
+            self.draft_status.setProperty("role", "success")
+        else:
+            self.draft_status.setText("图文矩阵内容尚未保存")
+            self.draft_status.setProperty("role", "caption")
+
+    def restore_matrix_draft(self) -> dict[str, list[str]]:
+        draft = douyin_graphic_matrix_draft_service.load_draft()
+        if not draft:
+            raise douyin_graphic_matrix_draft_service.DouyinGraphicMatrixDraftError(
+                "当前没有已保存的图文矩阵内容"
+            )
+        payload = dict(draft.get("payload") or {})
+
+        material_by_id = {
+            int(row.get("id") or 0): dict(row)
+            for row in media_service.list_media()
+            if int(row.get("id") or 0) > 0
+        }
+        image_paths: list[str] = []
+        missing_images: list[str] = []
+        for reference in payload.get("images") or []:
+            saved_path = str(reference.get("path") or "")
+            material = material_by_id.get(int(reference.get("mediaId") or 0), {})
+            candidate = str(material.get("storedPath") or saved_path)
+            path = Path(candidate).expanduser()
+            if path.is_file():
+                resolved = str(path.resolve())
+                if resolved not in image_paths:
+                    image_paths.append(resolved)
+            else:
+                missing_images.append(Path(saved_path or candidate).name or "未知图片")
+        self._set_image_paths(image_paths)
+
+        accounts_by_id = {
+            int(account.get("id") or 0): account
+            for account in self._available_accounts
+        }
+        accounts_by_file = {
+            str(account.get("filePath") or ""): account
+            for account in self._available_accounts
+            if str(account.get("filePath") or "")
+        }
+        restored_account_ids: list[int] = []
+        restored_account_id_map: dict[int, int] = {}
+        missing_accounts: list[str] = []
+        for reference in payload.get("accounts") or []:
+            saved_id = int(reference.get("accountId") or 0)
+            account = accounts_by_id.get(saved_id) or accounts_by_file.get(
+                str(reference.get("filePath") or "")
+            )
+            if account:
+                account_id = int(account.get("id") or 0)
+                restored_account_id_map[saved_id] = account_id
+                if account_id not in restored_account_ids:
+                    restored_account_ids.append(account_id)
+            else:
+                missing_accounts.append(str(saved_id))
+        self.select_account_ids(restored_account_ids)
+
+        common = dict(payload.get("common") or {})
+        self.set_common_content(
+            str(common.get("title") or ""),
+            str(common.get("body") or ""),
+            list(common.get("tags") or []),
+        )
+        schedule = dict(payload.get("schedule") or {})
+        restored_date = QDate.fromString(
+            str(schedule.get("startDate") or ""), "yyyy-MM-dd"
+        )
+        restored_time = QTime.fromString(
+            str(schedule.get("startTime") or ""), "HH:mm"
+        )
+        if restored_date.isValid():
+            self.start_date.setDate(restored_date)
+        if restored_time.isValid():
+            self.start_time.setTime(restored_time)
+        self.interval.setValue(int(schedule.get("intervalMinutes") or 30))
+
+        selected_accounts = [
+            account
+            for account in self._available_accounts
+            if int(account.get("id") or 0) in restored_account_ids
+        ]
+        self.account_table.set_accounts(selected_accounts)
+        self._common_changed()
+        self._apply_schedule()
+        target_by_account: dict[int, dict] = {}
+        for target in payload.get("targets") or []:
+            saved_id = int(target.get("accountId") or 0)
+            current_id = restored_account_id_map.get(saved_id, saved_id)
+            target_by_account[current_id] = dict(target)
+        for account_id in restored_account_ids:
+            target = target_by_account.get(account_id)
+            if not target:
+                continue
+            row = self.account_table.row_for(account_id)
+            for field, value in dict(target.get("overrides") or {}).items():
+                if field not in {"title", "body", "tags"}:
+                    continue
+                text = (
+                    " ".join(f"#{str(tag).lstrip('#')}" for tag in value)
+                    if field == "tags" and isinstance(value, list)
+                    else str(value)
+                )
+                row.set_field(field, text, overridden=True)
+            schedule_text = str(target.get("scheduleTime") or "").strip()
+            if schedule_text:
+                row.set_schedule(
+                    datetime.strptime(schedule_text, "%Y-%m-%d %H:%M"),
+                    overridden=bool(target.get("scheduleOverridden")),
+                )
+
+        requested_step = int(payload.get("currentStep") or 0)
+        if requested_step > 0 and (not image_paths or not restored_account_ids):
+            requested_step = 0
+        if requested_step == 2:
+            self._refresh_summary()
+        self._set_step(requested_step)
+        self.draft_status.setText(
+            f"已恢复 {draft.get('updatedAt') or ''}".strip()
+        )
+        return {
+            "missingImages": missing_images,
+            "missingAccounts": missing_accounts,
+        }
+
+    def _restore_matrix_draft_clicked(self) -> None:
+        try:
+            result = self.restore_matrix_draft()
+        except douyin_graphic_matrix_draft_service.DouyinGraphicMatrixDraftError as exc:
+            QMessageBox.warning(self, "恢复图文矩阵", str(exc))
+            return
+        missing = [
+            *(f"图片：{name}" for name in result["missingImages"]),
+            *(f"账号ID：{account_id}" for account_id in result["missingAccounts"]),
+        ]
+        detail = (
+            "\n\n以下项目已不存在，未恢复：\n" + "\n".join(missing)
+            if missing
+            else ""
+        )
+        QMessageBox.information(
+            self,
+            "恢复图文矩阵",
+            "已恢复上次保存的图文矩阵内容。" + detail,
+        )
+
+    def clear_matrix_state(self) -> None:
+        self._set_image_paths([])
+        self.set_common_content("", "", [])
+        self.select_account_ids([])
+        self.account_table.set_accounts([])
+        tomorrow = datetime.now(SHANGHAI).date() + timedelta(days=1)
+        self.start_date.setDate(QDate(tomorrow.year, tomorrow.month, tomorrow.day))
+        self.start_time.setTime(QTime(18, 0))
+        self.interval.setValue(30)
+        self.summary_table.setRowCount(0)
+        self._current_task_id = 0
+        self.open_task_button.setEnabled(False)
+        self.status_label.setText(
+            "尚未检查。本地批量检查只核对图片、字段、账号和排期，不会打开抖音。"
+        )
+        self._set_step(0)
+        self.draft_status.setText("当前填写已清空，可用“恢复保存内容”找回")
+
+    def _clear_matrix_clicked(self) -> None:
+        answer = QMessageBox.question(
+            self,
+            "清空图文矩阵",
+            "确定清空当前图片、账号、文案、逐账号设置和排期吗？\n\n"
+            "已经保存的内容不会删除，仍可恢复。",
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self.clear_matrix_state()
 
     def _start_local_check(self) -> None:
         try:

@@ -4,13 +4,21 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
+import tempfile
 import unittest
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication, QLabel, QPushButton
 
-from ui.douyin_graphic_matrix_page import DouyinGraphicMatrixPage
+from app_core import database
+from ui.douyin_graphic_matrix_page import (
+    DouyinGraphicMatrixPage,
+    DouyinGraphicMediaDialog,
+)
 
 
 def _accounts(count: int = 3) -> list[dict]:
@@ -78,6 +86,174 @@ class DouyinGraphicMatrixPageTests(unittest.TestCase):
         self.assertGreater(self.page.width(), 0)
         self.assertIsNotNone(self.page.findChild(QPushButton, "douyinGraphicNextButton"))
         self.assertIsNotNone(self.page.findChild(QPushButton, "douyinGraphicLocalCheckButton"))
+
+    def test_account_select_all_and_cancel_all_respect_twenty_account_limit(self) -> None:
+        self.page.set_available_accounts(_accounts(23))
+
+        self.page.select_all_accounts_button.click()
+        self.assertEqual(self.page.selected_account_ids(), list(range(1, 21)))
+        self.assertIn("20", self.page.account_selection_status.text())
+
+        self.page.deselect_all_accounts_button.click()
+        self.assertEqual(self.page.selected_account_ids(), [])
+
+    def test_manual_account_selection_cannot_exceed_twenty(self) -> None:
+        self.page.set_available_accounts(_accounts(21))
+        self.page.select_account_ids(range(1, 21))
+
+        self.page.account_list.item(20).setCheckState(Qt.CheckState.Checked)
+
+        self.assertEqual(self.page.selected_account_ids(), list(range(1, 21)))
+        self.assertEqual(
+            self.page.account_list.item(20).checkState(),
+            Qt.CheckState.Unchecked,
+        )
+
+
+class DouyinGraphicMediaDialogTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        root = Path(self.temporary.name)
+        self.rows: list[dict] = []
+        for index in range(1, 41):
+            path = root / f"image-{index:02}.jpg"
+            path.write_bytes(b"image")
+            self.rows.append(
+                {
+                    "id": index,
+                    "filename": path.name,
+                    "storedPath": str(path),
+                    "typeText": "图片",
+                    "mediaCategory": "广州" if index <= 20 else "江苏",
+                    "remark": f"素材{index}",
+                }
+            )
+        video = root / "video.mp4"
+        video.write_bytes(b"video")
+        self.rows.append(
+            {
+                "id": 99,
+                "filename": video.name,
+                "storedPath": str(video),
+                "typeText": "视频",
+                "mediaCategory": "广州",
+                "remark": "不应显示",
+            }
+        )
+        self.dialog = DouyinGraphicMediaDialog(self.rows)
+
+    def tearDown(self) -> None:
+        self.dialog.close()
+        self.dialog.deleteLater()
+        self.temporary.cleanup()
+
+    def test_material_picker_lists_only_images_and_selects_at_most_thirty_five(self) -> None:
+        self.assertEqual(self.dialog.media_list.count(), 40)
+
+        self.dialog.select_all_button.click()
+
+        self.assertEqual(len(self.dialog.selected_paths()), 35)
+        self.assertTrue(all(path.endswith(".jpg") for path in self.dialog.selected_paths()))
+        self.assertIn("35", self.dialog.selection_status.text())
+
+    def test_filter_changes_keep_previous_selection_and_cancel_all_clears_everything(self) -> None:
+        first = self.dialog.media_list.item(0)
+        first.setCheckState(Qt.CheckState.Checked)
+        first_path = str((first.data(Qt.ItemDataRole.UserRole) or {})["storedPath"])
+
+        self.dialog.search_input.setText("image-40")
+        self.assertIn(first_path, self.dialog.selected_paths())
+        self.dialog.select_all_button.click()
+        self.assertEqual(len(self.dialog.selected_paths()), 2)
+
+        self.dialog.deselect_all_button.click()
+        self.assertEqual(self.dialog.selected_paths(), [])
+
+
+class DouyinGraphicMatrixDraftPageTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        root = Path(self.temporary.name)
+        self.database_patch = patch.object(database, "DB_PATH", root / "database.db")
+        self.database_patch.start()
+        self.image_a = root / "a.jpg"
+        self.image_b = root / "b.jpg"
+        self.image_a.write_bytes(b"a")
+        self.image_b.write_bytes(b"b")
+        accounts = _accounts(2)
+        accounts[0]["filePath"] = "oneclick_3_account-1.json"
+        accounts[1]["filePath"] = "oneclick_3_account-2.json"
+        self.page = DouyinGraphicMatrixPage(accounts=accounts)
+
+    def tearDown(self) -> None:
+        self.page.close()
+        self.page.deleteLater()
+        self.database_patch.stop()
+        self.temporary.cleanup()
+
+    def test_save_clear_and_restore_keeps_full_matrix_without_touching_snapshot(self) -> None:
+        self.page.set_images([str(self.image_a), str(self.image_b)])
+        self.page.set_common_content("通用标题", "通用正文", ["矩阵", "图文"])
+        self.page.select_account_ids([1, 2])
+        self.page._go_account_step()
+        self.page.account_table.edit_title(2, "账号二标题")
+        self.page._set_step(1)
+
+        saved = self.page.save_matrix_draft()
+        self.page.clear_matrix_state()
+
+        self.assertEqual(self.page.image_paths(), [])
+        self.assertEqual(self.page.selected_account_ids(), [])
+        self.assertEqual(self.page.common_title.text(), "")
+        restored = self.page.restore_matrix_draft()
+
+        self.assertEqual(restored["missingImages"], [])
+        self.assertEqual(restored["missingAccounts"], [])
+        self.assertEqual(
+            self.page.image_paths(),
+            [str(self.image_a.resolve()), str(self.image_b.resolve())],
+        )
+        self.assertEqual(self.page.selected_account_ids(), [1, 2])
+        self.assertEqual(self.page.account_table.row_for(2).title(), "账号二标题")
+        self.assertEqual(self.page._step, 1)
+        self.assertEqual(saved["payload"]["common"]["title"], "通用标题")
+
+    def test_restore_uses_account_file_when_database_id_changed(self) -> None:
+        self.page.set_images([str(self.image_a)])
+        self.page.set_common_content("通用标题", "通用正文", ["矩阵"])
+        self.page.select_account_ids([1])
+        self.page._go_account_step()
+        self.page.account_table.edit_title(1, "账号一专属标题")
+        self.page.save_matrix_draft()
+        self.page.clear_matrix_state()
+        self.page.set_available_accounts(
+            [
+                {
+                    "id": 101,
+                    "type": 3,
+                    "profileName": "账号一",
+                    "userName": "douyin-1",
+                    "filePath": "oneclick_3_account-1.json",
+                }
+            ]
+        )
+
+        restored = self.page.restore_matrix_draft()
+
+        self.assertEqual(restored["missingAccounts"], [])
+        self.assertEqual(self.page.selected_account_ids(), [101])
+        self.assertEqual(
+            self.page.account_table.row_for(101).title(),
+            "账号一专属标题",
+        )
 
 
 if __name__ == "__main__":
