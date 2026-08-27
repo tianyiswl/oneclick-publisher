@@ -8172,7 +8172,11 @@ class DouyinCommerceLocationDomTests(unittest.IsolatedAsyncioTestCase):
                         result = await douyin_commerce_service.load_more_commerce_location_candidates(
                             page,
                             previous_candidates=previous,
-                            timeout_ms=350,
+                            # Chromium shares resources with the rest of the full
+                            # regression suite. Keep a bounded deadline, but do not
+                            # make scheduler load decide whether the read-only DOM
+                            # inspection reaches its first snapshot.
+                            timeout_ms=1_500,
                         )
 
                         self.assertFalse(result["hasMore"])

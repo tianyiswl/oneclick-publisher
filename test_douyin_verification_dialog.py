@@ -6,6 +6,7 @@ from __future__ import annotations
 from io import BytesIO
 import inspect
 import os
+from time import monotonic
 import unittest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -14,7 +15,10 @@ import qrcode
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QLineEdit
 
-from app_core.douyin_verification import DouyinVerificationBroker
+from app_core.douyin_verification import (
+    DouyinVerificationBroker,
+    DouyinVerificationError,
+)
 from ui.douyin_verification_dialog import DouyinVerificationDialog
 
 
@@ -167,9 +171,15 @@ class DouyinVerificationDialogTests(unittest.TestCase):
         self.broker.begin_processing(request_id)
         self.broker.succeed(request_id)
         dialog.poll_state()
-        QTest.qWait(300)
+        deadline = monotonic() + 2.0
+        while monotonic() < deadline:
+            try:
+                self.broker.snapshot(request_id)
+            except DouyinVerificationError:
+                break
+            QTest.qWait(25)
         self.assertTrue(dialog._terminal)
-        with self.assertRaises(Exception):
+        with self.assertRaises(DouyinVerificationError):
             self.broker.snapshot(request_id)
 
     def test_batch_verification_context_shows_only_index_and_file_name(self):
