@@ -302,7 +302,7 @@ class AccountPage(QWidget):
         self.auto_check_timer.stop()
 
     def refresh(self) -> None:
-        rows = account_service.list_accounts()
+        rows = account_service.list_managed_accounts()
         self._refresh_filters()
 
         selected_profile = self.profile_filter.currentText()
@@ -399,12 +399,21 @@ class AccountPage(QWidget):
             "刷新账号信息",
             lambda _checked=False, r=row: self.refresh_avatar(r),
         )
+        is_youtube_oauth = (
+            row.get("authMode") == account_service.AUTH_MODE_YOUTUBE_OAUTH
+        )
+        refresh_action.setEnabled(not is_youtube_oauth)
         menu.addAction("编辑备注", lambda _checked=False, r=row: self.edit_remark(r))
         menu.addSeparator()
         menu.addAction("删除账号", lambda _checked=False, r=row: self.delete_one(r))
 
         open_backend_btn = button("打开后台", variant="primary", compact=True)
-        open_backend_btn.setToolTip("使用一键发保存的本地会话打开对应平台官网")
+        open_backend_btn.setEnabled(not is_youtube_oauth)
+        open_backend_btn.setToolTip(
+            "OAuth 账号请直接使用完成授权的系统浏览器打开 YouTube Studio"
+            if is_youtube_oauth
+            else "使用一键发保存的本地会话打开对应平台官网"
+        )
         open_backend_btn.clicked.connect(
             lambda _checked=False, r=row: self.open_backend(r)
         )
@@ -433,12 +442,17 @@ class AccountPage(QWidget):
             return
         menu = QMenu(self)
         menu.addAction("重新登录", lambda: self.relogin(row))
-        menu.addAction("打开后台", lambda: self.open_backend(row))
+        open_action = menu.addAction("打开后台", lambda: self.open_backend(row))
+        is_youtube_oauth = (
+            row.get("authMode") == account_service.AUTH_MODE_YOUTUBE_OAUTH
+        )
+        open_action.setEnabled(not is_youtube_oauth)
         menu.addAction("检测登录", lambda: self.check_one(row))
-        menu.addAction(
+        refresh_action = menu.addAction(
             "刷新头像/登录信息",
             lambda: self.refresh_avatar(row),
         )
+        refresh_action.setEnabled(not is_youtube_oauth)
         menu.addAction("编辑备注", lambda: self.edit_remark(row))
         menu.addAction("删除账号", lambda: self.delete_one(row))
         menu.exec(self.table.mapToGlobal(pos))

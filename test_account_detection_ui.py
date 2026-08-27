@@ -3,6 +3,7 @@
 
 import os
 import importlib.util
+import queue
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -12,6 +13,7 @@ from PyQt6.QtWidgets import QApplication, QMessageBox, QPushButton
 
 from app_core import account_browser_service, account_service
 from ui.account_page import AccountPage
+from ui.login_dialog import LoginDialog
 from ui.main_window import MainWindow
 from ui.publish_page import PublishPage
 
@@ -44,6 +46,62 @@ class AccountDetectionUiTests(unittest.TestCase):
         self.assertFalse(any("API" in label for label in labels))
         self.assertFalse(any("开发者配置" in label for label in labels))
         page.close()
+
+    def test_account_page_uses_managed_rows_while_publish_list_stays_separate(self) -> None:
+        oauth_account = {
+            "id": 71,
+            "type": 7,
+            "platformName": "YouTube",
+            "profileName": "海外主体",
+            "userName": "OAuth 测试频道",
+            "status": 1,
+            "healthStatus": "normal",
+            "statusText": "正常",
+            "remark": "",
+            "authMode": "youtube_oauth",
+            "filePath": "youtube-oauth:opaque-reference",
+            "accountReference": "UC123",
+        }
+        with (
+            patch.object(
+                account_service,
+                "list_managed_accounts",
+                return_value=[oauth_account],
+                create=True,
+            ),
+            patch.object(account_service, "list_accounts", return_value=[]),
+        ):
+            page = AccountPage()
+            page.refresh()
+
+        self.assertEqual(page.result_label.text(), "1 个账号")
+        self.assertEqual(page.row_data(0)["accountReference"], "UC123")
+        page.close()
+
+    def test_youtube_system_browser_login_disables_manual_save_fallback(self) -> None:
+        class OAuthSession:
+            manual_save_supported = False
+
+            def __init__(self) -> None:
+                self.queue: queue.Queue[str] = queue.Queue()
+                self.queue.put("BROWSER_OPENED")
+
+            def cancel(self) -> None:
+                pass
+
+            def save(self) -> None:
+                raise AssertionError("manual save must stay disabled")
+
+        dialog = LoginDialog(background_login=True)
+        dialog.platform_combo.setCurrentIndex(dialog.platform_combo.findData(7))
+        dialog.profile_input.setCurrentText("海外主体")
+        with patch("ui.login_dialog.login_service.start_login", return_value=OAuthSession()):
+            dialog.start_login()
+            dialog.poll_messages()
+
+        self.assertFalse(dialog.save_btn.isEnabled())
+        self.assertIn("官方登录页面", dialog.qr_label.text())
+        dialog.close()
 
     def test_expired_account_cookie_is_checked_before_being_marked_pending(self) -> None:
         """超过 24 小时先静默复核 Cookie，复核失败才进入待检测状态。"""

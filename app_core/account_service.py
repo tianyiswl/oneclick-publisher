@@ -39,6 +39,8 @@ LOGIN_PLATFORM_OPTIONS = [
     (8, "Instagram / Facebook（Meta）"),
 ]
 OVERSEAS_PLATFORM_TYPES = {6, 7, 8, 9}
+AUTH_MODE_BROWSER = "browser"
+AUTH_MODE_YOUTUBE_OAUTH = "youtube_oauth"
 DRAFT_SUPPORTED_PLATFORM_TYPES = frozenset({2, 5})
 DRAFT_UNSUPPORTED_PLATFORM_MESSAGES = {
     1: (
@@ -218,18 +220,26 @@ def _row_to_dict(row) -> dict:
     return data
 
 
-def list_accounts() -> list[dict]:
+def _list_accounts(*, include_youtube_oauth: bool) -> list[dict]:
     _ensure_demo_accounts()
     _promote_confirmed_oneclick_sessions()
+    auth_modes = (
+        (AUTH_MODE_BROWSER, AUTH_MODE_YOUTUBE_OAUTH)
+        if include_youtube_oauth
+        else (AUTH_MODE_BROWSER,)
+    )
+    placeholders = ", ".join("?" for _item in auth_modes)
     with connect() as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT id, type, filePath, userName, status, profileName, avatarPath,
-                   avatarUpdatedAt, remark, lastCheckedAt, lastLoginAt
+                   avatarUpdatedAt, remark, lastCheckedAt, lastLoginAt,
+                   COALESCE(authMode, 'browser') AS authMode, accountReference
             FROM user_info
-            WHERE COALESCE(authMode, 'browser') = 'browser'
+            WHERE COALESCE(authMode, 'browser') IN ({placeholders})
             ORDER BY profileName COLLATE NOCASE, type
-            """
+            """,
+            auth_modes,
         ).fetchall()
     # 演示账号只用于早期展示，不应混入用户的真实账号、发布目标或统计结果。
     return [
@@ -237,6 +247,26 @@ def list_accounts() -> list[dict]:
         for row in rows
         if not str(row["filePath"] or "").startswith("__oneclick_demo_")
     ]
+
+
+def list_accounts() -> list[dict]:
+    """Return browser-session rows that existing publishing can safely consume."""
+
+    return _list_accounts(include_youtube_oauth=False)
+
+
+def list_managed_accounts() -> list[dict]:
+    """Return all account-management rows, including official YouTube OAuth."""
+
+    return _list_accounts(include_youtube_oauth=True)
+
+
+def get_managed_account(account_id: int) -> dict | None:
+    wanted = int(account_id)
+    return next(
+        (row for row in list_managed_accounts() if int(row["id"]) == wanted),
+        None,
+    )
 
 
 def save_oneclick_authorized_account(
@@ -294,9 +324,85 @@ def save_oneclick_authorized_account(
         return int(cursor.lastrowid)
 
 
+def save_youtube_oauth_account(
+    *,
+    profile_name: str,
+    credential_reference: str,
+    channel_id: str,
+    display_name: str | None,
+    record_id: int | None = None,
+) -> int:
+    """Persist public YouTube identity without storing OAuth tokens in SQLite."""
+
+    profile_name = str(profile_name or "").strip()
+    credential_reference = str(credential_reference or "").strip()
+    channel_id = str(channel_id or "").strip()
+    user_name = str(display_name or "").strip() or "YouTube 频道"
+    if (
+        not profile_name
+        or not credential_reference.startswith("youtube-oauth:")
+        or not channel_id
+    ):
+        raise ValueError("YouTube OAuth 账号信息不完整")
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with connect() as conn:
+        if record_id is not None:
+            existing = conn.execute(
+                """
+                SELECT id, type, COALESCE(authMode, 'browser') AS authMode
+                FROM user_info WHERE id = ?
+                """,
+                (int(record_id),),
+            ).fetchone()
+            if (
+                not existing
+                or int(existing["type"]) != 7
+                or str(existing["authMode"]) != AUTH_MODE_YOUTUBE_OAUTH
+            ):
+                raise ValueError("待更新的 YouTube OAuth 账号不存在")
+            conn.execute(
+                """
+                UPDATE user_info
+                SET type = 7, filePath = ?, userName = ?, status = 1,
+                    profileName = ?, remark = '', lastLoginAt = ?,
+                    lastCheckedAt = ?, authMode = ?, accountReference = ?
+                WHERE id = ?
+                """,
+                (
+                    credential_reference,
+                    user_name,
+                    profile_name,
+                    now,
+                    now,
+                    AUTH_MODE_YOUTUBE_OAUTH,
+                    channel_id,
+                    int(record_id),
+                ),
+            )
+            return int(record_id)
+        cursor = conn.execute(
+            """
+            INSERT INTO user_info
+                (type, filePath, userName, status, profileName, remark,
+                 lastLoginAt, lastCheckedAt, authMode, accountReference)
+            VALUES (7, ?, ?, 1, ?, '', ?, ?, ?, ?)
+            """,
+            (
+                credential_reference,
+                user_name,
+                profile_name,
+                now,
+                now,
+                AUTH_MODE_YOUTUBE_OAUTH,
+                channel_id,
+            ),
+        )
+        return int(cursor.lastrowid)
+
+
 def group_accounts() -> list[dict]:
     grouped: dict[str, dict] = {}
-    for account in list_accounts():
+    for account in list_managed_accounts():
         profile = account["profileName"]
         if profile not in grouped:
             grouped[profile] = {"profileName": profile, "accounts": {}}
@@ -308,7 +414,7 @@ def list_profiles() -> list[str]:
     return sorted(
         {
             row["profileName"]
-            for row in list_accounts()
+            for row in list_managed_accounts()
             if row.get("profileName")
             and not str(row.get("filePath") or "").startswith("__oneclick_demo_")
         }
@@ -316,7 +422,7 @@ def list_profiles() -> list[str]:
 
 
 def account_stats() -> dict:
-    accounts = list_accounts()
+    accounts = list_managed_accounts()
     by_platform = defaultdict(lambda: {"total": 0, "normal": 0, "abnormal": 0})
     for account in accounts:
         item = by_platform[account["type"]]
@@ -357,7 +463,7 @@ def accounts_requiring_check(account_ids: Iterable[int] | None = None) -> list[i
     wanted = {int(item) for item in account_ids or []}
     return [
         int(account["id"])
-        for account in list_accounts()
+        for account in list_managed_accounts()
         if account.get("healthStatus") == "stale"
         and (not wanted or int(account["id"]) in wanted)
     ]
@@ -365,7 +471,19 @@ def accounts_requiring_check(account_ids: Iterable[int] | None = None) -> list[i
 
 def delete_account(account_id: int) -> None:
     with connect() as conn:
-        row = conn.execute("SELECT filePath, avatarPath FROM user_info WHERE id = ?", (account_id,)).fetchone()
+        row = conn.execute(
+            """
+            SELECT filePath, avatarPath, COALESCE(authMode, 'browser') AS authMode
+            FROM user_info WHERE id = ?
+            """,
+            (account_id,),
+        ).fetchone()
+        if row and str(row["authMode"]) == AUTH_MODE_YOUTUBE_OAUTH:
+            from .overseas_youtube_credentials import KeyringOAuthCredentialStore
+
+            KeyringOAuthCredentialStore().delete_refresh_token(
+                str(row["filePath"] or "")
+            )
         conn.execute("DELETE FROM user_info WHERE id = ?", (account_id,))
         remaining_file_refs = 0
         remaining_avatar_refs = 0
@@ -381,6 +499,12 @@ def delete_account(account_id: int) -> None:
             ).fetchone()[0]
         conn.commit()
     if not row:
+        return
+    if str(row["authMode"]) == AUTH_MODE_YOUTUBE_OAUTH:
+        if row["avatarPath"] and not remaining_avatar_refs:
+            avatar_path = AVATAR_DIR / Path(row["avatarPath"]).name
+            if avatar_path.exists():
+                avatar_path.unlink()
         return
     candidates = (
         (COOKIE_DIR, row["filePath"], remaining_file_refs),
@@ -402,10 +526,12 @@ def validate_accounts(
     invalid_status: int = 0,
 ) -> dict:
     """静默复核登录态；仅返回需用户介入的账号，不自行弹浏览器。"""
+    from conf import YOUTUBE_OAUTH_CLIENT_ID
     from .oneclick_authorization import verify_saved_session
+    from .overseas_youtube_login import validate_saved_youtube_oauth_account
     if int(invalid_status) not in {0, 2}:
         raise ValueError("无效登录态只能标记为异常或待检测")
-    accounts = list_accounts()
+    accounts = list_managed_accounts()
     wanted = {int(item) for item in account_ids or []}
     selected = [row for row in accounts if not wanted or row["id"] in wanted]
     failures: list[str] = []
@@ -429,7 +555,17 @@ def validate_accounts(
         }
         report({**base_event, "phase": "checking"})
         try:
-            valid = verify_saved_session(row)
+            if (
+                str(row.get("authMode") or AUTH_MODE_BROWSER)
+                == AUTH_MODE_YOUTUBE_OAUTH
+            ):
+                identity = validate_saved_youtube_oauth_account(
+                    row,
+                    client_id=YOUTUBE_OAUTH_CLIENT_ID,
+                )
+                valid = identity.channel_id == str(row.get("accountReference") or "")
+            else:
+                valid = verify_saved_session(row)
         except Exception as exc:
             valid = False
             failures.append(f"{row['platformName']}：检测失败（{type(exc).__name__}）。")

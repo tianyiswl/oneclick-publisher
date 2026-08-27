@@ -1,7 +1,7 @@
 """一键发账号授权入口。
 
-国内平台使用一键发已验收的授权执行器；海外平台直接复用已恢复的
-蚁小二浏览器登录流程，但会话和账号仍保存在一键发的用户数据目录。
+国内平台使用一键发已验收的授权执行器；TikTok 与 Meta 复用已恢复的
+浏览器登录流程，YouTube 使用 Google 官方桌面 OAuth 系统浏览器流程。
 """
 
 from __future__ import annotations
@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio
 import queue
 import threading
+
+import conf
 
 from . import account_service
 
@@ -86,6 +88,24 @@ def start_login(
 
     del background_mode
     login_type = account_service.login_platform_type(platform_type)
+    if login_type == 7:
+        from .overseas_youtube_login import YouTubeOAuthLoginSession
+
+        existing_account = (
+            account_service.get_managed_account(int(record_id))
+            if update_mode and record_id is not None
+            else None
+        )
+        session = YouTubeOAuthLoginSession(
+            client_id=conf.YOUTUBE_OAUTH_CLIENT_ID,
+            profile_name=profile_name,
+            update_mode=update_mode,
+            record_id=record_id,
+            existing_account=existing_account,
+            account_saver=account_service.save_youtube_oauth_account,
+        )
+        session.start()
+        return session
     if login_type in account_service.OVERSEAS_PLATFORM_TYPES:
         session = RecoveredOverseasLoginSession(
             login_type,

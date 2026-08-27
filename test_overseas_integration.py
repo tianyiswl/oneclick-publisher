@@ -9,9 +9,18 @@ import tempfile
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
-from app_core import account_service, login_service, overseas_preflight, publish_service
+import conf
+from app_core import (
+    account_service,
+    login_service,
+    overseas_preflight,
+    overseas_youtube_credentials,
+    overseas_youtube_login,
+    publish_service,
+)
+from app_core.overseas_youtube_api import YouTubeChannelIdentity
 from myUtils import login as recovered_login
 from myUtils import postVideo as recovered_publish
 from uploader.youtube_uploader.main import YouTubeVideo
@@ -38,6 +47,172 @@ class OverseasAccountEntryTests(unittest.TestCase):
         )
         self.assertEqual(session.platform_type, 8)
         start.assert_called_once_with()
+
+    def test_login_service_routes_youtube_to_official_oauth_session(self) -> None:
+        created = MagicMock()
+        created.start = MagicMock()
+        with (
+            patch.object(
+                conf,
+                "YOUTUBE_OAUTH_CLIENT_ID",
+                "desktop-client.apps.googleusercontent.com",
+                create=True,
+            ),
+            patch.object(
+                overseas_youtube_login,
+                "YouTubeOAuthLoginSession",
+                return_value=created,
+            ) as session_type,
+            patch.object(
+                account_service,
+                "get_managed_account",
+                return_value=None,
+                create=True,
+            ),
+        ):
+            session = login_service.start_login(7, "海外主体")
+
+        self.assertIs(session, created)
+        created.start.assert_called_once_with()
+        kwargs = session_type.call_args.kwargs
+        self.assertEqual(
+            kwargs["client_id"],
+            "desktop-client.apps.googleusercontent.com",
+        )
+        self.assertEqual(kwargs["profile_name"], "海外主体")
+        self.assertIs(kwargs["account_saver"], account_service.save_youtube_oauth_account)
+
+
+class YouTubeOAuthAccountPersistenceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.database = Path(self.temp.name) / "database.db"
+        connection = sqlite3.connect(self.database)
+        connection.execute(
+            """
+            CREATE TABLE user_info (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                type INTEGER NOT NULL,
+                filePath TEXT NOT NULL,
+                userName TEXT NOT NULL,
+                status INTEGER DEFAULT 0,
+                profileName TEXT,
+                avatarPath TEXT,
+                avatarUpdatedAt TEXT,
+                remark TEXT,
+                lastCheckedAt TEXT,
+                lastLoginAt TEXT,
+                authMode TEXT NOT NULL DEFAULT 'browser',
+                accountReference TEXT
+            )
+            """
+        )
+        connection.commit()
+        connection.close()
+
+        @contextmanager
+        def connect_test_database():
+            connection = sqlite3.connect(self.database)
+            connection.row_factory = sqlite3.Row
+            try:
+                yield connection
+                connection.commit()
+            finally:
+                connection.close()
+
+        self.connect_patch = patch.object(
+            account_service,
+            "connect",
+            connect_test_database,
+        )
+        self.demo_patch = patch.object(account_service, "_ensure_demo_accounts")
+        self.promote_patch = patch.object(
+            account_service,
+            "_promote_confirmed_oneclick_sessions",
+        )
+        self.connect_patch.start()
+        self.demo_patch.start()
+        self.promote_patch.start()
+
+    def tearDown(self) -> None:
+        self.promote_patch.stop()
+        self.demo_patch.stop()
+        self.connect_patch.stop()
+        self.temp.cleanup()
+
+    def _save_oauth_account(self) -> int:
+        return account_service.save_youtube_oauth_account(
+            profile_name="海外主体",
+            credential_reference="youtube-oauth:opaque-reference",
+            channel_id="UC123",
+            display_name="测试频道",
+        )
+
+    def test_oauth_account_is_managed_but_excluded_from_publish_facing_accounts(self) -> None:
+        account_id = self._save_oauth_account()
+
+        self.assertEqual(account_service.list_accounts(), [])
+        managed = account_service.list_managed_accounts()
+        self.assertEqual(len(managed), 1)
+        self.assertEqual(managed[0]["id"], account_id)
+        self.assertEqual(managed[0]["authMode"], "youtube_oauth")
+        self.assertEqual(managed[0]["filePath"], "youtube-oauth:opaque-reference")
+        self.assertEqual(managed[0]["accountReference"], "UC123")
+        self.assertEqual(managed[0]["userName"], "测试频道")
+
+        connection = sqlite3.connect(self.database)
+        stored = repr(connection.execute("SELECT * FROM user_info").fetchone())
+        connection.close()
+        self.assertNotIn("refresh", stored.lower())
+        self.assertNotIn("access-token", stored)
+
+    def test_restart_validation_uses_official_channel_check_for_oauth_account(self) -> None:
+        account_id = self._save_oauth_account()
+        identity = YouTubeChannelIdentity(
+            channel_id="UC123",
+            display_name="重启后频道",
+        )
+        with (
+            patch.object(
+                conf,
+                "YOUTUBE_OAUTH_CLIENT_ID",
+                "desktop-client.apps.googleusercontent.com",
+                create=True,
+            ),
+            patch.object(
+                overseas_youtube_login,
+                "validate_saved_youtube_oauth_account",
+                return_value=identity,
+            ) as validate,
+        ):
+            result = account_service.validate_accounts([account_id])
+
+        self.assertEqual([row["id"] for row in result["normal"]], [account_id])
+        validate.assert_called_once()
+        checked_account = validate.call_args.args[0]
+        self.assertEqual(checked_account["accountReference"], "UC123")
+        self.assertEqual(
+            validate.call_args.kwargs["client_id"],
+            "desktop-client.apps.googleusercontent.com",
+        )
+
+    def test_deleting_oauth_account_removes_keyring_entry_not_cookie_file(self) -> None:
+        account_id = self._save_oauth_account()
+        credential_store = MagicMock()
+        with patch.object(
+            overseas_youtube_credentials,
+            "KeyringOAuthCredentialStore",
+            return_value=credential_store,
+        ):
+            account_service.delete_account(account_id)
+
+        credential_store.delete_refresh_token.assert_called_once_with(
+            "youtube-oauth:opaque-reference"
+        )
+        connection = sqlite3.connect(self.database)
+        count = connection.execute("SELECT COUNT(*) FROM user_info").fetchone()[0]
+        connection.close()
+        self.assertEqual(count, 0)
 
     def test_meta_relogin_updates_shared_instagram_and_facebook_rows(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
