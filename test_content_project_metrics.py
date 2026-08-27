@@ -23,7 +23,7 @@ class ContentProjectMetricsTests(unittest.TestCase):
         self.now = datetime(2026, 8, 26, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
         self.calls: list[int] = []
         self.failed_accounts: set[int] = set()
-        self.platform_types = {31: 3, 11: 1}
+        self.platform_types = {31: 3, 11: 1, 2: 10}
         with database.connect() as conn:
             conn.executemany(
                 """
@@ -34,6 +34,7 @@ class ContentProjectMetricsTests(unittest.TestCase):
                 [
                     (31, 3, "douyin.json", "抖音主体", "抖音主体"),
                     (11, 1, "xhs.json", "小红书主体", "小红书主体"),
+                    (2, 10, "wechat.json", "硅基进化", "硅基进化"),
                 ],
             )
         self.profile = {
@@ -108,16 +109,18 @@ class ContentProjectMetricsTests(unittest.TestCase):
         phase: str,
         status: str,
         platform_post_id: str | None,
+        platform_type: int = 3,
+        account_file: str = "douyin.json",
     ) -> int:
         mode = "oneclick_publish" if phase == "formal" else "oneclick_preflight"
         task = task_service.create_pending_task(
             [
                 {
-                    "type": 3,
-                    "contentType": "video",
+                    "type": platform_type,
+                    "contentType": "article" if platform_type == 10 else "video",
                     "title": f"{project_id}-{phase}",
                     "fileList": [f"/{project_id}-{phase}.mp4"],
-                    "accountList": ["douyin.json"],
+                    "accountList": [account_file],
                     "debugDryRun": phase == "preflight",
                     "contentProjectId": project_id,
                 }
@@ -260,6 +263,45 @@ class ContentProjectMetricsTests(unittest.TestCase):
         self.assertIsNone(item["contentId"])
         self.assertEqual(item["availability"], "missing")
         self.assertTrue(all(value is None for value in item["metrics"].values()))
+
+    def test_known_publish_waiting_for_platform_statistics_is_pending(self) -> None:
+        """已有发表回执但平台尚未结算数据时，不能把作品本身报成缺失。"""
+
+        task_id = self._create_project_task(
+            "project-a", phase="formal", status="success", platform_post_id="today-work"
+        )
+
+        result = self.service.get_project_metrics("project-a", self.profile, 1)
+
+        item = next(row for row in result["contents"] if row["taskId"] == task_id)
+        self.assertEqual(item["contentId"], "today-work")
+        self.assertEqual(item["availability"], "pending")
+        self.assertTrue(all(value is None for value in item["metrics"].values()))
+
+    def test_wechat_profile_alias_keeps_confirmed_publish_in_project_results(self) -> None:
+        """“公众号”和“微信公众号”必须归一，否则真实文章会被本地过滤。"""
+
+        task_id = self._create_project_task(
+            "silicon-evolution",
+            phase="formal",
+            status="success",
+            platform_post_id="wechat-post",
+            platform_type=10,
+            account_file="wechat.json",
+        )
+        profile = {
+            "projectId": "silicon-evolution",
+            "targets": [{"platform": "微信公众号", "accountId": 2}],
+        }
+
+        result = self.service.get_project_metrics(
+            "silicon-evolution", profile, 1
+        )
+
+        item = next(row for row in result["contents"] if row["taskId"] == task_id)
+        self.assertEqual(item["platform"], "微信公众号")
+        self.assertEqual(item["contentId"], "wechat-post")
+        self.assertEqual(item["availability"], "pending")
 
     def test_preflight_and_failed_tasks_do_not_enter_project_contents(self) -> None:
         preflight_task = self._create_project_task(

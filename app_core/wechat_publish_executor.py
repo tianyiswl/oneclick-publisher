@@ -51,6 +51,7 @@ _NAVIGATION_TRANSIENT_MARKERS = (
     "Execution context was destroyed",
     "Cannot find context with specified id",
     "Most likely the page has been closed",
+    "net::ERR_ABORTED",
 )
 
 

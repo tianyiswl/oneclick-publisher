@@ -29,6 +29,15 @@ from app_core.wechat_verification import validate_qr_image_bytes
 
 
 class WechatPublishExecutorBoundaryTests(unittest.TestCase):
+    def test_err_aborted_after_submit_is_a_transient_navigation_error(self):
+        """公众号已接收提交后的首页跳转中断不能被写成发表失败。"""
+
+        error = RuntimeError(
+            "Page.goto: net::ERR_ABORTED at https://mp.weixin.qq.com/"
+        )
+
+        self.assertTrue(_is_transient_navigation_error(error))
+
     def _payload(self, root: Path) -> dict:
         cover = root / "cover.png"
         cover.write_bytes(b"png")

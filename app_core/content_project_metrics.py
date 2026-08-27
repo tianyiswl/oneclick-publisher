@@ -8,7 +8,13 @@ from datetime import datetime, timedelta
 from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo
 
-from . import account_service, database, platform_data_service, platform_data_sync
+from . import (
+    account_service,
+    database,
+    oneclick_capabilities,
+    platform_data_service,
+    platform_data_sync,
+)
 
 
 _BEIJING = ZoneInfo("Asia/Shanghai")
@@ -366,7 +372,10 @@ class ContentProjectMetricsService:
         profile: Mapping[str, Any],
     ) -> list[dict[str, Any]]:
         allowed = {
-            (int(target["accountId"]), str(target["platform"]))
+            (
+                int(target["accountId"]),
+                oneclick_capabilities.canonical_platform(str(target["platform"])),
+            )
             for target in _targets(profile)
         }
         try:
@@ -403,8 +412,10 @@ class ContentProjectMetricsService:
         for row in rows:
             account_id = int(row["accountId"] or 0)
             platform_type = int(row["platformType"] or 0)
-            platform = account_service.PLATFORMS.get(
-                platform_type, f"平台{platform_type}"
+            platform = oneclick_capabilities.canonical_platform(
+                account_service.PLATFORMS.get(
+                    platform_type, f"平台{platform_type}"
+                )
             )
             if (account_id, platform) not in allowed:
                 continue
@@ -435,7 +446,7 @@ class ContentProjectMetricsService:
                     "availability": (
                         "available"
                         if content_id and any(value is not None for value in metrics.values())
-                        else "missing"
+                        else "pending" if content_id else "missing"
                     ),
                     "platformObservedAt": observed_at,
                     "localSyncedAt": local_synced_at,
