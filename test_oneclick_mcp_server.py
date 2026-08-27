@@ -15,6 +15,9 @@ from app_core.oneclick_mcp_server import create_server
 
 
 class _Gateway:
+    def __init__(self):
+        self.calls = []
+
     def list_accounts(self):
         return []
 
@@ -24,7 +27,10 @@ class _Gateway:
     def save_profile(self, project_id, display_name, targets):
         return {"projectId": project_id, "displayName": display_name, "targets": targets}
 
-    def preflight_content(self, project_id, manifest_path, schedules=None):
+    def preflight_content(
+        self, project_id, manifest_path, schedules=None, settings=None
+    ):
+        self.calls.append(("preflight", schedules, settings))
         return {"taskId": 7, "phase": "preflight", "status": "pending", "platforms": []}
 
     def task_status(self, task_id):
@@ -41,12 +47,15 @@ class _Gateway:
         confirmed_preflight_task_id,
         authorization_id,
         schedules=None,
+        settings=None,
     ):
+        self.calls.append(("formal", schedules, settings))
         return {"taskId": 8, "phase": "formal", "status": "pending", "platforms": []}
 
     def direct_publish_content(
-        self, project_id, manifest_path, schedules=None
+        self, project_id, manifest_path, schedules=None, settings=None
     ):
+        self.calls.append(("direct", schedules, settings))
         return {
             "taskId": 11,
             "phase": "formal",
@@ -158,6 +167,9 @@ class OneclickMcpServerTests(unittest.TestCase):
         self.assertIn("confirmed_preflight_task_id", formal_schema["properties"])
         self.assertIn("authorization_id", formal_schema["properties"])
         direct_schema = by_name["oneclick_direct_publish_content"].input_schema
+        self.assertIn("settings", preflight_schema["properties"])
+        self.assertIn("settings", formal_schema["properties"])
+        self.assertIn("settings", direct_schema["properties"])
         self.assertNotIn(
             "confirmed_preflight_task_id",
             direct_schema.get("properties", {}),
@@ -263,13 +275,20 @@ class OneclickMcpServerTests(unittest.TestCase):
         self.assertEqual(result.structured_content["task"]["phase"], "preflight")
 
     def test_direct_publish_tool_uses_chat_authorization_without_preflight_args(self) -> None:
-        server = create_server(_Gateway())
+        gateway = _Gateway()
+        server = create_server(gateway)
         result = asyncio.run(
             server.call_tool(
                 "oneclick_direct_publish_content",
                 {
                     "project_id": "silicon-exploration",
                     "manifest_path": "/content/manifest.json",
+                    "settings": {
+                        "YouTube": {
+                            "visibility": "private",
+                            "madeForKids": False,
+                        }
+                    },
                 },
             )
         )
@@ -277,6 +296,10 @@ class OneclickMcpServerTests(unittest.TestCase):
         self.assertFalse(result.is_error)
         self.assertEqual(result.structured_content["task"]["taskId"], 11)
         self.assertEqual(result.structured_content["task"]["phase"], "formal")
+        self.assertEqual(
+            gateway.calls[0][2]["YouTube"]["visibility"],
+            "private",
+        )
 
 
 if __name__ == "__main__":

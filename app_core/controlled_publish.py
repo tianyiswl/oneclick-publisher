@@ -38,8 +38,11 @@ _REQUEST_KEYS = {
     "authorizationId",
     "directAuthorizationId",
 }
-_TARGET_KEYS = {"platform", "accountId", "schedule"}
+_TARGET_KEYS = {"platform", "accountId", "schedule", "settings"}
 _PROJECT_ID_RE = re.compile(r"[a-z0-9][a-z0-9._-]{1,63}")
+_YOUTUBE_VISIBILITIES = frozenset(
+    {"private", "unlisted", "public", "scheduled_public"}
+)
 
 
 class ControlledPublishError(ValueError):
@@ -79,6 +82,47 @@ def _schedule(value: object) -> tuple[bool, str, str]:
 def _preferred_cover(platform_type: int, covers: Mapping[str, str]) -> str:
     ratios = ("3:4", "4:3") if platform_type in {1, 3, 6, 8, 9} else ("4:3", "3:4")
     return next((str(covers[ratio]) for ratio in ratios if covers.get(ratio)), "")
+
+
+def _youtube_settings(value: object, *, mode: str) -> dict[str, object]:
+    settings = (
+        {}
+        if value is None
+        else _require_mapping(
+            value,
+            "youtube_settings_invalid",
+            "YouTube 发布设置必须是对象",
+        )
+    )
+    if set(settings) - {"visibility", "madeForKids", "notifySubscribers"}:
+        raise ControlledPublishError(
+            "youtube_settings_invalid", "YouTube 发布设置包含不支持字段"
+        )
+    visibility = str(settings.get("visibility") or "private").strip().lower()
+    if visibility not in _YOUTUBE_VISIBILITIES:
+        raise ControlledPublishError(
+            "youtube_visibility_invalid", "YouTube 可见性无效"
+        )
+    audience = settings.get("madeForKids")
+    if mode in {"formal", "direct"} and type(audience) is not bool:
+        raise ControlledPublishError(
+            "youtube_audience_required",
+            "YouTube 正式发布必须明确选择是否面向儿童",
+        )
+    if audience is not None and type(audience) is not bool:
+        raise ControlledPublishError(
+            "youtube_audience_invalid", "YouTube 受众设置无效"
+        )
+    notify = settings.get("notifySubscribers", True)
+    if type(notify) is not bool:
+        raise ControlledPublishError(
+            "youtube_notify_invalid", "YouTube 通知设置无效"
+        )
+    return {
+        "visibility": visibility,
+        "madeForKids": audience,
+        "notifySubscribers": notify,
+    }
 
 
 def build_controlled_payloads(
@@ -136,7 +180,14 @@ def build_controlled_payloads(
     targets = request.get("targets")
     if not isinstance(targets, list) or not targets:
         raise ControlledPublishError("controlled_targets_required", "至少需要一个明确平台账号")
-    account_rows = [dict(row) for row in (accounts if accounts is not None else account_service.list_accounts())]
+    account_rows = [
+        dict(row)
+        for row in (
+            accounts
+            if accounts is not None
+            else account_service.list_publishable_accounts()
+        )
+    ]
     by_id = {int(row.get("id") or 0): row for row in account_rows if int(row.get("id") or 0) > 0}
     preferred = {
         oneclick_capabilities.canonical_platform(name)
@@ -149,6 +200,7 @@ def build_controlled_payloads(
 
     payloads: list[dict[str, Any]] = []
     seen: set[tuple[int, int]] = set()
+    youtube_target_count = 0
     for raw_target in targets:
         target = _require_mapping(
             raw_target, "controlled_target_invalid", "每个目标必须是 JSON 对象"
@@ -172,6 +224,33 @@ def build_controlled_payloads(
             raise ControlledPublishError(
                 "controlled_platform_not_in_bundle", f"内容包没有声明目标平台：{platform}"
             )
+        youtube_settings: dict[str, object] | None = None
+        if platform_type == 7:
+            youtube_target_count += 1
+            if youtube_target_count > 1:
+                raise ControlledPublishError(
+                    "youtube_target_invalid",
+                    "一次 YouTube 任务只能选择一个官方 OAuth 账号",
+                )
+            if str(account.get("authMode") or "") != account_service.AUTH_MODE_YOUTUBE_OAUTH:
+                raise ControlledPublishError(
+                    "youtube_oauth_required",
+                    "YouTube 发布必须使用官方 OAuth 账号",
+                )
+            if (
+                mode in {"formal", "direct"}
+                and int(account.get("oauthScopeVersion") or 1) < 2
+            ):
+                raise ControlledPublishError(
+                    "youtube_oauth_scope_upgrade_required",
+                    "YouTube 账号需要重新授权发布权限",
+                )
+            if bundle.get("contentType") != "video" or len(bundle["assetPaths"]) != 1:
+                raise ControlledPublishError(
+                    "youtube_content_invalid",
+                    "一次 YouTube 任务必须只包含一个视频",
+                )
+            youtube_settings = _youtube_settings(target.get("settings"), mode=mode)
         override = override_by_platform.get(platform, {})
         title = str(override.get("title") or bundle.get("commonTitle") or bundle["title"]).strip()
         description = str(override.get("body") or bundle.get("commonBody") or "").strip()
@@ -186,6 +265,13 @@ def build_controlled_payloads(
                 "抖音正文包含原始 @文字；当前内容包没有独立 mentions 字段和官方候选回读，不能冒充有效提及",
             )
         enable_timer, schedule_time, schedule_timezone = _schedule(target.get("schedule"))
+        if youtube_settings is not None:
+            scheduled_public = youtube_settings["visibility"] == "scheduled_public"
+            if enable_timer != scheduled_public:
+                raise ControlledPublishError(
+                    "youtube_schedule_invalid",
+                    "YouTube 排期只适用于定时公开，定时公开也必须提供排期",
+                )
         covers = dict(bundle["coverPaths"])
         cover_path = _preferred_cover(platform_type, covers)
         display_name = str(account.get("profileName") or account.get("userName") or "")
@@ -239,6 +325,14 @@ def build_controlled_payloads(
             payload.update(
                 {"locationKeyword": "", "locationScope": "", "locationPoi": {}}
             )
+        elif platform_type == 7 and youtube_settings is not None:
+            payload.update(youtube_settings)
+            payload.update(
+                {
+                    "youtubeOfficialApi": True,
+                    "backgroundMode": True,
+                }
+            )
         payloads.append(payload)
     return payloads
 
@@ -279,6 +373,8 @@ def scope_fingerprint(payloads: Iterable[Mapping[str, Any]]) -> str:
                 "aiGenerated": bool(payload.get("aiGenerated")),
                 "aiDisclosure": payload.get("aiDisclosure") or {},
                 "visibility": str(payload.get("visibility") or ""),
+                "madeForKids": payload.get("madeForKids"),
+                "notifySubscribers": payload.get("notifySubscribers"),
             }
         )
     encoded = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))

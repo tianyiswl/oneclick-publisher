@@ -75,10 +75,11 @@ class ContentProjectGatewayTests(unittest.TestCase):
         metrics_service: _MetricsService | None = None,
         direct_authorizer=None,
         silicon_direct_authorizer=None,
+        accounts_provider=None,
     ) -> ContentProjectGateway:
         return ContentProjectGateway(
             profile_store=PublishProfileStore(root / "publish-profiles.json"),
-            accounts_provider=self._accounts,
+            accounts_provider=accounts_provider or self._accounts,
             submitter=lambda request: submitted.append(dict(request)) or {
                 "taskId": 42,
                 "taskNo": "T42",
@@ -496,6 +497,65 @@ class ContentProjectGatewayTests(unittest.TestCase):
         self.assertEqual(
             submitted[0]["directAuthorizationId"],
             "direct-one-time-grant",
+        )
+
+    def test_direct_publish_forwards_youtube_settings(self) -> None:
+        youtube_account = {
+            "id": 71,
+            "type": 7,
+            "filePath": "youtube-oauth:test",
+            "profileName": "YouTube 测试",
+            "userName": "YouTube 测试",
+            "authMode": "youtube_oauth",
+            "oauthScopeVersion": 2,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            submitted: list[dict] = []
+            gateway = self._gateway(
+                Path(directory),
+                submitted,
+                accounts_provider=lambda: [youtube_account],
+            )
+            gateway.save_profile(
+                "youtube-test",
+                "YouTube 测试",
+                [{"platform": "YouTube", "accountId": 71}],
+            )
+            gateway.direct_publish_content(
+                "youtube-test",
+                "/content/manifest.json",
+                settings={
+                    "YouTube": {
+                        "visibility": "private",
+                        "madeForKids": False,
+                        "notifySubscribers": False,
+                    }
+                },
+            )
+
+        target = submitted[0]["targets"][0]
+        self.assertEqual(target["settings"]["visibility"], "private")
+        self.assertIs(target["settings"]["madeForKids"], False)
+        self.assertIs(target["settings"]["notifySubscribers"], False)
+
+    def test_settings_for_unconfigured_platform_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            gateway = self._gateway(Path(directory), [])
+            gateway.save_profile(
+                "silicon-exploration",
+                "硅基探索",
+                [{"platform": "抖音", "accountId": 31}],
+            )
+            with self.assertRaises(ContentProjectGatewayError) as raised:
+                gateway.preflight_content(
+                    "silicon-exploration",
+                    "/content/manifest.json",
+                    settings={"YouTube": {"visibility": "private"}},
+                )
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "content_project_settings_mismatch",
         )
 
     def test_profile_rejects_account_that_belongs_to_another_platform(self) -> None:

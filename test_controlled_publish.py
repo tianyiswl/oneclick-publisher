@@ -62,6 +62,38 @@ class ControlledPublishTests(unittest.TestCase):
         )
         return manifest
 
+    def _youtube_bundle(self, root: Path) -> Path:
+        (root / "youtube.mp4").write_bytes(b"youtube-video")
+        (root / "youtube-cover.png").write_bytes(b"youtube-cover")
+        (root / "正文.md").write_text("YouTube 正文", encoding="utf-8")
+        manifest = root / "manifest.json"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": "oneclick-content/v1",
+                    "contentType": "video",
+                    "title": "YouTube 标题",
+                    "bodyFile": "正文.md",
+                    "tags": ["oneclick"],
+                    "assets": ["youtube.mp4"],
+                    "covers": {"4:3": "youtube-cover.png"},
+                    "preferredPlatforms": ["YouTube"],
+                    "platformOverrides": {
+                        "YouTube": {
+                            "title": "YouTube 独立标题",
+                            "body": "YouTube 独立正文",
+                            "tags": ["youtube"],
+                        }
+                    },
+                    "debugDryRun": True,
+                    "publishAllowed": False,
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        return manifest
+
     @staticmethod
     def _accounts() -> list[dict]:
         return [
@@ -208,6 +240,137 @@ class ControlledPublishTests(unittest.TestCase):
             "controlled_mentions_unsupported",
         )
 
+    def test_youtube_target_defaults_private_and_keeps_explicit_audience(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest = self._youtube_bundle(Path(temporary))
+            payload = build_controlled_payloads(
+                {
+                    "manifestPath": str(manifest),
+                    "mode": "preflight",
+                    "targets": [
+                        {
+                            "platform": "YouTube",
+                            "accountId": 71,
+                            "schedule": None,
+                            "settings": {
+                                "visibility": "private",
+                                "madeForKids": False,
+                            },
+                        }
+                    ],
+                },
+                accounts=[
+                    {
+                        "id": 71,
+                        "type": 7,
+                        "filePath": "youtube-oauth:test",
+                        "profileName": "YouTube 测试",
+                        "authMode": "youtube_oauth",
+                        "oauthScopeVersion": 2,
+                    }
+                ],
+            )[0]
+
+        self.assertEqual(payload["visibility"], "private")
+        self.assertIs(payload["madeForKids"], False)
+        self.assertTrue(payload["notifySubscribers"])
+        self.assertTrue(payload["youtubeOfficialApi"])
+        self.assertTrue(payload["backgroundMode"])
+
+    def test_youtube_schedule_requires_scheduled_public(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest = self._youtube_bundle(Path(temporary))
+            with self.assertRaises(ControlledPublishError) as raised:
+                build_controlled_payloads(
+                    {
+                        "manifestPath": str(manifest),
+                        "mode": "preflight",
+                        "targets": [
+                            {
+                                "platform": "YouTube",
+                                "accountId": 71,
+                                "schedule": {
+                                    "localTime": "2026-08-28 09:00",
+                                    "timezone": "Asia/Shanghai",
+                                },
+                                "settings": {
+                                    "visibility": "private",
+                                    "madeForKids": False,
+                                },
+                            }
+                        ],
+                    },
+                    accounts=[
+                        {
+                            "id": 71,
+                            "type": 7,
+                            "filePath": "youtube-oauth:test",
+                            "authMode": "youtube_oauth",
+                            "oauthScopeVersion": 2,
+                        }
+                    ],
+                )
+
+        self.assertEqual(raised.exception.error_code, "youtube_schedule_invalid")
+
+    def test_youtube_formal_requires_upgraded_oauth_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest = self._youtube_bundle(Path(temporary))
+            with self.assertRaises(ControlledPublishError) as raised:
+                build_controlled_payloads(
+                    {
+                        "manifestPath": str(manifest),
+                        "mode": "formal",
+                        "confirmedPreflightTaskId": 4,
+                        "authorizationId": "grant",
+                        "targets": [
+                            {
+                                "platform": "YouTube",
+                                "accountId": 71,
+                                "schedule": None,
+                                "settings": {
+                                    "visibility": "private",
+                                    "madeForKids": False,
+                                },
+                            }
+                        ],
+                    },
+                    accounts=[
+                        {
+                            "id": 71,
+                            "type": 7,
+                            "filePath": "youtube-oauth:test",
+                            "authMode": "youtube_oauth",
+                            "oauthScopeVersion": 1,
+                        }
+                    ],
+                )
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "youtube_oauth_scope_upgrade_required",
+        )
+
+    def test_youtube_settings_change_authorization_fingerprint(self) -> None:
+        base = [
+            {
+                "type": 7,
+                "accountIds": [71],
+                "visibility": "private",
+                "madeForKids": False,
+                "notifySubscribers": True,
+            }
+        ]
+        visibility_changed = [{**base[0], "visibility": "unlisted"}]
+        audience_changed = [{**base[0], "madeForKids": True}]
+
+        self.assertNotEqual(
+            scope_fingerprint(base), scope_fingerprint(visibility_changed)
+        )
+        self.assertNotEqual(
+            scope_fingerprint(base), scope_fingerprint(audience_changed)
+        )
+
     def test_authorization_is_bound_short_lived_and_single_use(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
@@ -327,7 +490,7 @@ class ControlledPublishTests(unittest.TestCase):
                 }
 
             with db_patch, patch(
-                "app_core.account_service.list_accounts",
+                "app_core.account_service.list_publishable_accounts",
                 return_value=self._accounts(),
             ), patch(
                 "app_core.task_service.list_tasks", return_value=[]

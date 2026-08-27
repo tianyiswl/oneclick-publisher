@@ -201,6 +201,10 @@ class YouTubeOAuthAccountPersistenceTests(unittest.TestCase):
         self.assertEqual(managed[0]["filePath"], "youtube-oauth:opaque-reference")
         self.assertEqual(managed[0]["accountReference"], "UC123")
         self.assertEqual(managed[0]["userName"], "测试频道")
+        self.assertEqual(
+            [row["id"] for row in account_service.list_publishable_accounts()],
+            [account_id],
+        )
 
         connection = sqlite3.connect(self.database)
         stored = repr(connection.execute("SELECT * FROM user_info").fetchone())

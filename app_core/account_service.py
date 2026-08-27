@@ -262,6 +262,20 @@ def list_managed_accounts() -> list[dict]:
     return _list_accounts(include_youtube_oauth=True)
 
 
+def list_publishable_accounts() -> list[dict]:
+    """Return browser accounts plus official YouTube OAuth publishing rows."""
+
+    return [
+        row
+        for row in list_managed_accounts()
+        if str(row.get("authMode") or AUTH_MODE_BROWSER) == AUTH_MODE_BROWSER
+        or (
+            int(row.get("type") or 0) == 7
+            and str(row.get("authMode") or "") == AUTH_MODE_YOUTUBE_OAUTH
+        )
+    ]
+
+
 def get_managed_account(account_id: int) -> dict | None:
     wanted = int(account_id)
     return next(

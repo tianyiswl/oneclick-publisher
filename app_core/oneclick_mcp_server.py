@@ -83,10 +83,16 @@ def create_server(gateway: ContentProjectGateway | None = None) -> MCPServer:
         project_id: str,
         manifest_path: str,
         schedules: Mapping[str, Any] | None = None,
+        settings: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> dict[str, Any]:
         return _call(
             "task",
-            lambda: gateway.preflight_content(project_id, manifest_path, schedules),
+            lambda: gateway.preflight_content(
+                project_id,
+                manifest_path,
+                schedules,
+                settings,
+            ),
         )
 
     @server.tool(
@@ -101,6 +107,7 @@ def create_server(gateway: ContentProjectGateway | None = None) -> MCPServer:
         project_id: str,
         manifest_path: str,
         schedules: Mapping[str, Any] | None = None,
+        settings: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> dict[str, Any]:
         return _call(
             "task",
@@ -108,6 +115,7 @@ def create_server(gateway: ContentProjectGateway | None = None) -> MCPServer:
                 project_id,
                 manifest_path,
                 schedules,
+                settings,
             ),
         )
 
@@ -144,6 +152,7 @@ def create_server(gateway: ContentProjectGateway | None = None) -> MCPServer:
         confirmed_preflight_task_id: int,
         authorization_id: str,
         schedules: Mapping[str, Any] | None = None,
+        settings: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> dict[str, Any]:
         return _call(
             "task",
@@ -153,6 +162,7 @@ def create_server(gateway: ContentProjectGateway | None = None) -> MCPServer:
                 confirmed_preflight_task_id=confirmed_preflight_task_id,
                 authorization_id=authorization_id,
                 schedules=schedules,
+                settings=settings,
             ),
         )
 

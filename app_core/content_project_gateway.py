@@ -130,7 +130,9 @@ class ContentProjectGateway:
         self,
         *,
         profile_store: PublishProfileStore | None = None,
-        accounts_provider: Callable[[], Sequence[Mapping[str, Any]]] = account_service.list_accounts,
+        accounts_provider: Callable[
+            [], Sequence[Mapping[str, Any]]
+        ] = account_service.list_publishable_accounts,
         submitter: Callable[[Mapping[str, Any]], dict[str, Any]] | None = None,
         status_reader: Callable[[int], dict[str, Any]] = controlled_publish.task_status,
         authorizer: Callable[[int], dict[str, Any]] = controlled_publish.authorize_completed_preflight,
@@ -282,12 +284,30 @@ class ContentProjectGateway:
         manifest_path: str,
         mode: str,
         schedules: Mapping[str, object] | None,
+        settings: Mapping[str, Mapping[str, Any]] | None,
     ) -> dict[str, Any]:
         normalized_project_id = str(project_id or "").strip().lower()
         profile = self.profile_store.get(normalized_project_id)
         normalized_schedules = {
             oneclick_capabilities.canonical_platform(str(platform)): schedule
             for platform, schedule in dict(schedules or {}).items()
+        }
+        raw_settings = (
+            {}
+            if settings is None
+            else _mapping(
+                settings,
+                "content_project_settings_invalid",
+                "平台发布设置必须是对象",
+            )
+        )
+        normalized_settings = {
+            oneclick_capabilities.canonical_platform(str(platform)): _mapping(
+                value,
+                "content_project_settings_invalid",
+                "每个平台发布设置必须是对象",
+            )
+            for platform, value in raw_settings.items()
         }
         configured_platforms = {
             str(target.get("platform") or "") for target in profile.get("targets") or []
@@ -298,14 +318,24 @@ class ContentProjectGateway:
                 "content_project_schedule_mismatch",
                 "发布时间包含项目未配置的平台：" + "、".join(sorted(extra_schedules)),
             )
-        targets = [
-            {
+        extra_settings = set(normalized_settings) - configured_platforms
+        if extra_settings:
+            raise ContentProjectGatewayError(
+                "content_project_settings_mismatch",
+                "发布设置包含项目未配置的平台："
+                + "、".join(sorted(extra_settings)),
+            )
+        targets = []
+        for target in profile.get("targets") or []:
+            platform = str(target["platform"])
+            normalized_target = {
                 "platform": str(target["platform"]),
                 "accountId": int(target["accountId"]),
-                "schedule": normalized_schedules.get(str(target["platform"])),
+                "schedule": normalized_schedules.get(platform),
             }
-            for target in profile.get("targets") or []
-        ]
+            if platform in normalized_settings:
+                normalized_target["settings"] = dict(normalized_settings[platform])
+            targets.append(normalized_target)
         return {
             "projectId": normalized_project_id,
             "manifestPath": str(manifest_path or "").strip(),
@@ -342,10 +372,17 @@ class ContentProjectGateway:
         project_id: str,
         manifest_path: str,
         schedules: Mapping[str, object] | None = None,
+        settings: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> dict[str, Any]:
         self._ensure_platform_work_available()
         return self.submitter(
-            self._request(project_id, manifest_path, "preflight", schedules)
+            self._request(
+                project_id,
+                manifest_path,
+                "preflight",
+                schedules,
+                settings,
+            )
         )
 
     def formal_publish(
@@ -356,6 +393,7 @@ class ContentProjectGateway:
         confirmed_preflight_task_id: int,
         authorization_id: str,
         schedules: Mapping[str, object] | None = None,
+        settings: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> dict[str, Any]:
         self._ensure_platform_work_available()
         if (
@@ -367,7 +405,13 @@ class ContentProjectGateway:
                 "content_project_authorization_required",
                 "正式发布必须绑定全部成功的预检和一次性本地授权",
             )
-        request = self._request(project_id, manifest_path, "formal", schedules)
+        request = self._request(
+            project_id,
+            manifest_path,
+            "formal",
+            schedules,
+            settings,
+        )
         request.update(
             {
                 "confirmedPreflightTaskId": confirmed_preflight_task_id,
@@ -381,6 +425,7 @@ class ContentProjectGateway:
         project_id: str,
         manifest_path: str,
         schedules: Mapping[str, object] | None = None,
+        settings: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """用当次对话授权直接创建隐藏的正式发布任务。
 
@@ -389,7 +434,13 @@ class ContentProjectGateway:
         """
 
         self._ensure_platform_work_available()
-        request = self._request(project_id, manifest_path, "direct", schedules)
+        request = self._request(
+            project_id,
+            manifest_path,
+            "direct",
+            schedules,
+            settings,
+        )
         grant = self.direct_authorizer(request)
         authorization_id = str(grant.get("authorizationId") or "").strip()
         if not authorization_id:
