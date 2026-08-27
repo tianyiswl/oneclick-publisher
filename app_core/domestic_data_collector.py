@@ -93,6 +93,9 @@ class DomesticCollectorConfig:
     max_requests: int = 400
     phase_settle_milliseconds: int = 2_000
     navigation_by_phase: Mapping[str, str] | None = None
+    pagination_phase: str = ""
+    pagination_url_builder: Callable[[str, Mapping[str, object]], str | None] | None = None
+    pagination_max_pages: int = 1
 
     def __post_init__(self) -> None:
         if type(self.platform_type) is not int or self.platform_type <= 0:
@@ -157,6 +160,20 @@ class DomesticCollectorConfig:
             or not 1 <= self.phase_settle_milliseconds <= 5_000
         ):
             raise CollectionFailure("metric_payload_invalid")
+        pagination_builder = self.pagination_url_builder
+        if pagination_builder is None:
+            if self.pagination_phase or self.pagination_max_pages != 1:
+                raise CollectionFailure("metric_payload_invalid")
+        else:
+            pagination_phase = _controlled_text(self.pagination_phase)
+            if (
+                not callable(pagination_builder)
+                or pagination_phase not in phases.values()
+                or tuple(navigation)[-1] != pagination_phase
+                or type(self.pagination_max_pages) is not int
+                or not 2 <= self.pagination_max_pages <= 20
+            ):
+                raise CollectionFailure("metric_payload_invalid")
         object.__setattr__(self, "allowed_hosts", hosts)
         object.__setattr__(self, "endpoint_by_path", endpoints)
         object.__setattr__(self, "phase_by_path", phases)
@@ -302,6 +319,7 @@ class DomesticBrowserCollector:
         caught: BaseException | None = None
         cleanup_errors: list[BaseException] = []
         captures: list[CapturedJson] = []
+        capture_sources: list[tuple[CapturedJson, str]] = []
         response_tasks: list[asyncio.Task] = []
         request_paths: dict[int, tuple[object, str, str]] = {}
         seen_requests: dict[int, object] = {}
@@ -396,14 +414,14 @@ class DomesticBrowserCollector:
                 raise _invalid(endpoint=endpoint, stage="json_decode", reason="invalid_json") from None
             if type(payload) is not dict:
                 raise _invalid(endpoint=endpoint, stage="json_decode", reason="payload_shape_invalid")
-            captures.append(
-                CapturedJson(
-                    endpoint=endpoint,
-                    phase=self._config.phase_by_path[path],
-                    path=path,
-                    payload=payload,
-                )
+            captured = CapturedJson(
+                endpoint=endpoint,
+                phase=self._config.phase_by_path[path],
+                path=path,
+                payload=payload,
             )
+            captures.append(captured)
+            capture_sources.append((captured, str(getattr(response, "url", "") or "")))
 
         def remember_response(response: object) -> None:
             nonlocal capture_error, response_count, saw_unreviewed_response
@@ -557,6 +575,99 @@ class DomesticBrowserCollector:
                 )
                 await flush_responses()
 
+        async def paginate(phase: str) -> None:
+            builder = self._config.pagination_url_builder
+            if builder is None or phase != self._config.pagination_phase:
+                return
+            phase_sources = [
+                (capture, source_url)
+                for capture, source_url in capture_sources
+                if capture.phase == phase
+            ]
+            if not phase_sources:
+                return
+            capture, source_url = phase_sources[-1]
+            seen_urls = {source_url}
+            page_count = 1
+            while page_count < self._config.pagination_max_pages:
+                next_url = builder(source_url, capture.payload)
+                if next_url is None:
+                    return
+                if type(next_url) is not str or not next_url or next_url in seen_urls:
+                    raise _invalid(
+                        endpoint=capture.endpoint,
+                        stage="pagination",
+                        reason="pagination_cursor_invalid",
+                    )
+                try:
+                    current = urlsplit(source_url)
+                    target = urlsplit(next_url)
+                except ValueError:
+                    raise _invalid(
+                        endpoint=capture.endpoint,
+                        stage="pagination",
+                        reason="pagination_cursor_invalid",
+                    ) from None
+                if (
+                    target.scheme != "https"
+                    or target.hostname not in self._config.allowed_hosts
+                    or target.path != current.path
+                    or target.path not in self._config.endpoint_by_path
+                    or self._config.phase_by_path[target.path] != phase
+                    or target.fragment
+                ):
+                    raise _invalid(
+                        endpoint=capture.endpoint,
+                        stage="pagination",
+                        reason="pagination_cursor_invalid",
+                    )
+                before = len(capture_sources)
+                await _await_until(
+                    page.goto(
+                        next_url,
+                        wait_until="domcontentloaded",
+                        timeout=max(
+                            1,
+                            int((work_deadline - self._monotonic()) * 1000),
+                        ),
+                    ),
+                    deadline=work_deadline,
+                    monotonic=self._monotonic,
+                )
+                await flush_responses()
+                waiter = getattr(page, "wait_for_timeout", None)
+                if not callable(waiter):
+                    raise _error("browser_signature_timeout")
+                while len(capture_sources) == before:
+                    if work_deadline - self._monotonic() <= 0:
+                        raise _error("browser_signature_timeout")
+                    await _await_until(
+                        waiter(_POLL_MILLISECONDS),
+                        deadline=work_deadline,
+                        monotonic=self._monotonic,
+                    )
+                    await flush_responses()
+                await _await_until(
+                    waiter(self._config.phase_settle_milliseconds),
+                    deadline=work_deadline,
+                    monotonic=self._monotonic,
+                )
+                await flush_responses()
+                new_sources = [
+                    item
+                    for item in capture_sources[before:]
+                    if item[0].phase == phase and item[0].path == target.path
+                ]
+                if not new_sources:
+                    raise _invalid(
+                        endpoint=capture.endpoint,
+                        stage="pagination",
+                        reason="pagination_response_missing",
+                    )
+                capture, source_url = new_sources[-1]
+                seen_urls.add(next_url)
+                page_count += 1
+
         try:
             manager = await _await_until(self._browser_factory(), deadline=work_deadline, monotonic=self._monotonic)
             start = getattr(manager, "start", None)
@@ -568,6 +679,7 @@ class DomesticBrowserCollector:
             page.on("response", remember_response)
             for phase, navigation_url in self._config.navigation_by_phase.items():
                 await navigate(phase, navigation_url)
+                await paginate(phase)
             if saw_unreviewed_response and not response_tasks:
                 raise _error("metric_payload_empty")
             while not captures:

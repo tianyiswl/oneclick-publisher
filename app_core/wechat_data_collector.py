@@ -6,6 +6,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import replace
 from datetime import date, datetime
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 from .domestic_data_collector import (
@@ -23,6 +24,63 @@ from .platform_data_models import (
 
 _WECHAT_HOST = "mp.weixin.qq.com"
 _BEIJING = ZoneInfo("Asia/Shanghai")
+_CONTENT_QUERY_KEYS = frozenset(
+    {
+        "action",
+        "ajax",
+        "article_source",
+        "begin_timestamp",
+        "count",
+        "end_timestamp",
+        "f",
+        "fingerprint",
+        "lang",
+        "offset",
+        "token",
+    }
+)
+
+
+def _next_content_page_url(
+    current_url: str, payload: Mapping[str, object]
+) -> str | None:
+    """只使用公众号已返回的游标翻页，不读取或记录登录凭据。"""
+
+    if type(current_url) is not str or not isinstance(payload, Mapping):
+        _invalid()
+    try:
+        parsed = urlsplit(current_url)
+        pairs = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=True)
+    except (ValueError, TypeError):
+        _invalid()
+    keys = [key for key, _value in pairs]
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != _WECHAT_HOST
+        or parsed.path != "/misc/appmsganalysis"
+        or parsed.fragment
+        or frozenset(keys) != _CONTENT_QUERY_KEYS
+        or len(keys) != len(_CONTENT_QUERY_KEYS)
+    ):
+        _invalid()
+    values = dict(pairs)
+    current_offset = values.get("offset", "")
+    if not current_offset.isascii() or not current_offset.isdigit():
+        _invalid()
+    next_offset = payload.get("next_offset")
+    if next_offset is None or next_offset == 0:
+        return None
+    if type(next_offset) is not int or next_offset < 0:
+        _invalid()
+    if next_offset <= int(current_offset):
+        return None
+    updated = [
+        (key, str(next_offset) if key == "offset" else value)
+        for key, value in pairs
+    ]
+    return urlunsplit(
+        (parsed.scheme, parsed.netloc, parsed.path, urlencode(updated), "")
+    )
 
 WECHAT_CONFIG = DomesticCollectorConfig(
     platform_type=10,
@@ -41,6 +99,9 @@ WECHAT_CONFIG = DomesticCollectorConfig(
         "account": "/misc/useranalysis",
         "content": "/misc/appmsganalysis",
     },
+    pagination_phase="content",
+    pagination_url_builder=_next_content_page_url,
+    pagination_max_pages=20,
 )
 
 
@@ -199,7 +260,7 @@ def _content_rows(
             continue
         saw_content_contract = True
         next_offset = _integer(payload.get("next_offset"), nonnegative=False)
-        truncated = truncated or next_offset > 0
+        truncated = next_offset > 0
         for raw_row in rows:
             row = _mapping(raw_row)
             message_id = _integer(row.get("msg_id"))

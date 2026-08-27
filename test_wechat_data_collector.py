@@ -7,11 +7,12 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
+from urllib.parse import urlsplit
 
 from app_core.domestic_data_collector import CapturedJson
 from app_core.platform_data_collection_errors import PlatformDataCollectionError
 from app_core.platform_data_models import CollectionFailure
-from app_core.wechat_data_collector import WechatDataCollector
+from app_core.wechat_data_collector import WechatDataCollector, _next_content_page_url
 
 
 def wechat_captures(
@@ -81,6 +82,44 @@ def wechat_captures(
 
 
 class WechatDataCollectorTests(unittest.TestCase):
+    def test_reviewed_content_cursor_builds_the_next_page_without_changing_scope(self) -> None:
+        """公众号分页只能替换平台返回的 offset，不能猜新请求或扩大查询。"""
+
+        current = (
+            "https://mp.weixin.qq.com/misc/appmsganalysis?"
+            "action=all&ajax=1&article_source=0&begin_timestamp=1&count=10&"
+            "end_timestamp=2&f=json&fingerprint=fp&lang=zh_CN&offset=0&token=secret"
+        )
+
+        next_url = _next_content_page_url(current, {"next_offset": 10})
+
+        self.assertIsNotNone(next_url)
+        self.assertIn("offset=10", next_url)
+        self.assertNotIn("offset=0", next_url)
+        self.assertEqual(
+            set(urlsplit(next_url).query.split("&")),
+            set(urlsplit(current.replace("offset=0", "offset=10")).query.split("&")),
+        )
+
+    def test_terminal_page_clears_truncation_after_all_pages_are_captured(self) -> None:
+        """前页有游标而末页已穷尽时，完整列表不能继续显示为截断。"""
+
+        first = wechat_captures(next_offset=10)
+        terminal = wechat_captures(
+            article_id=1002,
+            article_date="2026-04-18",
+            title="older",
+            views=20,
+            next_offset=0,
+        )
+
+        batch = WechatDataCollector.parse_captures(
+            5, (first[0], first[1], terminal[1])
+        )
+
+        self.assertEqual(len(batch.contents), 2)
+        self.assertEqual(batch.warning_code, "")
+
     def test_parser_maps_account_and_article_metrics(self) -> None:
         """字段映射错位会把关注或阅读数据写到错误主体。"""
 

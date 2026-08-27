@@ -9,7 +9,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
 from app_core.domestic_data_collector import (
     DomesticBrowserCollector,
@@ -148,6 +148,28 @@ class DynamicNavigationPage(FakePage):
         self.goto_urls.append(url)
         self.url = url
         for response in self.responses_by_path.get(urlsplit(url).path, ()):
+            self.listeners["request"](response.request)
+            self.listeners["response"](response)
+        await asyncio.sleep(0)
+
+
+class CursorPaginationPage(DynamicNavigationPage):
+    """数据页先返回 offset=0，后续只在受控 cursor URL 返回下一页。"""
+
+    async def goto(self, url: str, *, wait_until: str, timeout: float) -> None:
+        self.goto_urls.append(url)
+        self.url = url
+        parsed = urlsplit(url)
+        responses = self.responses_by_path.get(parsed.path, ())
+        if parsed.path == "/content":
+            offset = parse_qs(parsed.query).get("offset", [""])[0]
+            responses = tuple(
+                response
+                for response in responses
+                if parse_qs(urlsplit(response.url).query).get("offset", [""])[0]
+                == offset
+            )
+        for response in responses:
             self.listeners["request"](response.request)
             self.listeners["response"](response)
         await asyncio.sleep(0)
@@ -556,6 +578,80 @@ class DomesticBrowserCollectorTests(unittest.TestCase):
         batch = collector.collect(account())
 
         self.assertEqual(batch.source_mode, "browser_signed")
+
+    def test_collector_follows_reviewed_cursor_until_terminal_page(self) -> None:
+        """有下一页时必须使用当前响应生成受控 URL，并把末页交给解析器。"""
+
+        page = CursorPaginationPage(
+            hrefs=("https://official.example/content-page?token=private-token",),
+            responses_by_path={
+                "/content-page": (
+                    FakeResponse(
+                        "https://official.example/content?offset=0&token=private-token",
+                        {"items": [1], "next": 10},
+                    ),
+                ),
+                "/content": (
+                    FakeResponse(
+                        "https://official.example/content?offset=10&token=private-token",
+                        {"items": [2], "next": 0},
+                    ),
+                ),
+            },
+        )
+        seen: list[tuple] = []
+
+        def next_page(current_url: str, payload: dict) -> str | None:
+            next_offset = int(payload.get("next") or 0)
+            if not next_offset:
+                return None
+            parsed = urlsplit(current_url)
+            query = parse_qs(parsed.query)
+            query["offset"] = [str(next_offset)]
+            return urlunsplit(
+                (
+                    parsed.scheme,
+                    parsed.netloc,
+                    parsed.path,
+                    urlencode({key: values[0] for key, values in query.items()}),
+                    "",
+                )
+            )
+
+        def parser(account_id: int, captures: tuple) -> CollectionBatch:
+            seen.append(captures)
+            return parsed_batch(account_id, captures)
+
+        collector = DomesticBrowserCollector(
+            config(
+                endpoint_by_path={"/content": "content_list"},
+                phase_by_path={"/content": "content"},
+                navigation_by_phase={
+                    "bootstrap": "https://official.example/home",
+                    "content": "/content-page",
+                },
+                pagination_phase="content",
+                pagination_url_builder=next_page,
+                pagination_max_pages=3,
+            ),
+            browser_factory=lambda: FakeStarter(FakeBrowser(FakeContext(page))),
+            parse_captures=parser,
+        )
+
+        collector.collect(account())
+
+        self.assertEqual(
+            page.goto_urls,
+            [
+                "https://official.example/home",
+                "https://official.example/content-page?token=private-token",
+                "https://official.example/content?offset=10&token=private-token",
+            ],
+        )
+        self.assertEqual(
+            [capture.payload["items"] for capture in seen[0]],
+            [(1,), (2,)],
+        )
 
     def test_collector_keeps_responses_arriving_within_phase_settle_window(self) -> None:
         """同一数据页的稍晚响应不能被下一次导航释放后改报读取失败。"""
