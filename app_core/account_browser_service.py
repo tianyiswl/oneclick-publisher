@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import webbrowser
 from pathlib import Path
 
 from .oneclick_authorization import authorization_plan
+from .overseas_youtube_profile import youtube_studio_url
 from .paths import COOKIE_DIR, ensure_runtime_dirs
 
 
@@ -71,6 +73,12 @@ def open_account_backend(account: dict) -> bool:
 
     ensure_runtime_dirs()
     account_id = _account_key(account)
+    if str(account.get("authMode") or "browser") == "youtube_oauth":
+        if int(account.get("type") or 0) != 7:
+            raise RuntimeError("YouTube OAuth 账号记录无效")
+        if not webbrowser.open(youtube_studio_url(account)):
+            raise RuntimeError("系统浏览器未能打开 YouTube Studio")
+        return False
     # 在启动线程前完成本地参数校验，让界面能立即给出可理解的错误。
     authorization_plan(int(account.get("type") or 0), str(account.get("profileName") or ""))
     state_file = COOKIE_DIR / Path(str(account.get("filePath") or "")).name

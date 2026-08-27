@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtWidgets import QApplication, QMessageBox, QPushButton
+from PyQt6.QtWidgets import QApplication, QMenu, QMessageBox, QPushButton
 
 from app_core import account_browser_service, account_service
 from ui.account_page import AccountPage
@@ -77,6 +77,55 @@ class AccountDetectionUiTests(unittest.TestCase):
         self.assertEqual(page.result_label.text(), "1 个账号")
         self.assertEqual(page.row_data(0)["accountReference"], "UC123")
         page.close()
+
+    def test_youtube_oauth_account_actions_stay_enabled(self) -> None:
+        account = {
+            "id": 71,
+            "type": 7,
+            "platformName": "YouTube",
+            "profileName": "海外主体",
+            "userName": "OAuth 测试频道",
+            "status": 1,
+            "healthStatus": "normal",
+            "statusText": "正常",
+            "remark": "",
+            "authMode": "youtube_oauth",
+            "filePath": "youtube-oauth:opaque-reference",
+            "accountReference": "UC_safe",
+        }
+        page = AccountPage()
+        actions = page._actions(account)
+        buttons = {item.text(): item for item in actions.findChildren(QPushButton)}
+
+        self.assertTrue(buttons["打开后台"].isEnabled())
+        menu_actions = [
+            action
+            for menu in actions.findChildren(QMenu)
+            for action in menu.actions()
+        ]
+        refresh = next(action for action in menu_actions if action.text() == "刷新账号信息")
+        self.assertTrue(refresh.isEnabled())
+        page.close()
+
+    def test_youtube_oauth_backend_uses_system_browser_and_saved_channel_id(self) -> None:
+        account = {
+            "id": 71,
+            "type": 7,
+            "authMode": "youtube_oauth",
+            "accountReference": "UC_safe",
+            "filePath": "youtube-oauth:opaque-reference",
+        }
+
+        with patch(
+            "app_core.account_browser_service.webbrowser.open",
+            return_value=True,
+        ) as open_browser:
+            reused = account_browser_service.open_account_backend(account)
+
+        self.assertFalse(reused)
+        open_browser.assert_called_once_with(
+            "https://studio.youtube.com/channel/UC_safe"
+        )
 
     def test_youtube_system_browser_login_disables_manual_save_fallback(self) -> None:
         class OAuthSession:

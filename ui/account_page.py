@@ -402,15 +402,18 @@ class AccountPage(QWidget):
         is_youtube_oauth = (
             row.get("authMode") == account_service.AUTH_MODE_YOUTUBE_OAUTH
         )
-        refresh_action.setEnabled(not is_youtube_oauth)
+        refresh_action.setToolTip(
+            "从 YouTube 官方 API 刷新频道名和头像"
+            if is_youtube_oauth
+            else "从当前已登录的官方后台刷新账号信息"
+        )
         menu.addAction("编辑备注", lambda _checked=False, r=row: self.edit_remark(r))
         menu.addSeparator()
         menu.addAction("删除账号", lambda _checked=False, r=row: self.delete_one(r))
 
         open_backend_btn = button("打开后台", variant="primary", compact=True)
-        open_backend_btn.setEnabled(not is_youtube_oauth)
         open_backend_btn.setToolTip(
-            "OAuth 账号请直接使用完成授权的系统浏览器打开 YouTube Studio"
+            "使用系统默认浏览器打开该频道的 YouTube Studio"
             if is_youtube_oauth
             else "使用一键发保存的本地会话打开对应平台官网"
         )
@@ -446,13 +449,21 @@ class AccountPage(QWidget):
         is_youtube_oauth = (
             row.get("authMode") == account_service.AUTH_MODE_YOUTUBE_OAUTH
         )
-        open_action.setEnabled(not is_youtube_oauth)
+        open_action.setToolTip(
+            "使用系统默认浏览器打开该频道的 YouTube Studio"
+            if is_youtube_oauth
+            else "使用一键发保存的本地会话打开对应平台官网"
+        )
         menu.addAction("检测登录", lambda: self.check_one(row))
         refresh_action = menu.addAction(
             "刷新头像/登录信息",
             lambda: self.refresh_avatar(row),
         )
-        refresh_action.setEnabled(not is_youtube_oauth)
+        refresh_action.setToolTip(
+            "从 YouTube 官方 API 刷新频道名和头像"
+            if is_youtube_oauth
+            else "从当前已登录的官方后台刷新账号信息"
+        )
         menu.addAction("编辑备注", lambda: self.edit_remark(row))
         menu.addAction("删除账号", lambda: self.delete_one(row))
         menu.exec(self.table.mapToGlobal(pos))

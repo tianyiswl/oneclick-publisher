@@ -18,6 +18,7 @@ from app_core import (
     overseas_preflight,
     overseas_youtube_credentials,
     overseas_youtube_login,
+    overseas_youtube_profile,
     publish_service,
 )
 from app_core.overseas_youtube_api import YouTubeChannelIdentity
@@ -195,6 +196,31 @@ class YouTubeOAuthAccountPersistenceTests(unittest.TestCase):
             validate.call_args.kwargs["client_id"],
             "desktop-client.apps.googleusercontent.com",
         )
+
+    def test_oauth_profile_refresh_updates_only_public_name_and_local_avatar(self) -> None:
+        account_id = self._save_oauth_account()
+        with (
+            patch.object(
+                overseas_youtube_profile,
+                "refresh_youtube_oauth_profile",
+                return_value={
+                    "displayName": "刷新后频道",
+                    "avatarFileName": "oneclick_account_1.png",
+                },
+            ) as refresh,
+            patch.object(account_service, "run_async_capture_account_avatar") as browser,
+        ):
+            account = account_service.refresh_account_avatar(account_id)
+
+        refresh.assert_called_once()
+        browser.assert_not_called()
+        self.assertEqual(account["userName"], "刷新后频道")
+        self.assertEqual(account["avatarPath"], "oneclick_account_1.png")
+        connection = sqlite3.connect(self.database)
+        stored = repr(connection.execute("SELECT * FROM user_info").fetchone())
+        connection.close()
+        self.assertNotIn("yt3.ggpht.com", stored)
+        self.assertNotIn("access-token", stored)
 
     def test_deleting_oauth_account_removes_keyring_entry_not_cookie_file(self) -> None:
         account_id = self._save_oauth_account()

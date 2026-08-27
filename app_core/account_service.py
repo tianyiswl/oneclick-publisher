@@ -594,18 +594,55 @@ def validate_accounts(
 
 
 def refresh_account_avatar(account_id: int) -> dict:
-    run_async_capture_account_avatar(int(account_id))
+    account_id = int(account_id)
+    account = get_managed_account(account_id)
+    if not account:
+        return {}
+    if str(account.get("authMode") or AUTH_MODE_BROWSER) == AUTH_MODE_YOUTUBE_OAUTH:
+        from .overseas_youtube_profile import refresh_youtube_oauth_profile
+
+        profile = refresh_youtube_oauth_profile(account, avatar_dir=AVATAR_DIR)
+        _save_youtube_public_profile(
+            account_id,
+            profile.get("displayName"),
+            profile.get("avatarFileName"),
+        )
+    else:
+        run_async_capture_account_avatar(account_id)
+    return get_managed_account(account_id) or {}
+
+
+def _save_youtube_public_profile(
+    account_id: int,
+    display_name: object,
+    avatar_file_name: object,
+) -> None:
+    """Persist only locally derived public profile fields for one OAuth row."""
+
+    name = str(display_name or "").strip()
+    avatar = Path(str(avatar_file_name or "")).name
+    if not name and not avatar:
+        return
+    updates: list[str] = []
+    params: list[object] = []
+    if name:
+        updates.append("userName = ?")
+        params.append(name)
+    if avatar:
+        updates.append("avatarPath = ?")
+        params.append(avatar)
+    updates.append("avatarUpdatedAt = ?")
+    params.append(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    params.extend((int(account_id), AUTH_MODE_YOUTUBE_OAUTH))
     with connect() as conn:
-        row = conn.execute(
-            """
-            SELECT id, type, filePath, userName, status, profileName, avatarPath,
-                   avatarUpdatedAt, remark, lastCheckedAt, lastLoginAt
-            FROM user_info
-            WHERE id = ?
+        conn.execute(
+            f"""
+            UPDATE user_info SET {', '.join(updates)}
+            WHERE id = ? AND COALESCE(authMode, 'browser') = ?
             """,
-            (account_id,),
-        ).fetchone()
-    return _row_to_dict(row) if row else {}
+            params,
+        )
+        conn.commit()
 
 
 _ACCOUNT_AVATAR_SELECTORS = {
