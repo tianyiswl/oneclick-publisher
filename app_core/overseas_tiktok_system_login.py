@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -154,6 +155,24 @@ def _absolute_path(path: Path) -> Path:
     return Path(os.path.abspath(os.fspath(path)))
 
 
+def _has_symlinked_existing_component(path: Path) -> bool:
+    """Fail closed when any existing component of an absolute path is a link."""
+
+    absolute = _absolute_path(path)
+    current = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        current /= part
+        try:
+            mode = current.lstat().st_mode
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+        if stat.S_ISLNK(mode):
+            return True
+    return False
+
+
 def _make_private_directory(path: Path, *, exist_ok: bool = True) -> None:
     path.mkdir(parents=False, exist_ok=exist_ok, mode=0o700)
     if path.is_symlink() or not path.is_dir():
@@ -167,6 +186,8 @@ def create_login_attempt(user_data_dir: Path = USER_DATA_DIR) -> TikTokLoginAtte
 
     user_root = _absolute_path(Path(user_data_dir))
     try:
+        if _has_symlinked_existing_component(user_root):
+            raise _cleanup_failed()
         user_root.mkdir(parents=True, exist_ok=True)
         if user_root.is_symlink() or not user_root.is_dir():
             raise _cleanup_failed()
@@ -224,6 +245,7 @@ def _resolved_owned_attempt(attempt_root: Path, staging_root: Path) -> tuple[Pat
         or raw_attempt == raw_staging
         or raw_attempt.parent != raw_staging
         or _ATTEMPT_ID.fullmatch(raw_attempt.name) is None
+        or _has_symlinked_existing_component(raw_user_root)
         or raw_user_root.is_symlink()
         or raw_login_staging.is_symlink()
         or raw_staging.is_symlink()
@@ -267,7 +289,8 @@ def recover_stale_tiktok_login_attempts(
     login_staging = user_root / "login-staging"
     staging_root = login_staging / "tiktok"
     if (
-        user_root.is_symlink()
+        _has_symlinked_existing_component(user_root)
+        or user_root.is_symlink()
         or not user_root.is_dir()
         or not staging_root.exists()
         or not staging_root.is_dir()

@@ -58,7 +58,7 @@ class TikTokSystemLoginTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
-        self.root = Path(self.temp_dir.name)
+        self.root = Path(self.temp_dir.name).resolve()
         self.user_data_dir = self.root / "user-data"
         self.staging = self.user_data_dir / "login-staging" / "tiktok"
 
@@ -157,6 +157,24 @@ class TikTokSystemLoginTests(unittest.TestCase):
         self.assertEqual(raised.exception.error_code, "tiktok_login_cleanup_failed")
         self.assertTrue(external_attempt.is_dir())
 
+    def test_cleanup_rejects_a_symlink_above_user_data_without_touching_external_attempt(self):
+        external_tree = self.root / "external-tree"
+        linked_ancestor = self.root / "linked-ancestor"
+        attempt_id = "f" * 32
+        external_attempt = (
+            external_tree / "user-data" / "login-staging" / "tiktok" / attempt_id
+        )
+        external_attempt.mkdir(parents=True)
+        linked_ancestor.symlink_to(external_tree, target_is_directory=True)
+        user_data_dir = linked_ancestor / "user-data"
+        staging = user_data_dir / "login-staging" / "tiktok"
+
+        with self.assertRaises(TikTokSystemLoginError) as raised:
+            remove_login_attempt(staging / attempt_id, staging)
+
+        self.assertEqual(raised.exception.error_code, "tiktok_login_cleanup_failed")
+        self.assertTrue(external_attempt.is_dir())
+
     def test_startup_recovery_removes_safe_direct_children_only(self):
         first = create_login_attempt(self.user_data_dir)
         second = create_login_attempt(self.user_data_dir)
@@ -186,6 +204,22 @@ class TikTokSystemLoginTests(unittest.TestCase):
         self.user_data_dir.symlink_to(external_user_data, target_is_directory=True)
 
         recovered = recover_stale_tiktok_login_attempts(self.user_data_dir)
+
+        self.assertEqual(recovered, [])
+        self.assertTrue(external_attempt.is_dir())
+
+    def test_startup_recovery_rejects_a_symlink_above_user_data_without_touching_external_attempt(self):
+        external_tree = self.root / "external-tree"
+        linked_ancestor = self.root / "linked-ancestor"
+        attempt_id = "0" * 32
+        external_attempt = (
+            external_tree / "user-data" / "login-staging" / "tiktok" / attempt_id
+        )
+        external_attempt.mkdir(parents=True)
+        linked_ancestor.symlink_to(external_tree, target_is_directory=True)
+        user_data_dir = linked_ancestor / "user-data"
+
+        recovered = recover_stale_tiktok_login_attempts(user_data_dir)
 
         self.assertEqual(recovered, [])
         self.assertTrue(external_attempt.is_dir())
