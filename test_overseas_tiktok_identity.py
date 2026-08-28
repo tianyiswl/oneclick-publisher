@@ -205,6 +205,31 @@ class TikTokIdentityTests(unittest.TestCase):
         self.assertNotIn("private", raised.exception.public_message)
         self.assertNotIn("value", raised.exception.public_message)
 
+    def test_read_identity_rejects_hidden_anchor_on_insecure_or_auth_studio_route(self):
+        for url in (
+            "http://www.tiktok.com/tiktokstudio/upload",
+            "https://www.tiktok.com/tiktokstudio/login/",
+            "https://www.tiktok.com/tiktokstudio/ChAlLeNgE/?private=value",
+            "https://www.tiktok.com/tiktokstudio/verify-email",
+            "https://www.tiktok.com/tiktokstudio/captcha",
+            "https://www.tiktok.com/tiktokstudio/SeCuRiTy/",
+            "https://www.tiktok.com/TikTokStudio/upload",
+        ):
+            with self.subTest(url=url):
+                page = _FakeTikTokPage(
+                    [_FakeProfileLink("/@expected.user", visible=False)],
+                    url=url,
+                )
+
+                with self.assertRaises(TikTokIdentityError) as raised:
+                    asyncio.run(
+                        read_tiktok_identity(page, poll_seconds=0.0, max_attempts=2)
+                    )
+
+                self.assertEqual(raised.exception.error_code, "tiktok_account_invalid")
+                self.assertNotIn("private", raised.exception.public_message)
+                self.assertNotIn("value", raised.exception.public_message)
+
     def test_read_identity_rejects_hidden_conflicting_handles_on_every_route(self):
         for url in (
             "https://www.tiktok.com/tiktokstudio/upload",

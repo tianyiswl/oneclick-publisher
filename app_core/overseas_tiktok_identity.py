@@ -12,7 +12,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from playwright.async_api import async_playwright
 
@@ -25,6 +25,7 @@ _PROFILE_PATH_PATTERN = re.compile(r"^/@([^/]+)$")
 _PROFILE_LINK_SELECTOR = 'a[href*="/@"]'
 _TIKTOK_HOSTS = {"tiktok.com", "www.tiktok.com"}
 _TIKTOK_STUDIO_URL = "https://www.tiktok.com/tiktokstudio/upload?lang=en"
+_AUTH_ROUTE_TOKENS = ("login", "challenge", "verify", "captcha", "security")
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,17 +121,26 @@ async def _text(locator) -> str:
 
 
 def _is_tiktok_studio_route(page) -> bool:
-    """Allow the Studio account shell without retaining or reporting its URL."""
+    """Allow only an authenticated-looking Studio workspace route.
+
+    The URL is classified locally and never retained or reported.  This is a
+    narrow allowance for the Studio account shell, not proof of authentication.
+    """
 
     try:
         parsed = urlsplit(str(getattr(page, "url", "")))
     except Exception:
         return False
     host = (parsed.hostname or "").lower().rstrip(".")
-    return (
-        parsed.scheme.lower() in {"http", "https"}
-        and host in _TIKTOK_HOSTS
-        and parsed.path.startswith("/tiktokstudio/")
+    if parsed.scheme.lower() != "https" or host not in _TIKTOK_HOSTS:
+        return False
+    segments = [unquote(segment) for segment in parsed.path.split("/") if segment]
+    if len(segments) < 2 or segments[0] != "tiktokstudio":
+        return False
+    return not any(
+        token in segment.lower()
+        for segment in segments[1:]
+        for token in _AUTH_ROUTE_TOKENS
     )
 
 
