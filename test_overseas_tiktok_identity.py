@@ -60,6 +60,18 @@ class _FakeTikTokPage:
         return self.links
 
 
+class _DelayedProfileLinkPage:
+    def __init__(self, samples: list[list[_FakeProfileLink]]) -> None:
+        self.samples = list(samples)
+        self.locator_calls = 0
+
+    def locator(self, selector: str) -> _FakeProfileLinks:
+        self.selector = selector
+        index = min(self.locator_calls, len(self.samples) - 1)
+        self.locator_calls += 1
+        return _FakeProfileLinks(self.samples[index])
+
+
 class TikTokIdentityTests(unittest.TestCase):
     def test_normalize_handle_accepts_profile_url_and_at_prefix(self):
         self.assertEqual(normalize_tiktok_handle("https://www.tiktok.com/@Test.User"), "test.user")
@@ -110,6 +122,17 @@ class TikTokIdentityTests(unittest.TestCase):
         self.assertEqual(identity.handle, "expected.user")
         self.assertEqual(identity.display_name, "Expected")
         self.assertEqual(identity.profile_url, "https://www.tiktok.com/@expected.user")
+
+    def test_read_identity_waits_for_a_profile_link_then_requires_a_stable_repeat(self):
+        visible = _FakeProfileLink("/@expected.user", "Expected", visible=True)
+        page = _DelayedProfileLinkPage([[], [visible], [visible]])
+
+        identity = asyncio.run(
+            read_tiktok_identity(page, poll_seconds=0.0, max_attempts=3)
+        )
+
+        self.assertEqual(identity.handle, "expected.user")
+        self.assertEqual(page.locator_calls, 3)
 
     def test_read_identity_rejects_when_no_visible_profile_handle_exists(self):
         page = _FakeTikTokPage(

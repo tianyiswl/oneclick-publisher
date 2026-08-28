@@ -24,6 +24,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 from playwright.async_api import async_playwright
 
@@ -397,10 +398,27 @@ def _terminate_owned_process(process, *, poll_seconds: float) -> bool:
     return _wait_for_owned_process_stop(process, timeout_seconds=interval)
 
 
+def _gracefully_stop_owned_process(process, *, poll_seconds: float) -> bool:
+    """Ask only the owned browser process to exit; never escalate to kill."""
+
+    if _owned_process_has_exited(process):
+        return True
+    try:
+        process.terminate()
+    except ProcessLookupError:
+        return True
+    except Exception:
+        return _owned_process_has_exited(process)
+    return _wait_for_owned_process_stop(
+        process, timeout_seconds=max(0.1, poll_seconds)
+    )
+
+
 def wait_for_browser_exit(
     process,
     cancel_event: threading.Event,
     *,
+    complete_event: threading.Event | None = None,
     timeout_seconds: float,
     poll_seconds: float = 0.2,
 ) -> str:
@@ -414,6 +432,9 @@ def wait_for_browser_exit(
         if cancel_event.is_set():
             stopped = _terminate_owned_process(process, poll_seconds=interval)
             return "cancelled" if stopped else "cleanup_failed"
+        if complete_event is not None and complete_event.is_set():
+            stopped = _gracefully_stop_owned_process(process, poll_seconds=interval)
+            return "closed" if stopped else "cleanup_failed"
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             stopped = _terminate_owned_process(process, poll_seconds=interval)
@@ -498,6 +519,35 @@ def _translate_identity_error(error: TikTokIdentityError) -> TikTokSystemLoginEr
     return TikTokSystemLoginError(
         "tiktok_account_invalid", "TikTok 未返回唯一可核对账号"
     )
+
+
+def _page_is_tiktok_login_or_challenge(page) -> bool:
+    """Classify only the route family; never retain a page URL or its query."""
+
+    try:
+        parsed = urlsplit(str(getattr(page, "url", "")))
+        host = (parsed.hostname or "").lower().rstrip(".")
+        path = parsed.path.lower()
+    except Exception:
+        return False
+    if host not in {"tiktok.com", "www.tiktok.com"}:
+        return False
+    return any(token in path for token in ("login", "challenge", "verify", "captcha", "security"))
+
+
+def _translate_candidate_identity_error(
+    error: TikTokIdentityError,
+    page,
+) -> TikTokSystemLoginError:
+    if str(error.error_code or "") == "tiktok_account_invalid":
+        if _page_is_tiktok_login_or_challenge(page):
+            return TikTokSystemLoginError(
+                "tiktok_session_expired", "TikTok 登录状态已失效"
+            )
+        return TikTokSystemLoginError(
+            "tiktok_account_invalid", "TikTok 未返回唯一可核对账号"
+        )
+    return _translate_identity_error(error)
 
 
 async def _close_playwright_resources(*resources) -> bool:
@@ -595,7 +645,9 @@ async def collect_validated_tiktok_candidate(
                 exc.public_message,
             ) from exc
         except TikTokIdentityError as exc:
-            raise _translate_identity_error(exc) from exc
+            raise _translate_candidate_identity_error(
+                exc, second_page or first_page
+            ) from exc
         except Exception as exc:
             raise TikTokSystemLoginError(
                 "tiktok_session_expired", "TikTok 登录状态已失效"
@@ -794,6 +846,7 @@ class TikTokSystemBrowserLoginSession:
         self.queue: queue.Queue[str] = queue.Queue()
         self.last_error_code: str | None = None
         self._cancel_requested = threading.Event()
+        self._complete_requested = threading.Event()
         self._owned_process = None
         self._owned_attempt: TikTokLoginAttempt | None = None
 
@@ -806,6 +859,11 @@ class TikTokSystemBrowserLoginSession:
 
     def cancel(self) -> None:
         self._cancel_requested.set()
+
+    def complete_login(self) -> None:
+        """Finish the manual browser phase; validation still decides success."""
+
+        self._complete_requested.set()
 
     def save(self) -> None:
         self.queue.put("TikTok 会在完成账号核对后自动保存，不支持手动保存。")
@@ -863,6 +921,7 @@ class TikTokSystemBrowserLoginSession:
             outcome = wait_for_browser_exit(
                 self._owned_process,
                 self._cancel_requested,
+                complete_event=self._complete_requested,
                 timeout_seconds=self.timeout_seconds,
             )
             if outcome == "cleanup_failed":

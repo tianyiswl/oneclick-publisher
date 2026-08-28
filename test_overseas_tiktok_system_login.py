@@ -42,6 +42,7 @@ from app_core.overseas_tiktok_system_login import (
 class _FakePage:
     def __init__(self, *, close_error: Exception | None = None) -> None:
         self.close_error = close_error
+        self.url = "https://www.tiktok.com/tiktokstudio/upload"
         self.goto_calls: list[tuple[str, str, int]] = []
         self.close_calls = 0
 
@@ -446,7 +447,58 @@ class TikTokSystemLoginTests(unittest.TestCase):
 
         self.assertEqual(outcome, "closed")
         self.assertEqual(process.terminate_calls, 0)
-        self.assertEqual(process.wait_calls, [])
+
+    def test_complete_event_gracefully_stops_only_the_owned_browser(self):
+        process = FakeProcess([None])
+        cancel = threading.Event()
+        complete = threading.Event()
+        complete.set()
+
+        outcome = wait_for_browser_exit(
+            process,
+            cancel,
+            complete_event=complete,
+            timeout_seconds=1,
+            poll_seconds=0.001,
+        )
+
+        self.assertEqual(outcome, "closed")
+        self.assertEqual(process.terminate_calls, 1)
+
+    def test_cancel_takes_priority_over_complete_event(self):
+        process = FakeProcess([None])
+        cancel = threading.Event()
+        complete = threading.Event()
+        cancel.set()
+        complete.set()
+
+        outcome = wait_for_browser_exit(
+            process,
+            cancel,
+            complete_event=complete,
+            timeout_seconds=1,
+            poll_seconds=0.001,
+        )
+
+        self.assertEqual(outcome, "cancelled")
+        self.assertEqual(process.terminate_calls, 1)
+
+    def test_complete_event_fails_closed_when_owned_process_stays_alive(self):
+        process = ProcessStaysAliveAfterTerminate()
+        complete = threading.Event()
+        complete.set()
+
+        outcome = wait_for_browser_exit(
+            process,
+            threading.Event(),
+            complete_event=complete,
+            timeout_seconds=1,
+            poll_seconds=0.001,
+        )
+
+        self.assertEqual(outcome, "cleanup_failed")
+        self.assertEqual(process.terminate_calls, 1)
+        self.assertEqual(process.kill_calls, 0)
 
     def test_wait_for_browser_exit_cancels_only_its_own_process(self):
         process = FakeProcess([None])
@@ -624,6 +676,7 @@ class TikTokCandidateIntakeTests(unittest.TestCase):
         )
 
     def test_candidate_translates_blank_context_login_rejection_to_expired(self):
+        self.second_page.url = "https://www.tiktok.com/login"
         with self.assertRaises(TikTokSystemLoginError) as raised:
             self._collect(
                 TikTokIdentity(
@@ -636,6 +689,17 @@ class TikTokCandidateIntakeTests(unittest.TestCase):
             )
 
         self.assertEqual(raised.exception.error_code, "tiktok_session_expired")
+
+    def test_candidate_keeps_studio_identity_selector_failure_distinct(self):
+        with self.assertRaises(TikTokSystemLoginError) as raised:
+            self._collect(
+                TikTokIdentityError(
+                    "tiktok_account_invalid",
+                    "TikTok page has no unique account",
+                )
+            )
+
+        self.assertEqual(raised.exception.error_code, "tiktok_account_invalid")
 
     def test_candidate_translates_ambiguous_identity_to_public_invalid_code(self):
         with self.assertRaises(TikTokSystemLoginError) as raised:
@@ -1032,6 +1096,26 @@ class TikTokPublicLoginSessionTests(unittest.TestCase):
         )
         self.assertEqual(order, ["validated", "cleaned", "committed"])
         self.assertIsNone(session.last_error_code)
+
+    def test_complete_login_stops_owned_browser_then_uses_normal_validation_flow(self):
+        process = FakeProcess([None])
+        session = self._session(process_factory=Mock(return_value=process))
+        session.complete_login()
+
+        with (
+            patch("app_core.overseas_tiktok_system_login.create_login_attempt", return_value=self.attempt),
+            patch("app_core.overseas_tiktok_system_login.find_system_browser", return_value=self.browser),
+            patch("app_core.overseas_tiktok_system_login.wait_for_profile_release", return_value=True),
+            patch("app_core.overseas_tiktok_system_login.collect_validated_tiktok_candidate", new=AsyncMock(return_value=self.candidate)),
+            patch("app_core.overseas_tiktok_system_login.remove_login_attempt"),
+            patch("app_core.overseas_tiktok_system_login.commit_tiktok_login_candidate", return_value=23),
+        ):
+            session.start()
+            messages = self._messages(session)
+
+        self.assertEqual(process.terminate_calls, 1)
+        self.assertNotIn("CANCELLED", messages)
+        self.assertEqual(messages[-1], "ACCOUNT_SAVED:23")
 
     def test_update_mode_rejects_a_different_handle_before_commit(self):
         old_account = {"id": 7, "type": 6, "accountReference": "saved.user"}

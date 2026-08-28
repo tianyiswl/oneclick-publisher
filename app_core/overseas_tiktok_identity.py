@@ -7,6 +7,7 @@ name or avatar is useful UI context, but neither is a stable account binding.
 
 from __future__ import annotations
 
+import asyncio
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -118,14 +119,8 @@ async def _text(locator) -> str:
     return " ".join(str(value or "").split())
 
 
-async def read_tiktok_identity(page) -> TikTokIdentity:
-    """Read one stable, visible TikTok profile handle from a page.
-
-    The page must expose one or more Playwright-compatible profile-link
-    locators.  Invisible links are ignored.  Duplicate links for the same
-    handle are harmless; conflicting visible handles are rejected instead of
-    guessing which account is logged in.
-    """
+async def _visible_profile_candidates(page) -> dict[str, object]:
+    """Read visible public profile links once, without retaining page content."""
 
     try:
         links = page.locator(_PROFILE_LINK_SELECTOR)
@@ -135,7 +130,7 @@ async def read_tiktok_identity(page) -> TikTokIdentity:
             "tiktok_account_invalid", "TikTok 页面没有返回稳定账号标识"
         ) from exc
 
-    candidates: dict[str, tuple[object, str]] = {}
+    candidates: dict[str, object] = {}
     for index in range(count):
         try:
             link = links.nth(index)
@@ -144,25 +139,51 @@ async def read_tiktok_identity(page) -> TikTokIdentity:
         if not await _visible(link):
             continue
         handle = normalize_tiktok_handle(await _attribute(link, "href"))
-        if not handle:
-            continue
-        candidates.setdefault(handle, (link, ""))
+        if handle:
+            candidates.setdefault(handle, link)
+    return candidates
 
-    if not candidates:
-        raise TikTokIdentityError(
-            "tiktok_account_invalid", "TikTok 页面没有返回稳定账号标识"
-        )
-    if len(candidates) > 1:
-        raise TikTokIdentityError(
-            "tiktok_account_identity_ambiguous", "TikTok 页面返回了多个冲突的账号标识"
-        )
 
-    handle, (link, _) = next(iter(candidates.items()))
-    display_name = await _text(link)
-    return TikTokIdentity(
-        handle=handle,
-        display_name=display_name,
-        profile_url=f"https://www.tiktok.com/@{handle}",
+async def read_tiktok_identity(
+    page,
+    *,
+    poll_seconds: float = 0.15,
+    max_attempts: int = 5,
+) -> TikTokIdentity:
+    """Read one stable, visible TikTok profile handle from a page.
+
+    The page must expose one or more Playwright-compatible profile-link
+    locators.  Invisible links are ignored.  Duplicate links for the same
+    handle are harmless; conflicting visible handles are rejected instead of
+    guessing which account is logged in.
+    """
+
+    attempts = max(2, int(max_attempts))
+    interval = max(0.0, float(poll_seconds))
+    previous_handle = ""
+    for index in range(attempts):
+        candidates = await _visible_profile_candidates(page)
+        if len(candidates) > 1:
+            raise TikTokIdentityError(
+                "tiktok_account_identity_ambiguous",
+                "TikTok 页面返回了多个冲突的账号标识",
+            )
+        if len(candidates) == 1:
+            handle, link = next(iter(candidates.items()))
+            if handle == previous_handle:
+                return TikTokIdentity(
+                    handle=handle,
+                    display_name=await _text(link),
+                    profile_url=f"https://www.tiktok.com/@{handle}",
+                )
+            previous_handle = handle
+        else:
+            previous_handle = ""
+        if index + 1 < attempts:
+            await asyncio.sleep(interval)
+
+    raise TikTokIdentityError(
+        "tiktok_account_invalid", "TikTok 页面没有返回稳定账号标识"
     )
 
 
