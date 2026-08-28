@@ -222,9 +222,44 @@ def persist_tiktok_identity(
             identity,
             allow_initial_bind=allow_initial_bind,
         )
-        conn.execute(
-            "UPDATE user_info SET accountReference = ? WHERE id = ?",
-            (handle, int(account_id)),
+        original_reference = row["accountReference"]
+        if original_reference is None or not str(original_reference).strip():
+            updated = conn.execute(
+                """
+                UPDATE user_info
+                SET accountReference = ?
+                WHERE id = ? AND type = 6
+                  AND (accountReference IS NULL OR TRIM(accountReference) = '')
+                """,
+                (handle, int(account_id)),
+            )
+        else:
+            updated = conn.execute(
+                """
+                UPDATE user_info
+                SET accountReference = ?
+                WHERE id = ? AND type = 6 AND accountReference = ?
+                """,
+                (handle, int(account_id), original_reference),
+            )
+        if int(updated.rowcount or 0) == 1:
+            return
+
+        current = conn.execute(
+            "SELECT id, type, accountReference FROM user_info WHERE id = ?",
+            (int(account_id),),
+        ).fetchone()
+        if not current or int(current["type"] or 0) != 6:
+            raise TikTokIdentityError(
+                "tiktok_account_invalid", "TikTok 账号记录已变更"
+            )
+        validate_identity_binding(
+            dict(current),
+            identity,
+            allow_initial_bind=False,
+        )
+        raise TikTokIdentityError(
+            "tiktok_account_invalid", "TikTok 账号绑定在保存期间已变更"
         )
 
 

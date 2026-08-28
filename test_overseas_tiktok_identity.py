@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import tempfile
+import threading
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
@@ -264,6 +265,189 @@ class TikTokSavedIdentityTests(unittest.TestCase):
             self._stored_account(account_id)["accountReference"],
             "expected.user",
         )
+
+    def test_concurrent_initial_bind_allows_only_one_verified_handle(self) -> None:
+        account_id = self._save_account(reference="")
+        barrier = threading.Barrier(2)
+        write_lock = threading.Lock()
+
+        class RacingCursor:
+            def __init__(self, cursor, *, wait_after_fetch: bool) -> None:
+                self._cursor = cursor
+                self._wait_after_fetch = wait_after_fetch
+
+            @property
+            def rowcount(self):
+                return self._cursor.rowcount
+
+            def fetchone(self):
+                row = self._cursor.fetchone()
+                if self._wait_after_fetch:
+                    barrier.wait(timeout=3)
+                return row
+
+        class RacingConnection:
+            def __init__(self, connection) -> None:
+                self._connection = connection
+                self._identity_reads = 0
+
+            def execute(self, sql, params=()):
+                is_identity_read = sql.lstrip().upper().startswith("SELECT ID, TYPE")
+                if is_identity_read:
+                    self._identity_reads += 1
+                    return RacingCursor(
+                        self._connection.execute(sql, params),
+                        wait_after_fetch=self._identity_reads == 1,
+                    )
+                with write_lock:
+                    return RacingCursor(
+                        self._connection.execute(sql, params),
+                        wait_after_fetch=False,
+                    )
+
+        @contextmanager
+        def racing_connect():
+            connection = sqlite3.connect(
+                self.database,
+                isolation_level=None,
+                check_same_thread=False,
+                timeout=3,
+            )
+            connection.row_factory = sqlite3.Row
+            try:
+                yield RacingConnection(connection)
+            finally:
+                connection.close()
+
+        outcomes: list[tuple[str, str]] = []
+        outcome_lock = threading.Lock()
+
+        def bind(handle: str) -> None:
+            try:
+                identity_service.persist_tiktok_identity(
+                    account_id,
+                    TikTokIdentity(
+                        handle,
+                        handle,
+                        f"https://www.tiktok.com/@{handle}",
+                    ),
+                    allow_initial_bind=True,
+                )
+            except TikTokIdentityError as exc:
+                outcome = ("error", exc.error_code)
+            else:
+                outcome = ("success", handle)
+            with outcome_lock:
+                outcomes.append(outcome)
+
+        with patch.object(identity_service, "connect", racing_connect):
+            workers = [
+                threading.Thread(target=bind, args=(handle,))
+                for handle in ("first.user", "second.user")
+            ]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(timeout=5)
+
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+        self.assertEqual(sum(kind == "success" for kind, _ in outcomes), 1)
+        self.assertEqual(
+            [value for kind, value in outcomes if kind == "error"],
+            ["tiktok_account_identity_mismatch"],
+        )
+        self.assertIn(
+            self._stored_account(account_id)["accountReference"],
+            {"first.user", "second.user"},
+        )
+
+    def test_persist_rejects_row_deleted_or_changed_type_after_read(self) -> None:
+        for mutation in ("delete", "change_type"):
+            with self.subTest(mutation=mutation):
+                account_id = self._save_account(reference="")
+                mutated = False
+
+                class MutationCursor:
+                    def __init__(self, cursor, *, mutate_after_fetch: bool) -> None:
+                        self._cursor = cursor
+                        self._mutate_after_fetch = mutate_after_fetch
+
+                    @property
+                    def rowcount(self):
+                        return self._cursor.rowcount
+
+                    def fetchone(inner_self):
+                        nonlocal mutated
+                        row = inner_self._cursor.fetchone()
+                        if inner_self._mutate_after_fetch and not mutated:
+                            mutated = True
+                            other = sqlite3.connect(self.database, isolation_level=None)
+                            if mutation == "delete":
+                                other.execute("DELETE FROM user_info WHERE id = ?", (account_id,))
+                            else:
+                                other.execute(
+                                    "UPDATE user_info SET type = 7 WHERE id = ?",
+                                    (account_id,),
+                                )
+                            other.close()
+                        return row
+
+                class MutationConnection:
+                    def __init__(self, connection) -> None:
+                        self._connection = connection
+                        self._reads = 0
+
+                    def execute(inner_self, sql, params=()):
+                        is_identity_read = sql.lstrip().upper().startswith("SELECT ID, TYPE")
+                        if is_identity_read:
+                            inner_self._reads += 1
+                        return MutationCursor(
+                            inner_self._connection.execute(sql, params),
+                            mutate_after_fetch=is_identity_read and inner_self._reads == 1,
+                        )
+
+                @contextmanager
+                def mutation_connect():
+                    connection = sqlite3.connect(self.database, isolation_level=None)
+                    connection.row_factory = sqlite3.Row
+                    try:
+                        yield MutationConnection(connection)
+                    finally:
+                        connection.close()
+
+                with patch.object(identity_service, "connect", mutation_connect):
+                    with self.assertRaises(TikTokIdentityError) as raised:
+                        identity_service.persist_tiktok_identity(
+                            account_id,
+                            TikTokIdentity(
+                                "expected.user",
+                                "Expected",
+                                "https://www.tiktok.com/@expected.user",
+                            ),
+                            allow_initial_bind=True,
+                        )
+
+                self.assertEqual(raised.exception.error_code, "tiktok_account_invalid")
+
+    def test_empty_binding_rejects_persist_when_initial_bind_is_disabled(self) -> None:
+        account_id = self._save_account(reference="")
+
+        with self.assertRaises(TikTokIdentityError) as raised:
+            identity_service.persist_tiktok_identity(
+                account_id,
+                TikTokIdentity(
+                    "expected.user",
+                    "Expected",
+                    "https://www.tiktok.com/@expected.user",
+                ),
+                allow_initial_bind=False,
+            )
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "tiktok_account_identity_mismatch",
+        )
+        self.assertEqual(self._stored_account(account_id)["accountReference"], "")
 
     def test_saved_validation_reports_missing_session_without_starting_browser(self) -> None:
         account_id = self._save_account(file_name="missing.json")
