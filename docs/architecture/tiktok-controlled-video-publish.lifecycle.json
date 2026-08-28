@@ -1,0 +1,216 @@
+{
+  "schema_version": 1,
+  "diagram_type": "lifecycle",
+  "meta": {
+    "title": "TikTok 受控发布生命周期",
+    "output": "docs/architecture/tiktok-controlled-video-publish.lifecycle.html",
+    "quality_profile": "showcase",
+    "viewBox": [1380, 675],
+    "views": [
+      {
+        "id": "formal-main-path",
+        "label": "正式发布主链",
+        "focus": ["local_preflight_passed", "final_action_triggered", "platform_accepted", "published_readback_confirmed"],
+        "note": "一次性授权后只触发一次 Post；平台接受与作品回读是两层证据。"
+      },
+      {
+        "id": "form-check-stop",
+        "label": "平台表单检查",
+        "focus": ["local_preflight_passed", "waiting_user_verification", "platform_form_verified"],
+        "note": "platform_form_check 会发生上传写入，但在 Post 前终止。"
+      },
+      {
+        "id": "failure-and-ambiguity",
+        "label": "失败、结果不明与防重复",
+        "focus": ["failed_before_final_action", "final_action_triggered", "ambiguous", "duplicate_blocked"],
+        "note": "最终动作前失败可以修正后重新预检；最终动作后没有自动重试返回路径。"
+      }
+    ]
+  },
+  "lanes": [
+    {"id": "main", "label": "正式发布证据主链"},
+    {"id": "pre_final", "label": "发布前检查与人工验证"},
+    {"id": "terminal", "label": "失败、结果不明与防重复终态"}
+  ],
+  "states": [
+    {
+      "id": "local_preflight_passed",
+      "type": "start",
+      "label": "本地预检通过",
+      "sublabel": "零平台写入",
+      "lane": "main",
+      "col": 0,
+      "width": 112,
+      "step": "01",
+      "tag": "preflight"
+    },
+    {
+      "id": "final_action_triggered",
+      "type": "active",
+      "label": "最终动作已触发",
+      "sublabel": "一次 Post；无自动重试",
+      "lane": "main",
+      "col": 2,
+      "width": 120,
+      "step": "02",
+      "tag": "no auto retry"
+    },
+    {
+      "id": "platform_accepted",
+      "type": "success",
+      "label": "平台已受理",
+      "sublabel": "platform_accepted · 明确反馈",
+      "lane": "main",
+      "col": 3,
+      "width": 120,
+      "step": "03",
+      "tag": "receipt"
+    },
+    {
+      "id": "published_readback_confirmed",
+      "type": "success",
+      "label": "作品回读已确认",
+      "sublabel": "published_readback_confirmed",
+      "lane": "main",
+      "col": 4,
+      "width": 120,
+      "step": "04",
+      "tag": "confirmed"
+    },
+    {
+      "id": "waiting_user_verification",
+      "type": "waiting",
+      "label": "等待用户验证",
+      "sublabel": "同一页面等待用户",
+      "lane": "pre_final",
+      "col": 1,
+      "width": 120,
+      "tag": "human gate"
+    },
+    {
+      "id": "platform_form_verified",
+      "type": "success",
+      "label": "平台表单已核对",
+      "sublabel": "已上传；Post 前停止",
+      "lane": "pre_final",
+      "col": 2,
+      "width": 120,
+      "tag": "platform_form_check"
+    },
+    {
+      "id": "failed_before_final_action",
+      "type": "failure",
+      "label": "最终动作前失败",
+      "sublabel": "failed · Post 前",
+      "lane": "terminal",
+      "col": 2,
+      "width": 120,
+      "tag": "retry after new preflight"
+    },
+    {
+      "id": "ambiguous",
+      "type": "failure",
+      "label": "结果不明",
+      "sublabel": "ambiguous · Post 后只读核对",
+      "lane": "terminal",
+      "col": 0,
+      "width": 120,
+      "tag": "read-only reconcile"
+    },
+    {
+      "id": "duplicate_blocked",
+      "type": "failure",
+      "label": "重复提交已阻止",
+      "sublabel": "duplicate_blocked · 同一指纹",
+      "lane": "terminal",
+      "col": 1,
+      "width": 120,
+      "tag": "terminal guard"
+    }
+  ],
+  "transitions": [
+    {
+      "id": "preflight-to-form-check",
+      "from": "local_preflight_passed",
+      "to": "platform_form_verified",
+      "variant": "emphasis"
+    },
+    {
+      "id": "preflight-to-formal",
+      "from": "local_preflight_passed",
+      "to": "final_action_triggered",
+      "variant": "security",
+      "route": "straight"
+    },
+    {
+      "id": "preflight-to-verification",
+      "from": "local_preflight_passed",
+      "to": "waiting_user_verification",
+      "variant": "security"
+    },
+    {
+      "id": "verification-expired",
+      "from": "waiting_user_verification",
+      "to": "failed_before_final_action",
+      "variant": "security"
+    },
+    {
+      "id": "final-to-accepted",
+      "from": "final_action_triggered",
+      "to": "platform_accepted",
+      "variant": "emphasis",
+      "route": "straight"
+    },
+    {
+      "id": "accepted-to-readback",
+      "from": "platform_accepted",
+      "to": "published_readback_confirmed",
+      "variant": "emphasis",
+      "route": "straight"
+    },
+    {
+      "id": "final-to-ambiguous",
+      "from": "final_action_triggered",
+      "to": "ambiguous",
+      "variant": "security",
+      "via": [[402, 205], [820, 205], [820, 550], [402, 550]]
+    },
+    {
+      "id": "ambiguous-duplicate-block",
+      "from": "ambiguous",
+      "to": "duplicate_blocked",
+      "variant": "security",
+      "route": "straight"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "两种发布前结果",
+      "items": [
+        "local_preflight_passed 只证明本地合同，platformWriteOccurred=false",
+        "platform_form_verified 证明真实上传与字段回读，finalActionTriggered=false",
+        "两者都不等于已发布"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "正式证据递进",
+      "items": [
+        "final_action_triggered 只证明一次 Post 已发生",
+        "platform_accepted 需要 TikTok 明确成功反馈",
+        "published_readback_confirmed 需要精确作品或列表回读"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "租约与防重复",
+      "items": [
+        "Post 前 lease expiry 进入 failed_before_final_action",
+        "Post 后 lease expiry 进入 ambiguous，只允许只读核对",
+        "人工验证完成后续跑同一页面；图中省略重复上传路径",
+        "final_action_triggered 之后没有返回自动 retry / preflight 的迁移"
+      ]
+    }
+  ]
+}
