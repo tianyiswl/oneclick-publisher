@@ -69,6 +69,14 @@ class OneClickCapabilityTests(unittest.TestCase):
             "Instagram Reels",
         )
 
+    def test_tiktok_video_note_describes_default_local_preflight_boundary(self) -> None:
+        capability = adapter.capability_for("TikTok", "video")
+        self.assertIsNotNone(capability)
+        note = capability.notes
+        self.assertIn("默认本地检查", note)
+        self.assertNotIn("停在 Post 前预检", note)
+        self.assertNotIn("预检上传", note)
+
     def test_unsupported_type_is_blocked_before_task_creation(self) -> None:
         result = adapter.validate_payload({
             "platform": "公众号", "content_type": "video", "title": "测试视频",
