@@ -9,8 +9,6 @@ from typing import Any
 from urllib.parse import urlsplit
 
 
-_AUTH_COOKIE_NAMES = frozenset({"sessionid", "sid_tt", "sessionid_ss"})
-
 
 class TikTokSessionScopeError(RuntimeError):
     """A storage-state boundary violation with a stable public error code."""
@@ -53,23 +51,16 @@ def _invalid(message: str) -> TikTokSessionScopeError:
     return TikTokSessionScopeError("tiktok_session_scope_invalid", message)
 
 
-def _has_tiktok_auth_cookie(cookies: list[dict[str, Any]]) -> bool:
-    """Check the fixed TikTok login-cookie allowlist without exposing names."""
-
-    return any(
-        isinstance(cookie.get("name"), str)
-        and cookie["name"].lower() in _AUTH_COOKIE_NAMES
-        for cookie in cookies
-    )
-
-
 def sanitize_tiktok_storage_state(
     raw_state: Mapping[str, Any],
 ) -> dict[str, list[dict[str, Any]]]:
     """Keep only TikTok cookies and origins without mutating the input.
 
-    Foreign entries are discarded.  Shape violations use a fixed public
-    message; no cookie or localStorage value is ever included in an error.
+    Foreign entries are discarded.  The retained-cookie count is only a
+    TikTok-state-presence signal, not authentication proof: callers must still
+    prove one public handle in two independent blank contexts.  Shape
+    violations use a fixed public message; no cookie or localStorage value is
+    ever included in an error.
     """
 
     if not isinstance(raw_state, Mapping) or set(raw_state) != {"cookies", "origins"}:
@@ -98,7 +89,7 @@ def sanitize_tiktok_storage_state(
         if is_tiktok_https_origin(origin["origin"]):
             kept_origins.append(copy.deepcopy(dict(origin)))
 
-    if not _has_tiktok_auth_cookie(kept_cookies):
+    if not kept_cookies:
         raise TikTokSessionScopeError(
             "tiktok_session_missing", "TikTok 本地登录会话不存在"
         )

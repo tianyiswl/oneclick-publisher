@@ -42,7 +42,7 @@ class TikTokSessionScopeTests(unittest.TestCase):
             sanitize_tiktok_storage_state({"cookies": [], "origins": []})
         self.assertEqual(raised.exception.error_code, "tiktok_session_missing")
 
-    def test_tiktok_visitor_cookies_without_an_auth_marker_are_not_a_login(self):
+    def test_tiktok_cookie_without_a_known_auth_name_is_preserved_for_blank_verification(self):
         raw = {
             "cookies": [
                 {"name": "tt_webid", "value": "visitor", "domain": ".tiktok.com"}
@@ -50,11 +50,13 @@ class TikTokSessionScopeTests(unittest.TestCase):
             "origins": [],
         }
 
-        with self.assertRaises(TikTokSessionScopeError) as raised:
-            sanitize_tiktok_storage_state(raw)
+        try:
+            result = sanitize_tiktok_storage_state(raw)
+        except TikTokSessionScopeError as exc:
+            self.fail(f"TikTok cookie must reach blank verification: {exc.error_code}")
 
-        self.assertEqual(raised.exception.error_code, "tiktok_session_missing")
-        self.assertNotIn("visitor", raised.exception.public_message)
+        self.assertEqual(len(result["cookies"]), 1)
+        self.assertEqual(result["cookies"][0]["domain"], ".tiktok.com")
 
     def test_cookie_domain_allowlist_accepts_tiktok_subdomains_only(self):
         accepted = ("www.tiktok.com", ".tiktok.com", "shop.tiktok.com", "SHOP.TIKTOK.COM.")

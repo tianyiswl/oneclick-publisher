@@ -686,7 +686,7 @@ class TikTokCandidateIntakeTests(unittest.TestCase):
         candidate = self._collect()
 
         self.assertEqual(candidate.identity.handle, "expected.user")
-        self.assertTrue(getattr(candidate, "auth_cookie_present", False))
+        self.assertTrue(getattr(candidate, "tiktok_cookie_present", False))
         self.assertEqual(
             getattr(candidate, "validation_stage", ""),
             "tiktok_blank_identity_verified",
@@ -753,7 +753,7 @@ class TikTokCandidateIntakeTests(unittest.TestCase):
             self._collect()
 
         self.assertEqual(raised.exception.error_code, "tiktok_session_missing")
-        self.assertFalse(getattr(raised.exception, "auth_cookie_present", True))
+        self.assertFalse(getattr(raised.exception, "tiktok_cookie_present", True))
         self.assertEqual(
             getattr(raised.exception, "validation_stage", ""),
             "tiktok_persistent_state",
@@ -761,6 +761,67 @@ class TikTokCandidateIntakeTests(unittest.TestCase):
         self.assertNotIn("secret", raised.exception.public_message)
         self.assertEqual(self.fake_persistent.new_page_calls, 0)
         self.assertEqual(self.fake_verifier.blank_contexts, [])
+
+    def test_candidate_rejects_when_profile_export_has_no_tiktok_state(self):
+        self.fake_persistent.raw_storage_state = {"cookies": [], "origins": []}
+
+        with self.assertRaises(TikTokSystemLoginError) as raised:
+            self._collect()
+
+        self.assertEqual(raised.exception.error_code, "tiktok_session_missing")
+        self.assertFalse(getattr(raised.exception, "tiktok_cookie_present", True))
+        self.assertEqual(
+            getattr(raised.exception, "validation_stage", ""),
+            "tiktok_persistent_state",
+        )
+        self.assertEqual(self.fake_verifier.blank_contexts, [])
+
+    def test_candidate_revalidates_unknown_tiktok_cookie_name_in_two_blank_contexts(self):
+        self.fake_persistent.raw_storage_state = {
+            "cookies": [
+                {
+                    "name": "new_tiktok_session_marker",
+                    "value": "secret",
+                    "domain": ".tiktok.com",
+                }
+            ],
+            "origins": [],
+        }
+
+        try:
+            candidate = self._collect()
+        except TikTokSystemLoginError as exc:
+            self.fail(
+                "Unknown TikTok cookie must be checked in blank contexts: "
+                f"{exc.error_code}"
+            )
+
+        self.assertTrue(getattr(candidate, "tiktok_cookie_present", False))
+        self.assertEqual(len(self.fake_verifier.blank_contexts), 2)
+        self.assertEqual(self.fake_identity_reads, ["expected.user", "expected.user"])
+
+    def test_candidate_rejects_visitor_tiktok_state_when_blank_context_has_no_identity(self):
+        self.fake_persistent.raw_storage_state = {
+            "cookies": [
+                {
+                    "name": "visitor_marker",
+                    "value": "visitor-state",
+                    "domain": ".tiktok.com",
+                }
+            ],
+            "origins": [],
+        }
+
+        with self.assertRaises(TikTokSystemLoginError) as raised:
+            self._collect(
+                TikTokIdentityError(
+                    "tiktok_account_invalid", "TikTok page has no unique account"
+                )
+            )
+
+        self.assertEqual(raised.exception.error_code, "tiktok_identity_missing")
+        self.assertTrue(getattr(raised.exception, "tiktok_cookie_present", False))
+        self.assertEqual(len(self.fake_verifier.blank_contexts), 1)
 
     def test_candidate_rejects_two_blank_context_handle_mismatch(self):
         with self.assertRaises(TikTokSystemLoginError) as raised:
@@ -799,7 +860,7 @@ class TikTokCandidateIntakeTests(unittest.TestCase):
             )
 
         self.assertEqual(raised.exception.error_code, "tiktok_identity_missing")
-        self.assertTrue(getattr(raised.exception, "auth_cookie_present", False))
+        self.assertTrue(getattr(raised.exception, "tiktok_cookie_present", False))
         self.assertEqual(
             getattr(raised.exception, "validation_stage", ""),
             "tiktok_blank_identity_first",
@@ -818,7 +879,7 @@ class TikTokCandidateIntakeTests(unittest.TestCase):
             raised.exception.error_code,
             "tiktok_account_identity_ambiguous",
         )
-        self.assertTrue(getattr(raised.exception, "auth_cookie_present", False))
+        self.assertTrue(getattr(raised.exception, "tiktok_cookie_present", False))
         self.assertEqual(
             getattr(raised.exception, "validation_stage", ""),
             "tiktok_blank_identity_first",

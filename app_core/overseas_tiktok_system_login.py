@@ -74,7 +74,7 @@ class TikTokLoginCandidate:
 
     storage_state: dict[str, list[dict[str, Any]]]
     identity: TikTokIdentity
-    auth_cookie_present: bool = True
+    tiktok_cookie_present: bool = True
     validation_stage: str = "tiktok_blank_identity_verified"
 
 
@@ -86,12 +86,12 @@ class TikTokSystemLoginError(RuntimeError):
         error_code: str,
         message: str,
         *,
-        auth_cookie_present: bool | None = None,
+        tiktok_cookie_present: bool | None = None,
         validation_stage: str = "",
     ) -> None:
         self.error_code = str(error_code)
         self.public_message = str(message)
-        self.auth_cookie_present = auth_cookie_present
+        self.tiktok_cookie_present = tiktok_cookie_present
         self.validation_stage = str(validation_stage)
         super().__init__(self.public_message)
 
@@ -594,27 +594,27 @@ def _translate_candidate_identity_error(
             return TikTokSystemLoginError(
                 "tiktok_session_expired",
                 "TikTok 登录状态已失效",
-                auth_cookie_present=True,
+                tiktok_cookie_present=True,
                 validation_stage=validation_stage,
             )
         return TikTokSystemLoginError(
             "tiktok_identity_missing",
             "TikTok 登录状态已读取，但未找到唯一公开账号",
-            auth_cookie_present=True,
+            tiktok_cookie_present=True,
             validation_stage=validation_stage,
         )
     if code == "tiktok_account_identity_ambiguous":
         return TikTokSystemLoginError(
             "tiktok_account_identity_ambiguous",
             "TikTok 返回了多个公开账号，已停止保存",
-            auth_cookie_present=True,
+            tiktok_cookie_present=True,
             validation_stage=validation_stage,
         )
     translated = _translate_identity_error(error)
     return TikTokSystemLoginError(
         translated.error_code,
         translated.public_message,
-        auth_cookie_present=True,
+        tiktok_cookie_present=True,
         validation_stage=validation_stage,
     )
 
@@ -711,7 +711,7 @@ async def collect_validated_tiktok_candidate(
                 candidate = TikTokLoginCandidate(
                     sanitized,
                     second_identity,
-                    auth_cookie_present=True,
+                    tiktok_cookie_present=True,
                     validation_stage="tiktok_blank_identity_verified",
                 )
         except TikTokSystemLoginError:
@@ -720,7 +720,7 @@ async def collect_validated_tiktok_candidate(
             raise TikTokSystemLoginError(
                 exc.error_code,
                 exc.public_message,
-                auth_cookie_present=False,
+                tiktok_cookie_present=False,
                 validation_stage="tiktok_persistent_state",
             ) from exc
         except TikTokIdentityError as exc:

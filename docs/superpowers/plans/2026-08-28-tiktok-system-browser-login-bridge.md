@@ -59,7 +59,7 @@
 - Produces: `is_tiktok_cookie_domain(value: object) -> bool`.
 - Produces: `is_tiktok_https_origin(value: object) -> bool`.
 - Produces: `sanitize_tiktok_storage_state(raw_state: Mapping[str, Any]) -> dict[str, list[dict[str, Any]]]`.
-- Contract: return value contains only `cookies` and `origins`; input is never mutated; no allowlisted TikTok login-session marker raises `tiktok_session_missing`; malformed or forbidden structure raises `tiktok_session_scope_invalid`.
+- Contract: return value contains only `cookies` and `origins`; input is never mutated; no TikTok-domain cookie raises `tiktok_session_missing`; a retained cookie is only a state-presence signal and must still pass the two independent blank-context handle reads; malformed or forbidden structure raises `tiktok_session_scope_invalid`.
 
 - [ ] **Step 1: Write the failing filter tests**
 
@@ -280,7 +280,7 @@ def test_candidate_is_revalidated_in_a_blank_context_with_sanitized_state(self):
     self.assertEqual(self.fake_identity_reads, ["expected.user", "expected.user"])
 ```
 
-Add failures for no allowlisted TikTok login-session marker, two blank-context handle mismatch, blank-context login rejection, profile lock, Playwright close failure, update-mode handle mismatch, ambiguous public handle and non-TikTok origin leakage. Fakes must expose only the minimal `launch_persistent_context`, `launch`, `new_context`, `new_page`, `goto`, `storage_state` and `close` methods. Persistent-profile intake only reads and filters state; two independent blank contexts perform the public-handle reads. Missing and ambiguous blank identities use their own stable public codes.
+Add failures for no TikTok-domain cookie, a retained non-authenticated visitor state, two blank-context handle mismatch, blank-context login rejection, profile lock, Playwright close failure, update-mode handle mismatch, ambiguous public handle and non-TikTok origin leakage. Fakes must expose only the minimal `launch_persistent_context`, `launch`, `new_context`, `new_page`, `goto`, `storage_state` and `close` methods. Persistent-profile intake only reads and filters state; two independent blank contexts perform the public-handle reads. Missing and ambiguous blank identities use their own stable public codes.
 
 - [ ] **Step 2: Write failing account commit and compensation tests**
 
