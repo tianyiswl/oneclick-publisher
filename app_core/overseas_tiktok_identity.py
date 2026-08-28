@@ -8,7 +8,6 @@ or avatar is useful UI context, but neither is a stable account binding.
 from __future__ import annotations
 
 import asyncio
-import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,10 +23,35 @@ from .paths import COOKIE_DIR
 _HANDLE_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 _PROFILE_PATH_PATTERN = re.compile(r"^/@([^/]+)$")
 _PROFILE_LINK_SELECTOR = 'a[href*="/@"]'
-_UNIVERSAL_DATA_SELECTOR = 'script#__UNIVERSAL_DATA_FOR_REHYDRATION__'
 _TIKTOK_HOSTS = {"tiktok.com", "www.tiktok.com"}
 TIKTOK_IDENTITY_URL = "https://www.tiktok.com/"
 _AUTH_ROUTE_TOKENS = ("login", "challenge", "verify", "captcha", "security")
+_APP_CONTEXT_USER_EVALUATOR = """
+() => {
+  const scripts = document.querySelectorAll('script#__UNIVERSAL_DATA_FOR_REHYDRATION__');
+  if (scripts.length === 0) return { state: 'missing' };
+  if (scripts.length !== 1) return { state: 'invalid' };
+  try {
+    const documentData = JSON.parse(scripts[0].textContent || '');
+    const scope = documentData && documentData.__DEFAULT_SCOPE__;
+    const appContext = scope && scope['webapp.app-context'];
+    const user = appContext && appContext.user;
+    if (!user || typeof user !== 'object') return { state: 'invalid' };
+    const result = { state: 'ok' };
+    if (Object.prototype.hasOwnProperty.call(user, 'uniqueId')) {
+      if (typeof user.uniqueId !== 'string') return { state: 'invalid' };
+      result.uniqueId = user.uniqueId;
+    }
+    if (Object.prototype.hasOwnProperty.call(user, 'unique_id')) {
+      if (typeof user.unique_id !== 'string') return { state: 'invalid' };
+      result.unique_id = user.unique_id;
+    }
+    return result;
+  } catch (_error) {
+    return { state: 'invalid' };
+  }
+}
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,14 +146,6 @@ async def _text(locator) -> str:
     return " ".join(str(value or "").split())
 
 
-async def _text_content(locator) -> str | None:
-    try:
-        value = await _call_async(locator.text_content, timeout=1200)
-    except Exception:
-        return None
-    return value if isinstance(value, str) else None
-
-
 def _identity_invalid() -> TikTokIdentityError:
     return TikTokIdentityError(
         "tiktok_account_invalid", "TikTok 页面没有返回稳定账号标识"
@@ -137,31 +153,18 @@ def _identity_invalid() -> TikTokIdentityError:
 
 
 def parse_tiktok_app_context_handle(payload: object) -> str:
-    """Read only the fixed public username path from TikTok's homepage JSON."""
+    """Validate only the two public username fields returned by page-side code."""
 
-    if not isinstance(payload, str):
+    if not isinstance(payload, dict):
         raise _identity_invalid()
-    try:
-        document = json.loads(payload)
-    except (TypeError, ValueError) as exc:
-        raise _identity_invalid() from exc
-    if not isinstance(document, dict):
-        raise _identity_invalid()
-    scope = document.get("__DEFAULT_SCOPE__")
-    if not isinstance(scope, dict):
-        raise _identity_invalid()
-    app_context = scope.get("webapp.app-context")
-    if not isinstance(app_context, dict):
-        raise _identity_invalid()
-    user = app_context.get("user")
-    if not isinstance(user, dict):
+    if payload.get("state") != "ok":
         raise _identity_invalid()
 
     handles: set[str] = set()
     for field in ("uniqueId", "unique_id"):
-        if field not in user:
+        if field not in payload:
             continue
-        value = user[field]
+        value = payload[field]
         if not isinstance(value, str):
             raise _identity_invalid()
         handle = _valid_handle(value)
@@ -207,19 +210,17 @@ def _is_tiktok_homepage_route(page) -> bool:
 
 
 async def _homepage_app_context_handle(page) -> str:
-    """Read one exact homepage script node; never inspect profile-link markup."""
+    """Ask the page to return only its two public app-context username fields."""
 
     try:
-        scripts = page.locator(_UNIVERSAL_DATA_SELECTOR)
-        if int(await scripts.count()) != 1:
-            return ""
-        script = scripts.nth(0)
+        result = await page.evaluate(_APP_CONTEXT_USER_EVALUATOR)
     except Exception:
         return ""
-    payload = await _text_content(script)
-    if payload is None or not payload.strip():
+    if not isinstance(result, dict):
+        raise _identity_invalid()
+    if result.get("state") == "missing":
         return ""
-    return parse_tiktok_app_context_handle(payload)
+    return parse_tiktok_app_context_handle(result)
 
 
 def _is_tiktok_studio_route(page) -> bool:
