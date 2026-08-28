@@ -7,6 +7,7 @@ import argparse
 import asyncio
 from datetime import datetime
 import json
+import logging
 import os
 import sys
 import time
@@ -33,6 +34,10 @@ from app_core import (
     controlled_publish,
 )
 from app_core.release_integrity import verify_release_artifact
+from app_core.overseas_tiktok_system_login import (
+    TikTokSystemLoginError,
+    recover_stale_tiktok_login_attempts,
+)
 from app_core.branding import APP_ICON_RELATIVE_PATH, APP_TITLE, APP_VERSION, PRODUCT_NAME
 from app_core.database import ensure_schema
 from app_core.paths import USER_DATA_DIR, WECHAT_DRAFT_BRIDGE_DIR
@@ -40,6 +45,9 @@ from app_core.source_live_runtime import installed_gui_block_reason
 from ui.common import apply_style
 from ui.main_window import LicenseDialog, MainWindow
 from ui.runtime_log import install_runtime_log_capture
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def configure_application(app: QApplication) -> None:
@@ -80,6 +88,10 @@ def run_self_test() -> None:
 def create_main_window() -> MainWindow:
     """创建并完成正常桌面端接线。"""
 
+    try:
+        recover_stale_tiktok_login_attempts()
+    except TikTokSystemLoginError as exc:
+        LOGGER.warning("%s", exc.error_code)
     window = MainWindow()
     window.publish.configure_wechat_draft_queue(WECHAT_DRAFT_BRIDGE_DIR)
     return window

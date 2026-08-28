@@ -1,7 +1,7 @@
 """一键发账号授权入口。
 
-国内平台使用一键发已验收的授权执行器；TikTok 与 Meta 复用已恢复的
-浏览器登录流程，YouTube 使用 Google 官方桌面 OAuth 系统浏览器流程。
+国内平台使用一键发已验收的授权执行器；Meta 复用已恢复的浏览器登录流程，
+TikTok 使用系统浏览器专用临时资料，YouTube 使用 Google 官方桌面 OAuth。
 """
 
 from __future__ import annotations
@@ -57,10 +57,9 @@ class RecoveredOverseasLoginSession:
             self.queue.put(f"ERROR:{type(exc).__name__}: {exc}")
 
     async def _run(self) -> None:
-        from myUtils.login import meta_cookie_gen, tiktok_cookie_gen, youtube_cookie_gen
+        from myUtils.login import meta_cookie_gen, youtube_cookie_gen
 
         callback = {
-            6: tiktok_cookie_gen,
             7: youtube_cookie_gen,
             8: meta_cookie_gen,
         }.get(self.platform_type)
@@ -88,6 +87,22 @@ def start_login(
 
     del background_mode
     login_type = account_service.login_platform_type(platform_type)
+    if login_type == 6:
+        from .overseas_tiktok_system_login import TikTokSystemBrowserLoginSession
+
+        existing_account = (
+            account_service.get_managed_account(int(record_id))
+            if update_mode and record_id is not None
+            else None
+        )
+        session = TikTokSystemBrowserLoginSession(
+            profile_name=profile_name,
+            update_mode=update_mode,
+            record_id=record_id,
+            existing_account=existing_account,
+        )
+        session.start()
+        return session
     if login_type == 7:
         from .overseas_youtube_login import YouTubeOAuthLoginSession
 

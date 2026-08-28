@@ -21,6 +21,7 @@ from app_core import (
     login_service,
     overseas_preflight,
     overseas_tiktok_publish,
+    overseas_tiktok_system_login,
     overseas_youtube_credentials,
     overseas_youtube_login,
     overseas_youtube_profile,
@@ -204,6 +205,24 @@ class OverseasAccountEntryTests(unittest.TestCase):
         )
         self.assertEqual(session.platform_type, 8)
         start.assert_called_once_with()
+
+    def test_login_service_routes_tiktok_to_system_browser_session(self) -> None:
+        created = MagicMock()
+        created.start = MagicMock()
+        with patch.object(
+            overseas_tiktok_system_login,
+            "TikTokSystemBrowserLoginSession",
+            return_value=created,
+        ) as session_type:
+            session = login_service.start_login(6, "TikTok 测试")
+
+        self.assertIs(session, created)
+        created.start.assert_called_once_with()
+        kwargs = session_type.call_args.kwargs
+        self.assertEqual(kwargs["profile_name"], "TikTok 测试")
+        self.assertFalse(kwargs["update_mode"])
+        self.assertIsNone(kwargs["record_id"])
+        self.assertIsNone(kwargs["existing_account"])
 
     def test_login_service_routes_youtube_to_official_oauth_session(self) -> None:
         created = MagicMock()

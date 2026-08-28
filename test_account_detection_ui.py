@@ -183,6 +183,137 @@ class AccountDetectionUiTests(unittest.TestCase):
         self.assertIn("官方登录页面", dialog.qr_label.text())
         dialog.close()
 
+    def test_tiktok_dialog_explains_system_chrome_and_disables_manual_save(self) -> None:
+        class TikTokSession:
+            manual_save_supported = False
+
+            def __init__(self) -> None:
+                self.queue: queue.Queue[str] = queue.Queue()
+
+            def cancel(self) -> None:
+                pass
+
+            def save(self) -> None:
+                raise AssertionError("TikTok manual save must stay disabled")
+
+        dialog = LoginDialog(background_login=True)
+        dialog.platform_combo.setCurrentIndex(dialog.platform_combo.findData(6))
+        dialog.reset_login_prompt()
+        self.assertEqual(
+            dialog.qr_label.text(),
+            "请点击“开始登录”，一键发将打开系统 Chrome 专用临时窗口；登录完成后请关闭该窗口。",
+        )
+        self.assertTrue(dialog.save_btn.isHidden())
+        dialog.platform_combo.setCurrentIndex(dialog.platform_combo.findData(1))
+        self.assertFalse(dialog.save_btn.isHidden())
+        dialog.platform_combo.setCurrentIndex(dialog.platform_combo.findData(6))
+        dialog.profile_input.setCurrentText("TikTok 测试")
+        with patch("ui.login_dialog.login_service.start_login", return_value=TikTokSession()):
+            dialog.start_login()
+        self.assertFalse(dialog.save_btn.isEnabled())
+        dialog.close()
+
+    def test_tiktok_dialog_consumes_each_system_browser_lifecycle_message(self) -> None:
+        expected = {
+            "OPENING_SYSTEM_BROWSER": "正在准备系统 Chrome 专用临时窗口...",
+            "SYSTEM_BROWSER_OPENED": "系统 Chrome 专用临时窗口已打开。",
+            "WAITING_BROWSER_EXIT": "请在系统 Chrome 专用临时窗口完成 TikTok 登录，完成后关闭该窗口。",
+            "VALIDATING_TIKTOK_SESSION": "专用窗口已关闭，正在核对 TikTok 登录状态...",
+            "CLEANING_LOGIN_ATTEMPT": "正在清理 TikTok 临时登录资料...",
+        }
+        forbidden = ("Cookie 导出", "默认资料", "避开 Google", "手动保存会话")
+
+        for lifecycle, visible_text in expected.items():
+            with self.subTest(lifecycle=lifecycle):
+                session = MagicMock()
+                session.manual_save_supported = False
+                session.queue = queue.Queue()
+                session.queue.put(lifecycle)
+                dialog = LoginDialog(background_login=True)
+                dialog.platform_combo.setCurrentIndex(dialog.platform_combo.findData(6))
+                dialog.session = session
+
+                dialog.poll_messages()
+
+                self.assertEqual(dialog.qr_label.text(), visible_text)
+                self.assertFalse(dialog.save_btn.isEnabled())
+                rendered = dialog.qr_label.text() + "\n" + dialog.log.toPlainText()
+                for phrase in forbidden:
+                    self.assertNotIn(phrase, rendered)
+                dialog.close()
+
+    def test_tiktok_dialog_maps_every_stable_error_without_security_bypass_advice(self) -> None:
+        expected = {
+            "tiktok_system_browser_unavailable": "未找到可用的系统 Chrome 或 Edge。",
+            "tiktok_login_attempt_timeout": "等待登录超时，未保存账号。",
+            "tiktok_login_profile_busy": "TikTok 临时登录资料仍被浏览器占用。",
+            "tiktok_session_scope_invalid": "登录状态包含超出 TikTok 的数据，已拒绝保存。",
+            "tiktok_session_missing": "未检测到可用的 TikTok 登录状态。",
+            "tiktok_session_expired": "TikTok 登录状态已失效。",
+            "tiktok_account_invalid": "TikTok 未返回唯一可核对账号。",
+            "tiktok_account_identity_mismatch": "当前 TikTok 账号与原记录不一致。",
+            "tiktok_login_cleanup_failed": "临时登录资料清理失败，已停止保存账号。",
+            "tiktok_login_commit_failed": "TikTok 会话未能安全写入账号库。",
+        }
+        forbidden = ("Cookie 导出", "默认资料", "避开 Google", "手动保存会话")
+
+        for error_code, error_text in expected.items():
+            with self.subTest(error_code=error_code):
+                session = MagicMock()
+                session.manual_save_supported = False
+                session.queue = queue.Queue()
+                session.queue.put(f"ERROR:{error_code}")
+                dialog = LoginDialog(background_login=True)
+                dialog.platform_combo.setCurrentIndex(dialog.platform_combo.findData(6))
+                dialog.session = session
+                with patch.object(dialog, "reject") as reject:
+                    dialog.poll_messages()
+
+                self.assertEqual(dialog.lifecycle_message, f"登录失败：{error_text}")
+                self.assertFalse(dialog.save_btn.isEnabled())
+                reject.assert_called_once_with()
+                rendered = dialog.lifecycle_message + "\n" + dialog.log.toPlainText()
+                for phrase in forbidden:
+                    self.assertNotIn(phrase, rendered)
+                dialog.close()
+
+    def test_tiktok_account_saved_uses_silent_readback_before_accepting(self) -> None:
+        session = MagicMock()
+        session.manual_save_supported = False
+        session.queue = queue.Queue()
+        session.queue.put("ACCOUNT_SAVED:44")
+        dialog = LoginDialog(background_login=True)
+        dialog.platform_combo.setCurrentIndex(dialog.platform_combo.findData(6))
+        dialog.session = session
+
+        with (
+            patch.object(dialog, "_verify_saved_account") as readback,
+            patch.object(dialog, "accept") as accept,
+        ):
+            dialog.poll_messages()
+
+        readback.assert_called_once_with(44)
+        accept.assert_not_called()
+        self.assertFalse(dialog.save_btn.isEnabled())
+        dialog.close()
+
+    def test_tiktok_cancelled_rejects_without_saving(self) -> None:
+        session = MagicMock()
+        session.manual_save_supported = False
+        session.queue = queue.Queue()
+        session.queue.put("CANCELLED")
+        dialog = LoginDialog(background_login=True)
+        dialog.platform_combo.setCurrentIndex(dialog.platform_combo.findData(6))
+        dialog.session = session
+
+        with patch.object(dialog, "reject") as reject:
+            dialog.poll_messages()
+
+        self.assertEqual(dialog.lifecycle_message, "登录已取消，未修改账号会话。")
+        self.assertFalse(dialog.save_btn.isEnabled())
+        reject.assert_called_once_with()
+        dialog.close()
+
     def test_expired_account_cookie_is_checked_before_being_marked_pending(self) -> None:
         """超过 24 小时先静默复核 Cookie，复核失败才进入待检测状态。"""
 

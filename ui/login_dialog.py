@@ -29,6 +29,18 @@ from .background_task import BackgroundTaskRunner
 
 QR_CANVAS_SIZE = 248
 QR_CONTENT_MAX_SIZE = 220
+TIKTOK_LOGIN_ERROR_TEXT = {
+    "tiktok_system_browser_unavailable": "未找到可用的系统 Chrome 或 Edge。",
+    "tiktok_login_attempt_timeout": "等待登录超时，未保存账号。",
+    "tiktok_login_profile_busy": "TikTok 临时登录资料仍被浏览器占用。",
+    "tiktok_session_scope_invalid": "登录状态包含超出 TikTok 的数据，已拒绝保存。",
+    "tiktok_session_missing": "未检测到可用的 TikTok 登录状态。",
+    "tiktok_session_expired": "TikTok 登录状态已失效。",
+    "tiktok_account_invalid": "TikTok 未返回唯一可核对账号。",
+    "tiktok_account_identity_mismatch": "当前 TikTok 账号与原记录不一致。",
+    "tiktok_login_cleanup_failed": "临时登录资料清理失败，已停止保存账号。",
+    "tiktok_login_commit_failed": "TikTok 会话未能安全写入账号库。",
+}
 
 
 def _qr_display_size(width: int, height: int) -> tuple[int, int]:
@@ -162,7 +174,15 @@ class LoginDialog(QDialog):
         if self.session and self.timer.isActive():
             return
         self.qr_label.clear()
-        if int(self.platform_combo.currentData() or 0) == 7:
+        platform_type = int(self.platform_combo.currentData() or 0)
+        self.save_btn.setVisible(platform_type != 6)
+        if platform_type == 6:
+            self.save_btn.setEnabled(False)
+            self.qr_label.setText(
+                "请点击“开始登录”，一键发将打开系统 Chrome 专用临时窗口；"
+                "登录完成后请关闭该窗口。"
+            )
+        elif platform_type == 7:
             self.qr_label.setText("请点击下方“开始登录”在系统默认浏览器中授权 YouTube")
         else:
             self.qr_label.setText("请点击下方“开始登录”在一键发独立会话中打开官方页面")
@@ -264,6 +284,34 @@ class LoginDialog(QDialog):
             return
         while not self.session.queue.empty():
             msg = str(self.session.queue.get())
+            if msg == "OPENING_SYSTEM_BROWSER":
+                self.save_btn.setEnabled(False)
+                self.qr_label.setText("正在准备系统 Chrome 专用临时窗口...")
+                self.log.append("正在创建本次 TikTok 登录使用的临时资料。")
+                continue
+            if msg == "SYSTEM_BROWSER_OPENED":
+                self.save_btn.setEnabled(False)
+                self.qr_label.setText("系统 Chrome 专用临时窗口已打开。")
+                self.log.append("TikTok 官方登录页已在专用窗口打开。")
+                continue
+            if msg == "WAITING_BROWSER_EXIT":
+                self.save_btn.setEnabled(False)
+                self.qr_label.setText(
+                    "请在系统 Chrome 专用临时窗口完成 TikTok 登录，"
+                    "完成后关闭该窗口。"
+                )
+                self.log.append("等待你完成 TikTok 登录并关闭专用窗口。")
+                continue
+            if msg == "VALIDATING_TIKTOK_SESSION":
+                self.save_btn.setEnabled(False)
+                self.qr_label.setText("专用窗口已关闭，正在核对 TikTok 登录状态...")
+                self.log.append("正在核对 TikTok 登录数据和账号身份。")
+                continue
+            if msg == "CLEANING_LOGIN_ATTEMPT":
+                self.save_btn.setEnabled(False)
+                self.qr_label.setText("正在清理 TikTok 临时登录资料...")
+                self.log.append("正在清理本次 TikTok 登录使用的临时资料。")
+                continue
             if msg == "SCAN_CONFIRMED":
                 self.log.append("扫码成功，正在验证并保存账号数据，请稍等...")
                 self.qr_label.setText("扫码成功，正在验证并保存账号数据...")
@@ -315,15 +363,17 @@ class LoginDialog(QDialog):
                 return
             if msg.startswith("ERROR:"):
                 reason = msg.split(":", 1)[1]
-                message = {
-                    "youtube_oauth_client_not_configured": "尚未配置 Google 测试项目，当前不能开始 YouTube 官方登录。",
-                    "authorization_denied": "你已拒绝 Google 授权，账号没有发生变化。",
-                    "authorization_invalid": "Google 授权回调无效，请重新发起登录。",
-                    "system_browser_open_failed": "系统默认浏览器未能打开 Google 授权页。",
-                    "credential_unavailable": "系统凭据库不可用，未保存 YouTube 登录凭据。",
-                    "channel_identity_mismatch": "本次授权频道与原账号不一致，未覆盖原账号。",
-                    "channel_identity_unavailable": "Google 未返回唯一 YouTube 频道，未保存账号。",
-                }.get(reason, "YouTube 官方登录未完成，账号没有发生变化。")
+                message = TIKTOK_LOGIN_ERROR_TEXT.get(reason)
+                if message is None:
+                    message = {
+                        "youtube_oauth_client_not_configured": "尚未配置 Google 测试项目，当前不能开始 YouTube 官方登录。",
+                        "authorization_denied": "你已拒绝 Google 授权，账号没有发生变化。",
+                        "authorization_invalid": "Google 授权回调无效，请重新发起登录。",
+                        "system_browser_open_failed": "系统默认浏览器未能打开 Google 授权页。",
+                        "credential_unavailable": "系统凭据库不可用，未保存 YouTube 登录凭据。",
+                        "channel_identity_mismatch": "本次授权频道与原账号不一致，未覆盖原账号。",
+                        "channel_identity_unavailable": "Google 未返回唯一 YouTube 频道，未保存账号。",
+                    }.get(reason, "YouTube 官方登录未完成，账号没有发生变化。")
                 self.lifecycle_message = f"登录失败：{message}"
                 self.log.append(self.lifecycle_message)
                 self.timer.stop()
