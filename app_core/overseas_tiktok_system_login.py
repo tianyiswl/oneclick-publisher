@@ -216,12 +216,16 @@ def _resolved_owned_attempt(attempt_root: Path, staging_root: Path) -> tuple[Pat
 
     raw_staging = _absolute_path(Path(staging_root))
     raw_attempt = _absolute_path(Path(attempt_root))
+    raw_login_staging = raw_staging.parent
+    raw_user_root = raw_login_staging.parent
     if (
         raw_staging.name != "tiktok"
-        or raw_staging.parent.name != "login-staging"
+        or raw_login_staging.name != "login-staging"
         or raw_attempt == raw_staging
         or raw_attempt.parent != raw_staging
         or _ATTEMPT_ID.fullmatch(raw_attempt.name) is None
+        or raw_user_root.is_symlink()
+        or raw_login_staging.is_symlink()
         or raw_staging.is_symlink()
         or raw_attempt.is_symlink()
         or not raw_staging.is_dir()
@@ -263,7 +267,9 @@ def recover_stale_tiktok_login_attempts(
     login_staging = user_root / "login-staging"
     staging_root = login_staging / "tiktok"
     if (
-        not staging_root.exists()
+        user_root.is_symlink()
+        or not user_root.is_dir()
+        or not staging_root.exists()
         or not staging_root.is_dir()
         or login_staging.is_symlink()
         or staging_root.is_symlink()
@@ -291,10 +297,13 @@ def recover_stale_tiktok_login_attempts(
 def _terminate_owned_process(process, *, poll_seconds: float) -> None:
     """Request termination and wait briefly; never signal any other process."""
 
-    process.terminate()
+    try:
+        process.terminate()
+    except ProcessLookupError:
+        return
     try:
         process.wait(timeout=max(0.1, poll_seconds))
-    except subprocess.TimeoutExpired:
+    except (ProcessLookupError, subprocess.TimeoutExpired):
         return
 
 
@@ -337,6 +346,18 @@ def _resolved_owned_profile(attempt: TikTokLoginAttempt) -> Path:
     return resolved_profile
 
 
+def _profile_lock_entry_exists(lock_path: Path) -> bool:
+    """Check for a lock directory entry without following a symlink target."""
+
+    try:
+        lock_path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
 def wait_for_profile_release(
     attempt: TikTokLoginAttempt,
     *,
@@ -349,7 +370,7 @@ def wait_for_profile_release(
     deadline = time.monotonic() + max(0.0, float(timeout_seconds))
     interval = max(0.001, float(poll_seconds))
     while True:
-        if not any((profile_dir / name).exists() for name in _PROFILE_LOCK_NAMES):
+        if not any(_profile_lock_entry_exists(profile_dir / name) for name in _PROFILE_LOCK_NAMES):
             return True
         remaining = deadline - time.monotonic()
         if remaining <= 0:

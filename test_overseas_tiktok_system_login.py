@@ -46,6 +46,14 @@ class FakeProcess:
         return 0
 
 
+class ProcessExitsDuringTerminate(FakeProcess):
+    """Models the owned process exiting after poll() but before terminate()."""
+
+    def terminate(self) -> None:
+        self.terminate_calls += 1
+        raise ProcessLookupError()
+
+
 class TikTokSystemLoginTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -134,6 +142,21 @@ class TikTokSystemLoginTests(unittest.TestCase):
         self.assertTrue(link.is_symlink())
         self.assertTrue(external.is_dir())
 
+    def test_cleanup_rejects_a_symlinked_user_data_ancestor_without_touching_external_attempt(self):
+        external_user_data = self.root / "external-user-data"
+        attempt_id = "d" * 32
+        external_attempt = (
+            external_user_data / "login-staging" / "tiktok" / attempt_id
+        )
+        external_attempt.mkdir(parents=True)
+        self.user_data_dir.symlink_to(external_user_data, target_is_directory=True)
+
+        with self.assertRaises(TikTokSystemLoginError) as raised:
+            remove_login_attempt(self.staging / attempt_id, self.staging)
+
+        self.assertEqual(raised.exception.error_code, "tiktok_login_cleanup_failed")
+        self.assertTrue(external_attempt.is_dir())
+
     def test_startup_recovery_removes_safe_direct_children_only(self):
         first = create_login_attempt(self.user_data_dir)
         second = create_login_attempt(self.user_data_dir)
@@ -152,6 +175,20 @@ class TikTokSystemLoginTests(unittest.TestCase):
         self.assertTrue(unsafe.is_dir())
         self.assertTrue(linked.is_symlink())
         self.assertTrue(external.is_dir())
+
+    def test_startup_recovery_rejects_a_symlinked_user_data_ancestor_without_touching_external_attempt(self):
+        external_user_data = self.root / "external-user-data"
+        attempt_id = "e" * 32
+        external_attempt = (
+            external_user_data / "login-staging" / "tiktok" / attempt_id
+        )
+        external_attempt.mkdir(parents=True)
+        self.user_data_dir.symlink_to(external_user_data, target_is_directory=True)
+
+        recovered = recover_stale_tiktok_login_attempts(self.user_data_dir)
+
+        self.assertEqual(recovered, [])
+        self.assertTrue(external_attempt.is_dir())
 
     def test_find_system_browser_prefers_chrome_before_edge_on_linux(self):
         paths = {
@@ -234,6 +271,22 @@ class TikTokSystemLoginTests(unittest.TestCase):
         self.assertEqual(process.terminate_calls, 1)
         self.assertEqual(len(process.wait_calls), 1)
 
+    def test_wait_for_browser_exit_returns_cancelled_when_process_exits_during_terminate(self):
+        process = ProcessExitsDuringTerminate([None])
+        cancelled = threading.Event()
+        cancelled.set()
+
+        outcome = wait_for_browser_exit(
+            process,
+            cancelled,
+            timeout_seconds=1.0,
+            poll_seconds=0.001,
+        )
+
+        self.assertEqual(outcome, "cancelled")
+        self.assertEqual(process.terminate_calls, 1)
+        self.assertEqual(process.wait_calls, [])
+
     def test_wait_for_profile_release_returns_immediately_when_no_lock_exists(self):
         attempt = create_login_attempt(self.user_data_dir)
 
@@ -250,6 +303,16 @@ class TikTokSystemLoginTests(unittest.TestCase):
 
         self.assertFalse(released)
         self.assertTrue(lock.exists())
+
+    def test_wait_for_profile_release_treats_a_dangling_singleton_lock_symlink_as_busy(self):
+        attempt = create_login_attempt(self.user_data_dir)
+        lock = attempt.profile_dir / "SingletonLock"
+        lock.symlink_to(self.root / "missing-lock-target")
+
+        released = wait_for_profile_release(attempt, timeout_seconds=0.0)
+
+        self.assertFalse(released)
+        self.assertTrue(os.path.lexists(lock))
 
 
 if __name__ == "__main__":
