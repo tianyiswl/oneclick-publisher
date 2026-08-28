@@ -12,7 +12,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from app_core import account_service, overseas_tiktok_publish, task_service
+from app_core import (
+    account_service,
+    overseas_preflight,
+    overseas_tiktok_publish,
+    task_service,
+)
 from app_core.overseas_tiktok_identity import (
     TikTokIdentity,
     validate_identity_binding,
@@ -861,7 +866,7 @@ class TikTokPublishContractTests(unittest.TestCase):
             self.payload(title="T", description="b" * 2195, tags=["x"]),
         )
 
-    def test_local_preflight_returns_hash_only_snapshot_and_does_not_touch_session(self) -> None:
+    def test_controlled_local_preflight_never_calls_platform_side_effects(self) -> None:
         original_session = self.session.read_bytes()
         with (
             patch.object(overseas_tiktok_publish, "COOKIE_DIR", self.root),
@@ -870,13 +875,25 @@ class TikTokPublishContractTests(unittest.TestCase):
                 "_read_account_record",
                 return_value=self.account(),
             ),
-            patch(
-                "app_core.overseas_tiktok_identity.async_playwright"
-            ) as playwright,
+            patch.object(
+                overseas_tiktok_publish,
+                "_load_async_playwright_factory",
+            ) as playwright_factory,
+            patch.object(
+                overseas_tiktok_publish,
+                "_load_tiktok_uploader_class",
+            ) as uploader_factory,
+            patch.object(
+                overseas_tiktok_publish,
+                "save_context_storage_state",
+                new_callable=AsyncMock,
+            ) as save_session,
         ):
-            result = overseas_tiktok_publish.run_tiktok_local_preflight(self.payload())
+            result = overseas_preflight.run_overseas_preflight_sync(self.payload())
 
-        playwright.assert_not_called()
+        playwright_factory.assert_not_called()
+        uploader_factory.assert_not_called()
+        save_session.assert_not_called()
         self.assertEqual(result["phase"], "local_preflight_passed")
         self.assertFalse(result["receipt"]["platformWriteOccurred"])
         self.assertFalse(result["receipt"]["finalActionTriggered"])

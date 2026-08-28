@@ -65,7 +65,8 @@
 ## TikTok 受控视频发布离线证据
 
 - 2026-08-28 在 `feature/overseas-login-publish-v2@a251def` 加上本轮能力文案与测试差异运行离线验收：计划指定的聚焦套件 `283/283` 通过，完整仓库回归 `2389/2389` 通过，用时 `80.188s`；源码离屏客户端返回 `NATIVE_DESKTOP_UI_OK`，`git diff --check` 无输出。
-- TikTok 视频能力说明现在明确为“默认本地检查”。对应本地预检测试证明没有创建 Playwright，平台写入标记为 `false`，会话文件运行前后字节一致；因此本次只证明默认预检没有打开浏览器、没有上传视频、没有改写会话文件。
+- Task 8 复审修复以已提交基线 `eb63a75` 加本轮测试差异重新验收：能力和直接相关模块 `93/93` 通过，计划指定的聚焦套件 `283/283` 通过，完整仓库回归 `2389/2389` 通过，用时 `80.523s`；源码离屏客户端返回 `NATIVE_DESKTOP_UI_OK`，`git diff --check` 无输出。
+- TikTok 视频能力说明现在明确为“默认本地检查”。测试通过真实受控预检入口 `run_overseas_preflight_sync` 执行，并分别证明 `_load_async_playwright_factory`、`_load_tiktok_uploader_class`、`save_context_storage_state` 和平台窗口显示入口均未调用；回执的 `platformWriteOccurred=false`，会话文件运行前后字节一致。因此本次只证明默认预检没有启动平台浏览器、没有进入上传器、没有尝试写会话状态，也没有显示平台窗口。
 - 工作线范围检查实际返回 `changed=28`、`REVIEW_REQUIRED`；海外专属文件可进入复审，共享账号、受控 CLI、任务服务、能力说明与状态文件仍需集成线审查，不能由功能分支自行合并。
 - 尚未运行真实 TikTok `platform_form_check`，没有打开真实 TikTok 页面、上传素材或核对真实表单；没有执行正式模式，也没有点击 `Post`。正式公开发布未验证。
 

@@ -1731,22 +1731,29 @@ class OverseasPreflightTests(unittest.TestCase):
                 self._local_tiktok(root),
                 patch.dict(overseas_preflight.PREFLIGHT_HANDLERS, {6: handler}),
                 patch.object(
-                    tiktok_identity_service,
-                    "async_playwright",
-                ) as playwright,
-                patch.object(recovered_publish, "reveal_page_window") as reveal,
-                patch(
-                    "uploader.tk_uploader.main.save_context_storage_state"
+                    overseas_tiktok_publish,
+                    "_load_async_playwright_factory",
+                ) as playwright_factory,
+                patch.object(
+                    overseas_tiktok_publish,
+                    "_load_tiktok_uploader_class",
+                ) as uploader_factory,
+                patch.object(
+                    overseas_tiktok_publish,
+                    "save_context_storage_state",
+                    new_callable=AsyncMock,
                 ) as save_session,
+                patch.object(recovered_publish, "reveal_page_window") as reveal,
             ):
                 result = overseas_preflight.run_overseas_preflight_sync(
                     self._payload(video)
                 )
 
             handler.assert_not_called()
-            playwright.assert_not_called()
-            reveal.assert_not_called()
+            playwright_factory.assert_not_called()
+            uploader_factory.assert_not_called()
             save_session.assert_not_called()
+            reveal.assert_not_called()
             self.assertEqual(result["phase"], "local_preflight_passed")
             self.assertFalse(result["receipt"]["platformWriteOccurred"])
             self.assertFalse(result["receipt"]["finalActionTriggered"])
