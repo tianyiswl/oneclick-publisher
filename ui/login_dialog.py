@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import base64
+import re
 import urllib.request
 
 from PyQt6.QtCore import QTimer, Qt
@@ -37,12 +38,31 @@ TIKTOK_LOGIN_ERROR_TEXT = {
     "tiktok_session_missing": "未检测到可用的 TikTok 登录状态。",
     "tiktok_session_expired": "TikTok 登录状态已失效。",
     "tiktok_identity_missing": "已读取 TikTok 登录状态，但未找到唯一公开账号。",
+    "tiktok_identity_probe_required": "已读取登录状态，但当前页面账号入口发生变化；已生成安全诊断，未保存账号。",
     "tiktok_account_identity_ambiguous": "TikTok 返回了多个公开账号，已停止保存。",
     "tiktok_account_invalid": "TikTok 未返回唯一可核对账号。",
     "tiktok_account_identity_mismatch": "当前 TikTok 账号与原记录不一致。",
     "tiktok_login_cleanup_failed": "临时登录资料清理失败，已停止保存账号。",
     "tiktok_login_commit_failed": "TikTok 会话未能安全写入账号库。",
 }
+
+_PROBE_STATE = (
+    r"(?:missing|invalid|present_no_handle|present_one|present_multiple)"
+)
+_PROBE_COUNT = r"(?:0|[1-9][0-9]{0,2}|1000)"
+_PROBE_PATH = (
+    r"(?:none|app_context|user_detail|app_context_and_user_detail)"
+)
+_TIKTOK_PROBE_SUMMARY = re.compile(
+    rf"app={_PROBE_STATE}/{_PROBE_STATE};"
+    rf"top={_PROBE_COUNT}/{_PROBE_COUNT};"
+    rf"controls={_PROBE_COUNT}/{_PROBE_COUNT};"
+    rf"semantic={_PROBE_COUNT}/{_PROBE_COUNT};"
+    rf"paths={_PROBE_PATH}/{_PROBE_PATH};"
+    rf"families={_PROBE_COUNT}/{_PROBE_COUNT};"
+    rf"rehydration={_PROBE_COUNT}/{_PROBE_COUNT};"
+    r"consistent=(?:true|false)\Z"
+)
 
 
 def _qr_display_size(width: int, height: int) -> tuple[int, int]:
@@ -361,6 +381,11 @@ class LoginDialog(QDialog):
                 self.save_btn.setEnabled(False)
                 self.qr_label.setText("已检测到平台登录，正在自动保存账号信息...")
                 self.log.append("已检测到平台身份回执，正在自动保存一键发本地会话。")
+                continue
+            if msg.startswith("IDENTITY_PROBE_SUMMARY:"):
+                summary = msg.split(":", 1)[1]
+                if _TIKTOK_PROBE_SUMMARY.fullmatch(summary):
+                    self.log.append(f"安全诊断：{summary}")
                 continue
             if msg.startswith("ACCOUNT_SAVED:"):
                 self.complete_btn.setEnabled(False)

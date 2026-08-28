@@ -288,6 +288,7 @@ class AccountDetectionUiTests(unittest.TestCase):
             "tiktok_session_missing": "未检测到可用的 TikTok 登录状态。",
             "tiktok_session_expired": "TikTok 登录状态已失效。",
             "tiktok_identity_missing": "已读取 TikTok 登录状态，但未找到唯一公开账号。",
+            "tiktok_identity_probe_required": "已读取登录状态，但当前页面账号入口发生变化；已生成安全诊断，未保存账号。",
             "tiktok_account_identity_ambiguous": "TikTok 返回了多个公开账号，已停止保存。",
             "tiktok_account_invalid": "TikTok 未返回唯一可核对账号。",
             "tiktok_account_identity_mismatch": "当前 TikTok 账号与原记录不一致。",
@@ -315,6 +316,30 @@ class AccountDetectionUiTests(unittest.TestCase):
                 for phrase in forbidden:
                     self.assertNotIn(phrase, rendered)
                 dialog.close()
+
+    def test_tiktok_dialog_accepts_only_the_fixed_safe_probe_summary_shape(self) -> None:
+        safe_summary = (
+            "app=present_no_handle/present_no_handle;top=1/1;controls=2/2;"
+            "semantic=1/1;paths=app_context/app_context;families=1/1;"
+            "rehydration=0/0;consistent=true"
+        )
+        session = MagicMock()
+        session.manual_save_supported = False
+        session.queue = queue.Queue()
+        session.queue.put(f"IDENTITY_PROBE_SUMMARY:{safe_summary}")
+        session.queue.put("IDENTITY_PROBE_SUMMARY:dom-text-secret")
+        session.queue.put("ERROR:tiktok_identity_probe_required")
+        dialog = LoginDialog(background_login=True)
+        dialog.platform_combo.setCurrentIndex(dialog.platform_combo.findData(6))
+        dialog.session = session
+
+        with patch.object(dialog, "reject"):
+            dialog.poll_messages()
+
+        rendered = dialog.log.toPlainText()
+        self.assertIn(safe_summary, rendered)
+        self.assertNotIn("dom-text-secret", rendered)
+        dialog.close()
 
     def test_tiktok_account_saved_uses_silent_readback_before_accepting(self) -> None:
         session = MagicMock()
