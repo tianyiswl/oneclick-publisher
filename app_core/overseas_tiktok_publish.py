@@ -7,23 +7,47 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import importlib
 import json
 import math
 import sqlite3
 import unicodedata
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 from urllib.parse import urlsplit
 
+from utils.base_social_media import (
+    launch_publish_browser,
+    new_publish_context,
+    save_context_storage_state,
+    set_init_script,
+)
+from utils.publish_observer import publish_context
+
+from . import task_service
 from .overseas_tiktok_errors import TikTokPublishError
-from .overseas_tiktok_identity import normalize_tiktok_handle
+from .overseas_tiktok_identity import (
+    TikTokIdentityError,
+    normalize_tiktok_handle,
+    read_tiktok_identity,
+    validate_identity_binding,
+)
 from .paths import COOKIE_DIR, DB_PATH
 
 
 TIKTOK_CONTENT_LIMIT = 2200
 TIKTOK_MODES = frozenset({"preflight", "platform_form_check", "formal"})
 TIKTOK_VIDEO_SUFFIXES = frozenset({".mp4", ".mov", ".mkv", ".avi", ".webm"})
+TIKTOK_UPLOAD_URL = "https://www.tiktok.com/tiktokstudio/upload?lang=en"
+
+# Kept lazy so importing this module for local preflight never imports the
+# uploader (which imports the caption composer back from this module) and never
+# constructs Playwright.  Tests may replace either seam with an offline fake.
+TiktokVideo = None
+async_playwright = None
 
 _RUNTIME_MODE_BY_MODE = {
     "preflight": "preflight",
@@ -988,6 +1012,458 @@ def run_tiktok_local_preflight(payload: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _record_tiktok_event(
+    task_id: int,
+    event_type: str,
+    message: str,
+    *,
+    level: str = "info",
+) -> None:
+    task_service.record_task_event(
+        int(task_id),
+        str(event_type),
+        str(message),
+        level=level,
+    )
+
+
+def _load_tiktok_uploader_class():
+    uploader_class = TiktokVideo
+    if uploader_class is not None:
+        return uploader_class
+    module = importlib.import_module("uploader.tk_uploader.main")
+    return module.TiktokVideo
+
+
+def _load_async_playwright_factory():
+    factory = async_playwright
+    if factory is not None:
+        return factory
+    module = importlib.import_module("playwright.async_api")
+    return module.async_playwright
+
+
+def _require_current_account_snapshot(prepared: Mapping[str, Any]) -> dict[str, Any]:
+    account = _read_account_record(int(prepared["accountId"]))
+    if not isinstance(account, Mapping):
+        _fail("tiktok_account_invalid", "TikTok 账号记录已变更")
+    expected_file = Path(str(prepared["accountFile"])).name
+    if (
+        int(account.get("id") or 0) != int(prepared["accountId"])
+        or int(account.get("type") or 0) != 6
+        or int(account.get("status") or 0) != 1
+        or str(account.get("authMode") or "browser") != "browser"
+        or Path(str(account.get("filePath") or "")).name != expected_file
+        or normalize_tiktok_handle(account.get("accountReference"))
+        != str(prepared["expectedAccountReference"])
+    ):
+        _fail("tiktok_account_invalid", "TikTok 账号记录已变更")
+    return dict(account)
+
+
+def _validate_live_identity(account: Mapping[str, Any], identity) -> None:
+    try:
+        validate_identity_binding(
+            account,
+            identity,
+            allow_initial_bind=False,
+        )
+    except TikTokIdentityError as exc:
+        raise TikTokPublishError(exc.error_code, exc.public_message) from exc
+
+
+def _verify_authorized_form_snapshot(
+    prepared: Mapping[str, Any],
+    form_receipt: object,
+) -> dict[str, Any]:
+    if not isinstance(form_receipt, Mapping):
+        _fail("tiktok_form_snapshot_mismatch", "TikTok 表单快照无法安全核对")
+    expected_caption = compose_tiktok_caption(
+        str(prepared["title"]),
+        str(prepared["body"]),
+        prepared["topics"],
+    )
+    expected = {
+        "plainCaption": str(prepared["plainCaption"]),
+        "topicEntities": list(prepared["topics"]),
+        "visibility": "public",
+        "finalCaption": expected_caption,
+        "finalActionReady": True,
+    }
+    actual = {
+        "plainCaption": form_receipt.get("plainCaption"),
+        "topicEntities": form_receipt.get("topicEntities"),
+        "visibility": form_receipt.get("visibility"),
+        "finalCaption": form_receipt.get("finalCaption"),
+        "finalActionReady": form_receipt.get("finalActionReady"),
+    }
+    if actual != expected:
+        _fail("tiktok_form_snapshot_mismatch", "TikTok 表单快照与授权内容不一致")
+    if hashlib.sha256(expected_caption.encode("utf-8")).hexdigest() != str(
+        prepared["textSha256"]
+    ):
+        _fail("tiktok_form_snapshot_mismatch", "TikTok 表单快照与授权内容不一致")
+    if _sha256_file(Path(str(prepared["videoPath"]))) != str(
+        prepared["videoSha256"]
+    ):
+        _fail("tiktok_form_snapshot_mismatch", "TikTok 视频在最终动作前已发生变化")
+    return expected
+
+
+async def _tiktok_verification_reason(page) -> str | None:
+    module = importlib.import_module("uploader.tk_uploader.main")
+    return module.tiktok_security_intervention_reason(
+        str(getattr(page, "url", "") or ""),
+        await module._body_text(page),
+    )
+
+
+def _instrument_manual_verification(uploader, *, task_id: int) -> None:
+    original = getattr(uploader, "_wait_for_manual_intervention", None)
+    if not callable(original):
+        return
+
+    async def tracked(page):
+        reason = await _tiktok_verification_reason(page)
+        if reason:
+            _record_tiktok_event(
+                task_id,
+                "tiktok_waiting_user_verification",
+                "TikTok 正在同一浏览器等待用户完成安全验证",
+                level="warning",
+            )
+        result = await original(page)
+        if reason:
+            _record_tiktok_event(
+                task_id,
+                "tiktok_user_verification_resolved",
+                "TikTok 用户安全验证已完成，继续同一页面",
+            )
+        return result
+
+    uploader._wait_for_manual_intervention = tracked
+
+
+class _FinalActionButton:
+    def __init__(self, button, trigger) -> None:
+        self._button = button
+        self._trigger = trigger
+
+    async def click(self, *args, **kwargs):
+        self._trigger()
+        return await self._button.click(*args, **kwargs)
+
+    def __getattr__(self, name: str):
+        return getattr(self._button, name)
+
+
+def _instrument_final_action(uploader, *, trigger) -> bool:
+    original = getattr(uploader, "_post_button", None)
+    if not callable(original):
+        return False
+
+    async def tracked(base):
+        button = await original(base)
+        return None if button is None else _FinalActionButton(button, trigger)
+
+    uploader._post_button = tracked
+    return True
+
+
+def _is_explicit_platform_rejection(exc: BaseException) -> bool:
+    if isinstance(exc, TikTokPublishError):
+        return exc.error_code == "tiktok_publish_rejected"
+    return str(exc) == "TikTok 页面提示最终发布失败"
+
+
+def _valid_published_at(value: object) -> bool:
+    if type(value) is not str:
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None
+
+
+def _exact_content_readback(
+    result: Mapping[str, Any],
+    *,
+    expected_handle: str,
+) -> dict[str, str] | None:
+    nested = result.get("receipt")
+    source = nested if isinstance(nested, Mapping) else result
+    content_id = source.get("contentId")
+    content_url = source.get("contentUrl")
+    published_at = source.get("publishedAt")
+    if content_id is None and content_url is None and published_at is None:
+        return None
+    if (
+        type(content_id) is not str
+        or not content_id.isdigit()
+        or type(content_url) is not str
+        or not _valid_published_at(published_at)
+    ):
+        return None
+    try:
+        parsed = urlsplit(content_url)
+    except ValueError:
+        return None
+    if (
+        parsed.scheme not in {"http", "https"}
+        or (parsed.hostname or "").casefold() not in {"tiktok.com", "www.tiktok.com"}
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path.rstrip("/")
+        != f"/@{expected_handle}/video/{content_id}"
+    ):
+        return None
+    return {
+        "contentId": content_id,
+        "contentUrl": content_url,
+        "publishedAt": str(published_at),
+    }
+
+
+def _platform_result_is_accepted(result: object) -> bool:
+    if not isinstance(result, Mapping) or result.get("status") != "published":
+        return False
+    evidence = result.get("evidence")
+    return type(evidence) is str and evidence.startswith(
+        ("platform_feedback:", "platform_content_route")
+    )
+
+
+async def _run_tiktok_platform(
+    prepared: Mapping[str, Any],
+    *,
+    mode: str,
+    task_id: int,
+) -> dict[str, Any]:
+    playwright_manager = _load_async_playwright_factory()()
+    playwright = None
+    browser = None
+    context = None
+    page = None
+    final_state = {"triggered": False}
+
+    def trigger_final_action() -> None:
+        if final_state["triggered"]:
+            return
+        _record_tiktok_event(
+            task_id,
+            "tiktok_final_action_triggered",
+            "TikTok 最终动作即将执行，已禁止自动重试",
+        )
+        final_state["triggered"] = True
+
+    try:
+        playwright = await playwright_manager.start()
+        browser = await launch_publish_browser(playwright)
+        context = await new_publish_context(
+            browser,
+            storage_state=str(prepared["accountFile"]),
+        )
+        context = await set_init_script(context)
+        page = await context.new_page()
+        await page.goto(
+            TIKTOK_UPLOAD_URL,
+            wait_until="domcontentloaded",
+            timeout=60_000,
+        )
+        await page.wait_for_timeout(2_500)
+
+        account_snapshot = _require_current_account_snapshot(prepared)
+        identity = await read_tiktok_identity(page)
+        _validate_live_identity(account_snapshot, identity)
+
+        uploader_class = _load_tiktok_uploader_class()
+        uploader = uploader_class(
+            str(prepared["title"]),
+            str(prepared["videoPath"]),
+            list(prepared["topics"]),
+            0,
+            str(prepared["accountFile"]),
+            description=str(prepared["body"]),
+            dry_run=mode == "platform_form_check",
+            dry_run_hold_browser=False,
+            expected_account_reference=str(prepared["expectedAccountReference"]),
+            execution_mode=mode,
+        )
+        _instrument_manual_verification(uploader, task_id=task_id)
+        final_button_instrumented = _instrument_final_action(
+            uploader,
+            trigger=trigger_final_action,
+        )
+
+        _record_tiktok_event(
+            task_id,
+            "tiktok_platform_form_started",
+            "TikTok 开始上传并核对发布表单",
+        )
+        base = await uploader._base(page)
+        form_receipt = await uploader.prepare_form(page, base)
+        verified_form = _verify_authorized_form_snapshot(prepared, form_receipt)
+
+        current_account = _require_current_account_snapshot(prepared)
+        current_identity = await read_tiktok_identity(page)
+        _validate_live_identity(current_account, current_identity)
+        _record_tiktok_event(
+            task_id,
+            "tiktok_platform_form_verified",
+            "TikTok 表单、账号和公开设置已精确回读",
+        )
+
+        receipt: dict[str, Any] = {
+            "accountId": int(prepared["accountId"]),
+            "visibility": "public",
+            "mode": mode,
+            "platformWriteOccurred": True,
+            "finalActionTriggered": False,
+            "contentId": None,
+            "contentUrl": None,
+            "publishedAt": None,
+            "topicEntities": list(verified_form["topicEntities"]),
+        }
+        if mode == "platform_form_check":
+            receipt["phase"] = "platform_form_verified"
+            await save_context_storage_state(context, str(prepared["accountFile"]))
+            return {
+                "type": 6,
+                "platform": "TikTok",
+                "ok": True,
+                "phase": "platform_form_verified",
+                "message": "TikTok 表单检查通过；未点击 Post",
+                "receipt": receipt,
+            }
+
+        uploader.publish_confirmed = True
+        if not final_button_instrumented:
+            trigger_final_action()
+        submitted = await uploader.submit_once(page, base)
+        if not final_state["triggered"]:
+            _fail(
+                "tiktok_publish_outcome_unknown",
+                "TikTok 最终动作没有可持久化证据",
+            )
+        receipt["finalActionTriggered"] = True
+        receipt["phase"] = "platform_accepted"
+        if not _platform_result_is_accepted(submitted):
+            raise TikTokPublishError(
+                "tiktok_publish_outcome_unknown",
+                "TikTok 最终动作后的平台结果无法确认，请人工核对内容列表",
+                outcome_ambiguous=True,
+                receipt=receipt,
+            )
+
+        readback = _exact_content_readback(
+            submitted,
+            expected_handle=str(prepared["expectedAccountReference"]),
+        )
+        if readback is None:
+            phase = "platform_accepted"
+            event_type = "tiktok_platform_accepted"
+            message = "TikTok 已返回明确受理反馈，尚无精确内容回读"
+        else:
+            phase = "published_readback_confirmed"
+            event_type = "tiktok_published_readback_confirmed"
+            message = "TikTok 已精确回读同一公开内容"
+            receipt.update(readback)
+        receipt["phase"] = phase
+        _record_tiktok_event(task_id, event_type, message)
+        await save_context_storage_state(context, str(prepared["accountFile"]))
+        return {
+            "type": 6,
+            "platform": "TikTok",
+            "ok": True,
+            "phase": phase,
+            "message": message,
+            "receipt": receipt,
+        }
+    except Exception as exc:
+        if final_state["triggered"]:
+            receipt = {
+                "accountId": int(prepared["accountId"]),
+                "visibility": "public",
+                "mode": "formal",
+                "phase": "ambiguous",
+                "platformWriteOccurred": True,
+                "finalActionTriggered": True,
+                "contentId": None,
+                "contentUrl": None,
+                "publishedAt": None,
+            }
+            if _is_explicit_platform_rejection(exc):
+                receipt["phase"] = "final_action_triggered"
+                _record_tiktok_event(
+                    task_id,
+                    "tiktok_publish_rejected",
+                    "TikTok 已明确拒绝本次发布",
+                    level="error",
+                )
+                raise TikTokPublishError(
+                    "tiktok_publish_rejected",
+                    "TikTok 页面明确提示发布失败",
+                    receipt=receipt,
+                ) from exc
+            try:
+                _record_tiktok_event(
+                    task_id,
+                    "tiktok_publish_outcome_ambiguous",
+                    "TikTok 最终动作后的结果不明，禁止自动重试",
+                    level="error",
+                )
+            except Exception:
+                pass
+            if isinstance(exc, TikTokPublishError) and exc.outcome_ambiguous:
+                raise
+            raise TikTokPublishError(
+                "tiktok_publish_outcome_unknown",
+                "TikTok 最终动作后的平台结果无法确认，请人工核对内容列表",
+                outcome_ambiguous=True,
+                receipt=receipt,
+            ) from exc
+        raise
+    finally:
+        for resource in (page, context, browser):
+            if resource is None:
+                continue
+            try:
+                await resource.close()
+            except Exception:
+                pass
+        if playwright_manager is not None:
+            try:
+                await playwright_manager.stop()
+            except Exception:
+                pass
+
+
+def run_tiktok_platform_sync(
+    payload: Mapping[str, Any],
+    *,
+    mode: str,
+    task_id: int,
+) -> dict[str, Any]:
+    """Run form check or formal posting in one isolated page/context."""
+
+    if mode not in {"platform_form_check", "formal"}:
+        _fail("tiktok_unsupported_publish_setting", "TikTok 平台执行模式无效")
+    if type(task_id) is not int or task_id <= 0:
+        _fail("tiktok_unsupported_publish_setting", "TikTok 任务标识无效")
+    prepared = validate_tiktok_payload(payload, mode=mode)
+    with publish_context(mode=mode, background_mode=False):
+        return asyncio.run(
+            _run_tiktok_platform(
+                prepared,
+                mode=mode,
+                task_id=task_id,
+            )
+        )
+
+
 __all__ = [
     "TIKTOK_CONTENT_LIMIT",
     "TIKTOK_MODES",
@@ -996,5 +1472,6 @@ __all__ = [
     "compose_tiktok_caption",
     "payload_has_tiktok_platform_signal",
     "run_tiktok_local_preflight",
+    "run_tiktok_platform_sync",
     "validate_tiktok_payload",
 ]

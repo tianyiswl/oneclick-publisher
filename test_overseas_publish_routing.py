@@ -6,9 +6,9 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
-from app_core import publish_service
+from app_core import overseas_video_publish, publish_service
 
 
 def _video_payload(video: Path, platform_type: int, mode: str) -> dict:
@@ -69,6 +69,28 @@ class PublishServiceRoutingTests(unittest.TestCase):
         payload["debugDryRun"] = False
         with self.assertRaisesRegex(ValueError, "正式发布确认"):
             publish_service._validate_payloads([payload])
+
+    def test_tiktok_is_absent_from_legacy_combined_formal_route(self) -> None:
+        payload = _video_payload(self.video, 6, "publish")
+        payload["debugDryRun"] = False
+        payload["overseasVideoPublishConfirmed"] = True
+        (Path(self.temp.name) / "offline-account.json").write_text(
+            '{"cookies": [], "origins": []}',
+            encoding="utf-8",
+        )
+        legacy = MagicMock(return_value=[])
+        with (
+            patch.object(overseas_video_publish, "COOKIE_DIR", Path(self.temp.name)),
+            patch.dict(overseas_video_publish.HANDLERS, {6: legacy}),
+            self.assertRaisesRegex(
+                overseas_video_publish.OverseasVideoPublishError,
+                "TikTok.*专用受控服务",
+            ),
+        ):
+            overseas_video_publish.run_overseas_video_publish_sync(payload)
+
+        self.assertNotIn(6, overseas_video_publish.PLATFORM_NAMES)
+        legacy.assert_not_called()
 
     def test_youtube_browser_publish_routes_after_confirmation_contract(self) -> None:
         payload = _video_payload(self.video, 7, "publish")

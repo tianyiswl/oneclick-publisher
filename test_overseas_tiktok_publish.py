@@ -9,9 +9,14 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
-from app_core import account_service, overseas_tiktok_publish
+from app_core import account_service, overseas_tiktok_publish, task_service
+from app_core.overseas_tiktok_identity import (
+    TikTokIdentity,
+    validate_identity_binding,
+)
 
 
 _DEFAULT_ACCOUNT = object()
@@ -982,6 +987,367 @@ class TikTokPublishContractTests(unittest.TestCase):
             "https://www.tiktok.com/@expected.user/video/7512345678901234567",
         )
         self.assertEqual(safe.receipt["publishedAt"], "2026-08-28T12:30:00+08:00")
+
+
+class TikTokPlatformSyncTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.video = self.root / "video.mp4"
+        self.video.write_bytes(b"offline-tiktok-video")
+        self.session = self.root / "tiktok.json"
+        self.session.write_text('{"cookies": [], "origins": []}', encoding="utf-8")
+        self.identity = TikTokIdentity(
+            "expected.user",
+            "Expected User",
+            "https://www.tiktok.com/@expected.user",
+        )
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def prepared(self, *, mode: str) -> dict:
+        caption = "TikTok 标题\n\n受控发布正文 #OneClick #AI工具"
+        return {
+            "accountId": 61,
+            "accountFile": str(self.session),
+            "expectedAccountReference": "expected.user",
+            "videoPath": str(self.video),
+            "videoSha256": hashlib.sha256(self.video.read_bytes()).hexdigest(),
+            "title": "TikTok 标题",
+            "body": "受控发布正文",
+            "topics": ["OneClick", "AI工具"],
+            "plainCaption": "TikTok 标题\n\n受控发布正文",
+            "textSha256": hashlib.sha256(caption.encode("utf-8")).hexdigest(),
+            "visibility": "public",
+            "mode": mode,
+        }
+
+    def form_receipt(self, **changes) -> dict:
+        result = {
+            "plainCaption": "TikTok 标题\n\n受控发布正文",
+            "topicEntities": ["OneClick", "AI工具"],
+            "visibility": "public",
+            "finalCaption": "TikTok 标题\n\n受控发布正文 #OneClick #AI工具",
+            "finalActionReady": True,
+        }
+        result.update(changes)
+        return result
+
+    def fake_uploader(self, *, submit_result: dict | None = None):
+        uploader = SimpleNamespace()
+        uploader.prepare_form = AsyncMock(return_value=self.form_receipt())
+        uploader.submit_once = AsyncMock(
+            return_value=submit_result
+            or {
+                "status": "published",
+                "evidence": "platform_feedback:video posted successfully",
+                "formSnapshot": self.form_receipt(),
+            }
+        )
+        uploader._base = AsyncMock(return_value=object())
+        uploader.publish_confirmed = False
+        return uploader
+
+    def run_sync(
+        self,
+        *,
+        mode: str,
+        uploader=None,
+        identity_effect=None,
+        account_effect=None,
+        verification_effect=None,
+        event_sink: list[str] | None = None,
+    ):
+        uploader = uploader or self.fake_uploader()
+        page = SimpleNamespace(
+            url="about:blank",
+            goto=AsyncMock(return_value=None),
+            wait_for_timeout=AsyncMock(return_value=None),
+            close=AsyncMock(return_value=None),
+        )
+        context = SimpleNamespace(
+            new_page=AsyncMock(return_value=page),
+            close=AsyncMock(return_value=None),
+        )
+        browser = SimpleNamespace(close=AsyncMock(return_value=None))
+        manager = SimpleNamespace(
+            start=AsyncMock(return_value=object()),
+            stop=AsyncMock(return_value=None),
+        )
+        events: list[str] = []
+        event_sink = event_sink if event_sink is not None else []
+        account = {
+            "id": 61,
+            "type": 6,
+            "status": 1,
+            "authMode": "browser",
+            "filePath": self.session.name,
+            "accountReference": "expected.user",
+        }
+        identity_reader = AsyncMock(
+            side_effect=identity_effect
+            if identity_effect is not None
+            else [self.identity, self.identity]
+        )
+        account_reader = (
+            MagicMock(return_value=account)
+            if account_effect is None
+            else MagicMock(side_effect=account_effect)
+        )
+        save_session = AsyncMock(return_value=None)
+        uploader._test_save_session = save_session
+
+        def record_event(_task_id, event_type, _message, *, level="info"):
+            del level
+            events.append(event_type)
+            event_sink.append(event_type)
+
+        with (
+            patch.object(
+                overseas_tiktok_publish,
+                "validate_tiktok_payload",
+                return_value=self.prepared(mode=mode),
+            ),
+            patch.object(overseas_tiktok_publish, "_read_account_record", account_reader),
+            patch.object(
+                overseas_tiktok_publish,
+                "read_tiktok_identity",
+                new=identity_reader,
+                create=True,
+            ),
+            patch.object(
+                overseas_tiktok_publish,
+                "validate_identity_binding",
+                new=validate_identity_binding,
+                create=True,
+            ),
+            patch.object(
+                overseas_tiktok_publish,
+                "TiktokVideo",
+                return_value=uploader,
+                create=True,
+            ) as uploader_type,
+            patch.object(
+                overseas_tiktok_publish,
+                "async_playwright",
+                return_value=manager,
+                create=True,
+            ),
+            patch.object(
+                overseas_tiktok_publish,
+                "launch_publish_browser",
+                new=AsyncMock(return_value=browser),
+                create=True,
+            ),
+            patch.object(
+                overseas_tiktok_publish,
+                "new_publish_context",
+                new=AsyncMock(return_value=context),
+                create=True,
+            ),
+            patch.object(
+                overseas_tiktok_publish,
+                "set_init_script",
+                new=AsyncMock(return_value=context),
+                create=True,
+            ),
+            patch.object(
+                overseas_tiktok_publish,
+                "save_context_storage_state",
+                new=save_session,
+                create=True,
+            ),
+            patch.object(
+                overseas_tiktok_publish,
+                "_tiktok_verification_reason",
+                new=AsyncMock(
+                    side_effect=verification_effect
+                    if verification_effect is not None
+                    else None,
+                    return_value=None,
+                ),
+                create=True,
+            ),
+            patch.object(task_service, "record_task_event", side_effect=record_event),
+        ):
+            result = overseas_tiktok_publish.run_tiktok_platform_sync(
+                {"type": 6},
+                mode=mode,
+                task_id=71,
+            )
+        return SimpleNamespace(
+            result=result,
+            uploader=uploader,
+            uploader_type=uploader_type,
+            page=page,
+            context=context,
+            browser=browser,
+            manager=manager,
+            events=events,
+            identity_reader=identity_reader,
+            account_reader=account_reader,
+            save_session=save_session,
+        )
+
+    def test_platform_form_check_prepares_once_and_never_submits(self) -> None:
+        run = self.run_sync(mode="platform_form_check")
+
+        run.uploader.prepare_form.assert_awaited_once()
+        run.uploader.submit_once.assert_not_awaited()
+        prepare_page, prepare_base = run.uploader.prepare_form.await_args.args
+        self.assertIs(prepare_page, run.page)
+        self.assertIs(prepare_base, run.uploader._base.return_value)
+        self.assertEqual(run.result["phase"], "platform_form_verified")
+        self.assertTrue(run.result["receipt"]["platformWriteOccurred"])
+        self.assertFalse(run.result["receipt"]["finalActionTriggered"])
+        self.assertIn("tiktok_platform_form_started", run.events)
+        self.assertIn("tiktok_platform_form_verified", run.events)
+        self.assertNotIn("tiktok_final_action_triggered", run.events)
+
+    def test_formal_uses_same_prepared_page_then_submits_once(self) -> None:
+        run = self.run_sync(mode="formal")
+
+        run.uploader.prepare_form.assert_awaited_once()
+        run.uploader.submit_once.assert_awaited_once()
+        self.assertEqual(
+            run.uploader.prepare_form.await_args.args,
+            run.uploader.submit_once.await_args.args,
+        )
+        self.assertIs(run.uploader.prepare_form.await_args.args[0], run.page)
+        self.assertTrue(run.uploader.publish_confirmed)
+        self.assertEqual(run.result["phase"], "platform_accepted")
+        self.assertEqual(run.events.count("tiktok_final_action_triggered"), 1)
+        self.assertIn("tiktok_platform_accepted", run.events)
+
+    def test_final_action_event_is_persisted_immediately_before_button_click(self) -> None:
+        order: list[str] = []
+        uploader = self.fake_uploader()
+        button = SimpleNamespace(
+            click=AsyncMock(side_effect=lambda: order.append("click"))
+        )
+        uploader._post_button = AsyncMock(return_value=button)
+
+        async def submit_once(_page, base):
+            current = await uploader._post_button(base)
+            await current.click()
+            return {
+                "status": "published",
+                "evidence": "platform_feedback:video posted successfully",
+            }
+
+        uploader.submit_once = AsyncMock(side_effect=submit_once)
+        self.run_sync(mode="formal", uploader=uploader, event_sink=order)
+
+        click_index = order.index("click")
+        self.assertEqual(order[click_index - 1], "tiktok_final_action_triggered")
+        self.assertEqual(order.count("tiktok_final_action_triggered"), 1)
+
+    def test_identity_mismatch_stops_before_upload_and_session_refresh(self) -> None:
+        uploader = self.fake_uploader()
+        other = TikTokIdentity(
+            "other.user",
+            "Other User",
+            "https://www.tiktok.com/@other.user",
+        )
+        with self.assertRaises(overseas_tiktok_publish.TikTokPublishError) as raised:
+            self.run_sync(
+                mode="platform_form_check",
+                uploader=uploader,
+                identity_effect=[other],
+            )
+
+        self.assertEqual(raised.exception.error_code, "tiktok_account_identity_mismatch")
+        uploader.prepare_form.assert_not_awaited()
+        uploader.submit_once.assert_not_awaited()
+        uploader._test_save_session.assert_not_awaited()
+
+    def test_form_snapshot_mismatch_stops_before_final_action(self) -> None:
+        uploader = self.fake_uploader()
+        uploader.prepare_form.return_value = self.form_receipt(
+            finalCaption="不同的页面正文",
+        )
+        with self.assertRaises(overseas_tiktok_publish.TikTokPublishError) as raised:
+            self.run_sync(mode="formal", uploader=uploader)
+
+        self.assertEqual(raised.exception.error_code, "tiktok_form_snapshot_mismatch")
+        uploader.submit_once.assert_not_awaited()
+
+    def test_explicit_platform_rejection_is_not_marked_ambiguous(self) -> None:
+        uploader = self.fake_uploader()
+        uploader.submit_once.side_effect = RuntimeError("TikTok 页面提示最终发布失败")
+        with self.assertRaises(overseas_tiktok_publish.TikTokPublishError) as raised:
+            self.run_sync(mode="formal", uploader=uploader)
+
+        self.assertEqual(raised.exception.error_code, "tiktok_publish_rejected")
+        self.assertFalse(raised.exception.outcome_ambiguous)
+        self.assertTrue(raised.exception.receipt["finalActionTriggered"])
+        self.assertEqual(raised.exception.receipt["phase"], "final_action_triggered")
+
+    def test_post_click_exception_becomes_ambiguous_and_blocks_success(self) -> None:
+        uploader = self.fake_uploader()
+        uploader.submit_once.side_effect = RuntimeError("page detached after click")
+        with self.assertRaises(overseas_tiktok_publish.TikTokPublishError) as raised:
+            self.run_sync(mode="formal", uploader=uploader)
+
+        self.assertEqual(raised.exception.error_code, "tiktok_publish_outcome_unknown")
+        self.assertTrue(raised.exception.outcome_ambiguous)
+        self.assertTrue(raised.exception.receipt["finalActionTriggered"])
+
+    def test_exact_content_readback_is_distinct_from_platform_acceptance(self) -> None:
+        uploader = self.fake_uploader(
+            submit_result={
+                "status": "published",
+                "evidence": "platform_feedback:video posted successfully",
+                "contentId": "7512345678901234567",
+                "contentUrl": (
+                    "https://www.tiktok.com/@expected.user/video/"
+                    "7512345678901234567"
+                ),
+                "publishedAt": "2026-08-28T12:30:00+08:00",
+            }
+        )
+        run = self.run_sync(mode="formal", uploader=uploader)
+
+        self.assertEqual(run.result["phase"], "published_readback_confirmed")
+        self.assertEqual(
+            run.result["receipt"]["contentId"],
+            "7512345678901234567",
+        )
+        self.assertIn("tiktok_published_readback_confirmed", run.events)
+
+    def test_unverified_submit_result_is_always_ambiguous(self) -> None:
+        uploader = self.fake_uploader(
+            submit_result={"status": "published", "evidence": ""}
+        )
+        with self.assertRaises(overseas_tiktok_publish.TikTokPublishError) as raised:
+            self.run_sync(mode="formal", uploader=uploader)
+
+        self.assertEqual(raised.exception.error_code, "tiktok_publish_outcome_unknown")
+        self.assertTrue(raised.exception.outcome_ambiguous)
+
+    def test_matching_identity_allows_refresh_of_existing_session_only(self) -> None:
+        run = self.run_sync(mode="platform_form_check")
+
+        run.save_session.assert_awaited_once_with(run.context, str(self.session))
+
+    def test_manual_verification_emits_waiting_and_resolved_events(self) -> None:
+        uploader = self.fake_uploader()
+        uploader._wait_for_manual_intervention = AsyncMock(return_value=None)
+
+        async def prepare(page, _base):
+            await uploader._wait_for_manual_intervention(page)
+            return self.form_receipt()
+
+        uploader.prepare_form = AsyncMock(side_effect=prepare)
+        run = self.run_sync(
+            mode="platform_form_check",
+            uploader=uploader,
+            verification_effect=["TikTok 要求安全验证", None],
+        )
+
+        self.assertIn("tiktok_waiting_user_verification", run.events)
+        self.assertIn("tiktok_user_verification_resolved", run.events)
 
 
 if __name__ == "__main__":

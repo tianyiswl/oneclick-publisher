@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
-"""TikTok 与 YouTube 浏览器正式发布的受控入口。
+"""YouTube 浏览器正式发布的兼容入口。
 
 首版只开放单账号、单视频、立即发布。最终按钮只能在桌面端确认后点击，
 并且只有上传器返回平台成功证据时才允许任务记为成功。验证码、扫码、
 两步验证或未知页面状态会切换到可见浏览器并安全停止等待用户处理。
+
+TikTok 已迁移到 ``app_core.overseas_tiktok_publish`` 的专用受控服务，
+不得再从本兼容入口或 ``HANDLERS`` 双路由。
 """
 
 from __future__ import annotations
@@ -11,15 +14,15 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from myUtils.postVideo import post_video_tiktok, post_video_youtube
+from myUtils.postVideo import post_video_youtube
 from utils.publish_observer import publish_context
 
 from .paths import COOKIE_DIR
 
 
 OVERSEAS_VIDEO_PUBLISH_CONFIRMED = "overseasVideoPublishConfirmed"
-PLATFORM_NAMES = {6: "TikTok", 7: "YouTube"}
-HANDLERS = {6: post_video_tiktok, 7: post_video_youtube}
+PLATFORM_NAMES = {7: "YouTube"}
+HANDLERS = {7: post_video_youtube}
 VISIBILITY_LABELS = {
     "public": "公开",
     "private": "私密",
@@ -37,9 +40,13 @@ def validate_overseas_video_publish_payload(
     """只校验本地文件、会话和字段边界，不启动浏览器。"""
 
     platform_type = int(payload.get("type") or 0)
-    platform_name = PLATFORM_NAMES.get(platform_type, "海外平台")
+    platform_name = (
+        "TikTok"
+        if platform_type == 6
+        else PLATFORM_NAMES.get(platform_type, "海外平台")
+    )
     errors: list[str] = []
-    if platform_type not in PLATFORM_NAMES:
+    if platform_type not in {6, *PLATFORM_NAMES}:
         errors.append("当前载荷不是 TikTok 或 YouTube 正式发布目标")
     if str(payload.get("contentType") or "") != "video":
         errors.append(f"{platform_name} 正式发布当前只支持视频")
@@ -124,6 +131,10 @@ def run_overseas_video_publish_sync(payload: dict[str, Any]) -> dict[str, Any]:
     if not checked["ok"]:
         raise OverseasVideoPublishError("；".join(checked["errors"]))
     platform_type = int(checked["platformType"])
+    if platform_type == 6:
+        raise OverseasVideoPublishError(
+            "TikTok 已迁移到专用受控服务；旧入口没有平台成功回执"
+        )
     handler = HANDLERS[platform_type]
     with publish_context(mode="publish", background_mode=False):
         results = handler(
