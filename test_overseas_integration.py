@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import asyncio
+import queue
 import sqlite3
 import tempfile
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import conf
 from app_core import (
@@ -23,6 +25,7 @@ from app_core import (
     publish_service,
 )
 from app_core.overseas_youtube_api import YouTubeChannelIdentity
+from app_core.overseas_tiktok_identity import TikTokIdentity, TikTokIdentityError
 from myUtils import login as recovered_login
 from myUtils import postVideo as recovered_publish
 from uploader.youtube_uploader.main import YouTubeVideo
@@ -83,6 +86,274 @@ class OverseasAccountEntryTests(unittest.TestCase):
         )
         self.assertEqual(kwargs["profile_name"], "海外主体")
         self.assertIs(kwargs["account_saver"], account_service.save_youtube_oauth_account)
+
+    def test_tiktok_login_persists_stable_handle_after_account_row_exists(self) -> None:
+        identity = TikTokIdentity(
+            "expected.user",
+            "Expected",
+            "https://www.tiktok.com/@expected.user",
+        )
+
+        class PlaywrightContext:
+            async def __aenter__(self):
+                return SimpleNamespace()
+
+            async def __aexit__(self, _exc_type, _exc, _traceback):
+                return False
+
+        browser = MagicMock()
+        context = MagicMock()
+        page = MagicMock()
+        context.new_page = AsyncMock(return_value=page)
+        page.goto = AsyncMock()
+
+        async def save_state(_context, path, **_kwargs):
+            Path(path).write_text("{}", encoding="utf-8")
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            (root / "cookiesFile").mkdir()
+            with (
+                patch.object(recovered_login, "BASE_DIR", root),
+                patch.object(
+                    recovered_login,
+                    "async_playwright",
+                    return_value=PlaywrightContext(),
+                ),
+                patch.object(
+                    recovered_login,
+                    "launch_login_browser",
+                    new=AsyncMock(return_value=browser),
+                ),
+                patch.object(
+                    recovered_login,
+                    "new_login_context",
+                    new=AsyncMock(return_value=context),
+                ),
+                patch.object(
+                    recovered_login,
+                    "set_init_script",
+                    new=AsyncMock(return_value=context),
+                ),
+                patch.object(
+                    recovered_login,
+                    "reveal_page_window",
+                    new=AsyncMock(),
+                ),
+                patch.object(
+                    recovered_login,
+                    "_wait_for_browser_login",
+                    new=AsyncMock(return_value="ready"),
+                ),
+                patch.object(
+                    recovered_login,
+                    "save_context_storage_state",
+                    new=AsyncMock(side_effect=save_state),
+                ),
+                patch.object(
+                    recovered_login,
+                    "check_cookie",
+                    new=AsyncMock(return_value=True),
+                ),
+                patch.object(
+                    recovered_login,
+                    "capture_login_identity",
+                    new=AsyncMock(return_value=(None, "Expected")),
+                ),
+                patch.object(
+                    recovered_login,
+                    "read_tiktok_identity",
+                    new=AsyncMock(return_value=identity),
+                    create=True,
+                ),
+                patch.object(recovered_login, "save_login_account", return_value=61),
+                patch.object(
+                    recovered_login,
+                    "persist_tiktok_identity",
+                    create=True,
+                ) as persist,
+                patch.object(
+                    recovered_login,
+                    "close_login_resources",
+                    new=AsyncMock(),
+                ),
+            ):
+                result = asyncio.run(
+                    recovered_login._browser_cookie_gen(
+                        6,
+                        "TikTok 主体",
+                        queue.Queue(),
+                    )
+                )
+
+        self.assertIsNotNone(result)
+        persist.assert_called_once_with(61, identity, allow_initial_bind=True)
+
+    def test_tiktok_identity_read_failure_leaves_no_account_row_or_session(self) -> None:
+        class PlaywrightContext:
+            async def __aenter__(self):
+                return SimpleNamespace()
+
+            async def __aexit__(self, _exc_type, _exc, _traceback):
+                return False
+
+        browser = MagicMock()
+        context = MagicMock()
+        page = MagicMock()
+        context.new_page = AsyncMock(return_value=page)
+        page.goto = AsyncMock()
+
+        async def save_state(_context, path, **_kwargs):
+            Path(path).write_text("{}", encoding="utf-8")
+
+        save_account = MagicMock(return_value=61)
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            cookie_dir = root / "cookiesFile"
+            cookie_dir.mkdir()
+            with (
+                patch.object(recovered_login, "BASE_DIR", root),
+                patch.object(
+                    recovered_login,
+                    "async_playwright",
+                    return_value=PlaywrightContext(),
+                ),
+                patch.object(
+                    recovered_login,
+                    "launch_login_browser",
+                    new=AsyncMock(return_value=browser),
+                ),
+                patch.object(
+                    recovered_login,
+                    "new_login_context",
+                    new=AsyncMock(return_value=context),
+                ),
+                patch.object(
+                    recovered_login,
+                    "set_init_script",
+                    new=AsyncMock(return_value=context),
+                ),
+                patch.object(
+                    recovered_login,
+                    "reveal_page_window",
+                    new=AsyncMock(),
+                ),
+                patch.object(
+                    recovered_login,
+                    "_wait_for_browser_login",
+                    new=AsyncMock(return_value="ready"),
+                ),
+                patch.object(
+                    recovered_login,
+                    "save_context_storage_state",
+                    new=AsyncMock(side_effect=save_state),
+                ),
+                patch.object(
+                    recovered_login,
+                    "check_cookie",
+                    new=AsyncMock(return_value=True),
+                ),
+                patch.object(
+                    recovered_login,
+                    "read_tiktok_identity",
+                    new=AsyncMock(
+                        side_effect=TikTokIdentityError(
+                            "tiktok_account_invalid",
+                            "TikTok 页面没有返回稳定账号标识",
+                        )
+                    ),
+                ),
+                patch.object(recovered_login, "save_login_account", save_account),
+                patch.object(
+                    recovered_login,
+                    "close_login_resources",
+                    new=AsyncMock(),
+                ),
+            ):
+                result = asyncio.run(
+                    recovered_login._browser_cookie_gen(
+                        6,
+                        "TikTok 主体",
+                        queue.Queue(),
+                    )
+                )
+            remaining_sessions = list(cookie_dir.iterdir())
+
+        self.assertIsNone(result)
+        save_account.assert_not_called()
+        self.assertEqual(remaining_sessions, [])
+
+    def test_failed_tiktok_binding_cleans_new_row_and_preserves_updated_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            (root / "db").mkdir()
+            (root / "cookiesFile").mkdir()
+            database = root / "db" / "database.db"
+            connection = sqlite3.connect(database)
+            connection.execute(
+                """
+                CREATE TABLE user_info (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    status INTEGER,
+                    accountReference TEXT
+                )
+                """
+            )
+            new_id = connection.execute(
+                "INSERT INTO user_info (status, accountReference) VALUES (1, '')"
+            ).lastrowid
+            update_id = connection.execute(
+                "INSERT INTO user_info (status, accountReference) VALUES (1, 'expected.user')"
+            ).lastrowid
+            connection.commit()
+            connection.close()
+
+            @contextmanager
+            def open_test_connection(_path):
+                connection = sqlite3.connect(database)
+                try:
+                    yield connection
+                finally:
+                    connection.close()
+
+            new_session = root / "cookiesFile" / "new.json"
+            update_session = root / "cookiesFile" / "update.json"
+            new_session.write_text("{}", encoding="utf-8")
+            update_session.write_text("{}", encoding="utf-8")
+            with (
+                patch.object(recovered_login, "BASE_DIR", root),
+                patch.object(
+                    recovered_login,
+                    "open_connection",
+                    open_test_connection,
+                ),
+            ):
+                recovered_login._discard_failed_tiktok_login(
+                    int(new_id),
+                    update_mode=False,
+                    cookie_path=new_session,
+                )
+                recovered_login._discard_failed_tiktok_login(
+                    int(update_id),
+                    update_mode=True,
+                    cookie_path=update_session,
+                )
+
+            connection = sqlite3.connect(database)
+            new_row = connection.execute(
+                "SELECT status, accountReference FROM user_info WHERE id = ?",
+                (new_id,),
+            ).fetchone()
+            updated_row = connection.execute(
+                "SELECT status, accountReference FROM user_info WHERE id = ?",
+                (update_id,),
+            ).fetchone()
+            connection.close()
+            sessions_removed = not new_session.exists() and not update_session.exists()
+
+        self.assertIsNone(new_row)
+        self.assertEqual(updated_row, (0, "expected.user"))
+        self.assertTrue(sessions_removed)
 
 
 class YouTubeOAuthAccountPersistenceTests(unittest.TestCase):
@@ -150,6 +421,69 @@ class YouTubeOAuthAccountPersistenceTests(unittest.TestCase):
             channel_id="UC123",
             display_name="测试频道",
         )
+
+    def _save_tiktok_account(self, *, reference: str = "expected.user") -> int:
+        connection = sqlite3.connect(self.database)
+        account_id = connection.execute(
+            """
+            INSERT INTO user_info
+                (type, filePath, userName, status, profileName, authMode,
+                 accountReference)
+            VALUES (6, 'tiktok.json', 'Expected', 1, 'TikTok 主体',
+                    'browser', ?)
+            """,
+            (reference,),
+        ).lastrowid
+        connection.commit()
+        connection.close()
+        return int(account_id)
+
+    def test_tiktok_identity_issues_mark_saved_account_invalid(self) -> None:
+        for error_code in (
+            "tiktok_account_identity_mismatch",
+            "tiktok_session_missing",
+            "tiktok_session_expired",
+        ):
+            with self.subTest(error_code=error_code):
+                account_id = self._save_tiktok_account()
+                with (
+                    patch.object(
+                        account_service,
+                        "validate_saved_tiktok_account",
+                        side_effect=TikTokIdentityError(error_code, "TikTok 账号异常"),
+                        create=True,
+                    ),
+                    patch(
+                        "app_core.oneclick_authorization.verify_saved_session",
+                        return_value=True,
+                    ),
+                ):
+                    result = account_service.validate_accounts([account_id])
+
+                self.assertEqual(result["accounts"][0]["status"], 0)
+                self.assertEqual(result["authIssues"][account_id], error_code)
+                self.assertEqual(
+                    result["accounts"][0]["accountReference"],
+                    "expected.user",
+                )
+
+    def test_abnormal_or_unbound_tiktok_account_is_not_publishable(self) -> None:
+        normal_id = self._save_tiktok_account(reference="expected.user")
+        abnormal_id = self._save_tiktok_account(reference="expected.user")
+        unbound_id = self._save_tiktok_account(reference="")
+        connection = sqlite3.connect(self.database)
+        connection.execute(
+            "UPDATE user_info SET status = 0 WHERE id = ?",
+            (abnormal_id,),
+        )
+        connection.commit()
+        connection.close()
+
+        publishable = account_service.list_publishable_accounts()
+
+        self.assertEqual([row["id"] for row in publishable], [normal_id])
+        self.assertNotIn(abnormal_id, [row["id"] for row in publishable])
+        self.assertNotIn(unbound_id, [row["id"] for row in publishable])
 
     def test_legacy_oauth_row_migrates_to_scope_version_one(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

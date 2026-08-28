@@ -11,6 +11,11 @@ from typing import Callable, Iterable
 from conf import DEBUG_SKIP_FINAL_PUBLISH
 
 from .database import connect
+from .overseas_tiktok_identity import (
+    TikTokIdentityError,
+    normalize_tiktok_handle,
+    validate_saved_tiktok_account,
+)
 from .paths import AVATAR_DIR, COOKIE_DIR
 
 
@@ -281,7 +286,16 @@ def list_publishable_accounts() -> list[dict]:
     return [
         row
         for row in list_managed_accounts()
-        if str(row.get("authMode") or AUTH_MODE_BROWSER) == AUTH_MODE_BROWSER
+        if (
+            str(row.get("authMode") or AUTH_MODE_BROWSER) == AUTH_MODE_BROWSER
+            and (
+                int(row.get("type") or 0) != 6
+                or (
+                    int(row.get("status") or 0) == 1
+                    and bool(normalize_tiktok_handle(row.get("accountReference")))
+                )
+            )
+        )
         or (
             int(row.get("type") or 0) == 7
             and str(row.get("authMode") or "") == AUTH_MODE_YOUTUBE_OAUTH
@@ -600,8 +614,29 @@ def validate_accounts(
                     client_id=YOUTUBE_OAUTH_CLIENT_ID,
                 )
                 valid = identity.channel_id == str(row.get("accountReference") or "")
+            elif (
+                int(row.get("type") or 0) == 6
+                and str(row.get("authMode") or AUTH_MODE_BROWSER)
+                == AUTH_MODE_BROWSER
+            ):
+                validate_saved_tiktok_account(row)
+                valid = True
             else:
                 valid = verify_saved_session(row)
+        except TikTokIdentityError as exc:
+            valid = False
+            error_code = str(exc.error_code or "tiktok_account_invalid")
+            if not error_code.startswith("tiktok_"):
+                error_code = "tiktok_account_invalid"
+            auth_issues[int(row["id"])] = error_code
+            if error_code == "tiktok_account_identity_mismatch":
+                failures.append(
+                    "TikTok：当前主体与已保存账号不一致，已保留原绑定。"
+                )
+            elif error_code == "tiktok_session_missing":
+                failures.append("TikTok：本地登录会话不存在，请重新登录。")
+            else:
+                failures.append("TikTok：登录已失效，请重新登录。")
         except Exception as exc:
             valid = False
             reason = str(exc)
@@ -653,6 +688,8 @@ def validate_accounts(
             checked_row["authIssueCode"] = issue_code
     return {
         "failures": failures,
+        "accounts": checked,
+        "authIssues": auth_issues,
         "checked": checked,
         "normal": [row for row in checked if row.get("status") == 1],
         "abnormal": [row for row in checked if row.get("status") == 0],

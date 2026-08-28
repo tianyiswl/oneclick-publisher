@@ -9,14 +9,21 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import urlsplit
+
+from playwright.async_api import async_playwright
+
+from .database import connect
+from .paths import COOKIE_DIR
 
 
 _HANDLE_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 _PROFILE_PATH_PATTERN = re.compile(r"^/@([^/]+)$")
 _PROFILE_LINK_SELECTOR = 'a[href*="/@"]'
 _TIKTOK_HOSTS = {"tiktok.com", "www.tiktok.com"}
+_TIKTOK_STUDIO_URL = "https://www.tiktok.com/tiktokstudio/upload?lang=en"
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,10 +200,106 @@ def validate_identity_binding(
     return actual
 
 
+def persist_tiktok_identity(
+    account_id: int,
+    identity: TikTokIdentity,
+    *,
+    allow_initial_bind: bool,
+) -> None:
+    """Persist only a verified public handle on one TikTok browser row."""
+
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT id, type, accountReference FROM user_info WHERE id = ?",
+            (int(account_id),),
+        ).fetchone()
+        if not row or int(row["type"] or 0) != 6:
+            raise TikTokIdentityError(
+                "tiktok_account_invalid", "TikTok 账号记录不存在或类型不正确"
+            )
+        handle = validate_identity_binding(
+            dict(row),
+            identity,
+            allow_initial_bind=allow_initial_bind,
+        )
+        conn.execute(
+            "UPDATE user_info SET accountReference = ? WHERE id = ?",
+            (handle, int(account_id)),
+        )
+
+
+async def _validate_saved_tiktok_account_async(
+    account: Mapping[str, Any],
+) -> TikTokIdentity:
+    state_file = COOKIE_DIR / Path(str(account.get("filePath") or "")).name
+    if not state_file.is_file():
+        raise TikTokIdentityError(
+            "tiktok_session_missing", "TikTok 本地登录会话不存在"
+        )
+
+    playwright = None
+    browser = None
+    context = None
+    page = None
+    try:
+        playwright = await async_playwright().start()
+        browser = await playwright.chromium.launch(headless=True)
+        context = await browser.new_context(storage_state=str(state_file))
+        page = await context.new_page()
+        await page.goto(
+            _TIKTOK_STUDIO_URL,
+            wait_until="domcontentloaded",
+            timeout=45_000,
+        )
+        try:
+            identity = await read_tiktok_identity(page)
+        except TikTokIdentityError as exc:
+            if exc.error_code == "tiktok_account_invalid":
+                raise TikTokIdentityError(
+                    "tiktok_session_expired", "TikTok 登录已失效"
+                ) from exc
+            raise
+        persist_tiktok_identity(
+            int(account.get("id") or 0),
+            identity,
+            allow_initial_bind=True,
+        )
+        return identity
+    except TikTokIdentityError:
+        raise
+    except Exception as exc:
+        raise TikTokIdentityError(
+            "tiktok_session_expired", "TikTok 登录已失效"
+        ) from exc
+    finally:
+        for resource in (page, context, browser):
+            if resource is None:
+                continue
+            try:
+                await resource.close()
+            except Exception:
+                pass
+        if playwright is not None:
+            try:
+                await playwright.stop()
+            except Exception:
+                pass
+
+
+def validate_saved_tiktok_account(account: Mapping[str, Any]) -> TikTokIdentity:
+    """Silently verify one saved isolated session against its public handle."""
+
+    import asyncio
+
+    return asyncio.run(_validate_saved_tiktok_account_async(dict(account)))
+
+
 __all__ = [
     "TikTokIdentity",
     "TikTokIdentityError",
     "normalize_tiktok_handle",
+    "persist_tiktok_identity",
     "read_tiktok_identity",
     "validate_identity_binding",
+    "validate_saved_tiktok_account",
 ]

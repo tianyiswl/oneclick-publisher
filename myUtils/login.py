@@ -8,6 +8,11 @@ from playwright.async_api import async_playwright
 from PIL import Image
 
 from app_core.database import open_connection
+from app_core.overseas_tiktok_identity import (
+    TikTokIdentityError,
+    persist_tiktok_identity,
+    read_tiktok_identity,
+)
 from myUtils.auth import check_cookie
 from myUtils.avatar import capture_identity_from_page
 from utils.base_social_media import (
@@ -254,6 +259,32 @@ def save_login_account(platform_type, cookie_file, profile_name, update_mode=Fal
         conn.commit()
         print("[OK] 用户状态已记录")
     return saved_account_id
+
+
+def _discard_failed_tiktok_login(
+    account_id: int | None,
+    *,
+    update_mode: bool,
+    cookie_path: Path,
+    avatar_path: str | None = None,
+) -> None:
+    """Remove only artifacts created by the failed TikTok login attempt."""
+
+    if account_id:
+        db_path = Path(BASE_DIR / "db" / "database.db")
+        with open_connection(db_path) as conn:
+            if update_mode:
+                conn.execute(
+                    "UPDATE user_info SET status = 0 WHERE id = ?",
+                    (int(account_id),),
+                )
+            else:
+                conn.execute("DELETE FROM user_info WHERE id = ?", (int(account_id),))
+            conn.commit()
+    cookie_path.unlink(missing_ok=True)
+    if avatar_path:
+        candidate = Path(BASE_DIR / "avatars" / Path(avatar_path).name)
+        candidate.unlink(missing_ok=True)
 
 
 def save_meta_login_accounts(cookie_file, profile_name, update_mode=False, record_id=None, avatar_path=None, display_name=None):
@@ -596,6 +627,18 @@ async def _browser_cookie_gen(
                     status_queue.put("500")
                     return None
 
+            tiktok_identity = None
+            if platform_type == 6:
+                try:
+                    tiktok_identity = await read_tiktok_identity(page)
+                except TikTokIdentityError as exc:
+                    cookie_path.unlink(missing_ok=True)
+                    status_queue.put(
+                        f"ERROR: TikTok 账号身份核对失败（{exc.error_code}）。"
+                    )
+                    status_queue.put("500")
+                    return None
+
             avatar_path, display_name = await capture_login_identity(page, platform_type, identity)
             if platform_type == 8:
                 account_ids = save_meta_login_accounts(
@@ -609,15 +652,42 @@ async def _browser_cookie_gen(
                 for account_id in account_ids:
                     status_queue.put(f"ACCOUNT_ID:{account_id}")
             else:
-                account_id = save_login_account(
-                    platform_type,
-                    cookie_file,
-                    profile_name,
-                    update_mode,
-                    record_id,
-                    avatar_path,
-                    display_name,
-                )
+                account_id = None
+                try:
+                    account_id = save_login_account(
+                        platform_type,
+                        cookie_file,
+                        profile_name,
+                        update_mode,
+                        record_id,
+                        avatar_path,
+                        display_name,
+                    )
+                    if platform_type == 6:
+                        if not account_id or tiktok_identity is None:
+                            raise TikTokIdentityError(
+                                "tiktok_account_invalid",
+                                "TikTok 账号记录未能安全保存",
+                            )
+                        persist_tiktok_identity(
+                            account_id,
+                            tiktok_identity,
+                            allow_initial_bind=True,
+                        )
+                except TikTokIdentityError as exc:
+                    if platform_type != 6:
+                        raise
+                    _discard_failed_tiktok_login(
+                        account_id,
+                        update_mode=bool(update_mode),
+                        cookie_path=cookie_path,
+                        avatar_path=avatar_path,
+                    )
+                    status_queue.put(
+                        f"ERROR: TikTok 账号身份绑定失败（{exc.error_code}）。"
+                    )
+                    status_queue.put("500")
+                    return None
                 if account_id:
                     status_queue.put(f"ACCOUNT_ID:{account_id}")
             status_queue.put("200")
