@@ -49,6 +49,8 @@ TOPIC_ENTITY_SELECTORS = (
 )
 TOPIC_CANDIDATE_STABLE_READS = 2
 TOPIC_CANDIDATE_POLL_ATTEMPTS = 20
+TOPIC_ENTITY_STABLE_READS = 3
+TOPIC_ENTITY_POLL_ATTEMPTS = 20
 
 
 class TikTokManualInterventionRequired(RuntimeError):
@@ -175,6 +177,7 @@ class TiktokVideo:
             execution_mode or ("preflight" if self.dry_run else "formal")
         )
         self.publish_confirmed = False
+        self._submit_consumed = False
         self.external_page = None
         self.external_context = None
         self.external_browser = None
@@ -247,25 +250,36 @@ class TiktokVideo:
 
     async def _resolve_caption_editor(self, base):
         for selector in CAPTION_EDITOR_SELECTORS:
-            candidates = base.locator(selector)
             try:
+                candidates = base.locator(selector)
                 count = await candidates.count()
-            except Exception:
+            except Exception as exc:
+                raise TikTokPublishError(
+                    "tiktok_caption_editor_invalid",
+                    "TikTok 文案框选择器命中后无法安全检查",
+                ) from exc
+            if count == 0:
                 continue
             visible_editors = []
             for index in range(count):
-                candidate = candidates.nth(index)
                 try:
+                    candidate = candidates.nth(index)
                     if not await candidate.is_visible():
                         continue
                     is_editable = getattr(candidate, "is_editable", None)
-                    if is_editable is not None and not await is_editable():
+                    if is_editable is None or not await is_editable():
                         continue
-                except Exception:
-                    continue
+                except Exception as exc:
+                    raise TikTokPublishError(
+                        "tiktok_caption_editor_invalid",
+                        "TikTok 文案框选择器命中后无法安全检查",
+                    ) from exc
                 visible_editors.append(candidate)
             if not visible_editors:
-                continue
+                raise TikTokPublishError(
+                    "tiktok_caption_editor_invalid",
+                    "TikTok 文案框选择器命中，但没有唯一可见可编辑对象",
+                )
             if len(visible_editors) != 1:
                 raise TikTokPublishError(
                     "tiktok_caption_editor_ambiguous",
@@ -302,6 +316,7 @@ class TiktokVideo:
         previous: tuple[str, tuple[str, ...]] | None = None
         stable_reads = 0
         for _ in range(TOPIC_CANDIDATE_POLL_ATTEMPTS):
+            await self._wait_for_manual_intervention(page)
             current: tuple[str, tuple[str, ...]] | None = None
             current_items: list[object] = []
             for selector in TOPIC_CANDIDATE_SELECTORS:
@@ -369,6 +384,39 @@ class TiktokVideo:
             value.casefold() for value in expected
         ]
 
+    async def _wait_for_expected_topic_entities(
+        self,
+        page,
+        editor,
+        expected: Sequence[str],
+        topic: str,
+    ) -> list[str]:
+        stable_reads = 0
+        saw_target = False
+        for _ in range(TOPIC_ENTITY_POLL_ATTEMPTS):
+            await self._wait_for_manual_intervention(page)
+            entities = await self._read_topic_entities(editor)
+            saw_target = saw_target or any(
+                value.casefold() == topic.casefold() for value in entities
+            )
+            if self._topics_equal(entities, expected):
+                stable_reads += 1
+                if stable_reads >= TOPIC_ENTITY_STABLE_READS:
+                    return entities
+            else:
+                stable_reads = 0
+            await page.wait_for_timeout(100)
+
+        if not saw_target:
+            raise TikTokPublishError(
+                "tiktok_topic_entity_missing",
+                f"TikTok 话题 {topic} 没有稳定回读为平台实体",
+            )
+        raise TikTokPublishError(
+            "tiktok_topic_entity_mismatch",
+            "TikTok 话题实体重复或顺序与结构化输入不一致",
+        )
+
     async def _append_official_topics(
         self,
         page,
@@ -404,20 +452,12 @@ class TiktokVideo:
                 )
             await exact[0].click()
             expected.append(topic)
-            entities = await self._read_topic_entities(editor)
-            target_count = sum(
-                value.casefold() == topic.casefold() for value in entities
+            await self._wait_for_expected_topic_entities(
+                page,
+                editor,
+                expected,
+                topic,
             )
-            if target_count == 0:
-                raise TikTokPublishError(
-                    "tiktok_topic_entity_missing",
-                    f"TikTok 话题 {topic} 没有回读为平台实体",
-                )
-            if target_count != 1 or not self._topics_equal(entities, expected):
-                raise TikTokPublishError(
-                    "tiktok_topic_entity_mismatch",
-                    "TikTok 话题实体重复或顺序与结构化输入不一致",
-                )
         return await self._read_topic_entities(editor)
 
     async def _verify_form_snapshot(self, page, base) -> dict[str, Any]:
@@ -475,11 +515,12 @@ class TiktokVideo:
             self._topics(),
         )
         await self._ensure_public_visibility(page, base)
-        await self._wait_until_ready(base)
+        await self._wait_until_ready(page, base)
         return await self._verify_form_snapshot(page, base)
 
-    async def _wait_until_ready(self, base) -> None:
+    async def _wait_until_ready(self, page, base) -> None:
         for _ in range(180):
+            await self._wait_for_manual_intervention(page)
             for selector in (
                 'button:has-text("Post")',
                 'div.button-group > button:has-text("Post")',
@@ -526,6 +567,7 @@ class TiktokVideo:
     async def _ensure_public_visibility(self, page, base) -> str:
         """选择“所有人/公开”并从同一控件回读，找不到控件时禁止发布。"""
 
+        await self._wait_for_manual_intervention(page)
         public_markers = ("everyone", "public", "所有人", "公开")
         privacy_markers = public_markers + ("friends", "only you", "好友", "仅自己")
         selectors = (
@@ -563,6 +605,7 @@ class TiktokVideo:
             raise RuntimeError("TikTok 未找到可回读的可见性控件，未执行最终发布")
 
         await trigger.click()
+        await self._wait_for_manual_intervention(page)
         option = None
         for name in ("Everyone", "Public", "所有人", "公开"):
             for finder in (
@@ -581,6 +624,7 @@ class TiktokVideo:
             raise RuntimeError("TikTok 可见性列表中未找到“所有人/公开”，未执行最终发布")
         await option.click()
         await page.wait_for_timeout(300)
+        await self._wait_for_manual_intervention(page)
         try:
             actual = " ".join((await trigger.inner_text()).lower().split())
         except Exception as exc:
@@ -639,11 +683,22 @@ class TiktokVideo:
     async def submit_once(self, page, base) -> dict[str, Any]:
         if self.execution_mode != "formal" or not self.publish_confirmed:
             raise RuntimeError(FORMAL_LOCK_MESSAGE)
+        if self._submit_consumed:
+            raise TikTokPublishError(
+                "tiktok_final_action_already_consumed",
+                "TikTok 最终动作已在本会话消费，禁止再次调用",
+            )
         await self._wait_for_manual_intervention(page)
         snapshot = await self._verify_form_snapshot(page, base)
         button = await self._post_button(base)
         if button is None:
             raise RuntimeError("TikTok 最终发布按钮不可用，未执行发布")
+        if self._submit_consumed:
+            raise TikTokPublishError(
+                "tiktok_final_action_already_consumed",
+                "TikTok 最终动作已在本会话消费，禁止再次调用",
+            )
+        self._submit_consumed = True
         publish_event("tiktok_final_click", "TikTok 已确认，正在点击 Post")
         await button.click()
         signal = await self._wait_for_publish_result(page)
