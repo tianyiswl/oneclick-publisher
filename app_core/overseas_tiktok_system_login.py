@@ -47,6 +47,7 @@ _ATTEMPT_ID = re.compile(r"[0-9a-f]{32}\Z")
 _PROFILE_LOCK_NAMES = ("SingletonLock", "SingletonCookie", "SingletonSocket")
 _TIKTOK_LOGIN_URL = "https://www.tiktok.com/login"
 TIKTOK_STUDIO_URL = "https://www.tiktok.com/tiktokstudio/upload?lang=en"
+_COMPLETE_BROWSER_EXIT_TIMEOUT_SECONDS = 5.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -398,7 +399,7 @@ def _terminate_owned_process(process, *, poll_seconds: float) -> bool:
     return _wait_for_owned_process_stop(process, timeout_seconds=interval)
 
 
-def _gracefully_stop_owned_process(process, *, poll_seconds: float) -> bool:
+def _gracefully_stop_owned_process(process, *, timeout_seconds: float) -> bool:
     """Ask only the owned browser process to exit; never escalate to kill."""
 
     if _owned_process_has_exited(process):
@@ -410,7 +411,7 @@ def _gracefully_stop_owned_process(process, *, poll_seconds: float) -> bool:
     except Exception:
         return _owned_process_has_exited(process)
     return _wait_for_owned_process_stop(
-        process, timeout_seconds=max(0.1, poll_seconds)
+        process, timeout_seconds=max(0.0, float(timeout_seconds))
     )
 
 
@@ -419,6 +420,7 @@ def wait_for_browser_exit(
     cancel_event: threading.Event,
     *,
     complete_event: threading.Event | None = None,
+    complete_timeout_seconds: float = _COMPLETE_BROWSER_EXIT_TIMEOUT_SECONDS,
     timeout_seconds: float,
     poll_seconds: float = 0.2,
 ) -> str:
@@ -433,7 +435,13 @@ def wait_for_browser_exit(
             stopped = _terminate_owned_process(process, poll_seconds=interval)
             return "cancelled" if stopped else "cleanup_failed"
         if complete_event is not None and complete_event.is_set():
-            stopped = _gracefully_stop_owned_process(process, poll_seconds=interval)
+            complete_wait = min(
+                _COMPLETE_BROWSER_EXIT_TIMEOUT_SECONDS,
+                max(0.0, float(complete_timeout_seconds)),
+            )
+            stopped = _gracefully_stop_owned_process(
+                process, timeout_seconds=complete_wait
+            )
             return "closed" if stopped else "cleanup_failed"
         remaining = deadline - time.monotonic()
         if remaining <= 0:

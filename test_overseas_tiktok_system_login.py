@@ -179,6 +179,25 @@ class ProcessStaysAliveAfterTerminate(FakeProcess):
         self.kill_calls += 1
 
 
+class ProcessExitsAfterGracefulDelay(FakeProcess):
+    """Models the owned browser needing a bounded graceful-exit wait."""
+
+    def __init__(self, required_wait_seconds: float) -> None:
+        super().__init__([None])
+        self.required_wait_seconds = float(required_wait_seconds)
+        self.kill_calls = 0
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.wait_calls.append(timeout)
+        if timeout is None or float(timeout) < self.required_wait_seconds:
+            raise subprocess.TimeoutExpired("owned-browser", timeout)
+        self._poll_results = [0]
+        return 0
+
+    def kill(self) -> None:
+        self.kill_calls += 1
+
+
 class TikTokSystemLoginTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -464,6 +483,24 @@ class TikTokSystemLoginTests(unittest.TestCase):
 
         self.assertEqual(outcome, "closed")
         self.assertEqual(process.terminate_calls, 1)
+
+    def test_complete_event_allows_a_bounded_delayed_owned_browser_exit(self):
+        process = ProcessExitsAfterGracefulDelay(required_wait_seconds=1.0)
+        complete = threading.Event()
+        complete.set()
+
+        outcome = wait_for_browser_exit(
+            process,
+            threading.Event(),
+            complete_event=complete,
+            timeout_seconds=1,
+            poll_seconds=0.001,
+        )
+
+        self.assertEqual(outcome, "closed")
+        self.assertEqual(process.terminate_calls, 1)
+        self.assertEqual(process.kill_calls, 0)
+        self.assertEqual(process.wait_calls, [5.0])
 
     def test_cancel_takes_priority_over_complete_event(self):
         process = FakeProcess([None])
