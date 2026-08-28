@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """Stable, public TikTok account identity readback.
 
-This module reads public profile links only.  A display name or avatar is
-useful UI context, but neither is a stable account binding.
+This module reads only TikTok's public username identity data.  A display name
+or avatar is useful UI context, but neither is a stable account binding.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,8 +24,9 @@ from .paths import COOKIE_DIR
 _HANDLE_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 _PROFILE_PATH_PATTERN = re.compile(r"^/@([^/]+)$")
 _PROFILE_LINK_SELECTOR = 'a[href*="/@"]'
+_UNIVERSAL_DATA_SELECTOR = 'script#__UNIVERSAL_DATA_FOR_REHYDRATION__'
 _TIKTOK_HOSTS = {"tiktok.com", "www.tiktok.com"}
-_TIKTOK_STUDIO_URL = "https://www.tiktok.com/tiktokstudio/upload?lang=en"
+TIKTOK_IDENTITY_URL = "https://www.tiktok.com/"
 _AUTH_ROUTE_TOKENS = ("login", "challenge", "verify", "captcha", "security")
 
 
@@ -120,6 +122,106 @@ async def _text(locator) -> str:
     return " ".join(str(value or "").split())
 
 
+async def _text_content(locator) -> str | None:
+    try:
+        value = await _call_async(locator.text_content, timeout=1200)
+    except Exception:
+        return None
+    return value if isinstance(value, str) else None
+
+
+def _identity_invalid() -> TikTokIdentityError:
+    return TikTokIdentityError(
+        "tiktok_account_invalid", "TikTok 页面没有返回稳定账号标识"
+    )
+
+
+def parse_tiktok_app_context_handle(payload: object) -> str:
+    """Read only the fixed public username path from TikTok's homepage JSON."""
+
+    if not isinstance(payload, str):
+        raise _identity_invalid()
+    try:
+        document = json.loads(payload)
+    except (TypeError, ValueError) as exc:
+        raise _identity_invalid() from exc
+    if not isinstance(document, dict):
+        raise _identity_invalid()
+    scope = document.get("__DEFAULT_SCOPE__")
+    if not isinstance(scope, dict):
+        raise _identity_invalid()
+    app_context = scope.get("webapp.app-context")
+    if not isinstance(app_context, dict):
+        raise _identity_invalid()
+    user = app_context.get("user")
+    if not isinstance(user, dict):
+        raise _identity_invalid()
+
+    handles: set[str] = set()
+    for field in ("uniqueId", "unique_id"):
+        if field not in user:
+            continue
+        value = user[field]
+        if not isinstance(value, str):
+            raise _identity_invalid()
+        handle = _valid_handle(value)
+        if not handle:
+            raise _identity_invalid()
+        handles.add(handle)
+    if len(handles) == 1:
+        return next(iter(handles))
+    if len(handles) > 1:
+        raise TikTokIdentityError(
+            "tiktok_account_identity_ambiguous",
+            "TikTok 页面返回了多个冲突的账号标识",
+        )
+    raise _identity_invalid()
+
+
+def _page_is_tiktok_auth_route(page) -> bool:
+    """Classify an authentication route without retaining or reporting its URL."""
+
+    try:
+        parsed = urlsplit(str(getattr(page, "url", "")))
+    except Exception:
+        return False
+    host = (parsed.hostname or "").lower().rstrip(".")
+    return host in _TIKTOK_HOSTS and any(
+        token in parsed.path.lower() for token in _AUTH_ROUTE_TOKENS
+    )
+
+
+def _is_tiktok_homepage_route(page) -> bool:
+    """Return whether the page is the HTTPS TikTok homepage, ignoring query data."""
+
+    try:
+        parsed = urlsplit(str(getattr(page, "url", "")))
+    except Exception:
+        return False
+    host = (parsed.hostname or "").lower().rstrip(".")
+    return (
+        parsed.scheme.lower() == "https"
+        and host in _TIKTOK_HOSTS
+        and parsed.path in {"", "/"}
+    )
+
+
+async def _homepage_app_context_handle(page) -> str:
+    """Read one exact homepage script node; never inspect profile-link markup."""
+
+    try:
+        scripts = page.locator(_UNIVERSAL_DATA_SELECTOR)
+        if int(await scripts.count()) != 1:
+            return ""
+        script = scripts.nth(0)
+    except Exception:
+        return ""
+    payload = await _text_content(script)
+    if payload is None or not payload.strip():
+        return ""
+    return parse_tiktok_app_context_handle(payload)
+
+
 def _is_tiktok_studio_route(page) -> bool:
     """Allow only an authenticated-looking Studio workspace route.
 
@@ -196,31 +298,43 @@ async def read_tiktok_identity(
 ) -> TikTokIdentity:
     """Read one stable TikTok public profile handle from a page.
 
-    Visible links are usable on all routes.  The dedicated TikTok Studio
-    account shell may expose its sole public link in responsive/closed markup,
-    so only that route may use one hidden link.  Conflicting handles always
-    fail closed, rather than guessing which account is logged in.
+    The HTTPS TikTok homepage uses only its fixed app-context username path;
+    feed profile links never participate there. Legacy pages retain the narrow
+    Studio-anchor fallback. Conflicting values always fail closed, rather than
+    guessing which account is logged in.
     """
 
     attempts = max(2, int(max_attempts))
     interval = max(0.0, float(poll_seconds))
     previous_handle = ""
     for index in range(attempts):
-        all_candidates, visible_candidates = await _profile_candidates(page)
-        if len(all_candidates) > 1:
-            raise TikTokIdentityError(
-                "tiktok_account_identity_ambiguous",
-                "TikTok 页面返回了多个冲突的账号标识",
-            )
-        candidates = (
-            all_candidates if _is_tiktok_studio_route(page) else visible_candidates
+        if _page_is_tiktok_auth_route(page):
+            raise _identity_invalid()
+        homepage_handle = (
+            await _homepage_app_context_handle(page)
+            if _is_tiktok_homepage_route(page)
+            else ""
         )
+        if homepage_handle:
+            candidates = {homepage_handle: (None, False)}
+        elif _is_tiktok_homepage_route(page):
+            candidates = {}
+        else:
+            all_candidates, visible_candidates = await _profile_candidates(page)
+            if len(all_candidates) > 1:
+                raise TikTokIdentityError(
+                    "tiktok_account_identity_ambiguous",
+                    "TikTok 页面返回了多个冲突的账号标识",
+                )
+            candidates = (
+                all_candidates if _is_tiktok_studio_route(page) else visible_candidates
+            )
         if len(candidates) == 1:
             handle, (link, visible) = next(iter(candidates.items()))
             if handle == previous_handle:
                 return TikTokIdentity(
                     handle=handle,
-                    display_name=await _text(link) if visible else "",
+                    display_name=await _text(link) if visible and link is not None else "",
                     profile_url=f"https://www.tiktok.com/@{handle}",
                 )
             previous_handle = handle
@@ -350,7 +464,7 @@ async def _validate_saved_tiktok_account_async(
         context = await browser.new_context(storage_state=str(state_file))
         page = await context.new_page()
         await page.goto(
-            _TIKTOK_STUDIO_URL,
+            TIKTOK_IDENTITY_URL,
             wait_until="domcontentloaded",
             timeout=45_000,
         )
@@ -401,8 +515,10 @@ __all__ = [
     "TikTokIdentity",
     "TikTokIdentityError",
     "normalize_tiktok_handle",
+    "parse_tiktok_app_context_handle",
     "persist_tiktok_identity",
     "read_tiktok_identity",
+    "TIKTOK_IDENTITY_URL",
     "validate_identity_binding",
     "validate_saved_tiktok_account",
 ]

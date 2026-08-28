@@ -683,6 +683,8 @@ class TikTokCandidateIntakeTests(unittest.TestCase):
         self.assertNotIn("google.com", repr(blank.storage_state_input))
         self.assertNotIn("accounts.google.com", repr(candidate.storage_state))
         self.assertEqual(self.fake_identity_reads, ["expected.user", "expected.user"])
+        self.assertEqual(self.first_page.goto_calls[0][0], "https://www.tiktok.com/")
+        self.assertEqual(self.second_page.goto_calls[0][0], "https://www.tiktok.com/")
         self.assertEqual(self.first_page.close_calls, 1)
         self.assertEqual(self.second_page.close_calls, 1)
         self.assertGreaterEqual(self.fake_persistent.close_calls, 1)
@@ -727,7 +729,7 @@ class TikTokCandidateIntakeTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.error_code, "tiktok_session_expired")
 
-    def test_candidate_keeps_studio_identity_selector_failure_distinct(self):
+    def test_candidate_keeps_homepage_identity_read_failure_distinct(self):
         with self.assertRaises(TikTokSystemLoginError) as raised:
             self._collect(
                 TikTokIdentityError(

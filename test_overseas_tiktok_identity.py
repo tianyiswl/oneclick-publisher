@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 import tempfile
 import threading
@@ -51,18 +52,49 @@ class _FakeProfileLinks:
         return self.links[index]
 
 
+class _FakeUniversalDataScript:
+    def __init__(self, content: str) -> None:
+        self.content = content
+
+    async def text_content(self, **_kwargs) -> str:
+        return self.content
+
+
+class _FakeUniversalDataScripts:
+    def __init__(self, scripts: list[_FakeUniversalDataScript]) -> None:
+        self.scripts = scripts
+
+    async def count(self) -> int:
+        return len(self.scripts)
+
+    def nth(self, index: int) -> _FakeUniversalDataScript:
+        return self.scripts[index]
+
+
 class _FakeTikTokPage:
     def __init__(
         self,
         links: list[_FakeProfileLink],
         *,
         url: str = "https://www.tiktok.com/foryou",
+        app_context: str | None = None,
     ) -> None:
         self.links = _FakeProfileLinks(links)
         self.url = url
+        self.app_context = app_context
+        self.profile_locator_calls = 0
+        self.app_context_locator_calls = 0
 
-    def locator(self, selector: str) -> _FakeProfileLinks:
+    def locator(self, selector: str):
         self.selector = selector
+        if selector == 'script#__UNIVERSAL_DATA_FOR_REHYDRATION__':
+            self.app_context_locator_calls += 1
+            if self.app_context is None:
+                return _FakeUniversalDataScripts([])
+            return _FakeUniversalDataScripts(
+                [_FakeUniversalDataScript(self.app_context)]
+            )
+        self.profile_locator_calls += 1
         return self.links
 
 
@@ -85,6 +117,18 @@ class _DelayedProfileLinkPage:
 
 
 class TikTokIdentityTests(unittest.TestCase):
+    @staticmethod
+    def _app_context(user: dict) -> str:
+        return json.dumps(
+            {
+                "__DEFAULT_SCOPE__": {
+                    "webapp.app-context": {
+                        "user": user,
+                    }
+                }
+            }
+        )
+
     def test_normalize_handle_accepts_profile_url_and_at_prefix(self):
         self.assertEqual(normalize_tiktok_handle("https://www.tiktok.com/@Test.User"), "test.user")
         self.assertEqual(normalize_tiktok_handle("@Test.User"), "test.user")
@@ -134,6 +178,76 @@ class TikTokIdentityTests(unittest.TestCase):
         self.assertEqual(identity.handle, "expected.user")
         self.assertEqual(identity.display_name, "Expected")
         self.assertEqual(identity.profile_url, "https://www.tiktok.com/@expected.user")
+
+    def test_read_identity_uses_stable_homepage_app_context_not_feed_authors(self):
+        page = _FakeTikTokPage(
+            [
+                _FakeProfileLink("/@feed.author", "Feed author"),
+                _FakeProfileLink("/@another.author", "Another author"),
+            ],
+            url="https://www.tiktok.com/",
+            app_context=self._app_context(
+                {"uniqueId": "Expected.User", "unique_id": "expected.user"}
+            ),
+        )
+
+        identity = asyncio.run(
+            read_tiktok_identity(page, poll_seconds=0.0, max_attempts=2)
+        )
+
+        self.assertEqual(identity.handle, "expected.user")
+        self.assertEqual(identity.display_name, "")
+        self.assertEqual(page.app_context_locator_calls, 2)
+        self.assertEqual(page.profile_locator_calls, 0)
+
+    def test_read_identity_rejects_conflicting_homepage_app_context_usernames(self):
+        page = _FakeTikTokPage(
+            [],
+            url="https://www.tiktok.com/",
+            app_context=self._app_context(
+                {"uniqueId": "expected.user", "unique_id": "other.user"}
+            ),
+        )
+
+        with self.assertRaises(TikTokIdentityError) as raised:
+            asyncio.run(read_tiktok_identity(page, poll_seconds=0.0, max_attempts=2))
+
+        self.assertEqual(raised.exception.error_code, "tiktok_account_identity_ambiguous")
+
+    def test_read_identity_rejects_malformed_homepage_app_context_without_leaking_it(self):
+        for payload in (
+            "{private-json",
+            json.dumps({"__DEFAULT_SCOPE__": {}}),
+            self._app_context({"uniqueId": "not a valid handle!"}),
+        ):
+            with self.subTest(payload=payload):
+                page = _FakeTikTokPage(
+                    [],
+                    url="https://www.tiktok.com/",
+                    app_context=payload,
+                )
+
+                with self.assertRaises(TikTokIdentityError) as raised:
+                    asyncio.run(
+                        read_tiktok_identity(page, poll_seconds=0.0, max_attempts=2)
+                    )
+
+                self.assertEqual(raised.exception.error_code, "tiktok_account_invalid")
+                self.assertNotIn("private", raised.exception.public_message)
+
+    def test_read_identity_rejects_homepage_app_context_on_auth_route(self):
+        page = _FakeTikTokPage(
+            [],
+            url="https://www.tiktok.com/login?private=value",
+            app_context=self._app_context({"unique_id": "expected.user"}),
+        )
+
+        with self.assertRaises(TikTokIdentityError) as raised:
+            asyncio.run(read_tiktok_identity(page, poll_seconds=0.0, max_attempts=2))
+
+        self.assertEqual(raised.exception.error_code, "tiktok_account_invalid")
+        self.assertNotIn("private", raised.exception.public_message)
+        self.assertNotIn("value", raised.exception.public_message)
 
     def test_read_identity_waits_for_a_profile_link_then_requires_a_stable_repeat(self):
         visible = _FakeProfileLink("/@expected.user", "Expected", visible=True)
@@ -230,10 +344,13 @@ class TikTokIdentityTests(unittest.TestCase):
                 self.assertNotIn("private", raised.exception.public_message)
                 self.assertNotIn("value", raised.exception.public_message)
 
-    def test_read_identity_rejects_hidden_conflicting_handles_on_every_route(self):
-        for url in (
-            "https://www.tiktok.com/tiktokstudio/upload",
-            "https://www.tiktok.com/login",
+    def test_read_identity_rejects_hidden_conflicting_handles_without_guessing(self):
+        for url, error_code in (
+            (
+                "https://www.tiktok.com/tiktokstudio/upload",
+                "tiktok_account_identity_ambiguous",
+            ),
+            ("https://www.tiktok.com/login", "tiktok_account_invalid"),
         ):
             with self.subTest(url=url):
                 page = _FakeTikTokPage(
@@ -251,7 +368,7 @@ class TikTokIdentityTests(unittest.TestCase):
 
                 self.assertEqual(
                     raised.exception.error_code,
-                    "tiktok_account_identity_ambiguous",
+                    error_code,
                 )
 
 
@@ -714,6 +831,11 @@ class TikTokSavedIdentityTests(unittest.TestCase):
             account_id,
             identity,
             allow_initial_bind=True,
+        )
+        page.goto.assert_awaited_once_with(
+            "https://www.tiktok.com/",
+            wait_until="domcontentloaded",
+            timeout=45_000,
         )
 
 

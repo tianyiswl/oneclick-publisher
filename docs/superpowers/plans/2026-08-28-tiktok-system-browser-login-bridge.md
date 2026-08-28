@@ -345,7 +345,7 @@ async def collect_validated_tiktok_candidate(attempt, browser, *, playwright_fac
             args=["--profile-directory=Default"],
         )
         first_page = await persistent.new_page()
-        await first_page.goto(TIKTOK_STUDIO_URL, wait_until="domcontentloaded", timeout=45_000)
+        await first_page.goto(TIKTOK_IDENTITY_URL, wait_until="domcontentloaded", timeout=45_000)
         first_identity = await read_tiktok_identity(first_page)
         sanitized = sanitize_tiktok_storage_state(await persistent.storage_state())
         await persistent.close()
@@ -353,7 +353,7 @@ async def collect_validated_tiktok_candidate(attempt, browser, *, playwright_fac
         verifier = await playwright.chromium.launch(headless=True)
         blank = await verifier.new_context(storage_state=sanitized)
         second_page = await blank.new_page()
-        await second_page.goto(TIKTOK_STUDIO_URL, wait_until="domcontentloaded", timeout=45_000)
+        await second_page.goto(TIKTOK_IDENTITY_URL, wait_until="domcontentloaded", timeout=45_000)
         second_identity = await read_tiktok_identity(second_page)
         if first_identity.handle != second_identity.handle:
             raise TikTokSystemLoginError("tiktok_account_identity_mismatch", "TikTok 两次账号回读不一致")

@@ -32,6 +32,7 @@ from app_core import account_service
 from app_core.overseas_tiktok_identity import (
     TikTokIdentity,
     TikTokIdentityError,
+    TIKTOK_IDENTITY_URL,
     normalize_tiktok_handle,
     read_tiktok_identity,
     validate_identity_binding,
@@ -46,7 +47,6 @@ from app_core.paths import COOKIE_DIR, USER_DATA_DIR
 _ATTEMPT_ID = re.compile(r"[0-9a-f]{32}\Z")
 _PROFILE_LOCK_NAMES = ("SingletonLock", "SingletonCookie", "SingletonSocket")
 _TIKTOK_LOGIN_URL = "https://www.tiktok.com/login"
-TIKTOK_STUDIO_URL = "https://www.tiktok.com/tiktokstudio/upload?lang=en"
 _COMPLETE_BROWSER_EXIT_TIMEOUT_SECONDS = 5.0
 
 
@@ -603,7 +603,7 @@ async def collect_validated_tiktok_candidate(
 
                 first_page = await persistent.new_page()
                 await first_page.goto(
-                    TIKTOK_STUDIO_URL,
+                    TIKTOK_IDENTITY_URL,
                     wait_until="domcontentloaded",
                     timeout=45_000,
                 )
@@ -623,7 +623,7 @@ async def collect_validated_tiktok_candidate(
                 blank = await verifier.new_context(storage_state=sanitized)
                 second_page = await blank.new_page()
                 await second_page.goto(
-                    TIKTOK_STUDIO_URL,
+                    TIKTOK_IDENTITY_URL,
                     wait_until="domcontentloaded",
                     timeout=45_000,
                 )
