@@ -13,6 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from app_core import account_service
 from app_core import overseas_tiktok_identity as identity_service
 from app_core.overseas_tiktok_identity import (
     TikTokIdentity,
@@ -549,6 +550,150 @@ class TikTokSavedIdentityTests(unittest.TestCase):
             "expected.user",
         )
         runtime.chromium.launch.assert_awaited_once_with(headless=True)
+
+
+class TikTokAccountPersistenceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.database = Path(self.temp.name) / "accounts.db"
+        connection = sqlite3.connect(self.database)
+        connection.execute(
+            """
+            CREATE TABLE user_info (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                type INTEGER NOT NULL,
+                filePath TEXT NOT NULL,
+                userName TEXT NOT NULL,
+                status INTEGER DEFAULT 0,
+                profileName TEXT,
+                avatarPath TEXT,
+                avatarUpdatedAt TEXT,
+                remark TEXT,
+                lastCheckedAt TEXT,
+                lastLoginAt TEXT,
+                authMode TEXT NOT NULL DEFAULT 'browser',
+                accountReference TEXT,
+                oauthScopeVersion INTEGER NOT NULL DEFAULT 1
+            )
+            """
+        )
+        connection.commit()
+        connection.close()
+
+        @contextmanager
+        def connect_test_database():
+            connection = sqlite3.connect(self.database)
+            connection.row_factory = sqlite3.Row
+            try:
+                with connection:
+                    yield connection
+            finally:
+                connection.close()
+
+        self.connect_patch = patch.object(
+            account_service,
+            "connect",
+            connect_test_database,
+        )
+        self.connect_patch.start()
+        self.addCleanup(self.connect_patch.stop)
+
+    def _stored_account(self, account_id: int) -> dict:
+        connection = sqlite3.connect(self.database)
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            "SELECT * FROM user_info WHERE id = ?",
+            (int(account_id),),
+        ).fetchone()
+        connection.close()
+        return dict(row)
+
+    def test_account_saver_binds_verified_handle_and_rejects_duplicate_new_binding(self):
+        identity = TikTokIdentity(
+            "expected.user",
+            "Expected",
+            "https://www.tiktok.com/@expected.user",
+        )
+
+        account_id = account_service.save_tiktok_browser_account(
+            profile_name="TikTok 测试",
+            storage_file_name="first.json",
+            identity=identity,
+        )
+
+        self.assertGreater(account_id, 0)
+        stored = self._stored_account(account_id)
+        self.assertEqual(stored["type"], 6)
+        self.assertEqual(stored["authMode"], "browser")
+        self.assertEqual(stored["accountReference"], "expected.user")
+        with self.assertRaises(TikTokIdentityError) as raised:
+            account_service.save_tiktok_browser_account(
+                profile_name="重复",
+                storage_file_name="second.json",
+                identity=identity,
+            )
+        self.assertEqual(raised.exception.error_code, "tiktok_account_invalid")
+
+    def test_update_repeats_identity_binding_check_inside_transaction(self):
+        account_id = account_service.save_tiktok_browser_account(
+            profile_name="TikTok 测试",
+            storage_file_name="first.json",
+            identity=TikTokIdentity(
+                "expected.user", "Expected", "https://www.tiktok.com/@expected.user"
+            ),
+        )
+        expected = self._stored_account(account_id)
+
+        with self.assertRaises(TikTokIdentityError) as raised:
+            account_service.save_tiktok_browser_account(
+                profile_name="TikTok 测试",
+                storage_file_name="second.json",
+                identity=TikTokIdentity(
+                    "other.user", "Other", "https://www.tiktok.com/@other.user"
+                ),
+                record_id=account_id,
+                expected_account=expected,
+            )
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "tiktok_account_identity_mismatch",
+        )
+        self.assertEqual(self._stored_account(account_id)["filePath"], "first.json")
+
+    def test_update_rejects_concurrent_row_change_without_overwriting_it(self):
+        account_id = account_service.save_tiktok_browser_account(
+            profile_name="TikTok 测试",
+            storage_file_name="first.json",
+            identity=TikTokIdentity(
+                "expected.user", "Expected", "https://www.tiktok.com/@expected.user"
+            ),
+        )
+        expected = self._stored_account(account_id)
+        connection = sqlite3.connect(self.database)
+        connection.execute(
+            "UPDATE user_info SET profileName = 'concurrent' WHERE id = ?",
+            (account_id,),
+        )
+        connection.commit()
+        connection.close()
+
+        with self.assertRaises(TikTokIdentityError) as raised:
+            account_service.save_tiktok_browser_account(
+                profile_name="TikTok 新名称",
+                storage_file_name="second.json",
+                identity=TikTokIdentity(
+                    "expected.user", "Expected", "https://www.tiktok.com/@expected.user"
+                ),
+                record_id=account_id,
+                expected_account=expected,
+            )
+
+        self.assertEqual(raised.exception.error_code, "tiktok_account_invalid")
+        current = self._stored_account(account_id)
+        self.assertEqual(current["profileName"], "concurrent")
+        self.assertEqual(current["filePath"], "first.json")
 
 
 if __name__ == "__main__":

@@ -4,16 +4,19 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Mapping
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable
 
 from conf import DEBUG_SKIP_FINAL_PUBLISH
 
 from .database import connect
 from .overseas_tiktok_identity import (
+    TikTokIdentity,
     TikTokIdentityError,
     normalize_tiktok_handle,
+    validate_identity_binding,
     validate_saved_tiktok_account,
 )
 from .paths import AVATAR_DIR, COOKIE_DIR
@@ -364,6 +367,176 @@ def save_oneclick_authorized_account(
             (platform_type, storage_file_name, user_name, profile_name, "", now, now),
         )
         return int(cursor.lastrowid)
+
+
+_TIKTOK_ACCOUNT_COMPARE_FIELDS = (
+    "id",
+    "type",
+    "filePath",
+    "userName",
+    "status",
+    "profileName",
+    "remark",
+    "lastCheckedAt",
+    "lastLoginAt",
+    "authMode",
+    "accountReference",
+)
+
+
+def _invalid_tiktok_account(message: str) -> TikTokIdentityError:
+    return TikTokIdentityError("tiktok_account_invalid", message)
+
+
+def _normalize_tiktok_session_basename(value: object) -> str:
+    raw = str(value or "").strip()
+    basename = Path(raw).name
+    if not raw or raw != basename or not basename.endswith(".json"):
+        raise _invalid_tiktok_account("TikTok 会话文件名无效")
+    return basename
+
+
+def _reject_duplicate_tiktok_handle(conn, handle: str, *, exclude_id: int | None) -> None:
+    rows = conn.execute(
+        """
+        SELECT id, accountReference
+        FROM user_info
+        WHERE type = 6
+          AND accountReference IS NOT NULL
+          AND TRIM(accountReference) != ''
+        """
+    ).fetchall()
+    for row in rows:
+        if exclude_id is not None and int(row["id"]) == int(exclude_id):
+            continue
+        if normalize_tiktok_handle(row["accountReference"]) == handle:
+            raise _invalid_tiktok_account("TikTok 账号已经绑定")
+
+
+def save_tiktok_browser_account(
+    *,
+    profile_name: str,
+    storage_file_name: str,
+    identity: TikTokIdentity,
+    record_id: int | None = None,
+    expected_account: Mapping[str, Any] | None = None,
+) -> int:
+    """Atomically bind one sanitized browser session to a verified TikTok handle."""
+
+    normalized_profile = str(profile_name or "").strip()
+    session_basename = _normalize_tiktok_session_basename(storage_file_name)
+    handle = normalize_tiktok_handle(getattr(identity, "handle", ""))
+    if not normalized_profile or not handle:
+        raise _invalid_tiktok_account("TikTok 账号信息不完整")
+    display_name = str(getattr(identity, "display_name", "") or "").strip()
+    user_name = display_name or f"@{handle}"
+    wanted_id = int(record_id) if record_id is not None else None
+    snapshot = dict(expected_account) if expected_account is not None else None
+    if (wanted_id is None) != (snapshot is None):
+        raise _invalid_tiktok_account("TikTok 账号更新信息不完整")
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with connect() as conn:
+        # Serialize duplicate checks and conditional updates inside one SQLite
+        # transaction.  The verified public handle is the only identity saved.
+        conn.execute("BEGIN IMMEDIATE")
+        if wanted_id is None:
+            validate_identity_binding(
+                {"accountReference": ""},
+                identity,
+                allow_initial_bind=True,
+            )
+            _reject_duplicate_tiktok_handle(conn, handle, exclude_id=None)
+            cursor = conn.execute(
+                """
+                INSERT INTO user_info
+                    (type, filePath, userName, status, profileName, remark,
+                     lastLoginAt, lastCheckedAt, authMode, accountReference)
+                VALUES (6, ?, ?, 1, ?, '', ?, ?, ?, ?)
+                """,
+                (
+                    session_basename,
+                    user_name,
+                    normalized_profile,
+                    now,
+                    now,
+                    AUTH_MODE_BROWSER,
+                    handle,
+                ),
+            )
+            account_id = int(cursor.lastrowid or 0)
+            if account_id <= 0:
+                raise _invalid_tiktok_account("TikTok 账号保存失败")
+            return account_id
+
+        if snapshot is None or any(
+            field not in snapshot
+            for field in ("id", "type", "filePath", "accountReference")
+        ):
+            raise _invalid_tiktok_account("TikTok 账号更新信息不完整")
+        try:
+            snapshot_id = int(snapshot["id"])
+            snapshot_type = int(snapshot["type"])
+        except (TypeError, ValueError):
+            raise _invalid_tiktok_account("TikTok 账号更新信息无效") from None
+        if snapshot_id != wanted_id or snapshot_type != 6:
+            raise _invalid_tiktok_account("TikTok 账号更新信息无效")
+
+        row = conn.execute(
+            """
+            SELECT id, type, filePath, userName, status, profileName,
+                   COALESCE(remark, '') AS remark,
+                   lastCheckedAt, lastLoginAt,
+                   COALESCE(authMode, 'browser') AS authMode,
+                   accountReference
+            FROM user_info
+            WHERE id = ?
+            """,
+            (wanted_id,),
+        ).fetchone()
+        if not row or int(row["type"] or 0) != 6:
+            raise _invalid_tiktok_account("TikTok 账号记录不存在或类型不正确")
+
+        current = dict(row)
+        compared_fields = tuple(
+            field
+            for field in _TIKTOK_ACCOUNT_COMPARE_FIELDS
+            if field in snapshot
+        )
+        if any(current.get(field) != snapshot.get(field) for field in compared_fields):
+            raise _invalid_tiktok_account("TikTok 账号记录在保存期间已变更")
+
+        validate_identity_binding(
+            current,
+            identity,
+            allow_initial_bind=False,
+        )
+        _reject_duplicate_tiktok_handle(conn, handle, exclude_id=wanted_id)
+
+        where_parts = [f"{field} IS ?" for field in compared_fields]
+        where_values = [snapshot.get(field) for field in compared_fields]
+        updated = conn.execute(
+            f"""
+            UPDATE user_info
+            SET type = 6, filePath = ?, userName = ?, status = 1,
+                profileName = ?, remark = '', lastLoginAt = ?,
+                lastCheckedAt = ?, authMode = ?, accountReference = ?
+            WHERE {' AND '.join(where_parts)}
+            """,
+            (
+                session_basename,
+                user_name,
+                normalized_profile,
+                now,
+                now,
+                AUTH_MODE_BROWSER,
+                handle,
+                *where_values,
+            ),
+        )
+        if int(updated.rowcount or 0) != 1:
+            raise _invalid_tiktok_account("TikTok 账号记录在保存期间已变更")
+        return wanted_id
 
 
 def save_youtube_oauth_account(
