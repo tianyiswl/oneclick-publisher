@@ -72,6 +72,10 @@ class TikTokPublishContractTests(unittest.TestCase):
             "enableTimer": False,
             "scheduleTime": None,
             "scheduleTimezone": "Asia/Shanghai",
+            "videosPerDay": 1,
+            "dailyTimes": [],
+            "startDays": 0,
+            "timeJitterMinutes": 0,
             "coverPath": "",
             "coverPaths": {},
             "aiGenerated": False,
@@ -176,6 +180,46 @@ class TikTokPublishContractTests(unittest.TestCase):
                     "tiktok_unsupported_publish_setting",
                     self.payload(**changes),
                 )
+
+    def test_immediate_schedule_defaults_are_required_and_type_strict(self) -> None:
+        without_enable_timer = self.payload()
+        without_enable_timer.pop("enableTimer")
+        without_daily_times = self.payload()
+        without_daily_times.pop("dailyTimes")
+        cases = (
+            without_enable_timer,
+            without_daily_times,
+            self.payload(enableTimer=1),
+            self.payload(scheduleTime="2026-08-29 10:00"),
+            self.payload(dailyTimes=["10:00"]),
+            self.payload(dailyTimes=()),
+            self.payload(videosPerDay=True),
+            self.payload(videosPerDay=2),
+            self.payload(startDays=False),
+            self.payload(startDays=1),
+            self.payload(timeJitterMinutes=False),
+            self.payload(timeJitterMinutes=5),
+            self.payload(schedule={"enabled": 0}),
+            self.payload(schedule={"enabled": True}),
+            self.payload(
+                schedule={"enabled": False, "localTime": "2026-08-29 10:00"}
+            ),
+            self.payload(publishAt=None),
+        )
+        for payload in cases:
+            with self.subTest(payload=payload):
+                self.assert_error_code(
+                    "tiktok_unsupported_publish_setting",
+                    payload,
+                )
+
+        prepared = self.validate(
+            self.payload(
+                schedule={"enabled": False},
+                scheduleTimezone="UTC",
+            )
+        )
+        self.assertEqual(prepared["visibility"], "public")
 
     def test_account_ids_and_session_lists_must_each_resolve_to_same_single_account(self) -> None:
         second = self.root / "second.json"
@@ -327,6 +371,33 @@ class TikTokPublishContractTests(unittest.TestCase):
         finally:
             outside.unlink(missing_ok=True)
 
+    def test_session_requires_basename_and_structured_storage_state(self) -> None:
+        nested = self.root / "nested"
+        nested.mkdir()
+        nested_session = nested / "session.json"
+        nested_session.write_text(
+            '{"cookies": [], "origins": []}',
+            encoding="utf-8",
+        )
+        cases = (
+            ("nested/session.json", '{"cookies": [], "origins": []}'),
+            ("empty.json", "{}"),
+            ("cookies-object.json", '{"cookies": {}, "origins": []}'),
+            ("origins-object.json", '{"cookies": [], "origins": {}}'),
+            ("cookie-item.json", '{"cookies": ["secret"], "origins": []}'),
+            ("origin-item.json", '{"cookies": [], "origins": ["secret"]}'),
+        )
+        for name, content in cases:
+            path = self.root / name
+            if "/" not in name:
+                path.write_text(content, encoding="utf-8")
+            with self.subTest(name=name):
+                self.assert_error_code(
+                    "tiktok_account_invalid",
+                    self.payload(accountList=[name]),
+                    account=self.account(filePath=name),
+                )
+
     def test_video_must_be_one_supported_local_regular_file(self) -> None:
         second = self.root / "second.mov"
         second.write_bytes(b"second")
@@ -368,6 +439,31 @@ class TikTokPublishContractTests(unittest.TestCase):
                     self.payload(**changes),
                 )
 
+    def test_raw_mentions_are_rejected_in_title_and_body_at_all_content_locations(self) -> None:
+        cases = (
+            {"title": "@someone title"},
+            {"description": "@someone body"},
+            {"title": "@someone title", "content": {"title": "@someone title"}},
+            {
+                "description": "@someone body",
+                "content": {"body": "@someone body"},
+            },
+            {
+                "title": "@someone title",
+                "platformOverrides": {"TikTok": {"title": "@someone title"}},
+            },
+            {
+                "description": "@someone body",
+                "platformOverrides": {"TikTok": {"body": "@someone body"}},
+            },
+        )
+        for changes in cases:
+            with self.subTest(changes=changes):
+                self.assert_error_code(
+                    "tiktok_unsupported_publish_setting",
+                    self.payload(**changes),
+                )
+
     def test_tiktok_platform_override_cannot_hide_mention_or_conflicting_topics(self) -> None:
         for override in (
             {"body": "平台正文包含 @someone"},
@@ -378,6 +474,68 @@ class TikTokPublishContractTests(unittest.TestCase):
                     "tiktok_unsupported_publish_setting",
                     self.payload(platformOverrides={"TikTok": override}),
                 )
+
+    def test_sensitive_aliases_in_unapproved_nested_paths_are_rejected(self) -> None:
+        second = self.root / "second.mp4"
+        second.write_bytes(b"second")
+        cases = (
+            {"settings": {"accountId": 62}},
+            {"content": {"accountFile": "other.json"}},
+            {
+                "targets": [
+                    {
+                        "platform": "TikTok",
+                        "accountId": 61,
+                        "videoPath": str(second),
+                    }
+                ]
+            },
+            {
+                "targets": [
+                    {
+                        "platform": "TikTok",
+                        "accountId": 61,
+                        "body": "hidden body",
+                    }
+                ]
+            },
+            {
+                "targets": [
+                    {
+                        "platform": "TikTok",
+                        "accountId": 61,
+                        "tags": ["hidden-topic"],
+                    }
+                ]
+            },
+            {
+                "platformOverrides": {
+                    "TikTok": {"assets": [str(second)]},
+                }
+            },
+        )
+        for changes in cases:
+            with self.subTest(changes=changes):
+                self.assert_error_code(
+                    "tiktok_unsupported_publish_setting",
+                    self.payload(**changes),
+                )
+
+    def test_other_platform_override_fields_do_not_affect_flattened_tiktok_payload(self) -> None:
+        prepared = self.validate(
+            self.payload(
+                platformOverrides={
+                    "YouTube": {
+                        "visibility": "private",
+                        "assets": ["youtube-only.mov"],
+                        "body": "YouTube-only body",
+                    }
+                }
+            )
+        )
+
+        self.assertEqual(prepared["accountId"], 61)
+        self.assertEqual(prepared["visibility"], "public")
 
     def test_normalized_duplicate_topics_are_rejected(self) -> None:
         for topics in (
@@ -401,6 +559,32 @@ class TikTokPublishContractTests(unittest.TestCase):
         self.assertNotIn(marker, str(raised.exception))
         self.assertNotIn(str(self.video), str(raised.exception))
         self.assertNotIn(str(self.session), str(raised.exception))
+
+    def test_caption_composer_is_canonical_for_format_hash_and_2200_boundary(self) -> None:
+        exact_caption = "T\n\n" + "b" * 2194 + " #x"
+        self.assertEqual(len(exact_caption), 2200)
+        self.assertEqual(
+            overseas_tiktok_publish.compose_tiktok_caption(
+                "Title",
+                "Body",
+                ["One", "Two"],
+            ),
+            "Title\n\nBody #One #Two",
+        )
+
+        prepared = self.validate(
+            self.payload(title="T", description="b" * 2194, tags=["x"])
+        )
+        self.assertEqual(prepared["plainCaption"], "T\n\n" + "b" * 2194)
+        self.assertEqual(
+            prepared["textSha256"],
+            hashlib.sha256(exact_caption.encode("utf-8")).hexdigest(),
+        )
+
+        self.assert_error_code(
+            "tiktok_content_too_long",
+            self.payload(title="T", description="b" * 2195, tags=["x"]),
+        )
 
     def test_local_preflight_returns_hash_only_snapshot_and_does_not_touch_session(self) -> None:
         original_session = self.session.read_bytes()
@@ -460,6 +644,90 @@ class TikTokPublishContractTests(unittest.TestCase):
         self.assertNotIn(str(self.session), repr(error.receipt))
         self.assertNotIn("完整正文", repr(error.receipt))
         self.assertNotIn("must-not-leak", repr(error.receipt))
+
+    def test_video_read_error_is_fixed_and_never_echoes_path(self) -> None:
+        original_open = Path.open
+
+        def fail_video_open(path, *args, **kwargs):
+            if path == self.video.resolve():
+                raise OSError(f"cannot read {path} COOKIE=must-not-leak")
+            return original_open(path, *args, **kwargs)
+
+        with (
+            patch.object(Path, "open", autospec=True, side_effect=fail_video_open),
+            self.assertRaises(overseas_tiktok_publish.TikTokPublishError) as raised,
+        ):
+            self.validate()
+
+        self.assertEqual(raised.exception.error_code, "tiktok_video_file_invalid")
+        public_error = str(raised.exception)
+        self.assertNotIn(str(self.video), public_error)
+        self.assertNotIn("COOKIE", public_error)
+        self.assertNotIn("must-not-leak", public_error)
+
+    def test_error_receipt_validates_values_inside_public_keys(self) -> None:
+        marker = "FULL-BODY-COOKIE-/tmp/session.json"
+
+        class LeakyString(str):
+            def __repr__(self) -> str:
+                return marker
+
+        unsafe = overseas_tiktok_publish.TikTokPublishError(
+            "tiktok_account_invalid",
+            "账号不可用",
+            receipt={
+                "accountId": [61, marker],
+                "visibility": marker,
+                "mode": marker,
+                "phase": marker,
+                "platformWriteOccurred": marker,
+                "finalActionTriggered": 1,
+                "contentId": marker,
+                "contentUrl": f"https://www.tiktok.com/{marker}",
+                "publishedAt": marker,
+            },
+        )
+        self.assertEqual(unsafe.receipt, {})
+        self.assertNotIn(marker, repr(unsafe.receipt))
+
+        subclass_value = overseas_tiktok_publish.TikTokPublishError(
+            "tiktok_account_invalid",
+            "账号不可用",
+            receipt={"mode": LeakyString("formal")},
+        )
+        self.assertEqual(subclass_value.receipt, {})
+        self.assertNotIn(marker, repr(subclass_value.receipt))
+
+        safe = overseas_tiktok_publish.TikTokPublishError(
+            "tiktok_publish_outcome_unknown",
+            "发布结果待确认",
+            receipt={
+                "accountId": 61,
+                "visibility": "public",
+                "mode": "formal",
+                "phase": "published_readback_confirmed",
+                "platformWriteOccurred": True,
+                "finalActionTriggered": True,
+                "contentId": "7512345678901234567",
+                "contentUrl": (
+                    "https://www.tiktok.com/@expected.user/video/"
+                    "7512345678901234567"
+                ),
+                "publishedAt": "2026-08-28T12:30:00+08:00",
+            },
+        )
+        self.assertEqual(safe.receipt["accountId"], 61)
+        self.assertEqual(safe.receipt["visibility"], "public")
+        self.assertEqual(safe.receipt["mode"], "formal")
+        self.assertEqual(safe.receipt["phase"], "published_readback_confirmed")
+        self.assertTrue(safe.receipt["platformWriteOccurred"])
+        self.assertTrue(safe.receipt["finalActionTriggered"])
+        self.assertEqual(safe.receipt["contentId"], "7512345678901234567")
+        self.assertEqual(
+            safe.receipt["contentUrl"],
+            "https://www.tiktok.com/@expected.user/video/7512345678901234567",
+        )
+        self.assertEqual(safe.receipt["publishedAt"], "2026-08-28T12:30:00+08:00")
 
 
 if __name__ == "__main__":

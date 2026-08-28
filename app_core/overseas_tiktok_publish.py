@@ -30,6 +30,86 @@ _RUNTIME_MODE_BY_MODE = {
 }
 _TOPIC_KEYS = frozenset({"tags", "topics", "hashtags"})
 _VIDEO_LIST_KEYS = frozenset({"fileList", "videoPaths", "videos", "assetPaths", "assets"})
+_VIDEO_ALIAS_KEYS = _VIDEO_LIST_KEYS | {"videoPath"}
+_CONTENT_ALIAS_KEYS = _TOPIC_KEYS | {"title", "description", "body"}
+_ACCOUNT_ALIAS_KEYS = frozenset(
+    {
+        "id",
+        "accountId",
+        "accountIds",
+        "accountReference",
+        "tiktokExpectedAccountReference",
+    }
+)
+_SESSION_ALIAS_KEYS = frozenset(
+    {"accountList", "accountFile", "sessionFile", "filePath"}
+)
+_SENSITIVE_ALIAS_KEYS = (
+    _ACCOUNT_ALIAS_KEYS
+    | _SESSION_ALIAS_KEYS
+    | _VIDEO_ALIAS_KEYS
+    | _CONTENT_ALIAS_KEYS
+)
+_ROOT_SENSITIVE_KEYS = frozenset(
+    {
+        "accountId",
+        "accountIds",
+        "accountReference",
+        "tiktokExpectedAccountReference",
+        "accountList",
+        "accountFile",
+        "sessionFile",
+        *_VIDEO_ALIAS_KEYS,
+        *_CONTENT_ALIAS_KEYS,
+    }
+)
+_ACCOUNT_ROW_SENSITIVE_KEYS = frozenset(
+    {
+        "id",
+        "accountId",
+        "accountReference",
+        "accountList",
+        "accountFile",
+        "sessionFile",
+        "filePath",
+    }
+)
+_TARGET_SENSITIVE_KEYS = frozenset(
+    {
+        "accountId",
+        "accountReference",
+        "accountList",
+        "accountFile",
+        "sessionFile",
+        "filePath",
+    }
+)
+_CONTENT_SENSITIVE_KEYS = _VIDEO_ALIAS_KEYS | _CONTENT_ALIAS_KEYS
+
+
+def payload_has_tiktok_platform_signal(payload: Mapping[str, Any]) -> bool:
+    """Return whether any supported platform discriminator selects TikTok."""
+
+    for key in ("type", "platformType"):
+        try:
+            if key in payload and int(payload[key]) == 6:
+                return True
+        except (TypeError, ValueError):
+            continue
+    if str(payload.get("platform") or "").strip().casefold() == "tiktok":
+        return True
+    candidates: list[object] = []
+    if "target" in payload:
+        candidates.append(payload["target"])
+    if isinstance(payload.get("targets"), Mapping):
+        candidates.append(payload["targets"])
+    elif isinstance(payload.get("targets"), (list, tuple)):
+        candidates.extend(payload["targets"])
+    return any(
+        isinstance(candidate, Mapping)
+        and str(candidate.get("platform") or "").strip().casefold() == "tiktok"
+        for candidate in candidates
+    )
 
 
 def _fail(error_code: str, message: str) -> None:
@@ -56,6 +136,68 @@ def _walk_mappings(value: object) -> Iterable[Mapping[str, Any]]:
             yield from _walk_mappings(nested)
 
 
+def _walk_tiktok_payload_mappings(
+    value: object,
+    *,
+    at_root: bool = False,
+) -> Iterable[Mapping[str, Any]]:
+    if not isinstance(value, Mapping):
+        if isinstance(value, (list, tuple)):
+            for nested in value:
+                yield from _walk_tiktok_payload_mappings(nested)
+        return
+    yield value
+    for key, nested in value.items():
+        if at_root and key == "platformOverrides":
+            if not isinstance(nested, Mapping):
+                continue
+            for platform, override in nested.items():
+                if str(platform).strip().casefold() == "tiktok":
+                    yield from _walk_tiktok_payload_mappings(override)
+            continue
+        yield from _walk_tiktok_payload_mappings(nested)
+
+
+def _validate_sensitive_alias_locations(payload: Mapping[str, Any]) -> None:
+    def visit(value: object, allowed: frozenset[str]) -> None:
+        if isinstance(value, (list, tuple)):
+            for nested in value:
+                visit(nested, allowed)
+            return
+        if not isinstance(value, Mapping):
+            return
+        for key, nested in value.items():
+            if key in _SENSITIVE_ALIAS_KEYS and key not in allowed:
+                _fail(
+                    "tiktok_unsupported_publish_setting",
+                    "TikTok 敏感字段出现在不允许的位置",
+                )
+            visit(nested, frozenset())
+
+    for key, value in payload.items():
+        if key in _SENSITIVE_ALIAS_KEYS and key not in _ROOT_SENSITIVE_KEYS:
+            _fail(
+                "tiktok_unsupported_publish_setting",
+                "TikTok 敏感字段出现在不允许的位置",
+            )
+        if key == "account":
+            visit(value, _ACCOUNT_ROW_SENSITIVE_KEYS)
+        elif key == "accounts":
+            visit(value, _ACCOUNT_ROW_SENSITIVE_KEYS)
+        elif key == "target":
+            visit(value, _TARGET_SENSITIVE_KEYS)
+        elif key == "targets":
+            visit(value, _TARGET_SENSITIVE_KEYS)
+        elif key == "content":
+            visit(value, _CONTENT_SENSITIVE_KEYS)
+        elif key == "platformOverrides":
+            if not isinstance(value, Mapping):
+                continue
+            for platform, override in value.items():
+                if str(platform).strip().casefold() == "tiktok":
+                    visit(override, _CONTENT_SENSITIVE_KEYS)
+        elif key not in _SENSITIVE_ALIAS_KEYS:
+            visit(value, frozenset())
 def _schedule_requested(value: object) -> bool:
     if not isinstance(value, Mapping):
         return _is_nonempty(value)
@@ -75,9 +217,78 @@ def _ai_requested(value: object) -> bool:
     )
 
 
+def _validate_immediate_schedule(payload: Mapping[str, Any]) -> None:
+    if payload.get("enableTimer") is not False:
+        _fail(
+            "tiktok_unsupported_publish_setting",
+            "TikTok 首版不支持定时时间，只支持立即公开发布",
+        )
+    if type(payload.get("dailyTimes")) is not list or payload["dailyTimes"] != []:
+        _fail(
+            "tiktok_unsupported_publish_setting",
+            "TikTok 首版不支持定时时间列表",
+        )
+    exact_integers = {
+        "videosPerDay": 1,
+        "startDays": 0,
+        "timeJitterMinutes": 0,
+    }
+    if any(
+        type(payload.get(key)) is not int or payload.get(key) != expected
+        for key, expected in exact_integers.items()
+    ):
+        _fail(
+            "tiktok_unsupported_publish_setting",
+            "TikTok 首版定时参数必须保持立即发布默认值",
+        )
+
+    known_schedule_keys = {
+        "enabletimer",
+        "scheduletime",
+        "scheduledat",
+        "schedule",
+        "publishschedule",
+        "scheduletimezone",
+        "videosperday",
+        "dailytimes",
+        "startdays",
+        "timejitterminutes",
+        "localtime",
+        "timezone",
+        "enabled",
+    }
+    explicit_unknown = {"publishat", "publishtime", "timer", "timerenabled"}
+    for mapping in _walk_tiktok_payload_mappings(payload, at_root=True):
+        for raw_key, value in mapping.items():
+            key = str(raw_key).strip().casefold()
+            if key in explicit_unknown or (
+                "schedule" in key and key not in known_schedule_keys
+            ):
+                _fail(
+                    "tiktok_unsupported_publish_setting",
+                    "TikTok 定时字段无效",
+                )
+            if key in {
+                "scheduletime",
+                "scheduledat",
+                "publishschedule",
+                "localtime",
+            } and _is_nonempty(value):
+                _fail(
+                    "tiktok_unsupported_publish_setting",
+                    "TikTok 首版不支持定时时间",
+                )
+            if key == "schedule" and value is not None:
+                if not isinstance(value, Mapping) or value.get("enabled") is not False:
+                    _fail(
+                        "tiktok_unsupported_publish_setting",
+                        "TikTok 首版不支持定时时间",
+                    )
+
+
 def _validate_unsupported_settings(payload: Mapping[str, Any]) -> str:
     visibility_values: list[str] = []
-    for mapping in _walk_mappings(payload):
+    for mapping in _walk_tiktok_payload_mappings(payload, at_root=True):
         for raw_key, value in mapping.items():
             key = str(raw_key).strip().lower()
             if key == "visibility" and _is_nonempty(value):
@@ -350,7 +561,12 @@ def _session_path(payload: Mapping[str, Any], account: Mapping[str, Any]) -> Pat
         _fail("tiktok_account_invalid", "TikTok 账号会话引用不一致")
 
     relative = Path(values[0])
-    if relative.is_absolute() or relative.suffix.lower() != ".json":
+    if (
+        relative.is_absolute()
+        or relative.name != values[0]
+        or "\\" in values[0]
+        or relative.suffix.lower() != ".json"
+    ):
         _fail("tiktok_account_invalid", "TikTok 账号会话引用无效")
     root = COOKIE_DIR.resolve()
     unresolved = root / relative
@@ -368,6 +584,15 @@ def _session_path(payload: Mapping[str, Any], account: Mapping[str, Any]) -> Pat
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         _fail("tiktok_account_invalid", "TikTok 本地登录会话无法安全解析")
     if not isinstance(session, Mapping):
+        _fail("tiktok_account_invalid", "TikTok 本地登录会话格式无效")
+    cookies = session.get("cookies")
+    origins = session.get("origins")
+    if (
+        type(cookies) is not list
+        or type(origins) is not list
+        or not all(isinstance(item, Mapping) for item in cookies)
+        or not all(isinstance(item, Mapping) for item in origins)
+    ):
         _fail("tiktok_account_invalid", "TikTok 本地登录会话格式无效")
     return resolved
 
@@ -401,8 +626,7 @@ def _video_path(payload: Mapping[str, Any]) -> Path:
         alias_values.append(_raw_video_value(values[0]))
     if "videoPath" in payload:
         alias_values.append(_raw_video_value(payload["videoPath"]))
-    content = payload.get("content")
-    if isinstance(content, Mapping):
+    for content in _content_mappings(payload)[1:]:
         for key in _VIDEO_LIST_KEYS:
             if key not in content:
                 continue
@@ -482,20 +706,21 @@ def _topics(payload: Mapping[str, Any]) -> list[str]:
 
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
+    try:
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError:
+        _fail("tiktok_video_file_invalid", "TikTok 视频素材无法安全读取")
     return digest.hexdigest()
 
 
-def _text_sha256(title: str, body: str, topics: list[str]) -> str:
-    encoded = json.dumps(
-        {"title": title, "body": body, "topics": topics},
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+def compose_tiktok_caption(title: str, body: str, topics: Iterable[str]) -> str:
+    """Compose the one canonical string used for limits and fingerprints."""
+
+    plain_caption = f"{title}\n\n{body}"
+    topic_suffix = " ".join(f"#{topic}" for topic in topics)
+    return f"{plain_caption} {topic_suffix}" if topic_suffix else plain_caption
 
 
 def validate_tiktok_payload(
@@ -507,6 +732,7 @@ def validate_tiktok_payload(
 
     if not isinstance(payload, Mapping) or mode not in TIKTOK_MODES:
         _fail("tiktok_unsupported_publish_setting", "TikTok 执行模式无效")
+    _validate_sensitive_alias_locations(payload)
     platform_types: list[int] = []
     for key in ("type", "platformType"):
         if key in payload:
@@ -541,6 +767,7 @@ def validate_tiktok_payload(
         )
         _fail("tiktok_unsupported_publish_setting", message)
 
+    _validate_immediate_schedule(payload)
     visibility = _validate_unsupported_settings(payload)
     account_id, account = _account_identity(payload)
     session_path = _session_path(payload, account)
@@ -551,17 +778,14 @@ def validate_tiktok_payload(
         frozenset({"description", "body"}),
         label="正文",
     )
-    if "@" in body:
+    if "@" in title or "@" in body:
         _fail(
             "tiktok_unsupported_publish_setting",
-            "TikTok 正文包含原始 @ 文字，首版不支持提及",
+            "TikTok 标题或正文包含原始 @ 文字，首版不支持提及",
         )
     topics = _topics(payload)
-    plain_caption = "\n\n".join((title, body))
-    combined_parts = [plain_caption]
-    if topics:
-        combined_parts.append(" ".join(f"#{topic}" for topic in topics))
-    combined = "\n\n".join(combined_parts)
+    plain_caption = f"{title}\n\n{body}"
+    combined = compose_tiktok_caption(title, body, topics)
     if len(combined) > TIKTOK_CONTENT_LIMIT:
         _fail(
             "tiktok_content_too_long",
@@ -580,7 +804,7 @@ def validate_tiktok_payload(
         "body": body,
         "topics": topics,
         "plainCaption": plain_caption,
-        "textSha256": _text_sha256(title, body, topics),
+        "textSha256": hashlib.sha256(combined.encode("utf-8")).hexdigest(),
         "visibility": visibility,
         "mode": mode,
     }
@@ -621,6 +845,8 @@ __all__ = [
     "TIKTOK_MODES",
     "TIKTOK_VIDEO_SUFFIXES",
     "TikTokPublishError",
+    "compose_tiktok_caption",
+    "payload_has_tiktok_platform_signal",
     "run_tiktok_local_preflight",
     "validate_tiktok_payload",
 ]

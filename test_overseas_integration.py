@@ -1613,6 +1613,10 @@ class OverseasPreflightTests(unittest.TestCase):
             "visibility": "public",
             "enableTimer": False,
             "scheduleTime": None,
+            "videosPerDay": 1,
+            "dailyTimes": [],
+            "startDays": 0,
+            "timeJitterMinutes": 0,
             "coverPath": "",
             "coverPaths": {},
             "aiGenerated": False,
@@ -1648,7 +1652,10 @@ class OverseasPreflightTests(unittest.TestCase):
             root = Path(raw)
             video = root / "video.mp4"
             video.write_bytes(b"video")
-            (root / "tiktok.json").write_text("{}", encoding="utf-8")
+            (root / "tiktok.json").write_text(
+                '{"cookies": [], "origins": []}',
+                encoding="utf-8",
+            )
             with self._local_tiktok(root):
                 result = overseas_preflight.validate_overseas_preflight_payload(
                     self._payload(video)
@@ -1744,6 +1751,74 @@ class OverseasPreflightTests(unittest.TestCase):
             self.assertFalse(result["receipt"]["platformWriteOccurred"])
             self.assertFalse(result["receipt"]["finalActionTriggered"])
             self.assertEqual(session.read_bytes(), original_session)
+
+    def test_any_tiktok_platform_signal_blocks_all_legacy_handlers_before_rejection(self) -> None:
+        cases = (
+            {"type": 7, "platformType": 6},
+            {"type": 8, "platform": "TikTok"},
+            {
+                "type": 9,
+                "target": {
+                    "platform": "TikTok",
+                    "accountId": 61,
+                    "schedule": None,
+                },
+            },
+            {
+                "type": 7,
+                "targets": [
+                    {
+                        "platform": "TikTok",
+                        "accountId": 61,
+                        "schedule": None,
+                    }
+                ],
+            },
+            {
+                "type": 8,
+                "targets": {
+                    "platform": "TikTok",
+                    "accountId": 61,
+                },
+            },
+        )
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            video = root / "video.mp4"
+            video.write_bytes(b"video")
+            (root / "tiktok.json").write_text(
+                '{"cookies": [], "origins": []}',
+                encoding="utf-8",
+            )
+            handlers = {
+                platform_type: MagicMock(
+                    side_effect=AssertionError("legacy handler must not run")
+                )
+                for platform_type in (6, 7, 8, 9)
+            }
+            with (
+                self._local_tiktok(root),
+                patch.dict(overseas_preflight.PREFLIGHT_HANDLERS, handlers),
+                patch.object(tiktok_identity_service, "async_playwright") as playwright,
+                patch.object(recovered_publish, "reveal_page_window") as reveal,
+                patch(
+                    "uploader.tk_uploader.main.save_context_storage_state"
+                ) as save_session,
+            ):
+                for signals in cases:
+                    with self.subTest(signals=signals):
+                        with self.assertRaises(
+                            overseas_tiktok_publish.TikTokPublishError
+                        ):
+                            overseas_preflight.run_overseas_preflight_sync(
+                                self._payload(video) | signals
+                            )
+
+            for handler in handlers.values():
+                handler.assert_not_called()
+            playwright.assert_not_called()
+            reveal.assert_not_called()
+            save_session.assert_not_called()
 
     def test_youtube_preflight_requires_verified_fields_and_reports_private_upload(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

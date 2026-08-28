@@ -23,6 +23,7 @@ from utils.publish_observer import publish_context
 from .paths import COOKIE_DIR
 from .overseas_tiktok_errors import TikTokPublishError
 from .overseas_tiktok_publish import (
+    payload_has_tiktok_platform_signal,
     run_tiktok_local_preflight,
     validate_tiktok_payload,
 )
@@ -52,7 +53,7 @@ def validate_overseas_preflight_payload(payload: dict[str, Any]) -> dict[str, An
 
     platform_type = int(payload.get("type") or 0)
     platform_name = PLATFORM_NAMES.get(platform_type, f"平台{platform_type}")
-    if platform_type == 6:
+    if payload_has_tiktok_platform_signal(payload):
         try:
             prepared = validate_tiktok_payload(payload, mode="preflight")
         except TikTokPublishError as exc:
@@ -165,7 +166,7 @@ def validate_overseas_preflight_payload(payload: dict[str, Any]) -> dict[str, An
 def run_overseas_preflight_sync(payload: dict[str, Any]) -> dict[str, Any]:
     """执行恢复的视频上传与字段填写，最终按钮始终锁定。"""
 
-    if int(payload.get("type") or 0) == 6:
+    if payload_has_tiktok_platform_signal(payload):
         return run_tiktok_local_preflight(payload)
 
     checked = validate_overseas_preflight_payload(payload)
