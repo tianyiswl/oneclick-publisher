@@ -59,7 +59,7 @@
 - Produces: `is_tiktok_cookie_domain(value: object) -> bool`.
 - Produces: `is_tiktok_https_origin(value: object) -> bool`.
 - Produces: `sanitize_tiktok_storage_state(raw_state: Mapping[str, Any]) -> dict[str, list[dict[str, Any]]]`.
-- Contract: return value contains only `cookies` and `origins`; input is never mutated; no TikTok cookie raises `tiktok_session_missing`; malformed or forbidden structure raises `tiktok_session_scope_invalid`.
+- Contract: return value contains only `cookies` and `origins`; input is never mutated; no allowlisted TikTok login-session marker raises `tiktok_session_missing`; malformed or forbidden structure raises `tiktok_session_scope_invalid`.
 
 - [ ] **Step 1: Write the failing filter tests**
 
@@ -280,7 +280,7 @@ def test_candidate_is_revalidated_in_a_blank_context_with_sanitized_state(self):
     self.assertEqual(self.fake_identity_reads, ["expected.user", "expected.user"])
 ```
 
-Add failures for no TikTok Cookie, first/second handle mismatch, blank-context login rejection, profile lock, Playwright close failure, update-mode handle mismatch, ambiguous public handle and non-TikTok origin leakage. Fakes must expose only the minimal `launch_persistent_context`, `launch`, `new_context`, `new_page`, `goto`, `storage_state` and `close` methods. Existing `tiktok_account_identity_ambiguous` must be translated to the public session code `tiktok_account_invalid`, because the approved contract exposes one stable invalid-identity code.
+Add failures for no allowlisted TikTok login-session marker, two blank-context handle mismatch, blank-context login rejection, profile lock, Playwright close failure, update-mode handle mismatch, ambiguous public handle and non-TikTok origin leakage. Fakes must expose only the minimal `launch_persistent_context`, `launch`, `new_context`, `new_page`, `goto`, `storage_state` and `close` methods. Persistent-profile intake only reads and filters state; two independent blank contexts perform the public-handle reads. Missing and ambiguous blank identities use their own stable public codes.
 
 - [ ] **Step 2: Write failing account commit and compensation tests**
 
