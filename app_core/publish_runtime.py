@@ -21,7 +21,6 @@ from myUtils.postVideo import (
     post_video_facebook,
     post_video_instagram,
     post_video_ks,
-    post_video_tiktok,
     post_video_tencent,
     post_video_youtube,
 )
@@ -51,7 +50,21 @@ PUBLISH_PLATFORM_ORDER_INDEX = {platform_type: index for index, platform_type in
 OVERSEAS_PLATFORM_TYPES = {6, 7, 8, 9}
 OVERSEAS_PREFLIGHT_ONLY_MESSAGE = "海外平台当前仅开放预发布检查，正式发布按钮尚未解锁"
 OVERSEAS_DRAFT_DISABLED_MESSAGE = "海外平台登录已暂缓，当前不执行平台草稿保存"
+TIKTOK_CONTROLLED_ROUTE_MESSAGE = (
+    "TikTok 专用受控服务已接管执行；旧发布运行时已拒绝 type 6"
+)
 PUBLISH_RUNTIME_MODES = {"preflight", "draft", "publish"}
+
+
+def _tiktok_legacy_route_rejection(
+    task: dict[str, Any],
+) -> dict[str, Any]:
+    fail_task(task["id"], TIKTOK_CONTROLLED_ROUTE_MESSAGE)
+    return {
+        "code": 409,
+        "msg": TIKTOK_CONTROLLED_ROUTE_MESSAGE,
+        "data": {"taskId": task["id"], "taskNo": task["taskNo"]},
+    }
 
 
 def _is_douyin_commerce_batch_payload(data: object) -> bool:
@@ -414,6 +427,8 @@ def execute_single_publish(data: dict[str, Any], task: dict[str, Any]) -> dict[s
     if _is_douyin_commerce_batch_payload(data):
         return _batch_runtime_rejection(task)
     platform_type = int(data.get("type"))
+    if platform_type == 6:
+        return _tiktok_legacy_route_rejection(task)
     runtime_mode = publish_runtime_mode(data)
     if platform_type in OVERSEAS_PLATFORM_TYPES and runtime_mode == "publish":
         fail_task(task["id"], OVERSEAS_PREFLIGHT_ONLY_MESSAGE)
@@ -481,8 +496,6 @@ def execute_single_publish(data: dict[str, Any], task: dict[str, Any]) -> dict[s
                     f"“{data.get('biliPartition')}”并校验后再投稿。",
                     level="warning",
                 )
-        elif platform_type == 6:
-            run_with_publish_context(task, "single", post_video_tiktok, title, file_list, tags, account_list, category, enable_timer, videos_per_day, daily_times, start_days, description=data.get("description"), cover_path=cover_path, cover_paths=cover_paths, schedule_time=data.get("scheduleTime"), jitter_minutes=jitter_minutes, dry_run=dry_run, dry_run_hold_browser=dry_run_hold_browser, background_mode=background_mode)
         elif platform_type == 7:
             run_with_publish_context(task, "single", post_video_youtube, title, file_list, tags, account_list, category, enable_timer, videos_per_day, daily_times, start_days, description=data.get("description"), cover_path=cover_path, cover_paths=cover_paths, schedule_time=data.get("scheduleTime"), jitter_minutes=jitter_minutes, dry_run=dry_run, dry_run_hold_browser=dry_run_hold_browser, background_mode=background_mode)
         elif platform_type == 8:
@@ -510,6 +523,8 @@ def execute_single_publish(data: dict[str, Any], task: dict[str, Any]) -> dict[s
 def execute_batch_publish(data_list: list[dict[str, Any]], task: dict[str, Any]) -> dict[str, Any]:
     if any(_is_douyin_commerce_batch_payload(data) for data in data_list):
         return _batch_runtime_rejection(task)
+    if any(int(data.get("type", 0) or 0) == 6 for data in data_list):
+        return _tiktok_legacy_route_rejection(task)
     formal_overseas = [
         data for data in data_list
         if int(data.get("type", 0) or 0) in OVERSEAS_PLATFORM_TYPES

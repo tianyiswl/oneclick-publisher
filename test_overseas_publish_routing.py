@@ -8,7 +8,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from app_core import overseas_video_publish, publish_service
+from app_core import (
+    overseas_preflight,
+    overseas_video_publish,
+    publish_runtime,
+    publish_service,
+)
 
 
 def _video_payload(video: Path, platform_type: int, mode: str) -> dict:
@@ -91,6 +96,38 @@ class PublishServiceRoutingTests(unittest.TestCase):
 
         self.assertNotIn(6, overseas_video_publish.PLATFORM_NAMES)
         legacy.assert_not_called()
+
+    def test_tiktok_is_absent_from_legacy_preflight_handler_registry(self) -> None:
+        self.assertNotIn(6, overseas_preflight.PREFLIGHT_HANDLERS)
+
+    def test_legacy_runtime_rejects_every_type6_mode_before_browser_dispatch(self) -> None:
+        task = {"id": 771, "taskNo": "TIKTOK-LEGACY-771"}
+        browser_dispatch = MagicMock(return_value=[])
+        with (
+            patch.object(
+                publish_runtime,
+                "validate_publish_accounts_before_run",
+                return_value=[],
+            ),
+            patch.object(publish_runtime, "run_with_publish_context", browser_dispatch),
+            patch.object(publish_runtime, "fail_task"),
+            patch.object(publish_runtime, "mark_task_running"),
+            patch.object(publish_runtime, "record_task_event"),
+            patch.object(publish_runtime, "complete_task"),
+            patch.object(publish_runtime, "mark_platform_results"),
+        ):
+            for mode in ("preflight", "platform_form_check", "publish", "draft"):
+                payload = _video_payload(self.video, 6, mode)
+                payload["debugDryRun"] = mode == "preflight"
+                with self.subTest(mode=mode):
+                    single = publish_runtime.execute_single_publish(payload, task)
+                    batch = publish_runtime.execute_batch_publish([payload], task)
+                    self.assertEqual(single["code"], 409)
+                    self.assertEqual(batch["code"], 409)
+                    self.assertIn("TikTok 专用受控服务", single["msg"])
+                    self.assertIn("TikTok 专用受控服务", batch["msg"])
+
+        browser_dispatch.assert_not_called()
 
     def test_youtube_browser_publish_routes_after_confirmation_contract(self) -> None:
         payload = _video_payload(self.video, 7, "publish")

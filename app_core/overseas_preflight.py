@@ -15,7 +15,6 @@ from typing import Any, Callable
 from myUtils.postVideo import (
     post_video_facebook,
     post_video_instagram,
-    post_video_tiktok,
     post_video_youtube,
 )
 from utils.publish_observer import publish_context
@@ -37,7 +36,6 @@ PLATFORM_NAMES = {
     9: "Facebook Reels",
 }
 PREFLIGHT_HANDLERS: dict[int, Callable[..., Any]] = {
-    6: post_video_tiktok,
     7: post_video_youtube,
     8: post_video_instagram,
     9: post_video_facebook,

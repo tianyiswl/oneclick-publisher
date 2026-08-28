@@ -1046,6 +1046,7 @@ class TikTokPlatformSyncTests(unittest.TestCase):
             }
         )
         uploader._base = AsyncMock(return_value=object())
+        uploader._wait_for_manual_intervention = AsyncMock(return_value=None)
         uploader.publish_confirmed = False
         return uploader
 
@@ -1058,6 +1059,7 @@ class TikTokPlatformSyncTests(unittest.TestCase):
         account_effect=None,
         verification_effect=None,
         event_sink: list[str] | None = None,
+        cleanup_error: Exception | None = None,
     ):
         uploader = uploader or self.fake_uploader()
         page = SimpleNamespace(
@@ -1068,7 +1070,10 @@ class TikTokPlatformSyncTests(unittest.TestCase):
         )
         context = SimpleNamespace(
             new_page=AsyncMock(return_value=page),
-            close=AsyncMock(return_value=None),
+            close=AsyncMock(
+                side_effect=cleanup_error,
+                return_value=None,
+            ),
         )
         browser = SimpleNamespace(close=AsyncMock(return_value=None))
         manager = SimpleNamespace(
@@ -1097,6 +1102,7 @@ class TikTokPlatformSyncTests(unittest.TestCase):
         )
         save_session = AsyncMock(return_value=None)
         uploader._test_save_session = save_session
+        logger = MagicMock()
 
         def record_event(_task_id, event_type, _message, *, level="info"):
             del level
@@ -1169,6 +1175,12 @@ class TikTokPlatformSyncTests(unittest.TestCase):
                 ),
                 create=True,
             ),
+            patch.object(
+                overseas_tiktok_publish,
+                "tiktok_logger",
+                logger,
+                create=True,
+            ),
             patch.object(task_service, "record_task_event", side_effect=record_event),
         ):
             result = overseas_tiktok_publish.run_tiktok_platform_sync(
@@ -1188,6 +1200,7 @@ class TikTokPlatformSyncTests(unittest.TestCase):
             identity_reader=identity_reader,
             account_reader=account_reader,
             save_session=save_session,
+            logger=logger,
         )
 
     def test_platform_form_check_prepares_once_and_never_submits(self) -> None:
@@ -1343,11 +1356,125 @@ class TikTokPlatformSyncTests(unittest.TestCase):
         run = self.run_sync(
             mode="platform_form_check",
             uploader=uploader,
-            verification_effect=["TikTok 要求安全验证", None],
+            verification_effect=[None, "TikTok 要求安全验证", None],
         )
 
         self.assertIn("tiktok_waiting_user_verification", run.events)
         self.assertIn("tiktok_user_verification_resolved", run.events)
+
+    def test_identity_checks_wait_for_challenges_on_same_page_without_reupload(self) -> None:
+        uploader = self.fake_uploader()
+        uploader._wait_for_manual_intervention = AsyncMock(return_value=None)
+        run = self.run_sync(
+            mode="formal",
+            uploader=uploader,
+            verification_effect=[
+                "TikTok 首次身份读取前要求安全验证",
+                "TikTok 二次身份读取前要求安全验证",
+            ],
+        )
+
+        self.assertEqual(run.events.count("tiktok_waiting_user_verification"), 2)
+        self.assertEqual(run.events.count("tiktok_user_verification_resolved"), 2)
+        self.assertEqual(run.identity_reader.await_count, 2)
+        run.context.new_page.assert_awaited_once()
+        run.uploader.prepare_form.assert_awaited_once()
+        self.assertIs(run.uploader.prepare_form.await_args.args[0], run.page)
+        self.assertIs(run.uploader.submit_once.await_args.args[0], run.page)
+
+    def test_content_route_without_exact_readback_is_ambiguous(self) -> None:
+        uploader = self.fake_uploader(
+            submit_result={
+                "status": "published",
+                "evidence": "platform_content_route",
+            }
+        )
+        with self.assertRaises(overseas_tiktok_publish.TikTokPublishError) as raised:
+            self.run_sync(mode="formal", uploader=uploader)
+
+        self.assertEqual(raised.exception.error_code, "tiktok_publish_outcome_unknown")
+        self.assertTrue(raised.exception.outcome_ambiguous)
+
+    def test_content_route_requires_exact_target_readback_for_success(self) -> None:
+        uploader = self.fake_uploader(
+            submit_result={
+                "status": "published",
+                "evidence": "platform_content_route",
+                "contentId": "7512345678901234567",
+                "contentUrl": (
+                    "https://www.tiktok.com/@expected.user/video/"
+                    "7512345678901234567"
+                ),
+                "publishedAt": "2026-08-28T12:30:00+08:00",
+            }
+        )
+
+        run = self.run_sync(mode="formal", uploader=uploader)
+
+        self.assertEqual(run.result["phase"], "published_readback_confirmed")
+        self.assertNotIn("tiktok_platform_accepted", run.events)
+
+    def test_generic_pre_final_exception_is_mapped_without_sensitive_text(self) -> None:
+        marker = f"COOKIE=secret BODY=private PATH={self.video}"
+        uploader = self.fake_uploader()
+        uploader.prepare_form.side_effect = RuntimeError(marker)
+        with self.assertRaises(overseas_tiktok_publish.TikTokPublishError) as raised:
+            self.run_sync(mode="platform_form_check", uploader=uploader)
+
+        self.assertEqual(raised.exception.error_code, "tiktok_platform_execution_failed")
+        self.assertEqual(
+            raised.exception.public_message,
+            "TikTok 平台执行在最终动作前失败，未点击 Post",
+        )
+        self.assertNotIn(marker, str(raised.exception))
+        self.assertNotIn(marker, repr(raised.exception.receipt))
+
+    def test_generic_identity_exception_uses_the_same_safe_boundary(self) -> None:
+        marker = f"COOKIE=secret BODY=private PATH={self.session}"
+        with self.assertRaises(overseas_tiktok_publish.TikTokPublishError) as raised:
+            self.run_sync(
+                mode="formal",
+                identity_effect=RuntimeError(marker),
+            )
+
+        self.assertEqual(raised.exception.error_code, "tiktok_platform_execution_failed")
+        self.assertEqual(
+            raised.exception.public_message,
+            "TikTok 平台执行在最终动作前失败，未点击 Post",
+        )
+        self.assertNotIn(marker, str(raised.exception))
+        self.assertIsNone(raised.exception.__cause__)
+
+    def test_form_check_cleanup_failure_is_not_silent_success(self) -> None:
+        marker = f"COOKIE=secret PATH={self.session}"
+        with self.assertRaises(overseas_tiktok_publish.TikTokPublishError) as raised:
+            self.run_sync(
+                mode="platform_form_check",
+                cleanup_error=RuntimeError(marker),
+            )
+
+        self.assertEqual(raised.exception.error_code, "tiktok_cleanup_failed")
+        self.assertEqual(
+            raised.exception.public_message,
+            "TikTok 浏览器资源未能确认关闭，任务已安全停止",
+        )
+        self.assertNotIn(marker, str(raised.exception))
+
+    def test_formal_success_evidence_survives_cleanup_failure(self) -> None:
+        marker = f"COOKIE=secret PATH={self.session}"
+        run = self.run_sync(
+            mode="formal",
+            cleanup_error=RuntimeError(marker),
+        )
+
+        self.assertEqual(run.result["phase"], "platform_accepted")
+        self.assertTrue(run.logger.error.called)
+        logged = " ".join(
+            str(arg)
+            for call in run.logger.error.call_args_list
+            for arg in call.args
+        )
+        self.assertNotIn(marker, logged)
 
 
 if __name__ == "__main__":

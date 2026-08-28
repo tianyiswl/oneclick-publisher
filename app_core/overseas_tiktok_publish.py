@@ -25,6 +25,7 @@ from utils.base_social_media import (
     save_context_storage_state,
     set_init_script,
 )
+from utils.log import tiktok_logger
 from utils.publish_observer import publish_context
 
 from . import task_service
@@ -42,6 +43,18 @@ TIKTOK_CONTENT_LIMIT = 2200
 TIKTOK_MODES = frozenset({"preflight", "platform_form_check", "formal"})
 TIKTOK_VIDEO_SUFFIXES = frozenset({".mp4", ".mov", ".mkv", ".avi", ".webm"})
 TIKTOK_UPLOAD_URL = "https://www.tiktok.com/tiktokstudio/upload?lang=en"
+_TIKTOK_ACCEPTED_EVIDENCE = frozenset(
+    {
+        "platform_feedback:your video has been uploaded",
+        "platform_feedback:video posted successfully",
+        "platform_feedback:post published",
+        "platform_feedback:posted successfully",
+        "platform_feedback:upload successful",
+        "platform_feedback:视频已发布",
+        "platform_feedback:发布成功",
+        "platform_feedback:上传成功",
+    }
+)
 
 # Kept lazy so importing this module for local preflight never imports the
 # uploader (which imports the caption composer back from this module) and never
@@ -1072,6 +1085,28 @@ def _validate_live_identity(account: Mapping[str, Any], identity) -> None:
         raise TikTokPublishError(exc.error_code, exc.public_message) from exc
 
 
+async def _wait_before_identity_read(uploader, page) -> None:
+    waiter = getattr(uploader, "_wait_for_manual_intervention", None)
+    if not callable(waiter):
+        _fail(
+            "tiktok_platform_execution_failed",
+            "TikTok 平台执行在最终动作前失败，未点击 Post",
+        )
+    await waiter(page)
+
+
+def _log_internal_failure(stage: str, exc: BaseException) -> None:
+    """只在本地记录受控的异常类型，不记录异常文本。"""
+
+    try:
+        tiktok_logger.error(
+            f"[tiktok-controlled] {stage} failed ({type(exc).__name__})"
+        )
+    except Exception:
+        # Logging must never replace the fixed public failure boundary.
+        return
+
+
 def _verify_authorized_form_snapshot(
     prepared: Mapping[str, Any],
     form_receipt: object,
@@ -1230,10 +1265,7 @@ def _exact_content_readback(
 def _platform_result_is_accepted(result: object) -> bool:
     if not isinstance(result, Mapping) or result.get("status") != "published":
         return False
-    evidence = result.get("evidence")
-    return type(evidence) is str and evidence.startswith(
-        ("platform_feedback:", "platform_content_route")
-    )
+    return result.get("evidence") in _TIKTOK_ACCEPTED_EVIDENCE
 
 
 async def _run_tiktok_platform(
@@ -1248,6 +1280,8 @@ async def _run_tiktok_platform(
     context = None
     page = None
     final_state = {"triggered": False}
+    platform_write_occurred = False
+    completed_successfully = False
 
     def trigger_final_action() -> None:
         if final_state["triggered"]:
@@ -1275,10 +1309,6 @@ async def _run_tiktok_platform(
         )
         await page.wait_for_timeout(2_500)
 
-        account_snapshot = _require_current_account_snapshot(prepared)
-        identity = await read_tiktok_identity(page)
-        _validate_live_identity(account_snapshot, identity)
-
         uploader_class = _load_tiktok_uploader_class()
         uploader = uploader_class(
             str(prepared["title"]),
@@ -1298,15 +1328,22 @@ async def _run_tiktok_platform(
             trigger=trigger_final_action,
         )
 
+        await _wait_before_identity_read(uploader, page)
+        account_snapshot = _require_current_account_snapshot(prepared)
+        identity = await read_tiktok_identity(page)
+        _validate_live_identity(account_snapshot, identity)
+
         _record_tiktok_event(
             task_id,
             "tiktok_platform_form_started",
             "TikTok 开始上传并核对发布表单",
         )
         base = await uploader._base(page)
+        platform_write_occurred = True
         form_receipt = await uploader.prepare_form(page, base)
         verified_form = _verify_authorized_form_snapshot(prepared, form_receipt)
 
+        await _wait_before_identity_read(uploader, page)
         current_account = _require_current_account_snapshot(prepared)
         current_identity = await read_tiktok_identity(page)
         _validate_live_identity(current_account, current_identity)
@@ -1330,6 +1367,7 @@ async def _run_tiktok_platform(
         if mode == "platform_form_check":
             receipt["phase"] = "platform_form_verified"
             await save_context_storage_state(context, str(prepared["accountFile"]))
+            completed_successfully = True
             return {
                 "type": 6,
                 "platform": "TikTok",
@@ -1350,7 +1388,11 @@ async def _run_tiktok_platform(
             )
         receipt["finalActionTriggered"] = True
         receipt["phase"] = "platform_accepted"
-        if not _platform_result_is_accepted(submitted):
+        readback = _exact_content_readback(
+            submitted,
+            expected_handle=str(prepared["expectedAccountReference"]),
+        )
+        if not _platform_result_is_accepted(submitted) and readback is None:
             raise TikTokPublishError(
                 "tiktok_publish_outcome_unknown",
                 "TikTok 最终动作后的平台结果无法确认，请人工核对内容列表",
@@ -1358,10 +1400,6 @@ async def _run_tiktok_platform(
                 receipt=receipt,
             )
 
-        readback = _exact_content_readback(
-            submitted,
-            expected_handle=str(prepared["expectedAccountReference"]),
-        )
         if readback is None:
             phase = "platform_accepted"
             event_type = "tiktok_platform_accepted"
@@ -1374,6 +1412,7 @@ async def _run_tiktok_platform(
         receipt["phase"] = phase
         _record_tiktok_event(task_id, event_type, message)
         await save_context_storage_state(context, str(prepared["accountFile"]))
+        completed_successfully = True
         return {
             "type": 6,
             "platform": "TikTok",
@@ -1407,7 +1446,7 @@ async def _run_tiktok_platform(
                     "tiktok_publish_rejected",
                     "TikTok 页面明确提示发布失败",
                     receipt=receipt,
-                ) from exc
+                ) from None
             try:
                 _record_tiktok_event(
                     task_id,
@@ -1419,26 +1458,73 @@ async def _run_tiktok_platform(
                 pass
             if isinstance(exc, TikTokPublishError) and exc.outcome_ambiguous:
                 raise
+            _log_internal_failure("after-final-action", exc)
             raise TikTokPublishError(
                 "tiktok_publish_outcome_unknown",
                 "TikTok 最终动作后的平台结果无法确认，请人工核对内容列表",
                 outcome_ambiguous=True,
                 receipt=receipt,
-            ) from exc
-        raise
+            ) from None
+        if isinstance(exc, TikTokPublishError):
+            raise
+        if isinstance(exc, TikTokIdentityError):
+            raise TikTokPublishError(exc.error_code, exc.public_message) from None
+        _log_internal_failure("before-final-action", exc)
+        raise TikTokPublishError(
+            "tiktok_platform_execution_failed",
+            "TikTok 平台执行在最终动作前失败，未点击 Post",
+            receipt={
+                "accountId": int(prepared["accountId"]),
+                "visibility": "public",
+                "mode": mode,
+                "phase": "failed_before_final_action",
+                "platformWriteOccurred": platform_write_occurred,
+                "finalActionTriggered": False,
+                "contentId": None,
+                "contentUrl": None,
+                "publishedAt": None,
+            },
+        ) from None
     finally:
-        for resource in (page, context, browser):
+        cleanup_failures: list[tuple[str, BaseException]] = []
+        for label, resource in (
+            ("page-close", page),
+            ("context-close", context),
+            ("browser-close", browser),
+        ):
             if resource is None:
                 continue
             try:
                 await resource.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                cleanup_failures.append((label, exc))
+                _log_internal_failure(label, exc)
         if playwright_manager is not None:
             try:
                 await playwright_manager.stop()
-            except Exception:
-                pass
+            except Exception as exc:
+                cleanup_failures.append(("playwright-stop", exc))
+                _log_internal_failure("playwright-stop", exc)
+        if (
+            cleanup_failures
+            and completed_successfully
+            and mode == "platform_form_check"
+        ):
+            raise TikTokPublishError(
+                "tiktok_cleanup_failed",
+                "TikTok 浏览器资源未能确认关闭，任务已安全停止",
+                receipt={
+                    "accountId": int(prepared["accountId"]),
+                    "visibility": "public",
+                    "mode": mode,
+                    "phase": "failed_before_final_action",
+                    "platformWriteOccurred": platform_write_occurred,
+                    "finalActionTriggered": False,
+                    "contentId": None,
+                    "contentUrl": None,
+                    "publishedAt": None,
+                },
+            )
 
 
 def run_tiktok_platform_sync(
@@ -1453,15 +1539,24 @@ def run_tiktok_platform_sync(
         _fail("tiktok_unsupported_publish_setting", "TikTok 平台执行模式无效")
     if type(task_id) is not int or task_id <= 0:
         _fail("tiktok_unsupported_publish_setting", "TikTok 任务标识无效")
-    prepared = validate_tiktok_payload(payload, mode=mode)
-    with publish_context(mode=mode, background_mode=False):
-        return asyncio.run(
-            _run_tiktok_platform(
-                prepared,
-                mode=mode,
-                task_id=task_id,
+    try:
+        prepared = validate_tiktok_payload(payload, mode=mode)
+        with publish_context(mode=mode, background_mode=False):
+            return asyncio.run(
+                _run_tiktok_platform(
+                    prepared,
+                    mode=mode,
+                    task_id=task_id,
+                )
             )
-        )
+    except TikTokPublishError:
+        raise
+    except Exception as exc:
+        _log_internal_failure("platform-entry", exc)
+        raise TikTokPublishError(
+            "tiktok_platform_execution_failed",
+            "TikTok 平台执行在最终动作前失败，未点击 Post",
+        ) from None
 
 
 __all__ = [
