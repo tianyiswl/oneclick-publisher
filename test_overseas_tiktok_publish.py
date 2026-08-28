@@ -221,6 +221,50 @@ class TikTokPublishContractTests(unittest.TestCase):
         )
         self.assertEqual(prepared["visibility"], "public")
 
+    def test_schedule_fields_are_root_only_and_root_schedule_has_exact_keys(self) -> None:
+        nested_cases = (
+            {"settings": {"enableTimer": False}},
+            {"content": {"dailyTimes": []}},
+            {"target": {"platform": "TikTok", "videosPerDay": 1}},
+            {
+                "targets": [
+                    {
+                        "platform": "TikTok",
+                        "accountId": 61,
+                        "startDays": 0,
+                    }
+                ]
+            },
+            {
+                "platformOverrides": {
+                    "TikTok": {"timeJitterMinutes": 0},
+                }
+            },
+            {"content": {"schedule": None}},
+            {"target": {"platform": "TikTok", "scheduledAt": None}},
+        )
+        root_schedule_cases = (
+            {"schedule": None},
+            {"schedule": {}},
+            {"schedule": {"enabled": 0}},
+            {"schedule": {"timezone": "UTC"}},
+            {"schedule": {"enabled": False, "at": None}},
+            {"schedule": {"enabled": False, "publishAt": None}},
+            {"schedule": {"enabled": False, "time": ""}},
+            {"schedule": {"enabled": False, "localTime": None}},
+        )
+        for changes in (*nested_cases, *root_schedule_cases):
+            with self.subTest(changes=changes):
+                self.assert_error_code(
+                    "tiktok_unsupported_publish_setting",
+                    self.payload(**changes),
+                )
+
+        prepared = self.validate(
+            self.payload(schedule={"enabled": False, "timezone": "UTC"})
+        )
+        self.assertEqual(prepared["visibility"], "public")
+
     def test_account_ids_and_session_lists_must_each_resolve_to_same_single_account(self) -> None:
         second = self.root / "second.json"
         second.write_text("{}", encoding="utf-8")
@@ -243,16 +287,15 @@ class TikTokPublishContractTests(unittest.TestCase):
         second.write_text("{}", encoding="utf-8")
         for targets in (
             [
-                {"platform": "TikTok", "accountId": 61, "schedule": None},
-                {"platform": "TikTok", "accountId": 62, "schedule": None},
+                {"platform": "TikTok", "accountId": 61},
+                {"platform": "TikTok", "accountId": 62},
             ],
-            [{"platform": "TikTok", "accountId": 62, "schedule": None}],
+            [{"platform": "TikTok", "accountId": 62}],
             [
                 {
                     "platform": "TikTok",
                     "accountId": 61,
                     "accountFile": second.name,
-                    "schedule": None,
                 }
             ],
             [
@@ -260,7 +303,6 @@ class TikTokPublishContractTests(unittest.TestCase):
                     "platform": "TikTok",
                     "accountId": 61,
                     "status": 0,
-                    "schedule": None,
                 }
             ],
         ):
@@ -398,6 +440,129 @@ class TikTokPublishContractTests(unittest.TestCase):
                     account=self.account(filePath=name),
                 )
 
+    def test_storage_state_validates_cookie_origin_and_local_storage_fields(self) -> None:
+        valid_cookie = {
+            "name": "sessionid",
+            "value": "opaque",
+            "domain": ".tiktok.com",
+            "path": "/",
+        }
+        cases = (
+            {"cookies": [{}], "origins": []},
+            {
+                "cookies": [{**valid_cookie, "value": 7}],
+                "origins": [],
+            },
+            {
+                "cookies": [{**valid_cookie, "expires": True}],
+                "origins": [],
+            },
+            {
+                "cookies": [{**valid_cookie, "expires": float("nan")}],
+                "origins": [],
+            },
+            {
+                "cookies": [{**valid_cookie, "httpOnly": 1}],
+                "origins": [],
+            },
+            {
+                "cookies": [{**valid_cookie, "secure": "false"}],
+                "origins": [],
+            },
+            {
+                "cookies": [{**valid_cookie, "sameSite": "unsafe"}],
+                "origins": [],
+            },
+            {
+                "cookies": [{**valid_cookie, "sameSite": ["Lax"]}],
+                "origins": [],
+            },
+            {
+                "cookies": [{**valid_cookie, "partitionKey": ["secret"]}],
+                "origins": [],
+            },
+            {"cookies": [], "origins": [{}]},
+            {
+                "cookies": [],
+                "origins": [{"origin": "file:///tmp/session", "localStorage": []}],
+            },
+            {
+                "cookies": [],
+                "origins": [
+                    {"origin": "https://www.tiktok.com:bad", "localStorage": []}
+                ],
+            },
+            {
+                "cookies": [],
+                "origins": [{"origin": "https://www.tiktok.com"}],
+            },
+            {
+                "cookies": [],
+                "origins": [
+                    {"origin": "https://www.tiktok.com", "localStorage": {}}
+                ],
+            },
+            {
+                "cookies": [],
+                "origins": [
+                    {"origin": "https://www.tiktok.com", "localStorage": [{}]}
+                ],
+            },
+            {
+                "cookies": [],
+                "origins": [
+                    {
+                        "origin": "https://www.tiktok.com",
+                        "localStorage": [{"name": 1, "value": "opaque"}],
+                    }
+                ],
+            },
+        )
+        for index, storage_state in enumerate(cases):
+            name = f"malformed-storage-{index}.json"
+            (self.root / name).write_text(
+                json.dumps(storage_state),
+                encoding="utf-8",
+            )
+            with self.subTest(index=index):
+                self.assert_error_code(
+                    "tiktok_account_invalid",
+                    self.payload(accountList=[name]),
+                    account=self.account(filePath=name),
+                )
+
+        valid_name = "valid-storage.json"
+        (self.root / valid_name).write_text(
+            json.dumps(
+                {
+                    "cookies": [
+                        {
+                            **valid_cookie,
+                            "expires": 1790000000.5,
+                            "httpOnly": True,
+                            "secure": True,
+                            "sameSite": "Lax",
+                            "partitionKey": "https://www.tiktok.com",
+                        }
+                    ],
+                    "origins": [
+                        {
+                            "origin": "https://www.tiktok.com",
+                            "localStorage": [
+                                {"name": "theme", "value": "dark"},
+                            ],
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        prepared = self.validate(
+            self.payload(accountList=[valid_name]),
+            account=self.account(filePath=valid_name),
+        )
+        self.assertEqual(prepared["accountFile"], str((self.root / valid_name).resolve()))
+
     def test_video_must_be_one_supported_local_regular_file(self) -> None:
         second = self.root / "second.mov"
         second.write_bytes(b"second")
@@ -520,6 +685,33 @@ class TikTokPublishContractTests(unittest.TestCase):
                     "tiktok_unsupported_publish_setting",
                     self.payload(**changes),
                 )
+
+    def test_allowed_content_video_path_aliases_must_match_the_primary_video(self) -> None:
+        second = self.root / "second.mp4"
+        second.write_bytes(b"second")
+        for changes in (
+            {"content": {"videoPath": str(second)}},
+            {
+                "platformOverrides": {
+                    "TikTok": {"videoPath": str(second)},
+                }
+            },
+        ):
+            with self.subTest(changes=changes):
+                self.assert_error_code(
+                    "tiktok_unsupported_publish_setting",
+                    self.payload(**changes),
+                )
+
+        prepared = self.validate(
+            self.payload(
+                content={"videoPath": str(self.video)},
+                platformOverrides={
+                    "TikTok": {"videoPath": str(self.video)},
+                },
+            )
+        )
+        self.assertEqual(prepared["videoPath"], str(self.video.resolve()))
 
     def test_other_platform_override_fields_do_not_affect_flattened_tiktok_payload(self) -> None:
         prepared = self.validate(

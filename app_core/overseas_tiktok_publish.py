@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
 import unicodedata
 from pathlib import Path
 from typing import Any, Iterable, Mapping
+from urllib.parse import urlsplit
 
 from .overseas_tiktok_errors import TikTokPublishError
 from .overseas_tiktok_identity import normalize_tiktok_handle
@@ -85,6 +87,24 @@ _TARGET_SENSITIVE_KEYS = frozenset(
     }
 )
 _CONTENT_SENSITIVE_KEYS = _VIDEO_ALIAS_KEYS | _CONTENT_ALIAS_KEYS
+_SCHEDULE_ALIAS_KEYS = frozenset(
+    {
+        "enabletimer",
+        "dailytimes",
+        "videosperday",
+        "startdays",
+        "timejitterminutes",
+        "schedule",
+        "scheduletime",
+        "scheduledat",
+        "publishschedule",
+        "publishat",
+        "publishtime",
+        "timer",
+        "timerenabled",
+        "localtime",
+    }
+)
 
 
 def payload_has_tiktok_platform_signal(payload: Mapping[str, Any]) -> bool:
@@ -217,7 +237,54 @@ def _ai_requested(value: object) -> bool:
     )
 
 
+def _validate_schedule_locations(payload: Mapping[str, Any]) -> None:
+    def visit_nonroot(value: object) -> None:
+        if isinstance(value, (list, tuple)):
+            for nested in value:
+                visit_nonroot(nested)
+            return
+        if not isinstance(value, Mapping):
+            return
+        for raw_key, nested in value.items():
+            key = str(raw_key).strip().casefold()
+            if key in _SCHEDULE_ALIAS_KEYS or "schedule" in key:
+                _fail(
+                    "tiktok_unsupported_publish_setting",
+                    "TikTok 定时字段只允许出现在根位置",
+                )
+            visit_nonroot(nested)
+
+    for key, value in payload.items():
+        if key == "schedule":
+            if (
+                not isinstance(value, Mapping)
+                or set(value) - {"enabled", "timezone"}
+                or value.get("enabled") is not False
+                or (
+                    "timezone" in value
+                    and (
+                        type(value["timezone"]) is not str
+                        or not value["timezone"].strip()
+                    )
+                )
+            ):
+                _fail(
+                    "tiktok_unsupported_publish_setting",
+                    "TikTok 根定时字段无效",
+                )
+            continue
+        if key == "platformOverrides":
+            if isinstance(value, Mapping):
+                for platform, override in value.items():
+                    if str(platform).strip().casefold() == "tiktok":
+                        visit_nonroot(override)
+            continue
+        if isinstance(value, (Mapping, list, tuple)):
+            visit_nonroot(value)
+
+
 def _validate_immediate_schedule(payload: Mapping[str, Any]) -> None:
+    _validate_schedule_locations(payload)
     if payload.get("enableTimer") is not False:
         _fail(
             "tiktok_unsupported_publish_setting",
@@ -531,6 +598,78 @@ def _account_identity(payload: Mapping[str, Any]) -> tuple[int, Mapping[str, Any
     return account_id, account
 
 
+def _valid_storage_cookie(cookie: object) -> bool:
+    if not isinstance(cookie, Mapping):
+        return False
+    required = {"name", "value", "domain", "path"}
+    optional = {"expires", "httpOnly", "secure", "sameSite", "partitionKey"}
+    if not required.issubset(cookie) or set(cookie) - required - optional:
+        return False
+    if any(type(cookie[key]) is not str for key in required):
+        return False
+    if not cookie["name"] or not cookie["domain"] or not cookie["path"]:
+        return False
+    if "expires" in cookie:
+        try:
+            valid_expires = type(cookie["expires"]) in {int, float} and math.isfinite(
+                cookie["expires"]
+            )
+        except (OverflowError, TypeError, ValueError):
+            valid_expires = False
+        if not valid_expires:
+            return False
+    if "httpOnly" in cookie and type(cookie["httpOnly"]) is not bool:
+        return False
+    if "secure" in cookie and type(cookie["secure"]) is not bool:
+        return False
+    if "sameSite" in cookie:
+        if type(cookie["sameSite"]) is not str or cookie["sameSite"] not in {
+            "Strict",
+            "Lax",
+            "None",
+        }:
+            return False
+    if "partitionKey" in cookie and type(cookie["partitionKey"]) is not str:
+        return False
+    return True
+
+
+def _valid_storage_origin(origin_row: object) -> bool:
+    if not isinstance(origin_row, Mapping) or set(origin_row) != {
+        "origin",
+        "localStorage",
+    }:
+        return False
+    origin = origin_row["origin"]
+    local_storage = origin_row["localStorage"]
+    if type(origin) is not str or type(local_storage) is not list:
+        return False
+    try:
+        parsed = urlsplit(origin)
+        parsed.port
+        valid_origin = (
+            parsed.scheme in {"http", "https"}
+            and bool(parsed.hostname)
+            and parsed.username is None
+            and parsed.password is None
+            and parsed.path in {"", "/"}
+            and not parsed.query
+            and not parsed.fragment
+        )
+    except ValueError:
+        return False
+    if not valid_origin:
+        return False
+    return all(
+        isinstance(item, Mapping)
+        and set(item) == {"name", "value"}
+        and type(item["name"]) is str
+        and bool(item["name"])
+        and type(item["value"]) is str
+        for item in local_storage
+    )
+
+
 def _session_path(payload: Mapping[str, Any], account: Mapping[str, Any]) -> Path:
     if "accountList" not in payload:
         _fail(
@@ -590,8 +729,8 @@ def _session_path(payload: Mapping[str, Any], account: Mapping[str, Any]) -> Pat
     if (
         type(cookies) is not list
         or type(origins) is not list
-        or not all(isinstance(item, Mapping) for item in cookies)
-        or not all(isinstance(item, Mapping) for item in origins)
+        or not all(_valid_storage_cookie(item) for item in cookies)
+        or not all(_valid_storage_origin(item) for item in origins)
     ):
         _fail("tiktok_account_invalid", "TikTok 本地登录会话格式无效")
     return resolved
@@ -636,6 +775,8 @@ def _video_path(payload: Mapping[str, Any]) -> Path:
                 message="TikTok 视频素材字段冲突",
             )
             alias_values.append(_raw_video_value(values[0]))
+        if "videoPath" in content:
+            alias_values.append(_raw_video_value(content["videoPath"]))
     if any(value != primary_value for value in alias_values):
         _fail("tiktok_unsupported_publish_setting", "TikTok 视频素材字段冲突")
 
