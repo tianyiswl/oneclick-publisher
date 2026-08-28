@@ -320,9 +320,13 @@ async def read_tiktok_identity(
         if _page_is_tiktok_auth_route(page):
             raise _identity_invalid()
         is_homepage = _is_tiktok_homepage_route(page)
+        if is_homepage and time.monotonic() >= homepage_deadline:
+            break
         homepage_handle = (
             await _homepage_app_context_handle(page) if is_homepage else ""
         )
+        if is_homepage and time.monotonic() >= homepage_deadline:
+            break
         if homepage_handle:
             candidates = {homepage_handle: (None, False)}
         elif is_homepage:
@@ -349,13 +353,20 @@ async def read_tiktok_identity(
         else:
             previous_handle = ""
         completed_attempts += 1
-        if completed_attempts >= attempts and (
-            not is_homepage
-            or interval <= 0.0
-            or time.monotonic() >= homepage_deadline
-        ):
+        if not is_homepage:
+            if completed_attempts >= attempts:
+                break
+            await asyncio.sleep(interval)
+            continue
+        if interval <= 0.0:
+            if completed_attempts >= attempts:
+                break
+            await asyncio.sleep(0.0)
+            continue
+        remaining = homepage_deadline - time.monotonic()
+        if remaining <= 0.0:
             break
-        await asyncio.sleep(interval)
+        await asyncio.sleep(min(interval, remaining))
 
     raise TikTokIdentityError(
         "tiktok_account_invalid", "TikTok 页面没有返回稳定账号标识"

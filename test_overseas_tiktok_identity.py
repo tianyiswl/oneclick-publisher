@@ -148,6 +148,19 @@ class _DelayedProfileLinkPage:
         return _FakeProfileLinks(self.samples[index])
 
 
+class _FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    async def sleep(self, delay: float) -> None:
+        self.sleeps.append(delay)
+        self.now += delay
+
+
 class TikTokIdentityTests(unittest.TestCase):
     @staticmethod
     def _app_context(user: dict) -> str:
@@ -282,6 +295,85 @@ class TikTokIdentityTests(unittest.TestCase):
         )
 
         self.assertEqual(identity.handle, "expected.user")
+        self.assertEqual(page.app_context_evaluate_calls, 2)
+
+    def test_read_identity_caps_a_missing_homepage_poll_at_the_deadline(self):
+        page = _FakeTikTokPage([], url="https://www.tiktok.com/", app_context=None)
+        clock = _FakeClock()
+
+        with (
+            patch.object(identity_service.time, "monotonic", clock.monotonic),
+            patch.object(identity_service.asyncio, "sleep", clock.sleep),
+            self.assertRaises(TikTokIdentityError) as raised,
+        ):
+            asyncio.run(
+                read_tiktok_identity(
+                    page,
+                    poll_seconds=10.0,
+                    max_attempts=5,
+                    homepage_settle_seconds=2.5,
+                )
+            )
+
+        self.assertEqual(raised.exception.error_code, "tiktok_account_invalid")
+        self.assertEqual(clock.sleeps, [2.5])
+        self.assertEqual(page.app_context_evaluate_calls, 1)
+
+    def test_read_identity_can_stabilize_after_the_old_five_attempt_limit(self):
+        page = _FakeTikTokPage(
+            [],
+            url="https://www.tiktok.com/",
+            app_context=[None] * 5
+            + [
+                self._app_context({"uniqueId": "expected.user"}),
+                self._app_context({"uniqueId": "expected.user"}),
+            ],
+        )
+        clock = _FakeClock()
+
+        with (
+            patch.object(identity_service.time, "monotonic", clock.monotonic),
+            patch.object(identity_service.asyncio, "sleep", clock.sleep),
+        ):
+            identity = asyncio.run(
+                read_tiktok_identity(
+                    page,
+                    poll_seconds=0.1,
+                    max_attempts=5,
+                    homepage_settle_seconds=1.0,
+                )
+            )
+
+        self.assertEqual(identity.handle, "expected.user")
+        self.assertEqual(page.app_context_evaluate_calls, 7)
+
+    def test_read_identity_rejects_one_handle_at_the_homepage_deadline(self):
+        page = _FakeTikTokPage(
+            [],
+            url="https://www.tiktok.com/",
+            app_context=[
+                None,
+                self._app_context({"uniqueId": "expected.user"}),
+                None,
+            ],
+        )
+        clock = _FakeClock()
+
+        with (
+            patch.object(identity_service.time, "monotonic", clock.monotonic),
+            patch.object(identity_service.asyncio, "sleep", clock.sleep),
+            self.assertRaises(TikTokIdentityError) as raised,
+        ):
+            asyncio.run(
+                read_tiktok_identity(
+                    page,
+                    poll_seconds=0.5,
+                    max_attempts=5,
+                    homepage_settle_seconds=1.0,
+                )
+            )
+
+        self.assertEqual(raised.exception.error_code, "tiktok_account_invalid")
         self.assertEqual(page.app_context_evaluate_calls, 2)
 
     def test_read_identity_rejects_conflicting_homepage_app_context_usernames(self):
