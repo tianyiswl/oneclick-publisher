@@ -5,18 +5,18 @@
     "title": "TikTok 受控发布生命周期",
     "output": "docs/architecture/tiktok-controlled-video-publish.lifecycle.html",
     "quality_profile": "showcase",
-    "viewBox": [1380, 675],
+    "viewBox": [1380, 652],
     "views": [
       {
         "id": "formal-main-path",
         "label": "正式发布主链",
-        "focus": ["local_preflight_passed", "final_action_triggered", "platform_accepted", "published_readback_confirmed"],
+        "focus": ["local_preflight_passed", "platform_page_active", "final_action_triggered", "platform_accepted", "published_readback_confirmed"],
         "note": "一次性授权后只触发一次 Post；平台接受与作品回读是两层证据。"
       },
       {
         "id": "form-check-stop",
         "label": "平台表单检查",
-        "focus": ["local_preflight_passed", "waiting_user_verification", "platform_form_verified"],
+        "focus": ["local_preflight_passed", "platform_page_active", "waiting_user_verification", "platform_form_verified"],
         "note": "platform_form_check 会发生上传写入，但在 Post 前终止。"
       },
       {
@@ -78,12 +78,22 @@
       "tag": "confirmed"
     },
     {
+      "id": "platform_page_active",
+      "type": "active",
+      "label": "平台页面执行中",
+      "sublabel": "Same Playwright Page",
+      "lane": "pre_final",
+      "col": 1,
+      "width": 120,
+      "tag": "form check / formal"
+    },
+    {
       "id": "waiting_user_verification",
       "type": "waiting",
       "label": "等待用户验证",
       "sublabel": "同一页面等待用户",
       "lane": "pre_final",
-      "col": 1,
+      "col": 0,
       "width": 120,
       "tag": "human gate"
     },
@@ -130,23 +140,38 @@
   ],
   "transitions": [
     {
-      "id": "preflight-to-form-check",
+      "id": "preflight-to-platform-page",
       "from": "local_preflight_passed",
+      "to": "platform_page_active",
+      "variant": "emphasis"
+    },
+    {
+      "id": "platform-page-to-form-check",
+      "from": "platform_page_active",
       "to": "platform_form_verified",
       "variant": "emphasis"
     },
     {
-      "id": "preflight-to-formal",
-      "from": "local_preflight_passed",
+      "id": "platform-page-to-formal",
+      "from": "platform_page_active",
       "to": "final_action_triggered",
+      "variant": "security"
+    },
+    {
+      "id": "platform-page-to-verification",
+      "from": "platform_page_active",
+      "to": "waiting_user_verification",
       "variant": "security",
       "route": "straight"
     },
     {
-      "id": "preflight-to-verification",
-      "from": "local_preflight_passed",
-      "to": "waiting_user_verification",
-      "variant": "security"
+      "id": "verification-completed",
+      "from": "waiting_user_verification",
+      "to": "platform_page_active",
+      "label": "验证完成，同页继续",
+      "labelAt": [395, 365],
+      "variant": "emphasis",
+      "route": "straight"
     },
     {
       "id": "verification-expired",
@@ -208,7 +233,7 @@
       "items": [
         "Post 前 lease expiry 进入 failed_before_final_action",
         "Post 后 lease expiry 进入 ambiguous，只允许只读核对",
-        "人工验证完成后续跑同一页面；图中省略重复上传路径",
+        "人工验证完成后返回 platform_page_active，在同一 Playwright 页面继续",
         "final_action_triggered 之后没有返回自动 retry / preflight 的迁移"
       ]
     }

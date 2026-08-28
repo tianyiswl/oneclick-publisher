@@ -14,8 +14,8 @@
       {
         "id": "controlled-main-path",
         "label": "受控发布主链",
-        "focus": ["content_ui", "controlled_cli", "controlled_publish", "publish_service", "tiktok_publish_service", "tiktok_uploader", "tiktok_studio"],
-        "note": "内容项目与桌面 UI 进入同一受控 CLI、发布服务和 TikTok 表单实现。"
+        "focus": ["content_ui", "controlled_cli", "controlled_publish", "publish_service", "local_preflight_result", "tiktok_publish_service", "tiktok_uploader", "tiktok_studio"],
+        "note": "本地 preflight 在创建 Playwright 前终止；platform_form_check / formal 才进入 TikTok 浏览器主链。"
       },
       {
         "id": "identity-session-boundary",
@@ -84,7 +84,7 @@
       "id": "tiktok_publish_service",
       "type": "backend",
       "label": "app_core.overseas_tiktok_publish",
-      "sublabel": "preflight / platform_form_check / formal",
+      "sublabel": "仅 platform_form_check / formal",
       "pos": [865, 295],
       "size": [220, 74],
       "tag": "single TikTok path",
@@ -97,7 +97,7 @@
       "id": "tiktok_uploader",
       "type": "backend",
       "label": "uploader.tk_uploader.TiktokVideo",
-      "sublabel": "同一页面：上传、字段、话题、公开范围、Post",
+      "sublabel": "Same Playwright Page：上传、字段、公开范围、Post",
       "pos": [1110, 295],
       "size": [220, 74],
       "sources": [
@@ -156,6 +156,19 @@
       ]
     },
     {
+      "id": "local_preflight_result",
+      "type": "security",
+      "label": "local_preflight_passed",
+      "sublabel": "本地终点：不创建 Playwright",
+      "pos": [865, 505],
+      "size": [220, 70],
+      "tag": "platformWriteOccurred=false",
+      "sources": [
+        {"path": "app_core/controlled_publish.py", "line": 128, "end_line": 180, "label": "本地请求合同"},
+        {"path": "docs/superpowers/specs/2026-08-28-tiktok-controlled-video-publish-design.md", "line": 122, "end_line": 132, "label": "零平台写入边界"}
+      ]
+    },
+    {
       "id": "task_db",
       "type": "database",
       "label": "Task DB",
@@ -185,7 +198,7 @@
     {
       "kind": "region",
       "label": "一键发受控本机边界",
-      "wraps": ["content_ui", "controlled_cli", "controlled_publish", "publish_service", "tiktok_publish_service", "tiktok_uploader", "account_db", "identity_reader", "session_file", "task_db"],
+      "wraps": ["content_ui", "controlled_cli", "controlled_publish", "publish_service", "tiktok_publish_service", "tiktok_uploader", "account_db", "identity_reader", "session_file", "local_preflight_result", "task_db"],
       "pad": 18
     },
     {
@@ -205,7 +218,8 @@
     {"id": "content-to-cli", "from": "content_ui", "to": "controlled_cli", "label": "manifest + accountId", "variant": "emphasis", "labelDy": -32},
     {"id": "cli-to-contract", "from": "controlled_cli", "to": "controlled_publish", "label": "受控 request JSON", "variant": "security", "labelDy": 62},
     {"id": "contract-to-service", "from": "controlled_publish", "to": "publish_service", "label": "快照 + 一次性授权", "variant": "security", "labelDy": -32},
-    {"id": "service-to-tiktok", "from": "publish_service", "to": "tiktok_publish_service", "label": "本地预检 / 表单检查 / 正式执行", "variant": "emphasis", "labelDy": 62},
+    {"id": "service-to-preflight-result", "from": "publish_service", "to": "local_preflight_result", "label": "preflight：本地只读后终止", "variant": "dashed", "labelDy": 25},
+    {"id": "service-to-tiktok", "from": "publish_service", "to": "tiktok_publish_service", "label": "platform_form_check / formal", "variant": "emphasis", "labelDx": 90, "labelDy": 62},
     {"id": "tiktok-to-uploader", "from": "tiktok_publish_service", "to": "tiktok_uploader", "label": "同一字段与回读实现", "variant": "emphasis", "labelDy": -32},
     {"id": "uploader-to-studio", "from": "tiktok_uploader", "to": "tiktok_studio", "label": "Playwright：upload / readback / one Post", "variant": "emphasis", "labelDy": 62},
     {"id": "account-to-identity", "from": "account_db", "to": "identity_reader", "label": "saved accountReference", "variant": "security", "labelDy": -30},
@@ -213,7 +227,8 @@
     {"id": "identity-to-tiktok", "from": "identity_reader", "to": "tiktok_publish_service", "label": "matched public handle", "variant": "security", "labelDy": 25},
     {"id": "session-to-uploader", "from": "session_file", "to": "tiktok_uploader", "label": "private session only", "variant": "security", "labelDy": 25},
     {"id": "service-to-task-db", "from": "publish_service", "to": "task_db", "label": "events / receipts / heartbeat", "variant": "dashed", "labelDy": 25},
-    {"id": "uploader-to-verification", "from": "tiktok_uploader", "to": "user_verification", "label": "同一 Playwright 页面双向等待", "variant": "security", "labelDy": 25}
+    {"id": "uploader-to-verification", "from": "tiktok_uploader", "to": "user_verification", "label": "触发验证：同一页面等待", "variant": "security", "labelDx": -80, "labelDy": 25},
+    {"id": "verification-to-uploader", "from": "user_verification", "to": "tiktok_uploader", "label": "验证完成：同页继续", "variant": "security", "labelDx": 70, "labelDy": -25}
   ],
   "cards": [
     {
@@ -221,7 +236,7 @@
       "title": "首轮范围",
       "items": [
         "单 TikTok 账号、单本地视频、立即公开",
-        "默认 preflight 只读本地 manifest、账号记录和素材，不创建 Playwright",
+        "默认 preflight 只读本地 manifest、账号记录和素材，在 local_preflight_passed 终止，不创建 Playwright",
         "内容项目与 Desktop UI 共用 Controlled CLI 和 Publish Service"
       ]
     },
