@@ -3,19 +3,32 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
+import queue
+import sqlite3
 import stat
 import tempfile
 import threading
+import time
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
+
+from app_core import account_service
+from app_core.overseas_tiktok_identity import TikTokIdentity, TikTokIdentityError
 
 from app_core.overseas_tiktok_system_login import (
     SystemBrowserSpec,
     TikTokLoginAttempt,
+    TikTokLoginCandidate,
+    TikTokSystemBrowserLoginSession,
     TikTokSystemLoginError,
     build_system_browser_command,
+    collect_validated_tiktok_candidate,
+    commit_tiktok_login_candidate,
     create_login_attempt,
     find_system_browser,
     recover_stale_tiktok_login_attempts,
@@ -23,6 +36,100 @@ from app_core.overseas_tiktok_system_login import (
     wait_for_browser_exit,
     wait_for_profile_release,
 )
+
+
+class _FakePage:
+    def __init__(self, *, close_error: Exception | None = None) -> None:
+        self.close_error = close_error
+        self.goto_calls: list[tuple[str, str, int]] = []
+        self.close_calls = 0
+
+    async def goto(self, url: str, *, wait_until: str, timeout: int) -> None:
+        self.goto_calls.append((url, wait_until, timeout))
+
+    async def close(self) -> None:
+        self.close_calls += 1
+        if self.close_error is not None:
+            raise self.close_error
+
+
+class _FakePersistentContext:
+    def __init__(self, page: _FakePage, storage_state: dict) -> None:
+        self.page = page
+        self.raw_storage_state = storage_state
+        self.close_calls = 0
+        self.close_error: Exception | None = None
+
+    async def new_page(self) -> _FakePage:
+        return self.page
+
+    async def storage_state(self) -> dict:
+        return self.raw_storage_state
+
+    async def close(self) -> None:
+        self.close_calls += 1
+        if self.close_error is not None:
+            raise self.close_error
+
+
+class _FakeBlankContext:
+    def __init__(self, page: _FakePage, storage_state_input: dict) -> None:
+        self.page = page
+        self.storage_state_input = storage_state_input
+        self.close_calls = 0
+
+    async def new_page(self) -> _FakePage:
+        return self.page
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+
+class _FakeVerifierBrowser:
+    def __init__(self, page: _FakePage) -> None:
+        self.page = page
+        self.blank_context: _FakeBlankContext | None = None
+        self.close_calls = 0
+
+    async def new_context(self, *, storage_state: dict) -> _FakeBlankContext:
+        self.blank_context = _FakeBlankContext(self.page, storage_state)
+        return self.blank_context
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+
+class _FakeChromium:
+    def __init__(
+        self,
+        persistent: _FakePersistentContext,
+        verifier: _FakeVerifierBrowser,
+    ) -> None:
+        self.persistent = persistent
+        self.verifier = verifier
+        self.persistent_kwargs: dict | None = None
+
+    async def launch_persistent_context(self, **kwargs) -> _FakePersistentContext:
+        self.persistent_kwargs = kwargs
+        return self.persistent
+
+    async def launch(self, *, headless: bool) -> _FakeVerifierBrowser:
+        if headless is not True:
+            raise AssertionError("verification browser must be headless")
+        return self.verifier
+
+
+class _FakePlaywrightManager:
+    def __init__(self, chromium: _FakeChromium) -> None:
+        self.chromium = chromium
+        self.exit_error: Exception | None = None
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, _exc_type, _exc, _tb) -> None:
+        if self.exit_error is not None:
+            raise self.exit_error
 
 
 class FakeProcess:
@@ -347,6 +454,532 @@ class TikTokSystemLoginTests(unittest.TestCase):
 
         self.assertFalse(released)
         self.assertTrue(os.path.lexists(lock))
+
+
+class TikTokCandidateIntakeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.root = Path(self.temp_dir.name).resolve()
+        self.attempt = create_login_attempt(self.root / "user-data")
+        self.browser = SystemBrowserSpec("Chrome", self.root / "chrome")
+        self.raw_state = {
+            "cookies": [
+                {"name": "sessionid", "value": "secret", "domain": ".tiktok.com"},
+                {"name": "SID", "value": "google-secret", "domain": ".google.com"},
+            ],
+            "origins": [
+                {"origin": "https://www.tiktok.com", "localStorage": []},
+                {"origin": "https://accounts.google.com", "localStorage": []},
+            ],
+        }
+        self.first_page = _FakePage()
+        self.second_page = _FakePage()
+        self.fake_persistent = _FakePersistentContext(self.first_page, self.raw_state)
+        self.fake_verifier = _FakeVerifierBrowser(self.second_page)
+        self.fake_chromium = _FakeChromium(self.fake_persistent, self.fake_verifier)
+        self.fake_playwright = _FakePlaywrightManager(self.fake_chromium)
+        self.fake_playwright_factory = lambda: self.fake_playwright
+        self.fake_identity_reads: list[str] = []
+
+    def _collect(self, *results: TikTokIdentity | Exception) -> TikTokLoginCandidate:
+        remaining = list(results) or [
+            TikTokIdentity(
+                "expected.user",
+                "Expected",
+                "https://www.tiktok.com/@expected.user",
+            ),
+            TikTokIdentity(
+                "expected.user",
+                "Expected",
+                "https://www.tiktok.com/@expected.user",
+            ),
+        ]
+
+        async def read_identity(_page):
+            result = remaining.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            self.fake_identity_reads.append(result.handle)
+            return result
+
+        with patch(
+            "app_core.overseas_tiktok_system_login.read_tiktok_identity",
+            new=read_identity,
+        ):
+            return asyncio.run(
+                collect_validated_tiktok_candidate(
+                    self.attempt,
+                    self.browser,
+                    playwright_factory=self.fake_playwright_factory,
+                )
+            )
+
+    def test_candidate_is_revalidated_in_a_blank_context_with_sanitized_state(self):
+        candidate = self._collect()
+
+        self.assertEqual(candidate.identity.handle, "expected.user")
+        blank = self.fake_verifier.blank_context
+        self.assertIsNotNone(blank)
+        self.assertEqual(
+            blank.storage_state_input["cookies"][0]["domain"],
+            ".tiktok.com",
+        )
+        self.assertNotIn("google.com", repr(blank.storage_state_input))
+        self.assertNotIn("accounts.google.com", repr(candidate.storage_state))
+        self.assertEqual(self.fake_identity_reads, ["expected.user", "expected.user"])
+        self.assertEqual(self.first_page.close_calls, 1)
+        self.assertEqual(self.second_page.close_calls, 1)
+        self.assertGreaterEqual(self.fake_persistent.close_calls, 1)
+        self.assertEqual(self.fake_verifier.close_calls, 1)
+
+    def test_candidate_rejects_state_without_a_tiktok_cookie(self):
+        self.fake_persistent.raw_storage_state = {
+            "cookies": [{"name": "SID", "value": "secret", "domain": ".google.com"}],
+            "origins": [],
+        }
+
+        with self.assertRaises(TikTokSystemLoginError) as raised:
+            self._collect()
+
+        self.assertEqual(raised.exception.error_code, "tiktok_session_missing")
+        self.assertNotIn("secret", raised.exception.public_message)
+
+    def test_candidate_rejects_first_and_blank_context_handle_mismatch(self):
+        with self.assertRaises(TikTokSystemLoginError) as raised:
+            self._collect(
+                TikTokIdentity("first.user", "First", "https://www.tiktok.com/@first.user"),
+                TikTokIdentity("second.user", "Second", "https://www.tiktok.com/@second.user"),
+            )
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "tiktok_account_identity_mismatch",
+        )
+
+    def test_candidate_translates_blank_context_login_rejection_to_expired(self):
+        with self.assertRaises(TikTokSystemLoginError) as raised:
+            self._collect(
+                TikTokIdentity(
+                    "expected.user", "Expected", "https://www.tiktok.com/@expected.user"
+                ),
+                TikTokIdentityError(
+                    "tiktok_account_invalid",
+                    "TikTok page has no unique account",
+                ),
+            )
+
+        self.assertEqual(raised.exception.error_code, "tiktok_session_expired")
+
+    def test_candidate_translates_ambiguous_identity_to_public_invalid_code(self):
+        with self.assertRaises(TikTokSystemLoginError) as raised:
+            self._collect(
+                TikTokIdentityError(
+                    "tiktok_account_identity_ambiguous",
+                    "conflicting public handles",
+                )
+            )
+
+        self.assertEqual(raised.exception.error_code, "tiktok_account_invalid")
+
+    def test_candidate_rejects_a_profile_that_is_still_locked(self):
+        (self.attempt.profile_dir / "SingletonLock").touch()
+
+        with self.assertRaises(TikTokSystemLoginError) as raised:
+            self._collect()
+
+        self.assertEqual(raised.exception.error_code, "tiktok_login_profile_busy")
+        self.assertIsNone(self.fake_chromium.persistent_kwargs)
+
+    def test_candidate_does_not_return_success_when_playwright_close_fails(self):
+        self.fake_persistent.close_error = RuntimeError("close failed")
+
+        with self.assertRaises(TikTokSystemLoginError) as raised:
+            self._collect()
+
+        self.assertEqual(raised.exception.error_code, "tiktok_login_profile_busy")
+        self.assertNotIn("close failed", raised.exception.public_message)
+
+
+class TikTokCandidateCommitTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.root = Path(self.temp_dir.name).resolve()
+        self.cookie_dir = self.root / "cookies"
+        self.cookie_dir.mkdir()
+        self.candidate = TikTokLoginCandidate(
+            {
+                "cookies": [
+                    {"name": "sessionid", "value": "secret", "domain": ".tiktok.com"}
+                ],
+                "origins": [
+                    {"origin": "https://www.tiktok.com", "localStorage": []}
+                ],
+            },
+            TikTokIdentity(
+                "expected.user", "Expected", "https://www.tiktok.com/@expected.user"
+            ),
+        )
+        self.old_cookie = self.cookie_dir / "old.json"
+        self.old_cookie.write_text('{"cookies": [], "origins": []}', encoding="utf-8")
+        self.old_account = {
+            "id": 7,
+            "type": 6,
+            "filePath": self.old_cookie.name,
+            "userName": "Expected",
+            "status": 1,
+            "profileName": "TikTok 测试",
+            "remark": "",
+            "lastCheckedAt": "2026-08-27 12:00:00",
+            "lastLoginAt": "2026-08-27 12:00:00",
+            "authMode": "browser",
+            "accountReference": "expected.user",
+        }
+
+    def _install_database(self) -> Path:
+        database = self.root / "accounts.db"
+        connection = sqlite3.connect(database)
+        connection.execute(
+            """
+            CREATE TABLE user_info (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                type INTEGER NOT NULL,
+                filePath TEXT NOT NULL,
+                userName TEXT NOT NULL,
+                status INTEGER DEFAULT 0,
+                profileName TEXT,
+                avatarPath TEXT,
+                avatarUpdatedAt TEXT,
+                remark TEXT,
+                lastCheckedAt TEXT,
+                lastLoginAt TEXT,
+                authMode TEXT NOT NULL DEFAULT 'browser',
+                accountReference TEXT,
+                oauthScopeVersion INTEGER NOT NULL DEFAULT 1
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO user_info
+                (id, type, filePath, userName, status, profileName, remark,
+                 lastCheckedAt, lastLoginAt, authMode, accountReference)
+            VALUES
+                (:id, :type, :filePath, :userName, :status, :profileName, :remark,
+                 :lastCheckedAt, :lastLoginAt, :authMode, :accountReference)
+            """,
+            self.old_account,
+        )
+        connection.commit()
+        connection.close()
+
+        @contextmanager
+        def connect_database():
+            connection = sqlite3.connect(database)
+            connection.row_factory = sqlite3.Row
+            try:
+                with connection:
+                    yield connection
+            finally:
+                connection.close()
+
+        patcher = patch.object(account_service, "connect", connect_database)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return database
+
+    def test_atomic_commit_writes_only_sanitized_json_with_private_permissions(self):
+        candidate = TikTokLoginCandidate(
+            {
+                "cookies": self.candidate.storage_state["cookies"]
+                + [{"name": "SID", "value": "foreign", "domain": ".google.com"}],
+                "origins": self.candidate.storage_state["origins"]
+                + [{"origin": "https://accounts.google.com", "localStorage": []}],
+            },
+            self.candidate.identity,
+        )
+        saver = Mock(return_value=11)
+
+        account_id = commit_tiktok_login_candidate(
+            candidate,
+            "TikTok 测试",
+            record_id=None,
+            existing_account=None,
+            cookie_dir=self.cookie_dir,
+            account_saver=saver,
+        )
+
+        self.assertEqual(account_id, 11)
+        files = sorted(self.cookie_dir.glob("*.json"))
+        self.assertEqual(len(files), 2)
+        new_file = next(path for path in files if path != self.old_cookie)
+        persisted = json.loads(new_file.read_text(encoding="utf-8"))
+        self.assertEqual(set(persisted), {"cookies", "origins"})
+        self.assertNotIn("google.com", repr(persisted))
+        self.assertEqual(list(self.cookie_dir.glob("*.tmp")), [])
+        if os.name == "posix":
+            self.assertEqual(stat.S_IMODE(new_file.stat().st_mode), 0o600)
+        saver.assert_called_once()
+
+    def test_database_failure_removes_new_session_and_preserves_old_account(self):
+        with self.assertRaises(TikTokSystemLoginError) as raised:
+            commit_tiktok_login_candidate(
+                self.candidate,
+                "TikTok 测试",
+                record_id=7,
+                existing_account=self.old_account,
+                cookie_dir=self.cookie_dir,
+                account_saver=Mock(side_effect=RuntimeError("db unavailable")),
+            )
+
+        self.assertEqual(raised.exception.error_code, "tiktok_login_commit_failed")
+        self.assertEqual(list(self.cookie_dir.glob("*.json")), [self.old_cookie])
+
+    def test_successful_update_repoints_row_before_removing_unreferenced_old_file(self):
+        database = self._install_database()
+
+        account_id = commit_tiktok_login_candidate(
+            self.candidate,
+            "TikTok 测试",
+            record_id=7,
+            existing_account=self.old_account,
+            cookie_dir=self.cookie_dir,
+        )
+
+        connection = sqlite3.connect(database)
+        row = connection.execute(
+            "SELECT id, filePath, accountReference FROM user_info WHERE id = 7"
+        ).fetchone()
+        connection.close()
+        self.assertEqual(account_id, 7)
+        self.assertNotEqual(row[1], self.old_cookie.name)
+        self.assertEqual(row[2], "expected.user")
+        self.assertTrue((self.cookie_dir / row[1]).is_file())
+        self.assertFalse(self.old_cookie.exists())
+
+    def test_concurrent_update_rejection_removes_candidate_and_preserves_current_row_file(self):
+        database = self._install_database()
+        connection = sqlite3.connect(database)
+        connection.execute("UPDATE user_info SET remark = 'concurrent' WHERE id = 7")
+        connection.commit()
+        connection.close()
+
+        with self.assertRaises(TikTokSystemLoginError) as raised:
+            commit_tiktok_login_candidate(
+                self.candidate,
+                "TikTok 测试",
+                record_id=7,
+                existing_account=self.old_account,
+                cookie_dir=self.cookie_dir,
+            )
+
+        self.assertEqual(raised.exception.error_code, "tiktok_login_commit_failed")
+        connection = sqlite3.connect(database)
+        row = connection.execute(
+            "SELECT filePath, remark FROM user_info WHERE id = 7"
+        ).fetchone()
+        connection.close()
+        self.assertEqual(row, ("old.json", "concurrent"))
+        self.assertEqual(list(self.cookie_dir.glob("*.json")), [self.old_cookie])
+
+
+class TikTokPublicLoginSessionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.root = Path(self.temp_dir.name).resolve()
+        self.attempt = create_login_attempt(self.root / "user-data")
+        self.browser = SystemBrowserSpec("Chrome", self.root / "chrome")
+        self.process = FakeProcess([0])
+        self.candidate = TikTokLoginCandidate(
+            {
+                "cookies": [{"name": "sessionid", "value": "secret", "domain": ".tiktok.com"}],
+                "origins": [],
+            },
+            TikTokIdentity(
+                "expected.user", "Expected", "https://www.tiktok.com/@expected.user"
+            ),
+        )
+
+    def _session(self, **kwargs) -> TikTokSystemBrowserLoginSession:
+        return TikTokSystemBrowserLoginSession(
+            "TikTok 测试",
+            timeout_seconds=0.01,
+            user_data_dir=self.root / "user-data",
+            cookie_dir=self.root / "cookies",
+            process_factory=kwargs.pop("process_factory", Mock(return_value=self.process)),
+            **kwargs,
+        )
+
+    @staticmethod
+    def _messages(session: TikTokSystemBrowserLoginSession) -> list[str]:
+        messages: list[str] = []
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            try:
+                message = session.queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            messages.append(message)
+            if message == "CANCELLED" or message.startswith(("ACCOUNT_SAVED:", "ERROR:")):
+                return messages
+        raise AssertionError(f"session did not reach a terminal message: {messages}")
+
+    def test_success_protocol_cleans_staging_before_committing_account(self):
+        order: list[str] = []
+        session = self._session()
+
+        async def collect(_attempt, _browser):
+            order.append("validated")
+            return self.candidate
+
+        def cleanup(_attempt_root, _staging_root):
+            order.append("cleaned")
+
+        def commit(*_args, **_kwargs):
+            order.append("committed")
+            return 23
+
+        with (
+            patch("app_core.overseas_tiktok_system_login.create_login_attempt", return_value=self.attempt),
+            patch("app_core.overseas_tiktok_system_login.find_system_browser", return_value=self.browser),
+            patch("app_core.overseas_tiktok_system_login.wait_for_profile_release", return_value=True),
+            patch("app_core.overseas_tiktok_system_login.collect_validated_tiktok_candidate", new=collect),
+            patch("app_core.overseas_tiktok_system_login.remove_login_attempt", side_effect=cleanup),
+            patch("app_core.overseas_tiktok_system_login.commit_tiktok_login_candidate", side_effect=commit),
+        ):
+            session.start()
+            messages = self._messages(session)
+
+        self.assertEqual(
+            messages,
+            [
+                "OPENING_SYSTEM_BROWSER",
+                "SYSTEM_BROWSER_OPENED",
+                "WAITING_BROWSER_EXIT",
+                "VALIDATING_TIKTOK_SESSION",
+                "CLEANING_LOGIN_ATTEMPT",
+                "ACCOUNT_SAVED:23",
+            ],
+        )
+        self.assertEqual(order, ["validated", "cleaned", "committed"])
+        self.assertIsNone(session.last_error_code)
+
+    def test_update_mode_rejects_a_different_handle_before_commit(self):
+        old_account = {"id": 7, "type": 6, "accountReference": "saved.user"}
+        session = self._session(update_mode=True, record_id=7, existing_account=old_account)
+        commit = Mock(return_value=7)
+
+        with (
+            patch("app_core.overseas_tiktok_system_login.create_login_attempt", return_value=self.attempt),
+            patch("app_core.overseas_tiktok_system_login.find_system_browser", return_value=self.browser),
+            patch("app_core.overseas_tiktok_system_login.wait_for_profile_release", return_value=True),
+            patch("app_core.overseas_tiktok_system_login.collect_validated_tiktok_candidate", new=AsyncMock(return_value=self.candidate)),
+            patch("app_core.overseas_tiktok_system_login.remove_login_attempt"),
+            patch("app_core.overseas_tiktok_system_login.commit_tiktok_login_candidate", commit),
+        ):
+            session.start()
+            messages = self._messages(session)
+
+        self.assertEqual(messages[-2:], ["CLEANING_LOGIN_ATTEMPT", "ERROR:tiktok_account_identity_mismatch"])
+        self.assertEqual(session.last_error_code, "tiktok_account_identity_mismatch")
+        commit.assert_not_called()
+
+    def test_timeout_reaches_error_only_after_owned_attempt_cleanup(self):
+        session = self._session()
+        cleaned = threading.Event()
+
+        def cleanup(_attempt_root, _staging_root):
+            cleaned.set()
+
+        with (
+            patch("app_core.overseas_tiktok_system_login.create_login_attempt", return_value=self.attempt),
+            patch("app_core.overseas_tiktok_system_login.find_system_browser", return_value=self.browser),
+            patch("app_core.overseas_tiktok_system_login.wait_for_browser_exit", return_value="timeout"),
+            patch("app_core.overseas_tiktok_system_login.remove_login_attempt", side_effect=cleanup),
+        ):
+            session.start()
+            messages = self._messages(session)
+
+        self.assertTrue(cleaned.is_set())
+        self.assertEqual(messages[-2:], ["CLEANING_LOGIN_ATTEMPT", "ERROR:tiktok_login_attempt_timeout"])
+        self.assertEqual(session.last_error_code, "tiktok_login_attempt_timeout")
+
+    def test_cleanup_failure_takes_precedence_over_validation_failure(self):
+        session = self._session()
+        with (
+            patch("app_core.overseas_tiktok_system_login.create_login_attempt", return_value=self.attempt),
+            patch("app_core.overseas_tiktok_system_login.find_system_browser", return_value=self.browser),
+            patch("app_core.overseas_tiktok_system_login.wait_for_profile_release", return_value=True),
+            patch(
+                "app_core.overseas_tiktok_system_login.collect_validated_tiktok_candidate",
+                new=AsyncMock(
+                    side_effect=TikTokSystemLoginError(
+                        "tiktok_session_expired", "TikTok 登录已失效"
+                    )
+                ),
+            ),
+            patch(
+                "app_core.overseas_tiktok_system_login.remove_login_attempt",
+                side_effect=TikTokSystemLoginError(
+                    "tiktok_login_cleanup_failed", "cleanup failed"
+                ),
+            ),
+        ):
+            session.start()
+            messages = self._messages(session)
+
+        self.assertEqual(messages[-2:], ["CLEANING_LOGIN_ATTEMPT", "ERROR:tiktok_login_cleanup_failed"])
+        self.assertEqual(session.last_error_code, "tiktok_login_cleanup_failed")
+
+    def test_cancel_stops_owned_process_and_cleans_before_terminal_message(self):
+        process = FakeProcess([None])
+        session = self._session(process_factory=Mock(return_value=process))
+        removed = threading.Event()
+
+        def cleanup(_attempt_root, _staging_root):
+            removed.set()
+
+        with (
+            patch("app_core.overseas_tiktok_system_login.create_login_attempt", return_value=self.attempt),
+            patch("app_core.overseas_tiktok_system_login.find_system_browser", return_value=self.browser),
+            patch("app_core.overseas_tiktok_system_login.remove_login_attempt", side_effect=cleanup),
+        ):
+            session.cancel()
+            session.start()
+            messages = self._messages(session)
+
+        self.assertTrue(removed.is_set())
+        self.assertEqual(process.terminate_calls, 1)
+        self.assertEqual(messages[-2:], ["CLEANING_LOGIN_ATTEMPT", "CANCELLED"])
+        self.assertEqual(session.last_error_code, "tiktok_login_cancelled")
+
+    def test_cancel_after_process_exit_cleans_without_starting_playwright(self):
+        session = self._session()
+        collector = AsyncMock(return_value=self.candidate)
+        with (
+            patch("app_core.overseas_tiktok_system_login.create_login_attempt", return_value=self.attempt),
+            patch("app_core.overseas_tiktok_system_login.find_system_browser", return_value=self.browser),
+            patch("app_core.overseas_tiktok_system_login.collect_validated_tiktok_candidate", collector),
+            patch("app_core.overseas_tiktok_system_login.remove_login_attempt"),
+        ):
+            session.cancel()
+            session.start()
+            messages = self._messages(session)
+
+        self.assertEqual(messages[-2:], ["CLEANING_LOGIN_ATTEMPT", "CANCELLED"])
+        collector.assert_not_awaited()
+
+    def test_manual_save_is_disabled_with_a_plain_language_message(self):
+        session = self._session()
+
+        session.save()
+
+        self.assertFalse(session.manual_save_supported)
+        message = session.queue.get_nowait()
+        self.assertIn("自动保存", message)
+        self.assertNotIn("Cookie", message)
 
 
 if __name__ == "__main__":

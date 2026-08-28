@@ -8,7 +8,10 @@ system browser, and offers bounded lifecycle helpers for the caller.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
+import queue
 import re
 import shutil
 import stat
@@ -20,13 +23,29 @@ import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Callable
 
-from app_core.paths import USER_DATA_DIR
+from playwright.async_api import async_playwright
+
+from app_core import account_service
+from app_core.overseas_tiktok_identity import (
+    TikTokIdentity,
+    TikTokIdentityError,
+    normalize_tiktok_handle,
+    read_tiktok_identity,
+    validate_identity_binding,
+)
+from app_core.overseas_tiktok_session_scope import (
+    TikTokSessionScopeError,
+    sanitize_tiktok_storage_state,
+)
+from app_core.paths import COOKIE_DIR, USER_DATA_DIR
 
 
 _ATTEMPT_ID = re.compile(r"[0-9a-f]{32}\Z")
 _PROFILE_LOCK_NAMES = ("SingletonLock", "SingletonCookie", "SingletonSocket")
 _TIKTOK_LOGIN_URL = "https://www.tiktok.com/login"
+TIKTOK_STUDIO_URL = "https://www.tiktok.com/tiktokstudio/upload?lang=en"
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +64,14 @@ class TikTokLoginAttempt:
     staging_root: Path
     attempt_root: Path
     profile_dir: Path
+
+
+@dataclass(frozen=True, slots=True)
+class TikTokLoginCandidate:
+    """Sanitized TikTok-only state bound to one twice-read public identity."""
+
+    storage_state: dict[str, list[dict[str, Any]]]
+    identity: TikTokIdentity
 
 
 class TikTokSystemLoginError(RuntimeError):
@@ -399,3 +426,447 @@ def wait_for_profile_release(
         if remaining <= 0:
             return False
         time.sleep(min(interval, remaining))
+
+
+def _profile_busy() -> TikTokSystemLoginError:
+    return TikTokSystemLoginError(
+        "tiktok_login_profile_busy", "TikTok 临时登录资料仍被浏览器占用"
+    )
+
+
+def _translate_identity_error(error: TikTokIdentityError) -> TikTokSystemLoginError:
+    code = str(error.error_code or "tiktok_account_invalid")
+    if code == "tiktok_account_identity_ambiguous":
+        return TikTokSystemLoginError(
+            "tiktok_account_invalid", "TikTok 未返回唯一可核对账号"
+        )
+    if code == "tiktok_account_invalid":
+        return TikTokSystemLoginError(
+            "tiktok_session_expired", "TikTok 登录状态已失效"
+        )
+    if code == "tiktok_account_identity_mismatch":
+        return TikTokSystemLoginError(
+            code, "当前 TikTok 账号与原记录不一致"
+        )
+    return TikTokSystemLoginError(
+        "tiktok_account_invalid", "TikTok 未返回唯一可核对账号"
+    )
+
+
+async def _close_playwright_resources(*resources) -> bool:
+    close_failed = False
+    for resource in resources:
+        if resource is None:
+            continue
+        try:
+            await resource.close()
+        except Exception:
+            close_failed = True
+    return close_failed
+
+
+async def collect_validated_tiktok_candidate(
+    attempt: TikTokLoginAttempt,
+    browser: SystemBrowserSpec,
+    *,
+    playwright_factory=async_playwright,
+) -> TikTokLoginCandidate:
+    """Read one dedicated profile, then prove it in a blank TikTok-only context."""
+
+    if not wait_for_profile_release(attempt, timeout_seconds=0.0):
+        raise _profile_busy()
+
+    persistent = None
+    first_page = None
+    verifier = None
+    blank = None
+    second_page = None
+    close_failed = False
+    try:
+        try:
+            manager = playwright_factory()
+            async with manager as playwright:
+                try:
+                    persistent = await playwright.chromium.launch_persistent_context(
+                        user_data_dir=str(attempt.profile_dir),
+                        executable_path=str(browser.executable),
+                        headless=True,
+                        args=["--profile-directory=Default"],
+                    )
+                except Exception as exc:
+                    raise _profile_busy() from exc
+
+                first_page = await persistent.new_page()
+                await first_page.goto(
+                    TIKTOK_STUDIO_URL,
+                    wait_until="domcontentloaded",
+                    timeout=45_000,
+                )
+                first_identity = await read_tiktok_identity(first_page)
+                sanitized = sanitize_tiktok_storage_state(
+                    await persistent.storage_state()
+                )
+
+                if await _close_playwright_resources(first_page):
+                    raise _profile_busy()
+                first_page = None
+                if await _close_playwright_resources(persistent):
+                    raise _profile_busy()
+                persistent = None
+
+                verifier = await playwright.chromium.launch(headless=True)
+                blank = await verifier.new_context(storage_state=sanitized)
+                second_page = await blank.new_page()
+                await second_page.goto(
+                    TIKTOK_STUDIO_URL,
+                    wait_until="domcontentloaded",
+                    timeout=45_000,
+                )
+                second_identity = await read_tiktok_identity(second_page)
+                first_handle = normalize_tiktok_handle(first_identity.handle)
+                second_handle = normalize_tiktok_handle(second_identity.handle)
+                if not first_handle or first_handle != second_handle:
+                    raise TikTokSystemLoginError(
+                        "tiktok_account_identity_mismatch",
+                        "TikTok 两次账号回读不一致",
+                    )
+                if await _close_playwright_resources(
+                    second_page,
+                    blank,
+                    verifier,
+                ):
+                    raise _profile_busy()
+                second_page = None
+                blank = None
+                verifier = None
+                candidate = TikTokLoginCandidate(sanitized, second_identity)
+        except TikTokSystemLoginError:
+            raise
+        except TikTokSessionScopeError as exc:
+            raise TikTokSystemLoginError(
+                exc.error_code,
+                exc.public_message,
+            ) from exc
+        except TikTokIdentityError as exc:
+            raise _translate_identity_error(exc) from exc
+        except Exception as exc:
+            raise TikTokSystemLoginError(
+                "tiktok_session_expired", "TikTok 登录状态已失效"
+            ) from exc
+    finally:
+        close_failed = await _close_playwright_resources(
+            second_page,
+            blank,
+            verifier,
+            first_page,
+            persistent,
+        )
+    if close_failed:
+        raise _profile_busy()
+    return candidate
+
+
+def _remove_file_safely(path: Path | None) -> None:
+    if path is None:
+        return
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _write_atomic_tiktok_state(
+    storage_state: Mapping[str, Any],
+    cookie_dir: Path,
+) -> tuple[str, Path]:
+    try:
+        sanitized = sanitize_tiktok_storage_state(storage_state)
+    except TikTokSessionScopeError as exc:
+        raise TikTokSystemLoginError(exc.error_code, exc.public_message) from exc
+
+    root = _absolute_path(Path(cookie_dir))
+    temporary: Path | None = None
+    final: Path | None = None
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        if root.is_symlink() or not root.is_dir():
+            raise OSError("unsafe cookie directory")
+        basename = f"{uuid.uuid4().hex}.json"
+        temporary = root / f".{basename}.tmp"
+        final = root / basename
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(temporary, flags, 0o600)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+                descriptor = -1
+                json.dump(
+                    sanitized,
+                    output,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                output.flush()
+                os.fsync(output.fileno())
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        if os.name == "posix":
+            temporary.chmod(0o600)
+        os.replace(temporary, final)
+        temporary = None
+        return basename, final
+    except Exception as exc:
+        _remove_file_safely(temporary)
+        _remove_file_safely(final)
+        raise TikTokSystemLoginError(
+            "tiktok_login_commit_failed", "TikTok 会话未能安全写入账号库"
+        ) from exc
+
+
+def _delete_replaced_tiktok_session_if_unreferenced(
+    *,
+    account_id: int,
+    new_basename: str,
+    old_basename: str,
+    cookie_dir: Path,
+) -> None:
+    if not old_basename or old_basename == new_basename:
+        return
+    try:
+        with account_service.connect() as conn:
+            current = conn.execute(
+                "SELECT type, filePath FROM user_info WHERE id = ?",
+                (int(account_id),),
+            ).fetchone()
+            old_references = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM user_info WHERE type = 6 AND filePath = ?",
+                    (old_basename,),
+                ).fetchone()[0]
+            )
+        if (
+            current
+            and int(current["type"] or 0) == 6
+            and Path(str(current["filePath"] or "")).name == new_basename
+            and old_references == 0
+        ):
+            _remove_file_safely(_absolute_path(Path(cookie_dir)) / old_basename)
+    except Exception:
+        # The new row/file are already committed.  If the reference check cannot
+        # be proven, preserve the old file instead of risking a live session.
+        return
+
+
+def commit_tiktok_login_candidate(
+    candidate: TikTokLoginCandidate,
+    profile_name: str,
+    *,
+    record_id: int | None,
+    existing_account: Mapping[str, Any] | None,
+    cookie_dir: Path = COOKIE_DIR,
+    account_saver=account_service.save_tiktok_browser_account,
+) -> int:
+    """Atomically replace the session file, compensating any database failure."""
+
+    basename, final_path = _write_atomic_tiktok_state(
+        candidate.storage_state,
+        cookie_dir,
+    )
+    try:
+        account_id = int(
+            account_saver(
+                profile_name=profile_name,
+                storage_file_name=basename,
+                identity=candidate.identity,
+                record_id=record_id,
+                expected_account=existing_account,
+            )
+        )
+        if account_id <= 0:
+            raise ValueError("invalid account id")
+    except Exception as exc:
+        _remove_file_safely(final_path)
+        raise TikTokSystemLoginError(
+            "tiktok_login_commit_failed", "TikTok 会话未能安全写入账号库"
+        ) from exc
+
+    if record_id is not None and existing_account is not None:
+        old_basename = Path(str(existing_account.get("filePath") or "")).name
+        _delete_replaced_tiktok_session_if_unreferenced(
+            account_id=account_id,
+            new_basename=basename,
+            old_basename=old_basename,
+            cookie_dir=cookie_dir,
+        )
+    return account_id
+
+
+class TikTokSystemBrowserLoginSession:
+    """Queue-compatible system-browser login with cleanup-before-commit order."""
+
+    manual_save_supported = False
+
+    def __init__(
+        self,
+        profile_name: str,
+        *,
+        update_mode: bool = False,
+        record_id: int | None = None,
+        existing_account: Mapping[str, Any] | None = None,
+        timeout_seconds: float = 600.0,
+        user_data_dir: Path = USER_DATA_DIR,
+        cookie_dir: Path = COOKIE_DIR,
+        process_factory: Callable[..., subprocess.Popen] = subprocess.Popen,
+    ) -> None:
+        self.profile_name = str(profile_name or "").strip()
+        self.update_mode = bool(update_mode)
+        self.record_id = int(record_id) if record_id is not None else None
+        self.existing_account = (
+            dict(existing_account) if existing_account is not None else None
+        )
+        self.timeout_seconds = float(timeout_seconds)
+        self.user_data_dir = Path(user_data_dir)
+        self.cookie_dir = Path(cookie_dir)
+        self.process_factory = process_factory
+        self.queue: queue.Queue[str] = queue.Queue()
+        self.last_error_code: str | None = None
+        self._cancel_requested = threading.Event()
+        self._owned_process = None
+
+    def start(self) -> None:
+        threading.Thread(
+            target=self.run,
+            daemon=True,
+            name="oneclick-tiktok-system-login",
+        ).start()
+
+    def cancel(self) -> None:
+        self._cancel_requested.set()
+
+    def save(self) -> None:
+        self.queue.put("TikTok 会在完成账号核对后自动保存，不支持手动保存。")
+
+    def _cleanup_attempt(
+        self,
+        attempt: TikTokLoginAttempt | None,
+    ) -> TikTokSystemLoginError | None:
+        if attempt is None:
+            return None
+        self.queue.put("CLEANING_LOGIN_ATTEMPT")
+        try:
+            remove_login_attempt(attempt.attempt_root, attempt.staging_root)
+        except TikTokSystemLoginError:
+            return _cleanup_failed()
+        except Exception:
+            return _cleanup_failed()
+        return None
+
+    def _finish_failure(
+        self,
+        error: TikTokSystemLoginError,
+        attempt: TikTokLoginAttempt | None,
+    ) -> None:
+        cleanup_error = self._cleanup_attempt(attempt)
+        final_error = cleanup_error or error
+        self.last_error_code = final_error.error_code
+        if final_error.error_code == "tiktok_login_cancelled":
+            self.queue.put("CANCELLED")
+        else:
+            self.queue.put(f"ERROR:{final_error.error_code}")
+
+    def run(self) -> int | None:
+        attempt: TikTokLoginAttempt | None = None
+        try:
+            if not self.profile_name:
+                raise TikTokSystemLoginError(
+                    "tiktok_account_invalid", "TikTok 账号主体不能为空"
+                )
+            attempt = create_login_attempt(self.user_data_dir)
+            self.queue.put("OPENING_SYSTEM_BROWSER")
+            browser = find_system_browser()
+            try:
+                self._owned_process = self.process_factory(
+                    build_system_browser_command(browser, attempt)
+                )
+            except Exception as exc:
+                raise _browser_unavailable() from exc
+            self.queue.put("SYSTEM_BROWSER_OPENED")
+            self.queue.put("WAITING_BROWSER_EXIT")
+
+            outcome = wait_for_browser_exit(
+                self._owned_process,
+                self._cancel_requested,
+                timeout_seconds=self.timeout_seconds,
+            )
+            self._owned_process = None
+            if outcome == "cancelled" or self._cancel_requested.is_set():
+                raise TikTokSystemLoginError(
+                    "tiktok_login_cancelled", "TikTok 登录已取消"
+                )
+            if outcome == "timeout":
+                raise TikTokSystemLoginError(
+                    "tiktok_login_attempt_timeout", "等待 TikTok 登录超时"
+                )
+            if not wait_for_profile_release(attempt):
+                raise _profile_busy()
+
+            self.queue.put("VALIDATING_TIKTOK_SESSION")
+            candidate = asyncio.run(
+                collect_validated_tiktok_candidate(attempt, browser)
+            )
+            if self._cancel_requested.is_set():
+                raise TikTokSystemLoginError(
+                    "tiktok_login_cancelled", "TikTok 登录已取消"
+                )
+            if self.update_mode:
+                if self.record_id is None or self.existing_account is None:
+                    raise TikTokSystemLoginError(
+                        "tiktok_account_invalid", "TikTok 账号更新信息不完整"
+                    )
+                validate_identity_binding(
+                    self.existing_account,
+                    candidate.identity,
+                    allow_initial_bind=False,
+                )
+            else:
+                validate_identity_binding(
+                    {"accountReference": ""},
+                    candidate.identity,
+                    allow_initial_bind=True,
+                )
+
+            cleanup_error = self._cleanup_attempt(attempt)
+            if cleanup_error is not None:
+                attempt = None
+                raise cleanup_error
+            attempt = None
+            if self._cancel_requested.is_set():
+                raise TikTokSystemLoginError(
+                    "tiktok_login_cancelled", "TikTok 登录已取消"
+                )
+            account_id = commit_tiktok_login_candidate(
+                candidate,
+                self.profile_name,
+                record_id=self.record_id if self.update_mode else None,
+                existing_account=(
+                    self.existing_account if self.update_mode else None
+                ),
+                cookie_dir=self.cookie_dir,
+            )
+            self.queue.put(f"ACCOUNT_SAVED:{account_id}")
+            self.last_error_code = None
+            return account_id
+        except TikTokIdentityError as exc:
+            self._finish_failure(_translate_identity_error(exc), attempt)
+        except TikTokSystemLoginError as exc:
+            self._finish_failure(exc, attempt)
+        except Exception:
+            self._finish_failure(
+                TikTokSystemLoginError(
+                    "tiktok_session_expired", "TikTok 登录状态已失效"
+                ),
+                attempt,
+            )
+        return None
