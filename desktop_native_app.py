@@ -85,13 +85,14 @@ def run_self_test() -> None:
     print("NATIVE_DESKTOP_SELF_TEST_OK")
 
 
-def create_main_window() -> MainWindow:
+def create_main_window(*, recover_tiktok_attempts: bool = True) -> MainWindow:
     """创建并完成正常桌面端接线。"""
 
-    try:
-        recover_stale_tiktok_login_attempts()
-    except TikTokSystemLoginError as exc:
-        LOGGER.warning("%s", exc.error_code)
+    if recover_tiktok_attempts:
+        try:
+            recover_stale_tiktok_login_attempts()
+        except TikTokSystemLoginError as exc:
+            LOGGER.warning("%s", exc.error_code)
     window = MainWindow()
     window.publish.configure_wechat_draft_queue(WECHAT_DRAFT_BRIDGE_DIR)
     return window
@@ -102,7 +103,7 @@ def run_ui_test() -> None:
     app = QApplication([])
     configure_application(app)
     apply_style(app)
-    window = create_main_window()
+    window = create_main_window(recover_tiktok_attempts=False)
     window.show()
     app.processEvents()
     print("NATIVE_DESKTOP_UI_OK")

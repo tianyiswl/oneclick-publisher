@@ -11,6 +11,29 @@ from app_core.overseas_tiktok_system_login import TikTokSystemLoginError
 
 
 class TikTokLoginStartupWiringTests(unittest.TestCase):
+    def test_ui_test_path_does_not_recover_real_tiktok_staging(self) -> None:
+        app = MagicMock()
+        window = MagicMock()
+        with (
+            patch.object(desktop_native_app, "QApplication", return_value=app),
+            patch.object(desktop_native_app, "configure_application") as configure,
+            patch.object(desktop_native_app, "apply_style") as apply_style,
+            patch.object(desktop_native_app, "MainWindow", return_value=window),
+            patch.object(
+                desktop_native_app,
+                "recover_stale_tiktok_login_attempts",
+            ) as recover,
+            patch("builtins.print") as print_output,
+        ):
+            desktop_native_app.run_ui_test()
+
+        recover.assert_not_called()
+        configure.assert_called_once_with(app)
+        apply_style.assert_called_once_with(app)
+        window.show.assert_called_once_with()
+        app.processEvents.assert_called_once_with()
+        print_output.assert_called_once_with("NATIVE_DESKTOP_UI_OK")
+
     def test_window_creation_recovers_stale_attempts_before_constructing_main_window(self) -> None:
         events: list[str] = []
         window = MagicMock()
