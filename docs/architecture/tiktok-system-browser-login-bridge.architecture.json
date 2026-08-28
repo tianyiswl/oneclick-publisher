@@ -1,0 +1,256 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "TikTok 系统浏览器登录桥",
+    "quality_profile": "showcase",
+    "viewBox": [1500, 800],
+    "views": [
+      {
+        "id": "login-path",
+        "label": "登录主路径",
+        "focus": ["user", "loginDialog", "systemChrome", "tiktok", "sessionIntake", "identityCheck", "accountStore"],
+        "note": "用户在不受自动化控制的系统 Chrome 中登录，一键发只接收 TikTok 会话。"
+      },
+      {
+        "id": "security-boundary",
+        "label": "安全与清理",
+        "focus": ["temporaryProfile", "sessionIntake", "identityCheck", "cleanup"],
+        "note": "Google 与其他站点数据不进入正式会话，临时资料夹无论成败都清理。"
+      },
+      {
+        "id": "publish-reuse",
+        "label": "发布复用",
+        "focus": ["accountStore", "controlledBrowser"],
+        "note": "后续预检和发布复用原有受控浏览器，不再重走登录。"
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "user",
+      "type": "external",
+      "label": "用户",
+      "sublabel": "只负责人工登录与确认",
+      "pos": [45, 300],
+      "size": [150, 70]
+    },
+    {
+      "id": "loginDialog",
+      "type": "frontend",
+      "label": "一键发登录窗口",
+      "sublabel": "创建尝试并回显状态",
+      "pos": [245, 300],
+      "size": [180, 70]
+    },
+    {
+      "id": "temporaryProfile",
+      "type": "security",
+      "label": "临时 Chrome 资料夹",
+      "sublabel": "每次登录独立创建",
+      "tag": "不复用日常资料",
+      "pos": [475, 115],
+      "size": [205, 74]
+    },
+    {
+      "id": "systemChrome",
+      "type": "external",
+      "label": "系统 Google Chrome",
+      "sublabel": "登录期间无自动化控制",
+      "pos": [475, 300],
+      "size": [205, 74]
+    },
+    {
+      "id": "googleIdentity",
+      "type": "external",
+      "label": "Google 身份页",
+      "sublabel": "仅在系统 Chrome 内可选使用",
+      "pos": [475, 495],
+      "size": [205, 70]
+    },
+    {
+      "id": "tiktok",
+      "type": "external",
+      "label": "TikTok 官方登录",
+      "sublabel": "返回已登录网页会话",
+      "pos": [735, 300],
+      "size": [190, 74]
+    },
+    {
+      "id": "sessionIntake",
+      "type": "security",
+      "label": "TikTok 会话接收器",
+      "sublabel": "只保留 TikTok 域数据",
+      "tag": "拒绝 Google Cookie",
+      "pos": [985, 185],
+      "size": [205, 78]
+    },
+    {
+      "id": "identityCheck",
+      "type": "security",
+      "label": "TikTok 账号核验",
+      "sublabel": "回读公开 handle 并防错绑",
+      "pos": [985, 330],
+      "size": [205, 78]
+    },
+    {
+      "id": "cleanup",
+      "type": "backend",
+      "label": "尝试清理器",
+      "sublabel": "成功、失败或取消都清理",
+      "pos": [985, 555],
+      "size": [205, 72]
+    },
+    {
+      "id": "accountStore",
+      "type": "database",
+      "label": "一键发账号库",
+      "sublabel": "TikTok 会话 + 公开身份",
+      "pos": [1240, 270],
+      "size": [165, 74]
+    },
+    {
+      "id": "controlledBrowser",
+      "type": "backend",
+      "label": "受控发布浏览器",
+      "sublabel": "预检、表单回读与发布",
+      "pos": [1240, 430],
+      "size": [165, 74]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "一键发本机应用",
+      "wraps": ["loginDialog", "sessionIntake", "identityCheck", "cleanup", "accountStore", "controlledBrowser"],
+      "pad": 22
+    },
+    {
+      "kind": "security-group",
+      "label": "临时登录隔离区",
+      "wraps": ["temporaryProfile", "systemChrome"],
+      "pad": 18
+    }
+  ],
+  "connections": [
+    {
+      "id": "start-login",
+      "from": "user",
+      "to": "loginDialog",
+      "label": "绑定 TikTok 账号",
+      "variant": "emphasis",
+      "labelAt": [220, 390]
+    },
+    {
+      "id": "create-profile",
+      "from": "loginDialog",
+      "to": "temporaryProfile",
+      "label": "创建独立资料夹",
+      "variant": "security",
+      "labelAt": [400, 210]
+    },
+    {
+      "id": "launch-chrome",
+      "from": "temporaryProfile",
+      "to": "systemChrome",
+      "label": "--user-data-dir",
+      "variant": "security",
+      "labelAt": [570, 208]
+    },
+    {
+      "id": "open-tiktok",
+      "from": "systemChrome",
+      "to": "tiktok",
+      "label": "官方 HTTPS 登录",
+      "variant": "emphasis",
+      "labelAt": [707, 395]
+    },
+    {
+      "id": "optional-google",
+      "from": "systemChrome",
+      "to": "googleIdentity",
+      "label": "可选联合登录",
+      "variant": "dashed",
+      "labelAt": [575, 402]
+    },
+    {
+      "id": "handoff-session",
+      "from": "temporaryProfile",
+      "to": "sessionIntake",
+      "label": "窗口关闭后本机接收",
+      "variant": "security"
+    },
+    {
+      "id": "verify-session",
+      "from": "sessionIntake",
+      "to": "identityCheck",
+      "label": "TikTok 域会话",
+      "variant": "security",
+      "labelAt": [1095, 282]
+    },
+    {
+      "id": "save-account",
+      "from": "identityCheck",
+      "to": "accountStore",
+      "label": "验证通过才原子写入",
+      "variant": "emphasis",
+      "labelAt": [1215, 422]
+    },
+    {
+      "id": "always-clean",
+      "from": "sessionIntake",
+      "to": "cleanup",
+      "label": "finally",
+      "variant": "dashed",
+      "fromSide": "left",
+      "toSide": "left",
+      "via": [[950, 224], [950, 591]],
+      "labelAt": [928, 430]
+    },
+    {
+      "id": "remove-profile",
+      "from": "cleanup",
+      "to": "temporaryProfile",
+      "label": "安全移除准确目录",
+      "variant": "security",
+      "fromSide": "left",
+      "toSide": "left",
+      "via": [[930, 591], [450, 591], [450, 152]],
+      "labelAt": [660, 616]
+    },
+    {
+      "id": "reuse-session",
+      "from": "accountStore",
+      "to": "controlledBrowser",
+      "label": "后续任务复用",
+      "variant": "emphasis",
+      "labelAt": [1323, 385]
+    }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "登录原则",
+      "items": [
+        "登录阶段不由 Playwright 控制 Chrome",
+        "不使用用户日常 Chrome 资料夹"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "凭据边界",
+      "items": [
+        "只保留 TikTok 域 Cookie 与必要站点存储",
+        "Google 与其他站点数据不写入正式会话"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "失败闭环",
+      "items": [
+        "账号不一致、会话无效或用户取消时不保存账号",
+        "无论成功或失败都清理临时资料夹"
+      ]
+    }
+  ]
+}
