@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -1153,6 +1154,10 @@ def start_desktop_publish(payloads: list[dict[str, Any]]) -> dict:
     runtime_mode = str(prepared[0].get("runtimeMode") or "preflight")
     if any(str(item.get("runtimeMode") or "preflight") != runtime_mode for item in prepared):
         raise ValueError("同一任务不能混合预检与正式发布")
+    if runtime_mode in {"publish", "platform_form_check"} and any(
+        int(item.get("type") or 0) == 6 for item in prepared
+    ):
+        raise ValueError("TikTok formal/form-check 缺少数据库受控任务 claim")
     is_publish = runtime_mode == "publish"
     is_platform_form_check = runtime_mode == "platform_form_check"
     is_draft = runtime_mode == "draft"
@@ -1192,6 +1197,64 @@ def start_desktop_publish(payloads: list[dict[str, Any]]) -> dict:
     )
     _active_threads[int(task["id"])] = worker
     worker.start()
+    return task
+
+
+def start_controlled_tiktok_publish(task_id: int) -> dict:
+    """Start one pre-created TikTok task only after verifying its DB claim."""
+
+    from .controlled_publish import require_tiktok_execution_claim
+
+    task = task_service.get_task(int(task_id))
+    if not isinstance(task, dict) or str(task.get("status") or "") != "pending":
+        raise ValueError("TikTok 受控任务不存在或已开始执行")
+    try:
+        raw_payloads = json.loads(str(task.get("payloadJson") or "[]"))
+    except json.JSONDecodeError as exc:
+        raise ValueError("TikTok 受控任务快照不可读取") from exc
+    if not isinstance(raw_payloads, list) or not all(
+        isinstance(item, dict) for item in raw_payloads
+    ):
+        raise ValueError("TikTok 受控任务快照不可读取")
+    payloads = [dict(item) for item in raw_payloads]
+    if len(payloads) != 1 or int(payloads[0].get("type") or 0) != 6:
+        raise ValueError("TikTok 受控任务只能包含一个账号和视频")
+    task_mode = str(task.get("mode") or "")
+    claim_mode = (
+        "formal"
+        if task_mode == "oneclick_publish"
+        else "platform_form_check"
+        if task_mode == "oneclick_platform_form_check"
+        else ""
+    )
+    if not claim_mode:
+        raise ValueError("TikTok 受控任务模式无效")
+    require_tiktok_execution_claim(
+        int(task_id),
+        payloads,
+        mode=claim_mode,
+    )
+    prepared = _validate_payloads(payloads)
+    expected_runtime = "publish" if claim_mode == "formal" else "platform_form_check"
+    if str(prepared[0].get("runtimeMode") or "") != expected_runtime:
+        raise ValueError("TikTok 受控任务模式与 claim 不一致")
+    target = _run_publish if claim_mode == "formal" else _run_platform_form_check
+    worker = threading.Thread(
+        target=target,
+        args=(task, prepared),
+        daemon=True,
+        name=(
+            f"oneclick-publish-{task_id}"
+            if claim_mode == "formal"
+            else f"oneclick-platform-form-check-{task_id}"
+        ),
+    )
+    _active_threads[int(task_id)] = worker
+    try:
+        worker.start()
+    except Exception:
+        _active_threads.pop(int(task_id), None)
+        raise
     return task
 
 

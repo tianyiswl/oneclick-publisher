@@ -12,6 +12,7 @@ import hashlib
 import importlib
 import json
 import math
+import re
 import sqlite3
 import unicodedata
 from datetime import datetime
@@ -957,6 +958,18 @@ def validate_tiktok_payload(
     account_id, account = _account_identity(payload)
     session_path = _session_path(payload, account)
     video_path = _video_path(payload)
+    current_video_sha256 = _sha256_file(video_path)
+    authorized_video_sha256 = payload.get("tiktokVideoSha256")
+    if payload.get("tiktokControlledPublish") is True:
+        if (
+            type(authorized_video_sha256) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", authorized_video_sha256) is None
+            or authorized_video_sha256 != current_video_sha256
+        ):
+            _fail(
+                "tiktok_video_snapshot_mismatch",
+                "TikTok 视频素材与已授权快照不一致",
+            )
     title = _one_text(payload, frozenset({"title"}), label="标题")
     body = _one_text(
         payload,
@@ -984,7 +997,11 @@ def validate_tiktok_payload(
             account.get("accountReference")
         ),
         "videoPath": str(video_path),
-        "videoSha256": _sha256_file(video_path),
+        "videoSha256": (
+            str(authorized_video_sha256)
+            if payload.get("tiktokControlledPublish") is True
+            else current_video_sha256
+        ),
         "title": title,
         "body": body,
         "topics": topics,

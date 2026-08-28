@@ -260,6 +260,7 @@ def build_controlled_payloads(
         youtube_settings: dict[str, object] | None = None
         tiktok_expected_reference = ""
         tiktok_settings: dict[str, object] | None = None
+        tiktok_video_sha256 = ""
         if platform_type == 6:
             if target.get("schedule") is not None:
                 raise ControlledPublishError(
@@ -286,6 +287,9 @@ def build_controlled_payloads(
                     "tiktok_unsupported_publish_setting",
                     "TikTok 首版只支持单个本地视频",
                 )
+            tiktok_video_sha256 = _stream_sha256(
+                Path(str(bundle["assetPaths"][0]))
+            )
             raw_settings = target.get("settings")
             if not isinstance(raw_settings, Mapping) or set(raw_settings) != {
                 "visibility"
@@ -439,6 +443,7 @@ def build_controlled_payloads(
                     "overseasVideoPublishConfirmed": mode == "formal",
                     "tiktokControlledPublish": True,
                     "tiktokExpectedAccountReference": tiktok_expected_reference,
+                    "tiktokVideoSha256": tiktok_video_sha256,
                     "tiktokExecutionIntent": (
                         "platform_form_check"
                         if mode == "platform_form_check"
@@ -466,6 +471,20 @@ def _file_identity(value: object) -> str:
     return str(value or "")
 
 
+def _stream_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise ControlledPublishError(
+            "tiktok_video_file_invalid",
+            "TikTok 视频素材无法安全读取",
+        ) from exc
+    return digest.hexdigest()
+
+
 def scope_fingerprint(payloads: Iterable[Mapping[str, Any]]) -> str:
     """只对发布对象和内容做指纹；不把 Cookie 或会话文件写入授权。"""
 
@@ -479,15 +498,24 @@ def scope_fingerprint(payloads: Iterable[Mapping[str, Any]]) -> str:
         return matrix_scope_fingerprint(payload_rows[0])
     normalized = []
     for payload in payload_rows:
+        platform_type = int(payload.get("type") or 0)
+        tiktok_video_sha256 = str(payload.get("tiktokVideoSha256") or "")
         normalized.append(
             {
-                "type": int(payload.get("type") or 0),
+                "type": platform_type,
                 "accountIds": [int(item) for item in payload.get("accountIds") or []],
                 "contentType": str(payload.get("contentType") or ""),
                 "title": str(payload.get("title") or ""),
                 "description": str(payload.get("description") or ""),
                 "tags": [str(item) for item in payload.get("tags") or []],
-                "assets": [_file_identity(item) for item in payload.get("fileList") or []],
+                "assets": (
+                    [str(item) for item in payload.get("fileList") or []]
+                    if platform_type == 6
+                    else [
+                        _file_identity(item)
+                        for item in payload.get("fileList") or []
+                    ]
+                ),
                 "cover": _file_identity(payload.get("coverPath")),
                 "scheduleTime": str(payload.get("scheduleTime") or ""),
                 "scheduleTimezone": str(payload.get("scheduleTimezone") or ""),
@@ -507,13 +535,14 @@ def scope_fingerprint(payloads: Iterable[Mapping[str, Any]]) -> str:
                 "tiktokExecutionIntent": str(
                     payload.get("tiktokExecutionIntent") or ""
                 ),
+                "tiktokVideoSha256": tiktok_video_sha256,
             }
         )
     encoded = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
-def create_authorization_schema(conn: sqlite3.Connection) -> None:
+def _ensure_authorization_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS controlled_publish_authorizations (
@@ -526,6 +555,10 @@ def create_authorization_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+
+
+def create_authorization_schema(conn: sqlite3.Connection) -> None:
+    _ensure_authorization_schema(conn)
     conn.commit()
 
 
@@ -583,7 +616,31 @@ def consume_authorization(
     *,
     now: datetime | None = None,
 ) -> None:
-    create_authorization_schema(conn)
+    try:
+        _consume_authorization_in_transaction(
+            conn,
+            authorization_id,
+            preflight_task_id,
+            payloads,
+            now=now,
+        )
+    except Exception:
+        conn.rollback()
+        raise
+    conn.commit()
+
+
+def _consume_authorization_in_transaction(
+    conn: sqlite3.Connection,
+    authorization_id: str,
+    preflight_task_id: int,
+    payloads: Iterable[Mapping[str, Any]],
+    *,
+    now: datetime | None = None,
+) -> None:
+    """Validate and consume without committing the caller's transaction."""
+
+    _ensure_authorization_schema(conn)
     current = _utc(now)
     row = conn.execute(
         "SELECT * FROM controlled_publish_authorizations WHERE authorizationId = ?",
@@ -610,9 +667,289 @@ def consume_authorization(
         (current.isoformat(), str(authorization_id).strip()),
     )
     if cursor.rowcount != 1:
-        conn.rollback()
         raise ControlledPublishError("controlled_authorization_consumed", "一次性授权已经使用")
-    conn.commit()
+
+
+def _ensure_tiktok_claim_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tiktok_controlled_execution_claims (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scopeFingerprint TEXT NOT NULL,
+            taskId INTEGER UNIQUE,
+            mode TEXT NOT NULL CHECK(mode IN ('formal', 'platform_form_check')),
+            state TEXT NOT NULL CHECK(state IN ('reserved', 'claimed', 'started')),
+            createdAt TEXT NOT NULL,
+            FOREIGN KEY(taskId) REFERENCES publish_tasks(id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_tiktok_formal_scope_claim
+        ON tiktok_controlled_execution_claims(scopeFingerprint)
+        WHERE mode = 'formal'
+        """
+    )
+
+
+def _existing_tiktok_formal_claim(
+    conn: sqlite3.Connection,
+    fingerprint: str,
+) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT claim.id, claim.taskId, claim.state,
+               task.status AS taskStatus,
+               EXISTS(
+                   SELECT 1 FROM publish_task_events AS event
+                   WHERE event.taskId = claim.taskId
+                     AND event.eventType IN (
+                         'tiktok_final_action_triggered',
+                         'tiktok_publish_outcome_ambiguous'
+                     )
+               ) AS hasFinalAction
+        FROM tiktok_controlled_execution_claims AS claim
+        LEFT JOIN publish_tasks AS task ON task.id = claim.taskId
+        WHERE claim.mode = 'formal' AND claim.scopeFingerprint = ?
+        LIMIT 1
+        """,
+        (fingerprint,),
+    ).fetchone()
+
+
+def _release_retryable_tiktok_claim_or_raise(
+    conn: sqlite3.Connection,
+    fingerprint: str,
+) -> None:
+    claim = _existing_tiktok_formal_claim(conn, fingerprint)
+    if claim is None:
+        return
+    data = dict(claim)
+    task_status = str(data.get("taskStatus") or "")
+    has_final_action = bool(data.get("hasFinalAction"))
+    if has_final_action:
+        raise ControlledPublishError(
+            "controlled_publish_outcome_ambiguous",
+            "同一 TikTok 发布范围已触发最终动作，必须先人工只读核对",
+        )
+    if task_status == "success":
+        raise ControlledPublishError(
+            "controlled_already_published",
+            "同一 TikTok 发布范围已有成功任务，已阻止重复发布",
+        )
+    if task_status in {"failed", "partial_failed"}:
+        deleted = conn.execute(
+            """
+            DELETE FROM tiktok_controlled_execution_claims
+            WHERE id = ? AND mode = 'formal'
+              AND NOT EXISTS (
+                  SELECT 1 FROM publish_task_events AS event
+                  WHERE event.taskId = tiktok_controlled_execution_claims.taskId
+                    AND event.eventType IN (
+                        'tiktok_final_action_triggered',
+                        'tiktok_publish_outcome_ambiguous'
+                    )
+              )
+            """,
+            (int(data["id"]),),
+        )
+        if deleted.rowcount == 1:
+            return
+        raise ControlledPublishError(
+            "controlled_publish_outcome_ambiguous",
+            "同一 TikTok 发布范围的最终动作状态已变化，必须先人工核对",
+        )
+    raise ControlledPublishError(
+        "controlled_publish_in_progress",
+        "同一 TikTok 发布范围已有等待执行或执行中的受控任务",
+    )
+
+
+def _load_tiktok_preflight_in_transaction(
+    conn: sqlite3.Connection,
+    preflight_task_id: int,
+) -> dict[str, Any]:
+    row = conn.execute(
+        "SELECT * FROM publish_tasks WHERE id = ?",
+        (int(preflight_task_id),),
+    ).fetchone()
+    if row is None or str(row["mode"] or "") != "oneclick_preflight":
+        raise ControlledPublishError(
+            "controlled_preflight_required",
+            "正式发布缺少对应预检任务",
+        )
+    if str(row["status"] or "") != "success":
+        raise ControlledPublishError(
+            "controlled_preflight_not_successful",
+            "对应预检尚未全部成功",
+        )
+    events = conn.execute(
+        "SELECT eventType FROM publish_task_events WHERE taskId = ? ORDER BY id",
+        (int(preflight_task_id),),
+    ).fetchall()
+    task = dict(row)
+    task["events"] = [dict(event) for event in events]
+    return task
+
+
+def _create_claimed_tiktok_task(
+    payloads: list[dict[str, Any]],
+    *,
+    mode: str,
+    preflight_task_id: int | None = None,
+    authorization_id: str = "",
+) -> dict[str, Any]:
+    """Atomically claim one TikTok execution and create its pending task."""
+
+    if mode not in {"formal", "platform_form_check"}:
+        raise ControlledPublishError(
+            "controlled_mode_invalid",
+            "TikTok claim 模式无效",
+        )
+    if len(payloads) != 1 or int(payloads[0].get("type") or 0) != 6:
+        raise ControlledPublishError(
+            "tiktok_target_invalid",
+            "TikTok claim 只能绑定一个目标",
+        )
+    from . import task_service
+    from .database import connect
+
+    fingerprint = scope_fingerprint(payloads)
+    with connect() as conn:
+        _ensure_authorization_schema(conn)
+        _ensure_tiktok_claim_schema(conn)
+        conn.commit()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            if mode == "formal":
+                _release_retryable_tiktok_claim_or_raise(conn, fingerprint)
+                if type(preflight_task_id) is not int or preflight_task_id <= 0:
+                    raise ControlledPublishError(
+                        "controlled_preflight_required",
+                        "正式发布缺少对应预检任务",
+                    )
+                preflight = _load_tiktok_preflight_in_transaction(
+                    conn,
+                    preflight_task_id,
+                )
+                try:
+                    preflight_payloads = json.loads(
+                        str(preflight.get("payloadJson") or "[]")
+                    )
+                except json.JSONDecodeError as exc:
+                    raise ControlledPublishError(
+                        "controlled_preflight_invalid",
+                        "预检任务快照不可读取",
+                    ) from exc
+                if not isinstance(preflight_payloads, list):
+                    raise ControlledPublishError(
+                        "controlled_preflight_invalid",
+                        "预检任务快照不可读取",
+                    )
+                _require_tiktok_local_preflight_task(
+                    preflight,
+                    [
+                        item
+                        for item in preflight_payloads
+                        if isinstance(item, Mapping)
+                    ],
+                )
+                _consume_authorization_in_transaction(
+                    conn,
+                    authorization_id,
+                    preflight_task_id,
+                    payloads,
+                )
+            claim = conn.execute(
+                """
+                INSERT INTO tiktok_controlled_execution_claims
+                    (scopeFingerprint, taskId, mode, state, createdAt)
+                VALUES (?, NULL, ?, 'reserved', ?)
+                """,
+                (fingerprint, mode, _utc(None).isoformat()),
+            )
+            task = task_service._insert_pending_task(
+                conn,
+                payloads,
+                mode=(
+                    "oneclick_publish"
+                    if mode == "formal"
+                    else "oneclick_platform_form_check"
+                ),
+            )
+            bound = conn.execute(
+                """
+                UPDATE tiktok_controlled_execution_claims
+                SET taskId = ?, state = 'claimed'
+                WHERE id = ? AND state = 'reserved' AND taskId IS NULL
+                """,
+                (int(task["id"]), int(claim.lastrowid)),
+            )
+            if bound.rowcount != 1:
+                raise ControlledPublishError(
+                    "tiktok_controlled_claim_invalid",
+                    "TikTok 受控任务 claim 无法绑定",
+                )
+            conn.commit()
+            return task
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def require_tiktok_execution_claim(
+    task_id: int,
+    payloads: Iterable[Mapping[str, Any]],
+    *,
+    mode: str,
+) -> None:
+    """Verify a task-bound DB claim before a TikTok worker can start."""
+
+    from .database import connect
+
+    rows = [dict(item) for item in payloads]
+    if len(rows) != 1 or int(rows[0].get("type") or 0) != 6:
+        raise ValueError("TikTok 受控任务 claim 无效")
+    with connect() as conn:
+        _ensure_tiktok_claim_schema(conn)
+        conn.commit()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            claim = conn.execute(
+                """
+                SELECT mode, state, scopeFingerprint
+                FROM tiktok_controlled_execution_claims
+                WHERE taskId = ?
+                """,
+                (int(task_id),),
+            ).fetchone()
+            if claim is not None and str(claim["state"] or "") == "started":
+                raise ValueError("TikTok 受控任务 claim 已经启动")
+            if (
+                claim is None
+                or str(claim["mode"] or "") != mode
+                or str(claim["state"] or "") != "claimed"
+                or str(claim["scopeFingerprint"] or "")
+                != scope_fingerprint(rows)
+            ):
+                raise ValueError(
+                    "TikTok formal/form-check 缺少有效的受控任务 claim"
+                )
+            updated = conn.execute(
+                """
+                UPDATE tiktok_controlled_execution_claims
+                SET state = 'started'
+                WHERE taskId = ? AND state = 'claimed'
+                """,
+                (int(task_id),),
+            )
+            if updated.rowcount != 1:
+                raise ValueError("TikTok 受控任务 claim 已经启动")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
 
 def create_direct_authorization_schema(conn: sqlite3.Connection) -> None:
@@ -971,6 +1308,9 @@ def project_task(task: Mapping[str, Any] | None) -> dict[str, Any]:
     ):
         stage = "ambiguous"
         user_action = None
+    elif task_status_value in {"failed", "partial_failed"}:
+        stage = "failed"
+        user_action = None
     elif "tiktok_waiting_user_verification" in event_types and (
         _latest_event_index("tiktok_waiting_user_verification")
         > _latest_event_index("tiktok_user_verification_resolved")
@@ -1220,6 +1560,27 @@ def submit_request(request: Mapping[str, Any]) -> dict[str, Any]:
 
     payloads = build_controlled_payloads(request)
     mode = str(request.get("mode") or "preflight").strip().lower()
+    is_single_tiktok = (
+        len(payloads) == 1 and int(payloads[0].get("type") or 0) == 6
+    )
+    if is_single_tiktok and mode in {"formal", "platform_form_check"}:
+        task = _create_claimed_tiktok_task(
+            payloads,
+            mode=mode,
+            preflight_task_id=(
+                int(request["confirmedPreflightTaskId"])
+                if mode == "formal"
+                else None
+            ),
+            authorization_id=(
+                str(request["authorizationId"])
+                if mode == "formal"
+                else ""
+            ),
+        )
+        publish_service.start_controlled_tiktok_publish(int(task["id"]))
+        stored = task_service.get_task(int(task["id"])) or task
+        return project_task(stored)
     if mode in {"formal", "direct"}:
         recent = task_service.list_tasks(limit=500)
         detailed = [

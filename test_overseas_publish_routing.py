@@ -148,21 +148,22 @@ class PublishServiceRoutingTests(unittest.TestCase):
         self.assertTrue(mark.call_args.kwargs["ok"])
         self.assertEqual(mark.call_args.kwargs["receipt"], result["receipt"])
 
-    def test_tiktok_form_check_gets_distinct_task_mode_and_worker_label(self) -> None:
-        payload = _video_payload(self.video, 6, "platform_form_check")
-        captured = {}
+    def test_public_start_fail_closes_tiktok_formal_and_form_check_without_claim(self) -> None:
+        captured = {"created": 0, "started": 0}
 
         class Worker:
             def __init__(self, *, target, args, daemon, name):
-                captured.update(
-                    {"target": target, "args": args, "daemon": daemon, "name": name}
-                )
+                captured["created"] += 1
 
             def start(self):
-                captured["started"] = True
+                captured["started"] += 1
 
         with (
-            patch.object(publish_service, "_validate_payloads", return_value=[payload]),
+            patch.object(
+                publish_service,
+                "_validate_payloads",
+                side_effect=lambda payloads: [dict(payloads[0])],
+            ),
             patch.object(
                 publish_service.task_service,
                 "create_pending_task",
@@ -170,12 +171,29 @@ class PublishServiceRoutingTests(unittest.TestCase):
             ) as create,
             patch.object(publish_service.threading, "Thread", Worker),
         ):
-            publish_service.start_desktop_publish([payload])
+            for runtime_mode in ("platform_form_check", "publish"):
+                payload = _video_payload(self.video, 6, runtime_mode)
+                payload.update(
+                    {
+                        "debugDryRun": False,
+                        "overseasVideoPublishConfirmed": runtime_mode == "publish",
+                        "tiktokControlledPublish": True,
+                        "tiktokExpectedAccountReference": "expected.user",
+                        "tiktokExecutionIntent": (
+                            "formal_public"
+                            if runtime_mode == "publish"
+                            else "platform_form_check"
+                        ),
+                    }
+                )
+                with self.subTest(runtime_mode=runtime_mode), self.assertRaisesRegex(
+                    ValueError,
+                    "受控任务 claim",
+                ):
+                    publish_service.start_desktop_publish([payload])
 
-        self.assertEqual(create.call_args.kwargs["mode"], "oneclick_platform_form_check")
-        self.assertIs(captured["target"], publish_service._run_platform_form_check)
-        self.assertEqual(captured["name"], "oneclick-platform-form-check-107")
-        self.assertTrue(captured["started"])
+        create.assert_not_called()
+        self.assertEqual(captured, {"created": 0, "started": 0})
 
     def test_tiktok_formal_routes_to_dedicated_service_and_preserves_ambiguous_error(self) -> None:
         payload = _video_payload(self.video, 6, "publish")

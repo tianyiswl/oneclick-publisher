@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 
 import json
+import hashlib
 import sqlite3
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -26,7 +28,7 @@ from app_core.controlled_publish import (
     scope_fingerprint,
     submit_request,
 )
-from app_core import database, task_service
+from app_core import database, publish_service, task_service
 from app_core.douyin_graphic_matrix_service import prepare_matrix
 
 
@@ -165,6 +167,59 @@ class ControlledPublishTests(unittest.TestCase):
             {"id": 31, "type": 3, "filePath": "douyin.json", "profileName": "抖音主体", "userName": "抖音主体"},
             {"id": 11, "type": 1, "filePath": "xhs.json", "profileName": "小红书主体", "userName": "小红书主体"},
         ]
+
+    def _seed_tiktok_preflight(
+        self,
+        root: Path,
+        *,
+        authorization_count: int,
+    ) -> tuple[Path, dict, list[dict]]:
+        manifest = self._tiktok_bundle(root)
+        preflight_payloads = build_controlled_payloads(
+            self._tiktok_request(manifest),
+            accounts=[self._tiktok_account()],
+        )
+        preflight = task_service.create_pending_task(
+            preflight_payloads,
+            mode="oneclick_preflight",
+        )
+        task_service.mark_platform_result(
+            preflight["id"],
+            6,
+            ok=True,
+            message="TikTok 本地预检通过",
+            content_type="video",
+            event_type="tiktok_local_preflight_passed",
+            receipt={
+                "accountId": 61,
+                "visibility": "public",
+                "platformWriteOccurred": False,
+                "finalActionTriggered": False,
+                "phase": "local_preflight_passed",
+            },
+        )
+        grants = []
+        with database.connect() as conn:
+            for _ in range(authorization_count):
+                grants.append(
+                    create_authorization(
+                        conn,
+                        preflight["id"],
+                        preflight_payloads,
+                        ttl_seconds=600,
+                    )
+                )
+        return manifest, preflight, grants
+
+    @staticmethod
+    def _claim_count(conn: sqlite3.Connection) -> int:
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM tiktok_controlled_execution_claims"
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return 0
+        return int(row[0])
 
     def test_builds_clean_mixed_schedule_preflight_payloads(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -316,7 +371,12 @@ class ControlledPublishTests(unittest.TestCase):
                 )
 
     def test_tiktok_platform_form_check_never_creates_or_consumes_formal_authorization(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            database,
+            "DB_PATH",
+            Path(temporary) / "database.db",
+        ):
+            database.ensure_schema()
             manifest = self._tiktok_bundle(Path(temporary))
             request = self._tiktok_request(
                 manifest,
@@ -324,27 +384,15 @@ class ControlledPublishTests(unittest.TestCase):
                 platformFormCheckConfirmed=True,
             )
 
-            def start(payloads):
-                rows = [dict(item) for item in payloads]
-                return {
-                    "id": 62,
-                    "taskNo": "T62",
-                    "mode": "oneclick_platform_form_check",
-                    "status": "pending",
-                    "payloadJson": json.dumps(rows, ensure_ascii=False),
-                    "items": [],
-                    "events": [],
-                }
+            def start(task_id: int):
+                return task_service.get_task(task_id)
 
             with patch(
                 "app_core.account_service.list_publishable_accounts",
                 return_value=[self._tiktok_account()],
             ), patch(
-                "app_core.publish_service.start_desktop_publish",
+                "app_core.publish_service.start_controlled_tiktok_publish",
                 side_effect=start,
-            ), patch(
-                "app_core.task_service.get_task",
-                return_value=None,
             ), patch(
                 "app_core.controlled_publish.create_authorization"
             ) as create_formal, patch(
@@ -353,11 +401,296 @@ class ControlledPublishTests(unittest.TestCase):
                 "app_core.controlled_publish.consume_direct_authorization"
             ) as consume_direct:
                 result = submit_request(request)
+            with database.connect() as conn:
+                claim = conn.execute(
+                    """
+                    SELECT taskId, mode, state, scopeFingerprint
+                    FROM tiktok_controlled_execution_claims
+                    """
+                ).fetchone()
 
         self.assertEqual(result["phase"], "platform_form_check")
+        self.assertEqual(claim["taskId"], result["taskId"])
+        self.assertEqual(claim["mode"], "platform_form_check")
+        self.assertEqual(claim["state"], "claimed")
         create_formal.assert_not_called()
         consume_formal.assert_not_called()
         consume_direct.assert_not_called()
+
+    def test_tiktok_claim_allows_only_one_worker_start(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            database,
+            "DB_PATH",
+            Path(temporary) / "database.db",
+        ):
+            database.ensure_schema()
+            manifest = self._tiktok_bundle(Path(temporary))
+            request = self._tiktok_request(
+                manifest,
+                mode="platform_form_check",
+                platformFormCheckConfirmed=True,
+            )
+            with patch(
+                "app_core.account_service.list_publishable_accounts",
+                return_value=[self._tiktok_account()],
+            ), patch(
+                "app_core.publish_service.start_controlled_tiktok_publish",
+                side_effect=lambda task_id: task_service.get_task(task_id),
+            ):
+                created = submit_request(request)
+
+            starts: list[int] = []
+
+            class Worker:
+                def __init__(self, *, target, args, daemon, name):
+                    self.task_id = int(args[0]["id"])
+
+                def start(self):
+                    starts.append(self.task_id)
+
+            with patch.object(
+                publish_service,
+                "_validate_payloads",
+                side_effect=lambda payloads: [dict(payloads[0])],
+            ), patch.object(publish_service.threading, "Thread", Worker):
+                publish_service.start_controlled_tiktok_publish(created["taskId"])
+                with self.assertRaisesRegex(ValueError, "claim.*已经启动"):
+                    publish_service.start_controlled_tiktok_publish(created["taskId"])
+
+            with database.connect() as conn:
+                claim = conn.execute(
+                    "SELECT state FROM tiktok_controlled_execution_claims WHERE taskId = ?",
+                    (created["taskId"],),
+                ).fetchone()
+
+        self.assertEqual(starts, [created["taskId"]])
+        self.assertEqual(claim["state"], "started")
+
+    def test_two_tiktok_formal_authorizations_compete_for_one_atomic_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            database,
+            "DB_PATH",
+            Path(temporary) / "database.db",
+        ):
+            database.ensure_schema()
+            manifest, preflight, grants = self._seed_tiktok_preflight(
+                Path(temporary),
+                authorization_count=2,
+            )
+            barrier = threading.Barrier(2)
+            outcomes: list[tuple[str, object]] = []
+            outcome_lock = threading.Lock()
+
+            def start_claimed(task_id: int):
+                return task_service.get_task(task_id)
+
+            def submit(grant: dict) -> None:
+                request = self._tiktok_request(
+                    manifest,
+                    mode="formal",
+                    confirmedPreflightTaskId=preflight["id"],
+                    authorizationId=grant["authorizationId"],
+                )
+                barrier.wait()
+                try:
+                    result = submit_request(request)
+                except ControlledPublishError as exc:
+                    outcome = ("error", exc.error_code)
+                else:
+                    outcome = ("ok", result["taskId"])
+                with outcome_lock:
+                    outcomes.append(outcome)
+
+            with patch(
+                "app_core.account_service.list_publishable_accounts",
+                return_value=[self._tiktok_account()],
+            ), patch(
+                "app_core.publish_service.start_desktop_publish",
+                return_value={
+                    "id": 900,
+                    "taskNo": "legacy-bypass",
+                    "mode": "oneclick_publish",
+                    "status": "pending",
+                    "payloadJson": "[]",
+                    "items": [],
+                    "events": [],
+                },
+            ), patch(
+                "app_core.publish_service.start_controlled_tiktok_publish",
+                side_effect=start_claimed,
+                create=True,
+            ):
+                threads = [threading.Thread(target=submit, args=(grant,)) for grant in grants]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=10)
+
+            with database.connect() as conn:
+                formal_tasks = conn.execute(
+                    "SELECT COUNT(*) FROM publish_tasks WHERE mode = 'oneclick_publish'"
+                ).fetchone()[0]
+                consumed = conn.execute(
+                    "SELECT COUNT(*) FROM controlled_publish_authorizations WHERE consumedAt IS NOT NULL"
+                ).fetchone()[0]
+                claims = self._claim_count(conn)
+
+        self.assertEqual(sum(kind == "ok" for kind, _ in outcomes), 1)
+        self.assertEqual(sum(kind == "error" for kind, _ in outcomes), 1)
+        self.assertEqual(formal_tasks, 1)
+        self.assertEqual(consumed, 1)
+        self.assertEqual(claims, 1)
+
+    def test_tiktok_atomic_task_creation_rolls_back_authorization_when_insert_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            database,
+            "DB_PATH",
+            Path(temporary) / "database.db",
+        ):
+            database.ensure_schema()
+            manifest, preflight, grants = self._seed_tiktok_preflight(
+                Path(temporary),
+                authorization_count=1,
+            )
+            request = self._tiktok_request(
+                manifest,
+                mode="formal",
+                confirmedPreflightTaskId=preflight["id"],
+                authorizationId=grants[0]["authorizationId"],
+            )
+            with patch(
+                "app_core.account_service.list_publishable_accounts",
+                return_value=[self._tiktok_account()],
+            ), patch(
+                "app_core.task_service._insert_pending_task",
+                side_effect=RuntimeError("forced insert failure"),
+            ):
+                with self.assertRaises(RuntimeError):
+                    submit_request(request)
+
+            with database.connect() as conn:
+                authorization = conn.execute(
+                    "SELECT consumedAt FROM controlled_publish_authorizations WHERE authorizationId = ?",
+                    (grants[0]["authorizationId"],),
+                ).fetchone()
+                formal_tasks = conn.execute(
+                    "SELECT COUNT(*) FROM publish_tasks WHERE mode = 'oneclick_publish'"
+                ).fetchone()[0]
+                claims = self._claim_count(conn)
+
+        self.assertIsNone(authorization["consumedAt"])
+        self.assertEqual(formal_tasks, 0)
+        self.assertEqual(claims, 0)
+
+    def test_tiktok_worker_start_failure_keeps_pending_task_and_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            database,
+            "DB_PATH",
+            Path(temporary) / "database.db",
+        ):
+            database.ensure_schema()
+            manifest, preflight, grants = self._seed_tiktok_preflight(
+                Path(temporary),
+                authorization_count=1,
+            )
+            request = self._tiktok_request(
+                manifest,
+                mode="formal",
+                confirmedPreflightTaskId=preflight["id"],
+                authorizationId=grants[0]["authorizationId"],
+            )
+            with patch(
+                "app_core.account_service.list_publishable_accounts",
+                return_value=[self._tiktok_account()],
+            ), patch(
+                "app_core.publish_service.start_desktop_publish",
+                side_effect=RuntimeError("forced worker start failure"),
+            ), patch(
+                "app_core.publish_service.start_controlled_tiktok_publish",
+                side_effect=RuntimeError("forced worker start failure"),
+                create=True,
+            ):
+                with self.assertRaises(RuntimeError):
+                    submit_request(request)
+
+            with database.connect() as conn:
+                formal_task = conn.execute(
+                    "SELECT id, status FROM publish_tasks WHERE mode = 'oneclick_publish'"
+                ).fetchone()
+                authorization = conn.execute(
+                    "SELECT consumedAt FROM controlled_publish_authorizations WHERE authorizationId = ?",
+                    (grants[0]["authorizationId"],),
+                ).fetchone()
+                claims = self._claim_count(conn)
+
+        self.assertIsNotNone(formal_task)
+        self.assertEqual(formal_task["status"], "pending")
+        self.assertIsNotNone(authorization["consumedAt"])
+        self.assertEqual(claims, 1)
+
+    def test_tiktok_claim_releases_only_terminal_failure_before_final_action(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            database,
+            "DB_PATH",
+            Path(temporary) / "database.db",
+        ):
+            database.ensure_schema()
+            manifest, preflight, grants = self._seed_tiktok_preflight(
+                Path(temporary),
+                authorization_count=3,
+            )
+
+            def request_for(grant: dict) -> dict:
+                return self._tiktok_request(
+                    manifest,
+                    mode="formal",
+                    confirmedPreflightTaskId=preflight["id"],
+                    authorizationId=grant["authorizationId"],
+                )
+
+            with patch(
+                "app_core.account_service.list_publishable_accounts",
+                return_value=[self._tiktok_account()],
+            ), patch(
+                "app_core.publish_service.start_controlled_tiktok_publish",
+                side_effect=lambda task_id: task_service.get_task(task_id),
+            ):
+                first = submit_request(request_for(grants[0]))
+                task_service.fail_active_task(
+                    first["taskId"],
+                    error_code="tiktok_platform_execution_failed",
+                    message="TikTok 最终动作前失败",
+                )
+                second = submit_request(request_for(grants[1]))
+                task_service.record_task_event(
+                    second["taskId"],
+                    "tiktok_final_action_triggered",
+                    "TikTok 最终动作已触发",
+                )
+                task_service.fail_active_task(
+                    second["taskId"],
+                    error_code="tiktok_publish_outcome_unknown",
+                    message="TikTok 最终动作后结果不明",
+                )
+                with self.assertRaises(ControlledPublishError) as blocked:
+                    submit_request(request_for(grants[2]))
+
+            with database.connect() as conn:
+                formal_tasks = conn.execute(
+                    "SELECT COUNT(*) FROM publish_tasks WHERE mode = 'oneclick_publish'"
+                ).fetchone()[0]
+                claim = conn.execute(
+                    "SELECT taskId FROM tiktok_controlled_execution_claims WHERE mode = 'formal'"
+                ).fetchone()
+                third = conn.execute(
+                    "SELECT consumedAt FROM controlled_publish_authorizations WHERE authorizationId = ?",
+                    (grants[2]["authorizationId"],),
+                ).fetchone()
+
+        self.assertEqual(blocked.exception.error_code, "controlled_publish_outcome_ambiguous")
+        self.assertEqual(formal_tasks, 2)
+        self.assertEqual(claim["taskId"], second["taskId"])
+        self.assertIsNone(third["consumedAt"])
 
     def test_tiktok_modes_and_local_contract_fail_closed_before_task_start(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -513,6 +846,74 @@ class ControlledPublishTests(unittest.TestCase):
         for changed in mutations:
             self.assertNotEqual(scope_fingerprint(base), scope_fingerprint(changed))
 
+    def test_tiktok_video_bytes_are_frozen_into_payload_and_fingerprint(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = self._tiktok_bundle(root)
+            preflight = build_controlled_payloads(
+                self._tiktok_request(manifest),
+                accounts=[self._tiktok_account()],
+            )
+            expected = hashlib.sha256(b"tiktok-video").hexdigest()
+            (root / "tiktok.mp4").write_bytes(b"changed-after-preflight")
+            formal = build_controlled_payloads(
+                self._tiktok_request(
+                    manifest,
+                    mode="formal",
+                    confirmedPreflightTaskId=71,
+                    authorizationId="authorization",
+                ),
+                accounts=[self._tiktok_account()],
+            )
+
+        self.assertEqual(preflight[0]["tiktokVideoSha256"], expected)
+        self.assertNotEqual(
+            preflight[0]["tiktokVideoSha256"],
+            formal[0]["tiktokVideoSha256"],
+        )
+        self.assertNotEqual(scope_fingerprint(preflight), scope_fingerprint(formal))
+
+    def test_tiktok_formal_rejects_video_mutation_without_consuming_authorization(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            database,
+            "DB_PATH",
+            Path(temporary) / "database.db",
+        ):
+            database.ensure_schema()
+            manifest, preflight, grants = self._seed_tiktok_preflight(
+                Path(temporary),
+                authorization_count=1,
+            )
+            (Path(temporary) / "tiktok.mp4").write_bytes(b"mutated-video")
+            request = self._tiktok_request(
+                manifest,
+                mode="formal",
+                confirmedPreflightTaskId=preflight["id"],
+                authorizationId=grants[0]["authorizationId"],
+            )
+            with patch(
+                "app_core.account_service.list_publishable_accounts",
+                return_value=[self._tiktok_account()],
+            ), self.assertRaises(ControlledPublishError) as raised:
+                submit_request(request)
+            with database.connect() as conn:
+                authorization = conn.execute(
+                    "SELECT consumedAt FROM controlled_publish_authorizations WHERE authorizationId = ?",
+                    (grants[0]["authorizationId"],),
+                ).fetchone()
+                formal_tasks = conn.execute(
+                    "SELECT COUNT(*) FROM publish_tasks WHERE mode = 'oneclick_publish'"
+                ).fetchone()[0]
+                claims = self._claim_count(conn)
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "controlled_authorization_scope_mismatch",
+        )
+        self.assertIsNone(authorization["consumedAt"])
+        self.assertEqual(formal_tasks, 0)
+        self.assertEqual(claims, 0)
+
     def test_tiktok_authorization_requires_a_successful_local_preflight_event(self) -> None:
         payload = {
             "type": 6,
@@ -615,6 +1016,55 @@ class ControlledPublishTests(unittest.TestCase):
         )
 
         self.assertEqual(projected["stage"], "ambiguous")
+
+    def test_tiktok_terminal_failures_are_not_overridden_by_progress_events(self) -> None:
+        cases = (
+            (
+                "form_verified_then_failed",
+                [{"eventType": "tiktok_platform_form_verified"}],
+                "platform_form_verified",
+                "tiktok_platform_execution_failed",
+            ),
+            (
+                "explicit_rejection_after_final_action",
+                [
+                    {"eventType": "tiktok_platform_form_verified"},
+                    {"eventType": "tiktok_final_action_triggered"},
+                    {"eventType": "tiktok_publish_rejected"},
+                ],
+                "final_action_triggered",
+                "tiktok_publish_rejected",
+            ),
+        )
+        for label, events, receipt_phase, error_code in cases:
+            with self.subTest(label=label):
+                projected = project_task(
+                    {
+                        "id": 64,
+                        "taskNo": "T64",
+                        "mode": "oneclick_publish",
+                        "status": "failed",
+                        "payloadJson": json.dumps(
+                            [{"type": 6, "accountIds": [61]}],
+                            ensure_ascii=False,
+                        ),
+                        "items": [
+                            {
+                                "platformType": 6,
+                                "status": "failed",
+                                "errorCode": error_code,
+                                "receiptJson": json.dumps(
+                                    {"phase": receipt_phase},
+                                    ensure_ascii=False,
+                                ),
+                            }
+                        ],
+                        "events": events,
+                    }
+                )
+
+                self.assertEqual(projected["stage"], "failed")
+                self.assertIsNone(projected["userAction"])
 
     def test_douyin_body_raw_mention_is_not_treated_as_platform_mention(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

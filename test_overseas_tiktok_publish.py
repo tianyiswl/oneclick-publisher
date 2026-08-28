@@ -134,6 +134,22 @@ class TikTokPublishContractTests(unittest.TestCase):
         self.assertEqual(prepared["topics"], ["OneClick", "AI工具"])
         self.assertEqual(prepared["plainCaption"], "TikTok 标题\n\n本地预检正文。")
 
+    def test_controlled_video_digest_is_checked_before_any_platform_execution(self) -> None:
+        payload = self.payload(
+            runtimeMode="publish",
+            debugDryRun=False,
+            overseasVideoPublishConfirmed=True,
+            tiktokControlledPublish=True,
+            tiktokExpectedAccountReference="expected.user",
+            tiktokExecutionIntent="formal_public",
+            tiktokVideoSha256="0" * 64,
+        )
+
+        with self.assertRaises(overseas_tiktok_publish.TikTokPublishError) as raised:
+            self.validate(payload, mode="formal")
+
+        self.assertEqual(raised.exception.error_code, "tiktok_video_snapshot_mismatch")
+
     def test_modes_are_exact_and_runtime_mode_must_match(self) -> None:
         cases = (
             ("preflight", "preflight"),
@@ -1280,6 +1296,20 @@ class TikTokPlatformSyncTests(unittest.TestCase):
         uploader.prepare_form.return_value = self.form_receipt(
             finalCaption="不同的页面正文",
         )
+        with self.assertRaises(overseas_tiktok_publish.TikTokPublishError) as raised:
+            self.run_sync(mode="formal", uploader=uploader)
+
+        self.assertEqual(raised.exception.error_code, "tiktok_form_snapshot_mismatch")
+        uploader.submit_once.assert_not_awaited()
+
+    def test_video_digest_is_rechecked_after_upload_before_final_action(self) -> None:
+        uploader = self.fake_uploader()
+
+        async def mutate_video(_page, _base):
+            self.video.write_bytes(b"mutated-after-upload")
+            return self.form_receipt()
+
+        uploader.prepare_form = AsyncMock(side_effect=mutate_video)
         with self.assertRaises(overseas_tiktok_publish.TikTokPublishError) as raised:
             self.run_sync(mode="formal", uploader=uploader)
 
