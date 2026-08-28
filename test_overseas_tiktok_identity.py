@@ -70,6 +70,16 @@ class TikTokIdentityTests(unittest.TestCase):
             "expected.user",
         )
 
+    def test_nonempty_invalid_legacy_binding_cannot_be_initialized(self):
+        identity = TikTokIdentity("expected.user", "Expected", "https://www.tiktok.com/@expected.user")
+        with self.assertRaises(TikTokIdentityError) as raised:
+            validate_identity_binding(
+                {"accountReference": "not a valid handle!"},
+                identity,
+                allow_initial_bind=True,
+            )
+        self.assertEqual(raised.exception.error_code, "tiktok_account_identity_mismatch")
+
     def test_existing_binding_accepts_the_same_normalized_handle(self):
         identity = TikTokIdentity(
             "@Expected.User", "Expected", "https://www.tiktok.com/@expected.user"

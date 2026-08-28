@@ -173,8 +173,18 @@ def validate_identity_binding(
             "tiktok_account_invalid", "TikTok 页面没有返回稳定账号标识"
         )
 
-    expected = normalize_tiktok_handle(account.get("accountReference"))
-    if not expected and allow_initial_bind:
+    raw_reference = account.get("accountReference")
+    if raw_reference is None:
+        reference_text = ""
+    elif isinstance(raw_reference, bytes):
+        try:
+            reference_text = raw_reference.decode("utf-8")
+        except UnicodeDecodeError:
+            reference_text = str(raw_reference)
+    else:
+        reference_text = str(raw_reference)
+    expected = normalize_tiktok_handle(raw_reference)
+    if not reference_text.strip() and allow_initial_bind:
         return actual
     if not expected or expected != actual:
         raise TikTokIdentityError(
