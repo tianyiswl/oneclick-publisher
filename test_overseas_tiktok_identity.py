@@ -52,8 +52,14 @@ class _FakeProfileLinks:
 
 
 class _FakeTikTokPage:
-    def __init__(self, links: list[_FakeProfileLink]) -> None:
+    def __init__(
+        self,
+        links: list[_FakeProfileLink],
+        *,
+        url: str = "https://www.tiktok.com/foryou",
+    ) -> None:
         self.links = _FakeProfileLinks(links)
+        self.url = url
 
     def locator(self, selector: str) -> _FakeProfileLinks:
         self.selector = selector
@@ -61,9 +67,15 @@ class _FakeTikTokPage:
 
 
 class _DelayedProfileLinkPage:
-    def __init__(self, samples: list[list[_FakeProfileLink]]) -> None:
+    def __init__(
+        self,
+        samples: list[list[_FakeProfileLink]],
+        *,
+        url: str = "https://www.tiktok.com/foryou",
+    ) -> None:
         self.samples = list(samples)
         self.locator_calls = 0
+        self.url = url
 
     def locator(self, selector: str) -> _FakeProfileLinks:
         self.selector = selector
@@ -152,6 +164,70 @@ class TikTokIdentityTests(unittest.TestCase):
         with self.assertRaises(TikTokIdentityError) as raised:
             asyncio.run(read_tiktok_identity(page))
         self.assertEqual(raised.exception.error_code, "tiktok_account_identity_ambiguous")
+
+    def test_read_identity_accepts_a_stable_hidden_profile_anchor_only_in_studio(self):
+        page = _FakeTikTokPage(
+            [_FakeProfileLink("/@Expected.User", "private display", visible=False)],
+            url="https://www.tiktok.com/tiktokstudio/upload?lang=en",
+        )
+
+        identity = asyncio.run(
+            read_tiktok_identity(page, poll_seconds=0.0, max_attempts=2)
+        )
+
+        self.assertEqual(identity.handle, "expected.user")
+        self.assertEqual(identity.display_name, "")
+        self.assertEqual(identity.profile_url, "https://www.tiktok.com/@expected.user")
+
+    def test_read_identity_rejects_a_hidden_profile_anchor_outside_studio(self):
+        page = _FakeTikTokPage(
+            [_FakeProfileLink("/@expected.user", "private display", visible=False)],
+            url="https://www.tiktok.com/foryou?private=value",
+        )
+
+        with self.assertRaises(TikTokIdentityError) as raised:
+            asyncio.run(read_tiktok_identity(page, poll_seconds=0.0, max_attempts=2))
+
+        self.assertEqual(raised.exception.error_code, "tiktok_account_invalid")
+        self.assertNotIn("private", raised.exception.public_message)
+        self.assertNotIn("value", raised.exception.public_message)
+
+    def test_read_identity_rejects_a_hidden_profile_anchor_on_login_route(self):
+        page = _FakeTikTokPage(
+            [_FakeProfileLink("/@expected.user", "private display", visible=False)],
+            url="https://www.tiktok.com/login?private=value",
+        )
+
+        with self.assertRaises(TikTokIdentityError) as raised:
+            asyncio.run(read_tiktok_identity(page, poll_seconds=0.0, max_attempts=2))
+
+        self.assertEqual(raised.exception.error_code, "tiktok_account_invalid")
+        self.assertNotIn("private", raised.exception.public_message)
+        self.assertNotIn("value", raised.exception.public_message)
+
+    def test_read_identity_rejects_hidden_conflicting_handles_on_every_route(self):
+        for url in (
+            "https://www.tiktok.com/tiktokstudio/upload",
+            "https://www.tiktok.com/login",
+        ):
+            with self.subTest(url=url):
+                page = _FakeTikTokPage(
+                    [
+                        _FakeProfileLink("/@expected.user", visible=False),
+                        _FakeProfileLink("/@other.user", visible=False),
+                    ],
+                    url=url,
+                )
+
+                with self.assertRaises(TikTokIdentityError) as raised:
+                    asyncio.run(
+                        read_tiktok_identity(page, poll_seconds=0.0, max_attempts=2)
+                    )
+
+                self.assertEqual(
+                    raised.exception.error_code,
+                    "tiktok_account_identity_ambiguous",
+                )
 
 
 class TikTokSavedIdentityTests(unittest.TestCase):
@@ -573,6 +649,47 @@ class TikTokSavedIdentityTests(unittest.TestCase):
             "expected.user",
         )
         runtime.chromium.launch.assert_awaited_once_with(headless=True)
+
+    def test_saved_validation_persists_the_verified_identity_once(self) -> None:
+        account_id = self._save_account(reference="")
+        (self.root / "tiktok.json").write_text("{}", encoding="utf-8")
+        page = SimpleNamespace(
+            goto=AsyncMock(),
+            close=AsyncMock(),
+            url="https://www.tiktok.com/tiktokstudio/upload",
+        )
+        factory, _runtime, _browser, _context = self._playwright_runtime(page)
+        identity = TikTokIdentity(
+            "expected.user",
+            "Expected",
+            "https://www.tiktok.com/@expected.user",
+        )
+        persist = MagicMock()
+
+        with (
+            patch.object(
+                identity_service,
+                "async_playwright",
+                return_value=factory,
+                create=True,
+            ),
+            patch.object(
+                identity_service,
+                "read_tiktok_identity",
+                new=AsyncMock(return_value=identity),
+            ),
+            patch.object(identity_service, "persist_tiktok_identity", persist),
+        ):
+            checked = identity_service.validate_saved_tiktok_account(
+                dict(self._stored_account(account_id))
+            )
+
+        self.assertEqual(checked, identity)
+        persist.assert_called_once_with(
+            account_id,
+            identity,
+            allow_initial_bind=True,
+        )
 
 
 class TikTokAccountPersistenceTests(unittest.TestCase):

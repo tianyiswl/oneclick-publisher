@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """Stable, public TikTok account identity readback.
 
-This module deliberately reads only a visible public profile link.  A display
-name or avatar is useful UI context, but neither is a stable account binding.
+This module reads public profile links only.  A display name or avatar is
+useful UI context, but neither is a stable account binding.
 """
 
 from __future__ import annotations
@@ -119,8 +119,39 @@ async def _text(locator) -> str:
     return " ".join(str(value or "").split())
 
 
-async def _visible_profile_candidates(page) -> dict[str, object]:
-    """Read visible public profile links once, without retaining page content."""
+def _is_tiktok_studio_route(page) -> bool:
+    """Allow the Studio account shell without retaining or reporting its URL."""
+
+    try:
+        parsed = urlsplit(str(getattr(page, "url", "")))
+    except Exception:
+        return False
+    host = (parsed.hostname or "").lower().rstrip(".")
+    return (
+        parsed.scheme.lower() in {"http", "https"}
+        and host in _TIKTOK_HOSTS
+        and parsed.path.startswith("/tiktokstudio/")
+    )
+
+
+def _store_profile_candidate(
+    candidates: dict[str, tuple[object, bool]],
+    handle: str,
+    link: object,
+    *,
+    visible: bool,
+) -> None:
+    """Keep one link per handle, preferring a visible link for UI context."""
+
+    existing = candidates.get(handle)
+    if existing is None or (visible and not existing[1]):
+        candidates[handle] = (link, visible)
+
+
+async def _profile_candidates(
+    page,
+) -> tuple[dict[str, tuple[object, bool]], dict[str, tuple[object, bool]]]:
+    """Read profile-link handles once, without retaining page content."""
 
     try:
         links = page.locator(_PROFILE_LINK_SELECTOR)
@@ -130,18 +161,21 @@ async def _visible_profile_candidates(page) -> dict[str, object]:
             "tiktok_account_invalid", "TikTok 页面没有返回稳定账号标识"
         ) from exc
 
-    candidates: dict[str, object] = {}
+    all_candidates: dict[str, tuple[object, bool]] = {}
+    visible_candidates: dict[str, tuple[object, bool]] = {}
     for index in range(count):
         try:
             link = links.nth(index)
         except Exception:
             continue
-        if not await _visible(link):
-            continue
         handle = normalize_tiktok_handle(await _attribute(link, "href"))
-        if handle:
-            candidates.setdefault(handle, link)
-    return candidates
+        if not handle:
+            continue
+        visible = await _visible(link)
+        _store_profile_candidate(all_candidates, handle, link, visible=visible)
+        if visible:
+            _store_profile_candidate(visible_candidates, handle, link, visible=True)
+    return all_candidates, visible_candidates
 
 
 async def read_tiktok_identity(
@@ -150,30 +184,33 @@ async def read_tiktok_identity(
     poll_seconds: float = 0.15,
     max_attempts: int = 5,
 ) -> TikTokIdentity:
-    """Read one stable, visible TikTok profile handle from a page.
+    """Read one stable TikTok public profile handle from a page.
 
-    The page must expose one or more Playwright-compatible profile-link
-    locators.  Invisible links are ignored.  Duplicate links for the same
-    handle are harmless; conflicting visible handles are rejected instead of
-    guessing which account is logged in.
+    Visible links are usable on all routes.  The dedicated TikTok Studio
+    account shell may expose its sole public link in responsive/closed markup,
+    so only that route may use one hidden link.  Conflicting handles always
+    fail closed, rather than guessing which account is logged in.
     """
 
     attempts = max(2, int(max_attempts))
     interval = max(0.0, float(poll_seconds))
     previous_handle = ""
     for index in range(attempts):
-        candidates = await _visible_profile_candidates(page)
-        if len(candidates) > 1:
+        all_candidates, visible_candidates = await _profile_candidates(page)
+        if len(all_candidates) > 1:
             raise TikTokIdentityError(
                 "tiktok_account_identity_ambiguous",
                 "TikTok 页面返回了多个冲突的账号标识",
             )
+        candidates = (
+            all_candidates if _is_tiktok_studio_route(page) else visible_candidates
+        )
         if len(candidates) == 1:
-            handle, link = next(iter(candidates.items()))
+            handle, (link, visible) = next(iter(candidates.items()))
             if handle == previous_handle:
                 return TikTokIdentity(
                     handle=handle,
-                    display_name=await _text(link),
+                    display_name=await _text(link) if visible else "",
                     profile_url=f"https://www.tiktok.com/@{handle}",
                 )
             previous_handle = handle
