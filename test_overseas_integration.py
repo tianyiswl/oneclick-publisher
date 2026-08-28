@@ -7,6 +7,7 @@ import asyncio
 import queue
 import sqlite3
 import tempfile
+import threading
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
@@ -444,16 +445,27 @@ class OverseasAccountEntryTests(unittest.TestCase):
                 """
                 CREATE TABLE user_info (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    type INTEGER NOT NULL,
+                    filePath TEXT NOT NULL,
                     status INTEGER,
+                    avatarPath TEXT,
                     accountReference TEXT
                 )
                 """
             )
             new_id = connection.execute(
-                "INSERT INTO user_info (status, accountReference) VALUES (1, '')"
+                """
+                INSERT INTO user_info
+                    (type, filePath, status, accountReference)
+                VALUES (6, 'new.json', 0, '')
+                """
             ).lastrowid
             update_id = connection.execute(
-                "INSERT INTO user_info (status, accountReference) VALUES (1, 'expected.user')"
+                """
+                INSERT INTO user_info
+                    (type, filePath, status, accountReference)
+                VALUES (6, 'old.json', 1, 'expected.user')
+                """
             ).lastrowid
             connection.commit()
             connection.close()
@@ -502,7 +514,7 @@ class OverseasAccountEntryTests(unittest.TestCase):
             sessions_removed = not new_session.exists() and not update_session.exists()
 
         self.assertIsNone(new_row)
-        self.assertEqual(updated_row, (0, "expected.user"))
+        self.assertEqual(updated_row, (1, "expected.user"))
         self.assertTrue(sessions_removed)
 
     def test_tiktok_update_mismatch_preserves_complete_old_account_and_session(self) -> None:
@@ -677,7 +689,7 @@ class OverseasAccountEntryTests(unittest.TestCase):
         self.assertEqual(remaining_avatars, [])
         self.assertNotIn("save-internal-detail", " ".join(messages))
 
-    def test_tiktok_persist_exception_restores_complete_updated_account(self) -> None:
+    def test_tiktok_atomic_update_exception_preserves_complete_old_account(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             database = self._create_tiktok_login_database(root)
@@ -709,8 +721,8 @@ class OverseasAccountEntryTests(unittest.TestCase):
                 ),
                 patch.object(
                     recovered_login,
-                    "persist_tiktok_identity",
-                    side_effect=RuntimeError("persist-internal-detail"),
+                    "_save_tiktok_update_if_unchanged",
+                    side_effect=RuntimeError("atomic-update-internal-detail"),
                 ),
             ):
                 try:
@@ -744,7 +756,7 @@ class OverseasAccountEntryTests(unittest.TestCase):
         self.assertEqual(current_row, old_row)
         self.assertEqual(remaining_sessions, ["old.json"])
         self.assertEqual(remaining_avatars, ["old.png"])
-        self.assertNotIn("persist-internal-detail", " ".join(messages))
+        self.assertNotIn("atomic-update-internal-detail", " ".join(messages))
 
     def test_tiktok_permission_exception_removes_partially_written_session(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -785,6 +797,247 @@ class OverseasAccountEntryTests(unittest.TestCase):
         self.assertEqual(row_count, 0)
         self.assertEqual(remaining_sessions, [])
         self.assertNotIn("permission-internal-detail", " ".join(messages))
+
+    def test_failed_tiktok_update_cleanup_preserves_concurrent_success(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            database = self._create_tiktok_login_database(root)
+            connection = sqlite3.connect(database)
+            account_id = connection.execute(
+                """
+                INSERT INTO user_info
+                    (type, filePath, userName, status, profileName, avatarPath,
+                     avatarUpdatedAt, lastCheckedAt, lastLoginAt, accountReference)
+                VALUES (6, 'old.json', 'Old Display', 1, 'Old Profile', 'old.png',
+                        '2026-08-01 01:00:00', '2026-08-01 02:00:00',
+                        '2026-08-01 03:00:00', 'expected.user')
+                """
+            ).lastrowid
+            connection.commit()
+            connection.row_factory = sqlite3.Row
+            previous_account = dict(
+                connection.execute(
+                    "SELECT * FROM user_info WHERE id = ?",
+                    (account_id,),
+                ).fetchone()
+            )
+            connection.close()
+
+            old_session = root / "cookiesFile" / "old.json"
+            failed_session = root / "cookiesFile" / "failed.json"
+            successful_session = root / "cookiesFile" / "successful.json"
+            old_session.write_text("old", encoding="utf-8")
+            failed_session.write_text("failed", encoding="utf-8")
+            successful_session.write_text("successful", encoding="utf-8")
+
+            successful_update_finished = threading.Event()
+            outcomes: list[tuple[str, str]] = []
+            outcome_lock = threading.Lock()
+
+            def finish_successful_update() -> None:
+                try:
+                    recovered_login._save_tiktok_update_if_unchanged(
+                        previous_account,
+                        cookie_file="successful.json",
+                        profile_name="Successful Profile",
+                        avatar_path=None,
+                        display_name="Successful Display",
+                        account_reference="expected.user",
+                    )
+                except Exception as exc:
+                    outcome = ("successful_error", type(exc).__name__)
+                else:
+                    outcome = ("success", "successful.json")
+                finally:
+                    successful_update_finished.set()
+                with outcome_lock:
+                    outcomes.append(outcome)
+
+            def clean_failed_update() -> None:
+                if not successful_update_finished.wait(timeout=3):
+                    with outcome_lock:
+                        outcomes.append(("failed_error", "timeout"))
+                    return
+                try:
+                    recovered_login._save_tiktok_update_if_unchanged(
+                        previous_account,
+                        cookie_file="failed.json",
+                        profile_name="Failed Profile",
+                        avatar_path=None,
+                        display_name="Failed Display",
+                        account_reference="expected.user",
+                    )
+                except TikTokIdentityError as exc:
+                    outcome = ("rejected", exc.error_code)
+                except Exception as exc:
+                    outcome = ("failed_error", type(exc).__name__)
+                else:
+                    outcome = ("unexpected_success", "failed.json")
+                recovered_login._discard_failed_tiktok_login(
+                    int(account_id),
+                    update_mode=True,
+                    cookie_path=failed_session,
+                    previous_account=previous_account,
+                )
+                with outcome_lock:
+                    outcomes.append(outcome)
+
+            with (
+                patch.object(recovered_login, "BASE_DIR", root),
+                patch.object(
+                    recovered_login,
+                    "open_connection",
+                    self._login_connection_factory(database),
+                ),
+            ):
+                successful_worker = threading.Thread(target=finish_successful_update)
+                failed_worker = threading.Thread(target=clean_failed_update)
+                failed_worker.start()
+                successful_worker.start()
+                successful_worker.join(timeout=5)
+                failed_worker.join(timeout=5)
+
+            connection = sqlite3.connect(database)
+            current = connection.execute(
+                """
+                SELECT filePath, userName, profileName, status, accountReference
+                FROM user_info WHERE id = ?
+                """,
+                (account_id,),
+            ).fetchone()
+            connection.close()
+            successful_session_exists = successful_session.exists()
+            failed_session_exists = failed_session.exists()
+
+        self.assertFalse(successful_worker.is_alive())
+        self.assertFalse(failed_worker.is_alive())
+        self.assertCountEqual(
+            outcomes,
+            [
+                ("success", "successful.json"),
+                ("rejected", "tiktok_account_invalid"),
+            ],
+        )
+        self.assertEqual(
+            current,
+            (
+                "successful.json",
+                "Successful Display",
+                "Successful Profile",
+                1,
+                "expected.user",
+            ),
+        )
+        self.assertTrue(successful_session_exists)
+        self.assertFalse(failed_session_exists)
+
+    def test_generic_tiktok_save_rejects_unconditional_update(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            database = self._create_tiktok_login_database(root)
+            connection = sqlite3.connect(database)
+            account_id = connection.execute(
+                """
+                INSERT INTO user_info
+                    (type, filePath, userName, status, profileName,
+                     accountReference)
+                VALUES (6, 'old.json', 'Old Display', 1, 'Old Profile',
+                        'expected.user')
+                """
+            ).lastrowid
+            connection.commit()
+            old_row = connection.execute(
+                "SELECT * FROM user_info WHERE id = ?",
+                (account_id,),
+            ).fetchone()
+            connection.close()
+
+            with (
+                patch.object(recovered_login, "BASE_DIR", root),
+                patch.object(
+                    recovered_login,
+                    "open_connection",
+                    self._login_connection_factory(database),
+                ),
+            ):
+                with self.assertRaises(TikTokIdentityError) as raised:
+                    recovered_login.save_login_account(
+                        6,
+                        "candidate.json",
+                        "Candidate Profile",
+                        update_mode=True,
+                        record_id=int(account_id),
+                        display_name="Candidate Display",
+                    )
+
+            connection = sqlite3.connect(database)
+            current_row = connection.execute(
+                "SELECT * FROM user_info WHERE id = ?",
+                (account_id,),
+            ).fetchone()
+            connection.close()
+
+        self.assertEqual(raised.exception.error_code, "tiktok_account_invalid")
+        self.assertEqual(current_row, old_row)
+
+    def test_tiktok_cleanup_database_failure_keeps_pending_session_recoverable(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            database = self._create_tiktok_login_database(root)
+            connection_attempts = 0
+
+            @contextmanager
+            def fail_cleanup_connection(_path, *, row_factory=False):
+                nonlocal connection_attempts
+                connection_attempts += 1
+                if connection_attempts > 1:
+                    raise sqlite3.OperationalError("cleanup-database-unavailable")
+                connection = sqlite3.connect(database)
+                if row_factory:
+                    connection.row_factory = sqlite3.Row
+                try:
+                    yield connection
+                    connection.commit()
+                finally:
+                    connection.close()
+
+            with (
+                patch.object(
+                    recovered_login,
+                    "open_connection",
+                    fail_cleanup_connection,
+                ),
+                patch.object(
+                    recovered_login,
+                    "persist_tiktok_identity",
+                    side_effect=RuntimeError("persist-internal-detail"),
+                ),
+            ):
+                result, messages = self._run_tiktok_login_attempt(
+                    root,
+                    TikTokIdentity(
+                        "expected.user",
+                        "Expected",
+                        "https://www.tiktok.com/@expected.user",
+                    ),
+                )
+
+            connection = sqlite3.connect(database)
+            row = connection.execute(
+                "SELECT status, filePath, avatarPath FROM user_info"
+            ).fetchone()
+            connection.close()
+            saved_session = root / "cookiesFile" / row[1]
+            saved_avatar = root / "avatars" / row[2]
+            saved_session_exists = saved_session.exists()
+            saved_avatar_exists = saved_avatar.exists()
+
+        self.assertIsNone(result)
+        self.assertEqual(row[0], 0)
+        self.assertTrue(saved_session_exists)
+        self.assertTrue(saved_avatar_exists)
+        self.assertNotIn("cleanup-database-unavailable", " ".join(messages))
+        self.assertNotIn("persist-internal-detail", " ".join(messages))
 
 
 class YouTubeOAuthAccountPersistenceTests(unittest.TestCase):

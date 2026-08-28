@@ -182,8 +182,14 @@ async def capture_login_identity(page, platform_type, avatar_key):
 
 
 def save_login_account(platform_type, cookie_file, profile_name, update_mode=False, record_id=None, avatar_path=None, display_name=None):
+    if int(platform_type) == 6 and update_mode:
+        raise TikTokIdentityError(
+            "tiktok_account_invalid",
+            "TikTok 账号更新必须使用已验证身份的条件写入",
+        )
     user_name = display_name or profile_name
     saved_account_id = int(record_id) if update_mode and record_id else None
+    initial_status = 0 if int(platform_type) == 6 and not update_mode else 1
     checked_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     db_path = Path(BASE_DIR / "db" / "database.db")
     with open_connection(db_path) as conn:
@@ -207,7 +213,7 @@ def save_login_account(platform_type, cookie_file, profile_name, update_mode=Fal
                     platform_type,
                     cookie_file,
                     user_name,
-                    1,
+                    initial_status,
                     profile_name,
                     avatar_path,
                     avatar_path,
@@ -229,7 +235,7 @@ def save_login_account(platform_type, cookie_file, profile_name, update_mode=Fal
                     platform_type,
                     cookie_file,
                     user_name,
-                    1,
+                    initial_status,
                     profile_name,
                     avatar_path,
                     checked_at,
@@ -250,7 +256,7 @@ def save_login_account(platform_type, cookie_file, profile_name, update_mode=Fal
                     platform_type,
                     cookie_file,
                     user_name,
-                    1,
+                    initial_status,
                     profile_name,
                     checked_at,
                     checked_at,
@@ -262,6 +268,79 @@ def save_login_account(platform_type, cookie_file, profile_name, update_mode=Fal
     return saved_account_id
 
 
+def _save_tiktok_update_if_unchanged(
+    previous_account: dict,
+    *,
+    cookie_file: str,
+    profile_name: str,
+    avatar_path: str | None,
+    display_name: str | None,
+    account_reference: str,
+) -> int:
+    """Replace one TikTok login only while every overwritten field is unchanged."""
+
+    checked_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    db_path = Path(BASE_DIR / "db" / "database.db")
+    with open_connection(db_path) as conn:
+        updated = conn.execute(
+            """
+            UPDATE user_info
+            SET type = 6,
+                filePath = ?,
+                userName = ?,
+                status = 1,
+                profileName = ?,
+                avatarPath = COALESCE(?, avatarPath),
+                avatarUpdatedAt = CASE
+                    WHEN ? IS NOT NULL THEN CURRENT_TIMESTAMP
+                    ELSE avatarUpdatedAt
+                END,
+                lastCheckedAt = ?,
+                lastLoginAt = ?,
+                accountReference = ?
+            WHERE id = ?
+              AND type IS ?
+              AND filePath IS ?
+              AND userName IS ?
+              AND status IS ?
+              AND profileName IS ?
+              AND avatarPath IS ?
+              AND avatarUpdatedAt IS ?
+              AND lastCheckedAt IS ?
+              AND lastLoginAt IS ?
+              AND accountReference IS ?
+            """,
+            (
+                cookie_file,
+                display_name or profile_name,
+                profile_name,
+                avatar_path,
+                avatar_path,
+                checked_at,
+                checked_at,
+                account_reference,
+                int(previous_account["id"]),
+                previous_account.get("type"),
+                previous_account.get("filePath"),
+                previous_account.get("userName"),
+                previous_account.get("status"),
+                previous_account.get("profileName"),
+                previous_account.get("avatarPath"),
+                previous_account.get("avatarUpdatedAt"),
+                previous_account.get("lastCheckedAt"),
+                previous_account.get("lastLoginAt"),
+                previous_account.get("accountReference"),
+            ),
+        )
+        if int(updated.rowcount or 0) != 1:
+            raise TikTokIdentityError(
+                "tiktok_account_invalid",
+                "TikTok 账号在登录保存期间已变更",
+            )
+        conn.commit()
+    return int(previous_account["id"])
+
+
 def _discard_failed_tiktok_login(
     account_id: int | None,
     *,
@@ -269,57 +348,54 @@ def _discard_failed_tiktok_login(
     cookie_path: Path,
     avatar_path: str | None = None,
     previous_account: dict | None = None,
+    account_write_attempted: bool = True,
 ) -> None:
     """Remove only artifacts created by the failed TikTok login attempt."""
 
+    if not account_write_attempted:
+        cookie_path.unlink(missing_ok=True)
+        if avatar_path:
+            (Path(BASE_DIR / "avatars") / Path(avatar_path).name).unlink(
+                missing_ok=True
+            )
+        return
+
+    cookie_unreferenced = False
+    avatar_unreferenced = not avatar_path
     try:
         db_path = Path(BASE_DIR / "db" / "database.db")
         with open_connection(db_path) as conn:
-            if update_mode and previous_account:
+            if not update_mode and account_id:
                 conn.execute(
                     """
-                    UPDATE user_info
-                    SET type = ?, filePath = ?, userName = ?, status = ?,
-                        profileName = ?, avatarPath = ?, avatarUpdatedAt = ?,
-                        lastCheckedAt = ?, lastLoginAt = ?, accountReference = ?
-                    WHERE id = ?
+                    DELETE FROM user_info
+                    WHERE id = ? AND type = 6 AND filePath = ?
                     """,
-                    (
-                        previous_account.get("type"),
-                        previous_account.get("filePath"),
-                        previous_account.get("userName"),
-                        previous_account.get("status"),
-                        previous_account.get("profileName"),
-                        previous_account.get("avatarPath"),
-                        previous_account.get("avatarUpdatedAt"),
-                        previous_account.get("lastCheckedAt"),
-                        previous_account.get("lastLoginAt"),
-                        previous_account.get("accountReference"),
-                        int(previous_account["id"]),
-                    ),
+                    (int(account_id), cookie_path.name),
                 )
-            elif update_mode and account_id:
-                conn.execute(
-                    "UPDATE user_info SET status = 0 WHERE id = ?",
-                    (int(account_id),),
-                )
-            elif account_id:
-                conn.execute("DELETE FROM user_info WHERE id = ?", (int(account_id),))
-            else:
+            elif not update_mode:
                 conn.execute(
                     "DELETE FROM user_info WHERE type = 6 AND filePath = ?",
                     (cookie_path.name,),
                 )
             conn.commit()
-    finally:
-        previous_cookie = str((previous_account or {}).get("filePath") or "")
-        if cookie_path.name != Path(previous_cookie).name:
-            cookie_path.unlink(missing_ok=True)
-        if avatar_path:
-            previous_avatar = str((previous_account or {}).get("avatarPath") or "")
-            candidate = Path(BASE_DIR / "avatars" / Path(avatar_path).name)
-            if candidate.name != Path(previous_avatar).name:
-                candidate.unlink(missing_ok=True)
+            cookie_unreferenced = not conn.execute(
+                "SELECT 1 FROM user_info WHERE type = 6 AND filePath = ? LIMIT 1",
+                (cookie_path.name,),
+            ).fetchone()
+            if avatar_path:
+                avatar_unreferenced = not conn.execute(
+                    "SELECT 1 FROM user_info WHERE type = 6 AND avatarPath = ? LIMIT 1",
+                    (Path(avatar_path).name,),
+                ).fetchone()
+    except Exception:
+        # 无法确认数据库补偿时保留候选文件，避免留下断链账号行。
+        return
+
+    if cookie_unreferenced:
+        cookie_path.unlink(missing_ok=True)
+    if avatar_path and avatar_unreferenced:
+        (Path(BASE_DIR / "avatars") / Path(avatar_path).name).unlink(missing_ok=True)
 
 
 def _load_tiktok_account_snapshot(record_id: int | None) -> dict:
@@ -338,6 +414,47 @@ def _load_tiktok_account_snapshot(record_id: int | None) -> dict:
             "tiktok_account_invalid", "待更新的 TikTok 账号不存在"
         )
     return dict(row)
+
+
+def _remove_replaced_tiktok_artifacts(
+    previous_account: dict,
+    *,
+    current_cookie: str,
+    current_avatar: str | None,
+) -> None:
+    """Best-effort removal after the replacement row has committed."""
+
+    old_cookie = Path(str(previous_account.get("filePath") or "")).name
+    old_avatar = Path(str(previous_account.get("avatarPath") or "")).name
+    try:
+        db_path = Path(BASE_DIR / "db" / "database.db")
+        with open_connection(db_path) as conn:
+            cookie_referenced = bool(
+                old_cookie
+                and conn.execute(
+                    "SELECT 1 FROM user_info WHERE filePath = ? LIMIT 1",
+                    (old_cookie,),
+                ).fetchone()
+            )
+            avatar_referenced = bool(
+                old_avatar
+                and conn.execute(
+                    "SELECT 1 FROM user_info WHERE avatarPath = ? LIMIT 1",
+                    (old_avatar,),
+                ).fetchone()
+            )
+    except Exception:
+        return
+
+    if old_cookie and old_cookie != Path(current_cookie).name and not cookie_referenced:
+        (Path(BASE_DIR / "cookiesFile") / old_cookie).unlink(missing_ok=True)
+    if (
+        current_avatar
+        and old_avatar
+        and old_avatar != Path(current_avatar).name
+        and not avatar_referenced
+    ):
+        (Path(BASE_DIR / "avatars") / old_avatar).unlink(missing_ok=True)
 
 
 def save_meta_login_accounts(cookie_file, profile_name, update_mode=False, record_id=None, avatar_path=None, display_name=None):
@@ -618,6 +735,7 @@ async def _browser_cookie_gen(
         account_id = None
         tiktok_previous_account = None
         tiktok_login_succeeded = False
+        tiktok_account_write_attempted = False
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=60000)
             if platform_type == 6 and background_mode:
@@ -721,27 +839,50 @@ async def _browser_cookie_gen(
             else:
                 account_id = None
                 try:
-                    account_id = save_login_account(
-                        platform_type,
-                        cookie_file,
-                        profile_name,
-                        update_mode,
-                        record_id,
-                        avatar_path,
-                        display_name,
-                    )
+                    tiktok_account_write_attempted = platform_type == 6
+                    if platform_type == 6 and update_mode:
+                        if tiktok_previous_account is None or tiktok_identity is None:
+                            raise TikTokIdentityError(
+                                "tiktok_account_invalid",
+                                "TikTok 账号记录未能安全更新",
+                            )
+                        account_id = _save_tiktok_update_if_unchanged(
+                            tiktok_previous_account,
+                            cookie_file=cookie_file,
+                            profile_name=profile_name,
+                            avatar_path=avatar_path,
+                            display_name=display_name,
+                            account_reference=tiktok_identity.handle,
+                        )
+                    else:
+                        account_id = save_login_account(
+                            platform_type,
+                            cookie_file,
+                            profile_name,
+                            update_mode,
+                            record_id,
+                            avatar_path,
+                            display_name,
+                        )
                     if platform_type == 6:
                         if not account_id or tiktok_identity is None:
                             raise TikTokIdentityError(
                                 "tiktok_account_invalid",
                                 "TikTok 账号记录未能安全保存",
                             )
-                        persist_tiktok_identity(
-                            account_id,
-                            tiktok_identity,
-                            allow_initial_bind=True,
-                        )
+                        if not update_mode:
+                            persist_tiktok_identity(
+                                account_id,
+                                tiktok_identity,
+                                allow_initial_bind=True,
+                            )
                         tiktok_login_succeeded = True
+                        if update_mode and tiktok_previous_account:
+                            _remove_replaced_tiktok_artifacts(
+                                tiktok_previous_account,
+                                current_cookie=cookie_file,
+                                current_avatar=avatar_path,
+                            )
                 except TikTokIdentityError as exc:
                     if platform_type != 6:
                         raise
@@ -775,6 +916,7 @@ async def _browser_cookie_gen(
                         cookie_path=cookie_path,
                         avatar_path=avatar_path,
                         previous_account=tiktok_previous_account,
+                        account_write_attempted=tiktok_account_write_attempted,
                     )
                 except Exception:
                     # 登录主错误保持稳定；仍继续关闭浏览器资源。

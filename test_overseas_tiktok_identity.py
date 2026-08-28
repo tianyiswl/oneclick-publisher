@@ -182,15 +182,21 @@ class TikTokSavedIdentityTests(unittest.TestCase):
         self.connect_patch.stop()
         self.temp.cleanup()
 
-    def _save_account(self, *, reference: str = "expected.user", file_name: str = "tiktok.json") -> int:
+    def _save_account(
+        self,
+        *,
+        reference: str = "expected.user",
+        file_name: str = "tiktok.json",
+        status: int = 1,
+    ) -> int:
         connection = sqlite3.connect(self.database)
         account_id = connection.execute(
             """
             INSERT INTO user_info
                 (type, filePath, userName, status, accountReference, authMode)
-            VALUES (6, ?, 'Expected', 1, ?, 'browser')
+            VALUES (6, ?, 'Expected', ?, ?, 'browser')
             """,
-            (file_name, reference),
+            (file_name, status, reference),
         ).lastrowid
         connection.commit()
         connection.close()
@@ -224,7 +230,7 @@ class TikTokSavedIdentityTests(unittest.TestCase):
         return factory, runtime, browser, context
 
     def test_initial_persist_binds_only_the_verified_handle(self) -> None:
-        account_id = self._save_account(reference="")
+        account_id = self._save_account(reference="", status=0)
         identity = TikTokIdentity(
             "Expected.User",
             "Expected",
@@ -241,6 +247,7 @@ class TikTokSavedIdentityTests(unittest.TestCase):
             self._stored_account(account_id)["accountReference"],
             "expected.user",
         )
+        self.assertEqual(self._stored_account(account_id)["status"], 1)
 
     def test_persist_mismatch_preserves_the_existing_reference(self) -> None:
         account_id = self._save_account(reference="expected.user")

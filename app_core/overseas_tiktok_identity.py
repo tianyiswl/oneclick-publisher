@@ -227,7 +227,7 @@ def persist_tiktok_identity(
             updated = conn.execute(
                 """
                 UPDATE user_info
-                SET accountReference = ?
+                SET accountReference = ?, status = 1
                 WHERE id = ? AND type = 6
                   AND (accountReference IS NULL OR TRIM(accountReference) = '')
                 """,
