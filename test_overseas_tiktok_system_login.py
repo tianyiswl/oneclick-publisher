@@ -196,7 +196,7 @@ class TikTokSystemLoginTests(unittest.TestCase):
             "Google Chrome",
             Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
         )
-        attempt = self._attempt()
+        attempt = create_login_attempt(self.user_data_dir)
 
         command = build_system_browser_command(browser, attempt)
 
@@ -207,7 +207,7 @@ class TikTokSystemLoginTests(unittest.TestCase):
             self.assertNotIn(forbidden, joined.lower())
 
     def test_macos_chrome_uses_mock_keychain_only_for_the_private_login_attempt(self):
-        attempt = self._attempt()
+        attempt = create_login_attempt(self.user_data_dir)
         chrome = SystemBrowserSpec(
             "Google Chrome",
             Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
@@ -229,6 +229,31 @@ class TikTokSystemLoginTests(unittest.TestCase):
         self.assertNotIn("--use-mock-keychain", macos_edge_command)
         self.assertNotIn("--use-mock-keychain", windows_chrome_command)
         self.assertNotIn("--use-mock-keychain", linux_chrome_command)
+
+    def test_macos_chrome_rejects_non_owned_missing_or_nonprivate_profile(self):
+        chrome = SystemBrowserSpec(
+            "Google Chrome",
+            Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+        )
+        ordinary_profile = self.root / "ordinary-profile"
+        ordinary_profile.mkdir()
+        ordinary_attempt = TikTokLoginAttempt(
+            "a" * 32,
+            self.staging,
+            self.staging / ("a" * 32),
+            ordinary_profile,
+        )
+        missing_attempt = self._attempt()
+        nonprivate_attempt = create_login_attempt(self.user_data_dir)
+        if os.name == "posix":
+            nonprivate_attempt.profile_dir.chmod(0o755)
+
+        with patch("app_core.overseas_tiktok_system_login.sys.platform", "darwin"):
+            for attempt in (ordinary_attempt, missing_attempt, nonprivate_attempt):
+                with self.subTest(profile_dir=attempt.profile_dir):
+                    with self.assertRaises(TikTokSystemLoginError) as raised:
+                        build_system_browser_command(chrome, attempt)
+                    self.assertEqual(raised.exception.error_code, "tiktok_login_cleanup_failed")
 
     def test_create_login_attempt_generates_private_uuid_profile(self):
         attempt = create_login_attempt(self.user_data_dir)

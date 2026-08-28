@@ -247,9 +247,12 @@ def build_system_browser_command(
 ) -> list[str]:
     """Build the fixed, non-automated system-browser command for this attempt."""
 
+    profile_dir = attempt.profile_dir
+    if sys.platform == "darwin" and browser.name == "Google Chrome":
+        profile_dir = _resolved_owned_profile(attempt)
     command = [
         str(browser.executable),
-        f"--user-data-dir={attempt.profile_dir}",
+        f"--user-data-dir={profile_dir}",
         "--profile-directory=Default",
         "--new-window",
         "--no-first-run",
@@ -257,9 +260,9 @@ def build_system_browser_command(
         "--disable-background-mode",
         _TIKTOK_LOGIN_URL,
     ]
-    # This command is issued only for the private staging profile created by
-    # create_login_attempt.  macOS Chrome otherwise relies on a Keychain item
-    # that a dedicated temporary profile cannot persist after the window exits.
+    # The profile was verified above as an owned, private staging directory.
+    # macOS Chrome otherwise relies on a Keychain item that a dedicated
+    # temporary profile cannot persist after the window exits.
     if sys.platform == "darwin" and browser.name == "Google Chrome":
         command.insert(2, "--use-mock-keychain")
     return command
@@ -421,7 +424,12 @@ def wait_for_browser_exit(
 def _resolved_owned_profile(attempt: TikTokLoginAttempt) -> Path:
     raw_attempt = _absolute_path(attempt.attempt_root)
     raw_profile = _absolute_path(attempt.profile_dir)
-    if raw_profile != raw_attempt / "chrome-profile" or raw_profile.is_symlink():
+    if (
+        str(attempt.attempt_id) != raw_attempt.name
+        or _ATTEMPT_ID.fullmatch(raw_attempt.name) is None
+        or raw_profile != raw_attempt / "chrome-profile"
+        or raw_profile.is_symlink()
+    ):
         raise _cleanup_failed()
     resolved_attempt, _ = _resolved_owned_attempt(raw_attempt, attempt.staging_root)
     try:
@@ -429,6 +437,8 @@ def _resolved_owned_profile(attempt: TikTokLoginAttempt) -> Path:
     except OSError as exc:
         raise _cleanup_failed() from exc
     if resolved_profile.parent != resolved_attempt or not resolved_profile.is_dir():
+        raise _cleanup_failed()
+    if os.name == "posix" and stat.S_IMODE(resolved_profile.stat().st_mode) != 0o700:
         raise _cleanup_failed()
     return resolved_profile
 
