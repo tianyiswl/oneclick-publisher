@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 
 from app_core import (
     account_service,
+    controlled_publish,
     database,
     douyin_commerce_batch_executor,
     publish_service,
@@ -1785,7 +1786,7 @@ class TikTokTaskServiceTests(unittest.TestCase):
         self.db_patch.stop()
         self.tempdir.cleanup()
 
-    def _task(self) -> dict:
+    def _task(self, *, mode: str = "oneclick_publish") -> dict:
         return task_service.create_pending_task(
             [
                 {
@@ -1800,8 +1801,21 @@ class TikTokTaskServiceTests(unittest.TestCase):
                     "tiktokExecutionIntent": "formal_public",
                 }
             ],
-            mode="oneclick_publish",
+            mode=mode,
         )
+
+    def _claim(self, task_id: int, *, mode: str, state: str = "claimed") -> None:
+        with database.connect() as conn:
+            controlled_publish._ensure_tiktok_claim_schema(conn)
+            conn.execute(
+                """
+                INSERT INTO tiktok_controlled_execution_claims
+                    (scopeFingerprint, taskId, mode, state, createdAt)
+                VALUES (?, ?, ?, ?, '2026-08-28T10:00:00+00:00')
+                """,
+                (f"scope-{task_id}", int(task_id), mode, state),
+            )
+            conn.commit()
 
     def _expire(self, task_id: int) -> None:
         with database.connect() as conn:
@@ -1942,6 +1956,92 @@ class TikTokTaskServiceTests(unittest.TestCase):
             detail["events"][-1]["eventType"],
             "controlled_worker_lease_expired",
         )
+
+    def test_delete_tasks_cleans_form_check_and_early_failed_formal_claims(self) -> None:
+        form_check = self._task(mode="oneclick_platform_form_check")
+        self._claim(form_check["id"], mode="platform_form_check")
+        task_service.mark_platform_result(
+            form_check["id"],
+            6,
+            ok=True,
+            message="TikTok 表单检查完成",
+            event_type="tiktok_platform_form_verified",
+            receipt={
+                "accountId": 61,
+                "visibility": "public",
+                "platformWriteOccurred": True,
+                "finalActionTriggered": False,
+                "phase": "platform_form_verified",
+            },
+        )
+        early_failure = self._task()
+        self._claim(early_failure["id"], mode="formal")
+        task_service.fail_active_task(
+            early_failure["id"],
+            error_code="tiktok_worker_start_failed",
+            message="TikTok worker 启动失败",
+            event_type="tiktok_worker_start_failed",
+        )
+
+        self.assertEqual(
+            task_service.delete_tasks([form_check["id"], early_failure["id"]]),
+            2,
+        )
+        self.assertIsNone(task_service.get_task(form_check["id"]))
+        self.assertIsNone(task_service.get_task(early_failure["id"]))
+        with database.connect() as conn:
+            claims = conn.execute(
+                "SELECT COUNT(*) FROM tiktok_controlled_execution_claims"
+            ).fetchone()[0]
+        self.assertEqual(claims, 0)
+
+    def test_delete_tasks_preserves_formal_dedupe_evidence_with_stable_error(self) -> None:
+        scenarios = ("success", "final_action", "ambiguous")
+        for scenario in scenarios:
+            with self.subTest(scenario=scenario):
+                task = self._task()
+                self._claim(task["id"], mode="formal")
+                if scenario == "success":
+                    task_service.mark_platform_result(
+                        task["id"],
+                        6,
+                        ok=True,
+                        message="TikTok 已发布",
+                        event_type="tiktok_published_readback_confirmed",
+                        receipt={
+                            "accountId": 61,
+                            "visibility": "public",
+                            "platformWriteOccurred": True,
+                            "finalActionTriggered": True,
+                            "phase": "published_readback_confirmed",
+                        },
+                    )
+                else:
+                    if scenario == "final_action":
+                        task_service.record_task_event(
+                            task["id"],
+                            "tiktok_final_action_triggered",
+                            "TikTok 必须保留的防重证据",
+                        )
+                    task_service.fail_active_task(
+                        task["id"],
+                        error_code="tiktok_publish_outcome_unknown",
+                        message="TikTok 最终动作后结果不明",
+                    )
+
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "^TikTok 已发布或最终动作后的任务不能删除，必须保留防重复证据$",
+                ):
+                    task_service.delete_tasks([task["id"]])
+
+                self.assertIsNotNone(task_service.get_task(task["id"]))
+                with database.connect() as conn:
+                    claim = conn.execute(
+                        "SELECT taskId FROM tiktok_controlled_execution_claims WHERE taskId = ?",
+                        (task["id"],),
+                    ).fetchone()
+                self.assertIsNotNone(claim)
 
 class DouyinGraphicMatrixTaskPersistenceTests(unittest.TestCase):
     def setUp(self) -> None:

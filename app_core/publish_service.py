@@ -1203,7 +1203,10 @@ def start_desktop_publish(payloads: list[dict[str, Any]]) -> dict:
 def start_controlled_tiktok_publish(task_id: int) -> dict:
     """Start one pre-created TikTok task only after verifying its DB claim."""
 
-    from .controlled_publish import require_tiktok_execution_claim
+    from .controlled_publish import (
+        compensate_tiktok_worker_start_failure,
+        require_tiktok_execution_claim,
+    )
 
     task = task_service.get_task(int(task_id))
     if not isinstance(task, dict) or str(task.get("status") or "") != "pending":
@@ -1229,11 +1232,6 @@ def start_controlled_tiktok_publish(task_id: int) -> dict:
     )
     if not claim_mode:
         raise ValueError("TikTok 受控任务模式无效")
-    require_tiktok_execution_claim(
-        int(task_id),
-        payloads,
-        mode=claim_mode,
-    )
     prepared = _validate_payloads(payloads)
     expected_runtime = "publish" if claim_mode == "formal" else "platform_form_check"
     if str(prepared[0].get("runtimeMode") or "") != expected_runtime:
@@ -1249,11 +1247,20 @@ def start_controlled_tiktok_publish(task_id: int) -> dict:
             else f"oneclick-platform-form-check-{task_id}"
         ),
     )
+    require_tiktok_execution_claim(
+        int(task_id),
+        payloads,
+        mode=claim_mode,
+    )
     _active_threads[int(task_id)] = worker
     try:
         worker.start()
     except Exception:
         _active_threads.pop(int(task_id), None)
+        compensate_tiktok_worker_start_failure(
+            int(task_id),
+            mode=claim_mode,
+        )
         raise
     return task
 

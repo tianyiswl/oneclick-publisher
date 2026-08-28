@@ -623,6 +623,57 @@ def delete_tasks(task_ids: list[int]) -> int:
             task_numbers = "、".join(str(row["taskNo"]) for row in active_rows)
             raise ValueError(f"等待执行或执行中的任务不能删除：{task_numbers}")
 
+        protected_tiktok = conn.execute(
+            f"""
+            SELECT 1
+            FROM publish_tasks AS task
+            WHERE task.id IN ({placeholders})
+              AND task.mode = 'oneclick_publish'
+              AND EXISTS (
+                  SELECT 1 FROM publish_task_items AS item
+                  WHERE item.taskId = task.id AND item.platformType = 6
+              )
+              AND (
+                  task.status = 'success'
+                  OR EXISTS (
+                      SELECT 1 FROM publish_task_events AS event
+                      WHERE event.taskId = task.id
+                        AND event.eventType IN (
+                            'tiktok_final_action_triggered',
+                            'tiktok_publish_outcome_ambiguous'
+                        )
+                  )
+                  OR EXISTS (
+                      SELECT 1 FROM publish_task_items AS item
+                      WHERE item.taskId = task.id
+                        AND item.platformType = 6
+                        AND item.errorCode = 'tiktok_publish_outcome_unknown'
+                  )
+              )
+            LIMIT 1
+            """,
+            tuple(normalized_ids),
+        ).fetchone()
+        if protected_tiktok:
+            raise ValueError(
+                "TikTok 已发布或最终动作后的任务不能删除，必须保留防重复证据"
+            )
+
+        claim_table = conn.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'tiktok_controlled_execution_claims'
+            """
+        ).fetchone()
+        if claim_table:
+            conn.execute(
+                f"""
+                DELETE FROM tiktok_controlled_execution_claims
+                WHERE taskId IN ({placeholders})
+                """,
+                tuple(normalized_ids),
+            )
+
         conn.execute(
             f"DELETE FROM publish_task_events WHERE taskId IN ({placeholders})",
             tuple(normalized_ids),
@@ -1971,7 +2022,8 @@ def touch_task_heartbeat(task_id: int) -> bool:
     return updated.rowcount == 1
 
 
-def fail_active_task(
+def _fail_active_task_in_transaction(
+    conn,
     task_id: int,
     *,
     error_code: str,
@@ -1979,7 +2031,7 @@ def fail_active_task(
     event_type: str = "controlled_task_aborted",
     receipt: Mapping[str, object] | None = None,
 ) -> bool:
-    """把未取得终态回执的执行项一次性关闭，防止永久 pending。"""
+    """Close an active task without committing the caller's transaction."""
 
     code = str(error_code or "controlled_task_aborted").strip()
     public_message = f"{str(message).strip()}（错误码 {code}）"
@@ -1994,93 +2046,115 @@ def fail_active_task(
                 separators=(",", ":"),
             )
     now = _now()
-    with connect() as conn:
-        updated = conn.execute(
-            """
-            UPDATE publish_task_items
-            SET status = 'failed', message = ?, errorCode = ?, attempts = attempts + 1,
-                startedAt = COALESCE(startedAt, ?), finishedAt = ?,
-                receiptJson = CASE WHEN ? <> '' THEN ? ELSE receiptJson END
-            WHERE taskId = ? AND status IN ('pending', 'running')
-            """,
-            (
-                public_message,
-                code,
-                now,
-                now,
-                receipt_json,
-                receipt_json,
-                int(task_id),
-            ),
-        )
-        if updated.rowcount == 0:
-            return False
-        summary = conn.execute(
-            """
-            SELECT
-                SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS success,
-                SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed
-            FROM publish_task_items WHERE taskId = ?
-            """,
-            (int(task_id),),
-        ).fetchone()
-        success = int(summary["success"] or 0)
-        failed = int(summary["failed"] or 0)
-        status = "partial_failed" if success and failed else "failed" if failed else "success"
-        conn.execute(
-            """
-            UPDATE publish_tasks
-            SET status = ?, successCount = ?, failedCount = ?, lastError = ?,
-                finishedAt = ?, workerHeartbeatAt = ?
-            WHERE id = ?
-            """,
-            (status, success, failed, public_message, now, now, int(task_id)),
-        )
-        conn.execute(
-            """
-            INSERT INTO publish_task_events
-                (taskId, level, eventType, message, createdAt)
-            VALUES (?, 'error', ?, ?, ?)
-            """,
-            (int(task_id), str(event_type), public_message, now),
-        )
-        conn.commit()
+    updated = conn.execute(
+        """
+        UPDATE publish_task_items
+        SET status = 'failed', message = ?, errorCode = ?, attempts = attempts + 1,
+            startedAt = COALESCE(startedAt, ?), finishedAt = ?,
+            receiptJson = CASE WHEN ? <> '' THEN ? ELSE receiptJson END
+        WHERE taskId = ? AND status IN ('pending', 'running')
+        """,
+        (
+            public_message,
+            code,
+            now,
+            now,
+            receipt_json,
+            receipt_json,
+            int(task_id),
+        ),
+    )
+    if updated.rowcount == 0:
+        return False
+    summary = conn.execute(
+        """
+        SELECT
+            SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS success,
+            SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed
+        FROM publish_task_items WHERE taskId = ?
+        """,
+        (int(task_id),),
+    ).fetchone()
+    success = int(summary["success"] or 0)
+    failed = int(summary["failed"] or 0)
+    status = "partial_failed" if success and failed else "failed" if failed else "success"
+    conn.execute(
+        """
+        UPDATE publish_tasks
+        SET status = ?, successCount = ?, failedCount = ?, lastError = ?,
+            finishedAt = ?, workerHeartbeatAt = ?
+        WHERE id = ?
+        """,
+        (status, success, failed, public_message, now, now, int(task_id)),
+    )
+    conn.execute(
+        """
+        INSERT INTO publish_task_events
+            (taskId, level, eventType, message, createdAt)
+        VALUES (?, 'error', ?, ?, ?)
+        """,
+        (int(task_id), str(event_type), public_message, now),
+    )
     return True
 
 
-def reconcile_stale_controlled_task(
+def fail_active_task(
+    task_id: int,
+    *,
+    error_code: str,
+    message: str,
+    event_type: str = "controlled_task_aborted",
+    receipt: Mapping[str, object] | None = None,
+) -> bool:
+    """把未取得终态回执的执行项一次性关闭，防止永久 pending。"""
+
+    with connect() as conn:
+        changed = _fail_active_task_in_transaction(
+            conn,
+            int(task_id),
+            error_code=error_code,
+            message=message,
+            event_type=event_type,
+            receipt=receipt,
+        )
+        if changed:
+            conn.commit()
+        return changed
+
+
+def _reconcile_stale_controlled_task_in_transaction(
+    conn,
     task_id: int,
     *,
     lease_seconds: int = 30,
     now: datetime | None = None,
 ) -> bool:
-    """查询时收口失联的本机任务；仅处理受控发布模式。"""
+    """Reconcile one stale task without committing the caller's transaction."""
 
     current = now or datetime.now()
-    with connect() as conn:
-        row = conn.execute(
-            """
-            SELECT task.mode, task.status, task.workerPid,
-                   task.workerHeartbeatAt, task.startedAt, task.createdAt,
-                   EXISTS(
-                       SELECT 1 FROM publish_task_items AS item
-                       WHERE item.taskId = task.id
-                         AND item.platformType = 7
-                         AND COALESCE(item.platformPostId, '') <> ''
-                   ) AS youtubeHasKnownVideo
-                   ,EXISTS(
-                       SELECT 1 FROM publish_task_events AS event
-                       WHERE event.taskId = task.id
-                         AND event.eventType IN (
-                             'tiktok_final_action_triggered',
-                             'tiktok_publish_outcome_ambiguous'
-                         )
-                   ) AS tiktokFinalActionTriggered,
-                   task.payloadJson
-            FROM publish_tasks AS task WHERE task.id = ?
-            """,
-            (int(task_id),),
-        ).fetchone()
+    row = conn.execute(
+        """
+        SELECT task.mode, task.status, task.workerPid,
+               task.workerHeartbeatAt, task.startedAt, task.createdAt,
+               EXISTS(
+                   SELECT 1 FROM publish_task_items AS item
+                   WHERE item.taskId = task.id
+                     AND item.platformType = 7
+                     AND COALESCE(item.platformPostId, '') <> ''
+               ) AS youtubeHasKnownVideo
+               ,EXISTS(
+                   SELECT 1 FROM publish_task_events AS event
+                   WHERE event.taskId = task.id
+                     AND event.eventType IN (
+                         'tiktok_final_action_triggered',
+                         'tiktok_publish_outcome_ambiguous'
+                     )
+               ) AS tiktokFinalActionTriggered,
+               task.payloadJson
+        FROM publish_tasks AS task WHERE task.id = ?
+        """,
+        (int(task_id),),
+    ).fetchone()
     if not row:
         return False
     if str(row["mode"] or "") not in {
@@ -2122,7 +2196,8 @@ def reconcile_stale_controlled_task(
             if len(account_ids) == 1 and type(account_ids[0]) is int
             else 0
         )
-        return fail_active_task(
+        return _fail_active_task_in_transaction(
+            conn,
             int(task_id),
             error_code="tiktok_publish_outcome_unknown",
             message="TikTok 最终动作后发布进程失联，必须先人工核对内容列表",
@@ -2138,7 +2213,8 @@ def reconcile_stale_controlled_task(
                 "phase": "ambiguous",
             },
         )
-    return fail_active_task(
+    return _fail_active_task_in_transaction(
+        conn,
         int(task_id),
         error_code=(
             "youtube_manual_reconciliation_required"
@@ -2157,6 +2233,26 @@ def reconcile_stale_controlled_task(
             else "controlled_worker_lease_expired"
         ),
     )
+
+
+def reconcile_stale_controlled_task(
+    task_id: int,
+    *,
+    lease_seconds: int = 30,
+    now: datetime | None = None,
+) -> bool:
+    """查询时收口失联的本机任务；仅处理受控发布模式。"""
+
+    with connect() as conn:
+        changed = _reconcile_stale_controlled_task_in_transaction(
+            conn,
+            int(task_id),
+            lease_seconds=lease_seconds,
+            now=now,
+        )
+        if changed:
+            conn.commit()
+        return changed
 
 
 def mark_task_paused(task_id: int, message: str, *, pause_reason_code: str) -> None:

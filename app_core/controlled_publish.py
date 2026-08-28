@@ -509,7 +509,7 @@ def scope_fingerprint(payloads: Iterable[Mapping[str, Any]]) -> str:
                 "description": str(payload.get("description") or ""),
                 "tags": [str(item) for item in payload.get("tags") or []],
                 "assets": (
-                    [str(item) for item in payload.get("fileList") or []]
+                    [tiktok_video_sha256]
                     if platform_type == 6
                     else [
                         _file_identity(item)
@@ -708,6 +708,11 @@ def _existing_tiktok_formal_claim(
                          'tiktok_final_action_triggered',
                          'tiktok_publish_outcome_ambiguous'
                      )
+               ) OR EXISTS(
+                   SELECT 1 FROM publish_task_items AS item
+                   WHERE item.taskId = claim.taskId
+                     AND item.platformType = 6
+                     AND item.errorCode = 'tiktok_publish_outcome_unknown'
                ) AS hasFinalAction
         FROM tiktok_controlled_execution_claims AS claim
         LEFT JOIN publish_tasks AS task ON task.id = claim.taskId
@@ -727,6 +732,18 @@ def _release_retryable_tiktok_claim_or_raise(
         return
     data = dict(claim)
     task_status = str(data.get("taskStatus") or "")
+    if task_status in {"pending", "running"}:
+        from . import task_service
+
+        task_service._reconcile_stale_controlled_task_in_transaction(
+            conn,
+            int(data.get("taskId") or 0),
+        )
+        claim = _existing_tiktok_formal_claim(conn, fingerprint)
+        if claim is None:
+            return
+        data = dict(claim)
+        task_status = str(data.get("taskStatus") or "")
     has_final_action = bool(data.get("hasFinalAction"))
     if has_final_action:
         raise ControlledPublishError(
@@ -750,6 +767,12 @@ def _release_retryable_tiktok_claim_or_raise(
                         'tiktok_final_action_triggered',
                         'tiktok_publish_outcome_ambiguous'
                     )
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM publish_task_items AS item
+                  WHERE item.taskId = tiktok_controlled_execution_claims.taskId
+                    AND item.platformType = 6
+                    AND item.errorCode = 'tiktok_publish_outcome_unknown'
               )
             """,
             (int(data["id"]),),
@@ -947,6 +970,66 @@ def require_tiktok_execution_claim(
             if updated.rowcount != 1:
                 raise ValueError("TikTok 受控任务 claim 已经启动")
             conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def compensate_tiktok_worker_start_failure(
+    task_id: int,
+    *,
+    mode: str,
+) -> bool:
+    """Close only the claim this process acquired before worker.start failed."""
+
+    from . import task_service
+    from .database import connect
+
+    with connect() as conn:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            claim = conn.execute(
+                """
+                SELECT id FROM tiktok_controlled_execution_claims
+                WHERE taskId = ? AND mode = ? AND state = 'started'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM publish_task_events AS event
+                      WHERE event.taskId = tiktok_controlled_execution_claims.taskId
+                        AND event.eventType IN (
+                            'tiktok_final_action_triggered',
+                            'tiktok_publish_outcome_ambiguous'
+                        )
+                  )
+                """,
+                (int(task_id), str(mode)),
+            ).fetchone()
+            if claim is None:
+                conn.rollback()
+                return False
+            failed = task_service._fail_active_task_in_transaction(
+                conn,
+                int(task_id),
+                error_code="tiktok_worker_start_failed",
+                message="TikTok 受控 worker 启动失败，未触发平台最终动作",
+                event_type="tiktok_worker_start_failed",
+            )
+            if not failed:
+                conn.rollback()
+                return False
+            deleted = conn.execute(
+                """
+                DELETE FROM tiktok_controlled_execution_claims
+                WHERE id = ? AND taskId = ? AND state = 'started'
+                """,
+                (int(claim["id"]), int(task_id)),
+            )
+            if deleted.rowcount != 1:
+                raise ControlledPublishError(
+                    "tiktok_worker_start_compensation_failed",
+                    "TikTok worker 启动失败状态无法安全收口",
+                )
+            conn.commit()
+            return True
         except Exception:
             conn.rollback()
             raise

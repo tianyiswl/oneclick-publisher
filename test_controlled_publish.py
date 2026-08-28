@@ -2,6 +2,7 @@
 
 import json
 import hashlib
+import os
 import sqlite3
 import tempfile
 import threading
@@ -440,10 +441,17 @@ class ControlledPublishTests(unittest.TestCase):
                 created = submit_request(request)
 
             starts: list[int] = []
+            constructed_states: list[str] = []
 
             class Worker:
                 def __init__(self, *, target, args, daemon, name):
                     self.task_id = int(args[0]["id"])
+                    with database.connect() as conn:
+                        state = conn.execute(
+                            "SELECT state FROM tiktok_controlled_execution_claims WHERE taskId = ?",
+                            (self.task_id,),
+                        ).fetchone()[0]
+                    constructed_states.append(state)
 
                 def start(self):
                     starts.append(self.task_id)
@@ -462,9 +470,23 @@ class ControlledPublishTests(unittest.TestCase):
                     "SELECT state FROM tiktok_controlled_execution_claims WHERE taskId = ?",
                     (created["taskId"],),
                 ).fetchone()
+                task = conn.execute(
+                    "SELECT status FROM publish_tasks WHERE id = ?",
+                    (created["taskId"],),
+                ).fetchone()
+                startup_failures = conn.execute(
+                    """
+                    SELECT COUNT(*) FROM publish_task_events
+                    WHERE taskId = ? AND eventType = 'tiktok_worker_start_failed'
+                    """,
+                    (created["taskId"],),
+                ).fetchone()[0]
 
         self.assertEqual(starts, [created["taskId"]])
+        self.assertEqual(constructed_states, ["claimed", "started"])
         self.assertEqual(claim["state"], "started")
+        self.assertEqual(task["status"], "pending")
+        self.assertEqual(startup_failures, 0)
 
     def test_two_tiktok_formal_authorizations_compete_for_one_atomic_claim(self) -> None:
         with tempfile.TemporaryDirectory() as temporary, patch.object(
@@ -582,7 +604,7 @@ class ControlledPublishTests(unittest.TestCase):
         self.assertEqual(formal_tasks, 0)
         self.assertEqual(claims, 0)
 
-    def test_tiktok_worker_start_failure_keeps_pending_task_and_claim(self) -> None:
+    def test_tiktok_worker_start_failure_after_claim_marks_failed_and_releases_claim(self) -> None:
         with tempfile.TemporaryDirectory() as temporary, patch.object(
             database,
             "DB_PATH",
@@ -603,30 +625,298 @@ class ControlledPublishTests(unittest.TestCase):
                 "app_core.account_service.list_publishable_accounts",
                 return_value=[self._tiktok_account()],
             ), patch(
-                "app_core.publish_service.start_desktop_publish",
-                side_effect=RuntimeError("forced worker start failure"),
-            ), patch(
                 "app_core.publish_service.start_controlled_tiktok_publish",
-                side_effect=RuntimeError("forced worker start failure"),
-                create=True,
+                side_effect=lambda task_id: task_service.get_task(task_id),
             ):
+                created = submit_request(request)
+
+            class Worker:
+                def __init__(self, *, target, args, daemon, name):
+                    self.task_id = int(args[0]["id"])
+                    with database.connect() as conn:
+                        state = conn.execute(
+                            "SELECT state FROM tiktok_controlled_execution_claims WHERE taskId = ?",
+                            (self.task_id,),
+                        ).fetchone()[0]
+                    if state != "claimed":
+                        raise AssertionError(
+                            "thread constructed after claim became started"
+                        )
+
+                def start(self):
+                    with database.connect() as conn:
+                        state = conn.execute(
+                            "SELECT state FROM tiktok_controlled_execution_claims WHERE taskId = ?",
+                            (self.task_id,),
+                        ).fetchone()[0]
+                    if state != "started":
+                        raise AssertionError("worker.start called before claim became started")
+                    raise RuntimeError("forced worker start failure")
+
+            with patch.object(
+                publish_service,
+                "_validate_payloads",
+                side_effect=lambda payloads: [dict(payloads[0])],
+            ), patch.object(publish_service.threading, "Thread", Worker):
                 with self.assertRaises(RuntimeError):
-                    submit_request(request)
+                    publish_service.start_controlled_tiktok_publish(
+                        created["taskId"]
+                    )
 
             with database.connect() as conn:
                 formal_task = conn.execute(
-                    "SELECT id, status FROM publish_tasks WHERE mode = 'oneclick_publish'"
+                    "SELECT id, status FROM publish_tasks WHERE id = ?",
+                    (created["taskId"],),
                 ).fetchone()
                 authorization = conn.execute(
                     "SELECT consumedAt FROM controlled_publish_authorizations WHERE authorizationId = ?",
                     (grants[0]["authorizationId"],),
                 ).fetchone()
                 claims = self._claim_count(conn)
+                failure = conn.execute(
+                    """
+                    SELECT eventType FROM publish_task_events
+                    WHERE taskId = ? ORDER BY id DESC LIMIT 1
+                    """,
+                    (created["taskId"],),
+                ).fetchone()
 
         self.assertIsNotNone(formal_task)
-        self.assertEqual(formal_task["status"], "pending")
+        self.assertEqual(formal_task["status"], "failed")
         self.assertIsNotNone(authorization["consumedAt"])
-        self.assertEqual(claims, 1)
+        self.assertEqual(claims, 0)
+        self.assertEqual(failure["eventType"], "tiktok_worker_start_failed")
+
+    def test_new_formal_submit_reclaims_expired_dead_worker_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            database,
+            "DB_PATH",
+            Path(temporary) / "database.db",
+        ):
+            database.ensure_schema()
+            manifest, preflight, grants = self._seed_tiktok_preflight(
+                Path(temporary),
+                authorization_count=2,
+            )
+
+            def request_for(grant: dict) -> dict:
+                return self._tiktok_request(
+                    manifest,
+                    mode="formal",
+                    confirmedPreflightTaskId=preflight["id"],
+                    authorizationId=grant["authorizationId"],
+                )
+
+            with patch(
+                "app_core.account_service.list_publishable_accounts",
+                return_value=[self._tiktok_account()],
+            ), patch(
+                "app_core.publish_service.start_controlled_tiktok_publish",
+                side_effect=lambda task_id: task_service.get_task(task_id),
+            ):
+                first = submit_request(request_for(grants[0]))
+                with database.connect() as conn:
+                    expired = (
+                        datetime.now() - timedelta(minutes=5)
+                    ).strftime("%Y-%m-%d %H:%M:%S")
+                    conn.execute(
+                        """
+                        UPDATE publish_tasks
+                        SET status = 'running', workerPid = 99999999,
+                            workerHeartbeatAt = ?, startedAt = ?
+                        WHERE id = ?
+                        """,
+                        (expired, expired, first["taskId"]),
+                    )
+                    conn.execute(
+                        "UPDATE publish_task_items SET status = 'running' WHERE taskId = ?",
+                        (first["taskId"],),
+                    )
+                    conn.execute(
+                        "UPDATE tiktok_controlled_execution_claims SET state = 'started' WHERE taskId = ?",
+                        (first["taskId"],),
+                    )
+                    conn.commit()
+
+                second = submit_request(request_for(grants[1]))
+
+            old = task_service.get_task(first["taskId"])
+            with database.connect() as conn:
+                claim = conn.execute(
+                    "SELECT taskId, state FROM tiktok_controlled_execution_claims WHERE mode = 'formal'",
+                ).fetchone()
+                second_authorization = conn.execute(
+                    "SELECT consumedAt FROM controlled_publish_authorizations WHERE authorizationId = ?",
+                    (grants[1]["authorizationId"],),
+                ).fetchone()
+
+        self.assertNotEqual(second["taskId"], first["taskId"])
+        self.assertEqual(old["status"], "failed")
+        self.assertEqual(
+            old["items"][0]["errorCode"],
+            "controlled_worker_lease_expired",
+        )
+        self.assertEqual(
+            old["events"][-1]["eventType"],
+            "controlled_worker_lease_expired",
+        )
+        self.assertEqual(claim["taskId"], second["taskId"])
+        self.assertEqual(claim["state"], "claimed")
+        self.assertIsNotNone(second_authorization["consumedAt"])
+
+    def test_new_formal_submit_reclaims_expired_unstarted_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            database,
+            "DB_PATH",
+            Path(temporary) / "database.db",
+        ):
+            database.ensure_schema()
+            manifest, preflight, grants = self._seed_tiktok_preflight(
+                Path(temporary),
+                authorization_count=2,
+            )
+
+            def request_for(grant: dict) -> dict:
+                return self._tiktok_request(
+                    manifest,
+                    mode="formal",
+                    confirmedPreflightTaskId=preflight["id"],
+                    authorizationId=grant["authorizationId"],
+                )
+
+            with patch(
+                "app_core.account_service.list_publishable_accounts",
+                return_value=[self._tiktok_account()],
+            ), patch(
+                "app_core.publish_service.start_controlled_tiktok_publish",
+                side_effect=lambda task_id: task_service.get_task(task_id),
+            ):
+                first = submit_request(request_for(grants[0]))
+
+            with patch.object(
+                publish_service,
+                "_validate_payloads",
+                side_effect=ValueError("local validation failed"),
+            ):
+                with self.assertRaisesRegex(ValueError, "local validation failed"):
+                    publish_service.start_controlled_tiktok_publish(first["taskId"])
+
+            with database.connect() as conn:
+                untouched_claim = conn.execute(
+                    "SELECT state FROM tiktok_controlled_execution_claims WHERE taskId = ?",
+                    (first["taskId"],),
+                ).fetchone()
+                startup_failures = conn.execute(
+                    "SELECT COUNT(*) FROM publish_task_events "
+                    "WHERE taskId = ? AND eventType = 'tiktok_worker_start_failed'",
+                    (first["taskId"],),
+                ).fetchone()[0]
+                expired = (
+                    datetime.now() - timedelta(minutes=5)
+                ).strftime("%Y-%m-%d %H:%M:%S")
+                conn.execute(
+                    "UPDATE publish_tasks SET createdAt = ? WHERE id = ?",
+                    (expired, first["taskId"]),
+                )
+                conn.commit()
+
+            with patch(
+                "app_core.account_service.list_publishable_accounts",
+                return_value=[self._tiktok_account()],
+            ), patch(
+                "app_core.publish_service.start_controlled_tiktok_publish",
+                side_effect=lambda task_id: task_service.get_task(task_id),
+            ):
+                second = submit_request(request_for(grants[1]))
+
+            old = task_service.get_task(first["taskId"])
+            with database.connect() as conn:
+                claim = conn.execute(
+                    "SELECT taskId, state FROM tiktok_controlled_execution_claims WHERE mode = 'formal'",
+                ).fetchone()
+
+        self.assertEqual(untouched_claim["state"], "claimed")
+        self.assertEqual(startup_failures, 0)
+        self.assertEqual(old["status"], "failed")
+        self.assertEqual(
+            old["items"][0]["errorCode"],
+            "controlled_worker_lease_expired",
+        )
+        self.assertEqual(claim["taskId"], second["taskId"])
+        self.assertEqual(claim["state"], "claimed")
+
+    def test_new_formal_submit_does_not_reclaim_live_worker_after_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            database,
+            "DB_PATH",
+            Path(temporary) / "database.db",
+        ):
+            database.ensure_schema()
+            manifest, preflight, grants = self._seed_tiktok_preflight(
+                Path(temporary),
+                authorization_count=2,
+            )
+
+            def request_for(grant: dict) -> dict:
+                return self._tiktok_request(
+                    manifest,
+                    mode="formal",
+                    confirmedPreflightTaskId=preflight["id"],
+                    authorizationId=grant["authorizationId"],
+                )
+
+            with patch(
+                "app_core.account_service.list_publishable_accounts",
+                return_value=[self._tiktok_account()],
+            ), patch(
+                "app_core.publish_service.start_controlled_tiktok_publish",
+                side_effect=lambda task_id: task_service.get_task(task_id),
+            ):
+                first = submit_request(request_for(grants[0]))
+                with database.connect() as conn:
+                    expired = (
+                        datetime.now() - timedelta(minutes=5)
+                    ).strftime("%Y-%m-%d %H:%M:%S")
+                    conn.execute(
+                        """
+                        UPDATE publish_tasks
+                        SET status = 'running', workerPid = ?,
+                            workerHeartbeatAt = ?, startedAt = ?
+                        WHERE id = ?
+                        """,
+                        (os.getpid(), expired, expired, first["taskId"]),
+                    )
+                    conn.execute(
+                        "UPDATE publish_task_items SET status = 'running' WHERE taskId = ?",
+                        (first["taskId"],),
+                    )
+                    conn.execute(
+                        "UPDATE tiktok_controlled_execution_claims SET state = 'started' WHERE taskId = ?",
+                        (first["taskId"],),
+                    )
+                    conn.commit()
+
+                with self.assertRaises(ControlledPublishError) as blocked:
+                    submit_request(request_for(grants[1]))
+
+            with database.connect() as conn:
+                second_authorization = conn.execute(
+                    "SELECT consumedAt FROM controlled_publish_authorizations WHERE authorizationId = ?",
+                    (grants[1]["authorizationId"],),
+                ).fetchone()
+                claim = conn.execute(
+                    "SELECT taskId, state FROM tiktok_controlled_execution_claims WHERE mode = 'formal'",
+                ).fetchone()
+            old = task_service.get_task(first["taskId"])
+
+        self.assertEqual(
+            blocked.exception.error_code,
+            "controlled_publish_in_progress",
+        )
+        self.assertEqual(old["status"], "running")
+        self.assertIsNone(second_authorization["consumedAt"])
+        self.assertEqual(claim["taskId"], first["taskId"])
+        self.assertEqual(claim["state"], "started")
 
     def test_tiktok_claim_releases_only_terminal_failure_before_final_action(self) -> None:
         with tempfile.TemporaryDirectory() as temporary, patch.object(
@@ -837,7 +1127,6 @@ class ControlledPublishTests(unittest.TestCase):
             for key, value in (
                 ("description", "changed body"),
                 ("tags", ["changed-topic"]),
-                ("fileList", [str(root / "changed.mp4")]),
                 ("tiktokExpectedAccountReference", "other.user"),
             ):
                 mutations.append([{**base[0], key: value}])
@@ -845,6 +1134,46 @@ class ControlledPublishTests(unittest.TestCase):
         self.assertNotEqual(scope_fingerprint(base), scope_fingerprint(form_check))
         for changed in mutations:
             self.assertNotEqual(scope_fingerprint(base), scope_fingerprint(changed))
+
+    def test_tiktok_fingerprint_uses_video_bytes_not_local_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first_root = root / "first"
+            second_root = root / "second"
+            first_root.mkdir()
+            second_root.mkdir()
+            first_manifest = self._tiktok_bundle(first_root)
+            second_manifest = self._tiktok_bundle(second_root)
+            first = build_controlled_payloads(
+                self._tiktok_request(first_manifest),
+                accounts=[self._tiktok_account()],
+            )
+            second = build_controlled_payloads(
+                self._tiktok_request(second_manifest),
+                accounts=[self._tiktok_account()],
+            )
+
+        self.assertNotEqual(first[0]["fileList"], second[0]["fileList"])
+        self.assertEqual(first[0]["tiktokVideoSha256"], second[0]["tiktokVideoSha256"])
+        self.assertEqual(scope_fingerprint(first), scope_fingerprint(second))
+
+    def test_tiktok_fingerprint_changes_for_new_bytes_at_same_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = self._tiktok_bundle(root)
+            first = build_controlled_payloads(
+                self._tiktok_request(manifest),
+                accounts=[self._tiktok_account()],
+            )
+            (root / "tiktok.mp4").write_bytes(b"replacement-video")
+            second = build_controlled_payloads(
+                self._tiktok_request(manifest),
+                accounts=[self._tiktok_account()],
+            )
+
+        self.assertEqual(first[0]["fileList"], second[0]["fileList"])
+        self.assertNotEqual(first[0]["tiktokVideoSha256"], second[0]["tiktokVideoSha256"])
+        self.assertNotEqual(scope_fingerprint(first), scope_fingerprint(second))
 
     def test_tiktok_video_bytes_are_frozen_into_payload_and_fingerprint(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
