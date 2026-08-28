@@ -42,6 +42,20 @@ class TikTokSessionScopeTests(unittest.TestCase):
             sanitize_tiktok_storage_state({"cookies": [], "origins": []})
         self.assertEqual(raised.exception.error_code, "tiktok_session_missing")
 
+    def test_tiktok_visitor_cookies_without_an_auth_marker_are_not_a_login(self):
+        raw = {
+            "cookies": [
+                {"name": "tt_webid", "value": "visitor", "domain": ".tiktok.com"}
+            ],
+            "origins": [],
+        }
+
+        with self.assertRaises(TikTokSessionScopeError) as raised:
+            sanitize_tiktok_storage_state(raw)
+
+        self.assertEqual(raised.exception.error_code, "tiktok_session_missing")
+        self.assertNotIn("visitor", raised.exception.public_message)
+
     def test_cookie_domain_allowlist_accepts_tiktok_subdomains_only(self):
         accepted = ("www.tiktok.com", ".tiktok.com", "shop.tiktok.com", "SHOP.TIKTOK.COM.")
         rejected = (

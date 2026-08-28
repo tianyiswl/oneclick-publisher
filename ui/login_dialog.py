@@ -36,6 +36,8 @@ TIKTOK_LOGIN_ERROR_TEXT = {
     "tiktok_session_scope_invalid": "登录状态包含超出 TikTok 的数据，已拒绝保存。",
     "tiktok_session_missing": "未检测到可用的 TikTok 登录状态。",
     "tiktok_session_expired": "TikTok 登录状态已失效。",
+    "tiktok_identity_missing": "已读取 TikTok 登录状态，但未找到唯一公开账号。",
+    "tiktok_account_identity_ambiguous": "TikTok 返回了多个公开账号，已停止保存。",
     "tiktok_account_invalid": "TikTok 未返回唯一可核对账号。",
     "tiktok_account_identity_mismatch": "当前 TikTok 账号与原记录不一致。",
     "tiktok_login_cleanup_failed": "临时登录资料清理失败，已停止保存账号。",
