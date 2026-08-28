@@ -249,9 +249,7 @@ def build_system_browser_command(
 ) -> list[str]:
     """Build the fixed, non-automated system-browser command for this attempt."""
 
-    profile_dir = attempt.profile_dir
-    if sys.platform == "darwin" and browser.name == "Google Chrome":
-        profile_dir = _resolved_owned_profile(attempt)
+    profile_dir = _browser_profile_dir(browser, attempt)
     command = [
         str(browser.executable),
         f"--user-data-dir={profile_dir}",
@@ -268,6 +266,36 @@ def build_system_browser_command(
     if sys.platform == "darwin" and browser.name == "Google Chrome":
         command.insert(2, "--use-mock-keychain")
     return command
+
+
+def _uses_macos_google_chrome(browser: SystemBrowserSpec) -> bool:
+    return sys.platform == "darwin" and browser.name == "Google Chrome"
+
+
+def _browser_profile_dir(
+    browser: SystemBrowserSpec,
+    attempt: TikTokLoginAttempt,
+) -> Path:
+    """Resolve the only profile eligible for macOS Chrome's mock keychain."""
+
+    if _uses_macos_google_chrome(browser):
+        return _resolved_owned_profile(attempt)
+    return attempt.profile_dir
+
+
+def _browser_profile_launch_args(
+    browser: SystemBrowserSpec,
+    attempt: TikTokLoginAttempt,
+) -> list[str]:
+    """Return the profile-scoped Chromium flags for the owned profile reopen."""
+
+    # Resolve before adding the mock keychain workaround, so this same safety
+    # gate applies both to the interactive launcher and Playwright readback.
+    _browser_profile_dir(browser, attempt)
+    args = ["--profile-directory=Default"]
+    if _uses_macos_google_chrome(browser):
+        args.append("--use-mock-keychain")
+    return args
 
 
 def _resolved_owned_attempt(attempt_root: Path, staging_root: Path) -> tuple[Path, Path]:
@@ -592,11 +620,12 @@ async def collect_validated_tiktok_candidate(
             manager = playwright_factory()
             async with manager as playwright:
                 try:
+                    profile_dir = _browser_profile_dir(browser, attempt)
                     persistent = await playwright.chromium.launch_persistent_context(
-                        user_data_dir=str(attempt.profile_dir),
+                        user_data_dir=str(profile_dir),
                         executable_path=str(browser.executable),
                         headless=True,
-                        args=["--profile-directory=Default"],
+                        args=_browser_profile_launch_args(browser, attempt),
                     )
                 except Exception as exc:
                     raise _profile_busy() from exc

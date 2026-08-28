@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -26,6 +27,7 @@ _PROFILE_LINK_SELECTOR = 'a[href*="/@"]'
 _TIKTOK_HOSTS = {"tiktok.com", "www.tiktok.com"}
 TIKTOK_IDENTITY_URL = "https://www.tiktok.com/"
 _AUTH_ROUTE_TOKENS = ("login", "challenge", "verify", "captcha", "security")
+_HOMEPAGE_CONTEXT_SETTLE_SECONDS = 12.0
 _APP_CONTEXT_USER_EVALUATOR = """
 () => {
   const scripts = document.querySelectorAll('script#__UNIVERSAL_DATA_FOR_REHYDRATION__');
@@ -296,29 +298,34 @@ async def read_tiktok_identity(
     *,
     poll_seconds: float = 0.15,
     max_attempts: int = 5,
+    homepage_settle_seconds: float = _HOMEPAGE_CONTEXT_SETTLE_SECONDS,
 ) -> TikTokIdentity:
     """Read one stable TikTok public profile handle from a page.
 
     The HTTPS TikTok homepage uses only its fixed app-context username path;
-    feed profile links never participate there. Legacy pages retain the narrow
+    feed profile links never participate there. It polls that page-side
+    extractor for a short bounded window because the script may appear before
+    the document reports ``complete``. Legacy pages retain the narrow
     Studio-anchor fallback. Conflicting values always fail closed, rather than
     guessing which account is logged in.
     """
 
     attempts = max(2, int(max_attempts))
     interval = max(0.0, float(poll_seconds))
+    settle_seconds = max(0.0, float(homepage_settle_seconds))
+    homepage_deadline = time.monotonic() + settle_seconds
     previous_handle = ""
-    for index in range(attempts):
+    completed_attempts = 0
+    while True:
         if _page_is_tiktok_auth_route(page):
             raise _identity_invalid()
+        is_homepage = _is_tiktok_homepage_route(page)
         homepage_handle = (
-            await _homepage_app_context_handle(page)
-            if _is_tiktok_homepage_route(page)
-            else ""
+            await _homepage_app_context_handle(page) if is_homepage else ""
         )
         if homepage_handle:
             candidates = {homepage_handle: (None, False)}
-        elif _is_tiktok_homepage_route(page):
+        elif is_homepage:
             candidates = {}
         else:
             all_candidates, visible_candidates = await _profile_candidates(page)
@@ -341,8 +348,14 @@ async def read_tiktok_identity(
             previous_handle = handle
         else:
             previous_handle = ""
-        if index + 1 < attempts:
-            await asyncio.sleep(interval)
+        completed_attempts += 1
+        if completed_attempts >= attempts and (
+            not is_homepage
+            or interval <= 0.0
+            or time.monotonic() >= homepage_deadline
+        ):
+            break
+        await asyncio.sleep(interval)
 
     raise TikTokIdentityError(
         "tiktok_account_invalid", "TikTok 页面没有返回稳定账号标识"

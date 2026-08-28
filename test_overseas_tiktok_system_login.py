@@ -690,6 +690,33 @@ class TikTokCandidateIntakeTests(unittest.TestCase):
         self.assertGreaterEqual(self.fake_persistent.close_calls, 1)
         self.assertEqual(self.fake_verifier.close_calls, 1)
 
+    def test_macos_google_chrome_reopen_uses_the_same_mock_keychain_profile_mode(self):
+        self.browser = SystemBrowserSpec("Google Chrome", self.root / "chrome")
+
+        with patch("app_core.overseas_tiktok_system_login.sys.platform", "darwin"):
+            self._collect()
+
+        self.assertEqual(
+            self.fake_chromium.persistent_kwargs["args"],
+            ["--profile-directory=Default", "--use-mock-keychain"],
+        )
+
+    def test_candidate_reopen_keeps_mock_keychain_off_for_edge_windows_and_linux(self):
+        cases = (
+            ("darwin", "Microsoft Edge"),
+            ("win32", "Google Chrome"),
+            ("linux", "Google Chrome"),
+        )
+        for platform, browser_name in cases:
+            with self.subTest(platform=platform, browser=browser_name):
+                self.browser = SystemBrowserSpec(browser_name, self.root / "chrome")
+                with patch("app_core.overseas_tiktok_system_login.sys.platform", platform):
+                    self._collect()
+                self.assertEqual(
+                    self.fake_chromium.persistent_kwargs["args"],
+                    ["--profile-directory=Default"],
+                )
+
     def test_candidate_rejects_state_without_a_tiktok_cookie(self):
         self.fake_persistent.raw_storage_state = {
             "cookies": [{"name": "SID", "value": "secret", "domain": ".google.com"}],

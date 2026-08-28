@@ -77,14 +77,20 @@ class _FakeTikTokPage:
         links: list[_FakeProfileLink],
         *,
         url: str = "https://www.tiktok.com/foryou",
-        app_context: str | None = None,
+        app_context: str | list[str | None] | None = None,
+        reject_ready_state_queries: bool = False,
     ) -> None:
         self.links = _FakeProfileLinks(links)
         self.url = url
         self.app_context = app_context
+        self.app_context_samples = (
+            list(app_context) if isinstance(app_context, list) else [app_context]
+        )
+        self.reject_ready_state_queries = reject_ready_state_queries
         self.profile_locator_calls = 0
         self.app_context_locator_calls = 0
         self.evaluate_calls: list[str] = []
+        self.app_context_evaluate_calls = 0
 
     def locator(self, selector: str):
         self.selector = selector
@@ -100,10 +106,20 @@ class _FakeTikTokPage:
 
     async def evaluate(self, expression: str):
         self.evaluate_calls.append(expression)
-        if self.app_context is None:
+        if "document.readyState" in expression:
+            if self.reject_ready_state_queries:
+                raise AssertionError("homepage identity must not wait for readyState")
+            return "complete"
+        index = min(
+            self.app_context_evaluate_calls,
+            len(self.app_context_samples) - 1,
+        )
+        self.app_context_evaluate_calls += 1
+        app_context = self.app_context_samples[index]
+        if app_context is None:
             return {"state": "missing"}
         try:
-            document = json.loads(self.app_context)
+            document = json.loads(app_context)
             user = document["__DEFAULT_SCOPE__"]["webapp.app-context"]["user"]
         except (KeyError, TypeError, ValueError):
             return {"state": "invalid"}
@@ -222,9 +238,51 @@ class TikTokIdentityTests(unittest.TestCase):
         self.assertEqual(identity.display_name, "")
         self.assertEqual(page.app_context_locator_calls, 0)
         self.assertEqual(page.profile_locator_calls, 0)
+        self.assertEqual(page.app_context_evaluate_calls, 2)
         self.assertEqual(len(page.evaluate_calls), 2)
         self.assertNotIn(secret, repr(page.evaluate_calls))
         self.assertNotIn(secret, repr(identity))
+
+    def test_read_identity_waits_for_delayed_homepage_context_then_a_stable_repeat(self):
+        page = _FakeTikTokPage(
+            [
+                _FakeProfileLink("/@feed.author", "Feed author"),
+                _FakeProfileLink("/@another.author", "Another author"),
+            ],
+            url="https://www.tiktok.com/",
+            app_context=[
+                None,
+                self._app_context({"uniqueId": "expected.user"}),
+                self._app_context({"uniqueId": "expected.user"}),
+            ],
+            reject_ready_state_queries=True,
+        )
+
+        identity = asyncio.run(
+            read_tiktok_identity(page, poll_seconds=0.0, max_attempts=4)
+        )
+
+        self.assertEqual(identity.handle, "expected.user")
+        self.assertEqual(page.app_context_evaluate_calls, 3)
+        self.assertEqual(page.profile_locator_calls, 0)
+
+    def test_read_identity_accepts_stable_context_while_homepage_is_interactive(self):
+        page = _FakeTikTokPage(
+            [],
+            url="https://www.tiktok.com/",
+            app_context=[
+                self._app_context({"uniqueId": "expected.user"}),
+                self._app_context({"uniqueId": "expected.user"}),
+            ],
+            reject_ready_state_queries=True,
+        )
+
+        identity = asyncio.run(
+            read_tiktok_identity(page, poll_seconds=0.0, max_attempts=2)
+        )
+
+        self.assertEqual(identity.handle, "expected.user")
+        self.assertEqual(page.app_context_evaluate_calls, 2)
 
     def test_read_identity_rejects_conflicting_homepage_app_context_usernames(self):
         page = _FakeTikTokPage(
