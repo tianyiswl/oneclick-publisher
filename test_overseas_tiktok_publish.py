@@ -265,6 +265,68 @@ class TikTokPublishContractTests(unittest.TestCase):
         )
         self.assertEqual(prepared["visibility"], "public")
 
+    def test_schedule_timezone_aliases_are_rejected_outside_root_schedule(self) -> None:
+        cases = (
+            {"settings": {"scheduleTimezone": "UTC"}},
+            {"settings": {"timezone": "UTC"}},
+            {"content": {"scheduleTimezone": "UTC"}},
+            {"content": {"timezone": "UTC"}},
+            {
+                "target": {
+                    "platform": "TikTok",
+                    "accountId": 61,
+                    "scheduleTimezone": "UTC",
+                }
+            },
+            {
+                "target": {
+                    "platform": "TikTok",
+                    "accountId": 61,
+                    "timezone": "UTC",
+                }
+            },
+            {
+                "targets": [
+                    {
+                        "platform": "TikTok",
+                        "accountId": 61,
+                        "scheduleTimezone": "UTC",
+                    }
+                ]
+            },
+            {
+                "targets": [
+                    {
+                        "platform": "TikTok",
+                        "accountId": 61,
+                        "timezone": "UTC",
+                    }
+                ]
+            },
+            {
+                "platformOverrides": {
+                    "TikTok": {"scheduleTimezone": "UTC"},
+                }
+            },
+            {
+                "platformOverrides": {
+                    "TikTok": {"timezone": "UTC"},
+                }
+            },
+            {"timezone": "UTC"},
+        )
+        for changes in cases:
+            with self.subTest(changes=changes):
+                self.assert_error_code(
+                    "tiktok_unsupported_publish_setting",
+                    self.payload(**changes),
+                )
+
+        prepared = self.validate(
+            self.payload(schedule={"enabled": False, "timezone": "UTC"})
+        )
+        self.assertEqual(prepared["visibility"], "public")
+
     def test_account_ids_and_session_lists_must_each_resolve_to_same_single_account(self) -> None:
         second = self.root / "second.json"
         second.write_text("{}", encoding="utf-8")

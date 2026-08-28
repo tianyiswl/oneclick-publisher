@@ -96,6 +96,7 @@ _SCHEDULE_ALIAS_KEYS = frozenset(
         "timejitterminutes",
         "schedule",
         "scheduletime",
+        "scheduletimezone",
         "scheduledat",
         "publishschedule",
         "publishat",
@@ -103,6 +104,7 @@ _SCHEDULE_ALIAS_KEYS = frozenset(
         "timer",
         "timerenabled",
         "localtime",
+        "timezone",
     }
 )
 
@@ -273,6 +275,11 @@ def _validate_schedule_locations(payload: Mapping[str, Any]) -> None:
                     "TikTok 根定时字段无效",
                 )
             continue
+        if str(key).strip().casefold() == "timezone":
+            _fail(
+                "tiktok_unsupported_publish_setting",
+                "TikTok timezone 只允许出现在根 schedule 内",
+            )
         if key == "platformOverrides":
             if isinstance(value, Mapping):
                 for platform, override in value.items():
