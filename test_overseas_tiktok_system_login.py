@@ -40,11 +40,20 @@ from app_core.overseas_tiktok_system_login import (
 
 
 class _FakePage:
-    def __init__(self, *, close_error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        close_error: Exception | None = None,
+        probe_payload: object | None = None,
+        evaluate_error: Exception | None = None,
+    ) -> None:
         self.close_error = close_error
+        self.probe_payload = probe_payload
+        self.evaluate_error = evaluate_error
         self.url = "https://www.tiktok.com/tiktokstudio/upload"
         self.goto_calls: list[tuple[str, str, int]] = []
         self.close_calls = 0
+        self.evaluate_calls = 0
 
     async def goto(self, url: str, *, wait_until: str, timeout: int) -> None:
         self.goto_calls.append((url, wait_until, timeout))
@@ -53,6 +62,12 @@ class _FakePage:
         self.close_calls += 1
         if self.close_error is not None:
             raise self.close_error
+
+    async def evaluate(self, _expression: str):
+        self.evaluate_calls += 1
+        if self.evaluate_error is not None:
+            raise self.evaluate_error
+        return self.probe_payload
 
 
 class _FakePersistentContext:
@@ -649,8 +664,43 @@ class TikTokCandidateIntakeTests(unittest.TestCase):
         self.fake_playwright_factory = lambda: self.fake_playwright
         self.fake_identity_reads: list[str] = []
 
+    @staticmethod
+    def _probe_payload(
+        *,
+        app_state: str = "present_no_handle",
+        top_count: int = 1,
+        semantic_control_count: int = 1,
+        semantic_candidate_count: int = 1,
+        rehydration_family_count: int = 1,
+        rehydration_candidate_count: int = 0,
+        rehydration_path_family: str = "app_context",
+    ) -> dict:
+        return {
+            "route": "homepage",
+            "appContext": {
+                "state": app_state,
+                "candidateCount": 0,
+                "unique": False,
+            },
+            "topRegion": {
+                "candidateCount": top_count,
+                "unique": top_count == 1,
+            },
+            "semanticControl": {
+                "controlCount": semantic_control_count,
+                "candidateCount": semantic_candidate_count,
+                "unique": semantic_candidate_count == 1,
+            },
+            "rehydration": {
+                "pathFamily": rehydration_path_family,
+                "familyCount": rehydration_family_count,
+                "candidateCount": rehydration_candidate_count,
+                "unique": rehydration_candidate_count == 1,
+            },
+        }
+
     def _collect(self, *results: TikTokIdentity | Exception) -> TikTokLoginCandidate:
-        remaining = list(results) or [
+        configured = list(results) or [
             TikTokIdentity(
                 "expected.user",
                 "Expected",
@@ -662,9 +712,11 @@ class TikTokCandidateIntakeTests(unittest.TestCase):
                 "https://www.tiktok.com/@expected.user",
             ),
         ]
+        remaining = list(configured)
+        fallback = configured[-1]
 
         async def read_identity(_page):
-            result = remaining.pop(0)
+            result = remaining.pop(0) if remaining else fallback
             if isinstance(result, Exception):
                 raise result
             self.fake_identity_reads.append(result.handle)
@@ -711,6 +763,212 @@ class TikTokCandidateIntakeTests(unittest.TestCase):
         self.assertEqual(self.second_blank_page.close_calls, 1)
         self.assertGreaterEqual(self.fake_persistent.close_calls, 1)
         self.assertEqual(self.fake_verifier.close_calls, 1)
+        self.assertEqual(self.first_blank_page.evaluate_calls, 0)
+        self.assertEqual(self.second_blank_page.evaluate_calls, 0)
+
+    def test_identity_missing_runs_safe_probe_in_both_blank_contexts_and_never_saves(self):
+        self.first_blank_page.probe_payload = self._probe_payload()
+        self.second_blank_page.probe_payload = self._probe_payload()
+        commit = Mock()
+
+        with patch(
+            "app_core.overseas_tiktok_system_login.commit_tiktok_login_candidate",
+            commit,
+        ):
+            with self.assertRaises(TikTokSystemLoginError) as raised:
+                self._collect(
+                    TikTokIdentityError("tiktok_account_invalid", "first secret"),
+                    TikTokIdentityError("tiktok_account_invalid", "second secret"),
+                )
+
+        self.assertEqual(raised.exception.error_code, "tiktok_identity_probe_required")
+        self.assertEqual(len(self.fake_verifier.blank_contexts), 2)
+        self.assertEqual(self.first_blank_page.evaluate_calls, 1)
+        self.assertEqual(self.second_blank_page.evaluate_calls, 1)
+        self.assertEqual(self.first_blank_page.close_calls, 1)
+        self.assertEqual(self.second_blank_page.close_calls, 1)
+        self.assertEqual(self.fake_verifier.close_calls, 1)
+        commit.assert_not_called()
+
+    def test_identity_probe_exposes_only_the_fixed_safe_schema(self):
+        self.first_blank_page.probe_payload = self._probe_payload(
+            top_count=2,
+            semantic_control_count=3,
+            semantic_candidate_count=1,
+            rehydration_family_count=2,
+            rehydration_candidate_count=1,
+        )
+        self.second_blank_page.probe_payload = self._probe_payload(
+            top_count=2,
+            semantic_control_count=3,
+            semantic_candidate_count=1,
+            rehydration_family_count=2,
+            rehydration_candidate_count=1,
+        )
+
+        with self.assertRaises(TikTokSystemLoginError) as raised:
+            self._collect(
+                TikTokIdentityError("tiktok_account_invalid", "missing"),
+                TikTokIdentityError("tiktok_account_invalid", "missing"),
+            )
+
+        probe = raised.exception.identity_probe
+        self.assertEqual(set(probe), {"schemaVersion", "first", "second", "consistent"})
+        self.assertEqual(probe["schemaVersion"], 1)
+        self.assertIs(probe["consistent"], True)
+        expected_context_keys = {
+            "route",
+            "appContext",
+            "topRegion",
+            "semanticControl",
+            "rehydration",
+        }
+        for context_name in ("first", "second"):
+            context = probe[context_name]
+            self.assertEqual(set(context), expected_context_keys)
+            self.assertIn(context["route"], {"homepage", "auth", "other", "invalid"})
+            self.assertEqual(
+                set(context["appContext"]),
+                {"state", "candidateCount", "unique"},
+            )
+            self.assertEqual(
+                set(context["topRegion"]),
+                {"candidateCount", "unique"},
+            )
+            self.assertEqual(
+                set(context["semanticControl"]),
+                {"controlCount", "candidateCount", "unique"},
+            )
+            self.assertEqual(
+                set(context["rehydration"]),
+                {"pathFamily", "familyCount", "candidateCount", "unique"},
+            )
+            for family_name in (
+                "appContext",
+                "topRegion",
+                "semanticControl",
+                "rehydration",
+            ):
+                for key, value in context[family_name].items():
+                    if key == "state":
+                        self.assertIn(
+                            value,
+                            {
+                                "missing",
+                                "invalid",
+                                "present_no_handle",
+                                "present_one",
+                                "present_multiple",
+                            },
+                        )
+                    elif key == "pathFamily":
+                        self.assertIn(
+                            value,
+                            {
+                                "none",
+                                "app_context",
+                                "user_detail",
+                                "app_context_and_user_detail",
+                            },
+                        )
+                    elif key in {"unique"}:
+                        self.assertIs(type(value), bool)
+                    else:
+                        self.assertIs(type(value), int)
+
+    def test_identity_probe_drops_malicious_cookie_dom_script_and_attribute_values(self):
+        secret_values = (
+            "cookie-name-secret",
+            "cookie-value-secret",
+            "dom-text-secret",
+            "script-secret",
+            "raw-attribute-secret",
+        )
+        self.fake_persistent.raw_storage_state = {
+            "cookies": [
+                {
+                    "name": secret_values[0],
+                    "value": secret_values[1],
+                    "domain": ".tiktok.com",
+                }
+            ],
+            "origins": [],
+        }
+        malicious = self._probe_payload()
+        malicious.update(
+            {
+                "domText": secret_values[2],
+                "script": secret_values[3],
+                "rawAttribute": secret_values[4],
+            }
+        )
+        self.first_blank_page.probe_payload = malicious
+        self.second_blank_page.probe_payload = malicious
+
+        with self.assertRaises(TikTokSystemLoginError) as raised:
+            self._collect(
+                TikTokIdentityError("tiktok_account_invalid", "identity-secret"),
+                TikTokIdentityError("tiktok_account_invalid", "identity-secret"),
+            )
+
+        self.assertEqual(raised.exception.error_code, "tiktok_identity_probe_required")
+        rendered = "\n".join(
+            (
+                raised.exception.public_message,
+                repr(raised.exception),
+                repr(getattr(raised.exception, "identity_probe", None)),
+                str(getattr(raised.exception, "probe_summary", "")),
+                repr(raised.exception.__cause__),
+            )
+        )
+        for secret in (*secret_values, "identity-secret"):
+            self.assertNotIn(secret, rendered)
+
+    def test_identity_probe_internal_error_keeps_missing_without_leaking(self):
+        self.first_blank_page.probe_payload = self._probe_payload()
+        self.second_blank_page.evaluate_error = RuntimeError("exception-secret")
+
+        with self.assertRaises(TikTokSystemLoginError) as raised:
+            self._collect(
+                TikTokIdentityError("tiktok_account_invalid", "identity-secret"),
+                TikTokIdentityError("tiktok_account_invalid", "identity-secret"),
+            )
+
+        self.assertEqual(raised.exception.error_code, "tiktok_identity_missing")
+        self.assertIsNone(raised.exception.identity_probe)
+        rendered = "\n".join(
+            (
+                raised.exception.public_message,
+                repr(raised.exception),
+                repr(raised.exception.__cause__),
+            )
+        )
+        self.assertNotIn("exception-secret", rendered)
+        self.assertNotIn("identity-secret", rendered)
+
+    def test_visitor_state_keeps_identity_missing_when_probe_has_no_structure(self):
+        empty_probe = self._probe_payload(
+            app_state="missing",
+            top_count=0,
+            semantic_control_count=0,
+            semantic_candidate_count=0,
+            rehydration_family_count=0,
+            rehydration_candidate_count=0,
+        )
+        self.first_blank_page.probe_payload = empty_probe
+        self.second_blank_page.probe_payload = empty_probe
+
+        with self.assertRaises(TikTokSystemLoginError) as raised:
+            self._collect(
+                TikTokIdentityError("tiktok_account_invalid", "visitor"),
+                TikTokIdentityError("tiktok_account_invalid", "visitor"),
+            )
+
+        self.assertEqual(raised.exception.error_code, "tiktok_identity_missing")
+        self.assertEqual(len(self.fake_verifier.blank_contexts), 2)
+        self.assertEqual(self.first_blank_page.evaluate_calls, 1)
+        self.assertEqual(self.second_blank_page.evaluate_calls, 1)
+        self.assertIsNone(getattr(raised.exception, "identity_probe", None))
 
     def test_macos_google_chrome_reopen_uses_the_same_mock_keychain_profile_mode(self):
         self.browser = SystemBrowserSpec("Google Chrome", self.root / "chrome")
@@ -821,7 +1079,7 @@ class TikTokCandidateIntakeTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.error_code, "tiktok_identity_missing")
         self.assertTrue(getattr(raised.exception, "tiktok_cookie_present", False))
-        self.assertEqual(len(self.fake_verifier.blank_contexts), 1)
+        self.assertEqual(len(self.fake_verifier.blank_contexts), 2)
 
     def test_candidate_rejects_two_blank_context_handle_mismatch(self):
         with self.assertRaises(TikTokSystemLoginError) as raised:
@@ -1376,6 +1634,92 @@ class TikTokPublicLoginSessionTests(unittest.TestCase):
 
         self.assertEqual(messages[-2:], ["CLEANING_LOGIN_ATTEMPT", "ERROR:tiktok_login_cleanup_failed"])
         self.assertEqual(session.last_error_code, "tiktok_login_cleanup_failed")
+
+    def test_probe_required_is_memory_only_never_commits_and_emits_one_safe_summary(self):
+        session = self._session()
+        commit = Mock()
+        probe = {
+            "schemaVersion": 1,
+            "first": TikTokCandidateIntakeTests._probe_payload(),
+            "second": TikTokCandidateIntakeTests._probe_payload(),
+            "consistent": True,
+        }
+
+        with (
+            patch("app_core.overseas_tiktok_system_login.create_login_attempt", return_value=self.attempt),
+            patch("app_core.overseas_tiktok_system_login.find_system_browser", return_value=self.browser),
+            patch("app_core.overseas_tiktok_system_login.wait_for_profile_release", return_value=True),
+            patch(
+                "app_core.overseas_tiktok_system_login.collect_validated_tiktok_candidate",
+                new=AsyncMock(
+                    side_effect=TikTokSystemLoginError(
+                        "tiktok_identity_probe_required",
+                        "fixed safe message",
+                        identity_probe=probe,
+                    )
+                ),
+            ),
+            patch("app_core.overseas_tiktok_system_login.remove_login_attempt"),
+            patch("app_core.overseas_tiktok_system_login.commit_tiktok_login_candidate", commit),
+        ):
+            session.start()
+            messages = self._messages(session)
+
+        self.assertEqual(messages[-1], "ERROR:tiktok_identity_probe_required")
+        summaries = [
+            message
+            for message in messages
+            if message.startswith("IDENTITY_PROBE_SUMMARY:")
+        ]
+        self.assertEqual(len(summaries), 1)
+        self.assertEqual(
+            summaries[0],
+            "IDENTITY_PROBE_SUMMARY:"
+            "app=present_no_handle/present_no_handle;top=1/1;controls=1/1;"
+            "semantic=1/1;paths=app_context/app_context;families=1/1;"
+            "rehydration=0/0;consistent=true",
+        )
+        self.assertEqual(session.last_identity_probe, probe)
+        commit.assert_not_called()
+
+    def test_cleanup_failure_discards_probe_output_and_keeps_priority(self):
+        session = self._session()
+        probe = {
+            "schemaVersion": 1,
+            "first": TikTokCandidateIntakeTests._probe_payload(),
+            "second": TikTokCandidateIntakeTests._probe_payload(),
+            "consistent": True,
+        }
+        with (
+            patch("app_core.overseas_tiktok_system_login.create_login_attempt", return_value=self.attempt),
+            patch("app_core.overseas_tiktok_system_login.find_system_browser", return_value=self.browser),
+            patch("app_core.overseas_tiktok_system_login.wait_for_profile_release", return_value=True),
+            patch(
+                "app_core.overseas_tiktok_system_login.collect_validated_tiktok_candidate",
+                new=AsyncMock(
+                    side_effect=TikTokSystemLoginError(
+                        "tiktok_identity_probe_required",
+                        "fixed safe message",
+                        identity_probe=probe,
+                    )
+                ),
+            ),
+            patch(
+                "app_core.overseas_tiktok_system_login.remove_login_attempt",
+                side_effect=TikTokSystemLoginError(
+                    "tiktok_login_cleanup_failed", "malicious-cleanup-secret"
+                ),
+            ),
+        ):
+            session.start()
+            messages = self._messages(session)
+
+        self.assertEqual(messages[-1], "ERROR:tiktok_login_cleanup_failed")
+        self.assertFalse(
+            any(message.startswith("IDENTITY_PROBE_SUMMARY:") for message in messages)
+        )
+        self.assertIsNone(session.last_identity_probe)
+        self.assertNotIn("malicious-cleanup-secret", repr(messages))
 
     def test_cancel_stops_owned_process_and_cleans_before_terminal_message(self):
         process = FakeProcess([None])
