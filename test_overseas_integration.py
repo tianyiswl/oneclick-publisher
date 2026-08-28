@@ -20,6 +20,7 @@ from app_core import (
     database as app_database,
     login_service,
     overseas_preflight,
+    overseas_tiktok_publish,
     overseas_youtube_credentials,
     overseas_youtube_login,
     overseas_youtube_profile,
@@ -1607,9 +1608,40 @@ class OverseasPreflightTests(unittest.TestCase):
             "description": "只检查字段，不发布。",
             "tags": ["oneclick"],
             "fileList": [str(video)],
+            "accountIds": [61],
             "accountList": ["tiktok.json"],
+            "visibility": "public",
             "enableTimer": False,
+            "scheduleTime": None,
+            "coverPath": "",
+            "coverPaths": {},
+            "aiGenerated": False,
+            "collectionName": "",
+            "mentions": [],
         }
+
+    def _account(self, file_name: str = "tiktok.json") -> dict:
+        return {
+            "id": 61,
+            "type": 6,
+            "status": 1,
+            "authMode": "browser",
+            "filePath": file_name,
+            "accountReference": "expected.user",
+        }
+
+    @contextmanager
+    def _local_tiktok(self, root: Path):
+        with (
+            patch.object(overseas_preflight, "COOKIE_DIR", root),
+            patch.object(overseas_tiktok_publish, "COOKIE_DIR", root),
+            patch.object(
+                overseas_tiktok_publish,
+                "_read_account_record",
+                return_value=self._account(),
+            ),
+        ):
+            yield
 
     def test_validation_requires_dry_run_video_and_local_session(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -1617,7 +1649,7 @@ class OverseasPreflightTests(unittest.TestCase):
             video = root / "video.mp4"
             video.write_bytes(b"video")
             (root / "tiktok.json").write_text("{}", encoding="utf-8")
-            with patch.object(overseas_preflight, "COOKIE_DIR", root):
+            with self._local_tiktok(root):
                 result = overseas_preflight.validate_overseas_preflight_payload(
                     self._payload(video)
                 )
@@ -1637,7 +1669,7 @@ class OverseasPreflightTests(unittest.TestCase):
                 self.assertFalse(result["ok"])
                 self.assertTrue(any("视频通道" in item for item in result["errors"]))
 
-    def test_recovered_handler_receives_forced_dry_run(self) -> None:
+    def test_meta_recovered_handler_receives_forced_dry_run(self) -> None:
         calls = []
 
         def handler(*args, **kwargs):
@@ -1647,20 +1679,22 @@ class OverseasPreflightTests(unittest.TestCase):
             root = Path(raw)
             video = root / "video.mp4"
             video.write_bytes(b"video")
-            (root / "tiktok.json").write_text("{}", encoding="utf-8")
+            (root / "instagram.json").write_text("{}", encoding="utf-8")
             with (
                 patch.object(overseas_preflight, "COOKIE_DIR", root),
-                patch.dict(overseas_preflight.PREFLIGHT_HANDLERS, {6: handler}),
+                patch.dict(overseas_preflight.PREFLIGHT_HANDLERS, {8: handler}),
             ):
                 payload = self._payload(video)
                 payload.update(
                     {
+                        "type": 8,
+                        "accountList": ["instagram.json"],
                         "visibility": "private",
                         "collectionName": "测试合集",
-                        "aiGenerated": True,
+                        "aiGenerated": False,
                         "madeForKids": True,
                         "notifySubscribers": False,
-                        "shareToFeed": False,
+                        "shareToFeed": True,
                     }
                 )
                 result = overseas_preflight.run_overseas_preflight_sync(payload)
@@ -1672,10 +1706,44 @@ class OverseasPreflightTests(unittest.TestCase):
         self.assertIsNone(calls[0][1]["schedule_time"])
         self.assertEqual(calls[0][1]["visibility"], "private")
         self.assertEqual(calls[0][1]["collection_name"], "测试合集")
-        self.assertTrue(calls[0][1]["ai_generated"])
+        self.assertFalse(calls[0][1]["ai_generated"])
         self.assertTrue(calls[0][1]["made_for_kids"])
         self.assertFalse(calls[0][1]["notify_subscribers"])
-        self.assertFalse(calls[0][1]["share_to_feed"])
+        self.assertTrue(calls[0][1]["share_to_feed"])
+
+    def test_tiktok_default_preflight_never_calls_browser_handler_or_session_writer(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            video = root / "video.mp4"
+            video.write_bytes(b"video")
+            session = root / "tiktok.json"
+            session.write_text('{"cookies": [], "origins": []}', encoding="utf-8")
+            original_session = session.read_bytes()
+            handler = MagicMock(side_effect=AssertionError("TikTok handler must stay local"))
+            with (
+                self._local_tiktok(root),
+                patch.dict(overseas_preflight.PREFLIGHT_HANDLERS, {6: handler}),
+                patch.object(
+                    tiktok_identity_service,
+                    "async_playwright",
+                ) as playwright,
+                patch.object(recovered_publish, "reveal_page_window") as reveal,
+                patch(
+                    "uploader.tk_uploader.main.save_context_storage_state"
+                ) as save_session,
+            ):
+                result = overseas_preflight.run_overseas_preflight_sync(
+                    self._payload(video)
+                )
+
+            handler.assert_not_called()
+            playwright.assert_not_called()
+            reveal.assert_not_called()
+            save_session.assert_not_called()
+            self.assertEqual(result["phase"], "local_preflight_passed")
+            self.assertFalse(result["receipt"]["platformWriteOccurred"])
+            self.assertFalse(result["receipt"]["finalActionTriggered"])
+            self.assertEqual(session.read_bytes(), original_session)
 
     def test_youtube_preflight_requires_verified_fields_and_reports_private_upload(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -1820,7 +1888,7 @@ class OverseasPreflightTests(unittest.TestCase):
             payload = self._payload(video)
             payload["enableTimer"] = True
             payload["scheduleTime"] = "2026-08-08 18:00"
-            with patch.object(overseas_preflight, "COOKIE_DIR", root):
+            with self._local_tiktok(root):
                 result = overseas_preflight.validate_overseas_preflight_payload(payload)
         self.assertFalse(result["ok"])
         self.assertTrue(any("定时时间" in item for item in result["errors"]))

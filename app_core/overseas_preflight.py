@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """海外平台视频预发布检查。
 
-本模块只调用已恢复的蚁小二 TikTok、YouTube 和 Meta 浏览器执行器。
-它强制 ``debugDryRun=true`` 并停在最终按钮前，不会点击最终发布动作。
+本模块对 TikTok 只做本地合同检查；YouTube 和 Meta 继续调用
+已恢复的浏览器执行器。浏览器预检强制 ``debugDryRun=true``
+并停在最终按钮前，不会点击最终发布动作。
 YouTube 在上传后可能由平台保留私密内容，必须在结果中明确标记。
 """
 
@@ -20,6 +21,11 @@ from myUtils.postVideo import (
 from utils.publish_observer import publish_context
 
 from .paths import COOKIE_DIR
+from .overseas_tiktok_errors import TikTokPublishError
+from .overseas_tiktok_publish import (
+    run_tiktok_local_preflight,
+    validate_tiktok_payload,
+)
 
 
 OVERSEAS_VIDEO_PLATFORM_TYPES = frozenset({6, 7, 8, 9})
@@ -46,6 +52,31 @@ def validate_overseas_preflight_payload(payload: dict[str, Any]) -> dict[str, An
 
     platform_type = int(payload.get("type") or 0)
     platform_name = PLATFORM_NAMES.get(platform_type, f"平台{platform_type}")
+    if platform_type == 6:
+        try:
+            prepared = validate_tiktok_payload(payload, mode="preflight")
+        except TikTokPublishError as exc:
+            return {
+                "ok": False,
+                "type": 6,
+                "platform": "TikTok",
+                "errors": [exc.public_message],
+                "snapshot": None,
+            }
+        return {
+            "ok": True,
+            "type": 6,
+            "platform": "TikTok",
+            "errors": [],
+            "snapshot": {
+                "accountId": prepared["accountId"],
+                "videoSha256": prepared["videoSha256"],
+                "textSha256": prepared["textSha256"],
+                "topics": list(prepared["topics"]),
+                "visibility": prepared["visibility"],
+                "mode": prepared["mode"],
+            },
+        }
     errors: list[str] = []
     if platform_type not in OVERSEAS_VIDEO_PLATFORM_TYPES:
         errors.append("当前载荷不属于已恢复的海外视频平台")
@@ -133,6 +164,9 @@ def validate_overseas_preflight_payload(payload: dict[str, Any]) -> dict[str, An
 
 def run_overseas_preflight_sync(payload: dict[str, Any]) -> dict[str, Any]:
     """执行恢复的视频上传与字段填写，最终按钮始终锁定。"""
+
+    if int(payload.get("type") or 0) == 6:
+        return run_tiktok_local_preflight(payload)
 
     checked = validate_overseas_preflight_payload(payload)
     if not checked["ok"]:
