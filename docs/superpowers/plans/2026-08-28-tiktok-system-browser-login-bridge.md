@@ -360,7 +360,7 @@ async def collect_validated_tiktok_candidate(attempt, browser, *, playwright_fac
         return TikTokLoginCandidate(sanitized, second_identity)
 ```
 
-The implementation must close page/context/browser/Playwright resources in `finally`, translate a locked profile to `tiktok_login_profile_busy`, a missing/expired session to the matching stable code, and never include the underlying Cookie/state value in the public message. Before returning, new binding calls `validate_identity_binding({"accountReference": ""}, second_identity, allow_initial_bind=True)`; update mode calls `validate_identity_binding(existing_account, second_identity, allow_initial_bind=False)` so the existing public-handle contract remains the only identity rule.
+The implementation must close page/context/browser/Playwright resources in `finally`, translate a locked profile to `tiktok_login_profile_busy`, a missing/expired session to the matching stable code, and never include the underlying Cookie/state value in the public message. Candidate collection is deliberately account-agnostic: it proves only that the dedicated profile and the blank verification context return the same unique public handle.
 
 - [ ] **Step 5: Implement conditional account persistence and atomic session replacement**
 
@@ -381,7 +381,7 @@ CLEANING_LOGIN_ATTEMPT
 ACCOUNT_SAVED:<positive id>
 ```
 
-The orchestration order is strict: wait for the browser process, wait for profile-lock release, collect and revalidate an in-memory candidate, remove the staging attempt, then call `commit_tiktok_login_candidate`. It must never write the candidate session or account row before staging cleanup succeeds. Cancellation sets `last_error_code = "tiktok_login_cancelled"` and emits `CANCELLED` only after its owned process has been stopped and its owned attempt has entered cleanup. Other failures set the same property and emit `ERROR:<stable_error_code>` after cleanup; `tiktok_login_cleanup_failed` takes precedence because no account may be committed while sensitive staging remains. `save()` only emits a plain-language message stating that manual save is disabled.
+The orchestration order is strict: wait for the browser process, wait for profile-lock release, collect and revalidate an in-memory candidate, validate its identity against `existing_account` with `allow_initial_bind=False` in update mode (or against an empty `accountReference` with `allow_initial_bind=True` for a new binding), remove the staging attempt, then call `commit_tiktok_login_candidate`. `save_tiktok_browser_account` repeats the same identity check inside its transaction to prevent a concurrent account-row change. The flow must never write the candidate session or account row before staging cleanup succeeds. Cancellation sets `last_error_code = "tiktok_login_cancelled"` and emits `CANCELLED` only after its owned process has been stopped and its owned attempt has entered cleanup. Other failures set the same property and emit `ERROR:<stable_error_code>` after cleanup; `tiktok_login_cleanup_failed` takes precedence because no account may be committed while sensitive staging remains. `save()` only emits a plain-language message stating that manual save is disabled.
 
 - [ ] **Step 7: Run the focused security and identity tests**
 
