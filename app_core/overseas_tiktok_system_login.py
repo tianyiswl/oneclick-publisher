@@ -247,7 +247,7 @@ def build_system_browser_command(
 ) -> list[str]:
     """Build the fixed, non-automated system-browser command for this attempt."""
 
-    return [
+    command = [
         str(browser.executable),
         f"--user-data-dir={attempt.profile_dir}",
         "--profile-directory=Default",
@@ -257,6 +257,12 @@ def build_system_browser_command(
         "--disable-background-mode",
         _TIKTOK_LOGIN_URL,
     ]
+    # This command is issued only for the private staging profile created by
+    # create_login_attempt.  macOS Chrome otherwise relies on a Keychain item
+    # that a dedicated temporary profile cannot persist after the window exits.
+    if sys.platform == "darwin" and browser.name == "Google Chrome":
+        command.insert(2, "--use-mock-keychain")
+    return command
 
 
 def _resolved_owned_attempt(attempt_root: Path, staging_root: Path) -> tuple[Path, Path]:

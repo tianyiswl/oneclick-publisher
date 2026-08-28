@@ -206,6 +206,30 @@ class TikTokSystemLoginTests(unittest.TestCase):
         for forbidden in ("remote-debugging", "enable-automation", "playwright"):
             self.assertNotIn(forbidden, joined.lower())
 
+    def test_macos_chrome_uses_mock_keychain_only_for_the_private_login_attempt(self):
+        attempt = self._attempt()
+        chrome = SystemBrowserSpec(
+            "Google Chrome",
+            Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+        )
+        edge = SystemBrowserSpec(
+            "Microsoft Edge",
+            Path("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+        )
+
+        with patch("app_core.overseas_tiktok_system_login.sys.platform", "darwin"):
+            macos_chrome_command = build_system_browser_command(chrome, attempt)
+            macos_edge_command = build_system_browser_command(edge, attempt)
+        with patch("app_core.overseas_tiktok_system_login.sys.platform", "win32"):
+            windows_chrome_command = build_system_browser_command(chrome, attempt)
+        with patch("app_core.overseas_tiktok_system_login.sys.platform", "linux"):
+            linux_chrome_command = build_system_browser_command(chrome, attempt)
+
+        self.assertIn("--use-mock-keychain", macos_chrome_command)
+        self.assertNotIn("--use-mock-keychain", macos_edge_command)
+        self.assertNotIn("--use-mock-keychain", windows_chrome_command)
+        self.assertNotIn("--use-mock-keychain", linux_chrome_command)
+
     def test_create_login_attempt_generates_private_uuid_profile(self):
         attempt = create_login_attempt(self.user_data_dir)
 
