@@ -196,14 +196,19 @@ class AccountDetectionUiTests(unittest.TestCase):
             def save(self) -> None:
                 raise AssertionError("TikTok manual save must stay disabled")
 
+            def complete_login(self) -> None:
+                pass
+
         dialog = LoginDialog(background_login=True)
         dialog.platform_combo.setCurrentIndex(dialog.platform_combo.findData(6))
         dialog.reset_login_prompt()
         self.assertEqual(
             dialog.qr_label.text(),
-            "请点击“开始登录”，一键发将打开系统 Chrome 专用临时窗口；登录完成后请关闭该窗口。",
+            "请点击“开始登录”，一键发将打开系统 Chrome 专用临时窗口；"
+            "登录完成后可关闭该窗口，或点击“完成登录并保存”。",
         )
         self.assertTrue(dialog.save_btn.isHidden())
+        self.assertFalse(dialog.complete_btn.isHidden())
         dialog.platform_combo.setCurrentIndex(dialog.platform_combo.findData(1))
         self.assertFalse(dialog.save_btn.isHidden())
         dialog.platform_combo.setCurrentIndex(dialog.platform_combo.findData(6))
@@ -211,13 +216,45 @@ class AccountDetectionUiTests(unittest.TestCase):
         with patch("ui.login_dialog.login_service.start_login", return_value=TikTokSession()):
             dialog.start_login()
         self.assertFalse(dialog.save_btn.isEnabled())
+        self.assertFalse(dialog.complete_btn.isEnabled())
+        dialog.close()
+
+    def test_tiktok_dialog_enables_complete_only_after_system_browser_opens(self) -> None:
+        class TikTokSession:
+            manual_save_supported = False
+
+            def __init__(self) -> None:
+                self.queue: queue.Queue[str] = queue.Queue()
+                self.completed = 0
+
+            def complete_login(self) -> None:
+                self.completed += 1
+
+        session = TikTokSession()
+        dialog = LoginDialog(background_login=True)
+        dialog.platform_combo.setCurrentIndex(dialog.platform_combo.findData(6))
+        dialog.session = session
+
+        self.assertFalse(dialog.complete_btn.isEnabled())
+        session.queue.put("SYSTEM_BROWSER_OPENED")
+        dialog.poll_messages()
+        self.assertTrue(dialog.complete_btn.isEnabled())
+        session.queue.put("WAITING_BROWSER_EXIT")
+        dialog.poll_messages()
+        self.assertTrue(dialog.complete_btn.isEnabled())
+
+        dialog.complete_tiktok_login()
+
+        self.assertEqual(session.completed, 1)
+        self.assertFalse(dialog.complete_btn.isEnabled())
+        self.assertIn("正在核验", dialog.qr_label.text())
         dialog.close()
 
     def test_tiktok_dialog_consumes_each_system_browser_lifecycle_message(self) -> None:
         expected = {
             "OPENING_SYSTEM_BROWSER": "正在准备系统 Chrome 专用临时窗口...",
             "SYSTEM_BROWSER_OPENED": "系统 Chrome 专用临时窗口已打开。",
-            "WAITING_BROWSER_EXIT": "请在系统 Chrome 专用临时窗口完成 TikTok 登录，完成后关闭该窗口。",
+            "WAITING_BROWSER_EXIT": "请在系统 Chrome 专用临时窗口完成 TikTok 登录后关闭该窗口，或点击“完成登录并保存”。",
             "VALIDATING_TIKTOK_SESSION": "专用窗口已关闭，正在核对 TikTok 登录状态...",
             "CLEANING_LOGIN_ATTEMPT": "正在清理 TikTok 临时登录资料...",
         }

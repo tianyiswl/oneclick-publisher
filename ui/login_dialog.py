@@ -153,6 +153,10 @@ class LoginDialog(QDialog):
         self.save_btn.setEnabled(False)
         self.save_btn.setToolTip("一键发通常会自动保存；仅在平台未返回可识别身份回执时作为兜底。")
         self.save_btn.clicked.connect(self.save_logged_in_account)
+        self.complete_btn = button("完成登录并保存", variant="secondary")
+        self.complete_btn.setEnabled(False)
+        self.complete_btn.setVisible(False)
+        self.complete_btn.clicked.connect(self.complete_tiktok_login)
         self.cancel_btn = button("取消登录", variant="warning")
         self.cancel_btn.clicked.connect(self.cancel_login)
         close_btn = button("关闭", variant="secondary")
@@ -160,6 +164,7 @@ class LoginDialog(QDialog):
         actions.addWidget(close_btn)
         actions.addStretch()
         actions.addWidget(self.cancel_btn)
+        actions.addWidget(self.complete_btn)
         actions.addWidget(self.save_btn)
         actions.addWidget(self.start_btn)
         layout.addLayout(actions)
@@ -176,11 +181,13 @@ class LoginDialog(QDialog):
         self.qr_label.clear()
         platform_type = int(self.platform_combo.currentData() or 0)
         self.save_btn.setVisible(platform_type != 6)
+        self.complete_btn.setVisible(platform_type == 6)
+        self.complete_btn.setEnabled(False)
         if platform_type == 6:
             self.save_btn.setEnabled(False)
             self.qr_label.setText(
                 "请点击“开始登录”，一键发将打开系统 Chrome 专用临时窗口；"
-                "登录完成后请关闭该窗口。"
+                "登录完成后可关闭该窗口，或点击“完成登录并保存”。"
             )
         elif platform_type == 7:
             self.qr_label.setText("请点击下方“开始登录”在系统默认浏览器中授权 YouTube")
@@ -201,6 +208,7 @@ class LoginDialog(QDialog):
         self.qr_label.setText("正在打开平台官方登录页面...")
         self.start_btn.setEnabled(False)
         self.save_btn.setEnabled(False)
+        self.complete_btn.setEnabled(False)
         self.scan_notified = False
         self.success = False
         self._saved_account_ids.clear()
@@ -224,9 +232,23 @@ class LoginDialog(QDialog):
         self.log.append("正在保存本地会话引用，并标记为登录正常。")
         self.session.save()
 
+    def complete_tiktok_login(self) -> None:
+        """End only TikTok's manual browser phase; saved-state validation follows."""
+
+        if int(self.platform_combo.currentData() or 0) != 6 or not self.session:
+            return
+        complete = getattr(self.session, "complete_login", None)
+        if not callable(complete):
+            return
+        self.complete_btn.setEnabled(False)
+        self.qr_label.setText("已请求结束专用窗口，正在核验 TikTok 登录状态...")
+        self.log.append("已请求结束本次专用窗口，正在核验 TikTok 登录状态。")
+        complete()
+
     def cancel_login(self) -> None:
         if self.session:
             self.session.cancel()
+        self.complete_btn.setEnabled(False)
         self.lifecycle_message = "登录已取消，未修改账号会话。"
         self.log.append(self.lifecycle_message)
         self.timer.stop()
@@ -286,29 +308,38 @@ class LoginDialog(QDialog):
             msg = str(self.session.queue.get())
             if msg == "OPENING_SYSTEM_BROWSER":
                 self.save_btn.setEnabled(False)
+                self.complete_btn.setEnabled(False)
                 self.qr_label.setText("正在准备系统 Chrome 专用临时窗口...")
                 self.log.append("正在创建本次 TikTok 登录使用的临时资料。")
                 continue
             if msg == "SYSTEM_BROWSER_OPENED":
                 self.save_btn.setEnabled(False)
+                self.complete_btn.setEnabled(
+                    callable(getattr(self.session, "complete_login", None))
+                )
                 self.qr_label.setText("系统 Chrome 专用临时窗口已打开。")
                 self.log.append("TikTok 官方登录页已在专用窗口打开。")
                 continue
             if msg == "WAITING_BROWSER_EXIT":
                 self.save_btn.setEnabled(False)
+                self.complete_btn.setEnabled(
+                    callable(getattr(self.session, "complete_login", None))
+                )
                 self.qr_label.setText(
-                    "请在系统 Chrome 专用临时窗口完成 TikTok 登录，"
-                    "完成后关闭该窗口。"
+                    "请在系统 Chrome 专用临时窗口完成 TikTok 登录后关闭该窗口，"
+                    "或点击“完成登录并保存”。"
                 )
                 self.log.append("等待你完成 TikTok 登录并关闭专用窗口。")
                 continue
             if msg == "VALIDATING_TIKTOK_SESSION":
                 self.save_btn.setEnabled(False)
+                self.complete_btn.setEnabled(False)
                 self.qr_label.setText("专用窗口已关闭，正在核对 TikTok 登录状态...")
                 self.log.append("正在核对 TikTok 登录数据和账号身份。")
                 continue
             if msg == "CLEANING_LOGIN_ATTEMPT":
                 self.save_btn.setEnabled(False)
+                self.complete_btn.setEnabled(False)
                 self.qr_label.setText("正在清理 TikTok 临时登录资料...")
                 self.log.append("正在清理本次 TikTok 登录使用的临时资料。")
                 continue
@@ -330,6 +361,7 @@ class LoginDialog(QDialog):
                 self.log.append("已检测到平台身份回执，正在自动保存一键发本地会话。")
                 continue
             if msg.startswith("ACCOUNT_SAVED:"):
+                self.complete_btn.setEnabled(False)
                 self.timer.stop()
                 account_id = int(msg.split(":", 1)[1])
                 self._verify_saved_account(account_id)
@@ -353,6 +385,7 @@ class LoginDialog(QDialog):
                     self.reject()
                 return
             if msg in ("500", "CANCELLED"):
+                self.complete_btn.setEnabled(False)
                 self.timer.stop()
                 if msg == "CANCELLED":
                     self.lifecycle_message = "登录已取消，未修改账号会话。"
@@ -362,6 +395,7 @@ class LoginDialog(QDialog):
                 self.reject()
                 return
             if msg.startswith("ERROR:"):
+                self.complete_btn.setEnabled(False)
                 reason = msg.split(":", 1)[1]
                 message = TIKTOK_LOGIN_ERROR_TEXT.get(reason)
                 if message is None:
