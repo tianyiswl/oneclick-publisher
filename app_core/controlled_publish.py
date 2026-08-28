@@ -23,6 +23,7 @@ from .silicon_evolution_publish_package import (
     FrozenWechatPublishPackageError,
     load_frozen_wechat_publish_package,
 )
+from .overseas_tiktok_identity import normalize_tiktok_handle
 
 
 _PLATFORM_TYPE_BY_NAME = {
@@ -37,6 +38,7 @@ _REQUEST_KEYS = {
     "confirmedPreflightTaskId",
     "authorizationId",
     "directAuthorizationId",
+    "platformFormCheckConfirmed",
 }
 _TARGET_KEYS = {"platform", "accountId", "schedule", "settings"}
 _PROJECT_ID_RE = re.compile(r"[a-z0-9][a-z0-9._-]{1,63}")
@@ -141,10 +143,18 @@ def build_controlled_payloads(
             "controlled_request_invalid", "受控发布请求包含不支持字段"
         )
     mode = str(request.get("mode") or "preflight").strip().lower()
-    if mode not in {"preflight", "formal", "direct"}:
+    if mode not in {"preflight", "platform_form_check", "formal", "direct"}:
         raise ControlledPublishError(
             "controlled_mode_invalid",
-            "执行模式只能是 preflight、formal 或 direct",
+            "执行模式只能是 preflight、platform_form_check、formal 或 direct",
+        )
+    if (
+        mode == "platform_form_check"
+        and request.get("platformFormCheckConfirmed") is not True
+    ):
+        raise ControlledPublishError(
+            "tiktok_platform_form_check_confirmation_required",
+            "TikTok 平台表单检查会上传并填写，必须显式确认",
         )
     if mode == "formal":
         if type(request.get("confirmedPreflightTaskId")) is not int or not str(
@@ -180,6 +190,29 @@ def build_controlled_payloads(
     targets = request.get("targets")
     if not isinstance(targets, list) or not targets:
         raise ControlledPublishError("controlled_targets_required", "至少需要一个明确平台账号")
+    tiktok_target_count = sum(
+        1
+        for item in targets
+        if isinstance(item, Mapping)
+        and oneclick_capabilities.canonical_platform(
+            str(item.get("platform") or "")
+        )
+        == "TikTok"
+    )
+    if tiktok_target_count:
+        if len(targets) != 1 or tiktok_target_count != 1:
+            raise ControlledPublishError(
+                "tiktok_target_invalid", "TikTok 首版一次只能选择一个账号"
+            )
+        if mode == "direct":
+            raise ControlledPublishError(
+                "tiktok_direct_mode_unsupported",
+                "TikTok 首版不支持 direct；必须由本地预检后进入 formal",
+            )
+    elif mode == "platform_form_check":
+        raise ControlledPublishError(
+            "tiktok_target_invalid", "平台表单检查首版只支持单个 TikTok 账号"
+        )
     account_rows = [
         dict(row)
         for row in (
@@ -225,6 +258,48 @@ def build_controlled_payloads(
                 "controlled_platform_not_in_bundle", f"内容包没有声明目标平台：{platform}"
             )
         youtube_settings: dict[str, object] | None = None
+        tiktok_expected_reference = ""
+        tiktok_settings: dict[str, object] | None = None
+        if platform_type == 6:
+            if target.get("schedule") is not None:
+                raise ControlledPublishError(
+                    "tiktok_unsupported_publish_setting",
+                    "TikTok 首版只支持立即公开发布",
+                )
+            if (
+                type(account.get("status")) is not int
+                or account.get("status") != 1
+                or str(account.get("authMode") or "") != "browser"
+            ):
+                raise ControlledPublishError(
+                    "tiktok_account_invalid", "TikTok 账号未通过同一主体检测"
+                )
+            tiktok_expected_reference = normalize_tiktok_handle(
+                account.get("accountReference")
+            )
+            if not tiktok_expected_reference:
+                raise ControlledPublishError(
+                    "tiktok_account_invalid", "TikTok 账号缺少稳定主体绑定"
+                )
+            if bundle.get("contentType") != "video" or len(bundle["assetPaths"]) != 1:
+                raise ControlledPublishError(
+                    "tiktok_unsupported_publish_setting",
+                    "TikTok 首版只支持单个本地视频",
+                )
+            raw_settings = target.get("settings")
+            if not isinstance(raw_settings, Mapping) or set(raw_settings) != {
+                "visibility"
+            }:
+                raise ControlledPublishError(
+                    "tiktok_unsupported_publish_setting",
+                    "TikTok 首版必须明确选择公开发布",
+                )
+            if str(raw_settings.get("visibility") or "").strip().lower() != "public":
+                raise ControlledPublishError(
+                    "tiktok_unsupported_publish_setting",
+                    "TikTok 首版只支持立即公开发布",
+                )
+            tiktok_settings = {"visibility": "public"}
         if platform_type == 7:
             youtube_target_count += 1
             if youtube_target_count > 1:
@@ -272,12 +347,22 @@ def build_controlled_payloads(
             raise ControlledPublishError(
                 "controlled_platform_fields_missing", f"{platform}缺少独立标题或正文"
             )
+        if platform_type == 6 and ("@" in title or "@" in description):
+            raise ControlledPublishError(
+                "tiktok_unsupported_publish_setting",
+                "TikTok 标题或正文包含原始 @ 文字，首版不支持提及",
+            )
         if platform_type == 3 and re.search(r"(?:^|\s)@[^\s@#]+", description):
             raise ControlledPublishError(
                 "controlled_mentions_unsupported",
                 "抖音正文包含原始 @文字；当前内容包没有独立 mentions 字段和官方候选回读，不能冒充有效提及",
             )
         enable_timer, schedule_time, schedule_timezone = _schedule(target.get("schedule"))
+        if platform_type == 6 and enable_timer:
+            raise ControlledPublishError(
+                "tiktok_unsupported_publish_setting",
+                "TikTok 首版只支持立即公开发布",
+            )
         if youtube_settings is not None:
             scheduled_public = youtube_settings["visibility"] == "scheduled_public"
             if enable_timer != scheduled_public:
@@ -301,7 +386,13 @@ def build_controlled_payloads(
             "accountDisplayNames": [display_name],
             "coverPath": cover_path,
             "coverPaths": covers,
-            "runtimeMode": "publish" if mode in {"formal", "direct"} else "preflight",
+            "runtimeMode": (
+                "platform_form_check"
+                if mode == "platform_form_check"
+                else "publish"
+                if mode in {"formal", "direct"}
+                else "preflight"
+            ),
             "debugDryRun": mode == "preflight",
             "saveDraftOnly": False,
             "debugDryRunHoldBrowser": False,
@@ -337,6 +428,23 @@ def build_controlled_payloads(
         elif platform_type == 3:
             payload.update(
                 {"locationKeyword": "", "locationScope": "", "locationPoi": {}}
+            )
+        elif platform_type == 6 and tiktok_settings is not None:
+            payload.update(tiktok_settings)
+            payload.update(
+                {
+                    "coverPath": "",
+                    "coverPaths": {},
+                    "backgroundMode": False,
+                    "overseasVideoPublishConfirmed": mode == "formal",
+                    "tiktokControlledPublish": True,
+                    "tiktokExpectedAccountReference": tiktok_expected_reference,
+                    "tiktokExecutionIntent": (
+                        "platform_form_check"
+                        if mode == "platform_form_check"
+                        else "formal_public"
+                    ),
+                }
             )
         elif platform_type == 7 and youtube_settings is not None:
             payload.update(youtube_settings)
@@ -393,6 +501,12 @@ def scope_fingerprint(payloads: Iterable[Mapping[str, Any]]) -> str:
                     payload.get("youtubeExpectedChannelId") or ""
                 ),
                 "youtubeOfficialApi": bool(payload.get("youtubeOfficialApi")),
+                "tiktokExpectedAccountReference": str(
+                    payload.get("tiktokExpectedAccountReference") or ""
+                ),
+                "tiktokExecutionIntent": str(
+                    payload.get("tiktokExecutionIntent") or ""
+                ),
             }
         )
     encoded = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -702,6 +816,8 @@ def project_task(task: Mapping[str, Any] | None) -> dict[str, Any]:
     phase = (
         "local_check"
         if mode == "oneclick_matrix_local_check"
+        else "platform_form_check"
+        if mode == "oneclick_platform_form_check"
         else "preflight"
         if "preflight" in mode
         else "formal"
@@ -724,7 +840,9 @@ def project_task(task: Mapping[str, Any] | None) -> dict[str, Any]:
 
     task_status_value = str(task.get("status") or "pending")
     user_action: dict[str, Any] | None = None
-    if task_status_value == "success":
+    if "tiktok_publish_outcome_ambiguous" in event_types:
+        stage = "ambiguous"
+    elif task_status_value == "success":
         stage = "succeeded"
     elif task_status_value in {"failed", "partial_failed"}:
         stage = "failed"
@@ -733,6 +851,12 @@ def project_task(task: Mapping[str, Any] | None) -> dict[str, Any]:
     elif phase == "local_check":
         stage = "local_check"
     else:
+        tiktok_verification_required_index = _latest_event_index(
+            "tiktok_waiting_user_verification"
+        )
+        tiktok_verification_resolved_index = _latest_event_index(
+            "tiktok_user_verification_resolved"
+        )
         verification_required_index = _latest_event_index(
             "wechat_verification_required",
             "wechat_publish_qr_required",
@@ -744,7 +868,13 @@ def project_task(task: Mapping[str, Any] | None) -> dict[str, Any]:
             "wechat_publish_user_action_required"
         )
         final_submit_index = _latest_event_index("wechat_final_submit_clicked")
-        if verification_required_index > verification_succeeded_index:
+        if tiktok_verification_required_index > tiktok_verification_resolved_index:
+            stage = "waiting_verification"
+            user_action = {
+                "type": "tiktok_verification",
+                "message": "TikTok 正在同一浏览器等待完成安全验证",
+            }
+        elif verification_required_index > verification_succeeded_index:
             stage = "waiting_verification"
             user_action = {
                 "type": "wechat_qr",
@@ -830,6 +960,44 @@ def project_task(task: Mapping[str, Any] | None) -> dict[str, Any]:
                 ),
             }
         )
+    tiktok_receipt_phases = {
+        str((platform.get("receipt") or {}).get("phase") or "")
+        for platform in platforms
+        if int(platform.get("platformType") or 0) == 6
+    }
+    if (
+        "tiktok_publish_outcome_ambiguous" in event_types
+        or "ambiguous" in tiktok_receipt_phases
+    ):
+        stage = "ambiguous"
+        user_action = None
+    elif "tiktok_waiting_user_verification" in event_types and (
+        _latest_event_index("tiktok_waiting_user_verification")
+        > _latest_event_index("tiktok_user_verification_resolved")
+    ):
+        stage = "waiting_verification"
+        user_action = {
+            "type": "tiktok_verification",
+            "message": "TikTok 正在同一浏览器等待完成安全验证",
+        }
+    elif "tiktok_published_readback_confirmed" in event_types or (
+        "published_readback_confirmed" in tiktok_receipt_phases
+    ):
+        stage = "published_readback_confirmed"
+    elif "tiktok_platform_accepted" in event_types or (
+        "platform_accepted" in tiktok_receipt_phases
+    ):
+        stage = "platform_accepted"
+    elif "tiktok_final_action_triggered" in event_types:
+        stage = "reconciling"
+    elif "tiktok_platform_form_verified" in event_types or (
+        "platform_form_verified" in tiktok_receipt_phases
+    ):
+        stage = "platform_form_verified"
+    elif "tiktok_local_preflight_passed" in event_types or (
+        "local_preflight_passed" in tiktok_receipt_phases
+    ):
+        stage = "local_preflight_passed"
     result = {
         "taskId": int(task.get("id") or 0),
         "taskNo": str(task.get("taskNo") or ""),
@@ -876,6 +1044,38 @@ def task_status(task_id: int) -> dict[str, Any]:
     return project_task(task_service.get_task(int(task_id)))
 
 
+def _require_tiktok_local_preflight_task(
+    task: Mapping[str, Any],
+    payloads: Iterable[Mapping[str, Any]],
+) -> None:
+    rows = [dict(item) for item in payloads]
+    tiktok_rows = [item for item in rows if int(item.get("type") or 0) == 6]
+    if not tiktok_rows:
+        return
+    event_types = {
+        str(event.get("eventType") or "")
+        for event in task.get("events") or []
+        if isinstance(event, Mapping)
+    }
+    valid_snapshot = (
+        len(rows) == 1
+        and len(tiktok_rows) == 1
+        and str(tiktok_rows[0].get("runtimeMode") or "") == "preflight"
+        and tiktok_rows[0].get("debugDryRun") is True
+        and str(tiktok_rows[0].get("tiktokExecutionIntent") or "")
+        == "formal_public"
+        and bool(
+            str(tiktok_rows[0].get("tiktokExpectedAccountReference") or "").strip()
+        )
+        and "tiktok_local_preflight_passed" in event_types
+    )
+    if not valid_snapshot:
+        raise ControlledPublishError(
+            "tiktok_local_preflight_required",
+            "TikTok 正式发布必须绑定同一输入的成功本地预检",
+        )
+
+
 def authorize_completed_check(
     task_id: int,
     *,
@@ -900,11 +1100,13 @@ def authorize_completed_check(
         raise ControlledPublishError("controlled_preflight_invalid", "预检任务快照不可读取") from exc
     if not isinstance(payloads, list) or not payloads:
         raise ControlledPublishError("controlled_preflight_invalid", "预检任务没有发布快照")
+    normalized_payloads = [dict(item) for item in payloads if isinstance(item, dict)]
+    _require_tiktok_local_preflight_task(task, normalized_payloads)
     with connect() as conn:
         return create_authorization(
             conn,
             int(task_id),
-            [dict(item) for item in payloads if isinstance(item, dict)],
+            normalized_payloads,
             ttl_seconds=ttl_seconds,
         )
 
@@ -999,7 +1201,13 @@ def _find_blocking_formal_scope_task(
             for event in raw_task.get("events") or []
             if isinstance(event, Mapping)
         }
-        if "wechat_final_submit_clicked" in event_types:
+        if event_types.intersection(
+            {
+                "wechat_final_submit_clicked",
+                "tiktok_final_action_triggered",
+                "tiktok_publish_outcome_ambiguous",
+            }
+        ):
             return dict(raw_task)
     return None
 
@@ -1028,7 +1236,15 @@ def submit_request(request: Mapping[str, Any]) -> dict[str, Any]:
             }
             ambiguous = (
                 str(existing.get("status") or "") != "success"
-                and "wechat_final_submit_clicked" in event_types
+                and bool(
+                    event_types.intersection(
+                        {
+                            "wechat_final_submit_clicked",
+                            "tiktok_final_action_triggered",
+                            "tiktok_publish_outcome_ambiguous",
+                        }
+                    )
+                )
             )
             existing_task_id = int(existing.get("id") or 0)
             message = (
@@ -1055,6 +1271,22 @@ def submit_request(request: Mapping[str, Any]) -> dict[str, Any]:
             raise ControlledPublishError(
                 "controlled_preflight_not_successful", "对应预检尚未全部成功"
             )
+        try:
+            preflight_payloads = json.loads(
+                str(preflight.get("payloadJson") or "[]")
+            )
+        except json.JSONDecodeError as exc:
+            raise ControlledPublishError(
+                "controlled_preflight_invalid", "预检任务快照不可读取"
+            ) from exc
+        if not isinstance(preflight_payloads, list):
+            raise ControlledPublishError(
+                "controlled_preflight_invalid", "预检任务快照不可读取"
+            )
+        _require_tiktok_local_preflight_task(
+            preflight,
+            [item for item in preflight_payloads if isinstance(item, Mapping)],
+        )
         with connect() as conn:
             consume_authorization(
                 conn,

@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 
 from .account_service import PLATFORMS
 from .database import connect
+from .overseas_tiktok_errors import TikTokPublishError
 
 
 PAUSE_REASON_USER_REQUEST = "user_request"
@@ -78,6 +79,30 @@ _YOUTUBE_RECEIPT_FIELDS = frozenset(
         "processingStatus",
         "thumbnailApplied",
         "platformMutation",
+    }
+)
+_TIKTOK_RECEIPT_FIELDS = frozenset(
+    {
+        "accountId",
+        "visibility",
+        "platformWriteOccurred",
+        "finalActionTriggered",
+        "contentId",
+        "contentUrl",
+        "publishedAt",
+        "topicEntities",
+        "phase",
+    }
+)
+_TIKTOK_RECEIPT_PHASES = frozenset(
+    {
+        "local_preflight_passed",
+        "platform_form_verified",
+        "failed_before_final_action",
+        "final_action_triggered",
+        "platform_accepted",
+        "published_readback_confirmed",
+        "ambiguous",
     }
 )
 _MATRIX_TASK_MODES = frozenset(
@@ -243,6 +268,51 @@ def _youtube_receipt_projection(receipt: object) -> dict[str, object]:
     }:
         projected.pop("visibility", None)
     return projected
+
+
+def _tiktok_receipt_projection(receipt: object) -> dict[str, object]:
+    """Apply the Task 4 value boundary to the shared TikTok receipt."""
+
+    if not isinstance(receipt, Mapping):
+        return {}
+    # Task 4 already owns the strict scalar/URL/time safety contract. Reuse its
+    # public error receipt projection, then add only the Task 7 topic list.
+    projected = dict(
+        TikTokPublishError(
+            "tiktok_receipt_projection",
+            "TikTok receipt projection",
+            receipt=receipt,
+        ).receipt
+    )
+    projected.pop("mode", None)
+
+    topics = receipt.get("topicEntities")
+    if type(topics) is list and len(topics) <= 50:
+        safe_topics = []
+        seen_topics: set[str] = set()
+        for topic in topics:
+            if (
+                type(topic) is not str
+                or not (1 <= len(topic) <= 100)
+                or any(character.isspace() or character in "#@/\\<>" for character in topic)
+            ):
+                break
+            identity = topic.casefold()
+            if identity in seen_topics:
+                break
+            seen_topics.add(identity)
+            safe_topics.append(topic)
+        else:
+            projected["topicEntities"] = safe_topics
+
+    phase = receipt.get("phase")
+    if type(phase) is str and phase in _TIKTOK_RECEIPT_PHASES:
+        projected["phase"] = phase
+    return {
+        key: projected[key]
+        for key in _TIKTOK_RECEIPT_FIELDS
+        if key in projected
+    }
 
 
 def _stable_error_code(value: object) -> str:
@@ -586,13 +656,19 @@ def _insert_pending_task(
         if (
             len(project_ids) != 1
             or not re.fullmatch(r"[a-z0-9][a-z0-9._-]{1,63}", next(iter(project_ids)))
-            or mode not in {"oneclick_preflight", "oneclick_publish"}
+            or mode
+            not in {
+                "oneclick_preflight",
+                "oneclick_platform_form_check",
+                "oneclick_publish",
+            }
         ):
             raise ValueError("内容项目任务归属无效")
-        project_identity = (
-            next(iter(project_ids)),
-            "formal" if mode == "oneclick_publish" else "preflight",
-        )
+        if mode != "oneclick_platform_form_check":
+            project_identity = (
+                next(iter(project_ids)),
+                "formal" if mode == "oneclick_publish" else "preflight",
+            )
     account_files = sorted({a for payload in payloads for a in payload.get("accountList", [])})
     account_meta = {}
     if account_files:
@@ -1901,21 +1977,41 @@ def fail_active_task(
     error_code: str,
     message: str,
     event_type: str = "controlled_task_aborted",
+    receipt: Mapping[str, object] | None = None,
 ) -> bool:
     """把未取得终态回执的执行项一次性关闭，防止永久 pending。"""
 
     code = str(error_code or "controlled_task_aborted").strip()
     public_message = f"{str(message).strip()}（错误码 {code}）"
+    receipt_json = ""
+    if receipt is not None:
+        projected_receipt = _tiktok_receipt_projection(receipt)
+        if projected_receipt:
+            receipt_json = json.dumps(
+                projected_receipt,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
     now = _now()
     with connect() as conn:
         updated = conn.execute(
             """
             UPDATE publish_task_items
             SET status = 'failed', message = ?, errorCode = ?, attempts = attempts + 1,
-                startedAt = COALESCE(startedAt, ?), finishedAt = ?
+                startedAt = COALESCE(startedAt, ?), finishedAt = ?,
+                receiptJson = CASE WHEN ? <> '' THEN ? ELSE receiptJson END
             WHERE taskId = ? AND status IN ('pending', 'running')
             """,
-            (public_message, code, now, now, int(task_id)),
+            (
+                public_message,
+                code,
+                now,
+                now,
+                receipt_json,
+                receipt_json,
+                int(task_id),
+            ),
         )
         if updated.rowcount == 0:
             return False
@@ -1972,6 +2068,15 @@ def reconcile_stale_controlled_task(
                          AND item.platformType = 7
                          AND COALESCE(item.platformPostId, '') <> ''
                    ) AS youtubeHasKnownVideo
+                   ,EXISTS(
+                       SELECT 1 FROM publish_task_events AS event
+                       WHERE event.taskId = task.id
+                         AND event.eventType IN (
+                             'tiktok_final_action_triggered',
+                             'tiktok_publish_outcome_ambiguous'
+                         )
+                   ) AS tiktokFinalActionTriggered,
+                   task.payloadJson
             FROM publish_tasks AS task WHERE task.id = ?
             """,
             (int(task_id),),
@@ -1981,6 +2086,7 @@ def reconcile_stale_controlled_task(
     if str(row["mode"] or "") not in {
         "oneclick_preflight",
         "oneclick_publish",
+        "oneclick_platform_form_check",
         "oneclick_draft",
         "oneclick_matrix_local_check",
         "oneclick_matrix_preflight",
@@ -2004,6 +2110,34 @@ def reconcile_stale_controlled_task(
     if (current - reference).total_seconds() <= max(1, int(lease_seconds)):
         return False
     youtube_has_known_video = bool(row["youtubeHasKnownVideo"])
+    payloads = _payloads_from_json(row["payloadJson"])
+    is_tiktok_task = (
+        len(payloads) == 1 and int(payloads[0].get("type") or 0) == 6
+    )
+    tiktok_final_action_triggered = bool(row["tiktokFinalActionTriggered"])
+    if is_tiktok_task and tiktok_final_action_triggered:
+        account_ids = list(payloads[0].get("accountIds") or [])
+        account_id = (
+            int(account_ids[0])
+            if len(account_ids) == 1 and type(account_ids[0]) is int
+            else 0
+        )
+        return fail_active_task(
+            int(task_id),
+            error_code="tiktok_publish_outcome_unknown",
+            message="TikTok 最终动作后发布进程失联，必须先人工核对内容列表",
+            event_type="tiktok_publish_outcome_ambiguous",
+            receipt={
+                "accountId": account_id,
+                "visibility": "public",
+                "platformWriteOccurred": True,
+                "finalActionTriggered": True,
+                "contentId": None,
+                "contentUrl": None,
+                "publishedAt": None,
+                "phase": "ambiguous",
+            },
+        )
     return fail_active_task(
         int(task_id),
         error_code=(
@@ -2168,6 +2302,10 @@ def mark_platform_result(
     public_receipt = (
         _youtube_receipt_projection(receipt if receipt is not None else readback)
         if int(platform_type) == 7
+        else _tiktok_receipt_projection(
+            receipt if receipt is not None else readback
+        )
+        if int(platform_type) == 6
         else public_readback
     )
     receipt_json = (
@@ -2188,7 +2326,15 @@ def mark_platform_result(
     if int(platform_type) == 7:
         receipt_values["platformPostId"] = str(public_receipt.get("videoId") or "")
         receipt_values["postUrl"] = str(public_receipt.get("watchUrl") or "")
-    keep_identifiers = bool(ok or int(platform_type) == 7)
+    elif int(platform_type) == 6:
+        receipt_values["platformPostId"] = str(
+            public_receipt.get("contentId") or ""
+        )
+        receipt_values["postUrl"] = str(public_receipt.get("contentUrl") or "")
+        receipt_values["publishedAt"] = str(
+            public_receipt.get("publishedAt") or ""
+        )
+    keep_identifiers = bool(ok or int(platform_type) in {6, 7})
     with connect() as conn:
         batch_item = conn.execute(
             """

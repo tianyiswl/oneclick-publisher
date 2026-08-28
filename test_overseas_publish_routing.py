@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 
 from app_core import (
     overseas_preflight,
+    overseas_tiktok_publish,
     overseas_video_publish,
     publish_runtime,
     publish_service,
@@ -99,6 +100,131 @@ class PublishServiceRoutingTests(unittest.TestCase):
 
     def test_tiktok_is_absent_from_legacy_preflight_handler_registry(self) -> None:
         self.assertNotIn(6, overseas_preflight.PREFLIGHT_HANDLERS)
+
+    def test_tiktok_platform_form_check_routes_only_to_dedicated_service(self) -> None:
+        payload = _video_payload(self.video, 6, "platform_form_check")
+        payload.update(
+            {
+                "debugDryRun": False,
+                "tiktokControlledPublish": True,
+                "tiktokExpectedAccountReference": "expected.user",
+                "tiktokExecutionIntent": "platform_form_check",
+            }
+        )
+        result = {
+            "ok": True,
+            "phase": "platform_form_verified",
+            "message": "TikTok 表单检查通过；未点击 Post",
+            "receipt": {
+                "accountId": 61,
+                "visibility": "public",
+                "platformWriteOccurred": True,
+                "finalActionTriggered": False,
+                "phase": "platform_form_verified",
+            },
+        }
+        with (
+            patch.object(
+                overseas_tiktok_publish,
+                "run_tiktok_platform_sync",
+                return_value=result,
+            ) as dedicated,
+            patch.object(
+                publish_service.overseas_video_publish,
+                "run_overseas_video_publish_sync",
+            ) as legacy,
+            patch.object(publish_service.task_service, "mark_task_running"),
+            patch.object(publish_service.task_service, "mark_platform_result") as mark,
+            patch.object(publish_service.task_service, "fail_active_task"),
+        ):
+            publish_service._run_platform_form_check({"id": 106}, [payload])
+
+        dedicated.assert_called_once_with(
+            payload,
+            mode="platform_form_check",
+            task_id=106,
+        )
+        legacy.assert_not_called()
+        self.assertTrue(mark.call_args.kwargs["ok"])
+        self.assertEqual(mark.call_args.kwargs["receipt"], result["receipt"])
+
+    def test_tiktok_form_check_gets_distinct_task_mode_and_worker_label(self) -> None:
+        payload = _video_payload(self.video, 6, "platform_form_check")
+        captured = {}
+
+        class Worker:
+            def __init__(self, *, target, args, daemon, name):
+                captured.update(
+                    {"target": target, "args": args, "daemon": daemon, "name": name}
+                )
+
+            def start(self):
+                captured["started"] = True
+
+        with (
+            patch.object(publish_service, "_validate_payloads", return_value=[payload]),
+            patch.object(
+                publish_service.task_service,
+                "create_pending_task",
+                return_value={"id": 107},
+            ) as create,
+            patch.object(publish_service.threading, "Thread", Worker),
+        ):
+            publish_service.start_desktop_publish([payload])
+
+        self.assertEqual(create.call_args.kwargs["mode"], "oneclick_platform_form_check")
+        self.assertIs(captured["target"], publish_service._run_platform_form_check)
+        self.assertEqual(captured["name"], "oneclick-platform-form-check-107")
+        self.assertTrue(captured["started"])
+
+    def test_tiktok_formal_routes_to_dedicated_service_and_preserves_ambiguous_error(self) -> None:
+        payload = _video_payload(self.video, 6, "publish")
+        payload.update(
+            {
+                "debugDryRun": False,
+                "overseasVideoPublishConfirmed": True,
+                "tiktokControlledPublish": True,
+                "tiktokExpectedAccountReference": "expected.user",
+                "tiktokExecutionIntent": "formal_public",
+            }
+        )
+        error = overseas_tiktok_publish.TikTokPublishError(
+            "tiktok_publish_outcome_unknown",
+            "TikTok 最终动作后的平台结果无法确认",
+            outcome_ambiguous=True,
+            receipt={
+                "accountId": 61,
+                "visibility": "public",
+                "platformWriteOccurred": True,
+                "finalActionTriggered": True,
+                "phase": "ambiguous",
+            },
+        )
+        with (
+            patch.object(
+                overseas_tiktok_publish,
+                "run_tiktok_platform_sync",
+                side_effect=error,
+            ) as dedicated,
+            patch.object(
+                publish_service.overseas_video_publish,
+                "run_overseas_video_publish_sync",
+            ) as legacy,
+            patch.object(publish_service.task_service, "mark_task_running"),
+            patch.object(publish_service.task_service, "record_task_event"),
+            patch.object(publish_service.task_service, "mark_platform_result") as mark,
+            patch.object(publish_service.task_service, "fail_active_task"),
+        ):
+            publish_service._run_publish({"id": 108}, [payload])
+
+        dedicated.assert_called_once_with(payload, mode="formal", task_id=108)
+        legacy.assert_not_called()
+        self.assertFalse(mark.call_args.kwargs["ok"])
+        self.assertEqual(
+            mark.call_args.kwargs["error_code"],
+            "tiktok_publish_outcome_unknown",
+        )
+        self.assertTrue(mark.call_args.kwargs["receipt"]["finalActionTriggered"])
 
     def test_legacy_runtime_rejects_every_type6_mode_before_browser_dispatch(self) -> None:
         task = {"id": 771, "taskNo": "TIKTOK-LEGACY-771"}

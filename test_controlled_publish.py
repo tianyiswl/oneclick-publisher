@@ -18,6 +18,7 @@ from app_core.controlled_publish import (
     create_direct_authorization,
     create_direct_authorization_schema,
     _find_blocking_formal_scope_task,
+    authorize_completed_check,
     authorize_direct_request,
     _find_successful_silicon_formal_task,
     _find_successful_formal_scope_task,
@@ -93,6 +94,70 @@ class ControlledPublishTests(unittest.TestCase):
             encoding="utf-8",
         )
         return manifest
+
+    def _tiktok_bundle(self, root: Path, *, body: str = "TikTok body") -> Path:
+        (root / "tiktok.mp4").write_bytes(b"tiktok-video")
+        (root / "tiktok-cover.png").write_bytes(b"tiktok-cover")
+        (root / "body.md").write_text(body, encoding="utf-8")
+        manifest = root / "manifest.json"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": "oneclick-content/v1",
+                    "contentType": "video",
+                    "title": "TikTok title",
+                    "bodyFile": "body.md",
+                    "tags": ["oneclick"],
+                    "assets": ["tiktok.mp4"],
+                    "covers": {"3:4": "tiktok-cover.png"},
+                    "preferredPlatforms": ["TikTok"],
+                    "platformOverrides": {
+                        "TikTok": {
+                            "title": "TikTok title",
+                            "body": body,
+                            "tags": ["oneclick"],
+                        }
+                    },
+                    "debugDryRun": True,
+                    "publishAllowed": False,
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        return manifest
+
+    @staticmethod
+    def _tiktok_account(**changes) -> dict:
+        return {
+            "id": 61,
+            "type": 6,
+            "filePath": "tiktok-session.json",
+            "profileName": "TikTok saved account",
+            "userName": "TikTok saved account",
+            "authMode": "browser",
+            "accountReference": "expected.user",
+            "status": 1,
+            **changes,
+        }
+
+    @staticmethod
+    def _tiktok_request(manifest: Path, *, mode: str = "preflight", **changes) -> dict:
+        request = {
+            "projectId": "tiktok-offline-test",
+            "manifestPath": str(manifest),
+            "mode": mode,
+            "targets": [
+                {
+                    "platform": "TikTok",
+                    "accountId": 61,
+                    "schedule": None,
+                    "settings": {"visibility": "public"},
+                }
+            ],
+        }
+        request.update(changes)
+        return request
 
     @staticmethod
     def _accounts() -> list[dict]:
@@ -213,6 +278,343 @@ class ControlledPublishTests(unittest.TestCase):
             raised.exception.error_code,
             "controlled_direct_authorization_required",
         )
+
+    def test_tiktok_preflight_builds_local_only_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest = self._tiktok_bundle(Path(temporary))
+            payload = build_controlled_payloads(
+                self._tiktok_request(manifest),
+                accounts=[self._tiktok_account()],
+            )[0]
+
+        self.assertEqual(payload["runtimeMode"], "preflight")
+        self.assertTrue(payload["debugDryRun"])
+        self.assertFalse(payload["backgroundMode"])
+        self.assertFalse(payload["overseasVideoPublishConfirmed"])
+        self.assertEqual(payload["tiktokExpectedAccountReference"], "expected.user")
+        self.assertEqual(payload["tiktokExecutionIntent"], "formal_public")
+
+    def test_tiktok_platform_form_check_requires_literal_confirmation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest = self._tiktok_bundle(Path(temporary))
+            for confirmation in (None, 1, "true", [], {}):
+                request = self._tiktok_request(
+                    manifest,
+                    mode="platform_form_check",
+                    platformFormCheckConfirmed=confirmation,
+                )
+                with self.subTest(confirmation=confirmation), self.assertRaises(
+                    ControlledPublishError
+                ) as raised:
+                    build_controlled_payloads(
+                        request,
+                        accounts=[self._tiktok_account()],
+                    )
+                self.assertEqual(
+                    raised.exception.error_code,
+                    "tiktok_platform_form_check_confirmation_required",
+                )
+
+    def test_tiktok_platform_form_check_never_creates_or_consumes_formal_authorization(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest = self._tiktok_bundle(Path(temporary))
+            request = self._tiktok_request(
+                manifest,
+                mode="platform_form_check",
+                platformFormCheckConfirmed=True,
+            )
+
+            def start(payloads):
+                rows = [dict(item) for item in payloads]
+                return {
+                    "id": 62,
+                    "taskNo": "T62",
+                    "mode": "oneclick_platform_form_check",
+                    "status": "pending",
+                    "payloadJson": json.dumps(rows, ensure_ascii=False),
+                    "items": [],
+                    "events": [],
+                }
+
+            with patch(
+                "app_core.account_service.list_publishable_accounts",
+                return_value=[self._tiktok_account()],
+            ), patch(
+                "app_core.publish_service.start_desktop_publish",
+                side_effect=start,
+            ), patch(
+                "app_core.task_service.get_task",
+                return_value=None,
+            ), patch(
+                "app_core.controlled_publish.create_authorization"
+            ) as create_formal, patch(
+                "app_core.controlled_publish.consume_authorization"
+            ) as consume_formal, patch(
+                "app_core.controlled_publish.consume_direct_authorization"
+            ) as consume_direct:
+                result = submit_request(request)
+
+        self.assertEqual(result["phase"], "platform_form_check")
+        create_formal.assert_not_called()
+        consume_formal.assert_not_called()
+        consume_direct.assert_not_called()
+
+    def test_tiktok_modes_and_local_contract_fail_closed_before_task_start(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = self._tiktok_bundle(root)
+            cases = [
+                (
+                    "direct",
+                    self._tiktok_request(
+                        manifest,
+                        mode="direct",
+                        directAuthorizationId="grant",
+                    ),
+                    [self._tiktok_account()],
+                    "tiktok_direct_mode_unsupported",
+                ),
+                (
+                    "status",
+                    self._tiktok_request(manifest),
+                    [self._tiktok_account(status=0)],
+                    "tiktok_account_invalid",
+                ),
+                (
+                    "identity",
+                    self._tiktok_request(manifest),
+                    [self._tiktok_account(accountReference="")],
+                    "tiktok_account_invalid",
+                ),
+                (
+                    "auth",
+                    self._tiktok_request(manifest),
+                    [self._tiktok_account(authMode="oauth")],
+                    "tiktok_account_invalid",
+                ),
+                (
+                    "schedule",
+                    self._tiktok_request(
+                        manifest,
+                        targets=[
+                            {
+                                "platform": "TikTok",
+                                "accountId": 61,
+                                "schedule": {
+                                    "localTime": "2026-08-28 10:00",
+                                    "timezone": "Asia/Shanghai",
+                                },
+                                "settings": {"visibility": "public"},
+                            }
+                        ],
+                    ),
+                    [self._tiktok_account()],
+                    "tiktok_unsupported_publish_setting",
+                ),
+                (
+                    "empty_schedule_object",
+                    self._tiktok_request(
+                        manifest,
+                        targets=[
+                            {
+                                "platform": "TikTok",
+                                "accountId": 61,
+                                "schedule": {},
+                                "settings": {"visibility": "public"},
+                            }
+                        ],
+                    ),
+                    [self._tiktok_account()],
+                    "tiktok_unsupported_publish_setting",
+                ),
+                (
+                    "visibility",
+                    self._tiktok_request(
+                        manifest,
+                        targets=[
+                            {
+                                "platform": "TikTok",
+                                "accountId": 61,
+                                "schedule": None,
+                                "settings": {"visibility": "private"},
+                            }
+                        ],
+                    ),
+                    [self._tiktok_account()],
+                    "tiktok_unsupported_publish_setting",
+                ),
+                (
+                    "multi_target",
+                    self._tiktok_request(
+                        manifest,
+                        targets=[
+                            {
+                                "platform": "TikTok",
+                                "accountId": 61,
+                                "schedule": None,
+                                "settings": {"visibility": "public"},
+                            },
+                            {
+                                "platform": "TikTok",
+                                "accountId": 62,
+                                "schedule": None,
+                                "settings": {"visibility": "public"},
+                            },
+                        ],
+                    ),
+                    [self._tiktok_account(), self._tiktok_account(id=62)],
+                    "tiktok_target_invalid",
+                ),
+            ]
+            for label, request, accounts, error_code in cases:
+                with self.subTest(label=label), self.assertRaises(
+                    ControlledPublishError
+                ) as raised:
+                    build_controlled_payloads(request, accounts=accounts)
+                self.assertEqual(raised.exception.error_code, error_code)
+
+            raw_mention = self._tiktok_bundle(root, body="body @raw.user")
+            with self.assertRaises(ControlledPublishError) as raised:
+                build_controlled_payloads(
+                    self._tiktok_request(raw_mention),
+                    accounts=[self._tiktok_account()],
+                )
+            self.assertEqual(
+                raised.exception.error_code,
+                "tiktok_unsupported_publish_setting",
+            )
+
+    def test_tiktok_fingerprint_binds_content_video_identity_and_execution_intent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = self._tiktok_bundle(root)
+            base = build_controlled_payloads(
+                self._tiktok_request(manifest),
+                accounts=[self._tiktok_account()],
+            )
+            form_check = build_controlled_payloads(
+                self._tiktok_request(
+                    manifest,
+                    mode="platform_form_check",
+                    platformFormCheckConfirmed=True,
+                ),
+                accounts=[self._tiktok_account()],
+            )
+            mutations = []
+            for key, value in (
+                ("description", "changed body"),
+                ("tags", ["changed-topic"]),
+                ("fileList", [str(root / "changed.mp4")]),
+                ("tiktokExpectedAccountReference", "other.user"),
+            ):
+                mutations.append([{**base[0], key: value}])
+
+        self.assertNotEqual(scope_fingerprint(base), scope_fingerprint(form_check))
+        for changed in mutations:
+            self.assertNotEqual(scope_fingerprint(base), scope_fingerprint(changed))
+
+    def test_tiktok_authorization_requires_a_successful_local_preflight_event(self) -> None:
+        payload = {
+            "type": 6,
+            "runtimeMode": "preflight",
+            "debugDryRun": True,
+            "tiktokExpectedAccountReference": "expected.user",
+            "tiktokExecutionIntent": "formal_public",
+        }
+        fake_task = {
+            "id": 61,
+            "mode": "oneclick_preflight",
+            "status": "success",
+            "payloadJson": json.dumps([payload]),
+            "items": [{"platformType": 6, "status": "success"}],
+            "events": [{"eventType": "platform_preflight"}],
+        }
+        with patch.object(task_service, "get_task", return_value=fake_task):
+            with self.assertRaises(ControlledPublishError) as raised:
+                authorize_completed_check(61)
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "tiktok_local_preflight_required",
+        )
+
+    def test_tiktok_project_task_maps_safe_lifecycle_without_sensitive_fields(self) -> None:
+        base = {
+            "id": 61,
+            "taskNo": "T61",
+            "mode": "oneclick_publish",
+            "status": "running",
+            "payloadJson": json.dumps(
+                [{"type": 6, "accountIds": [61]}], ensure_ascii=False
+            ),
+            "items": [
+                {
+                    "platformType": 6,
+                    "status": "running",
+                    "accountLabel": "TikTok saved account",
+                }
+            ],
+        }
+        waiting = project_task(
+            {
+                **base,
+                "events": [
+                    {
+                        "eventType": "tiktok_waiting_user_verification",
+                        "message": "private/session/path @expected.user full post",
+                    }
+                ],
+            }
+        )
+        ambiguous = project_task(
+            {
+                **base,
+                "status": "failed",
+                "items": [
+                    {
+                        "platformType": 6,
+                        "status": "failed",
+                        "errorCode": "tiktok_publish_outcome_unknown",
+                    }
+                ],
+                "events": [{"eventType": "tiktok_publish_outcome_ambiguous"}],
+            }
+        )
+
+        self.assertEqual(waiting["stage"], "waiting_verification")
+        self.assertEqual(waiting["userAction"]["type"], "tiktok_verification")
+        self.assertNotIn("expected.user", waiting["userAction"]["message"])
+        self.assertNotIn("session", waiting["userAction"]["message"])
+        self.assertEqual(ambiguous["stage"], "ambiguous")
+
+    def test_tiktok_ambiguous_receipt_sets_public_stage_without_event_message(self) -> None:
+        projected = project_task(
+            {
+                "id": 63,
+                "taskNo": "T63",
+                "mode": "oneclick_publish",
+                "status": "failed",
+                "payloadJson": json.dumps(
+                    [{"type": 6, "accountIds": [61]}], ensure_ascii=False
+                ),
+                "items": [
+                    {
+                        "platformType": 6,
+                        "status": "failed",
+                        "errorCode": "tiktok_publish_outcome_unknown",
+                        "receiptJson": json.dumps(
+                            {
+                                "finalActionTriggered": True,
+                                "phase": "ambiguous",
+                            }
+                        ),
+                    }
+                ],
+                "events": [],
+            }
+        )
+
+        self.assertEqual(projected["stage"], "ambiguous")
 
     def test_douyin_body_raw_mention_is_not_treated_as_platform_mention(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -801,6 +1203,40 @@ class ControlledPublishTests(unittest.TestCase):
         )
 
         self.assertEqual(match["id"], 53)
+
+    def test_tiktok_final_action_or_ambiguous_event_blocks_same_fingerprint(self) -> None:
+        payloads = [
+            {
+                "type": 6,
+                "accountIds": [61],
+                "contentType": "video",
+                "title": "title",
+                "description": "body",
+                "tags": ["topic"],
+                "fileList": ["video.mp4"],
+                "visibility": "public",
+                "tiktokExpectedAccountReference": "expected.user",
+                "tiktokExecutionIntent": "formal_public",
+            }
+        ]
+        for event_type in (
+            "tiktok_final_action_triggered",
+            "tiktok_publish_outcome_ambiguous",
+        ):
+            with self.subTest(event_type=event_type):
+                match = _find_blocking_formal_scope_task(
+                    [
+                        {
+                            "id": 62,
+                            "mode": "oneclick_publish",
+                            "status": "failed",
+                            "payloadJson": json.dumps(payloads),
+                            "events": [{"eventType": event_type}],
+                        }
+                    ],
+                    payloads,
+                )
+                self.assertEqual(match["id"], 62)
 
 
 class DouyinGraphicMatrixAuthorizationTests(unittest.TestCase):

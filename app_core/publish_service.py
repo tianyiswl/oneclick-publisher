@@ -27,6 +27,7 @@ from . import (
     oneclick_capabilities,
     oneclick_preflight,
     overseas_browser_publish,
+    overseas_tiktok_publish,
     overseas_video_publish,
     overseas_youtube_publish,
     overseas_preflight,
@@ -65,6 +66,7 @@ def _failure_error_code(exc: BaseException, *, platform_type: int) -> str:
     return {
         1: "xhs_publish_failed",
         3: "douyin_publish_failed",
+        6: "tiktok_publish_failed",
         7: "youtube_publish_failed",
         10: "wechat_publish_failed",
     }.get(int(platform_type), "platform_publish_failed")
@@ -349,6 +351,23 @@ def _validate_payloads(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
         is_youtube_official = (
             platform_type == 7 and payload.get("youtubeOfficialApi") is True
         )
+        if platform_type == 6:
+            if (
+                runtime_mode == "publish"
+                and payload.get("overseasVideoPublishConfirmed") is not True
+            ):
+                raise ValueError("TikTok 正式发布必须先完成当次正式发布确认")
+            tiktok_mode = {
+                "preflight": "preflight",
+                "platform_form_check": "platform_form_check",
+                "publish": "formal",
+            }.get(runtime_mode)
+            if tiktok_mode is None:
+                raise ValueError("TikTok 只支持本地预检、平台表单检查或受控正式发布")
+            overseas_tiktok_publish.validate_tiktok_payload(
+                payload,
+                mode=tiktok_mode,
+            )
         if is_youtube_official:
             overseas_youtube_publish.validate_youtube_publish_payload(
                 payload,
@@ -374,7 +393,9 @@ def _validate_payloads(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 # OAuth 官方通道不依赖可见浏览器，但仍只能由
                 # 受控任务服务在一次性授权后启动。
                 payload["backgroundMode"] = True
-            elif platform_type in {6, 7}:
+            elif platform_type == 6:
+                payload["backgroundMode"] = False
+            elif platform_type == 7:
                 checked = overseas_video_publish.validate_overseas_video_publish_payload(
                     payload
                 )
@@ -395,6 +416,12 @@ def _validate_payloads(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     raise ValueError("小红书已开启定时发布，但未设置发布时间")
             else:
                 wechat_publish_policy.normalize_wechat_publish_preferences(payload)
+        elif runtime_mode == "platform_form_check":
+            if platform_type != 6:
+                raise ValueError("TikTok 平台表单检查不能混入其他平台")
+            if payload.get("debugDryRun") is not False:
+                raise ValueError("TikTok 平台表单检查会写入平台表单")
+            payload["backgroundMode"] = False
         elif runtime_mode == "wechat_draft":
             if platform_type != 10:
                 raise ValueError("公众号草稿任务只能包含一个公众号账号")
@@ -724,9 +751,21 @@ def _run_preflight(task: dict, payloads: list[dict[str, Any]]) -> None:
                     content_type=str(payload.get("contentType") or ""),
                     error_code=str(result.get("errorCode") or ""),
                     receipt=(
-                        dict(result.get("receipt"))
+                        {
+                            **dict(result.get("receipt")),
+                            **(
+                                {"phase": "local_preflight_passed"}
+                                if platform_type == 6
+                                else {}
+                            ),
+                        }
                         if isinstance(result.get("receipt"), dict)
                         else None
+                    ),
+                    event_type=(
+                        "tiktok_local_preflight_passed"
+                        if platform_type == 6 and result.get("ok")
+                        else "platform_preflight"
                     ),
                 )
             except Exception as exc:
@@ -805,6 +844,71 @@ def _record_youtube_publish_progress(
         )
 
 
+def _run_platform_form_check(task: dict, payloads: list[dict[str, Any]]) -> None:
+    """Run the explicit TikTok platform-writing check without final action."""
+
+    payload = payloads[0]
+    if not _publish_lock.acquire(blocking=False):
+        task_service.mark_platform_result(
+            task["id"],
+            6,
+            ok=False,
+            message="已有发布任务正在执行，请稍后重试",
+            content_type=str(payload.get("contentType") or ""),
+            event_type="platform_form_check",
+            error_code="controlled_publish_busy",
+        )
+        _active_threads.pop(int(task["id"]), None)
+        return
+    try:
+        task_service.mark_task_running(
+            task["id"], "一键发开始执行 TikTok 平台表单检查"
+        )
+        try:
+            result = overseas_tiktok_publish.run_tiktok_platform_sync(
+                payload,
+                mode="platform_form_check",
+                task_id=int(task["id"]),
+            )
+            task_service.mark_platform_result(
+                task["id"],
+                6,
+                ok=bool(result.get("ok")),
+                message=str(result.get("message") or "TikTok 表单检查结束"),
+                content_type=str(payload.get("contentType") or ""),
+                event_type="platform_form_check",
+                error_code=str(result.get("errorCode") or ""),
+                receipt=(
+                    dict(result.get("receipt"))
+                    if isinstance(result.get("receipt"), dict)
+                    else None
+                ),
+            )
+        except Exception as exc:
+            task_service.mark_platform_result(
+                task["id"],
+                6,
+                ok=False,
+                message=_failure_message("TikTok 表单检查异常", exc, platform_type=6),
+                content_type=str(payload.get("contentType") or ""),
+                event_type="platform_form_check",
+                error_code=_failure_error_code(exc, platform_type=6),
+                receipt=(
+                    dict(getattr(exc, "receipt", {}))
+                    if isinstance(getattr(exc, "receipt", None), dict)
+                    else None
+                ),
+            )
+    finally:
+        task_service.fail_active_task(
+            int(task["id"]),
+            error_code="controlled_worker_ended_without_terminal_result",
+            message="TikTok 表单检查进程结束，但没有取得明确结果",
+        )
+        _publish_lock.release()
+        _active_threads.pop(int(task["id"]), None)
+
+
 def _run_publish(task: dict, payloads: list[dict[str, Any]]) -> None:
     """执行已获用户确认的小红书图文/视频或公众号正式提交。"""
 
@@ -865,7 +969,13 @@ def _run_publish(task: dict, payloads: list[dict[str, Any]]) -> None:
                             int(task["id"]), payload, stage, receipt
                         ),
                     )
-                elif platform_type in {6, 7}:
+                elif platform_type == 6:
+                    result = overseas_tiktok_publish.run_tiktok_platform_sync(
+                        payload,
+                        mode="formal",
+                        task_id=int(task["id"]),
+                    )
+                elif platform_type == 7:
                     result = overseas_video_publish.run_overseas_video_publish_sync(
                         payload
                     )
@@ -1044,6 +1154,7 @@ def start_desktop_publish(payloads: list[dict[str, Any]]) -> dict:
     if any(str(item.get("runtimeMode") or "preflight") != runtime_mode for item in prepared):
         raise ValueError("同一任务不能混合预检与正式发布")
     is_publish = runtime_mode == "publish"
+    is_platform_form_check = runtime_mode == "platform_form_check"
     is_draft = runtime_mode == "draft"
     is_wechat_draft = runtime_mode == "wechat_draft"
     task = task_service.create_pending_task(
@@ -1051,6 +1162,8 @@ def start_desktop_publish(payloads: list[dict[str, Any]]) -> dict:
         mode=(
             "oneclick_publish"
             if is_publish
+            else "oneclick_platform_form_check"
+            if is_platform_form_check
             else "oneclick_draft"
             if is_draft
             else "oneclick_wechat_draft"
@@ -1059,11 +1172,21 @@ def start_desktop_publish(payloads: list[dict[str, Any]]) -> dict:
         ),
     )
     worker = threading.Thread(
-        target=_run_publish if is_publish else _run_wechat_draft if is_wechat_draft else _run_draft if is_draft else _run_preflight,
+        target=(
+            _run_publish
+            if is_publish
+            else _run_platform_form_check
+            if is_platform_form_check
+            else _run_wechat_draft
+            if is_wechat_draft
+            else _run_draft
+            if is_draft
+            else _run_preflight
+        ),
         args=(task, prepared),
         daemon=True,
         name=(
-            f"oneclick-{'publish' if is_publish else 'wechat-draft' if is_wechat_draft else 'draft' if is_draft else 'preflight'}-"
+            f"oneclick-{'publish' if is_publish else 'platform-form-check' if is_platform_form_check else 'wechat-draft' if is_wechat_draft else 'draft' if is_draft else 'preflight'}-"
             f"{task['id']}"
         ),
     )

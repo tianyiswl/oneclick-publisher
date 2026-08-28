@@ -1773,6 +1773,176 @@ class DouyinCommerceBatchTaskTests(unittest.TestCase):
         self.assertEqual(task_service.get_task(task_id)["items"][0]["status"], "pending")
 
 
+class TikTokTaskServiceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.tempdir.name) / "database.db"
+        self.db_patch = patch.object(database, "DB_PATH", self.db_path)
+        self.db_patch.start()
+        database.ensure_schema()
+
+    def tearDown(self) -> None:
+        self.db_patch.stop()
+        self.tempdir.cleanup()
+
+    def _task(self) -> dict:
+        return task_service.create_pending_task(
+            [
+                {
+                    "type": 6,
+                    "contentType": "video",
+                    "title": "TikTok receipt test",
+                    "accountList": ["tiktok-session.json"],
+                    "accountIds": [61],
+                    "fileList": ["video.mp4"],
+                    "debugDryRun": False,
+                    "tiktokExpectedAccountReference": "expected.user",
+                    "tiktokExecutionIntent": "formal_public",
+                }
+            ],
+            mode="oneclick_publish",
+        )
+
+    def _expire(self, task_id: int) -> None:
+        with database.connect() as conn:
+            conn.execute(
+                """
+                UPDATE publish_tasks
+                SET status = 'running', workerPid = ?,
+                    workerHeartbeatAt = '2026-08-28 10:00:00',
+                    startedAt = '2026-08-28 10:00:00'
+                WHERE id = ?
+                """,
+                (99999999, int(task_id)),
+            )
+            conn.execute(
+                "UPDATE publish_task_items SET status = 'running' WHERE taskId = ?",
+                (int(task_id),),
+            )
+            conn.commit()
+
+    def test_tiktok_receipt_projection_keeps_only_safe_public_fields(self) -> None:
+        task = self._task()
+        task_service.mark_platform_result(
+            task["id"],
+            6,
+            ok=True,
+            message="TikTok 平台已接受",
+            content_type="video",
+            event_type="platform_publish",
+            receipt={
+                "accountId": 61,
+                "visibility": "public",
+                "platformWriteOccurred": True,
+                "finalActionTriggered": True,
+                "contentId": "741234",
+                "contentUrl": "https://www.tiktok.com/@expected.user/video/741234",
+                "publishedAt": "2026-08-28T10:00:00+08:00",
+                "topicEntities": ["oneclick", "AI"],
+                "phase": "published_readback_confirmed",
+                "cookie": "must-not-survive",
+                "sessionPath": "/private/tiktok-session.json",
+            },
+        )
+
+        item = task_service.get_task(task["id"])["items"][0]
+        receipt = json.loads(item["receiptJson"])
+        self.assertEqual(
+            set(receipt),
+            {
+                "accountId",
+                "visibility",
+                "platformWriteOccurred",
+                "finalActionTriggered",
+                "contentId",
+                "contentUrl",
+                "publishedAt",
+                "topicEntities",
+                "phase",
+            },
+        )
+        self.assertEqual(item["platformPostId"], "741234")
+        self.assertEqual(
+            item["postUrl"],
+            "https://www.tiktok.com/@expected.user/video/741234",
+        )
+        self.assertEqual(item["publishedAt"], "2026-08-28T10:00:00+08:00")
+        self.assertNotIn("cookie", item["receiptJson"])
+        self.assertNotIn("sessionPath", item["receiptJson"])
+
+    def test_tiktok_receipt_projection_reuses_task4_value_boundary(self) -> None:
+        task = self._task()
+        task_service.mark_platform_result(
+            task["id"],
+            6,
+            ok=True,
+            message="TikTok 平台已接受",
+            content_type="video",
+            event_type="platform_publish",
+            receipt={
+                "accountId": 61,
+                "visibility": "public",
+                "platformWriteOccurred": True,
+                "finalActionTriggered": True,
+                "contentId": "741234",
+                "contentUrl": "https://vm.tiktok.com/ZM123abc/",
+                "publishedAt": "not-an-iso-time",
+                "topicEntities": ["oneclick", "AI"],
+                "phase": "platform_accepted",
+            },
+        )
+
+        receipt = json.loads(
+            task_service.get_task(task["id"])["items"][0]["receiptJson"]
+        )
+        self.assertEqual(receipt["contentUrl"], "https://vm.tiktok.com/ZM123abc/")
+        self.assertNotIn("publishedAt", receipt)
+        self.assertEqual(receipt["topicEntities"], ["oneclick", "AI"])
+
+    def test_stale_tiktok_after_final_action_is_ambiguous_and_retains_safe_marker(self) -> None:
+        task = self._task()
+        task_service.record_task_event(
+            task["id"],
+            "tiktok_final_action_triggered",
+            "TikTok 最终动作已触发",
+        )
+        self._expire(task["id"])
+
+        changed = task_service.reconcile_stale_controlled_task(
+            task["id"],
+            now=datetime(2026, 8, 28, 10, 1, 0),
+        )
+        detail = task_service.get_task(task["id"])
+        item = detail["items"][0]
+
+        self.assertTrue(changed)
+        self.assertEqual(item["errorCode"], "tiktok_publish_outcome_unknown")
+        self.assertTrue(json.loads(item["receiptJson"])["finalActionTriggered"])
+        self.assertEqual(
+            detail["events"][-1]["eventType"],
+            "tiktok_publish_outcome_ambiguous",
+        )
+
+    def test_stale_tiktok_before_final_action_is_ordinary_failure(self) -> None:
+        task = self._task()
+        self._expire(task["id"])
+
+        self.assertTrue(
+            task_service.reconcile_stale_controlled_task(
+                task["id"],
+                now=datetime(2026, 8, 28, 10, 1, 0),
+            )
+        )
+        detail = task_service.get_task(task["id"])
+        self.assertEqual(
+            detail["items"][0]["errorCode"],
+            "controlled_worker_lease_expired",
+        )
+        self.assertEqual(
+            detail["events"][-1]["eventType"],
+            "controlled_worker_lease_expired",
+        )
+
 class DouyinGraphicMatrixTaskPersistenceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
