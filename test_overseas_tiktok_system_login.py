@@ -9,6 +9,7 @@ import os
 import queue
 import sqlite3
 import stat
+import subprocess
 import tempfile
 import threading
 import time
@@ -150,6 +151,7 @@ class FakeProcess:
 
     def wait(self, timeout: float | None = None) -> int:
         self.wait_calls.append(timeout)
+        self._poll_results = [0]
         return 0
 
 
@@ -159,6 +161,21 @@ class ProcessExitsDuringTerminate(FakeProcess):
     def terminate(self) -> None:
         self.terminate_calls += 1
         raise ProcessLookupError()
+
+
+class ProcessStaysAliveAfterTerminate(FakeProcess):
+    """Models a browser that survives bounded terminate and kill waits."""
+
+    def __init__(self) -> None:
+        super().__init__([None])
+        self.kill_calls = 0
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.wait_calls.append(timeout)
+        raise subprocess.TimeoutExpired("owned-browser", timeout)
+
+    def kill(self) -> None:
+        self.kill_calls += 1
 
 
 class TikTokSystemLoginTests(unittest.TestCase):
@@ -736,6 +753,58 @@ class TikTokCandidateCommitTests(unittest.TestCase):
         self.assertEqual(raised.exception.error_code, "tiktok_login_commit_failed")
         self.assertEqual(list(self.cookie_dir.glob("*.json")), [self.old_cookie])
 
+    def test_database_failure_reports_cleanup_failed_when_candidate_unlink_fails(self):
+        real_unlink = Path.unlink
+
+        def fail_new_session_unlink(path: Path, *args, **kwargs):
+            if path.parent == self.cookie_dir and path != self.old_cookie:
+                raise OSError("candidate remains busy")
+            return real_unlink(path, *args, **kwargs)
+
+        with patch.object(Path, "unlink", new=fail_new_session_unlink):
+            with self.assertRaises(TikTokSystemLoginError) as raised:
+                commit_tiktok_login_candidate(
+                    self.candidate,
+                    "TikTok 测试",
+                    record_id=7,
+                    existing_account=self.old_account,
+                    cookie_dir=self.cookie_dir,
+                    account_saver=Mock(side_effect=RuntimeError("db unavailable")),
+                )
+
+        self.assertEqual(raised.exception.error_code, "tiktok_login_cleanup_failed")
+        self.assertEqual(len(list(self.cookie_dir.glob("*.json"))), 2)
+
+    def test_atomic_write_reports_cleanup_failed_when_partial_temp_cannot_be_removed(self):
+        real_unlink = Path.unlink
+
+        def fail_temp_unlink(path: Path, *args, **kwargs):
+            if path.name.endswith(".tmp"):
+                raise OSError("temporary session remains busy")
+            return real_unlink(path, *args, **kwargs)
+
+        with (
+            patch(
+                "app_core.overseas_tiktok_system_login.os.replace",
+                side_effect=OSError("replace failed"),
+            ),
+            patch.object(Path, "unlink", new=fail_temp_unlink),
+        ):
+            with self.assertRaises(TikTokSystemLoginError) as raised:
+                commit_tiktok_login_candidate(
+                    self.candidate,
+                    "TikTok 测试",
+                    record_id=None,
+                    existing_account=None,
+                    cookie_dir=self.cookie_dir,
+                    account_saver=Mock(return_value=11),
+                )
+
+        self.assertEqual(raised.exception.error_code, "tiktok_login_cleanup_failed")
+        self.assertTrue(
+            any(path.name.endswith(".tmp") for path in self.cookie_dir.iterdir())
+        )
+
     def test_successful_update_repoints_row_before_removing_unreferenced_old_file(self):
         database = self._install_database()
 
@@ -756,6 +825,55 @@ class TikTokCandidateCommitTests(unittest.TestCase):
         self.assertNotEqual(row[1], self.old_cookie.name)
         self.assertEqual(row[2], "expected.user")
         self.assertTrue((self.cookie_dir / row[1]).is_file())
+        self.assertFalse(self.old_cookie.exists())
+
+    def test_old_session_final_reference_check_and_unlink_hold_a_write_transaction(self):
+        database = self._install_database()
+        real_unlink = Path.unlink
+        concurrent_outcome: list[str] = []
+
+        def attempt_concurrent_reference(path: Path, *args, **kwargs):
+            if path == self.old_cookie:
+                connection = sqlite3.connect(database, timeout=0.0)
+                try:
+                    connection.execute(
+                        """
+                        INSERT INTO user_info
+                            (type, filePath, userName, status, profileName,
+                             remark, authMode, accountReference)
+                        VALUES
+                            (6, 'old.json', 'Concurrent', 1, 'Concurrent',
+                             '', 'browser', 'concurrent.user')
+                        """
+                    )
+                    connection.commit()
+                except sqlite3.OperationalError as exc:
+                    connection.rollback()
+                    concurrent_outcome.append(
+                        "locked" if "locked" in str(exc).lower() else "error"
+                    )
+                else:
+                    concurrent_outcome.append("inserted")
+                finally:
+                    connection.close()
+            return real_unlink(path, *args, **kwargs)
+
+        with patch.object(Path, "unlink", new=attempt_concurrent_reference):
+            commit_tiktok_login_candidate(
+                self.candidate,
+                "TikTok 测试",
+                record_id=7,
+                existing_account=self.old_account,
+                cookie_dir=self.cookie_dir,
+            )
+
+        connection = sqlite3.connect(database)
+        old_references = connection.execute(
+            "SELECT COUNT(*) FROM user_info WHERE type = 6 AND filePath = 'old.json'"
+        ).fetchone()[0]
+        connection.close()
+        self.assertEqual(concurrent_outcome, ["locked"])
+        self.assertEqual(old_references, 0)
         self.assertFalse(self.old_cookie.exists())
 
     def test_concurrent_update_rejection_removes_candidate_and_preserves_current_row_file(self):
@@ -954,6 +1072,23 @@ class TikTokPublicLoginSessionTests(unittest.TestCase):
         self.assertEqual(process.terminate_calls, 1)
         self.assertEqual(messages[-2:], ["CLEANING_LOGIN_ATTEMPT", "CANCELLED"])
         self.assertEqual(session.last_error_code, "tiktok_login_cancelled")
+
+    def test_cancel_keeps_owned_process_and_staging_when_bounded_stop_fails(self):
+        process = ProcessStaysAliveAfterTerminate()
+        session = self._session(process_factory=Mock(return_value=process))
+        with (
+            patch("app_core.overseas_tiktok_system_login.create_login_attempt", return_value=self.attempt),
+            patch("app_core.overseas_tiktok_system_login.find_system_browser", return_value=self.browser),
+        ):
+            session.cancel()
+            session.start()
+            messages = self._messages(session)
+
+        self.assertEqual(messages[-1], "ERROR:tiktok_login_cleanup_failed")
+        self.assertNotIn("CANCELLED", messages)
+        self.assertTrue(self.attempt.attempt_root.is_dir())
+        self.assertIs(session._owned_process, process)
+        self.assertEqual(session.last_error_code, "tiktok_login_cleanup_failed")
 
     def test_cancel_after_process_exit_cleans_without_starting_playwright(self):
         session = self._session()

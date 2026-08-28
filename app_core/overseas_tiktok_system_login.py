@@ -344,17 +344,48 @@ def recover_stale_tiktok_login_attempts(
     return recovered
 
 
-def _terminate_owned_process(process, *, poll_seconds: float) -> None:
-    """Request termination and wait briefly; never signal any other process."""
+def _owned_process_has_exited(process) -> bool:
+    try:
+        return process.poll() is not None
+    except ProcessLookupError:
+        return True
+    except Exception:
+        return False
 
+
+def _wait_for_owned_process_stop(process, *, timeout_seconds: float) -> bool:
+    try:
+        process.wait(timeout=timeout_seconds)
+    except ProcessLookupError:
+        return True
+    except subprocess.TimeoutExpired:
+        return False
+    except Exception:
+        return _owned_process_has_exited(process)
+    return _owned_process_has_exited(process)
+
+
+def _terminate_owned_process(process, *, poll_seconds: float) -> bool:
+    """Stop only the owned process and prove it exited within bounded waits."""
+
+    interval = max(0.1, poll_seconds)
+    if _owned_process_has_exited(process):
+        return True
     try:
         process.terminate()
     except ProcessLookupError:
-        return
+        return True
+    except Exception:
+        return _owned_process_has_exited(process)
+    if _wait_for_owned_process_stop(process, timeout_seconds=interval):
+        return True
     try:
-        process.wait(timeout=max(0.1, poll_seconds))
-    except (ProcessLookupError, subprocess.TimeoutExpired):
-        return
+        process.kill()
+    except ProcessLookupError:
+        return True
+    except Exception:
+        return _owned_process_has_exited(process)
+    return _wait_for_owned_process_stop(process, timeout_seconds=interval)
 
 
 def wait_for_browser_exit(
@@ -372,12 +403,12 @@ def wait_for_browser_exit(
         if process.poll() is not None:
             return "closed"
         if cancel_event.is_set():
-            _terminate_owned_process(process, poll_seconds=interval)
-            return "cancelled"
+            stopped = _terminate_owned_process(process, poll_seconds=interval)
+            return "cancelled" if stopped else "cleanup_failed"
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            _terminate_owned_process(process, poll_seconds=interval)
-            return "timeout"
+            stopped = _terminate_owned_process(process, poll_seconds=interval)
+            return "timeout" if stopped else "cleanup_failed"
         time.sleep(min(interval, remaining))
 
 
@@ -566,13 +597,14 @@ async def collect_validated_tiktok_candidate(
     return candidate
 
 
-def _remove_file_safely(path: Path | None) -> None:
+def _remove_file_safely(path: Path | None) -> bool:
     if path is None:
-        return
+        return True
     try:
         path.unlink(missing_ok=True)
     except OSError:
-        pass
+        return False
+    return True
 
 
 def _write_atomic_tiktok_state(
@@ -618,8 +650,14 @@ def _write_atomic_tiktok_state(
         temporary = None
         return basename, final
     except Exception as exc:
-        _remove_file_safely(temporary)
-        _remove_file_safely(final)
+        cleanup_succeeded = all(
+            (
+                _remove_file_safely(temporary),
+                _remove_file_safely(final),
+            )
+        )
+        if not cleanup_succeeded:
+            raise _cleanup_failed() from exc
         raise TikTokSystemLoginError(
             "tiktok_login_commit_failed", "TikTok 会话未能安全写入账号库"
         ) from exc
@@ -636,6 +674,10 @@ def _delete_replaced_tiktok_session_if_unreferenced(
         return
     try:
         with account_service.connect() as conn:
+            # Hold a SQLite write reservation across the final reference check
+            # and unlink so no type-6 writer can claim the old basename between
+            # those two operations.
+            conn.execute("BEGIN IMMEDIATE")
             current = conn.execute(
                 "SELECT type, filePath FROM user_info WHERE id = ?",
                 (int(account_id),),
@@ -646,13 +688,15 @@ def _delete_replaced_tiktok_session_if_unreferenced(
                     (old_basename,),
                 ).fetchone()[0]
             )
-        if (
-            current
-            and int(current["type"] or 0) == 6
-            and Path(str(current["filePath"] or "")).name == new_basename
-            and old_references == 0
-        ):
-            _remove_file_safely(_absolute_path(Path(cookie_dir)) / old_basename)
+            if (
+                current
+                and int(current["type"] or 0) == 6
+                and Path(str(current["filePath"] or "")).name == new_basename
+                and old_references == 0
+            ):
+                _remove_file_safely(
+                    _absolute_path(Path(cookie_dir)) / old_basename
+                )
     except Exception:
         # The new row/file are already committed.  If the reference check cannot
         # be proven, preserve the old file instead of risking a live session.
@@ -687,7 +731,8 @@ def commit_tiktok_login_candidate(
         if account_id <= 0:
             raise ValueError("invalid account id")
     except Exception as exc:
-        _remove_file_safely(final_path)
+        if not _remove_file_safely(final_path):
+            raise _cleanup_failed() from exc
         raise TikTokSystemLoginError(
             "tiktok_login_commit_failed", "TikTok 会话未能安全写入账号库"
         ) from exc
@@ -734,6 +779,7 @@ class TikTokSystemBrowserLoginSession:
         self.last_error_code: str | None = None
         self._cancel_requested = threading.Event()
         self._owned_process = None
+        self._owned_attempt: TikTokLoginAttempt | None = None
 
     def start(self) -> None:
         threading.Thread(
@@ -769,6 +815,8 @@ class TikTokSystemBrowserLoginSession:
         attempt: TikTokLoginAttempt | None,
     ) -> None:
         cleanup_error = self._cleanup_attempt(attempt)
+        if cleanup_error is None and attempt is not None:
+            self._owned_attempt = None
         final_error = cleanup_error or error
         self.last_error_code = final_error.error_code
         if final_error.error_code == "tiktok_login_cancelled":
@@ -784,6 +832,7 @@ class TikTokSystemBrowserLoginSession:
                     "tiktok_account_invalid", "TikTok 账号主体不能为空"
                 )
             attempt = create_login_attempt(self.user_data_dir)
+            self._owned_attempt = attempt
             self.queue.put("OPENING_SYSTEM_BROWSER")
             browser = find_system_browser()
             try:
@@ -800,6 +849,12 @@ class TikTokSystemBrowserLoginSession:
                 self._cancel_requested,
                 timeout_seconds=self.timeout_seconds,
             )
+            if outcome == "cleanup_failed":
+                # The browser still owns the profile.  Keep both references and
+                # staging intact for a later bounded cleanup attempt.
+                self.last_error_code = "tiktok_login_cleanup_failed"
+                self.queue.put("ERROR:tiktok_login_cleanup_failed")
+                return None
             self._owned_process = None
             if outcome == "cancelled" or self._cancel_requested.is_set():
                 raise TikTokSystemLoginError(
@@ -841,6 +896,7 @@ class TikTokSystemBrowserLoginSession:
             if cleanup_error is not None:
                 attempt = None
                 raise cleanup_error
+            self._owned_attempt = None
             attempt = None
             if self._cancel_requested.is_set():
                 raise TikTokSystemLoginError(
