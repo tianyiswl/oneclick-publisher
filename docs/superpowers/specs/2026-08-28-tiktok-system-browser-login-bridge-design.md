@@ -118,6 +118,7 @@ TikTok 官方已提供桌面 OAuth 2.0 + PKCE，但需要注册应用、回调 U
 2. 在受控本地上下文重新打开该临时资料夹，不再执行 Google 登录。
 3. 只读回会话状态，先过滤为 TikTok-only 候选状态。过滤后没有任何 TikTok 域 Cookie 时按 `tiktok_session_missing` 停止；有 TikTok Cookie 仅表示可交给下一步核验，不能单独证明已登录或保存账号。这样不会因固定 Cookie 名称变化把真实状态过早判为缺失。
 4. 关闭该临时资料后，在两个彼此独立的新空白上下文中分别加载同一候选状态，打开 TikTok 首页的只读页面；每个上下文均在页面内从 `script#__UNIVERSAL_DATA_FOR_REHYDRATION__` 的固定 `__DEFAULT_SCOPE__ → webapp.app-context → user → uniqueId/unique_id` 路径解析，并且只把两个公开用户名字段或固定安全状态返回给 Python。不得读取或保存 uid、secUid、Cookie、昵称、页面全文或查询参数。
+   - 若该固定路径最终缺少公开 handle，两个上下文可各执行一次只诊断、永不保存的页内结构探针。探针仅返回固定路由枚举、固定路径族枚举、候选数量与唯一布尔值；不返回候选 handle、原始选择器、属性、键路径、DOM 文本、脚本、URL 或 Cookie 信息。只有两个上下文都返回可诊断的固定结构时，才能在内存和当次 UI 中显示诊断摘要；任意探针失败、游客空状态或无可诊断结构继续使用 `tiktok_identity_missing`。探针结果不得用于账号保存或主体绑定。
 5. 两个空白上下文必须读到同一唯一 handle；新绑定必须取得该 handle，更新登录必须与旧记录主体一致。
 6. 将过滤后候选文件写入私有临时文件。
 7. 先清理原 Chrome 临时资料夹；清理成功后才原子替换会话文件和账号记录。
@@ -152,6 +153,7 @@ TikTok 官方已提供桌面 OAuth 2.0 + PKCE，但需要注册应用、回调 U
 - `tiktok_session_missing`
 - `tiktok_session_expired`
 - `tiktok_identity_missing`
+- `tiktok_identity_probe_required`
 - `tiktok_account_identity_ambiguous`
 - `tiktok_account_invalid`
 - `tiktok_account_identity_mismatch`

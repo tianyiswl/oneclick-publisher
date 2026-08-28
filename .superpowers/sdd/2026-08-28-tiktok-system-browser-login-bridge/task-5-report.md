@@ -102,3 +102,36 @@
 - TikTok 聚焦梯：`158/158` 通过（`1.422s`）。
 - 受影响海外回归：`132/132` 通过（`0.382s`）。
 - 上述均为离线替身/合同测试；本轮没有启动真实浏览器或访问平台，不代表真实保存成功。
+
+## 真实登录第九轮后的只诊断探针实现（DONE_WITH_CONCERNS）
+
+### 范围与裁定
+
+- 本轮只实现下一次人工登录的安全结构取证，不尝试从无证据的 selector 绑定账号。没有启动真实浏览器、没有访问 TikTok、没有读写已安装账号、没有上传或发布。
+- 新增 `tiktok_identity_probe_required` 不违反稳定错误合同：它是一个新的失败分支，仅表示“两个空白上下文都产生了可用的无值诊断结构，但仍没有可保存的公开账号”。探针自身异常、游客空状态或任一上下文无可诊断结构时，仍返回 `tiktok_identity_missing`。
+
+### 产品实现
+
+- persistent profile 的边界不变：只导出并过滤 TikTok-only storage state，然后关闭。常规身份读取成功时不运行探针，仍要求两个独立 blank context 返回同一唯一 handle 才能继续保存。
+- 只有已有 TikTok 域状态，且常规身份读取最终为 `tiktok_identity_missing` 时，才会在原有两个 blank context 中各运行一次页内探针。两个上下文都只访问 TikTok HTTPS 首页，探针结果永不传入 `commit_tiktok_login_candidate`。
+- 页内只统计四类固定结构：app-context 固定路径；`header/nav/aside` 范围的公开 profile 链接数；属性中含 `profile/account/avatar` 固定语义的控件数和其关联公开 profile 链接数；rehydration 中只映射为 `app_context` / `user_detail` / `app_context_and_user_detail` / `none` 的 allowlist 路径族。
+- Python 会丢弃页面回传的所有未知 key 和值，只重建固定 key、枚举、`0..1000` 整数和布尔值。候选 handle 只在页面内短暂去重计数，不返回 Python，不进入异常、`repr`、日志或 UI。
+- 结果只保留在当次 session 内存中，UI 只接受严格正则 allowlist 匹配的一行摘要。稳定文案为：“已读取登录状态，但当前页面账号入口发生变化；已生成安全诊断，未保存账号”。本轮没有新建任何明文诊断文件。
+- 资源关闭和 staging 清理仍先于终态错误；任一关闭/清理失败时，`tiktok_login_profile_busy` / `tiktok_login_cleanup_failed` 优先，丢弃诊断内存和 UI 摘要，不保存账号。
+
+### 先红后绿与安全回归
+
+- 第一组红测试在旧实现上分别暴露：仍只返回 `tiktok_identity_missing`、第一 blank context 过早关闭、缺少固定诊断 schema、页面/异常秘密可被 cause 保留。实现后变绿。
+- 第二组红测试覆盖 session 永不保存且只发一条固定摘要、清理失败优先并丢弃诊断、UI 新错误码文案和恶意摘要拒绝；实现后变绿。
+- 自审时新增“任一探针内部异常必须保持 `tiktok_identity_missing`”红测试，旧组合逻辑错误地发出新诊断码；收紧为两个上下文均有结构后变绿。
+- TikTok 聚焦梯：`166/166` 通过（`1.441s`）。
+- 受影响海外回归：`132/132` 通过（`0.329s`）。
+- `py_compile` 通过，包括新探针、TikTok 会话、账号、UI 和桌面入口文件；`git diff --check` 无输出。
+- 范围检查仍对长期海外分支整体返回 `REVIEW_REQUIRED`：该分支相对 `origin/main` 已包含既有共享 UI、规格与台账路径。本轮已将海外核心、共享 UI 与报告分开提交，未合并或推送。
+
+### 提交与剩余边界
+
+- 海外核心与测试：`d6743ba` — `fix(tiktok): add value-free identity probe`。
+- 共享 UI 与测试：`d9ca002` — `fix(ui): show safe TikTok identity diagnostics`。
+- 状态：`DONE_WITH_CONCERNS`。只诊断实现已完成并通过离线验收，但还没有当前真实 TikTok 页面的安全结构摘要，也没有稳定公开 handle 新来源的证据。下一次人工登录只能用于读取该固定摘要；探针找到任何候选都不会保存账号。
+- 离线通过不等于真实保存成功，Task 5 规定的“保存后重启并回读同一主体”仍未验收。
