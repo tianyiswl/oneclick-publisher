@@ -370,12 +370,18 @@ def _discard_failed_tiktok_login(
                     """
                     DELETE FROM user_info
                     WHERE id = ? AND type = 6 AND filePath = ?
+                      AND status = 0
+                      AND (accountReference IS NULL OR TRIM(accountReference) = '')
                     """,
                     (int(account_id), cookie_path.name),
                 )
             elif not update_mode:
                 conn.execute(
-                    "DELETE FROM user_info WHERE type = 6 AND filePath = ?",
+                    """
+                    DELETE FROM user_info
+                    WHERE type = 6 AND filePath = ? AND status = 0
+                      AND (accountReference IS NULL OR TRIM(accountReference) = '')
+                    """,
                     (cookie_path.name,),
                 )
             conn.commit()
@@ -447,14 +453,20 @@ def _remove_replaced_tiktok_artifacts(
         return
 
     if old_cookie and old_cookie != Path(current_cookie).name and not cookie_referenced:
-        (Path(BASE_DIR / "cookiesFile") / old_cookie).unlink(missing_ok=True)
+        try:
+            (Path(BASE_DIR / "cookiesFile") / old_cookie).unlink(missing_ok=True)
+        except OSError:
+            pass
     if (
         current_avatar
         and old_avatar
         and old_avatar != Path(current_avatar).name
         and not avatar_referenced
     ):
-        (Path(BASE_DIR / "avatars") / old_avatar).unlink(missing_ok=True)
+        try:
+            (Path(BASE_DIR / "avatars") / old_avatar).unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def save_meta_login_accounts(cookie_file, profile_name, update_mode=False, record_id=None, avatar_path=None, display_name=None):

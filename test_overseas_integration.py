@@ -641,7 +641,7 @@ class OverseasAccountEntryTests(unittest.TestCase):
                     INSERT INTO user_info
                         (type, filePath, userName, status, profileName,
                          avatarPath, accountReference)
-                    VALUES (?, ?, ?, 1, ?, ?, '')
+                    VALUES (?, ?, ?, 0, ?, ?, '')
                     """,
                     (
                         platform_type,
@@ -1038,6 +1038,154 @@ class OverseasAccountEntryTests(unittest.TestCase):
         self.assertTrue(saved_avatar_exists)
         self.assertNotIn("cleanup-database-unavailable", " ".join(messages))
         self.assertNotIn("persist-internal-detail", " ".join(messages))
+
+    def test_failed_new_login_cleanup_preserves_concurrently_activated_row(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            database = self._create_tiktok_login_database(root)
+            connection = sqlite3.connect(database)
+            account_id = connection.execute(
+                """
+                INSERT INTO user_info
+                    (type, filePath, userName, status, profileName,
+                     accountReference)
+                VALUES (6, 'candidate.json', 'Pending', 0, 'Pending', '')
+                """
+            ).lastrowid
+            connection.commit()
+            connection.close()
+            candidate_session = root / "cookiesFile" / "candidate.json"
+            candidate_session.write_text("candidate", encoding="utf-8")
+
+            activated = threading.Event()
+
+            def activate_from_verified_session() -> None:
+                verifier = sqlite3.connect(database)
+                verifier.execute(
+                    """
+                    UPDATE user_info
+                    SET status = 1, accountReference = 'expected.user'
+                    WHERE id = ? AND status = 0
+                      AND (accountReference IS NULL OR TRIM(accountReference) = '')
+                    """,
+                    (account_id,),
+                )
+                verifier.commit()
+                verifier.close()
+                activated.set()
+
+            def finish_failed_login_cleanup() -> None:
+                if not activated.wait(timeout=3):
+                    return
+                recovered_login._discard_failed_tiktok_login(
+                    int(account_id),
+                    update_mode=False,
+                    cookie_path=candidate_session,
+                )
+
+            with (
+                patch.object(recovered_login, "BASE_DIR", root),
+                patch.object(
+                    recovered_login,
+                    "open_connection",
+                    self._login_connection_factory(database),
+                ),
+            ):
+                cleanup_worker = threading.Thread(target=finish_failed_login_cleanup)
+                verifier_worker = threading.Thread(target=activate_from_verified_session)
+                cleanup_worker.start()
+                verifier_worker.start()
+                verifier_worker.join(timeout=5)
+                cleanup_worker.join(timeout=5)
+
+            connection = sqlite3.connect(database)
+            current = connection.execute(
+                """
+                SELECT status, accountReference, filePath
+                FROM user_info WHERE id = ?
+                """,
+                (account_id,),
+            ).fetchone()
+            connection.close()
+            candidate_session_exists = candidate_session.exists()
+
+        self.assertFalse(verifier_worker.is_alive())
+        self.assertFalse(cleanup_worker.is_alive())
+        self.assertEqual(current, (1, "expected.user", "candidate.json"))
+        self.assertTrue(candidate_session_exists)
+
+    def test_tiktok_replaced_artifact_unlink_errors_do_not_change_login_success(self) -> None:
+        real_unlink = Path.unlink
+        for failing_name in ("old.json", "old.png"):
+            with self.subTest(failing_name=failing_name):
+                with tempfile.TemporaryDirectory() as raw:
+                    root = Path(raw)
+                    database = self._create_tiktok_login_database(root)
+                    connection = sqlite3.connect(database)
+                    account_id = connection.execute(
+                        """
+                        INSERT INTO user_info
+                            (type, filePath, userName, status, profileName,
+                             avatarPath, avatarUpdatedAt, lastCheckedAt,
+                             lastLoginAt, accountReference)
+                        VALUES (6, 'old.json', 'Old Display', 1, 'Old Profile',
+                                'old.png', '2026-08-01 01:00:00',
+                                '2026-08-01 02:00:00', '2026-08-01 03:00:00',
+                                'expected.user')
+                        """
+                    ).lastrowid
+                    connection.commit()
+                    connection.close()
+                    old_session = root / "cookiesFile" / "old.json"
+                    old_avatar = root / "avatars" / "old.png"
+                    old_session.write_text("old", encoding="utf-8")
+                    old_avatar.write_bytes(b"old-avatar")
+
+                    def fail_selected_unlink(path, *args, **kwargs):
+                        if path.name == failing_name:
+                            raise PermissionError("unlink-internal-detail")
+                        return real_unlink(path, *args, **kwargs)
+
+                    with (
+                        patch.object(
+                            recovered_login,
+                            "open_connection",
+                            self._login_connection_factory(database),
+                        ),
+                        patch.object(Path, "unlink", fail_selected_unlink),
+                    ):
+                        result, messages = self._run_tiktok_login_attempt(
+                            root,
+                            TikTokIdentity(
+                                "expected.user",
+                                "Expected",
+                                "https://www.tiktok.com/@expected.user",
+                            ),
+                            update_mode=True,
+                            record_id=int(account_id),
+                        )
+
+                    connection = sqlite3.connect(database)
+                    current = connection.execute(
+                        """
+                        SELECT status, accountReference, filePath, avatarPath
+                        FROM user_info WHERE id = ?
+                        """,
+                        (account_id,),
+                    ).fetchone()
+                    connection.close()
+                    old_session_exists = old_session.exists()
+                    old_avatar_exists = old_avatar.exists()
+
+                self.assertIsNotNone(result)
+                self.assertIn("200", messages)
+                self.assertNotIn("500", messages)
+                self.assertNotIn("unlink-internal-detail", " ".join(messages))
+                self.assertEqual(current[0:2], (1, "expected.user"))
+                self.assertNotEqual(current[2], "old.json")
+                self.assertEqual(current[3], "new.png")
+                self.assertEqual(old_session_exists, failing_name == "old.json")
+                self.assertEqual(old_avatar_exists, failing_name == "old.png")
 
 
 class YouTubeOAuthAccountPersistenceTests(unittest.TestCase):
