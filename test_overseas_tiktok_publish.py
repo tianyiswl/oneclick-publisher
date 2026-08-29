@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import sqlite3
@@ -11,6 +12,7 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, Mapping
 from unittest.mock import AsyncMock, MagicMock, call, patch
 from zoneinfo import ZoneInfo
 
@@ -1318,9 +1320,10 @@ class TikTokPlatformSyncTests(unittest.TestCase):
         mode: str,
         schedule_mode: str = "immediate",
         scheduled_at: str | None = None,
+        **changes,
     ) -> dict:
         caption = "TikTok 标题\n\n受控发布正文 #OneClick #AI工具"
-        return {
+        result = {
             "accountId": 61,
             "accountFile": str(self.session),
             "expectedAccountReference": "expected.user",
@@ -1337,6 +1340,8 @@ class TikTokPlatformSyncTests(unittest.TestCase):
             "scheduledAt": scheduled_at,
             "scheduleTimezone": "Asia/Shanghai",
         }
+        result.update(changes)
+        return result
 
     def form_receipt(self, **changes) -> dict:
         result = {
@@ -1365,6 +1370,16 @@ class TikTokPlatformSyncTests(unittest.TestCase):
         uploader.publish_confirmed = False
         return uploader
 
+    @staticmethod
+    def arm_scheduled_checkpoint(uploader) -> None:
+        result = uploader.submit_once.return_value
+
+        async def submit_once(_page, _base):
+            uploader.schedule_checkpoint_observer("scheduled_accepted")
+            return result
+
+        uploader.submit_once.side_effect = submit_once
+
     def run_sync(
         self,
         *,
@@ -1376,6 +1391,7 @@ class TikTokPlatformSyncTests(unittest.TestCase):
         event_sink: list[str] | None = None,
         cleanup_error: Exception | None = None,
         prepared: dict | None = None,
+        prepared_changes: Mapping[str, Any] | None = None,
         shanghai_now: datetime | None = None,
     ):
         uploader = uploader or self.fake_uploader()
@@ -1427,6 +1443,24 @@ class TikTokPlatformSyncTests(unittest.TestCase):
         save_session = AsyncMock(return_value=None)
         uploader._test_save_session = save_session
         logger = MagicMock()
+        prepared_snapshot = prepared or self.prepared(mode=mode)
+        prepared_snapshot.update(prepared_changes or {})
+        if (
+            prepared_snapshot.get("scheduleMode") == "platform_native"
+            and isinstance(uploader.prepare_form, AsyncMock)
+            and isinstance(uploader.prepare_form.return_value, dict)
+            and "scheduleMode" not in uploader.prepare_form.return_value
+        ):
+            uploader.prepare_form.return_value.update(
+                {
+                    "scheduleMode": "platform_native",
+                    "scheduledAt": prepared_snapshot["scheduledAt"],
+                    "scheduleTimezone": "Asia/Shanghai",
+                    "scheduleToggleEnabled": True,
+                    "finalActionLabel": "Schedule",
+                }
+            )
+        new_context = AsyncMock(return_value=context)
 
         def record_event(_task_id, event_type, _message, *, level="info"):
             del level
@@ -1437,7 +1471,7 @@ class TikTokPlatformSyncTests(unittest.TestCase):
             patch.object(
                 overseas_tiktok_publish,
                 "validate_tiktok_payload",
-                return_value=prepared or self.prepared(mode=mode),
+                return_value=prepared_snapshot,
             ),
             patch.object(
                 overseas_tiktok_publish,
@@ -1487,7 +1521,7 @@ class TikTokPlatformSyncTests(unittest.TestCase):
             patch.object(
                 overseas_tiktok_publish,
                 "new_publish_context",
-                new=AsyncMock(return_value=context),
+                new=new_context,
                 create=True,
             ),
             patch.object(
@@ -1541,6 +1575,156 @@ class TikTokPlatformSyncTests(unittest.TestCase):
             account_reader=account_reader,
             save_session=save_session,
             logger=logger,
+            new_context=new_context,
+        )
+
+    def test_scheduled_form_check_stops_before_schedule_and_returns_exact_time(self) -> None:
+        run = self.run_sync(
+            mode="platform_form_check",
+            prepared_changes={
+                "scheduleMode": "platform_native",
+                "scheduledAt": "2026-08-29 15:00",
+                "scheduleTimezone": "Asia/Shanghai",
+            },
+        )
+        self.assertEqual(run.result["phase"], "platform_form_verified")
+        self.assertEqual(run.result["receipt"]["scheduledAt"], "2026-08-29 15:00")
+        self.assertFalse(run.result["receipt"]["finalActionTriggered"])
+        run.uploader.submit_once.assert_not_awaited()
+        self.assertEqual(run.uploader_type.call_args.args[3], "2026-08-29 15:00")
+        self.assertEqual(
+            run.uploader_type.call_args.kwargs["schedule_timezone"],
+            "Asia/Shanghai",
+        )
+
+    def test_scheduled_formal_requires_readback_or_becomes_ambiguous(self) -> None:
+        uploader = self.fake_uploader(
+            submit_result={
+                "status": "scheduled",
+                "phase": "scheduled_accepted",
+                "receipt": {
+                    "scheduleMode": "platform_native",
+                    "scheduledAt": "2026-08-29 15:00",
+                    "scheduleTimezone": "Asia/Shanghai",
+                    "platformAccepted": True,
+                    "scheduledReadbackConfirmed": False,
+                    "publishedAt": None,
+                },
+            }
+        )
+        self.arm_scheduled_checkpoint(uploader)
+        with self.assertRaises(overseas_tiktok_publish.TikTokPublishError) as raised:
+            self.run_sync(
+                mode="formal",
+                uploader=uploader,
+                prepared_changes={
+                    "scheduleMode": "platform_native",
+                    "scheduledAt": "2026-08-29 15:00",
+                    "scheduleTimezone": "Asia/Shanghai",
+                },
+            )
+        self.assertEqual(raised.exception.error_code, "tiktok_schedule_outcome_unknown")
+        self.assertTrue(raised.exception.outcome_ambiguous)
+
+    def test_scheduled_formal_accepts_exact_readback_without_published_at(self) -> None:
+        uploader = self.fake_uploader(
+            submit_result={
+                "status": "scheduled",
+                "phase": "scheduled_readback_confirmed",
+                "evidence": "scheduled_list:unique",
+                "receipt": {
+                    "scheduleMode": "platform_native",
+                    "scheduledAt": "2026-08-29 15:00",
+                    "scheduleTimezone": "Asia/Shanghai",
+                    "platformAccepted": True,
+                    "scheduledReadbackConfirmed": True,
+                    "contentId": None,
+                    "contentUrl": None,
+                    "publishedAt": None,
+                },
+            }
+        )
+        self.arm_scheduled_checkpoint(uploader)
+        run = self.run_sync(
+            mode="formal",
+            uploader=uploader,
+            prepared_changes={
+                "scheduleMode": "platform_native",
+                "scheduledAt": "2026-08-29 15:00",
+                "scheduleTimezone": "Asia/Shanghai",
+            },
+        )
+        self.assertEqual(run.result["phase"], "scheduled_readback_confirmed")
+        self.assertIsNone(run.result["receipt"]["publishedAt"])
+        self.assertNotIn("timezone_id", run.new_context.await_args.kwargs)
+
+    def test_scheduled_time_mismatch_is_ambiguous(self) -> None:
+        uploader = self.fake_uploader(
+            submit_result={
+                "status": "scheduled",
+                "phase": "scheduled_readback_confirmed",
+                "receipt": {
+                    "scheduleMode": "platform_native",
+                    "scheduledAt": "2026-08-29 15:01",
+                    "scheduleTimezone": "Asia/Shanghai",
+                    "platformAccepted": True,
+                    "scheduledReadbackConfirmed": True,
+                    "publishedAt": None,
+                },
+            }
+        )
+        self.arm_scheduled_checkpoint(uploader)
+        with self.assertRaises(overseas_tiktok_publish.TikTokPublishError) as raised:
+            self.run_sync(
+                mode="formal",
+                uploader=uploader,
+                prepared_changes={
+                    "scheduleMode": "platform_native",
+                    "scheduledAt": "2026-08-29 15:00",
+                },
+            )
+        self.assertEqual(raised.exception.error_code, "tiktok_schedule_outcome_unknown")
+
+    def test_publish_context_factory_defaults_to_shanghai(self) -> None:
+        from utils.base_social_media import new_publish_context
+
+        browser = SimpleNamespace(new_context=AsyncMock(return_value=object()))
+        asyncio.run(new_publish_context(browser, storage_state=None))
+        self.assertEqual(
+            browser.new_context.await_args.kwargs["timezone_id"],
+            "Asia/Shanghai",
+        )
+
+    def test_scheduled_acceptance_event_is_persisted_before_list_readback(self) -> None:
+        uploader = self.fake_uploader()
+        events: list[str] = []
+
+        async def submit_once(_page, _base):
+            uploader.schedule_checkpoint_observer("scheduled_accepted")
+            raise overseas_tiktok_publish.TikTokPublishError(
+                "tiktok_schedule_outcome_unknown",
+                "list unreadable",
+                outcome_ambiguous=True,
+            )
+
+        uploader.submit_once = AsyncMock(side_effect=submit_once)
+        with self.assertRaises(overseas_tiktok_publish.TikTokPublishError) as raised:
+            self.run_sync(
+                mode="formal",
+                uploader=uploader,
+                event_sink=events,
+                prepared_changes={
+                    "scheduleMode": "platform_native",
+                    "scheduledAt": "2026-08-29 15:00",
+                },
+            )
+        self.assertEqual(raised.exception.error_code, "tiktok_schedule_outcome_unknown")
+        self.assertTrue(raised.exception.outcome_ambiguous)
+        self.assertIn("tiktok_scheduled_accepted", events)
+        self.assertIn("tiktok_publish_outcome_ambiguous", events)
+        self.assertLess(
+            events.index("tiktok_scheduled_accepted"),
+            events.index("tiktok_publish_outcome_ambiguous"),
         )
 
     def test_platform_form_check_prepares_once_and_never_submits(self) -> None:
@@ -1632,6 +1816,55 @@ class TikTokPlatformSyncTests(unittest.TestCase):
         self.assertEqual(order[click_index - 1], "tiktok_final_action_triggered")
         self.assertEqual(order.count("tiktok_final_action_triggered"), 1)
 
+    def test_scheduled_final_action_instruments_schedule_not_post(self) -> None:
+        order: list[str] = []
+        result = {
+            "status": "scheduled",
+            "phase": "scheduled_readback_confirmed",
+            "evidence": "scheduled_list:unique",
+            "receipt": {
+                "scheduleMode": "platform_native",
+                "scheduledAt": "2026-08-29 15:00",
+                "scheduleTimezone": "Asia/Shanghai",
+                "platformAccepted": True,
+                "scheduledReadbackConfirmed": True,
+                "contentId": None,
+                "contentUrl": None,
+                "publishedAt": None,
+            },
+        }
+        uploader = self.fake_uploader(submit_result=result)
+        button = SimpleNamespace(
+            click=AsyncMock(side_effect=lambda: order.append("schedule-click"))
+        )
+        uploader._final_action_button = AsyncMock(return_value=button)
+        uploader._post_button = AsyncMock(
+            side_effect=AssertionError("scheduled mode must not resolve Post")
+        )
+
+        async def submit_once(_page, base):
+            current = await uploader._final_action_button(base)
+            await current.click()
+            uploader.schedule_checkpoint_observer("scheduled_accepted")
+            return result
+
+        uploader.submit_once = AsyncMock(side_effect=submit_once)
+        run = self.run_sync(
+            mode="formal",
+            uploader=uploader,
+            event_sink=order,
+            prepared_changes={
+                "scheduleMode": "platform_native",
+                "scheduledAt": "2026-08-29 15:00",
+            },
+        )
+        click_index = order.index("schedule-click")
+        self.assertEqual(order[click_index - 1], "tiktok_final_action_triggered")
+        self.assertEqual(order.count("tiktok_final_action_triggered"), 1)
+        self.assertIn("tiktok_scheduled_accepted", order)
+        uploader._post_button.assert_not_awaited()
+        self.assertEqual(run.result["phase"], "scheduled_readback_confirmed")
+
     def test_formal_rechecks_fifteen_minute_window_before_final_action(self) -> None:
         uploader = self.fake_uploader()
         prepared = self.prepared(
@@ -1658,6 +1891,39 @@ class TikTokPlatformSyncTests(unittest.TestCase):
         self.assertEqual(raised.exception.error_code, "tiktok_schedule_out_of_range")
         uploader.prepare_form.assert_awaited_once()
         uploader.submit_once.assert_not_awaited()
+
+    def test_final_fifteen_minute_gate_runs_inside_schedule_click_trigger(self) -> None:
+        uploader = self.fake_uploader()
+        raw_button = SimpleNamespace(click=AsyncMock(return_value=None))
+        uploader._final_action_button = AsyncMock(return_value=raw_button)
+
+        async def submit_once(_page, base):
+            current = await uploader._final_action_button(base)
+            await current.click()
+            raise AssertionError("schedule click should have been blocked")
+
+        uploader.submit_once = AsyncMock(side_effect=submit_once)
+        with self.assertRaises(overseas_tiktok_publish.TikTokPublishError) as raised:
+            self.run_sync(
+                mode="formal",
+                uploader=uploader,
+                prepared_changes={
+                    "scheduleMode": "platform_native",
+                    "scheduledAt": "2026-08-29 15:00",
+                },
+                shanghai_now=datetime(
+                    2026,
+                    8,
+                    29,
+                    14,
+                    46,
+                    tzinfo=ZoneInfo("Asia/Shanghai"),
+                ),
+            )
+        self.assertEqual(raised.exception.error_code, "tiktok_schedule_out_of_range")
+        self.assertFalse(raised.exception.outcome_ambiguous)
+        uploader.submit_once.assert_awaited_once()
+        raw_button.click.assert_not_awaited()
 
     def test_identity_mismatch_stops_before_upload_and_session_refresh(self) -> None:
         uploader = self.fake_uploader()

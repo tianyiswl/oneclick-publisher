@@ -1222,6 +1222,18 @@ def _verify_authorized_form_snapshot(
         "finalCaption": expected_caption,
         "finalActionReady": True,
     }
+    if prepared.get("scheduleMode") == "platform_native":
+        expected.update(
+            {
+                "scheduleMode": "platform_native",
+                "scheduledAt": prepared.get("scheduledAt"),
+                "scheduleTimezone": "Asia/Shanghai",
+                "scheduleToggleEnabled": True,
+                "finalActionLabel": "Schedule",
+            }
+        )
+    else:
+        expected["finalActionLabel"] = "Post"
     actual = {
         "plainCaption": form_receipt.get("plainCaption"),
         "topicEntities": form_receipt.get("topicEntities"),
@@ -1229,6 +1241,22 @@ def _verify_authorized_form_snapshot(
         "finalCaption": form_receipt.get("finalCaption"),
         "finalActionReady": form_receipt.get("finalActionReady"),
     }
+    if prepared.get("scheduleMode") == "platform_native":
+        actual.update(
+            {
+                "scheduleMode": form_receipt.get("scheduleMode"),
+                "scheduledAt": form_receipt.get("scheduledAt"),
+                "scheduleTimezone": form_receipt.get("scheduleTimezone"),
+                "scheduleToggleEnabled": form_receipt.get(
+                    "scheduleToggleEnabled"
+                ),
+                "finalActionLabel": form_receipt.get("finalActionLabel"),
+            }
+        )
+    else:
+        actual["finalActionLabel"] = form_receipt.get(
+            "finalActionLabel", "Post"
+        )
     if actual != expected:
         _fail("tiktok_form_snapshot_mismatch", "TikTok 表单快照与授权内容不一致")
     if hashlib.sha256(expected_caption.encode("utf-8")).hexdigest() != str(
@@ -1290,7 +1318,7 @@ class _FinalActionButton:
 
 
 def _instrument_final_action(uploader, *, trigger) -> bool:
-    original = getattr(uploader, "_post_button", None)
+    original = getattr(uploader, "_final_action_button", None)
     if not callable(original):
         return False
 
@@ -1298,7 +1326,7 @@ def _instrument_final_action(uploader, *, trigger) -> bool:
         button = await original(base)
         return None if button is None else _FinalActionButton(button, trigger)
 
-    uploader._post_button = tracked
+    uploader._final_action_button = tracked
     return True
 
 
@@ -1359,6 +1387,39 @@ def _exact_content_readback(
     }
 
 
+def _exact_scheduled_readback(
+    result: Mapping[str, Any],
+    *,
+    expected_scheduled_at: str,
+) -> dict[str, Any] | None:
+    source = (
+        result.get("receipt")
+        if isinstance(result.get("receipt"), Mapping)
+        else result
+    )
+    if (
+        result.get("status") != "scheduled"
+        or result.get("phase") != "scheduled_readback_confirmed"
+        or source.get("scheduleMode") != "platform_native"
+        or source.get("scheduledAt") != expected_scheduled_at
+        or source.get("scheduleTimezone") != "Asia/Shanghai"
+        or source.get("platformAccepted") is not True
+        or source.get("scheduledReadbackConfirmed") is not True
+        or source.get("publishedAt") is not None
+    ):
+        return None
+    return {
+        "contentId": source.get("contentId"),
+        "contentUrl": source.get("contentUrl"),
+        "scheduleMode": "platform_native",
+        "scheduledAt": expected_scheduled_at,
+        "scheduleTimezone": "Asia/Shanghai",
+        "platformAccepted": True,
+        "scheduledReadbackConfirmed": True,
+        "publishedAt": None,
+    }
+
+
 def _platform_result_is_accepted(result: object) -> bool:
     if not isinstance(result, Mapping) or result.get("status") != "published":
         return False
@@ -1377,13 +1438,25 @@ async def _run_tiktok_platform(
     context = None
     identity_page = None
     page = None
-    final_state = {"triggered": False}
+    final_state = {
+        "triggered": False,
+        "action": (
+            "schedule"
+            if prepared.get("scheduleMode") == "platform_native"
+            else "post"
+        ),
+    }
     platform_write_occurred = False
     completed_successfully = False
+    schedule_checkpoint_state = {"accepted": False}
 
     def trigger_final_action() -> None:
         if final_state["triggered"]:
             return
+        validate_tiktok_final_schedule_window(
+            prepared,
+            now=_shanghai_now(),
+        )
         _record_tiktok_event(
             task_id,
             "tiktok_final_action_triggered",
@@ -1415,9 +1488,10 @@ async def _run_tiktok_platform(
             str(prepared["title"]),
             str(prepared["videoPath"]),
             list(prepared["topics"]),
-            0,
+            prepared.get("scheduledAt"),
             str(prepared["accountFile"]),
             description=str(prepared["body"]),
+            schedule_timezone=str(prepared["scheduleTimezone"]),
             dry_run=mode == "platform_form_check",
             dry_run_hold_browser=False,
             expected_account_reference=str(prepared["expectedAccountReference"]),
@@ -1450,6 +1524,26 @@ async def _run_tiktok_platform(
             )
 
         uploader.form_stage_observer = observe_form_stage
+
+        uploader.authorized_snapshot_validator = (
+            lambda live: _verify_authorized_form_snapshot(prepared, live)
+        )
+
+        def persist_schedule_checkpoint(stage: str) -> None:
+            if stage != "scheduled_accepted":
+                raise TikTokPublishError(
+                    "tiktok_schedule_outcome_unknown",
+                    "TikTok 排期检查点无效",
+                    outcome_ambiguous=True,
+                )
+            _record_tiktok_event(
+                task_id,
+                "tiktok_scheduled_accepted",
+                "TikTok 已明确受理排期，正在只读核对内容列表",
+            )
+            schedule_checkpoint_state["accepted"] = True
+
+        uploader.schedule_checkpoint_observer = persist_schedule_checkpoint
         _instrument_manual_verification(uploader, task_id=task_id)
         final_button_instrumented = _instrument_final_action(
             uploader,
@@ -1506,6 +1600,15 @@ async def _run_tiktok_platform(
             "contentUrl": None,
             "publishedAt": None,
             "topicEntities": list(verified_form["topicEntities"]),
+            "scheduleMode": prepared["scheduleMode"],
+            "scheduledAt": prepared["scheduledAt"],
+            "scheduleTimezone": prepared["scheduleTimezone"],
+            "scheduleToggleEnabled": verified_form.get(
+                "scheduleToggleEnabled", False
+            ),
+            "finalActionLabel": verified_form["finalActionLabel"],
+            "finalActionReady": verified_form["finalActionReady"],
+            "finalAction": final_state["action"],
         }
         if mode == "platform_form_check":
             receipt["phase"] = "platform_form_verified"
@@ -1520,7 +1623,6 @@ async def _run_tiktok_platform(
                 "receipt": receipt,
             }
 
-        validate_tiktok_final_schedule_window(prepared)
         uploader.publish_confirmed = True
         if not final_button_instrumented:
             trigger_final_action()
@@ -1532,6 +1634,43 @@ async def _run_tiktok_platform(
             )
         receipt["finalActionTriggered"] = True
         receipt["phase"] = "platform_accepted"
+        if prepared["scheduleMode"] == "platform_native":
+            if not schedule_checkpoint_state["accepted"]:
+                raise TikTokPublishError(
+                    "tiktok_schedule_outcome_unknown",
+                    "TikTok 排期缺少已持久化的受理检查点",
+                    outcome_ambiguous=True,
+                    receipt=receipt,
+                )
+            readback = _exact_scheduled_readback(
+                submitted,
+                expected_scheduled_at=str(prepared["scheduledAt"]),
+            )
+            if readback is None:
+                raise TikTokPublishError(
+                    "tiktok_schedule_outcome_unknown",
+                    "TikTok 排期受理后未能唯一回读内容列表",
+                    outcome_ambiguous=True,
+                    receipt=receipt,
+                )
+            phase = "scheduled_readback_confirmed"
+            event_type = "tiktok_scheduled_readback_confirmed"
+            message = "TikTok 已精确回读同一排期内容"
+            receipt.update(readback)
+            receipt["phase"] = phase
+            _record_tiktok_event(task_id, event_type, message)
+            await save_context_storage_state(
+                context, str(prepared["accountFile"])
+            )
+            completed_successfully = True
+            return {
+                "type": 6,
+                "platform": "TikTok",
+                "ok": True,
+                "phase": phase,
+                "message": message,
+                "receipt": receipt,
+            }
         readback = _exact_content_readback(
             submitted,
             expected_handle=str(prepared["expectedAccountReference"]),

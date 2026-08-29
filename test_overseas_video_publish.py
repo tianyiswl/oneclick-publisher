@@ -4,12 +4,15 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
+from zoneinfo import ZoneInfo
 
-from app_core import overseas_video_publish
+from app_core import overseas_tiktok_publish, overseas_video_publish
 from app_core.overseas_tiktok_publish import TikTokPublishError
 from uploader.tk_uploader import main as tiktok_uploader
 from uploader.youtube_uploader import main as youtube_uploader
@@ -17,6 +20,14 @@ from uploader.tk_uploader.main import (
     TiktokVideo,
     tiktok_publish_success_signal,
     tiktok_security_intervention_reason,
+)
+from uploader.tk_uploader.schedule_form import (
+    TikTokScheduleAcceptance,
+    TikTokScheduleForm,
+    TikTokScheduleFormSnapshot,
+    TikTokScheduledContentExpectation,
+    TikTokScheduledContentReadback,
+    TikTokScheduleTarget,
 )
 from uploader.youtube_uploader.main import (
     YouTubeVideo,
@@ -501,12 +512,13 @@ class TikTokFormAdapterTests(unittest.TestCase):
         description: str = "Body",
         tags: list[str] | None = None,
         execution_mode: str = "platform_form_check",
+        publish_date: object = None,
     ) -> TiktokVideo:
         app = TiktokVideo(
             title,
             "/not/used.mp4",
             tags if tags is not None else ["AI", "效率"],
-            0,
+            publish_date,
             "/not/used.json",
             description=description,
             expected_account_reference="expected.user",
@@ -517,6 +529,248 @@ class TikTokFormAdapterTests(unittest.TestCase):
         app._ensure_public_visibility = AsyncMock(return_value="public")
         app._post_button = AsyncMock(return_value=FakeTikTokLeaf(text="Post"))
         return app
+
+    def test_publish_date_activation_is_type_strict(self) -> None:
+        for immediate in (None, 0):
+            with self.subTest(immediate=immediate):
+                app = self.uploader(publish_date=immediate)
+                self.assertIsNone(app.publish_date)
+                self.assertIsNone(app._schedule_form)
+        scheduled = self.uploader(publish_date="2026-08-29 15:00")
+        self.assertEqual(scheduled.publish_date, "2026-08-29 15:00")
+        for invalid in (
+            datetime(2026, 8, 29, 15, 0),
+            datetime(2026, 8, 29, 15, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+            False,
+            0.0,
+            "",
+            "2026-8-29 15:00",
+            "not-a-time",
+            1,
+        ):
+            with self.subTest(invalid=repr(invalid)):
+                with self.assertRaises(TikTokPublishError) as raised:
+                    self.uploader(publish_date=invalid)
+                self.assertEqual(raised.exception.error_code, "tiktok_schedule_invalid")
+
+    def test_prepare_form_configures_schedule_after_visibility_and_before_snapshot(self) -> None:
+        page = FakeTikTokPage()
+        app = self.uploader(tags=[], publish_date="2026-08-29 15:00")
+        target = TikTokScheduleTarget("2026-08-29 15:00", "Asia/Shanghai")
+        snapshot = TikTokScheduleFormSnapshot(
+            schedule_mode="platform_native",
+            scheduled_at="2026-08-29 15:00",
+            timezone="Asia/Shanghai",
+            toggle_enabled=True,
+            final_action_label="Schedule",
+            final_action_ready=True,
+        )
+        form = AsyncMock(spec=TikTokScheduleForm)
+        clicks: list[str] = []
+        order: list[str] = []
+
+        async def visibility(*_args):
+            order.append("visibility")
+            return "public"
+
+        async def configure(_target):
+            order.append("configure")
+            return snapshot
+
+        async def verify(_target):
+            order.append("snapshot")
+            return snapshot
+
+        app._ensure_public_visibility = AsyncMock(side_effect=visibility)
+        form.configure.side_effect = configure
+        form.verify.side_effect = verify
+        form.final_button.return_value = FakeTikTokLeaf(
+            text="Schedule",
+            on_click=lambda: clicks.append("schedule"),
+        )
+        with patch.object(tiktok_uploader, "TikTokScheduleForm", return_value=form):
+            receipt = asyncio.run(app.prepare_form(page, page.base))
+        form.configure.assert_awaited_once_with(target)
+        form.verify.assert_awaited_once_with(target)
+        form.final_button.assert_awaited_once_with(target)
+        self.assertEqual(clicks, [])
+        self.assertLess(order.index("visibility"), order.index("configure"))
+        self.assertLess(order.index("configure"), order.index("snapshot"))
+        self.assertEqual(receipt["scheduledAt"], "2026-08-29 15:00")
+
+    def test_scheduled_submit_clicks_schedule_once_and_never_post(self) -> None:
+        clicks: list[str] = []
+        schedule_button = FakeTikTokLeaf(
+            text="Schedule",
+            on_click=lambda: clicks.append("schedule"),
+        )
+        app = self.uploader(
+            tags=[],
+            publish_date="2026-08-29 15:00",
+            execution_mode="formal",
+        )
+        app.publish_confirmed = True
+        form = AsyncMock(spec=TikTokScheduleForm)
+        form.final_button.return_value = schedule_button
+        form.wait_for_acceptance.return_value = TikTokScheduleAcceptance(
+            evidence="platform_feedback:scheduled",
+            accepted_at=datetime(2026, 8, 29, 14, 1, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+        form.readback_scheduled_content.return_value = TikTokScheduledContentReadback(
+            content_id=None,
+            content_url=None,
+            scheduled_at="2026-08-29 15:00",
+            schedule_timezone="Asia/Shanghai",
+            evidence="scheduled_list:unique",
+        )
+        app._schedule_form = form
+        app._schedule_target = TikTokScheduleTarget(
+            "2026-08-29 15:00", "Asia/Shanghai"
+        )
+        app.authorized_snapshot_validator = lambda snapshot: snapshot
+        app.schedule_checkpoint_observer = lambda stage: None
+        app._wait_for_manual_intervention = AsyncMock(return_value=None)
+        app._post_button = AsyncMock(
+            side_effect=AssertionError("scheduled mode must not resolve Post")
+        )
+        clicked_at = datetime(2026, 8, 29, 14, 1, tzinfo=ZoneInfo("Asia/Shanghai"))
+        snapshot = {
+            "finalActionLabel": "Schedule",
+            "scheduledAt": "2026-08-29 15:00",
+        }
+        with (
+            patch.object(tiktok_uploader, "_uploader_shanghai_now", return_value=clicked_at),
+            patch.object(app, "_verify_form_snapshot", new=AsyncMock(return_value=snapshot)),
+        ):
+            result = asyncio.run(app.submit_once(AsyncMock(), AsyncMock()))
+        expected_caption = app._caption()
+        expectation = TikTokScheduledContentExpectation(
+            account_reference=app.expected_account_reference,
+            expected_caption=expected_caption,
+            caption_sha256=hashlib.sha256(expected_caption.encode("utf-8")).hexdigest(),
+            target=app._schedule_target,
+            submitted_after=clicked_at,
+        )
+        self.assertEqual(clicks, ["schedule"])
+        self.assertEqual(result["phase"], "scheduled_readback_confirmed")
+        form.wait_for_acceptance.assert_awaited_once_with(app._schedule_target)
+        form.readback_scheduled_content.assert_awaited_once_with(expectation)
+        app._post_button.assert_not_awaited()
+
+    def test_scheduled_click_exception_is_outcome_unknown(self) -> None:
+        clicks: list[str] = []
+        raw_button = FakeTikTokLeaf(
+            on_click=lambda: (_ for _ in ()).throw(RuntimeError("detached"))
+        )
+        button = overseas_tiktok_publish._FinalActionButton(
+            raw_button,
+            lambda: clicks.append("final"),
+        )
+        app = self.uploader(tags=[], publish_date="2026-08-29 15:00", execution_mode="formal")
+        app.publish_confirmed = True
+        app._schedule_target = TikTokScheduleTarget("2026-08-29 15:00", "Asia/Shanghai")
+        form = AsyncMock(spec=TikTokScheduleForm)
+        form.final_button.return_value = button
+        app._schedule_form = form
+        app.authorized_snapshot_validator = lambda value: value
+        app.schedule_checkpoint_observer = lambda stage: clicks.append(stage)
+        app._wait_for_manual_intervention = AsyncMock(return_value=None)
+        app._verify_form_snapshot = AsyncMock(return_value={"finalActionLabel": "Schedule"})
+        with self.assertRaises(TikTokPublishError) as raised:
+            asyncio.run(app.submit_once(AsyncMock(), AsyncMock()))
+        self.assertEqual(raised.exception.error_code, "tiktok_schedule_outcome_unknown")
+        self.assertTrue(raised.exception.outcome_ambiguous)
+        self.assertEqual(clicks, ["final"])
+        form.wait_for_acceptance.assert_not_awaited()
+
+    def test_schedule_checkpoint_write_failure_blocks_success_and_readback(self) -> None:
+        app = self.uploader(tags=[], publish_date="2026-08-29 15:00", execution_mode="formal")
+        app.publish_confirmed = True
+        app._schedule_target = TikTokScheduleTarget("2026-08-29 15:00", "Asia/Shanghai")
+        form = AsyncMock(spec=TikTokScheduleForm)
+        form.final_button.return_value = FakeTikTokLeaf(text="Schedule")
+        form.wait_for_acceptance.return_value = TikTokScheduleAcceptance(
+            "scheduled", datetime(2026, 8, 29, 14, 1, tzinfo=ZoneInfo("Asia/Shanghai"))
+        )
+        app._schedule_form = form
+        app.authorized_snapshot_validator = lambda value: value
+        app.schedule_checkpoint_observer = lambda stage: (_ for _ in ()).throw(RuntimeError("db"))
+        app._wait_for_manual_intervention = AsyncMock(return_value=None)
+        app._verify_form_snapshot = AsyncMock(return_value={"finalActionLabel": "Schedule"})
+        with self.assertRaises(TikTokPublishError) as raised:
+            asyncio.run(app.submit_once(AsyncMock(), AsyncMock()))
+        self.assertEqual(raised.exception.error_code, "tiktok_schedule_outcome_unknown")
+        self.assertTrue(raised.exception.outcome_ambiguous)
+        form.readback_scheduled_content.assert_not_awaited()
+
+    def test_schedule_mutation_after_prepare_is_blocked_before_click(self) -> None:
+        clicked: list[str] = []
+        app = self.uploader(tags=[], publish_date="2026-08-29 15:00", execution_mode="formal")
+        app.publish_confirmed = True
+        app._schedule_target = TikTokScheduleTarget("2026-08-29 15:00", "Asia/Shanghai")
+        form = AsyncMock(spec=TikTokScheduleForm)
+        form.final_button.return_value = FakeTikTokLeaf(
+            text="Schedule", on_click=lambda: clicked.append("schedule")
+        )
+        app._schedule_form = form
+        app._wait_for_manual_intervention = AsyncMock(return_value=None)
+        app._verify_form_snapshot = AsyncMock(
+            return_value={
+                "scheduleMode": "platform_native",
+                "scheduledAt": "2026-08-29 15:01",
+                "scheduleTimezone": "Asia/Shanghai",
+                "scheduleToggleEnabled": True,
+                "finalActionLabel": "Schedule",
+                "finalActionReady": True,
+            }
+        )
+        app.authorized_snapshot_validator = lambda snapshot: (_ for _ in ()).throw(
+            TikTokPublishError(
+                "tiktok_form_snapshot_mismatch",
+                "changed",
+            )
+        )
+        app.schedule_checkpoint_observer = lambda stage: clicked.append(stage)
+        app._post_button = AsyncMock(side_effect=AssertionError("must not resolve Post"))
+        with self.assertRaises(TikTokPublishError) as raised:
+            asyncio.run(app.submit_once(AsyncMock(), AsyncMock()))
+        self.assertEqual(raised.exception.error_code, "tiktok_form_snapshot_mismatch")
+        self.assertEqual(clicked, [])
+        form.final_button.assert_not_awaited()
+        app._post_button.assert_not_awaited()
+
+    def test_final_schedule_gate_failure_stays_pre_click_and_non_ambiguous(self) -> None:
+        clicked: list[str] = []
+        raw_button = FakeTikTokLeaf(
+            text="Schedule", on_click=lambda: clicked.append("schedule")
+        )
+
+        def reject_window() -> None:
+            raise TikTokPublishError(
+                "tiktok_schedule_out_of_range",
+                "too late",
+            )
+
+        wrapped = overseas_tiktok_publish._FinalActionButton(
+            raw_button,
+            reject_window,
+        )
+        app = self.uploader(tags=[], publish_date="2026-08-29 15:00", execution_mode="formal")
+        app.publish_confirmed = True
+        app._schedule_target = TikTokScheduleTarget("2026-08-29 15:00", "Asia/Shanghai")
+        form = AsyncMock(spec=TikTokScheduleForm)
+        form.final_button.return_value = wrapped
+        app._schedule_form = form
+        app.authorized_snapshot_validator = lambda value: value
+        app.schedule_checkpoint_observer = lambda stage: None
+        app._wait_for_manual_intervention = AsyncMock(return_value=None)
+        app._verify_form_snapshot = AsyncMock(return_value={"finalActionLabel": "Schedule"})
+        with self.assertRaises(TikTokPublishError) as raised:
+            asyncio.run(app.submit_once(AsyncMock(), AsyncMock()))
+        self.assertEqual(raised.exception.error_code, "tiktok_schedule_out_of_range")
+        self.assertFalse(raised.exception.outcome_ambiguous)
+        self.assertEqual(clicked, [])
+        form.wait_for_acceptance.assert_not_awaited()
 
     def test_upload_waits_for_slow_page_before_selecting_video(self) -> None:
         class EmptyLocator:

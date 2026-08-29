@@ -4,10 +4,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
 import unicodedata
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Sequence
+from zoneinfo import ZoneInfo
 
 from playwright.async_api import Error as PlaywrightError, Playwright, async_playwright
 
@@ -25,12 +28,23 @@ from utils.base_social_media import (
 )
 from utils.log import tiktok_logger
 from utils.publish_observer import publish_event
+from uploader.tk_uploader.schedule_form import (
+    TikTokScheduleAcceptance,
+    TikTokScheduleForm,
+    TikTokScheduledContentExpectation,
+    TikTokScheduleTarget,
+)
 
 
 UPLOAD_URL = "https://www.tiktok.com/tiktokstudio/upload?lang=en"
 FORMAL_LOCK_MESSAGE = "TikTok 正式发布缺少桌面端确认"
 MANUAL_INTERVENTION_TIMEOUT_SECONDS = 600
 PUBLISH_RESULT_TIMEOUT_SECONDS = 120
+SHANGHAI = ZoneInfo("Asia/Shanghai")
+
+
+def _uploader_shanghai_now() -> datetime:
+    return datetime.now(SHANGHAI)
 
 CAPTION_EDITOR_SELECTORS = (
     '[data-e2e="caption-editor"] [contenteditable="true"]',
@@ -168,12 +182,43 @@ class TiktokVideo:
         dry_run_hold_browser=True,
         expected_account_reference: str = "",
         execution_mode: str | None = None,
+        schedule_timezone: str = "Asia/Shanghai",
     ):
         self.title = str(title or "")
         self.description = str(description or "")
         self.file_path = str(file_path)
         self.tags = list(tags or [])
-        self.publish_date = publish_date
+        if publish_date is None or (type(publish_date) is int and publish_date == 0):
+            self.publish_date = None
+        elif type(publish_date) is str and re.fullmatch(
+            r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}", publish_date
+        ):
+            try:
+                parsed_publish_date = datetime.strptime(
+                    publish_date, "%Y-%m-%d %H:%M"
+                )
+            except ValueError as exc:
+                raise TikTokPublishError(
+                    "tiktok_schedule_invalid",
+                    "TikTok 排期必须是有效的北京时间",
+                ) from exc
+            if parsed_publish_date.strftime("%Y-%m-%d %H:%M") != publish_date:
+                raise TikTokPublishError(
+                    "tiktok_schedule_invalid",
+                    "TikTok 排期必须是精确到分钟的北京时间字符串",
+                )
+            self.publish_date = publish_date
+        else:
+            raise TikTokPublishError(
+                "tiktok_schedule_invalid",
+                "TikTok 排期必须是精确到分钟的北京时间字符串",
+            )
+        self.schedule_timezone = str(schedule_timezone)
+        if self.publish_date is not None and self.schedule_timezone != "Asia/Shanghai":
+            raise TikTokPublishError(
+                "tiktok_schedule_invalid",
+                "TikTok 定时只支持 Asia/Shanghai 时区",
+            )
         self.account_file = str(account_file)
         self.thumbnail_path = str(thumbnail_path) if thumbnail_path else None
         self.thumbnail_paths = dict(thumbnail_paths or {})
@@ -189,6 +234,10 @@ class TiktokVideo:
         self.external_context = None
         self.external_browser = None
         self.form_stage_observer = None
+        self._schedule_form: TikTokScheduleForm | None = None
+        self._schedule_target: TikTokScheduleTarget | None = None
+        self.authorized_snapshot_validator = None
+        self.schedule_checkpoint_observer = None
 
     def _emit_form_stage(self, stage: str) -> None:
         observer = self.form_stage_observer
@@ -655,19 +704,27 @@ class TiktokVideo:
                 "tiktok_visibility_readback_mismatch",
                 "TikTok 可见性回读不是公开",
             )
-        button = await self._post_button(base)
+        button = await self._final_action_button(base)
         if button is None:
             raise TikTokPublishError(
                 "tiktok_final_action_unavailable",
-                "TikTok Post 按钮尚不可用",
+                "TikTok 最终动作按钮尚不可用",
             )
-        return {
+        result = {
             "plainCaption": self._plain_caption(),
             "topicEntities": entities,
             "visibility": "public",
             "finalCaption": self._caption(),
             "finalActionReady": True,
         }
+        if self._schedule_form is not None and self._schedule_target is not None:
+            verified_schedule = await self._schedule_form.verify(
+                self._schedule_target
+            )
+            result.update(verified_schedule.as_dict())
+        else:
+            result["finalActionLabel"] = "Post"
+        return result
 
     async def prepare_form(self, page, base) -> dict[str, Any]:
         self._emit_form_stage("upload_entry_waiting")
@@ -691,6 +748,17 @@ class TiktokVideo:
         self._emit_form_stage("visibility_started")
         await self._ensure_public_visibility(page, base)
         self._emit_form_stage("visibility_verified")
+        if self.publish_date is not None:
+            self._schedule_form = TikTokScheduleForm(
+                page,
+                resolve_base=lambda: self._base(page),
+                wait_for_manual_intervention=self._wait_for_manual_intervention,
+            )
+            self._schedule_target = TikTokScheduleTarget(
+                str(self.publish_date),
+                self.schedule_timezone,
+            )
+            await self._schedule_form.configure(self._schedule_target)
         self._emit_form_stage("post_ready_waiting")
         await self._wait_until_ready(page, base)
         self._emit_form_stage("form_snapshot_started")
@@ -701,7 +769,7 @@ class TiktokVideo:
     async def _wait_until_ready(self, page, base) -> None:
         for _ in range(180):
             await self._wait_for_manual_intervention(page)
-            if await self._post_button(base) is not None:
+            if await self._final_action_button(base) is not None:
                 return
             await asyncio.sleep(2)
         raise TikTokPublishError(
@@ -823,6 +891,21 @@ class TiktokVideo:
                 continue
         return None
 
+    async def _final_action_button(self, base):
+        if self._schedule_form is not None and self._schedule_target is not None:
+            return await self._schedule_form.final_button(self._schedule_target)
+        return await self._post_button(base)
+
+    def _emit_schedule_checkpoint(self, stage: str) -> None:
+        observer = self.schedule_checkpoint_observer
+        if not callable(observer):
+            raise TikTokPublishError(
+                "tiktok_schedule_outcome_unknown",
+                "TikTok 排期受理状态无法持久化",
+                outcome_ambiguous=True,
+            )
+        observer(stage)
+
     async def _wait_for_publish_result(self, page) -> str:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + PUBLISH_RESULT_TIMEOUT_SECONDS
@@ -864,7 +947,15 @@ class TiktokVideo:
             )
         await self._wait_for_manual_intervention(page)
         snapshot = await self._verify_form_snapshot(page, base)
-        button = await self._post_button(base)
+        if self._schedule_target is not None:
+            validator = self.authorized_snapshot_validator
+            if not callable(validator):
+                raise TikTokPublishError(
+                    "tiktok_form_snapshot_mismatch",
+                    "TikTok 定时表单缺少授权快照校验",
+                )
+            validator(snapshot)
+        button = await self._final_action_button(base)
         if button is None:
             raise RuntimeError("TikTok 最终发布按钮不可用，未执行发布")
         if self._submit_consumed:
@@ -873,6 +964,65 @@ class TiktokVideo:
                 "TikTok 最终动作已在本会话消费，禁止再次调用",
             )
         self._submit_consumed = True
+        if self._schedule_form is not None and self._schedule_target is not None:
+            publish_event("tiktok_final_click", "TikTok 已确认，正在点击 Schedule")
+            submitted_after = _uploader_shanghai_now()
+            try:
+                await button.click()
+                acceptance = await self._schedule_form.wait_for_acceptance(
+                    self._schedule_target
+                )
+                self._emit_schedule_checkpoint("scheduled_accepted")
+                expected_caption = self._caption()
+                expectation = TikTokScheduledContentExpectation(
+                    account_reference=self.expected_account_reference,
+                    expected_caption=expected_caption,
+                    caption_sha256=hashlib.sha256(
+                        expected_caption.encode("utf-8")
+                    ).hexdigest(),
+                    target=self._schedule_target,
+                    submitted_after=submitted_after,
+                )
+                readback = await self._schedule_form.readback_scheduled_content(
+                    expectation
+                )
+                if readback is None:
+                    raise TikTokPublishError(
+                        "tiktok_schedule_outcome_unknown",
+                        "TikTok 定时提交后未能唯一回读内容",
+                        outcome_ambiguous=True,
+                    )
+            except Exception as exc:
+                if isinstance(exc, TikTokPublishError) and exc.error_code in {
+                    "tiktok_publish_rejected",
+                    "tiktok_schedule_out_of_range",
+                }:
+                    raise
+                if isinstance(exc, TikTokPublishError) and exc.outcome_ambiguous:
+                    raise
+                raise TikTokPublishError(
+                    "tiktok_schedule_outcome_unknown",
+                    "TikTok 定时最终动作后结果无法确认",
+                    outcome_ambiguous=True,
+                ) from None
+            return {
+                "status": "scheduled",
+                "phase": "scheduled_readback_confirmed",
+                "evidence": readback.evidence,
+                "formSnapshot": snapshot,
+                "receipt": {
+                    "scheduleMode": "platform_native",
+                    "scheduledAt": readback.scheduled_at,
+                    "scheduleTimezone": readback.schedule_timezone,
+                    "platformAccepted": isinstance(
+                        acceptance, TikTokScheduleAcceptance
+                    ),
+                    "scheduledReadbackConfirmed": True,
+                    "contentId": readback.content_id,
+                    "contentUrl": readback.content_url,
+                    "publishedAt": None,
+                },
+            }
         publish_event("tiktok_final_click", "TikTok 已确认，正在点击 Post")
         await button.click()
         signal = await self._wait_for_publish_result(page)
