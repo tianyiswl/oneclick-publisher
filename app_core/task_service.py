@@ -315,6 +315,11 @@ def _tiktok_receipt_projection(receipt: object) -> dict[str, object]:
     phase = receipt.get("phase")
     if type(phase) is str and phase in _TIKTOK_RECEIPT_PHASES:
         projected["phase"] = phase
+    if projected.get("scheduleMode") == "platform_native":
+        # A platform-native schedule is accepted for future publication; even
+        # a syntactically valid upstream timestamp cannot turn that receipt
+        # into evidence that the content is already public.
+        projected["publishedAt"] = None
     return {
         key: projected[key]
         for key in _TIKTOK_RECEIPT_FIELDS

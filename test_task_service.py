@@ -1957,6 +1957,36 @@ class TikTokTaskServiceTests(unittest.TestCase):
         self.assertNotIn("cookie", receipt)
         self.assertEqual(item["publishedAt"], "")
 
+    def test_scheduled_tiktok_receipt_discards_upstream_published_at(self) -> None:
+        task = self._task(scheduled=True)
+        task_service.mark_platform_result(
+            task["id"],
+            6,
+            ok=True,
+            message="TikTok 定时内容已唯一回读",
+            content_type="video",
+            event_type="tiktok_scheduled_readback_confirmed",
+            readback={"publishedAt": "2026-08-30T09:00:00+08:00"},
+            receipt={
+                "accountId": 61,
+                "visibility": "public",
+                "scheduleMode": "platform_native",
+                "scheduledAt": "2026-08-30 09:00",
+                "scheduleTimezone": "Asia/Shanghai",
+                "platformWriteOccurred": True,
+                "finalActionTriggered": True,
+                "platformAccepted": True,
+                "scheduledReadbackConfirmed": True,
+                "publishedAt": "2026-08-30T09:00:00+08:00",
+                "phase": "scheduled_readback_confirmed",
+            },
+        )
+
+        item = task_service.get_task(task["id"])["items"][0]
+        receipt = json.loads(item["receiptJson"])
+        self.assertIsNone(receipt["publishedAt"])
+        self.assertEqual(item["publishedAt"], "")
+
     def test_stale_tiktok_after_final_action_is_ambiguous_and_retains_safe_marker(self) -> None:
         task = self._task()
         task_service.record_task_event(
