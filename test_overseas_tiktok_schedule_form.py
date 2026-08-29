@@ -209,12 +209,16 @@ class FakeSchedulePage(FakeScheduleBase):
         self.url = "https://www.tiktok.com/tiktokstudio/upload"
         self.goto_calls: list[str] = []
         self.goto_failures: set[str] = set()
+        self._rows_after_next_navigation: list[FakeScheduleControl] | None = None
 
     async def goto(self, route: str) -> None:
         self.goto_calls.append(route)
         if route in self.goto_failures:
             raise RuntimeError("bounded route unavailable")
         self.url = route
+        if self._rows_after_next_navigation is not None:
+            self.replace_rows(*self._rows_after_next_navigation)
+            self._rows_after_next_navigation = None
 
     def set_feedback(self, *messages: str) -> None:
         controls = [
@@ -235,6 +239,9 @@ class FakeSchedulePage(FakeScheduleBase):
     def replace_rows(self, *rows: FakeScheduleControl) -> None:
         for selector in SCHEDULED_ROW_SELECTORS:
             self._registered[selector] = list(rows)
+
+    def reveal_rows_on_next_navigation(self, *rows: FakeScheduleControl) -> None:
+        self._rows_after_next_navigation = list(rows)
 
     def set_page_account_references(self, *account_references: str) -> None:
         links = [
@@ -929,6 +936,48 @@ class TikTokScheduleFormTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(readback)
         assert readback is not None
         self.assertEqual(readback.content_id, "new-7654321")
+
+    async def test_readback_refreshes_after_baseline_and_accepts_only_new_exact_row(
+        self,
+    ) -> None:
+        page, bases = scheduled_form_page(toggle_enabled=True)
+        old, old_actions = scheduled_row(
+            node_id="row-old",
+            content_id="old-7654321",
+            content_url="https://www.tiktok.com/@expected.user/video/old-7654321",
+        )
+        page.replace_rows(old)
+        clock = FakeClock()
+        form, _, _ = self.form(page, bases, clock=clock)
+
+        baseline = await form.capture_scheduled_content_baseline("expected.user")
+        new, new_actions = scheduled_row(
+            node_id="row-new-after-refresh",
+            content_id="new-after-refresh-7654321",
+            content_url=(
+                "https://www.tiktok.com/@expected.user/video/new-after-refresh-7654321"
+            ),
+        )
+        page.reveal_rows_on_next_navigation(old, new)
+
+        readback = await form.readback_scheduled_content(
+            self.expectation(baseline_row_keys=baseline.row_keys)
+        )
+
+        self.assertIsNotNone(readback)
+        assert readback is not None
+        self.assertEqual(readback.content_id, "new-after-refresh-7654321")
+        self.assertEqual(
+            page.goto_calls,
+            [
+                "https://www.tiktok.com/tiktokstudio/content",
+                "https://www.tiktok.com/tiktokstudio/content",
+            ],
+        )
+        self.assertEqual(
+            [action.click_count for action in old_actions + new_actions],
+            [0] * 8,
+        )
 
     async def test_old_exact_row_is_not_accepted_while_new_row_is_delayed(self) -> None:
         page, bases = scheduled_form_page(toggle_enabled=True)

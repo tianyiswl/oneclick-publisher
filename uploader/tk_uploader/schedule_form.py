@@ -532,7 +532,7 @@ class TikTokScheduleForm:
     ) -> TikTokScheduledContentReadback | None:
         if not self._expectation_is_coherent(expected):
             return None
-        page = await self._load_scheduled_content_page()
+        page = await self._load_scheduled_content_page(refresh=True)
         if page is None:
             return None
 
@@ -636,7 +636,7 @@ class TikTokScheduleForm:
             )
         return TikTokScheduledContentBaseline(row_keys=snapshots[1])
 
-    async def _load_scheduled_content_page(self) -> Any | None:
+    async def _load_scheduled_content_page(self, *, refresh: bool = False) -> Any | None:
         if self._readback_page is None:
             try:
                 if self._readback_page_factory is not None:
@@ -648,7 +648,7 @@ class TikTokScheduleForm:
                     self._readback_page = await context.new_page()
             except Exception:
                 return None
-        if self._readback_route_loaded:
+        if self._readback_route_loaded and not refresh:
             return self._readback_page
         loaded = False
         for route in SCHEDULED_CONTENT_ROUTES:
