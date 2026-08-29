@@ -29,6 +29,7 @@ from .tiktok_schedule_contract import (
     TikTokScheduleContractError,
     TikTokScheduleIntent,
     parse_tiktok_schedule_fields,
+    tiktok_irreversible_evidence_sql,
     validate_tiktok_schedule_window,
 )
 
@@ -796,23 +797,12 @@ def _existing_tiktok_formal_claim(
     conn: sqlite3.Connection,
     fingerprint: str,
 ) -> sqlite3.Row | None:
+    irreversible = tiktok_irreversible_evidence_sql("claim.taskId")
     return conn.execute(
-        """
+        f"""
         SELECT claim.id, claim.taskId, claim.state,
                task.status AS taskStatus,
-               EXISTS(
-                   SELECT 1 FROM publish_task_events AS event
-                   WHERE event.taskId = claim.taskId
-                     AND event.eventType IN (
-                         'tiktok_final_action_triggered',
-                         'tiktok_publish_outcome_ambiguous'
-                     )
-               ) OR EXISTS(
-                   SELECT 1 FROM publish_task_items AS item
-                   WHERE item.taskId = claim.taskId
-                     AND item.platformType = 6
-                     AND item.errorCode = 'tiktok_publish_outcome_unknown'
-               ) AS hasFinalAction
+               {irreversible} AS hasFinalAction
         FROM tiktok_controlled_execution_claims AS claim
         LEFT JOIN publish_tasks AS task ON task.id = claim.taskId
         WHERE claim.mode = 'formal' AND claim.scopeFingerprint = ?
@@ -855,24 +845,14 @@ def _release_retryable_tiktok_claim_or_raise(
             "同一 TikTok 发布范围已有成功任务，已阻止重复发布",
         )
     if task_status in {"failed", "partial_failed"}:
+        irreversible = tiktok_irreversible_evidence_sql(
+            "tiktok_controlled_execution_claims.taskId"
+        )
         deleted = conn.execute(
-            """
+            f"""
             DELETE FROM tiktok_controlled_execution_claims
             WHERE id = ? AND mode = 'formal'
-              AND NOT EXISTS (
-                  SELECT 1 FROM publish_task_events AS event
-                  WHERE event.taskId = tiktok_controlled_execution_claims.taskId
-                    AND event.eventType IN (
-                        'tiktok_final_action_triggered',
-                        'tiktok_publish_outcome_ambiguous'
-                    )
-              )
-              AND NOT EXISTS (
-                  SELECT 1 FROM publish_task_items AS item
-                  WHERE item.taskId = tiktok_controlled_execution_claims.taskId
-                    AND item.platformType = 6
-                    AND item.errorCode = 'tiktok_publish_outcome_unknown'
-              )
+              AND NOT {irreversible}
             """,
             (int(data["id"]),),
         )
@@ -1087,18 +1067,14 @@ def compensate_tiktok_worker_start_failure(
     with connect() as conn:
         try:
             conn.execute("BEGIN IMMEDIATE")
+            irreversible = tiktok_irreversible_evidence_sql(
+                "tiktok_controlled_execution_claims.taskId"
+            )
             claim = conn.execute(
-                """
+                f"""
                 SELECT id FROM tiktok_controlled_execution_claims
                 WHERE taskId = ? AND mode = ? AND state = 'started'
-                  AND NOT EXISTS (
-                      SELECT 1 FROM publish_task_events AS event
-                      WHERE event.taskId = tiktok_controlled_execution_claims.taskId
-                        AND event.eventType IN (
-                            'tiktok_final_action_triggered',
-                            'tiktok_publish_outcome_ambiguous'
-                        )
-                  )
+                  AND NOT {irreversible}
                 """,
                 (int(task_id), str(mode)),
             ).fetchone()
@@ -1116,9 +1092,10 @@ def compensate_tiktok_worker_start_failure(
                 conn.rollback()
                 return False
             deleted = conn.execute(
-                """
+                f"""
                 DELETE FROM tiktok_controlled_execution_claims
                 WHERE id = ? AND taskId = ? AND state = 'started'
+                  AND NOT {irreversible}
                 """,
                 (int(claim["id"]), int(task_id)),
             )
@@ -1503,6 +1480,14 @@ def project_task(task: Mapping[str, Any] | None) -> dict[str, Any]:
             "type": "tiktok_verification",
             "message": "TikTok 正在同一浏览器等待完成安全验证",
         }
+    elif "tiktok_scheduled_readback_confirmed" in event_types or (
+        "scheduled_readback_confirmed" in tiktok_receipt_phases
+    ):
+        stage = "scheduled_readback_confirmed"
+    elif "tiktok_scheduled_accepted" in event_types or (
+        "scheduled_accepted" in tiktok_receipt_phases
+    ):
+        stage = "scheduled_accepted"
     elif "tiktok_published_readback_confirmed" in event_types or (
         "published_readback_confirmed" in tiktok_receipt_phases
     ):

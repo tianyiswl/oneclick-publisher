@@ -1,11 +1,74 @@
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import re
 from zoneinfo import ZoneInfo
 
 
 SHANGHAI_NAME = "Asia/Shanghai"
 SHANGHAI = ZoneInfo(SHANGHAI_NAME)
 MAXIMUM_LEAD = timedelta(days=10)
+_SQL_TASK_ID_EXPRESSION = re.compile(r"[A-Za-z_][A-Za-z0-9_.]*")
+
+
+def tiktok_irreversible_evidence_sql(task_id_expression: str) -> str:
+    """Return the shared SQLite predicate for irreversible TikTok evidence."""
+
+    expression = str(task_id_expression or "")
+    if _SQL_TASK_ID_EXPRESSION.fullmatch(expression) is None:
+        raise ValueError("invalid TikTok task-id SQL expression")
+    return f"""(
+        EXISTS (
+            SELECT 1 FROM publish_task_events AS irreversible_event
+            WHERE irreversible_event.taskId = {expression}
+              AND irreversible_event.eventType IN (
+                  'tiktok_final_action_triggered',
+                  'tiktok_publish_outcome_ambiguous',
+                  'tiktok_platform_accepted',
+                  'tiktok_published_readback_confirmed',
+                  'tiktok_scheduled_accepted',
+                  'tiktok_scheduled_readback_confirmed'
+              )
+        )
+        OR EXISTS (
+            SELECT 1 FROM publish_task_items AS irreversible_item
+            WHERE irreversible_item.taskId = {expression}
+              AND irreversible_item.platformType = 6
+              AND (
+                  irreversible_item.errorCode IN (
+                      'tiktok_publish_outcome_unknown',
+                      'tiktok_schedule_outcome_unknown'
+                  )
+                  OR (
+                      json_valid(COALESCE(irreversible_item.receiptJson, ''))
+                      AND (
+                          json_extract(
+                              irreversible_item.receiptJson,
+                              '$.finalActionTriggered'
+                          ) = 1
+                          OR json_extract(
+                              irreversible_item.receiptJson,
+                              '$.platformAccepted'
+                          ) = 1
+                          OR json_extract(
+                              irreversible_item.receiptJson,
+                              '$.scheduledReadbackConfirmed'
+                          ) = 1
+                          OR json_extract(
+                              irreversible_item.receiptJson,
+                              '$.phase'
+                          ) IN (
+                              'final_action_triggered',
+                              'platform_accepted',
+                              'published_readback_confirmed',
+                              'scheduled_accepted',
+                              'scheduled_readback_confirmed',
+                              'ambiguous'
+                          )
+                      )
+                  )
+              )
+        )
+    )"""
 
 
 @dataclass(frozen=True, slots=True)

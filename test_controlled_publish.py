@@ -1227,6 +1227,154 @@ class ControlledPublishTests(unittest.TestCase):
         self.assertEqual(claim["taskId"], second["taskId"])
         self.assertIsNone(third["consumedAt"])
 
+    def test_scheduled_item_only_ambiguous_evidence_never_releases_formal_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            database,
+            "DB_PATH",
+            Path(temporary) / "database.db",
+        ):
+            database.ensure_schema()
+            manifest, preflight, grants = self._seed_tiktok_preflight(
+                Path(temporary),
+                authorization_count=2,
+                target_schedule={
+                    "localTime": "2026-08-30 09:00",
+                    "timezone": "Asia/Shanghai",
+                },
+            )
+
+            def request_for(grant: dict) -> dict:
+                return self._tiktok_request(
+                    manifest,
+                    mode="formal",
+                    confirmedPreflightTaskId=preflight["id"],
+                    authorizationId=grant["authorizationId"],
+                    targets=[
+                        {
+                            "platform": "TikTok",
+                            "accountId": 61,
+                            "schedule": {
+                                "localTime": "2026-08-30 09:00",
+                                "timezone": "Asia/Shanghai",
+                            },
+                            "settings": {"visibility": "public"},
+                        }
+                    ],
+                )
+
+            with patch(
+                "app_core.account_service.list_publishable_accounts",
+                return_value=[self._tiktok_account()],
+            ), patch(
+                "app_core.publish_service.start_controlled_tiktok_publish",
+                side_effect=lambda task_id: task_service.get_task(task_id),
+            ):
+                first = submit_request(request_for(grants[0]))
+                task_service.fail_active_task(
+                    first["taskId"],
+                    error_code="tiktok_schedule_outcome_unknown",
+                    message="TikTok 定时最终动作后结果不明",
+                    receipt={
+                        "scheduleMode": "platform_native",
+                        "scheduledAt": "2026-08-30 09:00",
+                        "scheduleTimezone": "Asia/Shanghai",
+                        "finalActionTriggered": True,
+                        "phase": "ambiguous",
+                        "publishedAt": None,
+                    },
+                )
+                with self.assertRaises(ControlledPublishError) as blocked:
+                    submit_request(request_for(grants[1]))
+
+            with database.connect() as conn:
+                formal_tasks = conn.execute(
+                    "SELECT COUNT(*) FROM publish_tasks WHERE mode = 'oneclick_publish'"
+                ).fetchone()[0]
+                claim = conn.execute(
+                    "SELECT taskId FROM tiktok_controlled_execution_claims WHERE mode = 'formal'"
+                ).fetchone()
+                authorization = conn.execute(
+                    "SELECT consumedAt FROM controlled_publish_authorizations WHERE authorizationId = ?",
+                    (grants[1]["authorizationId"],),
+                ).fetchone()
+
+        self.assertEqual(
+            blocked.exception.error_code,
+            "controlled_publish_outcome_ambiguous",
+        )
+        self.assertEqual(formal_tasks, 1)
+        self.assertEqual(claim["taskId"], first["taskId"])
+        self.assertIsNone(authorization["consumedAt"])
+
+    def test_scheduled_receipt_only_acceptance_never_releases_formal_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            database,
+            "DB_PATH",
+            Path(temporary) / "database.db",
+        ):
+            database.ensure_schema()
+            manifest, preflight, grants = self._seed_tiktok_preflight(
+                Path(temporary),
+                authorization_count=2,
+                target_schedule={
+                    "localTime": "2026-08-30 09:00",
+                    "timezone": "Asia/Shanghai",
+                },
+            )
+
+            def request_for(grant: dict) -> dict:
+                request = self._tiktok_request(
+                    manifest,
+                    mode="formal",
+                    confirmedPreflightTaskId=preflight["id"],
+                    authorizationId=grant["authorizationId"],
+                )
+                request["targets"][0]["schedule"] = {
+                    "localTime": "2026-08-30 09:00",
+                    "timezone": "Asia/Shanghai",
+                }
+                return request
+
+            with patch(
+                "app_core.account_service.list_publishable_accounts",
+                return_value=[self._tiktok_account()],
+            ), patch(
+                "app_core.publish_service.start_controlled_tiktok_publish",
+                side_effect=lambda task_id: task_service.get_task(task_id),
+            ):
+                first = submit_request(request_for(grants[0]))
+                task_service.fail_active_task(
+                    first["taskId"],
+                    error_code="tiktok_platform_execution_failed",
+                    message="TikTok 回读后收口失败",
+                    receipt={
+                        "scheduleMode": "platform_native",
+                        "scheduledAt": "2026-08-30 09:00",
+                        "scheduleTimezone": "Asia/Shanghai",
+                        "platformAccepted": True,
+                        "phase": "scheduled_accepted",
+                        "publishedAt": None,
+                    },
+                )
+                with self.assertRaises(ControlledPublishError) as blocked:
+                    submit_request(request_for(grants[1]))
+
+            with database.connect() as conn:
+                claim = conn.execute(
+                    "SELECT taskId FROM tiktok_controlled_execution_claims WHERE mode = 'formal'"
+                ).fetchone()
+                authorization = conn.execute(
+                    "SELECT consumedAt FROM controlled_publish_authorizations WHERE authorizationId = ?",
+                    (grants[1]["authorizationId"],),
+                ).fetchone()
+
+        self.assertEqual(
+            blocked.exception.error_code,
+            "controlled_publish_outcome_ambiguous",
+        )
+        self.assertEqual(claim["taskId"], first["taskId"])
+        self.assertIsNone(authorization["consumedAt"])
+
     def test_tiktok_modes_and_local_contract_fail_closed_before_task_start(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1631,6 +1779,98 @@ class ControlledPublishTests(unittest.TestCase):
         receipt = projected["platforms"][0]["receipt"]
         self.assertEqual(receipt["scheduledAt"], "2026-08-29 15:00")
         self.assertNotIn("publishedAt", receipt)
+
+    def test_tiktok_schedule_lifecycle_projects_before_generic_final_action(self) -> None:
+        payload = json.dumps(
+            [
+                {
+                    "type": 6,
+                    "accountIds": [61],
+                    "scheduleMode": "platform_native",
+                    "scheduledAt": "2026-08-29 15:00",
+                }
+            ],
+            ensure_ascii=False,
+        )
+        base = {
+            "id": 631,
+            "taskNo": "T631",
+            "mode": "oneclick_publish",
+            "status": "running",
+            "payloadJson": payload,
+        }
+        event_only = project_task(
+            {
+                **base,
+                "items": [{"platformType": 6, "status": "running"}],
+                "events": [
+                    {"eventType": "tiktok_final_action_triggered"},
+                    {"eventType": "tiktok_scheduled_accepted"},
+                ],
+            }
+        )
+        receipt_only = project_task(
+            {
+                **base,
+                "items": [
+                    {
+                        "platformType": 6,
+                        "status": "running",
+                        "receiptJson": json.dumps(
+                            {
+                                "phase": "scheduled_accepted",
+                                "publishedAt": None,
+                            }
+                        ),
+                    }
+                ],
+                "events": [{"eventType": "tiktok_final_action_triggered"}],
+            }
+        )
+        success = project_task(
+            {
+                **base,
+                "status": "success",
+                "items": [
+                    {
+                        "platformType": 6,
+                        "status": "success",
+                        "receiptJson": json.dumps(
+                            {
+                                "phase": "scheduled_readback_confirmed",
+                                "publishedAt": None,
+                            }
+                        ),
+                    }
+                ],
+                "events": [
+                    {"eventType": "tiktok_final_action_triggered"},
+                    {"eventType": "tiktok_scheduled_readback_confirmed"},
+                ],
+            }
+        )
+
+        self.assertEqual(event_only["stage"], "scheduled_accepted")
+        self.assertEqual(receipt_only["stage"], "scheduled_accepted")
+        self.assertEqual(success["stage"], "scheduled_readback_confirmed")
+        self.assertIsNone(success["platforms"][0]["receipt"]["publishedAt"])
+
+    def test_tiktok_immediate_final_action_projection_remains_reconciling(self) -> None:
+        projected = project_task(
+            {
+                "id": 632,
+                "taskNo": "T632",
+                "mode": "oneclick_publish",
+                "status": "running",
+                "payloadJson": json.dumps(
+                    [{"type": 6, "accountIds": [61], "scheduleMode": "immediate"}]
+                ),
+                "items": [{"platformType": 6, "status": "running"}],
+                "events": [{"eventType": "tiktok_final_action_triggered"}],
+            }
+        )
+
+        self.assertEqual(projected["stage"], "reconciling")
 
     def test_tiktok_ambiguous_receipt_sets_public_stage_without_event_message(self) -> None:
         projected = project_task(

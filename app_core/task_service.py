@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 from .account_service import PLATFORMS
 from .database import connect
 from .overseas_tiktok_errors import TikTokPublishError
+from .tiktok_schedule_contract import tiktok_irreversible_evidence_sql
 
 
 PAUSE_REASON_USER_REQUEST = "user_request"
@@ -635,6 +636,7 @@ def delete_tasks(task_ids: list[int]) -> int:
             task_numbers = "、".join(str(row["taskNo"]) for row in active_rows)
             raise ValueError(f"等待执行或执行中的任务不能删除：{task_numbers}")
 
+        irreversible = tiktok_irreversible_evidence_sql("task.id")
         protected_tiktok = conn.execute(
             f"""
             SELECT 1
@@ -647,20 +649,7 @@ def delete_tasks(task_ids: list[int]) -> int:
               )
               AND (
                   task.status = 'success'
-                  OR EXISTS (
-                      SELECT 1 FROM publish_task_events AS event
-                      WHERE event.taskId = task.id
-                        AND event.eventType IN (
-                            'tiktok_final_action_triggered',
-                            'tiktok_publish_outcome_ambiguous'
-                        )
-                  )
-                  OR EXISTS (
-                      SELECT 1 FROM publish_task_items AS item
-                      WHERE item.taskId = task.id
-                        AND item.platformType = 6
-                        AND item.errorCode = 'tiktok_publish_outcome_unknown'
-                  )
+                  OR {irreversible}
               )
             LIMIT 1
             """,

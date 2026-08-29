@@ -2179,6 +2179,92 @@ class TikTokTaskServiceTests(unittest.TestCase):
                     ).fetchone()
                 self.assertIsNotNone(claim)
 
+    def test_delete_tasks_preserves_item_only_scheduled_ambiguous_evidence(self) -> None:
+        task = self._task(scheduled=True)
+        self._claim(task["id"], mode="formal")
+        task_service.fail_active_task(
+            task["id"],
+            error_code="tiktok_schedule_outcome_unknown",
+            message="TikTok 定时最终动作后结果不明",
+            receipt={
+                "scheduleMode": "platform_native",
+                "scheduledAt": "2026-08-30 09:00",
+                "scheduleTimezone": "Asia/Shanghai",
+                "finalActionTriggered": True,
+                "phase": "ambiguous",
+                "publishedAt": None,
+            },
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "^TikTok 已发布或最终动作后的任务不能删除，必须保留防重复证据$",
+        ):
+            task_service.delete_tasks([task["id"]])
+
+        detail = task_service.get_task(task["id"])
+        self.assertIsNotNone(detail)
+        assert detail is not None
+        self.assertEqual(
+            detail["items"][0]["errorCode"],
+            "tiktok_schedule_outcome_unknown",
+        )
+        self.assertFalse(
+            any(
+                event["eventType"] in {
+                    "tiktok_final_action_triggered",
+                    "tiktok_publish_outcome_ambiguous",
+                }
+                for event in detail["events"]
+            )
+        )
+        with database.connect() as conn:
+            claim = conn.execute(
+                "SELECT taskId FROM tiktok_controlled_execution_claims WHERE taskId = ?",
+                (task["id"],),
+            ).fetchone()
+        self.assertIsNotNone(claim)
+
+    def test_delete_tasks_preserves_receipt_only_irreversible_schedule_evidence(self) -> None:
+        scenarios = (
+            {
+                "finalActionTriggered": True,
+                "phase": "final_action_triggered",
+            },
+            {
+                "platformAccepted": True,
+                "phase": "scheduled_accepted",
+            },
+            {
+                "scheduledReadbackConfirmed": True,
+                "phase": "scheduled_readback_confirmed",
+            },
+        )
+        for evidence in scenarios:
+            with self.subTest(evidence=evidence):
+                task = self._task(scheduled=True)
+                self._claim(task["id"], mode="formal")
+                task_service.fail_active_task(
+                    task["id"],
+                    error_code="tiktok_platform_execution_failed",
+                    message="TikTok 持久化回执后收口失败",
+                    receipt={
+                        "scheduleMode": "platform_native",
+                        "scheduledAt": "2026-08-30 09:00",
+                        "scheduleTimezone": "Asia/Shanghai",
+                        "publishedAt": None,
+                        **evidence,
+                    },
+                )
+
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "^TikTok 已发布或最终动作后的任务不能删除，必须保留防重复证据$",
+                ):
+                    task_service.delete_tasks([task["id"]])
+
+                self.assertIsNotNone(task_service.get_task(task["id"]))
+
 class DouyinGraphicMatrixTaskPersistenceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
