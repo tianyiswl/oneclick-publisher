@@ -293,6 +293,14 @@ def list_managed_accounts() -> list[dict]:
     return _list_accounts(include_youtube_oauth=True)
 
 
+def _is_publishable_facebook_page_account(account: Mapping[str, Any]) -> bool:
+    try:
+        validate_saved_facebook_page_account(account)
+    except FacebookPagePublishError:
+        return False
+    return True
+
+
 def list_publishable_accounts() -> list[dict]:
     """Return browser accounts plus official YouTube OAuth publishing rows."""
 
@@ -310,11 +318,7 @@ def list_publishable_accounts() -> list[dict]:
             )
             and (
                 int(row.get("type") or 0) != 9
-                or (
-                    int(row.get("status") or 0) == 1
-                    and bool(str(row.get("accountReference") or "").strip())
-                    and bool(str(row.get("filePath") or "").strip())
-                )
+                or _is_publishable_facebook_page_account(row)
             )
         )
         or (

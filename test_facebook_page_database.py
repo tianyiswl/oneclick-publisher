@@ -137,6 +137,52 @@ class FacebookPageDatabaseTests(unittest.TestCase):
         self.assertEqual(self.read_account(second)["filePath"], "shared-meta.json")
         self.assertEqual(self.read_account(second)["avatarPath"], "shared-meta.png")
 
+    def test_migration_uses_task1_page_id_normalization_for_all_legacy_values(self):
+        canonical = self.insert_account(
+            type=9, status=1, account_reference="\t1001\t"
+        )
+        duplicate = self.insert_account(type=9, status=1, account_reference="1001")
+        invalid_full_width = self.insert_account(
+            type=9, status=1, account_reference="１００２"
+        )
+        invalid_name = self.insert_account(
+            type=9, status=1, account_reference="legacy-name"
+        )
+        invalid_whitespace = self.insert_account(
+            type=9, status=1, account_reference="\t\n"
+        )
+
+        database.ensure_schema()
+
+        self.assertEqual(self.read_account(canonical)["accountReference"], "1001")
+        for account_id in (
+            duplicate,
+            invalid_full_width,
+            invalid_name,
+            invalid_whitespace,
+        ):
+            with self.subTest(account_id=account_id):
+                row = self.read_account(account_id)
+                self.assertEqual(row["accountReference"], "")
+                self.assertEqual(row["status"], 0)
+                self.assertNotIn(account_id, self.publishable_ids())
+
+    def test_upsert_normalizes_tab_wrapped_legacy_page_before_matching(self):
+        database.ensure_schema()
+        legacy_id = self.insert_account(
+            type=9, status=1, account_reference="\t1001\t"
+        )
+
+        saved_id = account_service.save_facebook_page_browser_account(
+            profile_name="Meta 主体",
+            storage_file_name="updated.json",
+            identity=self.identity("1001", "Updated Page"),
+        )
+
+        self.assertEqual(saved_id, legacy_id)
+        self.assertEqual(len(self.all_accounts()), 1)
+        self.assertEqual(self.read_account(legacy_id)["accountReference"], "1001")
+
     def test_migration_is_idempotent(self):
         self.insert_account(type=9, status=1, account_reference=" 1001 ")
         self.insert_account(type=9, status=1, account_reference="1001")
