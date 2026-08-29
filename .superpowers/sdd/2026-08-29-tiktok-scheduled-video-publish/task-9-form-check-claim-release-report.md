@@ -97,9 +97,13 @@ The tests explicitly retain:
 - combined specified set: `153/153` passed;
 - `git diff --check 1d4ceac..HEAD`: clean;
 - `git diff --check`: clean;
-- scope checker from `1d4ceac`: `owned=1`, `shared=4`, `outside=0`, expected
-  `REVIEW_REQUIRED` because this approved repair necessarily changes shared
-  claim/task service files.
+- scope checker for the code commit `1d4ceac..5bfbabf`: `owned=1`, `shared=4`,
+  `outside=0`, expected `REVIEW_REQUIRED` because this approved repair
+  necessarily changes shared claim/task service files;
+- scope checker for the final documentation HEAD `1d4ceac..7d380a0`:
+  `owned=1`, `shared=4`, `outside=2`, expected `REVIEW_REQUIRED`; the two
+  `outside` paths are the required SDD report and ledger under
+  `.superpowers/sdd/`, not production or test code.
 
 ## Commit
 
