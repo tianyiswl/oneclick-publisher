@@ -8,9 +8,11 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call, patch
+from zoneinfo import ZoneInfo
 
 from app_core import (
     account_service,
@@ -100,6 +102,7 @@ class TikTokPublishContractTests(unittest.TestCase):
         payload: dict | None = None,
         *,
         mode: str = "preflight",
+        now: datetime | None = None,
         account=_DEFAULT_ACCOUNT,
     ):
         row = self.account() if account is _DEFAULT_ACCOUNT else account
@@ -115,6 +118,7 @@ class TikTokPublishContractTests(unittest.TestCase):
             return overseas_tiktok_publish.validate_tiktok_payload(
                 payload or self.payload(),
                 mode=mode,
+                now=now,
             )
 
     def assert_error_code(
@@ -138,6 +142,63 @@ class TikTokPublishContractTests(unittest.TestCase):
         self.assertEqual(prepared["videoPath"], str(self.video.resolve()))
         self.assertEqual(prepared["topics"], ["OneClick", "AI工具"])
         self.assertEqual(prepared["plainCaption"], "TikTok 标题\n\n本地预检正文。")
+        self.assertEqual(prepared["scheduleMode"], "immediate")
+        self.assertIsNone(prepared["scheduledAt"])
+        self.assertEqual(prepared["scheduleTimezone"], "Asia/Shanghai")
+
+    def test_scheduled_preflight_returns_schedule_snapshot_without_platform_write(self) -> None:
+        now = datetime(2026, 8, 29, 14, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        payload = self.payload(
+            enableTimer=True,
+            scheduleTime="2026-08-29 15:00",
+            scheduleTimezone="Asia/Shanghai",
+            dailyTimes=["15:00"],
+        )
+
+        prepared = self.validate(payload, mode="preflight", now=now)
+
+        self.assertEqual(prepared["scheduleMode"], "platform_native")
+        self.assertEqual(prepared["scheduledAt"], "2026-08-29 15:00")
+        self.assertEqual(prepared["scheduleTimezone"], "Asia/Shanghai")
+
+    def test_scheduled_local_preflight_never_loads_playwright(self) -> None:
+        payload = self.payload(
+            enableTimer=True,
+            scheduleTime="2026-08-29 15:00",
+            scheduleTimezone="Asia/Shanghai",
+            dailyTimes=["15:00"],
+        )
+        with (
+            patch.object(overseas_tiktok_publish, "COOKIE_DIR", self.root),
+            patch.object(
+                overseas_tiktok_publish,
+                "_read_account_record",
+                return_value=self.account(),
+            ),
+            patch.object(
+                overseas_tiktok_publish,
+                "_load_async_playwright_factory",
+                side_effect=AssertionError("local preflight must remain offline"),
+            ),
+        ):
+            result = overseas_tiktok_publish.run_tiktok_local_preflight(
+                payload,
+                now=datetime(
+                    2026,
+                    8,
+                    29,
+                    14,
+                    0,
+                    tzinfo=ZoneInfo("Asia/Shanghai"),
+                ),
+            )
+
+        self.assertFalse(result["receipt"]["platformWriteOccurred"])
+        self.assertFalse(result["receipt"]["finalActionTriggered"])
+        self.assertEqual(result["receipt"]["scheduleMode"], "platform_native")
+        self.assertEqual(result["receipt"]["scheduledAt"], "2026-08-29 15:00")
+        self.assertEqual(result["receipt"]["scheduleTimezone"], "Asia/Shanghai")
+        self.assertIsNone(result["receipt"]["publishedAt"])
 
     def test_controlled_video_digest_is_checked_before_any_platform_execution(self) -> None:
         payload = self.payload(
@@ -184,8 +245,6 @@ class TikTokPublishContractTests(unittest.TestCase):
 
     def test_flat_and_nested_unsupported_settings_cannot_bypass_contract(self) -> None:
         cases = (
-            {"enableTimer": True},
-            {"scheduleTime": "2026-08-29 10:00"},
             {"schedule": {"localTime": "2026-08-29 10:00"}},
             {"visibility": "private"},
             {"settings": {"visibility": "private"}},
@@ -212,13 +271,20 @@ class TikTokPublishContractTests(unittest.TestCase):
         without_enable_timer.pop("enableTimer")
         without_daily_times = self.payload()
         without_daily_times.pop("dailyTimes")
-        cases = (
+        invalid_schedule_cases = (
             without_enable_timer,
             without_daily_times,
             self.payload(enableTimer=1),
             self.payload(scheduleTime="2026-08-29 10:00"),
             self.payload(dailyTimes=["10:00"]),
             self.payload(dailyTimes=()),
+            self.payload(scheduleTimezone="UTC"),
+        )
+        for payload in invalid_schedule_cases:
+            with self.subTest(payload=payload):
+                self.assert_error_code("tiktok_schedule_invalid", payload)
+
+        unsupported_legacy_cases = (
             self.payload(videosPerDay=True),
             self.payload(videosPerDay=2),
             self.payload(startDays=False),
@@ -230,22 +296,146 @@ class TikTokPublishContractTests(unittest.TestCase):
             self.payload(
                 schedule={"enabled": False, "localTime": "2026-08-29 10:00"}
             ),
+            self.payload(scheduledAt=None),
+            self.payload(publishSchedule=None),
+            self.payload(localTime=None),
             self.payload(publishAt=None),
         )
-        for payload in cases:
+        for payload in unsupported_legacy_cases:
             with self.subTest(payload=payload):
                 self.assert_error_code(
                     "tiktok_unsupported_publish_setting",
                     payload,
                 )
 
-        prepared = self.validate(
+        self.assert_error_code(
+            "tiktok_schedule_invalid",
             self.payload(
                 schedule={"enabled": False},
                 scheduleTimezone="UTC",
-            )
+            ),
         )
-        self.assertEqual(prepared["visibility"], "public")
+
+        scheduled = self.validate(
+            self.payload(
+                enableTimer=True,
+                scheduleTime="2026-08-29 15:00",
+                dailyTimes=["15:00"],
+            ),
+            now=datetime(
+                2026,
+                8,
+                29,
+                14,
+                0,
+                tzinfo=ZoneInfo("Asia/Shanghai"),
+            ),
+        )
+        self.assertEqual(scheduled["scheduleMode"], "platform_native")
+
+    def test_service_schedule_windows_are_thirty_minutes_then_fifteen_minutes(self) -> None:
+        shanghai = ZoneInfo("Asia/Shanghai")
+        preflight_now = datetime(2026, 8, 29, 14, 31, tzinfo=shanghai)
+        with self.assertRaises(overseas_tiktok_publish.TikTokPublishError) as raised:
+            self.validate(
+                self.payload(
+                    enableTimer=True,
+                    scheduleTime="2026-08-29 15:00",
+                    dailyTimes=["15:00"],
+                ),
+                now=preflight_now,
+            )
+        self.assertEqual(raised.exception.error_code, "tiktok_schedule_out_of_range")
+
+        for mode, runtime_mode in (
+            ("platform_form_check", "platform_form_check"),
+            ("formal", "publish"),
+        ):
+            with self.subTest(mode=mode):
+                prepared = self.validate(
+                    self.payload(
+                        runtimeMode=runtime_mode,
+                        debugDryRun=False,
+                        enableTimer=True,
+                        scheduleTime="2026-08-29 15:00",
+                        dailyTimes=["15:00"],
+                    ),
+                    mode=mode,
+                    now=datetime(2026, 8, 29, 14, 40, tzinfo=shanghai),
+                )
+                self.assertEqual(prepared["scheduledAt"], "2026-08-29 15:00")
+
+        with self.assertRaises(overseas_tiktok_publish.TikTokPublishError) as raised:
+            self.validate(
+                self.payload(
+                    runtimeMode="publish",
+                    debugDryRun=False,
+                    enableTimer=True,
+                    scheduleTime="2026-08-29 15:00",
+                    dailyTimes=["15:00"],
+                ),
+                mode="formal",
+                now=datetime(2026, 8, 29, 14, 46, tzinfo=shanghai),
+            )
+        self.assertEqual(raised.exception.error_code, "tiktok_schedule_out_of_range")
+
+    def test_service_schedule_window_keeps_ten_day_maximum_in_every_mode(self) -> None:
+        shanghai = ZoneInfo("Asia/Shanghai")
+        now = datetime(2026, 8, 29, 14, 0, tzinfo=shanghai)
+        for mode, runtime_mode in (
+            ("preflight", "preflight"),
+            ("platform_form_check", "platform_form_check"),
+            ("formal", "publish"),
+        ):
+            with self.subTest(mode=mode), self.assertRaises(
+                overseas_tiktok_publish.TikTokPublishError
+            ) as raised:
+                self.validate(
+                    self.payload(
+                        runtimeMode=runtime_mode,
+                        debugDryRun=mode == "preflight",
+                        enableTimer=True,
+                        scheduleTime="2026-09-08 14:01",
+                        dailyTimes=["14:01"],
+                    ),
+                    mode=mode,
+                    now=now,
+                )
+            self.assertEqual(
+                raised.exception.error_code,
+                "tiktok_schedule_out_of_range",
+            )
+
+    def test_final_schedule_gate_uses_only_prepared_snapshot(self) -> None:
+        shanghai = ZoneInfo("Asia/Shanghai")
+        prepared = {
+            "scheduleMode": "platform_native",
+            "scheduledAt": "2026-08-29 15:00",
+            "scheduleTimezone": "Asia/Shanghai",
+            "enableTimer": False,
+            "scheduleTime": "2030-01-01 00:00",
+            "dailyTimes": ["00:00", "01:00"],
+        }
+        overseas_tiktok_publish.validate_tiktok_final_schedule_window(
+            prepared,
+            now=datetime(2026, 8, 29, 14, 45, tzinfo=shanghai),
+        )
+
+        with self.assertRaises(overseas_tiktok_publish.TikTokPublishError) as raised:
+            overseas_tiktok_publish.validate_tiktok_final_schedule_window(
+                prepared,
+                now=datetime(2026, 8, 29, 14, 46, tzinfo=shanghai),
+            )
+        self.assertEqual(raised.exception.error_code, "tiktok_schedule_out_of_range")
+
+        overseas_tiktok_publish.validate_tiktok_final_schedule_window(
+            {
+                "scheduleMode": "immediate",
+                "scheduledAt": "ignored raw alias",
+                "scheduleTimezone": "ignored raw alias",
+            },
+            now=datetime(2026, 8, 29, 14, 46),
+        )
 
     def test_schedule_fields_are_root_only_and_root_schedule_has_exact_keys(self) -> None:
         nested_cases = (
@@ -286,10 +476,10 @@ class TikTokPublishContractTests(unittest.TestCase):
                     self.payload(**changes),
                 )
 
-        prepared = self.validate(
-            self.payload(schedule={"enabled": False, "timezone": "UTC"})
+        self.assert_error_code(
+            "tiktok_unsupported_publish_setting",
+            self.payload(schedule={"enabled": False, "timezone": "UTC"}),
         )
-        self.assertEqual(prepared["visibility"], "public")
 
     def test_schedule_timezone_aliases_are_rejected_outside_root_schedule(self) -> None:
         cases = (
@@ -348,10 +538,10 @@ class TikTokPublishContractTests(unittest.TestCase):
                     self.payload(**changes),
                 )
 
-        prepared = self.validate(
-            self.payload(schedule={"enabled": False, "timezone": "UTC"})
+        self.assert_error_code(
+            "tiktok_unsupported_publish_setting",
+            self.payload(schedule={"enabled": False, "timezone": "UTC"}),
         )
-        self.assertEqual(prepared["visibility"], "public")
 
     def test_account_ids_and_session_lists_must_each_resolve_to_same_single_account(self) -> None:
         second = self.root / "second.json"
@@ -907,6 +1097,9 @@ class TikTokPublishContractTests(unittest.TestCase):
                 "topics",
                 "visibility",
                 "mode",
+                "scheduleMode",
+                "scheduledAt",
+                "scheduleTimezone",
             },
         )
         self.assertEqual(
@@ -978,6 +1171,14 @@ class TikTokPublishContractTests(unittest.TestCase):
                 "contentId": marker,
                 "contentUrl": f"https://www.tiktok.com/{marker}",
                 "publishedAt": marker,
+                "scheduleMode": marker,
+                "scheduledAt": marker,
+                "scheduleTimezone": marker,
+                "scheduleToggleEnabled": 1,
+                "platformAccepted": marker,
+                "scheduledReadbackConfirmed": {"value": True},
+                "scheduleSnapshot": {"scheduledAt": "2026-08-29 15:00"},
+                "cookie": marker,
             },
         )
         self.assertEqual(unsafe.receipt, {})
@@ -1007,6 +1208,12 @@ class TikTokPublishContractTests(unittest.TestCase):
                     "7512345678901234567"
                 ),
                 "publishedAt": "2026-08-28T12:30:00+08:00",
+                "scheduleMode": "platform_native",
+                "scheduledAt": "2026-08-29 15:00",
+                "scheduleTimezone": "Asia/Shanghai",
+                "scheduleToggleEnabled": True,
+                "platformAccepted": True,
+                "scheduledReadbackConfirmed": True,
             },
         )
         self.assertEqual(safe.receipt["accountId"], 61)
@@ -1021,6 +1228,44 @@ class TikTokPublishContractTests(unittest.TestCase):
             "https://www.tiktok.com/@expected.user/video/7512345678901234567",
         )
         self.assertEqual(safe.receipt["publishedAt"], "2026-08-28T12:30:00+08:00")
+        self.assertEqual(safe.receipt["scheduleMode"], "platform_native")
+        self.assertEqual(safe.receipt["scheduledAt"], "2026-08-29 15:00")
+        self.assertEqual(safe.receipt["scheduleTimezone"], "Asia/Shanghai")
+        self.assertTrue(safe.receipt["scheduleToggleEnabled"])
+        self.assertTrue(safe.receipt["platformAccepted"])
+        self.assertTrue(safe.receipt["scheduledReadbackConfirmed"])
+
+        for phase in ("scheduled_accepted", "scheduled_readback_confirmed"):
+            with self.subTest(phase=phase):
+                phase_receipt = overseas_tiktok_publish.TikTokPublishError(
+                    "tiktok_publish_outcome_unknown",
+                    "发布结果待确认",
+                    receipt={"phase": phase},
+                )
+                self.assertEqual(phase_receipt.receipt, {"phase": phase})
+
+    def test_schedule_receipt_fields_reject_near_miss_values(self) -> None:
+        cases = (
+            ("scheduleMode", "scheduled"),
+            ("scheduleMode", {"mode": "platform_native"}),
+            ("scheduledAt", "2026-8-29 15:00"),
+            ("scheduledAt", "2026-08-29T15:00"),
+            ("scheduledAt", "2026-02-29 15:00"),
+            ("scheduleTimezone", "UTC"),
+            ("scheduleTimezone", ["Asia/Shanghai"]),
+            ("scheduleToggleEnabled", 1),
+            ("platformAccepted", "true"),
+            ("scheduledReadbackConfirmed", None),
+            ("phase", "scheduled"),
+        )
+        for key, value in cases:
+            with self.subTest(key=key, value=value):
+                receipt = overseas_tiktok_publish.TikTokPublishError(
+                    "tiktok_publish_outcome_unknown",
+                    "发布结果待确认",
+                    receipt={key: value},
+                ).receipt
+                self.assertEqual(receipt, {})
 
 
 class TikTokPlatformSyncTests(unittest.TestCase):
@@ -1040,7 +1285,13 @@ class TikTokPlatformSyncTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def prepared(self, *, mode: str) -> dict:
+    def prepared(
+        self,
+        *,
+        mode: str,
+        schedule_mode: str = "immediate",
+        scheduled_at: str | None = None,
+    ) -> dict:
         caption = "TikTok 标题\n\n受控发布正文 #OneClick #AI工具"
         return {
             "accountId": 61,
@@ -1055,6 +1306,9 @@ class TikTokPlatformSyncTests(unittest.TestCase):
             "textSha256": hashlib.sha256(caption.encode("utf-8")).hexdigest(),
             "visibility": "public",
             "mode": mode,
+            "scheduleMode": schedule_mode,
+            "scheduledAt": scheduled_at,
+            "scheduleTimezone": "Asia/Shanghai",
         }
 
     def form_receipt(self, **changes) -> dict:
@@ -1094,6 +1348,8 @@ class TikTokPlatformSyncTests(unittest.TestCase):
         verification_effect=None,
         event_sink: list[str] | None = None,
         cleanup_error: Exception | None = None,
+        prepared: dict | None = None,
+        shanghai_now: datetime | None = None,
     ):
         uploader = uploader or self.fake_uploader()
         identity_page = SimpleNamespace(
@@ -1154,7 +1410,21 @@ class TikTokPlatformSyncTests(unittest.TestCase):
             patch.object(
                 overseas_tiktok_publish,
                 "validate_tiktok_payload",
-                return_value=self.prepared(mode=mode),
+                return_value=prepared or self.prepared(mode=mode),
+            ),
+            patch.object(
+                overseas_tiktok_publish,
+                "_shanghai_now",
+                return_value=shanghai_now
+                or datetime(
+                    2026,
+                    8,
+                    29,
+                    14,
+                    0,
+                    tzinfo=ZoneInfo("Asia/Shanghai"),
+                ),
+                create=True,
             ),
             patch.object(overseas_tiktok_publish, "_read_account_record", account_reader),
             patch.object(
@@ -1334,6 +1604,33 @@ class TikTokPlatformSyncTests(unittest.TestCase):
         click_index = order.index("click")
         self.assertEqual(order[click_index - 1], "tiktok_final_action_triggered")
         self.assertEqual(order.count("tiktok_final_action_triggered"), 1)
+
+    def test_formal_rechecks_fifteen_minute_window_before_final_action(self) -> None:
+        uploader = self.fake_uploader()
+        prepared = self.prepared(
+            mode="formal",
+            schedule_mode="platform_native",
+            scheduled_at="2026-08-29 15:00",
+        )
+
+        with self.assertRaises(overseas_tiktok_publish.TikTokPublishError) as raised:
+            self.run_sync(
+                mode="formal",
+                uploader=uploader,
+                prepared=prepared,
+                shanghai_now=datetime(
+                    2026,
+                    8,
+                    29,
+                    14,
+                    46,
+                    tzinfo=ZoneInfo("Asia/Shanghai"),
+                ),
+            )
+
+        self.assertEqual(raised.exception.error_code, "tiktok_schedule_out_of_range")
+        uploader.prepare_form.assert_awaited_once()
+        uploader.submit_once.assert_not_awaited()
 
     def test_identity_mismatch_stops_before_upload_and_session_refresh(self) -> None:
         uploader = self.fake_uploader()

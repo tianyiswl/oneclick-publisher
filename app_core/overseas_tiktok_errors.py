@@ -20,6 +20,12 @@ _PUBLIC_RECEIPT_KEYS = frozenset(
         "contentId",
         "contentUrl",
         "publishedAt",
+        "scheduleMode",
+        "scheduledAt",
+        "scheduleTimezone",
+        "scheduleToggleEnabled",
+        "platformAccepted",
+        "scheduledReadbackConfirmed",
     }
 )
 _PUBLIC_MODES = frozenset({"preflight", "platform_form_check", "formal"})
@@ -31,6 +37,8 @@ _PUBLIC_PHASES = frozenset(
         "final_action_triggered",
         "platform_accepted",
         "published_readback_confirmed",
+        "scheduled_accepted",
+        "scheduled_readback_confirmed",
         "ambiguous",
     }
 )
@@ -42,6 +50,9 @@ _TIKTOK_SHORT_PATH = re.compile(r"/[A-Za-z0-9]{1,64}/?\Z")
 _SAFE_TIME = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
     r"(?:\.[0-9]{1,6})?(?:Z|[+-][0-9]{2}:[0-9]{2})\Z"
+)
+_SAFE_SCHEDULE_TIME = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}\Z"
 )
 
 
@@ -77,6 +88,16 @@ def _safe_timestamp(value: object) -> bool:
     return True
 
 
+def _safe_schedule_time(value: object) -> bool:
+    if type(value) is not str or _SAFE_SCHEDULE_TIME.fullmatch(value) is None:
+        return False
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%d %H:%M")
+    except ValueError:
+        return False
+    return parsed.strftime("%Y-%m-%d %H:%M") == value
+
+
 def _safe_receipt_value(key: str, value: object) -> bool:
     if key == "accountId":
         return type(value) is int and value > 0
@@ -96,6 +117,18 @@ def _safe_receipt_value(key: str, value: object) -> bool:
         return value is None or _safe_tiktok_url(value)
     if key == "publishedAt":
         return value is None or _safe_timestamp(value)
+    if key == "scheduleMode":
+        return type(value) is str and value in {"immediate", "platform_native"}
+    if key == "scheduledAt":
+        return _safe_schedule_time(value)
+    if key == "scheduleTimezone":
+        return type(value) is str and value == "Asia/Shanghai"
+    if key in {
+        "scheduleToggleEnabled",
+        "platformAccepted",
+        "scheduledReadbackConfirmed",
+    }:
+        return type(value) is bool
     return False
 
 

@@ -15,7 +15,7 @@ import math
 import re
 import sqlite3
 import unicodedata
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 from urllib.parse import urlsplit
@@ -38,6 +38,14 @@ from .overseas_tiktok_identity import (
     validate_identity_binding,
 )
 from .paths import COOKIE_DIR, DB_PATH
+from .tiktok_schedule_contract import (
+    SHANGHAI,
+    SHANGHAI_NAME,
+    TikTokScheduleContractError,
+    TikTokScheduleIntent,
+    parse_tiktok_schedule_fields,
+    validate_tiktok_schedule_window,
+)
 
 
 TIKTOK_CONTENT_LIMIT = 2200
@@ -259,15 +267,6 @@ def _validate_sensitive_alias_locations(payload: Mapping[str, Any]) -> None:
                     visit(override, _CONTENT_SENSITIVE_KEYS)
         elif key not in _SENSITIVE_ALIAS_KEYS:
             visit(value, frozenset())
-def _schedule_requested(value: object) -> bool:
-    if not isinstance(value, Mapping):
-        return _is_nonempty(value)
-    return bool(value.get("enabled") is True) or any(
-        _is_nonempty(value.get(key))
-        for key in ("localTime", "scheduleTime", "scheduledAt")
-    )
-
-
 def _ai_requested(value: object) -> bool:
     if not isinstance(value, Mapping):
         return value is True or _is_nonempty(value)
@@ -308,6 +307,10 @@ def _validate_schedule_locations(payload: Mapping[str, Any]) -> None:
                         or not value["timezone"].strip()
                     )
                 )
+                or (
+                    "timezone" in value
+                    and value["timezone"] != payload.get("scheduleTimezone")
+                )
             ):
                 _fail(
                     "tiktok_unsupported_publish_setting",
@@ -329,18 +332,8 @@ def _validate_schedule_locations(payload: Mapping[str, Any]) -> None:
             visit_nonroot(value)
 
 
-def _validate_immediate_schedule(payload: Mapping[str, Any]) -> None:
+def _validate_schedule_fields(payload: Mapping[str, Any]) -> TikTokScheduleIntent:
     _validate_schedule_locations(payload)
-    if payload.get("enableTimer") is not False:
-        _fail(
-            "tiktok_unsupported_publish_setting",
-            "TikTok 首版不支持定时时间，只支持立即公开发布",
-        )
-    if type(payload.get("dailyTimes")) is not list or payload["dailyTimes"] != []:
-        _fail(
-            "tiktok_unsupported_publish_setting",
-            "TikTok 首版不支持定时时间列表",
-        )
     exact_integers = {
         "videosPerDay": 1,
         "startDays": 0,
@@ -381,22 +374,70 @@ def _validate_immediate_schedule(payload: Mapping[str, Any]) -> None:
                     "tiktok_unsupported_publish_setting",
                     "TikTok 定时字段无效",
                 )
-            if key in {
-                "scheduletime",
-                "scheduledat",
-                "publishschedule",
-                "localtime",
-            } and _is_nonempty(value):
+            if key in {"scheduledat", "publishschedule", "localtime"}:
                 _fail(
                     "tiktok_unsupported_publish_setting",
-                    "TikTok 首版不支持定时时间",
+                    "TikTok 定时字段无效",
                 )
-            if key == "schedule" and value is not None:
-                if not isinstance(value, Mapping) or value.get("enabled") is not False:
+            if key == "schedule" and value is not None and isinstance(value, Mapping):
+                if payload.get("enableTimer") is True:
                     _fail(
                         "tiktok_unsupported_publish_setting",
-                        "TikTok 首版不支持定时时间",
+                        "TikTok 定时字段冲突",
                     )
+
+    try:
+        return parse_tiktok_schedule_fields(
+            enable_timer=payload.get("enableTimer"),
+            schedule_time=payload.get("scheduleTime"),
+            schedule_timezone=payload.get("scheduleTimezone"),
+            daily_times=payload.get("dailyTimes"),
+        )
+    except TikTokScheduleContractError as exc:
+        _fail(exc.error_code, exc.public_message)
+
+
+def _shanghai_now() -> datetime:
+    return datetime.now(SHANGHAI)
+
+
+def _prepared_schedule_intent(
+    prepared: Mapping[str, Any],
+) -> TikTokScheduleIntent:
+    mode = prepared.get("scheduleMode")
+    if mode == "immediate":
+        return TikTokScheduleIntent("immediate", None, SHANGHAI_NAME, None)
+    if (
+        mode != "platform_native"
+        or type(prepared.get("scheduledAt")) is not str
+        or prepared.get("scheduleTimezone") != SHANGHAI_NAME
+    ):
+        _fail("tiktok_schedule_invalid", "TikTok 排期快照无效")
+    try:
+        return parse_tiktok_schedule_fields(
+            enable_timer=True,
+            schedule_time=prepared["scheduledAt"],
+            schedule_timezone=prepared["scheduleTimezone"],
+            daily_times=[prepared["scheduledAt"][-5:]],
+        )
+    except TikTokScheduleContractError as exc:
+        _fail(exc.error_code, exc.public_message)
+
+
+def validate_tiktok_final_schedule_window(
+    prepared: Mapping[str, Any],
+    *,
+    now: datetime | None = None,
+) -> None:
+    intent = _prepared_schedule_intent(prepared)
+    try:
+        validate_tiktok_schedule_window(
+            intent,
+            now=now or _shanghai_now(),
+            minimum_lead=timedelta(minutes=15),
+        )
+    except TikTokScheduleContractError as exc:
+        _fail(exc.error_code, exc.public_message)
 
 
 def _validate_unsupported_settings(payload: Mapping[str, Any]) -> str:
@@ -406,17 +447,6 @@ def _validate_unsupported_settings(payload: Mapping[str, Any]) -> str:
             key = str(raw_key).strip().lower()
             if key == "visibility" and _is_nonempty(value):
                 visibility_values.append(str(value).strip().lower())
-            elif key == "enabletimer" and value is True:
-                _fail(
-                    "tiktok_unsupported_publish_setting",
-                    "TikTok 首版不支持定时时间，只支持立即公开发布",
-                )
-            elif key in {"scheduletime", "scheduledat", "schedule", "publishschedule"}:
-                if _schedule_requested(value):
-                    _fail(
-                        "tiktok_unsupported_publish_setting",
-                        "TikTok 首版不支持定时时间，只支持立即公开发布",
-                    )
             elif key in {
                 "aigenerated",
                 "aidisclosure",
@@ -913,6 +943,7 @@ def validate_tiktok_payload(
     payload: Mapping[str, Any],
     *,
     mode: str,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
     """规范化 TikTok 输入，只读本地资料，不启动平台。"""
 
@@ -953,7 +984,19 @@ def validate_tiktok_payload(
         )
         _fail("tiktok_unsupported_publish_setting", message)
 
-    _validate_immediate_schedule(payload)
+    schedule_intent = _validate_schedule_fields(payload)
+    try:
+        validate_tiktok_schedule_window(
+            schedule_intent,
+            now=now or _shanghai_now(),
+            minimum_lead=(
+                timedelta(minutes=30)
+                if mode == "preflight"
+                else timedelta(minutes=15)
+            ),
+        )
+    except TikTokScheduleContractError as exc:
+        _fail(exc.error_code, exc.public_message)
     visibility = _validate_unsupported_settings(payload)
     account_id, account = _account_identity(payload)
     session_path = _session_path(payload, account)
@@ -1009,13 +1052,20 @@ def validate_tiktok_payload(
         "textSha256": hashlib.sha256(combined.encode("utf-8")).hexdigest(),
         "visibility": visibility,
         "mode": mode,
+        "scheduleMode": schedule_intent.mode,
+        "scheduledAt": schedule_intent.local_time,
+        "scheduleTimezone": schedule_intent.timezone,
     }
 
 
-def run_tiktok_local_preflight(payload: Mapping[str, Any]) -> dict[str, Any]:
+def run_tiktok_local_preflight(
+    payload: Mapping[str, Any],
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
     """运行零平台写入的 TikTok 本地预检。"""
 
-    prepared = validate_tiktok_payload(payload, mode="preflight")
+    prepared = validate_tiktok_payload(payload, mode="preflight", now=now)
     return {
         "type": 6,
         "platform": "TikTok",
@@ -1029,6 +1079,9 @@ def run_tiktok_local_preflight(payload: Mapping[str, Any]) -> dict[str, Any]:
             "topics": list(prepared["topics"]),
             "visibility": prepared["visibility"],
             "mode": prepared["mode"],
+            "scheduleMode": prepared["scheduleMode"],
+            "scheduledAt": prepared["scheduledAt"],
+            "scheduleTimezone": prepared["scheduleTimezone"],
         },
         "receipt": {
             "accountId": prepared["accountId"],
@@ -1038,6 +1091,9 @@ def run_tiktok_local_preflight(payload: Mapping[str, Any]) -> dict[str, Any]:
             "contentId": None,
             "contentUrl": None,
             "publishedAt": None,
+            "scheduleMode": prepared["scheduleMode"],
+            "scheduledAt": prepared["scheduledAt"],
+            "scheduleTimezone": prepared["scheduleTimezone"],
         },
     }
 
@@ -1440,6 +1496,7 @@ async def _run_tiktok_platform(
                 "receipt": receipt,
             }
 
+        validate_tiktok_final_schedule_window(prepared)
         uploader.publish_confirmed = True
         if not final_button_instrumented:
             trigger_final_action()
@@ -1632,5 +1689,6 @@ __all__ = [
     "payload_has_tiktok_platform_signal",
     "run_tiktok_local_preflight",
     "run_tiktok_platform_sync",
+    "validate_tiktok_final_schedule_window",
     "validate_tiktok_payload",
 ]
