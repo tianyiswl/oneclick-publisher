@@ -7,9 +7,11 @@ import sqlite3
 import tempfile
 import threading
 import unittest
+from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 from app_core.controlled_publish import (
     ControlledPublishError,
@@ -29,7 +31,7 @@ from app_core.controlled_publish import (
     scope_fingerprint,
     submit_request,
 )
-from app_core import database, publish_service, task_service
+from app_core import controlled_publish, database, publish_service, task_service
 from app_core.douyin_graphic_matrix_service import prepare_matrix
 
 
@@ -174,12 +176,18 @@ class ControlledPublishTests(unittest.TestCase):
         root: Path,
         *,
         authorization_count: int,
+        target_schedule: Mapping[str, str] | None = None,
     ) -> tuple[Path, dict, list[dict]]:
         manifest = self._tiktok_bundle(root)
+        request = self._tiktok_request(manifest)
+        request["targets"][0]["schedule"] = (
+            dict(target_schedule) if target_schedule is not None else None
+        )
         preflight_payloads = build_controlled_payloads(
-            self._tiktok_request(manifest),
+            request,
             accounts=[self._tiktok_account()],
         )
+        preflight_payload = preflight_payloads[0]
         preflight = task_service.create_pending_task(
             preflight_payloads,
             mode="oneclick_preflight",
@@ -197,6 +205,9 @@ class ControlledPublishTests(unittest.TestCase):
                 "platformWriteOccurred": False,
                 "finalActionTriggered": False,
                 "phase": "local_preflight_passed",
+                "scheduleMode": preflight_payload.get("scheduleMode"),
+                "scheduledAt": preflight_payload.get("scheduledAt"),
+                "scheduleTimezone": preflight_payload.get("scheduleTimezone"),
             },
         )
         grants = []
@@ -349,6 +360,240 @@ class ControlledPublishTests(unittest.TestCase):
         self.assertFalse(payload["overseasVideoPublishConfirmed"])
         self.assertEqual(payload["tiktokExpectedAccountReference"], "expected.user")
         self.assertEqual(payload["tiktokExecutionIntent"], "formal_public")
+
+    def test_tiktok_target_accepts_one_beijing_platform_schedule(self) -> None:
+        now = datetime(2026, 8, 29, 14, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest = self._tiktok_bundle(Path(temporary))
+            request = self._tiktok_request(manifest)
+            request["targets"][0]["schedule"] = {
+                "localTime": "2026-08-29 15:00",
+                "timezone": "Asia/Shanghai",
+            }
+            payload = build_controlled_payloads(
+                request,
+                accounts=[self._tiktok_account()],
+                schedule_now=now,
+            )[0]
+
+        self.assertTrue(payload["enableTimer"])
+        self.assertEqual(payload["scheduleTime"], "2026-08-29 15:00")
+        self.assertEqual(payload["dailyTimes"], ["15:00"])
+        self.assertEqual(payload["scheduleMode"], "platform_native")
+        self.assertEqual(payload["scheduledAt"], "2026-08-29 15:00")
+        self.assertEqual(payload["tiktokExecutionIntent"], "formal_public")
+
+    def test_tiktok_schedule_change_invalidates_preflight_authorization_without_consuming_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            database,
+            "DB_PATH",
+            Path(temporary) / "database.db",
+        ), patch.object(
+            controlled_publish,
+            "_shanghai_now",
+            return_value=datetime(
+                2026,
+                8,
+                29,
+                14,
+                0,
+                tzinfo=ZoneInfo("Asia/Shanghai"),
+            ),
+        ):
+            database.ensure_schema()
+            schedule = {
+                "localTime": "2026-08-29 15:00",
+                "timezone": "Asia/Shanghai",
+            }
+            manifest, preflight, grants = self._seed_tiktok_preflight(
+                Path(temporary),
+                authorization_count=1,
+                target_schedule=schedule,
+            )
+            formal = self._tiktok_request(
+                manifest,
+                mode="formal",
+                confirmedPreflightTaskId=preflight["id"],
+                authorizationId=grants[0]["authorizationId"],
+            )
+            formal["targets"][0]["schedule"] = {
+                "localTime": "2026-08-29 15:01",
+                "timezone": "Asia/Shanghai",
+            }
+            with patch(
+                "app_core.account_service.list_publishable_accounts",
+                return_value=[self._tiktok_account()],
+            ), self.assertRaises(ControlledPublishError) as raised:
+                submit_request(formal)
+            with database.connect() as conn:
+                authorization = conn.execute(
+                    "SELECT consumedAt FROM controlled_publish_authorizations WHERE authorizationId = ?",
+                    (grants[0]["authorizationId"],),
+                ).fetchone()
+                formal_tasks = conn.execute(
+                    "SELECT COUNT(*) FROM publish_tasks WHERE mode = 'oneclick_publish'"
+                ).fetchone()[0]
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "controlled_authorization_scope_mismatch",
+        )
+        self.assertIsNone(authorization["consumedAt"])
+        self.assertEqual(formal_tasks, 0)
+
+    def test_tiktok_schedule_rejects_creation_window_boundaries(self) -> None:
+        now = datetime(2026, 8, 29, 14, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        cases = (
+            ("29_minutes", "2026-08-29 14:29"),
+            ("10_days_plus_1_minute", "2026-09-08 14:01"),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest = self._tiktok_bundle(Path(temporary))
+            for label, local_time in cases:
+                request = self._tiktok_request(manifest)
+                request["targets"][0]["schedule"] = {
+                    "localTime": local_time,
+                    "timezone": "Asia/Shanghai",
+                }
+                with self.subTest(label=label), self.assertRaises(
+                    ControlledPublishError
+                ) as raised:
+                    build_controlled_payloads(
+                        request,
+                        accounts=[self._tiktok_account()],
+                        schedule_now=now,
+                    )
+                self.assertEqual(
+                    raised.exception.error_code,
+                    "tiktok_schedule_out_of_range",
+                )
+
+    def test_tiktok_schedule_rejects_wrong_timezone_and_extra_key(self) -> None:
+        now = datetime(2026, 8, 29, 14, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        cases = (
+            ("empty", {}),
+            (
+                "timezone",
+                {
+                    "localTime": "2026-08-29 15:00",
+                    "timezone": "UTC",
+                },
+            ),
+            (
+                "extra_key",
+                {
+                    "localTime": "2026-08-29 15:00",
+                    "timezone": "Asia/Shanghai",
+                    "fold": "0",
+                },
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest = self._tiktok_bundle(Path(temporary))
+            for label, schedule in cases:
+                request = self._tiktok_request(manifest)
+                request["targets"][0]["schedule"] = schedule
+                with self.subTest(label=label), self.assertRaises(
+                    ControlledPublishError
+                ) as raised:
+                    build_controlled_payloads(
+                        request,
+                        accounts=[self._tiktok_account()],
+                        schedule_now=now,
+                    )
+                self.assertEqual(
+                    raised.exception.error_code,
+                    "tiktok_schedule_invalid",
+                )
+
+    def test_tiktok_immediate_schedule_remains_compatible(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest = self._tiktok_bundle(Path(temporary))
+            payload = build_controlled_payloads(
+                self._tiktok_request(manifest),
+                accounts=[self._tiktok_account()],
+            )[0]
+
+        self.assertFalse(payload["enableTimer"])
+        self.assertIsNone(payload["scheduleTime"])
+        self.assertEqual(payload["dailyTimes"], [])
+        self.assertEqual(payload["scheduleMode"], "immediate")
+        self.assertIsNone(payload["scheduledAt"])
+        self.assertEqual(payload["tiktokExecutionIntent"], "formal_public")
+
+    def test_tiktok_forbidden_schedule_aliases_fail_before_task_creation(self) -> None:
+        aliases = (
+            ("root_scheduledAt", "root", "scheduledAt", "2026-08-29 15:00"),
+            ("root_publishAt", "root", "publishAt", "2026-08-29 15:00"),
+            (
+                "nested_scheduleTime",
+                "schedule",
+                "scheduleTime",
+                "2026-08-29 15:00",
+            ),
+            (
+                "nested_scheduledAt",
+                "schedule",
+                "scheduledAt",
+                "2026-08-29 15:00",
+            ),
+            (
+                "nested_publishAt",
+                "schedule",
+                "publishAt",
+                "2026-08-29 15:00",
+            ),
+            ("runtime_enableTimer", "target", "enableTimer", True),
+            (
+                "runtime_scheduleTime",
+                "target",
+                "scheduleTime",
+                "2026-08-29 15:00",
+            ),
+            (
+                "runtime_scheduleTimezone",
+                "target",
+                "scheduleTimezone",
+                "Asia/Shanghai",
+            ),
+            ("runtime_dailyTimes", "target", "dailyTimes", ["15:00"]),
+        )
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            database,
+            "DB_PATH",
+            Path(temporary) / "database.db",
+        ):
+            database.ensure_schema()
+            manifest = self._tiktok_bundle(Path(temporary))
+            for label, location, key, value in aliases:
+                request = self._tiktok_request(manifest)
+                if location == "root":
+                    request[key] = value
+                elif location == "schedule":
+                    request["targets"][0]["schedule"] = {
+                        "localTime": "2026-08-29 15:00",
+                        "timezone": "Asia/Shanghai",
+                        key: value,
+                    }
+                else:
+                    request["targets"][0][key] = value
+                with patch(
+                    "app_core.account_service.list_publishable_accounts",
+                    return_value=[self._tiktok_account()],
+                ), self.subTest(label=label), self.assertRaises(
+                    ControlledPublishError
+                ) as raised:
+                    submit_request(request)
+                self.assertEqual(
+                    raised.exception.error_code,
+                    "tiktok_schedule_invalid",
+                )
+            with database.connect() as conn:
+                task_count = conn.execute(
+                    "SELECT COUNT(*) FROM publish_tasks"
+                ).fetchone()[0]
+
+        self.assertEqual(task_count, 0)
 
     def test_tiktok_platform_form_check_requires_literal_confirmation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1016,41 +1261,6 @@ class ControlledPublishTests(unittest.TestCase):
                     "tiktok_account_invalid",
                 ),
                 (
-                    "schedule",
-                    self._tiktok_request(
-                        manifest,
-                        targets=[
-                            {
-                                "platform": "TikTok",
-                                "accountId": 61,
-                                "schedule": {
-                                    "localTime": "2026-08-28 10:00",
-                                    "timezone": "Asia/Shanghai",
-                                },
-                                "settings": {"visibility": "public"},
-                            }
-                        ],
-                    ),
-                    [self._tiktok_account()],
-                    "tiktok_unsupported_publish_setting",
-                ),
-                (
-                    "empty_schedule_object",
-                    self._tiktok_request(
-                        manifest,
-                        targets=[
-                            {
-                                "platform": "TikTok",
-                                "accountId": 61,
-                                "schedule": {},
-                                "settings": {"visibility": "public"},
-                            }
-                        ],
-                    ),
-                    [self._tiktok_account()],
-                    "tiktok_unsupported_publish_setting",
-                ),
-                (
                     "visibility",
                     self._tiktok_request(
                         manifest,
@@ -1134,6 +1344,36 @@ class ControlledPublishTests(unittest.TestCase):
         self.assertNotEqual(scope_fingerprint(base), scope_fingerprint(form_check))
         for changed in mutations:
             self.assertNotEqual(scope_fingerprint(base), scope_fingerprint(changed))
+
+    def test_tiktok_fingerprint_binds_normalized_schedule_fields(self) -> None:
+        now = datetime(2026, 8, 29, 14, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest = self._tiktok_bundle(Path(temporary))
+            request = self._tiktok_request(manifest)
+            request["targets"][0]["schedule"] = {
+                "localTime": "2026-08-29 15:00",
+                "timezone": "Asia/Shanghai",
+            }
+            scheduled = build_controlled_payloads(
+                request,
+                accounts=[self._tiktok_account()],
+                schedule_now=now,
+            )
+            wrong_mode = [
+                {**scheduled[0], "scheduleMode": "immediate"}
+            ]
+            wrong_projection = [
+                {**scheduled[0], "scheduledAt": "2026-08-29 15:01"}
+            ]
+
+        self.assertNotEqual(
+            scope_fingerprint(scheduled),
+            scope_fingerprint(wrong_mode),
+        )
+        self.assertNotEqual(
+            scope_fingerprint(scheduled),
+            scope_fingerprint(wrong_projection),
+        )
 
     def test_tiktok_fingerprint_uses_video_bytes_not_local_path(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1316,6 +1556,81 @@ class ControlledPublishTests(unittest.TestCase):
         self.assertNotIn("expected.user", waiting["userAction"]["message"])
         self.assertNotIn("session", waiting["userAction"]["message"])
         self.assertEqual(ambiguous["stage"], "ambiguous")
+
+    def test_tiktok_project_task_projects_canonical_scheduled_at(self) -> None:
+        projected = project_task(
+            {
+                "id": 62,
+                "taskNo": "T62",
+                "mode": "oneclick_publish",
+                "status": "pending",
+                "payloadJson": json.dumps(
+                    [
+                        {
+                            "type": 6,
+                            "accountIds": [61],
+                            "scheduleMode": "platform_native",
+                            "scheduledAt": "2026-08-29 15:00",
+                        }
+                    ],
+                    ensure_ascii=False,
+                ),
+                "items": [
+                    {
+                        "platformType": 6,
+                        "status": "pending",
+                        "accountLabel": "TikTok saved account",
+                    }
+                ],
+                "events": [],
+            }
+        )
+
+        self.assertEqual(
+            projected["platforms"][0]["scheduledAt"],
+            "2026-08-29 15:00",
+        )
+
+    def test_tiktok_scheduled_receipt_does_not_claim_published_at(self) -> None:
+        projected = project_task(
+            {
+                "id": 63,
+                "taskNo": "T63",
+                "mode": "oneclick_publish",
+                "status": "success",
+                "payloadJson": json.dumps(
+                    [
+                        {
+                            "type": 6,
+                            "accountIds": [61],
+                            "scheduleMode": "platform_native",
+                            "scheduledAt": "2026-08-29 15:00",
+                        }
+                    ],
+                    ensure_ascii=False,
+                ),
+                "items": [
+                    {
+                        "platformType": 6,
+                        "status": "success",
+                        "receiptJson": json.dumps(
+                            {
+                                "phase": "platform_accepted",
+                                "scheduledAt": "2026-08-29 15:00",
+                            },
+                            ensure_ascii=False,
+                        ),
+                    }
+                ],
+                "events": [
+                    {"eventType": "tiktok_platform_accepted"}
+                ],
+            }
+        )
+
+        receipt = projected["platforms"][0]["receipt"]
+        self.assertEqual(receipt["scheduledAt"], "2026-08-29 15:00")
+        self.assertNotIn("publishedAt", receipt)
 
     def test_tiktok_ambiguous_receipt_sets_public_stage_without_event_message(self) -> None:
         projected = project_task(

@@ -11,6 +11,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
+from zoneinfo import ZoneInfo
 
 from . import account_service, content_bundle, oneclick_capabilities
 from .silicon_evolution_auto_publish import (
@@ -24,6 +25,12 @@ from .silicon_evolution_publish_package import (
     load_frozen_wechat_publish_package,
 )
 from .overseas_tiktok_identity import normalize_tiktok_handle
+from .tiktok_schedule_contract import (
+    TikTokScheduleContractError,
+    TikTokScheduleIntent,
+    parse_tiktok_schedule_fields,
+    validate_tiktok_schedule_window,
+)
 
 
 _PLATFORM_TYPE_BY_NAME = {
@@ -41,6 +48,15 @@ _REQUEST_KEYS = {
     "platformFormCheckConfirmed",
 }
 _TARGET_KEYS = {"platform", "accountId", "schedule", "settings"}
+_TIKTOK_ROOT_SCHEDULE_ALIASES = {"scheduledAt", "publishAt"}
+_TIKTOK_TARGET_SCHEDULE_ALIASES = {
+    "scheduledAt",
+    "publishAt",
+    "enableTimer",
+    "scheduleTime",
+    "scheduleTimezone",
+    "dailyTimes",
+}
 _PROJECT_ID_RE = re.compile(r"[a-z0-9][a-z0-9._-]{1,63}")
 _YOUTUBE_VISIBILITIES = frozenset(
     {"private", "unlisted", "public", "scheduled_public"}
@@ -79,6 +95,54 @@ def _schedule(value: object) -> tuple[bool, str, str]:
             "controlled_schedule_invalid", "当前受控发布只接受 Asia/Shanghai 的完整本地时间"
         )
     return True, local_time, timezone_name
+
+
+def _shanghai_now() -> datetime:
+    return datetime.now(ZoneInfo("Asia/Shanghai"))
+
+
+def _tiktok_target_schedule(
+    value: object,
+    *,
+    now: datetime,
+) -> TikTokScheduleIntent:
+    if value is None:
+        enable_timer = False
+        schedule_time = None
+        schedule_timezone = "Asia/Shanghai"
+        daily_times: object = []
+    elif isinstance(value, Mapping) and set(value) == {"localTime", "timezone"}:
+        enable_timer = True
+        schedule_time = value["localTime"]
+        schedule_timezone = value["timezone"]
+        daily_times = (
+            [schedule_time[-5:]] if type(schedule_time) is str else []
+        )
+    else:
+        raise ControlledPublishError(
+            "tiktok_schedule_invalid",
+            "TikTok 排期字段、格式或时区无效",
+        )
+    try:
+        intent = parse_tiktok_schedule_fields(
+            enable_timer=enable_timer,
+            schedule_time=schedule_time,
+            schedule_timezone=schedule_timezone,
+            daily_times=daily_times,
+        )
+        validate_tiktok_schedule_window(
+            intent,
+            now=now,
+            minimum_lead=timedelta(minutes=30),
+        )
+    except TikTokScheduleContractError as exc:
+        if exc.error_code == "tiktok_schedule_invalid":
+            raise ControlledPublishError(
+                "tiktok_schedule_invalid",
+                "TikTok 排期字段、格式或时区无效",
+            ) from exc
+        raise ControlledPublishError(exc.error_code, exc.public_message) from exc
+    return intent
 
 
 def _preferred_cover(platform_type: int, covers: Mapping[str, str]) -> str:
@@ -131,12 +195,29 @@ def build_controlled_payloads(
     request: Mapping[str, Any],
     *,
     accounts: Iterable[Mapping[str, Any]] | None = None,
+    schedule_now: datetime | None = None,
 ) -> list[dict[str, Any]]:
     """把 manifest 与明确账号转换为 UI/CLI 共用发布服务载荷。"""
 
     request = _require_mapping(
         request, "controlled_request_invalid", "受控发布请求必须是 JSON 对象"
     )
+    raw_targets = request.get("targets")
+    has_tiktok_target = isinstance(raw_targets, list) and any(
+        isinstance(item, Mapping)
+        and oneclick_capabilities.canonical_platform(
+            str(item.get("platform") or "")
+        )
+        == "TikTok"
+        for item in raw_targets
+    )
+    if has_tiktok_target and set(request).intersection(
+        _TIKTOK_ROOT_SCHEDULE_ALIASES
+    ):
+        raise ControlledPublishError(
+            "tiktok_schedule_invalid",
+            "TikTok 排期字段、格式或时区无效",
+        )
     unexpected = set(request) - _REQUEST_KEYS
     if unexpected:
         raise ControlledPublishError(
@@ -238,9 +319,21 @@ def build_controlled_payloads(
         target = _require_mapping(
             raw_target, "controlled_target_invalid", "每个目标必须是 JSON 对象"
         )
-        if set(target) - _TARGET_KEYS:
+        target_platform = oneclick_capabilities.canonical_platform(
+            str(target.get("platform") or "")
+        )
+        target_unexpected = set(target) - _TARGET_KEYS
+        if (
+            target_platform == "TikTok"
+            and target_unexpected.intersection(_TIKTOK_TARGET_SCHEDULE_ALIASES)
+        ):
+            raise ControlledPublishError(
+                "tiktok_schedule_invalid",
+                "TikTok 排期字段、格式或时区无效",
+            )
+        if target_unexpected:
             raise ControlledPublishError("controlled_target_invalid", "平台目标包含不支持字段")
-        platform = oneclick_capabilities.canonical_platform(str(target.get("platform") or ""))
+        platform = target_platform
         platform_type = _PLATFORM_TYPE_BY_NAME.get(platform)
         account_id = target.get("accountId")
         if platform_type is None or type(account_id) is not int or account_id <= 0:
@@ -259,14 +352,14 @@ def build_controlled_payloads(
             )
         youtube_settings: dict[str, object] | None = None
         tiktok_expected_reference = ""
+        tiktok_schedule_intent: TikTokScheduleIntent | None = None
         tiktok_settings: dict[str, object] | None = None
         tiktok_video_sha256 = ""
         if platform_type == 6:
-            if target.get("schedule") is not None:
-                raise ControlledPublishError(
-                    "tiktok_unsupported_publish_setting",
-                    "TikTok 首版只支持立即公开发布",
-                )
+            tiktok_schedule_intent = _tiktok_target_schedule(
+                target.get("schedule"),
+                now=schedule_now if schedule_now is not None else _shanghai_now(),
+            )
             if (
                 type(account.get("status")) is not int
                 or account.get("status") != 1
@@ -361,11 +454,13 @@ def build_controlled_payloads(
                 "controlled_mentions_unsupported",
                 "抖音正文包含原始 @文字；当前内容包没有独立 mentions 字段和官方候选回读，不能冒充有效提及",
             )
-        enable_timer, schedule_time, schedule_timezone = _schedule(target.get("schedule"))
-        if platform_type == 6 and enable_timer:
-            raise ControlledPublishError(
-                "tiktok_unsupported_publish_setting",
-                "TikTok 首版只支持立即公开发布",
+        if tiktok_schedule_intent is not None:
+            enable_timer = tiktok_schedule_intent.mode == "platform_native"
+            schedule_time = tiktok_schedule_intent.local_time or ""
+            schedule_timezone = tiktok_schedule_intent.timezone
+        else:
+            enable_timer, schedule_time, schedule_timezone = _schedule(
+                target.get("schedule")
             )
         if youtube_settings is not None:
             scheduled_public = youtube_settings["visibility"] == "scheduled_public"
@@ -444,6 +539,8 @@ def build_controlled_payloads(
                     "tiktokControlledPublish": True,
                     "tiktokExpectedAccountReference": tiktok_expected_reference,
                     "tiktokVideoSha256": tiktok_video_sha256,
+                    "scheduleMode": tiktok_schedule_intent.mode,
+                    "scheduledAt": tiktok_schedule_intent.local_time,
                     "tiktokExecutionIntent": (
                         "platform_form_check"
                         if mode == "platform_form_check"
@@ -517,6 +614,8 @@ def scope_fingerprint(payloads: Iterable[Mapping[str, Any]]) -> str:
                     ]
                 ),
                 "cover": _file_identity(payload.get("coverPath")),
+                "scheduleMode": str(payload.get("scheduleMode") or ""),
+                "scheduledAt": str(payload.get("scheduledAt") or ""),
                 "scheduleTime": str(payload.get("scheduleTime") or ""),
                 "scheduleTimezone": str(payload.get("scheduleTimezone") or ""),
                 "originalDeclaration": bool(payload.get("originalDeclaration")),
@@ -1375,6 +1474,7 @@ def project_task(task: Mapping[str, Any] | None) -> dict[str, Any]:
                     (receipt or {}).get("scheduledAt")
                     or item.get("scheduleTime")
                     or item.get("scheduleSummary")
+                    or related_payload.get("scheduledAt")
                     or related_payload.get("scheduleTime")
                     or ""
                 ),
