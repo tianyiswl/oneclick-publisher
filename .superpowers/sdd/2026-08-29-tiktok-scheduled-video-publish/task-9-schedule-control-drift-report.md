@@ -88,3 +88,10 @@ Round 2 implementation: `dc020340f5fad7114228813b32be0e38a0b5e178` (`fix(tiktok)
 - Results: schedule form `44/44` in `14.585s`; focused chain `335/335` in `15.809s`; affected suite `552/552` in `17.179s`. Implementation scope against `e9191b2` was `changed=2`, overseas-owned, `scope-check: OK`; diff checks passed.
 
 Round 3 implementation: `f58a4609fc9373d6cedb0088047a6bfac86cafcf` (`fix(tiktok): isolate schedule control contexts`)
+
+## Review remediation (round 4)
+
+- Upload-frame A to B remounts now treat only the exact Playwright `JSHandles can be evaluated only in the context they were created` comparison error as a changed node; B must still be seen twice. Other comparison errors still propagate.
+- GREEN: adversarial `4/4`; schedule form `45/45` in `14.492s`; focused `336/336` in `15.705s`; affected `553/553` in `17.119s`. Diff checks passed before commit.
+
+Round 4 implementation: `db40891b3a8dddde60d18b3137476b6155f20cd5` (`fix(tiktok): tolerate upload frame remount`)
