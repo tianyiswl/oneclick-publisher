@@ -1,0 +1,116 @@
+# SDD ledger — plan: docs/superpowers/plans/2026-08-29-tiktok-scheduled-video-publish.md
+
+Spec: docs/superpowers/specs/2026-08-29-tiktok-scheduled-video-publish-design.md
+Start branch: feature/overseas-login-publish-v2
+Plan commit: 1befff9
+Execution boundary: offline implementation and verification only; do not open TikTok Studio, upload media, or click Post/Schedule.
+
+## Pre-flight consistency scan
+
+### Per-task self-consistency
+
+| Task | Files/tests against implementation | Finding |
+| --- | --- | --- |
+| 0 | Existing dirty baseline, focused tests, split commits, scope governance | Consistent; baseline files are explicitly bounded and shared changes are split. |
+| 1 | Two Archify JSON sources, generated HTML, validate/deliver/visual-check | Consistent; JSON is authoritative and HTML is generated only. |
+| 2 | Pure schedule contract plus boundary/timezone tests | Consistent; test seams and exact error boundaries match the implementation contract. |
+| 3 | Controlled request normalization, authorization fingerprint, task projection | Consistent; root schedule is the only user input and runtime fields are derived. |
+| 4 | TikTok payload normalization, time gates, safe receipt fields | Consistent; local preflight remains offline and formal entry uses the 15-minute gate. |
+| 5 | Isolated semantic form adapter and fake-page tests | Consistent; browser semantics are bounded and no final action is clicked by configure/verify. |
+| 6 | Uploader/service integration, strict final checkpoint, one list readback | Consistent; final action is exactly once and scheduled success requires unique readback. |
+| 7 | Task projection, stale recovery, thin publish-service passthrough | Consistent; scheduled acceptance is preserved without inventing published state. |
+| 8 | Focused, affected, full regression, UI smoke, scope and evidence docs | Consistent; evidence language is explicitly limited to offline implementation. |
+| 9 | Separate real-platform authorization gate | Consistent; no request or browser action is prepared during this execution. |
+
+### Shared-file and interface hand-offs
+
+| Producer task | Consumer task | Shared file/interface | Finding |
+| --- | --- | --- | --- |
+| 0 | 2, 3, 7 | Scope classification for shared schedule/core files | Consistent; shared files remain separate commits and integration-review-only. |
+| 0 | 1, 4, 6 | Sealed existing TikTok baseline | Consistent; later tasks build on the tested baseline without resetting it. |
+| 1 | 8 | Architecture/lifecycle JSON and generated HTML | Consistent; Task 8 replaces provisional references with implemented source lines. |
+| 2 | 3 | `TikTokScheduleIntent`, parser, window validator | Consistent; shared controlled request consumes only the neutral pure module. |
+| 2 | 4 | Same pure parser and window validator | Consistent; TikTok service translates stable errors without duplicating time logic. |
+| 3 | 4, 6, 7 | Normalized runtime schedule fields and fingerprint | Consistent; downstream layers consume derived fields, never alternate user aliases. |
+| 4 | 6 | Prepared schedule snapshot and final-time gate | Consistent; integration rechecks the authorized live snapshot immediately before the click. |
+| 4 | 7 | Safe receipt fields/phases | Consistent; task persistence uses the same strict scalar projection. |
+| 5 | 6 | Schedule form records and five adapter methods | Consistent; the uploader owns orchestration while the adapter owns DOM semantics. |
+| 6 | 7 | `scheduled_accepted` event and `scheduled_readback_confirmed` result | Consistent; checkpoint is persisted before the single list readback. |
+| 6 | 8 | Runtime implementation and affected suites | Consistent; Task 8 verifies without platform actions. |
+| 7 | 8 | Terminal stale-task reconciliation and public task projection | Consistent; full regression checks no permanent running/pending state. |
+
+Pre-flight result: no contradiction requiring a ruling before execution.
+
+Task 0: dispatched (BASE 1befff9, implementer /root/task0_baseline)
+Task 0: review needs fixes — three Important findings: avatar file rollback around database CAS/commit; profile persistence swallows identity/storage failures; upload-entry retry swallows deterministic failures and can exceed its advertised timeout. One Minor deferred: reset stale identity-probe summary on a new login attempt.
+Task 0: fix round 1/5 (2 addressed, 1 open — uploader button/chooser path can still begin after the absolute deadline and button.click is not bounded; commit ad06a1e..5342ca9)
+Task 0: fix round 2/5 (1 addressed, 0 open — unified hard deadline covers chooser and click; commit 5342ca9..cf07986)
+Task 0: minor (deferred): reset stale identity-probe summary on a new login attempt.
+Task 0: complete (commits 1befff9..cf07986, review clean)
+Task 1: dispatched (BASE cf07986, implementer /root/task1_architecture)
+Task 1: review needs fixes — three Important findings: stale/misleading uploader source-line evidence; missing `scheduled_accepted -> ambiguous` and Post-only ambiguous wording; Schedule-specific final authorization point not explicit. One Minor deferred: report contradicted itself about visual-check artifact retention.
+Task 1: Ruling: replace the plan-mandated stale `uploader/tk_uploader/main.py:610` evidence with the current truthful form-snapshot/final-action line — repository truth and the approved spec outrank the stale line number — cost if wrong: the provisional diagram may cite a nearby current orchestration point until Task 8 refreshes all references after implementation.
+Task 1: fix round 1/5 (3 addressed, 0 open — truthful source evidence, explicit Schedule authorization, and scheduled acceptance ambiguity; commits 385cc2b..04e673e)
+Task 1: minor (deferred): original report had contradictory temporary visual-artifact wording; Fix round 1 established the plan-specific evidence directory as authoritative.
+Task 1: complete (commits cf07986..04e673e, review clean)
+Task 2: dispatched (BASE 04e673e, implementer /root/task2_time_contract)
+Task 2: complete (commits 04e673e..81a0001, review clean)
+Task 3: dispatched (BASE 81a0001, implementer /root/task3_controlled_contract)
+Task 3: minor (deferred): non-public visibility error still says “只支持立即公开发布”; capability now supports scheduling, so final review should triage changing it to “只支持公开发布” with a matching assertion.
+Task 3: complete (commits 81a0001..5cc85cb, review clean except 1 deferred minor)
+Task 4: dispatched (BASE 5cc85cb, implementer /root/task4_service_snapshot)
+Task 4: review needs fixes — Important: case-folded root-field recognition silently accepts noncanonical schedule aliases such as `enabletimer`/`ScheduleTime` and can downgrade an intended schedule to immediate. Two Minors deferred: RED first hit missing `now` signature before old immediate-only rejection; scheduled zero-side-effect test blocks Playwright but relies on immediate tests for uploader/session writes.
+Task 4: fix round 1/5 (1 addressed, 0 open — exact canonical root schedule keys now required; commits ea91cd8..9a9f260)
+Task 4: minor (deferred): initial RED first hit missing `now` signature before the second RED hit the old immediate-only rejection.
+Task 4: minor (deferred): scheduled zero-side-effect test directly blocks Playwright but relies on existing immediate tests for uploader/session-write guards.
+Task 4: complete (commits 5cc85cb..9a9f260, review clean except 2 deferred minors)
+Task 5: dispatched (BASE 9a9f260, implementer /root/task5_schedule_adapter)
+Task 5: review needs fixes — three Important findings: substring success matching accepts negated/retry text; scheduled-row identity allows either page or row account instead of requiring both; unreadable feedback leaks raw exceptions instead of ending as `tiktok_schedule_outcome_unknown`. Two Minors deferred: real Playwright DOM-handle dedupe branch lacks protocol-level fake coverage; readonly date/time rejection lacks a direct test.
+Task 5: fix round 1/5 (3 addressed, 0 open — exact success templates, dual account binding, bounded unreadable-feedback handling; commits 1fb5626..f7b1cf6)
+Task 5: minor (deferred): real Playwright DOM-handle dedupe branch lacks protocol-level fake coverage.
+Task 5: minor (deferred): readonly date/time rejection lacks a direct behavior test.
+Task 5: complete (commits 9a9f260..f7b1cf6, review clean except 2 deferred minors)
+Task 6: dispatched (BASE f7b1cf6, implementer /root/task6_runtime_integration)
+Task 6: review needs fixes — four Important findings: Schedule readiness is required before the existing slow-upload wait; legacy `_attach_publish_options()` can rewrite normalized immediate `0` and activate scheduling; post-click outcome-unknown exceptions can escape without the standard ambiguous receipt; and missing final-button instrumentation can record `tiktok_final_action_triggered` before any real click. One Minor deferred: scheduled user-facing text still says “未点击 Post”.
+Task 6: fix round 1/5 (4 addressed, 0 open — delayed Schedule readiness, immutable immediate target, complete ambiguous receipts, and required final-button instrumentation; commits f0980b3..05d8d42)
+Task 6: minor (deferred): scheduled form-check/user-facing success text still says “未点击 Post” instead of Schedule/final action.
+Task 6: minor (deferred): a permanently Post-only scheduled page times out with generic `tiktok_post_ready_timeout` instead of preserving the schedule-specific unavailable code.
+Task 6: minor (deferred): immediate-zero compatibility regression asserts private state rather than directly proving zero schedule-control queries.
+Task 6: complete (commits f7b1cf6..05d8d42, review clean except 3 deferred minors)
+Task 7: dispatched (BASE 05d8d42, implementer /root/task7_receipt_recovery)
+Task 7: review needs fixes — Important: a platform-native scheduled receipt can still persist a non-empty but syntactically valid `publishedAt`; the task layer must force it to null/empty regardless of an upstream regression. One Minor deferred: stale recovery tests do not directly assert parent/item terminal statuses.
+Task 7: fix round 1/5 (1 addressed, 0 open — every platform-native scheduled receipt now forces `publishedAt=None`; commits f2159b3..8c23de2)
+Task 7: minor (deferred): stale recovery tests do not directly assert both parent and item terminal statuses.
+Task 7: complete (commits 05d8d42..8c23de2, review clean except 1 deferred minor)
+Task 8: dispatched (BASE 8c23de2, implementer /root/task8_verification_evidence)
+Task 8: review needs fixes — Important: the evidence commit mixes shared `SOURCE_OF_TRUTH.md` with overseas-owned architecture/verification files, violating the shared-core separate-commit gate. One Minor: SOT header date remains 2026-08-28 after adding a 2026-08-29 fact; fix while splitting the directly touched shared file.
+Task 8: fix round 1/5 (2 addressed, 0 open — owned/shared evidence split into separate commits and SOT date refreshed; commits c985472→4bd6927+94adf67)
+Task 8: complete (commits 8c23de2..94adf67, review clean)
+Final review: needs fixes — Critical: item-only `tiktok_schedule_outcome_unknown` is omitted from formal-claim release and task-delete protection, allowing duplicate Schedule after event-write loss. Important: production scheduled readback relies on fake-only `page.account_reference`; submitted-after compares poll time instead of proving a new row; TikTok-only session filtering is not enforced on publish load/refresh; public task projection omits scheduled accepted/readback phases; post-Schedule generic exceptions use the immediate outcome-unknown code; CRLF caption hashing disagrees after the irreversible action.
+Final review: deferred-minor triage — all 10 previously ledgered minors are safe to defer; one additional login-cancellation responsiveness Minor is safe to defer. Task 1 Ruling is confirmed harmless because Task 8 refreshed implemented source evidence and revalidated both diagrams.
+Final fix wave: complete (`94adf67..a9d851c`) — original 1 Critical and 6 Important findings addressed; independent verification passed 2627/2627 full tests, `NATIVE_DESKTOP_UI_OK`, both diff checks, expected scope result `REVIEW_REQUIRED` with `owned=39/shared=24/outside=0`, and both Archify diagrams at 9/9 with zero errors/warnings and eight visual screenshots approved. No real platform action occurred.
+Final scoped re-review: blocked — all original Critical/Important findings are ADDRESSED, but one new load-bearing Important remains: post-Schedule readback reuses the pre-click content-list page without a fresh reload/navigation, so a server-created row that appears only after refresh cannot be observed. Current fakes inject rows directly and do not prove this production path.
+Final integration ruling: NOT safe to defer — this is the only evidence path that distinguishes scheduled acceptance from an ambiguous outcome, so Task 9 must not start. The approved single final-fix-wave boundary is exhausted; a separately authorized corrective pass must add bounded read-only refresh/re-navigation after `scheduled_accepted`, prove the new row appears only after that read, then rerun affected/full verification and one scoped review. Cost if wrong: entering Task 9 now could schedule successfully yet return a false ambiguous result, blocking reliable receipts and creating unsafe user pressure to retry.
+Corrective refresh task: authorized by the user on 2026-08-29 (BASE `a9d851c`). Ruling: treat the explicit authorization as one new, narrowly scoped corrective task rather than an unbounded second final-review wave; only the post-Schedule fresh read and its covering tests may change — why: the prior breaker correctly surfaced a real load-bearing defect and the user has now authorized the missing implementation — cost if wrong: this could under-scope another coupled defect, which the scoped task review and fresh full regression must expose before Task 9.
+Corrective refresh task: implementation complete — RED failed as expected because the server-created row was invisible without a second content-list navigation; GREEN passed after forcing the post-acceptance readback to re-navigate the isolated bounded content route while preserving the frozen baseline and all identity checks (commits `a9d851c..4faeefb`).
+Corrective refresh task: task review clean — Spec compliance ✅, quality Approved, Critical 0, Important 0, Minor 0; reviewer confirmed the new test exposes the row only on the second content-list navigation and existing integration still proves Schedule exactly once.
+Corrective refresh task: fix round 1/5 (1 addressed, 0 open — local ignored audit report removed from Git scope without changing production/test bytes; commit `b3ea3c6`); scoped re-review Approved with no new Critical/Important.
+Corrective refresh task: complete (commits `a9d851c..b3ea3c6`, review clean). Independent final verification at HEAD: targeted schedule/uploader 87/87, full discovery 2628/2628, `NATIVE_DESKTOP_UI_OK`, both diff checks clean, corrective scope `owned=2/outside=0` and `scope-check: OK`, worktree clean. Task 9 is now technically ready but remains separately unauthorized; no platform/browser/upload/Post/Schedule/publish action occurred.
+Task 9 authorization gate: the user explicitly authorized the real-platform form check on 2026-08-29. Read-only reconciliation found one currently normal TikTok browser account (`id=13`, display `墨白 | Mobai`, reference `tianyiswl`) and the intact dedicated manifest `runtime/tiktok-form-check-20260829/manifest.json` with its single test video. Per the binding Task 9 gate, no request will be created and no platform/browser/upload action will start until the exact manifest, account ID, and future `Asia/Shanghai` time are confirmed together.
+Task 9 exact authorization: the user confirmed account `13` (`墨白 | Mobai`, `tianyiswl`), manifest `runtime/tiktok-form-check-20260829/manifest.json`, and `2026-08-30 10:00 Asia/Shanghai`, limited to `platform_form_check` with no `Post`/`Schedule` click.
+Task 9 runtime attempt 1: task `79 / T08291923-788D` was atomically created and claimed, then rejected by startup validation before worker construction/browser/upload with `tiktok_unsupported_publish_setting: TikTok 定时字段无效`; it has only the `created` event and no platform action occurred. Root cause reproduced locally: `controlled_publish` emits canonical root snapshots `scheduleMode/scheduledAt`, while `_validate_schedule_fields` rejects those same derived fields. Ruling: treat this as a narrow cross-layer contract repair under the existing Task 9 authorization, but require RED/GREEN tests and review before retrying — why: the authorized operation cannot reach the platform until the local contract is internally consistent — cost if wrong: a too-broad allowance could admit untrusted schedule aliases, so the repair must accept only an exact root snapshot pair matching the parsed intent.
+Task 9 runtime attempt 1 terminalization finding: because validation fails before `require_tiktok_execution_claim()` and before the existing `worker.start()` compensation block, task 79 remains `pending` and its claim remains `claimed`. Ruling: handle this as a second, separately tested startup-failure cleanup task before any real retry — why: a synchronous local validation failure must not leave an orphaned task or duplicate-execution lock — cost if wrong: broad cleanup around irreversible evidence could release a real publish claim, so the repair must apply only before any worker/final-action evidence exists and must preserve formal authorization consumption semantics.
+Task 9 runtime contract repair: review needs fixes — Important: the first repair still accepted a legacy root `schedule` object when `enabled=false`, contradicting the canonical-root-only contract.
+Task 9 runtime contract repair: fix round 1/5 (1 addressed, 0 open — every legacy root `schedule` object is rejected while the exact `scheduleMode/scheduledAt` snapshot pair remains accepted; commits `72ece35..2f59d3a`).
+Task 9 runtime contract repair: complete (commits `b3ea3c6..2f59d3a`, scoped re-review clean; contract 39/39 and affected 133/133; no browser, platform, real-database, or task-79 mutation occurred).
+Task 9 startup terminalization: implementation complete (`e2d77ad`) — synchronous validation/runtime-mode/thread-construction failures now atomically fail the task and item, record `tiktok_worker_start_failed`, and delete only the exact reversible `claimed` claim; the existing `started` compensation remains unchanged.
+Task 9 startup terminalization: review clean after one Minor test-hardening round (`42f60ac`) — formal runtime-mode mismatch and the production complete irreversible-evidence predicate are now fixed by database-backed regression tests; final scoped review Critical 0, Important 0, Minor 0.
+Task 9 repair verification at `42f60ac`: focused publishing chain 318/318, affected overseas chain 535/535, full discovery 2634/2634, `NATIVE_DESKTOP_UI_OK`, both diff checks clean, scope `outside=0` with expected `REVIEW_REQUIRED` for approved shared-core history. No real database or platform action occurred during these verification runs.
+Task 9 repair integration review: SAFE — Critical 0, Important 0, Minor 0; exact Task 79 cleanup and one new form-check attempt were allowed, with no expansion to formal publish or final-action click.
+Task 9 legacy task cleanup: status readback first reconciled Task `79 / T08291923-788D` to terminal `failed` with `controlled_worker_lease_expired`; an exact atomic cleanup then deleted its sole `platform_form_check/claimed` claim only after confirming task mode/status and complete irreversible evidence=false. The task record was retained. The first DELETE statement used an invalid alias and rolled back completely; the corrected transaction deleted exactly one claim and readback confirmed claimCount=0.
+Task 9 runtime attempt 2: task `80 / T08292003-B4F1` used the exact authorized account, manifest, video hash and `2026-08-30 10:00 Asia/Shanghai`. It uploaded the five-second test video and verified caption, official topic and public visibility, then failed before any schedule field or final action with `tiktok_schedule_unavailable`. No Post/Schedule click, platform acceptance, content ID/URL, or scheduled/public result exists.
+Task 9 runtime attempt 2 diagnosis: current adapter performs a one-shot search limited to three switch selectors in only one resolved scope, while the current TikTok Studio interface may expose the exact Schedule choice as a radio option and may load/re-mount controls after upload processing. Ruling: implement a narrow exact radio-or-legacy-switch semantic adapter with bounded stable polling, dual top-page/upload-frame inspection, and field-specific safe diagnostics before any retry — why: the existing failure cannot distinguish account eligibility from DOM drift or transient loading — cost if wrong: an overly broad selector could click the final Schedule action, so only exact schedule-setting semantics are allowed and the final-action selectors remain isolated.
+Task 9 runtime attempt 2 claim finding: terminal platform-form-check task 80 retained a harmless but stale `started` claim despite irreversible evidence=false. Ruling: add a separate atomic terminal form-check claim-release path before retry — why: form checks are not formal dedupe claims and terminal pre-final failures must not leave execution locks — cost if wrong: broad release could erase a formal or irreversible claim, so it must bind exact task/mode/state, terminal task status, and the complete irreversible-evidence predicate.
+Task 9 schedule-control drift correction: complete (`42f60ac..1d4ceac`) after six bounded review rounds. The final adapter accepts only exact Schedule setting semantics, polls top/upload scopes to a hard deadline, freezes handles before comparison, survives upload-frame remount only for the anchored real Playwright cross-context error forms, and requires the replacement control to be observed stably twice. Other errors continue to propagate and final Schedule/Post actions remain isolated.
+Task 9 schedule-control drift final review: PASS/PASS, Critical 0, Important 0, Minor 0. Independent protocol probes covered the short, driver-`!`, and `ElementHandle.evaluate:` Playwright error forms plus adversarial non-matches; schedule-form 46/46 and focused publishing chain 337/337 passed. No real database, browser, platform, or final action occurred during the corrective implementation or review.
+Task 9 terminal form-check claim release: implementation complete at `5bfbabf` with strict RED/GREEN temporary-SQLite coverage. Terminal `oneclick_platform_form_check` success/failed/partial_failed tasks now release only their exact `platform_form_check/started` claim when the complete shared TikTok irreversible-evidence predicate is false; publish-lock-busy and normal worker-finally paths are covered, cleanup failure preserves the terminal result and records only a stable warning. Exact tests 7/7, specified modules 64/64 + 7/7 + 68/68 + 14/14, combined 153/153, both diff checks clean; scope `owned=1/shared=4/outside=0` is the expected `REVIEW_REQUIRED`. No production database, browser, platform, media, package, version, or evidence document was touched.
