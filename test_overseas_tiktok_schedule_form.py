@@ -57,6 +57,8 @@ class FakeScheduleControl:
         attributes: dict[str, str | None] | None = None,
         fill_transform: Callable[[str], str] | None = None,
         raise_if_clicked: bool = False,
+        visibility_failures: int = 0,
+        text_failures: int = 0,
     ) -> None:
         self.node_id = node_id
         self.semantic_role = semantic_role
@@ -70,6 +72,8 @@ class FakeScheduleControl:
         self.attributes = dict(attributes or {})
         self.fill_transform = fill_transform
         self.raise_if_clicked = raise_if_clicked
+        self.visibility_failures = visibility_failures
+        self.text_failures = text_failures
         self.click_count = 0
         self.fill_count = 0
         self.detached = False
@@ -114,6 +118,9 @@ class FakeScheduleControl:
 
     async def inner_text(self) -> str:
         self._assert_attached()
+        if self.text_failures:
+            self.text_failures -= 1
+            raise RuntimeError("transient feedback text failure")
         return self.label
 
     async def get_attribute(self, name: str) -> str | None:
@@ -132,6 +139,9 @@ class FakeScheduleControl:
 
     async def is_visible(self) -> bool:
         self._assert_attached()
+        if self.visibility_failures:
+            self.visibility_failures -= 1
+            raise RuntimeError("transient feedback visibility failure")
         return self.visible
 
     async def is_enabled(self) -> bool:
@@ -157,12 +167,16 @@ class FakeScheduleBase:
         self.base_id = base_id
         self._registered: dict[str, list[FakeScheduleControl]] = {}
         self.controls: list[FakeScheduleControl] = []
+        self.locator_failures: dict[str, int] = {}
 
     def register(self, selector: str, *controls: FakeScheduleControl) -> None:
         self._registered.setdefault(selector, []).extend(controls)
         self.controls.extend(control for control in controls if control not in self.controls)
 
     def locator(self, selector: str) -> FakeScheduleLocator:
+        if self.locator_failures.get(selector, 0):
+            self.locator_failures[selector] -= 1
+            raise RuntimeError("transient feedback locator failure")
         return FakeScheduleLocator(_deduplicated(self._registered.get(selector, [])))
 
     def by_role(self, semantic_role: str) -> list[FakeScheduleControl]:
@@ -336,7 +350,7 @@ def scheduled_form_page(
 def scheduled_row(
     *,
     node_id: str = "row-1",
-    account_reference: str = "expected.user",
+    account_reference: str | None = "expected.user",
     caption: str = "Hello\nWorld",
     scheduled_at: str = "2026-08-29 15:00",
     timezone: str = "Asia/Shanghai",
@@ -600,6 +614,98 @@ class TikTokScheduleFormTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(clock.elapsed, 120.0)
         self.assertEqual(intervention.await_count, 120)
 
+    async def test_wait_for_acceptance_rejects_negated_or_reversed_success_words(
+        self,
+    ) -> None:
+        messages = (
+            "Video has not been scheduled successfully",
+            "This video has been scheduled successfully? No—please try again.",
+            "Video scheduled successfully but failed",
+            "Video scheduled successfully? Retry",
+            "Video scheduled successfully but then cancelled",
+        )
+        for message in messages:
+            with self.subTest(message=message):
+                page, bases = scheduled_form_page(toggle_enabled=True)
+                page.set_feedback(message)
+                clock = FakeClock()
+                form, _, _ = self.form(page, bases, clock=clock)
+                with self.assertRaises(TikTokPublishError) as raised:
+                    await form.wait_for_acceptance(self.target)
+                self.assertEqual(
+                    raised.exception.error_code,
+                    "tiktok_publish_rejected",
+                )
+                self.assertFalse(raised.exception.outcome_ambiguous)
+
+    async def test_wait_for_acceptance_ignores_stale_and_unrelated_alerts(
+        self,
+    ) -> None:
+        messages = (
+            "Your previous video has been scheduled successfully",
+            "Upload completed successfully",
+        )
+        for message in messages:
+            with self.subTest(message=message):
+                page, bases = scheduled_form_page(toggle_enabled=True)
+                page.set_feedback(message)
+                clock = FakeClock()
+                form, _, _ = self.form(page, bases, clock=clock)
+                with self.assertRaises(TikTokPublishError) as raised:
+                    await form.wait_for_acceptance(self.target)
+                self.assertEqual(
+                    raised.exception.error_code,
+                    "tiktok_schedule_outcome_unknown",
+                )
+                self.assertTrue(raised.exception.outcome_ambiguous)
+                self.assertEqual(clock.elapsed, 120.0)
+
+    async def test_transient_feedback_read_errors_stay_inside_bounded_poll(
+        self,
+    ) -> None:
+        for failure_kind in ("locator", "visibility", "text"):
+            with self.subTest(failure_kind=failure_kind):
+                page, bases = scheduled_form_page(toggle_enabled=True)
+                page.set_feedback("Video scheduled successfully")
+                feedback = page.by_role("feedback")[0]
+                if failure_kind == "locator":
+                    page.locator_failures[ACCEPTANCE_FEEDBACK_SELECTORS[0]] = 1
+                elif failure_kind == "visibility":
+                    feedback.visibility_failures = 1
+                else:
+                    feedback.text_failures = 1
+                clock = FakeClock()
+                form, _, _ = self.form(page, bases, clock=clock)
+
+                acceptance = await form.wait_for_acceptance(self.target)
+
+                self.assertEqual(
+                    acceptance.evidence,
+                    "Video scheduled successfully",
+                )
+                self.assertEqual(clock.elapsed, 1.0)
+                self.assertEqual(clock.sleeps, [1.0])
+
+    async def test_unreadable_feedback_until_deadline_is_outcome_unknown(
+        self,
+    ) -> None:
+        page, bases = scheduled_form_page(toggle_enabled=True)
+        page.set_feedback("Video scheduled successfully")
+        page.locator_failures[ACCEPTANCE_FEEDBACK_SELECTORS[0]] = 200
+        clock = FakeClock()
+        form, _, _ = self.form(page, bases, clock=clock)
+
+        with self.assertRaises(TikTokPublishError) as raised:
+            await form.wait_for_acceptance(self.target)
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "tiktok_schedule_outcome_unknown",
+        )
+        self.assertTrue(raised.exception.outcome_ambiguous)
+        self.assertEqual(clock.elapsed, 120.0)
+        self.assertEqual(len(clock.sleeps), 120)
+
     def expectation(
         self,
         *,
@@ -639,6 +745,27 @@ class TikTokScheduleFormTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(readback.scheduled_at, "2026-08-29 15:00")
         self.assertEqual(readback.schedule_timezone, "Asia/Shanghai")
         self.assertEqual(page.goto_calls, ["https://www.tiktok.com/tiktokstudio/content"])
+
+    async def test_readback_requires_both_page_and_row_account_references(
+        self,
+    ) -> None:
+        for missing_reference in ("page", "row"):
+            with self.subTest(missing_reference=missing_reference):
+                page, bases = scheduled_form_page(toggle_enabled=True)
+                row_account = (
+                    None if missing_reference == "row" else "expected.user"
+                )
+                row, _ = scheduled_row(account_reference=row_account)
+                page.set_rows(row)
+                if missing_reference == "page":
+                    del page.account_reference
+                clock = FakeClock()
+                form, _, _ = self.form(page, bases, clock=clock)
+
+                self.assertIsNone(
+                    await form.readback_scheduled_content(self.expectation())
+                )
+                self.assertEqual(clock.elapsed, 120.0)
 
     async def test_readback_zero_or_multiple_rows_is_not_success(self) -> None:
         page, bases = scheduled_form_page(toggle_enabled=True)

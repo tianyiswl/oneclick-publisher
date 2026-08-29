@@ -57,6 +57,16 @@ SCHEDULED_ROW_SELECTORS = (
 
 _SCHEDULE_LABELS = frozenset({"schedule", "定时发布", "排期"})
 _IMMEDIATE_LABELS = frozenset({"post", "发布"})
+_SCHEDULE_SUCCESS_MESSAGES = frozenset(
+    {
+        "video scheduled successfully",
+        "your video has been scheduled",
+        "your video has been scheduled successfully",
+        "定时发布成功",
+        "视频已定时发布",
+        "已成功排期",
+    }
+)
 _POLL_INTERVAL_SECONDS = 1.0
 _OUTCOME_TIMEOUT_SECONDS = 120.0
 
@@ -217,28 +227,26 @@ async def _switch_enabled(control: Any) -> bool:
 
 
 async def _read_feedback(page: Any) -> list[str]:
-    messages: list[str] = []
-    for candidate in await _bounded_candidates(page, ACCEPTANCE_FEEDBACK_SELECTORS):
-        if not await candidate.is_visible():
-            continue
-        text = str(await candidate.inner_text() or "").strip()
-        if text:
-            messages.append(text)
-    return messages
+    try:
+        messages: list[str] = []
+        candidates = await _bounded_candidates(
+            page,
+            ACCEPTANCE_FEEDBACK_SELECTORS,
+        )
+        for candidate in candidates:
+            if not await candidate.is_visible():
+                continue
+            text = str(await candidate.inner_text() or "").strip()
+            if text:
+                messages.append(text)
+        return messages
+    except Exception:
+        return []
 
 
 def _is_scheduled_success(message: str) -> bool:
-    normalized = _normalized_label(message)
-    return any(
-        phrase in normalized
-        for phrase in (
-            "scheduled successfully",
-            "has been scheduled",
-            "定时发布成功",
-            "视频已定时发布",
-            "已成功排期",
-        )
-    )
+    normalized = _normalized_label(message).rstrip(".!。！")
+    return normalized in _SCHEDULE_SUCCESS_MESSAGES
 
 
 def _is_explicit_rejection(message: str) -> bool:
@@ -251,9 +259,21 @@ def _is_explicit_rejection(message: str) -> bool:
             "unable to schedule",
             "failed to schedule",
             "schedule failed",
+            "not been scheduled",
+            "not scheduled",
+            "failed",
+            "retry",
+            "please try again",
+            "try again",
+            "cancelled",
+            "canceled",
+            "rejected",
             "定时发布失败",
             "无法定时",
             "未能定时",
+            "定时未成功",
+            "已取消",
+            "请重试",
         )
     )
 
@@ -537,7 +557,6 @@ class TikTokScheduleForm:
     ) -> TikTokScheduledContentReadback | None:
         page_account_reference = getattr(self._page, "account_reference", None)
         row_account_reference = await row.get_attribute("data-account-reference")
-        account_reference = row_account_reference or page_account_reference
         caption = await row.get_attribute("data-caption")
         if caption is None:
             caption = await row.inner_text()
@@ -547,11 +566,8 @@ class TikTokScheduleForm:
         scheduled_at = await row.get_attribute("data-schedule-time")
         timezone = await row.get_attribute("data-schedule-timezone")
         if (
-            account_reference != expected.account_reference
-            or (
-                page_account_reference is not None
-                and page_account_reference != expected.account_reference
-            )
+            page_account_reference != expected.account_reference
+            or row_account_reference != expected.account_reference
             or caption_hash != expected.caption_sha256
             or scheduled_at != expected.target.scheduled_at
             or timezone != expected.target.timezone
