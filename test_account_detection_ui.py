@@ -78,6 +78,39 @@ class AccountDetectionUiTests(unittest.TestCase):
         self.assertEqual(page.row_data(0)["accountReference"], "UC123")
         page.close()
 
+    def test_unbound_facebook_page_projects_rebind_as_red_abnormal(self) -> None:
+        projected = account_service._row_to_dict(
+            {
+                "id": 91,
+                "type": 9,
+                "filePath": "shared-meta.json",
+                "userName": "旧 Facebook Page",
+                "status": 0,
+                "profileName": "Meta 主体",
+                "avatarPath": None,
+                "avatarUpdatedAt": None,
+                "remark": "",
+                "lastCheckedAt": None,
+                "lastLoginAt": None,
+                "authMode": "browser",
+                "accountReference": "",
+                "oauthScopeVersion": 1,
+            }
+        )
+
+        self.assertTrue(projected["needsPageRebind"])
+        self.assertEqual(projected["healthStatus"], "abnormal")
+        with (
+            patch.object(account_service, "list_managed_accounts", return_value=[projected]),
+            patch.object(account_service, "list_profiles", return_value=["Meta 主体"]),
+        ):
+            page = AccountPage()
+            page.refresh()
+
+        self.assertEqual(page.row_data(0)["needsPageRebind"], True)
+        self.assertEqual(page.table.item(0, 2).foreground().color().name(), "#dc2626")
+        page.close()
+
     def test_youtube_oauth_account_actions_stay_enabled(self) -> None:
         account = {
             "id": 71,

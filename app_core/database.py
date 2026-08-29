@@ -146,6 +146,49 @@ def ensure_schema() -> None:
             ),
         )
         conn.execute(
+            """
+            UPDATE user_info
+            SET accountReference = TRIM(accountReference)
+            WHERE type = 9
+              AND accountReference IS NOT NULL
+              AND TRIM(accountReference) <> ''
+            """
+        )
+        conn.execute(
+            """
+            UPDATE user_info
+            SET status = 0
+            WHERE type = 9
+              AND (accountReference IS NULL OR TRIM(accountReference) = '')
+            """
+        )
+        conn.execute(
+            """
+            UPDATE user_info AS later
+            SET accountReference = '', status = 0
+            WHERE later.type = 9
+              AND later.accountReference IS NOT NULL
+              AND TRIM(later.accountReference) <> ''
+              AND EXISTS (
+                  SELECT 1
+                  FROM user_info AS earlier
+                  WHERE earlier.type = 9
+                    AND earlier.id < later.id
+                    AND earlier.accountReference IS NOT NULL
+                    AND TRIM(earlier.accountReference) = TRIM(later.accountReference)
+              )
+            """
+        )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_user_info_facebook_page_reference
+            ON user_info(accountReference)
+            WHERE type = 9
+              AND accountReference IS NOT NULL
+              AND TRIM(accountReference) <> ''
+            """
+        )
+        conn.execute(
             "UPDATE user_info SET authMode = 'browser' "
             "WHERE authMode IS NULL OR TRIM(authMode) = ''"
         )
