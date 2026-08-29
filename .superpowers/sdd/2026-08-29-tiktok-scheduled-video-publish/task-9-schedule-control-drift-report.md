@@ -95,3 +95,11 @@ Round 3 implementation: `f58a4609fc9373d6cedb0088047a6bfac86cafcf` (`fix(tiktok)
 - GREEN: adversarial `4/4`; schedule form `45/45` in `14.492s`; focused `336/336` in `15.705s`; affected `553/553` in `17.119s`. Diff checks passed before commit.
 
 Round 4 implementation: `db40891b3a8dddde60d18b3137476b6155f20cd5` (`fix(tiktok): tolerate upload frame remount`)
+
+## Review remediation (round 5)
+
+- RED used the real `playwright.async_api.Error` with the known JSHandle cross-context message; the prior RuntimeError-only handler let it escape.
+- The upload remount exception is now accepted only when its type is Playwright `Error`, scope is `upload`, and its message exactly matches the known JSHandle context error. Other Playwright errors and other exceptions propagate.
+- GREEN: adversarial `4/4`; schedule form `46/46` in `14.437s`; focused `337/337` in `15.627s`; affected `554/554` in `17.114s`. Implementation scope against `2a3b08e` was `changed=2`, overseas-owned, `scope-check: OK`; diff checks passed.
+
+Round 5 implementation: `b1361f4427af3e7725b274bfb7d005f8ce562cb6` (`fix(tiktok): classify upload handle context errors`)
