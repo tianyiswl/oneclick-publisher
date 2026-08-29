@@ -4869,7 +4869,7 @@
       </div>
     </div>
 
-    <script id="archify-guided-views-data" type="application/json">[{"id":"formal-main-path","label":"正式发布主链","focus":["local_preflight_passed","platform_page_active","platform_form_verified","final_action_triggered","platform_accepted","published_readback_confirmed"],"note":"表单核对后恰好一次 Post；平台接受与作品回读是两层证据。"},{"id":"form-check-stop","label":"平台表单检查","focus":["local_preflight_passed","platform_page_active","platform_form_verified","failed_before_final_action"],"note":"platform_form_check 会发生上传写入；定时控件不可用或失败时在最终动作前终止。"},{"id":"failure-and-ambiguity","label":"失败、结果不明与防重复","focus":["scheduled_accepted","scheduled_readback_confirmed","failed_before_final_action","final_action_triggered","ambiguous","duplicate_blocked"],"note":"定时成功只证明排期存在且 publishedAt=null；定时失败不回退 Post，最终动作后也不自动重试。"}]</script>
+    <script id="archify-guided-views-data" type="application/json">[{"id":"formal-main-path","label":"正式发布主链","focus":["local_preflight_passed","platform_page_active","platform_form_verified","final_action_triggered","platform_accepted","published_readback_confirmed"],"note":"表单核对后恰好一次 Post 或 Schedule；平台受理与最终回读是分层证据。"},{"id":"form-check-stop","label":"平台表单检查","focus":["local_preflight_passed","platform_page_active","platform_form_verified","failed_before_final_action"],"note":"platform_form_check 会发生上传写入；定时控件不可用或失败时在最终动作前终止。"},{"id":"failure-and-ambiguity","label":"失败、结果不明与防重复","focus":["scheduled_accepted","scheduled_readback_confirmed","failed_before_final_action","final_action_triggered","ambiguous","duplicate_blocked"],"note":"定时受理后的唯一列表回读失败进入 ambiguous；排期回读确认时 publishedAt=null，不等于已发布。"}]</script>
 
     <div class="guided-views no-print" id="guided-views" hidden aria-label="Guided diagram views">
       <button id="guided-view-prev" type="button" aria-label="Previous guided view" title="Previous guided view ([)">&#8592;</button>
@@ -4956,9 +4956,10 @@
         <path data-edge-from="final_action_triggered" data-edge-to="platform_accepted" data-edge-key="4" data-edge-id="final-to-accepted" data-composition-points="616,157;655,157" d="M 616 157 L 655 157" class="a-emphasis" stroke-width="2" marker-end="url(#arrowhead-emphasis)"/>
         <path data-edge-from="final_action_triggered" data-edge-to="scheduled_accepted" data-edge-key="5" data-edge-id="final-to-scheduled-accepted" data-composition-points="556,188;556,320" d="M 556 188 L 556 320" class="a-emphasis" stroke-width="2" marker-end="url(#arrowhead-emphasis)"/>
         <path data-edge-from="scheduled_accepted" data-edge-to="scheduled_readback_confirmed" data-edge-key="6" data-edge-id="scheduled-accepted-to-readback" data-composition-points="610,349;645,349" d="M 610 349 L 645 349" class="a-emphasis" stroke-width="2" marker-end="url(#arrowhead-emphasis)"/>
-        <path data-edge-from="platform_accepted" data-edge-to="published_readback_confirmed" data-edge-key="7" data-edge-id="accepted-to-readback" data-composition-points="710,188;710,240" d="M 710 188 L 710 240" class="a-emphasis" stroke-width="2" marker-end="url(#arrowhead-emphasis)"/>
-        <path data-edge-from="final_action_triggered" data-edge-to="ambiguous" data-edge-key="8" data-edge-id="final-to-ambiguous" data-composition-points="496,157;475,157;475,479;496,479" d="M 496 157 L 485 157 Q 475 157 475 167 L 475 469 Q 475 479 485 479 L 496 479" class="a-security" stroke-width="1.1" marker-end="url(#arrowhead-security)"/>
-        <path data-edge-from="ambiguous" data-edge-to="duplicate_blocked" data-edge-key="9" data-edge-id="ambiguous-duplicate-block" data-composition-points="616,479;650,479" d="M 616 479 L 650 479" class="a-security" stroke-width="1.1" marker-end="url(#arrowhead-security)"/>
+        <path data-edge-from="scheduled_accepted" data-edge-to="ambiguous" data-edge-label="唯一列表回读失败" data-edge-key="7" data-edge-id="scheduled-accepted-to-ambiguous" data-composition-points="556,378;556,450" d="M 556 378 L 556 450" class="a-security" stroke-width="1.1" marker-end="url(#arrowhead-security)"/>
+        <path data-edge-from="platform_accepted" data-edge-to="published_readback_confirmed" data-edge-key="8" data-edge-id="accepted-to-readback" data-composition-points="710,188;710,240" d="M 710 188 L 710 240" class="a-emphasis" stroke-width="2" marker-end="url(#arrowhead-emphasis)"/>
+        <path data-edge-from="final_action_triggered" data-edge-to="ambiguous" data-edge-key="9" data-edge-id="final-to-ambiguous" data-composition-points="496,157;475,157;475,479;496,479" d="M 496 157 L 485 157 Q 475 157 475 167 L 475 469 Q 475 479 485 479 L 496 479" class="a-security" stroke-width="1.1" marker-end="url(#arrowhead-security)"/>
+        <path data-edge-from="ambiguous" data-edge-to="duplicate_blocked" data-edge-key="10" data-edge-id="ambiguous-duplicate-block" data-composition-points="616,479;650,479" d="M 616 479 L 650 479" class="a-security" stroke-width="1.1" marker-end="url(#arrowhead-security)"/>
 
         <!-- States -->
         <g id="node-local_preflight_passed" data-node-id="local_preflight_passed" data-node-label="本地预检通过" tabindex="0" role="button" aria-label="Focus 本地预检通过, 零平台写入, 正式发布证据主链" aria-pressed="false" data-node-kind="start" data-node-sublabel="零平台写入" data-node-tag="preflight" data-node-context="正式发布证据主链">
@@ -5082,8 +5083,8 @@
         <text data-detail="fine" x="402" y="497" class="t-security" font-size="7" text-anchor="middle">retry after new preflight</text>
         </g>
 
-        <g id="node-ambiguous" data-node-id="ambiguous" data-node-label="结果不明" tabindex="0" role="button" aria-label="Focus 结果不明, ambiguous · Post 后只读核对, 失败、结果不明与防重复终态" aria-pressed="false" data-node-kind="failure" data-node-sublabel="ambiguous · Post 后只读核对" data-node-tag="read-only reconcile" data-node-context="失败、结果不明与防重复终态">
-          <title>结果不明 · ambiguous · Post 后只读核对 · 失败、结果不明与防重复终态 · read-only reconcile</title>
+        <g id="node-ambiguous" data-node-id="ambiguous" data-node-label="结果不明" tabindex="0" role="button" aria-label="Focus 结果不明, ambiguous · 最终动作后只读核对, 失败、结果不明与防重复终态" aria-pressed="false" data-node-kind="failure" data-node-sublabel="ambiguous · 最终动作后只读核对" data-node-tag="read-only reconcile" data-node-context="失败、结果不明与防重复终态">
+          <title>结果不明 · ambiguous · 最终动作后只读核对 · 失败、结果不明与防重复终态 · read-only reconcile</title>
           <rect x="496" y="450" width="120" height="58" rx="7" class="c-mask"/>
           <rect x="496" y="450" width="120" height="58" rx="7" class="c-security" stroke-width="1.5"/>
           <g aria-hidden="true" data-semantic-sigil="failure" class="semantic-sigil s-security" transform="translate(599 456) scale(0.6875)">
@@ -5091,7 +5092,7 @@
             <path d="m5.7 5.7 4.6 4.6m0-4.6-4.6 4.6"/>
           </g>
           <text data-detail-anchor x="556" y="471" class="t-primary" font-size="10" font-weight="600" text-anchor="middle">结果不明</text>
-          <text data-detail="context" x="556" y="487" class="t-muted" font-size="6.9" text-anchor="middle">ambiguous · Post 后只读核对</text>
+          <text data-detail="context" x="556" y="487" class="t-muted" font-size="6.2" text-anchor="middle">ambiguous · 最终动作后只读核对</text>
         <text data-detail="fine" x="556" y="497" class="t-security" font-size="7" text-anchor="middle">read-only reconcile</text>
         </g>
 
@@ -5116,6 +5117,10 @@
 
 
 
+        <g data-detail="context" data-edge-from="scheduled_accepted" data-edge-to="ambiguous" data-edge-label="唯一列表回读失败" data-edge-key="7" data-edge-id="scheduled-accepted-to-ambiguous">
+          <rect x="510.8" y="381" width="90.4" height="16" rx="4" class="c-mask"/>
+          <text x="556" y="392" class="t-security" font-size="8" text-anchor="middle">唯一列表回读失败</text>
+        </g>
 
 
 
@@ -5355,8 +5360,8 @@
         </div>
         <ul>
           <li>&bull; tiktok_schedule_unavailable 与所有定时控制失败进入 failed_before_final_action</li>
-          <li>&bull; 最终动作后结果不明进入 ambiguous，只允许只读核对</li>
-          <li>&bull; 所有定时控制失败都在最终动作前终止</li>
+          <li>&bull; Post / Schedule 最终动作后结果不明进入 ambiguous，只允许只读核对</li>
+          <li>&bull; scheduled_accepted 后唯一列表回读失败也进入 ambiguous，继续阻止重复提交</li>
           <li>&bull; failed_before_final_action 没有通往立即 Post 的迁移</li>
         </ul>
       </div>

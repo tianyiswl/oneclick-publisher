@@ -14,8 +14,8 @@
       {
         "id": "controlled-main-path",
         "label": "受控发布主链",
-        "focus": ["controlled_publish", "publish_service", "tiktok_publish_service", "tiktok_uploader", "tiktok_schedule_form", "tiktok_studio"],
-        "note": "受控请求经唯一 TikTok 服务和 TiktokVideo 进入原生定时表单；排期失败不回退 Post。"
+        "focus": ["controlled_publish", "publish_service", "tiktok_publish_service", "tiktok_uploader", "tiktok_schedule_form", "short_lived_formal_authorization", "tiktok_studio"],
+        "note": "定时表单精确回读后，必须经本次短期一次性正式授权，才可恰好一次 Schedule；失败不回退 Post。"
       },
       {
         "id": "identity-session-boundary",
@@ -26,24 +26,12 @@
       {
         "id": "receipts-and-verification",
         "label": "回执与人工验证",
-        "focus": ["publish_service", "task_db", "tiktok_uploader", "user_verification", "tiktok_studio"],
-        "note": "任务事件、回执和心跳落库；需要验证时继续使用同一 Playwright 页面。"
+        "focus": ["publish_service", "task_db", "tiktok_uploader", "user_verification", "short_lived_formal_authorization", "tiktok_studio"],
+        "note": "CAPTCHA / 风控人工确认只恢复页面执行，不是发布授权；Schedule 必须单独消费本次正式授权。"
       }
     ]
   },
   "components": [
-    {
-      "id": "content_ui",
-      "type": "frontend",
-      "label": "Content Project / Desktop UI",
-      "sublabel": "结构化内容包与明确账号",
-      "pos": [25, 80],
-      "size": [195, 74],
-      "sources": [
-        {"path": "app_core/content_project_gateway.py", "line": 126, "end_line": 175, "label": "内容项目入口"},
-        {"path": "ui/publish_page.py", "line": 4791, "label": "桌面发布入口"}
-      ]
-    },
     {
       "id": "controlled_publish",
       "type": "security",
@@ -102,10 +90,24 @@
       "tag": "no fallback to Post",
       "sources": [
         {"path": "docs/superpowers/specs/2026-08-29-tiktok-scheduled-video-publish-design.md", "line": 125, "label": "已批准的平台原生定时模块边界"},
-        {"path": "uploader/tk_uploader/main.py", "line": 610, "label": "现有表单快照与最终动作接线点"}
+        {"path": "uploader/tk_uploader/main.py", "line": 629, "label": "现有表单快照精确回读入口"},
+        {"path": "uploader/tk_uploader/main.py", "line": 857, "label": "现有正式模式锁与一次性提交入口"}
       ],
       "pos": [970, 295],
       "size": [230, 74]
+    },
+    {
+      "id": "short_lived_formal_authorization",
+      "type": "security",
+      "label": "本次短期一次性正式授权",
+      "sublabel": "精确绑定表单回读与排期；消费后才可最终点击",
+      "tag": "not CAPTCHA / risk control",
+      "sources": [
+        {"path": "app_core/controlled_publish.py", "line": 1502, "label": "检查成功后签发短期一次性授权"},
+        {"path": "app_core/controlled_publish.py", "line": 1735, "label": "正式任务原子消费当次授权"}
+      ],
+      "pos": [1260, 505],
+      "size": [190, 74]
     },
     {
       "id": "tiktok_studio",
@@ -177,6 +179,7 @@
       "sublabel": "CAPTCHA / 二次验证 / 风控由用户处理",
       "pos": [720, 505],
       "size": [225, 70],
+      "tag": "not publish authorization",
       "sources": [
         {"path": "uploader/tk_uploader/main.py", "line": 224, "end_line": 250, "label": "同页人工验证"},
         {"path": "docs/superpowers/specs/2026-08-28-tiktok-controlled-video-publish-design.md", "line": 171, "end_line": 179, "label": "验证边界"}
@@ -187,7 +190,7 @@
     {
       "kind": "region",
       "label": "一键发受控本机边界",
-      "wraps": ["content_ui", "controlled_publish", "publish_service", "tiktok_publish_service", "tiktok_uploader", "tiktok_schedule_form", "account_db", "identity_reader", "session_file", "task_db"],
+      "wraps": ["controlled_publish", "publish_service", "tiktok_publish_service", "tiktok_uploader", "tiktok_schedule_form", "short_lived_formal_authorization", "account_db", "identity_reader", "session_file", "task_db"],
       "pad": 18
     },
     {
@@ -204,12 +207,12 @@
     }
   ],
   "connections": [
-    {"id": "content-to-contract", "from": "content_ui", "to": "controlled_publish", "label": "结构化内容包 + accountId", "variant": "security", "fromSide": "bottom", "toSide": "top"},
-    {"id": "contract-to-service", "from": "controlled_publish", "to": "publish_service", "label": "快照 + 一次性授权", "variant": "security", "labelDy": -32},
+    {"id": "contract-to-service", "from": "controlled_publish", "to": "publish_service", "label": "受控任务 + 授权绑定", "variant": "security", "labelDy": -32},
     {"id": "service-to-tiktok", "from": "publish_service", "to": "tiktok_publish_service", "label": "platform_form_check / formal", "variant": "emphasis", "labelDx": 90, "labelDy": 62},
     {"id": "tiktok-to-uploader", "from": "tiktok_publish_service", "to": "tiktok_uploader", "label": "同一字段与回读实现", "variant": "emphasis", "labelDy": -32},
     {"id": "uploader-to-schedule-form", "from": "tiktok_uploader", "to": "tiktok_schedule_form", "label": "表单快照 + 定时意图", "variant": "emphasis", "labelDy": -32},
-    {"id": "schedule-form-to-studio", "from": "tiktok_schedule_form", "to": "tiktok_studio", "label": "唯一 Post 或 Schedule", "variant": "emphasis", "labelDy": 62},
+    {"id": "schedule-form-to-authorization", "from": "tiktok_schedule_form", "to": "short_lived_formal_authorization", "label": "精确回读后绑定本次正式授权", "variant": "security"},
+    {"id": "authorization-to-studio", "from": "short_lived_formal_authorization", "to": "tiktok_studio", "label": "消费授权后恰好一次 Schedule", "variant": "emphasis"},
     {"id": "account-to-identity", "from": "account_db", "to": "identity_reader", "label": "saved accountReference", "variant": "security", "labelDy": -30},
     {"id": "session-to-identity", "from": "session_file", "to": "identity_reader", "label": "isolated storage_state", "variant": "security", "labelDy": -30},
     {"id": "identity-to-tiktok", "from": "identity_reader", "to": "tiktok_publish_service", "label": "matched public handle", "variant": "security", "labelDy": 25},
@@ -233,7 +236,7 @@
       "title": "平台写入与最终动作",
       "items": [
         "platform_form_check 会上传并填写，必须停在 Post / Schedule 前",
-        "formal 仅在消费一次性授权后允许一次 Post 或 Schedule",
+        "定时表单精确回读后，formal 必须消费本次短期一次性授权才能点击 Schedule",
         "tiktok_schedule_unavailable 在最终动作前失败，禁止回退 Post"
       ]
     },
@@ -242,7 +245,7 @@
       "title": "隐私与回执",
       "items": [
         "Cookie/session bytes 只留在 Isolated Session File",
-        "request / receipt JSON 不携带 Cookie、验证码、二维码或会话内容",
+        "CAPTCHA / 风控人工处理不是发布授权；request / receipt JSON 不携带会话内容",
         "任务库只保存白名单回执、阶段事件和 worker heartbeat"
       ]
     }
