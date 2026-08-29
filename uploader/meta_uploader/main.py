@@ -37,8 +37,19 @@ MANUAL_INTERVENTION_TIMEOUT_SECONDS = 600
 PUBLISH_RESULT_TIMEOUT_SECONDS = 120
 
 
-class MetaManualInterventionRequired(RuntimeError):
+class MetaManualInterventionRequired(FacebookPagePublishError):
     """Meta 要求验证码、双重验证或其他真人安全确认。"""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(
+            "facebook_verification_timeout",
+            message,
+            receipt={
+                "phase": "verification",
+                "platformWriteOccurred": False,
+                "finalActionTriggered": False,
+            },
+        )
 
 
 class MetaPublishResultUnverified(RuntimeError):

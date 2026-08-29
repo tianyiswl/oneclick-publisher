@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from app_core.overseas_meta_errors import FacebookPagePublishError
+from uploader.meta_uploader.main import MetaManualInterventionRequired
 from uploader.meta_uploader.page_form import (
     FacebookPageFormAdapter,
     FacebookPageFormExpectation,
@@ -68,6 +69,7 @@ class _FakeFacebookPage:
         pages: tuple[tuple[str, str], ...],
         active_page_id: str,
         switch_mismatch: bool = False,
+        generic_create_buttons: list[Any] | None = None,
     ) -> None:
         self.rows = [
             _FakePageRow(self, page_id, page_name)
@@ -77,6 +79,7 @@ class _FakeFacebookPage:
         self.switch_mismatch = switch_mismatch
         self.activation_attempts: list[str] = []
         self.active_read_count = 0
+        self.generic_create_buttons = list(generic_create_buttons or [])
 
     def locator(self, selector: str) -> _FakeLocator:
         if selector == "[data-page-id]":
@@ -91,6 +94,28 @@ class _FakeFacebookPage:
             page_id = selector[len(prefix) : -2]
             return _FakeLocator(
                 [row for row in self.rows if row.page_id == page_id]
+            )
+        return _FakeLocator([])
+
+    def get_by_role(
+        self,
+        role: str,
+        *,
+        name: str,
+        exact: bool,
+    ) -> _FakeLocator:
+        if role == "button" and exact and name in {
+            "Create reel",
+            "Create Reel",
+            "创建 Reels",
+            "创建快拍",
+        }:
+            return _FakeLocator(
+                [
+                    button
+                    for button in self.generic_create_buttons
+                    if getattr(button, "label", None) == name
+                ]
             )
         return _FakeLocator([])
 
@@ -116,6 +141,224 @@ class _FakeButton:
         self.click_count += 1
 
 
+class _DomElement:
+    def __init__(
+        self,
+        page: "_PlaywrightLikeFacebookPage",
+        *,
+        attributes: dict[str, str] | None = None,
+        text: str = "",
+        action: str = "",
+        enabled: bool = True,
+    ) -> None:
+        self.page = page
+        self.attributes = dict(attributes or {})
+        self.text = text
+        self.action = action
+        self.enabled = enabled
+
+    async def is_visible(self) -> bool:
+        return True
+
+    async def get_attribute(self, name: str) -> str | None:
+        return self.attributes.get(name)
+
+    async def inner_text(self) -> str:
+        if self.action == "editor":
+            return self.page.editor_value
+        return self.text
+
+    async def text_content(self) -> str:
+        return await self.inner_text()
+
+    async def input_value(self) -> str:
+        if self.action != "editor":
+            raise RuntimeError("not an input")
+        return self.page.editor_value
+
+    async def fill(self, value: str) -> None:
+        if self.action != "editor":
+            raise RuntimeError("not an editor")
+        if value:
+            self.page.caption_fill_count += 1
+        else:
+            self.page.clear_count += 1
+        self.page.editor_value = value
+
+    async def click(self) -> None:
+        if self.action == "create":
+            self.page.create_click_count += 1
+            self.page.composer_open = True
+            if self.page.drift_after_create:
+                self.page.active_page_id = "1002"
+        elif self.action == "final":
+            self.page.final_click_count += 1
+
+    async def set_input_files(self, file_path: str) -> None:
+        if self.action != "upload":
+            raise RuntimeError("not a file input")
+        self.page.set_input_files_calls += 1
+        self.page.uploaded_name = Path(file_path).name
+
+    async def is_checked(self) -> bool:
+        return self.action == "public" and self.page.visibility == "public"
+
+    async def check(self) -> None:
+        if self.action != "public":
+            raise RuntimeError("not a visibility control")
+        self.page.public_select_count += 1
+        self.page.visibility = "public"
+
+    async def is_enabled(self) -> bool:
+        return self.enabled
+
+
+class _PlaywrightLikeFacebookPage:
+    """Selector-level fake that exercises the production adapter helpers."""
+
+    def __init__(
+        self,
+        *,
+        page_bound_create: bool = True,
+        generic_create: bool = False,
+        drift_after_create: bool = False,
+        media_empty_count: int = 1,
+        expose_media_collection: bool = False,
+        expose_draft_evidence: bool = True,
+    ) -> None:
+        self.rows = [
+            _FakePageRow(self, "1001", "One"),
+            _FakePageRow(self, "1002", "Two"),
+        ]
+        self.active_page_id = "1001"
+        self.switch_mismatch = False
+        self.activation_attempts: list[str] = []
+        self.active_read_count = 0
+        self.page_bound_create = page_bound_create
+        self.generic_create = generic_create
+        self.drift_after_create = drift_after_create
+        self.media_empty_count = media_empty_count
+        self.expose_media_collection = expose_media_collection
+        self.expose_draft_evidence = expose_draft_evidence
+        self.composer_open = False
+        self.editor_value = ""
+        self.uploaded_name = ""
+        self.visibility = "private"
+        self.create_click_count = 0
+        self.clear_count = 0
+        self.set_input_files_calls = 0
+        self.caption_fill_count = 0
+        self.public_select_count = 0
+        self.final_click_count = 0
+        self.wait_timeout_calls = 0
+        self._create = _DomElement(self, text="Create reel", action="create")
+        self._editor = _DomElement(self, action="editor")
+        self._upload = _DomElement(self, action="upload")
+        self._public = _DomElement(self, action="public")
+        self._final = _DomElement(self, text="Publish", action="final")
+
+    def locator(self, selector: str) -> _FakeLocator:
+        if selector == "[data-page-id]":
+            return _FakeLocator(self.rows)
+        if selector == '[data-page-id][data-page-active="true"]':
+            self.active_read_count += 1
+            return _FakeLocator(
+                [row for row in self.rows if row.page_id == self.active_page_id]
+            )
+        if selector in {'[data-page-id="1001"]', '[data-page-id="1002"]'}:
+            page_id = selector.removeprefix('[data-page-id="').removesuffix('"]')
+            return _FakeLocator(
+                [row for row in self.rows if row.page_id == page_id]
+            )
+        if selector == (
+            '[data-page-id="1001"][data-page-active="true"] '
+            "[data-meta-create-reel]"
+        ):
+            return _FakeLocator(
+                [self._create]
+                if self.page_bound_create and self.active_page_id == "1001"
+                else []
+            )
+        if not self.composer_open:
+            return _FakeLocator([])
+        if selector == "[data-meta-content-kind]":
+            return _FakeLocator(
+                [_DomElement(self, attributes={"data-meta-content-kind": "reel"})]
+            )
+        if selector == '[data-meta-composer-state="fresh"]':
+            return _FakeLocator(
+                [_DomElement(self)] if self.expose_draft_evidence else []
+            )
+        if selector == '[data-meta-media-empty="true"]':
+            return _FakeLocator(
+                [_DomElement(self) for _ in range(self.media_empty_count)]
+                if not self.uploaded_name
+                else []
+            )
+        if selector == "[data-meta-media-collection]":
+            return _FakeLocator(
+                [
+                    _DomElement(
+                        self,
+                        attributes={
+                            "data-video-count": "1" if self.uploaded_name else "0"
+                        },
+                    )
+                ]
+                if self.expose_media_collection
+                else []
+            )
+        if selector == "[data-meta-video-preview]" and self.uploaded_name:
+            return _FakeLocator(
+                [
+                    _DomElement(
+                        self,
+                        attributes={
+                            "data-video-name": self.uploaded_name,
+                            "data-upload-status": "completed",
+                        },
+                    )
+                ]
+            )
+        if selector == "[data-meta-caption-editor]":
+            return _FakeLocator([self._editor])
+        if selector == 'input[type="file"][accept*="video" i]':
+            return _FakeLocator([self._upload])
+        if selector == '[data-meta-visibility-option="public"]':
+            return _FakeLocator([self._public])
+        if selector == "[data-meta-visibility-current]":
+            return _FakeLocator(
+                [
+                    _DomElement(
+                        self,
+                        attributes={"data-meta-visibility-current": self.visibility},
+                    )
+                ]
+            )
+        if selector == "[data-meta-final-action]":
+            return _FakeLocator([self._final])
+        return _FakeLocator([])
+
+    def get_by_role(
+        self,
+        role: str,
+        *,
+        name: str,
+        exact: bool,
+    ) -> _FakeLocator:
+        if (
+            self.generic_create
+            and role == "button"
+            and exact
+            and name == "Create reel"
+        ):
+            return _FakeLocator([self._create])
+        return _FakeLocator([])
+
+    async def wait_for_timeout(self, _milliseconds: int) -> None:
+        self.wait_timeout_calls += 1
+
+
 class _HarnessAdapter(FacebookPageFormAdapter):
     def __init__(
         self,
@@ -132,6 +375,8 @@ class _HarnessAdapter(FacebookPageFormAdapter):
         clear_after: str = "",
         visibility: str = "public",
         final_buttons: list[_FakeButton] | None = None,
+        active_page_after_open: str | None = None,
+        active_page_after_completed_preview: str | None = None,
     ) -> None:
         super().__init__(page, wait_for_verification=wait_for_verification)
         self.content_kind = content_kind
@@ -155,10 +400,16 @@ class _HarnessAdapter(FacebookPageFormAdapter):
         self.upload_count = 0
         self.write_count = 0
         self.public_select_count = 0
+        self.active_page_after_open = active_page_after_open
+        self.active_page_after_completed_preview = (
+            active_page_after_completed_preview
+        )
 
     async def _click_create_reel_entry(self, expected_page_id: str) -> None:
         self.composer_open_count += 1
         self.opened_for_page_id = expected_page_id
+        if self.active_page_after_open is not None:
+            self.page.active_page_id = self.active_page_after_open
 
     async def _read_content_kind(self) -> str:
         return self.content_kind
@@ -169,7 +420,13 @@ class _HarnessAdapter(FacebookPageFormAdapter):
     async def _read_video_previews(self) -> list[tuple[str, str]]:
         if self.upload_count == 0:
             return [(name, "completed") for name in self.initial_video_names]
-        return list(zip(self.video_names, self.upload_statuses, strict=False))
+        previews = list(zip(self.video_names, self.upload_statuses, strict=False))
+        if (
+            self.active_page_after_completed_preview is not None
+            and any(str(status).casefold() == "completed" for _, status in previews)
+        ):
+            self.page.active_page_id = self.active_page_after_completed_preview
+        return previews
 
     async def _read_caption_editor(self) -> str:
         return self.editor_value
@@ -209,6 +466,10 @@ class FacebookPageFormTests(unittest.IsolatedAsyncioTestCase):
 
     async def _cleanup_temp(self) -> None:
         self.temp.cleanup()
+
+    @staticmethod
+    async def _no_verification(*_args, **_kwargs) -> None:
+        return None
 
     def expectation(
         self,
@@ -318,6 +579,54 @@ class FacebookPageFormTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(adapter.composer_open_count, 0)
         self.assertEqual(adapter.upload_count, 0)
 
+    async def test_unbound_generic_create_reel_entry_is_never_used(self) -> None:
+        generic = _FakeButton(label="Create reel")
+        page = _FakeFacebookPage(
+            pages=(("1001", "One"),),
+            active_page_id="1001",
+            generic_create_buttons=[generic],
+        )
+        adapter = FacebookPageFormAdapter(
+            page,
+            wait_for_verification=self._no_verification,
+        )
+        with self.assertRaises(RuntimeError):
+            await adapter._click_create_reel_entry("1001")
+        self.assertEqual(generic.click_count, 0)
+
+    async def test_page_drift_after_open_fails_before_any_form_write(self) -> None:
+        adapter = self.adapter(
+            pages=(("1001", "One"), ("1002", "Two")),
+            active_page_id="1001",
+            active_page_after_open="1002",
+        )
+        error = await self.assert_error_code(
+            adapter,
+            self.expectation(),
+            "facebook_page_form_readback_failed",
+        )
+        self.assertFalse(error.receipt["platformWriteOccurred"])
+        self.assertFalse(error.receipt["finalActionTriggered"])
+        self.assertEqual(adapter.clear_count, 0)
+        self.assertEqual(adapter.upload_count, 0)
+        self.assertEqual(adapter.write_count, 0)
+
+    async def test_page_drift_after_upload_readback_fails_before_caption(self) -> None:
+        adapter = self.adapter(
+            pages=(("1001", "One"), ("1002", "Two")),
+            active_page_id="1001",
+            active_page_after_completed_preview="1002",
+        )
+        error = await self.assert_error_code(
+            adapter,
+            self.expectation(),
+            "facebook_page_form_readback_failed",
+        )
+        self.assertTrue(error.receipt["platformWriteOccurred"])
+        self.assertFalse(error.receipt["finalActionTriggered"])
+        self.assertEqual(adapter.upload_count, 1)
+        self.assertEqual(adapter.write_count, 0)
+
     async def test_restored_old_media_fails_without_deleting_or_overwriting(self) -> None:
         adapter = self.adapter(initial_video_names=["old.mp4"])
         await self.assert_error_code(
@@ -329,6 +638,107 @@ class FacebookPageFormTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(adapter.clear_count, 0)
         self.assertEqual(adapter.upload_count, 0)
         self.assertEqual(adapter.write_count, 0)
+
+    async def test_missing_zero_media_evidence_fails_before_any_write(self) -> None:
+        page = _PlaywrightLikeFacebookPage(media_empty_count=0)
+        adapter = FacebookPageFormAdapter(
+            page,
+            wait_for_verification=self._no_verification,
+        )
+        with self.assertRaises(FacebookPagePublishError) as raised:
+            await adapter.fill_and_readback(self.expectation())
+        self.assertEqual(
+            raised.exception.error_code,
+            "facebook_page_form_readback_failed",
+        )
+        self.assertEqual(page.clear_count, 0)
+        self.assertEqual(page.set_input_files_calls, 0)
+        self.assertEqual(page.caption_fill_count, 0)
+
+    async def test_ambiguous_zero_media_state_fails_before_any_write(self) -> None:
+        page = _PlaywrightLikeFacebookPage(media_empty_count=2)
+        adapter = FacebookPageFormAdapter(
+            page,
+            wait_for_verification=self._no_verification,
+        )
+        with self.assertRaises(FacebookPagePublishError) as raised:
+            await adapter.fill_and_readback(self.expectation())
+        self.assertEqual(
+            raised.exception.error_code,
+            "facebook_page_form_readback_failed",
+        )
+        self.assertEqual(page.clear_count, 0)
+        self.assertEqual(page.set_input_files_calls, 0)
+
+    async def test_missing_fresh_or_restored_draft_evidence_fails_closed(self) -> None:
+        page = _PlaywrightLikeFacebookPage(expose_draft_evidence=False)
+        adapter = FacebookPageFormAdapter(
+            page,
+            wait_for_verification=self._no_verification,
+        )
+        with self.assertRaises(FacebookPagePublishError) as raised:
+            await adapter.fill_and_readback(self.expectation())
+        self.assertEqual(
+            raised.exception.error_code,
+            "facebook_page_form_readback_failed",
+        )
+        self.assertEqual(page.clear_count, 0)
+        self.assertEqual(page.set_input_files_calls, 0)
+
+    async def test_production_dom_helpers_complete_one_safe_form_readback(self) -> None:
+        page = _PlaywrightLikeFacebookPage(media_empty_count=1)
+        adapter = FacebookPageFormAdapter(
+            page,
+            wait_for_verification=self._no_verification,
+        )
+        snapshot = await adapter.fill_and_readback(self.expectation())
+        self.assertEqual(snapshot.page_id, "1001")
+        self.assertEqual(snapshot.content_kind, "reel")
+        self.assertEqual(snapshot.video_name, "clip.mp4")
+        self.assertEqual(snapshot.video_count, 1)
+        self.assertEqual(snapshot.caption, "正文 #标签")
+        self.assertEqual(snapshot.visibility, "public")
+        self.assertEqual(snapshot.final_action_label, "Publish")
+        self.assertTrue(snapshot.final_action_ready)
+        self.assertEqual(page.activation_attempts, ["1001"])
+        self.assertGreaterEqual(page.active_read_count, 5)
+        self.assertEqual(page.create_click_count, 1)
+        self.assertEqual(page.clear_count, 1)
+        self.assertEqual(page.set_input_files_calls, 1)
+        self.assertEqual(page.caption_fill_count, 1)
+        self.assertEqual(page.public_select_count, 1)
+        self.assertEqual(page.final_click_count, 0)
+
+    async def test_production_dom_page_drift_after_create_fails_before_write(self) -> None:
+        page = _PlaywrightLikeFacebookPage(drift_after_create=True)
+        adapter = FacebookPageFormAdapter(
+            page,
+            wait_for_verification=self._no_verification,
+        )
+        with self.assertRaises(FacebookPagePublishError) as raised:
+            await adapter.fill_and_readback(self.expectation())
+        self.assertEqual(
+            raised.exception.error_code,
+            "facebook_page_form_readback_failed",
+        )
+        self.assertEqual(page.create_click_count, 1)
+        self.assertEqual(page.clear_count, 0)
+        self.assertEqual(page.set_input_files_calls, 0)
+        self.assertEqual(page.caption_fill_count, 0)
+
+    async def test_production_dom_generic_create_selector_cannot_replace_page_bound_entry(self) -> None:
+        page = _PlaywrightLikeFacebookPage(
+            page_bound_create=False,
+            generic_create=True,
+        )
+        adapter = FacebookPageFormAdapter(
+            page,
+            wait_for_verification=self._no_verification,
+        )
+        with self.assertRaises(FacebookPagePublishError):
+            await adapter.fill_and_readback(self.expectation())
+        self.assertEqual(page.create_click_count, 0)
+        self.assertEqual(page.set_input_files_calls, 0)
 
     async def test_explicit_restored_draft_fails_even_when_fields_are_empty(self) -> None:
         adapter = self.adapter(restored_draft=True)
@@ -398,6 +808,8 @@ class FacebookPageFormTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("caption", error.receipt)
                 self.assertNotIn("dom", error.receipt)
                 self.assertNotIn("cookie", error.receipt)
+                self.assertTrue(error.receipt["platformWriteOccurred"])
+                self.assertFalse(error.receipt["finalActionTriggered"])
                 self.assertEqual(adapter.upload_count, 1)
 
     async def test_local_video_size_or_hash_change_fails_before_composer(self) -> None:
@@ -435,11 +847,13 @@ class FacebookPageFormTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_non_public_visibility_fails(self) -> None:
         adapter = self.adapter(visibility="private")
-        await self.assert_error_code(
+        error = await self.assert_error_code(
             adapter,
             self.expectation(),
             "facebook_page_form_readback_failed",
         )
+        self.assertTrue(error.receipt["platformWriteOccurred"])
+        self.assertFalse(error.receipt["finalActionTriggered"])
 
     async def test_final_button_must_be_unique_present_and_enabled(self) -> None:
         cases = (
@@ -450,21 +864,28 @@ class FacebookPageFormTests(unittest.IsolatedAsyncioTestCase):
         for buttons, label in cases:
             with self.subTest(case=label):
                 adapter = self.adapter(final_buttons=buttons)
-                await self.assert_error_code(
+                error = await self.assert_error_code(
                     adapter,
                     self.expectation(),
                     "facebook_page_form_readback_failed",
                 )
+                self.assertTrue(error.receipt["platformWriteOccurred"])
+                self.assertFalse(error.receipt["finalActionTriggered"])
+                self.assertNotIn("caption", error.receipt)
+                self.assertNotIn("dom", error.receipt)
+                self.assertNotIn("session", error.receipt)
                 self.assertEqual(sum(button.click_count for button in buttons), 0)
 
     async def test_final_button_label_must_be_a_final_publish_action(self) -> None:
         button = _FakeButton(label="Next", enabled=True)
         adapter = self.adapter(final_buttons=[button])
-        await self.assert_error_code(
+        error = await self.assert_error_code(
             adapter,
             self.expectation(),
             "facebook_page_form_readback_failed",
         )
+        self.assertTrue(error.receipt["platformWriteOccurred"])
+        self.assertFalse(error.receipt["finalActionTriggered"])
         self.assertEqual(button.click_count, 0)
 
     async def test_verification_pause_rechecks_the_same_exact_page_without_reselecting(self) -> None:
@@ -483,8 +904,56 @@ class FacebookPageFormTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot.page_id, "1001")
         self.assertEqual(adapter.page.active_page_id, "1001")
         self.assertEqual(adapter.page.activation_attempts, ["1001"])
-        self.assertEqual(wait_count, 3)
+        self.assertEqual(wait_count, 4)
         self.assertGreaterEqual(adapter.page.active_read_count, 2)
+
+    async def test_create_reel_verification_timeout_keeps_frozen_error(self) -> None:
+        wait_count = 0
+
+        async def verification_pause(*_args, **_kwargs) -> None:
+            nonlocal wait_count
+            wait_count += 1
+            if wait_count == 2:
+                raise MetaManualInterventionRequired("verification timeout")
+
+        adapter = self.adapter(wait_for_verification=verification_pause)
+        try:
+            await adapter.fill_and_readback(self.expectation())
+        except Exception as error:  # noqa: BLE001 - contract inspects public error
+            caught = error
+        else:
+            self.fail("verification timeout must stop the form")
+        self.assertIsInstance(caught, MetaManualInterventionRequired)
+        self.assertEqual(
+            getattr(caught, "error_code", None),
+            "facebook_verification_timeout",
+        )
+        self.assertEqual(adapter.clear_count, 0)
+        self.assertEqual(adapter.upload_count, 0)
+        self.assertEqual(adapter.write_count, 0)
+
+    async def test_create_reel_verification_required_semantics_are_preserved(self) -> None:
+        wait_count = 0
+
+        async def verification_pause(*_args, **_kwargs) -> None:
+            nonlocal wait_count
+            wait_count += 1
+            if wait_count == 2:
+                raise FacebookPagePublishError(
+                    "facebook_verification_required",
+                    "verification required",
+                )
+
+        adapter = self.adapter(wait_for_verification=verification_pause)
+        error = await self.assert_error_code(
+            adapter,
+            self.expectation(),
+            "facebook_verification_required",
+        )
+        self.assertFalse(error.receipt.get("platformWriteOccurred", False))
+        self.assertEqual(adapter.clear_count, 0)
+        self.assertEqual(adapter.upload_count, 0)
+        self.assertEqual(adapter.write_count, 0)
 
     async def test_verification_pause_returning_on_another_page_fails_closed(self) -> None:
         holder: dict[str, _HarnessAdapter] = {}
@@ -509,7 +978,8 @@ class FacebookPageFormTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(adapter.page.active_page_id, "1002")
         self.assertEqual(adapter.page.activation_attempts, ["1001"])
-        self.assertEqual(adapter.upload_count, 1)
+        self.assertEqual(adapter.clear_count, 0)
+        self.assertEqual(adapter.upload_count, 0)
         self.assertEqual(adapter.write_count, 0)
 
     async def test_generic_video_or_normal_post_composer_is_not_a_reel(self) -> None:

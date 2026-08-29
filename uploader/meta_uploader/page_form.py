@@ -71,11 +71,12 @@ def _safe_receipt(
     expected: FacebookPageFormExpectation,
     *,
     phase: str,
+    platform_write_occurred: bool = False,
     final_button_enabled: bool | None = None,
 ) -> dict[str, object]:
     receipt: dict[str, object] = {
         "phase": phase,
-        "platformWriteOccurred": False,
+        "platformWriteOccurred": bool(platform_write_occurred),
         "finalActionTriggered": False,
     }
     page_id = str(getattr(expected, "page_id", "") or "").strip()
@@ -106,6 +107,7 @@ def _safe_receipt(
 def _form_readback_failed(
     expected: FacebookPageFormExpectation,
     *,
+    platform_write_occurred: bool = False,
     final_button_enabled: bool | None = None,
 ) -> FacebookPagePublishError:
     return FacebookPagePublishError(
@@ -114,6 +116,7 @@ def _form_readback_failed(
         receipt=_safe_receipt(
             expected,
             phase="form_readback",
+            platform_write_occurred=platform_write_occurred,
             final_button_enabled=final_button_enabled,
         ),
     )
@@ -121,11 +124,17 @@ def _form_readback_failed(
 
 def _upload_failed(
     expected: FacebookPageFormExpectation,
+    *,
+    platform_write_occurred: bool = False,
 ) -> FacebookPagePublishError:
     return FacebookPagePublishError(
         "facebook_upload_failed",
         "Facebook Page Reel 视频上传或预览回读失败，已停止。",
-        receipt=_safe_receipt(expected, phase="form_upload"),
+        receipt=_safe_receipt(
+            expected,
+            phase="form_upload",
+            platform_write_occurred=platform_write_occurred,
+        ),
     )
 
 
@@ -160,6 +169,45 @@ class FacebookPageFormAdapter:
         self._wait_for_verification = wait_for_verification
         self._upload_attempted = False
         self._caption_written = False
+        self._platform_write_occurred = False
+        self._current_expected: FacebookPageFormExpectation | None = None
+
+    def _form_failure(
+        self,
+        expected: FacebookPageFormExpectation,
+        *,
+        final_button_enabled: bool | None = None,
+    ) -> FacebookPagePublishError:
+        return _form_readback_failed(
+            expected,
+            platform_write_occurred=self._platform_write_occurred,
+            final_button_enabled=final_button_enabled,
+        )
+
+    def _upload_failure(
+        self,
+        expected: FacebookPageFormExpectation,
+    ) -> FacebookPagePublishError:
+        return _upload_failed(
+            expected,
+            platform_write_occurred=self._platform_write_occurred,
+        )
+
+    def _preserve_verification_error(
+        self,
+        error: FacebookPagePublishError,
+        expected: FacebookPageFormExpectation,
+    ) -> FacebookPagePublishError:
+        if error.error_code in {
+            "facebook_verification_required",
+            "facebook_verification_timeout",
+        }:
+            error.receipt = _safe_receipt(
+                expected,
+                phase="verification",
+                platform_write_occurred=self._platform_write_occurred,
+            )
+        return error
 
     @staticmethod
     def _validate_expectation(
@@ -221,10 +269,25 @@ class FacebookPageFormAdapter:
         await self.select_expected_page(expected_page_id)
         try:
             await self._click_create_reel_entry(expected_page_id)
+            await self._wait_for_verification(self.page)
+            selected = await validate_facebook_page_binding(
+                self.page,
+                {"accountReference": expected_page_id},
+            )
             content_kind = str(await self._read_content_kind() or "").casefold()
+        except FacebookPagePublishError as exc:
+            if exc.error_code in {
+                "facebook_verification_required",
+                "facebook_verification_timeout",
+            }:
+                raise
+            raise _page_readback_failed(expected_page_id) from exc
         except Exception as exc:
             raise _page_readback_failed(expected_page_id) from exc
-        if content_kind != "reel":
+        if (
+            normalize_facebook_page_id(selected.page_id) != expected_page_id
+            or content_kind != "reel"
+        ):
             raise _page_readback_failed(expected_page_id)
 
     async def fill_and_readback(
@@ -233,6 +296,7 @@ class FacebookPageFormAdapter:
     ) -> FacebookPageFormSnapshot:
         page_id, expected_caption = self._validate_expectation(expected)
         self._validate_local_video(expected)
+        self._current_expected = expected
 
         try:
             await self._wait_for_verification(self.page)
@@ -243,52 +307,57 @@ class FacebookPageFormAdapter:
             initial_caption = canonical_meta_caption(
                 await self._read_caption_editor()
             )
-        except FacebookPagePublishError:
-            raise
+        except FacebookPagePublishError as exc:
+            raise self._preserve_verification_error(exc, expected)
         except Exception as exc:
-            raise _form_readback_failed(expected) from exc
+            raise self._form_failure(expected) from exc
         if (
             initial_kind != "reel"
             or restored_draft
             or initial_previews
             or initial_caption
         ):
-            raise _form_readback_failed(expected)
+            raise self._form_failure(expected)
 
         try:
+            await self._recheck_expected_page(expected)
             await self._clear_caption_editor()
             if canonical_meta_caption(await self._read_caption_editor()):
-                raise _form_readback_failed(expected)
-        except FacebookPagePublishError:
-            raise
+                raise self._form_failure(expected)
+        except FacebookPagePublishError as exc:
+            raise self._preserve_verification_error(exc, expected)
         except Exception as exc:
-            raise _form_readback_failed(expected) from exc
+            raise self._form_failure(expected) from exc
 
         if self._upload_attempted:
-            raise _upload_failed(expected)
+            raise self._upload_failure(expected)
         self._upload_attempted = True
         try:
+            await self._recheck_expected_page(expected)
             await self._upload_video_once(expected.video_name)
+            self._platform_write_occurred = True
             video_name, video_count = await self._wait_for_completed_video(
                 expected
             )
-        except FacebookPagePublishError:
-            raise
+        except FacebookPagePublishError as exc:
+            raise self._preserve_verification_error(exc, expected)
         except Exception as exc:
-            raise _upload_failed(expected) from exc
+            raise self._upload_failure(expected) from exc
 
         if self._caption_written:
-            raise _form_readback_failed(expected)
+            raise self._form_failure(expected)
         self._caption_written = True
         try:
+            await self._recheck_expected_page(expected)
             await self._write_caption_once(expected_caption)
+            self._platform_write_occurred = True
             caption = canonical_meta_caption(await self._read_caption_editor())
             if caption != expected_caption:
-                raise _form_readback_failed(expected)
+                raise self._form_failure(expected)
             await self._select_public_visibility()
             visibility = str(await self._read_visibility() or "").casefold()
             if visibility != "public":
-                raise _form_readback_failed(expected)
+                raise self._form_failure(expected)
 
             await self._wait_for_verification(self.page)
             selected = await self._recheck_expected_page(expected)
@@ -301,10 +370,10 @@ class FacebookPageFormAdapter:
             final_visibility = str(
                 await self._read_visibility() or ""
             ).casefold()
-        except FacebookPagePublishError:
-            raise
+        except FacebookPagePublishError as exc:
+            raise self._preserve_verification_error(exc, expected)
         except Exception as exc:
-            raise _form_readback_failed(expected) from exc
+            raise self._form_failure(expected) from exc
 
         if (
             normalize_facebook_page_id(selected.page_id) != page_id
@@ -317,16 +386,16 @@ class FacebookPageFormAdapter:
             or final_caption != expected_caption
             or final_visibility != "public"
         ):
-            raise _form_readback_failed(expected)
+            raise self._form_failure(expected)
 
         button = await self.final_action_button()
         try:
             label = " ".join((await self._button_label(button)).split())
             ready = bool(await self._button_ready(button))
         except Exception as exc:
-            raise _form_readback_failed(expected) from exc
+            raise self._form_failure(expected) from exc
         if label not in _FINAL_ACTION_LABELS or not ready:
-            raise _form_readback_failed(
+            raise self._form_failure(
                 expected,
                 final_button_enabled=ready,
             )
@@ -346,15 +415,13 @@ class FacebookPageFormAdapter:
         try:
             buttons = await self._final_action_buttons()
         except Exception as exc:
-            raise FacebookPagePublishError(
-                "facebook_page_form_readback_failed",
-                "Facebook Page Reel 最终按钮回读失败，已停止。",
-            ) from exc
+            if self._current_expected is not None:
+                raise self._form_failure(self._current_expected) from exc
+            raise
         if len(buttons) != 1:
-            raise FacebookPagePublishError(
-                "facebook_page_form_readback_failed",
-                "Facebook Page Reel 最终按钮不唯一，已停止。",
-            )
+            if self._current_expected is not None:
+                raise self._form_failure(self._current_expected)
+            raise RuntimeError("Facebook Page Reel final action is not unique")
         return buttons[0]
 
     async def _wait_for_completed_video(
@@ -367,16 +434,16 @@ class FacebookPageFormAdapter:
             await self._recheck_expected_page(expected)
             previews = await self._read_video_previews()
             if len(previews) > 1:
-                raise _upload_failed(expected)
+                raise self._upload_failure(expected)
             if len(previews) == 1:
                 actual_name = Path(str(previews[0][0] or "")).name
                 state = str(previews[0][1] or "").casefold()
                 if actual_name != expected_name:
-                    raise _upload_failed(expected)
+                    raise self._upload_failure(expected)
                 if state in _COMPLETE_VIDEO_STATES:
                     return actual_name, 1
             await self._sleep()
-        raise _upload_failed(expected)
+        raise self._upload_failure(expected)
 
     async def _recheck_expected_page(
         self,
@@ -388,9 +455,9 @@ class FacebookPageFormAdapter:
                 {"accountReference": expected.page_id},
             )
         except Exception as exc:
-            raise _form_readback_failed(expected) from exc
+            raise self._form_failure(expected) from exc
         if normalize_facebook_page_id(selected.page_id) != expected.page_id:
-            raise _form_readback_failed(expected)
+            raise self._form_failure(expected)
         return selected
 
     async def _click_create_reel_entry(self, expected_page_id: str) -> None:
@@ -399,15 +466,6 @@ class FacebookPageFormAdapter:
             '[data-page-active="true"] [data-meta-create-reel]'
         )
         candidates = await self._visible_from_locator(self.page.locator(page_selector))
-        if not candidates:
-            candidates = []
-            for label in ("Create reel", "Create Reel", "创建 Reels", "创建快拍"):
-                locator = self.page.get_by_role(
-                    "button",
-                    name=label,
-                    exact=True,
-                )
-                candidates.extend(await self._visible_from_locator(locator))
         if len(candidates) != 1:
             raise RuntimeError("fresh Reel entry is not unique")
         await candidates[0].click()
@@ -429,13 +487,29 @@ class FacebookPageFormAdapter:
         return "reel" if len(reel) == 1 else ""
 
     async def _read_restored_draft(self) -> bool:
+        restored: list[Any] = []
         for selector in (
             '[data-restored-draft="true"]',
             '[data-draft-restored="true"]',
             '[data-meta-composer-state="restored"]',
         ):
-            if await self._visible_from_locator(self.page.locator(selector)):
-                return True
+            restored.extend(
+                await self._visible_from_locator(self.page.locator(selector))
+            )
+        if restored:
+            return True
+
+        fresh: list[Any] = []
+        for selector in (
+            '[data-restored-draft="false"]',
+            '[data-draft-restored="false"]',
+            '[data-meta-composer-state="fresh"]',
+        ):
+            fresh.extend(
+                await self._visible_from_locator(self.page.locator(selector))
+            )
+        if len(fresh) != 1:
+            raise RuntimeError("fresh Reel composer state is not provable")
         return False
 
     async def _read_video_previews(self) -> list[tuple[str, str]]:
@@ -448,6 +522,41 @@ class FacebookPageFormAdapter:
             items = await self._visible_from_locator(self.page.locator(selector))
             if items:
                 break
+        if not items:
+            empty_states: list[Any] = []
+            for selector in (
+                '[data-meta-media-empty="true"]',
+                '[data-testid="reel-composer-media-empty"]',
+            ):
+                empty_states.extend(
+                    await self._visible_from_locator(self.page.locator(selector))
+                )
+            if len(empty_states) == 1:
+                return []
+            if len(empty_states) > 1:
+                raise RuntimeError("Reel composer empty media state is ambiguous")
+
+            collections: list[Any] = []
+            for selector in (
+                "[data-meta-media-collection]",
+                '[data-testid="reel-composer-media"]',
+            ):
+                collections.extend(
+                    await self._visible_from_locator(self.page.locator(selector))
+                )
+            if len(collections) != 1:
+                raise RuntimeError("Reel composer media state is not readable")
+            count_value = (
+                await collections[0].get_attribute("data-video-count")
+                or await collections[0].get_attribute("data-media-count")
+            )
+            try:
+                media_count = int(str(count_value))
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("Reel composer media count is not readable") from exc
+            if media_count == 0:
+                return []
+            raise RuntimeError("Reel composer media previews are not readable")
         result: list[tuple[str, str]] = []
         for item in items:
             name = (
