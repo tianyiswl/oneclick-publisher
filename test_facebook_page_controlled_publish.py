@@ -294,10 +294,22 @@ class FacebookPageControlledPublishTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             manifest = self.manifest(root)
-            video = root / "facebook.mp4"
-            video.chmod(0)
-            self.addCleanup(lambda: video.chmod(0o600) if video.exists() else None)
-            with self.assertRaises(ControlledPublishError) as raised:
+            video = (root / "facebook.mp4").resolve()
+            path_type = type(video)
+            real_open = path_type.open
+
+            def open_with_video_permission_denied(path, *args, **kwargs):
+                mode = args[0] if args else kwargs.get("mode", "r")
+                if path == video and mode == "rb":
+                    raise PermissionError("simulated unreadable video")
+                return real_open(path, *args, **kwargs)
+
+            with patch.object(
+                path_type,
+                "open",
+                autospec=True,
+                side_effect=open_with_video_permission_denied,
+            ), self.assertRaises(ControlledPublishError) as raised:
                 build_controlled_payloads(
                     self.request(manifest),
                     accounts=[self.account()],
