@@ -12,7 +12,7 @@ import json
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
 from myUtils.postVideo import post_video_batch_draft_tabs
@@ -42,6 +42,7 @@ from . import (
     xhs_publish_executor,
 )
 from .douyin_graphic_matrix_service import prepare_matrix
+from .overseas_meta_errors import FacebookPagePublishError
 from .paths import VIDEO_DIR
 
 
@@ -60,6 +61,14 @@ _DOUYIN_COMMERCE_BATCH_WORKFLOW = "douyin-commerce-batch"
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
+class PublishServiceError(ValueError):
+    """Stable public boundary error raised before a publish worker starts."""
+
+    def __init__(self, error_code: str, message: str) -> None:
+        self.error_code = str(error_code)
+        super().__init__(str(message))
+
+
 def _failure_error_code(exc: BaseException, *, platform_type: int) -> str:
     error_code = str(getattr(exc, "error_code", "") or "").strip()
     if error_code:
@@ -69,6 +78,7 @@ def _failure_error_code(exc: BaseException, *, platform_type: int) -> str:
         3: "douyin_publish_failed",
         6: "tiktok_publish_failed",
         7: "youtube_publish_failed",
+        9: "facebook_publish_failed",
         10: "wechat_publish_failed",
     }.get(int(platform_type), "platform_publish_failed")
 
@@ -205,6 +215,13 @@ def _validate_payloads(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
             ]
         runtime_mode = str(payload.get("runtimeMode") or "preflight")
         platform_type = int(payload.get("type") or 0)
+        if platform_type == 9:
+            for untrusted_key in (
+                "metaBrowserPublishConfirmed",
+                "metaBrowserAutomationAcknowledged",
+                "overseasVideoPublishConfirmed",
+            ):
+                payload.pop(untrusted_key, None)
         if platform_type == 1:
             content_type = str(payload.get("contentType") or "").strip()
             xhs_location_keys = (
@@ -377,6 +394,11 @@ def _validate_payloads(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if runtime_mode == "preflight":
             if payload.get("debugDryRun") is not True:
                 raise ValueError("预发布检查必须保持 debugDryRun=true")
+            if platform_type == 9:
+                overseas_browser_publish._validate_facebook_page_payload(
+                    payload,
+                    mode="preflight",
+                )
         elif runtime_mode == "publish":
             if platform_type not in {1, 3, 6, 7, 8, 9, 10}:
                 raise ValueError(
@@ -404,7 +426,13 @@ def _validate_payloads(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     raise ValueError("；".join(checked["errors"]))
                 # 海外账号风控与二次验证必须能在前台由用户处理。
                 payload["backgroundMode"] = False
-            elif platform_type in {8, 9}:
+            elif platform_type == 9:
+                overseas_browser_publish._validate_facebook_page_payload(
+                    payload,
+                    mode="formal",
+                )
+                payload["backgroundMode"] = False
+            elif platform_type == 8:
                 checked = overseas_browser_publish.validate_meta_browser_publish_payload(
                     payload
                 )
@@ -740,7 +768,12 @@ def _run_preflight(task: dict, payloads: list[dict[str, Any]]) -> None:
                     result = overseas_youtube_publish.run_youtube_preflight_sync(
                         payload
                     )
-                elif platform_type in {6, 7, 8, 9}:
+                elif platform_type == 9:
+                    result = overseas_preflight.run_facebook_page_preflight_sync(
+                        payload,
+                        task_id=int(task["id"]),
+                    )
+                elif platform_type in {6, 7, 8}:
                     result = overseas_preflight.run_overseas_preflight_sync(payload)
                 else:
                     result = oneclick_preflight.run_preflight_sync(payload)
@@ -1009,7 +1042,12 @@ def _run_publish(task: dict, payloads: list[dict[str, Any]]) -> None:
                     result = overseas_video_publish.run_overseas_video_publish_sync(
                         payload
                     )
-                elif platform_type in {8, 9}:
+                elif platform_type == 9:
+                    raise PublishServiceError(
+                        "facebook_publish_authorization_invalid",
+                        "Facebook Page 正式发布必须由数据库 claim 的专用 worker 启动。",
+                    )
+                elif platform_type == 8:
                     result = overseas_browser_publish.run_meta_browser_publish_sync(
                         payload
                     )
@@ -1150,6 +1188,17 @@ def _run_wechat_draft(task: dict, payloads: list[dict[str, Any]]) -> None:
 def start_desktop_publish(payloads: list[dict[str, Any]]) -> dict:
     """按载荷启动预检或已确认的公众号正式发布任务。"""
 
+    if any(
+        isinstance(item, dict)
+        and int(item.get("type") or 0) == 9
+        and str(item.get("runtimeMode") or "preflight") == "publish"
+        for item in payloads
+    ):
+        raise PublishServiceError(
+            "facebook_publish_authorization_invalid",
+            "Facebook Page 正式发布缺少数据库受控任务 claim。",
+        )
+
     if payloads and _is_douyin_commerce_batch_payload(payloads[0]):
         raw_batch = dict(payloads[0])
         runtime_mode = str(raw_batch.get("runtimeMode") or "preflight").strip()
@@ -1226,6 +1275,293 @@ def start_desktop_publish(payloads: list[dict[str, Any]]) -> dict:
     )
     _active_threads[int(task["id"])] = worker
     worker.start()
+    return task
+
+
+def _facebook_failure_receipt(
+    payload: dict[str, Any],
+    exc: BaseException | None = None,
+) -> dict[str, object]:
+    receipt = {
+        "pageId": str(payload.get("facebookExpectedPageReference") or ""),
+    }
+    error_receipt = getattr(exc, "receipt", None)
+    if isinstance(error_receipt, dict):
+        receipt.update(error_receipt)
+        receipt["pageId"] = str(
+            payload.get("facebookExpectedPageReference") or ""
+        )
+    return receipt
+
+
+def _mark_facebook_worker_start_failed(
+    task_id: int,
+    payload: dict[str, Any],
+    exc: BaseException,
+) -> None:
+    """Close a reserved Page claim only when no worker could have run."""
+
+    from .controlled_publish import mark_facebook_page_checkpoint
+
+    receipt = _facebook_failure_receipt(payload, exc)
+    mark_facebook_page_checkpoint(
+        int(task_id),
+        expected_state="reserved",
+        new_state="safe_failed",
+        receipt=receipt,
+    )
+    task_service.mark_platform_result(
+        int(task_id),
+        9,
+        ok=False,
+        message=_failure_message(
+            "Facebook Page worker 启动失败",
+            exc,
+            platform_type=9,
+        ),
+        content_type=str(payload.get("contentType") or "video"),
+        event_type="facebook_worker_start_failed",
+        error_code=_failure_error_code(exc, platform_type=9),
+        receipt=receipt,
+    )
+
+
+def _run_facebook_page_publish(
+    task: dict[str, Any],
+    payloads: list[dict[str, Any]],
+) -> None:
+    """Execute one lease-owned Page task and persist every claim edge."""
+
+    from .controlled_publish import mark_facebook_page_checkpoint
+
+    task_id = int(task["id"])
+    payload = dict(payloads[0])
+    claim_state = "reserved"
+    platform_decision: object | None = None
+    if not _publish_lock.acquire(blocking=False):
+        busy = PublishServiceError(
+            "controlled_publish_busy",
+            "已有发布任务正在执行，Facebook Page 未启动浏览器。",
+        )
+        try:
+            mark_facebook_page_checkpoint(
+                task_id,
+                expected_state="reserved",
+                new_state="safe_failed",
+                receipt=_facebook_failure_receipt(payload, busy),
+            )
+        finally:
+            task_service.mark_platform_result(
+                task_id,
+                9,
+                ok=False,
+                message=str(busy),
+                content_type=str(payload.get("contentType") or "video"),
+                event_type="facebook_publish_busy",
+                error_code=busy.error_code,
+                receipt=_facebook_failure_receipt(payload, busy),
+            )
+            _active_threads.pop(task_id, None)
+        return
+
+    def progress(stage: str, receipt: Any) -> None:
+        nonlocal claim_state, platform_decision
+        evidence = dict(receipt) if isinstance(receipt, Mapping) else {}
+        if stage == "final_action_claimed":
+            mark_facebook_page_checkpoint(
+                task_id,
+                expected_state="reserved",
+                new_state="final_action_claimed",
+                receipt=evidence,
+            )
+            claim_state = "final_action_claimed"
+            message = "Facebook Page 最终动作 claim 已持久化"
+        elif stage == "final_action_clicked":
+            mark_facebook_page_checkpoint(
+                task_id,
+                expected_state="final_action_claimed",
+                new_state="final_action_clicked",
+                receipt=evidence,
+            )
+            claim_state = "final_action_clicked"
+            message = "Facebook Page 单次点击已持久化"
+        elif stage == "readback_unique":
+            mark_facebook_page_checkpoint(
+                task_id,
+                expected_state="final_action_clicked",
+                new_state="succeeded",
+                receipt=evidence,
+            )
+            claim_state = "succeeded"
+            message = "Facebook Page 新 Reel 已唯一回读"
+        elif stage in {"readback_none", "readback_mismatch"}:
+            evidence.setdefault(
+                "pageId",
+                str(payload.get("facebookExpectedPageReference") or ""),
+            )
+            mark_facebook_page_checkpoint(
+                task_id,
+                expected_state="final_action_clicked",
+                new_state="ambiguous",
+                receipt=evidence,
+            )
+            claim_state = "ambiguous"
+            message = "Facebook Page 点击后尚无唯一目标 Reel 回读"
+        elif stage == "platform_decision_observed":
+            platform_decision = evidence.get("platformDecision")
+            message = "Facebook Page 平台反馈已记录，但尚未判定成功"
+        else:
+            raise ValueError("未知的 Facebook Page worker 进度")
+        try:
+            task_service.touch_task_heartbeat(task_id)
+            task_service.record_task_event(
+                task_id,
+                f"facebook_{stage}",
+                message,
+            )
+        except Exception:
+            # Claim CAS is the authority. Ancillary progress diagnostics must
+            # never roll back or reinterpret an already committed edge.
+            pass
+
+    try:
+        task_service.mark_task_running(
+            task_id,
+            "一键发开始执行受控 Facebook Page Reel 发布",
+        )
+        result = overseas_browser_publish.run_facebook_page_publish_sync(
+            payload,
+            task_id=task_id,
+            progress=progress,
+        )
+        if claim_state != "succeeded" or not bool(result.get("ok")):
+            raise FacebookPagePublishError(
+                "facebook_publish_outcome_unknown",
+                "Facebook Page worker 未取得 claim 与内容列表一致的成功终态。",
+                receipt=(
+                    result.get("receipt")
+                    if isinstance(result.get("receipt"), dict)
+                    else _facebook_failure_receipt(payload)
+                ),
+                outcome_ambiguous=True,
+            )
+        task_service.mark_platform_result(
+            task_id,
+            9,
+            ok=True,
+            message=str(result.get("message") or "Facebook Page 发布回读成功"),
+            content_type=str(payload.get("contentType") or "video"),
+            event_type="facebook_publish_readback_confirmed",
+            receipt=(
+                dict(result.get("receipt"))
+                if isinstance(result.get("receipt"), dict)
+                else None
+            ),
+        )
+    except Exception as exc:
+        try:
+            if claim_state == "reserved":
+                mark_facebook_page_checkpoint(
+                    task_id,
+                    expected_state="reserved",
+                    new_state="safe_failed",
+                    receipt=_facebook_failure_receipt(payload, exc),
+                )
+                claim_state = "safe_failed"
+            elif claim_state in {"final_action_claimed", "final_action_clicked"}:
+                failure_receipt = _facebook_failure_receipt(payload, exc)
+                if platform_decision is not None:
+                    failure_receipt["platformDecision"] = platform_decision
+                mark_facebook_page_checkpoint(
+                    task_id,
+                    expected_state=claim_state,
+                    new_state="ambiguous",
+                    receipt=failure_receipt,
+                )
+                claim_state = "ambiguous"
+        finally:
+            task_service.mark_platform_result(
+                task_id,
+                9,
+                ok=False,
+                message=_failure_message(
+                    "Facebook Page 正式发布异常",
+                    exc,
+                    platform_type=9,
+                ),
+                content_type=str(payload.get("contentType") or "video"),
+                event_type="facebook_publish",
+                error_code=_failure_error_code(exc, platform_type=9),
+                receipt=_facebook_failure_receipt(payload, exc),
+            )
+    finally:
+        task_service.fail_active_task(
+            task_id,
+            error_code="controlled_worker_ended_without_terminal_result",
+            message="Facebook Page worker 结束，但任务没有取得明确终态",
+        )
+        _publish_lock.release()
+        _active_threads.pop(task_id, None)
+
+
+def start_controlled_facebook_publish(task_id: int) -> dict[str, Any]:
+    """Start exactly one pre-created Page task after consuming its worker lease."""
+
+    from .controlled_publish import require_facebook_page_execution_claim
+
+    task = task_service.get_task(int(task_id))
+    if not isinstance(task, dict) or str(task.get("status") or "") != "pending":
+        raise PublishServiceError(
+            "facebook_publish_authorization_invalid",
+            "Facebook Page 受控任务不存在或已开始执行。",
+        )
+    try:
+        raw_payloads = json.loads(str(task.get("payloadJson") or "[]"))
+    except json.JSONDecodeError as exc:
+        raise PublishServiceError(
+            "facebook_publish_authorization_invalid",
+            "Facebook Page 受控任务快照不可读取。",
+        ) from exc
+    if (
+        str(task.get("mode") or "") != "oneclick_publish"
+        or not isinstance(raw_payloads, list)
+        or len(raw_payloads) != 1
+        or not isinstance(raw_payloads[0], dict)
+        or int(raw_payloads[0].get("type") or 0) != 9
+    ):
+        raise PublishServiceError(
+            "facebook_publish_authorization_invalid",
+            "Facebook Page 受控任务只能包含一个 Page 和一个 Reel。",
+        )
+    payload = dict(raw_payloads[0])
+    try:
+        prepared = _validate_payloads([payload])
+        if str(prepared[0].get("runtimeMode") or "") != "publish":
+            raise PublishServiceError(
+                "facebook_publish_authorization_invalid",
+                "Facebook Page 受控任务模式与 claim 不一致。",
+            )
+        worker = threading.Thread(
+            target=_run_facebook_page_publish,
+            args=(task, prepared),
+            daemon=True,
+            name=f"oneclick-facebook-page-publish-{task_id}",
+        )
+    except Exception as exc:
+        _mark_facebook_worker_start_failed(int(task_id), payload, exc)
+        raise
+
+    require_facebook_page_execution_claim(
+        int(task_id),
+        [payload],
+    )
+    _active_threads[int(task_id)] = worker
+    try:
+        worker.start()
+    except Exception as exc:
+        _active_threads.pop(int(task_id), None)
+        _mark_facebook_worker_start_failed(int(task_id), payload, exc)
+        raise
     return task
 
 

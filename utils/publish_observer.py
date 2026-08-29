@@ -23,6 +23,13 @@ def get_publish_context() -> dict[str, Any]:
 @contextmanager
 def publish_context(**values):
     current = get_publish_context()
+    incoming_task_id = values.get("task_id")
+    current_task_id = current.get("task_id")
+    if incoming_task_id is not None:
+        if type(incoming_task_id) is not int or incoming_task_id <= 0:
+            raise ValueError("发布观察上下文的 task_id 必须是正整数")
+        if current_task_id is not None and int(current_task_id) != incoming_task_id:
+            raise ValueError("同一发布观察上下文不能切换到其他任务")
     merged = {**current, **{key: value for key, value in values.items() if value is not None}}
     token = _PUBLISH_CONTEXT.set(merged)
     try:

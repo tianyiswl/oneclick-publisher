@@ -309,5 +309,32 @@ class PublishServiceTikTokFormCheckClaimTests(unittest.TestCase):
         self.assertNotIn("private database detail", diagnostics[0]["message"])
 
 
+class FacebookPageLegacyStartBoundaryTests(unittest.TestCase):
+    def test_generic_desktop_publish_rejects_formal_facebook_without_claim(self) -> None:
+        payload = {
+            "type": 9,
+            "contentType": "video",
+            "runtimeMode": "publish",
+            "debugDryRun": False,
+            "fileList": ["facebook.mp4"],
+            "accountList": ["facebook.json"],
+            "accountIds": [91],
+            "facebookExpectedPageReference": "1001",
+        }
+        with (
+            patch.object(publish_service.task_service, "create_pending_task") as create,
+            patch.object(publish_service.threading, "Thread") as thread,
+            self.assertRaises(publish_service.PublishServiceError) as raised,
+        ):
+            publish_service.start_desktop_publish([payload])
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "facebook_publish_authorization_invalid",
+        )
+        create.assert_not_called()
+        thread.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
