@@ -24,11 +24,12 @@ Result: `FAILED (failures=1, errors=5)`. The existing implementation only querie
 
 ## Implementation
 
-- Preserved legacy schedule-switch selectors and added only exact `Schedule` / `定时发布` / `排期` radio and checkbox choices.
+- Preserved legacy schedule-switch selectors and resolves native radio/checkbox choices only through Playwright exact `get_by_role(..., name=..., exact=True)` semantics for `Schedule` / `定时发布` / `排期`; this includes associated-label and `aria-labelledby` accessible names without querying final-action buttons.
 - Kept final-action selectors out of schedule-choice resolution.
-- Added an eight-observation, 250 ms bounded poll. A usable candidate must be the same DOM node on two consecutive observations.
+- Each observation freezes locators to element handles before comparison. A usable candidate, or a multi-candidate set, must be the same frozen DOM identity on two consecutive observations.
 - Resolves each schedule field over the upload base plus top page, deduplicates identical DOM nodes, and stops on stable distinct usable controls with `tiktok_schedule_control_ambiguous`.
-- Re-resolves the choice after selection until it is checked; date and time remain editable-only with exact readback.
+- Native radio/checkbox choices use `is_checked()`; legacy switches retain only the `aria-checked`/`checked` fallback. The choice is re-resolved after selection until checked; date and time remain editable-only with exact readback.
+- Added a 15-second monotonic absolute deadline for each control resolution; every DOM await uses the remaining budget via `asyncio.wait_for`. The 64-observation cap is an additional guard, not a substitute for elapsed time. Only timeout/detached/remount transitions are retried.
 - `tiktok_schedule_unavailable` diagnostics now identify only `schedule choice`, `date`, or `time` and bounded structural counts (`scopes`, `candidates`, `usable`). No page text, HTML, attributes, captions, cookies, screenshots, or session data are retained.
 
 ## GREEN evidence
@@ -40,6 +41,13 @@ Result: `FAILED (failures=1, errors=5)`. The existing implementation only querie
 - `git diff --check`: passed with no output.
 - `git diff --cached --check`: passed with no output.
 - `.venv/bin/python tools/check_workstream_scope.py --stream overseas --base origin/main`: `REVIEW_REQUIRED`, because the checker sees 63 branch changes relative to `origin/main`, including pre-existing shared files. This task's own source and test changes are overseas-owned; this report is the required task artifact.
+
+## Review remediation (round 1)
+
+- RED: four adversarial tests failed against the first repair: exact accessible-name/native-property handling was unavailable, a live locator returned its original node after re-mount, changing multi-node sets were declared ambiguous too early, and a hung DOM read exceeded the caller deadline.
+- GREEN: the four adversarial tests passed in `0.283s`; the full schedule-form suite passed `38` tests in `14.787s`; the focused publishing chain passed `329` tests in `15.989s`; the explicit affected suite passed `546` tests in `17.390s`.
+- Diff checks: `git diff --check` and staged `git diff --cached --check` passed with no output before the implementation commit.
+- Exact scope: `.venv/bin/python tools/check_workstream_scope.py --stream overseas --base 49f5395` reported `changed=2`, both overseas-owned, `scope-check: OK`.
 
 ## Changed files
 
@@ -59,4 +67,6 @@ The actual TikTok account may still lack scheduling eligibility, render a differ
 
 ## Commit
 
-`fix(tiktok): stabilize schedule control resolution`
+Initial repair: `49f5395`
+
+Review remediation implementation: `6c80a25ced742b20345fab2c44a0df23c50b0a97` (`fix(tiktok): harden schedule control polling`)
