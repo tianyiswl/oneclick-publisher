@@ -1357,13 +1357,22 @@ class TikTokPlatformSyncTests(unittest.TestCase):
     def fake_uploader(self, *, submit_result: dict | None = None):
         uploader = SimpleNamespace()
         uploader.prepare_form = AsyncMock(return_value=self.form_receipt())
-        uploader.submit_once = AsyncMock(
-            return_value=submit_result
-            or {
+        result = submit_result or {
                 "status": "published",
                 "evidence": "platform_feedback:video posted successfully",
                 "formSnapshot": self.form_receipt(),
             }
+        final_button = SimpleNamespace(click=AsyncMock(return_value=None))
+        uploader._final_action_button = AsyncMock(return_value=final_button)
+
+        async def submit_once(_page, base):
+            button = await uploader._final_action_button(base)
+            await button.click()
+            return result
+
+        uploader.submit_once = AsyncMock(
+            side_effect=submit_once,
+            return_value=result,
         )
         uploader._base = AsyncMock(return_value=object())
         uploader._wait_for_manual_intervention = AsyncMock(return_value=None)
@@ -1374,7 +1383,9 @@ class TikTokPlatformSyncTests(unittest.TestCase):
     def arm_scheduled_checkpoint(uploader) -> None:
         result = uploader.submit_once.return_value
 
-        async def submit_once(_page, _base):
+        async def submit_once(_page, base):
+            button = await uploader._final_action_button(base)
+            await button.click()
             uploader.schedule_checkpoint_observer("scheduled_accepted")
             return result
 
@@ -1625,6 +1636,37 @@ class TikTokPlatformSyncTests(unittest.TestCase):
             )
         self.assertEqual(raised.exception.error_code, "tiktok_schedule_outcome_unknown")
         self.assertTrue(raised.exception.outcome_ambiguous)
+        self.assertEqual(raised.exception.receipt["phase"], "ambiguous")
+        self.assertTrue(raised.exception.receipt["finalActionTriggered"])
+        self.assertEqual(
+            raised.exception.receipt["scheduleMode"], "platform_native"
+        )
+        self.assertEqual(
+            raised.exception.receipt["scheduledAt"], "2026-08-29 15:00"
+        )
+        self.assertEqual(
+            raised.exception.receipt["scheduleTimezone"], "Asia/Shanghai"
+        )
+        self.assertTrue(raised.exception.receipt["platformAccepted"])
+
+    def test_missing_final_action_instrumentation_stays_pre_click(self) -> None:
+        uploader = self.fake_uploader()
+        if hasattr(uploader, "_final_action_button"):
+            del uploader._final_action_button
+        uploader.submit_once.side_effect = overseas_tiktok_publish.TikTokPublishError(
+            "tiktok_form_snapshot_mismatch",
+            "changed before click",
+        )
+        events: list[str] = []
+        with self.assertRaises(overseas_tiktok_publish.TikTokPublishError) as raised:
+            self.run_sync(
+                mode="formal",
+                uploader=uploader,
+                event_sink=events,
+            )
+        self.assertFalse(raised.exception.outcome_ambiguous)
+        self.assertNotIn("tiktok_final_action_triggered", events)
+        uploader.submit_once.assert_not_awaited()
 
     def test_scheduled_formal_accepts_exact_readback_without_published_at(self) -> None:
         uploader = self.fake_uploader(
@@ -1700,6 +1742,8 @@ class TikTokPlatformSyncTests(unittest.TestCase):
         events: list[str] = []
 
         async def submit_once(_page, _base):
+            button = await uploader._final_action_button(_base)
+            await button.click()
             uploader.schedule_checkpoint_observer("scheduled_accepted")
             raise overseas_tiktok_publish.TikTokPublishError(
                 "tiktok_schedule_outcome_unknown",
@@ -1799,10 +1843,10 @@ class TikTokPlatformSyncTests(unittest.TestCase):
         button = SimpleNamespace(
             click=AsyncMock(side_effect=lambda: order.append("click"))
         )
-        uploader._post_button = AsyncMock(return_value=button)
+        uploader._final_action_button = AsyncMock(return_value=button)
 
         async def submit_once(_page, base):
-            current = await uploader._post_button(base)
+            current = await uploader._final_action_button(base)
             await current.click()
             return {
                 "status": "published",
@@ -1867,6 +1911,7 @@ class TikTokPlatformSyncTests(unittest.TestCase):
 
     def test_formal_rechecks_fifteen_minute_window_before_final_action(self) -> None:
         uploader = self.fake_uploader()
+        button = uploader._final_action_button.return_value
         prepared = self.prepared(
             mode="formal",
             schedule_mode="platform_native",
@@ -1890,7 +1935,8 @@ class TikTokPlatformSyncTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.error_code, "tiktok_schedule_out_of_range")
         uploader.prepare_form.assert_awaited_once()
-        uploader.submit_once.assert_not_awaited()
+        uploader.submit_once.assert_awaited_once()
+        button.click.assert_not_awaited()
 
     def test_final_fifteen_minute_gate_runs_inside_schedule_click_trigger(self) -> None:
         uploader = self.fake_uploader()
@@ -1971,7 +2017,13 @@ class TikTokPlatformSyncTests(unittest.TestCase):
 
     def test_explicit_platform_rejection_is_not_marked_ambiguous(self) -> None:
         uploader = self.fake_uploader()
-        uploader.submit_once.side_effect = RuntimeError("TikTok 页面提示最终发布失败")
+
+        async def reject(_page, base):
+            button = await uploader._final_action_button(base)
+            await button.click()
+            raise RuntimeError("TikTok 页面提示最终发布失败")
+
+        uploader.submit_once.side_effect = reject
         with self.assertRaises(overseas_tiktok_publish.TikTokPublishError) as raised:
             self.run_sync(mode="formal", uploader=uploader)
 
@@ -1982,13 +2034,25 @@ class TikTokPlatformSyncTests(unittest.TestCase):
 
     def test_post_click_exception_becomes_ambiguous_and_blocks_success(self) -> None:
         uploader = self.fake_uploader()
-        uploader.submit_once.side_effect = RuntimeError("page detached after click")
+
+        async def detached(_page, base):
+            button = await uploader._final_action_button(base)
+            await button.click()
+            raise RuntimeError("page detached after click")
+
+        uploader.submit_once.side_effect = detached
         with self.assertRaises(overseas_tiktok_publish.TikTokPublishError) as raised:
             self.run_sync(mode="formal", uploader=uploader)
 
         self.assertEqual(raised.exception.error_code, "tiktok_publish_outcome_unknown")
         self.assertTrue(raised.exception.outcome_ambiguous)
         self.assertTrue(raised.exception.receipt["finalActionTriggered"])
+        self.assertEqual(raised.exception.receipt["phase"], "ambiguous")
+        self.assertEqual(raised.exception.receipt["scheduleMode"], "immediate")
+        self.assertEqual(
+            raised.exception.receipt["scheduleTimezone"], "Asia/Shanghai"
+        )
+        self.assertNotIn("platformAccepted", raised.exception.receipt)
 
     def test_exact_content_readback_is_distinct_from_platform_acceptance(self) -> None:
         uploader = self.fake_uploader(

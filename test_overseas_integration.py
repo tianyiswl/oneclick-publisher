@@ -1632,6 +1632,7 @@ class OverseasPreflightTests(unittest.TestCase):
             "visibility": "public",
             "enableTimer": False,
             "scheduleTime": None,
+            "scheduleTimezone": "Asia/Shanghai",
             "videosPerDay": 1,
             "dailyTimes": [],
             "startDays": 0,
@@ -1980,6 +1981,26 @@ class OverseasPreflightTests(unittest.TestCase):
         self.assertFalse(app.notify_subscribers)
         self.assertTrue(app.ai_generated)
 
+    def test_recovered_tiktok_immediate_zero_never_reactivates_schedule(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            video = Path(raw) / "video.mp4"
+            video.write_bytes(b"video")
+            app = recovered_publish._make_platform_app(
+                {
+                    "type": 6,
+                    "title": "TikTok immediate",
+                    "description": "offline",
+                    "tags": [],
+                    "visibility": "public",
+                },
+                str(video),
+                0,
+                Path(raw) / "tiktok.json",
+                dry_run=True,
+            )
+        self.assertIsNone(app._requested_schedule_at)
+        self.assertIsNone(app._schedule_target)
+
     def test_schedule_is_rejected_until_platform_time_is_read_back(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -1989,10 +2010,11 @@ class OverseasPreflightTests(unittest.TestCase):
             payload = self._payload(video)
             payload["enableTimer"] = True
             payload["scheduleTime"] = "2026-08-08 18:00"
+            payload["dailyTimes"] = ["18:00"]
             with self._local_tiktok(root):
                 result = overseas_preflight.validate_overseas_preflight_payload(payload)
         self.assertFalse(result["ok"])
-        self.assertTrue(any("定时时间" in item for item in result["errors"]))
+        self.assertTrue(any("排期" in item for item in result["errors"]))
 
     def test_formal_publish_requires_explicit_confirmation(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

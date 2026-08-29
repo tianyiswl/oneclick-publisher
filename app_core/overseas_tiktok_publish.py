@@ -1549,6 +1549,11 @@ async def _run_tiktok_platform(
             uploader,
             trigger=trigger_final_action,
         )
+        if not final_button_instrumented:
+            _fail(
+                "tiktok_platform_execution_failed",
+                "TikTok 最终动作无法安全监测，已停止在点击前",
+            )
 
         await _wait_before_identity_read(uploader, identity_page)
         account_snapshot = _require_current_account_snapshot(prepared)
@@ -1624,8 +1629,6 @@ async def _run_tiktok_platform(
             }
 
         uploader.publish_confirmed = True
-        if not final_button_instrumented:
-            trigger_final_action()
         submitted = await uploader.submit_once(page, base)
         if not final_state["triggered"]:
             _fail(
@@ -1716,7 +1719,13 @@ async def _run_tiktok_platform(
                 "contentId": None,
                 "contentUrl": None,
                 "publishedAt": None,
+                "scheduleMode": prepared["scheduleMode"],
+                "scheduleTimezone": prepared["scheduleTimezone"],
             }
+            if prepared.get("scheduledAt") is not None:
+                receipt["scheduledAt"] = prepared["scheduledAt"]
+            if schedule_checkpoint_state["accepted"]:
+                receipt["platformAccepted"] = True
             if _is_explicit_platform_rejection(exc):
                 receipt["phase"] = "final_action_triggered"
                 _record_tiktok_event(
@@ -1740,7 +1749,27 @@ async def _run_tiktok_platform(
             except Exception:
                 pass
             if isinstance(exc, TikTokPublishError) and exc.outcome_ambiguous:
-                raise
+                merged_receipt = dict(receipt)
+                merged_receipt.update(exc.receipt)
+                merged_receipt.update(
+                    {
+                        "phase": "ambiguous",
+                        "finalActionTriggered": True,
+                        "scheduleMode": prepared["scheduleMode"],
+                        "scheduleTimezone": prepared["scheduleTimezone"],
+                    }
+                )
+                if prepared.get("scheduledAt") is not None:
+                    merged_receipt["scheduledAt"] = prepared["scheduledAt"]
+                merged_receipt.pop("platformAccepted", None)
+                if schedule_checkpoint_state["accepted"]:
+                    merged_receipt["platformAccepted"] = True
+                raise TikTokPublishError(
+                    exc.error_code,
+                    exc.public_message,
+                    outcome_ambiguous=True,
+                    receipt=merged_receipt,
+                ) from None
             _log_internal_failure("after-final-action", exc)
             raise TikTokPublishError(
                 "tiktok_publish_outcome_unknown",

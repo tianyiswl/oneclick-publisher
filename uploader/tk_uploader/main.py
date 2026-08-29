@@ -213,8 +213,9 @@ class TiktokVideo:
                 "tiktok_schedule_invalid",
                 "TikTok 排期必须是精确到分钟的北京时间字符串",
             )
+        self._requested_schedule_at = self.publish_date
         self.schedule_timezone = str(schedule_timezone)
-        if self.publish_date is not None and self.schedule_timezone != "Asia/Shanghai":
+        if self._requested_schedule_at is not None and self.schedule_timezone != "Asia/Shanghai":
             raise TikTokPublishError(
                 "tiktok_schedule_invalid",
                 "TikTok 定时只支持 Asia/Shanghai 时区",
@@ -748,14 +749,14 @@ class TiktokVideo:
         self._emit_form_stage("visibility_started")
         await self._ensure_public_visibility(page, base)
         self._emit_form_stage("visibility_verified")
-        if self.publish_date is not None:
+        if self._requested_schedule_at is not None:
             self._schedule_form = TikTokScheduleForm(
                 page,
                 resolve_base=lambda: self._base(page),
                 wait_for_manual_intervention=self._wait_for_manual_intervention,
             )
             self._schedule_target = TikTokScheduleTarget(
-                str(self.publish_date),
+                str(self._requested_schedule_at),
                 self.schedule_timezone,
             )
             await self._schedule_form.configure(self._schedule_target)
@@ -769,8 +770,16 @@ class TiktokVideo:
     async def _wait_until_ready(self, page, base) -> None:
         for _ in range(180):
             await self._wait_for_manual_intervention(page)
-            if await self._final_action_button(base) is not None:
-                return
+            try:
+                if await self._final_action_button(base) is not None:
+                    return
+            except TikTokPublishError as exc:
+                if (
+                    self._schedule_target is None
+                    or exc.error_code
+                    != "tiktok_schedule_final_action_unavailable"
+                ):
+                    raise
             await asyncio.sleep(2)
         raise TikTokPublishError(
             "tiktok_post_ready_timeout",

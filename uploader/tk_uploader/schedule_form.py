@@ -362,7 +362,14 @@ class TikTokScheduleForm:
                 "tiktok_schedule_readback_mismatch",
                 "TikTok 定时时间写入后回读不一致",
             )
-        return await self.verify(target)
+        return TikTokScheduleFormSnapshot(
+            schedule_mode="platform_native",
+            scheduled_at=target.scheduled_at,
+            timezone=target.timezone,
+            toggle_enabled=True,
+            final_action_label="Schedule",
+            final_action_ready=False,
+        )
 
     async def verify(
         self,

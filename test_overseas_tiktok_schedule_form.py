@@ -430,7 +430,7 @@ class TikTokScheduleFormTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot.timezone, "Asia/Shanghai")
         self.assertTrue(snapshot.toggle_enabled)
         self.assertEqual(snapshot.final_action_label, "Schedule")
-        self.assertTrue(snapshot.final_action_ready)
+        self.assertFalse(snapshot.final_action_ready)
         self.assertEqual(
             snapshot.as_dict(),
             {
@@ -439,7 +439,7 @@ class TikTokScheduleFormTests(unittest.IsolatedAsyncioTestCase):
                 "scheduleTimezone": "Asia/Shanghai",
                 "scheduleToggleEnabled": True,
                 "finalActionLabel": "Schedule",
-                "finalActionReady": True,
+                "finalActionReady": False,
             },
         )
         self.assertEqual(bases[0].by_role("final_action")[0].click_count, 0)
@@ -473,6 +473,21 @@ class TikTokScheduleFormTests(unittest.IsolatedAsyncioTestCase):
             await form.configure(self.target)
 
         self.assertEqual(raised.exception.error_code, "tiktok_schedule_unavailable")
+
+    async def test_configure_allows_final_action_to_become_ready_after_upload_processing(self) -> None:
+        page, bases = scheduled_form_page()
+        final_button = bases[0].by_role("final_action")[0]
+        final_button.enabled = False
+        form, _, _ = self.form(page, bases)
+
+        configured = await form.configure(self.target)
+
+        self.assertFalse(configured.final_action_ready)
+        self.assertEqual(final_button.click_count, 0)
+        final_button.enabled = True
+        verified = await form.verify(self.target)
+        self.assertTrue(verified.final_action_ready)
+        self.assertEqual(final_button.click_count, 0)
 
     async def test_ambiguous_date_time_and_final_controls_share_stable_code(self) -> None:
         for semantic_role, selectors in (
@@ -562,7 +577,7 @@ class TikTokScheduleFormTests(unittest.IsolatedAsyncioTestCase):
         snapshot = await form.configure(self.target)
 
         self.assertEqual(snapshot.scheduled_at, "2026-08-29 15:00")
-        self.assertEqual(resolver.await_count, 10)
+        self.assertEqual(resolver.await_count, 6)
         self.assertEqual(bases[0].by_role("switch")[0].click_count, 1)
         self.assertEqual(bases[2].by_role("date")[0].fill_count, 1)
         self.assertEqual(bases[4].by_role("time")[0].fill_count, 1)
@@ -570,9 +585,8 @@ class TikTokScheduleFormTests(unittest.IsolatedAsyncioTestCase):
             bases[0].by_role("switch")[0].node_id,
             bases[2].by_role("date")[0].node_id,
             bases[4].by_role("time")[0].node_id,
-            bases[9].by_role("final_action")[0].node_id,
         }
-        self.assertEqual(len(used_node_ids), 4)
+        self.assertEqual(len(used_node_ids), 3)
 
     def test_label_normalization_is_nfkc_whitespace_and_casefolded(self) -> None:
         self.assertEqual(_normalized_label("  Ｓｃｈｅｄｕｌｅ\n"), "schedule")
