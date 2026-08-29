@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import unittest
@@ -7,7 +8,7 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtCore import QDate, QTime
-from PyQt6.QtWidgets import QApplication, QMessageBox
+from PyQt6.QtWidgets import QApplication, QDialog, QMessageBox
 
 from app_core.wechat_verification import verification_broker
 from ui.publish_page import PublishPage
@@ -81,6 +82,275 @@ class PublishPageWechatDraftQueueTests(unittest.TestCase):
                 page._poll_wechat_draft_queue()
             show.assert_called_once_with(41)
             self._dispose_page(page)
+
+
+class PublishPageFacebookControlledTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.video = Path(self.temporary.name) / "facebook.mp4"
+        self.video.write_bytes(b"facebook-page-ui-video")
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def _dispose_page(self, page: PublishPage) -> None:
+        page.wechat_draft_queue_timer.stop()
+        page.task_timer.stop()
+        page.close()
+        page.deleteLater()
+        self.app.processEvents()
+
+    @staticmethod
+    def _account() -> dict:
+        return {
+            "id": 91,
+            "type": 9,
+            "platformName": "Facebook Reels",
+            "filePath": "facebook-page.json",
+            "profileName": "品牌主体",
+            "userName": "Saved Facebook Page",
+            "statusText": "正常",
+            "healthStatus": "normal",
+            "status": 1,
+            "authMode": "browser",
+            "accountReference": "1000000000006789",
+            "remark": "",
+        }
+
+    def _payload(self, *, enable_timer: bool = False) -> dict:
+        return {
+            "type": 9,
+            "contentType": "video",
+            "runtimeMode": "preflight",
+            "debugDryRun": True,
+            "debugDryRunHoldBrowser": False,
+            "backgroundMode": False,
+            "title": "Facebook Page 标题",
+            "description": "Facebook Page 正文",
+            "tags": ["OneClick"],
+            "fileList": [str(self.video)],
+            "accountList": ["facebook-page.json"],
+            "accountIds": [91],
+            "coverPath": "",
+            "coverPaths": {},
+            "visibility": "public",
+            "enableTimer": enable_timer,
+            "scheduleTime": "2026-09-01 09:00" if enable_timer else None,
+            "originalDeclaration": False,
+            "aiGenerated": False,
+        }
+
+    def test_facebook_ui_preflight_uses_standard_controlled_payload(self) -> None:
+        page = PublishPage()
+        page._account_rows = [self._account()]
+        payloads = [self._payload()]
+
+        with patch(
+            "ui.publish_page.facebook_page_v1_enabled",
+            return_value=True,
+        ):
+            page._prepare_facebook_page_payloads(payloads, "preflight")
+
+        payload = payloads[0]
+        self.assertIs(payload["facebookControlledPublish"], True)
+        self.assertEqual(
+            payload["facebookExpectedPageReference"],
+            "1000000000006789",
+        )
+        self.assertEqual(
+            payload["facebookFinalCaption"],
+            "Facebook Page 标题\n\nFacebook Page 正文\n\n#OneClick",
+        )
+        for key in (
+            "facebookCaptionSha256",
+            "facebookVideoSha256",
+            "facebookManifestIntentSha256",
+        ):
+            self.assertRegex(payload[key], r"[0-9a-f]{64}\Z")
+        self.assertNotIn("metaBrowserPublishConfirmed", payload)
+        self.assertNotIn("metaBrowserAutomationAcknowledged", payload)
+        self._dispose_page(page)
+
+    def test_facebook_ui_formal_uses_preflight_authorization_not_meta_flags(self) -> None:
+        page = PublishPage()
+        payload = self._payload()
+        payload.update(
+            {
+                "facebookControlledPublish": True,
+                "facebookExpectedPageReference": "1000000000006789",
+                "facebookFinalCaption": "Facebook Page 标题",
+                "facebookCaptionSha256": "a" * 64,
+                "facebookVideoSha256": "b" * 64,
+                "facebookManifestIntentSha256": "c" * 64,
+                "scheduleMode": "immediate",
+                "scheduledAt": None,
+            }
+        )
+        task = {
+            "id": 17,
+            "payloadJson": json.dumps([payload], ensure_ascii=False),
+        }
+        authorization = {
+            "preflightTaskId": 17,
+            "authorizationId": "single-use-grant",
+            "singleUse": True,
+        }
+        envelope = {
+            "taskId": 18,
+            "taskNo": "T18",
+            "phase": "formal",
+            "status": "pending",
+            "platforms": [{"platformType": 9}],
+        }
+
+        with (
+            patch.object(page, "confirm_meta_browser_publish", return_value=True),
+            patch(
+                "ui.publish_page.controlled_publish.authorize_completed_check",
+                return_value=authorization,
+            ) as authorize,
+            patch(
+                "ui.publish_page.controlled_publish_process.submit_authorized_preflight_task",
+                return_value=envelope,
+            ) as submit,
+            patch(
+                "ui.publish_page.publish_service.start_desktop_publish"
+            ) as legacy_start,
+            patch(
+                "ui.publish_page.facebook_page_v1_enabled",
+                return_value=True,
+            ),
+        ):
+            page.start_formal_publish_from_task(task)
+
+        authorize.assert_called_once_with(17)
+        submit.assert_called_once_with(17, "single-use-grant")
+        legacy_start.assert_not_called()
+        self.assertNotIn("metaBrowserPublishConfirmed", payload)
+        self.assertNotIn("metaBrowserAutomationAcknowledged", payload)
+        self.assertEqual(page.active_task_id, 18)
+        self._dispose_page(page)
+
+    def test_facebook_formal_cancel_creates_no_authorization(self) -> None:
+        page = PublishPage()
+        task = {
+            "id": 17,
+            "payloadJson": json.dumps([self._payload()], ensure_ascii=False),
+        }
+
+        with (
+            patch.object(page, "confirm_meta_browser_publish", return_value=False),
+            patch(
+                "ui.publish_page.facebook_page_v1_enabled",
+                return_value=True,
+            ),
+            patch(
+                "ui.publish_page.controlled_publish.authorize_completed_check"
+            ) as authorize,
+            patch(
+                "ui.publish_page.controlled_publish_process.submit_authorized_preflight_task"
+            ) as submit,
+        ):
+            page.start_formal_publish_from_task(task)
+
+        authorize.assert_not_called()
+        submit.assert_not_called()
+        self.assertIsNone(page.active_task_id)
+        self._dispose_page(page)
+
+    def test_unsupported_facebook_settings_stop_before_confirmation(self) -> None:
+        page = PublishPage()
+        page.preflight.setChecked(True)
+        page._account_rows = [self._account()]
+
+        with (
+            patch.object(page, "collect_payloads", return_value=[self._payload(enable_timer=True)]),
+            patch(
+                "ui.publish_page.facebook_page_v1_enabled",
+                return_value=True,
+            ),
+            patch("ui.publish_page.PublishConfirmDialog.exec") as confirm,
+            patch.object(QMessageBox, "warning") as warning,
+        ):
+            page.create_task()
+
+        confirm.assert_not_called()
+        warning.assert_called_once()
+        self.assertIn("Facebook Page", str(warning.call_args.args[-1]))
+        self._dispose_page(page)
+
+    def test_saved_page_name_and_id_tail_are_visible_but_default_off_hides_entry(self) -> None:
+        account = self._account()
+        page = PublishPage()
+        with (
+            patch(
+                "ui.publish_page.account_service.list_publishable_accounts",
+                return_value=[account],
+            ),
+            patch(
+                "ui.publish_page.facebook_page_v1_enabled",
+                return_value=True,
+            ),
+        ):
+            page.refresh_accounts()
+
+        self.assertEqual(page.account_list.count(), 1)
+        visible = page.account_list.item(0).text()
+        self.assertIn("Saved Facebook Page", visible)
+        self.assertIn("6789", visible)
+
+        with (
+            patch(
+                "ui.publish_page.account_service.list_publishable_accounts",
+                return_value=[account],
+            ),
+            patch(
+                "ui.publish_page.facebook_page_v1_enabled",
+                return_value=False,
+            ),
+        ):
+            page.refresh_accounts()
+
+        self.assertEqual(page.account_list.count(), 0)
+        self.assertEqual(page._account_rows, [])
+        self._dispose_page(page)
+
+    def test_waiting_verification_renders_one_action_without_failure(self) -> None:
+        page = PublishPage()
+        projection = {
+            "taskId": 18,
+            "status": "running",
+            "items": [
+                {
+                    "platformType": 9,
+                    "status": "waiting_user_verification",
+                    "errorCode": "",
+                    "actionRequired": {
+                        "code": "facebook_verification_required",
+                        "message": "请在同一可见窗口完成 Facebook 安全验证",
+                    },
+                }
+            ],
+        }
+
+        self.assertTrue(page.render_controlled_task_action(projection))
+        self.assertTrue(page.render_controlled_task_action(projection))
+        self.assertEqual(
+            page.task_status_label.text(),
+            "需要处理：请在同一可见窗口完成 Facebook 安全验证",
+        )
+        self.assertNotIn("失败", page.task_status_label.text())
+        matching_logs = [
+            line
+            for line in page.log.toPlainText().splitlines()
+            if "Facebook 安全验证" in line
+        ]
+        self.assertEqual(len(matching_logs), 1)
+        self._dispose_page(page)
 
 
 class PublishPageYouTubeSettingsTests(unittest.TestCase):

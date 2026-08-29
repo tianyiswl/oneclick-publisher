@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from app_core.controlled_publish import ControlledPublishError
 from app_core.content_project_gateway import (
     ContentProjectGateway,
     ContentProjectGatewayError,
@@ -76,7 +79,14 @@ class ContentProjectGatewayTests(unittest.TestCase):
         direct_authorizer=None,
         silicon_direct_authorizer=None,
         accounts_provider=None,
+        formal_submitter=None,
+        reconciler=None,
     ) -> ContentProjectGateway:
+        optional = {}
+        if formal_submitter is not None:
+            optional["formal_submitter"] = formal_submitter
+        if reconciler is not None:
+            optional["reconciler"] = reconciler
         return ContentProjectGateway(
             profile_store=PublishProfileStore(root / "publish-profiles.json"),
             accounts_provider=accounts_provider or self._accounts,
@@ -146,7 +156,23 @@ class ContentProjectGatewayTests(unittest.TestCase):
                 else None
             ),
             metrics_service=metrics_service,
+            **optional,
         )
+
+    @staticmethod
+    def _facebook_account() -> dict:
+        return {
+            "id": 91,
+            "type": 9,
+            "filePath": "facebook-page.json",
+            "profileName": "品牌主体",
+            "userName": "Saved Facebook Page",
+            "healthStatus": "normal",
+            "statusText": "正常",
+            "status": 1,
+            "authMode": "browser",
+            "accountReference": "1000000000001001",
+        }
 
     @staticmethod
     def _article_bundle(root: Path) -> Path:
@@ -438,32 +464,116 @@ class ContentProjectGatewayTests(unittest.TestCase):
 
     def test_formal_publish_cannot_bypass_preflight_and_one_time_authorization(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            submitted: list[dict] = []
-            gateway = self._gateway(Path(directory), submitted)
-            gateway.save_profile(
-                "silicon-exploration",
-                "硅基探索",
-                [{"platform": "抖音", "accountId": 31}],
+            submitted: list[tuple[int, str]] = []
+            gateway = self._gateway(
+                Path(directory),
+                [],
+                formal_submitter=lambda preflight_task_id, authorization_id: (
+                    submitted.append((preflight_task_id, authorization_id))
+                    or {
+                        "taskId": 42,
+                        "taskNo": "T42",
+                        "phase": "formal",
+                        "status": "pending",
+                        "platforms": [],
+                    }
+                ),
             )
             with self.assertRaises(ContentProjectGatewayError) as missing:
                 gateway.formal_publish(
-                    "silicon-exploration",
-                    "/content/manifest.json",
-                    confirmed_preflight_task_id=0,
+                    preflight_task_id=0,
                     authorization_id="",
                 )
             result = gateway.formal_publish(
-                "silicon-exploration",
-                "/content/manifest.json",
-                confirmed_preflight_task_id=41,
+                preflight_task_id=41,
                 authorization_id="one-time-grant",
             )
 
         self.assertEqual(missing.exception.error_code, "content_project_authorization_required")
         self.assertEqual(result["taskId"], 42)
-        self.assertEqual(submitted[0]["mode"], "formal")
-        self.assertEqual(submitted[0]["confirmedPreflightTaskId"], 41)
-        self.assertEqual(submitted[0]["authorizationId"], "one-time-grant")
+        self.assertEqual(submitted, [(41, "one-time-grant")])
+
+    def test_facebook_direct_requires_preflight_before_authorizer_or_submitter(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ,
+            {"ONECLICK_ENABLE_FACEBOOK_PAGE_V1": "1"},
+            clear=False,
+        ):
+            submitted: list[dict] = []
+            authorized: list[dict] = []
+            gateway = self._gateway(
+                Path(directory),
+                submitted,
+                accounts_provider=lambda: [self._facebook_account()],
+                direct_authorizer=lambda request: authorized.append(dict(request))
+                or {"authorizationId": "must-not-be-created"},
+            )
+            gateway.save_profile(
+                "facebook-page",
+                "Facebook Page",
+                [{"platform": "Facebook Reels", "accountId": 91}],
+            )
+
+            with self.assertRaises(ContentProjectGatewayError) as raised:
+                gateway.direct_publish_content(
+                    "facebook-page",
+                    "/content/manifest.json",
+                    settings={"Facebook Reels": {"visibility": "public"}},
+                )
+
+        self.assertEqual(raised.exception.error_code, "facebook_preflight_required")
+        self.assertEqual(authorized, [])
+        self.assertEqual(submitted, [])
+
+    def test_default_off_hides_page_accounts_and_blocks_new_page_profiles(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ,
+            {},
+            clear=True,
+        ):
+            gateway = self._gateway(
+                Path(directory),
+                [],
+                accounts_provider=lambda: [self._facebook_account()],
+            )
+
+            self.assertEqual(gateway.list_accounts(), [])
+            with self.assertRaises(ContentProjectGatewayError) as raised:
+                gateway.save_profile(
+                    "facebook-page",
+                    "Facebook Page",
+                    [{"platform": "Facebook Reels", "accountId": 91}],
+                )
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "facebook_page_feature_disabled",
+        )
+
+    def test_read_only_reconcile_forwards_only_task_id_and_rejects_preflight(self) -> None:
+        calls: list[int] = []
+
+        def reconcile(task_id: int) -> dict:
+            calls.append(task_id)
+            raise ControlledPublishError(
+                "facebook_claim_lifecycle_invalid",
+                "Facebook Page 预检任务不允许只读核对。",
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            gateway = self._gateway(
+                Path(directory),
+                [],
+                reconciler=reconcile,
+            )
+            with self.assertRaises(ControlledPublishError) as raised:
+                gateway.reconcile_publish_outcome(17)
+
+        self.assertEqual(calls, [17])
+        self.assertEqual(
+            raised.exception.error_code,
+            "facebook_claim_lifecycle_invalid",
+        )
 
     def test_direct_publish_creates_bound_authorization_without_preflight(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

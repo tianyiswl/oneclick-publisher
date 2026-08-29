@@ -34,23 +34,48 @@ class _Gateway:
         return {"taskId": 7, "phase": "preflight", "status": "pending", "platforms": []}
 
     def task_status(self, task_id):
-        return {"taskId": task_id, "phase": "preflight", "status": "success", "platforms": []}
+        return {
+            "taskId": task_id,
+            "phase": "waiting_user_verification",
+            "status": "waiting_user_verification",
+            "errorCode": "",
+            "receipt": {
+                "pageId": "1000000000001001",
+                "phase": "waiting_user_verification",
+                "reelId": None,
+                "url": None,
+                "publishedAt": None,
+            },
+            "platforms": [],
+        }
 
     def authorize_preflight(self, task_id):
         return {"preflightTaskId": task_id, "authorizationId": "grant", "singleUse": True}
 
     def formal_publish(
         self,
-        project_id,
-        manifest_path,
-        *,
-        confirmed_preflight_task_id,
+        preflight_task_id,
         authorization_id,
-        schedules=None,
-        settings=None,
     ):
-        self.calls.append(("formal", schedules, settings))
+        self.calls.append(("formal", preflight_task_id, authorization_id))
         return {"taskId": 8, "phase": "formal", "status": "pending", "platforms": []}
+
+    def reconcile_publish_outcome(self, task_id):
+        self.calls.append(("reconcile", task_id))
+        return {
+            "taskId": task_id,
+            "phase": "ambiguous",
+            "status": "ambiguous",
+            "errorCode": "",
+            "receipt": {
+                "pageId": "1000000000001001",
+                "phase": "ambiguous",
+                "reelId": None,
+                "url": None,
+                "publishedAt": None,
+            },
+            "platforms": [],
+        }
 
     def direct_publish_content(
         self, project_id, manifest_path, schedules=None, settings=None
@@ -150,6 +175,7 @@ class OneclickMcpServerTests(unittest.TestCase):
                 "oneclick_task_status",
                 "oneclick_authorize_preflight",
                 "oneclick_formal_publish",
+                "oneclick_reconcile_publish_outcome",
                 "oneclick_direct_publish_content",
                 "oneclick_sync_project_metrics",
                 "oneclick_get_project_metrics",
@@ -164,11 +190,14 @@ class OneclickMcpServerTests(unittest.TestCase):
         preflight_schema = by_name["oneclick_preflight_content"].input_schema
         formal_schema = by_name["oneclick_formal_publish"].input_schema
         self.assertNotIn("mode", preflight_schema.get("properties", {}))
-        self.assertIn("confirmed_preflight_task_id", formal_schema["properties"])
-        self.assertIn("authorization_id", formal_schema["properties"])
+        self.assertEqual(
+            set(formal_schema["properties"]),
+            {"preflight_task_id", "authorization_id"},
+        )
+        reconcile_schema = by_name["oneclick_reconcile_publish_outcome"].input_schema
+        self.assertEqual(set(reconcile_schema["properties"]), {"task_id"})
         direct_schema = by_name["oneclick_direct_publish_content"].input_schema
         self.assertIn("settings", preflight_schema["properties"])
-        self.assertIn("settings", formal_schema["properties"])
         self.assertIn("settings", direct_schema["properties"])
         self.assertNotIn(
             "confirmed_preflight_task_id",
@@ -185,8 +214,59 @@ class OneclickMcpServerTests(unittest.TestCase):
             "verification_code",
             "captcha",
             "storage_state",
+            "page_id",
+            "pageid",
+            "meta_browser_publish_confirmed",
+            "meta_browser_automation_acknowledged",
         ):
             self.assertNotIn(forbidden, all_schemas)
+
+    def test_formal_tool_forwards_only_preflight_task_and_authorization(self) -> None:
+        gateway = _Gateway()
+        server = create_server(gateway)
+
+        result = asyncio.run(
+            server.call_tool(
+                "oneclick_formal_publish",
+                {
+                    "preflight_task_id": 17,
+                    "authorization_id": "single-use-grant",
+                },
+            )
+        )
+
+        self.assertEqual(result.structured_content["task"]["taskId"], 8)
+        self.assertEqual(
+            gateway.calls,
+            [("formal", 17, "single-use-grant")],
+        )
+
+    def test_read_only_reconcile_tool_accepts_only_task_id(self) -> None:
+        gateway = _Gateway()
+        server = create_server(gateway)
+
+        result = asyncio.run(
+            server.call_tool(
+                "oneclick_reconcile_publish_outcome",
+                {"task_id": 18},
+            )
+        )
+
+        self.assertEqual(result.structured_content["task"]["taskId"], 18)
+        self.assertEqual(gateway.calls, [("reconcile", 18)])
+
+    def test_status_tool_preserves_the_gateway_safe_receipt_shape(self) -> None:
+        gateway = _Gateway()
+        server = create_server(gateway)
+
+        result = asyncio.run(
+            server.call_tool("oneclick_task_status", {"task_id": 18})
+        )
+
+        self.assertEqual(
+            result.structured_content["task"],
+            gateway.task_status(18),
+        )
 
     def test_matrix_tools_keep_local_check_and_formal_publish_separate(self) -> None:
         server = create_server(_Gateway())

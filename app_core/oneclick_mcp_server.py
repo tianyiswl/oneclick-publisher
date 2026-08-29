@@ -147,23 +147,29 @@ def create_server(gateway: ContentProjectGateway | None = None) -> MCPServer:
         structured_output=True,
     )
     def formal_publish(
-        project_id: str,
-        manifest_path: str,
-        confirmed_preflight_task_id: int,
+        preflight_task_id: int,
         authorization_id: str,
-        schedules: Mapping[str, Any] | None = None,
-        settings: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> dict[str, Any]:
         return _call(
             "task",
             lambda: gateway.formal_publish(
-                project_id,
-                manifest_path,
-                confirmed_preflight_task_id=confirmed_preflight_task_id,
+                preflight_task_id=preflight_task_id,
                 authorization_id=authorization_id,
-                schedules=schedules,
-                settings=settings,
             ),
+        )
+
+    @server.tool(
+        name="oneclick_reconcile_publish_outcome",
+        description=(
+            "只读核对一条 Facebook Page 正式任务的当前结果；"
+            "只接受 taskId，不接受授权、Page 身份或会话数据。"
+        ),
+        structured_output=True,
+    )
+    def reconcile_publish_outcome(task_id: int) -> dict[str, Any]:
+        return _call(
+            "task",
+            lambda: gateway.reconcile_publish_outcome(task_id),
         )
 
     @server.tool(

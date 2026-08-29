@@ -261,8 +261,83 @@ def run_controlled_publish_cli(args: argparse.Namespace) -> int:
                 raise controlled_publish.ControlledPublishError(
                     "controlled_task_id_required", "创建授权必须提供预检 taskId"
                 )
+            projection = controlled_publish.task_status(
+                args.controlled_publish_task_id
+            )
+            if any(
+                int(item.get("platformType") or 0) == 9
+                for item in projection.get("platforms") or []
+                if isinstance(item, dict)
+            ):
+                from app_core.overseas_meta_page_identity import (
+                    facebook_page_v1_enabled,
+                )
+
+                if not facebook_page_v1_enabled():
+                    raise controlled_publish.ControlledPublishError(
+                        "facebook_page_feature_disabled",
+                        "Facebook Page 发布功能尚未开启。",
+                    )
             _controlled_json(
                 controlled_publish.authorize_completed_check(
+                    args.controlled_publish_task_id
+                )
+            )
+            return 0
+        if action == "formal":
+            if args.controlled_publish_request:
+                raise controlled_publish.ControlledPublishError(
+                    "controlled_request_invalid",
+                    "正式发布只接受预检 taskId 和一次性授权 ID",
+                )
+            authorization_id = str(
+                args.controlled_publish_authorization_id or ""
+            ).strip()
+            if not args.controlled_publish_task_id or not authorization_id:
+                raise controlled_publish.ControlledPublishError(
+                    "controlled_authorization_required",
+                    "正式发布必须提供预检 taskId 和一次性授权 ID",
+                )
+            from app_core.controlled_publish_process import (
+                submit_authorized_preflight_task,
+            )
+
+            initial = submit_authorized_preflight_task(
+                args.controlled_publish_task_id,
+                authorization_id,
+            )
+            _controlled_json(initial)
+            task_id = int(initial["taskId"])
+            try:
+                _wait_for_controlled_task(
+                    task_id,
+                    interactive_verification=True,
+                )
+            except KeyboardInterrupt:
+                task_service.fail_active_task(
+                    task_id,
+                    error_code="controlled_cli_interrupted",
+                    message="受控正式发布被中断，未取得最终回执的平台已安全停止",
+                    event_type="controlled_cli_interrupted",
+                )
+                _controlled_json(controlled_publish.task_status(task_id))
+                return 130
+            final = controlled_publish.task_status(task_id)
+            if final != initial:
+                _controlled_json(final)
+            return 0 if final["status"] == "success" else 2
+        if action == "reconcile":
+            if (
+                not args.controlled_publish_task_id
+                or args.controlled_publish_request
+                or str(args.controlled_publish_authorization_id or "").strip()
+            ):
+                raise controlled_publish.ControlledPublishError(
+                    "controlled_task_id_required",
+                    "只读核对只接受一个正式任务 taskId",
+                )
+            _controlled_json(
+                controlled_publish.reconcile_facebook_page_publish_outcome(
                     args.controlled_publish_task_id
                 )
             )
@@ -273,6 +348,11 @@ def run_controlled_publish_cli(args: argparse.Namespace) -> int:
                     "controlled_request_file_required", "创建任务必须提供 JSON 请求文件"
                 )
             request = _read_controlled_request(args.controlled_publish_request)
+            if str(request.get("mode") or "preflight").strip().lower() == "formal":
+                raise controlled_publish.ControlledPublishError(
+                    "controlled_formal_action_required",
+                    "正式发布必须改用 formal action，且只传预检 taskId 与授权 ID",
+                )
             initial = controlled_publish.submit_request(request)
             _controlled_json(initial)
             task_id = int(initial["taskId"])
@@ -540,6 +620,8 @@ def main() -> int:
             "create",
             "status",
             "authorize",
+            "formal",
+            "reconcile",
             "silicon-preflight",
             "silicon-formal",
             "silicon-direct",
@@ -562,6 +644,11 @@ def main() -> int:
         "--controlled-publish-task-id",
         type=int,
         metavar="TASK_ID",
+    )
+    parser.add_argument(
+        "--controlled-publish-authorization-id",
+        metavar="AUTHORIZATION_ID",
+        help="受控正式发布的一次性本地授权 ID。",
     )
     parser.add_argument(
         "--content-project-id",

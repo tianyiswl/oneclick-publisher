@@ -13,11 +13,207 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .controlled_publish import ControlledPublishError
+from .meta_browser_policy import (
+    META_BROWSER_AUTOMATION_ACKNOWLEDGED,
+    META_BROWSER_PUBLISH_CONFIRMED,
+)
+from .overseas_meta_page_identity import facebook_page_v1_enabled
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 _ACTIVE: dict[int, subprocess.Popen[str]] = {}
 _ACTIVE_LOCK = threading.Lock()
+
+
+def _authorized_preflight_payloads(
+    preflight_task_id: int,
+    authorization_id: str,
+) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
+    """Load one successful immutable preflight without caller-supplied content."""
+
+    if (
+        type(preflight_task_id) is not int
+        or preflight_task_id <= 0
+        or not str(authorization_id or "").strip()
+    ):
+        raise ControlledPublishError(
+            "controlled_authorization_required",
+            "正式发布必须携带已完成预检和一次性本地授权",
+        )
+    from . import task_service
+
+    preflight = task_service.get_task(preflight_task_id)
+    if (
+        not isinstance(preflight, dict)
+        or str(preflight.get("mode") or "") != "oneclick_preflight"
+    ):
+        raise ControlledPublishError(
+            "controlled_preflight_required",
+            "正式发布缺少对应预检任务",
+        )
+    if str(preflight.get("status") or "") != "success":
+        raise ControlledPublishError(
+            "controlled_preflight_not_successful",
+            "对应预检尚未全部成功",
+        )
+    try:
+        raw_payloads = json.loads(str(preflight.get("payloadJson") or "[]"))
+    except json.JSONDecodeError as exc:
+        raise ControlledPublishError(
+            "controlled_preflight_invalid",
+            "预检任务快照不可读取",
+        ) from exc
+    if (
+        not isinstance(raw_payloads, list)
+        or not raw_payloads
+        or not all(isinstance(item, dict) for item in raw_payloads)
+    ):
+        raise ControlledPublishError(
+            "controlled_preflight_invalid",
+            "预检任务快照不可读取",
+        )
+    return (
+        preflight,
+        [dict(item) for item in raw_payloads],
+        str(authorization_id).strip(),
+    )
+
+
+def _formal_payloads_from_preflight(
+    payloads: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Convert only runtime fields; content and target identity stay frozen."""
+
+    prepared: list[dict[str, Any]] = []
+    for stored in payloads:
+        payload = dict(stored)
+        platform_type = int(payload.get("type") or 0)
+        payload["runtimeMode"] = "publish"
+        payload["debugDryRun"] = False
+        payload["debugDryRunHoldBrowser"] = False
+        if platform_type == 7 and payload.get("youtubeOfficialApi") is True:
+            payload["backgroundMode"] = True
+        elif platform_type in {6, 7, 8, 9}:
+            payload["backgroundMode"] = False
+        if platform_type == 6 or (
+            platform_type == 7
+            and payload.get("youtubeOfficialApi") is not True
+        ):
+            payload["overseasVideoPublishConfirmed"] = True
+        if platform_type == 8:
+            # Instagram type 8 keeps its internal compatibility evidence.  It
+            # is derived from the one-time authorization, never public input.
+            payload[META_BROWSER_PUBLISH_CONFIRMED] = True
+            payload[META_BROWSER_AUTOMATION_ACKNOWLEDGED] = True
+        if platform_type == 9:
+            # Page authorization is the database claim; legacy Meta booleans
+            # are neither trusted nor persisted on the formal task.
+            payload.pop(META_BROWSER_PUBLISH_CONFIRMED, None)
+            payload.pop(META_BROWSER_AUTOMATION_ACKNOWLEDGED, None)
+            payload.pop("overseasVideoPublishConfirmed", None)
+        prepared.append(payload)
+    return prepared
+
+
+def submit_authorized_preflight_task(
+    preflight_task_id: int,
+    authorization_id: str,
+) -> dict[str, Any]:
+    """Submit a frozen preflight using only its ID and one-time authorization."""
+
+    _preflight, stored_payloads, normalized_authorization = (
+        _authorized_preflight_payloads(preflight_task_id, authorization_id)
+    )
+    payloads = _formal_payloads_from_preflight(stored_payloads)
+    platform_types = [int(item.get("type") or 0) for item in payloads]
+    from . import controlled_publish, publish_service, task_service
+
+    if 9 in platform_types:
+        if not facebook_page_v1_enabled():
+            raise ControlledPublishError(
+                "facebook_page_feature_disabled",
+                "Facebook Page 发布功能尚未开启。",
+            )
+        if len(payloads) != 1 or platform_types != [9]:
+            raise ControlledPublishError(
+                "facebook_unsupported_publish_setting",
+                "Facebook Page 首版一次只支持一个 Page 和一个视频。",
+            )
+        task = controlled_publish._create_claimed_facebook_page_task(
+            payloads,
+            preflight_task_id=preflight_task_id,
+            authorization_id=normalized_authorization,
+        )
+    elif 6 in platform_types:
+        if len(payloads) != 1 or platform_types != [6]:
+            raise ControlledPublishError(
+                "tiktok_target_invalid",
+                "TikTok 受控正式任务一次只支持一个账号和视频",
+            )
+        task = controlled_publish._create_claimed_tiktok_task(
+            payloads,
+            mode="formal",
+            preflight_task_id=preflight_task_id,
+            authorization_id=normalized_authorization,
+        )
+        publish_service.start_controlled_tiktok_publish(int(task["id"]))
+    else:
+        recent = task_service.list_tasks(limit=500)
+        detailed = [
+            task_service.get_task(int(row.get("id") or 0)) or dict(row)
+            for row in recent
+            if int(row.get("id") or 0) > 0
+        ]
+        existing = controlled_publish._find_blocking_formal_scope_task(
+            detailed,
+            payloads,
+        )
+        if existing:
+            event_types = {
+                str(event.get("eventType") or "")
+                for event in existing.get("events") or []
+                if isinstance(event, Mapping)
+            }
+            ambiguous = (
+                str(existing.get("status") or "") != "success"
+                and bool(
+                    event_types.intersection(
+                        {
+                            "wechat_final_submit_clicked",
+                            "tiktok_final_action_triggered",
+                            "tiktok_publish_outcome_ambiguous",
+                        }
+                    )
+                )
+            )
+            existing_task_id = int(existing.get("id") or 0)
+            message = (
+                "同一账号、内容与排期已点击最终发布，"
+                "结果需要先做只读核对，已阻止自动重发；"
+                if ambiguous
+                else "同一账号、内容与排期已有正式成功回执，"
+                "已阻止重复发布；"
+            )
+            raise ControlledPublishError(
+                (
+                    "controlled_publish_outcome_ambiguous"
+                    if ambiguous
+                    else "controlled_already_published"
+                ),
+                f"{message}taskId={existing_task_id}",
+            )
+        from .database import connect
+
+        with connect() as conn:
+            controlled_publish.consume_authorization(
+                conn,
+                normalized_authorization,
+                preflight_task_id,
+                payloads,
+            )
+        task = publish_service.start_desktop_publish(payloads)
+    stored = task_service.get_task(int(task["id"])) or task
+    return controlled_publish.project_task(stored)
 
 
 def _command() -> list[str]:
