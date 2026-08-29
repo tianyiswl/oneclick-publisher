@@ -573,10 +573,6 @@ async def _facebook_page_formal_async(
             "formSnapshotHash": _hash_json(form_projection),
         }
         progress("final_action_claimed", claim_receipt)
-        publish_event(
-            "facebook_final_action_claimed",
-            "Facebook Page 最终动作 claim 已持久化",
-        )
 
         button = await adapter.final_action_button()
         label = " ".join((await adapter._button_label(button)).split())
@@ -596,10 +592,6 @@ async def _facebook_page_formal_async(
                 "phase": "final_action_clicked",
             },
         )
-        publish_event(
-            "facebook_final_action_clicked",
-            "Facebook Page 最终按钮已执行一次，点击时间已持久化",
-        )
         clicked_at = _load_clicked_at(int(task_id))
 
         decision = await reader.read_platform_decision(
@@ -607,10 +599,6 @@ async def _facebook_page_formal_async(
             page=page,
         )
         progress("platform_decision_observed", {"platformDecision": decision})
-        publish_event(
-            "facebook_platform_decision_observed",
-            "Facebook Page 已记录平台反馈，继续等待内容列表唯一回读",
-        )
         match = await reader.readback_unique_reel(
             baseline=baseline,
             expected_page_id=str(prepared["pageId"]),
@@ -632,10 +620,6 @@ async def _facebook_page_formal_async(
                     "url": match.receipt.url,
                     "publishedAt": match.receipt.published_at,
                 }
-            )
-            publish_event(
-                "facebook_publish_readback_confirmed",
-                "Facebook Page 内容列表已唯一回读新 Reel",
             )
             return {
                 "ok": True,

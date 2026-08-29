@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import tempfile
@@ -24,6 +25,7 @@ from app_core import (
 from app_core.overseas_meta_errors import FacebookPagePublishError
 from uploader.meta_uploader.content_list import (
     FacebookPageContentBaseline,
+    FacebookPageContentReader as Task7FacebookPageContentReader,
     FacebookReelMatch,
     FacebookReelReceipt,
 )
@@ -63,7 +65,9 @@ class FacebookPageExecutorTests(unittest.TestCase):
         self.snapshot_caption = self.caption
         self.snapshot_kind = "reel"
         self.baseline_error: BaseException | None = None
+        self.readback_error: BaseException | None = None
         self.match_status = "unique"
+        self.platform_decision: object | None = None
         self.adapter_classes: list[type] = []
 
     def payload(self, mode: str) -> dict:
@@ -111,7 +115,12 @@ class FacebookPageExecutorTests(unittest.TestCase):
         }
 
     @contextmanager
-    def patched_runtime(self, authorized_receipt: dict | None = None):
+    def patched_runtime(
+        self,
+        authorized_receipt: dict | None = None,
+        *,
+        real_clicked_at: bool = False,
+    ):
         owner = self
 
         class Button:
@@ -175,7 +184,7 @@ class FacebookPageExecutorTests(unittest.TestCase):
 
             async def read_platform_decision(self, expected_page_id, *, page):
                 owner.log.append("decision:accepted")
-                return SimpleNamespace(kind="accepted")
+                return owner.platform_decision or SimpleNamespace(kind="accepted")
 
             async def readback_unique_reel(
                 self,
@@ -185,13 +194,18 @@ class FacebookPageExecutorTests(unittest.TestCase):
                 clicked_at,
             ):
                 owner.log.append(f"readback:{owner.match_status}")
+                if owner.readback_error is not None:
+                    raise owner.readback_error
                 receipt = None
                 if owner.match_status == "unique":
                     receipt = FacebookReelReceipt(
                         page_id=owner.page_id,
                         reel_id="new-reel-1",
                         url="https://www.facebook.com/reel/new-reel-1",
-                        published_at="2026-08-30T00:00:10+00:00",
+                        published_at=(
+                            datetime.fromisoformat(clicked_at)
+                            + timedelta(seconds=1)
+                        ).isoformat(),
                     )
                 return FacebookReelMatch(
                     status=owner.match_status,
@@ -215,7 +229,7 @@ class FacebookPageExecutorTests(unittest.TestCase):
         def validate(payload, *, mode):
             return owner._prepared(payload)
 
-        patches = (
+        patches = [
             patch.object(
                 overseas_browser_publish,
                 "_validate_facebook_page_payload",
@@ -236,13 +250,16 @@ class FacebookPageExecutorTests(unittest.TestCase):
                 return_value=authorized_receipt,
                 create=True,
             ),
-            patch.object(
-                overseas_browser_publish,
-                "_load_clicked_at",
-                return_value="2026-08-30T00:00:01+00:00",
-                create=True,
-            ),
-        )
+        ]
+        if not real_clicked_at:
+            patches.append(
+                patch.object(
+                    overseas_browser_publish,
+                    "_load_clicked_at",
+                    return_value="2026-08-30T00:00:01+00:00",
+                    create=True,
+                )
+            )
         started = []
         try:
             for current in patches:
@@ -252,6 +269,126 @@ class FacebookPageExecutorTests(unittest.TestCase):
         finally:
             for current in reversed(started):
                 current.stop()
+
+    def _claimed_formal_task(self) -> tuple[dict, dict]:
+        payload = self.payload("publish")
+        preflight = task_service.create_pending_task(
+            [{**payload, "runtimeMode": "preflight", "debugDryRun": True}],
+            mode="oneclick_preflight",
+        )
+        task = task_service.create_pending_task([payload], mode="oneclick_publish")
+        intent = controlled_publish.publish_intent_fingerprint([payload])
+        replay = controlled_publish.facebook_replay_fingerprint([payload])
+        now = datetime.now(timezone.utc).isoformat()
+        with database.connect() as conn:
+            controlled_publish._ensure_facebook_page_claim_schema(conn)
+            conn.execute(
+                """
+                UPDATE publish_task_items
+                SET accountId = 91, authorizationSnapshotHash = ?
+                WHERE taskId = ? AND platformType = 9
+                """,
+                (intent, task["id"]),
+            )
+            conn.execute(
+                """
+                INSERT INTO facebook_page_publish_claims (
+                    pageReference, publishIntentFingerprint, replayFingerprint,
+                    preflightTaskId, preflightReceiptHash, taskId, state,
+                    blocksReplay, createdAt, updatedAt
+                ) VALUES (?, ?, ?, ?, ?, ?, 'reserved', 1, ?, ?)
+                """,
+                (
+                    self.page_id,
+                    intent,
+                    replay,
+                    preflight["id"],
+                    "f" * 64,
+                    task["id"],
+                    now,
+                    now,
+                ),
+            )
+            conn.commit()
+        controlled_publish.require_facebook_page_execution_claim(
+            int(task["id"]),
+            [payload],
+        )
+        return task, payload
+
+    @staticmethod
+    def _sealed_accepted_decision(page_id: str):
+        class Element:
+            async def is_visible(self) -> bool:
+                return True
+
+            async def inner_text(self) -> str:
+                return "Your reel is being published"
+
+        class Locator:
+            async def count(self) -> int:
+                return 1
+
+            def nth(self, index: int):
+                if index != 0:
+                    raise IndexError(index)
+                return Element()
+
+        class Context:
+            async def new_page(self):
+                return page
+
+        context = Context()
+
+        class Page:
+            def context(self):
+                return context
+
+            def get_by_role(self, role: str):
+                return Locator() if role == "alert" else EmptyLocator()
+
+        class EmptyLocator:
+            async def count(self) -> int:
+                return 0
+
+            def nth(self, index: int):  # pragma: no cover - empty by contract
+                raise IndexError(index)
+
+        page = Page()
+
+        async def no_verification(_page) -> None:
+            return None
+
+        async def same_page(_page, _account):
+            return SimpleNamespace(page_id=page_id)
+
+        reader = Task7FacebookPageContentReader(
+            context,
+            wait_for_verification=no_verification,
+        )
+        with patch(
+            "uploader.meta_uploader.content_list.validate_facebook_page_binding",
+            side_effect=same_page,
+        ):
+            return asyncio.run(
+                reader.read_platform_decision(
+                    expected_page_id=page_id,
+                    page=page,
+                )
+            )
+
+    @staticmethod
+    def _facebook_event_types(task_id: int) -> list[str]:
+        with database.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT eventType FROM publish_task_events
+                WHERE taskId = ? AND eventType LIKE 'facebook_%'
+                ORDER BY id
+                """,
+                (int(task_id),),
+            ).fetchall()
+        return [str(row["eventType"]) for row in rows]
 
     def test_preflight_and_formal_share_adapter_and_checkpoint_click_order(self) -> None:
         events = []
@@ -300,7 +437,15 @@ class FacebookPageExecutorTests(unittest.TestCase):
         returned = self.log.index("click:return")
         self.assertEqual(self.log[returned + 1], "commit:final_action_clicked")
         self.assertEqual(self.click_count, 1)
-        self.assertIn("readback_unique", events)
+        self.assertEqual(
+            events,
+            [
+                "final_action_claimed",
+                "final_action_clicked",
+                "platform_decision_observed",
+                "readback_unique",
+            ],
+        )
         self.assertEqual(self.log[-1], "session:closed")
         with database.connect() as conn:
             persisted_events = conn.execute(
@@ -319,16 +464,128 @@ class FacebookPageExecutorTests(unittest.TestCase):
             for row in persisted_events
             if int(row["taskId"]) == 502
         ]
-        self.assertIn("facebook_platform_form_verified", preflight_events)
+        self.assertEqual(preflight_events, ["facebook_platform_form_verified"])
         self.assertEqual(
             formal_events,
+            [],
+        )
+
+    def test_real_formal_runner_persists_each_lifecycle_event_once(self) -> None:
+        with self.patched_runtime():
+            authorized = overseas_preflight.run_facebook_page_preflight_sync(
+                self.payload("preflight"),
+                task_id=601,
+            )["receipt"]
+        task, payload = self._claimed_formal_task()
+        self.platform_decision = self._sealed_accepted_decision(self.page_id)
+
+        with (
+            patch.object(
+                publish_observer,
+                "record_task_event",
+                wraps=publish_observer.record_task_event,
+            ) as legacy_event_writer,
+            patch.object(
+                task_service,
+                "touch_task_heartbeat",
+                wraps=task_service.touch_task_heartbeat,
+            ) as standalone_heartbeat,
+            self.patched_runtime(authorized, real_clicked_at=True),
+        ):
+            publish_service._run_facebook_page_publish(task, [payload])
+
+        self.assertEqual(
+            self._facebook_event_types(task["id"]),
             [
                 "facebook_final_action_claimed",
                 "facebook_final_action_clicked",
                 "facebook_platform_decision_observed",
+                "facebook_readback_unique",
                 "facebook_publish_readback_confirmed",
             ],
         )
+        self.assertEqual(legacy_event_writer.call_count, 0)
+        self.assertEqual(standalone_heartbeat.call_count, 0)
+        saved = task_service.get_task(task["id"])
+        self.assertEqual(saved["status"], "success")
+        with database.connect() as conn:
+            item_id = int(
+                conn.execute(
+                    "SELECT id FROM publish_task_items WHERE taskId = ?",
+                    (int(task["id"]),),
+                ).fetchone()["id"]
+            )
+            lifecycle_item_ids = [
+                int(row["itemId"])
+                for row in conn.execute(
+                    """
+                    SELECT itemId FROM publish_task_events
+                    WHERE taskId = ? AND eventType LIKE 'facebook_%'
+                    ORDER BY id
+                    """,
+                    (int(task["id"]),),
+                ).fetchall()
+            ]
+            terminal = conn.execute(
+                """
+                SELECT workerPid, workerHeartbeatAt, finishedAt
+                FROM publish_tasks WHERE id = ?
+                """,
+                (int(task["id"]),),
+            ).fetchone()
+        self.assertEqual(lifecycle_item_ids, [item_id] * 5)
+        self.assertIsNone(terminal["workerPid"])
+        self.assertEqual(terminal["workerHeartbeatAt"], terminal["finishedAt"])
+
+    def test_real_formal_runner_keeps_one_atomic_decision_when_readback_crashes(
+        self,
+    ) -> None:
+        with self.patched_runtime():
+            authorized = overseas_preflight.run_facebook_page_preflight_sync(
+                self.payload("preflight"),
+                task_id=602,
+            )["receipt"]
+        task, payload = self._claimed_formal_task()
+        self.platform_decision = self._sealed_accepted_decision(self.page_id)
+        self.readback_error = FacebookPagePublishError(
+            "facebook_page_baseline_read_failed",
+            "offline readback crash after decision",
+            receipt={"pageId": self.page_id},
+            outcome_ambiguous=True,
+        )
+
+        with (
+            patch.object(
+                publish_observer,
+                "record_task_event",
+                wraps=publish_observer.record_task_event,
+            ) as legacy_event_writer,
+            self.patched_runtime(authorized, real_clicked_at=True),
+        ):
+            publish_service._run_facebook_page_publish(task, [payload])
+
+        with database.connect() as conn:
+            claim = dict(
+                conn.execute(
+                    "SELECT * FROM facebook_page_publish_claims WHERE taskId = ?",
+                    (int(task["id"]),),
+                ).fetchone()
+            )
+        decision_json = str(claim["platformDecisionJson"] or "")
+        self.assertEqual(
+            hashlib.sha256(decision_json.encode("utf-8")).hexdigest(),
+            str(claim["platformDecisionHash"]),
+        )
+        evidence = controlled_publish._validated_facebook_page_claim_evidence(claim)
+        self.assertEqual(evidence["decision"]["kind"], "accepted")
+        self.assertEqual(claim["state"], "ambiguous")
+        self.assertEqual(
+            self._facebook_event_types(task["id"]).count(
+                "facebook_platform_decision_observed"
+            ),
+            1,
+        )
+        self.assertEqual(legacy_event_writer.call_count, 0)
 
     def test_publish_context_rejects_invalid_and_nested_task_switches(self) -> None:
         for invalid in (0, -1, True, "501"):
