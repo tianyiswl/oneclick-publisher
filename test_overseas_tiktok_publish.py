@@ -23,6 +23,7 @@ from app_core import (
     overseas_tiktok_publish,
     task_service,
 )
+from app_core.controlled_publish import build_controlled_payloads
 from app_core.overseas_tiktok_identity import (
     TikTokIdentity,
     validate_identity_binding,
@@ -163,6 +164,109 @@ class TikTokPublishContractTests(unittest.TestCase):
         self.assertEqual(prepared["scheduleMode"], "platform_native")
         self.assertEqual(prepared["scheduledAt"], "2026-08-29 15:00")
         self.assertEqual(prepared["scheduleTimezone"], "Asia/Shanghai")
+
+    def test_controlled_scheduled_form_check_payload_accepts_its_derived_snapshot(
+        self,
+    ) -> None:
+        manifest = self.root / "manifest.json"
+        body = self.root / "body.md"
+        cover = self.root / "cover.png"
+        body.write_text("TikTok 表单检查正文。", encoding="utf-8")
+        cover.write_bytes(b"offline-tiktok-cover")
+        manifest.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": "oneclick-content/v1",
+                    "contentType": "video",
+                    "title": "TikTok 定时表单检查",
+                    "bodyFile": body.name,
+                    "tags": ["OneClick"],
+                    "assets": [self.video.name],
+                    "covers": {"3:4": cover.name},
+                    "preferredPlatforms": ["TikTok"],
+                    "platformOverrides": {
+                        "TikTok": {
+                            "title": "TikTok 定时表单检查",
+                            "body": "TikTok 表单检查正文。",
+                            "tags": ["OneClick"],
+                        }
+                    },
+                    "debugDryRun": True,
+                    "publishAllowed": False,
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        schedule_now = datetime(
+            2026, 8, 29, 14, 0, tzinfo=ZoneInfo("Asia/Shanghai")
+        )
+        payload = build_controlled_payloads(
+            {
+                "projectId": "tiktok-contract-test",
+                "manifestPath": str(manifest),
+                "mode": "platform_form_check",
+                "platformFormCheckConfirmed": True,
+                "targets": [
+                    {
+                        "platform": "TikTok",
+                        "accountId": 61,
+                        "schedule": {
+                            "localTime": "2026-08-29 15:00",
+                            "timezone": "Asia/Shanghai",
+                        },
+                        "settings": {"visibility": "public"},
+                    }
+                ],
+            },
+            accounts=[self.account()],
+            schedule_now=schedule_now,
+        )[0]
+
+        prepared = self.validate(
+            payload,
+            mode="platform_form_check",
+            now=datetime(2026, 8, 29, 14, 40, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+
+        self.assertEqual(prepared["scheduleMode"], "platform_native")
+        self.assertEqual(prepared["scheduledAt"], "2026-08-29 15:00")
+
+    def test_canonical_schedule_snapshot_pair_must_match_derived_intent(self) -> None:
+        scheduled = self.payload(
+            runtimeMode="platform_form_check",
+            debugDryRun=False,
+            enableTimer=True,
+            scheduleTime="2026-08-29 15:00",
+            dailyTimes=["15:00"],
+        )
+        cases = (
+            {"scheduleMode": "platform_native"},
+            {"scheduledAt": "2026-08-29 15:00"},
+            {
+                "scheduleMode": "immediate",
+                "scheduledAt": "2026-08-29 15:00",
+            },
+            {
+                "scheduleMode": "platform_native",
+                "scheduledAt": "2026-08-29 15:01",
+            },
+        )
+        for snapshot in cases:
+            with self.subTest(snapshot=snapshot):
+                self.assert_error_code(
+                    "tiktok_unsupported_publish_setting",
+                    scheduled | snapshot,
+                    mode="platform_form_check",
+                )
+
+    def test_immediate_canonical_schedule_snapshot_matches_immediate_intent(self) -> None:
+        prepared = self.validate(
+            self.payload(scheduleMode="immediate", scheduledAt=None)
+        )
+
+        self.assertEqual(prepared["scheduleMode"], "immediate")
+        self.assertIsNone(prepared["scheduledAt"])
 
     def test_scheduled_local_preflight_never_loads_playwright(self) -> None:
         payload = self.payload(

@@ -168,6 +168,8 @@ _CANONICAL_ROOT_SCHEDULE_KEYS = frozenset(
         "startDays",
         "timeJitterMinutes",
         "schedule",
+        "scheduleMode",
+        "scheduledAt",
     }
 )
 _CANONICAL_ROOT_SCHEDULE_KEYS_BY_CASEFOLD = {
@@ -362,6 +364,13 @@ def _validate_schedule_fields(payload: Mapping[str, Any]) -> TikTokScheduleInten
                 "TikTok 排期字段名无效",
             )
     _validate_schedule_locations(payload)
+    has_schedule_mode = "scheduleMode" in payload
+    has_scheduled_at = "scheduledAt" in payload
+    if has_schedule_mode != has_scheduled_at:
+        _fail(
+            "tiktok_unsupported_publish_setting",
+            "TikTok 排期快照必须同时包含模式和时间",
+        )
     exact_integers = {
         "videosPerDay": 1,
         "startDays": 0,
@@ -379,6 +388,7 @@ def _validate_schedule_fields(payload: Mapping[str, Any]) -> TikTokScheduleInten
     known_schedule_keys = {
         "enabletimer",
         "scheduletime",
+        "schedulemode",
         "scheduledat",
         "schedule",
         "publishschedule",
@@ -402,7 +412,7 @@ def _validate_schedule_fields(payload: Mapping[str, Any]) -> TikTokScheduleInten
                     "tiktok_unsupported_publish_setting",
                     "TikTok 定时字段无效",
                 )
-            if key in {"scheduledat", "publishschedule", "localtime"}:
+            if key in {"publishschedule", "localtime"}:
                 _fail(
                     "tiktok_unsupported_publish_setting",
                     "TikTok 定时字段无效",
@@ -415,7 +425,7 @@ def _validate_schedule_fields(payload: Mapping[str, Any]) -> TikTokScheduleInten
                     )
 
     try:
-        return parse_tiktok_schedule_fields(
+        intent = parse_tiktok_schedule_fields(
             enable_timer=payload.get("enableTimer"),
             schedule_time=payload.get("scheduleTime"),
             schedule_timezone=payload.get("scheduleTimezone"),
@@ -423,6 +433,15 @@ def _validate_schedule_fields(payload: Mapping[str, Any]) -> TikTokScheduleInten
         )
     except TikTokScheduleContractError as exc:
         _fail(exc.error_code, exc.public_message)
+    if has_schedule_mode and (
+        payload.get("scheduleMode") != intent.mode
+        or payload.get("scheduledAt") != intent.local_time
+    ):
+        _fail(
+            "tiktok_unsupported_publish_setting",
+            "TikTok 排期快照与定时设置不一致",
+        )
+    return intent
 
 
 def _shanghai_now() -> datetime:
