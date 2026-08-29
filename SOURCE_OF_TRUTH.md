@@ -1,6 +1,6 @@
 # 一键发当前事实
 
-更新时间：2026-08-28（Asia/Shanghai）
+更新时间：2026-08-29（Asia/Shanghai）
 
 本文件是一键发当前版本、三线状态和真实验收的唯一状态入口。能力说明与本文件冲突时，先按本文件降级判断，再用当前源码、同次运行证据和平台回读核验并修正冲突。
 
@@ -71,6 +71,7 @@
 - 2026-08-29 使用账号 `13`（显示主体 `墨白 | Mobai`，账号引用 `tianyiswl`）执行真实 `platform_form_check`。任务 `67 / T08291239-FA3D` 在无结构化话题条件下成功回读单个测试视频、唯一正文、公开范围和可用最终按钮，`finalActionTriggered=false`；这只证明基础表单路径，不证明正式发布。
 - 任务 `77 / T08291310-FA1A` 的脱敏结构诊断确认当前 TikTok Draft.js 编辑器用 `span.mention` 表示已选择的官方话题，旧版 `data-hashtag`/`/tag/` 选择器无法回读。按该证据完成最小兼容后，相关回归 `297/297`、完整仓库回归 `2531/2531` 通过。
 - 任务 `78 / T08291320-3D3D` 真实 `platform_form_check` 成功回读 `topicEntities=["AI"]`、`visibility=public` 和最终按钮，状态为 `platform_form_verified`，`finalActionTriggered=false`，无作品 ID、URL 或发布时间。没有执行正式模式，没有点击 `Post`，没有公开发布；下一真实门槛是经单独明确授权的正式公开发布与平台内容回读。
+- 2026-08-29 已在 `feature/overseas-login-publish-v2@8c23de2` 完成 TikTok 平台原生定时发布的源码实现与离线验证：聚焦测试 `297/297`、海外受影响测试 `512/512`、完整回归 `2611/2611` 通过，离屏客户端返回 `NATIVE_DESKTOP_UI_OK`。本轮没有执行真实 TikTok 表单检查，没有打开 TikTok Studio、上传视频、点击 `Schedule` 或取得正式排期回执；因此当前只能记为源码与本地回归通过，不能记为真实定时发布可用。详见 `docs/verification/2026-08-29-tiktok-scheduled-video-publish.md`。
 
 ## 硅基进化公众号只保存草稿桥
 
