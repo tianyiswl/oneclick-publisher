@@ -1024,6 +1024,111 @@ class FacebookPageAuthorizedSubmitTests(unittest.TestCase):
             ).fetchone()[0]
         self.assertEqual(claim_count, 1)
 
+    def test_constructor_failure_cannot_close_concurrent_winner_lease(self) -> None:
+        preflight_task_id, authorization_id, preflight_payload = (
+            self._authorized_preflight()
+        )
+        payload = self._formal_payload(preflight_payload)
+        with patch.object(
+            publish_service,
+            "start_controlled_facebook_publish",
+            side_effect=lambda task_id: task_service.get_task(int(task_id)),
+        ):
+            task = controlled_publish._create_claimed_facebook_page_task(
+                [payload],
+                preflight_task_id=preflight_task_id,
+                authorization_id=authorization_id,
+            )
+
+        winner_lease_barrier = threading.Barrier(2)
+        release_winner = threading.Event()
+        constructor_lock = threading.Lock()
+        outcome_lock = threading.Lock()
+        constructor_count = 0
+        starts: list[str] = []
+        outcomes: dict[str, tuple[str, str, str]] = {}
+        real_thread = threading.Thread
+
+        class Worker:
+            def __init__(self, *, target, args, daemon, name) -> None:
+                nonlocal constructor_count
+                with constructor_lock:
+                    constructor_count += 1
+                    ordinal = constructor_count
+                if ordinal == 2:
+                    raise RuntimeError("offline loser constructor failure")
+                self.name = str(name)
+
+            def start(self) -> None:
+                starts.append(self.name)
+                winner_lease_barrier.wait(timeout=5)
+                if not release_winner.wait(timeout=5):
+                    raise AssertionError("winner was not released")
+                # Model the already-started worker reaching its normal cleanup.
+                publish_service._active_threads.pop(task["id"], None)
+
+            def is_alive(self) -> bool:
+                return False
+
+        def caller(label: str) -> None:
+            try:
+                returned = publish_service.start_controlled_facebook_publish(
+                    task["id"]
+                )
+            except Exception as exc:
+                outcome = (
+                    "error",
+                    str(getattr(exc, "error_code", "")),
+                    str(exc),
+                )
+            else:
+                outcome = ("ok", "", str(returned["id"]))
+            with outcome_lock:
+                outcomes[label] = outcome
+
+        with (
+            patch.object(
+                publish_service,
+                "_validate_payloads",
+                return_value=[dict(payload)],
+            ),
+            patch.object(publish_service.threading, "Thread", Worker),
+        ):
+            winner = real_thread(target=caller, args=("winner",))
+            winner.start()
+            winner_lease_barrier.wait(timeout=5)
+            loser = real_thread(target=caller, args=("loser",))
+            loser.start()
+            loser.join(timeout=10)
+            try:
+                self.assertFalse(loser.is_alive())
+                self.assertEqual(
+                    outcomes.get("loser"),
+                    ("error", "", "offline loser constructor failure"),
+                )
+                claim = self._claim(task["id"])
+                self.assertEqual(claim["state"], "reserved")
+                self.assertTrue(claim["workerStartedAt"])
+                self.assertNotEqual(
+                    task_service.get_task(task["id"])["status"],
+                    "failed",
+                )
+                self.assertEqual(
+                    starts,
+                    [f"oneclick-facebook-page-publish-{task['id']}"],
+                )
+                self.assertEqual(
+                    list(publish_service._active_threads),
+                    [task["id"]],
+                )
+            finally:
+                release_winner.set()
+                winner.join(timeout=10)
+
+        self.assertFalse(winner.is_alive())
+        self.assertEqual(outcomes.get("winner"), ("ok", "", str(task["id"])))
+        self.assertEqual(publish_service._active_threads, {})
+
 
 class FacebookPageLegacyStartBoundaryTests(unittest.TestCase):
     def test_generic_desktop_publish_rejects_formal_facebook_without_claim(self) -> None:

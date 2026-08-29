@@ -1584,7 +1584,17 @@ def start_controlled_facebook_publish(task_id: int) -> dict[str, Any]:
             name=f"oneclick-facebook-page-publish-{task_id}",
         )
     except Exception as exc:
-        _mark_facebook_worker_start_failed(int(task_id), payload, exc)
+        try:
+            _mark_facebook_worker_start_failed(
+                int(task_id),
+                payload,
+                exc,
+                require_unleased=True,
+            )
+        except Exception:
+            # Validation and construction happen before this caller owns the
+            # lease.  A concurrent winner's claim must remain untouched.
+            pass
         raise
 
     try:
