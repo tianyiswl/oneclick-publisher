@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -1105,15 +1106,19 @@ class TikTokPublishContractTests(unittest.TestCase):
             ) as uploader_factory,
             patch.object(
                 overseas_tiktok_publish,
-                "save_context_storage_state",
-                new_callable=AsyncMock,
-            ) as save_session,
+                "load_sanitized_tiktok_storage_state_file",
+            ) as load_session,
+            patch.object(
+                overseas_tiktok_publish,
+                "replace_tiktok_storage_state_file",
+            ) as replace_session,
         ):
             result = overseas_preflight.run_overseas_preflight_sync(self.payload())
 
         playwright_factory.assert_not_called()
         uploader_factory.assert_not_called()
-        save_session.assert_not_called()
+        load_session.assert_not_called()
+        replace_session.assert_not_called()
         self.assertEqual(result["phase"], "local_preflight_passed")
         self.assertFalse(result["receipt"]["platformWriteOccurred"])
         self.assertFalse(result["receipt"]["finalActionTriggered"])
@@ -1304,7 +1309,22 @@ class TikTokPlatformSyncTests(unittest.TestCase):
         self.video = self.root / "video.mp4"
         self.video.write_bytes(b"offline-tiktok-video")
         self.session = self.root / "tiktok.json"
-        self.session.write_text('{"cookies": [], "origins": []}', encoding="utf-8")
+        self.session.write_text(
+            json.dumps(
+                {
+                    "cookies": [
+                        {
+                            "name": "sessionid",
+                            "value": "tiktok-session-value",
+                            "domain": ".tiktok.com",
+                            "path": "/",
+                        }
+                    ],
+                    "origins": [],
+                }
+            ),
+            encoding="utf-8",
+        )
         self.identity = TikTokIdentity(
             "expected.user",
             "Expected User",
@@ -1404,6 +1424,7 @@ class TikTokPlatformSyncTests(unittest.TestCase):
         prepared: dict | None = None,
         prepared_changes: Mapping[str, Any] | None = None,
         shanghai_now: datetime | None = None,
+        runtime_storage_state: Mapping[str, Any] | None = None,
     ):
         uploader = uploader or self.fake_uploader()
         identity_page = SimpleNamespace(
@@ -1421,6 +1442,10 @@ class TikTokPlatformSyncTests(unittest.TestCase):
         )
         context = SimpleNamespace(
             new_page=AsyncMock(side_effect=[identity_page, page]),
+            storage_state=AsyncMock(
+                return_value=runtime_storage_state
+                or json.loads(self.session.read_text(encoding="utf-8"))
+            ),
             close=AsyncMock(
                 side_effect=cleanup_error,
                 return_value=None,
@@ -2054,6 +2079,45 @@ class TikTokPlatformSyncTests(unittest.TestCase):
         )
         self.assertNotIn("platformAccepted", raised.exception.receipt)
 
+    def test_post_schedule_plain_exception_uses_scheduled_outcome_unknown(self) -> None:
+        marker = "DETACHED-SECRET-MUST-NOT-LEAK"
+        uploader = self.fake_uploader()
+
+        async def detached(_page, base):
+            button = await uploader._final_action_button(base)
+            await button.click()
+            raise RuntimeError(marker)
+
+        uploader.submit_once.side_effect = detached
+        with self.assertRaises(overseas_tiktok_publish.TikTokPublishError) as raised:
+            self.run_sync(
+                mode="formal",
+                uploader=uploader,
+                prepared_changes={
+                    "scheduleMode": "platform_native",
+                    "scheduledAt": "2026-08-29 15:00",
+                },
+            )
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "tiktok_schedule_outcome_unknown",
+        )
+        self.assertTrue(raised.exception.outcome_ambiguous)
+        self.assertEqual(raised.exception.receipt["phase"], "ambiguous")
+        self.assertTrue(raised.exception.receipt["finalActionTriggered"])
+        self.assertEqual(
+            raised.exception.receipt["scheduleMode"],
+            "platform_native",
+        )
+        self.assertEqual(
+            raised.exception.receipt["scheduledAt"],
+            "2026-08-29 15:00",
+        )
+        self.assertIsNone(raised.exception.receipt["publishedAt"])
+        self.assertNotIn(marker, str(raised.exception))
+        self.assertNotIn(marker, repr(raised.exception.receipt))
+
     def test_exact_content_readback_is_distinct_from_platform_acceptance(self) -> None:
         uploader = self.fake_uploader(
             submit_result={
@@ -2089,7 +2153,106 @@ class TikTokPlatformSyncTests(unittest.TestCase):
     def test_matching_identity_allows_refresh_of_existing_session_only(self) -> None:
         run = self.run_sync(mode="platform_form_check")
 
-        run.save_session.assert_awaited_once_with(run.context, str(self.session))
+        run.context.storage_state.assert_awaited_once_with()
+        persisted = json.loads(self.session.read_text(encoding="utf-8"))
+        self.assertEqual(
+            [cookie["domain"] for cookie in persisted["cookies"]],
+            [".tiktok.com"],
+        )
+
+    def test_mixed_domain_input_is_sanitized_before_publish_context_creation(self) -> None:
+        marker = "GOOGLE-INPUT-MUST-NOT-SURVIVE"
+        self.session.write_text(
+            json.dumps(
+                {
+                    "cookies": [
+                        {
+                            "name": "sessionid",
+                            "value": "tiktok-session-value",
+                            "domain": ".tiktok.com",
+                            "path": "/",
+                        },
+                        {
+                            "name": "google",
+                            "value": marker,
+                            "domain": ".google.com",
+                            "path": "/",
+                        },
+                    ],
+                    "origins": [
+                        {
+                            "origin": "https://accounts.google.com",
+                            "localStorage": [{"name": "secret", "value": marker}],
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        run = self.run_sync(mode="platform_form_check")
+
+        supplied = run.new_context.await_args.kwargs["storage_state"]
+        self.assertIsInstance(supplied, dict)
+        self.assertEqual(
+            [cookie["domain"] for cookie in supplied["cookies"]],
+            [".tiktok.com"],
+        )
+        self.assertNotIn(marker, self.session.read_text(encoding="utf-8"))
+        if os.name == "posix":
+            self.assertEqual(self.session.stat().st_mode & 0o777, 0o600)
+
+    def test_refresh_removes_runtime_external_state_and_retains_tiktok_only(self) -> None:
+        marker = "GOOGLE-RUNTIME-MUST-NOT-SURVIVE"
+        runtime_state = {
+            "cookies": [
+                {
+                    "name": "sessionid",
+                    "value": "new-tiktok-session-value",
+                    "domain": ".tiktok.com",
+                    "path": "/",
+                },
+                {
+                    "name": "google",
+                    "value": marker,
+                    "domain": ".google.com",
+                    "path": "/",
+                },
+            ],
+            "origins": [
+                {
+                    "origin": "https://www.tiktok.com",
+                    "localStorage": [{"name": "tt", "value": "retained"}],
+                },
+                {
+                    "origin": "https://accounts.google.com",
+                    "localStorage": [{"name": "secret", "value": marker}],
+                },
+            ],
+        }
+
+        run = self.run_sync(
+            mode="platform_form_check",
+            runtime_storage_state=runtime_state,
+        )
+
+        persisted = json.loads(self.session.read_text(encoding="utf-8"))
+        self.assertEqual(
+            [cookie["domain"] for cookie in persisted["cookies"]],
+            [".tiktok.com"],
+        )
+        self.assertEqual(
+            [origin["origin"] for origin in persisted["origins"]],
+            ["https://www.tiktok.com"],
+        )
+        public_surface = "\n".join(
+            (
+                json.dumps(run.result, ensure_ascii=False),
+                repr(run.logger.mock_calls),
+                self.session.read_text(encoding="utf-8"),
+            )
+        )
+        self.assertNotIn(marker, public_surface)
 
     def test_manual_verification_emits_waiting_and_resolved_events(self) -> None:
         uploader = self.fake_uploader()

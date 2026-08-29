@@ -18,12 +18,15 @@ from app_core.overseas_tiktok_publish import (
     TikTokPublishError,
     compose_tiktok_caption,
 )
+from app_core.overseas_tiktok_session_scope import (
+    load_sanitized_tiktok_storage_state_file,
+    replace_tiktok_storage_state_file,
+)
 from utils.base_social_media import (
     keep_browser_open_for_dry_run,
     launch_publish_browser,
     new_publish_context,
     reveal_page_window,
-    save_context_storage_state,
     set_init_script,
 )
 from utils.log import tiktok_logger
@@ -33,6 +36,7 @@ from uploader.tk_uploader.schedule_form import (
     TikTokScheduleForm,
     TikTokScheduledContentExpectation,
     TikTokScheduleTarget,
+    canonicalize_tiktok_caption,
 )
 
 
@@ -339,8 +343,7 @@ class TiktokVideo:
 
     @staticmethod
     def _normalize_caption_text(value: object) -> str:
-        text = unicodedata.normalize("NFKC", str(value or ""))
-        return text.replace("\r\n", "\n").replace("\r", "\n").strip()
+        return canonicalize_tiktok_caption(value)
 
     @staticmethod
     def _normalize_topic_label(value: object) -> str:
@@ -972,26 +975,32 @@ class TiktokVideo:
                 "tiktok_final_action_already_consumed",
                 "TikTok 最终动作已在本会话消费，禁止再次调用",
             )
-        self._submit_consumed = True
         if self._schedule_form is not None and self._schedule_target is not None:
-            publish_event("tiktok_final_click", "TikTok 已确认，正在点击 Schedule")
+            expected_caption = canonicalize_tiktok_caption(self._caption())
+            baseline = (
+                await self._schedule_form.capture_scheduled_content_baseline(
+                    self.expected_account_reference
+                )
+            )
             submitted_after = _uploader_shanghai_now()
+            expectation = TikTokScheduledContentExpectation(
+                account_reference=self.expected_account_reference,
+                expected_caption=expected_caption,
+                caption_sha256=hashlib.sha256(
+                    expected_caption.encode("utf-8")
+                ).hexdigest(),
+                target=self._schedule_target,
+                submitted_after=submitted_after,
+                baseline_row_keys=baseline.row_keys,
+            )
+            self._submit_consumed = True
+            publish_event("tiktok_final_click", "TikTok 已确认，正在点击 Schedule")
             try:
                 await button.click()
                 acceptance = await self._schedule_form.wait_for_acceptance(
                     self._schedule_target
                 )
                 self._emit_schedule_checkpoint("scheduled_accepted")
-                expected_caption = self._caption()
-                expectation = TikTokScheduledContentExpectation(
-                    account_reference=self.expected_account_reference,
-                    expected_caption=expected_caption,
-                    caption_sha256=hashlib.sha256(
-                        expected_caption.encode("utf-8")
-                    ).hexdigest(),
-                    target=self._schedule_target,
-                    submitted_after=submitted_after,
-                )
                 readback = await self._schedule_form.readback_scheduled_content(
                     expectation
                 )
@@ -1032,6 +1041,7 @@ class TiktokVideo:
                     "publishedAt": None,
                 },
             }
+        self._submit_consumed = True
         publish_event("tiktok_final_click", "TikTok 已确认，正在点击 Post")
         await button.click()
         signal = await self._wait_for_publish_result(page)
@@ -1060,7 +1070,13 @@ class TiktokVideo:
         context = self.external_context
         page = self.external_page
         if context is None:
-            context = await new_publish_context(browser, storage_state=self.account_file)
+            storage_state = load_sanitized_tiktok_storage_state_file(
+                Path(self.account_file)
+            )
+            context = await new_publish_context(
+                browser,
+                storage_state=storage_state,
+            )
             context = await set_init_script(context)
         if page is None:
             page = await context.new_page()
@@ -1080,7 +1096,10 @@ class TiktokVideo:
             result: dict[str, Any] | None = await self.prepare_form(page, base)
             if not self.dry_run:
                 result = await self.submit_once(page, base)
-            await save_context_storage_state(context, self.account_file)
+            replace_tiktok_storage_state_file(
+                Path(self.account_file),
+                await context.storage_state(),
+            )
             if self.dry_run:
                 tiktok_logger.success("[tiktok] 已停在最终发布前，未点击 Post")
             else:
@@ -1092,7 +1111,7 @@ class TiktokVideo:
                         page,
                         context,
                         browser,
-                        account_file=self.account_file,
+                        account_file=None,
                         logger=tiktok_logger,
                         platform_name="TikTok",
                         block_until_close=self.dry_run_hold_browser,

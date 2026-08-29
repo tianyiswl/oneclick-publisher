@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock
 from zoneinfo import ZoneInfo
 
 from app_core.overseas_tiktok_errors import TikTokPublishError
+from uploader.tk_uploader import schedule_form as tiktok_schedule_form
 from uploader.tk_uploader.schedule_form import (
     ACCEPTANCE_FEEDBACK_SELECTORS,
     FINAL_ACTION_SELECTORS,
@@ -23,6 +24,17 @@ from uploader.tk_uploader.schedule_form import (
     TikTokScheduleForm,
     TikTokScheduleTarget,
     _normalized_label,
+)
+
+
+TEST_PAGE_ACCOUNT_REFERENCE_SELECTORS = (
+    'a[data-e2e="nav-profile"][href*="/@"]',
+    'a[data-e2e="profile-link"][href*="/@"]',
+    '[data-e2e="user-avatar"] a[href*="/@"]',
+)
+TEST_ROW_ACCOUNT_REFERENCE_SELECTORS = (
+    'a[data-e2e="content-row-account"][href*="/@"]',
+    'a[data-e2e="account-link"][href*="/@"]',
 )
 
 
@@ -197,7 +209,6 @@ class FakeSchedulePage(FakeScheduleBase):
         self.url = "https://www.tiktok.com/tiktokstudio/upload"
         self.goto_calls: list[str] = []
         self.goto_failures: set[str] = set()
-        self.account_reference = "expected.user"
 
     async def goto(self, route: str) -> None:
         self.goto_calls.append(route)
@@ -221,12 +232,31 @@ class FakeSchedulePage(FakeScheduleBase):
         for selector in SCHEDULED_ROW_SELECTORS:
             self.register(selector, *rows)
 
+    def replace_rows(self, *rows: FakeScheduleControl) -> None:
+        for selector in SCHEDULED_ROW_SELECTORS:
+            self._registered[selector] = list(rows)
+
+    def set_page_account_references(self, *account_references: str) -> None:
+        links = [
+            FakeScheduleControl(
+                f"page-account-{index}-{reference}",
+                "page_account_link",
+                label=f"@{reference}",
+                attributes={"href": f"https://www.tiktok.com/@{reference}"},
+            )
+            for index, reference in enumerate(account_references)
+        ]
+        for selector in TEST_PAGE_ACCOUNT_REFERENCE_SELECTORS:
+            self._registered[selector] = list(links)
+        self.controls.extend(link for link in links if link not in self.controls)
+
 
 class FakeClock:
     def __init__(self) -> None:
         self.elapsed = 0.0
         self.current = datetime(2026, 8, 29, 15, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
         self.sleeps: list[float] = []
+        self.on_sleep: Callable[[float], None] | None = None
 
     def monotonic(self) -> float:
         return self.elapsed
@@ -238,6 +268,8 @@ class FakeClock:
         self.sleeps.append(seconds)
         self.elapsed += seconds
         self.current += timedelta(seconds=seconds)
+        if self.on_sleep is not None:
+            self.on_sleep(seconds)
 
 
 def _register_form_controls(
@@ -306,6 +338,7 @@ def scheduled_form_page(
 ) -> tuple[FakeSchedulePage, list[FakeScheduleBase]]:
     """Return one fake page plus the exact base sequence consumed by resolve_base."""
     page = FakeSchedulePage()
+    page.set_page_account_references("expected.user")
     base_count = 24 if remount_after_writes else 1
     bases: list[FakeScheduleBase] = []
     for index in range(base_count):
@@ -350,7 +383,7 @@ def scheduled_form_page(
 def scheduled_row(
     *,
     node_id: str = "row-1",
-    account_reference: str | None = "expected.user",
+    account_reference: str | tuple[str, ...] | None = "expected.user",
     caption: str = "Hello\nWorld",
     scheduled_at: str = "2026-08-29 15:00",
     timezone: str = "Asia/Shanghai",
@@ -362,7 +395,6 @@ def scheduled_row(
         "scheduled_row",
         label=caption,
         attributes={
-            "data-account-reference": account_reference,
             "data-caption": caption,
             "data-schedule-time": scheduled_at,
             "data-schedule-timezone": timezone,
@@ -370,6 +402,24 @@ def scheduled_row(
             "data-content-url": content_url,
         },
     )
+    account_references = (
+        account_reference
+        if isinstance(account_reference, tuple)
+        else (account_reference,)
+        if account_reference is not None
+        else ()
+    )
+    account_links = [
+        FakeScheduleControl(
+            f"{node_id}-account-{index}-{reference}",
+            "row_account_link",
+            label=f"@{reference}",
+            attributes={"href": f"https://www.tiktok.com/@{reference}"},
+        )
+        for index, reference in enumerate(account_references)
+    ]
+    for selector in TEST_ROW_ACCOUNT_REFERENCE_SELECTORS:
+        row.register(selector, *account_links)
     actions = [
         FakeScheduleControl(
             f"{node_id}-{name}",
@@ -414,6 +464,7 @@ class TikTokScheduleFormTests(unittest.IsolatedAsyncioTestCase):
                 page,
                 resolve_base=resolver,
                 wait_for_manual_intervention=intervention,
+                readback_page_factory=AsyncMock(return_value=page),
                 **kwargs,
             ),
             resolver,
@@ -727,16 +778,20 @@ class TikTokScheduleFormTests(unittest.IsolatedAsyncioTestCase):
         caption: str = "Hello\nWorld",
         target: TikTokScheduleTarget | None = None,
         submitted_after: datetime | None = None,
+        baseline_row_keys: frozenset[str] | None = None,
     ) -> TikTokScheduledContentExpectation:
         normalized = normalized_caption(caption)
-        return TikTokScheduledContentExpectation(
-            account_reference=account_reference,
-            expected_caption=caption,
-            caption_sha256=hashlib.sha256(normalized.encode("utf-8")).hexdigest(),
-            target=target or self.target,
-            submitted_after=submitted_after
+        values = {
+            "account_reference": account_reference,
+            "expected_caption": caption,
+            "caption_sha256": hashlib.sha256(normalized.encode("utf-8")).hexdigest(),
+            "target": target or self.target,
+            "submitted_after": submitted_after
             or datetime(2026, 8, 29, 14, 59, tzinfo=ZoneInfo("Asia/Shanghai")),
-        )
+        }
+        if baseline_row_keys is not None:
+            values["baseline_row_keys"] = baseline_row_keys
+        return TikTokScheduledContentExpectation(**values)
 
     async def test_readback_returns_only_one_exact_row(self) -> None:
         page, bases = scheduled_form_page(toggle_enabled=True)
@@ -772,7 +827,7 @@ class TikTokScheduleFormTests(unittest.IsolatedAsyncioTestCase):
                 row, _ = scheduled_row(account_reference=row_account)
                 page.set_rows(row)
                 if missing_reference == "page":
-                    del page.account_reference
+                    page.set_page_account_references()
                 clock = FakeClock()
                 form, _, _ = self.form(page, bases, clock=clock)
 
@@ -820,13 +875,119 @@ class TikTokScheduleFormTests(unittest.IsolatedAsyncioTestCase):
                 )
 
         page, bases = scheduled_form_page(toggle_enabled=True)
-        page.account_reference = "wrong.page"
+        page.set_page_account_references("wrong.page")
         row, _ = scheduled_row()
         page.set_rows(row)
         clock = FakeClock()
         form, _, _ = self.form(page, bases, clock=clock)
         self.assertIsNone(
             await form.readback_scheduled_content(self.expectation())
+        )
+
+    async def test_readback_rejects_ambiguous_page_or_row_dom_identity(self) -> None:
+        for ambiguity in ("page", "row"):
+            with self.subTest(ambiguity=ambiguity):
+                page, bases = scheduled_form_page(toggle_enabled=True)
+                if ambiguity == "page":
+                    page.set_page_account_references("expected.user", "other.user")
+                    row, _ = scheduled_row()
+                else:
+                    row, _ = scheduled_row(
+                        account_reference=("expected.user", "other.user")
+                    )
+                page.set_rows(row)
+                clock = FakeClock()
+                form, _, _ = self.form(page, bases, clock=clock)
+
+                self.assertIsNone(
+                    await form.readback_scheduled_content(self.expectation())
+                )
+
+    async def test_baseline_allows_only_one_exact_new_row(self) -> None:
+        page, bases = scheduled_form_page(toggle_enabled=True)
+        old, _ = scheduled_row(
+            node_id="row-old",
+            content_id="old-7654321",
+            content_url="https://www.tiktok.com/@expected.user/video/old-7654321",
+        )
+        page.replace_rows(old)
+        clock = FakeClock()
+        form, _, _ = self.form(page, bases, clock=clock)
+
+        baseline = await form.capture_scheduled_content_baseline("expected.user")
+        new, _ = scheduled_row(
+            node_id="row-new",
+            content_id="new-7654321",
+            content_url="https://www.tiktok.com/@expected.user/video/new-7654321",
+        )
+        page.replace_rows(old, new)
+
+        readback = await form.readback_scheduled_content(
+            self.expectation(baseline_row_keys=baseline.row_keys)
+        )
+
+        self.assertIsNotNone(readback)
+        assert readback is not None
+        self.assertEqual(readback.content_id, "new-7654321")
+
+    async def test_old_exact_row_is_not_accepted_while_new_row_is_delayed(self) -> None:
+        page, bases = scheduled_form_page(toggle_enabled=True)
+        old, _ = scheduled_row(
+            node_id="row-old",
+            content_id="old-7654321",
+            content_url="https://www.tiktok.com/@expected.user/video/old-7654321",
+        )
+        page.replace_rows(old)
+        clock = FakeClock()
+        form, _, _ = self.form(page, bases, clock=clock)
+        baseline = await form.capture_scheduled_content_baseline("expected.user")
+        new, _ = scheduled_row(
+            node_id="row-new-delayed",
+            content_id="new-delayed-7654321",
+            content_url=(
+                "https://www.tiktok.com/@expected.user/video/new-delayed-7654321"
+            ),
+        )
+        readback_sleep_count = 0
+
+        def reveal_new_row(_seconds: float) -> None:
+            nonlocal readback_sleep_count
+            readback_sleep_count += 1
+            if readback_sleep_count == 1:
+                page.replace_rows(old, new)
+
+        clock.on_sleep = reveal_new_row
+
+        readback = await form.readback_scheduled_content(
+            self.expectation(baseline_row_keys=baseline.row_keys)
+        )
+
+        self.assertIsNotNone(readback)
+        assert readback is not None
+        self.assertEqual(readback.content_id, "new-delayed-7654321")
+        self.assertEqual(readback_sleep_count, 1)
+
+    async def test_zero_or_multiple_exact_new_rows_never_succeed(self) -> None:
+        page, bases = scheduled_form_page(toggle_enabled=True)
+        old, _ = scheduled_row(node_id="row-old", content_id="old")
+        page.replace_rows(old)
+        clock = FakeClock()
+        form, _, _ = self.form(page, bases, clock=clock)
+        baseline = await form.capture_scheduled_content_baseline("expected.user")
+
+        self.assertIsNone(
+            await form.readback_scheduled_content(
+                self.expectation(baseline_row_keys=baseline.row_keys)
+            )
+        )
+
+        first, _ = scheduled_row(node_id="row-new-1", content_id="new-1")
+        second, _ = scheduled_row(node_id="row-new-2", content_id="new-2")
+        page.replace_rows(old, first, second)
+        self.assertIsNone(
+            await form.readback_scheduled_content(
+                self.expectation(baseline_row_keys=baseline.row_keys)
+            )
         )
 
         page, bases = scheduled_form_page(toggle_enabled=True)

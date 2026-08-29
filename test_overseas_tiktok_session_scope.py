@@ -4,8 +4,13 @@
 from __future__ import annotations
 
 import copy
+import json
+import os
+import tempfile
 import unittest
+from pathlib import Path
 
+from app_core import overseas_tiktok_session_scope as session_scope
 from app_core.overseas_tiktok_session_scope import (
     TikTokSessionScopeError,
     is_tiktok_cookie_domain,
@@ -15,6 +20,37 @@ from app_core.overseas_tiktok_session_scope import (
 
 
 class TikTokSessionScopeTests(unittest.TestCase):
+    @staticmethod
+    def mixed_state() -> dict:
+        return {
+            "cookies": [
+                {
+                    "name": "sessionid",
+                    "value": "tiktok-secret",
+                    "domain": ".tiktok.com",
+                    "path": "/",
+                },
+                {
+                    "name": "google",
+                    "value": "foreign-secret",
+                    "domain": ".google.com",
+                    "path": "/",
+                },
+            ],
+            "origins": [
+                {
+                    "origin": "https://www.tiktok.com",
+                    "localStorage": [{"name": "tt", "value": "kept"}],
+                },
+                {
+                    "origin": "https://accounts.google.com",
+                    "localStorage": [
+                        {"name": "foreign", "value": "foreign-secret"}
+                    ],
+                },
+            ],
+        }
+
     def test_sanitize_keeps_only_tiktok_domains_and_origins(self):
         raw = {
             "cookies": [
@@ -148,6 +184,50 @@ class TikTokSessionScopeTests(unittest.TestCase):
 
         self.assertEqual(raw["cookies"][0]["meta"]["nested"], ["value"])
         self.assertEqual(raw["origins"][0]["localStorage"][0]["value"], "secret-storage-value")
+
+    def test_load_sanitizes_mixed_file_before_context_and_migrates_atomically(self):
+        with tempfile.TemporaryDirectory() as raw:
+            state_file = Path(raw) / "tiktok.json"
+            state_file.write_text(
+                json.dumps(self.mixed_state(), ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            loaded = session_scope.load_sanitized_tiktok_storage_state_file(
+                state_file
+            )
+
+            persisted = json.loads(state_file.read_text(encoding="utf-8"))
+            self.assertEqual(loaded, persisted)
+            self.assertEqual(
+                [cookie["domain"] for cookie in loaded["cookies"]],
+                [".tiktok.com"],
+            )
+            self.assertEqual(
+                [origin["origin"] for origin in loaded["origins"]],
+                ["https://www.tiktok.com"],
+            )
+            self.assertNotIn("foreign-secret", state_file.read_text(encoding="utf-8"))
+            if os.name == "posix":
+                self.assertEqual(state_file.stat().st_mode & 0o777, 0o600)
+
+    def test_atomic_replace_filters_runtime_added_external_state(self):
+        with tempfile.TemporaryDirectory() as raw:
+            state_file = Path(raw) / "tiktok.json"
+            state_file.write_text("{}", encoding="utf-8")
+
+            replaced = session_scope.replace_tiktok_storage_state_file(
+                state_file,
+                self.mixed_state(),
+            )
+
+            persisted = json.loads(state_file.read_text(encoding="utf-8"))
+            self.assertEqual(replaced, persisted)
+            self.assertEqual(len(persisted["cookies"]), 1)
+            self.assertEqual(len(persisted["origins"]), 1)
+            self.assertNotIn("foreign-secret", state_file.read_text(encoding="utf-8"))
+            if os.name == "posix":
+                self.assertEqual(state_file.stat().st_mode & 0o777, 0o600)
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ from typing import Any, Awaitable, Callable, Literal
 from zoneinfo import ZoneInfo
 
 from app_core.overseas_tiktok_errors import TikTokPublishError
+from app_core.overseas_tiktok_identity import normalize_tiktok_handle
 
 
 SCHEDULE_TOGGLE_SELECTORS = (
@@ -53,6 +54,15 @@ SCHEDULED_ROW_SELECTORS = (
     '[data-e2e="content-row"]',
     '[data-e2e="post-item"]',
     '[role="row"][data-schedule-time]',
+)
+PAGE_ACCOUNT_REFERENCE_SELECTORS = (
+    'a[data-e2e="nav-profile"][href*="/@"]',
+    'a[data-e2e="profile-link"][href*="/@"]',
+    '[data-e2e="user-avatar"] a[href*="/@"]',
+)
+ROW_ACCOUNT_REFERENCE_SELECTORS = (
+    'a[data-e2e="content-row-account"][href*="/@"]',
+    'a[data-e2e="account-link"][href*="/@"]',
 )
 
 _SCHEDULE_LABELS = frozenset({"schedule", "定时发布", "排期"})
@@ -110,6 +120,12 @@ class TikTokScheduledContentExpectation:
     caption_sha256: str
     target: TikTokScheduleTarget
     submitted_after: datetime
+    baseline_row_keys: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True, slots=True)
+class TikTokScheduledContentBaseline:
+    row_keys: frozenset[str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,9 +147,12 @@ def _normalized_label(value: object) -> str:
     ).casefold()
 
 
-def _normalized_caption(value: object) -> str:
+def canonicalize_tiktok_caption(value: object) -> str:
     text = unicodedata.normalize("NFKC", str(value or ""))
     return text.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
+_normalized_caption = canonicalize_tiktok_caption
 
 
 async def _same_dom_node(left: Any, right: Any) -> bool:
@@ -175,6 +194,31 @@ async def _bounded_candidates(base: Any, selectors: tuple[str, ...]) -> list[Any
         for index in range(count):
             await _append_unique(candidates, locator.nth(index))
     return candidates
+
+
+async def _unique_dom_account_reference(
+    base: Any,
+    selectors: tuple[str, ...],
+) -> str | None:
+    references: set[str] = set()
+    try:
+        candidates = await _bounded_candidates(base, selectors)
+    except Exception:
+        return None
+    for candidate in candidates:
+        try:
+            if not await candidate.is_visible():
+                continue
+            reference = normalize_tiktok_handle(
+                await candidate.get_attribute("href")
+            )
+        except Exception:
+            continue
+        if reference:
+            references.add(reference)
+    if len(references) != 1:
+        return None
+    return next(iter(references))
 
 
 async def _visible_enabled_final_buttons(base: Any) -> list[tuple[Any, str]]:
@@ -288,6 +332,7 @@ class TikTokScheduleForm:
         monotonic: Callable[[], float] | None = None,
         now: Callable[[], datetime] | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
+        readback_page_factory: Callable[[], Awaitable[Any]] | None = None,
     ) -> None:
         self._page = page
         self._resolve_base = resolve_base
@@ -295,6 +340,9 @@ class TikTokScheduleForm:
         self._monotonic = monotonic or time.monotonic
         self._now = now or _shanghai_now
         self._sleep = sleep or asyncio.sleep
+        self._readback_page_factory = readback_page_factory
+        self._readback_page: Any | None = None
+        self._readback_route_loaded = False
 
     async def configure(
         self,
@@ -484,31 +532,41 @@ class TikTokScheduleForm:
     ) -> TikTokScheduledContentReadback | None:
         if not self._expectation_is_coherent(expected):
             return None
-        loaded = False
-        for route in SCHEDULED_CONTENT_ROUTES:
-            try:
-                await self._page.goto(route)
-            except Exception:
-                continue
-            loaded = True
-            break
-        if not loaded:
+        page = await self._load_scheduled_content_page()
+        if page is None:
             return None
 
         deadline = self._monotonic() + _OUTCOME_TIMEOUT_SECONDS
         while self._monotonic() < deadline:
-            await self._wait_for_manual_intervention(self._page)
+            await self._wait_for_manual_intervention(page)
             observed_at = self._now()
+            page_account_reference = await _unique_dom_account_reference(
+                page,
+                PAGE_ACCOUNT_REFERENCE_SELECTORS,
+            )
             exact: list[TikTokScheduledContentReadback] = []
-            rows = await _bounded_candidates(self._page, SCHEDULED_ROW_SELECTORS)
+            try:
+                rows = await _bounded_candidates(page, SCHEDULED_ROW_SELECTORS)
+            except Exception:
+                rows = []
             for row in rows:
-                if not await row.is_visible():
+                try:
+                    if not await row.is_visible():
+                        continue
+                    row_key = await self._stable_row_key(row)
+                    if (
+                        row_key is None
+                        or row_key in expected.baseline_row_keys
+                    ):
+                        continue
+                    readback = await self._matching_row(
+                        row,
+                        expected,
+                        page_account_reference=page_account_reference,
+                        observed_at=observed_at,
+                    )
+                except Exception:
                     continue
-                readback = await self._matching_row(
-                    row,
-                    expected,
-                    observed_at=observed_at,
-                )
                 if readback is not None:
                     exact.append(readback)
             if len(exact) == 1:
@@ -520,6 +578,123 @@ class TikTokScheduleForm:
                 break
             await self._sleep(min(_POLL_INTERVAL_SECONDS, remaining))
         return None
+
+    async def capture_scheduled_content_baseline(
+        self,
+        expected_account_reference: str,
+    ) -> TikTokScheduledContentBaseline:
+        expected_reference = normalize_tiktok_handle(expected_account_reference)
+        page = await self._load_scheduled_content_page()
+        if page is None or not expected_reference:
+            raise TikTokPublishError(
+                "tiktok_schedule_baseline_unavailable",
+                "TikTok 定时列表基线无法安全读取",
+            )
+        snapshots: list[frozenset[str]] = []
+        for index in range(2):
+            await self._wait_for_manual_intervention(page)
+            page_reference = await _unique_dom_account_reference(
+                page,
+                PAGE_ACCOUNT_REFERENCE_SELECTORS,
+            )
+            if page_reference != expected_reference:
+                raise TikTokPublishError(
+                    "tiktok_schedule_readback_identity_mismatch",
+                    "TikTok 定时列表账号身份无法唯一匹配",
+                )
+            try:
+                rows = await _bounded_candidates(page, SCHEDULED_ROW_SELECTORS)
+            except Exception as exc:
+                raise TikTokPublishError(
+                    "tiktok_schedule_baseline_unavailable",
+                    "TikTok 定时列表基线无法安全读取",
+                ) from exc
+            row_keys: set[str] = set()
+            for row in rows:
+                try:
+                    if not await row.is_visible():
+                        continue
+                    row_key = await self._stable_row_key(row)
+                except Exception as exc:
+                    raise TikTokPublishError(
+                        "tiktok_schedule_baseline_unavailable",
+                        "TikTok 定时列表基线无法安全读取",
+                    ) from exc
+                if row_key is None:
+                    raise TikTokPublishError(
+                        "tiktok_schedule_baseline_unavailable",
+                        "TikTok 定时列表存在无法唯一标识的内容",
+                    )
+                row_keys.add(row_key)
+            snapshots.append(frozenset(row_keys))
+            if index == 0:
+                await self._sleep(_POLL_INTERVAL_SECONDS)
+        if snapshots[0] != snapshots[1]:
+            raise TikTokPublishError(
+                "tiktok_schedule_baseline_unstable",
+                "TikTok 定时列表基线尚未稳定",
+            )
+        return TikTokScheduledContentBaseline(row_keys=snapshots[1])
+
+    async def _load_scheduled_content_page(self) -> Any | None:
+        if self._readback_page is None:
+            try:
+                if self._readback_page_factory is not None:
+                    self._readback_page = await self._readback_page_factory()
+                else:
+                    context = getattr(self._page, "context", None)
+                    if callable(context):
+                        context = context()
+                    self._readback_page = await context.new_page()
+            except Exception:
+                return None
+        if self._readback_route_loaded:
+            return self._readback_page
+        loaded = False
+        for route in SCHEDULED_CONTENT_ROUTES:
+            try:
+                await self._readback_page.goto(route)
+            except Exception:
+                continue
+            loaded = True
+            break
+        if not loaded:
+            return None
+        self._readback_route_loaded = True
+        return self._readback_page
+
+    @staticmethod
+    async def _stable_row_key(row: Any) -> str | None:
+        content_id = str(await row.get_attribute("data-content-id") or "").strip()
+        if content_id:
+            return f"content-id:{content_id}"
+        content_url = str(
+            await row.get_attribute("data-content-url") or ""
+        ).strip()
+        if content_url:
+            return f"content-url:{content_url}"
+        row_reference = await _unique_dom_account_reference(
+            row,
+            ROW_ACCOUNT_REFERENCE_SELECTORS,
+        )
+        caption = await row.get_attribute("data-caption")
+        if caption is None:
+            caption = await row.inner_text()
+        scheduled_at = str(
+            await row.get_attribute("data-schedule-time") or ""
+        ).strip()
+        timezone = str(
+            await row.get_attribute("data-schedule-timezone") or ""
+        ).strip()
+        caption_hash = hashlib.sha256(
+            canonicalize_tiktok_caption(caption).encode("utf-8")
+        ).hexdigest()
+        if not row_reference or not scheduled_at or not timezone:
+            return None
+        material = "\x1f".join(
+            (row_reference, caption_hash, scheduled_at, timezone)
+        )
+        return "content-key:" + hashlib.sha256(material.encode("utf-8")).hexdigest()
 
     @staticmethod
     def _target_values(target: TikTokScheduleTarget) -> tuple[str, str]:
@@ -546,7 +721,7 @@ class TikTokScheduleForm:
     def _expectation_is_coherent(
         expected: TikTokScheduledContentExpectation,
     ) -> bool:
-        caption = _normalized_caption(expected.expected_caption)
+        caption = canonicalize_tiktok_caption(expected.expected_caption)
         actual_hash = hashlib.sha256(caption.encode("utf-8")).hexdigest()
         return (
             expected.target.timezone == "Asia/Shanghai"
@@ -560,21 +735,28 @@ class TikTokScheduleForm:
         row: Any,
         expected: TikTokScheduledContentExpectation,
         *,
+        page_account_reference: str | None,
         observed_at: datetime,
     ) -> TikTokScheduledContentReadback | None:
-        page_account_reference = getattr(self._page, "account_reference", None)
-        row_account_reference = await row.get_attribute("data-account-reference")
+        expected_account_reference = normalize_tiktok_handle(
+            expected.account_reference
+        )
+        row_account_reference = await _unique_dom_account_reference(
+            row,
+            ROW_ACCOUNT_REFERENCE_SELECTORS,
+        )
         caption = await row.get_attribute("data-caption")
         if caption is None:
             caption = await row.inner_text()
         caption_hash = hashlib.sha256(
-            _normalized_caption(caption).encode("utf-8")
+            canonicalize_tiktok_caption(caption).encode("utf-8")
         ).hexdigest()
         scheduled_at = await row.get_attribute("data-schedule-time")
         timezone = await row.get_attribute("data-schedule-timezone")
         if (
-            page_account_reference != expected.account_reference
-            or row_account_reference != expected.account_reference
+            not expected_account_reference
+            or page_account_reference != expected_account_reference
+            or row_account_reference != expected_account_reference
             or caption_hash != expected.caption_sha256
             or scheduled_at != expected.target.scheduled_at
             or timezone != expected.target.timezone

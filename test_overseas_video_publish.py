@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 from zoneinfo import ZoneInfo
 
@@ -25,9 +27,11 @@ from uploader.tk_uploader.schedule_form import (
     TikTokScheduleAcceptance,
     TikTokScheduleForm,
     TikTokScheduleFormSnapshot,
+    TikTokScheduledContentBaseline,
     TikTokScheduledContentExpectation,
     TikTokScheduledContentReadback,
     TikTokScheduleTarget,
+    canonicalize_tiktok_caption,
 )
 from uploader.youtube_uploader.main import (
     YouTubeVideo,
@@ -612,6 +616,10 @@ class TikTokFormAdapterTests(unittest.TestCase):
         app.publish_confirmed = True
         form = AsyncMock(spec=TikTokScheduleForm)
         form.final_button.return_value = schedule_button
+        baseline = TikTokScheduledContentBaseline(
+            row_keys=frozenset({"content-id:old"})
+        )
+        form.capture_scheduled_content_baseline.return_value = baseline
         form.wait_for_acceptance.return_value = TikTokScheduleAcceptance(
             evidence="platform_feedback:scheduled",
             accepted_at=datetime(2026, 8, 29, 14, 1, tzinfo=ZoneInfo("Asia/Shanghai")),
@@ -650,12 +658,105 @@ class TikTokFormAdapterTests(unittest.TestCase):
             caption_sha256=hashlib.sha256(expected_caption.encode("utf-8")).hexdigest(),
             target=app._schedule_target,
             submitted_after=clicked_at,
+            baseline_row_keys=baseline.row_keys,
         )
         self.assertEqual(clicks, ["schedule"])
         self.assertEqual(result["phase"], "scheduled_readback_confirmed")
+        form.capture_scheduled_content_baseline.assert_awaited_once_with(
+            app.expected_account_reference
+        )
         form.wait_for_acceptance.assert_awaited_once_with(app._schedule_target)
         form.readback_scheduled_content.assert_awaited_once_with(expectation)
         app._post_button.assert_not_awaited()
+
+    def test_scheduled_submit_canonicalizes_crlf_and_cr_before_click_and_readback(self) -> None:
+        for raw_caption in ("Line one\r\nLine two", "Line one\rLine two"):
+            with self.subTest(raw_caption=repr(raw_caption)):
+                clicks: list[str] = []
+                app = self.uploader(
+                    tags=[],
+                    publish_date="2026-08-29 15:00",
+                    execution_mode="formal",
+                )
+                app.publish_confirmed = True
+                app._caption = lambda value=raw_caption: value
+                app._schedule_target = TikTokScheduleTarget(
+                    "2026-08-29 15:00",
+                    "Asia/Shanghai",
+                )
+                form = AsyncMock(spec=TikTokScheduleForm)
+                form.final_button.return_value = FakeTikTokLeaf(
+                    text="Schedule",
+                    on_click=lambda: clicks.append("schedule"),
+                )
+                baseline = TikTokScheduledContentBaseline(
+                    row_keys=frozenset({"content-id:old"})
+                )
+                form.capture_scheduled_content_baseline.return_value = baseline
+                form.wait_for_acceptance.return_value = TikTokScheduleAcceptance(
+                    evidence="platform_feedback:scheduled",
+                    accepted_at=datetime(
+                        2026,
+                        8,
+                        29,
+                        14,
+                        1,
+                        tzinfo=ZoneInfo("Asia/Shanghai"),
+                    ),
+                )
+                canonical = canonicalize_tiktok_caption(raw_caption)
+
+                async def readback(
+                    expectation: TikTokScheduledContentExpectation,
+                ) -> TikTokScheduledContentReadback:
+                    self.assertEqual(expectation.expected_caption, canonical)
+                    self.assertEqual(
+                        expectation.caption_sha256,
+                        hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+                    )
+                    self.assertEqual(
+                        expectation.baseline_row_keys,
+                        baseline.row_keys,
+                    )
+                    return TikTokScheduledContentReadback(
+                        content_id="new",
+                        content_url=(
+                            "https://www.tiktok.com/@expected.user/video/new"
+                        ),
+                        scheduled_at="2026-08-29 15:00",
+                        schedule_timezone="Asia/Shanghai",
+                        evidence="scheduled_list:unique_new",
+                    )
+
+                form.readback_scheduled_content.side_effect = readback
+                app._schedule_form = form
+                app.authorized_snapshot_validator = lambda snapshot: snapshot
+                app.schedule_checkpoint_observer = lambda _stage: None
+                app._wait_for_manual_intervention = AsyncMock(return_value=None)
+                app._verify_form_snapshot = AsyncMock(
+                    return_value={"finalActionLabel": "Schedule"}
+                )
+                clicked_at = datetime(
+                    2026,
+                    8,
+                    29,
+                    14,
+                    1,
+                    tzinfo=ZoneInfo("Asia/Shanghai"),
+                )
+
+                with patch.object(
+                    tiktok_uploader,
+                    "_uploader_shanghai_now",
+                    return_value=clicked_at,
+                ):
+                    result = asyncio.run(app.submit_once(AsyncMock(), AsyncMock()))
+
+                self.assertEqual(clicks, ["schedule"])
+                self.assertEqual(result["phase"], "scheduled_readback_confirmed")
+                form.capture_scheduled_content_baseline.assert_awaited_once_with(
+                    app.expected_account_reference
+                )
 
     def test_scheduled_click_exception_is_outcome_unknown(self) -> None:
         clicks: list[str] = []
@@ -1246,19 +1347,58 @@ class TikTokFormAdapterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             video = Path(raw) / "video.mp4"
             video.write_bytes(b"offline")
+            state_file = Path(raw) / "tiktok.json"
+            state_file.write_text(
+                json.dumps(
+                    {
+                        "cookies": [
+                            {
+                                "name": "sessionid",
+                                "value": "old",
+                                "domain": ".tiktok.com",
+                                "path": "/",
+                            }
+                        ],
+                        "origins": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
             page = FakeTikTokPage()
             app = TiktokVideo(
                 "Title",
                 str(video),
                 [],
                 0,
-                "/not/used.json",
+                str(state_file),
                 description="Body",
                 expected_account_reference="expected.user",
                 execution_mode="platform_form_check",
             )
             app.external_browser = object()
-            app.external_context = object()
+            marker = "RUNTIME-GOOGLE-MUST-NOT-SURVIVE"
+            external_context = SimpleNamespace(
+                storage_state=AsyncMock(
+                    return_value={
+                        "cookies": [
+                            {
+                                "name": "sessionid",
+                                "value": "new",
+                                "domain": ".tiktok.com",
+                                "path": "/",
+                            },
+                            {
+                                "name": "google",
+                                "value": marker,
+                                "domain": ".google.com",
+                                "path": "/",
+                            },
+                        ],
+                        "origins": [],
+                    }
+                )
+            )
+            app.external_context = external_context
             app.external_page = page
             app._base = AsyncMock(return_value=page.base)
             app._wait_for_manual_intervention = AsyncMock(return_value=None)
@@ -1283,13 +1423,26 @@ class TikTokFormAdapterTests(unittest.TestCase):
                 patch.object(
                     tiktok_uploader,
                     "save_context_storage_state",
-                    new=AsyncMock(return_value=None),
-                ),
+                    new=AsyncMock(
+                        side_effect=AssertionError(
+                            "generic all-domain saver must not be used for TikTok"
+                        )
+                    ),
+                    create=True,
+                ) as generic_saver,
             ):
                 asyncio.run(app.upload(None))
+            persisted = json.loads(state_file.read_text(encoding="utf-8"))
 
         reveal.assert_not_awaited()
         app.prepare_form.assert_awaited_once_with(page, page.base)
+        external_context.storage_state.assert_awaited_once_with()
+        generic_saver.assert_not_awaited()
+        self.assertEqual(
+            [cookie["domain"] for cookie in persisted["cookies"]],
+            [".tiktok.com"],
+        )
+        self.assertNotIn(marker, json.dumps(persisted))
 
     def test_plain_hashtag_text_never_satisfies_topic_entity_readback(self) -> None:
         page = FakeTikTokPage(editor_text="Title\n\nBody #AI")

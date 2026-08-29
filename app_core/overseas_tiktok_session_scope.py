@@ -4,7 +4,11 @@
 from __future__ import annotations
 
 import copy
+import json
+import os
+import tempfile
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -94,3 +98,81 @@ def sanitize_tiktok_storage_state(
             "tiktok_session_missing", "TikTok 本地登录会话不存在"
         )
     return {"cookies": kept_cookies, "origins": kept_origins}
+
+
+def replace_tiktok_storage_state_file(
+    state_file: Path | str,
+    raw_state: Mapping[str, Any],
+) -> dict[str, list[dict[str, Any]]]:
+    """Sanitize and atomically replace one isolated TikTok state file."""
+
+    path = Path(state_file)
+    temporary: Path | None = None
+    try:
+        if path.is_symlink() or path.parent.is_symlink() or not path.parent.is_dir():
+            raise OSError("unsafe TikTok state path")
+        sanitized = sanitize_tiktok_storage_state(raw_state)
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as output:
+            temporary = Path(output.name)
+            json.dump(
+                sanitized,
+                output,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            output.flush()
+            os.fsync(output.fileno())
+        if os.name == "posix":
+            temporary.chmod(0o600)
+        os.replace(temporary, path)
+        temporary = None
+        if os.name == "posix":
+            path.chmod(0o600)
+        return sanitized
+    except TikTokSessionScopeError:
+        raise
+    except (OSError, TypeError, ValueError) as exc:
+        raise TikTokSessionScopeError(
+            "tiktok_session_scope_invalid",
+            "TikTok 登录会话结构无效",
+        ) from exc
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def load_sanitized_tiktok_storage_state_file(
+    state_file: Path | str,
+) -> dict[str, list[dict[str, Any]]]:
+    """Load, sanitize, and safely migrate one TikTok-only state file."""
+
+    path = Path(state_file)
+    if path.is_symlink() or path.parent.is_symlink() or not path.is_file():
+        raise TikTokSessionScopeError(
+            "tiktok_session_missing",
+            "TikTok 本地登录会话不存在",
+        )
+    try:
+        raw_state = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise TikTokSessionScopeError(
+            "tiktok_session_missing",
+            "TikTok 本地登录会话不存在",
+        ) from exc
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise TikTokSessionScopeError(
+            "tiktok_session_scope_invalid",
+            "TikTok 登录会话结构无效",
+        ) from exc
+    sanitized = sanitize_tiktok_storage_state(raw_state)
+    return replace_tiktok_storage_state_file(path, sanitized)

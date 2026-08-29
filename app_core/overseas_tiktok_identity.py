@@ -8,10 +8,7 @@ or avatar is useful UI context, but neither is a stable account binding.
 from __future__ import annotations
 
 import asyncio
-import json
-import os
 import re
-import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,7 +20,7 @@ from playwright.async_api import async_playwright
 from .database import connect
 from .overseas_tiktok_session_scope import (
     TikTokSessionScopeError,
-    sanitize_tiktok_storage_state,
+    replace_tiktok_storage_state_file,
 )
 from .paths import COOKIE_DIR
 
@@ -603,44 +600,12 @@ def _replace_saved_tiktok_state_file(
 ) -> None:
     """Atomically replace one existing TikTok-only state file."""
 
-    temporary: Path | None = None
     try:
-        if state_file.is_symlink() or state_file.parent.is_symlink():
-            raise OSError("unsafe TikTok state path")
-        sanitized = sanitize_tiktok_storage_state(storage_state)
-        with tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            dir=state_file.parent,
-            prefix=f".{state_file.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as output:
-            temporary = Path(output.name)
-            json.dump(
-                sanitized,
-                output,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-            output.flush()
-            os.fsync(output.fileno())
-        if os.name == "posix":
-            temporary.chmod(0o600)
-        os.replace(temporary, state_file)
-        temporary = None
-        if os.name == "posix":
-            state_file.chmod(0o600)
+        replace_tiktok_storage_state_file(state_file, storage_state)
     except (OSError, TikTokSessionScopeError, TypeError, ValueError) as exc:
         raise TikTokIdentityError(
             "tiktok_session_expired", "TikTok 登录已失效"
         ) from exc
-    finally:
-        if temporary is not None:
-            try:
-                temporary.unlink(missing_ok=True)
-            except OSError:
-                pass
 
 
 async def read_tiktok_public_profile(page, identity: TikTokIdentity):

@@ -23,7 +23,6 @@ from urllib.parse import urlsplit
 from utils.base_social_media import (
     launch_publish_browser,
     new_publish_context,
-    save_context_storage_state,
     set_init_script,
 )
 from utils.log import tiktok_logger
@@ -38,6 +37,11 @@ from .overseas_tiktok_identity import (
     validate_identity_binding,
 )
 from .paths import COOKIE_DIR, DB_PATH
+from .overseas_tiktok_session_scope import (
+    TikTokSessionScopeError,
+    load_sanitized_tiktok_storage_state_file,
+    replace_tiktok_storage_state_file,
+)
 from .tiktok_schedule_contract import (
     SHANGHAI,
     SHANGHAI_NAME,
@@ -1464,12 +1468,27 @@ async def _run_tiktok_platform(
         )
         final_state["triggered"] = True
 
+    async def refresh_isolated_session() -> None:
+        _require_current_account_snapshot(prepared)
+        raw_state = await context.storage_state()
+        _require_current_account_snapshot(prepared)
+        replace_tiktok_storage_state_file(
+            Path(str(prepared["accountFile"])),
+            raw_state,
+        )
+
     try:
         playwright = await playwright_manager.start()
         browser = await launch_publish_browser(playwright)
+        try:
+            storage_state = load_sanitized_tiktok_storage_state_file(
+                Path(str(prepared["accountFile"]))
+            )
+        except TikTokSessionScopeError as exc:
+            raise TikTokPublishError(exc.error_code, exc.public_message) from None
         context = await new_publish_context(
             browser,
-            storage_state=str(prepared["accountFile"]),
+            storage_state=storage_state,
         )
         context = await set_init_script(context)
         identity_page = await context.new_page()
@@ -1617,7 +1636,7 @@ async def _run_tiktok_platform(
         }
         if mode == "platform_form_check":
             receipt["phase"] = "platform_form_verified"
-            await save_context_storage_state(context, str(prepared["accountFile"]))
+            await refresh_isolated_session()
             completed_successfully = True
             return {
                 "type": 6,
@@ -1662,9 +1681,7 @@ async def _run_tiktok_platform(
             receipt.update(readback)
             receipt["phase"] = phase
             _record_tiktok_event(task_id, event_type, message)
-            await save_context_storage_state(
-                context, str(prepared["accountFile"])
-            )
+            await refresh_isolated_session()
             completed_successfully = True
             return {
                 "type": 6,
@@ -1697,7 +1714,7 @@ async def _run_tiktok_platform(
             receipt.update(readback)
         receipt["phase"] = phase
         _record_tiktok_event(task_id, event_type, message)
-        await save_context_storage_state(context, str(prepared["accountFile"]))
+        await refresh_isolated_session()
         completed_successfully = True
         return {
             "type": 6,
@@ -1771,9 +1788,18 @@ async def _run_tiktok_platform(
                     receipt=merged_receipt,
                 ) from None
             _log_internal_failure("after-final-action", exc)
+            scheduled_action = prepared["scheduleMode"] == "platform_native"
             raise TikTokPublishError(
-                "tiktok_publish_outcome_unknown",
-                "TikTok 最终动作后的平台结果无法确认，请人工核对内容列表",
+                (
+                    "tiktok_schedule_outcome_unknown"
+                    if scheduled_action
+                    else "tiktok_publish_outcome_unknown"
+                ),
+                (
+                    "TikTok 定时最终动作后的结果无法确认，请人工核对内容列表"
+                    if scheduled_action
+                    else "TikTok 最终动作后的平台结果无法确认，请人工核对内容列表"
+                ),
                 outcome_ambiguous=True,
                 receipt=receipt,
             ) from None
