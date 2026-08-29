@@ -80,3 +80,11 @@ Review remediation implementation: `6c80a25ced742b20345fab2c44a0df23c50b0a97` (`
 - Current `origin/main` scope reports `changed=64` and `REVIEW_REQUIRED`: it includes the branch's pre-existing shared changes plus this required ignored-path report (`outside`). It is not an implementation scope failure.
 
 Round 2 implementation: `dc020340f5fad7114228813b32be0e38a0b5e178` (`fix(tiktok): compare frozen schedule handles`)
+
+## Review remediation (round 3)
+
+- Frozen candidates now carry stable `upload` or `top_page` scope identity. Different scopes are never compared through ElementHandle evaluation and therefore remain distinct; same-scope handles retain exact evaluation de-duplication and stability checks.
+- RED reproduced a cross-execution-context comparison failure. GREEN protocol coverage includes cross-scope ambiguity without comparison, same-scope same-DOM de-duplication, and top-page-only success.
+- Results: schedule form `44/44` in `14.585s`; focused chain `335/335` in `15.809s`; affected suite `552/552` in `17.179s`. Implementation scope against `e9191b2` was `changed=2`, overseas-owned, `scope-check: OK`; diff checks passed.
+
+Round 3 implementation: `f58a4609fc9373d6cedb0088047a6bfac86cafcf` (`fix(tiktok): isolate schedule control contexts`)
