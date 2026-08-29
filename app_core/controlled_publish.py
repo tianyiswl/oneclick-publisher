@@ -1058,12 +1058,15 @@ def compensate_tiktok_worker_start_failure(
     task_id: int,
     *,
     mode: str,
+    expected_claim_state: str = "started",
 ) -> bool:
-    """Close only the claim this process acquired before worker.start failed."""
+    """Close only a reversible claim after this process failed to start a worker."""
 
     from . import task_service
     from .database import connect
 
+    if expected_claim_state not in {"claimed", "started"}:
+        raise ValueError("TikTok worker 启动补偿 claim 状态无效")
     with connect() as conn:
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -1073,10 +1076,10 @@ def compensate_tiktok_worker_start_failure(
             claim = conn.execute(
                 f"""
                 SELECT id FROM tiktok_controlled_execution_claims
-                WHERE taskId = ? AND mode = ? AND state = 'started'
+                WHERE taskId = ? AND mode = ? AND state = ?
                   AND NOT {irreversible}
                 """,
-                (int(task_id), str(mode)),
+                (int(task_id), str(mode), expected_claim_state),
             ).fetchone()
             if claim is None:
                 conn.rollback()
@@ -1094,10 +1097,15 @@ def compensate_tiktok_worker_start_failure(
             deleted = conn.execute(
                 f"""
                 DELETE FROM tiktok_controlled_execution_claims
-                WHERE id = ? AND taskId = ? AND state = 'started'
+                WHERE id = ? AND taskId = ? AND mode = ? AND state = ?
                   AND NOT {irreversible}
                 """,
-                (int(claim["id"]), int(task_id)),
+                (
+                    int(claim["id"]),
+                    int(task_id),
+                    str(mode),
+                    expected_claim_state,
+                ),
             )
             if deleted.rowcount != 1:
                 raise ControlledPublishError(

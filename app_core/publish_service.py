@@ -1232,21 +1232,29 @@ def start_controlled_tiktok_publish(task_id: int) -> dict:
     )
     if not claim_mode:
         raise ValueError("TikTok 受控任务模式无效")
-    prepared = _validate_payloads(payloads)
-    expected_runtime = "publish" if claim_mode == "formal" else "platform_form_check"
-    if str(prepared[0].get("runtimeMode") or "") != expected_runtime:
-        raise ValueError("TikTok 受控任务模式与 claim 不一致")
-    target = _run_publish if claim_mode == "formal" else _run_platform_form_check
-    worker = threading.Thread(
-        target=target,
-        args=(task, prepared),
-        daemon=True,
-        name=(
-            f"oneclick-publish-{task_id}"
-            if claim_mode == "formal"
-            else f"oneclick-platform-form-check-{task_id}"
-        ),
-    )
+    try:
+        prepared = _validate_payloads(payloads)
+        expected_runtime = "publish" if claim_mode == "formal" else "platform_form_check"
+        if str(prepared[0].get("runtimeMode") or "") != expected_runtime:
+            raise ValueError("TikTok 受控任务模式与 claim 不一致")
+        target = _run_publish if claim_mode == "formal" else _run_platform_form_check
+        worker = threading.Thread(
+            target=target,
+            args=(task, prepared),
+            daemon=True,
+            name=(
+                f"oneclick-publish-{task_id}"
+                if claim_mode == "formal"
+                else f"oneclick-platform-form-check-{task_id}"
+            ),
+        )
+    except Exception:
+        compensate_tiktok_worker_start_failure(
+            int(task_id),
+            mode=claim_mode,
+            expected_claim_state="claimed",
+        )
+        raise
     require_tiktok_execution_claim(
         int(task_id),
         payloads,
