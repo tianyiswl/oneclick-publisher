@@ -309,6 +309,17 @@ class BrokenCompareHandle(HandleWrapper):
         raise RuntimeError("comparison protocol bug")
 
 
+class ContextHandle(HandleWrapper):
+    def __init__(self, record: HandleRecord, context: str) -> None:
+        super().__init__(record)
+        self.context = context
+
+    async def evaluate(self, expression: str, other: HandleWrapper) -> bool:
+        if not isinstance(other, ContextHandle) or self.context != other.context:
+            raise RuntimeError("cross execution context compare")
+        return await super().evaluate(expression, other)
+
+
 class WrapperScheduleLocator:
     def __init__(self, factories: list[Callable[[], HandleWrapper]]) -> None:
         self._factories = factories
@@ -392,6 +403,17 @@ class FakeSchedulePage(FakeScheduleBase):
         for selector in TEST_PAGE_ACCOUNT_REFERENCE_SELECTORS:
             self._registered[selector] = list(links)
         self.controls.extend(link for link in links if link not in self.controls)
+
+
+class ContextSchedulePage(FakeSchedulePage):
+    def __init__(self, live_locators: dict[str, object]) -> None:
+        super().__init__()
+        self._live_locators = live_locators
+
+    def locator(self, selector: str) -> object:
+        if selector in self._live_locators:
+            return self._live_locators[selector]
+        return super().locator(selector)
 
 
 class FakeClock:
@@ -818,6 +840,27 @@ class TikTokScheduleFormTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(raised.exception.error_code, "tiktok_schedule_control_ambiguous")
 
+    async def test_distinct_scope_handles_are_ambiguous_without_cross_context_compare(self) -> None:
+        upload_record = HandleRecord("upload")
+        page_record = HandleRecord("page")
+        base = LiveScheduleBase(
+            {SCHEDULE_TOGGLE_SELECTORS[0]: WrapperScheduleLocator([lambda: ContextHandle(upload_record, "upload")])}
+        )
+        page = ContextSchedulePage(
+            {SCHEDULE_TOGGLE_SELECTORS[0]: WrapperScheduleLocator([lambda: ContextHandle(page_record, "page")])}
+        )
+        clock = FakeClock()
+        form, _, _ = self.form(page, [base] * 8, clock=clock)
+
+        with self.assertRaises(TikTokPublishError) as raised:
+            await form._schedule_control(
+                SCHEDULE_TOGGLE_SELECTORS,
+                setting="schedule choice",
+                editable=False,
+            )
+
+        self.assertEqual(raised.exception.error_code, "tiktok_schedule_control_ambiguous")
+
     async def test_handle_comparison_protocol_error_is_not_silently_transient(self) -> None:
         record = HandleRecord("broken")
         base = LiveScheduleBase(
@@ -954,7 +997,7 @@ class TikTokScheduleFormTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(radio.click_count, 1)
         self.assertEqual(bases[0].by_role("final_action")[0].click_count, 0)
 
-    async def test_same_schedule_radio_in_both_scopes_is_deduplicated(self) -> None:
+    async def test_same_fake_node_in_both_scopes_is_ambiguous(self) -> None:
         page, bases = scheduled_form_page(toggle_count=0)
         radio = FakeScheduleControl("shared-schedule-radio", "radio", label="Schedule")
         bases[0].register(EXACT_SCHEDULE_RADIO_SELECTOR, radio)
@@ -962,9 +1005,11 @@ class TikTokScheduleFormTests(unittest.IsolatedAsyncioTestCase):
         clock = FakeClock()
         form, _, _ = self.form(page, bases, clock=clock)
 
-        await form.configure(self.target)
+        with self.assertRaises(TikTokPublishError) as raised:
+            await form.configure(self.target)
 
-        self.assertEqual(radio.click_count, 1)
+        self.assertEqual(raised.exception.error_code, "tiktok_schedule_control_ambiguous")
+        self.assertEqual(radio.click_count, 0)
 
     async def test_distinct_schedule_radios_across_base_and_top_page_are_ambiguous(
         self,

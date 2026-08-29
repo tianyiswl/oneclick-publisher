@@ -145,6 +145,7 @@ class TikTokScheduledContentReadback:
 class _FrozenScheduleCandidate:
     node: Any
     kind: Literal["switch", "radio", "checkbox", "field"]
+    scope: Literal["upload", "top_page"]
 
 
 def _shanghai_now() -> datetime:
@@ -372,6 +373,7 @@ class TikTokScheduleForm:
         locator: Any,
         *,
         kind: Literal["switch", "radio", "checkbox", "field"],
+        scope: Literal["upload", "top_page"],
         deadline: float,
     ) -> list[_FrozenScheduleCandidate]:
         frozen: list[_FrozenScheduleCandidate] = []
@@ -385,7 +387,7 @@ class TikTokScheduleForm:
                 else live
             )
             if node is not None:
-                frozen.append(_FrozenScheduleCandidate(node, kind))
+                frozen.append(_FrozenScheduleCandidate(node, kind, scope))
         return frozen
 
     async def _same_frozen_node(
@@ -394,6 +396,8 @@ class TikTokScheduleForm:
         right: _FrozenScheduleCandidate,
         deadline: float,
     ) -> bool:
+        if left.scope != right.scope:
+            return False
         left_id = getattr(left.node, "node_id", None)
         right_id = getattr(right.node, "node_id", None)
         if left_id is not None and right_id is not None:
@@ -428,15 +432,18 @@ class TikTokScheduleForm:
         deadline: float,
     ) -> list[_FrozenScheduleCandidate]:
         candidates: list[_FrozenScheduleCandidate] = []
-        for scope in scopes:
+        for scope_index, scope in enumerate(scopes):
             try:
+                scope_name: Literal["upload", "top_page"] = (
+                    "upload" if scope_index == 0 else "top_page"
+                )
                 for selector in selectors:
                     locator = scope.locator(selector)
                     kind: Literal["switch", "radio", "checkbox", "field"] = (
                         "switch" if choice else "field"
                     )
                     for candidate in await self._freeze_locator_candidates(
-                        locator, kind=kind, deadline=deadline
+                        locator, kind=kind, scope=scope_name, deadline=deadline
                     ):
                         await self._append_unique_frozen(candidates, candidate, deadline)
                 if choice:
@@ -446,7 +453,7 @@ class TikTokScheduleForm:
                             for name in ("Schedule", "定时发布", "排期"):
                                 locator = get_by_role(role, name=name, exact=True)
                                 for candidate in await self._freeze_locator_candidates(
-                                    locator, kind=role, deadline=deadline
+                                    locator, kind=role, scope=scope_name, deadline=deadline
                                 ):
                                     await self._append_unique_frozen(candidates, candidate, deadline)
             except BaseException as exc:
