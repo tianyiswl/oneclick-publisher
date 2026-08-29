@@ -113,6 +113,7 @@ class LoginDialog(QDialog):
         self.background_login = bool(background_login)
         self.scan_notified = False
         self.lifecycle_message = ""
+        self._tiktok_identity_probe_summary = ""
         self.readback_runner = BackgroundTaskRunner(self)
         self._saved_account_ids: list[int] = []
 
@@ -385,6 +386,7 @@ class LoginDialog(QDialog):
             if msg.startswith("IDENTITY_PROBE_SUMMARY:"):
                 summary = msg.split(":", 1)[1]
                 if _TIKTOK_PROBE_SUMMARY.fullmatch(summary):
+                    self._tiktok_identity_probe_summary = summary
                     self.log.append(f"安全诊断：{summary}")
                 continue
             if msg.startswith("ACCOUNT_SAVED:"):
@@ -436,6 +438,13 @@ class LoginDialog(QDialog):
                         "channel_identity_unavailable": "Google 未返回唯一 YouTube 频道，未保存账号。",
                     }.get(reason, "YouTube 官方登录未完成，账号没有发生变化。")
                 self.lifecycle_message = f"登录失败：{message}"
+                if (
+                    reason == "tiktok_identity_probe_required"
+                    and self._tiktok_identity_probe_summary
+                ):
+                    self.lifecycle_message += (
+                        f" 安全诊断：{self._tiktok_identity_probe_summary}"
+                    )
                 self.log.append(self.lifecycle_message)
                 self.timer.stop()
                 self.reject()

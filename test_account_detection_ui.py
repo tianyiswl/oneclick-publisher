@@ -339,6 +339,11 @@ class AccountDetectionUiTests(unittest.TestCase):
         rendered = dialog.log.toPlainText()
         self.assertIn(safe_summary, rendered)
         self.assertNotIn("dom-text-secret", rendered)
+        self.assertEqual(
+            dialog.lifecycle_message,
+            "登录失败：已读取登录状态，但当前页面账号入口发生变化；"
+            f"已生成安全诊断，未保存账号。 安全诊断：{safe_summary}",
+        )
         dialog.close()
 
     def test_tiktok_account_saved_uses_silent_readback_before_accepting(self) -> None:
