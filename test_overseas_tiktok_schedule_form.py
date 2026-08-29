@@ -13,6 +13,8 @@ from typing import Callable
 from unittest.mock import AsyncMock
 from zoneinfo import ZoneInfo
 
+from playwright.async_api import Error as PlaywrightError
+
 from app_core.overseas_tiktok_errors import TikTokPublishError
 from uploader.tk_uploader import schedule_form as tiktok_schedule_form
 from uploader.tk_uploader.schedule_form import (
@@ -323,8 +325,13 @@ class ContextHandle(HandleWrapper):
 class UploadRemountHandle(HandleWrapper):
     async def evaluate(self, expression: str, other: HandleWrapper) -> bool:
         if not isinstance(other, UploadRemountHandle) or self._record is not other._record:
-            raise RuntimeError("JSHandles can be evaluated only in the context they were created")
+            raise PlaywrightError("JSHandles can be evaluated only in the context they were created")
         return True
+
+
+class OtherPlaywrightErrorHandle(HandleWrapper):
+    async def evaluate(self, expression: str, other: HandleWrapper) -> bool:
+        raise PlaywrightError("unrelated Playwright comparison failure")
 
 
 class WrapperScheduleLocator:
@@ -890,6 +897,22 @@ class TikTokScheduleFormTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsInstance(control, UploadRemountHandle)
         self.assertEqual(clock.sleeps, [0.25, 0.25])
+
+    async def test_other_playwright_comparison_error_propagates(self) -> None:
+        record = HandleRecord("other-error")
+        base = LiveScheduleBase(
+            {SCHEDULE_TOGGLE_SELECTORS[0]: WrapperScheduleLocator([lambda: OtherPlaywrightErrorHandle(record)])}
+        )
+        page = FakeSchedulePage()
+        clock = FakeClock()
+        form, _, _ = self.form(page, [base] * 8, clock=clock)
+
+        with self.assertRaisesRegex(PlaywrightError, "unrelated Playwright comparison failure"):
+            await form._schedule_control(
+                SCHEDULE_TOGGLE_SELECTORS,
+                setting="schedule choice",
+                editable=False,
+            )
 
     async def test_handle_comparison_protocol_error_is_not_silently_transient(self) -> None:
         record = HandleRecord("broken")

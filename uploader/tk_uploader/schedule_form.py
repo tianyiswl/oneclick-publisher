@@ -12,6 +12,8 @@ from datetime import datetime
 from typing import Any, Awaitable, Callable, Literal
 from zoneinfo import ZoneInfo
 
+from playwright.async_api import Error as PlaywrightError
+
 from app_core.overseas_tiktok_errors import TikTokPublishError
 from app_core.overseas_tiktok_identity import normalize_tiktok_handle
 
@@ -412,7 +414,7 @@ class TikTokScheduleForm:
                     deadline,
                 )
             )
-        except RuntimeError as exc:
+        except PlaywrightError as exc:
             if (
                 left.scope == "upload"
                 and str(exc) == "JSHandles can be evaluated only in the context they were created"
