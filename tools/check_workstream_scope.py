@@ -19,11 +19,16 @@ SHARED_EXACT = {
     "requirements-oneclick.txt",
     "conf.py",
     "desktop_native_app.py",
+    "app_core/login_service.py",
     "app_core/account_service.py",
     "app_core/account_browser_service.py",
     "app_core/database.py",
     "app_core/paths.py",
     "app_core/publish_service.py",
+    "app_core/publish_runtime.py",
+    "app_core/tiktok_schedule_contract.py",
+    "app_core/controlled_publish.py",
+    "app_core/task_service.py",
     "app_core/oneclick_preflight.py",
     "app_core/xhs_native_adapter.py",
     "app_core/xhs_publish_executor.py",
@@ -35,8 +40,18 @@ SHARED_EXACT = {
     "ui/publish_page.py",
     "ui/main_window.py",
     "myUtils/postVideo.py",
+    "myUtils/login.py",
     "tools/check_workstream_scope.py",
+    "test_tiktok_schedule_contract.py",
+    "test_account_detection_ui.py",
+    "test_controlled_publish.py",
+    "test_task_service.py",
+    "test_publish_service.py",
+    "test_oneclick_capabilities.py",
+    "test_tiktok_login_startup_wiring.py",
     "test_workstream_scope.py",
+    ".superpowers/sdd/2026-08-28-tiktok-system-browser-login-bridge/progress.md",
+    ".superpowers/sdd/2026-08-28-tiktok-system-browser-login-bridge/task-5-report.md",
 }
 
 SHARED_PREFIXES = (
@@ -94,6 +109,19 @@ def is_overseas_owned(path: str) -> bool:
         return True
     if path.startswith("docs/adr/") and any(
         marker in path.lower() for marker in ("tiktok", "youtube", "meta", "overseas")
+    ):
+        return True
+    document = PurePosixPath(path)
+    if (
+        path.startswith("docs/")
+        and "tiktok" in document.name.lower()
+        and str(document.parent)
+        in {
+            "docs/architecture",
+            "docs/verification",
+            "docs/superpowers/specs",
+            "docs/superpowers/plans",
+        }
     ):
         return True
     return False

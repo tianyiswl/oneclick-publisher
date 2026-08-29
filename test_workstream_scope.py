@@ -19,6 +19,22 @@ class WorkstreamScopeTests(unittest.TestCase):
                 self.assertEqual(classify_path("ui/publish_page.py", stream), "shared")
                 self.assertEqual(classify_path("tools/build_windows.py", stream), "shared")
 
+    def test_controlled_tiktok_core_and_its_tests_are_shared(self):
+        paths = (
+            "app_core/tiktok_schedule_contract.py",
+            "app_core/controlled_publish.py",
+            "app_core/task_service.py",
+            "test_tiktok_schedule_contract.py",
+            "test_account_detection_ui.py",
+            "test_controlled_publish.py",
+            "test_task_service.py",
+            "test_publish_service.py",
+        )
+        for stream in ("data", "overseas", "location"):
+            for path in paths:
+                with self.subTest(stream=stream, path=path):
+                    self.assertEqual(classify_path(path, stream), "shared")
+
     def test_data_stream_owns_collectors_ui_tests_and_architecture(self):
         paths = (
             "app_core/platform_data_sync.py",
@@ -38,6 +54,20 @@ class WorkstreamScopeTests(unittest.TestCase):
             "uploader/youtube_uploader/main.py",
             "test_overseas_integration.py",
             "docs/OVERSEAS_PLATFORM_STATUS.md",
+        )
+        for path in paths:
+            with self.subTest(path=path):
+                self.assertEqual(classify_path(path, "overseas"), "owned")
+
+    def test_overseas_stream_owns_tiktok_architecture_plan_and_verification_docs(self):
+        paths = (
+            "docs/architecture/tiktok-controlled-video-publish.architecture.html",
+            "docs/architecture/tiktok-controlled-video-publish.architecture.json",
+            "docs/architecture/tiktok-controlled-video-publish.lifecycle.html",
+            "docs/architecture/tiktok-controlled-video-publish.lifecycle.json",
+            "docs/superpowers/specs/2026-08-29-tiktok-scheduled-video-publish-design.md",
+            "docs/superpowers/plans/2026-08-29-tiktok-scheduled-video-publish.md",
+            "docs/verification/2026-08-29-tiktok-scheduled-video-publish.md",
         )
         for path in paths:
             with self.subTest(path=path):
@@ -72,7 +102,7 @@ class WorkstreamScopeTests(unittest.TestCase):
 
     def test_unrelated_files_require_review(self):
         self.assertEqual(classify_path("ui/dashboard_page.py", "data"), "outside")
-        self.assertEqual(classify_path("app_core/task_service.py", "overseas"), "outside")
+        self.assertEqual(classify_path("app_core/unknown_service.py", "overseas"), "outside")
         self.assertEqual(classify_path("uploader/xhs_uploader/main.py", "location"), "outside")
 
     def test_integration_stream_can_change_any_file(self):

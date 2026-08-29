@@ -44,11 +44,16 @@
 - `requirements-oneclick.txt`
 - `conf.py`
 - `desktop_native_app.py`
+- `app_core/login_service.py`
 - `app_core/account_service.py`
 - `app_core/account_browser_service.py`
 - `app_core/database.py`
 - `app_core/paths.py`
 - `app_core/publish_service.py`
+- `app_core/publish_runtime.py`
+- `app_core/tiktok_schedule_contract.py`
+- `app_core/controlled_publish.py`
+- `app_core/task_service.py`
 - `app_core/oneclick_preflight.py`
 - `app_core/xhs_native_adapter.py`
 - `app_core/xhs_publish_executor.py`
@@ -60,6 +65,7 @@
 - `ui/publish_page.py`
 - `ui/main_window.py`
 - `myUtils/postVideo.py`
+- `myUtils/login.py`
 - `tools/build_*`
 - `.github/**`
 
