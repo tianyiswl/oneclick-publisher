@@ -585,7 +585,7 @@ def build_controlled_payloads(
         title = str(override.get("title") or bundle.get("commonTitle") or bundle["title"]).strip()
         description = str(override.get("body") or bundle.get("commonBody") or "").strip()
         tags = list(override.get("tags") or bundle.get("commonTags") or [])
-        if not title or not description:
+        if platform_type != 9 and (not title or not description):
             raise ControlledPublishError(
                 "controlled_platform_fields_missing", f"{platform}缺少独立标题或正文"
             )
@@ -973,6 +973,56 @@ def _single_facebook_page_payload(
     return rows[0]
 
 
+def facebook_form_snapshot_hash(evidence: Mapping[str, object]) -> str:
+    """Hash the safe Page form fields persisted by the real preflight builder."""
+
+    if not isinstance(evidence, Mapping):
+        raise _facebook_authorization_invalid()
+    account_id = evidence.get("accountId")
+    page_id = evidence.get("pageId")
+    video_name = evidence.get("videoName")
+    video_size = evidence.get("videoSize")
+    video_hash = evidence.get("videoSha256")
+    caption_hash = evidence.get("captionSha256")
+    visibility = evidence.get("visibility")
+    final_button_enabled = evidence.get("finalButtonEnabled")
+    if (
+        type(account_id) is not int
+        or account_id <= 0
+        or type(page_id) is not str
+        or not page_id
+        or not page_id.isascii()
+        or not page_id.isdigit()
+        or type(video_name) is not str
+        or not video_name
+        or len(video_name) > 512
+        or "\r" in video_name
+        or "\n" in video_name
+        or Path(video_name).name != video_name
+        or type(video_size) is not int
+        or video_size < 0
+        or type(video_hash) is not str
+        or _SAFE_SHA256_RE.fullmatch(video_hash) is None
+        or type(caption_hash) is not str
+        or _SAFE_SHA256_RE.fullmatch(caption_hash) is None
+        or visibility != "public"
+        or type(final_button_enabled) is not bool
+    ):
+        raise _facebook_authorization_invalid()
+    return _canonical_safe_hash(
+        {
+            "accountId": account_id,
+            "pageId": page_id,
+            "videoName": video_name,
+            "videoSize": video_size,
+            "videoSha256": video_hash,
+            "captionSha256": caption_hash,
+            "visibility": visibility,
+            "finalButtonEnabled": final_button_enabled,
+        }
+    )
+
+
 def facebook_preflight_receipt_hash(
     conn: sqlite3.Connection,
     preflight_task_id: int,
@@ -1073,11 +1123,13 @@ def facebook_preflight_receipt_hash(
     try:
         current_video_hash = _facebook_video_sha256(video_path)
         current_video_size = video_path.stat().st_size
+        expected_form_snapshot_hash = facebook_form_snapshot_hash(safe_receipt)
     except (ControlledPublishError, OSError) as exc:
         raise _facebook_authorization_invalid() from exc
     if (
         current_video_hash != video_hash
         or safe_receipt.get("phase") != "platform_form_verified"
+        or safe_receipt.get("platformWriteOccurred") is not True
         or safe_receipt.get("pageId") != page_reference
         or safe_receipt.get("videoName") != video_path.name
         or safe_receipt.get("videoSize") != current_video_size
@@ -1086,6 +1138,8 @@ def facebook_preflight_receipt_hash(
         or safe_receipt.get("visibility") != "public"
         or safe_receipt.get("finalButtonEnabled") is not True
         or safe_receipt.get("finalActionTriggered") is not False
+        or safe_receipt.get("formSnapshotHash")
+        != expected_form_snapshot_hash
     ):
         raise _facebook_authorization_invalid()
     return _canonical_safe_hash(safe_receipt)

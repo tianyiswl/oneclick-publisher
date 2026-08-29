@@ -777,6 +777,71 @@ class FacebookPageExecutorTests(unittest.TestCase):
         ):
             self.assertNotIn(key, prepared["payload"])
 
+    def test_formal_rejects_malformed_persisted_evidence_before_session(self) -> None:
+        task, payload = self._claimed_formal_task()
+        with database.connect() as conn:
+            claim = conn.execute(
+                "SELECT preflightTaskId FROM facebook_page_publish_claims "
+                "WHERE taskId = ?",
+                (int(task["id"]),),
+            ).fetchone()
+            preflight_task_id = int(claim["preflightTaskId"])
+            item = conn.execute(
+                "SELECT receiptJson FROM publish_task_items "
+                "WHERE taskId = ? AND platformType = 9",
+                (preflight_task_id,),
+            ).fetchone()
+            receipt = json.loads(str(item["receiptJson"]))
+            receipt["platformWriteOccurred"] = False
+            receipt_json = json.dumps(
+                receipt,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            forged_receipt_hash = hashlib.sha256(
+                receipt_json.encode("utf-8")
+            ).hexdigest()
+            conn.execute(
+                "UPDATE publish_task_items SET receiptJson = ? "
+                "WHERE taskId = ? AND platformType = 9",
+                (receipt_json, preflight_task_id),
+            )
+            conn.execute(
+                "UPDATE facebook_page_publish_claims "
+                "SET preflightReceiptHash = ? WHERE taskId = ?",
+                (forged_receipt_hash, int(task["id"])),
+            )
+            conn.commit()
+
+        @asynccontextmanager
+        async def forbidden_session(_prepared):
+            raise FacebookPagePublishError(
+                "facebook_page_form_readback_failed",
+                "Malformed evidence reached the browser session.",
+            )
+            yield  # pragma: no cover - required by async context manager shape
+
+        with (
+            patch.object(
+                overseas_browser_publish,
+                "_facebook_page_session",
+                side_effect=forbidden_session,
+            ) as browser_session,
+            self.assertRaises(FacebookPagePublishError) as raised,
+        ):
+            overseas_browser_publish.run_facebook_page_publish_sync(
+                payload,
+                task_id=int(task["id"]),
+                progress=lambda _stage, _receipt: None,
+            )
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "facebook_publish_authorization_invalid",
+        )
+        browser_session.assert_not_called()
+
     def test_form_drift_stops_before_claim_and_click(self) -> None:
         with self.patched_runtime():
             preflight = overseas_preflight.run_facebook_page_preflight_sync(

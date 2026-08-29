@@ -10,6 +10,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal
 
+from app_core.overseas_meta_content import (
+    canonical_facebook_page_caption as canonical_meta_caption,
+    facebook_page_caption_sha256,
+)
 from app_core.overseas_meta_errors import FacebookPagePublishError
 from app_core.overseas_meta_page_identity import (
     FacebookPageIdentity,
@@ -59,14 +63,6 @@ class FacebookPageFormSnapshot:
     final_action_ready: bool
 
 
-def canonical_meta_caption(value: object) -> str:
-    """Normalize editor-only whitespace without changing content order."""
-
-    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
-    text = text.replace("\u00a0", " ").replace("\u202f", " ")
-    return "\n".join(line.rstrip() for line in text.split("\n")).strip()
-
-
 def _safe_receipt(
     expected: FacebookPageFormExpectation,
     *,
@@ -93,9 +89,7 @@ def _safe_receipt(
         receipt["videoSha256"] = video_sha256
     caption = getattr(expected, "caption", None)
     if type(caption) is str:
-        receipt["captionSha256"] = hashlib.sha256(
-            canonical_meta_caption(caption).encode("utf-8")
-        ).hexdigest()
+        receipt["captionSha256"] = facebook_page_caption_sha256(caption)
     visibility = getattr(expected, "visibility", None)
     if visibility == "public":
         receipt["visibility"] = "public"

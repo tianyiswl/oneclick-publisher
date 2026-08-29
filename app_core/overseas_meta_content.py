@@ -15,10 +15,22 @@ def _content_invalid() -> FacebookPagePublishError:
     )
 
 
+def canonical_facebook_page_caption(value: object) -> str:
+    """Normalize only Facebook editor whitespace, preserving content order."""
+
+    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+    text = text.replace("\u00a0", " ").replace("\u202f", " ")
+    return "\n".join(line.rstrip() for line in text.split("\n")).strip()
+
+
 def build_facebook_page_caption(*, title: str, body: str, topics: Iterable[str]) -> str:
     """Compose title, body, and structured topics exactly once for all phases."""
 
-    if type(title) is not str or not title or type(body) is not str or not body:
+    if type(title) is not str or type(body) is not str:
+        raise _content_invalid()
+    canonical_title = canonical_facebook_page_caption(title)
+    canonical_body = canonical_facebook_page_caption(body)
+    if not canonical_title or not canonical_body:
         raise _content_invalid()
     if type(topics) is str:
         raise _content_invalid()
@@ -32,9 +44,9 @@ def build_facebook_page_caption(*, title: str, body: str, topics: Iterable[str])
     for topic in source_topics:
         if type(topic) is not str or "\r" in topic or "\n" in topic:
             raise _content_invalid()
-        normalized = topic.strip()
+        normalized = canonical_facebook_page_caption(topic)
         if normalized.startswith("#"):
-            normalized = normalized[1:].strip()
+            normalized = canonical_facebook_page_caption(normalized[1:])
         if not normalized or normalized in seen:
             if not normalized:
                 raise _content_invalid()
@@ -42,13 +54,14 @@ def build_facebook_page_caption(*, title: str, body: str, topics: Iterable[str])
         seen.add(normalized)
         normalized_topics.append(normalized)
 
-    parts = [title, body]
+    parts = [canonical_title, canonical_body]
     if normalized_topics:
         parts.append(" ".join(f"#{topic}" for topic in normalized_topics))
-    return "\n\n".join(parts)
+    return canonical_facebook_page_caption("\n\n".join(parts))
 
 
 def facebook_page_caption_sha256(caption: str) -> str:
     if type(caption) is not str:
         raise _content_invalid()
-    return hashlib.sha256(caption.encode("utf-8")).hexdigest()
+    canonical = canonical_facebook_page_caption(caption)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()

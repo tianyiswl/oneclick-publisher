@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import unittest
 
+from app_core import overseas_meta_content
 from app_core.overseas_meta_content import (
     build_facebook_page_caption,
     facebook_page_caption_sha256,
@@ -52,6 +53,42 @@ class FacebookPageContentTests(unittest.TestCase):
             facebook_page_caption_sha256(caption),
             hashlib.sha256(caption.encode("utf-8")).hexdigest(),
         )
+
+    def test_one_public_canonicalizer_normalizes_all_supported_spacing(self) -> None:
+        canonicalize = getattr(
+            overseas_meta_content,
+            "canonical_facebook_page_caption",
+            None,
+        )
+        self.assertTrue(callable(canonicalize))
+        raw = " \t标题\u00a0  \r\n正文\u202f内容\t \r尾行  \n "
+        expected = "标题\n正文 内容\n尾行"
+        self.assertEqual(canonicalize(raw), expected)
+        self.assertEqual(
+            facebook_page_caption_sha256(raw),
+            hashlib.sha256(expected.encode("utf-8")).hexdigest(),
+        )
+
+    def test_caption_builder_stores_canonical_text_and_appends_topics_once(self) -> None:
+        caption = build_facebook_page_caption(
+            title=" \t标题\u00a0  ",
+            body="正文\u202f内容  \r尾行 \t",
+            topics=(" AI\u00a0 ", "AI ", "工具"),
+        )
+        self.assertEqual(caption, "标题\n\n正文 内容\n尾行\n\n#AI #工具")
+
+    def test_empty_space_or_newline_only_title_and_body_are_content_invalid(self) -> None:
+        for field in ("title", "body"):
+            for value in ("", " ", "\n", "\r\n", "\u00a0\u202f"):
+                values = {"title": "标题", "body": "正文"}
+                values[field] = value
+                with self.subTest(field=field, value=repr(value)):
+                    with self.assertRaises(FacebookPagePublishError) as raised:
+                        build_facebook_page_caption(**values, topics=())
+                    self.assertEqual(
+                        raised.exception.error_code,
+                        "facebook_page_content_invalid",
+                    )
 
 
 if __name__ == "__main__":

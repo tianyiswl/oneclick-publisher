@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from app_core import overseas_meta_content
 from app_core.overseas_meta_errors import FacebookPagePublishError
 from uploader.meta_uploader.main import MetaManualInterventionRequired
 from uploader.meta_uploader.page_form import (
@@ -1012,12 +1013,20 @@ class FacebookPageFormTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(button.click_count, 0)
 
     async def test_caption_canonicalization_changes_only_platform_spacing(self) -> None:
-        raw = "  第一行\r\n#AI #AI  \r最后一行  "
+        raw = "  第一行\r\n#AI #AI\u202f  \r最后一行 \t "
         self.assertEqual(
             canonical_meta_caption(raw),
             "第一行\n#AI #AI\n最后一行",
         )
         self.assertEqual(canonical_meta_caption(None), "")
+        self.assertIs(
+            canonical_meta_caption,
+            getattr(
+                overseas_meta_content,
+                "canonical_facebook_page_caption",
+                None,
+            ),
+        )
 
 
 class _ContentElement:

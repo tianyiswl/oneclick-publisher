@@ -36,7 +36,6 @@ from uploader.meta_uploader.page_form import (
     FacebookPageFormAdapter,
     FacebookPageFormExpectation,
     FacebookPageFormSnapshot,
-    canonical_meta_caption,
 )
 
 from . import account_service, database
@@ -49,6 +48,10 @@ from .meta_browser_policy import (
 from .overseas_meta_errors import (
     FacebookPagePublishError,
     project_facebook_page_receipt,
+)
+from .overseas_meta_content import (
+    canonical_facebook_page_caption,
+    facebook_page_caption_sha256,
 )
 from .overseas_meta_page_identity import facebook_page_v1_enabled
 from .paths import COOKIE_DIR
@@ -220,8 +223,10 @@ def _validate_facebook_page_payload(
             page_id=page_id,
             error_code="facebook_video_file_invalid",
         )
-    caption = canonical_meta_caption(sanitized.get("facebookFinalCaption"))
-    caption_hash = hashlib.sha256(caption.encode("utf-8")).hexdigest()
+    caption = canonical_facebook_page_caption(
+        sanitized.get("facebookFinalCaption")
+    )
+    caption_hash = facebook_page_caption_sha256(caption)
     if (
         not caption
         or str(sanitized.get("facebookCaptionSha256") or "") != caption_hash
@@ -306,9 +311,7 @@ def _form_snapshot_projection(
         "videoCount": int(snapshot.video_count),
         "videoSize": int(expected.video_size),
         "videoSha256": str(expected.video_sha256),
-        "captionSha256": hashlib.sha256(
-            canonical_meta_caption(snapshot.caption).encode("utf-8")
-        ).hexdigest(),
+        "captionSha256": facebook_page_caption_sha256(snapshot.caption),
         "visibility": str(snapshot.visibility),
         "finalButtonLabel": str(snapshot.final_action_label),
         "finalButtonReady": bool(snapshot.final_action_ready),
@@ -322,24 +325,25 @@ def _public_form_receipt(
     phase: str,
     final_action_triggered: bool,
 ) -> dict[str, object]:
+    from .controlled_publish import facebook_form_snapshot_hash
+
     expected = prepared["expectation"]
     projection = _form_snapshot_projection(expected, snapshot)
-    return project_facebook_page_receipt(
-        {
-            "accountId": int(prepared["accountId"]),
-            "pageId": projection["pageId"],
-            "videoName": projection["videoName"],
-            "videoSize": projection["videoSize"],
-            "videoSha256": projection["videoSha256"],
-            "captionSha256": projection["captionSha256"],
-            "visibility": projection["visibility"],
-            "phase": phase,
-            "platformWriteOccurred": True,
-            "finalActionTriggered": bool(final_action_triggered),
-            "finalButtonEnabled": bool(projection["finalButtonReady"]),
-            "formSnapshotHash": _hash_json(projection),
-        }
-    )
+    receipt: dict[str, object] = {
+        "accountId": int(prepared["accountId"]),
+        "pageId": projection["pageId"],
+        "videoName": projection["videoName"],
+        "videoSize": projection["videoSize"],
+        "videoSha256": projection["videoSha256"],
+        "captionSha256": projection["captionSha256"],
+        "visibility": projection["visibility"],
+        "phase": phase,
+        "platformWriteOccurred": True,
+        "finalActionTriggered": bool(final_action_triggered),
+        "finalButtonEnabled": bool(projection["finalButtonReady"]),
+    }
+    receipt["formSnapshotHash"] = facebook_form_snapshot_hash(receipt)
+    return project_facebook_page_receipt(receipt)
 
 
 async def _facebook_page_preflight_async(
@@ -407,11 +411,14 @@ def _load_authorized_preflight_receipt(
             or not str(claim["workerStartedAt"] or "")
         ):
             raise _authorization_error()
-        actual_hash = facebook_preflight_receipt_hash(
-            conn,
-            int(claim["preflightTaskId"]),
-            [payload],
-        )
+        try:
+            actual_hash = facebook_preflight_receipt_hash(
+                conn,
+                int(claim["preflightTaskId"]),
+                [payload],
+            )
+        except (TypeError, ValueError) as exc:
+            raise _authorization_error() from exc
         if actual_hash != str(claim["preflightReceiptHash"] or ""):
             raise _authorization_error()
         rows = conn.execute(
@@ -459,6 +466,7 @@ def _assert_authorized_form_snapshot(
         str(snapshot.content_kind) != "reel"
         or int(snapshot.video_count) != 1
         or authorized_receipt.get("phase") != "platform_form_verified"
+        or authorized_receipt.get("platformWriteOccurred") is not True
         or authorized_receipt.get("finalActionTriggered") is not False
         or any(current.get(key) != authorized_receipt.get(key) for key in stable_keys)
     ):
@@ -496,9 +504,7 @@ def _claim_form_snapshot(
         "videoName": snapshot.video_name,
         "videoSize": expected.video_size,
         "videoSha256": expected.video_sha256,
-        "captionSha256": hashlib.sha256(
-            canonical_meta_caption(snapshot.caption).encode("utf-8")
-        ).hexdigest(),
+        "captionSha256": facebook_page_caption_sha256(snapshot.caption),
         "visibility": snapshot.visibility,
         "finalButtonLabel": snapshot.final_action_label,
         "finalButtonReady": snapshot.final_action_ready,

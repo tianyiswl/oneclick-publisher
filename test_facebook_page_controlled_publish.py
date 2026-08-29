@@ -13,7 +13,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from app_core import controlled_publish, database, task_service
+from app_core import (
+    controlled_publish,
+    database,
+    overseas_browser_publish,
+    task_service,
+)
 from app_core.controlled_publish import (
     ControlledPublishError,
     authorize_completed_check,
@@ -23,6 +28,10 @@ from app_core.controlled_publish import (
     submit_request,
 )
 from app_core.overseas_meta_content import build_facebook_page_caption
+from uploader.meta_uploader.page_form import (
+    FacebookPageFormExpectation,
+    FacebookPageFormSnapshot,
+)
 
 
 class FacebookPageControlledPublishTests(unittest.TestCase):
@@ -213,6 +222,47 @@ class FacebookPageControlledPublishTests(unittest.TestCase):
 
         self.assertEqual(preflight["facebookFinalCaption"], formal["facebookFinalCaption"])
         self.assertEqual(preflight["facebookCaptionSha256"], formal["facebookCaptionSha256"])
+        self.assertEqual(
+            publish_intent_fingerprint([preflight]),
+            publish_intent_fingerprint([formal]),
+        )
+        self.assertEqual(
+            facebook_replay_fingerprint([preflight]),
+            facebook_replay_fingerprint([formal]),
+        )
+
+    def test_request_preflight_and_formal_share_one_canonical_caption_hash(self) -> None:
+        expected_caption = (
+            "Facebook title\nsecond line\n\n"
+            "Facebook body text\nlast line\n\n"
+            "#TopicOne #TopicTwo"
+        )
+        expected_hash = hashlib.sha256(expected_caption.encode("utf-8")).hexdigest()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = self.manifest(root)
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            data["platformOverrides"]["Facebook"] = {
+                "title": "  Facebook title\u00a0 \r\nsecond line  ",
+                "body": " Facebook body\u202ftext \rlast line \t ",
+                "tags": [" TopicOne\u00a0", "TopicOne", "#TopicTwo"],
+            }
+            manifest.write_text(
+                json.dumps(data, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            preflight = build_controlled_payloads(
+                self.request(manifest),
+                accounts=[self.account()],
+            )[0]
+            formal = build_controlled_payloads(
+                self.request(manifest, mode="formal"),
+                accounts=[self.account()],
+            )[0]
+
+        for current in (preflight, formal):
+            self.assertEqual(current["facebookFinalCaption"], expected_caption)
+            self.assertEqual(current["facebookCaptionSha256"], expected_hash)
         self.assertEqual(
             publish_intent_fingerprint([preflight]),
             publish_intent_fingerprint([formal]),
@@ -465,7 +515,7 @@ class FacebookPageFormalClaimTests(unittest.TestCase):
                 int(formal_task_id)
             ),
         )
-        self.worker_start_patch.start()
+        self.worker_start = self.worker_start_patch.start()
         self.addCleanup(self.worker_start_patch.stop)
         self.video = Path(self.temporary.name) / "facebook.mp4"
         self.video.write_bytes(b"facebook-page-claim-video")
@@ -574,21 +624,34 @@ class FacebookPageFormalClaimTests(unittest.TestCase):
         **changes,
     ) -> dict:
         payload = payload or self.payload()
-        receipt = {
-            "accountId": int(payload["accountIds"][0]),
-            "pageId": str(payload["facebookExpectedPageReference"]),
-            "pageName": "Saved Facebook Page",
-            "videoName": self.video.name,
-            "videoSize": self.video.stat().st_size,
-            "videoSha256": str(payload["facebookVideoSha256"]),
-            "captionSha256": str(payload["facebookCaptionSha256"]),
-            "visibility": "public",
-            "phase": "platform_form_verified",
-            "platformWriteOccurred": True,
-            "finalActionTriggered": False,
-            "finalButtonEnabled": True,
-            "formSnapshotHash": "f" * 64,
-        }
+        expectation = FacebookPageFormExpectation(
+            page_id=str(payload["facebookExpectedPageReference"]),
+            content_kind="reel",
+            video_name=self.video.name,
+            video_size=self.video.stat().st_size,
+            video_sha256=str(payload["facebookVideoSha256"]),
+            caption=str(payload["facebookFinalCaption"]),
+            visibility="public",
+        )
+        snapshot = FacebookPageFormSnapshot(
+            page_id=expectation.page_id,
+            content_kind="reel",
+            video_name=self.video.name,
+            video_count=1,
+            caption=expectation.caption,
+            visibility="public",
+            final_action_label="Publish",
+            final_action_ready=True,
+        )
+        receipt = overseas_browser_publish._public_form_receipt(
+            {
+                "accountId": int(payload["accountIds"][0]),
+                "expectation": expectation,
+            },
+            snapshot,
+            phase="platform_form_verified",
+            final_action_triggered=False,
+        )
         receipt.update(changes)
         return receipt
 
@@ -830,13 +893,91 @@ class FacebookPageFormalClaimTests(unittest.TestCase):
         )
 
     def test_facebook_authorization_requires_verified_platform_form_receipt(self) -> None:
-        task_id = self.completed_preflight()
+        payload = self.payload()
+        with patch.object(
+            overseas_browser_publish,
+            "_public_form_receipt",
+            wraps=overseas_browser_publish._public_form_receipt,
+        ) as real_preflight_receipt_builder:
+            receipt = self.verified_form_receipt(payload)
+        real_preflight_receipt_builder.assert_called_once()
+        task_id = self.completed_preflight(payload=payload, receipt=receipt)
 
         authorization = authorize_completed_check(task_id)
         row = self.read_authorization(str(authorization["authorizationId"]))
 
         self.assertEqual(row.get("authorizationScope"), "formal")
         self.assertEqual(len(str(row.get("preflightReceiptHash") or "")), 64)
+
+    def test_invalid_write_or_snapshot_hash_evidence_stops_before_side_effects(self) -> None:
+        payload = self.payload()
+        valid = self.verified_form_receipt(payload)
+        mismatched_hash = self.verified_form_receipt(
+            self.payload(page_id="1002")
+        )["formSnapshotHash"]
+        self.assertNotEqual(valid["formSnapshotHash"], mismatched_hash)
+
+        def without(key: str) -> dict:
+            return {name: value for name, value in valid.items() if name != key}
+
+        cases = (
+            ("write_false", {**valid, "platformWriteOccurred": False}),
+            ("write_missing", without("platformWriteOccurred")),
+            ("hash_missing", without("formSnapshotHash")),
+            ("hash_placeholder", {**valid, "formSnapshotHash": "f" * 64}),
+            (
+                "hash_arbitrary",
+                {
+                    **valid,
+                    "formSnapshotHash": hashlib.sha256(
+                        b"caller-chosen-form-snapshot"
+                    ).hexdigest(),
+                },
+            ),
+            ("hash_mismatched", {**valid, "formSnapshotHash": mismatched_hash}),
+        )
+        with patch.object(
+            overseas_browser_publish,
+            "_facebook_page_session",
+        ) as browser_session:
+            for label, receipt in cases:
+                with self.subTest(label=label):
+                    self.worker_start.reset_mock()
+                    browser_session.reset_mock()
+                    task_id = self.completed_preflight(
+                        payload=payload,
+                        receipt=receipt,
+                    )
+                    with self.assertRaises(ControlledPublishError) as raised:
+                        authorize_completed_check(task_id)
+                    self.assertEqual(
+                        raised.exception.error_code,
+                        "facebook_publish_authorization_invalid",
+                    )
+                    with database.connect() as conn:
+                        counts = {}
+                        for table in (
+                            "controlled_publish_authorizations",
+                            "facebook_page_publish_claims",
+                        ):
+                            exists = conn.execute(
+                                "SELECT 1 FROM sqlite_master "
+                                "WHERE type = 'table' AND name = ?",
+                                (table,),
+                            ).fetchone()
+                            counts[table] = (
+                                int(
+                                    conn.execute(
+                                        f"SELECT COUNT(*) FROM {table}"
+                                    ).fetchone()[0]
+                                )
+                                if exists is not None
+                                else 0
+                            )
+                    self.assertEqual(counts["controlled_publish_authorizations"], 0)
+                    self.assertEqual(counts["facebook_page_publish_claims"], 0)
+                    self.worker_start.assert_not_called()
+                    browser_session.assert_not_called()
 
     def test_text_or_route_success_cannot_authorize_facebook_formal_publish(self) -> None:
         payload = self.payload()
