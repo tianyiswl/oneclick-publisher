@@ -111,7 +111,7 @@ jobs:
           if ($LASTEXITCODE -eq 0) {
             gh release upload $tag $zip.FullName $shaFile --clobber
           } else {
-            gh release create $tag $zip.FullName $shaFile --target $env:GITHUB_SHA --title "一键发 $version 候选客户端" --notes "包含国内定位、数据监测/分析和 YouTube 官方 OAuth 私密优先发布；公开、不公开与定时公开尚未完成真实平台验收。" --prerelease
+            gh release create $tag $zip.FullName $shaFile --target $env:GITHUB_SHA --title "一键发 $version 候选客户端" --notes "包含国内定位、数据监测/分析、YouTube 官方 OAuth 私密优先发布，以及 TikTok 受控即时/原生定时实现。当前 TikTok 测试账号未显示 Scheduler，定时受理与排期回读、即时公开、Meta 真实登录及 YouTube 公开/不公开/定时均未完成真实平台验收。" --prerelease
           }
           if ($LASTEXITCODE -ne 0) {
             throw "保存私有候选版本失败"
