@@ -1664,6 +1664,74 @@ class FacebookPageContentListTests(unittest.IsolatedAsyncioTestCase):
             "facebook_page_baseline_read_failed",
         )
 
+    async def test_load_more_rejects_shrunk_or_replaced_prior_dom(self) -> None:
+        cases = (
+            [self.list_row("a")],
+            [self.list_row("a"), self.list_row("c")],
+        )
+        for terminal_rows in cases:
+            with self.subTest(terminal_rows=terminal_rows):
+                context = _ContentContext(
+                    pages=[
+                        [self.list_row("a"), self.list_row("b")],
+                        terminal_rows,
+                    ],
+                    details={
+                        "a": {"caption": "A"},
+                        "b": {"caption": "B"},
+                        "c": {"caption": "C"},
+                    },
+                )
+                reader = FacebookPageContentReader(
+                    context,
+                    wait_for_verification=self.no_verification,
+                )
+                with self.assertRaises(FacebookPagePublishError) as raised:
+                    await reader.capture_baseline(expected_page_id="1001")
+                self.assertEqual(
+                    raised.exception.error_code,
+                    "facebook_page_baseline_read_failed",
+                )
+
+    async def test_load_more_accepts_full_prior_dom_plus_new_terminal_row(self) -> None:
+        context = _ContentContext(
+            pages=[
+                [self.list_row("a"), self.list_row("b")],
+                [self.list_row("a"), self.list_row("b"), self.list_row("c")],
+            ],
+            details={
+                "a": {"caption": "A"},
+                "b": {"caption": "B"},
+                "c": {"caption": "C"},
+            },
+        )
+        reader = FacebookPageContentReader(
+            context,
+            wait_for_verification=self.no_verification,
+        )
+        baseline = await reader.capture_baseline(expected_page_id="1001")
+        self.assertEqual([row.reel_id for row in baseline.rows], ["a", "b", "c"])
+        self.assertEqual(context.actions, ["next_page"])
+
+    async def test_load_more_accepts_unchanged_full_dom_at_explicit_terminal(self) -> None:
+        context = _ContentContext(
+            pages=[
+                [self.list_row("a"), self.list_row("b")],
+                [self.list_row("a"), self.list_row("b")],
+            ],
+            details={
+                "a": {"caption": "A"},
+                "b": {"caption": "B"},
+            },
+        )
+        reader = FacebookPageContentReader(
+            context,
+            wait_for_verification=self.no_verification,
+        )
+        baseline = await reader.capture_baseline(expected_page_id="1001")
+        self.assertEqual([row.reel_id for row in baseline.rows], ["a", "b"])
+        self.assertEqual(context.actions, ["next_page"])
+
     async def test_reader_rejects_missing_ambiguous_or_generic_list_selector(self) -> None:
         cases = (
             _ContentContext(pages=[[]], root_count=0, explicit_empty=True),
@@ -1775,6 +1843,7 @@ class FacebookPageContentListTests(unittest.IsolatedAsyncioTestCase):
                 "old": {"caption": "旧内容"},
                 "new": {"caption": self.expected_caption},
             },
+            next_label="Next",
         )
         reader = FacebookPageContentReader(
             context,
@@ -1843,7 +1912,7 @@ class FacebookPageContentListTests(unittest.IsolatedAsyncioTestCase):
         context = _ContentContext(
             pages=[
                 [self.list_row("b")],
-                [self.list_row("a")],
+                [self.list_row("b"), self.list_row("a")],
             ],
             details={
                 "a": {"caption": "A"},

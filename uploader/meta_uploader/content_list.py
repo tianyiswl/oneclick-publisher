@@ -716,9 +716,16 @@ class FacebookPageContentReader:
                 signature.append((reel_id, url, published_at))
 
             signature_tuple = tuple(signature)
-            if previous_signature == signature_tuple and new_count == 0:
+            if (
+                allow_persisted_prefix
+                and previous_signature is not None
+                and signature_tuple[: len(previous_signature)]
+                != previous_signature
+            ):
                 raise _baseline_failed(expected_page_id)
-            previous_signature = signature_tuple
+            no_progress = (
+                previous_signature == signature_tuple and new_count == 0
+            )
 
             statuses = await self._visible(page.get_by_role("status"))
             terminal_count = 0
@@ -753,11 +760,14 @@ class FacebookPageContentReader:
                 return tuple(
                     sorted(rows_by_id.values(), key=lambda item: item.reel_id)
                 )
+            if no_progress:
+                raise _baseline_failed(expected_page_id)
             if len(next_buttons) != 1:
                 raise _baseline_failed(expected_page_id)
             next_label, next_button = next_buttons[0]
             if not await next_button.is_enabled():
                 raise _baseline_failed(expected_page_id)
+            previous_signature = signature_tuple
             allow_persisted_prefix = next_label in {"Load more", "加载更多"}
             await next_button.click()
             await self._wait_for_verification(page)
