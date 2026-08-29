@@ -1,3 +1,4 @@
+import json
 import tempfile
 import time
 import unittest
@@ -93,6 +94,67 @@ class DouyinGraphicMatrixLocalCheckTests(unittest.TestCase):
         self.assertTrue(
             all("本地批量检查" in row["message"] for row in saved["items"])
         )
+
+
+class PublishServiceTikTokScheduleTests(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.db_patch = patch.object(
+            database, "DB_PATH", Path(self.tempdir.name) / "database.db"
+        )
+        self.db_patch.start()
+        database.ensure_schema()
+
+    def tearDown(self):
+        self.db_patch.stop()
+        self.tempdir.cleanup()
+
+    def test_scheduled_result_is_persisted_without_published_at(self):
+        payload = {
+            "type": 6,
+            "contentType": "video",
+            "runtimeMode": "publish",
+            "accountList": ["tiktok.json"],
+            "scheduleMode": "platform_native",
+            "scheduledAt": "2026-08-30 09:00",
+            "scheduleTimezone": "Asia/Shanghai",
+        }
+        task = task_service.create_pending_task([payload], mode="oneclick_publish")
+        result = {
+            "ok": True,
+            "status": "scheduled",
+            "phase": "scheduled_readback_confirmed",
+            "message": "TikTok 定时内容已唯一回读",
+            "receipt": {
+                "scheduleMode": "platform_native",
+                "scheduledAt": "2026-08-30 09:00",
+                "scheduleTimezone": "Asia/Shanghai",
+                "platformAccepted": True,
+                "scheduledReadbackConfirmed": True,
+                "contentId": None,
+                "contentUrl": None,
+                "publishedAt": None,
+            },
+        }
+        with patch.object(
+            publish_service.overseas_tiktok_publish,
+            "run_tiktok_platform_sync",
+            return_value=result,
+        ) as run_tiktok:
+            publish_service._run_publish(task, [payload])
+        saved = task_service.get_task(task["id"])
+        item = saved["items"][0]
+        receipt = json.loads(item["receiptJson"])
+        run_tiktok.assert_called_once_with(
+            payload, mode="formal", task_id=int(task["id"])
+        )
+        self.assertEqual(saved["status"], "success")
+        self.assertEqual(receipt["scheduleMode"], "platform_native")
+        self.assertEqual(receipt["scheduledAt"], "2026-08-30 09:00")
+        self.assertEqual(receipt["scheduleTimezone"], "Asia/Shanghai")
+        self.assertTrue(receipt["platformAccepted"])
+        self.assertTrue(receipt["scheduledReadbackConfirmed"])
+        self.assertEqual(item["publishedAt"], "")
 
 
 if __name__ == "__main__":

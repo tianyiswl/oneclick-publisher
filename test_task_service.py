@@ -1786,21 +1786,33 @@ class TikTokTaskServiceTests(unittest.TestCase):
         self.db_patch.stop()
         self.tempdir.cleanup()
 
-    def _task(self, *, mode: str = "oneclick_publish") -> dict:
-        return task_service.create_pending_task(
-            [
+    def _task(
+        self,
+        *,
+        mode: str = "oneclick_publish",
+        scheduled: bool = False,
+    ) -> dict:
+        payload = {
+            "type": 6,
+            "contentType": "video",
+            "title": "TikTok receipt test",
+            "accountList": ["tiktok-session.json"],
+            "accountIds": [61],
+            "fileList": ["video.mp4"],
+            "debugDryRun": False,
+            "tiktokExpectedAccountReference": "expected.user",
+            "tiktokExecutionIntent": "formal_public",
+        }
+        if scheduled:
+            payload.update(
                 {
-                    "type": 6,
-                    "contentType": "video",
-                    "title": "TikTok receipt test",
-                    "accountList": ["tiktok-session.json"],
-                    "accountIds": [61],
-                    "fileList": ["video.mp4"],
-                    "debugDryRun": False,
-                    "tiktokExpectedAccountReference": "expected.user",
-                    "tiktokExecutionIntent": "formal_public",
+                    "scheduleMode": "platform_native",
+                    "scheduledAt": "2026-08-30 09:00",
+                    "scheduleTimezone": "Asia/Shanghai",
                 }
-            ],
+            )
+        return task_service.create_pending_task(
+            [payload],
             mode=mode,
         )
 
@@ -1913,6 +1925,38 @@ class TikTokTaskServiceTests(unittest.TestCase):
         self.assertNotIn("publishedAt", receipt)
         self.assertEqual(receipt["topicEntities"], ["oneclick", "AI"])
 
+    def test_scheduled_tiktok_receipt_keeps_safe_schedule_and_no_published_at(self) -> None:
+        task = self._task(scheduled=True)
+        task_service.mark_platform_result(
+            task["id"],
+            6,
+            ok=True,
+            message="TikTok 定时内容已唯一回读",
+            content_type="video",
+            event_type="tiktok_scheduled_readback_confirmed",
+            receipt={
+                "accountId": 61,
+                "visibility": "public",
+                "scheduleMode": "platform_native",
+                "scheduledAt": "2026-08-30 09:00",
+                "scheduleTimezone": "Asia/Shanghai",
+                "platformWriteOccurred": True,
+                "finalActionTriggered": True,
+                "platformAccepted": True,
+                "scheduledReadbackConfirmed": True,
+                "publishedAt": None,
+                "phase": "scheduled_readback_confirmed",
+                "cookie": "must-not-survive",
+            },
+        )
+
+        item = task_service.get_task(task["id"])["items"][0]
+        receipt = json.loads(item["receiptJson"])
+        self.assertEqual(receipt["scheduledAt"], "2026-08-30 09:00")
+        self.assertIsNone(receipt["publishedAt"])
+        self.assertNotIn("cookie", receipt)
+        self.assertEqual(item["publishedAt"], "")
+
     def test_stale_tiktok_after_final_action_is_ambiguous_and_retains_safe_marker(self) -> None:
         task = self._task()
         task_service.record_task_event(
@@ -1936,6 +1980,68 @@ class TikTokTaskServiceTests(unittest.TestCase):
             detail["events"][-1]["eventType"],
             "tiktok_publish_outcome_ambiguous",
         )
+
+    def test_stale_scheduled_tiktok_after_final_action_is_ambiguous_and_retains_schedule(
+        self,
+    ) -> None:
+        task = self._task(scheduled=True)
+        task_service.record_task_event(
+            task["id"],
+            "tiktok_final_action_triggered",
+            "TikTok 定时最终动作已触发",
+        )
+        self._expire(task["id"])
+
+        self.assertTrue(
+            task_service.reconcile_stale_controlled_task(
+                task["id"],
+                now=datetime(2026, 8, 28, 10, 1, 0),
+            )
+        )
+        item = task_service.get_task(task["id"])["items"][0]
+        receipt = json.loads(item["receiptJson"])
+        self.assertEqual(item["errorCode"], "tiktok_schedule_outcome_unknown")
+        self.assertEqual(receipt["scheduleMode"], "platform_native")
+        self.assertEqual(receipt["scheduledAt"], "2026-08-30 09:00")
+        self.assertEqual(receipt["scheduleTimezone"], "Asia/Shanghai")
+        self.assertTrue(receipt["finalActionTriggered"])
+        self.assertIsNot(receipt.get("platformAccepted"), True)
+        self.assertEqual(receipt["phase"], "ambiguous")
+        self.assertIsNone(receipt["publishedAt"])
+        self.assertEqual(item["publishedAt"], "")
+
+    def test_stale_scheduled_tiktok_after_acceptance_retains_acceptance_without_claiming_readback(
+        self,
+    ) -> None:
+        task = self._task(scheduled=True)
+        task_service.record_task_event(
+            task["id"],
+            "tiktok_final_action_triggered",
+            "TikTok 定时最终动作已触发",
+        )
+        task_service.record_task_event(
+            task["id"],
+            "tiktok_scheduled_accepted",
+            "TikTok 定时内容已受理",
+        )
+        self._expire(task["id"])
+
+        self.assertTrue(
+            task_service.reconcile_stale_controlled_task(
+                task["id"],
+                now=datetime(2026, 8, 28, 10, 1, 0),
+            )
+        )
+        item = task_service.get_task(task["id"])["items"][0]
+        receipt = json.loads(item["receiptJson"])
+        self.assertEqual(item["errorCode"], "tiktok_schedule_outcome_unknown")
+        self.assertEqual(receipt["scheduleMode"], "platform_native")
+        self.assertEqual(receipt["scheduledAt"], "2026-08-30 09:00")
+        self.assertEqual(receipt["scheduleTimezone"], "Asia/Shanghai")
+        self.assertTrue(receipt["platformAccepted"])
+        self.assertIsNot(receipt.get("scheduledReadbackConfirmed"), True)
+        self.assertEqual(receipt["phase"], "ambiguous")
+        self.assertIsNone(receipt["publishedAt"])
 
     def test_stale_tiktok_before_final_action_is_ordinary_failure(self) -> None:
         task = self._task()

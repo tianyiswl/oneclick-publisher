@@ -85,8 +85,13 @@ _TIKTOK_RECEIPT_FIELDS = frozenset(
     {
         "accountId",
         "visibility",
+        "scheduleMode",
+        "scheduledAt",
+        "scheduleTimezone",
         "platformWriteOccurred",
         "finalActionTriggered",
+        "platformAccepted",
+        "scheduledReadbackConfirmed",
         "contentId",
         "contentUrl",
         "publishedAt",
@@ -102,6 +107,8 @@ _TIKTOK_RECEIPT_PHASES = frozenset(
         "final_action_triggered",
         "platform_accepted",
         "published_readback_confirmed",
+        "scheduled_accepted",
+        "scheduled_readback_confirmed",
         "ambiguous",
     }
 )
@@ -2036,6 +2043,7 @@ def _fail_active_task_in_transaction(
     code = str(error_code or "controlled_task_aborted").strip()
     public_message = f"{str(message).strip()}（错误码 {code}）"
     receipt_json = ""
+    projected_receipt: dict[str, object] = {}
     if receipt is not None:
         projected_receipt = _tiktok_receipt_projection(receipt)
         if projected_receipt:
@@ -2045,13 +2053,19 @@ def _fail_active_task_in_transaction(
                 sort_keys=True,
                 separators=(",", ":"),
             )
+    clear_scheduled_published_at = bool(
+        projected_receipt.get("scheduleMode") == "platform_native"
+        and "publishedAt" in projected_receipt
+        and projected_receipt.get("publishedAt") is None
+    )
     now = _now()
     updated = conn.execute(
         """
         UPDATE publish_task_items
         SET status = 'failed', message = ?, errorCode = ?, attempts = attempts + 1,
             startedAt = COALESCE(startedAt, ?), finishedAt = ?,
-            receiptJson = CASE WHEN ? <> '' THEN ? ELSE receiptJson END
+            receiptJson = CASE WHEN ? <> '' THEN ? ELSE receiptJson END,
+            publishedAt = CASE WHEN ? THEN '' ELSE publishedAt END
         WHERE taskId = ? AND status IN ('pending', 'running')
         """,
         (
@@ -2061,6 +2075,7 @@ def _fail_active_task_in_transaction(
             now,
             receipt_json,
             receipt_json,
+            clear_scheduled_published_at,
             int(task_id),
         ),
     )
@@ -2190,28 +2205,84 @@ def _reconcile_stale_controlled_task_in_transaction(
     )
     tiktok_final_action_triggered = bool(row["tiktokFinalActionTriggered"])
     if is_tiktok_task and tiktok_final_action_triggered:
-        account_ids = list(payloads[0].get("accountIds") or [])
+        payload = payloads[0]
+        account_ids = list(payload.get("accountIds") or [])
         account_id = (
             int(account_ids[0])
             if len(account_ids) == 1 and type(account_ids[0]) is int
             else 0
         )
+        scheduled_tiktok = (
+            payload.get("scheduleMode") == "platform_native"
+            and payload.get("scheduleTimezone") == "Asia/Shanghai"
+            and type(payload.get("scheduledAt")) is str
+        )
+        platform_accepted = False
+        if scheduled_tiktok:
+            accepted_event = conn.execute(
+                """
+                SELECT 1
+                FROM publish_task_events
+                WHERE taskId = ? AND eventType = 'tiktok_scheduled_accepted'
+                LIMIT 1
+                """,
+                (int(task_id),),
+            ).fetchone()
+            prior_item = conn.execute(
+                """
+                SELECT receiptJson
+                FROM publish_task_items
+                WHERE taskId = ? AND platformType = 6
+                ORDER BY id
+                LIMIT 1
+                """,
+                (int(task_id),),
+            ).fetchone()
+            prior_receipt: dict[str, object] = {}
+            if prior_item and str(prior_item["receiptJson"] or ""):
+                try:
+                    loaded_receipt = json.loads(str(prior_item["receiptJson"]))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    loaded_receipt = {}
+                prior_receipt = _tiktok_receipt_projection(loaded_receipt)
+            platform_accepted = bool(
+                accepted_event or prior_receipt.get("platformAccepted") is True
+            )
+        receipt = {
+            "accountId": account_id,
+            "visibility": "public",
+            "platformWriteOccurred": True,
+            "finalActionTriggered": True,
+            "contentId": None,
+            "contentUrl": None,
+            "publishedAt": None,
+            "phase": "ambiguous",
+        }
+        if scheduled_tiktok:
+            receipt.update(
+                {
+                    "scheduleMode": "platform_native",
+                    "scheduledAt": payload["scheduledAt"],
+                    "scheduleTimezone": payload["scheduleTimezone"],
+                }
+            )
+            if platform_accepted:
+                receipt["platformAccepted"] = True
         return _fail_active_task_in_transaction(
             conn,
             int(task_id),
-            error_code="tiktok_publish_outcome_unknown",
-            message="TikTok 最终动作后发布进程失联，必须先人工核对内容列表",
+            error_code=(
+                "tiktok_schedule_outcome_unknown"
+                if scheduled_tiktok
+                else "tiktok_publish_outcome_unknown"
+            ),
+            message=(
+                "TikTok 定时动作后发布进程失联，必须先人工核对定时内容列表"
+                if scheduled_tiktok
+                else "TikTok 最终动作后发布进程失联，必须先人工核对内容列表"
+            ),
             event_type="tiktok_publish_outcome_ambiguous",
-            receipt={
-                "accountId": account_id,
-                "visibility": "public",
-                "platformWriteOccurred": True,
-                "finalActionTriggered": True,
-                "contentId": None,
-                "contentUrl": None,
-                "publishedAt": None,
-                "phase": "ambiguous",
-            },
+            receipt=receipt,
         )
     return _fail_active_task_in_transaction(
         conn,
@@ -2430,6 +2501,13 @@ def mark_platform_result(
         receipt_values["publishedAt"] = str(
             public_receipt.get("publishedAt") or ""
         )
+    clear_tiktok_scheduled_published_at = bool(
+        int(platform_type) == 6
+        and ok
+        and public_receipt.get("scheduleMode") == "platform_native"
+        and "publishedAt" in public_receipt
+        and public_receipt.get("publishedAt") is None
+    )
     keep_identifiers = bool(ok or int(platform_type) in {6, 7})
     with connect() as conn:
         batch_item = conn.execute(
@@ -2470,7 +2548,13 @@ def mark_platform_result(
                     stable_error_code, receipt_json, receipt_json,
                     bool(keep_identifiers and receipt_values["platformPostId"]), receipt_values["platformPostId"],
                     bool(keep_identifiers and receipt_values["postUrl"]), receipt_values["postUrl"],
-                    bool(ok and receipt_values["publishedAt"]), receipt_values["publishedAt"],
+                    bool(
+                        ok
+                        and (
+                            receipt_values["publishedAt"]
+                            or clear_tiktok_scheduled_published_at
+                        )
+                    ), receipt_values["publishedAt"],
                     int(task_id), int(platform_type), str(content_type),
                 ),
             )
@@ -2493,7 +2577,13 @@ def mark_platform_result(
                     stable_error_code, receipt_json, receipt_json,
                     bool(keep_identifiers and receipt_values["platformPostId"]), receipt_values["platformPostId"],
                     bool(keep_identifiers and receipt_values["postUrl"]), receipt_values["postUrl"],
-                    bool(ok and receipt_values["publishedAt"]), receipt_values["publishedAt"],
+                    bool(
+                        ok
+                        and (
+                            receipt_values["publishedAt"]
+                            or clear_tiktok_scheduled_published_at
+                        )
+                    ), receipt_values["publishedAt"],
                     int(task_id), int(platform_type),
                 ),
             )
