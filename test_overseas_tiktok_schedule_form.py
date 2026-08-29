@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import re
 import time
 import unittest
 import unicodedata
@@ -323,15 +324,23 @@ class ContextHandle(HandleWrapper):
 
 
 class UploadRemountHandle(HandleWrapper):
+    def __init__(self, record: HandleRecord, message: str = "JSHandles can be evaluated only in the context they were created") -> None:
+        super().__init__(record)
+        self._message = message
+
     async def evaluate(self, expression: str, other: HandleWrapper) -> bool:
         if not isinstance(other, UploadRemountHandle) or self._record is not other._record:
-            raise PlaywrightError("JSHandles can be evaluated only in the context they were created")
+            raise PlaywrightError(self._message)
         return True
 
 
 class OtherPlaywrightErrorHandle(HandleWrapper):
+    def __init__(self, record: HandleRecord, message: str = "unrelated Playwright comparison failure") -> None:
+        super().__init__(record)
+        self._message = message
+
     async def evaluate(self, expression: str, other: HandleWrapper) -> bool:
-        raise PlaywrightError("unrelated Playwright comparison failure")
+        raise PlaywrightError(self._message)
 
 
 class WrapperScheduleLocator:
@@ -876,43 +885,55 @@ class TikTokScheduleFormTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.error_code, "tiktok_schedule_control_ambiguous")
 
     async def test_upload_frame_remount_requires_new_handle_twice(self) -> None:
-        before = HandleRecord("upload-a")
-        after = HandleRecord("upload-b")
-        base = LiveScheduleBase(
-            {SCHEDULE_TOGGLE_SELECTORS[0]: WrapperScheduleLocator([
-                lambda: UploadRemountHandle(before),
-                lambda: UploadRemountHandle(after),
-                lambda: UploadRemountHandle(after),
-            ])}
-        )
-        page = FakeSchedulePage()
-        clock = FakeClock()
-        form, _, _ = self.form(page, [base] * 8, clock=clock)
+        for message in (
+            "JSHandles can be evaluated only in the context they were created",
+            "JSHandles can be evaluated only in the context they were created!",
+            "ElementHandle.evaluate: JSHandles can be evaluated only in the context they were created!",
+        ):
+            with self.subTest(message=message):
+                before = HandleRecord("upload-a")
+                after = HandleRecord("upload-b")
+                base = LiveScheduleBase(
+                    {SCHEDULE_TOGGLE_SELECTORS[0]: WrapperScheduleLocator([
+                        lambda: UploadRemountHandle(before, message),
+                        lambda: UploadRemountHandle(after, message),
+                        lambda: UploadRemountHandle(after, message),
+                    ])}
+                )
+                page = FakeSchedulePage()
+                clock = FakeClock()
+                form, _, _ = self.form(page, [base] * 8, clock=clock)
 
-        control = await form._schedule_control(
-            SCHEDULE_TOGGLE_SELECTORS,
-            setting="schedule choice",
-            editable=False,
-        )
+                control = await form._schedule_control(
+                    SCHEDULE_TOGGLE_SELECTORS,
+                    setting="schedule choice",
+                    editable=False,
+                )
 
-        self.assertIsInstance(control, UploadRemountHandle)
-        self.assertEqual(clock.sleeps, [0.25, 0.25])
+                self.assertIsInstance(control, UploadRemountHandle)
+                self.assertEqual(clock.sleeps, [0.25, 0.25])
 
     async def test_other_playwright_comparison_error_propagates(self) -> None:
-        record = HandleRecord("other-error")
-        base = LiveScheduleBase(
-            {SCHEDULE_TOGGLE_SELECTORS[0]: WrapperScheduleLocator([lambda: OtherPlaywrightErrorHandle(record)])}
-        )
-        page = FakeSchedulePage()
-        clock = FakeClock()
-        form, _, _ = self.form(page, [base] * 8, clock=clock)
+        for message in (
+            "unrelated Playwright comparison failure",
+            "NotElementHandle.evaluate: JSHandles can be evaluated only in the context they were created",
+            "JSHandles can be evaluated only in the context they were created! extra",
+        ):
+            with self.subTest(message=message):
+                record = HandleRecord("other-error")
+                base = LiveScheduleBase(
+                    {SCHEDULE_TOGGLE_SELECTORS[0]: WrapperScheduleLocator([lambda: OtherPlaywrightErrorHandle(record, message)])}
+                )
+                page = FakeSchedulePage()
+                clock = FakeClock()
+                form, _, _ = self.form(page, [base] * 8, clock=clock)
 
-        with self.assertRaisesRegex(PlaywrightError, "unrelated Playwright comparison failure"):
-            await form._schedule_control(
-                SCHEDULE_TOGGLE_SELECTORS,
-                setting="schedule choice",
-                editable=False,
-            )
+                with self.assertRaisesRegex(PlaywrightError, re.escape(message)):
+                    await form._schedule_control(
+                        SCHEDULE_TOGGLE_SELECTORS,
+                        setting="schedule choice",
+                        editable=False,
+                    )
 
     async def test_handle_comparison_protocol_error_is_not_silently_transient(self) -> None:
         record = HandleRecord("broken")

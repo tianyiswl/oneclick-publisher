@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import re
 import time
 import unicodedata
 from dataclasses import dataclass
@@ -85,6 +86,10 @@ _OUTCOME_TIMEOUT_SECONDS = 120.0
 _CONTROL_POLL_INTERVAL_SECONDS = 0.25
 _CONTROL_POLL_OBSERVATIONS = 64
 _CONTROL_TIMEOUT_SECONDS = 15.0
+_UPLOAD_HANDLE_CONTEXT_ERROR = re.compile(
+    r"^(?:ElementHandle\.evaluate: )?"
+    r"JSHandles can be evaluated only in the context they were created!?$"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -417,7 +422,7 @@ class TikTokScheduleForm:
         except PlaywrightError as exc:
             if (
                 left.scope == "upload"
-                and str(exc) == "JSHandles can be evaluated only in the context they were created"
+                and _UPLOAD_HANDLE_CONTEXT_ERROR.fullmatch(str(exc)) is not None
             ):
                 return False
             raise
