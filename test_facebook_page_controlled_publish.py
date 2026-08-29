@@ -4,8 +4,10 @@ import hashlib
 import json
 import os
 import sqlite3
+import sys
 import tempfile
 import threading
+import types
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -513,6 +515,51 @@ class FacebookPageFormalClaimTests(unittest.TestCase):
         )
         return formal
 
+    def install_task7_evidence_types(self):
+        module_name = "uploader.meta_uploader.content_list"
+        module = types.ModuleType(module_name)
+
+        class FacebookReelReceipt:
+            def __init__(self, page_id, reel_id, url, published_at):
+                self.page_id = page_id
+                self.reel_id = reel_id
+                self.url = url
+                self.published_at = published_at
+
+        class FacebookReelMatch:
+            def __init__(
+                self,
+                status,
+                receipt,
+                new_count,
+                matching_count,
+            ):
+                self.status = status
+                self.receipt = receipt
+                self.new_count = new_count
+                self.matching_count = matching_count
+
+        class FacebookPlatformDecision:
+            def __init__(
+                self,
+                kind,
+                page_id,
+                observed_at,
+                evidence_sha256,
+            ):
+                self.kind = kind
+                self.page_id = page_id
+                self.observed_at = observed_at
+                self.evidence_sha256 = evidence_sha256
+
+        module.FacebookReelReceipt = FacebookReelReceipt
+        module.FacebookReelMatch = FacebookReelMatch
+        module.FacebookPlatformDecision = FacebookPlatformDecision
+        module_patch = patch.dict(sys.modules, {module_name: module})
+        module_patch.start()
+        self.addCleanup(module_patch.stop)
+        return module
+
     def verified_form_receipt(
         self,
         payload: dict | None = None,
@@ -735,18 +782,36 @@ class FacebookPageFormalClaimTests(unittest.TestCase):
         )
         if state == "final_action_clicked":
             return
+        task7 = self.install_task7_evidence_types()
+        with database.connect() as conn:
+            clicked_at = conn.execute(
+                """
+                SELECT clickedAt FROM facebook_page_publish_claims
+                WHERE taskId = ?
+                """,
+                (task_id,),
+            ).fetchone()[0]
+        published_at = (
+            datetime.fromisoformat(clicked_at) + timedelta(seconds=1)
+        ).isoformat()
         controlled_publish.mark_facebook_page_checkpoint(
             task_id,
             expected_state="final_action_clicked",
             new_state=state,
             receipt={
-                "pageId": str(payload["facebookExpectedPageReference"]),
-                "phase": "published_readback_confirmed",
-                "platformWriteOccurred": True,
-                "finalActionTriggered": True,
-                "reelId": "new-reel",
-                "url": "https://www.facebook.com/reel/new-reel",
-                "publishedAt": "2026-08-30T10:05:00+08:00",
+                "reelMatch": task7.FacebookReelMatch(
+                    status="unique",
+                    receipt=task7.FacebookReelReceipt(
+                        page_id=str(
+                            payload["facebookExpectedPageReference"]
+                        ),
+                        reel_id="new-reel",
+                        url="https://www.facebook.com/reel/new-reel",
+                        published_at=published_at,
+                    ),
+                    new_count=1,
+                    matching_count=1,
+                )
             },
         )
 
@@ -1136,20 +1201,26 @@ class FacebookPageFormalClaimTests(unittest.TestCase):
         )
 
     def test_confirmed_not_published_releases_active_slot_but_is_preserved(self) -> None:
+        task7 = self.install_task7_evidence_types()
         task_id, authorization_id, payload = self.authorized_preflight()
         first = self.create_formal(task_id, authorization_id, payload)
         self.transition_to(first["id"], payload, "ambiguous")
-        with database.connect() as conn:
-            updated = conn.execute(
-                """
-                UPDATE facebook_page_publish_claims
-                SET state = 'confirmed_not_published', blocksReplay = 0
-                WHERE taskId = ? AND state = 'ambiguous'
-                """,
-                (first["id"],),
+        try:
+            controlled_publish.mark_facebook_page_checkpoint(
+                first["id"],
+                expected_state="ambiguous",
+                new_state="confirmed_not_published",
+                receipt={
+                    "platformDecision": task7.FacebookPlatformDecision(
+                        kind="rejected_no_creation",
+                        page_id="1001",
+                        observed_at="2026-08-30T10:10:00+08:00",
+                        evidence_sha256="d" * 64,
+                    )
+                },
             )
-            self.assertEqual(updated.rowcount, 1)
-            conn.commit()
+        except ControlledPublishError as exc:
+            self.fail(f"trusted Task 7 platform decision rejected: {exc.error_code}")
         second_authorization = authorize_completed_check(task_id)
 
         second = self.create_formal(
@@ -1174,6 +1245,7 @@ class FacebookPageFormalClaimTests(unittest.TestCase):
         )
 
     def test_caller_platform_decision_cannot_release_ambiguous_claim(self) -> None:
+        self.install_task7_evidence_types()
         task_id, authorization_id, payload = self.authorized_preflight()
         task = self.create_formal(task_id, authorization_id, payload)
         self.transition_to(task["id"], payload, "ambiguous")
@@ -1207,6 +1279,225 @@ class FacebookPageFormalClaimTests(unittest.TestCase):
                 (task["id"],),
             ).fetchone()
         self.assertEqual(tuple(claim), ("ambiguous", 1, "{}"))
+
+    def test_same_named_forged_platform_decision_type_is_rejected(self) -> None:
+        self.install_task7_evidence_types()
+        task_id, authorization_id, payload = self.authorized_preflight()
+        task = self.create_formal(task_id, authorization_id, payload)
+        self.transition_to(task["id"], payload, "ambiguous")
+        forged_type = type(
+            "FacebookPlatformDecision",
+            (),
+            {
+                "__module__": "uploader.meta_uploader.content_list",
+                "kind": "rejected_no_creation",
+                "page_id": "1001",
+                "observed_at": "2026-08-30T10:10:00+08:00",
+                "evidence_sha256": "d" * 64,
+            },
+        )
+
+        with self.assertRaises(ControlledPublishError) as raised:
+            controlled_publish.mark_facebook_page_checkpoint(
+                task["id"],
+                expected_state="ambiguous",
+                new_state="confirmed_not_published",
+                receipt={"platformDecision": forged_type()},
+            )
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "facebook_claim_lifecycle_invalid",
+        )
+        with database.connect() as conn:
+            claim = conn.execute(
+                """
+                SELECT state, blocksReplay
+                FROM facebook_page_publish_claims WHERE taskId = ?
+                """,
+                (task["id"],),
+            ).fetchone()
+        self.assertEqual(tuple(claim), ("ambiguous", 1))
+
+    def test_ordinary_mapping_cannot_release_ambiguous_claim_as_succeeded(
+        self,
+    ) -> None:
+        self.install_task7_evidence_types()
+        task_id, authorization_id, payload = self.authorized_preflight()
+        task = self.create_formal(task_id, authorization_id, payload)
+        self.transition_to(task["id"], payload, "final_action_clicked")
+        controlled_publish.mark_facebook_page_checkpoint(
+            task["id"],
+            expected_state="final_action_clicked",
+            new_state="ambiguous",
+            receipt={"pageId": "1001"},
+        )
+
+        with self.assertRaises(ControlledPublishError) as raised:
+            controlled_publish.mark_facebook_page_checkpoint(
+                task["id"],
+                expected_state="ambiguous",
+                new_state="succeeded",
+                receipt={
+                    "pageId": "1001",
+                    "captionSha256": payload["facebookCaptionSha256"],
+                    "reelId": "forged-reel",
+                    "url": "https://www.facebook.com/reel/forged-reel",
+                    "publishedAt": "2026-08-30T10:05:00+08:00",
+                },
+            )
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "facebook_claim_lifecycle_invalid",
+        )
+        with database.connect() as conn:
+            claim = conn.execute(
+                """
+                SELECT state, blocksReplay, reelId, reelUrl
+                FROM facebook_page_publish_claims WHERE taskId = ?
+                """,
+                (task["id"],),
+            ).fetchone()
+        self.assertEqual(tuple(claim), ("ambiguous", 1, "", ""))
+
+    def test_trusted_task7_unique_reel_match_allows_succeeded(self) -> None:
+        task7 = self.install_task7_evidence_types()
+        task_id, authorization_id, payload = self.authorized_preflight()
+        task = self.create_formal(task_id, authorization_id, payload)
+        self.transition_to(task["id"], payload, "final_action_clicked")
+        controlled_publish.mark_facebook_page_checkpoint(
+            task["id"],
+            expected_state="final_action_clicked",
+            new_state="ambiguous",
+            receipt={"pageId": "1001"},
+        )
+        with database.connect() as conn:
+            clicked_at = conn.execute(
+                """
+                SELECT clickedAt FROM facebook_page_publish_claims
+                WHERE taskId = ?
+                """,
+                (task["id"],),
+            ).fetchone()[0]
+        published_at = (
+            datetime.fromisoformat(clicked_at) + timedelta(seconds=1)
+        ).isoformat()
+        match = task7.FacebookReelMatch(
+            status="unique",
+            receipt=task7.FacebookReelReceipt(
+                page_id="1001",
+                reel_id="new-reel",
+                url="https://www.facebook.com/reel/new-reel",
+                published_at=published_at,
+            ),
+            new_count=2,
+            matching_count=1,
+        )
+
+        try:
+            controlled_publish.mark_facebook_page_checkpoint(
+                task["id"],
+                expected_state="ambiguous",
+                new_state="succeeded",
+                receipt={
+                    "reelMatch": match,
+                    "captionSha256": "f" * 64,
+                },
+            )
+        except ControlledPublishError as exc:
+            self.fail(f"trusted Task 7 Reel match was rejected: {exc.error_code}")
+
+        with database.connect() as conn:
+            claim = dict(
+                conn.execute(
+                    """
+                    SELECT * FROM facebook_page_publish_claims
+                    WHERE taskId = ?
+                    """,
+                    (task["id"],),
+                ).fetchone()
+            )
+        persisted_receipt = json.loads(claim["receiptJson"])
+        self.assertEqual(claim["state"], "succeeded")
+        self.assertEqual(claim["reelId"], "new-reel")
+        self.assertEqual(
+            persisted_receipt["captionSha256"],
+            payload["facebookCaptionSha256"],
+        )
+        self.assertEqual(persisted_receipt["publishedAt"], published_at)
+
+    def test_trusted_reel_match_must_bind_unique_new_page_and_click_time(
+        self,
+    ) -> None:
+        task7 = self.install_task7_evidence_types()
+        cases = (
+            ("wrong_page", {"page_id": "1002"}),
+            ("baseline_reel", {"reel_id": "old-reel"}),
+            ("before_click", {"published_delta": -1}),
+            ("zero_new", {"new_count": 0}),
+            ("multiple_matches", {"matching_count": 2}),
+            ("not_unique", {"status": "mismatch"}),
+        )
+        for label, changes in cases:
+            with self.subTest(label=label):
+                payload = self.payload(caption=f"typed match {label}")
+                task_id, authorization_id, _ = self.authorized_preflight(
+                    payload=payload
+                )
+                task = self.create_formal(task_id, authorization_id, payload)
+                self.transition_to(task["id"], payload, "final_action_clicked")
+                controlled_publish.mark_facebook_page_checkpoint(
+                    task["id"],
+                    expected_state="final_action_clicked",
+                    new_state="ambiguous",
+                    receipt={"pageId": "1001"},
+                )
+                with database.connect() as conn:
+                    clicked_at = conn.execute(
+                        """
+                        SELECT clickedAt FROM facebook_page_publish_claims
+                        WHERE taskId = ?
+                        """,
+                        (task["id"],),
+                    ).fetchone()[0]
+                published_at = (
+                    datetime.fromisoformat(clicked_at)
+                    + timedelta(seconds=changes.get("published_delta", 1))
+                ).isoformat()
+                match = task7.FacebookReelMatch(
+                    status=changes.get("status", "unique"),
+                    receipt=task7.FacebookReelReceipt(
+                        page_id=changes.get("page_id", "1001"),
+                        reel_id=changes.get("reel_id", "new-reel"),
+                        url="https://www.facebook.com/reel/new-reel",
+                        published_at=published_at,
+                    ),
+                    new_count=changes.get("new_count", 1),
+                    matching_count=changes.get("matching_count", 1),
+                )
+
+                with self.assertRaises(ControlledPublishError) as raised:
+                    controlled_publish.mark_facebook_page_checkpoint(
+                        task["id"],
+                        expected_state="ambiguous",
+                        new_state="succeeded",
+                        receipt={"reelMatch": match},
+                    )
+
+                self.assertEqual(
+                    raised.exception.error_code,
+                    "facebook_claim_lifecycle_invalid",
+                )
+                with database.connect() as conn:
+                    state = conn.execute(
+                        """
+                        SELECT state FROM facebook_page_publish_claims
+                        WHERE taskId = ?
+                        """,
+                        (task["id"],),
+                    ).fetchone()[0]
+                self.assertEqual(state, "ambiguous")
 
     def test_final_action_claimed_clicked_ambiguous_and_succeeded_block_republish(self) -> None:
         for state in (
@@ -1314,6 +1605,159 @@ class FacebookPageFormalClaimTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, serialized)
 
+    def test_checkpoint_hashes_platform_decision_and_receipt_json(self) -> None:
+        task7 = self.install_task7_evidence_types()
+        task_id, authorization_id, payload = self.authorized_preflight()
+        task = self.create_formal(task_id, authorization_id, payload)
+        self.transition_to(task["id"], payload, "final_action_claimed")
+        controlled_publish.mark_facebook_page_checkpoint(
+            task["id"],
+            expected_state="final_action_claimed",
+            new_state="ambiguous",
+            receipt={
+                "pageId": "1001",
+                "platformDecision": task7.FacebookPlatformDecision(
+                    kind="unknown",
+                    page_id="1001",
+                    observed_at="2026-08-30T10:10:00+08:00",
+                    evidence_sha256="d" * 64,
+                ),
+            },
+        )
+
+        with database.connect() as conn:
+            claim = dict(
+                conn.execute(
+                    """
+                    SELECT * FROM facebook_page_publish_claims
+                    WHERE taskId = ?
+                    """,
+                    (task["id"],),
+                ).fetchone()
+            )
+        decision = json.loads(claim["platformDecisionJson"])
+        receipt = json.loads(claim["receiptJson"])
+        canonical = lambda value: json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        self.assertEqual(
+            claim.get("platformDecisionHash"),
+            hashlib.sha256(canonical(decision).encode("utf-8")).hexdigest(),
+        )
+        self.assertEqual(
+            claim.get("receiptHash"),
+            hashlib.sha256(canonical(receipt).encode("utf-8")).hexdigest(),
+        )
+
+    def test_tampered_receipt_json_fails_closed_before_transition(self) -> None:
+        task_id, authorization_id, payload = self.authorized_preflight()
+        task = self.create_formal(task_id, authorization_id, payload)
+        self.transition_to(task["id"], payload, "final_action_claimed")
+        with database.connect() as conn:
+            conn.execute(
+                """
+                UPDATE facebook_page_publish_claims
+                SET receiptJson = ? WHERE taskId = ?
+                """,
+                ('{"pageId":"1001"}', task["id"]),
+            )
+            conn.commit()
+
+        with self.assertRaises(ControlledPublishError) as raised:
+            controlled_publish.mark_facebook_page_checkpoint(
+                task["id"],
+                expected_state="final_action_claimed",
+                new_state="ambiguous",
+                receipt={"pageId": "1001"},
+            )
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "facebook_claim_lifecycle_invalid",
+        )
+        with database.connect() as conn:
+            state = conn.execute(
+                """
+                SELECT state FROM facebook_page_publish_claims
+                WHERE taskId = ?
+                """,
+                (task["id"],),
+            ).fetchone()[0]
+        self.assertEqual(state, "final_action_claimed")
+
+    def test_tampered_platform_decision_fails_closed_before_release(self) -> None:
+        task7 = self.install_task7_evidence_types()
+        task_id, authorization_id, payload = self.authorized_preflight()
+        task = self.create_formal(task_id, authorization_id, payload)
+        self.transition_to(task["id"], payload, "final_action_clicked")
+        controlled_publish.mark_facebook_page_checkpoint(
+            task["id"],
+            expected_state="final_action_clicked",
+            new_state="ambiguous",
+            receipt={
+                "pageId": "1001",
+                "platformDecision": task7.FacebookPlatformDecision(
+                    kind="unknown",
+                    page_id="1001",
+                    observed_at="2026-08-30T10:10:00+08:00",
+                    evidence_sha256="d" * 64,
+                ),
+            },
+        )
+        with database.connect() as conn:
+            conn.execute(
+                """
+                UPDATE facebook_page_publish_claims
+                SET platformDecisionJson = ? WHERE taskId = ?
+                """,
+                (
+                    json.dumps(
+                        {
+                            "pageId": "1001",
+                            "kind": "accepted",
+                            "observedAt": "2026-08-30T10:11:00+08:00",
+                            "evidenceSha256": "e" * 64,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    task["id"],
+                ),
+            )
+            conn.commit()
+
+        with self.assertRaises(ControlledPublishError) as raised:
+            controlled_publish.mark_facebook_page_checkpoint(
+                task["id"],
+                expected_state="ambiguous",
+                new_state="confirmed_not_published",
+                receipt={
+                    "platformDecision": task7.FacebookPlatformDecision(
+                        kind="rejected_no_creation",
+                        page_id="1001",
+                        observed_at="2026-08-30T10:12:00+08:00",
+                        evidence_sha256="f" * 64,
+                    )
+                },
+            )
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "facebook_claim_lifecycle_invalid",
+        )
+        with database.connect() as conn:
+            claim = conn.execute(
+                """
+                SELECT state, blocksReplay
+                FROM facebook_page_publish_claims WHERE taskId = ?
+                """,
+                (task["id"],),
+            ).fetchone()
+        self.assertEqual(tuple(claim), ("ambiguous", 1))
+
     def test_corrupted_snapshot_hash_fails_closed_before_recovery(self) -> None:
         task_id, authorization_id, payload = self.authorized_preflight()
         task = self.create_formal(task_id, authorization_id, payload)
@@ -1406,6 +1850,113 @@ class FacebookPageFormalClaimTests(unittest.TestCase):
             mismatch.exception.error_code,
             "facebook_publish_authorization_invalid",
         )
+
+    def test_execution_claim_rejects_terminal_task_or_item_without_start(
+        self,
+    ) -> None:
+        cases = (
+            ("terminal_task", "task", "success"),
+            ("terminal_item", "item", "failed"),
+        )
+        for label, target, status in cases:
+            with self.subTest(label=label):
+                payload = self.payload(caption=f"worker state {label}")
+                task_id, authorization_id, _ = self.authorized_preflight(
+                    payload=payload
+                )
+                task = self.create_formal(task_id, authorization_id, payload)
+                with database.connect() as conn:
+                    if target == "task":
+                        conn.execute(
+                            "UPDATE publish_tasks SET status = ? WHERE id = ?",
+                            (status, task["id"]),
+                        )
+                    else:
+                        conn.execute(
+                            """
+                            UPDATE publish_task_items SET status = ?
+                            WHERE taskId = ?
+                            """,
+                            (status, task["id"]),
+                        )
+                    conn.commit()
+
+                with self.assertRaises(ControlledPublishError) as raised:
+                    controlled_publish.require_facebook_page_execution_claim(
+                        task["id"],
+                        [self.formal_payload(payload)],
+                    )
+
+                self.assertEqual(
+                    raised.exception.error_code,
+                    "facebook_publish_authorization_invalid",
+                )
+                with database.connect() as conn:
+                    worker_started_at = conn.execute(
+                        """
+                        SELECT workerStartedAt
+                        FROM facebook_page_publish_claims WHERE taskId = ?
+                        """,
+                        (task["id"],),
+                    ).fetchone()[0]
+                self.assertIsNone(worker_started_at)
+
+    def test_execution_claim_requires_exactly_one_pending_target_item(
+        self,
+    ) -> None:
+        for item_count in (0, 2):
+            with self.subTest(item_count=item_count):
+                payload = self.payload(caption=f"worker item count {item_count}")
+                task_id, authorization_id, _ = self.authorized_preflight(
+                    payload=payload
+                )
+                task = self.create_formal(task_id, authorization_id, payload)
+                with database.connect() as conn:
+                    if item_count == 0:
+                        conn.execute(
+                            "DELETE FROM publish_task_items WHERE taskId = ?",
+                            (task["id"],),
+                        )
+                    else:
+                        conn.execute(
+                            """
+                            INSERT INTO publish_task_items (
+                                taskId, platformType, platformName, accountId,
+                                accountFile, accountLabel, profileName,
+                                userName, accountRemark, contentType, filePath,
+                                fileName, status, authorizationSnapshotHash,
+                                createdAt
+                            )
+                            SELECT taskId, platformType, platformName, accountId,
+                                   accountFile, accountLabel, profileName,
+                                   userName, accountRemark, contentType, filePath,
+                                   fileName, status,
+                                   authorizationSnapshotHash, createdAt
+                            FROM publish_task_items WHERE taskId = ?
+                            """,
+                            (task["id"],),
+                        )
+                    conn.commit()
+
+                with self.assertRaises(ControlledPublishError) as raised:
+                    controlled_publish.require_facebook_page_execution_claim(
+                        task["id"],
+                        [self.formal_payload(payload)],
+                    )
+
+                self.assertEqual(
+                    raised.exception.error_code,
+                    "facebook_publish_authorization_invalid",
+                )
+                with database.connect() as conn:
+                    worker_started_at = conn.execute(
+                        """
+                        SELECT workerStartedAt
+                        FROM facebook_page_publish_claims WHERE taskId = ?
+                        """,
+                        (task["id"],),
+                    ).fetchone()[0]
+                self.assertIsNone(worker_started_at)
 
 
 if __name__ == "__main__":

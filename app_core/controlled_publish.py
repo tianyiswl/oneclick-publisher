@@ -1286,7 +1286,9 @@ def _ensure_facebook_page_claim_schema(conn: sqlite3.Connection) -> None:
             formSnapshotHash TEXT NOT NULL DEFAULT '',
             clickedAt TEXT NOT NULL DEFAULT '',
             platformDecisionJson TEXT NOT NULL DEFAULT '{}',
+            platformDecisionHash TEXT NOT NULL DEFAULT '',
             receiptJson TEXT NOT NULL DEFAULT '{}',
+            receiptHash TEXT NOT NULL DEFAULT '',
             reelId TEXT NOT NULL DEFAULT '',
             reelUrl TEXT NOT NULL DEFAULT '',
             createdAt TEXT NOT NULL,
@@ -1295,6 +1297,16 @@ def _ensure_facebook_page_claim_schema(conn: sqlite3.Connection) -> None:
             FOREIGN KEY(preflightTaskId) REFERENCES publish_tasks(id)
         )
         """
+    )
+    from .database import _add_columns
+
+    _add_columns(
+        conn,
+        "facebook_page_publish_claims",
+        (
+            ("platformDecisionHash", "TEXT NOT NULL DEFAULT ''"),
+            ("receiptHash", "TEXT NOT NULL DEFAULT ''"),
+        ),
     )
     conn.execute(
         """
@@ -1557,9 +1569,21 @@ def require_facebook_page_execution_claim(
                   AND publishIntentFingerprint = ?
                   AND replayFingerprint = ?
                   AND EXISTS (
+                      SELECT 1 FROM publish_tasks AS task
+                      WHERE task.id = facebook_page_publish_claims.taskId
+                        AND task.mode = 'oneclick_publish'
+                        AND task.status = 'pending'
+                  )
+                  AND 1 = (
+                      SELECT COUNT(*) FROM publish_task_items AS counted_item
+                      WHERE counted_item.taskId =
+                            facebook_page_publish_claims.taskId
+                  )
+                  AND EXISTS (
                       SELECT 1 FROM publish_task_items AS item
                       WHERE item.taskId = facebook_page_publish_claims.taskId
                         AND item.platformType = 9
+                        AND item.status = 'pending'
                         AND item.accountId = ?
                         AND item.authorizationSnapshotHash = ?
                   )
@@ -1735,29 +1759,92 @@ def _load_hashed_facebook_snapshot(
     return loaded
 
 
-def _safe_facebook_platform_decision(
+def _safe_stored_facebook_platform_decision(
     value: object,
     *,
     expected_page_reference: str,
 ) -> dict[str, object]:
-    # JSON-like request/receipt mappings are untrusted by definition.  Task 7's
-    # internal DOM parser is the only producer whose immutable value object is
-    # accepted here.
-    value_type = type(value)
-    if (
-        value_type.__module__ != "uploader.meta_uploader.content_list"
-        or value_type.__name__ != "FacebookPlatformDecision"
-    ):
-        return {}
-    page_id = getattr(value, "page_id", None)
-    kind = getattr(value, "kind", None)
-    observed_at = getattr(value, "observed_at", None)
-    evidence_hash = getattr(value, "evidence_sha256", None)
+    if not isinstance(value, Mapping) or set(value) != {
+        "pageId",
+        "kind",
+        "observedAt",
+        "evidenceSha256",
+    }:
+        raise ControlledPublishError(
+            "facebook_claim_lifecycle_invalid",
+            "Facebook Page 已存平台决定不安全。",
+        )
+    page_id = value.get("pageId")
+    kind = value.get("kind")
+    observed_at = value.get("observedAt")
+    evidence_hash = value.get("evidenceSha256")
     try:
         observed = datetime.fromisoformat(str(observed_at))
         if observed.tzinfo is None:
             raise ValueError
     except (TypeError, ValueError):
+        raise ControlledPublishError(
+            "facebook_claim_lifecycle_invalid",
+            "Facebook Page 已存平台决定不安全。",
+        ) from None
+    if (
+        page_id != expected_page_reference
+        or kind not in {"accepted", "rejected_no_creation", "unknown"}
+        or type(evidence_hash) is not str
+        or not _SAFE_SHA256_RE.fullmatch(evidence_hash)
+    ):
+        raise ControlledPublishError(
+            "facebook_claim_lifecycle_invalid",
+            "Facebook Page 已存平台决定不安全。",
+        )
+    return dict(value)
+
+
+def _safe_stored_facebook_receipt(
+    value: object,
+    *,
+    expected_page_reference: str,
+) -> dict[str, object]:
+    try:
+        projected = project_facebook_page_receipt(value)
+    except ValueError as exc:
+        raise ControlledPublishError(
+            "facebook_claim_lifecycle_invalid",
+            "Facebook Page 已存回执不安全。",
+        ) from exc
+    if projected != value or projected.get("pageId") not in (
+        None,
+        expected_page_reference,
+    ):
+        raise ControlledPublishError(
+            "facebook_claim_lifecycle_invalid",
+            "Facebook Page 已存回执不安全。",
+        )
+    return projected
+
+
+def _safe_facebook_platform_decision(
+    value: object,
+    *,
+    expected_page_reference: str,
+) -> dict[str, object]:
+    try:
+        from uploader.meta_uploader.content_list import FacebookPlatformDecision
+    except (AttributeError, ImportError):
+        return {}
+    if not isinstance(FacebookPlatformDecision, type) or type(
+        value
+    ) is not FacebookPlatformDecision:
+        return {}
+    try:
+        page_id = value.page_id
+        kind = value.kind
+        observed_at = value.observed_at
+        evidence_hash = value.evidence_sha256
+        observed = datetime.fromisoformat(str(observed_at))
+        if observed.tzinfo is None:
+            raise ValueError
+    except (AttributeError, TypeError, ValueError):
         raise ControlledPublishError(
             "facebook_claim_lifecycle_invalid",
             "Facebook Page 平台决定证据无效。",
@@ -1778,6 +1865,98 @@ def _safe_facebook_platform_decision(
         "observedAt": str(observed_at),
         "evidenceSha256": evidence_hash,
     }
+
+
+def _facebook_task7_reel_types() -> tuple[type, type] | None:
+    try:
+        from uploader.meta_uploader.content_list import (
+            FacebookReelMatch,
+            FacebookReelReceipt,
+        )
+    except (AttributeError, ImportError):
+        return None
+    if not isinstance(FacebookReelMatch, type) or not isinstance(
+        FacebookReelReceipt,
+        type,
+    ):
+        return None
+    return FacebookReelMatch, FacebookReelReceipt
+
+
+def _safe_facebook_reel_match(
+    value: object,
+    *,
+    expected_page_reference: str,
+    baseline: object,
+    form_snapshot: object,
+    clicked_at: str,
+) -> dict[str, object]:
+    task7_types = _facebook_task7_reel_types()
+    if task7_types is None or type(value) is not task7_types[0]:
+        raise ControlledPublishError(
+            "facebook_claim_lifecycle_invalid",
+            "Facebook Page 成功终态缺少可信唯一 Reel 匹配证据。",
+        )
+    try:
+        reel_receipt = value.receipt
+        if (
+            type(value.status) is not str
+            or value.status != "unique"
+            or type(value.new_count) is not int
+            or value.new_count < 1
+            or type(value.matching_count) is not int
+            or value.matching_count != 1
+            or type(reel_receipt) is not task7_types[1]
+        ):
+            raise ValueError
+        if not isinstance(baseline, Mapping) or not isinstance(
+            form_snapshot,
+            Mapping,
+        ):
+            raise ValueError
+        caption_hash = form_snapshot.get("captionSha256")
+        if (
+            type(caption_hash) is not str
+            or not _SAFE_SHA256_RE.fullmatch(caption_hash)
+        ):
+            raise ValueError
+        safe_receipt = project_facebook_page_receipt(
+            {
+                "pageId": reel_receipt.page_id,
+                "reelId": reel_receipt.reel_id,
+                "url": reel_receipt.url,
+                "publishedAt": reel_receipt.published_at,
+                "captionSha256": caption_hash,
+                "visibility": "public",
+                "phase": "published_readback_confirmed",
+                "platformWriteOccurred": True,
+                "finalActionTriggered": True,
+            }
+        )
+        clicked = datetime.fromisoformat(clicked_at)
+        published = datetime.fromisoformat(str(reel_receipt.published_at))
+        if clicked.tzinfo is None or published.tzinfo is None:
+            raise ValueError
+        old_reel_ids = {
+            row.get("reelId")
+            for row in baseline.get("rows", [])
+            if isinstance(row, Mapping)
+        }
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ControlledPublishError(
+            "facebook_claim_lifecycle_invalid",
+            "Facebook Page 唯一 Reel 匹配证据无效。",
+        ) from exc
+    if (
+        safe_receipt.get("pageId") != expected_page_reference
+        or safe_receipt.get("reelId") in old_reel_ids
+        or published.astimezone(timezone.utc) < clicked.astimezone(timezone.utc)
+    ):
+        raise ControlledPublishError(
+            "facebook_claim_lifecycle_invalid",
+            "Facebook Page 唯一 Reel 匹配证据与 claim 不一致。",
+        )
+    return safe_receipt
 
 
 def mark_facebook_page_checkpoint(
@@ -1838,6 +2017,9 @@ def mark_facebook_page_checkpoint(
             form_json = str(claim.get("formSnapshotJson") or "{}")
             form_hash = str(claim.get("formSnapshotHash") or "")
             decision_json = str(claim.get("platformDecisionJson") or "{}")
+            decision_hash = str(claim.get("platformDecisionHash") or "")
+            receipt_json = str(claim.get("receiptJson") or "{}")
+            receipt_hash = str(claim.get("receiptHash") or "")
             stored_baseline = _load_hashed_facebook_snapshot(
                 baseline_json,
                 baseline_hash,
@@ -1858,6 +2040,24 @@ def mark_facebook_page_checkpoint(
                 raise ControlledPublishError(
                     "facebook_claim_lifecycle_invalid",
                     "Facebook Page claim 表单快照不安全。",
+                )
+            stored_decision = _load_hashed_facebook_snapshot(
+                decision_json,
+                decision_hash,
+            )
+            if stored_decision is not None:
+                _safe_stored_facebook_platform_decision(
+                    stored_decision,
+                    expected_page_reference=page_reference,
+                )
+            stored_receipt = _load_hashed_facebook_snapshot(
+                receipt_json,
+                receipt_hash,
+            )
+            if stored_receipt is not None:
+                _safe_stored_facebook_receipt(
+                    stored_receipt,
+                    expected_page_reference=page_reference,
                 )
             if "baseline" in receipt:
                 baseline = _safe_facebook_baseline(
@@ -1901,6 +2101,7 @@ def mark_facebook_page_checkpoint(
             )
             if decision:
                 decision_json = _canonical_safe_json(decision)
+                decision_hash = _canonical_safe_hash(decision)
             if new_state == "confirmed_not_published" and (
                 not decision or decision.get("kind") != "rejected_no_creation"
             ):
@@ -1908,18 +2109,14 @@ def mark_facebook_page_checkpoint(
                     "facebook_claim_lifecycle_invalid",
                     "Facebook Page 未发布终态缺少平台拒绝证据。",
                 )
-            if new_state == "succeeded" and (
-                safe_receipt.get("pageId") != page_reference
-                or type(safe_receipt.get("reelId")) is not str
-                or not safe_receipt.get("reelId")
-                or type(safe_receipt.get("url")) is not str
-                or not safe_receipt.get("url")
-                or type(safe_receipt.get("publishedAt")) is not str
-                or not safe_receipt.get("publishedAt")
-            ):
-                raise ControlledPublishError(
-                    "facebook_claim_lifecycle_invalid",
-                    "Facebook Page 成功终态缺少唯一 Reel 回读。",
+            clicked_at = str(claim.get("clickedAt") or "")
+            if new_state == "succeeded":
+                safe_receipt = _safe_facebook_reel_match(
+                    receipt.get("reelMatch"),
+                    expected_page_reference=page_reference,
+                    baseline=stored_baseline,
+                    form_snapshot=stored_form,
+                    clicked_at=clicked_at,
                 )
             safe_receipt.pop("baselineHash", None)
             safe_receipt.pop("formSnapshotHash", None)
@@ -1928,7 +2125,7 @@ def mark_facebook_page_checkpoint(
             if form_hash:
                 safe_receipt["formSnapshotHash"] = form_hash
             receipt_json = _canonical_safe_json(safe_receipt)
-            clicked_at = str(claim.get("clickedAt") or "")
+            receipt_hash = _canonical_safe_hash(safe_receipt)
             now = _utc(None).isoformat()
             if new_state == "final_action_clicked":
                 clicked_at = now
@@ -1941,7 +2138,8 @@ def mark_facebook_page_checkpoint(
                 SET state = ?, blocksReplay = ?, baselineJson = ?,
                     baselineHash = ?, formSnapshotJson = ?,
                     formSnapshotHash = ?, clickedAt = ?,
-                    platformDecisionJson = ?, receiptJson = ?,
+                    platformDecisionJson = ?, platformDecisionHash = ?,
+                    receiptJson = ?, receiptHash = ?,
                     reelId = ?, reelUrl = ?, updatedAt = ?
                 WHERE taskId = ? AND state = ?
                 """,
@@ -1954,7 +2152,9 @@ def mark_facebook_page_checkpoint(
                     form_hash,
                     clicked_at,
                     decision_json,
+                    decision_hash,
                     receipt_json,
+                    receipt_hash,
                     str(safe_receipt.get("reelId") or claim.get("reelId") or ""),
                     str(safe_receipt.get("url") or claim.get("reelUrl") or ""),
                     now,
