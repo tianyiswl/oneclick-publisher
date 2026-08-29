@@ -103,3 +103,11 @@ Round 4 implementation: `db40891b3a8dddde60d18b3137476b6155f20cd5` (`fix(tiktok)
 - GREEN: adversarial `4/4`; schedule form `46/46` in `14.437s`; focused `337/337` in `15.627s`; affected `554/554` in `17.114s`. Implementation scope against `2a3b08e` was `changed=2`, overseas-owned, `scope-check: OK`; diff checks passed.
 
 Round 5 implementation: `b1361f4427af3e7725b274bfb7d005f8ce562cb6` (`fix(tiktok): classify upload handle context errors`)
+
+## Review remediation (round 6)
+
+- Necessary correction: real Playwright errors may include a terminal `!` and the `ElementHandle.evaluate:` API prefix. Recognition remains upload-only, Playwright-Error-only, and full-string-only: optional exact API prefix, exact core sentence, optional `!`.
+- RED: both variant messages escaped the round-5 narrow matcher. GREEN: short, `!`, and API-prefixed forms complete A-to-B-to-B safely; arbitrary prefix/suffix and unrelated errors still propagate.
+- Results: schedule form `46/46` in `14.503s`; focused `337/337` in `15.733s`; affected `554/554` in `17.138s`. Implementation scope against `307d948` was `changed=2`, overseas-owned, `scope-check: OK`; diff checks passed.
+
+Round 6 implementation: `f81381e2a8ec5f13fdac7693018f7bb51e79c3fc` (`fix(tiktok): match upload context error variants`)
