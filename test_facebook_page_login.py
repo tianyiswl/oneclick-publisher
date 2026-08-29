@@ -712,6 +712,11 @@ class FacebookPagePersistenceTimingTests(unittest.IsolatedAsyncioTestCase):
                     connection.close()
                     failure = FacebookPagePublishError(error_code, "Page check failed")
                     with (
+                        patch.dict(
+                            os.environ,
+                            {"ONECLICK_ENABLE_FACEBOOK_PAGE_V1": "1"},
+                            clear=True,
+                        ),
                         patch.object(account_service, "connect", self._connect),
                         patch.object(
                             account_browser_service,
@@ -773,8 +778,100 @@ class FacebookPagePersistenceTimingTests(unittest.IsolatedAsyncioTestCase):
         returned = startup_results.get_nowait()
         self.assertIs(returned, failure)
 
+    def test_backend_startup_without_a_worker_result_has_a_bounded_stable_failure(self) -> None:
+        account = {
+            "id": 51,
+            "type": 9,
+            "status": 1,
+            "authMode": "browser",
+            "profileName": "Meta 主体",
+            "filePath": "page.json",
+            "accountReference": "1001",
+        }
+        worker = MagicMock()
+        worker.is_alive.return_value = True
+        startup_results: queue.Queue[object] = queue.Queue()
+        failures: list[Exception] = []
+        real_thread_factory = threading.Thread
+        startup_signal = None
+
+        def invoke() -> None:
+            try:
+                account_browser_service.open_account_backend(account)
+            except Exception as exc:
+                failures.append(exc)
+
+        with tempfile.TemporaryDirectory() as raw:
+            (Path(raw) / "page.json").write_text("{}", encoding="utf-8")
+            try:
+                with (
+                    patch.dict(
+                        os.environ,
+                        {"ONECLICK_ENABLE_FACEBOOK_PAGE_V1": "1"},
+                        clear=True,
+                    ),
+                    patch.object(account_browser_service, "COOKIE_DIR", Path(raw)),
+                    patch.object(
+                        account_browser_service,
+                        "FACEBOOK_PAGE_BACKEND_STARTUP_TIMEOUT_SECONDS",
+                        0.01,
+                        create=True,
+                    ),
+                    patch.object(
+                        account_browser_service.queue,
+                        "Queue",
+                        return_value=startup_results,
+                    ),
+                    patch.object(
+                        account_browser_service.threading,
+                        "Thread",
+                        return_value=worker,
+                    ),
+                ):
+                    caller = real_thread_factory(target=invoke)
+                    caller.start()
+                    caller.join(timeout=0.05)
+                    if caller.is_alive():
+                        startup_results.put(RuntimeError("test-only unblock"))
+                        caller.join(timeout=0.5)
+                    with account_browser_service._session_lock:
+                        startup_signal = account_browser_service._backend_startups.get(51)
+            finally:
+                with account_browser_service._session_lock:
+                    account_browser_service._backend_threads.pop(51, None)
+                    account_browser_service._backend_startups.pop(51, None)
+
+        self.assertFalse(caller.is_alive())
+        self.assertEqual(len(failures), 1)
+        self.assertIsInstance(failures[0], FacebookPagePublishError)
+        self.assertEqual(failures[0].error_code, "facebook_page_identity_mismatch")
+        self.assertIn("启动超时", str(failures[0]))
+        self.assertIsNotNone(startup_signal)
+        self.assertFalse(startup_signal.report(True))
+        worker.start.assert_called_once_with()
+
 
 class FacebookPageSavedSessionTests(unittest.IsolatedAsyncioTestCase):
+    def test_malformed_saved_page_status_maps_to_the_stable_identity_error(self) -> None:
+        base_account = {
+            "id": 5,
+            "type": 9,
+            "authMode": "browser",
+            "profileName": "Meta 主体",
+            "filePath": "page.json",
+            "accountReference": "1001",
+        }
+
+        for status in ("not-a-status", object()):
+            with self.subTest(status=repr(status)):
+                account = {**base_account, "status": status}
+                with self.assertRaises(FacebookPagePublishError) as raised:
+                    account_service.validate_saved_facebook_page_account(account)
+                self.assertEqual(
+                    raised.exception.error_code,
+                    "facebook_page_identity_mismatch",
+                )
+
     async def test_saved_session_check_returns_the_exact_page_identity(self) -> None:
         identity = _identity("1001")
         with tempfile.TemporaryDirectory() as raw:
@@ -881,11 +978,38 @@ class FacebookPageSavedSessionTests(unittest.IsolatedAsyncioTestCase):
             "filePath": "legacy.json",
             "accountReference": "",
         }
-        with patch.object(account_browser_service.threading.Thread, "start") as start:
+        with (
+            patch.dict(
+                os.environ,
+                {"ONECLICK_ENABLE_FACEBOOK_PAGE_V1": "1"},
+                clear=True,
+            ),
+            patch.object(account_browser_service.threading.Thread, "start") as start,
+        ):
             with self.assertRaises(FacebookPagePublishError) as raised:
                 account_browser_service.open_account_backend(account)
 
         self.assertEqual(raised.exception.error_code, "facebook_page_identity_mismatch")
+        start.assert_not_called()
+
+    def test_feature_flag_off_rejects_saved_page_backend_before_thread_start(self) -> None:
+        account = {
+            "id": 5,
+            "type": 9,
+            "status": 1,
+            "authMode": "browser",
+            "profileName": "Meta 主体",
+            "filePath": "page.json",
+            "accountReference": "1001",
+        }
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(account_browser_service.threading.Thread, "start") as start,
+            self.assertRaisesRegex(RuntimeError, "功能未开启"),
+        ):
+            account_browser_service.open_account_backend(account)
+
         start.assert_not_called()
 
 

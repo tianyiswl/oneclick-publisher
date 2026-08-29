@@ -4,6 +4,8 @@
 import os
 import importlib.util
 import queue
+import threading
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -144,6 +146,73 @@ class AccountDetectionUiTests(unittest.TestCase):
         self.assertGreaterEqual(enabled_dialog.platform_combo.findData(9), 0)
         enabled_dialog.close()
 
+    def test_feature_flag_off_disables_saved_page_relogin_and_backend_actions(self) -> None:
+        account = {
+            "id": 91,
+            "type": 9,
+            "platformName": "Facebook Page",
+            "profileName": "Meta 主体",
+            "userName": "已保存 Page",
+            "status": 1,
+            "healthStatus": "normal",
+            "statusText": "正常",
+            "authMode": "browser",
+            "filePath": "page.json",
+            "accountReference": "1001",
+        }
+        page = AccountPage()
+
+        with patch.dict(os.environ, {}, clear=True):
+            actions = page._actions(account)
+
+        buttons = {item.text(): item for item in actions.findChildren(QPushButton)}
+        menu_actions = [
+            action
+            for menu in actions.findChildren(QMenu)
+            for action in menu.actions()
+        ]
+        relogin = next(action for action in menu_actions if action.text() == "重新登录")
+        self.assertFalse(buttons["打开后台"].isEnabled())
+        self.assertFalse(relogin.isEnabled())
+        self.assertIn("功能未开启", buttons["打开后台"].toolTip())
+        page.close()
+
+    def test_feature_flag_off_rejects_saved_page_actions_before_dialog_or_worker(self) -> None:
+        account = {
+            "id": 91,
+            "type": 9,
+            "platformName": "Facebook Page",
+            "profileName": "Meta 主体",
+            "userName": "已保存 Page",
+            "status": 1,
+            "authMode": "browser",
+            "filePath": "page.json",
+            "accountReference": "1001",
+        }
+        page = AccountPage()
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("ui.account_page.LoginDialog") as login_dialog,
+            patch.object(
+                account_browser_service,
+                "open_account_backend",
+            ) as open_backend,
+            patch.object(QMessageBox, "warning") as warning,
+        ):
+            page.relogin(account)
+            self.assertEqual(warning.call_count, 1)
+            self.assertIn("功能未开启", warning.call_args.args[2])
+            warning.reset_mock()
+
+            page.open_backend(account)
+            self.assertEqual(warning.call_count, 1)
+            self.assertIn("功能未开启", warning.call_args.args[2])
+
+        login_dialog.assert_not_called()
+        open_backend.assert_not_called()
+        page.close()
+
     def test_facebook_page_prompt_selects_the_exact_id_behind_the_label(self) -> None:
         request = login_service.FacebookPageSelectionRequest(
             (
@@ -264,6 +333,67 @@ class AccountDetectionUiTests(unittest.TestCase):
         open_browser.assert_called_once_with(
             "https://studio.youtube.com/channel/UC_safe"
         )
+
+    def test_account_page_backend_open_is_non_blocking_deduplicated_and_reports_on_ui_thread(self) -> None:
+        account = {
+            "id": 9,
+            "type": 1,
+            "platformName": "小红书",
+            "profileName": "AI",
+            "userName": "海风",
+            "status": 1,
+            "authMode": "browser",
+            "filePath": "oneclick_1_test.json",
+        }
+        started = threading.Event()
+        release = threading.Event()
+        callback_threads: list[int] = []
+        ui_thread_id = threading.get_ident()
+
+        def blocked_open(_account: dict) -> bool:
+            started.set()
+            release.wait(0.5)
+            raise RuntimeError("受控后台启动失败")
+
+        page = AccountPage()
+        with (
+            patch.object(
+                account_browser_service,
+                "open_account_backend",
+                side_effect=blocked_open,
+            ) as open_backend,
+            patch.object(
+                QMessageBox,
+                "warning",
+                side_effect=lambda *_args: callback_threads.append(threading.get_ident()),
+            ) as warning,
+        ):
+            before = time.monotonic()
+            page.open_backend(account)
+            elapsed = time.monotonic() - before
+
+            self.assertLess(elapsed, 0.1)
+            self.assertTrue(started.wait(0.5))
+            page.open_backend(account)
+            self.assertEqual(open_backend.call_count, 1)
+            self.assertIn("正在打开后台", page.status_label.text())
+
+            release.set()
+            deadline = time.monotonic() + 1.0
+            while (
+                page.tasks.is_running("open_account_backend:9")
+                and time.monotonic() < deadline
+            ):
+                self.app.processEvents()
+                time.sleep(0.005)
+            self.app.processEvents()
+
+            self.assertFalse(page.tasks.is_running("open_account_backend:9"))
+            warning.assert_called_once()
+            self.assertIn("受控后台启动失败", warning.call_args.args[2])
+            self.assertEqual(callback_threads, [ui_thread_id])
+
+        page.close()
 
     def test_youtube_system_browser_login_disables_manual_save_fallback(self) -> None:
         class OAuthSession:

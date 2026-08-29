@@ -73,6 +73,44 @@ class _FakePage:
         return _FakeLocator([_FakePageRow(self, item) for item in records])
 
 
+class _DelayedPageRow(_FakePageRow):
+    async def click(self) -> None:
+        self._page.clicked_page_ids.append(str(self._record["page_id"]))
+        self._page.pending_page_id = str(self._record["page_id"])
+
+
+class _DelayedActivationPage(_FakePage):
+    def __init__(
+        self,
+        records: list[dict[str, object]],
+        *,
+        active_page_id: str,
+        activate_on_active_read: int | None,
+    ) -> None:
+        super().__init__(records, active_page_id=active_page_id)
+        self.activate_on_active_read = activate_on_active_read
+        self.active_read_count = 0
+        self.pending_page_id = ""
+
+    def locator(self, selector: str) -> _FakeLocator:
+        records = self.records
+        if 'data-page-active="true"' in selector:
+            self.active_read_count += 1
+            if (
+                self.pending_page_id
+                and self.activate_on_active_read is not None
+                and self.active_read_count >= self.activate_on_active_read
+            ):
+                self.active_page_id = self.pending_page_id
+            records = [
+                item for item in records if item["page_id"] == self.active_page_id
+            ]
+        elif 'data-page-id="' in selector:
+            expected = selector.split('data-page-id="', 1)[1].split('"', 1)[0]
+            records = [item for item in records if item["page_id"] == expected]
+        return _FakeLocator([_DelayedPageRow(self, item) for item in records])
+
+
 class FacebookPageIdentityTests(unittest.IsolatedAsyncioTestCase):
     def test_zero_pages_is_not_found(self) -> None:
         with self.assertRaises(FacebookPagePublishError) as raised:
@@ -202,6 +240,49 @@ class FacebookPageIdentityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(selected.page_id, "1002")
         self.assertEqual(page.clicked_page_ids, ["1002"])
         self.assertEqual(page.active_page_id, "1002")
+
+    async def test_activation_waits_for_the_exact_page_to_become_active_on_a_later_read(self) -> None:
+        page = _DelayedActivationPage(
+            [
+                {"page_id": "1001", "page_name": "原主页", "can_manage_content": True},
+                {"page_id": "1002", "page_name": "目标主页", "can_manage_content": True},
+            ],
+            active_page_id="1001",
+            activate_on_active_read=3,
+        )
+
+        selected = await activate_saved_facebook_page(
+            page,
+            "1002",
+            timeout_seconds=0.2,
+            poll_interval_seconds=0.001,
+        )
+
+        self.assertEqual(selected.page_id, "1002")
+        self.assertEqual(page.clicked_page_ids, ["1002"])
+        self.assertGreaterEqual(page.active_read_count, 3)
+
+    async def test_activation_timeout_never_accepts_the_requested_but_inactive_page(self) -> None:
+        page = _DelayedActivationPage(
+            [
+                {"page_id": "1001", "page_name": "原主页", "can_manage_content": True},
+                {"page_id": "1002", "page_name": "目标主页", "can_manage_content": True},
+            ],
+            active_page_id="1001",
+            activate_on_active_read=None,
+        )
+
+        with self.assertRaises(FacebookPagePublishError) as raised:
+            await activate_saved_facebook_page(
+                page,
+                "1002",
+                timeout_seconds=0.01,
+                poll_interval_seconds=0.001,
+            )
+
+        self.assertEqual(raised.exception.error_code, "facebook_page_identity_mismatch")
+        self.assertEqual(page.clicked_page_ids, ["1002"])
+        self.assertEqual(page.active_page_id, "1001")
 
     def test_feature_gate_is_disabled_by_default_and_only_exact_one_enables_it(self) -> None:
         self.assertFalse(facebook_page_v1_enabled({}))

@@ -400,13 +400,17 @@ class AccountPage(QWidget):
             is_youtube_oauth
             and int(row.get("oauthScopeVersion") or 1) < 2
         )
+        facebook_page_disabled = self._facebook_page_feature_disabled(row)
         menu.addAction("检测登录状态", lambda _checked=False, r=row: self.check_one(r))
-        menu.addAction(
+        relogin_action = menu.addAction(
             "升级 YouTube 发布权限"
             if needs_youtube_scope_upgrade
             else "重新登录",
             lambda _checked=False, r=row: self.relogin(r),
         )
+        if facebook_page_disabled:
+            relogin_action.setEnabled(False)
+            relogin_action.setToolTip("Facebook Page 功能未开启。")
         refresh_action = menu.addAction(
             "刷新账号信息",
             lambda _checked=False, r=row: self.refresh_avatar(r),
@@ -421,7 +425,10 @@ class AccountPage(QWidget):
         menu.addAction("删除账号", lambda _checked=False, r=row: self.delete_one(r))
 
         open_backend_btn = button("打开后台", variant="primary", compact=True)
-        if row.get("needsPageRebind"):
+        if facebook_page_disabled:
+            open_backend_btn.setEnabled(False)
+            open_backend_btn.setToolTip("Facebook Page 功能未开启。")
+        elif row.get("needsPageRebind"):
             open_backend_btn.setEnabled(False)
             open_backend_btn.setToolTip(
                 "旧 Facebook Page 记录没有精确 Page ID，请先重新登录绑定。"
@@ -466,18 +473,25 @@ class AccountPage(QWidget):
             is_youtube_oauth
             and int(row.get("oauthScopeVersion") or 1) < 2
         )
-        menu.addAction(
+        facebook_page_disabled = self._facebook_page_feature_disabled(row)
+        relogin_action = menu.addAction(
             "升级 YouTube 发布权限"
             if needs_youtube_scope_upgrade
             else "重新登录",
             lambda: self.relogin(row),
         )
+        if facebook_page_disabled:
+            relogin_action.setEnabled(False)
+            relogin_action.setToolTip("Facebook Page 功能未开启。")
         open_action = menu.addAction("打开后台", lambda: self.open_backend(row))
         open_action.setToolTip(
             "使用系统默认浏览器打开该频道的 YouTube Studio"
             if is_youtube_oauth
             else "使用一键发保存的本地会话打开对应平台官网"
         )
+        if facebook_page_disabled:
+            open_action.setEnabled(False)
+            open_action.setToolTip("Facebook Page 功能未开启。")
         menu.addAction("检测登录", lambda: self.check_one(row))
         refresh_action = menu.addAction(
             "刷新头像/登录信息",
@@ -499,7 +513,24 @@ class AccountPage(QWidget):
         if dialog.lifecycle_message:
             self._set_status(dialog.lifecycle_message)
 
+    @staticmethod
+    def _facebook_page_feature_disabled(row: dict) -> bool:
+        return (
+            str(row.get("type") or "") == "9"
+            and not account_service.facebook_page_v1_enabled()
+        )
+
+    def _reject_disabled_facebook_page_action(self, row: dict) -> bool:
+        if not self._facebook_page_feature_disabled(row):
+            return False
+        message = "Facebook Page 功能未开启。"
+        self._set_status(message)
+        QMessageBox.warning(self, "Facebook Page 功能未开启", message)
+        return True
+
     def relogin(self, row: dict) -> None:
+        if self._reject_disabled_facebook_page_action(row):
+            return
         dialog = LoginDialog(
             self,
             row,
@@ -685,16 +716,40 @@ class AccountPage(QWidget):
             QMessageBox.warning(self, "检测登录", message)
 
     def open_backend(self, row: dict) -> None:
-        try:
-            reused = account_browser_service.open_account_backend(row)
-        except Exception as exc:
-            self._set_status(f"无法打开后台：{row['platformName']}")
-            QMessageBox.warning(self, "打开平台后台", str(exc))
+        if self._reject_disabled_facebook_page_action(row):
             return
-        action = "已切换到现有后台" if reused else "已打开后台"
-        self._set_status(
-            f"{action}：{row['platformName']} | {row['profileName']}"
+
+        key = f"open_account_backend:{row.get('id')}"
+        progress_text = (
+            f"正在打开后台：{row.get('platformName') or '平台'} | "
+            f"{row.get('profileName') or '账号'}，请稍等..."
         )
+        if self.tasks.is_running(key):
+            self._set_status(progress_text)
+            return
+
+        def opened(reused: object) -> None:
+            action = "已切换到现有后台" if reused is True else "已打开后台"
+            self._set_status(
+                f"{action}：{row.get('platformName') or '平台'} | "
+                f"{row.get('profileName') or '账号'}"
+            )
+
+        def failed(message: str) -> None:
+            self._set_status(
+                f"无法打开后台：{row.get('platformName') or '平台'}"
+            )
+            QMessageBox.warning(self, "打开平台后台", message)
+
+        started = self.tasks.run(
+            key,
+            lambda: account_browser_service.open_account_backend(row),
+            on_started=lambda: self._set_status(progress_text),
+            on_success=opened,
+            on_error=failed,
+        )
+        if started:
+            self._set_status(progress_text)
 
     def edit_remark(self, row: dict) -> None:
         text, ok = QInputDialog.getText(self, "编辑备注", "备注：", text=row.get("remark") or "")

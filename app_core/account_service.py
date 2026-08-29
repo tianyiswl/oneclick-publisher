@@ -607,8 +607,12 @@ def validate_saved_facebook_page_account(account: Mapping[str, Any]) -> str:
         raise _facebook_page_identity_mismatch("Facebook Page 账号记录无效。") from None
     if platform_type != 9:
         raise _facebook_page_identity_mismatch("Facebook Page 账号记录类型不正确。")
+    try:
+        status = int(account.get("status") or 0)
+    except (TypeError, ValueError):
+        raise _facebook_page_identity_mismatch("Facebook Page 账号记录无效。") from None
     if (
-        int(account.get("status") or 0) != 1
+        status != 1
         or str(account.get("authMode") or AUTH_MODE_BROWSER) != AUTH_MODE_BROWSER
         or not str(account.get("filePath") or "").strip()
     ):

@@ -3,11 +3,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 
 from .overseas_meta_errors import FacebookPagePublishError
+
+
+FACEBOOK_PAGE_ACTIVATION_TIMEOUT_SECONDS = 15.0
+FACEBOOK_PAGE_ACTIVATION_POLL_INTERVAL_SECONDS = 0.25
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,7 +161,13 @@ async def validate_facebook_page_binding(
     return selected
 
 
-async def activate_saved_facebook_page(page, expected_page_id: str) -> FacebookPageIdentity:
+async def activate_saved_facebook_page(
+    page,
+    expected_page_id: str,
+    *,
+    timeout_seconds: float = FACEBOOK_PAGE_ACTIVATION_TIMEOUT_SECONDS,
+    poll_interval_seconds: float = FACEBOOK_PAGE_ACTIVATION_POLL_INTERVAL_SECONDS,
+) -> FacebookPageIdentity:
     """Switch to one explicit Page and prove the active Page ID after the switch."""
 
     expected = normalize_facebook_page_id(expected_page_id)
@@ -167,19 +178,34 @@ async def activate_saved_facebook_page(page, expected_page_id: str) -> FacebookP
         if int(await targets.count()) != 1:
             raise _identity_mismatch()
         await targets.nth(0).click()
-        active_rows = page.locator('[data-page-id][data-page-active="true"]')
-        if int(await active_rows.count()) != 1:
-            raise _identity_mismatch()
-        active_page_id = normalize_facebook_page_id(
-            await active_rows.nth(0).get_attribute("data-page-id")
-        )
     except FacebookPagePublishError:
         raise
     except Exception as exc:
         raise _identity_mismatch() from exc
-    if active_page_id != expected:
-        raise _identity_mismatch()
-    return await validate_facebook_page_binding(page, {"accountReference": expected})
+
+    async def wait_for_exact_readback() -> FacebookPageIdentity:
+        while True:
+            try:
+                return await validate_facebook_page_binding(
+                    page,
+                    {"accountReference": expected},
+                )
+            except FacebookPagePublishError as exc:
+                if exc.error_code == "facebook_page_content_permission_missing":
+                    raise
+            await asyncio.sleep(max(0.0, float(poll_interval_seconds)))
+
+    try:
+        return await asyncio.wait_for(
+            wait_for_exact_readback(),
+            timeout=max(0.001, float(timeout_seconds)),
+        )
+    except TimeoutError as exc:
+        raise _identity_mismatch() from exc
+    except FacebookPagePublishError:
+        raise
+    except (TypeError, ValueError) as exc:
+        raise _identity_mismatch() from exc
 
 
 def facebook_page_v1_enabled(environ: Mapping[str, str] = os.environ) -> bool:
