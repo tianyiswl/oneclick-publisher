@@ -25,6 +25,12 @@ from .silicon_evolution_publish_package import (
     load_frozen_wechat_publish_package,
 )
 from .overseas_tiktok_identity import normalize_tiktok_handle
+from .overseas_meta_content import (
+    build_facebook_page_caption,
+    facebook_page_caption_sha256,
+)
+from .overseas_meta_errors import FacebookPagePublishError
+from .overseas_meta_page_identity import facebook_page_v1_enabled
 from .tiktok_schedule_contract import (
     TikTokScheduleContractError,
     TikTokScheduleIntent,
@@ -204,6 +210,30 @@ def build_controlled_payloads(
         request, "controlled_request_invalid", "受控发布请求必须是 JSON 对象"
     )
     raw_targets = request.get("targets")
+    facebook_target_count = (
+        sum(
+            1
+            for item in raw_targets
+            if isinstance(item, Mapping)
+            and oneclick_capabilities.canonical_platform(
+                str(item.get("platform") or "")
+            )
+            == "Facebook Reels"
+        )
+        if isinstance(raw_targets, list)
+        else 0
+    )
+    if facebook_target_count:
+        if not facebook_page_v1_enabled():
+            raise ControlledPublishError(
+                "facebook_page_feature_disabled",
+                "Facebook Page 发布功能尚未开启。",
+            )
+        if len(raw_targets) != 1 or facebook_target_count != 1:
+            raise ControlledPublishError(
+                "facebook_unsupported_publish_setting",
+                "Facebook Page 首版一次只支持一个 Page 和一个视频。",
+            )
     has_tiktok_target = isinstance(raw_targets, list) and any(
         isinstance(item, Mapping)
         and oneclick_capabilities.canonical_platform(
@@ -229,6 +259,16 @@ def build_controlled_payloads(
         raise ControlledPublishError(
             "controlled_mode_invalid",
             "执行模式只能是 preflight、platform_form_check、formal 或 direct",
+        )
+    if facebook_target_count and mode == "direct":
+        raise ControlledPublishError(
+            "facebook_preflight_required",
+            "Facebook Page 首版必须先完成受控预检。",
+        )
+    if facebook_target_count and mode == "platform_form_check":
+        raise ControlledPublishError(
+            "facebook_unsupported_publish_setting",
+            "Facebook Page 首版只支持 preflight 和 formal 受控流程。",
         )
     if (
         mode == "platform_form_check"
@@ -267,6 +307,18 @@ def build_controlled_payloads(
     try:
         bundle = content_bundle.load_content_bundle(manifest_path)
     except content_bundle.ContentBundleError as exc:
+        if facebook_target_count:
+            message = str(exc)
+            if "视频包必须且只能包含一个视频素材" in message:
+                raise ControlledPublishError(
+                    "facebook_unsupported_publish_setting",
+                    "Facebook Page 首版一次只支持一个本地视频。",
+                ) from exc
+            if "assets[" in message and "不存在" in message:
+                raise ControlledPublishError(
+                    "facebook_video_file_invalid",
+                    "Facebook Page 视频素材无法安全读取。",
+                ) from exc
         raise ControlledPublishError("controlled_manifest_invalid", str(exc)) from exc
 
     targets = request.get("targets")
@@ -312,6 +364,21 @@ def build_controlled_payloads(
         oneclick_capabilities.canonical_platform(name): dict(value)
         for name, value in bundle["platformOverrides"].items()
     }
+    if facebook_target_count:
+        disclosure = dict(bundle.get("aiDisclosure") or {})
+        if (
+            bundle.get("contentType") != "video"
+            or len(bundle.get("assetPaths") or []) != 1
+            or bool((bundle.get("publishSchedule") or {}).get("enabled"))
+            or bool(disclosure.get("containsAiGeneratedContent"))
+            or bool(disclosure.get("contentKinds"))
+            or bool(disclosure.get("assetPaths"))
+            or bool(disclosure.get("allowPlatformAutoDeclaration"))
+        ):
+            raise ControlledPublishError(
+                "facebook_unsupported_publish_setting",
+                "Facebook Page 首版只支持单视频、立即公开发布。",
+            )
 
     payloads: list[dict[str, Any]] = []
     seen: set[tuple[int, int]] = set()
@@ -332,6 +399,11 @@ def build_controlled_payloads(
                 "tiktok_schedule_invalid",
                 "TikTok 排期字段、格式或时区无效",
             )
+        if target_unexpected and target_platform == "Facebook Reels":
+            raise ControlledPublishError(
+                "facebook_unsupported_publish_setting",
+                "Facebook Page 发布设置包含首版不支持的字段。",
+            )
         if target_unexpected:
             raise ControlledPublishError("controlled_target_invalid", "平台目标包含不支持字段")
         platform = target_platform
@@ -343,6 +415,13 @@ def build_controlled_payloads(
             raise ControlledPublishError("controlled_target_duplicate", "同一平台账号不能重复")
         seen.add((platform_type, account_id))
         account = by_id.get(account_id)
+        if platform_type == 9 and (
+            not account or int(account.get("type") or 0) != platform_type
+        ):
+            raise ControlledPublishError(
+                "facebook_account_invalid",
+                "Facebook Page 账号记录无效。",
+            )
         if not account or int(account.get("type") or 0) != platform_type:
             raise ControlledPublishError(
                 "controlled_account_mismatch", f"账号 {account_id} 不属于 {platform}"
@@ -356,6 +435,44 @@ def build_controlled_payloads(
         tiktok_schedule_intent: TikTokScheduleIntent | None = None
         tiktok_settings: dict[str, object] | None = None
         tiktok_video_sha256 = ""
+        facebook_expected_page_reference = ""
+        facebook_video_sha256 = ""
+        facebook_settings: dict[str, object] | None = None
+        if platform_type == 9:
+            if not str(account.get("filePath") or "").strip():
+                raise ControlledPublishError(
+                    "facebook_session_missing",
+                    "Facebook Page 账号缺少可用的本地会话引用。",
+                )
+            try:
+                facebook_expected_page_reference = (
+                    account_service.validate_saved_facebook_page_account(account)
+                )
+            except (FacebookPagePublishError, TypeError, ValueError):
+                raise ControlledPublishError(
+                    "facebook_account_invalid",
+                    "Facebook Page 账号记录无效。",
+                ) from None
+            if target.get("schedule") is not None:
+                raise ControlledPublishError(
+                    "facebook_unsupported_publish_setting",
+                    "Facebook Page 首版不支持定时发布。",
+                )
+            raw_settings = target.get("settings")
+            if (
+                not isinstance(raw_settings, Mapping)
+                or set(raw_settings) != {"visibility"}
+                or str(raw_settings.get("visibility") or "").strip().lower()
+                != "public"
+            ):
+                raise ControlledPublishError(
+                    "facebook_unsupported_publish_setting",
+                    "Facebook Page 首版必须明确选择立即公开发布。",
+                )
+            facebook_video_sha256 = _facebook_video_sha256(
+                Path(str(bundle["assetPaths"][0]))
+            )
+            facebook_settings = {"visibility": "public"}
         if platform_type == 6:
             tiktok_schedule_intent = _tiktok_target_schedule(
                 target.get("schedule"),
@@ -444,6 +561,17 @@ def build_controlled_payloads(
         if not title or not description:
             raise ControlledPublishError(
                 "controlled_platform_fields_missing", f"{platform}缺少独立标题或正文"
+            )
+        facebook_final_caption = ""
+        facebook_caption_sha256 = ""
+        if platform_type == 9:
+            facebook_final_caption = build_facebook_page_caption(
+                title=title,
+                body=description,
+                topics=tags,
+            )
+            facebook_caption_sha256 = facebook_page_caption_sha256(
+                facebook_final_caption
             )
         if platform_type == 6 and ("@" in title or "@" in description):
             raise ControlledPublishError(
@@ -558,6 +686,45 @@ def build_controlled_payloads(
                     "backgroundMode": True,
                 }
             )
+        elif platform_type == 9 and facebook_settings is not None:
+            manifest_intent = {
+                "schemaVersion": str(bundle.get("schemaVersion") or ""),
+                "contentType": str(bundle.get("contentType") or ""),
+                "title": str(bundle.get("title") or ""),
+                "body": str(bundle.get("body") or ""),
+                "tags": [str(item) for item in bundle.get("tags") or []],
+                "preferredPlatforms": sorted(
+                    oneclick_capabilities.canonical_platform(item)
+                    for item in bundle.get("preferredPlatforms") or []
+                ),
+                "platformOverride": dict(override),
+            }
+            encoded_manifest_intent = json.dumps(
+                manifest_intent,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            payload.update(facebook_settings)
+            payload.update(
+                {
+                    "coverPath": "",
+                    "coverPaths": {},
+                    "backgroundMode": False,
+                    "scheduleMode": "immediate",
+                    "scheduledAt": None,
+                    "facebookControlledPublish": True,
+                    "facebookExpectedPageReference": (
+                        facebook_expected_page_reference
+                    ),
+                    "facebookFinalCaption": facebook_final_caption,
+                    "facebookCaptionSha256": facebook_caption_sha256,
+                    "facebookVideoSha256": facebook_video_sha256,
+                    "facebookManifestIntentSha256": hashlib.sha256(
+                        encoded_manifest_intent.encode("utf-8")
+                    ).hexdigest(),
+                }
+            )
         payloads.append(payload)
     return payloads
 
@@ -583,8 +750,103 @@ def _stream_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def scope_fingerprint(payloads: Iterable[Mapping[str, Any]]) -> str:
-    """只对发布对象和内容做指纹；不把 Cookie 或会话文件写入授权。"""
+def _facebook_video_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise ControlledPublishError(
+            "facebook_video_file_invalid",
+            "Facebook Page 视频素材无法安全读取。",
+        ) from exc
+    return digest.hexdigest()
+
+
+def _publish_intent_projection(
+    payload: Mapping[str, Any],
+    *,
+    include_local_account_id: bool,
+) -> dict[str, Any]:
+    platform_type = int(payload.get("type") or 0)
+    if platform_type == 9:
+        projection: dict[str, Any] = {
+            "type": platform_type,
+            "contentType": str(payload.get("contentType") or ""),
+            "manifestIntentSha256": str(
+                payload.get("facebookManifestIntentSha256") or ""
+            ),
+            "title": str(payload.get("title") or ""),
+            "description": str(payload.get("description") or ""),
+            "tags": [str(item) for item in payload.get("tags") or []],
+            "assets": [
+                str(payload.get("facebookVideoSha256") or "")
+                or _file_identity(item)
+                for item in payload.get("fileList") or []
+            ],
+            "facebookExpectedPageReference": str(
+                payload.get("facebookExpectedPageReference") or ""
+            ),
+            "facebookFinalCaption": str(
+                payload.get("facebookFinalCaption") or ""
+            ),
+            "facebookCaptionSha256": str(
+                payload.get("facebookCaptionSha256") or ""
+            ),
+            "visibility": str(payload.get("visibility") or ""),
+            "scheduleMode": str(payload.get("scheduleMode") or ""),
+            "scheduledAt": str(payload.get("scheduledAt") or ""),
+            "scheduleTime": str(payload.get("scheduleTime") or ""),
+            "scheduleTimezone": str(payload.get("scheduleTimezone") or ""),
+            "enableTimer": bool(payload.get("enableTimer")),
+        }
+        if include_local_account_id:
+            projection["accountIds"] = [
+                int(item) for item in payload.get("accountIds") or []
+            ]
+        return projection
+
+    tiktok_video_sha256 = str(payload.get("tiktokVideoSha256") or "")
+    return {
+        "type": platform_type,
+        "accountIds": [int(item) for item in payload.get("accountIds") or []],
+        "contentType": str(payload.get("contentType") or ""),
+        "title": str(payload.get("title") or ""),
+        "description": str(payload.get("description") or ""),
+        "tags": [str(item) for item in payload.get("tags") or []],
+        "assets": (
+            [tiktok_video_sha256]
+            if platform_type == 6
+            else [_file_identity(item) for item in payload.get("fileList") or []]
+        ),
+        "cover": _file_identity(payload.get("coverPath")),
+        "scheduleMode": str(payload.get("scheduleMode") or ""),
+        "scheduledAt": str(payload.get("scheduledAt") or ""),
+        "scheduleTime": str(payload.get("scheduleTime") or ""),
+        "scheduleTimezone": str(payload.get("scheduleTimezone") or ""),
+        "originalDeclaration": bool(payload.get("originalDeclaration")),
+        "aiGenerated": bool(payload.get("aiGenerated")),
+        "aiDisclosure": payload.get("aiDisclosure") or {},
+        "visibility": str(payload.get("visibility") or ""),
+        "madeForKids": payload.get("madeForKids"),
+        "notifySubscribers": payload.get("notifySubscribers"),
+        "youtubeExpectedChannelId": str(
+            payload.get("youtubeExpectedChannelId") or ""
+        ),
+        "youtubeOfficialApi": bool(payload.get("youtubeOfficialApi")),
+        "tiktokExpectedAccountReference": str(
+            payload.get("tiktokExpectedAccountReference") or ""
+        ),
+        "tiktokExecutionIntent": str(
+            payload.get("tiktokExecutionIntent") or ""
+        ),
+        "tiktokVideoSha256": tiktok_video_sha256,
+    }
+
+
+def publish_intent_fingerprint(payloads: Iterable[Mapping[str, Any]]) -> str:
+    """Hash stable publish intent while excluding runtime/auth/session state."""
 
     payload_rows = [dict(payload) for payload in payloads]
     if (
@@ -594,52 +856,55 @@ def scope_fingerprint(payloads: Iterable[Mapping[str, Any]]) -> str:
         from .douyin_graphic_matrix_service import matrix_scope_fingerprint
 
         return matrix_scope_fingerprint(payload_rows[0])
-    normalized = []
-    for payload in payload_rows:
-        platform_type = int(payload.get("type") or 0)
-        tiktok_video_sha256 = str(payload.get("tiktokVideoSha256") or "")
-        normalized.append(
-            {
-                "type": platform_type,
-                "accountIds": [int(item) for item in payload.get("accountIds") or []],
-                "contentType": str(payload.get("contentType") or ""),
-                "title": str(payload.get("title") or ""),
-                "description": str(payload.get("description") or ""),
-                "tags": [str(item) for item in payload.get("tags") or []],
-                "assets": (
-                    [tiktok_video_sha256]
-                    if platform_type == 6
-                    else [
-                        _file_identity(item)
-                        for item in payload.get("fileList") or []
-                    ]
-                ),
-                "cover": _file_identity(payload.get("coverPath")),
-                "scheduleMode": str(payload.get("scheduleMode") or ""),
-                "scheduledAt": str(payload.get("scheduledAt") or ""),
-                "scheduleTime": str(payload.get("scheduleTime") or ""),
-                "scheduleTimezone": str(payload.get("scheduleTimezone") or ""),
-                "originalDeclaration": bool(payload.get("originalDeclaration")),
-                "aiGenerated": bool(payload.get("aiGenerated")),
-                "aiDisclosure": payload.get("aiDisclosure") or {},
-                "visibility": str(payload.get("visibility") or ""),
-                "madeForKids": payload.get("madeForKids"),
-                "notifySubscribers": payload.get("notifySubscribers"),
-                "youtubeExpectedChannelId": str(
-                    payload.get("youtubeExpectedChannelId") or ""
-                ),
-                "youtubeOfficialApi": bool(payload.get("youtubeOfficialApi")),
-                "tiktokExpectedAccountReference": str(
-                    payload.get("tiktokExpectedAccountReference") or ""
-                ),
-                "tiktokExecutionIntent": str(
-                    payload.get("tiktokExecutionIntent") or ""
-                ),
-                "tiktokVideoSha256": tiktok_video_sha256,
-            }
-        )
+    normalized = sorted(
+        (
+            _publish_intent_projection(
+                payload,
+                include_local_account_id=True,
+            )
+            for payload in payload_rows
+        ),
+        key=lambda item: json.dumps(
+            item,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    )
     encoded = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def facebook_replay_fingerprint(
+    payloads: Iterable[Mapping[str, Any]],
+) -> str:
+    """Hash one Page intent while excluding only the local account row ID."""
+
+    payload_rows = [dict(payload) for payload in payloads]
+    if len(payload_rows) != 1 or int(payload_rows[0].get("type") or 0) != 9:
+        raise ControlledPublishError(
+            "facebook_unsupported_publish_setting",
+            "Facebook Page 重放指纹只支持单 Page 请求。",
+        )
+    normalized = [
+        _publish_intent_projection(
+            payload_rows[0],
+            include_local_account_id=False,
+        )
+    ]
+    encoded = json.dumps(
+        normalized,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def scope_fingerprint(payloads: Iterable[Mapping[str, Any]]) -> str:
+    """Compatibility wrapper over the stable publish-intent fingerprint."""
+
+    return publish_intent_fingerprint(payloads)
 
 
 def _ensure_authorization_schema(conn: sqlite3.Connection) -> None:
