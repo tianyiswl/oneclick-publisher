@@ -268,6 +268,17 @@ class TikTokPublishContractTests(unittest.TestCase):
         self.assertEqual(prepared["scheduleMode"], "immediate")
         self.assertIsNone(prepared["scheduledAt"])
 
+    def test_legacy_root_schedule_object_is_always_rejected(self) -> None:
+        for legacy_schedule in (
+            {"enabled": False},
+            {"enabled": False, "timezone": "Asia/Shanghai"},
+        ):
+            with self.subTest(legacy_schedule=legacy_schedule):
+                self.assert_error_code(
+                    "tiktok_unsupported_publish_setting",
+                    self.payload(schedule=legacy_schedule),
+                )
+
     def test_scheduled_local_preflight_never_loads_playwright(self) -> None:
         payload = self.payload(
             enableTimer=True,

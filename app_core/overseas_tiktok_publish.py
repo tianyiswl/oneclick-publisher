@@ -433,6 +433,11 @@ def _validate_schedule_fields(payload: Mapping[str, Any]) -> TikTokScheduleInten
         )
     except TikTokScheduleContractError as exc:
         _fail(exc.error_code, exc.public_message)
+    if "schedule" in payload:
+        _fail(
+            "tiktok_unsupported_publish_setting",
+            "TikTok 不接受旧式根定时字段",
+        )
     if has_schedule_mode and (
         payload.get("scheduleMode") != intent.mode
         or payload.get("scheduledAt") != intent.local_time
