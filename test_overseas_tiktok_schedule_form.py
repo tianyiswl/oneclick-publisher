@@ -288,6 +288,40 @@ class HangingScheduleLocator:
         raise AssertionError("unreachable")
 
 
+class TransientCountThenEmptyLocator:
+    """A real Playwright transient while a later selector is enumerated."""
+
+    def __init__(self, failures: int) -> None:
+        self._failures = failures
+
+    async def count(self) -> int:
+        if self._failures:
+            self._failures -= 1
+            raise PlaywrightError(
+                "Execution context was destroyed, most likely because of a navigation"
+            )
+        return 0
+
+    def nth(self, index: int) -> object:
+        raise IndexError(index)
+
+
+class TransientVisibilityScheduleControl(FakeScheduleControl):
+    """A real Playwright transient while the second candidate is checked."""
+
+    def __init__(self, *args: object, visibility_failures: int, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self._playwright_visibility_failures = visibility_failures
+
+    async def is_visible(self) -> bool:
+        if self._playwright_visibility_failures:
+            self._playwright_visibility_failures -= 1
+            raise PlaywrightError(
+                "Execution context was destroyed, most likely because of a navigation"
+            )
+        return await super().is_visible()
+
+
 class HandleRecord:
     def __init__(self, identity: str) -> None:
         self.identity = identity
@@ -802,6 +836,81 @@ class TikTokScheduleFormTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(raised.exception.error_code, "tiktok_schedule_control_ambiguous")
         self.assertEqual(clock.sleeps, [0.25, 0.25])
+
+    async def test_later_selector_transient_discards_the_whole_observation(self) -> None:
+        record = HandleRecord("upload-schedule")
+        base = LiveScheduleBase(
+            {
+                SCHEDULE_TOGGLE_SELECTORS[0]: WrapperScheduleLocator(
+                    [lambda: HandleWrapper(record)]
+                ),
+                SCHEDULE_TOGGLE_SELECTORS[1]: TransientCountThenEmptyLocator(2),
+            }
+        )
+        page = FakeSchedulePage()
+        clock = FakeClock()
+        form, _, _ = self.form(page, [base] * 8, clock=clock)
+
+        control = await form._schedule_control(
+            SCHEDULE_TOGGLE_SELECTORS,
+            setting="schedule choice",
+            editable=False,
+        )
+
+        self.assertIsInstance(control, HandleWrapper)
+        self.assertEqual(clock.sleeps, [0.25, 0.25, 0.25])
+
+    async def test_top_page_transient_discards_upload_scope_observation(self) -> None:
+        record = HandleRecord("upload-schedule")
+        base = LiveScheduleBase(
+            {
+                SCHEDULE_TOGGLE_SELECTORS[0]: WrapperScheduleLocator(
+                    [lambda: HandleWrapper(record)]
+                ),
+            }
+        )
+        page = ContextSchedulePage(
+            {SCHEDULE_TOGGLE_SELECTORS[1]: TransientCountThenEmptyLocator(2)}
+        )
+        clock = FakeClock()
+        form, _, _ = self.form(page, [base] * 8, clock=clock)
+
+        control = await form._schedule_control(
+            SCHEDULE_TOGGLE_SELECTORS,
+            setting="schedule choice",
+            editable=False,
+        )
+
+        self.assertIsInstance(control, HandleWrapper)
+        self.assertEqual(clock.sleeps, [0.25, 0.25, 0.25])
+
+    async def test_second_candidate_transient_discards_the_whole_observation(self) -> None:
+        first = FakeScheduleControl("first-schedule", "switch", checked=True)
+        second = TransientVisibilityScheduleControl(
+            "second-schedule",
+            "switch",
+            checked=True,
+            visibility_failures=2,
+        )
+        base = LiveScheduleBase(
+            {
+                SCHEDULE_TOGGLE_SELECTORS[0]: LiveScheduleLocator([first]),
+                SCHEDULE_TOGGLE_SELECTORS[1]: LiveScheduleLocator([second]),
+            }
+        )
+        page = FakeSchedulePage()
+        clock = FakeClock()
+        form, _, _ = self.form(page, [base] * 8, clock=clock)
+
+        with self.assertRaises(TikTokPublishError) as raised:
+            await form._schedule_control(
+                SCHEDULE_TOGGLE_SELECTORS,
+                setting="schedule choice",
+                editable=False,
+            )
+
+        self.assertEqual(raised.exception.error_code, "tiktok_schedule_control_ambiguous")
+        self.assertEqual(clock.sleeps, [0.25, 0.25, 0.25])
 
     async def test_distinct_handle_wrappers_for_one_dom_node_are_stable(self) -> None:
         record = HandleRecord("same-dom")

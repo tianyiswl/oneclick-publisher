@@ -155,6 +155,10 @@ class _FrozenScheduleCandidate:
     scope: Literal["upload", "top_page"]
 
 
+class _IncompleteScheduleObservation(Exception):
+    """A transient made this control observation incomplete."""
+
+
 def _shanghai_now() -> datetime:
     return datetime.now(ZoneInfo("Asia/Shanghai"))
 
@@ -474,7 +478,7 @@ class TikTokScheduleForm:
             except BaseException as exc:
                 if not self._is_transient_control_error(exc):
                     raise
-                continue
+                raise _IncompleteScheduleObservation() from exc
         return candidates
 
     async def _choice_checked(
@@ -514,7 +518,7 @@ class TikTokScheduleForm:
             except BaseException as exc:
                 if not self._is_transient_control_error(exc):
                     raise
-                continue
+                raise _IncompleteScheduleObservation() from exc
             usable.append(candidate)
         return usable
 
@@ -561,6 +565,10 @@ class TikTokScheduleForm:
                 usable = await self._usable_schedule_candidates(
                     candidates, editable=editable, checked=checked, deadline=deadline
                 )
+            except _IncompleteScheduleObservation:
+                scopes = ()
+                candidates = []
+                usable = []
             except BaseException as exc:
                 if not self._is_transient_control_error(exc):
                     raise
