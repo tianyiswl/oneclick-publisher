@@ -70,3 +70,13 @@ The actual TikTok account may still lack scheduling eligibility, render a differ
 Initial repair: `49f5395`
 
 Review remediation implementation: `6c80a25ced742b20345fab2c44a0df23c50b0a97` (`fix(tiktok): harden schedule control polling`)
+
+## Review remediation (round 2)
+
+- Frozen-node comparison now uses the fake `node_id` seam only for immutable test nodes; real element handles compare with the exact Playwright `evaluate("(element, other) => element === other", other_handle)` protocol within the remaining deadline. Comparison errors propagate unless they are classified detached/remount/timeout transitions.
+- Added protocol coverage for fresh Python wrappers of one real DOM node, duplicate same-node matches across two selectors, stable distinct handle nodes, and a broken comparison protocol. Added a real wall-clock 0.01-second deadline test; poll sleep is now `min(250 ms, remaining budget)` and itself is bounded.
+- GREEN: protocol adversarial tests `5/5`; schedule form `43/43` in `14.549s`; focused publishing chain `334/334` in `15.784s`; explicit affected suite `551/551` in `17.221s`.
+- Diff checks passed before the implementation commit. Implementation-only scope against `3d222d6` was `changed=2`, both overseas-owned, `scope-check: OK`.
+- Current `origin/main` scope reports `changed=64` and `REVIEW_REQUIRED`: it includes the branch's pre-existing shared changes plus this required ignored-path report (`outside`). It is not an implementation scope failure.
+
+Round 2 implementation: `dc020340f5fad7114228813b32be0e38a0b5e178` (`fix(tiktok): compare frozen schedule handles`)
