@@ -36,6 +36,9 @@ TEST_ROW_ACCOUNT_REFERENCE_SELECTORS = (
     'a[data-e2e="content-row-account"][href*="/@"]',
     'a[data-e2e="account-link"][href*="/@"]',
 )
+EXACT_SCHEDULE_RADIO_SELECTOR = (
+    '[data-e2e="schedule-settings"] [role="radio"][aria-label="Schedule"]'
+)
 
 
 class FakeScheduleLocator:
@@ -110,7 +113,7 @@ class FakeScheduleControl:
         if not self.visible or not self.enabled:
             raise RuntimeError(f"unusable control: {self.node_id}")
         self.click_count += 1
-        if self.semantic_role == "switch":
+        if self.semantic_role in {"switch", "radio", "checkbox"}:
             self.checked = not self.checked
         if self.on_click is not None:
             self.on_click(self)
@@ -532,6 +535,139 @@ class TikTokScheduleFormTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(raised.exception.error_code, "tiktok_schedule_unavailable")
 
+    async def test_configure_accepts_an_exact_schedule_radio_choice(self) -> None:
+        page, bases = scheduled_form_page(toggle_count=0)
+        radio = FakeScheduleControl(
+            "schedule-radio",
+            "radio",
+            label="Schedule",
+            checked=False,
+        )
+        bases[0].register(EXACT_SCHEDULE_RADIO_SELECTOR, radio)
+        clock = FakeClock()
+        form, _, _ = self.form(page, bases, clock=clock)
+
+        await form.configure(self.target)
+
+        self.assertTrue(radio.checked)
+        self.assertEqual(radio.click_count, 1)
+        self.assertEqual(bases[0].by_role("final_action")[0].click_count, 0)
+
+    async def test_configure_waits_for_delayed_exact_schedule_radio_choice(
+        self,
+    ) -> None:
+        page, bases = scheduled_form_page(toggle_count=0)
+        radio = FakeScheduleControl(
+            "delayed-schedule-radio",
+            "radio",
+            label="Schedule",
+        )
+        clock = FakeClock()
+        clock.on_sleep = lambda _seconds: bases[0].register(
+            EXACT_SCHEDULE_RADIO_SELECTOR,
+            radio,
+        )
+        form, _, _ = self.form(page, bases, clock=clock)
+
+        await form.configure(self.target)
+
+        self.assertGreaterEqual(len(clock.sleeps), 2)
+        self.assertEqual(radio.click_count, 1)
+
+    async def test_configure_waits_for_disabled_radio_then_rechecks_its_choice(
+        self,
+    ) -> None:
+        page, bases = scheduled_form_page(toggle_count=0)
+        radio = FakeScheduleControl(
+            "disabled-then-enabled-radio",
+            "radio",
+            label="Schedule",
+            enabled=False,
+        )
+        bases[0].register(EXACT_SCHEDULE_RADIO_SELECTOR, radio)
+        clock = FakeClock()
+        clock.on_sleep = lambda _seconds: setattr(radio, "enabled", True)
+        form, _, _ = self.form(page, bases, clock=clock)
+
+        await form.configure(self.target)
+
+        self.assertTrue(radio.checked)
+        self.assertEqual(radio.click_count, 1)
+
+    async def test_configure_discards_detached_radio_and_uses_stable_remount(
+        self,
+    ) -> None:
+        page, bases = scheduled_form_page(toggle_count=0)
+        first = FakeScheduleControl("schedule-radio-before-remount", "radio", label="Schedule")
+        replacement = FakeScheduleControl(
+            "schedule-radio-after-remount",
+            "radio",
+            label="Schedule",
+        )
+        bases[0].register(EXACT_SCHEDULE_RADIO_SELECTOR, first)
+        clock = FakeClock()
+
+        def remount(_seconds: float) -> None:
+            first.detached = True
+            bases[0]._registered[EXACT_SCHEDULE_RADIO_SELECTOR] = [replacement]
+
+        clock.on_sleep = remount
+        form, _, _ = self.form(page, bases, clock=clock)
+
+        await form.configure(self.target)
+
+        self.assertEqual(first.click_count, 0)
+        self.assertEqual(replacement.click_count, 1)
+
+    async def test_configure_resolves_unique_top_page_radio_when_upload_base_is_iframe(
+        self,
+    ) -> None:
+        page, bases = scheduled_form_page(toggle_count=0)
+        radio = FakeScheduleControl("top-page-schedule-radio", "radio", label="Schedule")
+        page.register(EXACT_SCHEDULE_RADIO_SELECTOR, radio)
+        clock = FakeClock()
+        form, _, _ = self.form(page, bases, clock=clock)
+
+        await form.configure(self.target)
+
+        self.assertEqual(radio.click_count, 1)
+        self.assertEqual(bases[0].by_role("final_action")[0].click_count, 0)
+
+    async def test_same_schedule_radio_in_both_scopes_is_deduplicated(self) -> None:
+        page, bases = scheduled_form_page(toggle_count=0)
+        radio = FakeScheduleControl("shared-schedule-radio", "radio", label="Schedule")
+        bases[0].register(EXACT_SCHEDULE_RADIO_SELECTOR, radio)
+        page.register(EXACT_SCHEDULE_RADIO_SELECTOR, radio)
+        clock = FakeClock()
+        form, _, _ = self.form(page, bases, clock=clock)
+
+        await form.configure(self.target)
+
+        self.assertEqual(radio.click_count, 1)
+
+    async def test_distinct_schedule_radios_across_base_and_top_page_are_ambiguous(
+        self,
+    ) -> None:
+        page, bases = scheduled_form_page(toggle_count=0)
+        bases[0].register(
+            EXACT_SCHEDULE_RADIO_SELECTOR,
+            FakeScheduleControl("iframe-schedule-radio", "radio", label="Schedule"),
+        )
+        page.register(
+            EXACT_SCHEDULE_RADIO_SELECTOR,
+            FakeScheduleControl("top-page-schedule-radio", "radio", label="Schedule"),
+        )
+        clock = FakeClock()
+        form, _, _ = self.form(page, bases, clock=clock)
+
+        with self.assertRaises(TikTokPublishError) as raised:
+            await form.configure(self.target)
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "tiktok_schedule_control_ambiguous",
+        )
+
     async def test_configure_allows_final_action_to_become_ready_after_upload_processing(self) -> None:
         page, bases = scheduled_form_page()
         final_button = bases[0].by_role("final_action")[0]
@@ -630,19 +766,23 @@ class TikTokScheduleFormTests(unittest.IsolatedAsyncioTestCase):
             time_value="15:59",
             remount_after_writes=True,
         )
-        form, resolver, _ = self.form(page, bases)
+        stable_bases = [
+            bases[index]
+            for index in (0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3)
+        ]
+        form, resolver, _ = self.form(page, stable_bases)
 
         snapshot = await form.configure(self.target)
 
         self.assertEqual(snapshot.scheduled_at, "2026-08-29 15:00")
-        self.assertEqual(resolver.await_count, 6)
+        self.assertEqual(resolver.await_count, 12)
         self.assertEqual(bases[0].by_role("switch")[0].click_count, 1)
-        self.assertEqual(bases[2].by_role("date")[0].fill_count, 1)
-        self.assertEqual(bases[4].by_role("time")[0].fill_count, 1)
+        self.assertEqual(bases[1].by_role("date")[0].fill_count, 1)
+        self.assertEqual(bases[2].by_role("time")[0].fill_count, 1)
         used_node_ids = {
             bases[0].by_role("switch")[0].node_id,
-            bases[2].by_role("date")[0].node_id,
-            bases[4].by_role("time")[0].node_id,
+            bases[1].by_role("date")[0].node_id,
+            bases[2].by_role("time")[0].node_id,
         }
         self.assertEqual(len(used_node_ids), 3)
 

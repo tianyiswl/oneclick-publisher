@@ -21,6 +21,21 @@ SCHEDULE_TOGGLE_SELECTORS = (
     '[role="switch"][aria-label*="schedule" i]',
     '[role="switch"][aria-label*="定时"]',
 )
+SCHEDULE_CHOICE_SELECTORS = SCHEDULE_TOGGLE_SELECTORS + (
+    '[data-e2e="schedule-settings"] [role="radio"][aria-label="Schedule"]',
+    '[data-e2e*="schedule" i] [role="radio"][aria-label="Schedule"]',
+    '[data-e2e*="schedule" i] [role="radio"][aria-label="定时发布"]',
+    '[data-e2e*="schedule" i] [role="radio"][aria-label="排期"]',
+    '[data-e2e*="schedule" i] [role="checkbox"][aria-label="Schedule"]',
+    '[data-e2e*="schedule" i] [role="checkbox"][aria-label="定时发布"]',
+    '[data-e2e*="schedule" i] [role="checkbox"][aria-label="排期"]',
+    '[role="radio"][aria-label="Schedule"]',
+    '[role="radio"][aria-label="定时发布"]',
+    '[role="radio"][aria-label="排期"]',
+    '[role="checkbox"][aria-label="Schedule"]',
+    '[role="checkbox"][aria-label="定时发布"]',
+    '[role="checkbox"][aria-label="排期"]',
+)
 SCHEDULE_DATE_SELECTORS = (
     '[data-e2e*="schedule" i] input[type="date"]',
     'input[aria-label*="date" i]',
@@ -79,6 +94,8 @@ _SCHEDULE_SUCCESS_MESSAGES = frozenset(
 )
 _POLL_INTERVAL_SECONDS = 1.0
 _OUTCOME_TIMEOUT_SECONDS = 120.0
+_CONTROL_POLL_INTERVAL_SECONDS = 0.25
+_CONTROL_POLL_OBSERVATIONS = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,35 +250,6 @@ async def _visible_enabled_final_buttons(base: Any) -> list[tuple[Any, str]]:
     return buttons
 
 
-async def _one_schedule_control(
-    base: Any,
-    selectors: tuple[str, ...],
-    *,
-    editable: bool,
-) -> Any:
-    usable: list[Any] = []
-    for candidate in await _bounded_candidates(base, selectors):
-        if not await candidate.is_visible() or not await candidate.is_enabled():
-            continue
-        if editable:
-            if not await candidate.is_editable():
-                continue
-            if await candidate.get_attribute("readonly") is not None:
-                continue
-        usable.append(candidate)
-    if not usable:
-        raise TikTokPublishError(
-            "tiktok_schedule_unavailable",
-            "TikTok 上传页没有唯一可用的定时控件",
-        )
-    if len(usable) != 1:
-        raise TikTokPublishError(
-            "tiktok_schedule_control_ambiguous",
-            "TikTok 定时控件不唯一",
-        )
-    return usable[0]
-
-
 async def _switch_enabled(control: Any) -> bool:
     aria_checked = _normalized_label(await control.get_attribute("aria-checked"))
     if aria_checked in {"true", "false"}:
@@ -344,45 +332,133 @@ class TikTokScheduleForm:
         self._readback_page: Any | None = None
         self._readback_route_loaded = False
 
+    async def _schedule_scopes(self) -> tuple[Any, ...]:
+        upload_base = await self._resolve_base()
+        if upload_base is self._page:
+            return (upload_base,)
+        return (upload_base, self._page)
+
+    @staticmethod
+    async def _usable_schedule_candidates(
+        scopes: tuple[Any, ...],
+        selectors: tuple[str, ...],
+        *,
+        editable: bool,
+        checked: bool | None,
+    ) -> tuple[list[Any], int]:
+        candidates: list[Any] = []
+        for scope in scopes:
+            try:
+                scoped_candidates = await _bounded_candidates(scope, selectors)
+            except Exception:
+                continue
+            for candidate in scoped_candidates:
+                await _append_unique(candidates, candidate)
+
+        usable: list[Any] = []
+        for candidate in candidates:
+            try:
+                if not await candidate.is_visible() or not await candidate.is_enabled():
+                    continue
+                if editable:
+                    if not await candidate.is_editable():
+                        continue
+                    if await candidate.get_attribute("readonly") is not None:
+                        continue
+                if checked is not None and await _switch_enabled(candidate) != checked:
+                    continue
+            except Exception:
+                continue
+            usable.append(candidate)
+        return usable, len(candidates)
+
+    async def _schedule_control(
+        self,
+        selectors: tuple[str, ...],
+        *,
+        setting: Literal["schedule choice", "date", "time"],
+        editable: bool,
+        checked: bool | None = None,
+    ) -> Any:
+        stable_candidate: Any | None = None
+        prior_multiple = False
+        last_scope_count = 0
+        last_candidate_count = 0
+        last_usable_count = 0
+        for observation in range(_CONTROL_POLL_OBSERVATIONS):
+            try:
+                scopes = await self._schedule_scopes()
+            except Exception:
+                scopes = ()
+            usable, candidate_count = await self._usable_schedule_candidates(
+                scopes,
+                selectors,
+                editable=editable,
+                checked=checked,
+            )
+            last_scope_count = len(scopes)
+            last_candidate_count = candidate_count
+            last_usable_count = len(usable)
+            if len(usable) == 1:
+                candidate = usable[0]
+                if (
+                    stable_candidate is not None
+                    and await _same_dom_node(stable_candidate, candidate)
+                ):
+                    return candidate
+                stable_candidate = candidate
+                prior_multiple = False
+            elif len(usable) > 1:
+                if prior_multiple:
+                    raise TikTokPublishError(
+                        "tiktok_schedule_control_ambiguous",
+                        f"TikTok {setting} ambiguous (scopes={last_scope_count}, "
+                        f"candidates={last_candidate_count}, usable={last_usable_count})",
+                    )
+                stable_candidate = None
+                prior_multiple = True
+            else:
+                stable_candidate = None
+                prior_multiple = False
+            if observation + 1 < _CONTROL_POLL_OBSERVATIONS:
+                await self._sleep(_CONTROL_POLL_INTERVAL_SECONDS)
+        raise TikTokPublishError(
+            "tiktok_schedule_unavailable",
+            f"TikTok {setting} unavailable (scopes={last_scope_count}, "
+            f"candidates={last_candidate_count}, usable={last_usable_count})",
+        )
+
     async def configure(
         self,
         target: TikTokScheduleTarget,
     ) -> TikTokScheduleFormSnapshot:
         date_value, time_value = self._target_values(target)
 
-        base = await self._resolve_base()
-        toggle = await _one_schedule_control(
-            base,
-            SCHEDULE_TOGGLE_SELECTORS,
+        toggle = await self._schedule_control(
+            SCHEDULE_CHOICE_SELECTORS,
+            setting="schedule choice",
             editable=False,
         )
         if not await _switch_enabled(toggle):
             await toggle.click()
 
-        base = await self._resolve_base()
-        toggle = await _one_schedule_control(
-            base,
-            SCHEDULE_TOGGLE_SELECTORS,
+        toggle = await self._schedule_control(
+            SCHEDULE_CHOICE_SELECTORS,
+            setting="schedule choice",
             editable=False,
+            checked=True,
         )
-        if not await _switch_enabled(toggle):
-            raise TikTokPublishError(
-                "tiktok_schedule_readback_mismatch",
-                "TikTok 定时开关写入后回读不一致",
-            )
 
-        base = await self._resolve_base()
-        date_control = await _one_schedule_control(
-            base,
+        date_control = await self._schedule_control(
             SCHEDULE_DATE_SELECTORS,
+            setting="date",
             editable=True,
         )
         await date_control.fill(date_value)
 
-        base = await self._resolve_base()
-        date_control = await _one_schedule_control(
-            base,
+        date_control = await self._schedule_control(
             SCHEDULE_DATE_SELECTORS,
+            setting="date",
             editable=True,
         )
         if str(await date_control.input_value()) != date_value:
@@ -391,18 +467,16 @@ class TikTokScheduleForm:
                 "TikTok 定时日期写入后回读不一致",
             )
 
-        base = await self._resolve_base()
-        time_control = await _one_schedule_control(
-            base,
+        time_control = await self._schedule_control(
             SCHEDULE_TIME_SELECTORS,
+            setting="time",
             editable=True,
         )
         await time_control.fill(time_value)
 
-        base = await self._resolve_base()
-        time_control = await _one_schedule_control(
-            base,
+        time_control = await self._schedule_control(
             SCHEDULE_TIME_SELECTORS,
+            setting="time",
             editable=True,
         )
         if str(await time_control.input_value()) != time_value:
@@ -425,22 +499,16 @@ class TikTokScheduleForm:
     ) -> TikTokScheduleFormSnapshot:
         date_value, time_value = self._target_values(target)
 
-        base = await self._resolve_base()
-        toggle = await _one_schedule_control(
-            base,
-            SCHEDULE_TOGGLE_SELECTORS,
+        await self._schedule_control(
+            SCHEDULE_CHOICE_SELECTORS,
+            setting="schedule choice",
             editable=False,
+            checked=True,
         )
-        if not await _switch_enabled(toggle):
-            raise TikTokPublishError(
-                "tiktok_schedule_readback_mismatch",
-                "TikTok 定时开关回读未开启",
-            )
 
-        base = await self._resolve_base()
-        date_control = await _one_schedule_control(
-            base,
+        date_control = await self._schedule_control(
             SCHEDULE_DATE_SELECTORS,
+            setting="date",
             editable=True,
         )
         if str(await date_control.input_value()) != date_value:
@@ -449,10 +517,9 @@ class TikTokScheduleForm:
                 "TikTok 定时日期回读不一致",
             )
 
-        base = await self._resolve_base()
-        time_control = await _one_schedule_control(
-            base,
+        time_control = await self._schedule_control(
             SCHEDULE_TIME_SELECTORS,
+            setting="time",
             editable=True,
         )
         if str(await time_control.input_value()) != time_value:
