@@ -696,6 +696,143 @@ class TikTokFormAdapterTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.error_code, "tiktok_upload_entry_timeout")
 
+    def test_upload_does_not_click_a_button_when_deadline_expires_after_lookup(self) -> None:
+        class Clock:
+            now = 0.0
+
+            def time(self) -> float:
+                return self.now
+
+        class EmptyLocator:
+            @property
+            def first(self):
+                return self
+
+            async def count(self) -> int:
+                return 0
+
+        class ExpiringButton:
+            @property
+            def first(self):
+                return self
+
+            async def count(self) -> int:
+                clock.now = 10.0
+                return 1
+
+            async def click(self, **_kwargs) -> None:
+                raise AssertionError("click attempted after deadline")
+
+        class ExpiringPage:
+            url = tiktok_uploader.UPLOAD_URL
+
+            def locator(self, _selector: str):
+                return EmptyLocator()
+
+            def get_by_role(self, *_args, **_kwargs):
+                return ExpiringButton()
+
+            def expect_file_chooser(self, **_kwargs):
+                raise AssertionError("chooser entered after deadline")
+
+            async def wait_for_timeout(self, _milliseconds: int) -> None:
+                return None
+
+        clock = Clock()
+        app = TiktokVideo(
+            "Title",
+            "/tmp/missing-upload.mp4",
+            [],
+            0,
+            "/not/used.json",
+            execution_mode="platform_form_check",
+        )
+        app._wait_for_manual_intervention = AsyncMock(return_value=None)
+
+        with (
+            patch.object(tiktok_uploader, "UPLOAD_ENTRY_TIMEOUT_SECONDS", 10),
+            patch.object(tiktok_uploader.asyncio, "get_running_loop", return_value=clock),
+            self.assertRaises(TikTokPublishError) as raised,
+        ):
+            asyncio.run(app._upload_file(ExpiringPage(), ExpiringPage()))
+
+        self.assertEqual(raised.exception.error_code, "tiktok_upload_entry_timeout")
+
+    def test_upload_button_click_uses_the_remaining_deadline_budget(self) -> None:
+        class Clock:
+            now = 0.0
+
+            def time(self) -> float:
+                return self.now
+
+        class EmptyLocator:
+            @property
+            def first(self):
+                return self
+
+            async def count(self) -> int:
+                clock.now = 6.0
+                return 0
+
+        class UploadButton:
+            @property
+            def first(self):
+                return self
+
+            async def count(self) -> int:
+                return 1
+
+            async def click(self, *, timeout=None) -> None:
+                self.click_timeout = timeout
+                raise TikTokPublishError("test_stop", "stop after recording timeout")
+
+        class ChooserContext:
+            async def __aenter__(self):
+                return object()
+
+            async def __aexit__(self, *_args):
+                return False
+
+        class UploadButtonPage:
+            url = tiktok_uploader.UPLOAD_URL
+
+            def __init__(self) -> None:
+                self.button = UploadButton()
+                self.chooser_timeout = None
+
+            def locator(self, _selector: str):
+                return EmptyLocator()
+
+            def get_by_role(self, *_args, **_kwargs):
+                return self.button
+
+            def expect_file_chooser(self, *, timeout):
+                self.chooser_timeout = timeout
+                return ChooserContext()
+
+        clock = Clock()
+        page = UploadButtonPage()
+        app = TiktokVideo(
+            "Title",
+            "/tmp/missing-upload.mp4",
+            [],
+            0,
+            "/not/used.json",
+            execution_mode="platform_form_check",
+        )
+        app._wait_for_manual_intervention = AsyncMock(return_value=None)
+
+        with (
+            patch.object(tiktok_uploader, "UPLOAD_ENTRY_TIMEOUT_SECONDS", 10),
+            patch.object(tiktok_uploader.asyncio, "get_running_loop", return_value=clock),
+            self.assertRaises(TikTokPublishError) as raised,
+        ):
+            asyncio.run(app._upload_file(page, page))
+
+        self.assertEqual(raised.exception.error_code, "test_stop")
+        self.assertEqual(page.chooser_timeout, 4_000)
+        self.assertEqual(page.button.click_timeout, 4_000)
+
     def test_caption_editor_waits_for_uploaded_video_form_to_render(self) -> None:
         class EmptyLocator:
             @property

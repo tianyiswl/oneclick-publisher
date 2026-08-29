@@ -258,9 +258,14 @@ class TiktokVideo:
                 try:
                     if not await button.count():
                         continue
-                    remaining_ms = int(max(1, (deadline - loop.time()) * 1000))
+                    remaining_ms = int((deadline - loop.time()) * 1000)
+                    if remaining_ms <= 0:
+                        break
                     async with page.expect_file_chooser(timeout=remaining_ms) as chooser_info:
-                        await button.click()
+                        remaining_ms = int((deadline - loop.time()) * 1000)
+                        if remaining_ms <= 0:
+                            break
+                        await button.click(timeout=remaining_ms)
                     chooser = await chooser_info.value
                     await chooser.set_files(self.file_path)
                     return
