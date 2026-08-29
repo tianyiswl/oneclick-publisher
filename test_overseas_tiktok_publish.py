@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 from app_core import (
     account_service,
@@ -638,6 +638,7 @@ class TikTokPublishContractTests(unittest.TestCase):
                             "origin": "https://www.tiktok.com",
                             "localStorage": [
                                 {"name": "theme", "value": "dark"},
+                                {"name": "", "value": "platform-created"},
                             ],
                         }
                     ],
@@ -1095,6 +1096,13 @@ class TikTokPlatformSyncTests(unittest.TestCase):
         cleanup_error: Exception | None = None,
     ):
         uploader = uploader or self.fake_uploader()
+        identity_page = SimpleNamespace(
+            url="https://www.tiktok.com/",
+            goto=AsyncMock(return_value=None),
+            reload=AsyncMock(return_value=None),
+            wait_for_timeout=AsyncMock(return_value=None),
+            close=AsyncMock(return_value=None),
+        )
         page = SimpleNamespace(
             url="about:blank",
             goto=AsyncMock(return_value=None),
@@ -1102,16 +1110,16 @@ class TikTokPlatformSyncTests(unittest.TestCase):
             close=AsyncMock(return_value=None),
         )
         context = SimpleNamespace(
-            new_page=AsyncMock(return_value=page),
+            new_page=AsyncMock(side_effect=[identity_page, page]),
             close=AsyncMock(
                 side_effect=cleanup_error,
                 return_value=None,
             ),
         )
         browser = SimpleNamespace(close=AsyncMock(return_value=None))
+        playwright = SimpleNamespace(stop=AsyncMock(return_value=None))
         manager = SimpleNamespace(
-            start=AsyncMock(return_value=object()),
-            stop=AsyncMock(return_value=None),
+            start=AsyncMock(return_value=playwright),
         )
         events: list[str] = []
         event_sink = event_sink if event_sink is not None else []
@@ -1151,7 +1159,7 @@ class TikTokPlatformSyncTests(unittest.TestCase):
             patch.object(overseas_tiktok_publish, "_read_account_record", account_reader),
             patch.object(
                 overseas_tiktok_publish,
-                "read_tiktok_identity",
+                "read_tiktok_signed_in_navigation_identity",
                 new=identity_reader,
                 create=True,
             ),
@@ -1225,10 +1233,12 @@ class TikTokPlatformSyncTests(unittest.TestCase):
             result=result,
             uploader=uploader,
             uploader_type=uploader_type,
+            identity_page=identity_page,
             page=page,
             context=context,
             browser=browser,
             manager=manager,
+            playwright=playwright,
             events=events,
             identity_reader=identity_reader,
             account_reader=account_reader,
@@ -1250,6 +1260,42 @@ class TikTokPlatformSyncTests(unittest.TestCase):
         self.assertIn("tiktok_platform_form_started", run.events)
         self.assertIn("tiktok_platform_form_verified", run.events)
         self.assertNotIn("tiktok_final_action_triggered", run.events)
+
+    def test_platform_form_check_stops_started_playwright(self) -> None:
+        run = self.run_sync(mode="platform_form_check")
+
+        run.playwright.stop.assert_awaited_once_with()
+
+    def test_platform_identity_is_verified_by_account_navigation_not_upload_form(self) -> None:
+        run = self.run_sync(mode="platform_form_check")
+
+        self.assertEqual(run.context.new_page.await_count, 2)
+        identity_probe_url = "https://www.tiktok.com/@expected.user"
+        self.assertEqual(
+            run.identity_page.goto.await_args_list,
+            [
+                call(
+                    identity_probe_url,
+                    wait_until="domcontentloaded",
+                    timeout=120_000,
+                ),
+                call(
+                    identity_probe_url,
+                    wait_until="domcontentloaded",
+                    timeout=120_000,
+                ),
+            ],
+        )
+        run.page.goto.assert_awaited_once_with(
+            overseas_tiktok_publish.TIKTOK_UPLOAD_URL,
+            wait_until="domcontentloaded",
+            timeout=120_000,
+        )
+        self.assertEqual(
+            [call.args[0] for call in run.identity_reader.await_args_list],
+            [run.identity_page, run.identity_page],
+        )
+        run.identity_page.reload.assert_not_awaited()
 
     def test_formal_uses_same_prepared_page_then_submits_once(self) -> None:
         run = self.run_sync(mode="formal")
@@ -1409,7 +1455,19 @@ class TikTokPlatformSyncTests(unittest.TestCase):
         self.assertIn("tiktok_waiting_user_verification", run.events)
         self.assertIn("tiktok_user_verification_resolved", run.events)
 
-    def test_identity_checks_wait_for_challenges_on_same_page_without_reupload(self) -> None:
+    def test_form_stage_observer_records_the_last_safe_stage(self) -> None:
+        uploader = self.fake_uploader()
+
+        async def prepare(_page, _base):
+            uploader.form_stage_observer("caption_editor_waiting")
+            return self.form_receipt()
+
+        uploader.prepare_form = AsyncMock(side_effect=prepare)
+        run = self.run_sync(mode="platform_form_check", uploader=uploader)
+
+        self.assertIn("tiktok_form_caption_editor_waiting", run.events)
+
+    def test_identity_checks_wait_for_challenges_in_same_context_without_reupload(self) -> None:
         uploader = self.fake_uploader()
         uploader._wait_for_manual_intervention = AsyncMock(return_value=None)
         run = self.run_sync(
@@ -1424,7 +1482,7 @@ class TikTokPlatformSyncTests(unittest.TestCase):
         self.assertEqual(run.events.count("tiktok_waiting_user_verification"), 2)
         self.assertEqual(run.events.count("tiktok_user_verification_resolved"), 2)
         self.assertEqual(run.identity_reader.await_count, 2)
-        run.context.new_page.assert_awaited_once()
+        self.assertEqual(run.context.new_page.await_count, 2)
         run.uploader.prepare_form.assert_awaited_once()
         self.assertIs(run.uploader.prepare_form.await_args.args[0], run.page)
         self.assertIs(run.uploader.submit_once.await_args.args[0], run.page)

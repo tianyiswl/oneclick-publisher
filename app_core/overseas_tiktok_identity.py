@@ -8,7 +8,10 @@ or avatar is useful UI context, but neither is a stable account binding.
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import re
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,16 +21,26 @@ from urllib.parse import unquote, urlsplit
 from playwright.async_api import async_playwright
 
 from .database import connect
+from .overseas_tiktok_session_scope import (
+    TikTokSessionScopeError,
+    sanitize_tiktok_storage_state,
+)
 from .paths import COOKIE_DIR
 
 
 _HANDLE_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 _PROFILE_PATH_PATTERN = re.compile(r"^/@([^/]+)$")
 _PROFILE_LINK_SELECTOR = 'a[href*="/@"]'
+_PROFILE_NAVIGATION_SELECTOR = 'a[data-e2e="nav-profile"]'
 _TIKTOK_HOSTS = {"tiktok.com", "www.tiktok.com"}
 TIKTOK_IDENTITY_URL = "https://www.tiktok.com/"
 _AUTH_ROUTE_TOKENS = ("login", "challenge", "verify", "captcha", "security")
-_HOMEPAGE_CONTEXT_SETTLE_SECONDS = 12.0
+_HOMEPAGE_CONTEXT_SETTLE_SECONDS = 75.0
+_TIKTOK_IDENTITY_NAVIGATION_TIMEOUT_MS = 120_000
+_SAVED_IDENTITY_MAX_CONTEXT_ATTEMPTS = 5
+_PROFILE_NAVIGATION_MAX_ATTEMPTS = 200
+_FEED_PROFILE_NAVIGATION_SETTLE_SECONDS = 90.0
+_FEED_SHELL_PATHS = {"/foryou", "/following", "/explore"}
 _APP_CONTEXT_USER_EVALUATOR = """
 () => {
   const scripts = document.querySelectorAll('script#__UNIVERSAL_DATA_FOR_REHYDRATION__');
@@ -41,12 +54,10 @@ _APP_CONTEXT_USER_EVALUATOR = """
     if (!user || typeof user !== 'object') return { state: 'invalid' };
     const result = { state: 'ok' };
     if (Object.prototype.hasOwnProperty.call(user, 'uniqueId')) {
-      if (typeof user.uniqueId !== 'string') return { state: 'invalid' };
-      result.uniqueId = user.uniqueId;
+      if (typeof user.uniqueId === 'string') result.uniqueId = user.uniqueId;
     }
     if (Object.prototype.hasOwnProperty.call(user, 'unique_id')) {
-      if (typeof user.unique_id !== 'string') return { state: 'invalid' };
-      result.unique_id = user.unique_id;
+      if (typeof user.unique_id === 'string') result.unique_id = user.unique_id;
     }
     return result;
   } catch (_error) {
@@ -168,10 +179,10 @@ def parse_tiktok_app_context_handle(payload: object) -> str:
             continue
         value = payload[field]
         if not isinstance(value, str):
-            raise _identity_invalid()
+            continue
         handle = _valid_handle(value)
         if not handle:
-            raise _identity_invalid()
+            continue
         handles.add(handle)
     if len(handles) == 1:
         return next(iter(handles))
@@ -208,6 +219,21 @@ def _is_tiktok_homepage_route(page) -> bool:
         parsed.scheme.lower() == "https"
         and host in _TIKTOK_HOSTS
         and parsed.path in {"", "/"}
+    )
+
+
+def _is_tiktok_feed_shell_route(page) -> bool:
+    """Return whether TikTok redirected the signed-in user to a feed shell."""
+
+    try:
+        parsed = urlsplit(str(getattr(page, "url", "")))
+    except Exception:
+        return False
+    host = (parsed.hostname or "").lower().rstrip(".")
+    return (
+        parsed.scheme.lower() == "https"
+        and host in _TIKTOK_HOSTS
+        and parsed.path.rstrip("/") in _FEED_SHELL_PATHS
     )
 
 
@@ -293,6 +319,92 @@ async def _profile_candidates(
     return all_candidates, visible_candidates
 
 
+async def _homepage_profile_navigation_identity(
+    page,
+    *,
+    poll_seconds: float,
+) -> TikTokIdentity | None:
+    """Read the signed-in handle through TikTok's unique Profile navigation.
+
+    TikTok's current homepage no longer always exposes the app-context user.
+    The one visible ``nav-profile`` control is account-scoped even when its
+    href is an opaque route.  We therefore accept only one visible control,
+    click it, and require the resulting TikTok profile URL to stabilize.
+    Feed-author links never participate in this fallback.
+    """
+
+    try:
+        controls = page.locator(_PROFILE_NAVIGATION_SELECTOR)
+        if int(await controls.count()) != 1:
+            return None
+        control = controls.nth(0)
+        if not await _visible(control):
+            return None
+        await _call_async(control.click)
+    except Exception:
+        return None
+
+    interval = max(0.0, float(poll_seconds))
+    previous_handle = ""
+    for _ in range(_PROFILE_NAVIGATION_MAX_ATTEMPTS):
+        if _page_is_tiktok_auth_route(page):
+            raise _identity_invalid()
+        handle = normalize_tiktok_handle(str(getattr(page, "url", "") or ""))
+        if handle and handle == previous_handle:
+            return TikTokIdentity(
+                handle=handle,
+                display_name="",
+                profile_url=f"https://www.tiktok.com/@{handle}",
+            )
+        previous_handle = handle
+        await asyncio.sleep(interval)
+    raise _identity_invalid()
+
+
+async def _feed_profile_navigation_identity(
+    page,
+    *,
+    poll_seconds: float,
+    settle_seconds: float = _FEED_PROFILE_NAVIGATION_SETTLE_SECONDS,
+) -> TikTokIdentity | None:
+    """Wait for the unique signed-in Profile control on a slow feed shell."""
+
+    interval = max(0.0, float(poll_seconds))
+    deadline = time.monotonic() + max(0.0, float(settle_seconds))
+    attempts = 2 if interval <= 0.0 else int(settle_seconds / interval) + 2
+    attempts = max(2, min(attempts, 2_000))
+    for _ in range(attempts):
+        identity = await _homepage_profile_navigation_identity(
+            page,
+            poll_seconds=interval,
+        )
+        if identity is not None:
+            return identity
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            break
+        await asyncio.sleep(min(interval, remaining) if interval > 0.0 else 0.0)
+    return None
+
+
+async def read_tiktok_signed_in_navigation_identity(
+    page,
+    *,
+    poll_seconds: float = 0.15,
+    settle_seconds: float = _FEED_PROFILE_NAVIGATION_SETTLE_SECONDS,
+) -> TikTokIdentity:
+    """Read only the account-scoped Profile navigation, never page authors."""
+
+    identity = await _feed_profile_navigation_identity(
+        page,
+        poll_seconds=poll_seconds,
+        settle_seconds=settle_seconds,
+    )
+    if identity is None:
+        raise _identity_invalid()
+    return identity
+
+
 async def read_tiktok_identity(
     page,
     *,
@@ -320,6 +432,7 @@ async def read_tiktok_identity(
         if _page_is_tiktok_auth_route(page):
             raise _identity_invalid()
         is_homepage = _is_tiktok_homepage_route(page)
+        is_feed_shell = _is_tiktok_feed_shell_route(page)
         if is_homepage and time.monotonic() >= homepage_deadline:
             break
         homepage_handle = (
@@ -330,7 +443,21 @@ async def read_tiktok_identity(
         if homepage_handle:
             candidates = {homepage_handle: (None, False)}
         elif is_homepage:
+            navigation_identity = await _homepage_profile_navigation_identity(
+                page,
+                poll_seconds=interval,
+            )
+            if navigation_identity is not None:
+                return navigation_identity
             candidates = {}
+        elif is_feed_shell:
+            navigation_identity = await _feed_profile_navigation_identity(
+                page,
+                poll_seconds=interval,
+            )
+            if navigation_identity is not None:
+                return navigation_identity
+            raise _identity_invalid()
         else:
             all_candidates, visible_candidates = await _profile_candidates(page)
             if len(all_candidates) > 1:
@@ -470,43 +597,154 @@ def persist_tiktok_identity(
         )
 
 
+def _replace_saved_tiktok_state_file(
+    state_file: Path,
+    storage_state: Mapping[str, Any],
+) -> None:
+    """Atomically replace one existing TikTok-only state file."""
+
+    temporary: Path | None = None
+    try:
+        if state_file.is_symlink() or state_file.parent.is_symlink():
+            raise OSError("unsafe TikTok state path")
+        sanitized = sanitize_tiktok_storage_state(storage_state)
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=state_file.parent,
+            prefix=f".{state_file.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as output:
+            temporary = Path(output.name)
+            json.dump(
+                sanitized,
+                output,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            output.flush()
+            os.fsync(output.fileno())
+        if os.name == "posix":
+            temporary.chmod(0o600)
+        os.replace(temporary, state_file)
+        temporary = None
+        if os.name == "posix":
+            state_file.chmod(0o600)
+    except (OSError, TikTokSessionScopeError, TypeError, ValueError) as exc:
+        raise TikTokIdentityError(
+            "tiktok_session_expired", "TikTok 登录已失效"
+        ) from exc
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+async def read_tiktok_public_profile(page, identity: TikTokIdentity):
+    """Lazy bridge avoids a module cycle while keeping the reader patchable."""
+
+    from .overseas_tiktok_profile import read_tiktok_public_profile as reader
+
+    return await reader(page, identity)
+
+
+def persist_tiktok_public_profile(account_id: int, profile) -> str:
+    """Lazy bridge for the bound public-profile persistence step."""
+
+    from .overseas_tiktok_profile import persist_tiktok_public_profile as persist
+
+    return persist(account_id, profile)
+
+
 async def _validate_saved_tiktok_account_async(
     account: Mapping[str, Any],
 ) -> TikTokIdentity:
     state_file = COOKIE_DIR / Path(str(account.get("filePath") or "")).name
-    if not state_file.is_file():
+    if (
+        state_file.is_symlink()
+        or state_file.parent.is_symlink()
+        or not state_file.is_file()
+    ):
         raise TikTokIdentityError(
             "tiktok_session_missing", "TikTok 本地登录会话不存在"
         )
 
     playwright = None
     browser = None
-    context = None
-    page = None
     try:
         playwright = await async_playwright().start()
         browser = await playwright.chromium.launch(headless=True)
-        context = await browser.new_context(storage_state=str(state_file))
-        page = await context.new_page()
-        await page.goto(
-            TIKTOK_IDENTITY_URL,
-            wait_until="domcontentloaded",
-            timeout=45_000,
+        for _ in range(_SAVED_IDENTITY_MAX_CONTEXT_ATTEMPTS):
+            context = None
+            page = None
+            try:
+                context = await browser.new_context(storage_state=str(state_file))
+                page = await context.new_page()
+                await page.goto(
+                    TIKTOK_IDENTITY_URL,
+                    wait_until="domcontentloaded",
+                    timeout=_TIKTOK_IDENTITY_NAVIGATION_TIMEOUT_MS,
+                )
+                identity = await read_tiktok_identity(page)
+            except TikTokIdentityError as exc:
+                if exc.error_code != "tiktok_account_invalid":
+                    raise
+                continue
+            except Exception:
+                continue
+            else:
+                validate_identity_binding(
+                    account,
+                    identity,
+                    allow_initial_bind=True,
+                )
+                public_profile = None
+                try:
+                    public_profile = await read_tiktok_public_profile(page, identity)
+                except TikTokIdentityError as exc:
+                    if exc.error_code == "tiktok_account_identity_mismatch":
+                        raise
+                if public_profile is not None:
+                    identity = TikTokIdentity(
+                        public_profile.handle,
+                        public_profile.display_name,
+                        f"https://www.tiktok.com/@{public_profile.handle}",
+                    )
+                refreshed_state = await context.storage_state()
+                persist_tiktok_identity(
+                    int(account.get("id") or 0),
+                    identity,
+                    allow_initial_bind=True,
+                )
+                if public_profile is not None:
+                    try:
+                        persist_tiktok_public_profile(
+                            int(account.get("id") or 0),
+                            public_profile,
+                        )
+                    except TikTokIdentityError as exc:
+                        if exc.error_code in {
+                            "tiktok_account_identity_mismatch",
+                            "tiktok_account_invalid",
+                        }:
+                            raise
+                _replace_saved_tiktok_state_file(state_file, refreshed_state)
+                return identity
+            finally:
+                for resource in (page, context):
+                    if resource is None:
+                        continue
+                    try:
+                        await resource.close()
+                    except Exception:
+                        pass
+
+        raise TikTokIdentityError(
+            "tiktok_session_expired", "TikTok 登录已失效"
         )
-        try:
-            identity = await read_tiktok_identity(page)
-        except TikTokIdentityError as exc:
-            if exc.error_code == "tiktok_account_invalid":
-                raise TikTokIdentityError(
-                    "tiktok_session_expired", "TikTok 登录已失效"
-                ) from exc
-            raise
-        persist_tiktok_identity(
-            int(account.get("id") or 0),
-            identity,
-            allow_initial_bind=True,
-        )
-        return identity
     except TikTokIdentityError:
         raise
     except Exception as exc:
@@ -514,11 +752,9 @@ async def _validate_saved_tiktok_account_async(
             "tiktok_session_expired", "TikTok 登录已失效"
         ) from exc
     finally:
-        for resource in (page, context, browser):
-            if resource is None:
-                continue
+        if browser is not None:
             try:
-                await resource.close()
+                await browser.close()
             except Exception:
                 pass
         if playwright is not None:

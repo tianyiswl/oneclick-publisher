@@ -12,7 +12,7 @@ import unittest
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 from app_core import account_service
 from app_core import overseas_tiktok_identity as identity_service
@@ -23,6 +23,7 @@ from app_core.overseas_tiktok_identity import (
     read_tiktok_identity,
     validate_identity_binding,
 )
+from app_core.overseas_tiktok_profile import TikTokPublicProfile
 
 
 class _FakeProfileLink:
@@ -52,6 +53,18 @@ class _FakeProfileLinks:
         return self.links[index]
 
 
+class _FakeProfileNavigation(_FakeProfileLink):
+    def __init__(self, page, landing_url: str, *, visible: bool = True) -> None:
+        super().__init__("/profile", visible=visible)
+        self.page = page
+        self.landing_url = landing_url
+        self.click_count = 0
+
+    async def click(self) -> None:
+        self.click_count += 1
+        self.page.url = self.landing_url
+
+
 class _FakeUniversalDataScript:
     def __init__(self, content: str) -> None:
         self.content = content
@@ -76,9 +89,11 @@ class _FakeTikTokPage:
         self,
         links: list[_FakeProfileLink],
         *,
-        url: str = "https://www.tiktok.com/foryou",
+        url: str = "https://www.tiktok.com/video/123456789",
         app_context: str | list[str | None] | None = None,
         reject_ready_state_queries: bool = False,
+        profile_navigation_urls: list[str] | None = None,
+        profile_navigation_delay_calls: int = 0,
     ) -> None:
         self.links = _FakeProfileLinks(links)
         self.url = url
@@ -91,9 +106,26 @@ class _FakeTikTokPage:
         self.app_context_locator_calls = 0
         self.evaluate_calls: list[str] = []
         self.app_context_evaluate_calls = 0
+        self.profile_navigation = [
+            _FakeProfileNavigation(self, landing_url)
+            for landing_url in (profile_navigation_urls or [])
+        ]
+        self.profile_navigation_delay_calls = max(
+            0,
+            int(profile_navigation_delay_calls),
+        )
+        self.profile_navigation_locator_calls = 0
 
     def locator(self, selector: str):
         self.selector = selector
+        if selector == 'a[data-e2e="nav-profile"]':
+            self.profile_navigation_locator_calls += 1
+            if (
+                self.profile_navigation_locator_calls
+                <= self.profile_navigation_delay_calls
+            ):
+                return _FakeProfileLinks([])
+            return _FakeProfileLinks(self.profile_navigation)
         if selector == 'script#__UNIVERSAL_DATA_FOR_REHYDRATION__':
             self.app_context_locator_calls += 1
             if self.app_context is None:
@@ -135,7 +167,7 @@ class _DelayedProfileLinkPage:
         self,
         samples: list[list[_FakeProfileLink]],
         *,
-        url: str = "https://www.tiktok.com/foryou",
+        url: str = "https://www.tiktok.com/video/123456789",
     ) -> None:
         self.samples = list(samples)
         self.locator_calls = 0
@@ -256,6 +288,27 @@ class TikTokIdentityTests(unittest.TestCase):
         self.assertNotIn(secret, repr(page.evaluate_calls))
         self.assertNotIn(secret, repr(identity))
 
+    def test_read_identity_ignores_an_empty_alternate_username_field(self):
+        for empty_alias in ("", None):
+            with self.subTest(empty_alias=empty_alias):
+                page = _FakeTikTokPage(
+                    [],
+                    url="https://www.tiktok.com/",
+                    app_context=self._app_context(
+                        {
+                            "uniqueId": "Expected.User",
+                            "unique_id": empty_alias,
+                        }
+                    ),
+                )
+
+                identity = asyncio.run(
+                    read_tiktok_identity(page, poll_seconds=0.0, max_attempts=2)
+                )
+
+                self.assertEqual(identity.handle, "expected.user")
+                self.assertEqual(page.app_context_evaluate_calls, 2)
+
     def test_read_identity_waits_for_delayed_homepage_context_then_a_stable_repeat(self):
         page = _FakeTikTokPage(
             [
@@ -277,6 +330,85 @@ class TikTokIdentityTests(unittest.TestCase):
 
         self.assertEqual(identity.handle, "expected.user")
         self.assertEqual(page.app_context_evaluate_calls, 3)
+        self.assertEqual(page.profile_locator_calls, 0)
+
+    def test_read_identity_uses_unique_homepage_profile_navigation_when_context_is_removed(self):
+        page = _FakeTikTokPage(
+            [
+                _FakeProfileLink("/@feed.author", "Feed author"),
+                _FakeProfileLink("/@another.author", "Another author"),
+            ],
+            url="https://www.tiktok.com/",
+            app_context=None,
+            profile_navigation_urls=["https://www.tiktok.com/@expected.user"],
+        )
+
+        identity = asyncio.run(
+            read_tiktok_identity(
+                page,
+                poll_seconds=0.0,
+                max_attempts=2,
+                homepage_settle_seconds=1.0,
+            )
+        )
+
+        self.assertEqual(identity.handle, "expected.user")
+        self.assertEqual(page.profile_navigation[0].click_count, 1)
+        self.assertEqual(page.profile_locator_calls, 0)
+
+    def test_read_identity_waits_for_unique_profile_navigation_on_slow_feed(self):
+        page = _FakeTikTokPage(
+            [
+                _FakeProfileLink("/@feed.author", "Feed author"),
+                _FakeProfileLink("/@another.author", "Another author"),
+            ],
+            url="https://www.tiktok.com/foryou",
+            app_context=None,
+            profile_navigation_urls=["https://www.tiktok.com/@expected.user"],
+            profile_navigation_delay_calls=3,
+        )
+        clock = _FakeClock()
+
+        with (
+            patch.object(identity_service.time, "monotonic", clock.monotonic),
+            patch.object(identity_service.asyncio, "sleep", clock.sleep),
+        ):
+            identity = asyncio.run(
+                read_tiktok_identity(
+                    page,
+                    poll_seconds=0.5,
+                    max_attempts=2,
+                )
+            )
+
+        self.assertEqual(identity.handle, "expected.user")
+        self.assertEqual(page.profile_navigation[0].click_count, 1)
+        self.assertGreaterEqual(page.profile_navigation_locator_calls, 4)
+        self.assertEqual(page.profile_locator_calls, 0)
+
+    def test_signed_in_navigation_identity_does_not_trust_open_profile_content(self):
+        page = _FakeTikTokPage(
+            [_FakeProfileLink("/@other.public", "Other public profile")],
+            url="https://www.tiktok.com/@other.public",
+            profile_navigation_urls=["https://www.tiktok.com/@expected.user"],
+            profile_navigation_delay_calls=3,
+        )
+        clock = _FakeClock()
+
+        with (
+            patch.object(identity_service.time, "monotonic", clock.monotonic),
+            patch.object(identity_service.asyncio, "sleep", clock.sleep),
+        ):
+            identity = asyncio.run(
+                identity_service.read_tiktok_signed_in_navigation_identity(
+                    page,
+                    poll_seconds=0.5,
+                    settle_seconds=10.0,
+                )
+            )
+
+        self.assertEqual(identity.handle, "expected.user")
+        self.assertEqual(page.profile_navigation[0].click_count, 1)
         self.assertEqual(page.profile_locator_calls, 0)
 
     def test_read_identity_accepts_stable_context_while_homepage_is_interactive(self):
@@ -346,6 +478,33 @@ class TikTokIdentityTests(unittest.TestCase):
 
         self.assertEqual(identity.handle, "expected.user")
         self.assertEqual(page.app_context_evaluate_calls, 7)
+
+    def test_read_identity_allows_slow_homepage_hydration_by_default(self):
+        page = _FakeTikTokPage(
+            [],
+            url="https://www.tiktok.com/",
+            app_context=[None] * 3
+            + [
+                self._app_context({"uniqueId": "expected.user"}),
+                self._app_context({"uniqueId": "expected.user"}),
+            ],
+        )
+        clock = _FakeClock()
+
+        with (
+            patch.object(identity_service.time, "monotonic", clock.monotonic),
+            patch.object(identity_service.asyncio, "sleep", clock.sleep),
+        ):
+            identity = asyncio.run(
+                read_tiktok_identity(
+                    page,
+                    poll_seconds=15.0,
+                    max_attempts=5,
+                )
+            )
+
+        self.assertEqual(identity.handle, "expected.user")
+        self.assertEqual(page.app_context_evaluate_calls, 5)
 
     def test_read_identity_rejects_one_handle_at_the_homepage_deadline(self):
         page = _FakeTikTokPage(
@@ -638,6 +797,18 @@ class TikTokSavedIdentityTests(unittest.TestCase):
     def _playwright_runtime(self, page):
         context = SimpleNamespace(
             new_page=AsyncMock(return_value=page),
+            storage_state=AsyncMock(
+                return_value={
+                    "cookies": [
+                        {
+                            "name": "sessionid",
+                            "value": "refreshed-safe-state",
+                            "domain": ".tiktok.com",
+                        }
+                    ],
+                    "origins": [],
+                }
+            ),
             close=AsyncMock(),
         )
         browser = SimpleNamespace(
@@ -897,6 +1068,29 @@ class TikTokSavedIdentityTests(unittest.TestCase):
         self.assertEqual(raised.exception.error_code, "tiktok_session_missing")
         factory.start.assert_not_awaited()
 
+    def test_saved_validation_rejects_a_symlinked_session_without_reading_it(self) -> None:
+        account_id = self._save_account(file_name="tiktok.json")
+        outside = self.root / "outside.json"
+        outside.write_text("private", encoding="utf-8")
+        (self.root / "tiktok.json").symlink_to(outside)
+        factory = MagicMock()
+        factory.start = AsyncMock()
+
+        with patch.object(
+            identity_service,
+            "async_playwright",
+            return_value=factory,
+            create=True,
+        ):
+            with self.assertRaises(TikTokIdentityError) as raised:
+                identity_service.validate_saved_tiktok_account(
+                    dict(self._stored_account(account_id))
+                )
+
+        self.assertEqual(raised.exception.error_code, "tiktok_session_missing")
+        factory.start.assert_not_awaited()
+        self.assertEqual(outside.read_text(encoding="utf-8"), "private")
+
     def test_saved_validation_marks_missing_unique_handle_as_expired_and_closes_resources(self) -> None:
         account_id = self._save_account()
         (self.root / "tiktok.json").write_text("{}", encoding="utf-8")
@@ -930,10 +1124,180 @@ class TikTokSavedIdentityTests(unittest.TestCase):
                 )
 
         self.assertEqual(raised.exception.error_code, "tiktok_session_expired")
-        page.close.assert_awaited_once()
-        context.close.assert_awaited_once()
+        self.assertEqual(context.new_page.await_count, 5)
+        self.assertEqual(page.close.await_count, 5)
+        self.assertEqual(context.close.await_count, 5)
         browser.close.assert_awaited_once()
         runtime.stop.assert_awaited_once()
+
+    def test_saved_validation_retries_a_transient_blank_page_in_a_fresh_context(self) -> None:
+        account_id = self._save_account()
+        (self.root / "tiktok.json").write_text("{}", encoding="utf-8")
+        first_page = SimpleNamespace(
+            goto=AsyncMock(),
+            close=AsyncMock(),
+            url="https://www.tiktok.com/",
+        )
+        second_page = SimpleNamespace(
+            goto=AsyncMock(),
+            close=AsyncMock(),
+            url="https://www.tiktok.com/",
+        )
+        factory, _runtime, _browser, context = self._playwright_runtime(first_page)
+        context.new_page = AsyncMock(side_effect=[first_page, second_page])
+        identity = TikTokIdentity(
+            "expected.user",
+            "Expected",
+            "https://www.tiktok.com/@expected.user",
+        )
+        with (
+            patch.object(
+                identity_service,
+                "async_playwright",
+                return_value=factory,
+                create=True,
+            ),
+            patch.object(
+                identity_service,
+                "read_tiktok_identity",
+                new=AsyncMock(
+                    side_effect=[
+                        TikTokIdentityError(
+                            "tiktok_account_invalid",
+                            "transient blank homepage shell",
+                        ),
+                        identity,
+                    ]
+                ),
+            ),
+        ):
+            checked = identity_service.validate_saved_tiktok_account(
+                dict(self._stored_account(account_id))
+            )
+
+        self.assertEqual(checked, identity)
+        self.assertEqual(context.new_page.await_count, 2)
+        first_page.close.assert_awaited_once()
+        second_page.close.assert_awaited_once()
+
+    def test_saved_validation_retries_a_fresh_context_and_replaces_stale_state(self) -> None:
+        account_id = self._save_account()
+        state_file = self.root / "tiktok.json"
+        state_file.write_text(
+            json.dumps(
+                {
+                    "cookies": [
+                        {
+                            "name": "sessionid",
+                            "value": "stale-state",
+                            "domain": ".tiktok.com",
+                        }
+                    ],
+                    "origins": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        first_page = SimpleNamespace(
+            goto=AsyncMock(),
+            close=AsyncMock(),
+            url="https://www.tiktok.com/",
+        )
+        second_page = SimpleNamespace(
+            goto=AsyncMock(),
+            close=AsyncMock(),
+            url="https://www.tiktok.com/",
+        )
+        first_context = SimpleNamespace(
+            new_page=AsyncMock(return_value=first_page),
+            storage_state=AsyncMock(),
+            close=AsyncMock(),
+        )
+        second_context = SimpleNamespace(
+            new_page=AsyncMock(return_value=second_page),
+            storage_state=AsyncMock(
+                return_value={
+                    "cookies": [
+                        {
+                            "name": "sessionid",
+                            "value": "refreshed-tiktok-state",
+                            "domain": ".tiktok.com",
+                        },
+                        {
+                            "name": "SID",
+                            "value": "must-not-be-saved",
+                            "domain": ".google.com",
+                        },
+                    ],
+                    "origins": [
+                        {
+                            "origin": "https://www.tiktok.com",
+                            "localStorage": [],
+                        },
+                        {
+                            "origin": "https://accounts.google.com",
+                            "localStorage": [],
+                        },
+                    ],
+                }
+            ),
+            close=AsyncMock(),
+        )
+        browser = SimpleNamespace(
+            new_context=AsyncMock(side_effect=[first_context, second_context]),
+            close=AsyncMock(),
+        )
+        runtime = SimpleNamespace(
+            chromium=SimpleNamespace(launch=AsyncMock(return_value=browser)),
+            stop=AsyncMock(),
+        )
+        factory = MagicMock()
+        factory.start = AsyncMock(return_value=runtime)
+        identity = TikTokIdentity(
+            "expected.user",
+            "Expected",
+            "https://www.tiktok.com/@expected.user",
+        )
+
+        with (
+            patch.object(
+                identity_service,
+                "async_playwright",
+                return_value=factory,
+                create=True,
+            ),
+            patch.object(
+                identity_service,
+                "read_tiktok_identity",
+                new=AsyncMock(
+                    side_effect=[
+                        TikTokIdentityError(
+                            "tiktok_account_invalid",
+                            "transient blank homepage shell",
+                        ),
+                        identity,
+                    ]
+                ),
+            ),
+        ):
+            checked = identity_service.validate_saved_tiktok_account(
+                dict(self._stored_account(account_id))
+            )
+
+        self.assertEqual(checked, identity)
+        self.assertEqual(browser.new_context.await_count, 2)
+        self.assertEqual(first_context.new_page.await_count, 1)
+        self.assertEqual(second_context.new_page.await_count, 1)
+        refreshed = json.loads(state_file.read_text(encoding="utf-8"))
+        self.assertEqual(
+            refreshed["cookies"][0]["value"],
+            "refreshed-tiktok-state",
+        )
+        self.assertNotIn("google.com", repr(refreshed))
+        self.assertEqual(
+            self._stored_account(account_id)["accountReference"],
+            "expected.user",
+        )
 
     def test_saved_validation_silently_initializes_one_legacy_binding(self) -> None:
         account_id = self._save_account(reference="")
@@ -1013,11 +1377,74 @@ class TikTokSavedIdentityTests(unittest.TestCase):
             identity,
             allow_initial_bind=True,
         )
-        page.goto.assert_awaited_once_with(
-            "https://www.tiktok.com/",
-            wait_until="domcontentloaded",
-            timeout=45_000,
+        self.assertEqual(
+            page.goto.await_args_list,
+            [
+                call(
+                    "https://www.tiktok.com/",
+                    wait_until="domcontentloaded",
+                    timeout=120_000,
+                ),
+                call(
+                    "https://www.tiktok.com/@expected.user",
+                    wait_until="domcontentloaded",
+                    timeout=120_000,
+                ),
+            ],
         )
+
+    def test_saved_validation_refreshes_public_name_and_avatar_after_binding(self) -> None:
+        account_id = self._save_account(reference="expected.user")
+        (self.root / "tiktok.json").write_text("{}", encoding="utf-8")
+        page = SimpleNamespace(
+            goto=AsyncMock(),
+            close=AsyncMock(),
+            url="https://www.tiktok.com/",
+        )
+        factory, _runtime, _browser, _context = self._playwright_runtime(page)
+        identity = TikTokIdentity(
+            "expected.user",
+            "",
+            "https://www.tiktok.com/@expected.user",
+        )
+        profile = TikTokPublicProfile(
+            handle="expected.user",
+            display_name="Mobai",
+            avatar_png=b"public-avatar-png",
+        )
+        persist_profile = MagicMock()
+
+        with (
+            patch.object(
+                identity_service,
+                "async_playwright",
+                return_value=factory,
+                create=True,
+            ),
+            patch.object(
+                identity_service,
+                "read_tiktok_identity",
+                new=AsyncMock(return_value=identity),
+            ),
+            patch.object(
+                identity_service,
+                "read_tiktok_public_profile",
+                new=AsyncMock(return_value=profile),
+                create=True,
+            ),
+            patch.object(
+                identity_service,
+                "persist_tiktok_public_profile",
+                persist_profile,
+                create=True,
+            ),
+        ):
+            checked = identity_service.validate_saved_tiktok_account(
+                dict(self._stored_account(account_id))
+            )
+
+        self.assertEqual(checked.display_name, "Mobai")
+        persist_profile.assert_called_once_with(account_id, profile)
 
 
 class TikTokAccountPersistenceTests(unittest.TestCase):

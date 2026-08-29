@@ -34,7 +34,7 @@ from .overseas_tiktok_errors import TikTokPublishError
 from .overseas_tiktok_identity import (
     TikTokIdentityError,
     normalize_tiktok_handle,
-    read_tiktok_identity,
+    read_tiktok_signed_in_navigation_identity,
     validate_identity_binding,
 )
 from .paths import COOKIE_DIR, DB_PATH
@@ -44,6 +44,7 @@ TIKTOK_CONTENT_LIMIT = 2200
 TIKTOK_MODES = frozenset({"preflight", "platform_form_check", "formal"})
 TIKTOK_VIDEO_SUFFIXES = frozenset({".mp4", ".mov", ".mkv", ".avi", ".webm"})
 TIKTOK_UPLOAD_URL = "https://www.tiktok.com/tiktokstudio/upload?lang=en"
+TIKTOK_NAVIGATION_TIMEOUT_MS = 120_000
 _TIKTOK_ACCEPTED_EVIDENCE = frozenset(
     {
         "platform_feedback:your video has been uploaded",
@@ -709,7 +710,6 @@ def _valid_storage_origin(origin_row: object) -> bool:
         isinstance(item, Mapping)
         and set(item) == {"name", "value"}
         and type(item["name"]) is str
-        and bool(item["name"])
         and type(item["value"]) is str
         for item in local_storage
     )
@@ -1295,6 +1295,7 @@ async def _run_tiktok_platform(
     playwright = None
     browser = None
     context = None
+    identity_page = None
     page = None
     final_state = {"triggered": False}
     platform_write_occurred = False
@@ -1318,13 +1319,16 @@ async def _run_tiktok_platform(
             storage_state=str(prepared["accountFile"]),
         )
         context = await set_init_script(context)
-        page = await context.new_page()
-        await page.goto(
-            TIKTOK_UPLOAD_URL,
-            wait_until="domcontentloaded",
-            timeout=60_000,
+        identity_page = await context.new_page()
+        identity_probe_url = (
+            "https://www.tiktok.com/@"
+            f"{str(prepared['expectedAccountReference'])}"
         )
-        await page.wait_for_timeout(2_500)
+        await identity_page.goto(
+            identity_probe_url,
+            wait_until="domcontentloaded",
+            timeout=TIKTOK_NAVIGATION_TIMEOUT_MS,
+        )
 
         uploader_class = _load_tiktok_uploader_class()
         uploader = uploader_class(
@@ -1339,16 +1343,51 @@ async def _run_tiktok_platform(
             expected_account_reference=str(prepared["expectedAccountReference"]),
             execution_mode=mode,
         )
+        form_stage_messages = {
+            "upload_entry_waiting": "TikTok 正在等待视频选择入口",
+            "video_selected": "TikTok 已选择视频文件",
+            "caption_editor_waiting": "TikTok 正在等待文案编辑区域",
+            "caption_editor_ready": "TikTok 文案编辑区域已就绪",
+            "caption_write_started": "TikTok 正在写入文案",
+            "caption_write_verified": "TikTok 文案写入已回读",
+            "topics_started": "TikTok 正在核对官方话题",
+            "topics_verified": "TikTok 官方话题已回读",
+            "visibility_started": "TikTok 正在核对公开范围",
+            "visibility_verified": "TikTok 公开范围已回读",
+            "post_ready_waiting": "TikTok 正在等待最终按钮就绪",
+            "form_snapshot_started": "TikTok 正在执行最终表单快照核对",
+            "form_snapshot_verified": "TikTok 最终表单快照已核对",
+        }
+
+        def observe_form_stage(stage: str) -> None:
+            message = form_stage_messages.get(str(stage))
+            if message is None:
+                return
+            _record_tiktok_event(
+                task_id,
+                f"tiktok_form_{stage}",
+                message,
+            )
+
+        uploader.form_stage_observer = observe_form_stage
         _instrument_manual_verification(uploader, task_id=task_id)
         final_button_instrumented = _instrument_final_action(
             uploader,
             trigger=trigger_final_action,
         )
 
-        await _wait_before_identity_read(uploader, page)
+        await _wait_before_identity_read(uploader, identity_page)
         account_snapshot = _require_current_account_snapshot(prepared)
-        identity = await read_tiktok_identity(page)
+        identity = await read_tiktok_signed_in_navigation_identity(identity_page)
         _validate_live_identity(account_snapshot, identity)
+
+        page = await context.new_page()
+        await page.goto(
+            TIKTOK_UPLOAD_URL,
+            wait_until="domcontentloaded",
+            timeout=TIKTOK_NAVIGATION_TIMEOUT_MS,
+        )
+        await page.wait_for_timeout(2_500)
 
         _record_tiktok_event(
             task_id,
@@ -1360,9 +1399,16 @@ async def _run_tiktok_platform(
         form_receipt = await uploader.prepare_form(page, base)
         verified_form = _verify_authorized_form_snapshot(prepared, form_receipt)
 
-        await _wait_before_identity_read(uploader, page)
+        await identity_page.goto(
+            identity_probe_url,
+            wait_until="domcontentloaded",
+            timeout=TIKTOK_NAVIGATION_TIMEOUT_MS,
+        )
+        await _wait_before_identity_read(uploader, identity_page)
         current_account = _require_current_account_snapshot(prepared)
-        current_identity = await read_tiktok_identity(page)
+        current_identity = await read_tiktok_signed_in_navigation_identity(
+            identity_page
+        )
         _validate_live_identity(current_account, current_identity)
         _record_tiktok_event(
             task_id,
@@ -1505,6 +1551,7 @@ async def _run_tiktok_platform(
     finally:
         cleanup_failures: list[tuple[str, BaseException]] = []
         for label, resource in (
+            ("identity-page-close", identity_page),
             ("page-close", page),
             ("context-close", context),
             ("browser-close", browser),
@@ -1516,9 +1563,9 @@ async def _run_tiktok_platform(
             except Exception as exc:
                 cleanup_failures.append((label, exc))
                 _log_internal_failure(label, exc)
-        if playwright_manager is not None:
+        if playwright is not None:
             try:
-                await playwright_manager.stop()
+                await playwright.stop()
             except Exception as exc:
                 cleanup_failures.append(("playwright-stop", exc))
                 _log_internal_failure("playwright-stop", exc)

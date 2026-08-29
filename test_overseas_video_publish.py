@@ -147,8 +147,14 @@ class FakeTikTokLeaf:
     async def is_visible(self) -> bool:
         return self.visible
 
+    async def count(self) -> int:
+        return 1
+
     async def is_editable(self) -> bool:
         return self.editable
+
+    async def is_enabled(self) -> bool:
+        return True
 
     async def inner_text(self, timeout: int = 0) -> str:
         del timeout
@@ -181,6 +187,9 @@ class FakeTikTokEditor(FakeTikTokLeaf):
         self.normalized_text_before_topics: str | None = None
 
     async def click(self) -> None:
+        self.page.active_editor = self
+
+    async def focus(self) -> None:
         self.page.active_editor = self
 
     def locator(self, selector: str) -> FakeTikTokCollection:
@@ -238,14 +247,27 @@ class FakeTikTokCandidate(FakeTikTokLeaf):
         *,
         entity_values: list[str] | None = None,
         mutate_text: str | None = None,
+        focused: bool = False,
     ) -> None:
+        self.clicked = False
+        self.focused = focused
+
         def select() -> None:
+            self.clicked = True
             if entity_values is not None:
                 page.editor.entity_nodes.extend(entity_values)
             if mutate_text is not None:
                 page.editor.text = mutate_text
 
         super().__init__(label, visible=True, on_click=select)
+
+    async def get_attribute(self, name: str) -> str | None:
+        if name == "class":
+            suffix = " focused" if self.focused else ""
+            return f"hashtag-suggestion-item{suffix}"
+        if name == "aria-selected":
+            return "true" if self.focused else "false"
+        return None
 
 
 class FakeTikTokBase:
@@ -287,6 +309,11 @@ class FakeTikTokPage:
                 FakeTikTokEditor(self, editor_text) for _ in range(editor_count - 1)
             )
         self.base = FakeTikTokBase(self, editors)
+
+    def locator(self, selector: str):
+        if selector == 'iframe[data-tt="Upload_index_iframe"]':
+            return FakeTikTokCollection([])
+        return self.base.locator(selector)
 
     async def wait_for_timeout(self, milliseconds: int) -> None:
         del milliseconds
@@ -491,6 +518,152 @@ class TikTokFormAdapterTests(unittest.TestCase):
         app._post_button = AsyncMock(return_value=FakeTikTokLeaf(text="Post"))
         return app
 
+    def test_upload_waits_for_slow_page_before_selecting_video(self) -> None:
+        class EmptyLocator:
+            @property
+            def first(self):
+                return self
+
+            async def count(self) -> int:
+                return 0
+
+        class DelayedFileInput:
+            def __init__(self) -> None:
+                self.reads = 0
+                self.selected_path: str | None = None
+
+            @property
+            def first(self):
+                return self
+
+            async def count(self) -> int:
+                self.reads += 1
+                return int(self.reads >= 3)
+
+            async def set_input_files(self, path: str) -> None:
+                self.selected_path = path
+
+        class SlowUploadPage:
+            def __init__(self) -> None:
+                self.url = tiktok_uploader.UPLOAD_URL
+                self.file_input = DelayedFileInput()
+                self.waits = 0
+
+            def locator(self, selector: str):
+                if selector == 'iframe[data-tt="Upload_index_iframe"]':
+                    return EmptyLocator()
+                if selector == 'input[type="file"]':
+                    return self.file_input
+                return EmptyLocator()
+
+            def get_by_role(self, *_args, **_kwargs):
+                return EmptyLocator()
+
+            async def wait_for_timeout(self, _milliseconds: int) -> None:
+                self.waits += 1
+
+        page = SlowUploadPage()
+        app = TiktokVideo(
+            "Title",
+            "/tmp/slow-upload.mp4",
+            [],
+            0,
+            "/not/used.json",
+            execution_mode="platform_form_check",
+        )
+        app._wait_for_manual_intervention = AsyncMock(return_value=None)
+
+        asyncio.run(app._upload_file(page, page))
+
+        self.assertEqual(page.file_input.selected_path, "/tmp/slow-upload.mp4")
+        self.assertGreaterEqual(page.waits, 2)
+        self.assertGreaterEqual(app._wait_for_manual_intervention.await_count, 2)
+
+    def test_upload_entry_timeout_has_a_stable_error_code(self) -> None:
+        class EmptyLocator:
+            @property
+            def first(self):
+                return self
+
+            async def count(self) -> int:
+                return 0
+
+        class MissingUploadPage:
+            url = tiktok_uploader.UPLOAD_URL
+
+            def locator(self, _selector: str):
+                return EmptyLocator()
+
+            def get_by_role(self, *_args, **_kwargs):
+                return EmptyLocator()
+
+            async def wait_for_timeout(self, _milliseconds: int) -> None:
+                return None
+
+        page = MissingUploadPage()
+        app = TiktokVideo(
+            "Title",
+            "/tmp/missing-upload.mp4",
+            [],
+            0,
+            "/not/used.json",
+            execution_mode="platform_form_check",
+        )
+        app._wait_for_manual_intervention = AsyncMock(return_value=None)
+
+        with (
+            patch.object(tiktok_uploader, "UPLOAD_ENTRY_POLL_ATTEMPTS", 2),
+            self.assertRaises(TikTokPublishError) as raised,
+        ):
+            asyncio.run(app._upload_file(page, page))
+
+        self.assertEqual(raised.exception.error_code, "tiktok_upload_entry_timeout")
+
+    def test_caption_editor_waits_for_uploaded_video_form_to_render(self) -> None:
+        class EmptyLocator:
+            @property
+            def first(self):
+                return self
+
+            async def count(self) -> int:
+                return 0
+
+        class DelayedCaptionPage:
+            def __init__(self) -> None:
+                self.url = tiktok_uploader.UPLOAD_URL
+                self.waits = 0
+                self.editor = FakeTikTokLeaf(editable=True)
+
+            def locator(self, selector: str):
+                if selector == 'iframe[data-tt="Upload_index_iframe"]':
+                    return EmptyLocator()
+                if (
+                    selector == tiktok_uploader.CAPTION_EDITOR_SELECTORS[0]
+                    and self.waits >= 2
+                ):
+                    return FakeTikTokCollection([self.editor])
+                return EmptyLocator()
+
+            async def wait_for_timeout(self, _milliseconds: int) -> None:
+                self.waits += 1
+
+        page = DelayedCaptionPage()
+        app = TiktokVideo(
+            "Title",
+            "/tmp/slow-form.mp4",
+            [],
+            0,
+            "/not/used.json",
+            execution_mode="platform_form_check",
+        )
+        app._wait_for_manual_intervention = AsyncMock(return_value=None)
+
+        base, editor = asyncio.run(app._wait_for_caption_editor(page, page))
+
+        self.assertIs(base, page)
+        self.assertIs(editor, page.editor)
+        self.assertGreaterEqual(page.waits, 2)
+
     @staticmethod
     def add_candidates(
         page: FakeTikTokPage,
@@ -515,6 +688,8 @@ class TikTokFormAdapterTests(unittest.TestCase):
         self.add_candidates(page, "AI", "#AI")
         self.add_candidates(page, "效率", "#效率")
         app = self.uploader()
+        stages: list[str] = []
+        app.form_stage_observer = stages.append
 
         with (
             patch.object(tiktok_uploader, "_body_text", new=AsyncMock(return_value="")),
@@ -532,6 +707,72 @@ class TikTokFormAdapterTests(unittest.TestCase):
         self.assertEqual(receipt["topicEntities"], ["AI", "效率"])
         self.assertEqual(receipt["plainCaption"], "Title\n\nBody")
         self.assertEqual(receipt["visibility"], "public")
+        self.assertEqual(
+            stages,
+            [
+                "upload_entry_waiting",
+                "video_selected",
+                "caption_editor_waiting",
+                "caption_editor_ready",
+                "caption_write_started",
+                "caption_write_verified",
+                "topics_started",
+                "topics_verified",
+                "visibility_started",
+                "visibility_verified",
+                "post_ready_waiting",
+                "form_snapshot_started",
+                "form_snapshot_verified",
+            ],
+        )
+
+    def test_caption_writing_focuses_editor_without_pointer_click(self) -> None:
+        page = FakeTikTokPage()
+        page.editor.click = AsyncMock(side_effect=TimeoutError("covered"))
+        page.editor.focus = AsyncMock(
+            side_effect=lambda: setattr(page, "active_editor", page.editor)
+        )
+        app = self.uploader(tags=[])
+
+        with patch.object(
+            tiktok_uploader,
+            "_body_text",
+            new=AsyncMock(return_value=""),
+        ):
+            receipt = asyncio.run(app.prepare_form(page, page.base))
+
+        page.editor.focus.assert_awaited()
+        page.editor.click.assert_not_awaited()
+        self.assertEqual(receipt["plainCaption"], "Title\n\nBody")
+
+    def test_post_ready_wait_uses_the_same_chinese_button_contract(self) -> None:
+        button = FakeTikTokLeaf("发布")
+
+        class ChinesePostBase:
+            def locator(self, selector: str):
+                if selector == 'button:has-text("发布")':
+                    return FakeTikTokCollection([button])
+                return FakeTikTokCollection([])
+
+        page = FakeTikTokPage()
+        app = TiktokVideo(
+            "Title",
+            "/tmp/chinese-post.mp4",
+            [],
+            0,
+            "/not/used.json",
+            execution_mode="platform_form_check",
+        )
+        app._wait_for_manual_intervention = AsyncMock(return_value=None)
+
+        with patch.object(
+            tiktok_uploader.asyncio,
+            "sleep",
+            new=AsyncMock(return_value=None),
+        ):
+            asyncio.run(app._wait_until_ready(page, ChinesePostBase()))
+
+        app._wait_for_manual_intervention.assert_awaited_once_with(page)
 
     def test_normal_upload_preparation_never_reveals_browser(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -679,6 +920,204 @@ class TikTokFormAdapterTests(unittest.TestCase):
                         asyncio.run(app.prepare_form(page, page.base))
                 self.assertEqual(raised.exception.error_code, expected_code)
 
+    def test_topic_candidate_label_ignores_platform_work_count_suffix(self) -> None:
+        page = FakeTikTokPage()
+        self.add_candidates(page, "AI", "#AI 37.8M 个作品")
+        app = self.uploader(tags=["AI"])
+
+        with patch.object(
+            tiktok_uploader,
+            "_body_text",
+            new=AsyncMock(return_value=""),
+        ):
+            receipt = asyncio.run(app.prepare_form(page, page.base))
+
+        self.assertEqual(receipt["topicEntities"], ["AI"])
+
+    def test_topic_candidate_supports_unscoped_role_option_fallback(self) -> None:
+        candidate = FakeTikTokLeaf("#AI 37.8M 个作品")
+
+        class CurrentTikTokCandidatePage(FakeTikTokPage):
+            def locator(self, selector: str):
+                if selector == '[role="option"]':
+                    return FakeTikTokCollection([candidate])
+                return super().locator(selector)
+
+        class CurrentTikTokCandidateBase:
+            def locator(self, selector: str):
+                return FakeTikTokCollection([])
+
+        page = CurrentTikTokCandidatePage()
+        app = self.uploader(tags=["AI"])
+        app._wait_for_manual_intervention = AsyncMock(return_value=None)
+
+        candidates, labels = asyncio.run(
+            app._stable_topic_candidates(
+                page,
+                CurrentTikTokCandidateBase(),
+                topic="AI",
+            )
+        )
+
+        self.assertEqual(candidates, [candidate])
+        self.assertEqual(labels, ["AI"])
+
+    def test_topic_candidate_wait_tolerates_slow_network_beyond_two_seconds(self) -> None:
+        candidate = FakeTikTokLeaf("#AI 37.8M 个作品")
+
+        class SlowCandidatePage:
+            url = tiktok_uploader.UPLOAD_URL
+
+            def __init__(self) -> None:
+                self.waits = 0
+
+            async def wait_for_timeout(self, _milliseconds: int) -> None:
+                self.waits += 1
+
+        class SlowCandidateBase:
+            def __init__(self, page) -> None:
+                self.page = page
+
+            def locator(self, selector: str):
+                if (
+                    selector == tiktok_uploader.TOPIC_CANDIDATE_SELECTORS[0]
+                    and self.page.waits >= 25
+                ):
+                    return FakeTikTokCollection([candidate])
+                return FakeTikTokCollection([])
+
+        page = SlowCandidatePage()
+        app = self.uploader(tags=["AI"])
+        app._wait_for_manual_intervention = AsyncMock(return_value=None)
+
+        candidates, labels = asyncio.run(
+            app._stable_topic_candidates(page, SlowCandidateBase(page))
+        )
+
+        self.assertEqual(candidates, [candidate])
+        self.assertEqual(labels, ["AI"])
+        self.assertGreaterEqual(page.waits, 25)
+
+    def test_target_topic_can_stabilize_while_unrelated_suggestions_change(self) -> None:
+        class DynamicCandidatePage:
+            url = tiktok_uploader.UPLOAD_URL
+
+            def __init__(self) -> None:
+                self.waits = 0
+
+            async def wait_for_timeout(self, _milliseconds: int) -> None:
+                self.waits += 1
+
+        class DynamicCandidateBase:
+            def __init__(self, page) -> None:
+                self.page = page
+
+            def locator(self, selector: str):
+                if selector != tiktok_uploader.TOPIC_CANDIDATE_SELECTORS[0]:
+                    return FakeTikTokCollection([])
+                return FakeTikTokCollection(
+                    [
+                        FakeTikTokLeaf("#AI 37.8M 个作品"),
+                        FakeTikTokLeaf(f"#trend{self.page.waits} 1K 个作品"),
+                    ]
+                )
+
+        page = DynamicCandidatePage()
+        app = self.uploader(tags=["AI"])
+        app._wait_for_manual_intervention = AsyncMock(return_value=None)
+
+        candidates, labels = asyncio.run(
+            app._stable_topic_candidates(
+                page,
+                DynamicCandidateBase(page),
+                topic="AI",
+            )
+        )
+
+        self.assertEqual(labels, ["AI"])
+        self.assertEqual(len(candidates), 1)
+
+    def test_exact_target_candidate_does_not_require_full_dom_list_stability(self) -> None:
+        focused = FakeTikTokLeaf("#AI 37.8M 个作品")
+        duplicate = FakeTikTokLeaf("#AI 37.8M 个作品")
+
+        class RepaintingPage:
+            url = tiktok_uploader.UPLOAD_URL
+
+            def __init__(self) -> None:
+                self.waits = 0
+
+            async def wait_for_timeout(self, _milliseconds: int) -> None:
+                self.waits += 1
+
+        class RepaintingBase:
+            def __init__(self, page) -> None:
+                self.page = page
+
+            def locator(self, selector: str):
+                if selector != tiktok_uploader.TOPIC_CANDIDATE_SELECTORS[0]:
+                    return FakeTikTokCollection([])
+                items = [focused]
+                if self.page.waits % 2:
+                    items.append(duplicate)
+                return FakeTikTokCollection(items)
+
+        page = RepaintingPage()
+        app = self.uploader(tags=["AI"])
+        app._wait_for_manual_intervention = AsyncMock(return_value=None)
+
+        candidates, labels = asyncio.run(
+            app._stable_topic_candidates(
+                page,
+                RepaintingBase(page),
+                topic="AI",
+            )
+        )
+
+        self.assertEqual(candidates, [focused])
+        self.assertEqual(labels, ["AI"])
+        self.assertEqual(page.waits, 0)
+
+    def test_duplicate_topic_dom_nodes_require_one_focused_exact_candidate(self) -> None:
+        page = FakeTikTokPage()
+        focused = FakeTikTokCandidate(
+            page,
+            "#AI 37.8M 个作品",
+            entity_values=["AI"],
+            focused=True,
+        )
+        duplicate = FakeTikTokCandidate(
+            page,
+            "#AI 37.8M 个作品",
+            entity_values=["AI"],
+        )
+        page.candidates["AI"] = [focused, duplicate]
+        app = self.uploader(tags=["AI"])
+
+        with patch.object(
+            tiktok_uploader,
+            "_body_text",
+            new=AsyncMock(return_value=""),
+        ):
+            receipt = asyncio.run(app.prepare_form(page, page.base))
+
+        self.assertEqual(receipt["topicEntities"], ["AI"])
+        self.assertTrue(focused.clicked)
+        self.assertFalse(duplicate.clicked)
+
+    def test_current_draft_editor_mention_node_is_a_topic_entity(self) -> None:
+        class CurrentDraftEditor:
+            def locator(self, selector: str) -> FakeTikTokCollection:
+                if selector == "span.mention":
+                    return FakeTikTokCollection([FakeTikTokLeaf("#AI")])
+                return FakeTikTokCollection([])
+
+        app = self.uploader(tags=["AI"])
+
+        entities = asyncio.run(app._read_topic_entities(CurrentDraftEditor()))
+
+        self.assertEqual(entities, ["AI"])
+
     def test_duplicate_or_wrong_order_topic_entities_are_rejected(self) -> None:
         for existing, selected in (([], ["AI", "AI"]), (["其他"], ["AI"])):
             with self.subTest(existing=existing, selected=selected):
@@ -705,7 +1144,7 @@ class TikTokFormAdapterTests(unittest.TestCase):
 
     def test_caption_editor_must_be_unique(self) -> None:
         for count, expected_code in (
-            (0, "tiktok_caption_editor_missing"),
+            (0, "tiktok_caption_editor_timeout"),
             (2, "tiktok_caption_editor_ambiguous"),
         ):
             with self.subTest(count=count):

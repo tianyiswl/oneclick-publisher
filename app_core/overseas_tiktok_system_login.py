@@ -47,6 +47,12 @@ from app_core.overseas_tiktok_session_scope import (
     TikTokSessionScopeError,
     sanitize_tiktok_storage_state,
 )
+from app_core.overseas_tiktok_profile import (
+    TikTokPublicProfile,
+    fetch_tiktok_public_profile,
+    persist_tiktok_public_profile,
+    read_tiktok_public_profile,
+)
 from app_core.paths import COOKIE_DIR, USER_DATA_DIR
 
 
@@ -54,6 +60,9 @@ _ATTEMPT_ID = re.compile(r"[0-9a-f]{32}\Z")
 _PROFILE_LOCK_NAMES = ("SingletonLock", "SingletonCookie", "SingletonSocket")
 _TIKTOK_LOGIN_URL = "https://www.tiktok.com/login"
 _COMPLETE_BROWSER_EXIT_TIMEOUT_SECONDS = 5.0
+_COMPLETE_BROWSER_FORCE_EXIT_TIMEOUT_SECONDS = 5.0
+_TIKTOK_IDENTITY_NAVIGATION_TIMEOUT_MS = 120_000
+_TIKTOK_IDENTITY_MAX_READ_ATTEMPTS = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,6 +91,7 @@ class TikTokLoginCandidate:
     identity: TikTokIdentity
     tiktok_cookie_present: bool = True
     validation_stage: str = "tiktok_blank_identity_verified"
+    public_profile: TikTokPublicProfile | None = None
 
 
 class TikTokSystemLoginError(RuntimeError):
@@ -448,7 +458,7 @@ def _terminate_owned_process(process, *, poll_seconds: float) -> bool:
 
 
 def _gracefully_stop_owned_process(process, *, timeout_seconds: float) -> bool:
-    """Ask only the owned browser process to exit; never escalate to kill."""
+    """Close the owned browser, force-stopping only its hung background process."""
 
     if _owned_process_has_exited(process):
         return True
@@ -458,8 +468,19 @@ def _gracefully_stop_owned_process(process, *, timeout_seconds: float) -> bool:
         return True
     except Exception:
         return _owned_process_has_exited(process)
-    return _wait_for_owned_process_stop(
+    if _wait_for_owned_process_stop(
         process, timeout_seconds=max(0.0, float(timeout_seconds))
+    ):
+        return True
+    try:
+        process.kill()
+    except ProcessLookupError:
+        return True
+    except Exception:
+        return _owned_process_has_exited(process)
+    return _wait_for_owned_process_stop(
+        process,
+        timeout_seconds=_COMPLETE_BROWSER_FORCE_EXIT_TIMEOUT_SECONDS,
     )
 
 
@@ -646,17 +667,16 @@ async def collect_validated_tiktok_candidate(
     *,
     playwright_factory=async_playwright,
 ) -> TikTokLoginCandidate:
-    """Read one dedicated profile, then prove it in a blank TikTok-only context."""
+    """Export one profile, then match two pages in a TikTok-only context."""
 
     if not wait_for_profile_release(attempt, timeout_seconds=0.0):
         raise _profile_busy()
 
     persistent = None
     verifier = None
-    first_blank = None
-    first_blank_page = None
-    second_blank = None
-    second_blank_page = None
+    blank_contexts: list[Any] = []
+    blank_pages: list[Any] = []
+    primary_error_pending = False
     try:
         try:
             manager = playwright_factory()
@@ -680,49 +700,115 @@ async def collect_validated_tiktok_candidate(
                 persistent = None
 
                 verifier = await playwright.chromium.launch(headless=True)
-                first_blank = await verifier.new_context(storage_state=sanitized)
-                first_blank_page = await first_blank.new_page()
-                await first_blank_page.goto(
-                    TIKTOK_IDENTITY_URL,
-                    wait_until="domcontentloaded",
-                    timeout=45_000,
-                )
-                first_identity = None
-                first_identity_error = None
-                try:
-                    first_identity = await read_tiktok_identity(first_blank_page)
-                except TikTokIdentityError as exc:
-                    first_identity_error = _translate_candidate_identity_error(
-                        exc,
-                        first_blank_page,
-                        validation_stage="tiktok_blank_identity_first",
-                    )
-                    if first_identity_error.error_code != "tiktok_identity_missing":
-                        raise first_identity_error from None
+                identity_reads: list[
+                    tuple[Any, TikTokIdentity | None, TikTokSystemLoginError | None]
+                ] = []
+                matching_identities: list[TikTokIdentity] = []
+                verified_context = None
 
-                second_blank = await verifier.new_context(storage_state=sanitized)
-                second_blank_page = await second_blank.new_page()
-                await second_blank_page.goto(
-                    TIKTOK_IDENTITY_URL,
-                    wait_until="domcontentloaded",
-                    timeout=45_000,
-                )
-                second_identity = None
-                second_identity_error = None
-                try:
-                    second_identity = await read_tiktok_identity(second_blank_page)
-                except TikTokIdentityError as exc:
-                    second_identity_error = _translate_candidate_identity_error(
-                        exc,
-                        second_blank_page,
-                        validation_stage="tiktok_blank_identity_second",
-                    )
-                    if second_identity_error.error_code != "tiktok_identity_missing":
-                        raise second_identity_error from None
+                def remember_matching_identity(identity: TikTokIdentity) -> None:
+                    handle = normalize_tiktok_handle(identity.handle)
+                    if not handle:
+                        raise TikTokSystemLoginError(
+                            "tiktok_identity_missing",
+                            "TikTok 登录状态已读取，但未找到唯一公开账号",
+                            tiktok_cookie_present=True,
+                            validation_stage="tiktok_blank_identity_probe",
+                        )
+                    if matching_identities:
+                        expected = normalize_tiktok_handle(
+                            matching_identities[0].handle
+                        )
+                        if handle != expected:
+                            raise TikTokSystemLoginError(
+                                "tiktok_account_identity_mismatch",
+                                "TikTok 两次账号回读不一致",
+                            )
+                    matching_identities.append(identity)
 
-                if first_identity_error is not None or second_identity_error is not None:
-                    first_probe = await probe_tiktok_identity_structure(first_blank_page)
-                    second_probe = await probe_tiktok_identity_structure(second_blank_page)
+                def validation_stage(
+                    context_number: int, *, confirmation: bool
+                ) -> str:
+                    if context_number == 1:
+                        base = "tiktok_blank_identity_first"
+                    elif context_number == 2:
+                        base = "tiktok_blank_identity_second"
+                    else:
+                        base = f"tiktok_blank_identity_retry_{context_number}"
+                    return f"{base}_confirm" if confirmation else base
+
+                async def read_blank_page(
+                    context,
+                    *,
+                    context_number: int,
+                    confirmation: bool,
+                ) -> TikTokIdentity | None:
+                    nonlocal verified_context
+                    page = await context.new_page()
+                    blank_pages.append(page)
+                    await page.goto(
+                        TIKTOK_IDENTITY_URL,
+                        wait_until="domcontentloaded",
+                        timeout=_TIKTOK_IDENTITY_NAVIGATION_TIMEOUT_MS,
+                    )
+                    identity = None
+                    identity_error = None
+                    try:
+                        identity = await read_tiktok_identity(page)
+                    except TikTokIdentityError as exc:
+                        identity_error = _translate_candidate_identity_error(
+                            exc,
+                            page,
+                            validation_stage=validation_stage(
+                                context_number,
+                                confirmation=confirmation,
+                            ),
+                        )
+                        if identity_error.error_code != "tiktok_identity_missing":
+                            raise identity_error from None
+                    identity_reads.append((page, identity, identity_error))
+                    if identity is not None:
+                        remember_matching_identity(identity)
+                        if len(matching_identities) >= 2:
+                            verified_context = context
+                    return identity
+
+                for context_number in range(
+                    1, _TIKTOK_IDENTITY_MAX_READ_ATTEMPTS + 1
+                ):
+                    if len(matching_identities) >= 2:
+                        break
+                    context = await verifier.new_context(storage_state=sanitized)
+                    blank_contexts.append(context)
+                    identity = await read_blank_page(
+                        context,
+                        context_number=context_number,
+                        confirmation=False,
+                    )
+                    if identity is not None and len(matching_identities) < 2:
+                        await read_blank_page(
+                            context,
+                            context_number=context_number,
+                            confirmation=True,
+                        )
+
+                if len(matching_identities) < 2:
+                    missing_reads = [
+                        item for item in identity_reads if item[2] is not None
+                    ]
+                    successful_reads = [
+                        item for item in identity_reads if item[1] is not None
+                    ]
+                    if missing_reads and successful_reads:
+                        probe_reads = (missing_reads[0], successful_reads[0])
+                    else:
+                        probe_reads = tuple(identity_reads[:2])
+                    first_probe = await probe_tiktok_identity_structure(
+                        probe_reads[0][0]
+                    )
+                    second_probe = await probe_tiktok_identity_structure(
+                        probe_reads[1][0]
+                    )
                     identity_probe = combine_tiktok_identity_probes(
                         first_probe,
                         second_probe,
@@ -735,7 +821,17 @@ async def collect_validated_tiktok_candidate(
                             validation_stage="tiktok_blank_identity_probe",
                             identity_probe=identity_probe,
                         ) from None
-                    missing = first_identity_error or second_identity_error
+                    missing = next(
+                        (item[2] for item in identity_reads if item[2] is not None),
+                        None,
+                    )
+                    if missing is None:
+                        raise TikTokSystemLoginError(
+                            "tiktok_identity_missing",
+                            "TikTok 登录状态已读取，但未找到唯一公开账号",
+                            tiktok_cookie_present=True,
+                            validation_stage="tiktok_blank_identity_probe",
+                        ) from None
                     raise TikTokSystemLoginError(
                         missing.error_code,
                         missing.public_message,
@@ -743,42 +839,62 @@ async def collect_validated_tiktok_candidate(
                         validation_stage=missing.validation_stage,
                     ) from None
 
-                if first_identity is None or second_identity is None:
+                if verified_context is None:
                     raise TikTokSystemLoginError(
                         "tiktok_identity_missing",
                         "TikTok 登录状态已读取，但未找到唯一公开账号",
                         tiktok_cookie_present=True,
                         validation_stage="tiktok_blank_identity_probe",
                     ) from None
-                first_handle = normalize_tiktok_handle(first_identity.handle)
-                second_handle = normalize_tiktok_handle(second_identity.handle)
-                if not first_handle or first_handle != second_handle:
-                    raise TikTokSystemLoginError(
-                        "tiktok_account_identity_mismatch",
-                        "TikTok 两次账号回读不一致",
+                confirmed_identity = matching_identities[1]
+                public_profile = None
+                try:
+                    public_profile = await read_tiktok_public_profile(
+                        identity_reads[-1][0],
+                        confirmed_identity,
                     )
+                except TikTokIdentityError as exc:
+                    if exc.error_code == "tiktok_account_identity_mismatch":
+                        raise
+                    try:
+                        public_profile = await asyncio.to_thread(
+                            fetch_tiktok_public_profile,
+                            confirmed_identity,
+                        )
+                    except TikTokIdentityError as fallback_exc:
+                        if fallback_exc.error_code == "tiktok_account_identity_mismatch":
+                            raise
+                if public_profile is not None:
+                    confirmed_identity = TikTokIdentity(
+                        public_profile.handle,
+                        public_profile.display_name,
+                        f"https://www.tiktok.com/@{public_profile.handle}",
+                    )
+                verified_state = sanitize_tiktok_storage_state(
+                    await verified_context.storage_state()
+                )
+
                 if await _close_playwright_resources(
-                    second_blank_page,
-                    second_blank,
-                    first_blank_page,
-                    first_blank,
+                    *blank_pages,
+                    *blank_contexts,
                     verifier,
                 ):
                     raise _profile_busy()
-                second_blank_page = None
-                second_blank = None
-                first_blank_page = None
-                first_blank = None
+                blank_pages.clear()
+                blank_contexts.clear()
                 verifier = None
                 candidate = TikTokLoginCandidate(
-                    sanitized,
-                    second_identity,
+                    verified_state,
+                    confirmed_identity,
                     tiktok_cookie_present=True,
                     validation_stage="tiktok_blank_identity_verified",
+                    public_profile=public_profile,
                 )
         except TikTokSystemLoginError:
+            primary_error_pending = True
             raise
         except TikTokSessionScopeError as exc:
+            primary_error_pending = True
             raise TikTokSystemLoginError(
                 exc.error_code,
                 exc.public_message,
@@ -786,30 +902,25 @@ async def collect_validated_tiktok_candidate(
                 validation_stage="tiktok_persistent_state",
             ) from exc
         except TikTokIdentityError as exc:
-            is_second_blank = second_blank_page is not None
+            primary_error_pending = True
             raise _translate_candidate_identity_error(
                 exc,
-                second_blank_page or first_blank_page,
-                validation_stage=(
-                    "tiktok_blank_identity_second"
-                    if is_second_blank
-                    else "tiktok_blank_identity_first"
-                ),
+                blank_pages[-1] if blank_pages else None,
+                validation_stage="tiktok_blank_identity_first",
             ) from None
         except Exception as exc:
+            primary_error_pending = True
             raise TikTokSystemLoginError(
                 "tiktok_session_expired", "TikTok 登录状态已失效"
             ) from exc
     finally:
         close_failed = await _close_playwright_resources(
-            second_blank_page,
-            second_blank,
+            *blank_pages,
+            *blank_contexts,
             verifier,
-            first_blank_page,
-            first_blank,
             persistent,
         )
-        if close_failed:
+        if close_failed and not primary_error_pending:
             raise _profile_busy() from None
     return candidate
 
@@ -928,6 +1039,7 @@ def commit_tiktok_login_candidate(
     existing_account: Mapping[str, Any] | None,
     cookie_dir: Path = COOKIE_DIR,
     account_saver=account_service.save_tiktok_browser_account,
+    profile_persister=persist_tiktok_public_profile,
 ) -> int:
     """Atomically replace the session file, compensating any database failure."""
 
@@ -962,6 +1074,14 @@ def commit_tiktok_login_candidate(
             old_basename=old_basename,
             cookie_dir=cookie_dir,
         )
+    if candidate.public_profile is not None:
+        try:
+            profile_persister(account_id, candidate.public_profile)
+        except Exception:
+            # The stable handle and isolated session are already committed.
+            # A transient public-avatar write must not turn that valid login
+            # into a false failure; account-page refresh can retry this field.
+            pass
     return account_id
 
 

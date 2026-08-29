@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from app_core import account_service
 from app_core.overseas_tiktok_identity import TikTokIdentity, TikTokIdentityError
+from app_core.overseas_tiktok_profile import TikTokPublicProfile
 
 from app_core.overseas_tiktok_system_login import (
     SystemBrowserSpec,
@@ -44,10 +45,14 @@ class _FakePage:
         self,
         *,
         close_error: Exception | None = None,
+        goto_error: Exception | None = None,
+        minimum_goto_timeout: int = 0,
         probe_payload: object | None = None,
         evaluate_error: Exception | None = None,
     ) -> None:
         self.close_error = close_error
+        self.goto_error = goto_error
+        self.minimum_goto_timeout = int(minimum_goto_timeout)
         self.probe_payload = probe_payload
         self.evaluate_error = evaluate_error
         self.url = "https://www.tiktok.com/tiktokstudio/upload"
@@ -57,6 +62,10 @@ class _FakePage:
 
     async def goto(self, url: str, *, wait_until: str, timeout: int) -> None:
         self.goto_calls.append((url, wait_until, timeout))
+        if self.goto_error is not None:
+            raise self.goto_error
+        if timeout < self.minimum_goto_timeout:
+            raise TimeoutError("simulated slow TikTok homepage")
 
     async def close(self) -> None:
         self.close_calls += 1
@@ -92,15 +101,24 @@ class _FakePersistentContext:
 
 
 class _FakeBlankContext:
-    def __init__(self, page: _FakePage, storage_state_input: dict) -> None:
+    def __init__(
+        self,
+        page: _FakePage,
+        storage_state_input: dict,
+        storage_state_output: dict | None = None,
+    ) -> None:
         self.page = page
         self.storage_state_input = storage_state_input
+        self.storage_state_output = storage_state_output or storage_state_input
         self.new_page_calls = 0
         self.close_calls = 0
 
     async def new_page(self) -> _FakePage:
         self.new_page_calls += 1
         return self.page
+
+    async def storage_state(self) -> dict:
+        return self.storage_state_output
 
     async def close(self) -> None:
         self.close_calls += 1
@@ -111,11 +129,22 @@ class _FakeVerifierBrowser:
         self.pages = list(pages)
         self.blank_context: _FakeBlankContext | None = None
         self.blank_contexts: list[_FakeBlankContext] = []
+        self.storage_state_outputs: list[dict] = []
         self.close_calls = 0
 
     async def new_context(self, *, storage_state: dict) -> _FakeBlankContext:
-        page = self.pages[len(self.blank_contexts)]
-        self.blank_context = _FakeBlankContext(page, storage_state)
+        index = len(self.blank_contexts)
+        page = self.pages[index]
+        storage_state_output = (
+            self.storage_state_outputs[index]
+            if index < len(self.storage_state_outputs)
+            else storage_state
+        )
+        self.blank_context = _FakeBlankContext(
+            page,
+            storage_state,
+            storage_state_output,
+        )
         self.blank_contexts.append(self.blank_context)
         return self.blank_context
 
@@ -196,6 +225,24 @@ class ProcessStaysAliveAfterTerminate(FakeProcess):
     def wait(self, timeout: float | None = None) -> int:
         self.wait_calls.append(timeout)
         raise subprocess.TimeoutExpired("owned-browser", timeout)
+
+    def kill(self) -> None:
+        self.kill_calls += 1
+
+
+class ProcessExitsOnlyAfterKill(FakeProcess):
+    """Models Chrome keeping background services alive after its window closes."""
+
+    def __init__(self) -> None:
+        super().__init__([None])
+        self.kill_calls = 0
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.wait_calls.append(timeout)
+        if self.kill_calls == 0:
+            raise subprocess.TimeoutExpired("owned-browser", timeout)
+        self._poll_results = [0]
+        return 0
 
     def kill(self) -> None:
         self.kill_calls += 1
@@ -522,7 +569,25 @@ class TikTokSystemLoginTests(unittest.TestCase):
         self.assertEqual(outcome, "closed")
         self.assertEqual(process.terminate_calls, 1)
         self.assertEqual(process.kill_calls, 0)
-        self.assertEqual(process.wait_calls, [5.0])
+
+    def test_complete_event_force_stops_only_its_hung_background_process(self):
+        process = ProcessExitsOnlyAfterKill()
+        complete = threading.Event()
+        complete.set()
+
+        outcome = wait_for_browser_exit(
+            process,
+            threading.Event(),
+            complete_event=complete,
+            timeout_seconds=60,
+            poll_seconds=0.001,
+        )
+
+        self.assertEqual(outcome, "closed")
+        self.assertEqual(process.terminate_calls, 1)
+        self.assertEqual(process.kill_calls, 1)
+        self.assertEqual(len(process.wait_calls), 2)
+        self.assertTrue(all(timeout is not None for timeout in process.wait_calls))
 
     def test_cancel_takes_priority_over_complete_event(self):
         process = FakeProcess([None])
@@ -557,7 +622,7 @@ class TikTokSystemLoginTests(unittest.TestCase):
 
         self.assertEqual(outcome, "cleanup_failed")
         self.assertEqual(process.terminate_calls, 1)
-        self.assertEqual(process.kill_calls, 0)
+        self.assertEqual(process.kill_calls, 1)
 
     def test_wait_for_browser_exit_cancels_only_its_own_process(self):
         process = FakeProcess([None])
@@ -653,11 +718,20 @@ class TikTokCandidateIntakeTests(unittest.TestCase):
         self.persistent_page = _FakePage()
         self.first_blank_page = _FakePage()
         self.second_blank_page = _FakePage()
+        self.third_blank_page = _FakePage()
+        self.fourth_blank_page = _FakePage()
+        self.fifth_blank_page = _FakePage()
         self.fake_persistent = _FakePersistentContext(
             self.persistent_page, self.raw_state
         )
         self.fake_verifier = _FakeVerifierBrowser(
-            [self.first_blank_page, self.second_blank_page]
+            [
+                self.first_blank_page,
+                self.second_blank_page,
+                self.third_blank_page,
+                self.fourth_blank_page,
+                self.fifth_blank_page,
+            ]
         )
         self.fake_chromium = _FakeChromium(self.fake_persistent, self.fake_verifier)
         self.fake_playwright = _FakePlaywrightManager(self.fake_chromium)
@@ -699,7 +773,12 @@ class TikTokCandidateIntakeTests(unittest.TestCase):
             },
         }
 
-    def _collect(self, *results: TikTokIdentity | Exception) -> TikTokLoginCandidate:
+    def _collect(
+        self,
+        *results: TikTokIdentity | Exception,
+        public_profile: TikTokPublicProfile | Exception | None = None,
+        fetched_profile: TikTokPublicProfile | Exception | None = None,
+    ) -> TikTokLoginCandidate:
         configured = list(results) or [
             TikTokIdentity(
                 "expected.user",
@@ -722,9 +801,41 @@ class TikTokCandidateIntakeTests(unittest.TestCase):
             self.fake_identity_reads.append(result.handle)
             return result
 
-        with patch(
-            "app_core.overseas_tiktok_system_login.read_tiktok_identity",
-            new=read_identity,
+        async def read_profile(_page, _identity):
+            if isinstance(public_profile, Exception):
+                raise public_profile
+            if public_profile is None:
+                raise TikTokIdentityError(
+                    "tiktok_profile_unavailable",
+                    "profile unavailable in identity-only fixture",
+                )
+            return public_profile
+
+        def fetch_profile(_identity):
+            if isinstance(fetched_profile, Exception):
+                raise fetched_profile
+            if fetched_profile is None:
+                raise TikTokIdentityError(
+                    "tiktok_profile_unavailable",
+                    "public profile unavailable in identity-only fixture",
+                )
+            return fetched_profile
+
+        with (
+            patch(
+                "app_core.overseas_tiktok_system_login.read_tiktok_identity",
+                new=read_identity,
+            ),
+            patch(
+                "app_core.overseas_tiktok_system_login.read_tiktok_public_profile",
+                new=read_profile,
+                create=True,
+            ),
+            patch(
+                "app_core.overseas_tiktok_system_login.fetch_tiktok_public_profile",
+                side_effect=fetch_profile,
+                create=True,
+            ),
         ):
             return asyncio.run(
                 collect_validated_tiktok_candidate(
@@ -734,7 +845,7 @@ class TikTokCandidateIntakeTests(unittest.TestCase):
                 )
             )
 
-    def test_candidate_uses_two_blank_contexts_after_exporting_sanitized_state(self):
+    def test_candidate_uses_two_fresh_pages_after_exporting_sanitized_state(self):
         candidate = self._collect()
 
         self.assertEqual(candidate.identity.handle, "expected.user")
@@ -744,27 +855,171 @@ class TikTokCandidateIntakeTests(unittest.TestCase):
             "tiktok_blank_identity_verified",
         )
         blanks = self.fake_verifier.blank_contexts
-        self.assertEqual(len(blanks), 2)
+        self.assertEqual(len(blanks), 1)
         for blank in blanks:
             self.assertEqual(
                 blank.storage_state_input["cookies"][0]["domain"],
                 ".tiktok.com",
             )
-            self.assertEqual(blank.new_page_calls, 1)
+            self.assertEqual(blank.new_page_calls, 2)
             self.assertEqual(blank.close_calls, 1)
         self.assertNotIn("google.com", repr(blanks))
         self.assertNotIn("accounts.google.com", repr(candidate.storage_state))
         self.assertEqual(self.fake_identity_reads, ["expected.user", "expected.user"])
         self.assertEqual(self.fake_persistent.new_page_calls, 0)
-        self.assertEqual(self.first_blank_page.goto_calls[0][0], "https://www.tiktok.com/")
-        self.assertEqual(self.second_blank_page.goto_calls[0][0], "https://www.tiktok.com/")
+        self.assertEqual(len(self.first_blank_page.goto_calls), 2)
+        self.assertTrue(
+            all(
+                call[0] == "https://www.tiktok.com/"
+                for call in self.first_blank_page.goto_calls
+            )
+        )
+        self.assertEqual(self.second_blank_page.goto_calls, [])
         self.assertEqual(self.persistent_page.close_calls, 0)
-        self.assertEqual(self.first_blank_page.close_calls, 1)
-        self.assertEqual(self.second_blank_page.close_calls, 1)
+        self.assertEqual(self.first_blank_page.close_calls, 2)
+        self.assertEqual(self.second_blank_page.close_calls, 0)
         self.assertGreaterEqual(self.fake_persistent.close_calls, 1)
         self.assertEqual(self.fake_verifier.close_calls, 1)
         self.assertEqual(self.first_blank_page.evaluate_calls, 0)
         self.assertEqual(self.second_blank_page.evaluate_calls, 0)
+
+    def test_candidate_enriches_the_verified_handle_from_its_exact_profile(self):
+        profile = TikTokPublicProfile(
+            handle="expected.user",
+            display_name="Mobai",
+            avatar_png=b"public-avatar-png",
+        )
+        candidate = self._collect(public_profile=profile)
+
+        self.assertEqual(candidate.identity.handle, "expected.user")
+        self.assertEqual(candidate.identity.display_name, "Mobai")
+        self.assertEqual(candidate.public_profile, profile)
+
+    def test_candidate_falls_back_to_the_cookie_free_public_profile(self):
+        profile = TikTokPublicProfile(
+            handle="expected.user",
+            display_name="Mobai",
+            avatar_png=b"public-avatar-png",
+        )
+
+        candidate = self._collect(
+            public_profile=TikTokIdentityError(
+                "tiktok_profile_unavailable",
+                "headless profile shell",
+            ),
+            fetched_profile=profile,
+        )
+
+        self.assertEqual(candidate.identity.display_name, "Mobai")
+        self.assertEqual(candidate.public_profile, profile)
+
+    def test_candidate_confirms_a_success_in_a_fresh_page_of_the_warm_context(self):
+        candidate = self._collect()
+
+        self.assertEqual(candidate.identity.handle, "expected.user")
+        self.assertEqual(len(self.fake_verifier.blank_contexts), 1)
+        self.assertEqual(
+            self.fake_verifier.blank_contexts[0].new_page_calls,
+            2,
+        )
+        self.assertEqual(self.fake_identity_reads, ["expected.user", "expected.user"])
+
+    def test_candidate_persists_the_verified_context_refreshed_tiktok_state(self):
+        self.fake_verifier.storage_state_outputs = [
+            {
+                "cookies": [
+                    {
+                        "name": "sessionid",
+                        "value": "refreshed-tiktok-state",
+                        "domain": ".tiktok.com",
+                    },
+                    {
+                        "name": "SID",
+                        "value": "must-not-be-saved",
+                        "domain": ".google.com",
+                    },
+                ],
+                "origins": [
+                    {"origin": "https://www.tiktok.com", "localStorage": []},
+                    {"origin": "https://accounts.google.com", "localStorage": []},
+                ],
+            }
+        ]
+
+        candidate = self._collect()
+
+        self.assertEqual(
+            candidate.storage_state["cookies"][0]["value"],
+            "refreshed-tiktok-state",
+        )
+        self.assertNotIn("google.com", repr(candidate.storage_state))
+
+    def test_candidate_allows_a_slow_tiktok_homepage_navigation_budget(self):
+        self.first_blank_page.minimum_goto_timeout = 90_000
+        self.second_blank_page.minimum_goto_timeout = 90_000
+
+        candidate = self._collect()
+
+        self.assertEqual(candidate.identity.handle, "expected.user")
+
+    def test_candidate_retries_one_transient_blank_shell_for_a_second_match(self):
+        identity = TikTokIdentity(
+            "expected.user",
+            "Expected",
+            "https://www.tiktok.com/@expected.user",
+        )
+
+        candidate = self._collect(
+            identity,
+            TikTokIdentityError(
+                "tiktok_account_invalid",
+                "transient blank homepage shell",
+            ),
+            identity,
+        )
+
+        self.assertEqual(candidate.identity.handle, "expected.user")
+        self.assertEqual(self.fake_identity_reads, ["expected.user", "expected.user"])
+        self.assertEqual(len(self.fake_verifier.blank_contexts), 2)
+        self.assertTrue(
+            all(context.close_calls == 1 for context in self.fake_verifier.blank_contexts)
+        )
+
+    def test_candidate_keeps_retrying_when_two_blank_shells_split_matching_reads(self):
+        identity = TikTokIdentity(
+            "expected.user",
+            "Expected",
+            "https://www.tiktok.com/@expected.user",
+        )
+
+        candidate = self._collect(
+            identity,
+            TikTokIdentityError(
+                "tiktok_account_invalid",
+                "first transient blank homepage shell",
+            ),
+            TikTokIdentityError(
+                "tiktok_account_invalid",
+                "second transient blank homepage shell",
+            ),
+            identity,
+        )
+
+        self.assertEqual(candidate.identity.handle, "expected.user")
+        self.assertEqual(self.fake_identity_reads, ["expected.user", "expected.user"])
+        self.assertEqual(len(self.fake_verifier.blank_contexts), 3)
+        self.assertTrue(
+            all(context.close_calls == 1 for context in self.fake_verifier.blank_contexts)
+        )
+
+    def test_navigation_error_is_not_masked_by_cleanup_error(self):
+        self.first_blank_page.goto_error = TimeoutError("primary network failure")
+        self.first_blank_page.close_error = RuntimeError("secondary close failure")
+
+        with self.assertRaises(TikTokSystemLoginError) as raised:
+            self._collect()
+
+        self.assertEqual(raised.exception.error_code, "tiktok_session_expired")
 
     def test_identity_missing_runs_safe_probe_in_both_blank_contexts_and_never_saves(self):
         self.first_blank_page.probe_payload = self._probe_payload()
@@ -782,11 +1037,14 @@ class TikTokCandidateIntakeTests(unittest.TestCase):
                 )
 
         self.assertEqual(raised.exception.error_code, "tiktok_identity_probe_required")
-        self.assertEqual(len(self.fake_verifier.blank_contexts), 2)
+        self.assertEqual(len(self.fake_verifier.blank_contexts), 5)
         self.assertEqual(self.first_blank_page.evaluate_calls, 1)
         self.assertEqual(self.second_blank_page.evaluate_calls, 1)
         self.assertEqual(self.first_blank_page.close_calls, 1)
         self.assertEqual(self.second_blank_page.close_calls, 1)
+        self.assertTrue(
+            all(context.close_calls == 1 for context in self.fake_verifier.blank_contexts)
+        )
         self.assertEqual(self.fake_verifier.close_calls, 1)
         commit.assert_not_called()
 
@@ -965,7 +1223,7 @@ class TikTokCandidateIntakeTests(unittest.TestCase):
             )
 
         self.assertEqual(raised.exception.error_code, "tiktok_identity_missing")
-        self.assertEqual(len(self.fake_verifier.blank_contexts), 2)
+        self.assertEqual(len(self.fake_verifier.blank_contexts), 5)
         self.assertEqual(self.first_blank_page.evaluate_calls, 1)
         self.assertEqual(self.second_blank_page.evaluate_calls, 1)
         self.assertIsNone(getattr(raised.exception, "identity_probe", None))
@@ -1034,7 +1292,7 @@ class TikTokCandidateIntakeTests(unittest.TestCase):
         )
         self.assertEqual(self.fake_verifier.blank_contexts, [])
 
-    def test_candidate_revalidates_unknown_tiktok_cookie_name_in_two_blank_contexts(self):
+    def test_candidate_revalidates_unknown_tiktok_cookie_name_in_two_blank_pages(self):
         self.fake_persistent.raw_storage_state = {
             "cookies": [
                 {
@@ -1055,7 +1313,8 @@ class TikTokCandidateIntakeTests(unittest.TestCase):
             )
 
         self.assertTrue(getattr(candidate, "tiktok_cookie_present", False))
-        self.assertEqual(len(self.fake_verifier.blank_contexts), 2)
+        self.assertEqual(len(self.fake_verifier.blank_contexts), 1)
+        self.assertEqual(self.fake_verifier.blank_contexts[0].new_page_calls, 2)
         self.assertEqual(self.fake_identity_reads, ["expected.user", "expected.user"])
 
     def test_candidate_rejects_visitor_tiktok_state_when_blank_context_has_no_identity(self):
@@ -1079,7 +1338,7 @@ class TikTokCandidateIntakeTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.error_code, "tiktok_identity_missing")
         self.assertTrue(getattr(raised.exception, "tiktok_cookie_present", False))
-        self.assertEqual(len(self.fake_verifier.blank_contexts), 2)
+        self.assertEqual(len(self.fake_verifier.blank_contexts), 5)
 
     def test_candidate_rejects_two_blank_context_handle_mismatch(self):
         with self.assertRaises(TikTokSystemLoginError) as raised:
@@ -1302,6 +1561,37 @@ class TikTokCandidateCommitTests(unittest.TestCase):
         if os.name == "posix":
             self.assertEqual(stat.S_IMODE(new_file.stat().st_mode), 0o600)
         saver.assert_called_once()
+
+    def test_commit_persists_public_profile_after_binding_the_account_row(self):
+        profile = TikTokPublicProfile(
+            handle="expected.user",
+            display_name="Mobai",
+            avatar_png=b"public-avatar-png",
+        )
+        candidate = TikTokLoginCandidate(
+            self.candidate.storage_state,
+            TikTokIdentity(
+                "expected.user",
+                "Mobai",
+                "https://www.tiktok.com/@expected.user",
+            ),
+            public_profile=profile,
+        )
+        saver = Mock(return_value=23)
+        persister = Mock()
+
+        account_id = commit_tiktok_login_candidate(
+            candidate,
+            "TikTok 测试",
+            record_id=None,
+            existing_account=None,
+            cookie_dir=self.cookie_dir,
+            account_saver=saver,
+            profile_persister=persister,
+        )
+
+        self.assertEqual(account_id, 23)
+        persister.assert_called_once_with(23, profile)
 
     def test_database_failure_removes_new_session_and_preserves_old_account(self):
         with self.assertRaises(TikTokSystemLoginError) as raised:

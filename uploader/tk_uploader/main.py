@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import unicodedata
 from pathlib import Path
 from typing import Any, Sequence
@@ -40,17 +41,23 @@ TOPIC_CANDIDATE_SELECTORS = (
     '[data-e2e*="hashtag" i] [role="option"]',
     '[data-e2e*="suggest" i] [role="option"]',
     '[role="listbox"] [role="option"]',
+    '[role="option"]',
 )
 TOPIC_ENTITY_SELECTORS = (
     '[data-e2e*="hashtag" i]',
     '[data-type="hashtag"]',
     '[data-hashtag-name]',
     'a[href^="/tag/"]',
+    'span.mention',
 )
 TOPIC_CANDIDATE_STABLE_READS = 2
-TOPIC_CANDIDATE_POLL_ATTEMPTS = 20
+TOPIC_CANDIDATE_POLL_ATTEMPTS = 300
 TOPIC_ENTITY_STABLE_READS = 3
-TOPIC_ENTITY_POLL_ATTEMPTS = 20
+TOPIC_ENTITY_POLL_ATTEMPTS = 300
+UPLOAD_ENTRY_POLL_ATTEMPTS = 120
+UPLOAD_ENTRY_POLL_INTERVAL_MS = 1_000
+CAPTION_EDITOR_POLL_ATTEMPTS = 180
+CAPTION_EDITOR_POLL_INTERVAL_MS = 1_000
 
 
 class TikTokManualInterventionRequired(RuntimeError):
@@ -181,6 +188,17 @@ class TiktokVideo:
         self.external_page = None
         self.external_context = None
         self.external_browser = None
+        self.form_stage_observer = None
+
+    def _emit_form_stage(self, stage: str) -> None:
+        observer = self.form_stage_observer
+        if not callable(observer):
+            return
+        try:
+            observer(str(stage))
+        except Exception:
+            # 诊断事件不能改变发布表单本身的控制流。
+            return
 
     def _caption(self) -> str:
         return compose_tiktok_caption(
@@ -211,20 +229,44 @@ class TiktokVideo:
         return page
 
     async def _upload_file(self, page, base) -> None:
-        file_input = base.locator('input[type="file"]').first
-        if await file_input.count():
-            await file_input.set_input_files(self.file_path)
-            return
-        for label in ("Select video", "Select file", "Upload"):
-            button = base.get_by_role("button", name=label, exact=False).first
-            if not await button.count():
-                continue
-            async with page.expect_file_chooser(timeout=15000) as chooser_info:
-                await button.click()
-            chooser = await chooser_info.value
-            await chooser.set_files(self.file_path)
-            return
-        raise RuntimeError("TikTok 上传页未找到视频选择入口，页面结构可能已变化")
+        del base
+        for _ in range(UPLOAD_ENTRY_POLL_ATTEMPTS):
+            await self._wait_for_manual_intervention(page)
+            current_base = await self._base(page)
+            file_input = current_base.locator('input[type="file"]').first
+            try:
+                if await file_input.count():
+                    await file_input.set_input_files(self.file_path)
+                    return
+            except TikTokPublishError:
+                raise
+            except Exception:
+                # TikTok 慢加载时上传组件会重挂载；下一轮重新解析 iframe/入口。
+                pass
+            for label in ("Select video", "Select file", "Upload"):
+                button = current_base.get_by_role(
+                    "button",
+                    name=label,
+                    exact=False,
+                ).first
+                try:
+                    if not await button.count():
+                        continue
+                    async with page.expect_file_chooser(timeout=15000) as chooser_info:
+                        await button.click()
+                    chooser = await chooser_info.value
+                    await chooser.set_files(self.file_path)
+                    return
+                except TikTokPublishError:
+                    raise
+                except Exception:
+                    # 入口可能正从占位按钮切换为真实文件控件，继续等待稳定页面。
+                    continue
+            await page.wait_for_timeout(UPLOAD_ENTRY_POLL_INTERVAL_MS)
+        raise TikTokPublishError(
+            "tiktok_upload_entry_timeout",
+            "TikTok 上传页在等待时间内没有出现视频选择入口",
+        )
 
     @staticmethod
     def _normalize_caption_text(value: object) -> str:
@@ -234,6 +276,9 @@ class TiktokVideo:
     @staticmethod
     def _normalize_topic_label(value: object) -> str:
         text = unicodedata.normalize("NFKC", str(value or "")).strip()
+        leading = re.match(r"^#\s*([^\s#]+)", text)
+        if leading is not None:
+            return leading.group(1)
         return "".join(text.lstrip("#").strip().split())
 
     async def _read_editor_text(self, editor) -> str:
@@ -291,9 +336,38 @@ class TiktokVideo:
             "TikTok 上传页未找到唯一可编辑文案框",
         )
 
-    async def _fill_plain_caption(self, page, base, plain_caption: str):
-        editor = await self._resolve_caption_editor(base)
-        await editor.click()
+    async def _wait_for_caption_editor(self, page, base):
+        current_base = base
+        for attempt in range(CAPTION_EDITOR_POLL_ATTEMPTS):
+            await self._wait_for_manual_intervention(page)
+            if attempt:
+                current_base = await self._base(page)
+            try:
+                editor = await self._resolve_caption_editor(current_base)
+                return current_base, editor
+            except TikTokPublishError as exc:
+                if exc.error_code not in {
+                    "tiktok_caption_editor_missing",
+                    "tiktok_caption_editor_invalid",
+                }:
+                    raise
+            await page.wait_for_timeout(CAPTION_EDITOR_POLL_INTERVAL_MS)
+        raise TikTokPublishError(
+            "tiktok_caption_editor_timeout",
+            "TikTok 视频已选择，但等待文案编辑区域超时",
+        )
+
+    async def _fill_plain_caption(
+        self,
+        page,
+        base,
+        plain_caption: str,
+        *,
+        editor=None,
+    ):
+        if editor is None:
+            editor = await self._resolve_caption_editor(base)
+        await self._focus_caption_editor(editor)
         await page.keyboard.press("ControlOrMeta+A")
         await page.keyboard.press("Backspace")
         cleared = self._normalize_caption_text(await self._read_editor_text(editor))
@@ -312,37 +386,76 @@ class TiktokVideo:
             )
         return editor
 
-    async def _stable_topic_candidates(self, page, base):
+    async def _focus_caption_editor(self, editor) -> None:
+        focus = getattr(editor, "focus", None)
+        if not callable(focus):
+            raise TikTokPublishError(
+                "tiktok_caption_focus_failed",
+                "TikTok 文案框无法获得输入焦点",
+            )
+        try:
+            await focus()
+        except Exception as exc:
+            raise TikTokPublishError(
+                "tiktok_caption_focus_failed",
+                "TikTok 文案框无法获得输入焦点",
+            ) from exc
+
+    async def _stable_topic_candidates(
+        self,
+        page,
+        base,
+        *,
+        topic: str | None = None,
+    ):
         previous: tuple[str, tuple[str, ...]] | None = None
         stable_reads = 0
         for _ in range(TOPIC_CANDIDATE_POLL_ATTEMPTS):
             await self._wait_for_manual_intervention(page)
             current: tuple[str, tuple[str, ...]] | None = None
             current_items: list[object] = []
-            for selector in TOPIC_CANDIDATE_SELECTORS:
-                candidates = base.locator(selector)
-                try:
-                    count = await candidates.count()
-                except Exception:
-                    continue
-                labels: list[str] = []
-                items: list[object] = []
-                for index in range(count):
-                    candidate = candidates.nth(index)
+            scopes = (base,)
+            if base is not page and callable(getattr(page, "locator", None)):
+                scopes = (base, page)
+            for scope_index, scope in enumerate(scopes):
+                for selector in TOPIC_CANDIDATE_SELECTORS:
+                    candidates = scope.locator(selector)
                     try:
-                        if not await candidate.is_visible():
-                            continue
-                        label = self._normalize_topic_label(
-                            await candidate.inner_text(timeout=1000)
-                        )
+                        count = await candidates.count()
                     except Exception:
                         continue
-                    if label:
-                        labels.append(label)
-                        items.append(candidate)
-                if items:
-                    current = (selector, tuple(labels))
-                    current_items = items
+                    labels: list[str] = []
+                    items: list[object] = []
+                    for index in range(count):
+                        candidate = candidates.nth(index)
+                        try:
+                            if not await candidate.is_visible():
+                                continue
+                            label = self._normalize_topic_label(
+                                await candidate.inner_text(timeout=1000)
+                            )
+                        except Exception:
+                            continue
+                        if label:
+                            labels.append(label)
+                            items.append(candidate)
+                    if topic is not None:
+                        exact_pairs = [
+                            (item, label)
+                            for item, label in zip(items, labels)
+                            if label.casefold() == topic.casefold()
+                        ]
+                        items = [item for item, _label in exact_pairs]
+                        labels = [label for _item, label in exact_pairs]
+                    if items:
+                        if topic is not None:
+                            # TikTok 的建议下拉层可能挂在 iframe 外层；目标候选
+                            # 点击后仍须经过平台话题实体的连续稳定回读。
+                            return items, labels
+                        current = (f"{scope_index}:{selector}", tuple(labels))
+                        current_items = items
+                        break
+                if current is not None:
                     break
             if current is not None and current == previous:
                 stable_reads += 1
@@ -353,6 +466,46 @@ class TiktokVideo:
                 stable_reads = 0
             await page.wait_for_timeout(100)
         return [], []
+
+    async def _exact_topic_candidate(
+        self,
+        candidates: Sequence[object],
+        labels: Sequence[str],
+        topic: str,
+    ):
+        exact = [
+            candidate
+            for candidate, label in zip(candidates, labels)
+            if label.casefold() == topic.casefold()
+        ]
+        if not exact:
+            raise TikTokPublishError(
+                "tiktok_topic_candidate_missing",
+                f"TikTok 未返回话题 {topic} 的唯一精确官方候选",
+            )
+        if len(exact) == 1:
+            return exact[0]
+
+        focused = []
+        for candidate in exact:
+            try:
+                class_name = str(
+                    await candidate.get_attribute("class") or ""
+                ).casefold()
+                aria_selected = str(
+                    await candidate.get_attribute("aria-selected") or ""
+                ).casefold()
+            except Exception:
+                continue
+            class_tokens = set(class_name.split())
+            if "focused" in class_tokens or aria_selected == "true":
+                focused.append(candidate)
+        if len(focused) == 1:
+            return focused[0]
+        raise TikTokPublishError(
+            "tiktok_topic_candidate_ambiguous",
+            f"TikTok 话题 {topic} 出现多个精确官方候选",
+        )
 
     async def _read_topic_entities(self, editor) -> list[str]:
         for selector in TOPIC_ENTITY_SELECTORS:
@@ -426,7 +579,7 @@ class TiktokVideo:
     ) -> list[str]:
         expected: list[str] = []
         for topic in topics:
-            await editor.click()
+            await self._focus_caption_editor(editor)
             await page.keyboard.press("ControlOrMeta+End")
             current_text = self._normalize_caption_text(
                 await self._read_editor_text(editor)
@@ -434,23 +587,17 @@ class TiktokVideo:
             if current_text:
                 await page.keyboard.insert_text(" ")
             await page.keyboard.insert_text(f"#{topic}")
-            candidates, labels = await self._stable_topic_candidates(page, base)
-            exact = [
-                candidate
-                for candidate, label in zip(candidates, labels)
-                if label.casefold() == topic.casefold()
-            ]
-            if not exact:
-                raise TikTokPublishError(
-                    "tiktok_topic_candidate_missing",
-                    f"TikTok 未返回话题 {topic} 的唯一精确官方候选",
-                )
-            if len(exact) != 1:
-                raise TikTokPublishError(
-                    "tiktok_topic_candidate_ambiguous",
-                    f"TikTok 话题 {topic} 出现多个精确官方候选",
-                )
-            await exact[0].click()
+            candidates, labels = await self._stable_topic_candidates(
+                page,
+                base,
+                topic=topic,
+            )
+            exact = await self._exact_topic_candidate(
+                candidates,
+                labels,
+                topic,
+            )
+            await exact.click()
             expected.append(topic)
             await self._wait_for_expected_topic_entities(
                 page,
@@ -504,36 +651,44 @@ class TiktokVideo:
         }
 
     async def prepare_form(self, page, base) -> dict[str, Any]:
+        self._emit_form_stage("upload_entry_waiting")
         await self._upload_file(page, base)
-        await self._wait_for_manual_intervention(page)
+        self._emit_form_stage("video_selected")
+        self._emit_form_stage("caption_editor_waiting")
+        base, _editor = await self._wait_for_caption_editor(page, base)
+        self._emit_form_stage("caption_editor_ready")
         plain_caption = self._plain_caption()
+        self._emit_form_stage("caption_write_started")
         editor = await self._fill_plain_caption(page, base, plain_caption)
+        self._emit_form_stage("caption_write_verified")
+        self._emit_form_stage("topics_started")
         await self._append_official_topics(
             page,
             base,
             editor,
             self._topics(),
         )
+        self._emit_form_stage("topics_verified")
+        self._emit_form_stage("visibility_started")
         await self._ensure_public_visibility(page, base)
+        self._emit_form_stage("visibility_verified")
+        self._emit_form_stage("post_ready_waiting")
         await self._wait_until_ready(page, base)
-        return await self._verify_form_snapshot(page, base)
+        self._emit_form_stage("form_snapshot_started")
+        receipt = await self._verify_form_snapshot(page, base)
+        self._emit_form_stage("form_snapshot_verified")
+        return receipt
 
     async def _wait_until_ready(self, page, base) -> None:
         for _ in range(180):
             await self._wait_for_manual_intervention(page)
-            for selector in (
-                'button:has-text("Post")',
-                'div.button-group > button:has-text("Post")',
-                'div.btn-post > button',
-            ):
-                button = base.locator(selector).first
-                try:
-                    if await button.count() and await button.is_visible() and await button.is_enabled():
-                        return
-                except Exception:
-                    pass
+            if await self._post_button(base) is not None:
+                return
             await asyncio.sleep(2)
-        raise RuntimeError("TikTok 视频上传或处理超时，未进入可发布状态")
+        raise TikTokPublishError(
+            "tiktok_post_ready_timeout",
+            "TikTok 视频上传或处理超时，最终按钮未进入可用状态",
+        )
 
     async def _wait_for_manual_intervention(self, page) -> None:
         reason = tiktok_security_intervention_reason(page.url, await _body_text(page))
