@@ -394,8 +394,18 @@ class TikTokScheduleForm:
         right: _FrozenScheduleCandidate,
         deadline: float,
     ) -> bool:
+        left_id = getattr(left.node, "node_id", None)
+        right_id = getattr(right.node, "node_id", None)
+        if left_id is not None and right_id is not None:
+            return left_id == right_id
+        evaluate = getattr(left.node, "evaluate", None)
+        if not callable(evaluate):
+            raise RuntimeError("frozen schedule node lacks comparison protocol")
         return bool(
-            await self._await_control(_same_dom_node(left.node, right.node), deadline)
+            await self._await_control(
+                evaluate("(element, other) => element === other", right.node),
+                deadline,
+            )
         )
 
     async def _append_unique_frozen(
@@ -553,7 +563,16 @@ class TikTokScheduleForm:
             else:
                 previous_usable = []
             if observation + 1 < _CONTROL_POLL_OBSERVATIONS:
-                await self._sleep(_CONTROL_POLL_INTERVAL_SECONDS)
+                remaining = deadline - self._monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    await self._await_control(
+                        self._sleep(min(_CONTROL_POLL_INTERVAL_SECONDS, remaining)),
+                        deadline,
+                    )
+                except asyncio.TimeoutError:
+                    break
         raise TikTokPublishError(
             "tiktok_schedule_unavailable",
             f"TikTok {setting} unavailable (scopes={last_scope_count}, "

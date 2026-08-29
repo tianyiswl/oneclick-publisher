@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import time
 import unittest
 import unicodedata
 from datetime import datetime, timedelta
@@ -284,13 +285,58 @@ class HangingScheduleLocator:
         raise AssertionError("unreachable")
 
 
+class HandleRecord:
+    def __init__(self, identity: str) -> None:
+        self.identity = identity
+
+
+class HandleWrapper(FakeScheduleControl):
+    """Different Python wrappers for one immutable ElementHandle identity."""
+
+    def __init__(self, record: HandleRecord) -> None:
+        super().__init__("wrapper", "switch", checked=True)
+        del self.node_id
+        self._record = record
+
+    async def evaluate(self, expression: str, other: HandleWrapper) -> bool:
+        if expression != "(element, other) => element === other":
+            raise RuntimeError("comparison protocol bug")
+        return self._record is other._record
+
+
+class BrokenCompareHandle(HandleWrapper):
+    async def evaluate(self, expression: str, other: HandleWrapper) -> bool:
+        raise RuntimeError("comparison protocol bug")
+
+
+class WrapperScheduleLocator:
+    def __init__(self, factories: list[Callable[[], HandleWrapper]]) -> None:
+        self._factories = factories
+        self._index = 0
+
+    async def count(self) -> int:
+        return 1
+
+    def nth(self, index: int) -> WrapperScheduleLocator:
+        if index != 0:
+            raise IndexError(index)
+        return self
+
+    async def element_handle(self) -> HandleWrapper:
+        factory = self._factories[min(self._index, len(self._factories) - 1)]
+        self._index += 1
+        return factory()
+
+
 class LiveScheduleBase(FakeScheduleBase):
-    def __init__(self, live_locators: dict[str, LiveScheduleLocator]) -> None:
+    def __init__(self, live_locators: dict[str, object]) -> None:
         super().__init__("live-base")
         self._live_locators = live_locators
 
-    def locator(self, selector: str) -> FakeScheduleLocator | LiveScheduleLocator:
-        return self._live_locators.get(selector, super().locator(selector))
+    def locator(self, selector: str) -> object:
+        if selector in self._live_locators:
+            return self._live_locators[selector]
+        return super().locator(selector)
 
 
 class FakeSchedulePage(FakeScheduleBase):
@@ -711,6 +757,100 @@ class TikTokScheduleFormTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(raised.exception.error_code, "tiktok_schedule_control_ambiguous")
         self.assertEqual(clock.sleeps, [0.25, 0.25])
+
+    async def test_distinct_handle_wrappers_for_one_dom_node_are_stable(self) -> None:
+        record = HandleRecord("same-dom")
+        base = LiveScheduleBase(
+            {SCHEDULE_TOGGLE_SELECTORS[0]: WrapperScheduleLocator([lambda: HandleWrapper(record)])}
+        )
+        page = FakeSchedulePage()
+        clock = FakeClock()
+        form, _, _ = self.form(page, [base] * 8, clock=clock)
+
+        control = await form._schedule_control(
+            SCHEDULE_TOGGLE_SELECTORS,
+            setting="schedule choice",
+            editable=False,
+        )
+
+        self.assertIsInstance(control, HandleWrapper)
+        self.assertEqual(clock.sleeps, [0.25])
+
+    async def test_same_handle_node_from_two_selectors_is_deduplicated(self) -> None:
+        record = HandleRecord("same-dom")
+        base = LiveScheduleBase(
+            {
+                SCHEDULE_TOGGLE_SELECTORS[0]: WrapperScheduleLocator([lambda: HandleWrapper(record)]),
+                SCHEDULE_TOGGLE_SELECTORS[1]: WrapperScheduleLocator([lambda: HandleWrapper(record)]),
+            }
+        )
+        page = FakeSchedulePage()
+        clock = FakeClock()
+        form, _, _ = self.form(page, [base] * 8, clock=clock)
+
+        await form._schedule_control(
+            SCHEDULE_TOGGLE_SELECTORS,
+            setting="schedule choice",
+            editable=False,
+        )
+
+        self.assertEqual(clock.sleeps, [0.25])
+
+    async def test_stable_distinct_handle_nodes_are_ambiguous(self) -> None:
+        first = HandleRecord("one")
+        second = HandleRecord("two")
+        base = LiveScheduleBase(
+            {
+                SCHEDULE_TOGGLE_SELECTORS[0]: WrapperScheduleLocator([lambda: HandleWrapper(first)]),
+                SCHEDULE_TOGGLE_SELECTORS[1]: WrapperScheduleLocator([lambda: HandleWrapper(second)]),
+            }
+        )
+        page = FakeSchedulePage()
+        clock = FakeClock()
+        form, _, _ = self.form(page, [base] * 8, clock=clock)
+
+        with self.assertRaises(TikTokPublishError) as raised:
+            await form._schedule_control(
+                SCHEDULE_TOGGLE_SELECTORS,
+                setting="schedule choice",
+                editable=False,
+            )
+
+        self.assertEqual(raised.exception.error_code, "tiktok_schedule_control_ambiguous")
+
+    async def test_handle_comparison_protocol_error_is_not_silently_transient(self) -> None:
+        record = HandleRecord("broken")
+        base = LiveScheduleBase(
+            {SCHEDULE_TOGGLE_SELECTORS[0]: WrapperScheduleLocator([lambda: BrokenCompareHandle(record)])}
+        )
+        page = FakeSchedulePage()
+        clock = FakeClock()
+        form, _, _ = self.form(page, [base] * 8, clock=clock)
+
+        with self.assertRaisesRegex(RuntimeError, "comparison protocol bug"):
+            await form._schedule_control(
+                SCHEDULE_TOGGLE_SELECTORS,
+                setting="schedule choice",
+                editable=False,
+            )
+
+    async def test_control_sleep_does_not_exceed_real_deadline(self) -> None:
+        page, bases = scheduled_form_page(toggle_count=0)
+        form, _, _ = self.form(
+            page,
+            bases,
+            control_timeout_seconds=0.01,
+        )
+        started = time.monotonic()
+
+        with self.assertRaises(TikTokPublishError):
+            await form._schedule_control(
+                SCHEDULE_TOGGLE_SELECTORS,
+                setting="schedule choice",
+                editable=False,
+            )
+
+        self.assertLess(time.monotonic() - started, 0.1)
 
     async def test_hung_dom_read_hits_schedule_control_deadline(self) -> None:
         base = LiveScheduleBase({SCHEDULE_TOGGLE_SELECTORS[0]: HangingScheduleLocator()})
