@@ -1514,7 +1514,6 @@ def _create_claimed_facebook_page_task(
                 ),
             )
             conn.commit()
-            return task
         except sqlite3.IntegrityError as exc:
             conn.rollback()
             if (
@@ -1531,6 +1530,9 @@ def _create_claimed_facebook_page_task(
         except Exception:
             conn.rollback()
             raise
+    from . import publish_service
+
+    return publish_service.start_controlled_facebook_publish(int(task["id"]))
 
 
 def require_facebook_page_execution_claim(
@@ -1965,6 +1967,7 @@ def mark_facebook_page_checkpoint(
     expected_state: str,
     new_state: str,
     receipt: Mapping[str, object],
+    require_unleased: bool = False,
 ) -> None:
     """Persist one legal Page lifecycle edge by strict compare-and-swap."""
 
@@ -1972,6 +1975,13 @@ def mark_facebook_page_checkpoint(
         raise ControlledPublishError(
             "facebook_claim_lifecycle_invalid",
             "Facebook Page claim 生命周期跳转无效。",
+        )
+    if require_unleased and (
+        expected_state != "reserved" or new_state != "safe_failed"
+    ):
+        raise ControlledPublishError(
+            "facebook_claim_lifecycle_invalid",
+            "Facebook Page 未启动 worker 补偿边界无效。",
         )
     if not isinstance(receipt, Mapping):
         raise ControlledPublishError(
@@ -1996,6 +2006,11 @@ def mark_facebook_page_checkpoint(
                 raise ControlledPublishError(
                     "facebook_claim_lifecycle_invalid",
                     "Facebook Page claim 生命周期状态已变化。",
+                )
+            if require_unleased and str(claim.get("workerStartedAt") or ""):
+                raise ControlledPublishError(
+                    "facebook_claim_lifecycle_invalid",
+                    "Facebook Page worker lease 已由其他启动者持有。",
                 )
             page_reference = str(claim.get("pageReference") or "")
             receipt_page_id = receipt.get("pageId")
@@ -2142,6 +2157,7 @@ def mark_facebook_page_checkpoint(
                     receiptJson = ?, receiptHash = ?,
                     reelId = ?, reelUrl = ?, updatedAt = ?
                 WHERE taskId = ? AND state = ?
+                  AND (? = 0 OR workerStartedAt IS NULL)
                 """,
                 (
                     new_state,
@@ -2160,6 +2176,7 @@ def mark_facebook_page_checkpoint(
                     now,
                     int(task_id),
                     expected_state,
+                    int(require_unleased),
                 ),
             )
             if updated.rowcount != 1:
@@ -2171,6 +2188,54 @@ def mark_facebook_page_checkpoint(
         except Exception:
             conn.rollback()
             raise
+
+
+def _load_succeeded_facebook_page_receipt(task_id: int) -> dict[str, object]:
+    """Return the hash-verified safe receipt committed by the succeeded claim."""
+
+    from .database import connect
+
+    with connect() as conn:
+        _ensure_facebook_page_claim_schema(conn)
+        row = conn.execute(
+            """
+            SELECT pageReference, state, receiptJson, receiptHash,
+                   reelId, reelUrl
+            FROM facebook_page_publish_claims
+            WHERE taskId = ?
+            """,
+            (int(task_id),),
+        ).fetchone()
+        claim = dict(row) if row is not None else None
+    if claim is None or str(claim.get("state") or "") != "succeeded":
+        raise ControlledPublishError(
+            "facebook_claim_lifecycle_invalid",
+            "Facebook Page 成功任务缺少已持久化 claim 回执。",
+        )
+    stored = _load_hashed_facebook_snapshot(
+        str(claim.get("receiptJson") or "{}"),
+        str(claim.get("receiptHash") or ""),
+    )
+    if stored is None:
+        raise ControlledPublishError(
+            "facebook_claim_lifecycle_invalid",
+            "Facebook Page 成功 claim 回执哈希无效。",
+        )
+    safe_receipt = _safe_stored_facebook_receipt(
+        stored,
+        expected_page_reference=str(claim.get("pageReference") or ""),
+    )
+    if (
+        str(safe_receipt.get("reelId") or "")
+        != str(claim.get("reelId") or "")
+        or str(safe_receipt.get("url") or "")
+        != str(claim.get("reelUrl") or "")
+    ):
+        raise ControlledPublishError(
+            "facebook_claim_lifecycle_invalid",
+            "Facebook Page 成功 claim 回执与唯一 Reel 不一致。",
+        )
+    return safe_receipt
 
 
 def _ensure_tiktok_claim_schema(conn: sqlite3.Connection) -> None:

@@ -390,6 +390,10 @@ def _load_authorized_preflight_receipt(
     from .controlled_publish import facebook_preflight_receipt_hash
 
     with database.connect() as conn:
+        # Python's sqlite3 driver does not open a transaction for SELECTs.
+        # Begin one explicitly so the claim hash and the returned safe receipt
+        # are derived from the same immutable database snapshot (including WAL).
+        conn.execute("BEGIN")
         claim = conn.execute(
             """
             SELECT preflightTaskId, preflightReceiptHash, state, workerStartedAt
@@ -418,14 +422,14 @@ def _load_authorized_preflight_receipt(
             """,
             (int(claim["preflightTaskId"]),),
         ).fetchall()
-    if len(rows) != 1:
-        raise _authorization_error()
-    try:
-        receipt = project_facebook_page_receipt(
-            json.loads(str(rows[0]["receiptJson"] or ""))
-        )
-    except (TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise _authorization_error() from exc
+        if len(rows) != 1:
+            raise _authorization_error()
+        try:
+            receipt = project_facebook_page_receipt(
+                json.loads(str(rows[0]["receiptJson"] or ""))
+            )
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise _authorization_error() from exc
     return receipt
 
 

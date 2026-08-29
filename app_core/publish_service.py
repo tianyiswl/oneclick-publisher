@@ -1298,6 +1298,8 @@ def _mark_facebook_worker_start_failed(
     task_id: int,
     payload: dict[str, Any],
     exc: BaseException,
+    *,
+    require_unleased: bool = False,
 ) -> None:
     """Close a reserved Page claim only when no worker could have run."""
 
@@ -1309,6 +1311,7 @@ def _mark_facebook_worker_start_failed(
         expected_state="reserved",
         new_state="safe_failed",
         receipt=receipt,
+        require_unleased=require_unleased,
     )
     task_service.mark_platform_result(
         int(task_id),
@@ -1332,7 +1335,10 @@ def _run_facebook_page_publish(
 ) -> None:
     """Execute one lease-owned Page task and persist every claim edge."""
 
-    from .controlled_publish import mark_facebook_page_checkpoint
+    from .controlled_publish import (
+        _load_succeeded_facebook_page_receipt,
+        mark_facebook_page_checkpoint,
+    )
 
     task_id = int(task["id"])
     payload = dict(payloads[0])
@@ -1424,6 +1430,44 @@ def _run_facebook_page_publish(
             # never roll back or reinterpret an already committed edge.
             pass
 
+    def record_success_repair_required() -> None:
+        try:
+            task_service.record_task_event(
+                task_id,
+                "facebook_success_persistence_repair_required",
+                (
+                    "Facebook Page 成功 claim 已持久化，任务结果需要"
+                    "从同一安全回执修复；已保持防重禁止重发。"
+                ),
+                level="error",
+            )
+        except Exception:
+            pass
+
+    def persist_verified_success(
+        receipt: Mapping[str, object],
+    ) -> None:
+        """Write the task projection twice at most from one verified receipt."""
+
+        safe_receipt = dict(receipt)
+        for _attempt in range(2):
+            try:
+                task_service.mark_platform_result(
+                    task_id,
+                    9,
+                    ok=True,
+                    message=(
+                        "Facebook Page 新 Reel 已通过同页内容列表唯一回读"
+                    ),
+                    content_type=str(payload.get("contentType") or "video"),
+                    event_type="facebook_publish_readback_confirmed",
+                    receipt=safe_receipt,
+                )
+                return
+            except Exception:
+                continue
+        record_success_repair_required()
+
     try:
         task_service.mark_task_running(
             task_id,
@@ -1445,20 +1489,11 @@ def _run_facebook_page_publish(
                 ),
                 outcome_ambiguous=True,
             )
-        task_service.mark_platform_result(
-            task_id,
-            9,
-            ok=True,
-            message=str(result.get("message") or "Facebook Page 发布回读成功"),
-            content_type=str(payload.get("contentType") or "video"),
-            event_type="facebook_publish_readback_confirmed",
-            receipt=(
-                dict(result.get("receipt"))
-                if isinstance(result.get("receipt"), dict)
-                else None
-            ),
-        )
+        persist_verified_success(_load_succeeded_facebook_page_receipt(task_id))
     except Exception as exc:
+        if claim_state == "succeeded":
+            record_success_repair_required()
+            return
         try:
             if claim_state == "reserved":
                 mark_facebook_page_checkpoint(
@@ -1495,11 +1530,12 @@ def _run_facebook_page_publish(
                 receipt=_facebook_failure_receipt(payload, exc),
             )
     finally:
-        task_service.fail_active_task(
-            task_id,
-            error_code="controlled_worker_ended_without_terminal_result",
-            message="Facebook Page worker 结束，但任务没有取得明确终态",
-        )
+        if claim_state != "succeeded":
+            task_service.fail_active_task(
+                task_id,
+                error_code="controlled_worker_ended_without_terminal_result",
+                message="Facebook Page worker 结束，但任务没有取得明确终态",
+            )
         _publish_lock.release()
         _active_threads.pop(task_id, None)
 
@@ -1551,10 +1587,24 @@ def start_controlled_facebook_publish(task_id: int) -> dict[str, Any]:
         _mark_facebook_worker_start_failed(int(task_id), payload, exc)
         raise
 
-    require_facebook_page_execution_claim(
-        int(task_id),
-        [payload],
-    )
+    try:
+        require_facebook_page_execution_claim(
+            int(task_id),
+            [payload],
+        )
+    except Exception as exc:
+        try:
+            _mark_facebook_worker_start_failed(
+                int(task_id),
+                payload,
+                exc,
+                require_unleased=True,
+            )
+        except Exception:
+            # A concurrent winner owns the lease; its reserved claim must not
+            # be closed by the losing caller's compensation attempt.
+            pass
+        raise
     _active_threads[int(task_id)] = worker
     try:
         worker.start()

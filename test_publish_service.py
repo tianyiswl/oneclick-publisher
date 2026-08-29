@@ -1,7 +1,10 @@
+import hashlib
 import json
 import tempfile
+import threading
 import time
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -13,6 +16,10 @@ from app_core import (
     task_service,
 )
 from app_core.publish_service import _validate_payloads
+from uploader.meta_uploader.content_list import (
+    FacebookReelMatch,
+    FacebookReelReceipt,
+)
 
 
 class PublishServiceWechatDraftTests(unittest.TestCase):
@@ -307,6 +314,715 @@ class PublishServiceTikTokFormCheckClaimTests(unittest.TestCase):
         ]
         self.assertEqual(len(diagnostics), 1)
         self.assertNotIn("private database detail", diagnostics[0]["message"])
+
+
+class FacebookPageAuthorizedSubmitTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        self.db_patch = patch.object(
+            database,
+            "DB_PATH",
+            Path(self.tempdir.name) / "database.db",
+        )
+        self.db_patch.start()
+        self.addCleanup(self.db_patch.stop)
+        database.ensure_schema()
+        publish_service._active_threads.clear()
+        self.addCleanup(publish_service._active_threads.clear)
+        self.video = Path(self.tempdir.name) / "facebook.mp4"
+        self.video.write_bytes(b"facebook-authorized-submit-video")
+
+    def _preflight_payload(self) -> dict:
+        caption = "Facebook Page exact caption\n\n#OneClick"
+        return {
+            "type": 9,
+            "contentType": "video",
+            "title": "Facebook Page exact title",
+            "description": "Facebook Page exact caption",
+            "tags": ["OneClick"],
+            "fileList": [str(self.video)],
+            "accountList": ["facebook-page-41.json"],
+            "accountIds": [41],
+            "runtimeMode": "preflight",
+            "debugDryRun": True,
+            "backgroundMode": True,
+            "facebookControlledPublish": True,
+            "facebookExpectedPageReference": "1001",
+            "facebookFinalCaption": caption,
+            "facebookCaptionSha256": hashlib.sha256(
+                caption.encode("utf-8")
+            ).hexdigest(),
+            "facebookVideoSha256": hashlib.sha256(
+                self.video.read_bytes()
+            ).hexdigest(),
+            "facebookManifestIntentSha256": "d" * 64,
+            "visibility": "public",
+            "scheduleMode": "immediate",
+            "scheduledAt": "",
+            "scheduleTime": "",
+            "scheduleTimezone": "Asia/Shanghai",
+            "enableTimer": False,
+        }
+
+    def _authorized_preflight(self) -> tuple[int, str, dict]:
+        payload = self._preflight_payload()
+        task = task_service.create_pending_task(
+            [payload],
+            mode="oneclick_preflight",
+        )
+        task_service.mark_task_running(task["id"], "Facebook Page preflight")
+        task_service.mark_platform_result(
+            task["id"],
+            9,
+            ok=True,
+            message="Facebook Page form verified",
+            content_type="video",
+            event_type="facebook_platform_form_verified",
+            receipt={
+                "accountId": 41,
+                "pageId": "1001",
+                "pageName": "Saved Facebook Page",
+                "videoName": self.video.name,
+                "videoSize": self.video.stat().st_size,
+                "videoSha256": payload["facebookVideoSha256"],
+                "captionSha256": payload["facebookCaptionSha256"],
+                "visibility": "public",
+                "phase": "platform_form_verified",
+                "platformWriteOccurred": True,
+                "finalActionTriggered": False,
+                "finalButtonEnabled": True,
+                "formSnapshotHash": "f" * 64,
+            },
+        )
+        authorization = controlled_publish.authorize_completed_check(task["id"])
+        return task["id"], str(authorization["authorizationId"]), payload
+
+    @staticmethod
+    def _formal_payload(preflight_payload: dict) -> dict:
+        return {
+            **preflight_payload,
+            "runtimeMode": "publish",
+            "debugDryRun": False,
+            "backgroundMode": False,
+        }
+
+    def _create_leased_formal(
+        self,
+        preflight_task_id: int,
+        authorization_id: str,
+        formal_payload: dict,
+    ) -> dict:
+        def lease_without_thread(task_id: int) -> dict:
+            stored = task_service.get_task(int(task_id))
+            payloads = json.loads(str(stored["payloadJson"]))
+            controlled_publish.require_facebook_page_execution_claim(
+                int(task_id),
+                payloads,
+            )
+            return stored
+
+        with patch.object(
+            publish_service,
+            "start_controlled_facebook_publish",
+            side_effect=lease_without_thread,
+        ):
+            return controlled_publish._create_claimed_facebook_page_task(
+                [formal_payload],
+                preflight_task_id=preflight_task_id,
+                authorization_id=authorization_id,
+            )
+
+    @staticmethod
+    def _claim(task_id: int) -> dict:
+        with database.connect() as conn:
+            return dict(
+                conn.execute(
+                    """
+                    SELECT * FROM facebook_page_publish_claims WHERE taskId = ?
+                    """,
+                    (int(task_id),),
+                ).fetchone()
+            )
+
+    def _checkpoint_receipt(self, payload: dict) -> dict:
+        return {
+            "accountId": 41,
+            "pageId": "1001",
+            "videoName": self.video.name,
+            "videoSize": self.video.stat().st_size,
+            "videoSha256": payload["facebookVideoSha256"],
+            "captionSha256": payload["facebookCaptionSha256"],
+            "visibility": "public",
+            "phase": "final_action_claimed",
+            "platformWriteOccurred": True,
+            "finalActionTriggered": False,
+            "finalButtonEnabled": True,
+            "baseline": {"pageId": "1001", "rows": []},
+            "formSnapshot": {
+                "pageId": "1001",
+                "videoName": self.video.name,
+                "videoSize": self.video.stat().st_size,
+                "videoSha256": payload["facebookVideoSha256"],
+                "captionSha256": payload["facebookCaptionSha256"],
+                "visibility": "public",
+                "finalButtonLabel": "Publish",
+                "finalButtonReady": True,
+            },
+        }
+
+    def _unique_runner(
+        self,
+        payload: dict,
+        *,
+        result_reel_id: str = "new-reel-1",
+    ):
+        def runner(current, *, task_id, progress):
+            progress("final_action_claimed", self._checkpoint_receipt(payload))
+            progress("final_action_clicked", {"pageId": "1001"})
+            clicked_at = str(self._claim(task_id)["clickedAt"])
+            published_at = (
+                datetime.fromisoformat(clicked_at) + timedelta(seconds=1)
+            ).isoformat()
+            progress(
+                "readback_unique",
+                {
+                    "reelMatch": FacebookReelMatch(
+                        status="unique",
+                        receipt=FacebookReelReceipt(
+                            page_id="1001",
+                            reel_id="new-reel-1",
+                            url="https://www.facebook.com/reel/new-reel-1",
+                            published_at=published_at,
+                        ),
+                        new_count=1,
+                        matching_count=1,
+                    )
+                },
+            )
+            return {
+                "ok": True,
+                "message": "Facebook Page unique Reel confirmed",
+                "receipt": {
+                    "accountId": 41,
+                    "pageId": "1001",
+                    "videoName": self.video.name,
+                    "videoSize": self.video.stat().st_size,
+                    "videoSha256": payload["facebookVideoSha256"],
+                    "captionSha256": payload["facebookCaptionSha256"],
+                    "visibility": "public",
+                    "phase": "published_readback_confirmed",
+                    "platformWriteOccurred": True,
+                    "finalActionTriggered": True,
+                    "reelId": result_reel_id,
+                    "url": f"https://www.facebook.com/reel/{result_reel_id}",
+                    "publishedAt": published_at,
+                },
+            }
+
+        return runner
+
+    def test_authorized_submit_commits_claim_before_starting_controlled_worker(self) -> None:
+        preflight_task_id, authorization_id, preflight_payload = (
+            self._authorized_preflight()
+        )
+        formal_payload = self._formal_payload(preflight_payload)
+        committed: list[dict] = []
+
+        def start_controlled(task_id: int) -> dict:
+            with database.connect() as conn:
+                claim = conn.execute(
+                    """
+                    SELECT state, preflightTaskId, workerStartedAt
+                    FROM facebook_page_publish_claims WHERE taskId = ?
+                    """,
+                    (int(task_id),),
+                ).fetchone()
+                authorization = conn.execute(
+                    """
+                    SELECT consumedAt FROM controlled_publish_authorizations
+                    WHERE authorizationId = ?
+                    """,
+                    (authorization_id,),
+                ).fetchone()
+            committed.append(
+                {
+                    "taskId": int(task_id),
+                    "state": str(claim["state"]),
+                    "preflightTaskId": int(claim["preflightTaskId"]),
+                    "workerStartedAt": claim["workerStartedAt"],
+                    "authorizationConsumed": bool(authorization["consumedAt"]),
+                }
+            )
+            return task_service.get_task(int(task_id))
+
+        with (
+            patch.object(
+                controlled_publish,
+                "build_controlled_payloads",
+                return_value=[formal_payload],
+            ),
+            patch.object(
+                publish_service,
+                "start_controlled_facebook_publish",
+                side_effect=start_controlled,
+            ),
+        ):
+            returned = controlled_publish.submit_request(
+                {
+                    "mode": "formal",
+                    "confirmedPreflightTaskId": preflight_task_id,
+                    "authorizationId": authorization_id,
+                }
+            )
+
+        self.assertEqual(
+            committed,
+            [
+                {
+                    "taskId": returned["taskId"],
+                    "state": "reserved",
+                    "preflightTaskId": preflight_task_id,
+                    "workerStartedAt": None,
+                    "authorizationConsumed": True,
+                }
+            ],
+        )
+        self.assertEqual(returned["stage"], "preparing")
+
+    def test_authorized_submit_start_failure_safely_closes_reserved_history(
+        self,
+    ) -> None:
+        preflight_task_id, authorization_id, preflight_payload = (
+            self._authorized_preflight()
+        )
+        formal_payload = self._formal_payload(preflight_payload)
+
+        class Worker:
+            def __init__(self, *, target, args, daemon, name) -> None:
+                pass
+
+            def start(self) -> None:
+                raise RuntimeError("offline worker startup failure")
+
+        with (
+            patch.object(
+                controlled_publish,
+                "build_controlled_payloads",
+                return_value=[formal_payload],
+            ),
+            patch.object(
+                publish_service,
+                "_validate_payloads",
+                return_value=[dict(formal_payload)],
+            ),
+            patch.object(publish_service.threading, "Thread", Worker),
+            self.assertRaisesRegex(RuntimeError, "offline worker startup failure"),
+        ):
+            controlled_publish.submit_request(
+                {
+                    "mode": "formal",
+                    "confirmedPreflightTaskId": preflight_task_id,
+                    "authorizationId": authorization_id,
+                }
+            )
+
+        with database.connect() as conn:
+            formal_rows = conn.execute(
+                """
+                SELECT id, status FROM publish_tasks
+                WHERE mode = 'oneclick_publish'
+                """
+            ).fetchall()
+            claim = dict(
+                conn.execute(
+                    "SELECT * FROM facebook_page_publish_claims"
+                ).fetchone()
+            )
+            consumed_at = conn.execute(
+                """
+                SELECT consumedAt FROM controlled_publish_authorizations
+                WHERE authorizationId = ?
+                """,
+                (authorization_id,),
+            ).fetchone()["consumedAt"]
+        self.assertEqual(len(formal_rows), 1)
+        self.assertEqual(str(formal_rows[0]["status"]), "failed")
+        self.assertEqual(claim["taskId"], formal_rows[0]["id"])
+        self.assertEqual(claim["state"], "safe_failed")
+        self.assertEqual(claim["blocksReplay"], 0)
+        self.assertTrue(consumed_at)
+        self.assertEqual(
+            task_service.get_task(preflight_task_id)["status"],
+            "success",
+        )
+        self.assertNotIn(claim["taskId"], publish_service._active_threads)
+
+    def test_authorized_submit_lease_failure_closes_only_unleased_claim(self) -> None:
+        preflight_task_id, authorization_id, preflight_payload = (
+            self._authorized_preflight()
+        )
+        formal_payload = self._formal_payload(preflight_payload)
+
+        class Worker:
+            def __init__(self, *, target, args, daemon, name) -> None:
+                pass
+
+            def start(self) -> None:  # pragma: no cover - must stop before start
+                raise AssertionError("worker start crossed failed lease")
+
+        with (
+            patch.object(
+                controlled_publish,
+                "build_controlled_payloads",
+                return_value=[formal_payload],
+            ),
+            patch.object(
+                publish_service,
+                "_validate_payloads",
+                return_value=[dict(formal_payload)],
+            ),
+            patch.object(
+                controlled_publish,
+                "require_facebook_page_execution_claim",
+                side_effect=RuntimeError("offline lease storage failure"),
+            ),
+            patch.object(publish_service.threading, "Thread", Worker),
+            self.assertRaisesRegex(RuntimeError, "offline lease storage failure"),
+        ):
+            controlled_publish.submit_request(
+                {
+                    "mode": "formal",
+                    "confirmedPreflightTaskId": preflight_task_id,
+                    "authorizationId": authorization_id,
+                }
+            )
+
+        with database.connect() as conn:
+            claim = dict(
+                conn.execute(
+                    "SELECT * FROM facebook_page_publish_claims"
+                ).fetchone()
+            )
+        self.assertEqual(claim["state"], "safe_failed")
+        self.assertEqual(claim["blocksReplay"], 0)
+        self.assertIsNone(claim["workerStartedAt"])
+        self.assertEqual(task_service.get_task(claim["taskId"])["status"], "failed")
+        self.assertNotIn(claim["taskId"], publish_service._active_threads)
+
+    def test_authorized_receipt_hash_and_form_snapshot_share_one_sqlite_snapshot(
+        self,
+    ) -> None:
+        preflight_task_id, authorization_id, preflight_payload = (
+            self._authorized_preflight()
+        )
+        formal_payload = self._formal_payload(preflight_payload)
+        formal_task = self._create_leased_formal(
+            preflight_task_id,
+            authorization_id,
+            formal_payload,
+        )
+
+        with database.connect() as conn:
+            conn.execute("PRAGMA journal_mode = WAL")
+
+        original_hash = controlled_publish.facebook_preflight_receipt_hash
+        writer_commits: list[str] = []
+
+        def hash_then_commit_drift(conn, task_id, payloads):
+            receipt_hash = original_hash(conn, task_id, payloads)
+            with database.open_connection(
+                database.DB_PATH,
+                row_factory=True,
+            ) as writer:
+                row = writer.execute(
+                    """
+                    SELECT receiptJson FROM publish_task_items
+                    WHERE taskId = ? AND platformType = 9
+                    """,
+                    (preflight_task_id,),
+                ).fetchone()
+                receipt = json.loads(str(row["receiptJson"]))
+                receipt["formSnapshotHash"] = "a" * 64
+                writer.execute(
+                    """
+                    UPDATE publish_task_items SET receiptJson = ?
+                    WHERE taskId = ? AND platformType = 9
+                    """,
+                    (
+                        json.dumps(
+                            receipt,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        preflight_task_id,
+                    ),
+                )
+                writer.commit()
+            writer_commits.append("committed")
+            return receipt_hash
+
+        with patch.object(
+            controlled_publish,
+            "facebook_preflight_receipt_hash",
+            side_effect=hash_then_commit_drift,
+        ):
+            authorized_receipt = (
+                publish_service.overseas_browser_publish
+                ._load_authorized_preflight_receipt(
+                    formal_task["id"],
+                    formal_payload,
+                )
+            )
+
+        self.assertEqual(writer_commits, ["committed"])
+        self.assertEqual(authorized_receipt["formSnapshotHash"], "f" * 64)
+        with database.connect() as conn:
+            persisted = json.loads(
+                str(
+                    conn.execute(
+                        """
+                        SELECT receiptJson FROM publish_task_items
+                        WHERE taskId = ? AND platformType = 9
+                        """,
+                        (preflight_task_id,),
+                    ).fetchone()["receiptJson"]
+                )
+            )
+        self.assertEqual(persisted["formSnapshotHash"], "a" * 64)
+
+    def test_succeeded_claim_repairs_transient_task_success_write_failure(self) -> None:
+        preflight_task_id, authorization_id, preflight_payload = (
+            self._authorized_preflight()
+        )
+        payload = self._formal_payload(preflight_payload)
+        task = self._create_leased_formal(
+            preflight_task_id,
+            authorization_id,
+            payload,
+        )
+
+        real_mark_result = task_service.mark_platform_result
+        result_writes: list[bool] = []
+
+        def fail_first_success_write(*args, **kwargs):
+            result_writes.append(bool(kwargs["ok"]))
+            if result_writes == [True]:
+                raise RuntimeError("injected task result write failure")
+            return real_mark_result(*args, **kwargs)
+
+        with (
+            patch.object(
+                publish_service.overseas_browser_publish,
+                "run_facebook_page_publish_sync",
+                side_effect=self._unique_runner(payload),
+            ),
+            patch.object(
+                task_service,
+                "mark_platform_result",
+                side_effect=fail_first_success_write,
+            ),
+        ):
+            publish_service._run_facebook_page_publish(task, [payload])
+
+        saved = task_service.get_task(task["id"])
+        self.assertEqual(result_writes, [True, True])
+        self.assertEqual(self._claim(task["id"])["state"], "succeeded")
+        self.assertEqual(saved["status"], "success")
+
+        replay_authorization = controlled_publish.authorize_completed_check(
+            preflight_task_id
+        )
+        with self.assertRaises(controlled_publish.ControlledPublishError) as replayed:
+            self._create_leased_formal(
+                preflight_task_id,
+                str(replay_authorization["authorizationId"]),
+                payload,
+            )
+        self.assertEqual(
+            replayed.exception.error_code,
+            "facebook_duplicate_submit_blocked",
+        )
+
+    def test_task_success_uses_hashed_succeeded_claim_receipt_not_runner_copy(
+        self,
+    ) -> None:
+        preflight_task_id, authorization_id, preflight_payload = (
+            self._authorized_preflight()
+        )
+        payload = self._formal_payload(preflight_payload)
+        task = self._create_leased_formal(
+            preflight_task_id,
+            authorization_id,
+            payload,
+        )
+
+        with patch.object(
+            publish_service.overseas_browser_publish,
+            "run_facebook_page_publish_sync",
+            side_effect=self._unique_runner(
+                payload,
+                result_reel_id="runner-copy-mismatch",
+            ),
+        ):
+            publish_service._run_facebook_page_publish(task, [payload])
+
+        saved = task_service.get_task(task["id"])
+        task_receipt = json.loads(saved["items"][0]["receiptJson"])
+        claim = self._claim(task["id"])
+        claim_receipt = json.loads(str(claim["receiptJson"]))
+        self.assertEqual(saved["status"], "success")
+        self.assertEqual(claim_receipt["reelId"], "new-reel-1")
+        self.assertEqual(task_receipt["reelId"], "new-reel-1")
+        self.assertNotIn("runner-copy-mismatch", task_receipt["url"])
+
+    def test_persistent_task_success_write_failure_stays_repairable_and_blocked(
+        self,
+    ) -> None:
+        preflight_task_id, authorization_id, preflight_payload = (
+            self._authorized_preflight()
+        )
+        payload = self._formal_payload(preflight_payload)
+        task = self._create_leased_formal(
+            preflight_task_id,
+            authorization_id,
+            payload,
+        )
+        result_writes: list[bool] = []
+
+        def reject_success_write(*args, **kwargs):
+            result_writes.append(bool(kwargs["ok"]))
+            raise RuntimeError("private injected database detail")
+
+        with (
+            patch.object(
+                publish_service.overseas_browser_publish,
+                "run_facebook_page_publish_sync",
+                side_effect=self._unique_runner(payload),
+            ),
+            patch.object(
+                task_service,
+                "mark_platform_result",
+                side_effect=reject_success_write,
+            ),
+        ):
+            publish_service._run_facebook_page_publish(task, [payload])
+
+        saved = task_service.get_task(task["id"])
+        repair_events = [
+            event
+            for event in saved["events"]
+            if event["eventType"]
+            == "facebook_success_persistence_repair_required"
+        ]
+        self.assertEqual(result_writes, [True, True])
+        self.assertEqual(self._claim(task["id"])["state"], "succeeded")
+        self.assertEqual(saved["status"], "running")
+        self.assertEqual(len(repair_events), 1)
+        self.assertNotIn(
+            "private injected database detail",
+            repair_events[0]["message"],
+        )
+
+        replay_authorization = controlled_publish.authorize_completed_check(
+            preflight_task_id
+        )
+        with self.assertRaises(controlled_publish.ControlledPublishError) as replayed:
+            self._create_leased_formal(
+                preflight_task_id,
+                str(replay_authorization["authorizationId"]),
+                payload,
+            )
+        self.assertEqual(
+            replayed.exception.error_code,
+            "facebook_duplicate_submit_blocked",
+        )
+
+    def test_concurrent_controlled_starts_grant_one_lease_and_one_thread(self) -> None:
+        preflight_task_id, authorization_id, preflight_payload = (
+            self._authorized_preflight()
+        )
+        payload = self._formal_payload(preflight_payload)
+        with patch.object(
+            publish_service,
+            "start_controlled_facebook_publish",
+            side_effect=lambda task_id: task_service.get_task(int(task_id)),
+        ):
+            task = controlled_publish._create_claimed_facebook_page_task(
+                [payload],
+                preflight_task_id=preflight_task_id,
+                authorization_id=authorization_id,
+            )
+
+        caller_barrier = threading.Barrier(2)
+        constructor_barrier = threading.Barrier(2)
+        outcome_lock = threading.Lock()
+        starts: list[str] = []
+        outcomes: list[tuple[str, object]] = []
+        real_thread = threading.Thread
+
+        class Worker:
+            def __init__(self, *, target, args, daemon, name) -> None:
+                self.name = str(name)
+                constructor_barrier.wait(timeout=5)
+
+            def start(self) -> None:
+                starts.append(self.name)
+
+            def is_alive(self) -> bool:
+                return True
+
+        def caller() -> None:
+            caller_barrier.wait(timeout=5)
+            try:
+                returned = publish_service.start_controlled_facebook_publish(
+                    task["id"]
+                )
+            except Exception as exc:
+                outcome = ("error", getattr(exc, "error_code", ""))
+            else:
+                outcome = ("ok", int(returned["id"]))
+            with outcome_lock:
+                outcomes.append(outcome)
+
+        with (
+            patch.object(
+                publish_service,
+                "_validate_payloads",
+                return_value=[dict(payload)],
+            ),
+            patch.object(publish_service.threading, "Thread", Worker),
+        ):
+            callers = [real_thread(target=caller) for _ in range(2)]
+            for current in callers:
+                current.start()
+            for current in callers:
+                current.join(timeout=10)
+
+        self.assertFalse(any(current.is_alive() for current in callers))
+        self.assertEqual(outcomes.count(("ok", task["id"])), 1)
+        self.assertEqual(
+            outcomes.count(("error", "facebook_publish_authorization_invalid")),
+            1,
+        )
+        self.assertEqual(
+            starts,
+            [f"oneclick-facebook-page-publish-{task['id']}"],
+        )
+        self.assertEqual(list(publish_service._active_threads), [task["id"]])
+        claim = self._claim(task["id"])
+        self.assertEqual(claim["state"], "reserved")
+        self.assertTrue(claim["workerStartedAt"])
+        with database.connect() as conn:
+            claim_count = conn.execute(
+                """
+                SELECT COUNT(*) FROM facebook_page_publish_claims
+                WHERE taskId = ?
+                """,
+                (task["id"],),
+            ).fetchone()[0]
+        self.assertEqual(claim_count, 1)
 
 
 class FacebookPageLegacyStartBoundaryTests(unittest.TestCase):

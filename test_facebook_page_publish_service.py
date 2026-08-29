@@ -32,12 +32,25 @@ from uploader.meta_uploader.page_form import (
     FacebookPageFormExpectation,
     FacebookPageFormSnapshot,
 )
+from utils import publish_observer, publish_tasks
 
 
 class FacebookPageExecutorTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
+        self.db_path = Path(self.temporary.name) / "database.db"
+        self.database_patch = patch.object(database, "DB_PATH", self.db_path)
+        self.database_patch.start()
+        self.addCleanup(self.database_patch.stop)
+        self.publish_tasks_patch = patch.object(
+            publish_tasks,
+            "DB_PATH",
+            self.db_path,
+        )
+        self.publish_tasks_patch.start()
+        self.addCleanup(self.publish_tasks_patch.stop)
+        database.ensure_schema()
         self.video = Path(self.temporary.name) / "facebook.mp4"
         self.video.write_bytes(b"facebook-page-worker-video")
         self.page_id = "1001"
@@ -243,16 +256,13 @@ class FacebookPageExecutorTests(unittest.TestCase):
     def test_preflight_and_formal_share_adapter_and_checkpoint_click_order(self) -> None:
         events = []
         with self.patched_runtime():
-            with patch("utils.publish_observer.record_task_event") as observer:
-                preflight = overseas_preflight.run_facebook_page_preflight_sync(
-                    self.payload("preflight"),
-                    task_id=501,
-                )
+            preflight = overseas_preflight.run_facebook_page_preflight_sync(
+                self.payload("preflight"),
+                task_id=501,
+            )
             self.assertEqual(preflight["phase"], "platform_form_verified")
             self.assertFalse(preflight["receipt"]["finalActionTriggered"])
             self.assertEqual(self.click_count, 0)
-            self.assertTrue(observer.call_args_list)
-            self.assertTrue(all(call.args[0] == 501 for call in observer.call_args_list))
 
         self.log.clear()
 
@@ -292,6 +302,58 @@ class FacebookPageExecutorTests(unittest.TestCase):
         self.assertEqual(self.click_count, 1)
         self.assertIn("readback_unique", events)
         self.assertEqual(self.log[-1], "session:closed")
+        with database.connect() as conn:
+            persisted_events = conn.execute(
+                """
+                SELECT taskId, eventType FROM publish_task_events
+                WHERE taskId IN (501, 502) ORDER BY id
+                """
+            ).fetchall()
+        preflight_events = [
+            str(row["eventType"])
+            for row in persisted_events
+            if int(row["taskId"]) == 501
+        ]
+        formal_events = [
+            str(row["eventType"])
+            for row in persisted_events
+            if int(row["taskId"]) == 502
+        ]
+        self.assertIn("facebook_platform_form_verified", preflight_events)
+        self.assertEqual(
+            formal_events,
+            [
+                "facebook_final_action_claimed",
+                "facebook_final_action_clicked",
+                "facebook_platform_decision_observed",
+                "facebook_publish_readback_confirmed",
+            ],
+        )
+
+    def test_publish_context_rejects_invalid_and_nested_task_switches(self) -> None:
+        for invalid in (0, -1, True, "501"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                with publish_observer.publish_context(task_id=invalid):
+                    pass
+
+        with publish_observer.publish_context(task_id=501):
+            self.assertEqual(
+                publish_observer.get_publish_context()["task_id"],
+                501,
+            )
+            with publish_observer.publish_context(task_id=501):
+                self.assertEqual(
+                    publish_observer.get_publish_context()["task_id"],
+                    501,
+                )
+            with self.assertRaises(ValueError):
+                with publish_observer.publish_context(task_id=502):
+                    pass
+            self.assertEqual(
+                publish_observer.get_publish_context()["task_id"],
+                501,
+            )
+        self.assertNotIn("task_id", publish_observer.get_publish_context())
 
     def test_formal_validation_removes_legacy_confirmation_booleans(self) -> None:
         session = Path(self.temporary.name) / "facebook-page.json"
@@ -446,6 +508,13 @@ class FacebookPagePublishServiceTests(unittest.TestCase):
         )
         self.db_patch.start()
         self.addCleanup(self.db_patch.stop)
+        self.publish_tasks_patch = patch.object(
+            publish_tasks,
+            "DB_PATH",
+            Path(self.temporary.name) / "database.db",
+        )
+        self.publish_tasks_patch.start()
+        self.addCleanup(self.publish_tasks_patch.stop)
         database.ensure_schema()
         publish_service._active_threads.clear()
         self.addCleanup(publish_service._active_threads.clear)

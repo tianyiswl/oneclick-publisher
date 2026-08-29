@@ -459,6 +459,14 @@ class FacebookPageFormalClaimTests(unittest.TestCase):
         )
         self.feature_patch.start()
         self.addCleanup(self.feature_patch.stop)
+        self.worker_start_patch = patch(
+            "app_core.publish_service.start_controlled_facebook_publish",
+            side_effect=lambda formal_task_id: task_service.get_task(
+                int(formal_task_id)
+            ),
+        )
+        self.worker_start_patch.start()
+        self.addCleanup(self.worker_start_patch.stop)
         self.video = Path(self.temporary.name) / "facebook.mp4"
         self.video.write_bytes(b"facebook-page-claim-video")
         database.ensure_schema()
@@ -670,9 +678,15 @@ class FacebookPageFormalClaimTests(unittest.TestCase):
         task_id: int,
         authorization_id: str,
         payload: dict,
+        *,
+        formal_payload: dict | None = None,
     ) -> dict:
         return controlled_publish._create_claimed_facebook_page_task(
-            [self.formal_payload(payload)],
+            [
+                formal_payload
+                if formal_payload is not None
+                else self.formal_payload(payload)
+            ],
             preflight_task_id=task_id,
             authorization_id=authorization_id,
         )
@@ -961,10 +975,11 @@ class FacebookPageFormalClaimTests(unittest.TestCase):
             "finalButtonEnabled": False,
         }
 
-        created = controlled_publish._create_claimed_facebook_page_task(
-            [formal],
-            preflight_task_id=task_id,
-            authorization_id=authorization_id,
+        created = self.create_formal(
+            task_id,
+            authorization_id,
+            payload,
+            formal_payload=formal,
         )
 
         with database.connect() as conn:
