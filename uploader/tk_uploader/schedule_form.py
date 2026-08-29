@@ -405,12 +405,20 @@ class TikTokScheduleForm:
         evaluate = getattr(left.node, "evaluate", None)
         if not callable(evaluate):
             raise RuntimeError("frozen schedule node lacks comparison protocol")
-        return bool(
-            await self._await_control(
-                evaluate("(element, other) => element === other", right.node),
-                deadline,
+        try:
+            return bool(
+                await self._await_control(
+                    evaluate("(element, other) => element === other", right.node),
+                    deadline,
+                )
             )
-        )
+        except RuntimeError as exc:
+            if (
+                left.scope == "upload"
+                and str(exc) == "JSHandles can be evaluated only in the context they were created"
+            ):
+                return False
+            raise
 
     async def _append_unique_frozen(
         self,

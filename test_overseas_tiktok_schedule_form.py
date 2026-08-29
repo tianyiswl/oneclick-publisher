@@ -320,6 +320,13 @@ class ContextHandle(HandleWrapper):
         return await super().evaluate(expression, other)
 
 
+class UploadRemountHandle(HandleWrapper):
+    async def evaluate(self, expression: str, other: HandleWrapper) -> bool:
+        if not isinstance(other, UploadRemountHandle) or self._record is not other._record:
+            raise RuntimeError("JSHandles can be evaluated only in the context they were created")
+        return True
+
+
 class WrapperScheduleLocator:
     def __init__(self, factories: list[Callable[[], HandleWrapper]]) -> None:
         self._factories = factories
@@ -860,6 +867,29 @@ class TikTokScheduleFormTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(raised.exception.error_code, "tiktok_schedule_control_ambiguous")
+
+    async def test_upload_frame_remount_requires_new_handle_twice(self) -> None:
+        before = HandleRecord("upload-a")
+        after = HandleRecord("upload-b")
+        base = LiveScheduleBase(
+            {SCHEDULE_TOGGLE_SELECTORS[0]: WrapperScheduleLocator([
+                lambda: UploadRemountHandle(before),
+                lambda: UploadRemountHandle(after),
+                lambda: UploadRemountHandle(after),
+            ])}
+        )
+        page = FakeSchedulePage()
+        clock = FakeClock()
+        form, _, _ = self.form(page, [base] * 8, clock=clock)
+
+        control = await form._schedule_control(
+            SCHEDULE_TOGGLE_SELECTORS,
+            setting="schedule choice",
+            editable=False,
+        )
+
+        self.assertIsInstance(control, UploadRemountHandle)
+        self.assertEqual(clock.sleeps, [0.25, 0.25])
 
     async def test_handle_comparison_protocol_error_is_not_silently_transient(self) -> None:
         record = HandleRecord("broken")
