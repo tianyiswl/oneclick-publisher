@@ -136,6 +136,11 @@ class PublishServiceRoutingTests(unittest.TestCase):
             patch.object(publish_service.task_service, "mark_task_running"),
             patch.object(publish_service.task_service, "mark_platform_result") as mark,
             patch.object(publish_service.task_service, "fail_active_task"),
+            patch.object(
+                publish_service,
+                "_release_terminal_tiktok_form_check_claim",
+                create=True,
+            ),
         ):
             publish_service._run_platform_form_check({"id": 106}, [payload])
 

@@ -283,6 +283,106 @@ class ControlledPublishTests(unittest.TestCase):
         if authorization_id is not None:
             self.assertIsNotNone(authorization["consumedAt"])
 
+    @staticmethod
+    def _seed_tiktok_claim_for_release_test(
+        *,
+        task_mode: str = "oneclick_platform_form_check",
+        task_status: str = "failed",
+        claim_mode: str = "platform_form_check",
+        claim_state: str = "started",
+        error_code: str = "",
+        receipt: Mapping[str, object] | None = None,
+        event_type: str = "",
+    ) -> dict:
+        """Create a real temporary-SQLite task/claim fixture for release tests."""
+
+        payload = {
+            "type": 6,
+            "contentType": "video",
+            "runtimeMode": (
+                "platform_form_check"
+                if task_mode == "oneclick_platform_form_check"
+                else "publish"
+            ),
+            "accountList": ["tiktok-session.json"],
+            "fileList": ["video.mp4"],
+            "debugDryRun": False,
+            "tiktokExpectedAccountReference": "expected.user",
+            "tiktokExecutionIntent": (
+                "platform_form_check"
+                if task_mode == "oneclick_platform_form_check"
+                else "formal_public"
+            ),
+        }
+        task = task_service.create_pending_task([payload], mode=task_mode)
+        with database.connect() as conn:
+            controlled_publish._ensure_tiktok_claim_schema(conn)
+            conn.execute(
+                """
+                INSERT INTO tiktok_controlled_execution_claims
+                    (scopeFingerprint, taskId, mode, state, createdAt)
+                VALUES (?, ?, ?, ?, '2026-08-29T12:00:00+00:00')
+                """,
+                (
+                    f"release-scope-{task['id']}",
+                    int(task["id"]),
+                    claim_mode,
+                    claim_state,
+                ),
+            )
+            conn.execute(
+                "UPDATE publish_tasks SET status = ? WHERE id = ?",
+                (task_status, int(task["id"])),
+            )
+            item_status = {
+                "success": "success",
+                "failed": "failed",
+                "partial_failed": "failed",
+                "running": "running",
+                "pending": "pending",
+            }[task_status]
+            conn.execute(
+                """
+                UPDATE publish_task_items
+                SET status = ?, errorCode = ?, receiptJson = ?
+                WHERE taskId = ?
+                """,
+                (
+                    item_status,
+                    error_code,
+                    (
+                        json.dumps(receipt, ensure_ascii=False, sort_keys=True)
+                        if receipt is not None
+                        else ""
+                    ),
+                    int(task["id"]),
+                ),
+            )
+            if event_type:
+                conn.execute(
+                    """
+                    INSERT INTO publish_task_events
+                        (taskId, level, eventType, message, createdAt)
+                    VALUES (?, 'warning', ?, 'irreversible evidence',
+                            '2026-08-29 20:00:00')
+                    """,
+                    (int(task["id"]), event_type),
+                )
+            conn.commit()
+        return task
+
+    def _release_terminal_form_check_claim(self, task_id: int) -> bool:
+        release = getattr(
+            controlled_publish,
+            "release_terminal_tiktok_platform_form_check_claim",
+            None,
+        )
+        self.assertIsNotNone(
+            release,
+            "terminal platform-form-check claim release helper is missing",
+        )
+        return bool(release(int(task_id)))
+
     def test_builds_clean_mixed_schedule_preflight_payloads(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             manifest = self._bundle(Path(temporary))
@@ -782,6 +882,140 @@ class ControlledPublishTests(unittest.TestCase):
         self.assertEqual(claim["state"], "started")
         self.assertEqual(task["status"], "pending")
         self.assertEqual(startup_failures, 0)
+
+    def test_terminal_form_check_claim_release_accepts_only_terminal_task_statuses(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            database,
+            "DB_PATH",
+            Path(temporary) / "database.db",
+        ):
+            database.ensure_schema()
+            tasks = {
+                status: self._seed_tiktok_claim_for_release_test(
+                    task_status=status,
+                )
+                for status in ("success", "failed", "partial_failed")
+            }
+
+            released = {
+                status: self._release_terminal_form_check_claim(task["id"])
+                for status, task in tasks.items()
+            }
+            with database.connect() as conn:
+                remaining = conn.execute(
+                    "SELECT taskId FROM tiktok_controlled_execution_claims ORDER BY taskId"
+                ).fetchall()
+
+        self.assertEqual(
+            released,
+            {"success": True, "failed": True, "partial_failed": True},
+        )
+        self.assertEqual(remaining, [])
+
+    def test_terminal_form_check_claim_release_preserves_nonmatching_claims(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            database,
+            "DB_PATH",
+            Path(temporary) / "database.db",
+        ):
+            database.ensure_schema()
+            formal = self._seed_tiktok_claim_for_release_test(
+                task_mode="oneclick_publish",
+                claim_mode="formal",
+            )
+            wrong_task_mode = self._seed_tiktok_claim_for_release_test(
+                task_mode="oneclick_publish",
+                claim_mode="platform_form_check",
+            )
+            claimed = self._seed_tiktok_claim_for_release_test(
+                claim_state="claimed",
+            )
+            pending = self._seed_tiktok_claim_for_release_test(
+                task_status="pending",
+            )
+            running = self._seed_tiktok_claim_for_release_test(
+                task_status="running",
+            )
+            exact = self._seed_tiktok_claim_for_release_test()
+
+            self.assertFalse(
+                self._release_terminal_form_check_claim(formal["id"])
+            )
+            self.assertFalse(
+                self._release_terminal_form_check_claim(wrong_task_mode["id"])
+            )
+            self.assertFalse(
+                self._release_terminal_form_check_claim(claimed["id"])
+            )
+            self.assertFalse(
+                self._release_terminal_form_check_claim(pending["id"])
+            )
+            self.assertFalse(
+                self._release_terminal_form_check_claim(running["id"])
+            )
+            self.assertTrue(
+                self._release_terminal_form_check_claim(exact["id"])
+            )
+            with database.connect() as conn:
+                remaining = {
+                    int(row["taskId"])
+                    for row in conn.execute(
+                        "SELECT taskId FROM tiktok_controlled_execution_claims"
+                    ).fetchall()
+                }
+
+        self.assertEqual(
+            remaining,
+            {
+                formal["id"],
+                wrong_task_mode["id"],
+                claimed["id"],
+                pending["id"],
+                running["id"],
+            },
+        )
+
+    def test_terminal_form_check_claim_release_preserves_all_irreversible_evidence_shapes(self) -> None:
+        evidence = (
+            {"event_type": "tiktok_final_action_triggered"},
+            {"event_type": "tiktok_publish_outcome_ambiguous"},
+            {"event_type": "tiktok_platform_accepted"},
+            {"event_type": "tiktok_published_readback_confirmed"},
+            {"event_type": "tiktok_scheduled_accepted"},
+            {"event_type": "tiktok_scheduled_readback_confirmed"},
+            {"error_code": "tiktok_publish_outcome_unknown"},
+            {"error_code": "tiktok_schedule_outcome_unknown"},
+            {"receipt": {"finalActionTriggered": True}},
+            {"receipt": {"platformAccepted": True}},
+            {"receipt": {"scheduledReadbackConfirmed": True}},
+            {"receipt": {"phase": "final_action_triggered"}},
+            {"receipt": {"phase": "platform_accepted"}},
+            {"receipt": {"phase": "published_readback_confirmed"}},
+            {"receipt": {"phase": "scheduled_accepted"}},
+            {"receipt": {"phase": "scheduled_readback_confirmed"}},
+            {"receipt": {"phase": "ambiguous"}},
+        )
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            database,
+            "DB_PATH",
+            Path(temporary) / "database.db",
+        ):
+            database.ensure_schema()
+            tasks = [
+                self._seed_tiktok_claim_for_release_test(**scenario)
+                for scenario in evidence
+            ]
+            results = [
+                self._release_terminal_form_check_claim(task["id"])
+                for task in tasks
+            ]
+            with database.connect() as conn:
+                remaining = conn.execute(
+                    "SELECT COUNT(*) FROM tiktok_controlled_execution_claims"
+                ).fetchone()[0]
+
+        self.assertEqual(results, [False] * len(evidence))
+        self.assertEqual(remaining, len(evidence))
 
     def test_two_tiktok_formal_authorizations_compete_for_one_atomic_claim(self) -> None:
         with tempfile.TemporaryDirectory() as temporary, patch.object(

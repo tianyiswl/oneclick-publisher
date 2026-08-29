@@ -5,7 +5,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from app_core import account_service, database, publish_service, task_service
+from app_core import (
+    account_service,
+    controlled_publish,
+    database,
+    publish_service,
+    task_service,
+)
 from app_core.publish_service import _validate_payloads
 
 
@@ -155,6 +161,152 @@ class PublishServiceTikTokScheduleTests(unittest.TestCase):
         self.assertTrue(receipt["platformAccepted"])
         self.assertTrue(receipt["scheduledReadbackConfirmed"])
         self.assertEqual(item["publishedAt"], "")
+
+
+class PublishServiceTikTokFormCheckClaimTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.db_patch = patch.object(
+            database, "DB_PATH", Path(self.tempdir.name) / "database.db"
+        )
+        self.db_patch.start()
+        database.ensure_schema()
+        self.payload = {
+            "type": 6,
+            "contentType": "video",
+            "runtimeMode": "platform_form_check",
+            "accountList": ["tiktok.json"],
+            "fileList": ["video.mp4"],
+            "debugDryRun": False,
+            "tiktokControlledPublish": True,
+            "tiktokExpectedAccountReference": "expected.user",
+            "tiktokExecutionIntent": "platform_form_check",
+        }
+
+    def tearDown(self) -> None:
+        if publish_service._publish_lock.locked():
+            publish_service._publish_lock.release()
+        self.db_patch.stop()
+        self.tempdir.cleanup()
+
+    def _started_task(self) -> dict:
+        task = task_service.create_pending_task(
+            [self.payload],
+            mode="oneclick_platform_form_check",
+        )
+        with database.connect() as conn:
+            controlled_publish._ensure_tiktok_claim_schema(conn)
+            conn.execute(
+                """
+                INSERT INTO tiktok_controlled_execution_claims
+                    (scopeFingerprint, taskId, mode, state, createdAt)
+                VALUES (?, ?, 'platform_form_check', 'started',
+                        '2026-08-29T12:00:00+00:00')
+                """,
+                (f"worker-scope-{task['id']}", int(task["id"])),
+            )
+            conn.commit()
+        return task
+
+    @staticmethod
+    def _claim_count(task_id: int) -> int:
+        with database.connect() as conn:
+            return int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) FROM tiktok_controlled_execution_claims
+                    WHERE taskId = ?
+                    """,
+                    (int(task_id),),
+                ).fetchone()[0]
+            )
+
+    def test_publish_lock_busy_terminal_failure_releases_started_form_check_claim(self) -> None:
+        task = self._started_task()
+        self.assertTrue(publish_service._publish_lock.acquire(blocking=False))
+
+        publish_service._run_platform_form_check(task, [self.payload])
+
+        saved = task_service.get_task(task["id"])
+        self.assertEqual(saved["status"], "failed")
+        self.assertEqual(saved["items"][0]["errorCode"], "controlled_publish_busy")
+        self.assertEqual(self._claim_count(task["id"]), 0)
+
+    def test_normal_form_check_success_releases_started_claim_in_worker_finally(self) -> None:
+        task = self._started_task()
+        result = {
+            "ok": True,
+            "phase": "platform_form_verified",
+            "message": "TikTok 表单检查通过；未点击 Schedule",
+            "receipt": {
+                "accountId": 61,
+                "visibility": "public",
+                "platformWriteOccurred": True,
+                "finalActionTriggered": False,
+                "phase": "platform_form_verified",
+            },
+        }
+        with patch.object(
+            publish_service.overseas_tiktok_publish,
+            "run_tiktok_platform_sync",
+            return_value=result,
+        ):
+            publish_service._run_platform_form_check(task, [self.payload])
+
+        saved = task_service.get_task(task["id"])
+        self.assertEqual(saved["status"], "success")
+        self.assertEqual(self._claim_count(task["id"]), 0)
+
+    def test_normal_form_check_prefinal_exception_releases_started_claim(self) -> None:
+        task = self._started_task()
+        with patch.object(
+            publish_service.overseas_tiktok_publish,
+            "run_tiktok_platform_sync",
+            side_effect=RuntimeError("offline form check failure"),
+        ):
+            publish_service._run_platform_form_check(task, [self.payload])
+
+        saved = task_service.get_task(task["id"])
+        self.assertEqual(saved["status"], "failed")
+        self.assertEqual(saved["items"][0]["errorCode"], "tiktok_publish_failed")
+        self.assertEqual(self._claim_count(task["id"]), 0)
+
+    def test_claim_cleanup_failure_preserves_terminal_result_and_records_safe_diagnostic(self) -> None:
+        task = self._started_task()
+        result = {
+            "ok": True,
+            "phase": "platform_form_verified",
+            "message": "TikTok 表单检查通过；未点击 Schedule",
+            "receipt": {
+                "accountId": 61,
+                "visibility": "public",
+                "platformWriteOccurred": True,
+                "finalActionTriggered": False,
+                "phase": "platform_form_verified",
+            },
+        }
+        with patch.object(
+            publish_service.overseas_tiktok_publish,
+            "run_tiktok_platform_sync",
+            return_value=result,
+        ), patch.object(
+            publish_service,
+            "_release_terminal_tiktok_form_check_claim",
+            side_effect=RuntimeError("private database detail"),
+            create=True,
+        ):
+            publish_service._run_platform_form_check(task, [self.payload])
+
+        saved = task_service.get_task(task["id"])
+        self.assertEqual(saved["status"], "success")
+        self.assertEqual(self._claim_count(task["id"]), 1)
+        diagnostics = [
+            event
+            for event in saved["events"]
+            if event["eventType"] == "tiktok_form_check_claim_release_failed"
+        ]
+        self.assertEqual(len(diagnostics), 1)
+        self.assertNotIn("private database detail", diagnostics[0]["message"])
 
 
 if __name__ == "__main__":

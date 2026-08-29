@@ -845,21 +845,47 @@ def _record_youtube_publish_progress(
         )
 
 
+def _release_terminal_tiktok_form_check_claim(task_id: int) -> bool:
+    from .controlled_publish import (
+        release_terminal_tiktok_platform_form_check_claim,
+    )
+
+    return release_terminal_tiktok_platform_form_check_claim(int(task_id))
+
+
+def _release_terminal_tiktok_form_check_claim_safely(task_id: int) -> None:
+    try:
+        _release_terminal_tiktok_form_check_claim(int(task_id))
+    except Exception:
+        try:
+            task_service.record_task_event(
+                int(task_id),
+                "tiktok_form_check_claim_release_failed",
+                "TikTok 表单检查已结束，但本地执行锁未能安全清理",
+                level="warning",
+            )
+        except Exception:
+            pass
+
+
 def _run_platform_form_check(task: dict, payloads: list[dict[str, Any]]) -> None:
     """Run the explicit TikTok platform-writing check without final action."""
 
     payload = payloads[0]
     if not _publish_lock.acquire(blocking=False):
-        task_service.mark_platform_result(
-            task["id"],
-            6,
-            ok=False,
-            message="已有发布任务正在执行，请稍后重试",
-            content_type=str(payload.get("contentType") or ""),
-            event_type="platform_form_check",
-            error_code="controlled_publish_busy",
-        )
-        _active_threads.pop(int(task["id"]), None)
+        try:
+            task_service.mark_platform_result(
+                task["id"],
+                6,
+                ok=False,
+                message="已有发布任务正在执行，请稍后重试",
+                content_type=str(payload.get("contentType") or ""),
+                event_type="platform_form_check",
+                error_code="controlled_publish_busy",
+            )
+        finally:
+            _release_terminal_tiktok_form_check_claim_safely(int(task["id"]))
+            _active_threads.pop(int(task["id"]), None)
         return
     try:
         task_service.mark_task_running(
@@ -901,13 +927,16 @@ def _run_platform_form_check(task: dict, payloads: list[dict[str, Any]]) -> None
                 ),
             )
     finally:
-        task_service.fail_active_task(
-            int(task["id"]),
-            error_code="controlled_worker_ended_without_terminal_result",
-            message="TikTok 表单检查进程结束，但没有取得明确结果",
-        )
-        _publish_lock.release()
-        _active_threads.pop(int(task["id"]), None)
+        try:
+            task_service.fail_active_task(
+                int(task["id"]),
+                error_code="controlled_worker_ended_without_terminal_result",
+                message="TikTok 表单检查进程结束，但没有取得明确结果",
+            )
+        finally:
+            _release_terminal_tiktok_form_check_claim_safely(int(task["id"]))
+            _publish_lock.release()
+            _active_threads.pop(int(task["id"]), None)
 
 
 def _run_publish(task: dict, payloads: list[dict[str, Any]]) -> None:

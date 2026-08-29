@@ -1119,6 +1119,43 @@ def compensate_tiktok_worker_start_failure(
             raise
 
 
+def release_terminal_tiktok_platform_form_check_claim(task_id: int) -> bool:
+    """Atomically release one terminal, reversible form-check worker claim."""
+
+    from .database import connect
+
+    with connect() as conn:
+        _ensure_tiktok_claim_schema(conn)
+        conn.commit()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            irreversible = tiktok_irreversible_evidence_sql(
+                "tiktok_controlled_execution_claims.taskId"
+            )
+            deleted = conn.execute(
+                f"""
+                DELETE FROM tiktok_controlled_execution_claims
+                WHERE taskId = ?
+                  AND mode = 'platform_form_check'
+                  AND state = 'started'
+                  AND EXISTS (
+                      SELECT 1
+                      FROM publish_tasks AS task
+                      WHERE task.id = tiktok_controlled_execution_claims.taskId
+                        AND task.mode = 'oneclick_platform_form_check'
+                        AND task.status IN ('success', 'failed', 'partial_failed')
+                  )
+                  AND NOT {irreversible}
+                """,
+                (int(task_id),),
+            )
+            conn.commit()
+            return deleted.rowcount == 1
+        except Exception:
+            conn.rollback()
+            raise
+
+
 def create_direct_authorization_schema(conn: sqlite3.Connection) -> None:
     """创建对话直发的一次性授权表。
 
