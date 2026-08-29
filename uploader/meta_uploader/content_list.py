@@ -7,10 +7,11 @@ import asyncio
 import hashlib
 import json
 import re
-from dataclasses import dataclass
+import weakref
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Iterable, Literal
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urljoin, urlsplit
 
 from app_core.overseas_meta_errors import FacebookPagePublishError
 from app_core.overseas_meta_page_identity import (
@@ -27,6 +28,44 @@ _CONTENT_HOME_URL = "https://business.facebook.com/latest/home/"
 _CONTENT_LIST_URL = "https://business.facebook.com/latest/content?asset_id={}"
 _MAX_PAGES = 50
 _DEFAULT_SETTLEMENT_ATTEMPTS = 4
+_TERMINAL_STATUS_TEXTS = frozenset(
+    {
+        "no more results",
+        "you've reached the end",
+        "没有更多内容",
+        "已显示全部内容",
+    }
+)
+_EMPTY_STATUS_TEXTS = frozenset(
+    {
+        "no content yet",
+        "no posts yet",
+        "暂无内容",
+        "还没有内容",
+    }
+)
+_PAGINATION_LABELS = (
+    "Load more",
+    "Next",
+    "加载更多",
+    "下一页",
+)
+_ACCEPTED_DECISION_TEXTS = frozenset(
+    {
+        "your reel is being published",
+        "your reel was submitted for publishing",
+        "你的 reel 正在发布",
+        "你的 reel 已提交发布",
+    }
+)
+_REJECTED_DECISION_TEXTS = frozenset(
+    {
+        "your reel wasn't published",
+        "we couldn't publish your reel",
+        "你的 reel 未发布",
+        "无法发布你的 reel",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,14 +105,54 @@ class FacebookReelMatch:
     matching_count: int
 
 
-@dataclass(frozen=True, slots=True, init=False)
+@dataclass(frozen=True, slots=True, init=False, weakref_slot=True)
 class FacebookPlatformDecision:
     """Trusted decision value; instances are created only by the DOM parser."""
 
-    kind: Literal["accepted", "rejected_no_creation", "unknown"]
-    page_id: str
-    observed_at: str
-    evidence_sha256: str
+    _kind: Literal["accepted", "rejected_no_creation", "unknown"] = field(
+        repr=False
+    )
+    _page_id: str = field(repr=False)
+    _observed_at: str = field(repr=False)
+    _evidence_sha256: str = field(repr=False)
+
+    @property
+    def kind(self) -> Literal["accepted", "rejected_no_creation", "unknown"]:
+        return _trusted_decision_values(self)[0]
+
+    @property
+    def page_id(self) -> str:
+        return _trusted_decision_values(self)[1]
+
+    @property
+    def observed_at(self) -> str:
+        return _trusted_decision_values(self)[2]
+
+    @property
+    def evidence_sha256(self) -> str:
+        return _trusted_decision_values(self)[3]
+
+
+_DecisionValues = tuple[str, str, str, str]
+_TRUSTED_DECISIONS: dict[
+    int,
+    tuple[weakref.ReferenceType[FacebookPlatformDecision], _DecisionValues],
+] = {}
+
+
+def _trusted_decision_values(value: FacebookPlatformDecision) -> _DecisionValues:
+    record = _TRUSTED_DECISIONS.get(id(value))
+    if record is None or record[0]() is not value:
+        raise ValueError("untrusted Facebook platform decision")
+    actual = (
+        object.__getattribute__(value, "_kind"),
+        object.__getattribute__(value, "_page_id"),
+        object.__getattribute__(value, "_observed_at"),
+        object.__getattribute__(value, "_evidence_sha256"),
+    )
+    if actual != record[1]:
+        raise ValueError("mutated Facebook platform decision")
+    return record[1]
 
 
 def _baseline_failed(page_id: object = "") -> FacebookPagePublishError:
@@ -124,7 +203,7 @@ def _normalized_reel_id(value: object) -> str:
 def _canonical_reel_url(value: object, *, expected_reel_id: str) -> str:
     if type(value) is not str or not value.strip():
         raise ValueError("missing Reel URL")
-    parsed = urlsplit(value.strip())
+    parsed = urlsplit(urljoin("https://www.facebook.com", value.strip()))
     if (
         parsed.scheme.casefold() != "https"
         or parsed.hostname not in {"facebook.com", "www.facebook.com"}
@@ -140,6 +219,34 @@ def _canonical_reel_url(value: object, *, expected_reel_id: str) -> str:
     if reel_id != expected_reel_id:
         raise ValueError("Reel URL identity mismatch")
     return f"https://www.facebook.com/reel/{reel_id}"
+
+
+def _page_url(page: Any) -> str:
+    value = getattr(page, "url", "")
+    if callable(value):
+        value = value()
+    return str(value or "")
+
+
+def _is_exact_content_url(value: object, *, expected_page_id: str) -> bool:
+    if type(value) is not str:
+        return False
+    try:
+        parsed = urlsplit(value)
+        query = parse_qs(parsed.query, keep_blank_values=True)
+    except ValueError:
+        return False
+    return (
+        parsed.scheme.casefold() == "https"
+        and parsed.hostname == "business.facebook.com"
+        and parsed.port is None
+        and parsed.username is None
+        and parsed.password is None
+        and parsed.path.rstrip("/") == "/latest/content"
+        and set(query) == {"asset_id"}
+        and query.get("asset_id") == [expected_page_id]
+        and not parsed.fragment
+    )
 
 
 def _canonical_timestamp(value: object) -> str:
@@ -465,47 +572,68 @@ class FacebookPageContentReader:
     async def read_platform_decision(
         self,
         expected_page_id: str,
+        *,
+        page: Any | None = None,
     ) -> FacebookPlatformDecision:
-        """Parse one explicit platform decision from the current Page DOM."""
+        """Seal one decision parsed from an explicit, unique DOM announcement."""
 
         expected = _normalized_page_id(expected_page_id)
-        page = await self._prepare_list_page(expected)
         try:
-            decisions = await self._visible(
-                page.locator("[data-meta-platform-decision]")
-            )
-            if len(decisions) != 1:
-                raise _baseline_failed(expected)
-            element = decisions[0]
-            page_id = _normalized_page_id(
-                await element.get_attribute("data-page-id")
-            )
-            kind = str(
-                await element.get_attribute("data-meta-platform-decision") or ""
-            ).strip()
-            observed_at = _canonical_timestamp(
-                await element.get_attribute("data-observed-at")
-            )
-            if page_id != expected or kind not in {
-                "accepted",
-                "rejected_no_creation",
-                "unknown",
-            }:
-                raise _baseline_failed(expected)
-            evidence_text = canonical_meta_caption(await element.inner_text())
+            if page is None:
+                page = await self._get_list_page()
+            self._require_same_context(page)
+            await self._wait_for_verification(page)
+            await self._recheck_page(page, expected)
+
+            messages: list[str] = []
+            for role in ("alert", "status"):
+                elements = await self._visible(page.get_by_role(role))
+                for element in elements:
+                    text = canonical_meta_caption(await element.inner_text())
+                    if text:
+                        messages.append(text.casefold())
+
+            kind: Literal["accepted", "rejected_no_creation", "unknown"]
+            kind = "unknown"
+            if len(messages) == 1:
+                if messages[0] in _ACCEPTED_DECISION_TEXTS:
+                    kind = "accepted"
+                elif messages[0] in _REJECTED_DECISION_TEXTS:
+                    kind = "rejected_no_creation"
+            observed_at = datetime.now(timezone.utc).isoformat()
             evidence_hash = _hash_json(
                 {
-                    "pageId": page_id,
+                    "pageId": expected,
                     "kind": kind,
                     "observedAt": observed_at,
-                    "evidence": evidence_text,
+                    "messages": messages,
                 }
             )
             decision = object.__new__(FacebookPlatformDecision)
-            object.__setattr__(decision, "kind", kind)
-            object.__setattr__(decision, "page_id", page_id)
-            object.__setattr__(decision, "observed_at", observed_at)
-            object.__setattr__(decision, "evidence_sha256", evidence_hash)
+            values: _DecisionValues = (
+                kind,
+                expected,
+                observed_at,
+                evidence_hash,
+            )
+            for name, value in zip(
+                ("_kind", "_page_id", "_observed_at", "_evidence_sha256"),
+                values,
+            ):
+                object.__setattr__(decision, name, value)
+            decision_id = id(decision)
+
+            def discard(
+                reference: weakref.ReferenceType[FacebookPlatformDecision],
+                *,
+                identity: int = decision_id,
+            ) -> None:
+                record = _TRUSTED_DECISIONS.get(identity)
+                if record is not None and record[0] is reference:
+                    _TRUSTED_DECISIONS.pop(identity, None)
+
+            reference = weakref.ref(decision, discard)
+            _TRUSTED_DECISIONS[decision_id] = (reference, values)
             return decision
         except FacebookPagePublishError:
             raise
@@ -517,73 +645,121 @@ class FacebookPageContentReader:
         expected_page_id: str,
     ) -> tuple[FacebookReelRow, ...]:
         page = await self._prepare_list_page(expected_page_id)
-        rows: list[FacebookReelRow] = []
-        seen: set[str] = set()
+        rows_by_id: dict[str, FacebookReelRow] = {}
+        previous_signature: tuple[tuple[str, str, str], ...] | None = None
+        allow_persisted_prefix = False
         for _ in range(_MAX_PAGES):
             await self._recheck_page(page, expected_page_id)
-            roots = await self._visible(
-                page.locator("[data-meta-page-content-list]")
-            )
+            if not _is_exact_content_url(
+                _page_url(page),
+                expected_page_id=expected_page_id,
+            ):
+                raise _baseline_failed(expected_page_id)
+            roots = await self._visible(page.locator("main"))
             if len(roots) != 1:
                 raise _baseline_failed(expected_page_id)
-            root_page_id = _normalized_page_id(
-                await roots[0].get_attribute("data-page-id")
-            )
-            if root_page_id != expected_page_id:
-                raise _baseline_failed(expected_page_id)
 
-            row_elements = await self._visible(page.locator("[data-meta-reel-row]"))
-            for element in row_elements:
+            row_elements = await self._visible(
+                roots[0].locator('a[href*="/reel/"]')
+            )
+            page_seen: set[str] = set()
+            signature: list[tuple[str, str, str]] = []
+            new_count = 0
+            for row_index, element in enumerate(row_elements):
                 try:
-                    page_id = _normalized_page_id(
-                        await element.get_attribute("data-page-id")
+                    href = await element.get_attribute("href")
+                    parsed = urlsplit(
+                        urljoin("https://www.facebook.com", str(href or ""))
                     )
-                    reel_id = _normalized_reel_id(
-                        await element.get_attribute("data-reel-id")
-                    )
+                    path = [part for part in parsed.path.split("/") if part]
+                    if len(path) != 2 or path[0].casefold() != "reel":
+                        raise ValueError("missing canonical Reel identity")
+                    reel_id = _normalized_reel_id(path[1])
                     url = _canonical_reel_url(
-                        await element.get_attribute("data-reel-url"),
+                        href,
                         expected_reel_id=reel_id,
                     )
+                    timestamps = await self._visible(
+                        element.locator("time[datetime]")
+                    )
+                    if len(timestamps) != 1:
+                        raise ValueError("ambiguous Reel timestamp")
                     published_at = _canonical_timestamp(
-                        await element.get_attribute("data-published-at")
+                        await timestamps[0].get_attribute("datetime")
                     )
                 except (FacebookPagePublishError, TypeError, ValueError) as exc:
                     raise _baseline_failed(expected_page_id) from exc
-                if page_id != expected_page_id or reel_id in seen:
+                if reel_id in page_seen:
                     raise _baseline_failed(expected_page_id)
-                seen.add(reel_id)
-                rows.append(
-                    FacebookReelRow(
-                        page_id=page_id,
-                        reel_id=reel_id,
-                        url=url,
-                        caption_sha256="",
-                        published_at=published_at,
+                page_seen.add(reel_id)
+                row = FacebookReelRow(
+                    page_id=expected_page_id,
+                    reel_id=reel_id,
+                    url=url,
+                    caption_sha256="",
+                    published_at=published_at,
+                )
+                previous = rows_by_id.get(reel_id)
+                if previous is not None and previous != row:
+                    raise _baseline_failed(expected_page_id)
+                if previous is not None and not (
+                    allow_persisted_prefix
+                    and previous_signature is not None
+                    and row_index < len(previous_signature)
+                    and previous_signature[row_index]
+                    == (reel_id, url, published_at)
+                ):
+                    raise _baseline_failed(expected_page_id)
+                if previous is None:
+                    rows_by_id[reel_id] = row
+                    new_count += 1
+                signature.append((reel_id, url, published_at))
+
+            signature_tuple = tuple(signature)
+            if previous_signature == signature_tuple and new_count == 0:
+                raise _baseline_failed(expected_page_id)
+            previous_signature = signature_tuple
+
+            statuses = await self._visible(page.get_by_role("status"))
+            terminal_count = 0
+            empty_count = 0
+            for element in statuses:
+                status = canonical_meta_caption(
+                    await element.inner_text()
+                ).casefold()
+                terminal_count += int(status in _TERMINAL_STATUS_TEXTS)
+                empty_count += int(status in _EMPTY_STATUS_TEXTS)
+            if terminal_count > 1 or empty_count > 1:
+                raise _baseline_failed(expected_page_id)
+
+            next_buttons: list[tuple[str, Any]] = []
+            for label in _PAGINATION_LABELS:
+                next_buttons.extend(
+                    (label, button)
+                    for button in await self._visible(
+                        page.get_by_role("button", name=label, exact=True)
                     )
                 )
-
-            terminal = await self._visible(
-                page.locator('[data-meta-pagination-complete="true"]')
-            )
-            if len(terminal) > 1:
+            if len(next_buttons) > 1:
                 raise _baseline_failed(expected_page_id)
-            if len(terminal) == 1:
-                empty = await self._visible(
-                    page.locator('[data-meta-content-empty="true"]')
+
+            if empty_count == 1:
+                if row_elements or rows_by_id or terminal_count or next_buttons:
+                    raise _baseline_failed(expected_page_id)
+                return ()
+            if terminal_count == 1:
+                if not rows_by_id or next_buttons:
+                    raise _baseline_failed(expected_page_id)
+                return tuple(
+                    sorted(rows_by_id.values(), key=lambda item: item.reel_id)
                 )
-                if not rows and len(empty) != 1:
-                    raise _baseline_failed(expected_page_id)
-                if rows and empty:
-                    raise _baseline_failed(expected_page_id)
-                return tuple(sorted(rows, key=lambda item: item.reel_id))
-
-            next_buttons = await self._visible(
-                page.locator("[data-meta-pagination-next]")
-            )
-            if len(next_buttons) != 1 or not await next_buttons[0].is_enabled():
+            if len(next_buttons) != 1:
                 raise _baseline_failed(expected_page_id)
-            await next_buttons[0].click()
+            next_label, next_button = next_buttons[0]
+            if not await next_button.is_enabled():
+                raise _baseline_failed(expected_page_id)
+            allow_persisted_prefix = next_label in {"Load more", "加载更多"}
+            await next_button.click()
             await self._wait_for_verification(page)
             await self._recheck_page(page, expected_page_id)
         raise _baseline_failed(expected_page_id)
@@ -600,28 +776,32 @@ class FacebookPageContentReader:
             await detail.goto(row.url, wait_until="domcontentloaded")
             await self._wait_for_verification(detail)
             await self._recheck_page(detail, expected_page_id)
-            roots = await self._visible(detail.locator("[data-meta-reel-detail]"))
-            if len(roots) != 1:
+            if _canonical_reel_url(
+                _page_url(detail),
+                expected_reel_id=row.reel_id,
+            ) != row.url:
                 raise _baseline_failed(expected_page_id)
-            actual_page_id = _normalized_page_id(
-                await roots[0].get_attribute("data-page-id")
+            canonical_urls = await self._elements(
+                detail.locator('meta[property="og:url"][content]')
             )
-            actual_reel_id = _normalized_reel_id(
-                await roots[0].get_attribute("data-reel-id")
-            )
-            if (
-                actual_page_id != expected_page_id
-                or actual_reel_id != row.reel_id
-            ):
+            if len(canonical_urls) != 1:
                 raise _baseline_failed(expected_page_id)
-            captions = await self._visible(
-                detail.locator(
-                    '[data-meta-reel-detail-caption][data-caption-complete="true"]'
-                )
+            canonical_url = _canonical_reel_url(
+                await canonical_urls[0].get_attribute("content"),
+                expected_reel_id=row.reel_id,
+            )
+            if canonical_url != row.url:
+                raise _baseline_failed(expected_page_id)
+            captions = await self._elements(
+                detail.locator('meta[property="og:description"][content]')
             )
             if len(captions) != 1:
                 return None
-            caption = canonical_meta_caption(await captions[0].inner_text())
+            caption = canonical_meta_caption(
+                await captions[0].get_attribute("content")
+            )
+            if not caption:
+                return None
             return hashlib.sha256(caption.encode("utf-8")).hexdigest()
         except FacebookPagePublishError:
             raise
@@ -646,6 +826,11 @@ class FacebookPageContentReader:
             )
             await self._wait_for_verification(page)
             await self._recheck_page(page, expected_page_id)
+            if not _is_exact_content_url(
+                _page_url(page),
+                expected_page_id=expected_page_id,
+            ):
+                raise _baseline_failed(expected_page_id)
             return page
         except FacebookPagePublishError as exc:
             if exc.error_code == "facebook_page_baseline_read_failed":
@@ -689,6 +874,10 @@ class FacebookPageContentReader:
             await wait(250)
         else:
             await asyncio.sleep(0.25)
+
+    @staticmethod
+    async def _elements(locator: Any) -> list[Any]:
+        return [locator.nth(index) for index in range(int(await locator.count()))]
 
     @staticmethod
     async def _visible(locator: Any) -> list[Any]:

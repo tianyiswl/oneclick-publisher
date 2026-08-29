@@ -1028,14 +1028,18 @@ class _ContentElement:
         attributes: dict[str, str] | None = None,
         text: str = "",
         action: str = "",
+        row: dict[str, str] | None = None,
+        visible: bool = True,
     ) -> None:
         self.page = page
         self.attributes = dict(attributes or {})
         self.text = text
         self.action = action
+        self.row = row
+        self.visible = visible
 
     async def is_visible(self) -> bool:
-        return True
+        return self.visible
 
     async def get_attribute(self, name: str) -> str | None:
         return self.attributes.get(name)
@@ -1054,6 +1058,25 @@ class _ContentElement:
         if self.action == "next_page":
             self.page.page_index += 1
 
+    def locator(self, selector: str) -> _FakeLocator:
+        self.page.context.selectors.append(selector)
+        if self.action == "content_main" and selector == 'a[href*="/reel/"]':
+            return self.page.content_row_anchors()
+        if self.action == "reel_anchor" and selector == "time[datetime]":
+            count = int((self.row or {}).get("time_count", "1"))
+            return _FakeLocator(
+                [
+                    _ContentElement(
+                        self.page,
+                        attributes={
+                            "datetime": str((self.row or {}).get("published_at", ""))
+                        },
+                    )
+                    for _ in range(count)
+                ]
+            )
+        return _FakeLocator([])
+
 
 class _ContentPage:
     def __init__(self, context: "_ContentContext") -> None:
@@ -1063,10 +1086,11 @@ class _ContentPage:
             _FakePageRow(self, "1002", "Two"),
         ]
         self.active_page_id = context.active_page_id
-        self.switch_mismatch = False
+        self.switch_mismatch = context.switch_mismatch
         self.activation_attempts: list[str] = []
         self.active_read_count = 0
         self.mode = "blank"
+        self.url = "about:blank"
         self.page_index = 0
         self.detail_reel_id = ""
         self.closed = False
@@ -1078,12 +1102,16 @@ class _ContentPage:
         if "/latest/content" in url:
             self.mode = "list"
             self.page_index = 0
+            self.url = self.context.content_reported_url or url
             return
         if "/reel/" in url:
             self.mode = "detail"
             self.detail_reel_id = url.rstrip("/").rsplit("/", 1)[-1]
+            detail = self.context.details.get(self.detail_reel_id, {})
+            self.url = str(detail.get("reported_url", url))
             return
         self.mode = "generic"
+        self.url = url
 
     async def close(self) -> None:
         self.closed = True
@@ -1112,106 +1140,108 @@ class _ContentPage:
         return _FakeLocator([])
 
     def _list_locator(self, selector: str) -> _FakeLocator:
-        if selector == "[data-meta-page-content-list]":
+        if selector == "main":
             return _FakeLocator(
                 [
                     _ContentElement(
                         self,
-                        attributes={"data-page-id": self.context.list_page_id},
+                        action="content_main",
                     )
                     for _ in range(self.context.root_count)
                 ]
             )
+        return _FakeLocator([])
+
+    def content_row_anchors(self) -> _FakeLocator:
         page_rows = (
             self.context.pages[self.page_index]
             if self.page_index < len(self.context.pages)
             else []
         )
-        if selector == "[data-meta-reel-row]":
-            return _FakeLocator(
-                [
-                    _ContentElement(
-                        self,
-                        attributes={
-                            "data-page-id": str(row.get("page_id", "")),
-                            "data-reel-id": str(row.get("reel_id", "")),
-                            "data-reel-url": str(row.get("url", "")),
-                            "data-published-at": str(row.get("published_at", "")),
-                            "data-caption-preview": str(row.get("preview", "")),
-                        },
-                    )
-                    for row in page_rows
-                ]
-            )
-        on_last_page = self.page_index == len(self.context.pages) - 1
-        if selector == '[data-meta-pagination-complete="true"]':
-            count = (
-                self.context.terminal_count
-                if self.context.complete and on_last_page
-                else 0
-            )
-            return _FakeLocator([_ContentElement(self) for _ in range(count)])
-        if selector == '[data-meta-content-empty="true"]':
-            empty = (
-                self.context.explicit_empty
-                and not any(self.context.pages)
-                and on_last_page
-            )
-            return _FakeLocator([_ContentElement(self)] if empty else [])
-        if selector == "[data-meta-pagination-next]":
-            has_next = self.page_index + 1 < len(self.context.pages)
-            return _FakeLocator(
-                [_ContentElement(self, action="next_page")] if has_next else []
-            )
-        if selector == "[data-meta-platform-decision]":
-            decision = self.context.platform_decision
-            if decision is None:
-                return _FakeLocator([])
-            return _FakeLocator(
-                [
-                    _ContentElement(
-                        self,
-                        attributes={
-                            "data-page-id": str(decision["page_id"]),
-                            "data-meta-platform-decision": str(decision["kind"]),
-                            "data-observed-at": str(decision["observed_at"]),
-                        },
-                        text=str(decision.get("evidence", "")),
-                    )
-                ]
-            )
-        return _FakeLocator([])
+        return _FakeLocator(
+            [
+                _ContentElement(
+                    self,
+                    attributes={"href": str(row.get("url", ""))},
+                    action="reel_anchor",
+                    row=row,
+                )
+                for row in page_rows
+            ]
+        )
 
     def _detail_locator(self, selector: str) -> _FakeLocator:
         detail = self.context.details.get(self.detail_reel_id)
-        if selector == "[data-meta-reel-detail]" and detail is not None:
+        if selector == 'meta[property="og:url"][content]' and detail is not None:
+            count = int(detail.get("url_count", 1))
             return _FakeLocator(
                 [
                     _ContentElement(
                         self,
-                        attributes={
-                            "data-page-id": str(detail.get("page_id", "1001")),
-                            "data-reel-id": self.detail_reel_id,
-                        },
+                        attributes={"content": str(detail.get("url", self.url))},
+                        visible=False,
                     )
+                    for _ in range(count)
                 ]
             )
-        if selector == (
-            '[data-meta-reel-detail-caption][data-caption-complete="true"]'
-        ):
+        if selector == 'meta[property="og:description"][content]':
             if detail is None or detail.get("caption") is None:
                 return _FakeLocator([])
             count = int(detail.get("caption_count", 1))
             return _FakeLocator(
                 [
-                    _ContentElement(self, text=str(detail["caption"]))
+                    _ContentElement(
+                        self,
+                        attributes={"content": str(detail["caption"])},
+                        visible=False,
+                    )
                     for _ in range(count)
                 ]
             )
         return _FakeLocator([])
 
-    def get_by_role(self, *_args, **_kwargs) -> _FakeLocator:
+    def get_by_role(
+        self,
+        role: str,
+        *,
+        name: str | None = None,
+        exact: bool = False,
+    ) -> _FakeLocator:
         self.context.role_queries += 1
+        if self.mode == "decision" and role in {"alert", "status"} and name is None:
+            return _FakeLocator(
+                [
+                    _ContentElement(self, text=text)
+                    for message_role, text in self.context.decision_messages
+                    if message_role == role
+                ]
+            )
+        if self.mode != "list":
+            return _FakeLocator([])
+        on_last_page = self.page_index == len(self.context.pages) - 1
+        if role == "status" and name is None:
+            if self.context.explicit_empty and not any(self.context.pages):
+                return _FakeLocator(
+                    [_ContentElement(self, text=self.context.empty_text)]
+                )
+            if self.context.complete and on_last_page:
+                return _FakeLocator(
+                    [
+                        _ContentElement(self, text=self.context.terminal_text)
+                        for _ in range(self.context.terminal_count)
+                    ]
+                )
+            return _FakeLocator(
+                [_ContentElement(self, text=text) for text in self.context.extra_statuses]
+            )
+        has_next = self.page_index + 1 < len(self.context.pages)
+        if (
+            role == "button"
+            and exact
+            and name == self.context.next_label
+            and has_next
+        ):
+            return _FakeLocator([_ContentElement(self, action="next_page")])
         return _FakeLocator([])
 
 
@@ -1223,23 +1253,33 @@ class _ContentContext:
         details: dict[str, dict[str, object]] | None = None,
         complete: bool = True,
         explicit_empty: bool = False,
-        list_page_id: str = "1001",
         root_count: int = 1,
         terminal_count: int = 1,
         active_page_id: str = "1001",
+        switch_mismatch: bool = False,
         fail_urls: set[str] | None = None,
-        platform_decision: dict[str, str] | None = None,
+        content_reported_url: str = "",
+        terminal_text: str = "No more results",
+        empty_text: str = "No content yet",
+        next_label: str = "Load more",
+        extra_statuses: list[str] | None = None,
+        decision_messages: list[tuple[str, str]] | None = None,
     ) -> None:
         self.pages = pages
         self.details = dict(details or {})
         self.complete = complete
         self.explicit_empty = explicit_empty
-        self.list_page_id = list_page_id
         self.root_count = root_count
         self.terminal_count = terminal_count
         self.active_page_id = active_page_id
+        self.switch_mismatch = switch_mismatch
         self.fail_urls = set(fail_urls or set())
-        self.platform_decision = platform_decision
+        self.content_reported_url = content_reported_url
+        self.terminal_text = terminal_text
+        self.empty_text = empty_text
+        self.next_label = next_label
+        self.extra_statuses = list(extra_statuses or [])
+        self.decision_messages = list(decision_messages or [])
         self.created_pages: list[_ContentPage] = []
         self.goto_urls: list[str] = []
         self.actions: list[str] = []
@@ -1540,8 +1580,10 @@ class FacebookPageContentListTests(unittest.IsolatedAsyncioTestCase):
                 complete=False,
             ),
             _ContentContext(
-                pages=[[self.list_row("old", page_id="1002")]],
+                pages=[[self.list_row("old")]],
                 details={"old": {"caption": "旧内容"}},
+                active_page_id="1002",
+                switch_mismatch=True,
             ),
             _ContentContext(
                 pages=[[self.list_row("old"), self.list_row("old")]],
@@ -1572,6 +1614,19 @@ class FacebookPageContentListTests(unittest.IsolatedAsyncioTestCase):
                     "https://business.facebook.com/latest/content?asset_id=1001"
                 },
             ),
+            _ContentContext(
+                pages=[[self.list_row("old")]],
+                details={"old": {"caption": "旧内容"}},
+                content_reported_url="https://business.facebook.com/latest/content",
+            ),
+            _ContentContext(
+                pages=[[self.list_row("old")]],
+                details={"old": {"caption": "旧内容"}},
+                content_reported_url=(
+                    "https://business.facebook.com/latest/content"
+                    "?asset_id=1001&view=all"
+                ),
+            ),
         )
         for context in cases:
             with self.subTest(context=context):
@@ -1586,13 +1641,36 @@ class FacebookPageContentListTests(unittest.IsolatedAsyncioTestCase):
                     "facebook_page_baseline_read_failed",
                 )
 
+    async def test_reader_rejects_duplicate_id_reintroduced_on_later_page(self) -> None:
+        context = _ContentContext(
+            pages=[
+                [self.list_row("old")],
+                [self.list_row("old"), self.list_row("new")],
+            ],
+            details={
+                "old": {"caption": "旧内容"},
+                "new": {"caption": "新内容"},
+            },
+            next_label="Next",
+        )
+        reader = FacebookPageContentReader(
+            context,
+            wait_for_verification=self.no_verification,
+        )
+        with self.assertRaises(FacebookPagePublishError) as raised:
+            await reader.capture_baseline(expected_page_id="1001")
+        self.assertEqual(
+            raised.exception.error_code,
+            "facebook_page_baseline_read_failed",
+        )
+
     async def test_reader_rejects_missing_ambiguous_or_generic_list_selector(self) -> None:
         cases = (
             _ContentContext(pages=[[]], root_count=0, explicit_empty=True),
             _ContentContext(pages=[[]], root_count=2, explicit_empty=True),
             _ContentContext(
-                pages=[[]],
-                explicit_empty=True,
+                pages=[[self.list_row("old")]],
+                details={"old": {"caption": "旧内容"}},
                 terminal_count=2,
             ),
         )
@@ -1657,6 +1735,31 @@ class FacebookPageContentListTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(match.new_count, 1)
         self.assertEqual(match.matching_count, 0)
 
+    async def test_two_complete_detail_caption_candidates_stay_mismatch(self) -> None:
+        context = _ContentContext(
+            pages=[[]],
+            explicit_empty=True,
+        )
+        reader = FacebookPageContentReader(
+            context,
+            wait_for_verification=self.no_verification,
+        )
+        baseline = await reader.capture_baseline(expected_page_id="1001")
+        context.explicit_empty = False
+        context.pages = [[self.list_row("new")]]
+        context.details["new"] = {
+            "caption": self.expected_caption,
+            "caption_count": 2,
+        }
+        match = await reader.readback_unique_reel(
+            baseline=baseline,
+            expected_page_id="1001",
+            expected_caption_sha256=self.expected_caption_hash,
+            clicked_at=self.clicked_at,
+        )
+        self.assertEqual(match.status, "mismatch")
+        self.assertEqual(match.matching_count, 0)
+
     async def test_verification_resumes_same_context_and_rechecks_exact_page(self) -> None:
         contexts_seen: list[_ContentContext] = []
 
@@ -1715,7 +1818,7 @@ class FacebookPageContentListTests(unittest.IsolatedAsyncioTestCase):
             raised.exception.error_code,
             "facebook_page_baseline_read_failed",
         )
-        self.assertNotIn("[data-meta-reel-row]", context.selectors)
+        self.assertNotIn('a[href*="/reel/"]', context.selectors)
 
     async def test_readback_wait_is_bounded_and_returns_none_without_new_ids(self) -> None:
         context = _ContentContext(
@@ -1755,9 +1858,10 @@ class FacebookPageContentListTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([row.reel_id for row in baseline.rows], ["a", "b"])
         self.assertEqual(context.actions, ["next_page"])
         queried = " ".join(context.selectors).casefold()
+        self.assertNotIn("data-meta-", queried)
         for forbidden in ("create", "publish", "delete", "final-action"):
             self.assertNotIn(forbidden, queried)
-        self.assertEqual(context.role_queries, 0)
+        self.assertGreater(context.role_queries, 0)
 
     async def test_only_internal_dom_parser_can_create_trusted_platform_decision(self) -> None:
         from app_core import controlled_publish
@@ -1778,21 +1882,49 @@ class FacebookPageContentListTests(unittest.IsolatedAsyncioTestCase):
             {},
         )
 
+        forged_exact = object.__new__(FacebookPlatformDecision)
+        for name, value in (
+            ("kind", "rejected_no_creation"),
+            ("page_id", "1001"),
+            ("observed_at", "2026-08-30T02:02:00+00:00"),
+            ("evidence_sha256", "f" * 64),
+        ):
+            try:
+                object.__setattr__(forged_exact, name, value)
+            except (AttributeError, TypeError):
+                pass
+        for name, value in (
+            ("_kind", "rejected_no_creation"),
+            ("_page_id", "1001"),
+            ("_observed_at", "2026-08-30T02:02:00+00:00"),
+            ("_evidence_sha256", "f" * 64),
+            ("_sealed", True),
+        ):
+            try:
+                object.__setattr__(forged_exact, name, value)
+            except (AttributeError, TypeError):
+                pass
+        with self.assertRaises(controlled_publish.ControlledPublishError):
+            controlled_publish._safe_facebook_platform_decision(
+                forged_exact,
+                expected_page_reference="1001",
+            )
+
         context = _ContentContext(
             pages=[[]],
             explicit_empty=True,
-            platform_decision={
-                "kind": "rejected_no_creation",
-                "page_id": "1001",
-                "observed_at": "2026-08-30T02:02:00+00:00",
-                "evidence": "explicit no-creation feedback",
-            },
+            decision_messages=[("alert", "We couldn't publish your reel")],
         )
         reader = FacebookPageContentReader(
             context,
             wait_for_verification=self.no_verification,
         )
-        decision = await reader.read_platform_decision(expected_page_id="1001")
+        decision_page = await context.new_page()
+        decision_page.mode = "decision"
+        decision = await reader.read_platform_decision(
+            expected_page_id="1001",
+            page=decision_page,
+        )
         self.assertIs(type(decision), FacebookPlatformDecision)
         self.assertEqual(decision.kind, "rejected_no_creation")
         projected = controlled_publish._safe_facebook_platform_decision(
@@ -1801,6 +1933,38 @@ class FacebookPageContentListTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(projected["kind"], "rejected_no_creation")
         self.assertRegex(projected["evidenceSha256"], r"^[0-9a-f]{64}$")
+
+    async def test_internal_decision_parser_seals_accepted_rejected_and_unknown(self) -> None:
+        from app_core import controlled_publish
+
+        cases = (
+            ([("status", "Your reel is being published")], "accepted"),
+            ([("alert", "We couldn't publish your reel")], "rejected_no_creation"),
+            ([("status", "Saved")], "unknown"),
+            ([], "unknown"),
+        )
+        for messages, expected_kind in cases:
+            with self.subTest(messages=messages):
+                context = _ContentContext(
+                    pages=[[]],
+                    decision_messages=messages,
+                )
+                page = await context.new_page()
+                page.mode = "decision"
+                reader = FacebookPageContentReader(
+                    context,
+                    wait_for_verification=self.no_verification,
+                )
+                decision = await reader.read_platform_decision(
+                    expected_page_id="1001",
+                    page=page,
+                )
+                self.assertEqual(decision.kind, expected_kind)
+                projected = controlled_publish._safe_facebook_platform_decision(
+                    decision,
+                    expected_page_reference="1001",
+                )
+                self.assertEqual(projected["kind"], expected_kind)
 
 
 if __name__ == "__main__":
