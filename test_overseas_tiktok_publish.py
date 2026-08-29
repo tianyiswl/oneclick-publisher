@@ -333,6 +333,33 @@ class TikTokPublishContractTests(unittest.TestCase):
         )
         self.assertEqual(scheduled["scheduleMode"], "platform_native")
 
+    def test_noncanonical_root_schedule_field_casing_is_never_silently_ignored(
+        self,
+    ) -> None:
+        cases = (
+            ("lowercase enableTimer with value", {"enabletimer": True}),
+            ("lowercase enableTimer with None", {"enabletimer": None}),
+            (
+                "capitalized scheduleTime with value",
+                {"ScheduleTime": "2026-08-29 15:00"},
+            ),
+            ("capitalized scheduleTime with None", {"ScheduleTime": None}),
+            ("lowercase dailyTimes with value", {"dailytimes": ["15:00"]}),
+            ("lowercase dailyTimes with None", {"dailytimes": None}),
+            ("padded enableTimer with None", {" enableTimer ": None}),
+        )
+        for label, duplicate_variant in cases:
+            with self.subTest(label=label):
+                self.assert_error_code(
+                    "tiktok_schedule_invalid",
+                    self.payload(
+                        runtimeMode="publish",
+                        debugDryRun=False,
+                        **duplicate_variant,
+                    ),
+                    mode="formal",
+                )
+
     def test_service_schedule_windows_are_thirty_minutes_then_fifteen_minutes(self) -> None:
         shanghai = ZoneInfo("Asia/Shanghai")
         preflight_now = datetime(2026, 8, 29, 14, 31, tzinfo=shanghai)

@@ -154,6 +154,21 @@ _SCHEDULE_ALIAS_KEYS = frozenset(
         "timezone",
     }
 )
+_CANONICAL_ROOT_SCHEDULE_KEYS = frozenset(
+    {
+        "enableTimer",
+        "scheduleTime",
+        "scheduleTimezone",
+        "videosPerDay",
+        "dailyTimes",
+        "startDays",
+        "timeJitterMinutes",
+        "schedule",
+    }
+)
+_CANONICAL_ROOT_SCHEDULE_KEYS_BY_CASEFOLD = {
+    key.casefold(): key for key in _CANONICAL_ROOT_SCHEDULE_KEYS
+}
 
 
 def payload_has_tiktok_platform_signal(payload: Mapping[str, Any]) -> bool:
@@ -333,6 +348,15 @@ def _validate_schedule_locations(payload: Mapping[str, Any]) -> None:
 
 
 def _validate_schedule_fields(payload: Mapping[str, Any]) -> TikTokScheduleIntent:
+    for raw_key in payload:
+        canonical_key = _CANONICAL_ROOT_SCHEDULE_KEYS_BY_CASEFOLD.get(
+            str(raw_key).strip().casefold()
+        )
+        if canonical_key is not None and raw_key != canonical_key:
+            _fail(
+                "tiktok_schedule_invalid",
+                "TikTok 排期字段名无效",
+            )
     _validate_schedule_locations(payload)
     exact_integers = {
         "videosPerDay": 1,
