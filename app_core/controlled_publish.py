@@ -29,7 +29,10 @@ from .overseas_meta_content import (
     build_facebook_page_caption,
     facebook_page_caption_sha256,
 )
-from .overseas_meta_errors import FacebookPagePublishError
+from .overseas_meta_errors import (
+    FacebookPagePublishError,
+    project_facebook_page_receipt,
+)
 from .overseas_meta_page_identity import facebook_page_v1_enabled
 from .tiktok_schedule_contract import (
     TikTokScheduleContractError,
@@ -67,6 +70,19 @@ _TIKTOK_TARGET_SCHEDULE_ALIASES = {
 _PROJECT_ID_RE = re.compile(r"[a-z0-9][a-z0-9._-]{1,63}")
 _YOUTUBE_VISIBILITIES = frozenset(
     {"private", "unlisted", "public", "scheduled_public"}
+)
+_SAFE_SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+_FACEBOOK_PAGE_CLAIM_TRANSITIONS = {
+    "reserved": frozenset({"final_action_claimed", "safe_failed"}),
+    "final_action_claimed": frozenset({"final_action_clicked", "ambiguous"}),
+    "final_action_clicked": frozenset({"succeeded", "ambiguous"}),
+    "ambiguous": frozenset({"succeeded", "confirmed_not_published"}),
+    "safe_failed": frozenset(),
+    "confirmed_not_published": frozenset(),
+    "succeeded": frozenset(),
+}
+_FACEBOOK_PAGE_REPLAY_RELEASE_STATES = frozenset(
+    {"safe_failed", "confirmed_not_published"}
 )
 
 
@@ -250,6 +266,10 @@ def build_controlled_payloads(
             "TikTok 排期字段、格式或时区无效",
         )
     unexpected = set(request) - _REQUEST_KEYS
+    if facebook_target_count:
+        # Compatibility-only caller evidence is deliberately ignored.  The
+        # formal path always re-reads the task item stored by the preflight.
+        unexpected -= {"preflightReceiptHash", "preflightReceipt", "receipt"}
     if unexpected:
         raise ControlledPublishError(
             "controlled_request_invalid", "受控发布请求包含不支持字段"
@@ -901,6 +921,169 @@ def facebook_replay_fingerprint(
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def _canonical_safe_json(value: object) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _canonical_safe_hash(value: object) -> str:
+    return hashlib.sha256(_canonical_safe_json(value).encode("utf-8")).hexdigest()
+
+
+def _sqlite_row_dict(
+    cursor: sqlite3.Cursor,
+    row: sqlite3.Row | tuple[Any, ...] | None,
+) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    if isinstance(row, sqlite3.Row):
+        return dict(row)
+    columns = [str(item[0]) for item in cursor.description or ()]
+    return dict(zip(columns, row))
+
+
+def _facebook_authorization_invalid() -> ControlledPublishError:
+    return ControlledPublishError(
+        "facebook_publish_authorization_invalid",
+        "Facebook Page 正式发布授权无效，必须重新完成平台预检。",
+    )
+
+
+def _single_facebook_page_payload(
+    payloads: Iterable[Mapping[str, Any]],
+) -> dict[str, Any]:
+    rows = [dict(payload) for payload in payloads]
+    if (
+        len(rows) != 1
+        or type(rows[0].get("type")) is not int
+        or rows[0]["type"] != 9
+    ):
+        raise _facebook_authorization_invalid()
+    return rows[0]
+
+
+def facebook_preflight_receipt_hash(
+    conn: sqlite3.Connection,
+    preflight_task_id: int,
+    payloads: Iterable[Mapping[str, Any]],
+) -> str:
+    """Re-read and hash one verified Page form receipt from SQLite only."""
+
+    current_payload = _single_facebook_page_payload(payloads)
+    task_cursor = conn.execute(
+        """
+        SELECT id, mode, status, payloadJson
+        FROM publish_tasks WHERE id = ?
+        """,
+        (int(preflight_task_id),),
+    )
+    task = _sqlite_row_dict(task_cursor, task_cursor.fetchone())
+    if (
+        task is None
+        or str(task.get("mode") or "") != "oneclick_preflight"
+        or str(task.get("status") or "") != "success"
+    ):
+        raise _facebook_authorization_invalid()
+    try:
+        stored_payloads = json.loads(str(task.get("payloadJson") or "[]"))
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise _facebook_authorization_invalid() from exc
+    if (
+        not isinstance(stored_payloads, list)
+        or len(stored_payloads) != 1
+        or not isinstance(stored_payloads[0], Mapping)
+    ):
+        raise _facebook_authorization_invalid()
+    preflight_payload = _single_facebook_page_payload(stored_payloads)
+    if publish_intent_fingerprint([preflight_payload]) != publish_intent_fingerprint(
+        [current_payload]
+    ):
+        raise _facebook_authorization_invalid()
+
+    item_cursor = conn.execute(
+        """
+        SELECT id, status, accountId, filePath, fileName, receiptJson
+        FROM publish_task_items
+        WHERE taskId = ? AND platformType = 9
+        ORDER BY id
+        """,
+        (int(preflight_task_id),),
+    )
+    item_rows = item_cursor.fetchall()
+    items = [
+        _sqlite_row_dict(item_cursor, row)
+        for row in item_rows
+    ]
+    if (
+        len(items) != 1
+        or items[0] is None
+        or str(items[0].get("status") or "") != "success"
+    ):
+        raise _facebook_authorization_invalid()
+    item = items[0]
+    try:
+        loaded_receipt = json.loads(str(item.get("receiptJson") or ""))
+        safe_receipt = project_facebook_page_receipt(loaded_receipt)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise _facebook_authorization_invalid() from exc
+
+    account_ids = preflight_payload.get("accountIds")
+    current_account_ids = current_payload.get("accountIds")
+    if (
+        not isinstance(account_ids, list)
+        or len(account_ids) != 1
+        or type(account_ids[0]) is not int
+        or account_ids[0] <= 0
+        or current_account_ids != account_ids
+        or int(item.get("accountId") or 0) != account_ids[0]
+        or safe_receipt.get("accountId") != account_ids[0]
+    ):
+        raise _facebook_authorization_invalid()
+
+    page_reference = str(
+        preflight_payload.get("facebookExpectedPageReference") or ""
+    )
+    video_hash = str(preflight_payload.get("facebookVideoSha256") or "")
+    caption_hash = str(preflight_payload.get("facebookCaptionSha256") or "")
+    caption = str(preflight_payload.get("facebookFinalCaption") or "")
+    file_list = preflight_payload.get("fileList")
+    if (
+        not page_reference.isascii()
+        or not page_reference.isdigit()
+        or not _SAFE_SHA256_RE.fullmatch(video_hash)
+        or not _SAFE_SHA256_RE.fullmatch(caption_hash)
+        or facebook_page_caption_sha256(caption) != caption_hash
+        or not isinstance(file_list, list)
+        or len(file_list) != 1
+        or type(file_list[0]) is not str
+    ):
+        raise _facebook_authorization_invalid()
+    video_path = Path(file_list[0])
+    try:
+        current_video_hash = _facebook_video_sha256(video_path)
+        current_video_size = video_path.stat().st_size
+    except (ControlledPublishError, OSError) as exc:
+        raise _facebook_authorization_invalid() from exc
+    if (
+        current_video_hash != video_hash
+        or safe_receipt.get("phase") != "platform_form_verified"
+        or safe_receipt.get("pageId") != page_reference
+        or safe_receipt.get("videoName") != video_path.name
+        or safe_receipt.get("videoSize") != current_video_size
+        or safe_receipt.get("videoSha256") != video_hash
+        or safe_receipt.get("captionSha256") != caption_hash
+        or safe_receipt.get("visibility") != "public"
+        or safe_receipt.get("finalButtonEnabled") is not True
+        or safe_receipt.get("finalActionTriggered") is not False
+    ):
+        raise _facebook_authorization_invalid()
+    return _canonical_safe_hash(safe_receipt)
+
+
 def scope_fingerprint(payloads: Iterable[Mapping[str, Any]]) -> str:
     """Compatibility wrapper over the stable publish-intent fingerprint."""
 
@@ -908,6 +1091,8 @@ def scope_fingerprint(payloads: Iterable[Mapping[str, Any]]) -> str:
 
 
 def _ensure_authorization_schema(conn: sqlite3.Connection) -> None:
+    from .database import _add_columns
+
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS controlled_publish_authorizations (
@@ -919,6 +1104,14 @@ def _ensure_authorization_schema(conn: sqlite3.Connection) -> None:
             consumedAt TEXT
         )
         """
+    )
+    _add_columns(
+        conn,
+        "controlled_publish_authorizations",
+        (
+            ("authorizationScope", "TEXT NOT NULL DEFAULT 'formal'"),
+            ("preflightReceiptHash", "TEXT NOT NULL DEFAULT ''"),
+        ),
     )
 
 
@@ -941,11 +1134,26 @@ def create_authorization(
     *,
     now: datetime | None = None,
     ttl_seconds: int = 600,
+    authorization_scope: str = "formal",
+    preflight_receipt_hash: str = "",
 ) -> dict[str, Any]:
     if type(preflight_task_id) is not int or preflight_task_id <= 0:
         raise ControlledPublishError("controlled_preflight_required", "预检 taskId 无效")
     if not 1 <= int(ttl_seconds) <= 900:
         raise ControlledPublishError("controlled_authorization_ttl_invalid", "授权有效期不正确")
+    if authorization_scope != "formal":
+        raise ControlledPublishError(
+            "controlled_authorization_scope_mismatch",
+            "一次性授权范围无效",
+        )
+    if preflight_receipt_hash and (
+        type(preflight_receipt_hash) is not str
+        or not _SAFE_SHA256_RE.fullmatch(preflight_receipt_hash)
+    ):
+        raise ControlledPublishError(
+            "controlled_authorization_scope_mismatch",
+            "预检回执哈希无效",
+        )
     create_authorization_schema(conn)
     created = _utc(now)
     expires = created + timedelta(seconds=int(ttl_seconds))
@@ -953,13 +1161,17 @@ def create_authorization(
     conn.execute(
         """
         INSERT INTO controlled_publish_authorizations
-            (authorizationId, preflightTaskId, scopeFingerprint, createdAt, expiresAt, consumedAt)
-        VALUES (?, ?, ?, ?, ?, NULL)
+            (authorizationId, preflightTaskId, scopeFingerprint,
+             authorizationScope, preflightReceiptHash,
+             createdAt, expiresAt, consumedAt)
+        VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
         """,
         (
             authorization_id,
             preflight_task_id,
             scope_fingerprint(payloads),
+            authorization_scope,
+            preflight_receipt_hash,
             created.isoformat(),
             expires.isoformat(),
         ),
@@ -1005,6 +1217,7 @@ def _consume_authorization_in_transaction(
 ) -> None:
     """Validate and consume without committing the caller's transaction."""
 
+    payload_rows = [dict(payload) for payload in payloads]
     _ensure_authorization_schema(conn)
     current = _utc(now)
     row = conn.execute(
@@ -1014,6 +1227,10 @@ def _consume_authorization_in_transaction(
     if row is None:
         raise ControlledPublishError("controlled_authorization_invalid", "一次性授权不存在")
     data = dict(row)
+    if str(data.get("preflightReceiptHash") or "") or any(
+        int(payload.get("type") or 0) == 9 for payload in payload_rows
+    ):
+        raise _facebook_authorization_invalid()
     if data.get("consumedAt"):
         raise ControlledPublishError("controlled_authorization_consumed", "一次性授权已经使用")
     if int(data.get("preflightTaskId") or 0) != int(preflight_task_id):
@@ -1021,7 +1238,7 @@ def _consume_authorization_in_transaction(
     expires = datetime.fromisoformat(str(data["expiresAt"])).astimezone(timezone.utc)
     if current >= expires:
         raise ControlledPublishError("controlled_authorization_expired", "一次性授权已经过期")
-    if str(data.get("scopeFingerprint") or "") != scope_fingerprint(payloads):
+    if str(data.get("scopeFingerprint") or "") != scope_fingerprint(payload_rows):
         raise ControlledPublishError("controlled_authorization_scope_mismatch", "正式发布内容与预检不一致")
     cursor = conn.execute(
         """
@@ -1033,6 +1250,727 @@ def _consume_authorization_in_transaction(
     )
     if cursor.rowcount != 1:
         raise ControlledPublishError("controlled_authorization_consumed", "一次性授权已经使用")
+
+
+def _ensure_facebook_page_claim_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS facebook_page_publish_claims (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pageReference TEXT NOT NULL,
+            publishIntentFingerprint TEXT NOT NULL,
+            replayFingerprint TEXT NOT NULL,
+            preflightTaskId INTEGER NOT NULL,
+            preflightReceiptHash TEXT NOT NULL,
+            taskId INTEGER NOT NULL UNIQUE,
+            state TEXT NOT NULL CHECK(state IN (
+                'reserved',
+                'final_action_claimed',
+                'final_action_clicked',
+                'ambiguous',
+                'succeeded',
+                'confirmed_not_published',
+                'safe_failed'
+            )),
+            blocksReplay INTEGER NOT NULL CHECK(
+                (state IN ('safe_failed', 'confirmed_not_published')
+                 AND blocksReplay = 0)
+                OR
+                (state NOT IN ('safe_failed', 'confirmed_not_published')
+                 AND blocksReplay = 1)
+            ),
+            workerStartedAt TEXT,
+            baselineJson TEXT NOT NULL DEFAULT '{}',
+            baselineHash TEXT NOT NULL DEFAULT '',
+            formSnapshotJson TEXT NOT NULL DEFAULT '{}',
+            formSnapshotHash TEXT NOT NULL DEFAULT '',
+            clickedAt TEXT NOT NULL DEFAULT '',
+            platformDecisionJson TEXT NOT NULL DEFAULT '{}',
+            receiptJson TEXT NOT NULL DEFAULT '{}',
+            reelId TEXT NOT NULL DEFAULT '',
+            reelUrl TEXT NOT NULL DEFAULT '',
+            createdAt TEXT NOT NULL,
+            updatedAt TEXT NOT NULL,
+            FOREIGN KEY(taskId) REFERENCES publish_tasks(id),
+            FOREIGN KEY(preflightTaskId) REFERENCES publish_tasks(id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_facebook_page_active_replay_claim
+        ON facebook_page_publish_claims(pageReference, replayFingerprint)
+        WHERE blocksReplay = 1
+        """
+    )
+
+
+def _consume_facebook_authorization_in_transaction(
+    conn: sqlite3.Connection,
+    authorization_id: str,
+    preflight_task_id: int,
+    *,
+    publish_intent: str,
+    preflight_receipt_hash: str,
+    now: datetime | None = None,
+) -> None:
+    _ensure_authorization_schema(conn)
+    current = _utc(now)
+    cursor = conn.execute(
+        """
+        SELECT * FROM controlled_publish_authorizations
+        WHERE authorizationId = ?
+        """,
+        (str(authorization_id or "").strip(),),
+    )
+    row = _sqlite_row_dict(cursor, cursor.fetchone())
+    try:
+        expires = datetime.fromisoformat(str((row or {})["expiresAt"]))
+        if expires.tzinfo is None:
+            raise ValueError
+        expires = expires.astimezone(timezone.utc)
+    except (KeyError, TypeError, ValueError):
+        raise _facebook_authorization_invalid() from None
+    if (
+        row is None
+        or row.get("consumedAt")
+        or int(row.get("preflightTaskId") or 0) != int(preflight_task_id)
+        or str(row.get("authorizationScope") or "") != "formal"
+        or str(row.get("scopeFingerprint") or "") != publish_intent
+        or str(row.get("preflightReceiptHash") or "")
+        != preflight_receipt_hash
+        or current >= expires
+    ):
+        raise _facebook_authorization_invalid()
+    updated = conn.execute(
+        """
+        UPDATE controlled_publish_authorizations
+        SET consumedAt = ?
+        WHERE authorizationId = ?
+          AND consumedAt IS NULL
+          AND preflightTaskId = ?
+          AND authorizationScope = 'formal'
+          AND scopeFingerprint = ?
+          AND preflightReceiptHash = ?
+        """,
+        (
+            current.isoformat(),
+            str(authorization_id).strip(),
+            int(preflight_task_id),
+            publish_intent,
+            preflight_receipt_hash,
+        ),
+    )
+    if updated.rowcount != 1:
+        raise _facebook_authorization_invalid()
+
+
+def _bind_facebook_page_task_item(
+    conn: sqlite3.Connection,
+    task_id: int,
+    *,
+    account_id: int,
+    authorization_snapshot_hash: str,
+) -> None:
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS itemCount
+        FROM publish_task_items
+        WHERE taskId = ? AND platformType = 9
+        """,
+        (int(task_id),),
+    ).fetchone()
+    item_count = int(row["itemCount"] if isinstance(row, sqlite3.Row) else row[0])
+    if item_count != 1:
+        raise ControlledPublishError(
+            "facebook_claim_lifecycle_invalid",
+            "Facebook Page 正式任务明细无法原子绑定。",
+        )
+    updated = conn.execute(
+        """
+        UPDATE publish_task_items
+        SET accountId = ?, authorizationSnapshotHash = ?
+        WHERE taskId = ? AND platformType = 9
+        """,
+        (
+            int(account_id),
+            authorization_snapshot_hash,
+            int(task_id),
+        ),
+    )
+    if updated.rowcount != 1:
+        raise ControlledPublishError(
+            "facebook_claim_lifecycle_invalid",
+            "Facebook Page 正式任务明细无法原子绑定。",
+        )
+
+
+def _create_claimed_facebook_page_task(
+    payloads: list[dict[str, Any]],
+    *,
+    preflight_task_id: int,
+    authorization_id: str,
+) -> dict[str, Any]:
+    """Consume evidence and reserve one Page replay claim in one transaction."""
+
+    payload = _single_facebook_page_payload(payloads)
+    account_ids = payload.get("accountIds")
+    page_reference = str(payload.get("facebookExpectedPageReference") or "")
+    if (
+        type(preflight_task_id) is not int
+        or preflight_task_id <= 0
+        or not isinstance(account_ids, list)
+        or len(account_ids) != 1
+        or type(account_ids[0]) is not int
+        or account_ids[0] <= 0
+        or not page_reference.isascii()
+        or not page_reference.isdigit()
+    ):
+        raise _facebook_authorization_invalid()
+    from . import task_service
+    from .database import connect
+
+    untrusted_runtime_fields = {
+        "preflightReceiptHash",
+        "preflightReceipt",
+        "receipt",
+        "baseline",
+        "formSnapshot",
+        "platformDecision",
+        "blocksReplay",
+        "cookies",
+        "password",
+        "token",
+        "verificationCode",
+    }
+    stored_payload = {
+        key: value
+        for key, value in payload.items()
+        if key not in untrusted_runtime_fields
+    }
+    stored_payloads = [stored_payload]
+    publish_intent = publish_intent_fingerprint(stored_payloads)
+    replay_fingerprint = facebook_replay_fingerprint(stored_payloads)
+    with connect() as conn:
+        _ensure_authorization_schema(conn)
+        _ensure_facebook_page_claim_schema(conn)
+        conn.commit()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            preflight_receipt_hash = facebook_preflight_receipt_hash(
+                conn,
+                int(preflight_task_id),
+                stored_payloads,
+            )
+            _consume_facebook_authorization_in_transaction(
+                conn,
+                authorization_id,
+                int(preflight_task_id),
+                publish_intent=publish_intent,
+                preflight_receipt_hash=preflight_receipt_hash,
+            )
+            task = task_service._insert_pending_task(
+                conn,
+                stored_payloads,
+                mode="oneclick_publish",
+            )
+            _bind_facebook_page_task_item(
+                conn,
+                int(task["id"]),
+                account_id=int(account_ids[0]),
+                authorization_snapshot_hash=publish_intent,
+            )
+            now = _utc(None).isoformat()
+            conn.execute(
+                """
+                INSERT INTO facebook_page_publish_claims (
+                    pageReference, publishIntentFingerprint,
+                    replayFingerprint, preflightTaskId,
+                    preflightReceiptHash, taskId, state, blocksReplay,
+                    createdAt, updatedAt
+                ) VALUES (?, ?, ?, ?, ?, ?, 'reserved', 1, ?, ?)
+                """,
+                (
+                    page_reference,
+                    publish_intent,
+                    replay_fingerprint,
+                    int(preflight_task_id),
+                    preflight_receipt_hash,
+                    int(task["id"]),
+                    now,
+                    now,
+                ),
+            )
+            conn.commit()
+            return task
+        except sqlite3.IntegrityError as exc:
+            conn.rollback()
+            if (
+                "facebook_page_publish_claims.pageReference"
+                in str(exc)
+                and "facebook_page_publish_claims.replayFingerprint"
+                in str(exc)
+            ):
+                raise ControlledPublishError(
+                    "facebook_duplicate_submit_blocked",
+                    "同一 Facebook Page 发布意图已有防重记录，已阻止重复提交。",
+                ) from exc
+            raise
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def require_facebook_page_execution_claim(
+    task_id: int,
+    payloads: Iterable[Mapping[str, Any]],
+) -> None:
+    """Atomically grant one worker start for an exact reserved Page claim."""
+
+    payload = _single_facebook_page_payload(payloads)
+    page_reference = str(payload.get("facebookExpectedPageReference") or "")
+    account_ids = payload.get("accountIds")
+    if (
+        not isinstance(account_ids, list)
+        or len(account_ids) != 1
+        or type(account_ids[0]) is not int
+        or account_ids[0] <= 0
+    ):
+        raise _facebook_authorization_invalid()
+    publish_intent = publish_intent_fingerprint([payload])
+    replay_fingerprint = facebook_replay_fingerprint([payload])
+    from .database import connect
+
+    with connect() as conn:
+        _ensure_facebook_page_claim_schema(conn)
+        conn.commit()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            updated = conn.execute(
+                """
+                UPDATE facebook_page_publish_claims
+                SET workerStartedAt = ?, updatedAt = ?
+                WHERE taskId = ?
+                  AND state = 'reserved'
+                  AND workerStartedAt IS NULL
+                  AND pageReference = ?
+                  AND publishIntentFingerprint = ?
+                  AND replayFingerprint = ?
+                  AND EXISTS (
+                      SELECT 1 FROM publish_task_items AS item
+                      WHERE item.taskId = facebook_page_publish_claims.taskId
+                        AND item.platformType = 9
+                        AND item.accountId = ?
+                        AND item.authorizationSnapshotHash = ?
+                  )
+                """,
+                (
+                    _utc(None).isoformat(),
+                    _utc(None).isoformat(),
+                    int(task_id),
+                    page_reference,
+                    publish_intent,
+                    replay_fingerprint,
+                    int(account_ids[0]),
+                    publish_intent,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise _facebook_authorization_invalid()
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def _safe_facebook_baseline(
+    value: object,
+    *,
+    expected_page_reference: str,
+) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise ControlledPublishError(
+            "facebook_claim_lifecycle_invalid",
+            "Facebook Page 点击前基线无效。",
+        )
+    page_id = value.get("pageId")
+    rows = value.get("rows")
+    if page_id != expected_page_reference or not isinstance(rows, list):
+        raise ControlledPublishError(
+            "facebook_claim_lifecycle_invalid",
+            "Facebook Page 点击前基线无效。",
+        )
+    projected_rows: list[dict[str, object]] = []
+    seen_reel_ids: set[str] = set()
+    for raw_row in rows:
+        if not isinstance(raw_row, Mapping):
+            raise ControlledPublishError(
+                "facebook_claim_lifecycle_invalid",
+                "Facebook Page 点击前基线无效。",
+            )
+        reel_id = raw_row.get("reelId")
+        caption_hash = raw_row.get("captionSha256")
+        try:
+            safe_row = project_facebook_page_receipt(
+                {
+                    "pageId": page_id,
+                    "reelId": reel_id,
+                    "url": raw_row.get("url"),
+                    "publishedAt": raw_row.get("publishedAt"),
+                    "captionSha256": caption_hash,
+                }
+            )
+        except ValueError as exc:
+            raise ControlledPublishError(
+                "facebook_claim_lifecycle_invalid",
+                "Facebook Page 点击前基线无效。",
+            ) from exc
+        if (
+            type(reel_id) is not str
+            or not reel_id
+            or reel_id in seen_reel_ids
+            or safe_row.get("url") is None
+            or safe_row.get("publishedAt") is None
+            or type(caption_hash) is not str
+            or not _SAFE_SHA256_RE.fullmatch(caption_hash)
+        ):
+            raise ControlledPublishError(
+                "facebook_claim_lifecycle_invalid",
+                "Facebook Page 点击前基线无效。",
+            )
+        seen_reel_ids.add(reel_id)
+        projected_rows.append(
+            {
+                "reelId": reel_id,
+                "url": safe_row["url"],
+                "publishedAt": safe_row["publishedAt"],
+                "captionSha256": caption_hash,
+            }
+        )
+    projected_rows.sort(key=lambda row: str(row["reelId"]))
+    return {"pageId": page_id, "rows": projected_rows}
+
+
+def _safe_facebook_form_snapshot(
+    value: object,
+    *,
+    expected_page_reference: str,
+) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise ControlledPublishError(
+            "facebook_claim_lifecycle_invalid",
+            "Facebook Page 最终表单快照无效。",
+        )
+    page_id = value.get("pageId")
+    video_name = value.get("videoName")
+    video_size = value.get("videoSize")
+    video_hash = value.get("videoSha256")
+    caption_hash = value.get("captionSha256")
+    visibility = value.get("visibility")
+    final_button_label = value.get("finalButtonLabel")
+    final_button_ready = value.get("finalButtonReady")
+    if (
+        page_id != expected_page_reference
+        or type(video_name) is not str
+        or not video_name
+        or len(video_name) > 512
+        or "\n" in video_name
+        or "\r" in video_name
+        or type(video_size) is not int
+        or video_size < 0
+        or type(video_hash) is not str
+        or not _SAFE_SHA256_RE.fullmatch(video_hash)
+        or type(caption_hash) is not str
+        or not _SAFE_SHA256_RE.fullmatch(caption_hash)
+        or visibility != "public"
+        or type(final_button_label) is not str
+        or not final_button_label
+        or len(final_button_label) > 128
+        or "\n" in final_button_label
+        or "\r" in final_button_label
+        or final_button_ready is not True
+    ):
+        raise ControlledPublishError(
+            "facebook_claim_lifecycle_invalid",
+            "Facebook Page 最终表单快照无效。",
+        )
+    return {
+        "pageId": page_id,
+        "videoName": video_name,
+        "videoSize": video_size,
+        "videoSha256": video_hash,
+        "captionSha256": caption_hash,
+        "visibility": visibility,
+        "finalButtonLabel": final_button_label,
+        "finalButtonReady": final_button_ready,
+    }
+
+
+def _load_hashed_facebook_snapshot(
+    raw_json: str,
+    raw_hash: str,
+) -> object | None:
+    if raw_json == "{}" and raw_hash == "":
+        return None
+    if not _SAFE_SHA256_RE.fullmatch(raw_hash):
+        raise ControlledPublishError(
+            "facebook_claim_lifecycle_invalid",
+            "Facebook Page claim 快照完整性校验失败。",
+        )
+    try:
+        loaded = json.loads(raw_json)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ControlledPublishError(
+            "facebook_claim_lifecycle_invalid",
+            "Facebook Page claim 快照完整性校验失败。",
+        ) from exc
+    if (
+        _canonical_safe_json(loaded) != raw_json
+        or _canonical_safe_hash(loaded) != raw_hash
+    ):
+        raise ControlledPublishError(
+            "facebook_claim_lifecycle_invalid",
+            "Facebook Page claim 快照完整性校验失败。",
+        )
+    return loaded
+
+
+def _safe_facebook_platform_decision(
+    value: object,
+    *,
+    expected_page_reference: str,
+) -> dict[str, object]:
+    # JSON-like request/receipt mappings are untrusted by definition.  Task 7's
+    # internal DOM parser is the only producer whose immutable value object is
+    # accepted here.
+    value_type = type(value)
+    if (
+        value_type.__module__ != "uploader.meta_uploader.content_list"
+        or value_type.__name__ != "FacebookPlatformDecision"
+    ):
+        return {}
+    page_id = getattr(value, "page_id", None)
+    kind = getattr(value, "kind", None)
+    observed_at = getattr(value, "observed_at", None)
+    evidence_hash = getattr(value, "evidence_sha256", None)
+    try:
+        observed = datetime.fromisoformat(str(observed_at))
+        if observed.tzinfo is None:
+            raise ValueError
+    except (TypeError, ValueError):
+        raise ControlledPublishError(
+            "facebook_claim_lifecycle_invalid",
+            "Facebook Page 平台决定证据无效。",
+        ) from None
+    if (
+        page_id != expected_page_reference
+        or kind not in {"accepted", "rejected_no_creation", "unknown"}
+        or type(evidence_hash) is not str
+        or not _SAFE_SHA256_RE.fullmatch(evidence_hash)
+    ):
+        raise ControlledPublishError(
+            "facebook_claim_lifecycle_invalid",
+            "Facebook Page 平台决定证据无效。",
+        )
+    return {
+        "pageId": page_id,
+        "kind": kind,
+        "observedAt": str(observed_at),
+        "evidenceSha256": evidence_hash,
+    }
+
+
+def mark_facebook_page_checkpoint(
+    task_id: int,
+    *,
+    expected_state: str,
+    new_state: str,
+    receipt: Mapping[str, object],
+) -> None:
+    """Persist one legal Page lifecycle edge by strict compare-and-swap."""
+
+    if new_state not in _FACEBOOK_PAGE_CLAIM_TRANSITIONS.get(expected_state, ()):
+        raise ControlledPublishError(
+            "facebook_claim_lifecycle_invalid",
+            "Facebook Page claim 生命周期跳转无效。",
+        )
+    if not isinstance(receipt, Mapping):
+        raise ControlledPublishError(
+            "facebook_claim_lifecycle_invalid",
+            "Facebook Page claim 回执无效。",
+        )
+    from .database import connect
+
+    with connect() as conn:
+        _ensure_facebook_page_claim_schema(conn)
+        conn.commit()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                """
+                SELECT * FROM facebook_page_publish_claims WHERE taskId = ?
+                """,
+                (int(task_id),),
+            )
+            claim = _sqlite_row_dict(cursor, cursor.fetchone())
+            if claim is None or str(claim.get("state") or "") != expected_state:
+                raise ControlledPublishError(
+                    "facebook_claim_lifecycle_invalid",
+                    "Facebook Page claim 生命周期状态已变化。",
+                )
+            page_reference = str(claim.get("pageReference") or "")
+            receipt_page_id = receipt.get("pageId")
+            if receipt_page_id not in (None, page_reference):
+                raise ControlledPublishError(
+                    "facebook_claim_lifecycle_invalid",
+                    "Facebook Page claim 回执主体不匹配。",
+                )
+            try:
+                safe_receipt = project_facebook_page_receipt(receipt)
+            except ValueError as exc:
+                raise ControlledPublishError(
+                    "facebook_claim_lifecycle_invalid",
+                    "Facebook Page claim 回执无效。",
+                ) from exc
+
+            baseline_json = str(claim.get("baselineJson") or "{}")
+            baseline_hash = str(claim.get("baselineHash") or "")
+            form_json = str(claim.get("formSnapshotJson") or "{}")
+            form_hash = str(claim.get("formSnapshotHash") or "")
+            decision_json = str(claim.get("platformDecisionJson") or "{}")
+            stored_baseline = _load_hashed_facebook_snapshot(
+                baseline_json,
+                baseline_hash,
+            )
+            if stored_baseline is not None and _safe_facebook_baseline(
+                stored_baseline,
+                expected_page_reference=page_reference,
+            ) != stored_baseline:
+                raise ControlledPublishError(
+                    "facebook_claim_lifecycle_invalid",
+                    "Facebook Page claim 基线快照不安全。",
+                )
+            stored_form = _load_hashed_facebook_snapshot(form_json, form_hash)
+            if stored_form is not None and _safe_facebook_form_snapshot(
+                stored_form,
+                expected_page_reference=page_reference,
+            ) != stored_form:
+                raise ControlledPublishError(
+                    "facebook_claim_lifecycle_invalid",
+                    "Facebook Page claim 表单快照不安全。",
+                )
+            if "baseline" in receipt:
+                baseline = _safe_facebook_baseline(
+                    receipt["baseline"],
+                    expected_page_reference=page_reference,
+                )
+                next_baseline_json = _canonical_safe_json(baseline)
+                if baseline_json != "{}" and next_baseline_json != baseline_json:
+                    raise ControlledPublishError(
+                        "facebook_claim_lifecycle_invalid",
+                        "Facebook Page claim 基线快照不可改写。",
+                    )
+                baseline_json = next_baseline_json
+                baseline_hash = _canonical_safe_hash(baseline)
+            if "formSnapshot" in receipt:
+                form_snapshot = _safe_facebook_form_snapshot(
+                    receipt["formSnapshot"],
+                    expected_page_reference=page_reference,
+                )
+                next_form_json = _canonical_safe_json(form_snapshot)
+                if form_json != "{}" and next_form_json != form_json:
+                    raise ControlledPublishError(
+                        "facebook_claim_lifecycle_invalid",
+                        "Facebook Page claim 表单快照不可改写。",
+                    )
+                form_json = next_form_json
+                form_hash = _canonical_safe_hash(form_snapshot)
+            if new_state == "final_action_claimed" and (
+                baseline_json == "{}"
+                or not baseline_hash
+                or form_json == "{}"
+                or not form_hash
+            ):
+                raise ControlledPublishError(
+                    "facebook_claim_lifecycle_invalid",
+                    "Facebook Page 最终动作前缺少完整基线或表单证据。",
+                )
+            decision = _safe_facebook_platform_decision(
+                receipt.get("platformDecision"),
+                expected_page_reference=page_reference,
+            )
+            if decision:
+                decision_json = _canonical_safe_json(decision)
+            if new_state == "confirmed_not_published" and (
+                not decision or decision.get("kind") != "rejected_no_creation"
+            ):
+                raise ControlledPublishError(
+                    "facebook_claim_lifecycle_invalid",
+                    "Facebook Page 未发布终态缺少平台拒绝证据。",
+                )
+            if new_state == "succeeded" and (
+                safe_receipt.get("pageId") != page_reference
+                or type(safe_receipt.get("reelId")) is not str
+                or not safe_receipt.get("reelId")
+                or type(safe_receipt.get("url")) is not str
+                or not safe_receipt.get("url")
+                or type(safe_receipt.get("publishedAt")) is not str
+                or not safe_receipt.get("publishedAt")
+            ):
+                raise ControlledPublishError(
+                    "facebook_claim_lifecycle_invalid",
+                    "Facebook Page 成功终态缺少唯一 Reel 回读。",
+                )
+            safe_receipt.pop("baselineHash", None)
+            safe_receipt.pop("formSnapshotHash", None)
+            if baseline_hash:
+                safe_receipt["baselineHash"] = baseline_hash
+            if form_hash:
+                safe_receipt["formSnapshotHash"] = form_hash
+            receipt_json = _canonical_safe_json(safe_receipt)
+            clicked_at = str(claim.get("clickedAt") or "")
+            now = _utc(None).isoformat()
+            if new_state == "final_action_clicked":
+                clicked_at = now
+            blocks_replay = (
+                0 if new_state in _FACEBOOK_PAGE_REPLAY_RELEASE_STATES else 1
+            )
+            updated = conn.execute(
+                """
+                UPDATE facebook_page_publish_claims
+                SET state = ?, blocksReplay = ?, baselineJson = ?,
+                    baselineHash = ?, formSnapshotJson = ?,
+                    formSnapshotHash = ?, clickedAt = ?,
+                    platformDecisionJson = ?, receiptJson = ?,
+                    reelId = ?, reelUrl = ?, updatedAt = ?
+                WHERE taskId = ? AND state = ?
+                """,
+                (
+                    new_state,
+                    blocks_replay,
+                    baseline_json,
+                    baseline_hash,
+                    form_json,
+                    form_hash,
+                    clicked_at,
+                    decision_json,
+                    receipt_json,
+                    str(safe_receipt.get("reelId") or claim.get("reelId") or ""),
+                    str(safe_receipt.get("url") or claim.get("reelUrl") or ""),
+                    now,
+                    int(task_id),
+                    expected_state,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise ControlledPublishError(
+                    "facebook_claim_lifecycle_invalid",
+                    "Facebook Page claim 生命周期状态已变化。",
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
 
 def _ensure_tiktok_claim_schema(conn: sqlite3.Connection) -> None:
@@ -1921,11 +2859,23 @@ def authorize_completed_check(
     normalized_payloads = [dict(item) for item in payloads if isinstance(item, dict)]
     _require_tiktok_local_preflight_task(task, normalized_payloads)
     with connect() as conn:
+        preflight_receipt_hash = ""
+        if (
+            len(normalized_payloads) == 1
+            and int(normalized_payloads[0].get("type") or 0) == 9
+        ):
+            preflight_receipt_hash = facebook_preflight_receipt_hash(
+                conn,
+                int(task_id),
+                normalized_payloads,
+            )
         return create_authorization(
             conn,
             int(task_id),
             normalized_payloads,
             ttl_seconds=ttl_seconds,
+            authorization_scope="formal",
+            preflight_receipt_hash=preflight_receipt_hash,
         )
 
 
@@ -2041,6 +2991,17 @@ def submit_request(request: Mapping[str, Any]) -> dict[str, Any]:
     is_single_tiktok = (
         len(payloads) == 1 and int(payloads[0].get("type") or 0) == 6
     )
+    is_single_facebook_page = (
+        len(payloads) == 1 and int(payloads[0].get("type") or 0) == 9
+    )
+    if is_single_facebook_page and mode == "formal":
+        task = _create_claimed_facebook_page_task(
+            payloads,
+            preflight_task_id=int(request["confirmedPreflightTaskId"]),
+            authorization_id=str(request["authorizationId"]),
+        )
+        stored = task_service.get_task(int(task["id"])) or task
+        return project_task(stored)
     if is_single_tiktok and mode in {"formal", "platform_form_check"}:
         task = _create_claimed_tiktok_task(
             payloads,

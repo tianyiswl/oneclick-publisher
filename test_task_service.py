@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import tempfile
 import unittest
 from contextlib import contextmanager
@@ -2418,6 +2419,127 @@ class DouyinGraphicMatrixTaskPersistenceTests(unittest.TestCase):
         saved = task_service.get_task(task["id"])
         self.assertEqual(saved["status"], "paused")
         self.assertEqual([row["status"] for row in saved["items"]], ["pending", "pending"])
+
+
+class FacebookPageTaskPersistenceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.tempdir.name) / "database.db"
+        self.db_patch = patch.object(database, "DB_PATH", self.db_path)
+        self.db_patch.start()
+        database.ensure_schema()
+
+    def tearDown(self) -> None:
+        self.db_patch.stop()
+        self.tempdir.cleanup()
+
+    @staticmethod
+    def payload(*, account_id: int = 41) -> dict:
+        return {
+            "type": 9,
+            "contentType": "video",
+            "title": "Facebook Page task persistence",
+            "accountList": [f"facebook-page-{account_id}.json"],
+            "accountIds": [account_id],
+            "fileList": ["facebook.mp4"],
+            "debugDryRun": True,
+            "facebookExpectedPageReference": "1001",
+            "facebookVideoSha256": "a" * 64,
+            "facebookCaptionSha256": "b" * 64,
+            "visibility": "public",
+        }
+
+    def test_facebook_item_records_account_id_and_safe_platform_receipt(self) -> None:
+        task = task_service.create_pending_task(
+            [self.payload()],
+            mode="oneclick_preflight",
+        )
+
+        task_service.mark_platform_result(
+            task["id"],
+            9,
+            ok=True,
+            message="Facebook Page platform form verified",
+            content_type="video",
+            event_type="facebook_platform_form_verified",
+            receipt={
+                "accountId": 41,
+                "pageId": "1001",
+                "pageName": "Saved Facebook Page",
+                "videoName": "facebook.mp4",
+                "videoSize": 123,
+                "videoSha256": "a" * 64,
+                "captionSha256": "b" * 64,
+                "visibility": "public",
+                "phase": "platform_form_verified",
+                "platformWriteOccurred": True,
+                "finalActionTriggered": False,
+                "finalButtonEnabled": True,
+                "reelId": None,
+                "url": None,
+                "publishedAt": None,
+                "cookie": "must-not-persist",
+                "caption": "must-not-persist",
+            },
+        )
+
+        item = task_service.get_task(task["id"])["items"][0]
+        receipt = json.loads(item["receiptJson"])
+        self.assertEqual(item["accountId"], 41)
+        self.assertEqual(receipt["pageId"], "1001")
+        self.assertEqual(receipt["phase"], "platform_form_verified")
+        self.assertIsNone(receipt["reelId"])
+        self.assertNotIn("cookie", receipt)
+        self.assertNotIn("caption", receipt)
+
+    def test_database_rejects_invalid_facebook_state_replay_pairs(self) -> None:
+        preflight = task_service.create_pending_task(
+            [self.payload()],
+            mode="oneclick_preflight",
+        )
+        formal = task_service.create_pending_task(
+            [self.payload()],
+            mode="oneclick_publish",
+        )
+        invalid_pairs = (
+            ("reserved", 0),
+            ("final_action_claimed", 0),
+            ("final_action_clicked", 0),
+            ("ambiguous", 0),
+            ("succeeded", 0),
+            ("safe_failed", 1),
+            ("confirmed_not_published", 1),
+        )
+        with database.connect() as conn:
+            controlled_publish._ensure_facebook_page_claim_schema(conn)
+            conn.commit()
+            for index, (state, blocks_replay) in enumerate(invalid_pairs, start=1):
+                with self.subTest(state=state, blocksReplay=blocks_replay), self.assertRaises(
+                    sqlite3.IntegrityError
+                ):
+                    conn.execute(
+                        """
+                        INSERT INTO facebook_page_publish_claims (
+                            pageReference, publishIntentFingerprint,
+                            replayFingerprint, preflightTaskId,
+                            preflightReceiptHash, taskId, state, blocksReplay,
+                            createdAt, updatedAt
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            str(1000 + index),
+                            f"intent-{index}",
+                            f"replay-{index}",
+                            preflight["id"],
+                            "c" * 64,
+                            formal["id"],
+                            state,
+                            blocks_replay,
+                            "2026-08-30T10:00:00+00:00",
+                            "2026-08-30T10:00:00+00:00",
+                        ),
+                    )
+                conn.rollback()
 
 
 if __name__ == "__main__":

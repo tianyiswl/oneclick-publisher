@@ -9,8 +9,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
-from app_core import database, task_service
-from app_core.controlled_publish import project_task
+from app_core import controlled_publish, database, task_service
+from app_core.controlled_publish import ControlledPublishError, project_task
 from app_core.douyin_graphic_matrix_service import prepare_matrix
 
 
@@ -216,6 +216,97 @@ class ControlledPublishResilienceTests(unittest.TestCase):
 
         self.assertFalse(changed)
         self.assertEqual(task_service.get_task(task["id"])["status"], "running")
+
+    def test_facebook_claim_lifecycle_rejects_skipped_and_repeated_transitions(
+        self,
+    ) -> None:
+        payload = {
+            "type": 9,
+            "contentType": "video",
+            "title": "Facebook Page lifecycle",
+            "accountList": ["facebook-page.json"],
+            "accountIds": [41],
+            "fileList": ["facebook.mp4"],
+            "facebookExpectedPageReference": "1001",
+            "facebookVideoSha256": "a" * 64,
+            "facebookCaptionSha256": "b" * 64,
+            "visibility": "public",
+        }
+        preflight = task_service.create_pending_task(
+            [payload], mode="oneclick_preflight"
+        )
+        formal_tasks = [
+            task_service.create_pending_task([payload], mode="oneclick_publish")
+            for _ in range(2)
+        ]
+        with database.connect() as conn:
+            controlled_publish._ensure_facebook_page_claim_schema(conn)
+            for index, task in enumerate(formal_tasks, start=1):
+                conn.execute(
+                    """
+                    INSERT INTO facebook_page_publish_claims (
+                        pageReference, publishIntentFingerprint,
+                        replayFingerprint, preflightTaskId,
+                        preflightReceiptHash, taskId, state, blocksReplay,
+                        createdAt, updatedAt
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'reserved', 1, ?, ?)
+                    """,
+                    (
+                        str(1000 + index),
+                        f"intent-{index}",
+                        f"replay-{index}",
+                        preflight["id"],
+                        "c" * 64,
+                        task["id"],
+                        "2026-08-30T10:00:00+00:00",
+                        "2026-08-30T10:00:00+00:00",
+                    ),
+                )
+            conn.commit()
+
+        controlled_publish.mark_facebook_page_checkpoint(
+            formal_tasks[0]["id"],
+            expected_state="reserved",
+            new_state="safe_failed",
+            receipt={"pageId": "1001"},
+        )
+        with self.assertRaises(ControlledPublishError) as repeated:
+            controlled_publish.mark_facebook_page_checkpoint(
+                formal_tasks[0]["id"],
+                expected_state="safe_failed",
+                new_state="safe_failed",
+                receipt={"pageId": "1001"},
+            )
+        with self.assertRaises(ControlledPublishError) as skipped:
+            controlled_publish.mark_facebook_page_checkpoint(
+                formal_tasks[1]["id"],
+                expected_state="reserved",
+                new_state="final_action_clicked",
+                receipt={"pageId": "1002"},
+            )
+
+        self.assertEqual(
+            repeated.exception.error_code,
+            "facebook_claim_lifecycle_invalid",
+        )
+        self.assertEqual(
+            skipped.exception.error_code,
+            "facebook_claim_lifecycle_invalid",
+        )
+        with database.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT taskId, state, blocksReplay
+                FROM facebook_page_publish_claims ORDER BY taskId
+                """
+            ).fetchall()
+        self.assertEqual(
+            [tuple(row) for row in rows],
+            [
+                (formal_tasks[0]["id"], "safe_failed", 0),
+                (formal_tasks[1]["id"], "reserved", 1),
+            ],
+        )
 
 
 if __name__ == "__main__":

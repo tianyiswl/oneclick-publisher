@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 
 from .account_service import PLATFORMS
 from .database import connect
+from .overseas_meta_errors import project_facebook_page_receipt
 from .overseas_tiktok_errors import TikTokPublishError
 from .tiktok_schedule_contract import tiktok_irreversible_evidence_sql
 
@@ -734,10 +735,20 @@ def _insert_pending_task(
     items = []
     for payload in payloads:
         platform_type = int(payload.get("type"))
+        payload_account_files = list(payload.get("accountList", []))
+        payload_account_ids = payload.get("accountIds")
         # 纯文字没有素材文件，但同样必须生成账号执行项，才能正确回填结果。
         for file_path in payload.get("fileList", []) or [""]:
-            for account_file in payload.get("accountList", []):
+            for account_index, account_file in enumerate(payload_account_files):
                 meta = account_meta.get((platform_type, account_file), {})
+                account_id = (
+                    payload_account_ids[account_index]
+                    if isinstance(payload_account_ids, list)
+                    and account_index < len(payload_account_ids)
+                    and type(payload_account_ids[account_index]) is int
+                    and payload_account_ids[account_index] > 0
+                    else None
+                )
                 account_label = _account_display(
                     meta.get("profileName"),
                     meta.get("userName"),
@@ -749,6 +760,7 @@ def _insert_pending_task(
                         "platformType": platform_type,
                         "platformName": PLATFORMS.get(platform_type, f"平台{platform_type}"),
                         "contentType": str(payload.get("contentType") or ""),
+                        "accountId": account_id,
                         "accountFile": account_file,
                         "accountLabel": account_label,
                         "profileName": meta.get("profileName") or "",
@@ -812,15 +824,17 @@ def _insert_pending_task(
         cursor.execute(
             """
             INSERT INTO publish_task_items (
-                taskId, platformType, platformName, accountFile, accountLabel,
+                taskId, platformType, platformName, accountId,
+                accountFile, accountLabel,
                 profileName, userName, accountRemark, contentType, filePath, fileName, createdAt
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
                 item["platformType"],
                 item["platformName"],
+                item["accountId"],
                 item["accountFile"],
                 item["accountLabel"],
                 item["profileName"],
@@ -2463,6 +2477,10 @@ def mark_platform_result(
     public_receipt = (
         _youtube_receipt_projection(receipt if receipt is not None else readback)
         if int(platform_type) == 7
+        else project_facebook_page_receipt(
+            receipt if receipt is not None else (readback or {})
+        )
+        if int(platform_type) == 9
         else _tiktok_receipt_projection(
             receipt if receipt is not None else readback
         )
@@ -2495,6 +2513,14 @@ def mark_platform_result(
         receipt_values["publishedAt"] = str(
             public_receipt.get("publishedAt") or ""
         )
+    elif int(platform_type) == 9:
+        receipt_values["platformPostId"] = str(
+            public_receipt.get("reelId") or ""
+        )
+        receipt_values["postUrl"] = str(public_receipt.get("url") or "")
+        receipt_values["publishedAt"] = str(
+            public_receipt.get("publishedAt") or ""
+        )
     clear_tiktok_scheduled_published_at = bool(
         int(platform_type) == 6
         and ok
@@ -2502,7 +2528,7 @@ def mark_platform_result(
         and "publishedAt" in public_receipt
         and public_receipt.get("publishedAt") is None
     )
-    keep_identifiers = bool(ok or int(platform_type) in {6, 7})
+    keep_identifiers = bool(ok or int(platform_type) in {6, 7, 9})
     with connect() as conn:
         batch_item = conn.execute(
             """
