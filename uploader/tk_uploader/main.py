@@ -9,7 +9,7 @@ import unicodedata
 from pathlib import Path
 from typing import Any, Sequence
 
-from playwright.async_api import Playwright, async_playwright
+from playwright.async_api import Error as PlaywrightError, Playwright, async_playwright
 
 from app_core.overseas_tiktok_publish import (
     TikTokPublishError,
@@ -54,8 +54,8 @@ TOPIC_CANDIDATE_STABLE_READS = 2
 TOPIC_CANDIDATE_POLL_ATTEMPTS = 300
 TOPIC_ENTITY_STABLE_READS = 3
 TOPIC_ENTITY_POLL_ATTEMPTS = 300
-UPLOAD_ENTRY_POLL_ATTEMPTS = 120
 UPLOAD_ENTRY_POLL_INTERVAL_MS = 1_000
+UPLOAD_ENTRY_TIMEOUT_SECONDS = 120.0
 CAPTION_EDITOR_POLL_ATTEMPTS = 180
 CAPTION_EDITOR_POLL_INTERVAL_MS = 1_000
 
@@ -230,8 +230,12 @@ class TiktokVideo:
 
     async def _upload_file(self, page, base) -> None:
         del base
-        for _ in range(UPLOAD_ENTRY_POLL_ATTEMPTS):
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + UPLOAD_ENTRY_TIMEOUT_SECONDS
+        while loop.time() < deadline:
             await self._wait_for_manual_intervention(page)
+            if loop.time() >= deadline:
+                break
             current_base = await self._base(page)
             file_input = current_base.locator('input[type="file"]').first
             try:
@@ -240,9 +244,11 @@ class TiktokVideo:
                     return
             except TikTokPublishError:
                 raise
-            except Exception:
-                # TikTok 慢加载时上传组件会重挂载；下一轮重新解析 iframe/入口。
-                pass
+            except PlaywrightError as exc:
+                if "detached" not in str(exc).lower():
+                    raise
+                # TikTok 慢加载时上传组件会重挂载；只在该已知情形重新解析入口。
+                continue
             for label in ("Select video", "Select file", "Upload"):
                 button = current_base.get_by_role(
                     "button",
@@ -252,17 +258,25 @@ class TiktokVideo:
                 try:
                     if not await button.count():
                         continue
-                    async with page.expect_file_chooser(timeout=15000) as chooser_info:
+                    remaining_ms = int(max(1, (deadline - loop.time()) * 1000))
+                    async with page.expect_file_chooser(timeout=remaining_ms) as chooser_info:
                         await button.click()
                     chooser = await chooser_info.value
                     await chooser.set_files(self.file_path)
                     return
                 except TikTokPublishError:
                     raise
-                except Exception:
-                    # 入口可能正从占位按钮切换为真实文件控件，继续等待稳定页面。
-                    continue
-            await page.wait_for_timeout(UPLOAD_ENTRY_POLL_INTERVAL_MS)
+                except PlaywrightError as exc:
+                    if "detached" not in str(exc).lower():
+                        raise
+                    # 入口可能正从占位按钮切换为真实文件控件，重新解析页面。
+                    break
+            remaining_ms = int((deadline - loop.time()) * 1000)
+            if remaining_ms <= 0:
+                break
+            await page.wait_for_timeout(
+                min(UPLOAD_ENTRY_POLL_INTERVAL_MS, remaining_ms)
+            )
         raise TikTokPublishError(
             "tiktok_upload_entry_timeout",
             "TikTok 上传页在等待时间内没有出现视频选择入口",

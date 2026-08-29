@@ -387,6 +387,53 @@ class TikTokPublicProfilePersistenceTests(unittest.TestCase):
         self.assertEqual(self._stored()[:2], ("@tianyiswl", ""))
         self.assertFalse(self.avatar_dir.exists())
 
+    def test_persist_preserves_existing_avatar_when_compare_and_swap_rejects_update(self) -> None:
+        service = _profile_service()
+        profile = service.TikTokPublicProfile(
+            handle="tianyiswl",
+            display_name="Mobai",
+            avatar_png=PNG_1X1,
+        )
+        destination = self.avatar_dir / "oneclick_account_13.png"
+        self.avatar_dir.mkdir()
+        destination.write_bytes(b"old-avatar")
+
+        @contextmanager
+        def concurrent_connect():
+            connection = sqlite3.connect(self.database)
+            connection.row_factory = sqlite3.Row
+
+            class ConnectionWithConcurrentChange:
+                def execute(self, query, parameters=()):
+                    if "UPDATE user_info" in query and "SET userName" in query:
+                        connection.execute(
+                            "UPDATE user_info SET accountReference = ? WHERE id = ?",
+                            ("concurrent.user", 13),
+                        )
+                    return connection.execute(query, parameters)
+
+                def commit(self):
+                    connection.commit()
+
+            try:
+                with connection:
+                    yield ConnectionWithConcurrentChange()
+            finally:
+                connection.close()
+
+        with (
+            patch.object(service, "connect", concurrent_connect),
+            self.assertRaises(TikTokIdentityError) as raised,
+        ):
+            service.persist_tiktok_public_profile(
+                13,
+                profile,
+                avatar_dir=self.avatar_dir,
+            )
+
+        self.assertEqual(raised.exception.error_code, "tiktok_account_invalid")
+        self.assertEqual(destination.read_bytes(), b"old-avatar")
+
 
 if __name__ == "__main__":
     unittest.main()

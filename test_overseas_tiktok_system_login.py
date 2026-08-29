@@ -1593,6 +1593,40 @@ class TikTokCandidateCommitTests(unittest.TestCase):
         self.assertEqual(account_id, 23)
         persister.assert_called_once_with(23, profile)
 
+    def test_commit_rejects_identity_mismatch_from_public_profile_persister(self):
+        profile = TikTokPublicProfile(
+            handle="expected.user",
+            display_name="Mobai",
+            avatar_png=b"public-avatar-png",
+        )
+        candidate = TikTokLoginCandidate(
+            self.candidate.storage_state,
+            self.candidate.identity,
+            public_profile=profile,
+        )
+        persister = Mock(
+            side_effect=TikTokIdentityError(
+                "tiktok_account_identity_mismatch",
+                "TikTok 个人主页与已确认账号不一致",
+            )
+        )
+
+        with self.assertRaises(TikTokIdentityError) as raised:
+            commit_tiktok_login_candidate(
+                candidate,
+                "TikTok 测试",
+                record_id=None,
+                existing_account=None,
+                cookie_dir=self.cookie_dir,
+                account_saver=Mock(return_value=23),
+                profile_persister=persister,
+            )
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "tiktok_account_identity_mismatch",
+        )
+
     def test_database_failure_removes_new_session_and_preserves_old_account(self):
         with self.assertRaises(TikTokSystemLoginError) as raised:
             commit_tiktok_login_candidate(

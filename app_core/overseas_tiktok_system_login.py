@@ -1077,11 +1077,12 @@ def commit_tiktok_login_candidate(
     if candidate.public_profile is not None:
         try:
             profile_persister(account_id, candidate.public_profile)
-        except Exception:
+        except TikTokIdentityError as exc:
+            if exc.error_code != "tiktok_profile_unavailable":
+                raise
             # The stable handle and isolated session are already committed.
-            # A transient public-avatar write must not turn that valid login
-            # into a false failure; account-page refresh can retry this field.
-            pass
+            # Only a transient public-avatar read/write failure may be retried
+            # during a later account-page refresh.
     return account_id
 
 

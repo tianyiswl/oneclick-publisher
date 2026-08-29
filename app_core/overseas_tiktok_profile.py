@@ -470,36 +470,42 @@ def persist_tiktok_public_profile(
                 os.fsync(output.fileno())
             if os.name == "posix":
                 temporary.chmod(0o600)
+
+            updated = conn.execute(
+                """
+                UPDATE user_info
+                SET userName = ?, avatarPath = ?, avatarUpdatedAt = ?
+                WHERE id = ? AND type = 6 AND accountReference = ?
+                """,
+                (
+                    display_name,
+                    file_name,
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    account_id,
+                    row["accountReference"],
+                ),
+            )
+            if int(updated.rowcount or 0) != 1:
+                raise TikTokIdentityError(
+                    "tiktok_account_invalid", "TikTok 账号记录在资料保存期间已变更"
+                )
+
+            # The database CAS must be durably committed before the fixed avatar
+            # filename is replaced.  A rejected update or failed commit therefore
+            # leaves the existing account avatar intact.
+            conn.commit()
             os.replace(temporary, destination)
             temporary = None
             if os.name == "posix":
                 destination.chmod(0o600)
         except OSError:
+            raise _profile_unavailable() from None
+        finally:
             if temporary is not None:
                 try:
                     temporary.unlink(missing_ok=True)
                 except OSError:
                     pass
-            raise _profile_unavailable() from None
-
-        updated = conn.execute(
-            """
-            UPDATE user_info
-            SET userName = ?, avatarPath = ?, avatarUpdatedAt = ?
-            WHERE id = ? AND type = 6 AND accountReference = ?
-            """,
-            (
-                display_name,
-                file_name,
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                account_id,
-                row["accountReference"],
-            ),
-        )
-        if int(updated.rowcount or 0) != 1:
-            raise TikTokIdentityError(
-                "tiktok_account_invalid", "TikTok 账号记录在资料保存期间已变更"
-            )
     return file_name
 
 

@@ -612,10 +612,87 @@ class TikTokFormAdapterTests(unittest.TestCase):
         app._wait_for_manual_intervention = AsyncMock(return_value=None)
 
         with (
-            patch.object(tiktok_uploader, "UPLOAD_ENTRY_POLL_ATTEMPTS", 2),
+            patch.object(tiktok_uploader, "UPLOAD_ENTRY_TIMEOUT_SECONDS", 0),
             self.assertRaises(TikTokPublishError) as raised,
         ):
             asyncio.run(app._upload_file(page, page))
+
+        self.assertEqual(raised.exception.error_code, "tiktok_upload_entry_timeout")
+
+    def test_upload_preserves_missing_file_error_instead_of_rewriting_it_as_timeout(self) -> None:
+        class EmptyLocator:
+            @property
+            def first(self):
+                return self
+
+            async def count(self) -> int:
+                return 0
+
+        class MissingFileInput:
+            @property
+            def first(self):
+                return self
+
+            async def count(self) -> int:
+                return 1
+
+            async def set_input_files(self, _path: str) -> None:
+                raise FileNotFoundError("video disappeared")
+
+        class MissingFilePage:
+            url = tiktok_uploader.UPLOAD_URL
+
+            def locator(self, selector: str):
+                if selector == 'iframe[data-tt="Upload_index_iframe"]':
+                    return EmptyLocator()
+                return MissingFileInput()
+
+            def get_by_role(self, *_args, **_kwargs):
+                return EmptyLocator()
+
+            async def wait_for_timeout(self, _milliseconds: int) -> None:
+                return None
+
+        page = MissingFilePage()
+        app = TiktokVideo(
+            "Title",
+            "/tmp/deleted-video.mp4",
+            [],
+            0,
+            "/not/used.json",
+            execution_mode="platform_form_check",
+        )
+        app._wait_for_manual_intervention = AsyncMock(return_value=None)
+
+        with self.assertRaises(FileNotFoundError):
+            asyncio.run(app._upload_file(page, page))
+
+    def test_upload_entry_uses_one_absolute_deadline_before_polling(self) -> None:
+        class UnexpectedLookupPage:
+            url = tiktok_uploader.UPLOAD_URL
+
+            def locator(self, _selector: str):
+                raise AssertionError("expired upload deadline must not poll")
+
+        app = TiktokVideo(
+            "Title",
+            "/tmp/missing-upload.mp4",
+            [],
+            0,
+            "/not/used.json",
+            execution_mode="platform_form_check",
+        )
+        app._wait_for_manual_intervention = AsyncMock(return_value=None)
+
+        with (
+            patch.object(
+                tiktok_uploader,
+                "UPLOAD_ENTRY_TIMEOUT_SECONDS",
+                0,
+            ),
+            self.assertRaises(TikTokPublishError) as raised,
+        ):
+            asyncio.run(app._upload_file(UnexpectedLookupPage(), UnexpectedLookupPage()))
 
         self.assertEqual(raised.exception.error_code, "tiktok_upload_entry_timeout")
 
