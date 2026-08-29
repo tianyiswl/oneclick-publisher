@@ -63,7 +63,11 @@ def resolve_facebook_page_selection(
     distinct: dict[str, FacebookPageIdentity] = {}
     for page in pages:
         page_id = normalize_facebook_page_id(page.page_id)
-        distinct.setdefault(page_id, page)
+        existing = distinct.get(page_id)
+        if existing is None:
+            distinct[page_id] = page
+        elif existing.can_manage_content != page.can_manage_content:
+            raise _identity_mismatch()
 
     if not distinct:
         raise _page_not_found()
@@ -135,7 +139,21 @@ async def validate_facebook_page_binding(
     except AttributeError as exc:
         raise _identity_mismatch() from exc
     pages = await discover_manageable_facebook_pages(page)
-    return resolve_facebook_page_selection(pages, expected_page_id)
+    selected = resolve_facebook_page_selection(pages, expected_page_id)
+    try:
+        active_rows = page.locator('[data-page-id][data-page-active="true"]')
+        if int(await active_rows.count()) != 1:
+            raise _identity_mismatch()
+        active_page_id = normalize_facebook_page_id(
+            await active_rows.nth(0).get_attribute("data-page-id")
+        )
+    except FacebookPagePublishError:
+        raise
+    except Exception as exc:
+        raise _identity_mismatch() from exc
+    if active_page_id != expected_page_id:
+        raise _identity_mismatch()
+    return selected
 
 
 async def activate_saved_facebook_page(page, expected_page_id: str) -> FacebookPageIdentity:

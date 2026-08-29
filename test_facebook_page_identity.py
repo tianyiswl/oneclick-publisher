@@ -117,6 +117,15 @@ class FacebookPageIdentityTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(selected.page_id, "1001")
 
+    def test_duplicate_page_id_with_conflicting_permissions_is_rejected_in_either_order(self) -> None:
+        allowed = FacebookPageIdentity("1001", "主页", can_manage_content=True)
+        denied = FacebookPageIdentity("1001", "主页", can_manage_content=False)
+        for pages in ((allowed, denied), (denied, allowed)):
+            with self.subTest(pages=pages):
+                with self.assertRaises(FacebookPagePublishError) as raised:
+                    resolve_facebook_page_selection(pages, "1001")
+                self.assertEqual(raised.exception.error_code, "facebook_page_identity_mismatch")
+
     def test_blank_or_non_scalar_page_ids_are_rejected(self) -> None:
         for value in ("", "  ", [], {"page": "1001"}, True):
             with self.subTest(value=repr(value)), self.assertRaises(FacebookPagePublishError) as raised:
@@ -152,6 +161,19 @@ class FacebookPageIdentityTests(unittest.IsolatedAsyncioTestCase):
     async def test_saved_page_mismatch_stops_before_any_switch(self) -> None:
         page = _FakePage(
             [{"page_id": "1002", "page_name": "同名主页", "can_manage_content": True}],
+            active_page_id="1002",
+        )
+        with self.assertRaises(FacebookPagePublishError) as raised:
+            await validate_facebook_page_binding(page, {"accountReference": "1001"})
+        self.assertEqual(raised.exception.error_code, "facebook_page_identity_mismatch")
+        self.assertEqual(page.clicked_page_ids, [])
+
+    async def test_binding_rejects_when_saved_page_exists_but_another_page_is_active(self) -> None:
+        page = _FakePage(
+            [
+                {"page_id": "1001", "page_name": "目标主页", "can_manage_content": True},
+                {"page_id": "1002", "page_name": "当前主页", "can_manage_content": True},
+            ],
             active_page_id="1002",
         )
         with self.assertRaises(FacebookPagePublishError) as raised:
