@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """一键发授权执行器的离线测试：不启动浏览器，不访问平台。"""
 
+import asyncio
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -9,6 +10,7 @@ from unittest.mock import AsyncMock, patch
 from app_core.oneclick_authorization import (
     AuthorizationPlan,
     AuthorizationSession,
+    _verify_saved_session_async,
     authorization_browser_launch_options,
     authorization_plan,
     identity_response_display_name,
@@ -18,6 +20,8 @@ from app_core.oneclick_authorization import (
     wechat_authorization_page_confirms,
     wechat_home_session_confirms,
 )
+from app_core.overseas_meta_errors import FacebookPagePublishError
+from app_core.overseas_meta_page_identity import FacebookPageIdentity
 
 
 class _VisibleNode:
@@ -196,6 +200,87 @@ class OneClickAuthorizationTests(unittest.TestCase):
                 host,
                 authorization_plan(platform_type, "海外主体").login_url,
             )
+
+    def test_facebook_restart_validation_returns_the_exact_bound_page(self) -> None:
+        identity = FacebookPageIdentity(
+            "1001",
+            "测试 Page",
+            can_manage_content=True,
+        )
+        with TemporaryDirectory() as raw:
+            state_file = Path(raw) / "page.json"
+            state_file.write_text("{}", encoding="utf-8")
+            account = {
+                "type": 9,
+                "status": 1,
+                "authMode": "browser",
+                "profileName": "Meta 主体",
+                "filePath": state_file.name,
+                "accountReference": "1001",
+            }
+            with (
+                patch("app_core.oneclick_authorization.COOKIE_DIR", Path(raw)),
+                patch(
+                    "myUtils.auth.check_cookie",
+                    new=AsyncMock(return_value=identity),
+                ),
+            ):
+                result = asyncio.run(_verify_saved_session_async(account))
+
+        self.assertIs(result, identity)
+
+    def test_unbound_legacy_facebook_row_is_a_stable_error_even_when_session_is_missing(self) -> None:
+        account = {
+            "type": 9,
+            "status": 1,
+            "authMode": "browser",
+            "profileName": "Meta 主体",
+            "filePath": "missing.json",
+            "accountReference": "",
+        }
+        with TemporaryDirectory() as raw, patch(
+            "app_core.oneclick_authorization.COOKIE_DIR",
+            Path(raw),
+        ):
+            with self.assertRaises(FacebookPagePublishError) as raised:
+                asyncio.run(_verify_saved_session_async(account))
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "facebook_page_identity_mismatch",
+        )
+
+    def test_facebook_restart_validation_preserves_permission_loss_error(self) -> None:
+        denied = FacebookPageIdentity(
+            "1001",
+            "测试 Page",
+            can_manage_content=False,
+        )
+        with TemporaryDirectory() as raw:
+            state_file = Path(raw) / "page.json"
+            state_file.write_text("{}", encoding="utf-8")
+            account = {
+                "type": 9,
+                "status": 1,
+                "authMode": "browser",
+                "profileName": "Meta 主体",
+                "filePath": state_file.name,
+                "accountReference": "1001",
+            }
+            with (
+                patch("app_core.oneclick_authorization.COOKIE_DIR", Path(raw)),
+                patch(
+                    "myUtils.auth.check_cookie",
+                    new=AsyncMock(return_value=denied),
+                ),
+                self.assertRaises(FacebookPagePublishError) as raised,
+            ):
+                asyncio.run(_verify_saved_session_async(account))
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "facebook_page_content_permission_missing",
+        )
 
     def test_unknown_platform_is_rejected_without_browser_start(self) -> None:
         with self.assertRaisesRegex(ValueError, "尚未迁入"):

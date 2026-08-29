@@ -9,9 +9,10 @@ from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtWidgets import QApplication, QMenu, QMessageBox, QPushButton
+from PyQt6.QtWidgets import QApplication, QInputDialog, QMenu, QMessageBox, QPushButton
 
-from app_core import account_browser_service, account_service
+from app_core import account_browser_service, account_service, login_service
+from app_core.overseas_meta_page_identity import FacebookPageIdentity
 from ui.account_page import AccountPage
 from ui.login_dialog import LoginDialog
 from ui.main_window import MainWindow
@@ -85,7 +86,7 @@ class AccountDetectionUiTests(unittest.TestCase):
                 "type": 9,
                 "filePath": "shared-meta.json",
                 "userName": "旧 Facebook Page",
-                "status": 0,
+                "status": 1,
                 "profileName": "Meta 主体",
                 "avatarPath": None,
                 "avatarUpdatedAt": None,
@@ -109,7 +110,80 @@ class AccountDetectionUiTests(unittest.TestCase):
 
         self.assertEqual(page.row_data(0)["needsPageRebind"], True)
         self.assertEqual(page.table.item(0, 2).foreground().color().name(), "#dc2626")
+        buttons = {
+            item.text(): item
+            for item in page.table.cellWidget(0, 5).findChildren(QPushButton)
+        }
+        self.assertFalse(buttons["打开后台"].isEnabled())
         page.close()
+
+    def test_facebook_page_selection_prompt_uses_name_and_short_id_tail(self) -> None:
+        request = login_service.FacebookPageSelectionRequest(
+            (
+                FacebookPageIdentity("1234561001", "同名", can_manage_content=True),
+                FacebookPageIdentity("1234561002", "同名", can_manage_content=True),
+            )
+        )
+        labels = LoginDialog.facebook_page_selection_labels(request)
+
+        self.assertEqual(labels, ["同名 · …1001", "同名 · …1002"])
+        self.assertFalse(any("123456" in label for label in labels))
+
+    def test_facebook_page_login_entry_is_hidden_by_default_and_exposed_only_by_opt_in(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            default_dialog = LoginDialog()
+        self.assertLess(default_dialog.platform_combo.findData(9), 0)
+        default_dialog.close()
+
+        with patch.dict(
+            os.environ,
+            {"ONECLICK_ENABLE_FACEBOOK_PAGE_V1": "1"},
+            clear=True,
+        ):
+            enabled_dialog = LoginDialog()
+        self.assertGreaterEqual(enabled_dialog.platform_combo.findData(9), 0)
+        enabled_dialog.close()
+
+    def test_facebook_page_prompt_selects_the_exact_id_behind_the_label(self) -> None:
+        request = login_service.FacebookPageSelectionRequest(
+            (
+                FacebookPageIdentity("1234561001", "同名", can_manage_content=True),
+                FacebookPageIdentity("1234561002", "同名", can_manage_content=True),
+            )
+        )
+        dialog = LoginDialog()
+        dialog.session = MagicMock()
+
+        with patch.object(
+            QInputDialog,
+            "getItem",
+            return_value=("同名 · …1002", True),
+        ):
+            dialog._handle_facebook_page_selection(request)
+
+        dialog.session.select_facebook_page.assert_called_once_with("1234561002")
+        dialog.close()
+
+    def test_facebook_page_prompt_cancel_is_clean_and_saves_nothing(self) -> None:
+        request = login_service.FacebookPageSelectionRequest(
+            (FacebookPageIdentity("1001", "Page", can_manage_content=True),)
+        )
+        dialog = LoginDialog()
+        dialog.session = MagicMock()
+        dialog.timer.start()
+
+        with (
+            patch.object(QInputDialog, "getItem", return_value=("", False)),
+            patch.object(dialog, "reject") as reject,
+        ):
+            dialog._handle_facebook_page_selection(request)
+
+        dialog.session.cancel.assert_called_once_with()
+        dialog.session.select_facebook_page.assert_not_called()
+        self.assertEqual(dialog.lifecycle_message, "登录已取消，未保存 Facebook Page。")
+        self.assertFalse(dialog.timer.isActive())
+        reject.assert_called_once_with()
+        dialog.close()
 
     def test_youtube_oauth_account_actions_stay_enabled(self) -> None:
         account = {

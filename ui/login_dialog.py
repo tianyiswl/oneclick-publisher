@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (
     QFormLayout,
     QFrame,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QMessageBox,
     QSizePolicy,
@@ -103,6 +104,28 @@ def _qr_display_pixmap(source: QPixmap) -> QPixmap:
 
 
 class LoginDialog(QDialog):
+    @staticmethod
+    def facebook_page_selection_labels(
+        request: login_service.FacebookPageSelectionRequest,
+    ) -> list[str]:
+        """Show Page names with only a short, non-secret ID tail."""
+
+        bases = [
+            f"{page.page_name} · …{page.page_id[-4:]}"
+            for page in request.pages
+        ]
+        totals = {label: bases.count(label) for label in set(bases)}
+        seen: dict[str, int] = {}
+        labels: list[str] = []
+        for label in bases:
+            seen[label] = seen.get(label, 0) + 1
+            labels.append(
+                f"{label}（选项 {seen[label]}）"
+                if totals[label] > 1
+                else label
+            )
+        return labels
+
     def __init__(self, parent=None, account: dict | None = None, background_login: bool = True) -> None:
         super().__init__(parent)
         self.setWindowTitle("一键发账号登录")
@@ -137,7 +160,7 @@ class LoginDialog(QDialog):
         self.platform_combo = QComboBox()
         self.platform_combo.setMinimumWidth(360)
         self.platform_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        for platform_type, platform_name in account_service.LOGIN_PLATFORM_OPTIONS:
+        for platform_type, platform_name in account_service.login_platform_options():
             self.platform_combo.addItem(platform_name, platform_type)
         self.profile_input = QComboBox()
         self.profile_input.setEditable(True)
@@ -214,6 +237,11 @@ class LoginDialog(QDialog):
             )
         elif platform_type == 7:
             self.qr_label.setText("请点击下方“开始登录”在系统默认浏览器中授权 YouTube")
+        elif platform_type == 9:
+            self.save_btn.setEnabled(False)
+            self.qr_label.setText(
+                "请点击“开始登录”并选择要精确绑定的 Facebook Page"
+            )
         else:
             self.qr_label.setText("请点击下方“开始登录”在一键发独立会话中打开官方页面")
 
@@ -324,11 +352,56 @@ class LoginDialog(QDialog):
             on_error=verify_failed,
         )
 
+    def _handle_facebook_page_selection(
+        self,
+        request: login_service.FacebookPageSelectionRequest,
+    ) -> None:
+        labels = self.facebook_page_selection_labels(request)
+        selected_label, accepted = QInputDialog.getItem(
+            self,
+            "选择 Facebook Page",
+            "请选择要绑定的 Facebook Page：",
+            labels,
+            0,
+            False,
+        )
+        if not accepted:
+            if self.session:
+                self.session.cancel()
+            self.lifecycle_message = "登录已取消，未保存 Facebook Page。"
+            self.log.append(self.lifecycle_message)
+            self.timer.stop()
+            self.reject()
+            return
+        try:
+            selected_index = labels.index(str(selected_label))
+            selected = request.pages[selected_index]
+            self.session.select_facebook_page(selected.page_id)
+        except Exception:
+            if self.session:
+                self.session.cancel()
+            self.lifecycle_message = "Facebook Page 选择无效，未保存账号。"
+            self.log.append(self.lifecycle_message)
+            self.timer.stop()
+            self.reject()
+            return
+        self.qr_label.setText(
+            f"已选择 {selected.page_name} · …{selected.page_id[-4:]}，正在精确回读 Page 身份..."
+        )
+        self.log.append("已按 Page ID 提交选择，正在完成身份回读。")
+
     def poll_messages(self) -> None:
         if not self.session:
             return
         while not self.session.queue.empty():
-            msg = str(self.session.queue.get())
+            raw_message = self.session.queue.get()
+            if isinstance(
+                raw_message,
+                login_service.FacebookPageSelectionRequest,
+            ):
+                self._handle_facebook_page_selection(raw_message)
+                continue
+            msg = str(raw_message)
             if msg == "OPENING_SYSTEM_BROWSER":
                 self.save_btn.setEnabled(False)
                 self.complete_btn.setEnabled(False)
@@ -436,6 +509,9 @@ class LoginDialog(QDialog):
                         "credential_unavailable": "系统凭据库不可用，未保存 YouTube 登录凭据。",
                         "channel_identity_mismatch": "本次授权频道与原账号不一致，未覆盖原账号。",
                         "channel_identity_unavailable": "Google 未返回唯一 YouTube 频道，未保存账号。",
+                        "facebook_page_not_found": "当前会话没有可管理的 Facebook Page，未保存账号。",
+                        "facebook_page_content_permission_missing": "当前 Facebook Page 没有内容管理权限，未保存账号。",
+                        "facebook_page_identity_mismatch": "当前 Page 与所选或原绑定 Page 不一致，未保存账号。",
                     }.get(reason, "YouTube 官方登录未完成，账号没有发生变化。")
                 self.lifecycle_message = f"登录失败：{message}"
                 if (
@@ -473,7 +549,7 @@ class LoginDialog(QDialog):
         self.qr_label.setText(src)
 
     def _verify_saved_accounts(self, account_ids: list[int]) -> None:
-        """回读恢复流程保存的账号；Meta 会产生两个发布目标。"""
+        """Read back every exact account row returned by the login flow."""
 
         expected = {int(item) for item in account_ids if int(item) > 0}
         self.qr_label.setText("会话已保存，正在静默回读海外平台状态...")

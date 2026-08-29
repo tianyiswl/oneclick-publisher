@@ -11,7 +11,9 @@ import threading
 import webbrowser
 from pathlib import Path
 
+from . import account_service
 from .oneclick_authorization import authorization_plan
+from .overseas_meta_page_identity import activate_saved_facebook_page
 from .overseas_youtube_profile import youtube_studio_url
 from .paths import COOKIE_DIR, ensure_runtime_dirs
 
@@ -47,6 +49,11 @@ async def _open_backend(account: dict) -> None:
         context = await browser.new_context(storage_state=str(state_file))
         page = await context.new_page()
         await page.goto(plan.login_url, wait_until="domcontentloaded", timeout=45_000)
+        if int(account.get("type") or 0) == 9:
+            expected_page_id = account_service.validate_saved_facebook_page_account(
+                account
+            )
+            await activate_saved_facebook_page(page, expected_page_id)
         await page.bring_to_front()
         # 不在这里做登录检测或任何发布操作；用户可像普通浏览器一样查看后台。
         # Playwright 等待事件默认 30 秒超时；账号后台是交给用户手动操作的
@@ -79,6 +86,8 @@ def open_account_backend(account: dict) -> bool:
         if not webbrowser.open(youtube_studio_url(account)):
             raise RuntimeError("系统浏览器未能打开 YouTube Studio")
         return False
+    if int(account.get("type") or 0) == 9:
+        account_service.validate_saved_facebook_page_account(account)
     # 在启动线程前完成本地参数校验，让界面能立即给出可理解的错误。
     authorization_plan(int(account.get("type") or 0), str(account.get("profileName") or ""))
     state_file = COOKIE_DIR / Path(str(account.get("filePath") or "")).name

@@ -15,6 +15,7 @@ from .database import connect
 from .overseas_meta_errors import FacebookPagePublishError
 from .overseas_meta_page_identity import (
     FacebookPageIdentity,
+    facebook_page_v1_enabled,
     normalize_facebook_page_id,
 )
 from .overseas_tiktok_identity import (
@@ -49,7 +50,7 @@ LOGIN_PLATFORM_OPTIONS = [
     (10, "公众号"),
     (6, "TikTok"),
     (7, "YouTube"),
-    (8, "Instagram / Facebook（Meta）"),
+    (8, "Instagram Reels"),
 ]
 OVERSEAS_PLATFORM_TYPES = {6, 7, 8, 9}
 AUTH_MODE_BROWSER = "browser"
@@ -153,8 +154,18 @@ def _parse_datetime(value: str | None) -> datetime | None:
 
 
 def login_platform_type(platform_type: int) -> int:
-    """Instagram 与 Facebook 共用一次 Meta Business Suite 登录。"""
-    return 8 if int(platform_type) == 9 else int(platform_type)
+    """Keep each explicit publishing target on its own login route."""
+
+    return int(platform_type)
+
+
+def login_platform_options() -> tuple[tuple[int, str], ...]:
+    """Expose Facebook Page only for the process-local V1 opt-in."""
+
+    options = list(LOGIN_PLATFORM_OPTIONS)
+    if facebook_page_v1_enabled():
+        options.append((9, "Facebook Page"))
+    return tuple(options)
 
 
 def check_is_fresh(
@@ -220,7 +231,9 @@ def _row_to_dict(row) -> dict:
         == AUTH_MODE_YOUTUBE_OAUTH
         and int(data.get("oauthScopeVersion") or 1) < 2
     )
-    if raw_status == 2:
+    if needs_page_rebind:
+        health_status = "abnormal"
+    elif raw_status == 2:
         health_status = "pending"
     elif raw_status != 1:
         health_status = "abnormal"
@@ -1057,6 +1070,21 @@ def validate_accounts(
                 failures.append("TikTok：本地登录会话不存在，请重新登录。")
             else:
                 failures.append("TikTok：登录已失效，请重新登录。")
+        except FacebookPagePublishError as exc:
+            valid = False
+            error_code = str(
+                exc.error_code or "facebook_page_identity_mismatch"
+            )
+            if error_code not in {
+                "facebook_page_identity_mismatch",
+                "facebook_page_content_permission_missing",
+                "facebook_page_not_found",
+            }:
+                error_code = "facebook_page_identity_mismatch"
+            auth_issues[int(row["id"])] = error_code
+            failures.append(
+                "Facebook Page：保存的 Page 无法精确回读，请重新绑定。"
+            )
         except Exception as exc:
             valid = False
             reason = str(exc)
@@ -1091,13 +1119,20 @@ def validate_accounts(
                     f"{row['platformName']}：检测失败（{type(exc).__name__}）。"
                 )
         else:
+            valid = bool(valid)
             if not valid:
                 failures.append(f"{row['platformName']}：未确认当前登录状态，请重新登录。")
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        failed_status = (
+            0
+            if int(row.get("type") or 0) == 9
+            and int(row["id"]) in auth_issues
+            else int(invalid_status)
+        )
         with connect() as conn:
             conn.execute(
                 "UPDATE user_info SET status = ?, lastCheckedAt = ? WHERE id = ?",
-                (1 if valid else int(invalid_status), now, int(row["id"])),
+                (1 if valid else failed_status, now, int(row["id"])),
             )
         report({**base_event, "phase": "checked", "valid": valid})
     refreshed_map = {row["id"]: row for row in list_managed_accounts()}

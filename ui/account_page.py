@@ -421,10 +421,16 @@ class AccountPage(QWidget):
         menu.addAction("删除账号", lambda _checked=False, r=row: self.delete_one(r))
 
         open_backend_btn = button("打开后台", variant="primary", compact=True)
+        if row.get("needsPageRebind"):
+            open_backend_btn.setEnabled(False)
+            open_backend_btn.setToolTip(
+                "旧 Facebook Page 记录没有精确 Page ID，请先重新登录绑定。"
+            )
         open_backend_btn.setToolTip(
             "使用系统默认浏览器打开该频道的 YouTube Studio"
             if is_youtube_oauth
-            else "使用一键发保存的本地会话打开对应平台官网"
+            else open_backend_btn.toolTip()
+            or "使用一键发保存的本地会话打开对应平台官网"
         )
         open_backend_btn.clicked.connect(
             lambda _checked=False, r=row: self.open_backend(r)
