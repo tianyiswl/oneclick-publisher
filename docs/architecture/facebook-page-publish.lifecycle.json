@@ -123,7 +123,7 @@
       "id": "outcome-unknown",
       "type": "decision",
       "label": "结果不明 / 只读核对",
-      "sublabel": "claim 持续阻止自动重发",
+      "sublabel": "未确认结果持续阻止自动重发",
       "lane": "terminal",
       "col": 1,
       "tag": "ambiguous"
@@ -142,11 +142,11 @@
       "id": "confirmed-not-published",
       "type": "failure",
       "label": "确认没有发布",
-      "sublabel": "仅允许新预检与新人工授权",
+      "sublabel": "明确拒绝 + 完整核对后释放防重",
       "lane": "terminal",
       "col": 2,
       "yOffset": 72,
-      "tag": "安全终态"
+      "tag": "confirmed_not_published"
     }
   ],
   "transitions": [
@@ -272,7 +272,7 @@
       "items": [
         "平台接受不等于成功，仍需同一 Page 的唯一 Reel",
         "点击后验证只恢复回读，绝不再次点击最终按钮",
-        "结果不明可只读核对为成功或确认未发布，不能自动重发"
+        "仅有明确拒绝且完整核对无作品时，才确认未发布并允许新授权"
       ]
     }
   ]

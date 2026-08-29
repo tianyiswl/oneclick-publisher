@@ -2,7 +2,7 @@
 
 日期：2026-08-29
 
-状态：设计已完成，等待书面批准；尚未实施
+状态：书面设计已批准；尚未实施
 
 目标版本：下一次海外功能集成版（功能分支不改版本号）
 
@@ -27,6 +27,7 @@
 
 - 只支持 Facebook Page，不支持个人主页或专业模式个人账号；
 - 一个已绑定 Page、一个本地视频、立即公开发布；
+- 首轮一个受控请求只能包含这一个 Facebook Page 目标；不与其他平台目标混合执行；
 - 在一键发独立可见浏览器中复用本地 Meta 会话；
 - 登录后精确发现并绑定稳定 Page ID；
 - 桌面 UI、受控 CLI 和 MCP 调用同一个发布服务；
@@ -97,6 +98,8 @@ Facebook Page 使用现有 `type=9`，一条记录只绑定一个 Page：
 同一 Meta 会话可以管理多个 Page；这些 Page 可以安全共用同一个 `sessionRef`，但每个 Page 必须分别保存为独立 `type=9` 账号，并分别参与发布授权和回读。
 
 同一个非空 `pageId` 在当前数据库中只能对应一条有效 `type=9` 记录。实施时必须为 `(type=9, accountReference=pageId)` 建立幂等 upsert 和数据库级唯一约束；重复登录同一 Page 只能更新原记录，不能创建第二个 accountId。发布意图和防重复以 `pageId` 为主体，不能通过换一个本地 accountId 绕过。
+
+首轮只接受 Meta 页面稳定回读的非空 ASCII 数字 Page ID；名称、URL、列表位置或任意调用方字符串都不能代替 Page ID。回读值不符合该格式时返回 `facebook_page_identity_mismatch`，不得猜测修正。
 
 ### 6.2 登录后的 Page 发现
 
@@ -186,6 +189,8 @@ Facebook Page 首轮只显示并接受：
 
 `publishIntentFingerprint` 不包含瞬时运行阶段 `preflight/formal`，否则预检和正式任务天然无法匹配。正式授权另外绑定成功的 `preflightTaskId`、预检回执哈希、允许执行的 `formal` 范围和到期时间；调用模式仍必须单独校验。上述发布意图字段任一变化，或预检任务/回执不匹配时，已有正式授权必须失效。
 
+Page 级防重复另使用 `facebookReplayFingerprint`。它与 `publishIntentFingerprint` 绑定相同的 Page、视频字节、正文/话题、公开范围和立即发布意图，但不包含可被本地重建的 `accountId`；因此授权仍精确绑定当次本地账号记录，而同一 Page 不能借另一条本地记录绕过重放保护。两个指纹都不得包含 Cookie、会话内容、任务 ID、授权 ID 或运行阶段。
+
 ### 8.2 输出
 
 CLI、MCP 和桌面任务详情使用相同语义的稳定 JSON：
@@ -220,9 +225,9 @@ CLI、MCP 和桌面任务详情使用相同语义的稳定 JSON：
 
 1. 校验并消费一次性授权；
 2. 创建正式任务记录；
-3. 以 `(platform=Facebook, pageId, publishIntentFingerprint)` 创建唯一正式执行 claim。
+3. 以 `(platform=Facebook, pageId, facebookReplayFingerprint)` 创建唯一正式执行 claim，并在 claim 中同时保存完整 `publishIntentFingerprint` 供授权核对。
 
-只有事务整体提交成功的任务才能进入浏览器。并发请求、第二份授权或另一个本地 accountId 若命中同一 Page 和发布意图，必须返回 `facebook_duplicate_submit_blocked`。
+只有事务整体提交成功的任务才能进入浏览器。并发请求、第二份授权或另一个本地 accountId 若命中同一 Page 和相同重放指纹，必须返回 `facebook_duplicate_submit_blocked`。
 
 claim 至少区分：
 
@@ -231,9 +236,14 @@ claim 至少区分：
 - `final_action_clicked`：浏览器点击调用已经返回；
 - `ambiguous`：进入不可重放边界后进程中断或结果无法确认；
 - `succeeded`：唯一 Reel 回读成功；
+- `confirmed_not_published`：最终动作边界后的只读核对能够明确证明没有产生目标 Reel；保留历史证据，但允许在新预检和新授权后重试；
 - `safe_failed`：有持久化证据证明未进入最终动作，可在新预检和新授权后重试。
 
-claim 历史不能靠删除掩盖。只有 `safe_failed` 不再占用活动防重槽；`final_action_claimed`、`final_action_clicked`、`ambiguous` 和 `succeeded` 都持续阻止自动重发。
+claim 历史不能靠删除掩盖。只有 `safe_failed` 和 `confirmed_not_published` 不再占用活动防重槽；`final_action_claimed`、`final_action_clicked`、`ambiguous` 和 `succeeded` 都持续阻止自动重发。
+
+为支持进程重启后的只读核对，claim 必须持久化脱敏后的完整点击前基线、表单快照、各自哈希和 `clickedAt`。基线行只保存 Page ID、Reel ID、规范 URL、发布时间和正文哈希；表单快照只保存 Page、视频哈希、正文哈希、公开范围和最终按钮状态。平台明确拒绝时另存稳定决定码、观察时间和证据哈希。不得保存完整正文、DOM、Cookie、令牌、验证码、二维码或会话内容。哈希只校验持久化快照完整性，不能替代快照本身。
+
+平台决定码只允许 `accepted`、`rejected_no_creation`、`unknown`。它只能由 Page 执行器对当前 Meta 页面做只读 DOM 回读后生成，调用方 request、manifest、receipt 或 MCP 参数都不能注入。只有可信 `rejected_no_creation`、完整同一 Page 内容列表核对和完整性哈希同时通过，才允许 `ambiguous -> confirmed_not_published` 并释放防重槽。
 
 ## 9. 本地检查、平台预检与正式发布
 
@@ -256,11 +266,13 @@ claim 历史不能靠删除掩盖。只有 `safe_failed` 不再占用活动防�
 
 1. 打开可见 Meta Business Suite 会话；
 2. 回读并确认目标 Page ID；
-3. 选择 Facebook Page 作为唯一发布目标；
-4. 上传一个视频并等待平台确认完成；
-5. 填写最终文案、设置公开范围；
-6. 回读目标 Page、视频、完整文案、公开范围和最终按钮可用状态；
-7. 在最终发布按钮前停止，绝不点击。
+3. 打开一个全新的 Facebook Reel composer，并确认不是普通视频帖子或恢复的旧草稿；
+4. 上传前回读媒体数量为 0；若恢复了旧媒体或旧正文则安全停止，不自动删除或覆盖；
+5. 选择 Facebook Page 作为唯一发布目标；
+6. 上传一个视频并等待平台确认完成；
+7. 填写最终文案、设置公开范围；
+8. 回读目标 Page、Reel 类型、视频、完整文案、公开范围和最终按钮可用状态；
+9. 在最终发布按钮前停止，绝不点击。
 
 预检可能向平台上传临时素材或形成未提交草稿，因此回执必须标记 `platformWriteOccurred=true`、`finalActionTriggered=false`。本轮不自动删除平台临时内容，避免把测试清理变成新的破坏性动作。
 
@@ -273,7 +285,7 @@ claim 历史不能靠删除掩盖。只有 `safe_failed` 不再占用活动防�
 1. 完成第 8.3 节的原子事务，并确认发布意图指纹、账号 ID、Page ID 和正式授权范围完全一致；
 2. 重新实时核对 Page 身份和会话权限；
 3. 使用与预检相同的上传、填写与回读合同；
-4. 在最终按钮前再次比对页面值与授权快照；
+4. 在最终按钮前再次比对 Page ID、Reel 类型、视频/文案哈希、公开范围和最终按钮状态与已授权预检快照；稳定字段任一变化都停止；
 5. 用同一浏览器上下文的只读页面取得目标 Page 已发布内容列表基线；基线不完整或 Page 不一致时返回 `facebook_page_baseline_read_failed`，不得点击；
 6. 在事务中把 claim 更新为 `final_action_claimed`，保存基线哈希和最终页面快照；
 7. 最多点击一次最终发布按钮，点击调用返回后立即记录 `facebook_final_action_clicked`；
@@ -292,11 +304,13 @@ CLI/MCP 不能通过传入布尔字段伪造 Meta 专用确认；内部执行许
 
 ### 10.2 视频
 
-上传前记录本地文件名、大小和哈希。平台页完成上传后至少回读文件名或可对应的唯一视频预览状态，并确认没有第二个意外素材。只看到“上传完成”通用文字不能单独通过。
+上传前记录本地文件名、大小和哈希，并在全新 Reel composer 中回读媒体数量为 0。若 Meta 恢复了旧草稿或旧媒体，停止并保留平台原状，不自动删除。平台页完成上传后至少回读文件名或可对应的唯一视频预览状态，并确认没有第二个意外素材。只看到“上传完成”通用文字不能单独通过。
 
 ### 10.3 文案与话题
 
-服务层只生成一次最终文案。填写前清空编辑器并回读为空，随后写入一次并比较归一化后的完整文本、顺序和重复片段。
+服务层只生成一次最终文案：依次保留非空标题、非空正文和结构化话题行，三段之间使用一个空行；话题去掉调用方多余的首个 `#` 后按首次出现顺序精确去重，再以 `#话题` 形式用单个空格连接。标题和正文不做语义改写或猜测去重，正文中的原始 `@`/`#` 只按普通文本保留，不能冒充已核验提及或话题实体。标准化阶段生成唯一 caption 与哈希，指纹、预检、正式填写和平台回读必须复用该结果，不得在上传器内再次拼接。
+
+填写前清空编辑器并回读为空，随后写入一次并比较归一化后的完整文本、顺序和重复片段。
 
 如果 Meta 当前页面将结构化话题作为普通文案接受，回读合同必须明确其实际平台形态；不能把不存在的官方话题实体伪报为已选择。正文中原始 `@` 不得在没有独立提及字段和官方回读的情况下冒充有效提及。
 
@@ -327,6 +341,7 @@ CLI/MCP 不能通过传入布尔字段伪造 Meta 专用确认；内部执行许
 - `platform_accepted`：Meta 页面出现明确接受反馈；
 - `published_readback_confirmed`：同一 Page 唯一新增 Reel 回读成功；
 - `failed`：有明确错误且没有需核对的最终动作；
+- `confirmed_not_published`：最终动作边界后经只读核对明确没有产生目标 Reel，可在新预检和新授权后重试；
 - `ambiguous`：最终动作已触发但无法证明成功或失败。
 
 ### 12.2 唯一成功标准
@@ -339,6 +354,8 @@ CLI/MCP 不能通过传入布尔字段伪造 Meta 专用确认；内部执行许
 - 合理的发布时间窗口。
 
 通用成功提示、页面跳转、进入内容列表、上传完成、最终按钮消失或程序退出码 `0` 都不能单独证明发布成功。
+
+点击后暂时没有出现新增 Reel 时保持 `ambiguous` 并返回 `facebook_publish_outcome_unknown`，因为平台索引可能延迟。只有已经出现新增内容、但新增项不能唯一匹配当前任务时，才返回 `facebook_publish_readback_mismatch`；两种情况都禁止自动重发。
 
 ### 12.3 结果不明与进程恢复
 
@@ -357,6 +374,7 @@ CLI 中断、工作进程退出、线程异常或任务租约过期不得留下�
 首轮冻结以下语义：
 
 - `facebook_account_invalid`：账号不存在、类型不符或本地状态异常；
+- `facebook_page_feature_disabled`：Facebook Page V1 仍处于默认关闭的开发验证阶段；
 - `facebook_session_missing`：账号缺少可用本地 Meta 会话引用；
 - `facebook_page_not_found`：当前会话没有可管理的 Facebook Page；
 - `facebook_page_selection_required`：发现多个 Page 但用户尚未选择；
@@ -364,6 +382,7 @@ CLI 中断、工作进程退出、线程异常或任务租约过期不得留下�
 - `facebook_page_content_permission_missing`：目标 Page 存在但当前会话没有所需内容权限；
 - `facebook_video_file_invalid`：视频不存在、不可读或不满足首轮输入合同；
 - `facebook_unsupported_publish_setting`：请求包含定时、封面、AI 声明等未支持设置；
+- `facebook_preflight_required`：Facebook Page V1 不允许跳过预检直接正式发布；
 - `facebook_publish_authorization_invalid`：授权过期、已消费或与预检、Page、发布意图不匹配；
 - `facebook_duplicate_submit_blocked`：同一 Page 和发布意图已有活动、不明或成功 claim；
 - `facebook_upload_failed`：平台没有完成唯一视频上传；
@@ -374,6 +393,7 @@ CLI 中断、工作进程退出、线程异常或任务租约过期不得留下�
 - `facebook_publish_rejected`：最终动作后平台给出明确拒绝，并经只读核对确认未发布；
 - `facebook_publish_readback_mismatch`：存在新增内容，但不能唯一匹配本任务；
 - `facebook_publish_outcome_unknown`：进入最终动作临界点后无法证明成功或失败。
+- `facebook_worker_interrupted`：worker 在最终动作临界点前中断，任务已安全终止并允许新预检/新授权。
 
 等待人工验证时 `status=waiting_user_verification`、`errorCode` 为空，并通过 `actionRequired.code=facebook_verification_required` 提示用户。平台错误原文保留为 `errorMessage` 供诊断，但不得用动态页面原文替代稳定 `errorCode`。
 
@@ -459,6 +479,7 @@ CLI 中断、工作进程退出、线程异常或任务租约过期不得留下�
 ## 18. 回滚与兼容
 
 - 新 Page 绑定逻辑用独立服务和特性开关接入；真实验收前默认不向普通用户开放正式发布。
+- 开关固定为本机进程环境变量 `ONECLICK_ENABLE_FACEBOOK_PAGE_V1=1`；缺失、空值或任何其他值都视为关闭，request、manifest 和内容包不能覆盖。
 - 旧 Meta 共用会话文件继续保留，不自动删除；旧 Facebook 行只标记需重新绑定。
 - 若平台页面改版导致 Page 身份或表单回读失效，关闭 Facebook Page 发布入口，保留账号数据和任务回执。
 - 回滚代码不能清理会话文件、删除 Page 记录或把失败任务改写成成功。

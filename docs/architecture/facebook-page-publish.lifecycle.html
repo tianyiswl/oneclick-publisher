@@ -5083,8 +5083,8 @@
         <text data-detail="fine" x="402" y="497" class="t-security" font-size="7" text-anchor="middle">safe_failed</text>
         </g>
 
-        <g id="node-outcome-unknown" data-node-id="outcome-unknown" data-node-label="结果不明 / 只读核对" tabindex="0" role="button" aria-label="Focus 结果不明 / 只读核对, claim 持续阻止自动重发, 失败、核对与成功终态" aria-pressed="false" data-node-kind="decision" data-node-sublabel="claim 持续阻止自动重发" data-node-tag="ambiguous" data-node-context="失败、核对与成功终态">
-          <title>结果不明 / 只读核对 · claim 持续阻止自动重发 · 失败、核对与成功终态 · ambiguous</title>
+        <g id="node-outcome-unknown" data-node-id="outcome-unknown" data-node-label="结果不明 / 只读核对" tabindex="0" role="button" aria-label="Focus 结果不明 / 只读核对, 未确认结果持续阻止自动重发, 失败、核对与成功终态" aria-pressed="false" data-node-kind="decision" data-node-sublabel="未确认结果持续阻止自动重发" data-node-tag="ambiguous" data-node-context="失败、核对与成功终态">
+          <title>结果不明 / 只读核对 · 未确认结果持续阻止自动重发 · 失败、核对与成功终态 · ambiguous</title>
           <rect x="497" y="450" width="118" height="58" rx="7" class="c-mask"/>
           <rect x="497" y="450" width="118" height="58" rx="7" class="c-security" stroke-width="1.5"/>
           <g aria-hidden="true" data-semantic-sigil="neutral" class="semantic-sigil s-external" transform="translate(598 456) scale(0.6875)">
@@ -5092,7 +5092,7 @@
             <circle cx="8" cy="8" r="1.2" class="sigil-fill"/>
           </g>
           <text data-detail-anchor x="556" y="471" class="t-primary" font-size="9.6" font-weight="600" text-anchor="middle">结果不明 / 只读核对</text>
-          <text data-detail="context" x="556" y="487" class="t-muted" font-size="7" text-anchor="middle">claim 持续阻止自动重发</text>
+          <text data-detail="context" x="556" y="487" class="t-muted" font-size="7" text-anchor="middle">未确认结果持续阻止自动重发</text>
         <text data-detail="fine" x="556" y="497" class="t-security" font-size="7" text-anchor="middle">ambiguous</text>
         </g>
 
@@ -5109,8 +5109,8 @@
         <text data-detail="fine" x="710" y="425" class="t-database" font-size="7" text-anchor="middle">成功终态</text>
         </g>
 
-        <g id="node-confirmed-not-published" data-node-id="confirmed-not-published" data-node-label="确认没有发布" tabindex="0" role="button" aria-label="Focus 确认没有发布, 仅允许新预检与新人工授权, 失败、核对与成功终态" aria-pressed="false" data-node-kind="failure" data-node-sublabel="仅允许新预检与新人工授权" data-node-tag="安全终态" data-node-context="失败、核对与成功终态">
-          <title>确认没有发布 · 仅允许新预检与新人工授权 · 失败、核对与成功终态 · 安全终态</title>
+        <g id="node-confirmed-not-published" data-node-id="confirmed-not-published" data-node-label="确认没有发布" tabindex="0" role="button" aria-label="Focus 确认没有发布, 明确拒绝 + 完整核对后释放防重, 失败、核对与成功终态" aria-pressed="false" data-node-kind="failure" data-node-sublabel="明确拒绝 + 完整核对后释放防重" data-node-tag="confirmed_not_published" data-node-context="失败、核对与成功终态">
+          <title>确认没有发布 · 明确拒绝 + 完整核对后释放防重 · 失败、核对与成功终态 · confirmed_not_published</title>
           <rect x="651" y="522" width="118" height="58" rx="7" class="c-mask"/>
           <rect x="651" y="522" width="118" height="58" rx="7" class="c-security" stroke-width="1.5"/>
           <g aria-hidden="true" data-semantic-sigil="failure" class="semantic-sigil s-security" transform="translate(752 528) scale(0.6875)">
@@ -5118,8 +5118,8 @@
             <path d="m5.7 5.7 4.6 4.6m0-4.6-4.6 4.6"/>
           </g>
           <text data-detail-anchor x="710" y="543" class="t-primary" font-size="10" font-weight="600" text-anchor="middle">确认没有发布</text>
-          <text data-detail="context" x="710" y="559" class="t-muted" font-size="7" text-anchor="middle">仅允许新预检与新人工授权</text>
-        <text data-detail="fine" x="710" y="569" class="t-security" font-size="7" text-anchor="middle">安全终态</text>
+          <text data-detail="context" x="710" y="559" class="t-muted" font-size="6.3" text-anchor="middle">明确拒绝 + 完整核对后释放防重</text>
+        <text data-detail="fine" x="710" y="569" class="t-security" font-size="7" text-anchor="middle">confirmed_not_published</text>
         </g>
 
         <!-- Transition labels -->
@@ -5385,7 +5385,7 @@
         <ul>
           <li>&bull; 平台接受不等于成功，仍需同一 Page 的唯一 Reel</li>
           <li>&bull; 点击后验证只恢复回读，绝不再次点击最终按钮</li>
-          <li>&bull; 结果不明可只读核对为成功或确认未发布，不能自动重发</li>
+          <li>&bull; 仅有明确拒绝且完整核对无作品时，才确认未发布并允许新授权</li>
         </ul>
       </div>
     </div>
