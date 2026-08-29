@@ -7,15 +7,15 @@
     "quality_profile": "showcase",
     "repository": {
       "url": "https://github.com/tianyiswl/oneclick-publisher.git",
-      "revision": "b034da52f477c6afc311b8b87874a7739e11fb84"
+      "revision": "cf07986f36e4e86224315dfc4af04adf27a66848"
     },
     "viewBox": [1540, 730],
     "views": [
       {
         "id": "controlled-main-path",
         "label": "受控发布主链",
-        "focus": ["content_ui", "controlled_cli", "controlled_publish", "publish_service", "local_preflight_result", "tiktok_publish_service", "tiktok_uploader", "tiktok_studio"],
-        "note": "本地 preflight 在创建 Playwright 前终止；platform_form_check / formal 才进入 TikTok 浏览器主链。"
+        "focus": ["controlled_publish", "publish_service", "tiktok_publish_service", "tiktok_uploader", "tiktok_schedule_form", "tiktok_studio"],
+        "note": "受控请求经唯一 TikTok 服务和 TiktokVideo 进入原生定时表单；排期失败不回退 Post。"
       },
       {
         "id": "identity-session-boundary",
@@ -37,7 +37,7 @@
       "type": "frontend",
       "label": "Content Project / Desktop UI",
       "sublabel": "结构化内容包与明确账号",
-      "pos": [25, 295],
+      "pos": [25, 80],
       "size": [195, 74],
       "sources": [
         {"path": "app_core/content_project_gateway.py", "line": 126, "end_line": 175, "label": "内容项目入口"},
@@ -45,23 +45,12 @@
       ]
     },
     {
-      "id": "controlled_cli",
-      "type": "backend",
-      "label": "Controlled CLI request",
-      "sublabel": "稳定 JSON 请求与状态查询",
-      "pos": [245, 295],
-      "size": [170, 74],
-      "sources": [
-        {"path": "desktop_native_app.py", "line": 206, "end_line": 285, "label": "受控 CLI"}
-      ]
-    },
-    {
       "id": "controlled_publish",
       "type": "security",
       "label": "app_core.controlled_publish",
       "sublabel": "合同、快照、一次性授权、防重复",
-      "pos": [440, 295],
-      "size": [190, 74],
+      "pos": [25, 295],
+      "size": [205, 74],
       "tag": "authorization gate",
       "sources": [
         {"path": "app_core/controlled_publish.py", "line": 128, "end_line": 180, "label": "请求合同"},
@@ -73,8 +62,8 @@
       "type": "backend",
       "label": "app_core.publish_service",
       "sublabel": "唯一任务编排与 TikTok 路由",
-      "pos": [655, 295],
-      "size": [185, 74],
+      "pos": [255, 295],
+      "size": [190, 74],
       "sources": [
         {"path": "app_core/publish_service.py", "line": 808, "end_line": 913, "label": "正式发布主链"},
         {"path": "app_core/publish_service.py", "line": 1010, "end_line": 1072, "label": "任务启动入口"}
@@ -85,8 +74,8 @@
       "type": "backend",
       "label": "app_core.overseas_tiktok_publish",
       "sublabel": "仅 platform_form_check / formal",
-      "pos": [865, 295],
-      "size": [220, 74],
+      "pos": [470, 295],
+      "size": [225, 74],
       "tag": "single TikTok path",
       "sources": [
         {"path": "docs/superpowers/plans/2026-08-28-tiktok-controlled-video-publish.md", "line": 541, "end_line": 624, "label": "专用服务接入点"},
@@ -97,21 +86,34 @@
       "id": "tiktok_uploader",
       "type": "backend",
       "label": "uploader.tk_uploader.TiktokVideo",
-      "sublabel": "Same Playwright Page：上传、字段、公开范围、Post",
-      "pos": [1110, 295],
-      "size": [220, 74],
+      "sublabel": "Same Playwright Page：上传、字段、公开范围",
+      "pos": [720, 295],
+      "size": [225, 74],
       "sources": [
         {"path": "uploader/tk_uploader/main.py", "line": 121, "end_line": 150, "label": "TikTok 上传器"},
         {"path": "uploader/tk_uploader/main.py", "line": 365, "end_line": 437, "label": "同页表单与最终动作"}
       ]
     },
     {
+      "id": "tiktok_schedule_form",
+      "type": "backend",
+      "label": "TikTok Schedule Form",
+      "sublabel": "北京时间开关、日期时间、唯一 Schedule 与排期回读",
+      "tag": "no fallback to Post",
+      "sources": [
+        {"path": "docs/superpowers/specs/2026-08-29-tiktok-scheduled-video-publish-design.md", "line": 125, "label": "已批准的平台原生定时模块边界"},
+        {"path": "uploader/tk_uploader/main.py", "line": 610, "label": "现有表单快照与最终动作接线点"}
+      ],
+      "pos": [970, 295],
+      "size": [230, 74]
+    },
+    {
       "id": "tiktok_studio",
       "type": "external",
       "label": "TikTok Studio",
       "sublabel": "真实上传页、平台反馈与作品回读",
-      "pos": [1360, 295],
-      "size": [145, 74],
+      "pos": [1260, 295],
+      "size": [190, 74],
       "tag": "external platform",
       "brand": "tiktok",
       "sources": [
@@ -124,8 +126,8 @@
       "type": "database",
       "label": "Account DB",
       "sublabel": "账号记录与公开 accountReference",
-      "pos": [655, 80],
-      "size": [185, 70],
+      "pos": [255, 80],
+      "size": [190, 70],
       "sources": [
         {"path": "app_core/database.py", "line": 119, "end_line": 150, "label": "账号表与引用字段"},
         {"path": "app_core/account_service.py", "line": 236, "end_line": 289, "label": "账号读取"}
@@ -136,8 +138,8 @@
       "type": "security",
       "label": "TikTok Identity Reader",
       "sublabel": "稳定 handle 核对；不输出会话内容",
-      "pos": [865, 80],
-      "size": [220, 70],
+      "pos": [470, 80],
+      "size": [225, 70],
       "sources": [
         {"path": "docs/superpowers/plans/2026-08-28-tiktok-controlled-video-publish.md", "line": 142, "end_line": 220, "label": "主体回读合同"}
       ]
@@ -147,8 +149,8 @@
       "type": "security",
       "label": "Isolated Session File",
       "sublabel": "Cookie/session bytes：仅本机私有",
-      "pos": [1110, 80],
-      "size": [220, 70],
+      "pos": [720, 80],
+      "size": [225, 70],
       "tag": "never in JSON",
       "sources": [
         {"path": "app_core/paths.py", "line": 22, "end_line": 28, "label": "独立会话目录"},
@@ -156,25 +158,12 @@
       ]
     },
     {
-      "id": "local_preflight_result",
-      "type": "security",
-      "label": "local_preflight_passed",
-      "sublabel": "本地终点：不创建 Playwright",
-      "pos": [865, 505],
-      "size": [220, 70],
-      "tag": "platformWriteOccurred=false",
-      "sources": [
-        {"path": "app_core/controlled_publish.py", "line": 128, "end_line": 180, "label": "本地请求合同"},
-        {"path": "docs/superpowers/specs/2026-08-28-tiktok-controlled-video-publish-design.md", "line": 122, "end_line": 132, "label": "零平台写入边界"}
-      ]
-    },
-    {
       "id": "task_db",
       "type": "database",
       "label": "Task DB",
       "sublabel": "events / receipts / heartbeat",
-      "pos": [655, 505],
-      "size": [185, 70],
+      "pos": [255, 505],
+      "size": [190, 70],
       "sources": [
         {"path": "app_core/database.py", "line": 500, "end_line": 505, "label": "任务心跳字段"},
         {"path": "app_core/database.py", "line": 543, "end_line": 595, "label": "任务项与事件"},
@@ -186,8 +175,8 @@
       "type": "external",
       "label": "User Verification",
       "sublabel": "CAPTCHA / 二次验证 / 风控由用户处理",
-      "pos": [1110, 505],
-      "size": [220, 70],
+      "pos": [720, 505],
+      "size": [225, 70],
       "sources": [
         {"path": "uploader/tk_uploader/main.py", "line": 224, "end_line": 250, "label": "同页人工验证"},
         {"path": "docs/superpowers/specs/2026-08-28-tiktok-controlled-video-publish-design.md", "line": 171, "end_line": 179, "label": "验证边界"}
@@ -198,7 +187,7 @@
     {
       "kind": "region",
       "label": "一键发受控本机边界",
-      "wraps": ["content_ui", "controlled_cli", "controlled_publish", "publish_service", "tiktok_publish_service", "tiktok_uploader", "account_db", "identity_reader", "session_file", "local_preflight_result", "task_db"],
+      "wraps": ["content_ui", "controlled_publish", "publish_service", "tiktok_publish_service", "tiktok_uploader", "tiktok_schedule_form", "account_db", "identity_reader", "session_file", "task_db"],
       "pad": 18
     },
     {
@@ -215,13 +204,12 @@
     }
   ],
   "connections": [
-    {"id": "content-to-cli", "from": "content_ui", "to": "controlled_cli", "label": "manifest + accountId", "variant": "emphasis", "labelDy": -32},
-    {"id": "cli-to-contract", "from": "controlled_cli", "to": "controlled_publish", "label": "受控 request JSON", "variant": "security", "labelDy": 62},
+    {"id": "content-to-contract", "from": "content_ui", "to": "controlled_publish", "label": "结构化内容包 + accountId", "variant": "security", "fromSide": "bottom", "toSide": "top"},
     {"id": "contract-to-service", "from": "controlled_publish", "to": "publish_service", "label": "快照 + 一次性授权", "variant": "security", "labelDy": -32},
-    {"id": "service-to-preflight-result", "from": "publish_service", "to": "local_preflight_result", "label": "preflight：本地只读后终止", "variant": "dashed", "labelDy": 25},
     {"id": "service-to-tiktok", "from": "publish_service", "to": "tiktok_publish_service", "label": "platform_form_check / formal", "variant": "emphasis", "labelDx": 90, "labelDy": 62},
     {"id": "tiktok-to-uploader", "from": "tiktok_publish_service", "to": "tiktok_uploader", "label": "同一字段与回读实现", "variant": "emphasis", "labelDy": -32},
-    {"id": "uploader-to-studio", "from": "tiktok_uploader", "to": "tiktok_studio", "label": "Playwright：upload / readback / one Post", "variant": "emphasis", "labelDy": 62},
+    {"id": "uploader-to-schedule-form", "from": "tiktok_uploader", "to": "tiktok_schedule_form", "label": "表单快照 + 定时意图", "variant": "emphasis", "labelDy": -32},
+    {"id": "schedule-form-to-studio", "from": "tiktok_schedule_form", "to": "tiktok_studio", "label": "唯一 Post 或 Schedule", "variant": "emphasis", "labelDy": 62},
     {"id": "account-to-identity", "from": "account_db", "to": "identity_reader", "label": "saved accountReference", "variant": "security", "labelDy": -30},
     {"id": "session-to-identity", "from": "session_file", "to": "identity_reader", "label": "isolated storage_state", "variant": "security", "labelDy": -30},
     {"id": "identity-to-tiktok", "from": "identity_reader", "to": "tiktok_publish_service", "label": "matched public handle", "variant": "security", "labelDy": 25},
@@ -235,18 +223,18 @@
       "dot": "cyan",
       "title": "首轮范围",
       "items": [
-        "单 TikTok 账号、单本地视频、立即公开",
-        "默认 preflight 只读本地 manifest、账号记录和素材，在 local_preflight_passed 终止，不创建 Playwright",
-        "内容项目与 Desktop UI 共用 Controlled CLI 和 Publish Service"
+        "单 TikTok 账号、单本地视频、立即或平台原生定时公开",
+        "controlled_publish 经 publish_service 进入唯一 TikTok 发布链",
+        "TiktokVideo 复用同一 Playwright Page 填写表单与回读"
       ]
     },
     {
       "dot": "amber",
       "title": "平台写入与最终动作",
       "items": [
-        "platform_form_check 会上传并填写，必须停在 Post 前",
-        "formal 仅在消费一次性授权后允许一次 Post",
-        "最终动作后结果不明只读核对，禁止自动重发"
+        "platform_form_check 会上传并填写，必须停在 Post / Schedule 前",
+        "formal 仅在消费一次性授权后允许一次 Post 或 Schedule",
+        "tiktok_schedule_unavailable 在最终动作前失败，禁止回退 Post"
       ]
     },
     {

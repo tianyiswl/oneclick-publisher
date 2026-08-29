@@ -4869,7 +4869,7 @@
       </div>
     </div>
 
-    <script id="archify-guided-views-data" type="application/json">[{"id":"formal-main-path","label":"正式发布主链","focus":["local_preflight_passed","platform_page_active","final_action_triggered","platform_accepted","published_readback_confirmed"],"note":"一次性授权后只触发一次 Post；平台接受与作品回读是两层证据。"},{"id":"form-check-stop","label":"平台表单检查","focus":["local_preflight_passed","platform_page_active","waiting_user_verification","platform_form_verified"],"note":"platform_form_check 会发生上传写入，但在 Post 前终止。"},{"id":"failure-and-ambiguity","label":"失败、结果不明与防重复","focus":["failed_before_final_action","final_action_triggered","ambiguous","duplicate_blocked"],"note":"最终动作前失败可以修正后重新预检；最终动作后没有自动重试返回路径。"}]</script>
+    <script id="archify-guided-views-data" type="application/json">[{"id":"formal-main-path","label":"正式发布主链","focus":["local_preflight_passed","platform_page_active","platform_form_verified","final_action_triggered","platform_accepted","published_readback_confirmed"],"note":"表单核对后恰好一次 Post；平台接受与作品回读是两层证据。"},{"id":"form-check-stop","label":"平台表单检查","focus":["local_preflight_passed","platform_page_active","platform_form_verified","failed_before_final_action"],"note":"platform_form_check 会发生上传写入；定时控件不可用或失败时在最终动作前终止。"},{"id":"failure-and-ambiguity","label":"失败、结果不明与防重复","focus":["scheduled_accepted","scheduled_readback_confirmed","failed_before_final_action","final_action_triggered","ambiguous","duplicate_blocked"],"note":"定时成功只证明排期存在且 publishedAt=null；定时失败不回退 Post，最终动作后也不自动重试。"}]</script>
 
     <div class="guided-views no-print" id="guided-views" hidden aria-label="Guided diagram views">
       <button id="guided-view-prev" type="button" aria-label="Previous guided view" title="Previous guided view ([)">&#8592;</button>
@@ -4941,7 +4941,7 @@
         <path d="M 72 112 L 1308 112" class="a-default" stroke-width="0.8" stroke-dasharray="3,8"/>
         <text x="72" y="100" class="t-dim" font-size="10" font-weight="600">01 / 正式发布证据主链</text>
         <path d="M 72 264 L 1308 264" class="a-default" stroke-width="0.8" stroke-dasharray="3,8"/>
-        <text x="72" y="252" class="t-dim" font-size="10" font-weight="600">02 / 发布前检查与人工验证</text>
+        <text x="72" y="252" class="t-dim" font-size="10" font-weight="600">02 / 人工验证与立即发布回读 + 平台原生定时证据</text>
         <path d="M 72 436 L 1308 436" class="a-default" stroke-width="0.8" stroke-dasharray="3,8"/>
         <text x="72" y="424" class="t-dim" font-size="10" font-weight="600">03 / 失败、结果不明与防重复终态</text>
 
@@ -4949,16 +4949,16 @@
         <path d="M 154 157 L 748 157" class="a-emphasis" stroke-width="2.2" marker-end="url(#arrowhead-emphasis)"/>
 
         <!-- Transition paths -->
-        <path data-edge-from="local_preflight_passed" data-edge-to="platform_page_active" data-edge-key="0" data-edge-id="preflight-to-platform-page" data-composition-points="150,157;150,235.5;496,235.5;496,314" d="M 150 157 L 150 225.5 Q 150 235.5 160 235.5 L 486 235.5 Q 496 235.5 496 245.5 L 496 314" class="a-emphasis" stroke-width="2" marker-end="url(#arrowhead-emphasis)"/>
-        <path data-edge-from="platform_page_active" data-edge-to="platform_form_verified" data-edge-key="1" data-edge-id="platform-page-to-form-check" data-composition-points="616,307;650,307" d="M 616 307 L 650 307" class="a-emphasis" stroke-width="2" marker-end="url(#arrowhead-emphasis)"/>
-        <path data-edge-from="platform_page_active" data-edge-to="final_action_triggered" data-edge-key="2" data-edge-id="platform-page-to-formal" data-composition-points="496,300;496,228.5;462,228.5;462,157" d="M 496 300 L 496 238.5 Q 496 228.5 486 228.5 L 472 228.5 Q 462 228.5 462 218.5 L 462 157" class="a-security" stroke-width="1.1" marker-end="url(#arrowhead-security)"/>
-        <path data-edge-from="platform_page_active" data-edge-to="waiting_user_verification" data-edge-key="3" data-edge-id="platform-page-to-verification" data-composition-points="496,307;462,307" d="M 496 307 L 462 307" class="a-security" stroke-width="1.1" marker-end="url(#arrowhead-security)"/>
-        <path data-edge-from="waiting_user_verification" data-edge-to="platform_page_active" data-edge-label="验证完成，同页继续" data-edge-key="4" data-edge-id="verification-completed" data-composition-points="462,307;496,307" d="M 462 307 L 496 307" class="a-emphasis" stroke-width="2" marker-end="url(#arrowhead-emphasis)"/>
-        <path data-edge-from="waiting_user_verification" data-edge-to="failed_before_final_action" data-edge-key="5" data-edge-id="verification-expired" data-composition-points="462,307;462,393;650,393;650,479" d="M 462 307 L 462 383 Q 462 393 472 393 L 640 393 Q 650 393 650 403 L 650 479" class="a-security" stroke-width="1.1" marker-end="url(#arrowhead-security)"/>
-        <path data-edge-from="final_action_triggered" data-edge-to="platform_accepted" data-edge-key="6" data-edge-id="final-to-accepted" data-composition-points="462,157;496,157" d="M 462 157 L 496 157" class="a-emphasis" stroke-width="2" marker-end="url(#arrowhead-emphasis)"/>
-        <path data-edge-from="platform_accepted" data-edge-to="published_readback_confirmed" data-edge-key="7" data-edge-id="accepted-to-readback" data-composition-points="616,157;650,157" d="M 616 157 L 650 157" class="a-emphasis" stroke-width="2" marker-end="url(#arrowhead-emphasis)"/>
-        <path data-edge-from="final_action_triggered" data-edge-to="ambiguous" data-edge-key="8" data-edge-id="final-to-ambiguous" data-composition-points="402,188;402,205;820,205;820,550;402,550;402,450" d="M 402 188 L 402 196.5 Q 402 205 410.5 205 L 810 205 Q 820 205 820 215 L 820 540 Q 820 550 810 550 L 412 550 Q 402 550 402 540 L 402 450" class="a-security" stroke-width="1.1" marker-end="url(#arrowhead-security)"/>
-        <path data-edge-from="ambiguous" data-edge-to="duplicate_blocked" data-edge-key="9" data-edge-id="ambiguous-duplicate-block" data-composition-points="462,479;496,479" d="M 462 479 L 496 479" class="a-security" stroke-width="1.1" marker-end="url(#arrowhead-security)"/>
+        <path data-edge-from="local_preflight_passed" data-edge-to="platform_page_active" data-edge-key="0" data-edge-id="preflight-to-platform-page" data-composition-points="150,157;188,157" d="M 150 157 L 188 157" class="a-emphasis" stroke-width="2" marker-end="url(#arrowhead-emphasis)"/>
+        <path data-edge-from="platform_page_active" data-edge-to="platform_form_verified" data-edge-key="1" data-edge-id="platform-page-to-form-check" data-composition-points="308,157;342,157" d="M 308 157 L 342 157" class="a-emphasis" stroke-width="2" marker-end="url(#arrowhead-emphasis)"/>
+        <path data-edge-from="platform_form_verified" data-edge-to="final_action_triggered" data-edge-key="2" data-edge-id="form-check-to-final-action" data-composition-points="462,157;496,157" d="M 462 157 L 496 157" class="a-security" stroke-width="1.1" marker-end="url(#arrowhead-security)"/>
+        <path data-edge-from="platform_form_verified" data-edge-to="failed_before_final_action" data-edge-key="3" data-edge-id="schedule-control-failed" data-composition-points="402,188;402,450" d="M 402 188 L 402 450" class="a-security" stroke-width="1.1" marker-end="url(#arrowhead-security)"/>
+        <path data-edge-from="final_action_triggered" data-edge-to="platform_accepted" data-edge-key="4" data-edge-id="final-to-accepted" data-composition-points="616,157;655,157" d="M 616 157 L 655 157" class="a-emphasis" stroke-width="2" marker-end="url(#arrowhead-emphasis)"/>
+        <path data-edge-from="final_action_triggered" data-edge-to="scheduled_accepted" data-edge-key="5" data-edge-id="final-to-scheduled-accepted" data-composition-points="556,188;556,320" d="M 556 188 L 556 320" class="a-emphasis" stroke-width="2" marker-end="url(#arrowhead-emphasis)"/>
+        <path data-edge-from="scheduled_accepted" data-edge-to="scheduled_readback_confirmed" data-edge-key="6" data-edge-id="scheduled-accepted-to-readback" data-composition-points="610,349;645,349" d="M 610 349 L 645 349" class="a-emphasis" stroke-width="2" marker-end="url(#arrowhead-emphasis)"/>
+        <path data-edge-from="platform_accepted" data-edge-to="published_readback_confirmed" data-edge-key="7" data-edge-id="accepted-to-readback" data-composition-points="710,188;710,240" d="M 710 188 L 710 240" class="a-emphasis" stroke-width="2" marker-end="url(#arrowhead-emphasis)"/>
+        <path data-edge-from="final_action_triggered" data-edge-to="ambiguous" data-edge-key="8" data-edge-id="final-to-ambiguous" data-composition-points="496,157;475,157;475,479;496,479" d="M 496 157 L 485 157 Q 475 157 475 167 L 475 469 Q 475 479 485 479 L 496 479" class="a-security" stroke-width="1.1" marker-end="url(#arrowhead-security)"/>
+        <path data-edge-from="ambiguous" data-edge-to="duplicate_blocked" data-edge-key="9" data-edge-id="ambiguous-duplicate-block" data-composition-points="616,479;650,479" d="M 616 479 L 650 479" class="a-security" stroke-width="1.1" marker-end="url(#arrowhead-security)"/>
 
         <!-- States -->
         <g id="node-local_preflight_passed" data-node-id="local_preflight_passed" data-node-label="本地预检通过" tabindex="0" role="button" aria-label="Focus 本地预检通过, 零平台写入, 正式发布证据主链" aria-pressed="false" data-node-kind="start" data-node-sublabel="零平台写入" data-node-tag="preflight" data-node-context="正式发布证据主链">
@@ -4975,121 +4975,137 @@
         <text data-detail="fine" x="94" y="177" class="t-frontend" font-size="7" text-anchor="middle">preflight</text>
         </g>
 
-        <g id="node-final_action_triggered" data-node-id="final_action_triggered" data-node-label="最终动作已触发" tabindex="0" role="button" aria-label="Focus 最终动作已触发, 一次 Post；无自动重试, 正式发布证据主链" aria-pressed="false" data-node-kind="active" data-node-sublabel="一次 Post；无自动重试" data-node-tag="no auto retry" data-node-context="正式发布证据主链">
-          <title>最终动作已触发 · 一次 Post；无自动重试 · 正式发布证据主链 · no auto retry</title>
-          <rect x="342" y="126" width="120" height="62" rx="7" class="c-mask"/>
-          <rect x="342" y="126" width="120" height="62" rx="7" class="c-backend" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="active" class="semantic-sigil s-backend" transform="translate(445 132) scale(0.6875)">
+        <g id="node-final_action_triggered" data-node-id="final_action_triggered" data-node-label="最终动作已触发" tabindex="0" role="button" aria-label="Focus 最终动作已触发, 恰好一次 Post 或 Schedule, 正式发布证据主链" aria-pressed="false" data-node-kind="active" data-node-sublabel="恰好一次 Post 或 Schedule" data-node-tag="no auto retry" data-node-context="正式发布证据主链">
+          <title>最终动作已触发 · 恰好一次 Post 或 Schedule · 正式发布证据主链 · no auto retry</title>
+          <rect x="496" y="126" width="120" height="62" rx="7" class="c-mask"/>
+          <rect x="496" y="126" width="120" height="62" rx="7" class="c-backend" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="active" class="semantic-sigil s-backend" transform="translate(599 132) scale(0.6875)">
             <path d="M2 8h3l1.5-3.5L9 12l1.6-4H14"/>
           </g>
-        <text data-detail="fine" x="352" y="140" class="t-backend" font-size="7" font-weight="700">02</text>
-          <text data-detail-anchor x="402" y="147" class="t-primary" font-size="10" font-weight="600" text-anchor="middle">最终动作已触发</text>
-          <text data-detail="context" x="402" y="163" class="t-muted" font-size="7" text-anchor="middle">一次 Post；无自动重试</text>
-        <text data-detail="fine" x="402" y="177" class="t-backend" font-size="7" text-anchor="middle">no auto retry</text>
+        <text data-detail="fine" x="506" y="140" class="t-backend" font-size="7" font-weight="700">04</text>
+          <text data-detail-anchor x="556" y="147" class="t-primary" font-size="10" font-weight="600" text-anchor="middle">最终动作已触发</text>
+          <text data-detail="context" x="556" y="163" class="t-muted" font-size="7" text-anchor="middle">恰好一次 Post 或 Schedule</text>
+        <text data-detail="fine" x="556" y="177" class="t-backend" font-size="7" text-anchor="middle">no auto retry</text>
         </g>
 
         <g id="node-platform_accepted" data-node-id="platform_accepted" data-node-label="平台已受理" tabindex="0" role="button" aria-label="Focus 平台已受理, platform_accepted · 明确反馈, 正式发布证据主链" aria-pressed="false" data-node-kind="success" data-node-sublabel="platform_accepted · 明确反馈" data-node-tag="receipt" data-node-context="正式发布证据主链">
           <title>平台已受理 · platform_accepted · 明确反馈 · 正式发布证据主链 · receipt</title>
-          <rect x="496" y="126" width="120" height="62" rx="7" class="c-mask"/>
-          <rect x="496" y="126" width="120" height="62" rx="7" class="c-database" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="success" class="semantic-sigil s-database" transform="translate(599 132) scale(0.6875)">
+          <rect x="655" y="126" width="110" height="62" rx="7" class="c-mask"/>
+          <rect x="655" y="126" width="110" height="62" rx="7" class="c-database" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="success" class="semantic-sigil s-database" transform="translate(748 132) scale(0.6875)">
             <circle cx="8" cy="8" r="5.3"/>
             <path d="m5.2 8 1.8 1.8 3.8-4"/>
           </g>
-        <text data-detail="fine" x="506" y="140" class="t-database" font-size="7" font-weight="700">03</text>
-          <text data-detail-anchor x="556" y="147" class="t-primary" font-size="10" font-weight="600" text-anchor="middle">平台已受理</text>
-          <text data-detail="context" x="556" y="163" class="t-muted" font-size="6.6" text-anchor="middle">platform_accepted · 明确反馈</text>
-        <text data-detail="fine" x="556" y="177" class="t-database" font-size="7" text-anchor="middle">receipt</text>
+        <text data-detail="fine" x="665" y="140" class="t-database" font-size="7" font-weight="700">05</text>
+          <text data-detail-anchor x="710" y="147" class="t-primary" font-size="10" font-weight="600" text-anchor="middle">平台已受理</text>
+          <text data-detail="context" x="710" y="163" class="t-muted" font-size="6" text-anchor="middle">platform_accepted · 明确反馈</text>
+        <text data-detail="fine" x="710" y="177" class="t-database" font-size="7" text-anchor="middle">receipt</text>
         </g>
 
-        <g id="node-published_readback_confirmed" data-node-id="published_readback_confirmed" data-node-label="作品回读已确认" tabindex="0" role="button" aria-label="Focus 作品回读已确认, published_readback_confirmed, 正式发布证据主链" aria-pressed="false" data-node-kind="success" data-node-sublabel="published_readback_confirmed" data-node-tag="confirmed" data-node-context="正式发布证据主链">
-          <title>作品回读已确认 · published_readback_confirmed · 正式发布证据主链 · confirmed</title>
-          <rect x="650" y="126" width="120" height="62" rx="7" class="c-mask"/>
-          <rect x="650" y="126" width="120" height="62" rx="7" class="c-database" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="success" class="semantic-sigil s-database" transform="translate(753 132) scale(0.6875)">
+        <g id="node-published_readback_confirmed" data-node-id="published_readback_confirmed" data-node-label="作品回读已确认" tabindex="0" role="button" aria-label="Focus 作品回读已确认, published_readback_confirmed, 人工验证与立即发布回读" aria-pressed="false" data-node-kind="success" data-node-sublabel="published_readback_confirmed" data-node-tag="confirmed" data-node-context="人工验证与立即发布回读">
+          <title>作品回读已确认 · published_readback_confirmed · 人工验证与立即发布回读 · confirmed</title>
+          <rect x="650" y="240" width="120" height="58" rx="7" class="c-mask"/>
+          <rect x="650" y="240" width="120" height="58" rx="7" class="c-database" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="success" class="semantic-sigil s-database" transform="translate(753 246) scale(0.6875)">
             <circle cx="8" cy="8" r="5.3"/>
             <path d="m5.2 8 1.8 1.8 3.8-4"/>
           </g>
-        <text data-detail="fine" x="660" y="140" class="t-database" font-size="7" font-weight="700">04</text>
-          <text data-detail-anchor x="710" y="147" class="t-primary" font-size="10" font-weight="600" text-anchor="middle">作品回读已确认</text>
-          <text data-detail="context" x="710" y="163" class="t-muted" font-size="6.6" text-anchor="middle">published_readback_confirmed</text>
-        <text data-detail="fine" x="710" y="177" class="t-database" font-size="7" text-anchor="middle">confirmed</text>
+        <text data-detail="fine" x="660" y="254" class="t-database" font-size="7" font-weight="700">06</text>
+          <text data-detail-anchor x="710" y="261" class="t-primary" font-size="10" font-weight="600" text-anchor="middle">作品回读已确认</text>
+          <text data-detail="context" x="710" y="277" class="t-muted" font-size="6.6" text-anchor="middle">published_readback_confirmed</text>
+        <text data-detail="fine" x="710" y="287" class="t-database" font-size="7" text-anchor="middle">confirmed</text>
         </g>
 
-        <g id="node-platform_page_active" data-node-id="platform_page_active" data-node-label="平台页面执行中" tabindex="0" role="button" aria-label="Focus 平台页面执行中, Same Playwright Page, 发布前检查与人工验证" aria-pressed="false" data-node-kind="active" data-node-sublabel="Same Playwright Page" data-node-tag="form check / formal" data-node-context="发布前检查与人工验证">
-          <title>平台页面执行中 · Same Playwright Page · 发布前检查与人工验证 · form check / formal</title>
-          <rect x="496" y="278" width="120" height="58" rx="7" class="c-mask"/>
-          <rect x="496" y="278" width="120" height="58" rx="7" class="c-backend" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="active" class="semantic-sigil s-backend" transform="translate(599 284) scale(0.6875)">
+        <g id="node-platform_page_active" data-node-id="platform_page_active" data-node-label="平台页面执行中" tabindex="0" role="button" aria-label="Focus 平台页面执行中, Same Playwright Page, 正式发布证据主链" aria-pressed="false" data-node-kind="active" data-node-sublabel="Same Playwright Page" data-node-tag="form check / formal" data-node-context="正式发布证据主链">
+          <title>平台页面执行中 · Same Playwright Page · 正式发布证据主链 · form check / formal</title>
+          <rect x="188" y="126" width="120" height="62" rx="7" class="c-mask"/>
+          <rect x="188" y="126" width="120" height="62" rx="7" class="c-backend" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="active" class="semantic-sigil s-backend" transform="translate(291 132) scale(0.6875)">
             <path d="M2 8h3l1.5-3.5L9 12l1.6-4H14"/>
           </g>
-          <text data-detail-anchor x="556" y="299" class="t-primary" font-size="10" font-weight="600" text-anchor="middle">平台页面执行中</text>
-          <text data-detail="context" x="556" y="315" class="t-muted" font-size="7" text-anchor="middle">Same Playwright Page</text>
-        <text data-detail="fine" x="556" y="325" class="t-backend" font-size="7" text-anchor="middle">form check / formal</text>
+        <text data-detail="fine" x="198" y="140" class="t-backend" font-size="7" font-weight="700">02</text>
+          <text data-detail-anchor x="248" y="147" class="t-primary" font-size="10" font-weight="600" text-anchor="middle">平台页面执行中</text>
+          <text data-detail="context" x="248" y="163" class="t-muted" font-size="7" text-anchor="middle">Same Playwright Page</text>
+        <text data-detail="fine" x="248" y="177" class="t-backend" font-size="7" text-anchor="middle">form check / formal</text>
         </g>
 
-        <g id="node-waiting_user_verification" data-node-id="waiting_user_verification" data-node-label="等待用户验证" tabindex="0" role="button" aria-label="Focus 等待用户验证, 同一页面等待用户, 发布前检查与人工验证" aria-pressed="false" data-node-kind="waiting" data-node-sublabel="同一页面等待用户" data-node-tag="human gate" data-node-context="发布前检查与人工验证">
-          <title>等待用户验证 · 同一页面等待用户 · 发布前检查与人工验证 · human gate</title>
-          <rect x="342" y="278" width="120" height="58" rx="7" class="c-mask"/>
-          <rect x="342" y="278" width="120" height="58" rx="7" class="c-cloud" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="waiting" class="semantic-sigil s-cloud" transform="translate(445 284) scale(0.6875)">
-            <path d="M4 2.5h8M4 13.5h8M5 3c0 2.8 2 3.2 3 5-1 1.8-3 2.2-3 5M11 3c0 2.8-2 3.2-3 5 1 1.8 3 2.2 3 5"/>
-          </g>
-          <text data-detail-anchor x="402" y="299" class="t-primary" font-size="10" font-weight="600" text-anchor="middle">等待用户验证</text>
-          <text data-detail="context" x="402" y="315" class="t-muted" font-size="7" text-anchor="middle">同一页面等待用户</text>
-        <text data-detail="fine" x="402" y="325" class="t-cloud" font-size="7" text-anchor="middle">human gate</text>
-        </g>
-
-        <g id="node-platform_form_verified" data-node-id="platform_form_verified" data-node-label="平台表单已核对" tabindex="0" role="button" aria-label="Focus 平台表单已核对, 已上传；Post 前停止, 发布前检查与人工验证" aria-pressed="false" data-node-kind="success" data-node-sublabel="已上传；Post 前停止" data-node-tag="platform_form_check" data-node-context="发布前检查与人工验证">
-          <title>平台表单已核对 · 已上传；Post 前停止 · 发布前检查与人工验证 · platform_form_check</title>
-          <rect x="650" y="278" width="120" height="58" rx="7" class="c-mask"/>
-          <rect x="650" y="278" width="120" height="58" rx="7" class="c-database" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="success" class="semantic-sigil s-database" transform="translate(753 284) scale(0.6875)">
+        <g id="node-platform_form_verified" data-node-id="platform_form_verified" data-node-label="平台表单已核对" tabindex="0" role="button" aria-label="Focus 平台表单已核对, 已上传；Post / Schedule 前, 正式发布证据主链" aria-pressed="false" data-node-kind="success" data-node-sublabel="已上传；Post / Schedule 前" data-node-tag="platform_form_check" data-node-context="正式发布证据主链">
+          <title>平台表单已核对 · 已上传；Post / Schedule 前 · 正式发布证据主链 · platform_form_check</title>
+          <rect x="342" y="126" width="120" height="62" rx="7" class="c-mask"/>
+          <rect x="342" y="126" width="120" height="62" rx="7" class="c-database" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="success" class="semantic-sigil s-database" transform="translate(445 132) scale(0.6875)">
             <circle cx="8" cy="8" r="5.3"/>
             <path d="m5.2 8 1.8 1.8 3.8-4"/>
           </g>
-          <text data-detail-anchor x="710" y="299" class="t-primary" font-size="10" font-weight="600" text-anchor="middle">平台表单已核对</text>
-          <text data-detail="context" x="710" y="315" class="t-muted" font-size="7" text-anchor="middle">已上传；Post 前停止</text>
-        <text data-detail="fine" x="710" y="325" class="t-database" font-size="7" text-anchor="middle">platform_form_check</text>
+        <text data-detail="fine" x="352" y="140" class="t-database" font-size="7" font-weight="700">03</text>
+          <text data-detail-anchor x="402" y="147" class="t-primary" font-size="10" font-weight="600" text-anchor="middle">平台表单已核对</text>
+          <text data-detail="context" x="402" y="163" class="t-muted" font-size="7" text-anchor="middle">已上传；Post / Schedule 前</text>
+        <text data-detail="fine" x="402" y="177" class="t-database" font-size="7" text-anchor="middle">platform_form_check</text>
         </g>
 
-        <g id="node-failed_before_final_action" data-node-id="failed_before_final_action" data-node-label="最终动作前失败" tabindex="0" role="button" aria-label="Focus 最终动作前失败, failed · Post 前, 失败、结果不明与防重复终态" aria-pressed="false" data-node-kind="failure" data-node-sublabel="failed · Post 前" data-node-tag="retry after new preflight" data-node-context="失败、结果不明与防重复终态">
-          <title>最终动作前失败 · failed · Post 前 · 失败、结果不明与防重复终态 · retry after new preflight</title>
-          <rect x="650" y="450" width="120" height="58" rx="7" class="c-mask"/>
-          <rect x="650" y="450" width="120" height="58" rx="7" class="c-security" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="failure" class="semantic-sigil s-security" transform="translate(753 456) scale(0.6875)">
+        <g id="node-scheduled_accepted" data-node-id="scheduled_accepted" data-node-label="排期已受理" tabindex="0" role="button" aria-label="Focus 排期已受理, scheduled_accepted, 平台原生定时证据" aria-pressed="false" data-node-kind="success" data-node-sublabel="scheduled_accepted" data-node-tag="not published" data-node-context="平台原生定时证据">
+          <title>排期已受理 · scheduled_accepted · 平台原生定时证据 · not published</title>
+          <rect x="502" y="320" width="108" height="58" rx="7" class="c-mask"/>
+          <rect x="502" y="320" width="108" height="58" rx="7" class="c-database" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="success" class="semantic-sigil s-database" transform="translate(593 326) scale(0.6875)">
             <circle cx="8" cy="8" r="5.3"/>
-            <path d="m5.7 5.7 4.6 4.6m0-4.6-4.6 4.6"/>
+            <path d="m5.2 8 1.8 1.8 3.8-4"/>
           </g>
-          <text data-detail-anchor x="710" y="471" class="t-primary" font-size="10" font-weight="600" text-anchor="middle">最终动作前失败</text>
-          <text data-detail="context" x="710" y="487" class="t-muted" font-size="7" text-anchor="middle">failed · Post 前</text>
-        <text data-detail="fine" x="710" y="497" class="t-security" font-size="7" text-anchor="middle">retry after new preflight</text>
+          <text data-detail-anchor x="556" y="341" class="t-primary" font-size="10" font-weight="600" text-anchor="middle">排期已受理</text>
+          <text data-detail="context" x="556" y="357" class="t-muted" font-size="7" text-anchor="middle">scheduled_accepted</text>
+        <text data-detail="fine" x="556" y="367" class="t-database" font-size="7" text-anchor="middle">not published</text>
         </g>
 
-        <g id="node-ambiguous" data-node-id="ambiguous" data-node-label="结果不明" tabindex="0" role="button" aria-label="Focus 结果不明, ambiguous · Post 后只读核对, 失败、结果不明与防重复终态" aria-pressed="false" data-node-kind="failure" data-node-sublabel="ambiguous · Post 后只读核对" data-node-tag="read-only reconcile" data-node-context="失败、结果不明与防重复终态">
-          <title>结果不明 · ambiguous · Post 后只读核对 · 失败、结果不明与防重复终态 · read-only reconcile</title>
+        <g id="node-scheduled_readback_confirmed" data-node-id="scheduled_readback_confirmed" data-node-label="排期回读已确认" tabindex="0" role="button" aria-label="Focus 排期回读已确认, scheduled_readback_confirmed, 平台原生定时证据" aria-pressed="false" data-node-kind="success" data-node-sublabel="scheduled_readback_confirmed" data-node-tag="publishedAt=null" data-node-context="平台原生定时证据">
+          <title>排期回读已确认 · scheduled_readback_confirmed · 平台原生定时证据 · publishedAt=null</title>
+          <rect x="645" y="320" width="130" height="58" rx="7" class="c-mask"/>
+          <rect x="645" y="320" width="130" height="58" rx="7" class="c-database" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="success" class="semantic-sigil s-database" transform="translate(758 326) scale(0.6875)">
+            <circle cx="8" cy="8" r="5.3"/>
+            <path d="m5.2 8 1.8 1.8 3.8-4"/>
+          </g>
+          <text data-detail-anchor x="710" y="341" class="t-primary" font-size="10" font-weight="600" text-anchor="middle">排期回读已确认</text>
+          <text data-detail="context" x="710" y="357" class="t-muted" font-size="7" text-anchor="middle">scheduled_readback_confirmed</text>
+        <text data-detail="fine" x="710" y="367" class="t-database" font-size="7" text-anchor="middle">publishedAt=null</text>
+        </g>
+
+        <g id="node-failed_before_final_action" data-node-id="failed_before_final_action" data-node-label="最终动作前失败" tabindex="0" role="button" aria-label="Focus 最终动作前失败, tiktok_schedule_unavailable 等, 失败、结果不明与防重复终态" aria-pressed="false" data-node-kind="failure" data-node-sublabel="tiktok_schedule_unavailable 等" data-node-tag="retry after new preflight" data-node-context="失败、结果不明与防重复终态">
+          <title>最终动作前失败 · tiktok_schedule_unavailable 等 · 失败、结果不明与防重复终态 · retry after new preflight</title>
           <rect x="342" y="450" width="120" height="58" rx="7" class="c-mask"/>
           <rect x="342" y="450" width="120" height="58" rx="7" class="c-security" stroke-width="1.5"/>
           <g aria-hidden="true" data-semantic-sigil="failure" class="semantic-sigil s-security" transform="translate(445 456) scale(0.6875)">
             <circle cx="8" cy="8" r="5.3"/>
             <path d="m5.7 5.7 4.6 4.6m0-4.6-4.6 4.6"/>
           </g>
-          <text data-detail-anchor x="402" y="471" class="t-primary" font-size="10" font-weight="600" text-anchor="middle">结果不明</text>
-          <text data-detail="context" x="402" y="487" class="t-muted" font-size="6.9" text-anchor="middle">ambiguous · Post 后只读核对</text>
-        <text data-detail="fine" x="402" y="497" class="t-security" font-size="7" text-anchor="middle">read-only reconcile</text>
+          <text data-detail-anchor x="402" y="471" class="t-primary" font-size="10" font-weight="600" text-anchor="middle">最终动作前失败</text>
+          <text data-detail="context" x="402" y="487" class="t-muted" font-size="6.2" text-anchor="middle">tiktok_schedule_unavailable 等</text>
+        <text data-detail="fine" x="402" y="497" class="t-security" font-size="7" text-anchor="middle">retry after new preflight</text>
         </g>
 
-        <g id="node-duplicate_blocked" data-node-id="duplicate_blocked" data-node-label="重复提交已阻止" tabindex="0" role="button" aria-label="Focus 重复提交已阻止, duplicate_blocked · 同一指纹, 失败、结果不明与防重复终态" aria-pressed="false" data-node-kind="failure" data-node-sublabel="duplicate_blocked · 同一指纹" data-node-tag="terminal guard" data-node-context="失败、结果不明与防重复终态">
-          <title>重复提交已阻止 · duplicate_blocked · 同一指纹 · 失败、结果不明与防重复终态 · terminal guard</title>
+        <g id="node-ambiguous" data-node-id="ambiguous" data-node-label="结果不明" tabindex="0" role="button" aria-label="Focus 结果不明, ambiguous · Post 后只读核对, 失败、结果不明与防重复终态" aria-pressed="false" data-node-kind="failure" data-node-sublabel="ambiguous · Post 后只读核对" data-node-tag="read-only reconcile" data-node-context="失败、结果不明与防重复终态">
+          <title>结果不明 · ambiguous · Post 后只读核对 · 失败、结果不明与防重复终态 · read-only reconcile</title>
           <rect x="496" y="450" width="120" height="58" rx="7" class="c-mask"/>
           <rect x="496" y="450" width="120" height="58" rx="7" class="c-security" stroke-width="1.5"/>
           <g aria-hidden="true" data-semantic-sigil="failure" class="semantic-sigil s-security" transform="translate(599 456) scale(0.6875)">
             <circle cx="8" cy="8" r="5.3"/>
             <path d="m5.7 5.7 4.6 4.6m0-4.6-4.6 4.6"/>
           </g>
-          <text data-detail-anchor x="556" y="471" class="t-primary" font-size="10" font-weight="600" text-anchor="middle">重复提交已阻止</text>
-          <text data-detail="context" x="556" y="487" class="t-muted" font-size="6.6" text-anchor="middle">duplicate_blocked · 同一指纹</text>
-        <text data-detail="fine" x="556" y="497" class="t-security" font-size="7" text-anchor="middle">terminal guard</text>
+          <text data-detail-anchor x="556" y="471" class="t-primary" font-size="10" font-weight="600" text-anchor="middle">结果不明</text>
+          <text data-detail="context" x="556" y="487" class="t-muted" font-size="6.9" text-anchor="middle">ambiguous · Post 后只读核对</text>
+        <text data-detail="fine" x="556" y="497" class="t-security" font-size="7" text-anchor="middle">read-only reconcile</text>
+        </g>
+
+        <g id="node-duplicate_blocked" data-node-id="duplicate_blocked" data-node-label="重复提交已阻止" tabindex="0" role="button" aria-label="Focus 重复提交已阻止, duplicate_blocked · 同一指纹, 失败、结果不明与防重复终态" aria-pressed="false" data-node-kind="failure" data-node-sublabel="duplicate_blocked · 同一指纹" data-node-tag="terminal guard" data-node-context="失败、结果不明与防重复终态">
+          <title>重复提交已阻止 · duplicate_blocked · 同一指纹 · 失败、结果不明与防重复终态 · terminal guard</title>
+          <rect x="650" y="450" width="120" height="58" rx="7" class="c-mask"/>
+          <rect x="650" y="450" width="120" height="58" rx="7" class="c-security" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="failure" class="semantic-sigil s-security" transform="translate(753 456) scale(0.6875)">
+            <circle cx="8" cy="8" r="5.3"/>
+            <path d="m5.7 5.7 4.6 4.6m0-4.6-4.6 4.6"/>
+          </g>
+          <text data-detail-anchor x="710" y="471" class="t-primary" font-size="10" font-weight="600" text-anchor="middle">重复提交已阻止</text>
+          <text data-detail="context" x="710" y="487" class="t-muted" font-size="6.6" text-anchor="middle">duplicate_blocked · 同一指纹</text>
+        <text data-detail="fine" x="710" y="497" class="t-security" font-size="7" text-anchor="middle">terminal guard</text>
         </g>
 
         <!-- Transition labels -->
@@ -5097,10 +5113,7 @@
 
 
 
-        <g data-detail="context" data-edge-from="waiting_user_verification" data-edge-to="platform_page_active" data-edge-label="验证完成，同页继续" data-edge-key="4" data-edge-id="verification-completed">
-          <rect x="344.9" y="354" width="100.2" height="16" rx="4" class="c-mask"/>
-          <text x="395" y="365" class="t-backend" font-size="8" text-anchor="middle">验证完成，同页继续</text>
-        </g>
+
 
 
 
@@ -5118,17 +5131,13 @@
             <rect x="130" y="608" width="14" height="9" rx="2" class="c-backend" stroke-width="1"/>
             <text x="152" y="616" class="t-muted" font-size="10" font-weight="500">active state</text>
           </g>
-          <g data-legend-semantic-kind="waiting" data-legend-kind="waiting" data-legend-label="waiting" data-legend-x="255" data-legend-baseline="616" data-legend-width="78">
-            <rect x="255" y="608" width="14" height="9" rx="2" class="c-cloud" stroke-width="1"/>
-            <text x="277" y="616" class="t-muted" font-size="10" font-weight="500">waiting</text>
+          <g data-legend-semantic-kind="success" data-legend-kind="success" data-legend-label="terminal success" data-legend-x="255" data-legend-baseline="616" data-legend-width="123">
+            <rect x="255" y="608" width="14" height="9" rx="2" class="c-database" stroke-width="1"/>
+            <text x="277" y="616" class="t-muted" font-size="10" font-weight="500">terminal success</text>
           </g>
-          <g data-legend-semantic-kind="success" data-legend-kind="success" data-legend-label="terminal success" data-legend-x="355" data-legend-baseline="616" data-legend-width="123">
-            <rect x="355" y="608" width="14" height="9" rx="2" class="c-database" stroke-width="1"/>
-            <text x="377" y="616" class="t-muted" font-size="10" font-weight="500">terminal success</text>
-          </g>
-          <g data-legend-semantic-kind="failure" data-legend-kind="failure" data-legend-label="failure / exit" data-legend-x="500" data-legend-baseline="616" data-legend-width="113">
-            <rect x="500" y="608" width="14" height="9" rx="2" class="c-security" stroke-width="1"/>
-            <text x="522" y="616" class="t-muted" font-size="10" font-weight="500">failure / exit</text>
+          <g data-legend-semantic-kind="failure" data-legend-kind="failure" data-legend-label="failure / exit" data-legend-x="400" data-legend-baseline="616" data-legend-width="113">
+            <rect x="400" y="608" width="14" height="9" rx="2" class="c-security" stroke-width="1"/>
+            <text x="422" y="616" class="t-muted" font-size="10" font-weight="500">failure / exit</text>
           </g>
         </g>
       </svg>
@@ -5318,24 +5327,24 @@
       <div class="card">
         <div class="card-header">
           <div class="card-dot cyan"></div>
-          <h3>两种发布前结果</h3>
+          <h3>发布前证据顺序</h3>
         </div>
         <ul>
           <li>&bull; local_preflight_passed 只证明本地合同，platformWriteOccurred=false</li>
-          <li>&bull; platform_form_verified 证明真实上传与字段回读，finalActionTriggered=false</li>
-          <li>&bull; 两者都不等于已发布</li>
+          <li>&bull; platform_page_active 之后必须先到 platform_form_verified</li>
+          <li>&bull; platform_form_verified 之后才可恰好一次 Post 或 Schedule</li>
         </ul>
       </div>
 
       <div class="card">
         <div class="card-header">
           <div class="card-dot emerald"></div>
-          <h3>正式证据递进</h3>
+          <h3>两条成功证据</h3>
         </div>
         <ul>
-          <li>&bull; final_action_triggered 只证明一次 Post 已发生</li>
-          <li>&bull; platform_accepted 需要 TikTok 明确成功反馈</li>
-          <li>&bull; published_readback_confirmed 需要精确作品或列表回读</li>
+          <li>&bull; 立即分支：platform_accepted → published_readback_confirmed</li>
+          <li>&bull; 定时分支：scheduled_accepted → scheduled_readback_confirmed</li>
+          <li>&bull; scheduled_readback_confirmed 必须保持 publishedAt=null，不等于已发布</li>
         </ul>
       </div>
 
@@ -5345,10 +5354,10 @@
           <h3>租约与防重复</h3>
         </div>
         <ul>
-          <li>&bull; Post 前 lease expiry 进入 failed_before_final_action</li>
-          <li>&bull; Post 后 lease expiry 进入 ambiguous，只允许只读核对</li>
-          <li>&bull; 人工验证完成后返回 platform_page_active，在同一 Playwright 页面继续</li>
-          <li>&bull; final_action_triggered 之后没有返回自动 retry / preflight 的迁移</li>
+          <li>&bull; tiktok_schedule_unavailable 与所有定时控制失败进入 failed_before_final_action</li>
+          <li>&bull; 最终动作后结果不明进入 ambiguous，只允许只读核对</li>
+          <li>&bull; 所有定时控制失败都在最终动作前终止</li>
+          <li>&bull; failed_before_final_action 没有通往立即 Post 的迁移</li>
         </ul>
       </div>
     </div>

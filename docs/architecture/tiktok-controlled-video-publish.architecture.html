@@ -4869,8 +4869,8 @@
       </div>
     </div>
 
-    <script id="archify-guided-views-data" type="application/json">[{"id":"controlled-main-path","label":"受控发布主链","focus":["content_ui","controlled_cli","controlled_publish","publish_service","local_preflight_result","tiktok_publish_service","tiktok_uploader","tiktok_studio"],"note":"本地 preflight 在创建 Playwright 前终止；platform_form_check / formal 才进入 TikTok 浏览器主链。"},{"id":"identity-session-boundary","label":"账号与会话边界","focus":["account_db","identity_reader","session_file","tiktok_publish_service","tiktok_uploader"],"note":"身份核对只输出公开账号引用；Cookie/session bytes 留在本机私有会话边界。"},{"id":"receipts-and-verification","label":"回执与人工验证","focus":["publish_service","task_db","tiktok_uploader","user_verification","tiktok_studio"],"note":"任务事件、回执和心跳落库；需要验证时继续使用同一 Playwright 页面。"}]</script>
-    <script id="archify-source-evidence-data" type="application/json">{"schemaVersion":1,"verified":true,"repository":{"url":"https://github.com/tianyiswl/oneclick-publisher","revision":"b034da52f477c6afc311b8b87874a7739e11fb84","shortRevision":"b034da5"},"referenceCount":25,"nodes":{"content_ui":[{"path":"app_core/content_project_gateway.py","line":126,"endLine":175,"label":"内容项目入口","href":"https://github.com/tianyiswl/oneclick-publisher/blob/b034da52f477c6afc311b8b87874a7739e11fb84/app_core/content_project_gateway.py#L126-L175"},{"path":"ui/publish_page.py","line":4791,"label":"桌面发布入口","href":"https://github.com/tianyiswl/oneclick-publisher/blob/b034da52f477c6afc311b8b87874a7739e11fb84/ui/publish_page.py#L4791"}],"controlled_cli":[{"path":"desktop_native_app.py","line":206,"endLine":285,"label":"受控 CLI","href":"https://github.com/tianyiswl/oneclick-publisher/blob/b034da52f477c6afc311b8b87874a7739e11fb84/desktop_native_app.py#L206-L285"}],"controlled_publish":[{"path":"app_core/controlled_publish.py","line":128,"endLine":180,"label":"请求合同","href":"https://github.com/tianyiswl/oneclick-publisher/blob/b034da52f477c6afc311b8b87874a7739e11fb84/app_core/controlled_publish.py#L128-L180"},{"path":"app_core/controlled_publish.py","line":971,"endLine":1074,"label":"授权与防重复","href":"https://github.com/tianyiswl/oneclick-publisher/blob/b034da52f477c6afc311b8b87874a7739e11fb84/app_core/controlled_publish.py#L971-L1074"}],"publish_service":[{"path":"app_core/publish_service.py","line":808,"endLine":913,"label":"正式发布主链","href":"https://github.com/tianyiswl/oneclick-publisher/blob/b034da52f477c6afc311b8b87874a7739e11fb84/app_core/publish_service.py#L808-L913"},{"path":"app_core/publish_service.py","line":1010,"endLine":1072,"label":"任务启动入口","href":"https://github.com/tianyiswl/oneclick-publisher/blob/b034da52f477c6afc311b8b87874a7739e11fb84/app_core/publish_service.py#L1010-L1072"}],"tiktok_publish_service":[{"path":"docs/superpowers/plans/2026-08-28-tiktok-controlled-video-publish.md","line":541,"endLine":624,"label":"专用服务接入点","href":"https://github.com/tianyiswl/oneclick-publisher/blob/b034da52f477c6afc311b8b87874a7739e11fb84/docs/superpowers/plans/2026-08-28-tiktok-controlled-video-publish.md#L541-L624"},{"path":"app_core/overseas_video_publish.py","line":1,"endLine":22,"label":"现有兼容入口","href":"https://github.com/tianyiswl/oneclick-publisher/blob/b034da52f477c6afc311b8b87874a7739e11fb84/app_core/overseas_video_publish.py#L1-L22"}],"tiktok_uploader":[{"path":"uploader/tk_uploader/main.py","line":121,"endLine":150,"label":"TikTok 上传器","href":"https://github.com/tianyiswl/oneclick-publisher/blob/b034da52f477c6afc311b8b87874a7739e11fb84/uploader/tk_uploader/main.py#L121-L150"},{"path":"uploader/tk_uploader/main.py","line":365,"endLine":437,"label":"同页表单与最终动作","href":"https://github.com/tianyiswl/oneclick-publisher/blob/b034da52f477c6afc311b8b87874a7739e11fb84/uploader/tk_uploader/main.py#L365-L437"}],"tiktok_studio":[{"path":"uploader/tk_uploader/main.py","line":23,"label":"Studio 上传地址","href":"https://github.com/tianyiswl/oneclick-publisher/blob/b034da52f477c6afc311b8b87874a7739e11fb84/uploader/tk_uploader/main.py#L23"},{"path":"uploader/tk_uploader/main.py","line":93,"endLine":118,"label":"成功与内容页信号","href":"https://github.com/tianyiswl/oneclick-publisher/blob/b034da52f477c6afc311b8b87874a7739e11fb84/uploader/tk_uploader/main.py#L93-L118"}],"account_db":[{"path":"app_core/database.py","line":119,"endLine":150,"label":"账号表与引用字段","href":"https://github.com/tianyiswl/oneclick-publisher/blob/b034da52f477c6afc311b8b87874a7739e11fb84/app_core/database.py#L119-L150"},{"path":"app_core/account_service.py","line":236,"endLine":289,"label":"账号读取","href":"https://github.com/tianyiswl/oneclick-publisher/blob/b034da52f477c6afc311b8b87874a7739e11fb84/app_core/account_service.py#L236-L289"}],"identity_reader":[{"path":"docs/superpowers/plans/2026-08-28-tiktok-controlled-video-publish.md","line":142,"endLine":220,"label":"主体回读合同","href":"https://github.com/tianyiswl/oneclick-publisher/blob/b034da52f477c6afc311b8b87874a7739e11fb84/docs/superpowers/plans/2026-08-28-tiktok-controlled-video-publish.md#L142-L220"}],"session_file":[{"path":"app_core/paths.py","line":22,"endLine":28,"label":"独立会话目录","href":"https://github.com/tianyiswl/oneclick-publisher/blob/b034da52f477c6afc311b8b87874a7739e11fb84/app_core/paths.py#L22-L28"},{"path":"uploader/tk_uploader/main.py","line":389,"endLine":417,"label":"storage_state 使用","href":"https://github.com/tianyiswl/oneclick-publisher/blob/b034da52f477c6afc311b8b87874a7739e11fb84/uploader/tk_uploader/main.py#L389-L417"}],"local_preflight_result":[{"path":"app_core/controlled_publish.py","line":128,"endLine":180,"label":"本地请求合同","href":"https://github.com/tianyiswl/oneclick-publisher/blob/b034da52f477c6afc311b8b87874a7739e11fb84/app_core/controlled_publish.py#L128-L180"},{"path":"docs/superpowers/specs/2026-08-28-tiktok-controlled-video-publish-design.md","line":122,"endLine":132,"label":"零平台写入边界","href":"https://github.com/tianyiswl/oneclick-publisher/blob/b034da52f477c6afc311b8b87874a7739e11fb84/docs/superpowers/specs/2026-08-28-tiktok-controlled-video-publish-design.md#L122-L132"}],"task_db":[{"path":"app_core/database.py","line":500,"endLine":505,"label":"任务心跳字段","href":"https://github.com/tianyiswl/oneclick-publisher/blob/b034da52f477c6afc311b8b87874a7739e11fb84/app_core/database.py#L500-L505"},{"path":"app_core/database.py","line":543,"endLine":595,"label":"任务项与事件","href":"https://github.com/tianyiswl/oneclick-publisher/blob/b034da52f477c6afc311b8b87874a7739e11fb84/app_core/database.py#L543-L595"},{"path":"app_core/task_service.py","line":1860,"endLine":1895,"label":"运行与续租","href":"https://github.com/tianyiswl/oneclick-publisher/blob/b034da52f477c6afc311b8b87874a7739e11fb84/app_core/task_service.py#L1860-L1895"}],"user_verification":[{"path":"uploader/tk_uploader/main.py","line":224,"endLine":250,"label":"同页人工验证","href":"https://github.com/tianyiswl/oneclick-publisher/blob/b034da52f477c6afc311b8b87874a7739e11fb84/uploader/tk_uploader/main.py#L224-L250"},{"path":"docs/superpowers/specs/2026-08-28-tiktok-controlled-video-publish-design.md","line":171,"endLine":179,"label":"验证边界","href":"https://github.com/tianyiswl/oneclick-publisher/blob/b034da52f477c6afc311b8b87874a7739e11fb84/docs/superpowers/specs/2026-08-28-tiktok-controlled-video-publish-design.md#L171-L179"}]}}</script>
+    <script id="archify-guided-views-data" type="application/json">[{"id":"controlled-main-path","label":"受控发布主链","focus":["controlled_publish","publish_service","tiktok_publish_service","tiktok_uploader","tiktok_schedule_form","tiktok_studio"],"note":"受控请求经唯一 TikTok 服务和 TiktokVideo 进入原生定时表单；排期失败不回退 Post。"},{"id":"identity-session-boundary","label":"账号与会话边界","focus":["account_db","identity_reader","session_file","tiktok_publish_service","tiktok_uploader"],"note":"身份核对只输出公开账号引用；Cookie/session bytes 留在本机私有会话边界。"},{"id":"receipts-and-verification","label":"回执与人工验证","focus":["publish_service","task_db","tiktok_uploader","user_verification","tiktok_studio"],"note":"任务事件、回执和心跳落库；需要验证时继续使用同一 Playwright 页面。"}]</script>
+    <script id="archify-source-evidence-data" type="application/json">{"schemaVersion":1,"verified":true,"repository":{"url":"https://github.com/tianyiswl/oneclick-publisher","revision":"cf07986f36e4e86224315dfc4af04adf27a66848","shortRevision":"cf07986"},"referenceCount":24,"nodes":{"content_ui":[{"path":"app_core/content_project_gateway.py","line":126,"endLine":175,"label":"内容项目入口","href":"https://github.com/tianyiswl/oneclick-publisher/blob/cf07986f36e4e86224315dfc4af04adf27a66848/app_core/content_project_gateway.py#L126-L175"},{"path":"ui/publish_page.py","line":4791,"label":"桌面发布入口","href":"https://github.com/tianyiswl/oneclick-publisher/blob/cf07986f36e4e86224315dfc4af04adf27a66848/ui/publish_page.py#L4791"}],"controlled_publish":[{"path":"app_core/controlled_publish.py","line":128,"endLine":180,"label":"请求合同","href":"https://github.com/tianyiswl/oneclick-publisher/blob/cf07986f36e4e86224315dfc4af04adf27a66848/app_core/controlled_publish.py#L128-L180"},{"path":"app_core/controlled_publish.py","line":971,"endLine":1074,"label":"授权与防重复","href":"https://github.com/tianyiswl/oneclick-publisher/blob/cf07986f36e4e86224315dfc4af04adf27a66848/app_core/controlled_publish.py#L971-L1074"}],"publish_service":[{"path":"app_core/publish_service.py","line":808,"endLine":913,"label":"正式发布主链","href":"https://github.com/tianyiswl/oneclick-publisher/blob/cf07986f36e4e86224315dfc4af04adf27a66848/app_core/publish_service.py#L808-L913"},{"path":"app_core/publish_service.py","line":1010,"endLine":1072,"label":"任务启动入口","href":"https://github.com/tianyiswl/oneclick-publisher/blob/cf07986f36e4e86224315dfc4af04adf27a66848/app_core/publish_service.py#L1010-L1072"}],"tiktok_publish_service":[{"path":"docs/superpowers/plans/2026-08-28-tiktok-controlled-video-publish.md","line":541,"endLine":624,"label":"专用服务接入点","href":"https://github.com/tianyiswl/oneclick-publisher/blob/cf07986f36e4e86224315dfc4af04adf27a66848/docs/superpowers/plans/2026-08-28-tiktok-controlled-video-publish.md#L541-L624"},{"path":"app_core/overseas_video_publish.py","line":1,"endLine":22,"label":"现有兼容入口","href":"https://github.com/tianyiswl/oneclick-publisher/blob/cf07986f36e4e86224315dfc4af04adf27a66848/app_core/overseas_video_publish.py#L1-L22"}],"tiktok_uploader":[{"path":"uploader/tk_uploader/main.py","line":121,"endLine":150,"label":"TikTok 上传器","href":"https://github.com/tianyiswl/oneclick-publisher/blob/cf07986f36e4e86224315dfc4af04adf27a66848/uploader/tk_uploader/main.py#L121-L150"},{"path":"uploader/tk_uploader/main.py","line":365,"endLine":437,"label":"同页表单与最终动作","href":"https://github.com/tianyiswl/oneclick-publisher/blob/cf07986f36e4e86224315dfc4af04adf27a66848/uploader/tk_uploader/main.py#L365-L437"}],"tiktok_schedule_form":[{"path":"docs/superpowers/specs/2026-08-29-tiktok-scheduled-video-publish-design.md","line":125,"label":"已批准的平台原生定时模块边界","href":"https://github.com/tianyiswl/oneclick-publisher/blob/cf07986f36e4e86224315dfc4af04adf27a66848/docs/superpowers/specs/2026-08-29-tiktok-scheduled-video-publish-design.md#L125"},{"path":"uploader/tk_uploader/main.py","line":610,"label":"现有表单快照与最终动作接线点","href":"https://github.com/tianyiswl/oneclick-publisher/blob/cf07986f36e4e86224315dfc4af04adf27a66848/uploader/tk_uploader/main.py#L610"}],"tiktok_studio":[{"path":"uploader/tk_uploader/main.py","line":23,"label":"Studio 上传地址","href":"https://github.com/tianyiswl/oneclick-publisher/blob/cf07986f36e4e86224315dfc4af04adf27a66848/uploader/tk_uploader/main.py#L23"},{"path":"uploader/tk_uploader/main.py","line":93,"endLine":118,"label":"成功与内容页信号","href":"https://github.com/tianyiswl/oneclick-publisher/blob/cf07986f36e4e86224315dfc4af04adf27a66848/uploader/tk_uploader/main.py#L93-L118"}],"account_db":[{"path":"app_core/database.py","line":119,"endLine":150,"label":"账号表与引用字段","href":"https://github.com/tianyiswl/oneclick-publisher/blob/cf07986f36e4e86224315dfc4af04adf27a66848/app_core/database.py#L119-L150"},{"path":"app_core/account_service.py","line":236,"endLine":289,"label":"账号读取","href":"https://github.com/tianyiswl/oneclick-publisher/blob/cf07986f36e4e86224315dfc4af04adf27a66848/app_core/account_service.py#L236-L289"}],"identity_reader":[{"path":"docs/superpowers/plans/2026-08-28-tiktok-controlled-video-publish.md","line":142,"endLine":220,"label":"主体回读合同","href":"https://github.com/tianyiswl/oneclick-publisher/blob/cf07986f36e4e86224315dfc4af04adf27a66848/docs/superpowers/plans/2026-08-28-tiktok-controlled-video-publish.md#L142-L220"}],"session_file":[{"path":"app_core/paths.py","line":22,"endLine":28,"label":"独立会话目录","href":"https://github.com/tianyiswl/oneclick-publisher/blob/cf07986f36e4e86224315dfc4af04adf27a66848/app_core/paths.py#L22-L28"},{"path":"uploader/tk_uploader/main.py","line":389,"endLine":417,"label":"storage_state 使用","href":"https://github.com/tianyiswl/oneclick-publisher/blob/cf07986f36e4e86224315dfc4af04adf27a66848/uploader/tk_uploader/main.py#L389-L417"}],"task_db":[{"path":"app_core/database.py","line":500,"endLine":505,"label":"任务心跳字段","href":"https://github.com/tianyiswl/oneclick-publisher/blob/cf07986f36e4e86224315dfc4af04adf27a66848/app_core/database.py#L500-L505"},{"path":"app_core/database.py","line":543,"endLine":595,"label":"任务项与事件","href":"https://github.com/tianyiswl/oneclick-publisher/blob/cf07986f36e4e86224315dfc4af04adf27a66848/app_core/database.py#L543-L595"},{"path":"app_core/task_service.py","line":1860,"endLine":1895,"label":"运行与续租","href":"https://github.com/tianyiswl/oneclick-publisher/blob/cf07986f36e4e86224315dfc4af04adf27a66848/app_core/task_service.py#L1860-L1895"}],"user_verification":[{"path":"uploader/tk_uploader/main.py","line":224,"endLine":250,"label":"同页人工验证","href":"https://github.com/tianyiswl/oneclick-publisher/blob/cf07986f36e4e86224315dfc4af04adf27a66848/uploader/tk_uploader/main.py#L224-L250"},{"path":"docs/superpowers/specs/2026-08-28-tiktok-controlled-video-publish-design.md","line":171,"endLine":179,"label":"验证边界","href":"https://github.com/tianyiswl/oneclick-publisher/blob/cf07986f36e4e86224315dfc4af04adf27a66848/docs/superpowers/specs/2026-08-28-tiktok-controlled-video-publish-design.md#L171-L179"}]}}</script>
     <div class="guided-views no-print" id="guided-views" hidden aria-label="Guided diagram views">
       <button id="guided-view-prev" type="button" aria-label="Previous guided view" title="Previous guided view ([)">&#8592;</button>
       <div class="guided-view-copy">
@@ -4938,252 +4938,235 @@
         <rect width="100%" height="100%" fill="url(#grid)" />
 
         <!-- Boundaries (behind everything) -->
-        <rect data-graph-role="structural-frame" data-composition-frame-kind="region" data-composition-frame-id="0" x="7" y="62" width="1341" height="533" rx="12" class="c-region" stroke-width="1"/>
+        <rect data-graph-role="structural-frame" data-composition-frame-kind="region" data-composition-frame-id="0" x="7" y="62" width="1211" height="533" rx="12" class="c-region" stroke-width="1"/>
         <text x="15" y="80" class="t-cloud" font-size="9" font-weight="600">一键发受控本机边界</text>
 
-        <rect data-graph-role="structural-frame" data-composition-frame-kind="security-group" data-composition-frame-id="1" x="1098" y="68" width="244" height="102" rx="8" class="c-security-group" stroke-width="1"/>
-        <text x="1106" y="86" class="t-security" font-size="9" font-weight="600">本机私有会话：Cookie/session bytes 禁止进入 request / receipt JSON</text>
+        <rect data-graph-role="structural-frame" data-composition-frame-kind="security-group" data-composition-frame-id="1" x="708" y="68" width="249" height="102" rx="8" class="c-security-group" stroke-width="1"/>
+        <text x="716" y="86" class="t-security" font-size="9" font-weight="600">本机私有会话：Cookie/session bytes 禁止进入 request / receipt JSON</text>
 
-        <rect data-graph-role="structural-frame" data-composition-frame-kind="region" data-composition-frame-id="2" x="1094" y="279" width="427" height="316" rx="12" class="c-region" stroke-width="1"/>
-        <text x="1102" y="297" class="t-cloud" font-size="9" font-weight="600">TikTok 外部平台与人工安全步骤</text>
+        <rect data-graph-role="structural-frame" data-composition-frame-kind="region" data-composition-frame-id="2" x="704" y="279" width="762" height="316" rx="12" class="c-region" stroke-width="1"/>
+        <text x="712" y="297" class="t-cloud" font-size="9" font-weight="600">TikTok 外部平台与人工安全步骤</text>
 
         <!-- Connection paths (before components for correct z-order) -->
-        <path data-edge-from="content_ui" data-edge-to="controlled_cli" data-edge-label="manifest + accountId" data-edge-key="0" data-edge-id="content-to-cli" data-composition-points="220,332;245,332" d="M 220 332 L 245 332" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
-        <path data-edge-from="controlled_cli" data-edge-to="controlled_publish" data-edge-label="受控 request JSON" data-edge-key="1" data-edge-id="cli-to-contract" data-composition-points="415,332;440,332" d="M 415 332 L 440 332" class="a-security" stroke-width="1.5" marker-end="url(#arrowhead-security)"/>
-        <path data-edge-from="controlled_publish" data-edge-to="publish_service" data-edge-label="快照 + 一次性授权" data-edge-key="2" data-edge-id="contract-to-service" data-composition-points="630,332;655,332" d="M 630 332 L 655 332" class="a-security" stroke-width="1.5" marker-end="url(#arrowhead-security)"/>
-        <path data-edge-from="publish_service" data-edge-to="local_preflight_result" data-edge-label="preflight：本地只读后终止" data-edge-key="3" data-edge-id="service-to-preflight-result" data-composition-points="840,339;852.5,339;852.5,540;865,540" d="M 840 339 L 846.25 339 Q 852.5 339 852.5 345.25 L 852.5 533.75 Q 852.5 540 858.75 540 L 865 540" class="a-dashed" stroke-width="1.5" marker-end="url(#arrowhead-dashed)"/>
-        <path data-edge-from="publish_service" data-edge-to="tiktok_publish_service" data-edge-label="platform_form_check / formal" data-edge-key="4" data-edge-id="service-to-tiktok" data-composition-points="840,325;865,325" d="M 840 325 L 865 325" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
-        <path data-edge-from="tiktok_publish_service" data-edge-to="tiktok_uploader" data-edge-label="同一字段与回读实现" data-edge-key="5" data-edge-id="tiktok-to-uploader" data-composition-points="1085,332;1110,332" d="M 1085 332 L 1110 332" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
-        <path data-edge-from="tiktok_uploader" data-edge-to="tiktok_studio" data-edge-label="Playwright：upload / readback / one Post" data-edge-key="6" data-edge-id="uploader-to-studio" data-composition-points="1330,332;1360,332" d="M 1330 332 L 1360 332" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
-        <path data-edge-from="account_db" data-edge-to="identity_reader" data-edge-label="saved accountReference" data-edge-key="7" data-edge-id="account-to-identity" data-composition-points="840,115;865,115" d="M 840 115 L 865 115" class="a-security" stroke-width="1.5" marker-end="url(#arrowhead-security)"/>
-        <path data-edge-from="session_file" data-edge-to="identity_reader" data-edge-label="isolated storage_state" data-edge-key="8" data-edge-id="session-to-identity" data-composition-points="1110,115;1085,115" d="M 1110 115 L 1085 115" class="a-security" stroke-width="1.5" marker-end="url(#arrowhead-security)"/>
-        <path data-edge-from="identity_reader" data-edge-to="tiktok_publish_service" data-edge-label="matched public handle" data-edge-key="9" data-edge-id="identity-to-tiktok" data-composition-points="975,150;975,295" d="M 975 150 L 975 295" class="a-security" stroke-width="1.5" marker-end="url(#arrowhead-security)"/>
-        <path data-edge-from="session_file" data-edge-to="tiktok_uploader" data-edge-label="private session only" data-edge-key="10" data-edge-id="session-to-uploader" data-composition-points="1220,150;1220,295" d="M 1220 150 L 1220 295" class="a-security" stroke-width="1.5" marker-end="url(#arrowhead-security)"/>
-        <path data-edge-from="publish_service" data-edge-to="task_db" data-edge-label="events / receipts / heartbeat" data-edge-key="11" data-edge-id="service-to-task-db" data-composition-points="747.5,369;747.5,505" d="M 747.5 369 L 747.5 505" class="a-dashed" stroke-width="1.5" marker-end="url(#arrowhead-dashed)"/>
-        <path data-edge-from="tiktok_uploader" data-edge-to="user_verification" data-edge-label="触发验证：同一页面等待" data-edge-key="12" data-edge-id="uploader-to-verification" data-composition-points="1213,369;1213,505" d="M 1213 369 L 1213 505" class="a-security" stroke-width="1.5" marker-end="url(#arrowhead-security)"/>
-        <path data-edge-from="user_verification" data-edge-to="tiktok_uploader" data-edge-label="验证完成：同页继续" data-edge-key="13" data-edge-id="verification-to-uploader" data-composition-points="1227,505;1227,369" d="M 1227 505 L 1227 369" class="a-security" stroke-width="1.5" marker-end="url(#arrowhead-security)"/>
+        <path data-edge-from="content_ui" data-edge-to="controlled_publish" data-edge-label="结构化内容包 + accountId" data-edge-key="0" data-edge-id="content-to-contract" data-composition-points="122.5,154;122.5,178;143.5,178;143.5,271;127.5,271;127.5,295" d="M 122.5 154 L 122.5 170 Q 122.5 178 130.5 178 L 135.5 178 Q 143.5 178 143.5 186 L 143.5 263 Q 143.5 271 135.5 271 L 135.5 271 Q 127.5 271 127.5 279 L 127.5 295" class="a-security" stroke-width="1.5" marker-end="url(#arrowhead-security)"/>
+        <path data-edge-from="controlled_publish" data-edge-to="publish_service" data-edge-label="快照 + 一次性授权" data-edge-key="1" data-edge-id="contract-to-service" data-composition-points="230,332;255,332" d="M 230 332 L 255 332" class="a-security" stroke-width="1.5" marker-end="url(#arrowhead-security)"/>
+        <path data-edge-from="publish_service" data-edge-to="tiktok_publish_service" data-edge-label="platform_form_check / formal" data-edge-key="2" data-edge-id="service-to-tiktok" data-composition-points="445,332;470,332" d="M 445 332 L 470 332" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
+        <path data-edge-from="tiktok_publish_service" data-edge-to="tiktok_uploader" data-edge-label="同一字段与回读实现" data-edge-key="3" data-edge-id="tiktok-to-uploader" data-composition-points="695,332;720,332" d="M 695 332 L 720 332" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
+        <path data-edge-from="tiktok_uploader" data-edge-to="tiktok_schedule_form" data-edge-label="表单快照 + 定时意图" data-edge-key="4" data-edge-id="uploader-to-schedule-form" data-composition-points="945,332;970,332" d="M 945 332 L 970 332" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
+        <path data-edge-from="tiktok_schedule_form" data-edge-to="tiktok_studio" data-edge-label="唯一 Post 或 Schedule" data-edge-key="5" data-edge-id="schedule-form-to-studio" data-composition-points="1200,332;1260,332" d="M 1200 332 L 1260 332" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
+        <path data-edge-from="account_db" data-edge-to="identity_reader" data-edge-label="saved accountReference" data-edge-key="6" data-edge-id="account-to-identity" data-composition-points="445,115;470,115" d="M 445 115 L 470 115" class="a-security" stroke-width="1.5" marker-end="url(#arrowhead-security)"/>
+        <path data-edge-from="session_file" data-edge-to="identity_reader" data-edge-label="isolated storage_state" data-edge-key="7" data-edge-id="session-to-identity" data-composition-points="720,115;695,115" d="M 720 115 L 695 115" class="a-security" stroke-width="1.5" marker-end="url(#arrowhead-security)"/>
+        <path data-edge-from="identity_reader" data-edge-to="tiktok_publish_service" data-edge-label="matched public handle" data-edge-key="8" data-edge-id="identity-to-tiktok" data-composition-points="582.5,150;582.5,295" d="M 582.5 150 L 582.5 295" class="a-security" stroke-width="1.5" marker-end="url(#arrowhead-security)"/>
+        <path data-edge-from="session_file" data-edge-to="tiktok_uploader" data-edge-label="private session only" data-edge-key="9" data-edge-id="session-to-uploader" data-composition-points="832.5,150;832.5,295" d="M 832.5 150 L 832.5 295" class="a-security" stroke-width="1.5" marker-end="url(#arrowhead-security)"/>
+        <path data-edge-from="publish_service" data-edge-to="task_db" data-edge-label="events / receipts / heartbeat" data-edge-key="10" data-edge-id="service-to-task-db" data-composition-points="350,369;350,505" d="M 350 369 L 350 505" class="a-dashed" stroke-width="1.5" marker-end="url(#arrowhead-dashed)"/>
+        <path data-edge-from="tiktok_uploader" data-edge-to="user_verification" data-edge-label="触发验证：同一页面等待" data-edge-key="11" data-edge-id="uploader-to-verification" data-composition-points="825.5,369;825.5,505" d="M 825.5 369 L 825.5 505" class="a-security" stroke-width="1.5" marker-end="url(#arrowhead-security)"/>
+        <path data-edge-from="user_verification" data-edge-to="tiktok_uploader" data-edge-label="验证完成：同页继续" data-edge-key="12" data-edge-id="verification-to-uploader" data-composition-points="839.5,505;839.5,369" d="M 839.5 505 L 839.5 369" class="a-security" stroke-width="1.5" marker-end="url(#arrowhead-security)"/>
 
         <!-- Components -->
         <g id="node-content_ui" data-node-id="content_ui" data-node-label="Content Project / Desktop UI" tabindex="0" role="button" aria-label="Focus Content Project / Desktop UI, 结构化内容包与明确账号, 一键发受控本机边界" aria-pressed="false" data-node-kind="frontend" data-node-sublabel="结构化内容包与明确账号" data-node-context="一键发受控本机边界">
           <title>Content Project / Desktop UI · 结构化内容包与明确账号 · 一键发受控本机边界</title>
-          <rect x="25" y="295" width="195" height="74" rx="6" class="c-mask"/>
-          <rect x="25" y="295" width="195" height="74" rx="6" class="c-frontend" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="frontend" class="semantic-sigil s-frontend" transform="translate(31 301) scale(0.6875)">
+          <rect x="25" y="80" width="195" height="74" rx="6" class="c-mask"/>
+          <rect x="25" y="80" width="195" height="74" rx="6" class="c-frontend" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="frontend" class="semantic-sigil s-frontend" transform="translate(31 86) scale(0.6875)">
             <rect x="2" y="3" width="12" height="10" rx="2"/>
             <path d="M2 6.5h12"/>
             <circle cx="4.1" cy="4.8" r=".7" class="sigil-fill"/>
             <circle cx="6.3" cy="4.8" r=".7" class="sigil-fill"/>
           </g>
-          <text data-detail-anchor x="122.5" y="330" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">Content Project / Desktop UI</text>
-        <text data-detail="context" x="122.5" y="346" class="t-muted" font-size="9" text-anchor="middle">结构化内容包与明确账号</text>
-        </g>
-
-        <g id="node-controlled_cli" data-node-id="controlled_cli" data-node-label="Controlled CLI request" tabindex="0" role="button" aria-label="Focus Controlled CLI request, 稳定 JSON 请求与状态查询, 一键发受控本机边界" aria-pressed="false" data-node-kind="backend" data-node-sublabel="稳定 JSON 请求与状态查询" data-node-context="一键发受控本机边界">
-          <title>Controlled CLI request · 稳定 JSON 请求与状态查询 · 一键发受控本机边界</title>
-          <rect x="245" y="295" width="170" height="74" rx="6" class="c-mask"/>
-          <rect x="245" y="295" width="170" height="74" rx="6" class="c-backend" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(251 301) scale(0.6875)">
-            <path d="M6 3 3 8l3 5M10 3l3 5-3 5"/>
-          </g>
-          <text data-detail-anchor x="330" y="330" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">Controlled CLI request</text>
-        <text data-detail="context" x="330" y="346" class="t-muted" font-size="9" text-anchor="middle">稳定 JSON 请求与状态查询</text>
+          <text data-detail-anchor x="122.5" y="115" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">Content Project / Desktop UI</text>
+        <text data-detail="context" x="122.5" y="131" class="t-muted" font-size="9" text-anchor="middle">结构化内容包与明确账号</text>
         </g>
 
         <g id="node-controlled_publish" data-node-id="controlled_publish" data-node-label="app_core.controlled_publish" tabindex="0" role="button" aria-label="Focus app_core.controlled_publish, 合同、快照、一次性授权、防重复, 一键发受控本机边界" aria-pressed="false" data-node-kind="security" data-node-sublabel="合同、快照、一次性授权、防重复" data-node-tag="authorization gate" data-node-context="一键发受控本机边界">
           <title>app_core.controlled_publish · 合同、快照、一次性授权、防重复 · 一键发受控本机边界 · authorization gate</title>
-          <rect x="440" y="295" width="190" height="74" rx="6" class="c-mask"/>
-          <rect x="440" y="295" width="190" height="74" rx="6" class="c-security" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="security" class="semantic-sigil s-security" transform="translate(446 301) scale(0.6875)">
+          <rect x="25" y="295" width="205" height="74" rx="6" class="c-mask"/>
+          <rect x="25" y="295" width="205" height="74" rx="6" class="c-security" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="security" class="semantic-sigil s-security" transform="translate(31 301) scale(0.6875)">
             <path d="M8 2.2 13 4v3.5c0 3.1-1.8 5.4-5 6.5-3.2-1.1-5-3.4-5-6.5V4Z"/>
             <path d="m5.8 8 1.5 1.5 3-3"/>
           </g>
-          <text data-detail-anchor x="535" y="330" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">app_core.controlled_publish</text>
-        <text data-detail="context" x="535" y="346" class="t-muted" font-size="9" text-anchor="middle">合同、快照、一次性授权、防重复</text>
-        <text data-detail="fine" x="535" y="361" class="t-security" font-size="7" text-anchor="middle">authorization gate</text>
+          <text data-detail-anchor x="127.5" y="330" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">app_core.controlled_publish</text>
+        <text data-detail="context" x="127.5" y="346" class="t-muted" font-size="9" text-anchor="middle">合同、快照、一次性授权、防重复</text>
+        <text data-detail="fine" x="127.5" y="361" class="t-security" font-size="7" text-anchor="middle">authorization gate</text>
         </g>
 
         <g id="node-publish_service" data-node-id="publish_service" data-node-label="app_core.publish_service" tabindex="0" role="button" aria-label="Focus app_core.publish_service, 唯一任务编排与 TikTok 路由, 一键发受控本机边界" aria-pressed="false" data-node-kind="backend" data-node-sublabel="唯一任务编排与 TikTok 路由" data-node-context="一键发受控本机边界">
           <title>app_core.publish_service · 唯一任务编排与 TikTok 路由 · 一键发受控本机边界</title>
-          <rect x="655" y="295" width="185" height="74" rx="6" class="c-mask"/>
-          <rect x="655" y="295" width="185" height="74" rx="6" class="c-backend" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(661 301) scale(0.6875)">
+          <rect x="255" y="295" width="190" height="74" rx="6" class="c-mask"/>
+          <rect x="255" y="295" width="190" height="74" rx="6" class="c-backend" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(261 301) scale(0.6875)">
             <path d="M6 3 3 8l3 5M10 3l3 5-3 5"/>
           </g>
-          <text data-detail-anchor x="747.5" y="330" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">app_core.publish_service</text>
-        <text data-detail="context" x="747.5" y="346" class="t-muted" font-size="9" text-anchor="middle">唯一任务编排与 TikTok 路由</text>
+          <text data-detail-anchor x="350" y="330" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">app_core.publish_service</text>
+        <text data-detail="context" x="350" y="346" class="t-muted" font-size="9" text-anchor="middle">唯一任务编排与 TikTok 路由</text>
         </g>
 
         <g id="node-tiktok_publish_service" data-node-id="tiktok_publish_service" data-node-label="app_core.overseas_tiktok_publish" tabindex="0" role="button" aria-label="Focus app_core.overseas_tiktok_publish, 仅 platform_form_check / formal, 一键发受控本机边界" aria-pressed="false" data-node-kind="backend" data-node-sublabel="仅 platform_form_check / formal" data-node-tag="single TikTok path" data-node-context="一键发受控本机边界">
           <title>app_core.overseas_tiktok_publish · 仅 platform_form_check / formal · 一键发受控本机边界 · single TikTok path</title>
-          <rect x="865" y="295" width="220" height="74" rx="6" class="c-mask"/>
-          <rect x="865" y="295" width="220" height="74" rx="6" class="c-backend" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(871 301) scale(0.6875)">
+          <rect x="470" y="295" width="225" height="74" rx="6" class="c-mask"/>
+          <rect x="470" y="295" width="225" height="74" rx="6" class="c-backend" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(476 301) scale(0.6875)">
             <path d="M6 3 3 8l3 5M10 3l3 5-3 5"/>
           </g>
-          <text data-detail-anchor x="975" y="330" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">app_core.overseas_tiktok_publish</text>
-        <text data-detail="context" x="975" y="346" class="t-muted" font-size="9" text-anchor="middle">仅 platform_form_check / formal</text>
-        <text data-detail="fine" x="975" y="361" class="t-backend" font-size="7" text-anchor="middle">single TikTok path</text>
+          <text data-detail-anchor x="582.5" y="330" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">app_core.overseas_tiktok_publish</text>
+        <text data-detail="context" x="582.5" y="346" class="t-muted" font-size="9" text-anchor="middle">仅 platform_form_check / formal</text>
+        <text data-detail="fine" x="582.5" y="361" class="t-backend" font-size="7" text-anchor="middle">single TikTok path</text>
         </g>
 
-        <g id="node-tiktok_uploader" data-node-id="tiktok_uploader" data-node-label="uploader.tk_uploader.TiktokVideo" tabindex="0" role="button" aria-label="Focus uploader.tk_uploader.TiktokVideo, Same Playwright Page：上传、字段、公开范围、Post, 一键发受控本机边界" aria-pressed="false" data-node-kind="backend" data-node-sublabel="Same Playwright Page：上传、字段、公开范围、Post" data-node-context="一键发受控本机边界">
-          <title>uploader.tk_uploader.TiktokVideo · Same Playwright Page：上传、字段、公开范围、Post · 一键发受控本机边界</title>
-          <rect x="1110" y="295" width="220" height="74" rx="6" class="c-mask"/>
-          <rect x="1110" y="295" width="220" height="74" rx="6" class="c-backend" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(1116 301) scale(0.6875)">
+        <g id="node-tiktok_uploader" data-node-id="tiktok_uploader" data-node-label="uploader.tk_uploader.TiktokVideo" tabindex="0" role="button" aria-label="Focus uploader.tk_uploader.TiktokVideo, Same Playwright Page：上传、字段、公开范围, 一键发受控本机边界" aria-pressed="false" data-node-kind="backend" data-node-sublabel="Same Playwright Page：上传、字段、公开范围" data-node-context="一键发受控本机边界">
+          <title>uploader.tk_uploader.TiktokVideo · Same Playwright Page：上传、字段、公开范围 · 一键发受控本机边界</title>
+          <rect x="720" y="295" width="225" height="74" rx="6" class="c-mask"/>
+          <rect x="720" y="295" width="225" height="74" rx="6" class="c-backend" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(726 301) scale(0.6875)">
             <path d="M6 3 3 8l3 5M10 3l3 5-3 5"/>
           </g>
-          <text data-detail-anchor x="1220" y="330" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">uploader.tk_uploader.TiktokVideo</text>
-        <text data-detail="context" x="1220" y="346" class="t-muted" font-size="7.3" text-anchor="middle">Same Playwright Page：上传、字段、公开范围、Post</text>
+          <text data-detail-anchor x="832.5" y="330" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">uploader.tk_uploader.TiktokVideo</text>
+        <text data-detail="context" x="832.5" y="346" class="t-muted" font-size="8.6" text-anchor="middle">Same Playwright Page：上传、字段、公开范围</text>
+        </g>
+
+        <g id="node-tiktok_schedule_form" data-node-id="tiktok_schedule_form" data-node-label="TikTok Schedule Form" tabindex="0" role="button" aria-label="Focus TikTok Schedule Form, 北京时间开关、日期时间、唯一 Schedule 与排期回读, 一键发受控本机边界" aria-pressed="false" data-node-kind="backend" data-node-sublabel="北京时间开关、日期时间、唯一 Schedule 与排期回读" data-node-tag="no fallback to Post" data-node-context="一键发受控本机边界">
+          <title>TikTok Schedule Form · 北京时间开关、日期时间、唯一 Schedule 与排期回读 · 一键发受控本机边界 · no fallback to Post</title>
+          <rect x="970" y="295" width="230" height="74" rx="6" class="c-mask"/>
+          <rect x="970" y="295" width="230" height="74" rx="6" class="c-backend" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(976 301) scale(0.6875)">
+            <path d="M6 3 3 8l3 5M10 3l3 5-3 5"/>
+          </g>
+          <text data-detail-anchor x="1085" y="330" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">TikTok Schedule Form</text>
+        <text data-detail="context" x="1085" y="346" class="t-muted" font-size="7.7" text-anchor="middle">北京时间开关、日期时间、唯一 Schedule 与排期回读</text>
+        <text data-detail="fine" x="1085" y="361" class="t-backend" font-size="7" text-anchor="middle">no fallback to Post</text>
         </g>
 
         <g id="node-tiktok_studio" data-node-id="tiktok_studio" data-node-label="TikTok Studio" tabindex="0" role="button" aria-label="Focus TikTok Studio, 真实上传页、平台反馈与作品回读, TikTok 外部平台与人工安全步骤, TikTok" aria-pressed="false" data-node-kind="external" data-node-sublabel="真实上传页、平台反馈与作品回读" data-node-tag="external platform" data-node-context="TikTok 外部平台与人工安全步骤" data-node-brand="TikTok" data-node-brand-id="tiktok" data-node-brand-status="preset" data-node-brand-source="https://tiktok.com">
           <title>TikTok Studio · 真实上传页、平台反馈与作品回读 · TikTok 外部平台与人工安全步骤 · external platform · TikTok</title>
-          <rect x="1360" y="295" width="145" height="74" rx="6" class="c-mask"/>
-          <rect x="1360" y="295" width="145" height="74" rx="6" class="c-external" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="external" class="semantic-sigil s-external" transform="translate(1366 301) scale(0.6875)">
+          <rect x="1260" y="295" width="190" height="74" rx="6" class="c-mask"/>
+          <rect x="1260" y="295" width="190" height="74" rx="6" class="c-external" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="external" class="semantic-sigil s-external" transform="translate(1266 301) scale(0.6875)">
             <rect x="2.5" y="5" width="8.5" height="8" rx="1.5"/>
             <path d="M8 2.5h5.5V8M13.5 2.5 7.5 8.5"/>
           </g>
-          <g aria-hidden="true" data-brand-mark="tiktok" data-brand-title="TikTok" data-brand-status="preset" data-brand-source="https://tiktok.com" class="brand-mark" transform="translate(1483 301)">
+          <g aria-hidden="true" data-brand-mark="tiktok" data-brand-title="TikTok" data-brand-status="preset" data-brand-source="https://tiktok.com" class="brand-mark" transform="translate(1428 301)">
             <rect width="16" height="16" rx="4" class="brand-mark-badge"/>
             <path d="M12.525.02c1.31-.02 2.61-.01 3.91-.02.08 1.53.63 3.09 1.75 4.17 1.12 1.11 2.7 1.62 4.24 1.79v4.03c-1.44-.05-2.89-.35-4.2-.97-.57-.26-1.1-.59-1.62-.93-.01 2.92.01 5.84-.02 8.75-.08 1.4-.54 2.79-1.35 3.94-1.31 1.92-3.58 3.17-5.91 3.21-1.43.08-2.86-.31-4.08-1.03-2.02-1.19-3.44-3.37-3.65-5.71-.02-.5-.03-1-.01-1.49.18-1.9 1.12-3.72 2.58-4.96 1.66-1.44 3.98-2.13 6.15-1.72.02 1.48-.04 2.96-.04 4.44-.99-.32-2.15-.23-3.02.37-.63.41-1.11 1.04-1.36 1.75-.21.51-.15 1.07-.14 1.61.24 1.64 1.82 3.02 3.5 2.87 1.12-.01 2.19-.66 2.77-1.61.19-.33.4-.67.41-1.06.1-1.79.06-3.57.07-5.36.01-4.03-.01-8.05.02-12.07z" transform="translate(3 3) scale(0.4166666666666667)" fill="#000000"/>
             <rect width="16" height="16" rx="4" class="brand-mark-frame"/>
           </g>
-          <text data-detail-anchor x="1432.5" y="330" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">TikTok Studio</text>
-        <text data-detail="context" x="1432.5" y="346" class="t-muted" font-size="7.6" text-anchor="middle">真实上传页、平台反馈与作品回读</text>
-        <text data-detail="fine" x="1432.5" y="361" class="t-external" font-size="7" text-anchor="middle">external platform</text>
+          <text data-detail-anchor x="1355" y="330" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">TikTok Studio</text>
+        <text data-detail="context" x="1355" y="346" class="t-muted" font-size="9" text-anchor="middle">真实上传页、平台反馈与作品回读</text>
+        <text data-detail="fine" x="1355" y="361" class="t-external" font-size="7" text-anchor="middle">external platform</text>
         </g>
 
         <g id="node-account_db" data-node-id="account_db" data-node-label="Account DB" tabindex="0" role="button" aria-label="Focus Account DB, 账号记录与公开 accountReference, 一键发受控本机边界" aria-pressed="false" data-node-kind="database" data-node-sublabel="账号记录与公开 accountReference" data-node-context="一键发受控本机边界">
           <title>Account DB · 账号记录与公开 accountReference · 一键发受控本机边界</title>
-          <rect x="655" y="80" width="185" height="70" rx="6" class="c-mask"/>
-          <rect x="655" y="80" width="185" height="70" rx="6" class="c-database" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="database" class="semantic-sigil s-database" transform="translate(661 86) scale(0.6875)">
+          <rect x="255" y="80" width="190" height="70" rx="6" class="c-mask"/>
+          <rect x="255" y="80" width="190" height="70" rx="6" class="c-database" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="database" class="semantic-sigil s-database" transform="translate(261 86) scale(0.6875)">
             <ellipse cx="8" cy="4" rx="5" ry="2"/>
             <path d="M3 4v8c0 1.1 2.2 2 5 2s5-.9 5-2V4M3 8c0 1.1 2.2 2 5 2s5-.9 5-2"/>
           </g>
-          <text data-detail-anchor x="747.5" y="113" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">Account DB</text>
-        <text data-detail="context" x="747.5" y="129" class="t-muted" font-size="9" text-anchor="middle">账号记录与公开 accountReference</text>
+          <text data-detail-anchor x="350" y="113" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">Account DB</text>
+        <text data-detail="context" x="350" y="129" class="t-muted" font-size="9" text-anchor="middle">账号记录与公开 accountReference</text>
         </g>
 
         <g id="node-identity_reader" data-node-id="identity_reader" data-node-label="TikTok Identity Reader" tabindex="0" role="button" aria-label="Focus TikTok Identity Reader, 稳定 handle 核对；不输出会话内容, 一键发受控本机边界" aria-pressed="false" data-node-kind="security" data-node-sublabel="稳定 handle 核对；不输出会话内容" data-node-context="一键发受控本机边界">
           <title>TikTok Identity Reader · 稳定 handle 核对；不输出会话内容 · 一键发受控本机边界</title>
-          <rect x="865" y="80" width="220" height="70" rx="6" class="c-mask"/>
-          <rect x="865" y="80" width="220" height="70" rx="6" class="c-security" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="security" class="semantic-sigil s-security" transform="translate(871 86) scale(0.6875)">
+          <rect x="470" y="80" width="225" height="70" rx="6" class="c-mask"/>
+          <rect x="470" y="80" width="225" height="70" rx="6" class="c-security" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="security" class="semantic-sigil s-security" transform="translate(476 86) scale(0.6875)">
             <path d="M8 2.2 13 4v3.5c0 3.1-1.8 5.4-5 6.5-3.2-1.1-5-3.4-5-6.5V4Z"/>
             <path d="m5.8 8 1.5 1.5 3-3"/>
           </g>
-          <text data-detail-anchor x="975" y="113" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">TikTok Identity Reader</text>
-        <text data-detail="context" x="975" y="129" class="t-muted" font-size="9" text-anchor="middle">稳定 handle 核对；不输出会话内容</text>
+          <text data-detail-anchor x="582.5" y="113" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">TikTok Identity Reader</text>
+        <text data-detail="context" x="582.5" y="129" class="t-muted" font-size="9" text-anchor="middle">稳定 handle 核对；不输出会话内容</text>
         </g>
 
         <g id="node-session_file" data-node-id="session_file" data-node-label="Isolated Session File" tabindex="0" role="button" aria-label="Focus Isolated Session File, Cookie/session bytes：仅本机私有, 一键发受控本机边界 › 本机私有会话：Cookie/session bytes 禁止进入 request / receipt JSON" aria-pressed="false" data-node-kind="security" data-node-sublabel="Cookie/session bytes：仅本机私有" data-node-tag="never in JSON" data-node-context="一键发受控本机边界 › 本机私有会话：Cookie/session bytes 禁止进入 request / receipt JSON">
           <title>Isolated Session File · Cookie/session bytes：仅本机私有 · 一键发受控本机边界 › 本机私有会话：Cookie/session bytes 禁止进入 request / receipt JSON · never in JSON</title>
-          <rect x="1110" y="80" width="220" height="70" rx="6" class="c-mask"/>
-          <rect x="1110" y="80" width="220" height="70" rx="6" class="c-security" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="security" class="semantic-sigil s-security" transform="translate(1116 86) scale(0.6875)">
+          <rect x="720" y="80" width="225" height="70" rx="6" class="c-mask"/>
+          <rect x="720" y="80" width="225" height="70" rx="6" class="c-security" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="security" class="semantic-sigil s-security" transform="translate(726 86) scale(0.6875)">
             <path d="M8 2.2 13 4v3.5c0 3.1-1.8 5.4-5 6.5-3.2-1.1-5-3.4-5-6.5V4Z"/>
             <path d="m5.8 8 1.5 1.5 3-3"/>
           </g>
-          <text data-detail-anchor x="1220" y="113" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">Isolated Session File</text>
-        <text data-detail="context" x="1220" y="129" class="t-muted" font-size="9" text-anchor="middle">Cookie/session bytes：仅本机私有</text>
-        <text data-detail="fine" x="1220" y="142" class="t-security" font-size="7" text-anchor="middle">never in JSON</text>
-        </g>
-
-        <g id="node-local_preflight_result" data-node-id="local_preflight_result" data-node-label="local_preflight_passed" tabindex="0" role="button" aria-label="Focus local_preflight_passed, 本地终点：不创建 Playwright, 一键发受控本机边界" aria-pressed="false" data-node-kind="security" data-node-sublabel="本地终点：不创建 Playwright" data-node-tag="platformWriteOccurred=false" data-node-context="一键发受控本机边界">
-          <title>local_preflight_passed · 本地终点：不创建 Playwright · 一键发受控本机边界 · platformWriteOccurred=false</title>
-          <rect x="865" y="505" width="220" height="70" rx="6" class="c-mask"/>
-          <rect x="865" y="505" width="220" height="70" rx="6" class="c-security" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="security" class="semantic-sigil s-security" transform="translate(871 511) scale(0.6875)">
-            <path d="M8 2.2 13 4v3.5c0 3.1-1.8 5.4-5 6.5-3.2-1.1-5-3.4-5-6.5V4Z"/>
-            <path d="m5.8 8 1.5 1.5 3-3"/>
-          </g>
-          <text data-detail-anchor x="975" y="538" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">local_preflight_passed</text>
-        <text data-detail="context" x="975" y="554" class="t-muted" font-size="9" text-anchor="middle">本地终点：不创建 Playwright</text>
-        <text data-detail="fine" x="975" y="567" class="t-security" font-size="7" text-anchor="middle">platformWriteOccurred=false</text>
+          <text data-detail-anchor x="832.5" y="113" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">Isolated Session File</text>
+        <text data-detail="context" x="832.5" y="129" class="t-muted" font-size="9" text-anchor="middle">Cookie/session bytes：仅本机私有</text>
+        <text data-detail="fine" x="832.5" y="142" class="t-security" font-size="7" text-anchor="middle">never in JSON</text>
         </g>
 
         <g id="node-task_db" data-node-id="task_db" data-node-label="Task DB" tabindex="0" role="button" aria-label="Focus Task DB, events / receipts / heartbeat, 一键发受控本机边界" aria-pressed="false" data-node-kind="database" data-node-sublabel="events / receipts / heartbeat" data-node-context="一键发受控本机边界">
           <title>Task DB · events / receipts / heartbeat · 一键发受控本机边界</title>
-          <rect x="655" y="505" width="185" height="70" rx="6" class="c-mask"/>
-          <rect x="655" y="505" width="185" height="70" rx="6" class="c-database" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="database" class="semantic-sigil s-database" transform="translate(661 511) scale(0.6875)">
+          <rect x="255" y="505" width="190" height="70" rx="6" class="c-mask"/>
+          <rect x="255" y="505" width="190" height="70" rx="6" class="c-database" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="database" class="semantic-sigil s-database" transform="translate(261 511) scale(0.6875)">
             <ellipse cx="8" cy="4" rx="5" ry="2"/>
             <path d="M3 4v8c0 1.1 2.2 2 5 2s5-.9 5-2V4M3 8c0 1.1 2.2 2 5 2s5-.9 5-2"/>
           </g>
-          <text data-detail-anchor x="747.5" y="538" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">Task DB</text>
-        <text data-detail="context" x="747.5" y="554" class="t-muted" font-size="9" text-anchor="middle">events / receipts / heartbeat</text>
+          <text data-detail-anchor x="350" y="538" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">Task DB</text>
+        <text data-detail="context" x="350" y="554" class="t-muted" font-size="9" text-anchor="middle">events / receipts / heartbeat</text>
         </g>
 
         <g id="node-user_verification" data-node-id="user_verification" data-node-label="User Verification" tabindex="0" role="button" aria-label="Focus User Verification, CAPTCHA / 二次验证 / 风控由用户处理, TikTok 外部平台与人工安全步骤" aria-pressed="false" data-node-kind="external" data-node-sublabel="CAPTCHA / 二次验证 / 风控由用户处理" data-node-context="TikTok 外部平台与人工安全步骤">
           <title>User Verification · CAPTCHA / 二次验证 / 风控由用户处理 · TikTok 外部平台与人工安全步骤</title>
-          <rect x="1110" y="505" width="220" height="70" rx="6" class="c-mask"/>
-          <rect x="1110" y="505" width="220" height="70" rx="6" class="c-external" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="external" class="semantic-sigil s-external" transform="translate(1116 511) scale(0.6875)">
+          <rect x="720" y="505" width="225" height="70" rx="6" class="c-mask"/>
+          <rect x="720" y="505" width="225" height="70" rx="6" class="c-external" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="external" class="semantic-sigil s-external" transform="translate(726 511) scale(0.6875)">
             <rect x="2.5" y="5" width="8.5" height="8" rx="1.5"/>
             <path d="M8 2.5h5.5V8M13.5 2.5 7.5 8.5"/>
           </g>
-          <text data-detail-anchor x="1220" y="538" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">User Verification</text>
-        <text data-detail="context" x="1220" y="554" class="t-muted" font-size="9" text-anchor="middle">CAPTCHA / 二次验证 / 风控由用户处理</text>
+          <text data-detail-anchor x="832.5" y="538" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">User Verification</text>
+        <text data-detail="context" x="832.5" y="554" class="t-muted" font-size="9" text-anchor="middle">CAPTCHA / 二次验证 / 风控由用户处理</text>
         </g>
 
         <!-- Connection labels -->
-        <g data-detail="context" data-edge-from="content_ui" data-edge-to="controlled_cli" data-edge-label="manifest + accountId" data-edge-key="0" data-edge-id="content-to-cli">
-          <rect x="179.5" y="280" width="106" height="14" rx="3" class="c-mask"/>
-          <text x="232.5" y="290" class="t-backend" font-size="8" text-anchor="middle">manifest + accountId</text>
+        <g data-detail="context" data-edge-from="content_ui" data-edge-to="controlled_publish" data-edge-label="结构化内容包 + accountId" data-edge-key="0" data-edge-id="content-to-contract">
+          <rect x="70.4" y="158" width="125.19999999999999" height="14" rx="3" class="c-mask"/>
+          <text x="133" y="168" class="t-security" font-size="8" text-anchor="middle">结构化内容包 + accountId</text>
         </g>
-        <g data-detail="context" data-edge-from="controlled_cli" data-edge-to="controlled_publish" data-edge-label="受控 request JSON" data-edge-key="1" data-edge-id="cli-to-contract">
-          <rect x="381.7" y="374" width="91.6" height="14" rx="3" class="c-mask"/>
-          <text x="427.5" y="384" class="t-security" font-size="8" text-anchor="middle">受控 request JSON</text>
+        <g data-detail="context" data-edge-from="controlled_publish" data-edge-to="publish_service" data-edge-label="快照 + 一次性授权" data-edge-key="1" data-edge-id="contract-to-service">
+          <rect x="196.7" y="280" width="91.6" height="14" rx="3" class="c-mask"/>
+          <text x="242.5" y="290" class="t-security" font-size="8" text-anchor="middle">快照 + 一次性授权</text>
         </g>
-        <g data-detail="context" data-edge-from="controlled_publish" data-edge-to="publish_service" data-edge-label="快照 + 一次性授权" data-edge-key="2" data-edge-id="contract-to-service">
-          <rect x="596.7" y="280" width="91.6" height="14" rx="3" class="c-mask"/>
-          <text x="642.5" y="290" class="t-security" font-size="8" text-anchor="middle">快照 + 一次性授权</text>
+        <g data-detail="context" data-edge-from="publish_service" data-edge-to="tiktok_publish_service" data-edge-label="platform_form_check / formal" data-edge-key="2" data-edge-id="service-to-tiktok">
+          <rect x="475.3" y="374" width="144.4" height="14" rx="3" class="c-mask"/>
+          <text x="547.5" y="384" class="t-backend" font-size="8" text-anchor="middle">platform_form_check / formal</text>
         </g>
-        <g data-detail="context" data-edge-from="publish_service" data-edge-to="local_preflight_result" data-edge-label="preflight：本地只读后终止" data-edge-key="3" data-edge-id="service-to-preflight-result">
-          <rect x="787.5" y="444.5" width="130" height="14" rx="3" class="c-mask"/>
-          <text x="852.5" y="454.5" class="t-messagebus" font-size="8" text-anchor="middle">preflight：本地只读后终止</text>
+        <g data-detail="context" data-edge-from="tiktok_publish_service" data-edge-to="tiktok_uploader" data-edge-label="同一字段与回读实现" data-edge-key="3" data-edge-id="tiktok-to-uploader">
+          <rect x="659.3" y="280" width="96.39999999999999" height="14" rx="3" class="c-mask"/>
+          <text x="707.5" y="290" class="t-backend" font-size="8" text-anchor="middle">同一字段与回读实现</text>
         </g>
-        <g data-detail="context" data-edge-from="publish_service" data-edge-to="tiktok_publish_service" data-edge-label="platform_form_check / formal" data-edge-key="4" data-edge-id="service-to-tiktok">
-          <rect x="870.3" y="367" width="144.4" height="14" rx="3" class="c-mask"/>
-          <text x="942.5" y="377" class="t-backend" font-size="8" text-anchor="middle">platform_form_check / formal</text>
+        <g data-detail="context" data-edge-from="tiktok_uploader" data-edge-to="tiktok_schedule_form" data-edge-label="表单快照 + 定时意图" data-edge-key="4" data-edge-id="uploader-to-schedule-form">
+          <rect x="906.9" y="280" width="101.2" height="14" rx="3" class="c-mask"/>
+          <text x="957.5" y="290" class="t-backend" font-size="8" text-anchor="middle">表单快照 + 定时意图</text>
         </g>
-        <g data-detail="context" data-edge-from="tiktok_publish_service" data-edge-to="tiktok_uploader" data-edge-label="同一字段与回读实现" data-edge-key="5" data-edge-id="tiktok-to-uploader">
-          <rect x="1049.3" y="280" width="96.39999999999999" height="14" rx="3" class="c-mask"/>
-          <text x="1097.5" y="290" class="t-backend" font-size="8" text-anchor="middle">同一字段与回读实现</text>
+        <g data-detail="context" data-edge-from="tiktok_schedule_form" data-edge-to="tiktok_studio" data-edge-label="唯一 Post 或 Schedule" data-edge-key="5" data-edge-id="schedule-form-to-studio">
+          <rect x="1174.6" y="374" width="110.8" height="14" rx="3" class="c-mask"/>
+          <text x="1230" y="384" class="t-backend" font-size="8" text-anchor="middle">唯一 Post 或 Schedule</text>
         </g>
-        <g data-detail="context" data-edge-from="tiktok_uploader" data-edge-to="tiktok_studio" data-edge-label="Playwright：upload / readback / one Post" data-edge-key="6" data-edge-id="uploader-to-studio">
-          <rect x="1244" y="374" width="202" height="14" rx="3" class="c-mask"/>
-          <text x="1345" y="384" class="t-backend" font-size="8" text-anchor="middle">Playwright：upload / readback / one Post</text>
+        <g data-detail="context" data-edge-from="account_db" data-edge-to="identity_reader" data-edge-label="saved accountReference" data-edge-key="6" data-edge-id="account-to-identity">
+          <rect x="399.7" y="65" width="115.6" height="14" rx="3" class="c-mask"/>
+          <text x="457.5" y="75" class="t-security" font-size="8" text-anchor="middle">saved accountReference</text>
         </g>
-        <g data-detail="context" data-edge-from="account_db" data-edge-to="identity_reader" data-edge-label="saved accountReference" data-edge-key="7" data-edge-id="account-to-identity">
-          <rect x="794.7" y="65" width="115.6" height="14" rx="3" class="c-mask"/>
-          <text x="852.5" y="75" class="t-security" font-size="8" text-anchor="middle">saved accountReference</text>
+        <g data-detail="context" data-edge-from="session_file" data-edge-to="identity_reader" data-edge-label="isolated storage_state" data-edge-key="7" data-edge-id="session-to-identity">
+          <rect x="649.7" y="65" width="115.6" height="14" rx="3" class="c-mask"/>
+          <text x="707.5" y="75" class="t-security" font-size="8" text-anchor="middle">isolated storage_state</text>
         </g>
-        <g data-detail="context" data-edge-from="session_file" data-edge-to="identity_reader" data-edge-label="isolated storage_state" data-edge-key="8" data-edge-id="session-to-identity">
-          <rect x="1039.7" y="65" width="115.6" height="14" rx="3" class="c-mask"/>
-          <text x="1097.5" y="75" class="t-security" font-size="8" text-anchor="middle">isolated storage_state</text>
+        <g data-detail="context" data-edge-from="identity_reader" data-edge-to="tiktok_publish_service" data-edge-label="matched public handle" data-edge-key="8" data-edge-id="identity-to-tiktok">
+          <rect x="527.1" y="155" width="110.8" height="14" rx="3" class="c-mask"/>
+          <text x="582.5" y="165" class="t-security" font-size="8" text-anchor="middle">matched public handle</text>
         </g>
-        <g data-detail="context" data-edge-from="identity_reader" data-edge-to="tiktok_publish_service" data-edge-label="matched public handle" data-edge-key="9" data-edge-id="identity-to-tiktok">
-          <rect x="919.6" y="155" width="110.8" height="14" rx="3" class="c-mask"/>
-          <text x="975" y="165" class="t-security" font-size="8" text-anchor="middle">matched public handle</text>
+        <g data-detail="context" data-edge-from="session_file" data-edge-to="tiktok_uploader" data-edge-label="private session only" data-edge-key="9" data-edge-id="session-to-uploader">
+          <rect x="779.5" y="155" width="106" height="14" rx="3" class="c-mask"/>
+          <text x="832.5" y="165" class="t-security" font-size="8" text-anchor="middle">private session only</text>
         </g>
-        <g data-detail="context" data-edge-from="session_file" data-edge-to="tiktok_uploader" data-edge-label="private session only" data-edge-key="10" data-edge-id="session-to-uploader">
-          <rect x="1167" y="155" width="106" height="14" rx="3" class="c-mask"/>
-          <text x="1220" y="165" class="t-security" font-size="8" text-anchor="middle">private session only</text>
+        <g data-detail="context" data-edge-from="publish_service" data-edge-to="task_db" data-edge-label="events / receipts / heartbeat" data-edge-key="10" data-edge-id="service-to-task-db">
+          <rect x="275.4" y="374" width="149.2" height="14" rx="3" class="c-mask"/>
+          <text x="350" y="384" class="t-messagebus" font-size="8" text-anchor="middle">events / receipts / heartbeat</text>
         </g>
-        <g data-detail="context" data-edge-from="publish_service" data-edge-to="task_db" data-edge-label="events / receipts / heartbeat" data-edge-key="11" data-edge-id="service-to-task-db">
-          <rect x="672.9" y="374" width="149.2" height="14" rx="3" class="c-mask"/>
-          <text x="747.5" y="384" class="t-messagebus" font-size="8" text-anchor="middle">events / receipts / heartbeat</text>
+        <g data-detail="context" data-edge-from="tiktok_uploader" data-edge-to="user_verification" data-edge-label="触发验证：同一页面等待" data-edge-key="11" data-edge-id="uploader-to-verification">
+          <rect x="687.7" y="374" width="115.6" height="14" rx="3" class="c-mask"/>
+          <text x="745.5" y="384" class="t-security" font-size="8" text-anchor="middle">触发验证：同一页面等待</text>
         </g>
-        <g data-detail="context" data-edge-from="tiktok_uploader" data-edge-to="user_verification" data-edge-label="触发验证：同一页面等待" data-edge-key="12" data-edge-id="uploader-to-verification">
-          <rect x="1075.2" y="374" width="115.6" height="14" rx="3" class="c-mask"/>
-          <text x="1133" y="384" class="t-security" font-size="8" text-anchor="middle">触发验证：同一页面等待</text>
-        </g>
-        <g data-detail="context" data-edge-from="user_verification" data-edge-to="tiktok_uploader" data-edge-label="验证完成：同页继续" data-edge-key="13" data-edge-id="verification-to-uploader">
-          <rect x="1248.8" y="460" width="96.39999999999999" height="14" rx="3" class="c-mask"/>
-          <text x="1297" y="470" class="t-security" font-size="8" text-anchor="middle">验证完成：同页继续</text>
+        <g data-detail="context" data-edge-from="user_verification" data-edge-to="tiktok_uploader" data-edge-label="验证完成：同页继续" data-edge-key="12" data-edge-id="verification-to-uploader">
+          <rect x="861.3" y="460" width="96.39999999999999" height="14" rx="3" class="c-mask"/>
+          <text x="909.5" y="470" class="t-security" font-size="8" text-anchor="middle">验证完成：同页继续</text>
         </g>
 
         <!-- Legend -->
@@ -5400,9 +5383,9 @@
           <h3>首轮范围</h3>
         </div>
         <ul>
-          <li>&bull; 单 TikTok 账号、单本地视频、立即公开</li>
-          <li>&bull; 默认 preflight 只读本地 manifest、账号记录和素材，在 local_preflight_passed 终止，不创建 Playwright</li>
-          <li>&bull; 内容项目与 Desktop UI 共用 Controlled CLI 和 Publish Service</li>
+          <li>&bull; 单 TikTok 账号、单本地视频、立即或平台原生定时公开</li>
+          <li>&bull; controlled_publish 经 publish_service 进入唯一 TikTok 发布链</li>
+          <li>&bull; TiktokVideo 复用同一 Playwright Page 填写表单与回读</li>
         </ul>
       </div>
 
@@ -5412,9 +5395,9 @@
           <h3>平台写入与最终动作</h3>
         </div>
         <ul>
-          <li>&bull; platform_form_check 会上传并填写，必须停在 Post 前</li>
-          <li>&bull; formal 仅在消费一次性授权后允许一次 Post</li>
-          <li>&bull; 最终动作后结果不明只读核对，禁止自动重发</li>
+          <li>&bull; platform_form_check 会上传并填写，必须停在 Post / Schedule 前</li>
+          <li>&bull; formal 仅在消费一次性授权后允许一次 Post 或 Schedule</li>
+          <li>&bull; tiktok_schedule_unavailable 在最终动作前失败，禁止回退 Post</li>
         </ul>
       </div>
 
