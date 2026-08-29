@@ -1406,7 +1406,7 @@ class FacebookPageFormalClaimTests(unittest.TestCase):
                 url="https://www.facebook.com/reel/new-reel",
                 published_at=published_at,
             ),
-            new_count=2,
+            new_count=1,
             matching_count=1,
         )
 

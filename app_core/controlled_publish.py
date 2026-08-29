@@ -75,7 +75,9 @@ _YOUTUBE_VISIBILITIES = frozenset(
 )
 _SAFE_SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _FACEBOOK_PAGE_CLAIM_TRANSITIONS = {
-    "reserved": frozenset({"final_action_claimed", "safe_failed"}),
+    "reserved": frozenset(
+        {"final_action_claimed", "ambiguous", "safe_failed"}
+    ),
     "final_action_claimed": frozenset({"final_action_clicked", "ambiguous"}),
     "final_action_clicked": frozenset({"succeeded", "ambiguous"}),
     "ambiguous": frozenset({"succeeded", "confirmed_not_published"}),
@@ -1910,7 +1912,7 @@ def _safe_facebook_reel_match(
             type(value.status) is not str
             or value.status != "unique"
             or type(value.new_count) is not int
-            or value.new_count < 1
+            or value.new_count != 1
             or type(value.matching_count) is not int
             or value.matching_count != 1
             or type(reel_receipt) is not task7_types[1]
@@ -1956,6 +1958,11 @@ def _safe_facebook_reel_match(
         ) from exc
     if (
         safe_receipt.get("pageId") != expected_page_reference
+        or safe_receipt.get("url")
+        != (
+            "https://www.facebook.com/reel/"
+            f"{safe_receipt.get('reelId') or ''}"
+        )
         or safe_receipt.get("reelId") in old_reel_ids
         or published.astimezone(timezone.utc) < clicked.astimezone(timezone.utc)
     ):
@@ -2572,6 +2579,7 @@ def reconcile_facebook_page_publish_outcome(task_id: int) -> dict[str, object]:
             message="Facebook Page 新 Reel 已通过同页内容列表唯一回读",
             receipt={"pageId": page_id, "reelMatch": match},
             _expected_state=state,
+            _allow_reconcile_idempotence=True,
         )
         task_service.mark_facebook_result(
             int(task_id),
@@ -2598,6 +2606,7 @@ def reconcile_facebook_page_publish_outcome(task_id: int) -> dict[str, object]:
                 message="Facebook Page 已进入只读结果核对边界",
                 receipt={"pageId": page_id, "phase": "ambiguous"},
                 _expected_state="final_action_clicked",
+                _allow_reconcile_idempotence=True,
             )
             confirmation_state = "ambiguous"
         task_service.record_facebook_progress(
@@ -2607,6 +2616,7 @@ def reconcile_facebook_page_publish_outcome(task_id: int) -> dict[str, object]:
             receipt={"pageId": page_id, "phase": "confirmed_not_published"},
             _expected_state=confirmation_state,
             _allow_stored_rejected_decision=True,
+            _allow_reconcile_idempotence=True,
         )
     elif state != "ambiguous":
         task_service.record_facebook_progress(

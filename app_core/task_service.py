@@ -183,10 +183,36 @@ _FACEBOOK_PHASE_EVENT = {
     "final_action_claimed": "facebook_final_action_claimed",
     "final_action_clicked": "facebook_final_action_clicked",
     "platform_accepted": "facebook_platform_accepted",
-    "published_readback_confirmed": "facebook_publish_readback_confirmed",
+    "published_readback_confirmed": "facebook_readback_unique",
     "failed": "facebook_publish_failed",
     "confirmed_not_published": "facebook_confirmed_not_published",
     "ambiguous": "facebook_publish_outcome_ambiguous",
+}
+_FACEBOOK_IRREVERSIBLE_EVIDENCE_EVENTS = frozenset(
+    {
+        "facebook_final_action_claimed",
+        "facebook_final_action_clicked",
+        "facebook_platform_decision_observed",
+        "facebook_platform_accepted",
+        "facebook_readback_unique",
+        "facebook_readback_none",
+        "facebook_readback_mismatch",
+        "facebook_publish_outcome_ambiguous",
+        "facebook_publish_readback_confirmed",
+        "facebook_success_persistence_repair_required",
+        "facebook_confirmed_not_published",
+        "facebook_success_projection_repaired",
+    }
+)
+_FACEBOOK_NONTRANSITION_PHASES_BY_CLAIM = {
+    "reserved": frozenset(
+        {
+            "local_validation_passed",
+            "waiting_user_verification",
+            "platform_form_verified",
+        }
+    ),
+    "final_action_clicked": frozenset({"platform_accepted"}),
 }
 
 
@@ -2076,28 +2102,44 @@ def touch_task_heartbeat(task_id: int) -> bool:
     return updated.rowcount == 1
 
 
+_FACEBOOK_ERROR_PUBLIC_MESSAGES = {
+    "facebook_publish_readback_mismatch": "Facebook Page readback mismatch",
+    "facebook_publish_outcome_unknown": "Facebook Page 发布结果尚未唯一确认",
+    "facebook_worker_interrupted": "Facebook Page worker 在最终动作前已安全停止",
+    "facebook_publish_rejected": "Facebook Page 已确认未创建目标 Reel",
+    "facebook_publish_failed": "Facebook Page 发布未完成",
+}
+_FACEBOOK_PHASE_PUBLIC_MESSAGES = {
+    "local_validation_passed": "Facebook Page 本地校验已通过",
+    "waiting_user_verification": "Facebook Page 需要在同一可见窗口完成安全验证",
+    "platform_form_verified": "Facebook Page 表单已按授权快照回读",
+    "final_action_claimed": "Facebook Page 最终动作 claim 已持久化",
+    "final_action_clicked": "Facebook Page 最终动作已记录",
+    "platform_accepted": "Facebook Page 平台反馈已记录，尚未确认 Reel",
+    "published_readback_confirmed": "Facebook Page 新 Reel 已唯一回读",
+    "failed": "Facebook Page 发布未完成",
+    "confirmed_not_published": "Facebook Page 已确认未创建目标 Reel",
+    "ambiguous": "Facebook Page 发布结果尚未唯一确认",
+}
+
+
+def _facebook_public_message(phase: str, error_code: str) -> str:
+    """Return only reviewed lifecycle text; never persist caller diagnostics."""
+
+    return _FACEBOOK_ERROR_PUBLIC_MESSAGES.get(
+        error_code,
+        _FACEBOOK_PHASE_PUBLIC_MESSAGES[phase],
+    )
+
+
 def _redact_facebook_message(value: object) -> str:
-    """Keep a bounded diagnostic while removing credentials and local paths."""
+    """Project historical rows only when their text is on the reviewed allowlist."""
 
     message = " ".join(str(value or "").split())
-    message = re.sub(
-        r"(?i)\b(?:cookie|authorization|token|access[_-]?token|verificationcode|"
-        r"password|secret|sessionpath)"
-        r"\s*[:=]\s*[^\s;,]+",
-        "[redacted]",
-        message,
+    allowed = frozenset(
+        (*_FACEBOOK_ERROR_PUBLIC_MESSAGES.values(), *_FACEBOOK_PHASE_PUBLIC_MESSAGES.values())
     )
-    message = re.sub(
-        r"(?i)\bbearer\s+[^\s;,]+",
-        "[redacted]",
-        message,
-    )
-    message = re.sub(
-        r"/(?:Users|private|var|tmp)/[^\s;,]+",
-        "[local-path]",
-        message,
-    )
-    return message[:500]
+    return message if message in allowed else "Facebook Page 状态已更新"
 
 
 def _facebook_public_phase(value: object) -> str:
@@ -2183,7 +2225,6 @@ def _write_facebook_task_projection_in_transaction(
         "failed",
     }:
         raise ValueError("Facebook Page 任务状态无效")
-    public_message = _redact_facebook_message(message)
     safe_error = "" if item_status in {
         "running",
         "waiting_user_verification",
@@ -2195,6 +2236,7 @@ def _write_facebook_task_projection_in_transaction(
             if public_phase == "confirmed_not_published"
             else "facebook_publish_failed"
         )
+    public_message = _facebook_public_message(public_phase, safe_error)
     try:
         safe_receipt = project_facebook_page_receipt(receipt)
     except ValueError as exc:
@@ -2293,6 +2335,7 @@ def record_facebook_progress(
     _expected_state: str | None = None,
     _require_unleased: bool = False,
     _allow_stored_rejected_decision: bool = False,
+    _allow_reconcile_idempotence: bool = False,
 ) -> None:
     """Atomically persist one Page claim edge and its public task projection."""
 
@@ -2330,6 +2373,134 @@ def record_facebook_progress(
                 "confirmed_not_published": "confirmed_not_published",
                 "failed": "safe_failed",
             }.get(public_phase)
+            platform_decision: dict[str, object] | None = None
+            decision_only_write = False
+            if "platformDecision" in receipt:
+                if (
+                    desired_state == current_state
+                    and current_state != "final_action_clicked"
+                ):
+                    raise controlled_publish.ControlledPublishError(
+                        "facebook_claim_lifecycle_invalid",
+                        "Facebook Page 平台决定无法在当前 claim 自跳。",
+                    )
+                platform_decision = (
+                    controlled_publish._safe_facebook_platform_decision(
+                        receipt.get("platformDecision"),
+                        expected_page_reference=expected_page,
+                    )
+                )
+                if not platform_decision:
+                    raise controlled_publish.ControlledPublishError(
+                        "facebook_claim_lifecycle_invalid",
+                        "Facebook Page 平台决定必须是已封存类型。",
+                    )
+                evidence = (
+                    controlled_publish._validated_facebook_page_claim_evidence(
+                        claim
+                    )
+                )
+                stored_decision = evidence.get("decision")
+                if stored_decision not in (None, platform_decision):
+                    raise controlled_publish.ControlledPublishError(
+                        "facebook_claim_lifecycle_invalid",
+                        "Facebook Page 已存平台决定不可改写。",
+                    )
+                decision_only_write = (
+                    current_state == "final_action_clicked"
+                    and desired_state == "final_action_clicked"
+                )
+                if decision_only_write:
+                    decision_json = controlled_publish._canonical_safe_json(
+                        platform_decision
+                    )
+                    decision_hash = controlled_publish._canonical_safe_hash(
+                        platform_decision
+                    )
+                    updated = conn.execute(
+                        """
+                        UPDATE facebook_page_publish_claims
+                        SET platformDecisionJson = ?, platformDecisionHash = ?,
+                            updatedAt = ?
+                        WHERE taskId = ? AND state = 'final_action_clicked'
+                        """,
+                        (
+                            decision_json,
+                            decision_hash,
+                            _now(),
+                            int(task_id),
+                        ),
+                    )
+                    if updated.rowcount != 1:
+                        raise controlled_publish.ControlledPublishError(
+                            "facebook_claim_lifecycle_invalid",
+                            "Facebook Page 平台决定持久化时 claim 已变化。",
+                        )
+            if (
+                _allow_reconcile_idempotence
+                and desired_state == current_state
+                and current_state
+                in {"ambiguous", "succeeded", "confirmed_not_published"}
+            ):
+                evidence = (
+                    controlled_publish._validated_facebook_page_claim_evidence(
+                        claim
+                    )
+                )
+                if current_state == "succeeded":
+                    candidate = controlled_publish._safe_facebook_reel_match(
+                        receipt.get("reelMatch"),
+                        expected_page_reference=expected_page,
+                        baseline=evidence["baseline"],
+                        form_snapshot=evidence["formSnapshot"],
+                        clicked_at=str(evidence["clickedAt"]),
+                    )
+                    existing = dict(evidence["receipt"])
+                    if any(
+                        candidate.get(key) != existing.get(key)
+                        for key in ("pageId", "reelId", "url", "publishedAt")
+                    ):
+                        raise controlled_publish.ControlledPublishError(
+                            "facebook_claim_lifecycle_invalid",
+                            "Facebook Page 并发核对终态回执不一致。",
+                        )
+                elif current_state == "confirmed_not_published" and (
+                    not isinstance(evidence.get("decision"), Mapping)
+                    or evidence["decision"].get("kind")
+                    != "rejected_no_creation"
+                ):
+                    raise controlled_publish.ControlledPublishError(
+                        "facebook_claim_lifecycle_invalid",
+                        "Facebook Page 并发未发布终态证据无效。",
+                    )
+                conn.rollback()
+                return
+            if current_state in controlled_publish._FACEBOOK_PAGE_TERMINAL_STATES:
+                raise controlled_publish.ControlledPublishError(
+                    "facebook_claim_lifecycle_invalid",
+                    "Facebook Page 终态 claim 不接受普通进度回写。",
+                )
+            if (
+                desired_state == current_state
+                and platform_decision is None
+                and not _allow_reconcile_idempotence
+            ):
+                raise controlled_publish.ControlledPublishError(
+                    "facebook_claim_lifecycle_invalid",
+                    "Facebook Page claim 不允许无证据自跳。",
+                )
+            if (
+                desired_state is None
+                and public_phase
+                not in _FACEBOOK_NONTRANSITION_PHASES_BY_CLAIM.get(
+                    current_state,
+                    frozenset(),
+                )
+            ):
+                raise controlled_publish.ControlledPublishError(
+                    "facebook_claim_lifecycle_invalid",
+                    "Facebook Page 进度与当前 claim 阶段不一致。",
+                )
             authoritative_receipt: Mapping[str, object] = receipt
             if (
                 _expected_state is not None
@@ -2385,6 +2556,11 @@ def record_facebook_progress(
                     if public_phase == "published_readback_confirmed"
                     else None
                 ),
+                event_type=(
+                    "facebook_platform_decision_observed"
+                    if decision_only_write
+                    else None
+                ),
             )
             conn.commit()
         except Exception:
@@ -2411,7 +2587,7 @@ def mark_facebook_result(
         conn.commit()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            _facebook_task_item_in_transaction(conn, int(task_id))
+            item = _facebook_task_item_in_transaction(conn, int(task_id))
             row = conn.execute(
                 "SELECT * FROM facebook_page_publish_claims WHERE taskId = ?",
                 (int(task_id),),
@@ -2447,6 +2623,29 @@ def mark_facebook_result(
                             )
                 public_phase = "published_readback_confirmed"
                 safe_code = ""
+                if (
+                    str(item["status"] or "") == "success"
+                    and str(item["taskStatus"] or "") == "success"
+                ):
+                    try:
+                        existing_receipt = project_facebook_page_receipt(
+                            json.loads(str(item["receiptJson"] or "{}"))
+                        )
+                    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                        raise controlled_publish.ControlledPublishError(
+                            "facebook_claim_lifecycle_invalid",
+                            "Facebook Page 已成功任务投影回执无效。",
+                        ) from exc
+                    if any(
+                        existing_receipt.get(key) != authoritative.get(key)
+                        for key in ("pageId", "reelId", "url", "publishedAt")
+                    ):
+                        raise controlled_publish.ControlledPublishError(
+                            "facebook_claim_lifecycle_invalid",
+                            "Facebook Page 已成功任务投影与 claim 不一致。",
+                        )
+                    conn.rollback()
+                    return
             elif ok:
                 raise controlled_publish.ControlledPublishError(
                     "facebook_claim_lifecycle_invalid",
@@ -2541,27 +2740,32 @@ def _reconcile_stale_facebook_page_claim_in_transaction(
             event_type="facebook_success_projection_repaired",
         )
     if state == "reserved":
+        event_names = tuple(sorted(_FACEBOOK_IRREVERSIBLE_EVIDENCE_EVENTS))
+        placeholders = ",".join("?" for _ in event_names)
         boundary = conn.execute(
-            """
+            f"""
             SELECT 1 FROM publish_task_events
-            WHERE taskId = ? AND eventType IN (
-                'facebook_final_action_claimed',
-                'facebook_final_action_clicked',
-                'facebook_publish_outcome_ambiguous'
-            ) LIMIT 1
+            WHERE taskId = ? AND eventType IN ({placeholders}) LIMIT 1
             """,
-            (int(task_id),),
+            (int(task_id), *event_names),
         ).fetchone()
         if boundary is not None:
-            # A contradictory boundary cannot release replay.  Keep the claim
-            # blocking and surface the uncertainty without inventing an edge.
+            transition = (
+                controlled_publish._mark_facebook_page_checkpoint_in_transaction(
+                    conn,
+                    int(task_id),
+                    expected_state="reserved",
+                    new_state="ambiguous",
+                    receipt=page_receipt,
+                )
+            )
             return _write_facebook_task_projection_in_transaction(
                 conn,
                 int(task_id),
                 phase="ambiguous",
                 message="Facebook Page 存在最终动作记录，必须只读核对",
                 error_code="facebook_publish_outcome_unknown",
-                receipt=page_receipt,
+                receipt=dict(transition["receipt"]),
             )
         transition = controlled_publish._mark_facebook_page_checkpoint_in_transaction(
             conn,
@@ -2848,7 +3052,34 @@ def _reconcile_stale_controlled_task_in_transaction(
         "oneclick_matrix_local_check",
         "oneclick_matrix_preflight",
         "oneclick_matrix_publish",
-    } or str(row["status"] or "") not in {"pending", "running"}:
+    }:
+        return False
+    payloads = _payloads_from_json(row["payloadJson"])
+    is_facebook_page_task = (
+        len(payloads) == 1 and int(payloads[0].get("type") or 0) == 9
+    )
+    has_facebook_page_claim = False
+    if is_facebook_page_task:
+        claim_table = conn.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'facebook_page_publish_claims'
+            """
+        ).fetchone()
+        if claim_table is not None:
+            has_facebook_page_claim = (
+                conn.execute(
+                    "SELECT 1 FROM facebook_page_publish_claims WHERE taskId = ?",
+                    (int(task_id),),
+                ).fetchone()
+                is not None
+            )
+    active_statuses = (
+        {"pending", "running", "waiting_user_verification"}
+        if has_facebook_page_claim
+        else {"pending", "running"}
+    )
+    if str(row["status"] or "") not in active_statuses:
         return False
     worker_pid = int(row["workerPid"] or 0) if "workerPid" in row.keys() else 0
     if worker_pid > 0:
@@ -2867,27 +3098,11 @@ def _reconcile_stale_controlled_task_in_transaction(
     if (current - reference).total_seconds() <= max(1, int(lease_seconds)):
         return False
     youtube_has_known_video = bool(row["youtubeHasKnownVideo"])
-    payloads = _payloads_from_json(row["payloadJson"])
-    is_facebook_page_task = (
-        len(payloads) == 1 and int(payloads[0].get("type") or 0) == 9
-    )
-    if is_facebook_page_task:
-        claim_table = conn.execute(
-            """
-            SELECT 1 FROM sqlite_master
-            WHERE type = 'table' AND name = 'facebook_page_publish_claims'
-            """
-        ).fetchone()
-        if claim_table is not None:
-            claim = conn.execute(
-                "SELECT 1 FROM facebook_page_publish_claims WHERE taskId = ?",
-                (int(task_id),),
-            ).fetchone()
-            if claim is not None:
-                return _reconcile_stale_facebook_page_claim_in_transaction(
-                    conn,
-                    int(task_id),
-                )
+    if has_facebook_page_claim:
+        return _reconcile_stale_facebook_page_claim_in_transaction(
+            conn,
+            int(task_id),
+        )
     is_tiktok_task = (
         len(payloads) == 1 and int(payloads[0].get("type") or 0) == 6
     )
