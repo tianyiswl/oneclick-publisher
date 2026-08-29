@@ -4869,7 +4869,7 @@
       </div>
     </div>
 
-    <script id="archify-guided-views-data" type="application/json">[{"id":"formal-main-path","label":"正式发布主链","focus":["local_preflight_passed","platform_page_active","platform_form_verified","final_action_triggered","platform_accepted","published_readback_confirmed"],"note":"表单核对后恰好一次 Post 或 Schedule；平台受理与最终回读是分层证据。"},{"id":"form-check-stop","label":"平台表单检查","focus":["local_preflight_passed","platform_page_active","platform_form_verified","failed_before_final_action"],"note":"platform_form_check 会发生上传写入；定时控件不可用或失败时在最终动作前终止。"},{"id":"failure-and-ambiguity","label":"失败、结果不明与防重复","focus":["scheduled_accepted","scheduled_readback_confirmed","failed_before_final_action","final_action_triggered","ambiguous","duplicate_blocked"],"note":"定时受理后的唯一列表回读失败进入 ambiguous；排期回读确认时 publishedAt=null，不等于已发布。"}]</script>
+    <script id="archify-guided-views-data" type="application/json">[{"id":"formal-main-path","label":"正式发布主链","focus":["local_preflight_passed","platform_page_active","platform_form_verified","final_action_triggered","platform_accepted","published_readback_confirmed"],"note":"表单核对后恰好一次 Post 或 Schedule；平台受理与最终回读是分层证据。"},{"id":"form-check-stop","label":"平台表单检查","focus":["local_preflight_passed","platform_page_active","platform_form_verified","failed_before_final_action"],"note":"platform_form_check 会发生上传写入；定时控件不可用或失败时在最终动作前终止。"},{"id":"failure-and-ambiguity","label":"失败、结果不明与防重复","focus":["scheduled_accepted","scheduled_readback_confirmed","failed_before_final_action","final_action_triggered","ambiguous","duplicate_blocked"],"note":"定时最终动作后异常或唯一新排期回读失败进入 ambiguous；排期回读确认时 publishedAt=null，不等于已发布。"}]</script>
 
     <div class="guided-views no-print" id="guided-views" hidden aria-label="Guided diagram views">
       <button id="guided-view-prev" type="button" aria-label="Previous guided view" title="Previous guided view ([)">&#8592;</button>
@@ -5083,8 +5083,8 @@
         <text data-detail="fine" x="402" y="497" class="t-security" font-size="7" text-anchor="middle">retry after new preflight</text>
         </g>
 
-        <g id="node-ambiguous" data-node-id="ambiguous" data-node-label="结果不明" tabindex="0" role="button" aria-label="Focus 结果不明, ambiguous · 最终动作后只读核对, 失败、结果不明与防重复终态" aria-pressed="false" data-node-kind="failure" data-node-sublabel="ambiguous · 最终动作后只读核对" data-node-tag="read-only reconcile" data-node-context="失败、结果不明与防重复终态">
-          <title>结果不明 · ambiguous · 最终动作后只读核对 · 失败、结果不明与防重复终态 · read-only reconcile</title>
+        <g id="node-ambiguous" data-node-id="ambiguous" data-node-label="结果不明" tabindex="0" role="button" aria-label="Focus 结果不明, Schedule 后只读核对, 失败、结果不明与防重复终态" aria-pressed="false" data-node-kind="failure" data-node-sublabel="Schedule 后只读核对" data-node-tag="schedule outcome unknown" data-node-context="失败、结果不明与防重复终态">
+          <title>结果不明 · Schedule 后只读核对 · 失败、结果不明与防重复终态 · schedule outcome unknown</title>
           <rect x="496" y="450" width="120" height="58" rx="7" class="c-mask"/>
           <rect x="496" y="450" width="120" height="58" rx="7" class="c-security" stroke-width="1.5"/>
           <g aria-hidden="true" data-semantic-sigil="failure" class="semantic-sigil s-security" transform="translate(599 456) scale(0.6875)">
@@ -5092,8 +5092,8 @@
             <path d="m5.7 5.7 4.6 4.6m0-4.6-4.6 4.6"/>
           </g>
           <text data-detail-anchor x="556" y="471" class="t-primary" font-size="10" font-weight="600" text-anchor="middle">结果不明</text>
-          <text data-detail="context" x="556" y="487" class="t-muted" font-size="6.2" text-anchor="middle">ambiguous · 最终动作后只读核对</text>
-        <text data-detail="fine" x="556" y="497" class="t-security" font-size="7" text-anchor="middle">read-only reconcile</text>
+          <text data-detail="context" x="556" y="487" class="t-muted" font-size="7" text-anchor="middle">Schedule 后只读核对</text>
+        <text data-detail="fine" x="556" y="497" class="t-security" font-size="7" text-anchor="middle">schedule outcome unknown</text>
         </g>
 
         <g id="node-duplicate_blocked" data-node-id="duplicate_blocked" data-node-label="重复提交已阻止" tabindex="0" role="button" aria-label="Focus 重复提交已阻止, duplicate_blocked · 同一指纹, 失败、结果不明与防重复终态" aria-pressed="false" data-node-kind="failure" data-node-sublabel="duplicate_blocked · 同一指纹" data-node-tag="terminal guard" data-node-context="失败、结果不明与防重复终态">
@@ -5359,10 +5359,9 @@
           <h3>租约与防重复</h3>
         </div>
         <ul>
-          <li>&bull; tiktok_schedule_unavailable 与所有定时控制失败进入 failed_before_final_action</li>
-          <li>&bull; Post / Schedule 最终动作后结果不明进入 ambiguous，只允许只读核对</li>
-          <li>&bull; scheduled_accepted 后唯一列表回读失败也进入 ambiguous，继续阻止重复提交</li>
-          <li>&bull; failed_before_final_action 没有通往立即 Post 的迁移</li>
+          <li>&bull; 定时控件失败均进入 failed_before_final_action，不回退 Post</li>
+          <li>&bull; Post / Schedule 后结果不明进入 ambiguous，只允许只读核对</li>
+          <li>&bull; 排期结果不明时，任一不可逆证据都阻止重复提交</li>
         </ul>
       </div>
     </div>
