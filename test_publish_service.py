@@ -26,6 +26,10 @@ from uploader.meta_uploader.content_list import (
     FacebookReelMatch,
     FacebookReelReceipt,
 )
+from uploader.meta_uploader.page_form import (
+    FacebookPageFormExpectation,
+    FacebookPageFormSnapshot,
+)
 
 
 class PublishServiceWechatDraftTests(unittest.TestCase):
@@ -378,6 +382,32 @@ class FacebookPageAuthorizedSubmitTests(unittest.TestCase):
             mode="oneclick_preflight",
         )
         task_service.mark_task_running(task["id"], "Facebook Page preflight")
+        expectation = FacebookPageFormExpectation(
+            page_id=str(payload["facebookExpectedPageReference"]),
+            content_kind="reel",
+            video_name=self.video.name,
+            video_size=self.video.stat().st_size,
+            video_sha256=str(payload["facebookVideoSha256"]),
+            caption=str(payload["facebookFinalCaption"]),
+            visibility="public",
+        )
+        snapshot = FacebookPageFormSnapshot(
+            page_id=expectation.page_id,
+            content_kind=expectation.content_kind,
+            video_name=expectation.video_name,
+            video_count=1,
+            caption=expectation.caption,
+            visibility=expectation.visibility,
+            final_action_label="Publish",
+            final_action_ready=True,
+        )
+        receipt = publish_service.overseas_browser_publish._public_form_receipt(
+            {"accountId": 41, "expectation": expectation},
+            snapshot,
+            phase="platform_form_verified",
+            final_action_triggered=False,
+        )
+        self.verified_form_snapshot_hash = str(receipt["formSnapshotHash"])
         task_service.mark_platform_result(
             task["id"],
             9,
@@ -385,21 +415,7 @@ class FacebookPageAuthorizedSubmitTests(unittest.TestCase):
             message="Facebook Page form verified",
             content_type="video",
             event_type="facebook_platform_form_verified",
-            receipt={
-                "accountId": 41,
-                "pageId": "1001",
-                "pageName": "Saved Facebook Page",
-                "videoName": self.video.name,
-                "videoSize": self.video.stat().st_size,
-                "videoSha256": payload["facebookVideoSha256"],
-                "captionSha256": payload["facebookCaptionSha256"],
-                "visibility": "public",
-                "phase": "platform_form_verified",
-                "platformWriteOccurred": True,
-                "finalActionTriggered": False,
-                "finalButtonEnabled": True,
-                "formSnapshotHash": "f" * 64,
-            },
+            receipt=receipt,
         )
         authorization = controlled_publish.authorize_completed_check(task["id"])
         return task["id"], str(authorization["authorizationId"]), payload
@@ -778,6 +794,8 @@ class FacebookPageAuthorizedSubmitTests(unittest.TestCase):
             conn.execute("PRAGMA journal_mode = WAL")
 
         original_hash = controlled_publish.facebook_preflight_receipt_hash
+        verified_hash = self.verified_form_snapshot_hash
+        drifted_hash = ("0" if verified_hash[0] != "0" else "1") + verified_hash[1:]
         writer_commits: list[str] = []
 
         def hash_then_commit_drift(conn, task_id, payloads):
@@ -794,7 +812,7 @@ class FacebookPageAuthorizedSubmitTests(unittest.TestCase):
                     (preflight_task_id,),
                 ).fetchone()
                 receipt = json.loads(str(row["receiptJson"]))
-                receipt["formSnapshotHash"] = "a" * 64
+                receipt["formSnapshotHash"] = drifted_hash
                 writer.execute(
                     """
                     UPDATE publish_task_items SET receiptJson = ?
@@ -828,7 +846,7 @@ class FacebookPageAuthorizedSubmitTests(unittest.TestCase):
             )
 
         self.assertEqual(writer_commits, ["committed"])
-        self.assertEqual(authorized_receipt["formSnapshotHash"], "f" * 64)
+        self.assertEqual(authorized_receipt["formSnapshotHash"], verified_hash)
         with database.connect() as conn:
             persisted = json.loads(
                 str(
@@ -841,7 +859,7 @@ class FacebookPageAuthorizedSubmitTests(unittest.TestCase):
                     ).fetchone()["receiptJson"]
                 )
             )
-        self.assertEqual(persisted["formSnapshotHash"], "a" * 64)
+        self.assertEqual(persisted["formSnapshotHash"], drifted_hash)
 
     def test_succeeded_claim_repairs_transient_task_success_write_failure(self) -> None:
         preflight_task_id, authorization_id, preflight_payload = (
