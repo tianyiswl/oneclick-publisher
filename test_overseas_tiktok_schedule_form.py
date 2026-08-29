@@ -288,6 +288,32 @@ class HangingScheduleLocator:
         raise AssertionError("unreachable")
 
 
+class BatchScheduleHandle:
+    def __init__(self, locator: BatchScheduleLocator, index: int) -> None:
+        self._locator = locator
+        self._index = index
+
+    async def element_handle(self) -> FakeScheduleControl | None:
+        return self._locator.current[self._index]
+
+
+class BatchScheduleLocator:
+    """A locator whose complete element-handle batch changes per observation."""
+
+    def __init__(self, batches: list[list[FakeScheduleControl | None]]) -> None:
+        self._batches = batches
+        self._position = 0
+        self.current = batches[0]
+
+    async def count(self) -> int:
+        self.current = self._batches[min(self._position, len(self._batches) - 1)]
+        self._position += 1
+        return len(self.current)
+
+    def nth(self, index: int) -> BatchScheduleHandle:
+        return BatchScheduleHandle(self, index)
+
+
 class TransientCountThenEmptyLocator:
     """A real Playwright transient while a later selector is enumerated."""
 
@@ -911,6 +937,81 @@ class TikTokScheduleFormTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(raised.exception.error_code, "tiktok_schedule_control_ambiguous")
         self.assertEqual(clock.sleeps, [0.25, 0.25, 0.25])
+
+    async def test_second_none_handle_discards_first_partial_candidate(self) -> None:
+        first = FakeScheduleControl("first-schedule", "switch", checked=True)
+        replacement = FakeScheduleControl("replacement-schedule", "switch", checked=True)
+        base = LiveScheduleBase(
+            {
+                SCHEDULE_TOGGLE_SELECTORS[0]: BatchScheduleLocator(
+                    [
+                        [first, None],
+                        [first, None],
+                        [replacement, replacement],
+                        [replacement, replacement],
+                    ]
+                )
+            }
+        )
+        page = FakeSchedulePage()
+        clock = FakeClock()
+        form, _, _ = self.form(page, [base] * 8, clock=clock)
+
+        control = await form._schedule_control(
+            SCHEDULE_TOGGLE_SELECTORS,
+            setting="schedule choice",
+            editable=False,
+        )
+
+        self.assertEqual(control.node_id, "replacement-schedule")
+        self.assertEqual(clock.sleeps, [0.25, 0.25, 0.25])
+
+    async def test_none_handle_until_deadline_never_returns_partial_candidate(self) -> None:
+        first = FakeScheduleControl("first-schedule", "switch", checked=True)
+        base = LiveScheduleBase(
+            {SCHEDULE_TOGGLE_SELECTORS[0]: BatchScheduleLocator([[first, None]])}
+        )
+        page = FakeSchedulePage()
+        clock = FakeClock()
+        form, _, _ = self.form(
+            page,
+            [base] * 8,
+            clock=clock,
+            control_timeout_seconds=0.51,
+        )
+
+        with self.assertRaises(TikTokPublishError) as raised:
+            await form._schedule_control(
+                SCHEDULE_TOGGLE_SELECTORS,
+                setting="schedule choice",
+                editable=False,
+            )
+
+        self.assertEqual(raised.exception.error_code, "tiktok_schedule_unavailable")
+        self.assertEqual(clock.sleeps[:2], [0.25, 0.25])
+        self.assertAlmostEqual(clock.sleeps[2], 0.01)
+
+    async def test_none_handle_recovery_needs_two_complete_observations(self) -> None:
+        first = FakeScheduleControl("first-schedule", "switch", checked=True)
+        base = LiveScheduleBase(
+            {
+                SCHEDULE_TOGGLE_SELECTORS[0]: BatchScheduleLocator(
+                    [[first, None], [first, first], [first, first]]
+                )
+            }
+        )
+        page = FakeSchedulePage()
+        clock = FakeClock()
+        form, _, _ = self.form(page, [base] * 8, clock=clock)
+
+        control = await form._schedule_control(
+            SCHEDULE_TOGGLE_SELECTORS,
+            setting="schedule choice",
+            editable=False,
+        )
+
+        self.assertEqual(control.node_id, "first-schedule")
+        self.assertEqual(clock.sleeps, [0.25, 0.25])
 
     async def test_distinct_handle_wrappers_for_one_dom_node_are_stable(self) -> None:
         record = HandleRecord("same-dom")

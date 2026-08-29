@@ -397,8 +397,9 @@ class TikTokScheduleForm:
                 if callable(element_handle)
                 else live
             )
-            if node is not None:
-                frozen.append(_FrozenScheduleCandidate(node, kind, scope))
+            if node is None:
+                raise _IncompleteScheduleObservation()
+            frozen.append(_FrozenScheduleCandidate(node, kind, scope))
         return frozen
 
     async def _same_frozen_node(
