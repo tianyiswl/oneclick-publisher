@@ -3783,6 +3783,25 @@ def submit_request(request: Mapping[str, Any]) -> dict[str, Any]:
     from . import publish_service, task_service
     from .database import connect
 
+    request = _require_mapping(
+        request,
+        "controlled_request_invalid",
+        "受控发布请求必须是 JSON 对象",
+    )
+    requested_mode = str(request.get("mode") or "preflight").strip().lower()
+    requested_targets = request.get("targets")
+    if requested_mode == "formal" and isinstance(requested_targets, list) and any(
+        isinstance(target, Mapping)
+        and oneclick_capabilities.canonical_platform(
+            str(target.get("platform") or "")
+        )
+        == "Facebook Reels"
+        for target in requested_targets
+    ):
+        raise ControlledPublishError(
+            "facebook_formal_entry_required",
+            "Facebook Page 正式发布只接受预检 taskId 和一次性授权 ID。",
+        )
     payloads = build_controlled_payloads(request)
     mode = str(request.get("mode") or "preflight").strip().lower()
     is_single_tiktok = (
@@ -3792,13 +3811,10 @@ def submit_request(request: Mapping[str, Any]) -> dict[str, Any]:
         len(payloads) == 1 and int(payloads[0].get("type") or 0) == 9
     )
     if is_single_facebook_page and mode == "formal":
-        task = _create_claimed_facebook_page_task(
-            payloads,
-            preflight_task_id=int(request["confirmedPreflightTaskId"]),
-            authorization_id=str(request["authorizationId"]),
+        raise ControlledPublishError(
+            "facebook_formal_entry_required",
+            "Facebook Page 正式发布只接受预检 taskId 和一次性授权 ID。",
         )
-        stored = task_service.get_task(int(task["id"])) or task
-        return project_task(stored)
     if is_single_tiktok and mode in {"formal", "platform_form_check"}:
         task = _create_claimed_tiktok_task(
             payloads,

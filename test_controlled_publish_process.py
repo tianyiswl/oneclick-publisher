@@ -2,23 +2,210 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager, redirect_stdout
+import hashlib
+from io import StringIO
 import inspect
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from app_core import controlled_publish, publish_service, task_service
+from app_core import controlled_publish, database, publish_service, task_service
 from app_core.controlled_publish import ControlledPublishError
 from app_core.controlled_publish_process import (
     submit_authorized_preflight_task,
     submit_douyin_graphic_matrix_request_in_process,
     submit_request_in_process,
 )
+from utils import publish_tasks
+
+
+class FacebookPagePublicEntryFixture:
+    """One real DB-backed Page authorization, stopped only at worker start."""
+
+    def __enter__(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.db_path = self.root / "database.db"
+        self._patches = [
+            patch.object(database, "DB_PATH", self.db_path),
+            patch.object(publish_tasks, "DB_PATH", self.db_path),
+            patch.dict(
+                os.environ,
+                {
+                    "ONECLICK_ENABLE_FACEBOOK_PAGE_V1": "1",
+                    "QT_QPA_PLATFORM": "offscreen",
+                },
+                clear=False,
+            ),
+        ]
+        for current in self._patches:
+            current.start()
+        database.ensure_schema()
+        with database.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO user_info (
+                    id, type, filePath, userName, status,
+                    profileName, authMode, accountReference
+                ) VALUES (91, 9, 'facebook-page.json', ?, 1, ?, 'browser', ?)
+                """,
+                (
+                    "Saved Facebook Page",
+                    "Saved Facebook Page",
+                    "1000000000001001",
+                ),
+            )
+            conn.commit()
+        self.video = self.root / "facebook.mp4"
+        self.video.write_bytes(b"facebook-page-public-entry-video")
+        self.caption = "Facebook Page 标题\n\nFacebook Page 正文\n\n#OneClick"
+        self.payload = {
+            "type": 9,
+            "contentType": "video",
+            "runtimeMode": "preflight",
+            "debugDryRun": True,
+            "debugDryRunHoldBrowser": False,
+            "backgroundMode": False,
+            "title": "Facebook Page 标题",
+            "description": "Facebook Page 正文",
+            "tags": ["OneClick"],
+            "fileList": [str(self.video)],
+            "accountList": ["facebook-page.json"],
+            "accountIds": [91],
+            "coverPath": "",
+            "coverPaths": {},
+            "facebookControlledPublish": True,
+            "facebookExpectedPageReference": "1000000000001001",
+            "facebookFinalCaption": self.caption,
+            "facebookCaptionSha256": hashlib.sha256(
+                self.caption.encode("utf-8")
+            ).hexdigest(),
+            "facebookVideoSha256": hashlib.sha256(
+                self.video.read_bytes()
+            ).hexdigest(),
+            "facebookManifestIntentSha256": "c" * 64,
+            "visibility": "public",
+            "enableTimer": False,
+            "scheduleMode": "immediate",
+            "scheduledAt": None,
+            "scheduleTime": None,
+            "originalDeclaration": False,
+            "aiGenerated": False,
+        }
+        preflight = task_service.create_pending_task(
+            [self.payload],
+            mode="oneclick_preflight",
+        )
+        self.preflight_task_id = int(preflight["id"])
+        task_service.mark_task_running(
+            self.preflight_task_id,
+            "Facebook Page public-entry fixture",
+        )
+        receipt = {
+            "accountId": 91,
+            "pageId": "1000000000001001",
+            "pageName": "Saved Facebook Page",
+            "videoName": self.video.name,
+            "videoSize": self.video.stat().st_size,
+            "videoSha256": self.payload["facebookVideoSha256"],
+            "captionSha256": self.payload["facebookCaptionSha256"],
+            "visibility": "public",
+            "phase": "platform_form_verified",
+            "platformWriteOccurred": True,
+            "finalActionTriggered": False,
+            "finalButtonEnabled": True,
+            "formSnapshotHash": "f" * 64,
+        }
+        task_service.mark_platform_result(
+            self.preflight_task_id,
+            9,
+            ok=True,
+            message="Facebook Page form verified offline",
+            content_type="video",
+            event_type="facebook_platform_form_verified",
+            receipt=receipt,
+        )
+        self.started_task_ids: list[int] = []
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        for current in reversed(self._patches):
+            current.stop()
+        self.temporary.cleanup()
+
+    def authorize(self) -> str:
+        authorization = controlled_publish.authorize_completed_check(
+            self.preflight_task_id
+        )
+        return str(authorization["authorizationId"])
+
+    @contextmanager
+    def stop_at_worker_start(self):
+        def stop_before_worker(task_id: int) -> dict:
+            self.started_task_ids.append(int(task_id))
+            return task_service.get_task(int(task_id))
+
+        with patch.object(
+            publish_service,
+            "start_controlled_facebook_publish",
+            side_effect=stop_before_worker,
+        ) as start_spy:
+            yield start_spy
+
+    def assert_real_dispatch(
+        self,
+        case: unittest.TestCase,
+        envelope: dict,
+        start_spy,
+        *,
+        authorization_id: str | None = None,
+    ) -> None:
+        task_id = int(envelope["taskId"])
+        case.assertEqual(envelope, controlled_publish.task_status(task_id))
+        case.assertEqual(self.started_task_ids, [task_id])
+        start_spy.assert_called_once_with(task_id)
+        with database.connect() as conn:
+            authorizations = conn.execute(
+                """
+                SELECT authorizationId, consumedAt
+                FROM controlled_publish_authorizations
+                WHERE preflightTaskId = ?
+                """,
+                (self.preflight_task_id,),
+            ).fetchall()
+            claim = conn.execute(
+                """
+                SELECT taskId, preflightTaskId, state, blocksReplay
+                FROM facebook_page_publish_claims WHERE taskId = ?
+                """,
+                (task_id,),
+            ).fetchone()
+        case.assertEqual(len(authorizations), 1)
+        if authorization_id is not None:
+            case.assertEqual(authorizations[0]["authorizationId"], authorization_id)
+        case.assertTrue(str(authorizations[0]["consumedAt"] or ""))
+        case.assertIsNotNone(claim)
+        case.assertEqual(int(claim["preflightTaskId"]), self.preflight_task_id)
+        case.assertEqual(claim["state"], "reserved")
+        case.assertEqual(int(claim["blocksReplay"]), 1)
+        projected = json.dumps(envelope, ensure_ascii=False).casefold()
+        for forbidden in (
+            "cookie",
+            "password",
+            "verificationcode",
+            "storage_state",
+            "metabrowserpublishconfirmed",
+            "metabrowserautomationacknowledged",
+            self.caption.casefold(),
+        ):
+            case.assertNotIn(forbidden, projected)
 
 
 class ControlledPublishProcessTests(unittest.TestCase):
@@ -58,67 +245,21 @@ class ControlledPublishProcessTests(unittest.TestCase):
             ["preflight_task_id", "authorization_id"],
         )
 
-    def test_authorized_facebook_submission_reuses_snapshot_and_starts_controlled_service_once(self) -> None:
-        payload = self._facebook_payload()
-        preflight = {
-            "id": 17,
-            "mode": "oneclick_preflight",
-            "status": "success",
-            "payloadJson": json.dumps([payload]),
-        }
-        formal = {
-            "id": 18,
-            "mode": "oneclick_publish",
-            "status": "pending",
-            "payloadJson": json.dumps([{**payload, "runtimeMode": "publish"}]),
-        }
+    def test_authorized_facebook_submission_uses_real_db_claim_and_starts_once(self) -> None:
+        with FacebookPagePublicEntryFixture() as fixture:
+            authorization_id = fixture.authorize()
+            with fixture.stop_at_worker_start() as started:
+                result = submit_authorized_preflight_task(
+                    fixture.preflight_task_id,
+                    authorization_id,
+                )
 
-        def read_task(task_id: int):
-            return preflight if task_id == 17 else formal if task_id == 18 else None
-
-        def create_claim(payloads, *, preflight_task_id, authorization_id):
-            self.assertEqual(preflight_task_id, 17)
-            self.assertEqual(authorization_id, "single-use-grant")
-            self.assertEqual(payloads[0]["runtimeMode"], "publish")
-            self.assertIs(payloads[0]["debugDryRun"], False)
-            self.assertNotIn("metaBrowserPublishConfirmed", payloads[0])
-            self.assertNotIn("metaBrowserAutomationAcknowledged", payloads[0])
-            return publish_service.start_controlled_facebook_publish(18)
-
-        with (
-            patch.dict(
-                os.environ,
-                {"ONECLICK_ENABLE_FACEBOOK_PAGE_V1": "1"},
-                clear=False,
-            ),
-            patch.object(task_service, "get_task", side_effect=read_task),
-            patch.object(
-                controlled_publish,
-                "_create_claimed_facebook_page_task",
-                side_effect=create_claim,
-            ) as claimed,
-            patch.object(
-                publish_service,
-                "start_controlled_facebook_publish",
-                return_value=formal,
-            ) as started,
-            patch.object(
-                controlled_publish,
-                "project_task",
-                return_value={
-                    "taskId": 18,
-                    "taskNo": "T18",
-                    "phase": "formal",
-                    "status": "pending",
-                    "platforms": [],
-                },
-            ),
-        ):
-            result = submit_authorized_preflight_task(17, "single-use-grant")
-
-        self.assertEqual(result["taskId"], 18)
-        claimed.assert_called_once()
-        started.assert_called_once_with(18)
+            fixture.assert_real_dispatch(
+                self,
+                result,
+                started,
+                authorization_id=authorization_id,
+            )
 
     def test_feature_disabled_blocks_new_authorized_page_submission_before_claim(self) -> None:
         payload = self._facebook_payload()
@@ -172,35 +313,29 @@ class ControlledPublishProcessTests(unittest.TestCase):
     def test_cli_formal_forwards_only_two_ids_to_the_shared_service_once(self) -> None:
         import desktop_native_app
 
-        envelope = {
-            "taskId": 18,
-            "taskNo": "T18",
-            "phase": "formal",
-            "status": "success",
-            "platforms": [],
-        }
-        args = SimpleNamespace(
-            controlled_publish_action="formal",
-            controlled_publish_request=None,
-            controlled_publish_task_id=17,
-            controlled_publish_authorization_id="single-use-grant",
-        )
+        with FacebookPagePublicEntryFixture() as fixture:
+            authorization_id = fixture.authorize()
+            args = SimpleNamespace(
+                controlled_publish_action="formal",
+                controlled_publish_request=None,
+                controlled_publish_task_id=fixture.preflight_task_id,
+                controlled_publish_authorization_id=authorization_id,
+            )
+            output = StringIO()
+            with (
+                fixture.stop_at_worker_start() as started,
+                redirect_stdout(output),
+            ):
+                exit_code = desktop_native_app.run_controlled_publish_cli(args)
+            envelope = json.loads(output.getvalue().strip())
 
-        with (
-            patch.object(desktop_native_app, "ensure_schema"),
-            patch("utils.log.redirect_console_logger"),
-            patch(
-                "app_core.controlled_publish_process.submit_authorized_preflight_task",
-                return_value=envelope,
-            ) as submit,
-            patch.object(desktop_native_app, "_wait_for_controlled_task"),
-            patch.object(controlled_publish, "task_status", return_value=envelope),
-            patch.object(desktop_native_app, "_controlled_json"),
-        ):
-            exit_code = desktop_native_app.run_controlled_publish_cli(args)
-
-        self.assertEqual(exit_code, 0)
-        submit.assert_called_once_with(17, "single-use-grant")
+            self.assertEqual(exit_code, 2)
+            fixture.assert_real_dispatch(
+                self,
+                envelope,
+                started,
+                authorization_id=authorization_id,
+            )
 
     def test_shared_service_preserves_generic_ambiguous_duplicate_error(self) -> None:
         payload = {
@@ -254,6 +389,49 @@ class ControlledPublishProcessTests(unittest.TestCase):
             getattr(raised.exception, "error_code", ""),
             "facebook_publish_authorization_invalid",
         )
+
+    def test_legacy_full_payload_facebook_formal_entry_is_rejected_before_work(self) -> None:
+        request = {
+            "mode": "formal",
+            "manifestPath": "/must-not-be-read.json",
+            "targets": [
+                {
+                    "platform": "Facebook",
+                    "accountId": 91,
+                    "schedule": None,
+                    "settings": {"visibility": "public"},
+                }
+            ],
+            "confirmedPreflightTaskId": 17,
+            "authorizationId": "must-not-be-consumed",
+        }
+        with (
+            patch.object(
+                controlled_publish,
+                "build_controlled_payloads",
+                side_effect=AssertionError("legacy builder must not run"),
+            ) as builder,
+            patch.object(
+                controlled_publish,
+                "_create_claimed_facebook_page_task",
+            ) as claim,
+            patch.object(controlled_publish, "consume_authorization") as consume,
+            patch.object(
+                publish_service,
+                "start_controlled_facebook_publish",
+            ) as start,
+            self.assertRaises(ControlledPublishError) as raised,
+        ):
+            controlled_publish.submit_request(request)
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "facebook_formal_entry_required",
+        )
+        builder.assert_not_called()
+        claim.assert_not_called()
+        consume.assert_not_called()
+        start.assert_not_called()
 
     def test_process_adapter_preserves_cli_error_code_without_opening_desktop_ui(self) -> None:
         with self.assertRaises(ControlledPublishError) as raised:

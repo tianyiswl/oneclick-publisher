@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import redirect_stdout
+from io import StringIO
 import json
 import os
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 import unittest
 
 from mcp import Client, StdioServerParameters
 
+from app_core.content_project_gateway import ContentProjectGateway, PublishProfileStore
 from app_core.oneclick_mcp_server import create_server
+from test_controlled_publish_process import FacebookPagePublicEntryFixture
 
 
 class _Gateway:
@@ -222,24 +227,32 @@ class OneclickMcpServerTests(unittest.TestCase):
             self.assertNotIn(forbidden, all_schemas)
 
     def test_formal_tool_forwards_only_preflight_task_and_authorization(self) -> None:
-        gateway = _Gateway()
-        server = create_server(gateway)
-
-        result = asyncio.run(
-            server.call_tool(
-                "oneclick_formal_publish",
-                {
-                    "preflight_task_id": 17,
-                    "authorization_id": "single-use-grant",
-                },
+        with FacebookPagePublicEntryFixture() as fixture:
+            authorization_id = fixture.authorize()
+            gateway = ContentProjectGateway(
+                profile_store=PublishProfileStore(
+                    fixture.root / "publish-profiles.json"
+                ),
             )
-        )
+            server = create_server(gateway)
+            with fixture.stop_at_worker_start() as started:
+                result = asyncio.run(
+                    server.call_tool(
+                        "oneclick_formal_publish",
+                        {
+                            "preflight_task_id": fixture.preflight_task_id,
+                            "authorization_id": authorization_id,
+                        },
+                    )
+                )
+            envelope = result.structured_content["task"]
 
-        self.assertEqual(result.structured_content["task"]["taskId"], 8)
-        self.assertEqual(
-            gateway.calls,
-            [("formal", 17, "single-use-grant")],
-        )
+            fixture.assert_real_dispatch(
+                self,
+                envelope,
+                started,
+                authorization_id=authorization_id,
+            )
 
     def test_read_only_reconcile_tool_accepts_only_task_id(self) -> None:
         gateway = _Gateway()
@@ -256,17 +269,49 @@ class OneclickMcpServerTests(unittest.TestCase):
         self.assertEqual(gateway.calls, [("reconcile", 18)])
 
     def test_status_tool_preserves_the_gateway_safe_receipt_shape(self) -> None:
-        gateway = _Gateway()
-        server = create_server(gateway)
+        import desktop_native_app
 
-        result = asyncio.run(
-            server.call_tool("oneclick_task_status", {"task_id": 18})
-        )
+        with FacebookPagePublicEntryFixture() as fixture:
+            authorization_id = fixture.authorize()
+            gateway = ContentProjectGateway(
+                profile_store=PublishProfileStore(
+                    fixture.root / "publish-profiles.json"
+                ),
+            )
+            server = create_server(gateway)
+            with fixture.stop_at_worker_start() as started:
+                formal = asyncio.run(
+                    server.call_tool(
+                        "oneclick_formal_publish",
+                        {
+                            "preflight_task_id": fixture.preflight_task_id,
+                            "authorization_id": authorization_id,
+                        },
+                    )
+                ).structured_content["task"]
+            task_id = int(formal["taskId"])
+            mcp_status = asyncio.run(
+                server.call_tool("oneclick_task_status", {"task_id": task_id})
+            ).structured_content["task"]
+            output = StringIO()
+            with redirect_stdout(output):
+                exit_code = desktop_native_app.run_controlled_publish_cli(
+                    SimpleNamespace(
+                        controlled_publish_action="status",
+                        controlled_publish_task_id=task_id,
+                    )
+                )
+            cli_status = json.loads(output.getvalue().strip())
 
-        self.assertEqual(
-            result.structured_content["task"],
-            gateway.task_status(18),
-        )
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(cli_status, mcp_status)
+            self.assertEqual(cli_status, formal)
+            fixture.assert_real_dispatch(
+                self,
+                formal,
+                started,
+                authorization_id=authorization_id,
+            )
 
     def test_matrix_tools_keep_local_check_and_formal_publish_separate(self) -> None:
         server = create_server(_Gateway())

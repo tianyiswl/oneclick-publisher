@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import os
 import tempfile
 import threading
 import time
@@ -18,6 +19,7 @@ from app_core import (
     task_service,
 )
 from app_core.publish_service import _validate_payloads
+from app_core.controlled_publish_process import submit_authorized_preflight_task
 from app_core.overseas_meta_errors import FacebookPagePublishError
 from uploader.meta_uploader.content_list import (
     FacebookPageContentReader,
@@ -582,10 +584,9 @@ class FacebookPageAuthorizedSubmitTests(unittest.TestCase):
             )
 
     def test_authorized_submit_commits_claim_before_starting_controlled_worker(self) -> None:
-        preflight_task_id, authorization_id, preflight_payload = (
+        preflight_task_id, authorization_id, _ = (
             self._authorized_preflight()
         )
-        formal_payload = self._formal_payload(preflight_payload)
         committed: list[dict] = []
 
         def start_controlled(task_id: int) -> dict:
@@ -616,10 +617,10 @@ class FacebookPageAuthorizedSubmitTests(unittest.TestCase):
             return task_service.get_task(int(task_id))
 
         with (
-            patch.object(
-                controlled_publish,
-                "build_controlled_payloads",
-                return_value=[formal_payload],
+            patch.dict(
+                os.environ,
+                {"ONECLICK_ENABLE_FACEBOOK_PAGE_V1": "1"},
+                clear=False,
             ),
             patch.object(
                 publish_service,
@@ -627,12 +628,9 @@ class FacebookPageAuthorizedSubmitTests(unittest.TestCase):
                 side_effect=start_controlled,
             ),
         ):
-            returned = controlled_publish.submit_request(
-                {
-                    "mode": "formal",
-                    "confirmedPreflightTaskId": preflight_task_id,
-                    "authorizationId": authorization_id,
-                }
+            returned = submit_authorized_preflight_task(
+                preflight_task_id,
+                authorization_id,
             )
 
         self.assertEqual(
@@ -665,10 +663,10 @@ class FacebookPageAuthorizedSubmitTests(unittest.TestCase):
                 raise RuntimeError("offline worker startup failure")
 
         with (
-            patch.object(
-                controlled_publish,
-                "build_controlled_payloads",
-                return_value=[formal_payload],
+            patch.dict(
+                os.environ,
+                {"ONECLICK_ENABLE_FACEBOOK_PAGE_V1": "1"},
+                clear=False,
             ),
             patch.object(
                 publish_service,
@@ -678,12 +676,9 @@ class FacebookPageAuthorizedSubmitTests(unittest.TestCase):
             patch.object(publish_service.threading, "Thread", Worker),
             self.assertRaisesRegex(RuntimeError, "offline worker startup failure"),
         ):
-            controlled_publish.submit_request(
-                {
-                    "mode": "formal",
-                    "confirmedPreflightTaskId": preflight_task_id,
-                    "authorizationId": authorization_id,
-                }
+            submit_authorized_preflight_task(
+                preflight_task_id,
+                authorization_id,
             )
 
         with database.connect() as conn:
@@ -731,10 +726,10 @@ class FacebookPageAuthorizedSubmitTests(unittest.TestCase):
                 raise AssertionError("worker start crossed failed lease")
 
         with (
-            patch.object(
-                controlled_publish,
-                "build_controlled_payloads",
-                return_value=[formal_payload],
+            patch.dict(
+                os.environ,
+                {"ONECLICK_ENABLE_FACEBOOK_PAGE_V1": "1"},
+                clear=False,
             ),
             patch.object(
                 publish_service,
@@ -749,12 +744,9 @@ class FacebookPageAuthorizedSubmitTests(unittest.TestCase):
             patch.object(publish_service.threading, "Thread", Worker),
             self.assertRaisesRegex(RuntimeError, "offline lease storage failure"),
         ):
-            controlled_publish.submit_request(
-                {
-                    "mode": "formal",
-                    "confirmedPreflightTaskId": preflight_task_id,
-                    "authorizationId": authorization_id,
-                }
+            submit_authorized_preflight_task(
+                preflight_task_id,
+                authorization_id,
             )
 
         with database.connect() as conn:

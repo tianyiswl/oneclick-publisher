@@ -15,6 +15,7 @@ from app_core.content_project_gateway import (
     ContentProjectGatewayError,
     PublishProfileStore,
 )
+from test_controlled_publish_process import FacebookPagePublicEntryFixture
 
 
 class _MetricsService:
@@ -463,20 +464,10 @@ class ContentProjectGatewayTests(unittest.TestCase):
         self.assertEqual(raised.exception.error_code, "source_live_session_active")
 
     def test_formal_publish_cannot_bypass_preflight_and_one_time_authorization(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            submitted: list[tuple[int, str]] = []
-            gateway = self._gateway(
-                Path(directory),
-                [],
-                formal_submitter=lambda preflight_task_id, authorization_id: (
-                    submitted.append((preflight_task_id, authorization_id))
-                    or {
-                        "taskId": 42,
-                        "taskNo": "T42",
-                        "phase": "formal",
-                        "status": "pending",
-                        "platforms": [],
-                    }
+        with FacebookPagePublicEntryFixture() as fixture:
+            gateway = ContentProjectGateway(
+                profile_store=PublishProfileStore(
+                    fixture.root / "publish-profiles.json"
                 ),
             )
             with self.assertRaises(ContentProjectGatewayError) as missing:
@@ -484,14 +475,23 @@ class ContentProjectGatewayTests(unittest.TestCase):
                     preflight_task_id=0,
                     authorization_id="",
                 )
-            result = gateway.formal_publish(
-                preflight_task_id=41,
-                authorization_id="one-time-grant",
-            )
+            authorization_id = fixture.authorize()
+            with fixture.stop_at_worker_start() as started:
+                result = gateway.formal_publish(
+                    preflight_task_id=fixture.preflight_task_id,
+                    authorization_id=authorization_id,
+                )
 
-        self.assertEqual(missing.exception.error_code, "content_project_authorization_required")
-        self.assertEqual(result["taskId"], 42)
-        self.assertEqual(submitted, [(41, "one-time-grant")])
+            self.assertEqual(
+                missing.exception.error_code,
+                "content_project_authorization_required",
+            )
+            fixture.assert_real_dispatch(
+                self,
+                result,
+                started,
+                authorization_id=authorization_id,
+            )
 
     def test_facebook_direct_requires_preflight_before_authorizer_or_submitter(self) -> None:
         with tempfile.TemporaryDirectory() as directory, patch.dict(

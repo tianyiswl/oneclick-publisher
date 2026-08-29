@@ -481,6 +481,7 @@ class PublishPage(QWidget):
         self.active_task_started_at: datetime | None = None
         self.seen_event_ids: set[int] = set()
         self._rendered_controlled_actions: set[str] = set()
+        self._reported_controlled_projection_errors: set[int] = set()
         self._account_rows: list[dict] = []
         self._media_rows: list[dict] = []
         self._selected_account_ids: set[int] = set()
@@ -4944,6 +4945,7 @@ class PublishPage(QWidget):
         self.active_task_started_at = datetime.now()
         self.seen_event_ids.clear()
         self._rendered_controlled_actions.clear()
+        self._reported_controlled_projection_errors.clear()
         self.log.clear()
         mode_text = "预发布检查" if self.active_task_is_preflight else "正式发布"
         self.log.append(f"已创建{mode_text}任务：{task['taskNo']}，共 {task['itemCount']} 个执行项。")
@@ -5545,6 +5547,13 @@ class PublishPage(QWidget):
             projection = controlled_publish.project_task(task)
         except Exception:
             projection = None
+            task_id = int(task.get("id") or self.active_task_id or 0)
+            if task_id not in self._reported_controlled_projection_errors:
+                self._reported_controlled_projection_errors.add(task_id)
+                self.log.append(
+                    "[diagnostic] 受控任务状态暂时无法安全解析；"
+                    "将继续轮询。"
+                )
         if isinstance(projection, dict):
             self.render_controlled_task_action(projection)
         for event in task.get("events", []):
@@ -5691,7 +5700,7 @@ class PublishPage(QWidget):
         box.exec()
         return "formal" if box.clickedButton() == formal_btn else "manual"
 
-    def start_formal_publish_from_task(self, task: dict) -> None:
+    def start_formal_publish_from_task(self, task: dict) -> dict | None:
         try:
             payloads = json.loads(task.get("payloadJson") or "[]")
             if not isinstance(payloads, list) or not all(
@@ -5781,6 +5790,7 @@ class PublishPage(QWidget):
         self.active_task_started_at = datetime.now()
         self.seen_event_ids.clear()
         self._rendered_controlled_actions.clear()
+        self._reported_controlled_projection_errors.clear()
         self.log.append("")
         self.log.append(
             f"已启动正式发布任务："
@@ -5799,6 +5809,7 @@ class PublishPage(QWidget):
             f"正式发布运行中：{new_task.get('taskNo') or new_task_id}",
         )
         self.task_timer.start()
+        return new_task
 
     def confirm_meta_browser_publish(self, payloads: list[dict]) -> bool:
         """保留最终确认；仅 Instagram type 8 写兼容字段。"""

@@ -7,10 +7,17 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtCore import QDate, QTime
-from PyQt6.QtWidgets import QApplication, QDialog, QMessageBox
+from PyQt6.QtCore import QDate, QTime, QTimer
+from PyQt6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QDialogButtonBox,
+    QMessageBox,
+)
 
+from app_core import task_service
 from app_core.wechat_verification import verification_broker
+from test_controlled_publish_process import FacebookPagePublicEntryFixture
 from ui.publish_page import PublishPage
 
 
@@ -176,64 +183,33 @@ class PublishPageFacebookControlledTests(unittest.TestCase):
         self._dispose_page(page)
 
     def test_facebook_ui_formal_uses_preflight_authorization_not_meta_flags(self) -> None:
-        page = PublishPage()
-        payload = self._payload()
-        payload.update(
-            {
-                "facebookControlledPublish": True,
-                "facebookExpectedPageReference": "1000000000006789",
-                "facebookFinalCaption": "Facebook Page 标题",
-                "facebookCaptionSha256": "a" * 64,
-                "facebookVideoSha256": "b" * 64,
-                "facebookManifestIntentSha256": "c" * 64,
-                "scheduleMode": "immediate",
-                "scheduledAt": None,
-            }
-        )
-        task = {
-            "id": 17,
-            "payloadJson": json.dumps([payload], ensure_ascii=False),
-        }
-        authorization = {
-            "preflightTaskId": 17,
-            "authorizationId": "single-use-grant",
-            "singleUse": True,
-        }
-        envelope = {
-            "taskId": 18,
-            "taskNo": "T18",
-            "phase": "formal",
-            "status": "pending",
-            "platforms": [{"platformType": 9}],
-        }
+        with FacebookPagePublicEntryFixture() as fixture:
+            page = PublishPage()
+            dialog_events: list[str] = []
 
-        with (
-            patch.object(page, "confirm_meta_browser_publish", return_value=True),
-            patch(
-                "ui.publish_page.controlled_publish.authorize_completed_check",
-                return_value=authorization,
-            ) as authorize,
-            patch(
-                "ui.publish_page.controlled_publish_process.submit_authorized_preflight_task",
-                return_value=envelope,
-            ) as submit,
-            patch(
-                "ui.publish_page.publish_service.start_desktop_publish"
-            ) as legacy_start,
-            patch(
-                "ui.publish_page.facebook_page_v1_enabled",
-                return_value=True,
-            ),
-        ):
-            page.start_formal_publish_from_task(task)
+            def accept_real_confirmation() -> None:
+                dialog = QApplication.activeModalWidget()
+                if dialog is None or not hasattr(dialog, "acknowledgement"):
+                    dialog_events.append("missing")
+                    return
+                dialog.acknowledgement.setChecked(True)
+                buttons = dialog.findChild(QDialogButtonBox)
+                buttons.button(QDialogButtonBox.StandardButton.Ok).click()
+                dialog_events.append("accepted")
 
-        authorize.assert_called_once_with(17)
-        submit.assert_called_once_with(17, "single-use-grant")
-        legacy_start.assert_not_called()
-        self.assertNotIn("metaBrowserPublishConfirmed", payload)
-        self.assertNotIn("metaBrowserAutomationAcknowledged", payload)
-        self.assertEqual(page.active_task_id, 18)
-        self._dispose_page(page)
+            QTimer.singleShot(0, accept_real_confirmation)
+            task = task_service.get_task(fixture.preflight_task_id)
+            with fixture.stop_at_worker_start() as started:
+                envelope = page.start_formal_publish_from_task(task)
+
+            self.assertEqual(dialog_events, ["accepted"])
+            fixture.assert_real_dispatch(self, envelope, started)
+            self.assertEqual(page.active_task_id, envelope["taskId"])
+            stored = task_service.get_task(int(envelope["taskId"]))
+            payload = json.loads(str(stored["payloadJson"]))[0]
+            self.assertNotIn("metaBrowserPublishConfirmed", payload)
+            self.assertNotIn("metaBrowserAutomationAcknowledged", payload)
+            self._dispose_page(page)
 
     def test_facebook_formal_cancel_creates_no_authorization(self) -> None:
         page = PublishPage()
@@ -350,6 +326,43 @@ class PublishPageFacebookControlledTests(unittest.TestCase):
             if "Facebook 安全验证" in line
         ]
         self.assertEqual(len(matching_logs), 1)
+        self._dispose_page(page)
+
+    def test_projection_failure_logs_one_safe_diagnostic_and_keeps_polling(self) -> None:
+        page = PublishPage()
+        page.active_task_id = 77
+        task = {
+            "id": 77,
+            "status": "pending",
+            "dryRun": 0,
+            "itemCount": 1,
+            "successCount": 0,
+            "failedCount": 0,
+            "events": [],
+        }
+
+        with (
+            patch("ui.publish_page.task_service.get_task", return_value=task),
+            patch(
+                "ui.publish_page.douyin_verification_broker.request_for_task",
+                return_value=None,
+            ),
+            patch(
+                "ui.publish_page.controlled_publish.project_task",
+                side_effect=ValueError("token=must-not-leak"),
+            ),
+        ):
+            page.poll_task()
+            page.poll_task()
+
+        diagnostics = [
+            line
+            for line in page.log.toPlainText().splitlines()
+            if "受控任务状态暂时无法安全解析" in line
+        ]
+        self.assertEqual(len(diagnostics), 1)
+        self.assertNotIn("must-not-leak", page.log.toPlainText())
+        self.assertEqual(page.active_task_id, 77)
         self._dispose_page(page)
 
 
