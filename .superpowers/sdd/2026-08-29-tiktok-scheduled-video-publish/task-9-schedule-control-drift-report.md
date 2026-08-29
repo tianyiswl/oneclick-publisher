@@ -123,3 +123,15 @@ Round 6 implementation: `f81381e2a8ec5f13fdac7693018f7bb51e79c3fc` (`fix(tiktok)
 - This round used only offline fakes and automated tests. It did not access a real database, open a browser, upload media, or invoke TikTok or any platform final action.
 
 Round 7 implementation: `9378bd46e5bcd87aebfc37a95186762b9fa4b425` (`fix(tiktok): discard incomplete schedule observations`)
+
+## Review remediation (round 8)
+
+- Necessary correction: when a locator reported multiple matches but one later `nth(...).element_handle()` resolved to `None`, the prior freeze loop silently kept earlier frozen candidates. Repeating that incomplete set could return a partial unique control before the missing node recovered.
+- RED: offline protocol coverage with one locator reporting `count=2`, a stable first handle, and a second `None` failed three ways against the prior implementation: it returned the first partial candidate; it returned a partial candidate during persistent `None` rather than ending at the existing bounded unavailable boundary; and it accepted recovery after only one complete observation.
+- GREEN: `None` from a frozen locator candidate now raises the existing incomplete-observation marker. The outer poll discards all structural results and clears the prior stable signature exactly as it does for a transient enumeration/usability failure. Persistent `None` reaches `tiktok_schedule_unavailable` under the unchanged absolute deadline; a recovered complete set must be observed twice before return.
+- New offline protocol tests cover replacement after two incomplete `count=2` observations, persistent `None` through the deadline, and recovery requiring two complete stable observations. The exact upload-only JSHandle remount handling, non-transient propagation, selectors, final-action isolation, and deadline logic are unchanged.
+- Results: adversarial `3/3` in `0.006s`; schedule form `52/52` in `14.496s`; focused publishing chain `350/350` in `15.908s`; affected overseas suite `563/563` in `17.213s`. Diff checks passed with no output.
+- Scope: implementation relative to `b852145` is exactly `changed=2`, both overseas-owned (`uploader/tk_uploader/schedule_form.py`, `test_overseas_tiktok_schedule_form.py`), `scope-check: OK`. Current `origin/main` scope remains `changed=66`, `REVIEW_REQUIRED`, from the branch's pre-existing shared and report/ledger history.
+- This round used only offline fakes and automated tests. It did not access a real database, open a browser, upload media, or invoke any platform action.
+
+Round 8 implementation: `f71aaa427085069164c944ac99fbd6bebf5132f2` (`fix(tiktok): reject empty schedule handles`)
