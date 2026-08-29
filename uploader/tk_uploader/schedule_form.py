@@ -21,21 +21,7 @@ SCHEDULE_TOGGLE_SELECTORS = (
     '[role="switch"][aria-label*="schedule" i]',
     '[role="switch"][aria-label*="定时"]',
 )
-SCHEDULE_CHOICE_SELECTORS = SCHEDULE_TOGGLE_SELECTORS + (
-    '[data-e2e="schedule-settings"] [role="radio"][aria-label="Schedule"]',
-    '[data-e2e*="schedule" i] [role="radio"][aria-label="Schedule"]',
-    '[data-e2e*="schedule" i] [role="radio"][aria-label="定时发布"]',
-    '[data-e2e*="schedule" i] [role="radio"][aria-label="排期"]',
-    '[data-e2e*="schedule" i] [role="checkbox"][aria-label="Schedule"]',
-    '[data-e2e*="schedule" i] [role="checkbox"][aria-label="定时发布"]',
-    '[data-e2e*="schedule" i] [role="checkbox"][aria-label="排期"]',
-    '[role="radio"][aria-label="Schedule"]',
-    '[role="radio"][aria-label="定时发布"]',
-    '[role="radio"][aria-label="排期"]',
-    '[role="checkbox"][aria-label="Schedule"]',
-    '[role="checkbox"][aria-label="定时发布"]',
-    '[role="checkbox"][aria-label="排期"]',
-)
+SCHEDULE_CHOICE_SELECTORS = SCHEDULE_TOGGLE_SELECTORS
 SCHEDULE_DATE_SELECTORS = (
     '[data-e2e*="schedule" i] input[type="date"]',
     'input[aria-label*="date" i]',
@@ -95,7 +81,8 @@ _SCHEDULE_SUCCESS_MESSAGES = frozenset(
 _POLL_INTERVAL_SECONDS = 1.0
 _OUTCOME_TIMEOUT_SECONDS = 120.0
 _CONTROL_POLL_INTERVAL_SECONDS = 0.25
-_CONTROL_POLL_OBSERVATIONS = 8
+_CONTROL_POLL_OBSERVATIONS = 64
+_CONTROL_TIMEOUT_SECONDS = 15.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,6 +139,12 @@ class TikTokScheduledContentReadback:
     scheduled_at: str
     schedule_timezone: Literal["Asia/Shanghai"]
     evidence: str
+
+
+@dataclass(frozen=True, slots=True)
+class _FrozenScheduleCandidate:
+    node: Any
+    kind: Literal["switch", "radio", "checkbox", "field"]
 
 
 def _shanghai_now() -> datetime:
@@ -258,6 +251,16 @@ async def _switch_enabled(control: Any) -> bool:
     return checked in {"true", "checked"}
 
 
+async def _schedule_choice_enabled(control: Any) -> bool:
+    is_checked = getattr(control, "is_checked", None)
+    if callable(is_checked):
+        try:
+            return bool(await is_checked())
+        except Exception:
+            pass
+    return await _switch_enabled(control)
+
+
 async def _read_feedback(page: Any) -> list[str]:
     try:
         messages: list[str] = []
@@ -321,6 +324,7 @@ class TikTokScheduleForm:
         now: Callable[[], datetime] | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
         readback_page_factory: Callable[[], Awaitable[Any]] | None = None,
+        control_timeout_seconds: float = _CONTROL_TIMEOUT_SECONDS,
     ) -> None:
         self._page = page
         self._resolve_base = resolve_base
@@ -329,48 +333,176 @@ class TikTokScheduleForm:
         self._now = now or _shanghai_now
         self._sleep = sleep or asyncio.sleep
         self._readback_page_factory = readback_page_factory
+        self._control_timeout_seconds = control_timeout_seconds
         self._readback_page: Any | None = None
         self._readback_route_loaded = False
 
-    async def _schedule_scopes(self) -> tuple[Any, ...]:
-        upload_base = await self._resolve_base()
+    async def _await_control(self, operation: Awaitable[Any], deadline: float) -> Any:
+        remaining = deadline - self._monotonic()
+        if remaining <= 0:
+            close = getattr(operation, "close", None)
+            if callable(close):
+                close()
+            raise asyncio.TimeoutError()
+        return await asyncio.wait_for(operation, timeout=remaining)
+
+    @staticmethod
+    def _is_transient_control_error(exc: BaseException) -> bool:
+        if isinstance(exc, asyncio.TimeoutError):
+            return True
+        message = str(exc).casefold()
+        return any(
+            phrase in message
+            for phrase in (
+                "detached",
+                "not attached",
+                "execution context was destroyed",
+                "re-mounted",
+            )
+        )
+
+    async def _schedule_scopes(self, deadline: float) -> tuple[Any, ...]:
+        upload_base = await self._await_control(self._resolve_base(), deadline)
         if upload_base is self._page:
             return (upload_base,)
         return (upload_base, self._page)
 
-    @staticmethod
-    async def _usable_schedule_candidates(
+    async def _freeze_locator_candidates(
+        self,
+        locator: Any,
+        *,
+        kind: Literal["switch", "radio", "checkbox", "field"],
+        deadline: float,
+    ) -> list[_FrozenScheduleCandidate]:
+        frozen: list[_FrozenScheduleCandidate] = []
+        count = await self._await_control(locator.count(), deadline)
+        for index in range(count):
+            live = locator.nth(index)
+            element_handle = getattr(live, "element_handle", None)
+            node = (
+                await self._await_control(element_handle(), deadline)
+                if callable(element_handle)
+                else live
+            )
+            if node is not None:
+                frozen.append(_FrozenScheduleCandidate(node, kind))
+        return frozen
+
+    async def _same_frozen_node(
+        self,
+        left: _FrozenScheduleCandidate,
+        right: _FrozenScheduleCandidate,
+        deadline: float,
+    ) -> bool:
+        return bool(
+            await self._await_control(_same_dom_node(left.node, right.node), deadline)
+        )
+
+    async def _append_unique_frozen(
+        self,
+        items: list[_FrozenScheduleCandidate],
+        candidate: _FrozenScheduleCandidate,
+        deadline: float,
+    ) -> None:
+        for existing in items:
+            if await self._same_frozen_node(existing, candidate, deadline):
+                return
+        items.append(candidate)
+
+    async def _observed_schedule_candidates(
+        self,
         scopes: tuple[Any, ...],
         selectors: tuple[str, ...],
         *,
-        editable: bool,
-        checked: bool | None,
-    ) -> tuple[list[Any], int]:
-        candidates: list[Any] = []
+        choice: bool,
+        deadline: float,
+    ) -> list[_FrozenScheduleCandidate]:
+        candidates: list[_FrozenScheduleCandidate] = []
         for scope in scopes:
             try:
-                scoped_candidates = await _bounded_candidates(scope, selectors)
-            except Exception:
+                for selector in selectors:
+                    locator = scope.locator(selector)
+                    kind: Literal["switch", "radio", "checkbox", "field"] = (
+                        "switch" if choice else "field"
+                    )
+                    for candidate in await self._freeze_locator_candidates(
+                        locator, kind=kind, deadline=deadline
+                    ):
+                        await self._append_unique_frozen(candidates, candidate, deadline)
+                if choice:
+                    get_by_role = getattr(scope, "get_by_role", None)
+                    if callable(get_by_role):
+                        for role in ("radio", "checkbox"):
+                            for name in ("Schedule", "定时发布", "排期"):
+                                locator = get_by_role(role, name=name, exact=True)
+                                for candidate in await self._freeze_locator_candidates(
+                                    locator, kind=role, deadline=deadline
+                                ):
+                                    await self._append_unique_frozen(candidates, candidate, deadline)
+            except BaseException as exc:
+                if not self._is_transient_control_error(exc):
+                    raise
                 continue
-            for candidate in scoped_candidates:
-                await _append_unique(candidates, candidate)
+        return candidates
 
-        usable: list[Any] = []
+    async def _choice_checked(
+        self,
+        candidate: _FrozenScheduleCandidate,
+        deadline: float,
+    ) -> bool:
+        if candidate.kind in {"radio", "checkbox"}:
+            is_checked = getattr(candidate.node, "is_checked", None)
+            if not callable(is_checked):
+                raise RuntimeError("native schedule choice lacks is_checked")
+            return bool(await self._await_control(is_checked(), deadline))
+        return await self._await_control(_switch_enabled(candidate.node), deadline)
+
+    async def _usable_schedule_candidates(
+        self,
+        candidates: list[_FrozenScheduleCandidate],
+        *,
+        editable: bool,
+        checked: bool | None,
+        deadline: float,
+    ) -> list[_FrozenScheduleCandidate]:
+        usable: list[_FrozenScheduleCandidate] = []
         for candidate in candidates:
             try:
-                if not await candidate.is_visible() or not await candidate.is_enabled():
+                if not await self._await_control(candidate.node.is_visible(), deadline):
+                    continue
+                if not await self._await_control(candidate.node.is_enabled(), deadline):
                     continue
                 if editable:
-                    if not await candidate.is_editable():
+                    if not await self._await_control(candidate.node.is_editable(), deadline):
                         continue
-                    if await candidate.get_attribute("readonly") is not None:
+                    if await self._await_control(candidate.node.get_attribute("readonly"), deadline) is not None:
                         continue
-                if checked is not None and await _switch_enabled(candidate) != checked:
+                if checked is not None and await self._choice_checked(candidate, deadline) != checked:
                     continue
-            except Exception:
+            except BaseException as exc:
+                if not self._is_transient_control_error(exc):
+                    raise
                 continue
             usable.append(candidate)
-        return usable, len(candidates)
+        return usable
+
+    async def _same_candidate_sets(
+        self,
+        left: list[_FrozenScheduleCandidate],
+        right: list[_FrozenScheduleCandidate],
+        deadline: float,
+    ) -> bool:
+        if len(left) != len(right):
+            return False
+        unmatched = list(right)
+        for candidate in left:
+            for index, other in enumerate(unmatched):
+                if await self._same_frozen_node(candidate, other, deadline):
+                    unmatched.pop(index)
+                    break
+            else:
+                return False
+        return not unmatched
 
     async def _schedule_control(
         self,
@@ -380,46 +512,46 @@ class TikTokScheduleForm:
         editable: bool,
         checked: bool | None = None,
     ) -> Any:
-        stable_candidate: Any | None = None
-        prior_multiple = False
+        deadline = self._monotonic() + self._control_timeout_seconds
+        previous_usable: list[_FrozenScheduleCandidate] = []
         last_scope_count = 0
         last_candidate_count = 0
         last_usable_count = 0
         for observation in range(_CONTROL_POLL_OBSERVATIONS):
+            if self._monotonic() >= deadline:
+                break
             try:
-                scopes = await self._schedule_scopes()
-            except Exception:
+                await self._await_control(self._wait_for_manual_intervention(self._page), deadline)
+                scopes = await self._schedule_scopes(deadline)
+                candidates = await self._observed_schedule_candidates(
+                    scopes, selectors, choice=setting == "schedule choice", deadline=deadline
+                )
+                usable = await self._usable_schedule_candidates(
+                    candidates, editable=editable, checked=checked, deadline=deadline
+                )
+            except BaseException as exc:
+                if not self._is_transient_control_error(exc):
+                    raise
                 scopes = ()
-            usable, candidate_count = await self._usable_schedule_candidates(
-                scopes,
-                selectors,
-                editable=editable,
-                checked=checked,
-            )
+                candidates = []
+                usable = []
             last_scope_count = len(scopes)
-            last_candidate_count = candidate_count
+            last_candidate_count = len(candidates)
             last_usable_count = len(usable)
             if len(usable) == 1:
-                candidate = usable[0]
-                if (
-                    stable_candidate is not None
-                    and await _same_dom_node(stable_candidate, candidate)
-                ):
-                    return candidate
-                stable_candidate = candidate
-                prior_multiple = False
+                if await self._same_candidate_sets(previous_usable, usable, deadline):
+                    return usable[0].node
+                previous_usable = usable
             elif len(usable) > 1:
-                if prior_multiple:
+                if await self._same_candidate_sets(previous_usable, usable, deadline):
                     raise TikTokPublishError(
                         "tiktok_schedule_control_ambiguous",
                         f"TikTok {setting} ambiguous (scopes={last_scope_count}, "
                         f"candidates={last_candidate_count}, usable={last_usable_count})",
                     )
-                stable_candidate = None
-                prior_multiple = True
+                previous_usable = usable
             else:
-                stable_candidate = None
-                prior_multiple = False
+                previous_usable = []
             if observation + 1 < _CONTROL_POLL_OBSERVATIONS:
                 await self._sleep(_CONTROL_POLL_INTERVAL_SECONDS)
         raise TikTokPublishError(
@@ -439,7 +571,7 @@ class TikTokScheduleForm:
             setting="schedule choice",
             editable=False,
         )
-        if not await _switch_enabled(toggle):
+        if not await _schedule_choice_enabled(toggle):
             await toggle.click()
 
         toggle = await self._schedule_control(

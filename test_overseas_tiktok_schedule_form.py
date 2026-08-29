@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import unittest
 import unicodedata
@@ -69,6 +70,7 @@ class FakeScheduleControl:
         editable: bool = False,
         read_only: bool = False,
         checked: bool = False,
+        checked_attribute_tracks_state: bool = True,
         attributes: dict[str, str | None] | None = None,
         fill_transform: Callable[[str], str] | None = None,
         raise_if_clicked: bool = False,
@@ -84,6 +86,7 @@ class FakeScheduleControl:
         self.editable = editable
         self.read_only = read_only
         self.checked = checked
+        self.checked_attribute_tracks_state = checked_attribute_tracks_state
         self.attributes = dict(attributes or {})
         self.fill_transform = fill_transform
         self.raise_if_clicked = raise_if_clicked
@@ -141,8 +144,12 @@ class FakeScheduleControl:
     async def get_attribute(self, name: str) -> str | None:
         self._assert_attached()
         if name == "aria-checked":
+            if not self.checked_attribute_tracks_state:
+                return None
             return "true" if self.checked else "false"
         if name == "checked":
+            if not self.checked_attribute_tracks_state:
+                return None
             return "true" if self.checked else None
         if name == "readonly":
             return "true" if self.read_only else None
@@ -162,6 +169,10 @@ class FakeScheduleControl:
     async def is_enabled(self) -> bool:
         self._assert_attached()
         return self.enabled
+
+    async def is_checked(self) -> bool:
+        self._assert_attached()
+        return self.checked
 
     async def is_editable(self) -> bool:
         self._assert_attached()
@@ -183,6 +194,7 @@ class FakeScheduleBase:
         self._registered: dict[str, list[FakeScheduleControl]] = {}
         self.controls: list[FakeScheduleControl] = []
         self.locator_failures: dict[str, int] = {}
+        self._accessible_labels: dict[str, str] = {}
 
     def register(self, selector: str, *controls: FakeScheduleControl) -> None:
         self._registered.setdefault(selector, []).extend(controls)
@@ -194,6 +206,32 @@ class FakeScheduleBase:
             raise RuntimeError("transient feedback locator failure")
         return FakeScheduleLocator(_deduplicated(self._registered.get(selector, [])))
 
+    def set_accessible_label(self, label_id: str, value: str) -> None:
+        self._accessible_labels[label_id] = value
+
+    def get_by_role(
+        self,
+        semantic_role: str,
+        *,
+        name: str,
+        exact: bool,
+    ) -> FakeScheduleLocator:
+        def accessible_name(control: FakeScheduleControl) -> str:
+            labelled_by = str(control.attributes.get("aria-labelledby") or "")
+            labelled = " ".join(
+                self._accessible_labels.get(label_id, "")
+                for label_id in labelled_by.split()
+            ).strip()
+            return labelled or str(control.attributes.get("aria-label") or control.label)
+
+        return FakeScheduleLocator(
+            [
+                control
+                for control in self.by_role(semantic_role)
+                if (accessible_name(control) == name if exact else name in accessible_name(control))
+            ]
+        )
+
     def by_role(self, semantic_role: str) -> list[FakeScheduleControl]:
         return [
             control
@@ -204,6 +242,55 @@ class FakeScheduleBase:
     def detach(self) -> None:
         for control in _deduplicated(self.controls):
             control.detached = True
+
+
+class LiveScheduleLocator:
+    """A locator that re-resolves to a different DOM node on each handle read."""
+
+    def __init__(self, snapshots: list[FakeScheduleControl]) -> None:
+        self._snapshots = snapshots
+        self._position = 0
+
+    async def count(self) -> int:
+        return 1
+
+    def nth(self, index: int) -> LiveScheduleLocator:
+        if index != 0:
+            raise IndexError(index)
+        return self
+
+    @property
+    def node_id(self) -> str:
+        return self._snapshots[min(self._position, len(self._snapshots) - 1)].node_id
+
+    async def element_handle(self) -> FakeScheduleControl:
+        snapshot = self._snapshots[min(self._position, len(self._snapshots) - 1)]
+        self._position += 1
+        return snapshot
+
+    async def is_visible(self) -> bool:
+        return await self._snapshots[min(self._position, len(self._snapshots) - 1)].is_visible()
+
+    async def is_enabled(self) -> bool:
+        return await self._snapshots[min(self._position, len(self._snapshots) - 1)].is_enabled()
+
+    async def get_attribute(self, name: str) -> str | None:
+        return await self._snapshots[min(self._position, len(self._snapshots) - 1)].get_attribute(name)
+
+
+class HangingScheduleLocator:
+    async def count(self) -> int:
+        await asyncio.Future()
+        raise AssertionError("unreachable")
+
+
+class LiveScheduleBase(FakeScheduleBase):
+    def __init__(self, live_locators: dict[str, LiveScheduleLocator]) -> None:
+        super().__init__("live-base")
+        self._live_locators = live_locators
+
+    def locator(self, selector: str) -> FakeScheduleLocator | LiveScheduleLocator:
+        return self._live_locators.get(selector, super().locator(selector))
 
 
 class FakeSchedulePage(FakeScheduleBase):
@@ -459,6 +546,7 @@ class TikTokScheduleFormTests(unittest.IsolatedAsyncioTestCase):
         bases: list[FakeScheduleBase],
         *,
         clock: FakeClock | None = None,
+        control_timeout_seconds: float | None = None,
     ) -> tuple[TikTokScheduleForm, AsyncMock, AsyncMock]:
         resolver = AsyncMock(side_effect=bases)
         intervention = AsyncMock()
@@ -469,6 +557,8 @@ class TikTokScheduleFormTests(unittest.IsolatedAsyncioTestCase):
                 "now": clock.now,
                 "sleep": clock.sleep,
             }
+        if control_timeout_seconds is not None:
+            kwargs["control_timeout_seconds"] = control_timeout_seconds
         return (
             TikTokScheduleForm(
                 page,
@@ -507,7 +597,7 @@ class TikTokScheduleFormTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_missing_schedule_control_never_falls_back_to_post(self) -> None:
         page, bases = scheduled_form_page(toggle_count=0, final_button="Post")
-        form, _, _ = self.form(page, bases)
+        form, _, _ = self.form(page, bases, clock=FakeClock())
 
         with self.assertRaises(TikTokPublishError) as raised:
             await form.configure(self.target)
@@ -528,7 +618,7 @@ class TikTokScheduleFormTests(unittest.IsolatedAsyncioTestCase):
     async def test_disabled_schedule_control_is_unavailable(self) -> None:
         page, bases = scheduled_form_page()
         bases[0].by_role("switch")[0].enabled = False
-        form, _, _ = self.form(page, bases)
+        form, _, _ = self.form(page, bases, clock=FakeClock())
 
         with self.assertRaises(TikTokPublishError) as raised:
             await form.configure(self.target)
@@ -552,6 +642,93 @@ class TikTokScheduleFormTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(radio.checked)
         self.assertEqual(radio.click_count, 1)
         self.assertEqual(bases[0].by_role("final_action")[0].click_count, 0)
+
+    async def test_configure_uses_exact_role_name_and_native_checked_property(
+        self,
+    ) -> None:
+        page, bases = scheduled_form_page(toggle_count=0)
+        bases[0].set_accessible_label("schedule-choice-label", "Schedule")
+        radio = FakeScheduleControl(
+            "labelled-schedule-radio",
+            "radio",
+            attributes={"aria-labelledby": "schedule-choice-label"},
+            checked_attribute_tracks_state=False,
+        )
+        bases[0].register("[data-test-only='radio']", radio)
+        clock = FakeClock()
+        form, _, _ = self.form(page, bases, clock=clock)
+
+        await form.configure(self.target)
+
+        self.assertTrue(radio.checked)
+        self.assertEqual(radio.click_count, 1)
+        self.assertEqual(bases[0].by_role("final_action")[0].click_count, 0)
+
+    async def test_live_locator_remount_requires_the_new_node_twice(self) -> None:
+        first = FakeScheduleControl("live-radio-a", "switch", checked=True)
+        replacement = FakeScheduleControl("live-radio-b", "switch", checked=True)
+        base = LiveScheduleBase(
+            {SCHEDULE_TOGGLE_SELECTORS[0]: LiveScheduleLocator([first, replacement, replacement])}
+        )
+        page = FakeSchedulePage()
+        clock = FakeClock()
+        form, _, _ = self.form(page, [base] * 8, clock=clock)
+
+        control = await form._schedule_control(
+            SCHEDULE_TOGGLE_SELECTORS,
+            setting="schedule choice",
+            editable=False,
+        )
+
+        self.assertEqual(control.node_id, "live-radio-b")
+        self.assertEqual(clock.sleeps, [0.25, 0.25])
+
+    async def test_live_multiple_sets_must_be_stable_before_ambiguity(self) -> None:
+        first_a = FakeScheduleControl("set-a", "switch", checked=True)
+        first_b = FakeScheduleControl("set-b", "switch", checked=True)
+        second_c = FakeScheduleControl("set-c", "switch", checked=True)
+        second_d = FakeScheduleControl("set-d", "switch", checked=True)
+        base = LiveScheduleBase(
+            {
+                SCHEDULE_TOGGLE_SELECTORS[0]: LiveScheduleLocator(
+                    [first_a, second_c, second_c]
+                ),
+                SCHEDULE_TOGGLE_SELECTORS[1]: LiveScheduleLocator(
+                    [first_b, second_d, second_d]
+                ),
+            }
+        )
+        page = FakeSchedulePage()
+        clock = FakeClock()
+        form, _, _ = self.form(page, [base] * 8, clock=clock)
+
+        with self.assertRaises(TikTokPublishError) as raised:
+            await form._schedule_control(
+                SCHEDULE_TOGGLE_SELECTORS,
+                setting="schedule choice",
+                editable=False,
+            )
+
+        self.assertEqual(raised.exception.error_code, "tiktok_schedule_control_ambiguous")
+        self.assertEqual(clock.sleeps, [0.25, 0.25])
+
+    async def test_hung_dom_read_hits_schedule_control_deadline(self) -> None:
+        base = LiveScheduleBase({SCHEDULE_TOGGLE_SELECTORS[0]: HangingScheduleLocator()})
+        page = FakeSchedulePage()
+        form, _, _ = self.form(
+            page,
+            [base] * 8,
+            control_timeout_seconds=0.01,
+        )
+
+        with self.assertRaises(TikTokPublishError) as raised:
+            await form._schedule_control(
+                SCHEDULE_TOGGLE_SELECTORS,
+                setting="schedule choice",
+                editable=False,
+            )
+
+        self.assertEqual(raised.exception.error_code, "tiktok_schedule_unavailable")
 
     async def test_configure_waits_for_delayed_exact_schedule_radio_choice(
         self,
@@ -610,6 +787,10 @@ class TikTokScheduleFormTests(unittest.IsolatedAsyncioTestCase):
         def remount(_seconds: float) -> None:
             first.detached = True
             bases[0]._registered[EXACT_SCHEDULE_RADIO_SELECTOR] = [replacement]
+            bases[0].controls = [
+                replacement if control is first else control
+                for control in bases[0].controls
+            ]
 
         clock.on_sleep = remount
         form, _, _ = self.form(page, bases, clock=clock)
