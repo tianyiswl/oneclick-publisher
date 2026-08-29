@@ -111,3 +111,15 @@ Round 5 implementation: `b1361f4427af3e7725b274bfb7d005f8ce562cb6` (`fix(tiktok)
 - Results: schedule form `46/46` in `14.503s`; focused `337/337` in `15.733s`; affected `554/554` in `17.138s`. Implementation scope against `307d948` was `changed=2`, overseas-owned, `scope-check: OK`; diff checks passed.
 
 Round 6 implementation: `f81381e2a8ec5f13fdac7693018f7bb51e79c3fc` (`fix(tiktok): match upload context error variants`)
+
+## Review remediation (round 7)
+
+- Necessary correction: a transient while enumerating a later selector or the top-page scope previously retained candidates already collected from the same observation. Likewise, a transient while checking a later candidate left earlier usable controls intact. Either partial result could be observed twice and incorrectly satisfy the stable-control requirement.
+- RED: three new offline adversarial tests, each raising the real `playwright.async_api.Error("Execution context was destroyed, most likely because of a navigation")`, failed against the prior implementation: a later-selector transient and a top-page transient each returned after one poll; a second-candidate usability transient returned a control instead of reaching the stable ambiguity stop.
+- GREEN: any transient during candidate enumeration or usability inspection now invalidates the whole observation. The poll clears scope/candidate/usable counts and resets the prior stable set; after recovery, two new complete observations are required before a unique control can return or a stable multi-control set can stop as ambiguous. Non-transient exceptions continue to propagate. The earlier upload-only, exact JSHandle cross-context remount classification is unchanged.
+- New adversarial tests cover later-selector transient, top-page scope transient (so upload partials cannot survive), and second-candidate usability transient. In each recovery case, the observable result requires three 250 ms poll sleeps: two invalid observations, then two complete observations. No final-action selectors, schedule selectors, or deadline behavior changed.
+- Results: adversarial `3/3` in `0.009s`; schedule form `49/49` in `14.526s`; focused publishing chain `347/347` in `15.956s`; affected overseas suite `560/560` in `17.256s`. `git diff --check`, staged diff check, and committed-range diff check passed with no output.
+- Scope: implementation relative to `bce1a10` is exactly `changed=2`, both overseas-owned (`uploader/tk_uploader/schedule_form.py`, `test_overseas_tiktok_schedule_form.py`), `scope-check: OK`. Current `origin/main` scope is `changed=66`, `REVIEW_REQUIRED`, because it includes pre-existing shared and task-report/ledger history; this round's implementation scope remains clean.
+- This round used only offline fakes and automated tests. It did not access a real database, open a browser, upload media, or invoke TikTok or any platform final action.
+
+Round 7 implementation: `9378bd46e5bcd87aebfc37a95186762b9fa4b425` (`fix(tiktok): discard incomplete schedule observations`)
