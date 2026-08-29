@@ -7,7 +7,7 @@
     "quality_profile": "showcase",
     "repository": {
       "url": "https://github.com/tianyiswl/oneclick-publisher.git",
-      "revision": "cf07986f36e4e86224315dfc4af04adf27a66848"
+      "revision": "8c23de2592abf752311b88fac2a777a2dfac62d1"
     },
     "viewBox": [1540, 730],
     "views": [
@@ -66,8 +66,8 @@
       "size": [225, 74],
       "tag": "single TikTok path",
       "sources": [
-        {"path": "docs/superpowers/plans/2026-08-28-tiktok-controlled-video-publish.md", "line": 541, "end_line": 624, "label": "专用服务接入点"},
-        {"path": "app_core/overseas_video_publish.py", "line": 1, "end_line": 22, "label": "现有兼容入口"}
+        {"path": "app_core/overseas_tiktok_publish.py", "line": 451, "end_line": 464, "label": "最终点击前排期时窗复验"},
+        {"path": "app_core/overseas_tiktok_publish.py", "line": 1470, "end_line": 1668, "label": "同一受控会话提交与排期回读"}
       ]
     },
     {
@@ -78,8 +78,8 @@
       "pos": [720, 295],
       "size": [225, 74],
       "sources": [
-        {"path": "uploader/tk_uploader/main.py", "line": 121, "end_line": 150, "label": "TikTok 上传器"},
-        {"path": "uploader/tk_uploader/main.py", "line": 365, "end_line": 437, "label": "同页表单与最终动作"}
+        {"path": "uploader/tk_uploader/main.py", "line": 730, "end_line": 768, "label": "同页表单与定时配置"},
+        {"path": "uploader/tk_uploader/main.py", "line": 903, "end_line": 1034, "label": "唯一最终按钮、Schedule 受理与回读"}
       ]
     },
     {
@@ -89,9 +89,9 @@
       "sublabel": "北京时间开关、日期时间、唯一 Schedule 与排期回读",
       "tag": "no fallback to Post",
       "sources": [
-        {"path": "docs/superpowers/specs/2026-08-29-tiktok-scheduled-video-publish-design.md", "line": 125, "label": "已批准的平台原生定时模块边界"},
-        {"path": "uploader/tk_uploader/main.py", "line": 629, "label": "现有表单快照精确回读入口"},
-        {"path": "uploader/tk_uploader/main.py", "line": 857, "label": "现有正式模式锁与一次性提交入口"}
+        {"path": "app_core/tiktok_schedule_contract.py", "line": 47, "end_line": 99, "label": "严格北京时间排期合同"},
+        {"path": "uploader/tk_uploader/schedule_form.py", "line": 299, "end_line": 450, "label": "定时控件填写、精确回读与唯一 Schedule"},
+        {"path": "uploader/tk_uploader/schedule_form.py", "line": 452, "end_line": 522, "label": "平台受理与定时列表回读"}
       ],
       "pos": [970, 295],
       "size": [230, 74]
@@ -103,8 +103,8 @@
       "sublabel": "精确绑定表单回读与排期；消费后才可最终点击",
       "tag": "not CAPTCHA / risk control",
       "sources": [
-        {"path": "app_core/controlled_publish.py", "line": 1502, "label": "检查成功后签发短期一次性授权"},
-        {"path": "app_core/controlled_publish.py", "line": 1735, "label": "正式任务原子消费当次授权"}
+        {"path": "app_core/controlled_publish.py", "line": 891, "end_line": 990, "label": "绑定预检快照并原子消费一次性授权"},
+        {"path": "app_core/controlled_publish.py", "line": 1696, "end_line": 1735, "label": "最终动作后阻止同一指纹重发"}
       ],
       "pos": [1260, 505],
       "size": [190, 74]
@@ -167,9 +167,9 @@
       "pos": [255, 505],
       "size": [190, 70],
       "sources": [
-        {"path": "app_core/database.py", "line": 500, "end_line": 505, "label": "任务心跳字段"},
         {"path": "app_core/database.py", "line": 543, "end_line": 595, "label": "任务项与事件"},
-        {"path": "app_core/task_service.py", "line": 1860, "end_line": 1895, "label": "运行与续租"}
+        {"path": "app_core/task_service.py", "line": 2037, "end_line": 2085, "label": "终态回执投影与 publishedAt 清理"},
+        {"path": "app_core/task_service.py", "line": 2190, "end_line": 2331, "label": "失联任务按最终动作前后收口"}
       ]
     },
     {
