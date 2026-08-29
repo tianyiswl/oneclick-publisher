@@ -587,6 +587,33 @@ async def select_facebook_page_for_login(
     return await activate_saved_facebook_page(page, selected.page_id)
 
 
+def _mark_failed_facebook_page_update(
+    *,
+    update_mode: bool,
+    record_id: int | None,
+    expected_account,
+    error: FacebookPagePublishError,
+) -> None:
+    """Invalidate only the original Page row after an identity/permission failure."""
+
+    if not update_mode or record_id is None or not expected_account:
+        return
+    if error.error_code not in {
+        "facebook_page_identity_mismatch",
+        "facebook_page_content_permission_missing",
+        "facebook_page_not_found",
+    }:
+        return
+    try:
+        expected_id = int(expected_account.get("id"))
+        expected_type = int(expected_account.get("type"))
+    except (AttributeError, TypeError, ValueError):
+        return
+    if expected_id != int(record_id) or expected_type != 9:
+        return
+    account_service.update_status(expected_id, 0)
+
+
 async def _visible(page, selector: str) -> bool:
     try:
         locator = page.locator(selector).first
@@ -791,6 +818,7 @@ async def _browser_cookie_gen(
         tiktok_previous_account = None
         tiktok_login_succeeded = False
         tiktok_account_write_attempted = False
+        facebook_page_login_succeeded = False
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=60000)
             if platform_type == 6 and background_mode:
@@ -854,6 +882,12 @@ async def _browser_cookie_gen(
                     status_queue.put("CANCELLED")
                     return None
                 except FacebookPagePublishError as exc:
+                    _mark_failed_facebook_page_update(
+                        update_mode=bool(update_mode),
+                        record_id=record_id,
+                        expected_account=expected_account,
+                        error=exc,
+                    )
                     status_queue.put(f"ERROR:{exc.error_code}")
                     status_queue.put("500")
                     return None
@@ -889,6 +923,12 @@ async def _browser_cookie_gen(
                         facebook_identity.page_id,
                     )
                 except FacebookPagePublishError as exc:
+                    _mark_failed_facebook_page_update(
+                        update_mode=bool(update_mode),
+                        record_id=record_id,
+                        expected_account=expected_account,
+                        error=exc,
+                    )
                     cookie_path.unlink(missing_ok=True)
                     status_queue.put(f"ERROR:{exc.error_code}")
                     status_queue.put("500")
@@ -956,10 +996,17 @@ async def _browser_cookie_gen(
                         expected_account=expected_account if update_mode else None,
                     )
                 except FacebookPagePublishError as exc:
+                    _mark_failed_facebook_page_update(
+                        update_mode=bool(update_mode),
+                        record_id=record_id,
+                        expected_account=expected_account,
+                        error=exc,
+                    )
                     cookie_path.unlink(missing_ok=True)
                     status_queue.put(f"ERROR:{exc.error_code}")
                     status_queue.put("500")
                     return None
+                facebook_page_login_succeeded = True
                 status_queue.put(f"ACCOUNT_ID:{account_id}")
             else:
                 account_id = None
@@ -1029,24 +1076,32 @@ async def _browser_cookie_gen(
             status_queue.put("500")
             return None
         finally:
-            if (
-                platform_type == 6
-                and cookie_path is not None
-                and not tiktok_login_succeeded
-            ):
-                try:
-                    _discard_failed_tiktok_login(
-                        account_id,
-                        update_mode=bool(update_mode),
-                        cookie_path=cookie_path,
-                        avatar_path=avatar_path,
-                        previous_account=tiktok_previous_account,
-                        account_write_attempted=tiktok_account_write_attempted,
-                    )
-                except Exception:
-                    # 登录主错误保持稳定；仍继续关闭浏览器资源。
-                    pass
-            await close_login_resources(page, context, browser)
+            try:
+                if (
+                    platform_type == 9
+                    and cookie_path is not None
+                    and not facebook_page_login_succeeded
+                ):
+                    cookie_path.unlink(missing_ok=True)
+                if (
+                    platform_type == 6
+                    and cookie_path is not None
+                    and not tiktok_login_succeeded
+                ):
+                    try:
+                        _discard_failed_tiktok_login(
+                            account_id,
+                            update_mode=bool(update_mode),
+                            cookie_path=cookie_path,
+                            avatar_path=avatar_path,
+                            previous_account=tiktok_previous_account,
+                            account_write_attempted=tiktok_account_write_attempted,
+                        )
+                    except Exception:
+                        # 登录主错误保持稳定；仍继续关闭浏览器资源。
+                        pass
+            finally:
+                await close_login_resources(page, context, browser)
 
 
 async def tiktok_cookie_gen(id, status_queue, update_mode=False, record_id=None, cancel_event=None, background_mode=False):

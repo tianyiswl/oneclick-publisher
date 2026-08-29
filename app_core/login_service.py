@@ -55,6 +55,8 @@ class RecoveredOverseasLoginSession:
         self.manual_save_supported = self.platform_type != 9
 
     def start(self) -> None:
+        if self.platform_type == 9 and not facebook_page_v1_enabled():
+            raise RuntimeError("Facebook Page V1 默认关闭，当前不能启动登录。")
         threading.Thread(
             target=self._thread_main,
             daemon=True,

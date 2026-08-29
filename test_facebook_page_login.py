@@ -10,7 +10,7 @@ import queue
 import tempfile
 import threading
 import unittest
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -190,6 +190,22 @@ class FacebookPageLoginRoutingTests(unittest.TestCase):
         self.assertEqual(session.platform_type, 9)
         start.assert_called_once_with()
 
+    def test_direct_page_session_start_rechecks_the_exact_closed_gate(self) -> None:
+        session = login_service.RecoveredOverseasLoginSession(9, "Meta 主体")
+
+        with (
+            patch.dict(
+                os.environ,
+                {"ONECLICK_ENABLE_FACEBOOK_PAGE_V1": "true"},
+                clear=True,
+            ),
+            patch.object(login_service.threading, "Thread") as worker,
+            self.assertRaisesRegex(RuntimeError, "Facebook Page V1"),
+        ):
+            session.start()
+
+        worker.assert_not_called()
+
     def test_page_only_session_routes_to_page_generator_not_shared_meta_save(self) -> None:
         session = login_service.RecoveredOverseasLoginSession(9, "Meta 主体")
         with (
@@ -261,6 +277,10 @@ class FacebookPagePersistenceTimingTests(unittest.IsolatedAsyncioTestCase):
         *,
         check_error: Exception | None = None,
         cancel_event=None,
+        page_records: list[dict[str, object]] | None = None,
+        update_account: dict[str, object] | None = None,
+        save_error: Exception | None = None,
+        chmod_error: Exception | None = None,
     ):
         class PlaywrightContext:
             async def __aenter__(self):
@@ -270,7 +290,9 @@ class FacebookPagePersistenceTimingTests(unittest.IsolatedAsyncioTestCase):
                 return False
 
         page = _FakePage(
-            [
+            page_records
+            if page_records is not None
+            else [
                 {"page_id": "1001", "page_name": "同名", "can_manage_content": True},
                 {"page_id": "1002", "page_name": "同名", "can_manage_content": True},
             ]
@@ -282,6 +304,20 @@ class FacebookPagePersistenceTimingTests(unittest.IsolatedAsyncioTestCase):
             Path(path).write_text("{}", encoding="utf-8")
 
         status_queue: queue.Queue[object] = queue.Queue()
+        saver_patch = (
+            patch.object(
+                account_service,
+                "save_facebook_page_browser_account",
+                side_effect=save_error,
+            )
+            if save_error is not None
+            else nullcontext()
+        )
+        chmod_patch = (
+            patch.object(recovered_login.os, "chmod", side_effect=chmod_error)
+            if chmod_error is not None
+            else nullcontext()
+        )
         with (
             patch.object(recovered_login, "BASE_DIR", self.root),
             patch.object(account_service, "connect", self._connect),
@@ -291,6 +327,7 @@ class FacebookPagePersistenceTimingTests(unittest.IsolatedAsyncioTestCase):
             patch.object(recovered_login, "set_init_script", new=AsyncMock(return_value=context)),
             patch.object(recovered_login, "_wait_for_browser_login", new=AsyncMock(return_value="ready")),
             patch.object(recovered_login, "save_context_storage_state", new=AsyncMock(side_effect=save_state)),
+            chmod_patch,
             patch.object(
                 recovered_login,
                 "check_cookie",
@@ -300,14 +337,22 @@ class FacebookPagePersistenceTimingTests(unittest.IsolatedAsyncioTestCase):
                 ),
             ),
             patch.object(recovered_login, "close_login_resources", new=AsyncMock()),
+            saver_patch,
         ):
             result = await recovered_login._browser_cookie_gen(
                 9,
                 "Meta 主体",
                 status_queue,
+                update_mode=update_account is not None,
+                record_id=(
+                    int(update_account["id"])
+                    if update_account is not None
+                    else None
+                ),
                 background_mode=True,
                 cancel_event=cancel_event,
                 selection_callback=selection_callback,
+                expected_account=update_account,
             )
         return result, list(status_queue.queue)
 
@@ -449,6 +494,284 @@ class FacebookPagePersistenceTimingTests(unittest.IsolatedAsyncioTestCase):
             "facebook_page_identity_mismatch",
         )
         self.assertEqual(result["accounts"][0]["accountReference"], "1001")
+
+    async def test_update_identity_failures_mark_the_original_abnormal_without_overwriting_it(self) -> None:
+        connection = sqlite3.connect(self.database)
+        account_id = connection.execute(
+            """
+            INSERT INTO user_info
+                (type, filePath, userName, status, profileName, authMode,
+                 accountReference)
+            VALUES (9, 'old.json', '原 Page', 1, 'Meta 主体', 'browser', '1001')
+            """
+        ).lastrowid
+        connection.commit()
+        connection.close()
+        old_state = self.root / "cookiesFile" / "old.json"
+        old_state.write_text('{"saved": true}', encoding="utf-8")
+        expected_account = {
+            "id": int(account_id),
+            "type": 9,
+            "status": 1,
+            "authMode": "browser",
+            "profileName": "Meta 主体",
+            "userName": "原 Page",
+            "filePath": "old.json",
+            "accountReference": "1001",
+        }
+        allowed_pages = [
+            {"page_id": "1001", "page_name": "原 Page", "can_manage_content": True}
+        ]
+        scenarios = (
+            {
+                "name": "selection_permission_loss",
+                "page_records": [
+                    {
+                        "page_id": "1001",
+                        "page_name": "原 Page",
+                        "can_manage_content": False,
+                    }
+                ],
+                "checked_identity": None,
+                "check_error": None,
+                "save_error": None,
+                "error_code": "facebook_page_content_permission_missing",
+            },
+            {
+                "name": "saved_state_identity_mismatch",
+                "page_records": allowed_pages,
+                "checked_identity": None,
+                "check_error": FacebookPagePublishError(
+                    "facebook_page_identity_mismatch",
+                    "Page mismatch",
+                ),
+                "save_error": None,
+                "error_code": "facebook_page_identity_mismatch",
+            },
+            {
+                "name": "final_save_identity_mismatch",
+                "page_records": allowed_pages,
+                "checked_identity": _identity("1001", "原 Page"),
+                "check_error": None,
+                "save_error": FacebookPagePublishError(
+                    "facebook_page_identity_mismatch",
+                    "Page changed before commit",
+                ),
+                "error_code": "facebook_page_identity_mismatch",
+            },
+        )
+
+        for scenario in scenarios:
+            with self.subTest(stage=scenario["name"]):
+                connection = sqlite3.connect(self.database)
+                connection.execute(
+                    """
+                    UPDATE user_info
+                    SET status = 1, filePath = 'old.json', accountReference = '1001'
+                    WHERE id = ?
+                    """,
+                    (int(account_id),),
+                )
+                connection.commit()
+                connection.close()
+                result, messages = await self._run_page_login(
+                    None,
+                    scenario["checked_identity"],
+                    check_error=scenario["check_error"],
+                    page_records=scenario["page_records"],
+                    update_account=expected_account,
+                    save_error=scenario["save_error"],
+                )
+
+                self.assertIsNone(result)
+                self.assertIn(f"ERROR:{scenario['error_code']}", messages)
+                connection = sqlite3.connect(self.database)
+                saved = connection.execute(
+                    "SELECT status, filePath, accountReference FROM user_info WHERE id = ?",
+                    (int(account_id),),
+                ).fetchone()
+                connection.close()
+                self.assertEqual(saved, (0, "old.json", "1001"))
+                self.assertEqual(
+                    old_state.read_text(encoding="utf-8"),
+                    '{"saved": true}',
+                )
+
+    async def test_unexpected_page_login_failures_delete_only_the_candidate_state(self) -> None:
+        connection = sqlite3.connect(self.database)
+        account_id = connection.execute(
+            """
+            INSERT INTO user_info
+                (type, filePath, userName, status, profileName, authMode,
+                 accountReference)
+            VALUES (9, 'old.json', '原 Page', 1, 'Meta 主体', 'browser', '1001')
+            """
+        ).lastrowid
+        connection.commit()
+        connection.close()
+        old_state = self.root / "cookiesFile" / "old.json"
+        old_state.write_text('{"saved": true}', encoding="utf-8")
+        expected_account = {
+            "id": int(account_id),
+            "type": 9,
+            "status": 1,
+            "authMode": "browser",
+            "profileName": "Meta 主体",
+            "userName": "原 Page",
+            "filePath": "old.json",
+            "accountReference": "1001",
+        }
+        pages = [
+            {"page_id": "1001", "page_name": "原 Page", "can_manage_content": True}
+        ]
+        scenarios = (
+            {
+                "name": "saved_state_navigation_failure",
+                "check_error": RuntimeError("navigation failed"),
+                "chmod_error": None,
+                "save_error": None,
+            },
+            {
+                "name": "candidate_file_permission_failure",
+                "check_error": None,
+                "chmod_error": OSError("chmod failed"),
+                "save_error": None,
+            },
+            {
+                "name": "database_failure",
+                "check_error": None,
+                "chmod_error": None,
+                "save_error": sqlite3.OperationalError("database failed"),
+            },
+        )
+
+        for scenario in scenarios:
+            with self.subTest(stage=scenario["name"]):
+                for state_file in (self.root / "cookiesFile").iterdir():
+                    if state_file.name != "old.json":
+                        state_file.unlink()
+                with self.assertRaises(type(
+                    scenario["check_error"]
+                    or scenario["chmod_error"]
+                    or scenario["save_error"]
+                )):
+                    await self._run_page_login(
+                        None,
+                        _identity("1001", "原 Page"),
+                        check_error=scenario["check_error"],
+                        page_records=pages,
+                        update_account=expected_account,
+                        save_error=scenario["save_error"],
+                        chmod_error=scenario["chmod_error"],
+                    )
+
+                self.assertEqual(
+                    [item.name for item in (self.root / "cookiesFile").iterdir()],
+                    ["old.json"],
+                )
+                self.assertEqual(
+                    old_state.read_text(encoding="utf-8"),
+                    '{"saved": true}',
+                )
+
+    def test_backend_identity_failure_is_returned_and_marks_the_saved_row_abnormal(self) -> None:
+        connection = sqlite3.connect(self.database)
+        account_id = connection.execute(
+            """
+            INSERT INTO user_info
+                (type, filePath, userName, status, profileName, authMode,
+                 accountReference)
+            VALUES (9, 'page.json', '测试 Page', 1, 'Meta 主体', 'browser', '1001')
+            """
+        ).lastrowid
+        connection.commit()
+        connection.close()
+        account = {
+            "id": int(account_id),
+            "type": 9,
+            "status": 1,
+            "authMode": "browser",
+            "profileName": "Meta 主体",
+            "filePath": "page.json",
+            "accountReference": "1001",
+        }
+
+        with tempfile.TemporaryDirectory() as raw:
+            (Path(raw) / "page.json").write_text("{}", encoding="utf-8")
+            for error_code in (
+                "facebook_page_identity_mismatch",
+                "facebook_page_content_permission_missing",
+            ):
+                with self.subTest(error_code=error_code):
+                    connection = sqlite3.connect(self.database)
+                    connection.execute(
+                        "UPDATE user_info SET status = 1 WHERE id = ?",
+                        (int(account_id),),
+                    )
+                    connection.commit()
+                    connection.close()
+                    failure = FacebookPagePublishError(error_code, "Page check failed")
+                    with (
+                        patch.object(account_service, "connect", self._connect),
+                        patch.object(
+                            account_browser_service,
+                            "COOKIE_DIR",
+                            Path(raw),
+                        ),
+                        patch.object(
+                            account_browser_service,
+                            "_open_backend",
+                            new=AsyncMock(side_effect=failure),
+                        ),
+                        self.assertRaises(FacebookPagePublishError) as raised,
+                    ):
+                        account_browser_service.open_account_backend(account)
+
+                    self.assertEqual(raised.exception.error_code, error_code)
+                    connection = sqlite3.connect(self.database)
+                    status = connection.execute(
+                        "SELECT status FROM user_info WHERE id = ?",
+                        (int(account_id),),
+                    ).fetchone()[0]
+                    connection.close()
+                    self.assertEqual(status, 0)
+
+    def test_backend_identity_failure_is_returned_when_status_write_also_fails(self) -> None:
+        account = {
+            "id": 1,
+            "type": 9,
+            "status": 1,
+            "authMode": "browser",
+            "profileName": "Meta 主体",
+            "filePath": "page.json",
+            "accountReference": "1001",
+        }
+        failure = FacebookPagePublishError(
+            "facebook_page_identity_mismatch",
+            "Page mismatch",
+        )
+        startup_results: queue.Queue[object] = queue.Queue()
+
+        with (
+            patch.object(
+                account_browser_service,
+                "_open_backend",
+                new=AsyncMock(side_effect=failure),
+            ),
+            patch.object(
+                account_service,
+                "update_status",
+                side_effect=sqlite3.OperationalError("database unavailable"),
+            ),
+        ):
+            account_browser_service._thread_target(
+                account,
+                1,
+                startup_results,
+            )
+
+        returned = startup_results.get_nowait()
+        self.assertIs(returned, failure)
 
 
 class FacebookPageSavedSessionTests(unittest.IsolatedAsyncioTestCase):
