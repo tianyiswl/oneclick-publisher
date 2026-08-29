@@ -1381,7 +1381,6 @@ def _run_facebook_page_publish(
                 receipt=evidence,
             )
             claim_state = "final_action_claimed"
-            message = "Facebook Page 最终动作 claim 已持久化"
         elif stage == "final_action_clicked":
             mark_facebook_page_checkpoint(
                 task_id,
@@ -1390,7 +1389,6 @@ def _run_facebook_page_publish(
                 receipt=evidence,
             )
             claim_state = "final_action_clicked"
-            message = "Facebook Page 单次点击已持久化"
         elif stage == "readback_unique":
             mark_facebook_page_checkpoint(
                 task_id,
@@ -1399,7 +1397,6 @@ def _run_facebook_page_publish(
                 receipt=evidence,
             )
             claim_state = "succeeded"
-            message = "Facebook Page 新 Reel 已唯一回读"
         elif stage in {"readback_none", "readback_mismatch"}:
             evidence.setdefault(
                 "pageId",
@@ -1412,23 +1409,16 @@ def _run_facebook_page_publish(
                 receipt=evidence,
             )
             claim_state = "ambiguous"
-            message = "Facebook Page 点击后尚无唯一目标 Reel 回读"
         elif stage == "platform_decision_observed":
+            task_service.record_facebook_progress(
+                task_id,
+                phase="final_action_clicked",
+                message="Facebook Page 平台反馈已记录，尚未判定成功",
+                receipt=evidence,
+            )
             platform_decision = evidence.get("platformDecision")
-            message = "Facebook Page 平台反馈已记录，但尚未判定成功"
         else:
             raise ValueError("未知的 Facebook Page worker 进度")
-        try:
-            task_service.touch_task_heartbeat(task_id)
-            task_service.record_task_event(
-                task_id,
-                f"facebook_{stage}",
-                message,
-            )
-        except Exception:
-            # Claim CAS is the authority. Ancillary progress diagnostics must
-            # never roll back or reinterpret an already committed edge.
-            pass
 
     def record_success_repair_required() -> None:
         try:

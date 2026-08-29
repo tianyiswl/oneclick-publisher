@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import json
 import tempfile
@@ -6,6 +7,7 @@ import time
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from app_core import (
@@ -16,7 +18,9 @@ from app_core import (
     task_service,
 )
 from app_core.publish_service import _validate_payloads
+from app_core.overseas_meta_errors import FacebookPagePublishError
 from uploader.meta_uploader.content_list import (
+    FacebookPageContentReader,
     FacebookReelMatch,
     FacebookReelReceipt,
 )
@@ -522,6 +526,61 @@ class FacebookPageAuthorizedSubmitTests(unittest.TestCase):
 
         return runner
 
+    @staticmethod
+    def _sealed_rejected_decision(page_id: str):
+        class Element:
+            async def is_visible(self) -> bool:
+                return True
+
+            async def inner_text(self) -> str:
+                return "We couldn't publish your reel"
+
+        class Locator:
+            def __init__(self, elements: list[object]) -> None:
+                self.elements = elements
+
+            async def count(self) -> int:
+                return len(self.elements)
+
+            def nth(self, index: int):
+                return self.elements[index]
+
+        class Context:
+            async def new_page(self):
+                return page
+
+        context = Context()
+
+        class Page:
+            def context(self):
+                return context
+
+            def get_by_role(self, role: str):
+                return Locator([Element()] if role == "alert" else [])
+
+        page = Page()
+
+        async def no_verification(_page) -> None:
+            return None
+
+        async def same_page(_page, _account):
+            return SimpleNamespace(page_id=page_id)
+
+        reader = FacebookPageContentReader(
+            context,
+            wait_for_verification=no_verification,
+        )
+        with patch(
+            "uploader.meta_uploader.content_list.validate_facebook_page_binding",
+            side_effect=same_page,
+        ):
+            return asyncio.run(
+                reader.read_platform_decision(
+                    expected_page_id=page_id,
+                    page=page,
+                )
+            )
+
     def test_authorized_submit_commits_claim_before_starting_controlled_worker(self) -> None:
         preflight_task_id, authorization_id, preflight_payload = (
             self._authorized_preflight()
@@ -938,6 +997,77 @@ class FacebookPageAuthorizedSubmitTests(unittest.TestCase):
             replayed.exception.error_code,
             "facebook_duplicate_submit_blocked",
         )
+
+    def test_typed_decision_is_durable_before_readback_and_progress_events_are_unique(
+        self,
+    ) -> None:
+        preflight_task_id, authorization_id, preflight_payload = (
+            self._authorized_preflight()
+        )
+        payload = self._formal_payload(preflight_payload)
+        task = self._create_leased_formal(
+            preflight_task_id,
+            authorization_id,
+            payload,
+        )
+        decision = self._sealed_rejected_decision("1001")
+        durable_before_readback: list[tuple[str, str, bool]] = []
+
+        def runner(_payload, *, task_id, progress):
+            progress("final_action_claimed", self._checkpoint_receipt(payload))
+            progress("final_action_clicked", {"pageId": "1001"})
+            progress(
+                "platform_decision_observed",
+                {"pageId": "1001", "platformDecision": decision},
+            )
+            claim = self._claim(task_id)
+            persisted = json.loads(str(claim["platformDecisionJson"]))
+            expected_hash = hashlib.sha256(
+                json.dumps(
+                    persisted,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            durable_before_readback.append(
+                (
+                    str(claim["state"]),
+                    str(persisted.get("kind") or ""),
+                    str(claim["platformDecisionHash"]) == expected_hash,
+                )
+            )
+            raise FacebookPagePublishError(
+                "facebook_page_baseline_read_failed",
+                "readback crashed after sealed decision",
+                receipt={"pageId": "1001"},
+                outcome_ambiguous=True,
+            )
+
+        with patch.object(
+            publish_service.overseas_browser_publish,
+            "run_facebook_page_publish_sync",
+            side_effect=runner,
+        ):
+            publish_service._run_facebook_page_publish(task, [payload])
+
+        self.assertEqual(
+            durable_before_readback,
+            [("final_action_clicked", "rejected_no_creation", True)],
+        )
+        claim = self._claim(task["id"])
+        self.assertEqual((claim["state"], claim["blocksReplay"]), ("ambiguous", 1))
+        evidence = controlled_publish._validated_facebook_page_claim_evidence(
+            claim
+        )
+        self.assertEqual(evidence["decision"]["kind"], "rejected_no_creation")
+        event_types = [
+            event["eventType"]
+            for event in task_service.get_task(task["id"])["events"]
+        ]
+        self.assertEqual(event_types.count("facebook_final_action_claimed"), 1)
+        self.assertEqual(event_types.count("facebook_final_action_clicked"), 1)
+        self.assertEqual(event_types.count("facebook_platform_decision_observed"), 1)
 
     def test_concurrent_controlled_starts_grant_one_lease_and_one_thread(self) -> None:
         preflight_task_id, authorization_id, preflight_payload = (
