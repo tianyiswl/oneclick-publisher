@@ -413,6 +413,49 @@ class PublishServiceRoutingTests(unittest.TestCase):
         self.assertTrue(mark.call_args.kwargs["ok"])
         self.assertEqual(mark.call_args.args[1], 8)
 
+    def test_facebook_preflight_routes_to_page_executor_with_task_id(self) -> None:
+        payload = _video_payload(self.video, 9, "preflight")
+        result = {
+            "ok": True,
+            "phase": "platform_form_verified",
+            "message": "Facebook Page form verified",
+            "receipt": {
+                "accountId": 91,
+                "pageId": "1001",
+                "videoName": self.video.name,
+                "videoSize": self.video.stat().st_size,
+                "videoSha256": "a" * 64,
+                "captionSha256": "b" * 64,
+                "visibility": "public",
+                "phase": "platform_form_verified",
+                "platformWriteOccurred": True,
+                "finalActionTriggered": False,
+                "finalButtonEnabled": True,
+                "formSnapshotHash": "c" * 64,
+            },
+        }
+        with (
+            patch.object(
+                publish_service.overseas_preflight,
+                "run_facebook_page_preflight_sync",
+                return_value=result,
+                create=True,
+            ) as page_runner,
+            patch.object(
+                publish_service.overseas_preflight,
+                "run_overseas_preflight_sync",
+            ) as legacy,
+            patch.object(publish_service.task_service, "mark_task_running"),
+            patch.object(publish_service.task_service, "record_task_event"),
+            patch.object(publish_service.task_service, "mark_platform_result") as mark,
+            patch.object(publish_service.task_service, "fail_active_task"),
+        ):
+            publish_service._run_preflight({"id": 109}, [payload])
+
+        page_runner.assert_called_once_with(payload, task_id=109)
+        legacy.assert_not_called()
+        self.assertEqual(mark.call_args.kwargs["receipt"], result["receipt"])
+
 
 if __name__ == "__main__":
     unittest.main()
