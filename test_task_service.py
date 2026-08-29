@@ -2492,6 +2492,39 @@ class FacebookPageTaskPersistenceTests(unittest.TestCase):
         self.assertNotIn("cookie", receipt)
         self.assertNotIn("caption", receipt)
 
+    def test_formal_platform_acceptance_without_reel_cannot_be_marked_success(
+        self,
+    ) -> None:
+        payload = self.payload()
+        payload.update({"runtimeMode": "publish", "debugDryRun": False})
+        task = task_service.create_pending_task(
+            [payload],
+            mode="oneclick_publish",
+        )
+
+        with self.assertRaises((controlled_publish.ControlledPublishError, ValueError)):
+            task_service.mark_platform_result(
+                task["id"],
+                9,
+                ok=True,
+                message="Meta accepted the request",
+                content_type="video",
+                event_type="facebook_platform_accepted",
+                receipt={
+                    "pageId": "1001",
+                    "phase": "platform_accepted",
+                    "platformWriteOccurred": True,
+                    "finalActionTriggered": True,
+                    "reelId": None,
+                    "url": None,
+                    "publishedAt": None,
+                },
+            )
+
+        saved = task_service.get_task(task["id"])
+        self.assertEqual(saved["status"], "pending")
+        self.assertEqual(saved["items"][0]["status"], "pending")
+
     def test_database_rejects_invalid_facebook_state_replay_pairs(self) -> None:
         preflight = task_service.create_pending_task(
             [self.payload()],

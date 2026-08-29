@@ -3,15 +3,18 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import tempfile
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 from app_core import controlled_publish, database, task_service
 from app_core.controlled_publish import ControlledPublishError, project_task
 from app_core.douyin_graphic_matrix_service import prepare_matrix
+from uploader.meta_uploader.content_list import FacebookReelMatch, FacebookReelReceipt
 
 
 class ControlledPublishResilienceTests(unittest.TestCase):
@@ -307,6 +310,173 @@ class ControlledPublishResilienceTests(unittest.TestCase):
                 (formal_tasks[1]["id"], "reserved", 1),
             ],
         )
+
+    def test_dead_pid_repairs_succeeded_facebook_claim_instead_of_generic_failure(
+        self,
+    ) -> None:
+        page_id = "1001"
+        payload = {
+            "type": 9,
+            "contentType": "video",
+            "title": "Facebook Page restart repair",
+            "accountList": ["facebook-page.json"],
+            "accountIds": [41],
+            "fileList": ["facebook.mp4"],
+            "facebookExpectedPageReference": page_id,
+            "facebookVideoSha256": "a" * 64,
+            "facebookCaptionSha256": "b" * 64,
+            "visibility": "public",
+        }
+        preflight = task_service.create_pending_task(
+            [payload], mode="oneclick_preflight"
+        )
+        formal = task_service.create_pending_task(
+            [payload], mode="oneclick_publish"
+        )
+        baseline = {"pageId": page_id, "rows": []}
+        form_snapshot = {
+            "pageId": page_id,
+            "videoName": "facebook.mp4",
+            "videoSize": 123,
+            "videoSha256": "a" * 64,
+            "captionSha256": "b" * 64,
+            "visibility": "public",
+            "finalButtonLabel": "Publish",
+            "finalButtonReady": True,
+        }
+        claimed_receipt = {
+            "pageId": page_id,
+            "baseline": baseline,
+            "formSnapshot": form_snapshot,
+        }
+        with database.connect() as conn:
+            controlled_publish._ensure_facebook_page_claim_schema(conn)
+            conn.execute(
+                """
+                INSERT INTO facebook_page_publish_claims (
+                    pageReference, publishIntentFingerprint,
+                    replayFingerprint, preflightTaskId,
+                    preflightReceiptHash, taskId, state, blocksReplay,
+                    workerStartedAt, createdAt, updatedAt
+                ) VALUES (?, 'intent', 'replay', ?, ?, ?, 'reserved', 1,
+                          ?, ?, ?)
+                """,
+                (
+                    page_id,
+                    preflight["id"],
+                    "f" * 64,
+                    formal["id"],
+                    "2026-08-30T02:00:00+00:00",
+                    "2026-08-30T02:00:00+00:00",
+                    "2026-08-30T02:00:00+00:00",
+                ),
+            )
+            conn.commit()
+        controlled_publish.mark_facebook_page_checkpoint(
+            formal["id"],
+            expected_state="reserved",
+            new_state="final_action_claimed",
+            receipt=claimed_receipt,
+        )
+        controlled_publish.mark_facebook_page_checkpoint(
+            formal["id"],
+            expected_state="final_action_claimed",
+            new_state="final_action_clicked",
+            receipt={"pageId": page_id},
+        )
+        with database.connect() as conn:
+            clicked_at = conn.execute(
+                "SELECT clickedAt FROM facebook_page_publish_claims WHERE taskId = ?",
+                (formal["id"],),
+            ).fetchone()[0]
+        published_at = (
+            datetime.fromisoformat(clicked_at).astimezone(timezone.utc)
+            + timedelta(seconds=1)
+        ).isoformat()
+        controlled_publish.mark_facebook_page_checkpoint(
+            formal["id"],
+            expected_state="final_action_clicked",
+            new_state="succeeded",
+            receipt={
+                "reelMatch": FacebookReelMatch(
+                    status="unique",
+                    receipt=FacebookReelReceipt(
+                        page_id=page_id,
+                        reel_id="restart-reel",
+                        url="https://www.facebook.com/reel/restart-reel",
+                        published_at=published_at,
+                    ),
+                    new_count=1,
+                    matching_count=1,
+                )
+            },
+        )
+        stale = (datetime.now() - timedelta(minutes=10)).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+        with database.connect() as conn:
+            conn.execute(
+                """
+                UPDATE publish_tasks
+                SET status = 'running', successCount = 0, failedCount = 0,
+                    finishedAt = NULL, workerPid = ?, workerHeartbeatAt = ?
+                WHERE id = ?
+                """,
+                (999_999_999, stale, formal["id"]),
+            )
+            conn.execute(
+                """
+                UPDATE publish_task_items
+                SET status = 'running', receiptJson = '', errorCode = '',
+                    platformPostId = '', postUrl = '', publishedAt = ''
+                WHERE taskId = ? AND platformType = 9
+                """,
+                (formal["id"],),
+            )
+            conn.execute(
+                """
+                INSERT INTO publish_task_events
+                    (taskId, level, eventType, message, createdAt)
+                VALUES (?, 'error',
+                        'facebook_success_persistence_repair_required',
+                        'repair from succeeded claim', ?)
+                """,
+                (formal["id"], "2026-08-30T02:01:00+00:00"),
+            )
+            conn.commit()
+
+        changed = task_service.reconcile_stale_controlled_task(
+            formal["id"], lease_seconds=30
+        )
+
+        self.assertTrue(changed)
+        saved = task_service.get_task(formal["id"])
+        receipt = json.loads(saved["items"][0]["receiptJson"])
+        self.assertEqual(saved["status"], "success")
+        self.assertEqual(saved["items"][0]["status"], "success")
+        self.assertEqual(receipt["pageId"], page_id)
+        self.assertEqual(receipt["reelId"], "restart-reel")
+        self.assertEqual(
+            hashlib.sha256(
+                json.dumps(
+                    receipt,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+            self._facebook_claim_receipt_hash(formal["id"]),
+        )
+
+    @staticmethod
+    def _facebook_claim_receipt_hash(task_id: int) -> str:
+        with database.connect() as conn:
+            return str(
+                conn.execute(
+                    "SELECT receiptHash FROM facebook_page_publish_claims WHERE taskId = ?",
+                    (int(task_id),),
+                ).fetchone()[0]
+            )
 
 
 if __name__ == "__main__":
