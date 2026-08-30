@@ -477,6 +477,43 @@ def _remove_replaced_tiktok_artifacts(
             pass
 
 
+def _remove_replaced_facebook_page_session(
+    previous_account: dict,
+    *,
+    current_cookie: str,
+) -> None:
+    """Best-effort removal of one committed Page login's unreferenced old state."""
+
+    old_value = str(previous_account.get("filePath") or "").strip()
+    if (
+        not old_value
+        or old_value != Path(old_value).name
+        or old_value == Path(current_cookie).name
+    ):
+        return
+    try:
+        db_path = Path(BASE_DIR / "db" / "database.db")
+        with open_connection(db_path) as conn:
+            referenced = conn.execute(
+                "SELECT 1 FROM user_info WHERE filePath = ? LIMIT 1",
+                (old_value,),
+            ).fetchone()
+        if referenced:
+            return
+
+        managed_dir = Path(BASE_DIR / "cookiesFile").resolve(strict=True)
+        candidate = managed_dir / old_value
+        if candidate.is_symlink():
+            return
+        resolved_candidate = candidate.resolve(strict=False)
+        if resolved_candidate.parent != managed_dir:
+            return
+        candidate.unlink(missing_ok=True)
+    except Exception:
+        # The new account row has already committed; cleanup cannot invalidate it.
+        return
+
+
 def save_meta_login_accounts(cookie_file, profile_name, update_mode=False, record_id=None, avatar_path=None, display_name=None):
     """Persist only the explicitly selected Instagram target."""
     user_name = display_name or profile_name
@@ -1006,6 +1043,11 @@ async def _browser_cookie_gen(
                     status_queue.put(f"ERROR:{exc.error_code}")
                     status_queue.put("500")
                     return None
+                if update_mode and expected_account:
+                    _remove_replaced_facebook_page_session(
+                        dict(expected_account),
+                        current_cookie=cookie_file,
+                    )
                 facebook_page_login_succeeded = True
                 status_queue.put(f"ACCOUNT_ID:{account_id}")
             else:

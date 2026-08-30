@@ -172,9 +172,14 @@ class AccountDetectionUiTests(unittest.TestCase):
             for action in menu.actions()
         ]
         relogin = next(action for action in menu_actions if action.text() == "重新登录")
+        refresh = next(
+            action for action in menu_actions if action.text() == "刷新账号信息"
+        )
         self.assertFalse(buttons["打开后台"].isEnabled())
         self.assertFalse(relogin.isEnabled())
+        self.assertFalse(refresh.isEnabled())
         self.assertIn("功能未开启", buttons["打开后台"].toolTip())
+        self.assertIn("功能未开启", refresh.toolTip())
         page.close()
 
     def test_feature_flag_off_rejects_saved_page_actions_before_dialog_or_worker(self) -> None:
@@ -198,6 +203,7 @@ class AccountDetectionUiTests(unittest.TestCase):
                 account_browser_service,
                 "open_account_backend",
             ) as open_backend,
+            patch.object(page.tasks, "run") as run_task,
             patch.object(QMessageBox, "warning") as warning,
         ):
             page.relogin(account)
@@ -209,8 +215,14 @@ class AccountDetectionUiTests(unittest.TestCase):
             self.assertEqual(warning.call_count, 1)
             self.assertIn("功能未开启", warning.call_args.args[2])
 
+            warning.reset_mock()
+            page.refresh_avatar(account)
+            self.assertEqual(warning.call_count, 1)
+            self.assertIn("功能未开启", warning.call_args.args[2])
+
         login_dialog.assert_not_called()
         open_backend.assert_not_called()
+        run_task.assert_not_called()
         page.close()
 
     def test_facebook_page_prompt_selects_the_exact_id_behind_the_label(self) -> None:

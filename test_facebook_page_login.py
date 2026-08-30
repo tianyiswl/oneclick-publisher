@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+from io import BytesIO
 import sqlite3
 import os
 import queue
@@ -14,6 +15,8 @@ from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
+
+from PIL import Image
 
 from app_core import account_browser_service, account_service, login_service
 from app_core.oneclick_authorization import _verify_saved_session_async
@@ -673,6 +676,358 @@ class FacebookPagePersistenceTimingTests(unittest.IsolatedAsyncioTestCase):
                     old_state.read_text(encoding="utf-8"),
                     '{"saved": true}',
                 )
+
+    async def test_successful_relogin_reclaims_only_zero_reference_managed_session(self) -> None:
+        async def relogin(
+            old_file_path: str,
+            page_id: str,
+            *,
+            shared: bool = False,
+        ) -> str:
+            connection = sqlite3.connect(self.database)
+            account_id = connection.execute(
+                """
+                INSERT INTO user_info
+                    (type, filePath, userName, status, profileName, authMode,
+                     accountReference)
+                VALUES (9, ?, '原 Page', 1, 'Meta 主体', 'browser', ?)
+                """,
+                (old_file_path, page_id),
+            ).lastrowid
+            if shared:
+                connection.execute(
+                    """
+                    INSERT INTO user_info
+                        (type, filePath, userName, status, profileName, authMode,
+                         accountReference)
+                    VALUES (8, ?, 'Instagram', 1, 'Meta 主体', 'browser', NULL)
+                    """,
+                    (old_file_path,),
+                )
+            connection.commit()
+            connection.close()
+            expected_account = {
+                "id": int(account_id),
+                "type": 9,
+                "status": 1,
+                "authMode": "browser",
+                "profileName": "Meta 主体",
+                "userName": "原 Page",
+                "filePath": old_file_path,
+                "accountReference": page_id,
+            }
+
+            result, messages = await self._run_page_login(
+                None,
+                _identity(page_id, "原 Page"),
+                page_records=[
+                    {
+                        "page_id": page_id,
+                        "page_name": "原 Page",
+                        "can_manage_content": True,
+                    }
+                ],
+                update_account=expected_account,
+            )
+            self.assertIn("200", messages)
+            self.assertIsInstance(result, str)
+            return str(result)
+
+        unreferenced = self.root / "cookiesFile" / "old-unreferenced.json"
+        unreferenced.write_text('{"old": true}', encoding="utf-8")
+        await relogin(unreferenced.name, "1001")
+
+        shared = self.root / "cookiesFile" / "old-shared.json"
+        shared.write_text('{"shared": true}', encoding="utf-8")
+        await relogin(shared.name, "1002", shared=True)
+
+        outside = self.root / "outside-session.json"
+        outside.write_text('{"outside": true}', encoding="utf-8")
+        symlink = self.root / "cookiesFile" / "outside-link.json"
+        symlink.symlink_to(outside)
+        await relogin(symlink.name, "1003")
+
+        self.assertEqual(
+            (unreferenced.exists(), shared.exists(), symlink.is_symlink(), outside.exists()),
+            (False, True, True, True),
+        )
+
+    def test_relogin_cleanup_failure_preserves_the_committed_new_session(self) -> None:
+        old_state = self.root / "cookiesFile" / "old.json"
+        old_state.write_text('{"old": true}', encoding="utf-8")
+        connection = sqlite3.connect(self.database)
+        account_id = connection.execute(
+            """
+            INSERT INTO user_info
+                (type, filePath, userName, status, profileName, authMode,
+                 accountReference)
+            VALUES (9, 'old.json', '原 Page', 1, 'Meta 主体', 'browser', '2001')
+            """
+        ).lastrowid
+        connection.execute(
+            "UPDATE user_info SET filePath = 'new.json' WHERE id = ?",
+            (int(account_id),),
+        )
+        connection.commit()
+        connection.close()
+
+        real_unlink = Path.unlink
+        old_resolved = old_state.resolve()
+
+        def fail_old_only(path: Path, *args, **kwargs):
+            if path.resolve() == old_resolved:
+                raise OSError("cleanup failed")
+            return real_unlink(path, *args, **kwargs)
+
+        with (
+            patch.object(recovered_login, "BASE_DIR", self.root),
+            patch.object(Path, "unlink", autospec=True, side_effect=fail_old_only),
+        ):
+            cleanup_error = None
+            try:
+                recovered_login._remove_replaced_facebook_page_session(
+                    {"filePath": "old.json"},
+                    current_cookie="new.json",
+                )
+            except Exception as exc:
+                cleanup_error = exc
+
+        connection = sqlite3.connect(self.database)
+        saved_file = connection.execute(
+            "SELECT filePath FROM user_info WHERE id = ?",
+            (int(account_id),),
+        ).fetchone()[0]
+        connection.close()
+        self.assertEqual(
+            (cleanup_error, saved_file, old_state.exists()),
+            (None, "new.json", True),
+        )
+
+    def test_feature_flag_off_rejects_direct_page_refresh_before_browser_work(self) -> None:
+        connection = sqlite3.connect(self.database)
+        account_id = connection.execute(
+            """
+            INSERT INTO user_info
+                (type, filePath, userName, status, profileName, authMode,
+                 accountReference)
+            VALUES (9, 'page.json', 'Page', 1, 'Meta 主体', 'browser', '3001')
+            """
+        ).lastrowid
+        connection.commit()
+        connection.close()
+
+        with (
+            patch.object(account_service, "connect", self._connect),
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(account_service, "run_async_capture_account_avatar") as capture,
+            self.assertRaises(FacebookPagePublishError) as raised,
+        ):
+            account_service.refresh_account_avatar(int(account_id))
+
+        self.assertEqual(raised.exception.error_code, "facebook_page_feature_disabled")
+        capture.assert_not_called()
+
+    def _insert_refresh_account(
+        self,
+        *,
+        page_id: str | None = "4001",
+        user_name: str = "旧 Page 名",
+        avatar_path: str = "old-avatar.png",
+    ) -> int:
+        connection = sqlite3.connect(self.database)
+        account_id = connection.execute(
+            """
+            INSERT INTO user_info
+                (type, filePath, userName, status, profileName, avatarPath,
+                 authMode, accountReference)
+            VALUES (9, 'page.json', ?, 1, 'Meta 主体', ?, 'browser', ?)
+            """,
+            (user_name, avatar_path, page_id),
+        ).lastrowid
+        connection.commit()
+        connection.close()
+        return int(account_id)
+
+    def _saved_refresh_identity(self, account_id: int) -> tuple[str, str]:
+        connection = sqlite3.connect(self.database)
+        row = connection.execute(
+            "SELECT userName, avatarPath FROM user_info WHERE id = ?",
+            (int(account_id),),
+        ).fetchone()
+        connection.close()
+        return row
+
+    def test_enabled_refresh_writes_only_the_exact_bound_page_name_and_avatar(self) -> None:
+        account_id = self._insert_refresh_account()
+        exact_identity = FacebookPageIdentity(
+            "4001",
+            "精确 Page 名",
+            avatar_url="https://scontent.example.fbcdn.net/page.png",
+            can_manage_content=True,
+        )
+
+        with (
+            patch.object(account_service, "connect", self._connect),
+            patch.dict(
+                os.environ,
+                {"ONECLICK_ENABLE_FACEBOOK_PAGE_V1": "1"},
+                clear=True,
+            ),
+            patch.object(
+                account_service,
+                "_read_exact_facebook_page_identity",
+                return_value=exact_identity,
+                create=True,
+            ),
+            patch.object(
+                account_service,
+                "_download_facebook_page_avatar",
+                return_value=f"oneclick_facebook_page_{account_id}.png",
+                create=True,
+            ) as download_avatar,
+            patch.object(account_service, "run_async_capture_account_avatar") as generic,
+        ):
+            refreshed = account_service.refresh_account_avatar(account_id)
+
+        self.assertEqual(
+            self._saved_refresh_identity(account_id),
+            ("精确 Page 名", f"oneclick_facebook_page_{account_id}.png"),
+        )
+        self.assertEqual(refreshed["accountReference"], "4001")
+        download_avatar.assert_called_once_with(
+            exact_identity,
+            account_id=account_id,
+        )
+        generic.assert_not_called()
+
+    def test_page_avatar_download_saves_only_a_bounded_trusted_image(self) -> None:
+        image = Image.new("RGB", (2, 2), color=(12, 34, 56))
+        encoded = BytesIO()
+        image.save(encoded, format="PNG")
+        payload = encoded.getvalue()
+
+        class Response:
+            status_code = 200
+            headers = {
+                "Content-Type": "image/png",
+                "Content-Length": str(len(payload)),
+            }
+
+            @staticmethod
+            def iter_content(*, chunk_size: int):
+                self_chunk_size = chunk_size
+                if self_chunk_size <= 0:
+                    raise AssertionError("chunk size must be positive")
+                return iter((payload,))
+
+            @staticmethod
+            def close() -> None:
+                return None
+
+        identity = FacebookPageIdentity(
+            "4002",
+            "Page",
+            avatar_url="https://scontent.example.fbcdn.net/page.png",
+            can_manage_content=True,
+        )
+
+        with (
+            patch.object(account_service, "AVATAR_DIR", self.root / "avatars"),
+            patch("requests.get", return_value=Response()) as get_avatar,
+        ):
+            file_name = account_service._download_facebook_page_avatar(
+                identity,
+                account_id=7,
+            )
+
+        saved = self.root / "avatars" / file_name
+        self.assertTrue(saved.is_file())
+        with Image.open(saved) as decoded:
+            self.assertEqual((decoded.format, decoded.size), ("PNG", (2, 2)))
+        get_avatar.assert_called_once_with(
+            identity.avatar_url,
+            timeout=15,
+            stream=True,
+            allow_redirects=False,
+        )
+
+    def test_page_refresh_mismatch_or_missing_binding_keeps_display_identity_unchanged(self) -> None:
+        mismatched_id = self._insert_refresh_account(page_id="4101")
+        unbound_id = self._insert_refresh_account(page_id=None)
+        original = ("旧 Page 名", "old-avatar.png")
+        wrong_identity = FacebookPageIdentity(
+            "9999",
+            "错误 Page 名",
+            avatar_url="https://scontent.example.fbcdn.net/wrong.png",
+            can_manage_content=True,
+        )
+
+        with (
+            patch.object(account_service, "connect", self._connect),
+            patch.dict(
+                os.environ,
+                {"ONECLICK_ENABLE_FACEBOOK_PAGE_V1": "1"},
+                clear=True,
+            ),
+            patch.object(
+                account_service,
+                "_read_exact_facebook_page_identity",
+                return_value=wrong_identity,
+                create=True,
+            ) as read_identity,
+            patch.object(
+                account_service,
+                "_download_facebook_page_avatar",
+                create=True,
+            ) as download_avatar,
+            patch.object(
+                account_service,
+                "run_async_capture_account_avatar",
+                return_value=(None, None),
+            ),
+        ):
+            with self.assertRaises(FacebookPagePublishError) as mismatch:
+                account_service.refresh_account_avatar(mismatched_id)
+            with self.assertRaises(FacebookPagePublishError) as unbound:
+                account_service.refresh_account_avatar(unbound_id)
+
+        self.assertEqual(mismatch.exception.error_code, "facebook_page_identity_mismatch")
+        self.assertEqual(unbound.exception.error_code, "facebook_page_identity_mismatch")
+        self.assertEqual(self._saved_refresh_identity(mismatched_id), original)
+        self.assertEqual(self._saved_refresh_identity(unbound_id), original)
+        self.assertEqual(read_identity.call_count, 1)
+        download_avatar.assert_not_called()
+
+    def test_page_refresh_identity_reader_passes_the_exact_stored_page_id(self) -> None:
+        reader = getattr(account_service, "_read_exact_facebook_page_identity", None)
+        self.assertIsNotNone(reader)
+        account = {
+            "id": 1,
+            "type": 9,
+            "status": 1,
+            "authMode": "browser",
+            "filePath": "page.json",
+            "accountReference": "4201",
+        }
+        exact_identity = FacebookPageIdentity(
+            "4201",
+            "Page",
+            avatar_url="https://scontent.example.fbcdn.net/page.png",
+            can_manage_content=True,
+        )
+
+        with patch(
+            "myUtils.auth.check_cookie",
+            new=AsyncMock(return_value=exact_identity),
+        ) as check:
+            refreshed_identity = reader(account)
+
+        self.assertEqual(refreshed_identity, exact_identity)
+        check.assert_awaited_once_with(
+            9,
+            "page.json",
+            account_reference="4201",
+        )
 
     def test_backend_identity_failure_is_returned_and_marks_the_saved_row_abnormal(self) -> None:
         connection = sqlite3.connect(self.database)

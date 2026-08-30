@@ -420,6 +420,9 @@ class AccountPage(QWidget):
             if is_youtube_oauth
             else "从当前已登录的官方后台刷新账号信息"
         )
+        if facebook_page_disabled:
+            refresh_action.setEnabled(False)
+            refresh_action.setToolTip("Facebook Page 功能未开启。")
         menu.addAction("编辑备注", lambda _checked=False, r=row: self.edit_remark(r))
         menu.addSeparator()
         menu.addAction("删除账号", lambda _checked=False, r=row: self.delete_one(r))
@@ -502,6 +505,9 @@ class AccountPage(QWidget):
             if is_youtube_oauth
             else "从当前已登录的官方后台刷新账号信息"
         )
+        if facebook_page_disabled:
+            refresh_action.setEnabled(False)
+            refresh_action.setToolTip("Facebook Page 功能未开启。")
         menu.addAction("编辑备注", lambda: self.edit_remark(row))
         menu.addAction("删除账号", lambda: self.delete_one(row))
         menu.exec(self.table.mapToGlobal(pos))
@@ -758,6 +764,8 @@ class AccountPage(QWidget):
             self.refresh()
 
     def refresh_avatar(self, row: dict) -> None:
+        if self._reject_disabled_facebook_page_action(row):
+            return
         key = f"refresh_avatar_{row['id']}"
         if self.tasks.is_running(key):
             QMessageBox.information(self, "刷新账号", "该账号正在刷新，请稍等。")
