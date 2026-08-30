@@ -2062,6 +2062,32 @@ class FacebookPagePublishServiceTests(unittest.TestCase):
         self.assertEqual(self.claim(int(task["id"]))["state"], "safe_failed")
         self.assertNotIn(int(task["id"]), publish_service._active_threads)
 
+    def test_busy_preflight_worker_closes_its_owned_task_immediately(self) -> None:
+        payload = self.payload()
+        payload["runtimeMode"] = "preflight"
+        task = task_service.create_pending_task(
+            [payload], mode="oneclick_preflight"
+        )
+        worker_token = f"busy-preflight-{task['id']}"
+        self.assertTrue(
+            task_service.claim_facebook_worker(
+                int(task["id"]), worker_token, "busy preflight worker"
+            )
+        )
+        task["_workerToken"] = worker_token
+        publish_service._active_threads[int(task["id"])] = threading.current_thread()
+        self.assertTrue(publish_service._publish_lock.acquire(blocking=False))
+
+        try:
+            publish_service._run_preflight(task, [payload])
+        finally:
+            publish_service._publish_lock.release()
+
+        saved = task_service.get_task(int(task["id"]))
+        self.assertEqual(saved["status"], "failed")
+        self.assertEqual(saved["items"][0]["errorCode"], "controlled_publish_busy")
+        self.assertNotIn(int(task["id"]), publish_service._active_threads)
+
     def test_recovered_task_without_runtime_video_path_fails_before_session(self) -> None:
         task, payload = self.claimed_task()
         safe_payload = {

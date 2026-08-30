@@ -735,21 +735,28 @@ def _run_preflight(task: dict, payloads: list[dict[str, Any]]) -> None:
     if payloads and _is_douyin_commerce_batch_payload(payloads[0]):
         _run_douyin_commerce_batch_preflight(task, payloads)
         return
+    worker_token = str(task.get("_workerToken") or "")
     if not _publish_lock.acquire(blocking=False):
-        task_service.mark_platform_result(
-            task["id"], int(payloads[0]["type"]), ok=False,
-            message="已有预检任务正在执行，请稍后重试",
-            content_type=str(payloads[0].get("contentType") or ""),
-        )
-        task_service.fail_active_task(
-            int(task["id"]),
-            error_code="controlled_publish_busy",
-            message="已有预检任务正在执行，其余平台未启动",
-        )
-        _active_threads.pop(int(task["id"]), None)
+        try:
+            task_service.mark_platform_result(
+                task["id"], int(payloads[0]["type"]), ok=False,
+                message="已有预检任务正在执行，请稍后重试",
+                content_type=str(payloads[0].get("contentType") or ""),
+                error_code="controlled_publish_busy",
+                worker_token=(
+                    worker_token if int(payloads[0]["type"]) == 9 else ""
+                ),
+            )
+            if not worker_token:
+                task_service.fail_active_task(
+                    int(task["id"]),
+                    error_code="controlled_publish_busy",
+                    message="已有预检任务正在执行，其余平台未启动",
+                )
+        finally:
+            _active_threads.pop(int(task["id"]), None)
         return
     try:
-        worker_token = str(task.get("_workerToken") or "")
         if worker_token:
             if not task_service.touch_task_heartbeat(
                 int(task["id"]), worker_token=worker_token

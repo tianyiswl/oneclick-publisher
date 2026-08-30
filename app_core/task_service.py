@@ -2236,6 +2236,13 @@ def touch_task_heartbeat(task_id: int, *, worker_token: str | None = None) -> bo
 
     now = _now()
     with connect() as conn:
+        page_item = conn.execute(
+            "SELECT 1 FROM publish_task_items WHERE taskId = ? "
+            "AND platformType = 9 LIMIT 1",
+            (int(task_id),),
+        ).fetchone()
+        if page_item is not None and not str(worker_token or ""):
+            return False
         token_clause = "" if worker_token is None else " AND workerToken = ?"
         params: tuple[object, ...] = (
             os.getpid(),
@@ -2255,6 +2262,112 @@ def touch_task_heartbeat(task_id: int, *, worker_token: str | None = None) -> bo
         )
         conn.commit()
     return updated.rowcount == 1
+
+
+def claim_facebook_reconciliation_worker(
+    task_id: int,
+    worker_token: str,
+    *,
+    lease_seconds: int = 30,
+    now: datetime | None = None,
+) -> bool:
+    """Atomically replace only a stale formal Page worker with a read-only owner."""
+
+    from . import controlled_publish
+
+    token = str(worker_token or "").strip()
+    if not token:
+        raise ValueError("Facebook Page reconcile token 不能为空")
+    current = now or datetime.now().astimezone()
+    changed_at = current.isoformat()
+    with connect() as conn:
+        controlled_publish._ensure_facebook_page_claim_schema(conn)
+        conn.commit()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            item = _facebook_task_item_in_transaction(
+                conn,
+                int(task_id),
+                allowed_modes=frozenset({"oneclick_publish"}),
+            )
+            claim_row = conn.execute(
+                "SELECT state FROM facebook_page_publish_claims WHERE taskId = ?",
+                (int(task_id),),
+            ).fetchone()
+            if claim_row is None or str(claim_row["state"] or "") not in {
+                "final_action_claimed",
+                "final_action_clicked",
+                "ambiguous",
+            }:
+                conn.rollback()
+                return False
+            task_status = str(item["taskStatus"] or "")
+            item_status = str(item["status"] or "")
+            existing_token = str(item["taskWorkerToken"] or "")
+            if task_status in {"running", "waiting_user_verification"}:
+                if item_status not in {
+                    "pending",
+                    "running",
+                    "waiting_user_verification",
+                }:
+                    conn.rollback()
+                    return False
+                if existing_token:
+                    heartbeat_text = str(item["taskWorkerHeartbeatAt"] or "")
+                    try:
+                        heartbeat = datetime.fromisoformat(heartbeat_text)
+                    except ValueError:
+                        heartbeat = None
+                    if heartbeat is not None:
+                        comparable = current
+                        if heartbeat.tzinfo is not None and comparable.tzinfo is None:
+                            comparable = comparable.astimezone()
+                        if heartbeat.tzinfo is None and comparable.tzinfo is not None:
+                            comparable = comparable.replace(tzinfo=None)
+                        if (comparable - heartbeat).total_seconds() <= max(
+                            1, int(lease_seconds)
+                        ):
+                            conn.rollback()
+                            return False
+            elif not (task_status == "failed" and item_status == "failed"):
+                conn.rollback()
+                return False
+            updated = conn.execute(
+                """
+                UPDATE publish_tasks
+                SET workerToken = ?, workerPid = ?, workerHeartbeatAt = ?
+                WHERE id = ? AND status = ? AND COALESCE(workerToken, '') = ?
+                """,
+                (
+                    token,
+                    os.getpid(),
+                    changed_at,
+                    int(task_id),
+                    task_status,
+                    existing_token,
+                ),
+            )
+            if updated.rowcount != 1:
+                conn.rollback()
+                return False
+            conn.execute(
+                """
+                INSERT INTO publish_task_events
+                    (taskId, itemId, level, eventType, message, createdAt)
+                VALUES (?, ?, 'info', 'facebook_reconciliation_worker_claimed', ?, ?)
+                """,
+                (
+                    int(task_id),
+                    int(item["id"]),
+                    "Facebook Page 只读核对已原子接管失联任务",
+                    changed_at,
+                ),
+            )
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
 
 
 _FACEBOOK_ERROR_PUBLIC_MESSAGES = {
@@ -2321,7 +2434,8 @@ def _facebook_task_item_in_transaction(
     rows = conn.execute(
         """
         SELECT item.*, task.mode AS taskMode, task.payloadJson AS taskPayloadJson,
-               task.status AS taskStatus, task.workerToken AS taskWorkerToken
+               task.status AS taskStatus, task.workerToken AS taskWorkerToken,
+               task.workerHeartbeatAt AS taskWorkerHeartbeatAt
         FROM publish_task_items AS item
         JOIN publish_tasks AS task ON task.id = item.taskId
         WHERE item.taskId = ? AND item.platformType = 9
@@ -2518,6 +2632,14 @@ def record_facebook_progress(
             conn.execute("BEGIN IMMEDIATE")
             item = _facebook_task_item_in_transaction(conn, int(task_id))
             stored_worker_token = str(item["taskWorkerToken"] or "")
+            if _trusted_reconciliation and (
+                not str(worker_token or "")
+                or stored_worker_token != str(worker_token or "")
+            ):
+                raise controlled_publish.ControlledPublishError(
+                    "facebook_worker_lease_lost",
+                    "Facebook Page 只读核对租约已失效。",
+                )
             if stored_worker_token and not _trusted_reconciliation and (
                 stored_worker_token != str(worker_token or "")
                 or str(item["taskStatus"] or "")
@@ -2904,6 +3026,14 @@ def mark_facebook_result(
             conn.execute("BEGIN IMMEDIATE")
             item = _facebook_task_item_in_transaction(conn, int(task_id))
             stored_worker_token = str(item["taskWorkerToken"] or "")
+            if _trusted_reconciliation and (
+                not str(worker_token or "")
+                or stored_worker_token != str(worker_token or "")
+            ):
+                raise controlled_publish.ControlledPublishError(
+                    "facebook_worker_lease_lost",
+                    "Facebook Page 只读核对结果租约已失效。",
+                )
             if (
                 stored_worker_token
                 and not _trusted_reconciliation

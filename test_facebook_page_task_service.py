@@ -473,7 +473,8 @@ class FacebookPageTaskServiceTests(unittest.TestCase):
         task_id: int,
         outcomes: tuple[object, object],
     ) -> tuple[list[dict], list[BaseException]]:
-        reader_barrier = threading.Barrier(2)
+        reader_started = threading.Event()
+        release_reader = threading.Event()
         outcome_lock = threading.Lock()
         pending = list(outcomes)
         results: list[dict] = []
@@ -496,7 +497,9 @@ class FacebookPageTaskServiceTests(unittest.TestCase):
                     self.outcome = pending.pop(0)
 
             async def readback_unique_reel(self, **_kwargs):
-                reader_barrier.wait(timeout=5)
+                reader_started.set()
+                if not release_reader.wait(timeout=5):
+                    raise AssertionError("atomic reconciliation reader did not resume")
                 return self.outcome
 
         def reconcile() -> None:
@@ -524,10 +527,12 @@ class FacebookPageTaskServiceTests(unittest.TestCase):
             ),
         ):
             workers = [threading.Thread(target=reconcile) for _ in range(2)]
-            for worker in workers:
-                worker.start()
-            for worker in workers:
-                worker.join(timeout=10)
+            workers[0].start()
+            self.assertTrue(reader_started.wait(timeout=5))
+            workers[1].start()
+            workers[1].join(timeout=5)
+            release_reader.set()
+            workers[0].join(timeout=10)
             self.assertFalse(any(worker.is_alive() for worker in workers))
         return results, errors
 
@@ -576,7 +581,7 @@ class FacebookPageTaskServiceTests(unittest.TestCase):
             waiting["actionRequired"]["code"],
             "facebook_verification_required",
         )
-        self.assertTrue(task_service.touch_task_heartbeat(preflight_task_id))
+        self.assertFalse(task_service.touch_task_heartbeat(preflight_task_id))
         with self.assertRaisesRegex(ValueError, "不能删除"):
             task_service.delete_tasks([preflight_task_id])
 
@@ -874,6 +879,132 @@ class FacebookPageTaskServiceTests(unittest.TestCase):
         )
         self.assertEqual(reconciled["status"], "failed")
         self.assertEqual(self.claim(task_id)["state"], "ambiguous")
+
+    def test_reconciliation_takeover_and_original_heartbeat_are_atomic(self) -> None:
+        stale = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+
+        worker_first, _page_id = self.facebook_task(state="final_action_claimed")
+        with database.connect() as conn:
+            conn.execute(
+                "UPDATE publish_tasks SET status='running', workerToken=?, "
+                "workerHeartbeatAt=? WHERE id=?",
+                ("worker-first", stale, worker_first),
+            )
+            conn.commit()
+        self.assertTrue(
+            task_service.touch_task_heartbeat(
+                worker_first, worker_token="worker-first"
+            )
+        )
+        self.assertFalse(
+            task_service.claim_facebook_reconciliation_worker(
+                worker_first, "reconcile-loses", lease_seconds=30
+            )
+        )
+        self.assertEqual(
+            task_service.get_task(worker_first)["workerToken"], "worker-first"
+        )
+
+        reconcile_first, _page_id = self.facebook_task(state="final_action_claimed")
+        with database.connect() as conn:
+            conn.execute(
+                "UPDATE publish_tasks SET status='running', workerToken=?, "
+                "workerHeartbeatAt=? WHERE id=?",
+                ("stale-worker", stale, reconcile_first),
+            )
+            conn.commit()
+        self.assertTrue(
+            task_service.claim_facebook_reconciliation_worker(
+                reconcile_first, "reconcile-wins", lease_seconds=30
+            )
+        )
+        self.assertFalse(
+            task_service.touch_task_heartbeat(
+                reconcile_first, worker_token="stale-worker"
+            )
+        )
+        self.assertTrue(
+            task_service.touch_task_heartbeat(
+                reconcile_first, worker_token="reconcile-wins"
+            )
+        )
+
+    def test_public_reconcile_cannot_take_over_worker_refreshed_after_snapshot(self) -> None:
+        task_id, _page_id = self.facebook_task(state="final_action_claimed")
+        stale = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        with database.connect() as conn:
+            conn.execute(
+                "UPDATE publish_tasks SET status='running', workerToken=?, "
+                "workerHeartbeatAt=? WHERE id=?",
+                ("snapshot-owner", stale, task_id),
+            )
+            conn.commit()
+        original_snapshot = controlled_publish._facebook_reconciliation_snapshot
+
+        def refresh_after_snapshot(current_task_id: int):
+            snapshot = original_snapshot(current_task_id)
+            self.assertTrue(
+                task_service.touch_task_heartbeat(
+                    current_task_id, worker_token="snapshot-owner"
+                )
+            )
+            return snapshot
+
+        with patch.object(
+            controlled_publish,
+            "_facebook_reconciliation_snapshot",
+            side_effect=refresh_after_snapshot,
+        ):
+            projected = controlled_publish.reconcile_facebook_page_publish_outcome(
+                task_id
+            )
+        self.assertEqual(projected["status"], "running")
+        self.assertEqual(
+            task_service.get_task(task_id)["workerToken"], "snapshot-owner"
+        )
+        self.assertEqual(self.claim(task_id)["state"], "final_action_claimed")
+
+    def test_public_reconcile_rejects_live_preflight_before_owner_projection(self) -> None:
+        payload = self.payload(page_id="preflight-only")
+        preflight = task_service.create_pending_task(
+            [payload], mode="oneclick_preflight"
+        )
+        self.assertTrue(
+            task_service.claim_facebook_worker(
+                int(preflight["id"]), "preflight-owner", "live preflight"
+            )
+        )
+
+        with self.assertRaises(ControlledPublishError) as raised:
+            controlled_publish.reconcile_facebook_page_publish_outcome(
+                int(preflight["id"])
+            )
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "facebook_claim_lifecycle_invalid",
+        )
+
+    def test_page_heartbeat_requires_exact_worker_token(self) -> None:
+        formal_task_id, _page_id = self.facebook_task(state="reserved")
+        task_id = int(self.claim(formal_task_id)["preflightTaskId"])
+        self.assertTrue(
+            task_service.claim_facebook_worker(task_id, "heartbeat-owner", "start")
+        )
+        before = task_service.get_task(task_id)["workerHeartbeatAt"]
+        self.assertFalse(task_service.touch_task_heartbeat(task_id))
+        self.assertFalse(task_service.touch_task_heartbeat(task_id, worker_token=""))
+        self.assertFalse(
+            task_service.touch_task_heartbeat(
+                task_id, worker_token="wrong-heartbeat-owner"
+            )
+        )
+        self.assertEqual(task_service.get_task(task_id)["workerHeartbeatAt"], before)
+        self.assertTrue(
+            task_service.touch_task_heartbeat(
+                task_id, worker_token="heartbeat-owner"
+            )
+        )
 
     def test_waiting_verification_is_counted_as_active(self) -> None:
         formal_task_id, page_id = self.facebook_task()
@@ -1948,7 +2079,10 @@ class FacebookPageTaskServiceTests(unittest.TestCase):
         )
 
         self.assertEqual(errors, [])
-        self.assertEqual([result["status"] for result in results], ["success", "success"])
+        self.assertEqual(
+            sorted(result["status"] for result in results),
+            ["failed", "success"],
+        )
         self.assertEqual(self.claim(task_id)["state"], "succeeded")
         event_types = [
             event["eventType"]
@@ -1984,8 +2118,8 @@ class FacebookPageTaskServiceTests(unittest.TestCase):
 
         self.assertEqual(errors, [])
         self.assertEqual(
-            [result["phase"] for result in results],
-            ["confirmed_not_published", "confirmed_not_published"],
+            sorted(result["phase"] for result in results),
+            ["ambiguous", "confirmed_not_published"],
         )
         self.assertEqual(
             (self.claim(task_id)["state"], self.claim(task_id)["blocksReplay"]),
@@ -2030,13 +2164,9 @@ class FacebookPageTaskServiceTests(unittest.TestCase):
             (unique, none),
         )
 
-        self.assertEqual(len(results), 1)
-        self.assertEqual(len(errors), 1)
-        self.assertIsInstance(errors[0], ControlledPublishError)
-        self.assertIn(
-            self.claim(task_id)["state"],
-            {"succeeded", "confirmed_not_published"},
-        )
+        self.assertEqual(len(results), 2)
+        self.assertEqual(errors, [])
+        self.assertEqual(self.claim(task_id)["state"], "succeeded")
 
     def test_absence_incomplete_unrelated_or_multiple_remain_ambiguous(self) -> None:
         cases: tuple[tuple[str, object], ...] = (

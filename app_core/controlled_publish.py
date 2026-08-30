@@ -2923,8 +2923,6 @@ def reconcile_facebook_page_publish_outcome(task_id: int) -> dict[str, object]:
 
     from . import task_service
 
-    if task_service.facebook_reconciliation_owner_is_active(int(task_id)):
-        return project_task(task_service.get_task(int(task_id)))
     snapshot = _facebook_reconciliation_snapshot(int(task_id))
     state = str(snapshot.get("state") or "")
     if state in _FACEBOOK_PAGE_TERMINAL_STATES:
@@ -2934,6 +2932,13 @@ def reconcile_facebook_page_publish_outcome(task_id: int) -> dict[str, object]:
             "facebook_claim_lifecycle_invalid",
             "Facebook Page claim 当前不允许只读核对。",
         )
+    if task_service.facebook_reconciliation_owner_is_active(int(task_id)):
+        return project_task(task_service.get_task(int(task_id)))
+    reconcile_token = f"facebook-reconcile-{uuid.uuid4().hex}"
+    if not task_service.claim_facebook_reconciliation_worker(
+        int(task_id), reconcile_token
+    ):
+        return project_task(task_service.get_task(int(task_id)))
     page_id = str(snapshot.get("pageId") or "")
     if state == "final_action_claimed" and not str(snapshot.get("clickedAt") or ""):
         task_service.record_facebook_progress(
@@ -2942,6 +2947,7 @@ def reconcile_facebook_page_publish_outcome(task_id: int) -> dict[str, object]:
             message="Facebook Page 最终动作是否执行无法证明，需继续只读核对",
             receipt={"pageId": page_id, "phase": "ambiguous"},
             _expected_state="final_action_claimed",
+            worker_token=reconcile_token,
             _trusted_reconciliation=True,
         )
         return project_task(task_service.get_task(int(task_id)))
@@ -2955,6 +2961,7 @@ def reconcile_facebook_page_publish_outcome(task_id: int) -> dict[str, object]:
                 message="Facebook Page 只读列表未完整，结果保持未知",
                 receipt={"pageId": page_id, "phase": "ambiguous"},
                 _expected_state=state,
+                worker_token=reconcile_token,
                 _trusted_reconciliation=True,
             )
         return project_task(task_service.get_task(int(task_id)))
@@ -2972,6 +2979,7 @@ def reconcile_facebook_page_publish_outcome(task_id: int) -> dict[str, object]:
             receipt={"pageId": page_id, "reelMatch": match},
             _expected_state=state,
             _allow_reconcile_idempotence=True,
+            worker_token=reconcile_token,
             _trusted_reconciliation=True,
         )
         task_service.mark_facebook_result(
@@ -2980,6 +2988,7 @@ def reconcile_facebook_page_publish_outcome(task_id: int) -> dict[str, object]:
             message="Facebook Page 新 Reel 已通过同页内容列表唯一回读",
             receipt=_load_succeeded_facebook_page_receipt(int(task_id)),
             event_type="facebook_publish_readback_confirmed",
+            worker_token=reconcile_token,
             _trusted_reconciliation=True,
         )
     elif (
@@ -3001,6 +3010,7 @@ def reconcile_facebook_page_publish_outcome(task_id: int) -> dict[str, object]:
                 receipt={"pageId": page_id, "phase": "ambiguous"},
                 _expected_state="final_action_clicked",
                 _allow_reconcile_idempotence=True,
+                worker_token=reconcile_token,
                 _trusted_reconciliation=True,
             )
             confirmation_state = "ambiguous"
@@ -3012,6 +3022,7 @@ def reconcile_facebook_page_publish_outcome(task_id: int) -> dict[str, object]:
             _expected_state=confirmation_state,
             _allow_stored_rejected_decision=True,
             _allow_reconcile_idempotence=True,
+            worker_token=reconcile_token,
             _trusted_reconciliation=True,
         )
     elif state != "ambiguous":
@@ -3021,6 +3032,7 @@ def reconcile_facebook_page_publish_outcome(task_id: int) -> dict[str, object]:
             message="Facebook Page 未唯一回读目标 Reel，结果保持未知",
             receipt={"pageId": page_id, "phase": "ambiguous"},
             _expected_state=state,
+            worker_token=reconcile_token,
             _trusted_reconciliation=True,
         )
     return project_task(task_service.get_task(int(task_id)))

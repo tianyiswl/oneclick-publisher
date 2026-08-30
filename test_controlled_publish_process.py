@@ -719,6 +719,32 @@ class ControlledPublishProcessTests(unittest.TestCase):
                 authorization_id=authorization_id,
             )
 
+    def test_cli_supervisor_does_not_extend_facebook_page_worker_lease(self) -> None:
+        import desktop_native_app
+
+        with (
+            patch.object(
+                desktop_native_app.task_service,
+                "get_task",
+                return_value={"items": [{"platformType": 9}]},
+            ),
+            patch.object(
+                desktop_native_app.publish_service,
+                "is_task_running",
+                side_effect=[True, False],
+            ),
+            patch.object(
+                desktop_native_app.task_service,
+                "touch_task_heartbeat",
+            ) as heartbeat,
+            patch.object(desktop_native_app.time, "sleep"),
+        ):
+            desktop_native_app._wait_for_controlled_task(
+                901, interactive_verification=False
+            )
+
+        heartbeat.assert_not_called()
+
     def test_cli_interrupt_after_page_final_action_claim_converges_to_ambiguous(self) -> None:
         import desktop_native_app
 

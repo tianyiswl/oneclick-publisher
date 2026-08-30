@@ -197,8 +197,14 @@ def _wait_for_controlled_task(task_id: int, *, interactive_verification: bool) -
 
         douyin_verification_dialog = DouyinVerificationDialog
         wechat_verification_dialog = WechatVerificationDialog
+    snapshot = task_service.get_task(int(task_id))
+    is_facebook_page = any(
+        int(item.get("platformType") or 0) == 9
+        for item in list(snapshot.get("items") or [])
+    )
     while publish_service.is_task_running(task_id):
-        task_service.touch_task_heartbeat(task_id)
+        if not is_facebook_page:
+            task_service.touch_task_heartbeat(task_id)
         if app is not None:
             app.processEvents()
             request_id = douyin_verification_broker.request_for_task(task_id)
