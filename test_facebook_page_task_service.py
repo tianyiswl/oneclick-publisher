@@ -591,6 +591,105 @@ class FacebookPageTaskServiceTests(unittest.TestCase):
         self.assertEqual(resumed["phase"], "checking")
         self.assertIsNone(resumed["actionRequired"])
 
+    def test_waiting_projection_uses_executor_deadline_and_public_timeout(self) -> None:
+        formal_task_id, page_id = self.facebook_task()
+        preflight_task_id = int(self.claim(formal_task_id)["preflightTaskId"])
+        timing = {
+            "pageId": page_id,
+            "verificationStartedAt": "2026-08-30T05:00:00+00:00",
+            "deadlineAt": "2026-08-30T05:10:00+00:00",
+            "timeoutSeconds": 600,
+        }
+
+        task_service.record_facebook_verification_state(
+            preflight_task_id,
+            waiting=True,
+            receipt=timing,
+        )
+
+        projected = self.projection(preflight_task_id)
+        self.assertEqual(projected["actionRequired"]["timeoutSeconds"], 600)
+        self.assertEqual(
+            projected["actionRequired"]["deadlineAt"],
+            "2026-08-30T05:10:00+00:00",
+        )
+        self.assertEqual(projected["items"][0]["actionRequired"], projected["actionRequired"])
+        self.assertNotIn("createdAt", projected["actionRequired"])
+
+    def test_terminal_task_rejects_late_verification_callbacks(self) -> None:
+        formal_task_id, page_id = self.facebook_task()
+        preflight_task_id = int(self.claim(formal_task_id)["preflightTaskId"])
+        task_service.fail_active_task(
+            preflight_task_id,
+            error_code="controlled_worker_interrupted",
+            message="worker stopped",
+        )
+
+        for waiting in (True, False):
+            with self.subTest(waiting=waiting), self.assertRaises(
+                ControlledPublishError
+            ):
+                task_service.record_facebook_verification_state(
+                    preflight_task_id,
+                    waiting=waiting,
+                    receipt={"pageId": page_id},
+                )
+
+        self.assertEqual(task_service.get_task(preflight_task_id)["status"], "failed")
+
+    def test_verification_callback_requires_the_current_worker_token(self) -> None:
+        formal_task_id, page_id = self.facebook_task()
+        preflight_task_id = int(self.claim(formal_task_id)["preflightTaskId"])
+        task_service.mark_task_running(
+            preflight_task_id,
+            "worker started",
+            worker_token="current-worker",
+        )
+
+        with self.assertRaises(ControlledPublishError):
+            task_service.record_facebook_verification_state(
+                preflight_task_id,
+                waiting=True,
+                receipt={"pageId": page_id},
+                worker_token="late-worker",
+            )
+
+        task_service.record_facebook_verification_state(
+            preflight_task_id,
+            waiting=True,
+            receipt={"pageId": page_id},
+            worker_token="current-worker",
+        )
+        self.assertEqual(
+            task_service.get_task(preflight_task_id)["status"],
+            "waiting_user_verification",
+        )
+
+    def test_stale_preflight_verification_without_claim_is_recovered(self) -> None:
+        formal_task_id, page_id = self.facebook_task()
+        preflight_task_id = int(self.claim(formal_task_id)["preflightTaskId"])
+        task_service.record_facebook_verification_state(
+            preflight_task_id,
+            waiting=True,
+            receipt={"pageId": page_id},
+        )
+        with database.connect() as conn:
+            conn.execute(
+                "UPDATE publish_tasks SET workerHeartbeatAt = ? WHERE id = ?",
+                ((datetime.now() - timedelta(minutes=5)).isoformat(), preflight_task_id),
+            )
+            conn.commit()
+
+        self.assertTrue(
+            task_service.reconcile_stale_controlled_task(
+                preflight_task_id,
+                lease_seconds=30,
+            )
+        )
+        saved = task_service.get_task(preflight_task_id)
+        self.assertEqual(saved["status"], "failed")
+        self.assertEqual(saved["items"][0]["errorCode"], "facebook_verification_timeout")
+
     def test_formal_verification_is_claim_preserving_overlay_before_and_after_click(self) -> None:
         for claim_state, resumed_phase in (
             ("reserved", "checking"),

@@ -2138,7 +2138,12 @@ def create_douyin_batch_resume(task_id: int, *, now: datetime) -> dict[str, obje
     }
 
 
-def mark_task_running(task_id: int, message: str) -> None:
+def mark_task_running(
+    task_id: int,
+    message: str,
+    *,
+    worker_token: str = "",
+) -> None:
     """标记一键发本地预检开始执行。"""
 
     now = _now()
@@ -2147,10 +2152,10 @@ def mark_task_running(task_id: int, message: str) -> None:
             """
             UPDATE publish_tasks
             SET status = 'running', startedAt = COALESCE(startedAt, ?),
-                workerPid = ?, workerHeartbeatAt = ?
+                workerPid = ?, workerHeartbeatAt = ?, workerToken = ?
             WHERE id = ?
             """,
-            (now, os.getpid(), now, int(task_id)),
+            (now, os.getpid(), now, str(worker_token or ""), int(task_id)),
         )
         conn.execute(
             "INSERT INTO publish_task_events (taskId, level, eventType, message, createdAt) VALUES (?, 'info', 'running', ?, ?)",
@@ -2159,19 +2164,27 @@ def mark_task_running(task_id: int, message: str) -> None:
         conn.commit()
 
 
-def touch_task_heartbeat(task_id: int) -> bool:
+def touch_task_heartbeat(task_id: int, *, worker_token: str | None = None) -> bool:
     """续租受控发布进程；不改变已经结束的任务。"""
 
     now = _now()
     with connect() as conn:
+        token_clause = "" if worker_token is None else " AND workerToken = ?"
+        params: tuple[object, ...] = (
+            os.getpid(),
+            now,
+            int(task_id),
+            *(() if worker_token is None else (str(worker_token),)),
+        )
         updated = conn.execute(
-            """
+            f"""
             UPDATE publish_tasks
             SET workerPid = ?, workerHeartbeatAt = ?
             WHERE id = ?
               AND status IN ('pending', 'running', 'waiting_user_verification')
+              {token_clause}
             """,
-            (os.getpid(), now, int(task_id)),
+            params,
         )
         conn.commit()
     return updated.rowcount == 1
@@ -2241,7 +2254,7 @@ def _facebook_task_item_in_transaction(
     rows = conn.execute(
         """
         SELECT item.*, task.mode AS taskMode, task.payloadJson AS taskPayloadJson,
-               task.status AS taskStatus
+               task.status AS taskStatus, task.workerToken AS taskWorkerToken
         FROM publish_task_items AS item
         JOIN publish_tasks AS task ON task.id = item.taskId
         WHERE item.taskId = ? AND item.platformType = 9
@@ -2659,6 +2672,7 @@ def record_facebook_verification_state(
     *,
     waiting: bool,
     receipt: Mapping[str, object],
+    worker_token: str = "",
 ) -> None:
     """Persist a Page verification pause/resume without changing its claim."""
 
@@ -2675,6 +2689,35 @@ def record_facebook_verification_state(
                 int(task_id),
                 allowed_modes=allowed_modes,
             )
+            task_status = str(item["taskStatus"] or "")
+            item_status = str(item["status"] or "")
+            stored_worker_token = str(item["taskWorkerToken"] or "")
+            if stored_worker_token and stored_worker_token != str(worker_token or ""):
+                raise controlled_publish.ControlledPublishError(
+                    "facebook_worker_lease_lost",
+                    "Facebook Page worker 租约已由其他执行者持有。",
+                )
+            if task_status not in {
+                "pending",
+                "running",
+                "waiting_user_verification",
+            } or item_status not in {
+                "pending",
+                "running",
+                "waiting_user_verification",
+            }:
+                raise controlled_publish.ControlledPublishError(
+                    "facebook_worker_lease_lost",
+                    "Facebook Page 任务已终止，迟到的验证回调已拒绝。",
+                )
+            if not waiting and (
+                task_status != "waiting_user_verification"
+                or item_status != "waiting_user_verification"
+            ):
+                raise controlled_publish.ControlledPublishError(
+                    "facebook_worker_lease_lost",
+                    "Facebook Page 验证等待已失效。",
+                )
             values = dict(receipt)
             page_id = str(values.get("pageId") or "")
             resume_phase = "checking"
@@ -3262,15 +3305,15 @@ def _reconcile_stale_controlled_task_in_transaction(
             )
     active_statuses = (
         {"pending", "running", "waiting_user_verification"}
-        if has_facebook_page_claim
+        if is_facebook_page_task
         else {"pending", "running"}
     )
     if str(row["status"] or "") not in active_statuses:
         return False
-    if has_facebook_page_claim and _registered_worker_is_active(int(task_id)):
+    if is_facebook_page_task and _registered_worker_is_active(int(task_id)):
         return False
     worker_pid = int(row["workerPid"] or 0) if "workerPid" in row.keys() else 0
-    if not has_facebook_page_claim and worker_pid > 0:
+    if not is_facebook_page_task and worker_pid > 0:
         try:
             os.kill(worker_pid, 0)
             return False
@@ -3290,6 +3333,13 @@ def _reconcile_stale_controlled_task_in_transaction(
         return _reconcile_stale_facebook_page_claim_in_transaction(
             conn,
             int(task_id),
+        )
+    if is_facebook_page_task and str(row["status"] or "") == "waiting_user_verification":
+        return _fail_active_task_in_transaction(
+            conn,
+            int(task_id),
+            error_code="facebook_verification_timeout",
+            message="Facebook Page 安全验证等待超时，预检已停止",
         )
     is_tiktok_task = (
         len(payloads) == 1 and int(payloads[0].get("type") or 0) == 6

@@ -50,6 +50,8 @@ class ContentProjectGatewayTests(unittest.TestCase):
                 "code": "facebook_verification_required",
                 "type": "facebook_security_check",
                 "message": "请在同一可见窗口完成 Facebook 安全验证",
+                "timeoutSeconds": 600,
+                "deadlineAt": "2026-08-30T05:10:00+00:00",
             },
         }
         gateway = ContentProjectGateway(status_reader=lambda _task_id: expected)

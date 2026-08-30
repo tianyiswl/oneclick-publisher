@@ -105,9 +105,12 @@ class MetaBrowserPolicyTests(unittest.TestCase):
                 "verification_resolved",
             ],
         )
-        self.assertTrue(
-            all(receipt == {"pageId": "1001"} for _stage, receipt in events)
-        )
+        first_receipt = events[0][1]
+        self.assertEqual(first_receipt["pageId"], "1001")
+        self.assertEqual(first_receipt["timeoutSeconds"], 600)
+        self.assertIn("verificationStartedAt", first_receipt)
+        self.assertIn("deadlineAt", first_receipt)
+        self.assertTrue(all(receipt == first_receipt for _stage, receipt in events))
         self.assertIsNotNone(
             meta_publish_success_signal(
                 url="https://business.facebook.com/latest/composer/",

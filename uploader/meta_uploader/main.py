@@ -4,11 +4,16 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Mapping
 
 from playwright.async_api import Playwright, async_playwright
+
+from app_core.overseas_meta_errors import (
+    FACEBOOK_VERIFICATION_TIMEOUT_SECONDS,
+    FacebookPagePublishError,
+)
 
 from utils.base_social_media import (
     keep_browser_open_for_dry_run,
@@ -21,7 +26,6 @@ from utils.base_social_media import (
 from utils.log import meta_logger
 from utils.publish_observer import publish_event
 
-from app_core.overseas_meta_errors import FacebookPagePublishError
 from app_core.overseas_meta_page_identity import normalize_facebook_page_id
 from uploader.meta_uploader.page_form import (
     FacebookPageFormAdapter,
@@ -34,7 +38,7 @@ from uploader.meta_uploader.page_form import (
 COMPOSER_URL = "https://business.facebook.com/latest/composer/"
 FACEBOOK_PAGE_HOME_URL = "https://business.facebook.com/latest/home/"
 FORMAL_LOCK_MESSAGE = "Meta 浏览器正式发布缺少桌面端显式确认"
-MANUAL_INTERVENTION_TIMEOUT_SECONDS = 600
+MANUAL_INTERVENTION_TIMEOUT_SECONDS = FACEBOOK_VERIFICATION_TIMEOUT_SECONDS
 PUBLISH_RESULT_TIMEOUT_SECONDS = 120
 
 
@@ -329,8 +333,14 @@ class MetaReelVideo:
         if not reason:
             return
         await reveal_page_window(page)
+        started_at = datetime.now(timezone.utc)
         safe_receipt = {
             "pageId": str(self.facebook_expected_page_id or ""),
+            "verificationStartedAt": started_at.isoformat(),
+            "deadlineAt": (
+                started_at + timedelta(seconds=MANUAL_INTERVENTION_TIMEOUT_SECONDS)
+            ).isoformat(),
+            "timeoutSeconds": MANUAL_INTERVENTION_TIMEOUT_SECONDS,
         }
         if self.execution_progress is not None:
             self.execution_progress("waiting_user_verification", safe_receipt)

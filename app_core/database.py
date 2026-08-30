@@ -549,6 +549,7 @@ def ensure_schema() -> None:
                 ("revisionSourceTaskId", "INTEGER"),
                 ("workerPid", "INTEGER"),
                 ("workerHeartbeatAt", "TEXT"),
+                ("workerToken", "TEXT"),
             ),
         )
         conn.execute(

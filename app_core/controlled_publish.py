@@ -3819,6 +3819,13 @@ def project_task(task: Mapping[str, Any] | None) -> dict[str, Any]:
                     "type": "facebook_security_check",
                     "message": "请在同一可见窗口完成 Facebook 安全验证",
                 }
+                action_required.update(
+                    {
+                        key: receipt[key]
+                        for key in ("timeoutSeconds", "deadlineAt")
+                        if key in receipt
+                    }
+                )
             error_message = message if status == "failed" else ""
         item_error_code = (
             str(item.get("errorCode") or "")
@@ -3917,6 +3924,18 @@ def project_task(task: Mapping[str, Any] | None) -> dict[str, Any]:
         "local_preflight_passed" in tiktok_receipt_phases
     ):
         stage = "local_preflight_passed"
+    facebook_waiting_actions = [
+        item.get("actionRequired")
+        for item in platforms
+        if int(item.get("platformType") or 0) == 9
+        and item.get("status") == "waiting_user_verification"
+        and isinstance(item.get("actionRequired"), Mapping)
+    ]
+    if task_status_value == "waiting_user_verification" and len(
+        facebook_waiting_actions
+    ) == 1:
+        stage = "waiting_verification"
+        user_action = dict(facebook_waiting_actions[0])
     result = {
         "taskId": int(task.get("id") or 0),
         "taskNo": str(task.get("taskNo") or ""),
@@ -3934,6 +3953,11 @@ def project_task(task: Mapping[str, Any] | None) -> dict[str, Any]:
         "platforms": platforms,
         "items": platforms,
     }
+    if (
+        isinstance(user_action, Mapping)
+        and user_action.get("code") == "facebook_verification_required"
+    ):
+        result["actionRequired"] = dict(user_action)
     facebook_items = [
         item
         for item in platforms
@@ -3953,6 +3977,8 @@ def project_task(task: Mapping[str, Any] | None) -> dict[str, Any]:
                 "actionRequired": facebook.get("actionRequired"),
             }
         )
+        if result.get("actionRequired") is not None:
+            result["userAction"] = result["actionRequired"]
     silicon_payloads = [
         item
         for rows in payloads_by_type.values()

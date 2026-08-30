@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import threading
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping
@@ -748,7 +749,12 @@ def _run_preflight(task: dict, payloads: list[dict[str, Any]]) -> None:
         _active_threads.pop(int(task["id"]), None)
         return
     try:
-        task_service.mark_task_running(task["id"], "一键发开始执行真实预发布检查")
+        worker_token = str(task.get("_workerToken") or "")
+        task_service.mark_task_running(
+            task["id"],
+            "一键发开始执行真实预发布检查",
+            worker_token=worker_token,
+        )
         for payload in payloads:
             platform_type = int(payload["type"])
             task_service.record_task_event(task["id"], "platform_started", f"开始检查{platform_type}号平台的素材上传与表单填写")
@@ -778,9 +784,12 @@ def _run_preflight(task: dict, payloads: list[dict[str, Any]]) -> None:
                                 int(task["id"]),
                                 waiting=True,
                                 receipt=receipt,
+                                worker_token=worker_token,
                             )
                         elif stage == "verification_heartbeat":
-                            if not task_service.touch_task_heartbeat(int(task["id"])):
+                            if not task_service.touch_task_heartbeat(
+                                int(task["id"]), worker_token=worker_token
+                            ):
                                 raise RuntimeError(
                                     "Facebook Page 预检验证等待任务已失去执行租约"
                                 )
@@ -789,6 +798,7 @@ def _run_preflight(task: dict, payloads: list[dict[str, Any]]) -> None:
                                 int(task["id"]),
                                 waiting=False,
                                 receipt=receipt,
+                                worker_token=worker_token,
                             )
                         else:
                             raise ValueError("未知的 Facebook Page 预检验证进度")
@@ -1279,6 +1289,8 @@ def start_desktop_publish(payloads: list[dict[str, Any]]) -> dict:
             else "oneclick_preflight"
         ),
     )
+    if any(int(item.get("type") or 0) == 9 for item in prepared):
+        task["_workerToken"] = uuid.uuid4().hex
     worker = threading.Thread(
         target=(
             _run_publish
@@ -1366,6 +1378,7 @@ def _run_facebook_page_publish(
     )
 
     task_id = int(task["id"])
+    worker_token = str(task.get("_workerToken") or "")
     payload = dict(payloads[0])
     claim_state = "reserved"
     platform_decision: object | None = None
@@ -1403,15 +1416,19 @@ def _run_facebook_page_publish(
                 task_id,
                 waiting=True,
                 receipt=evidence,
+                worker_token=worker_token,
             )
         elif stage == "verification_heartbeat":
-            if not task_service.touch_task_heartbeat(task_id):
+            if not task_service.touch_task_heartbeat(
+                task_id, worker_token=worker_token
+            ):
                 raise RuntimeError("Facebook Page 验证等待任务已失去执行租约")
         elif stage == "verification_resolved":
             task_service.record_facebook_verification_state(
                 task_id,
                 waiting=False,
                 receipt=evidence,
+                worker_token=worker_token,
             )
         elif stage == "final_action_claimed":
             mark_facebook_page_checkpoint(
@@ -1502,6 +1519,7 @@ def _run_facebook_page_publish(
         task_service.mark_task_running(
             task_id,
             "一键发开始执行受控 Facebook Page Reel 发布",
+            worker_token=worker_token,
         )
         result = overseas_browser_publish.run_facebook_page_publish_sync(
             payload,
@@ -1655,6 +1673,7 @@ def start_controlled_facebook_publish(
                 "facebook_publish_authorization_invalid",
                 "Facebook Page 受控任务模式与 claim 不一致。",
             )
+        task["_workerToken"] = uuid.uuid4().hex
         worker = threading.Thread(
             target=_run_facebook_page_publish,
             args=(task, prepared),
@@ -1778,7 +1797,8 @@ def start_controlled_tiktok_publish(task_id: int) -> dict:
 
 def is_task_running(task_id: int) -> bool:
     worker = _active_threads.get(int(task_id))
-    return bool(worker and worker.is_alive())
+    is_alive = getattr(worker, "is_alive", None)
+    return bool(worker and callable(is_alive) and is_alive())
 
 
 task_service.register_worker_activity_probe(is_task_running)

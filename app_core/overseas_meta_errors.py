@@ -28,8 +28,12 @@ _PUBLIC_RECEIPT_KEYS = frozenset(
         "publishedAt",
         "baselineHash",
         "formSnapshotHash",
+        "verificationStartedAt",
+        "deadlineAt",
+        "timeoutSeconds",
     }
 )
+FACEBOOK_VERIFICATION_TIMEOUT_SECONDS = 600
 _SAFE_HASH = re.compile(r"[0-9a-f]{64}\Z")
 _SAFE_IDENTIFIER = re.compile(r"[A-Za-z0-9._:-]{1,128}\Z")
 _SAFE_PHASE = re.compile(r"[a-z0-9_]{1,64}\Z")
@@ -104,8 +108,10 @@ def _safe_receipt_value(key: str, value: object) -> bool:
         )
     if key == "url":
         return value is None or _safe_facebook_url(value)
-    if key == "publishedAt":
+    if key in {"publishedAt", "verificationStartedAt", "deadlineAt"}:
         return value is None or _safe_published_at(value)
+    if key == "timeoutSeconds":
+        return type(value) is int and value == FACEBOOK_VERIFICATION_TIMEOUT_SECONDS
     return False
 
 

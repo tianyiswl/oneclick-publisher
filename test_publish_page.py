@@ -684,6 +684,45 @@ class PublishPageFacebookControlledTests(unittest.TestCase):
         self.assertEqual(len(matching_logs), 1)
         self._dispose_page(page)
 
+    def test_parent_waiting_verification_keeps_task_active_and_polling(self) -> None:
+        page = PublishPage()
+        page.active_task_id = 18
+        page.active_task_mode = "preflight"
+        page._set_running(True, "running")
+        page.task_timer.start()
+        task = {
+            "id": 18,
+            "status": "waiting_user_verification",
+            "dryRun": 1,
+            "itemCount": 1,
+            "successCount": 0,
+            "failedCount": 0,
+            "events": [],
+            "items": [
+                {
+                    "platformType": 9,
+                    "status": "waiting_user_verification",
+                    "errorCode": "",
+                    "receiptJson": json.dumps(
+                        {
+                            "phase": "waiting_user_verification",
+                            "pageId": "1001",
+                            "deadlineAt": "2026-08-30T05:10:00+00:00",
+                            "timeoutSeconds": 600,
+                        }
+                    ),
+                }
+            ],
+        }
+
+        with patch("ui.publish_page.task_service.get_task", return_value=task):
+            page.poll_task()
+
+        self.assertEqual(page.active_task_id, 18)
+        self.assertTrue(page.task_timer.isActive())
+        self.assertNotIn("任务结束", page.log.toPlainText())
+        self._dispose_page(page)
+
     def test_projection_failure_logs_one_safe_diagnostic_and_keeps_polling(self) -> None:
         page = PublishPage()
         page.active_task_id = 77

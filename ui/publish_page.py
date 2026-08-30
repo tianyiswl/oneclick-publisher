@@ -5671,7 +5671,11 @@ class PublishPage(QWidget):
                 and douyin_verification_broker.request_for_task(self.active_task_id)
             ):
                 self._show_douyin_verification()
-        if task.get("status") not in ("pending", "running"):
+        if task.get("status") not in (
+            "pending",
+            "running",
+            "waiting_user_verification",
+        ):
             self.task_timer.stop()
             status_text = self._status_text(status)
             self.log.append(f"任务结束：{status_text}")
