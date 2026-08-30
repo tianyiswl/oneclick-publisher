@@ -7,6 +7,7 @@ import json
 import os
 import re
 import uuid
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Mapping
@@ -37,6 +38,21 @@ DOUYIN_BATCH_PAUSE_REASONS = frozenset(
         PAUSE_REASON_CLEANUP_INCOMPLETE,
     }
 )
+
+
+_worker_activity_probe: Callable[[int], bool] | None = None
+
+
+def register_worker_activity_probe(probe: Callable[[int], bool]) -> None:
+    """Inject the publish service's in-process worker registry without a cycle."""
+
+    global _worker_activity_probe
+    _worker_activity_probe = probe
+
+
+def _registered_worker_is_active(task_id: int) -> bool:
+    probe = _worker_activity_probe
+    return bool(probe and probe(int(task_id)))
 
 
 CONTENT_TYPE_LABELS = {
@@ -678,6 +694,7 @@ def delete_tasks(task_ids: list[int]) -> int:
 
     placeholders = ",".join("?" for _ in normalized_ids)
     with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         facebook_claim_table = conn.execute(
             """
             SELECT 1 FROM sqlite_master
@@ -2917,6 +2934,9 @@ def reconcile_stale_facebook_page_claim(
             }:
                 conn.rollback()
                 return False
+            if _registered_worker_is_active(int(task_id)):
+                conn.rollback()
+                return False
             reference_text = str(
                 row["workerHeartbeatAt"] or row["startedAt"] or row["createdAt"] or ""
             )
@@ -3141,6 +3161,8 @@ def _reconcile_stale_controlled_task_in_transaction(
         else {"pending", "running"}
     )
     if str(row["status"] or "") not in active_statuses:
+        return False
+    if has_facebook_page_claim and _registered_worker_is_active(int(task_id)):
         return False
     worker_pid = int(row["workerPid"] or 0) if "workerPid" in row.keys() else 0
     if not has_facebook_page_claim and worker_pid > 0:

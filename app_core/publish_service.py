@@ -1739,3 +1739,6 @@ def start_controlled_tiktok_publish(task_id: int) -> dict:
 def is_task_running(task_id: int) -> bool:
     worker = _active_threads.get(int(task_id))
     return bool(worker and worker.is_alive())
+
+
+task_service.register_worker_activity_probe(is_task_running)

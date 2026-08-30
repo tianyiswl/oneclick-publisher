@@ -10,7 +10,7 @@ import os
 import tempfile
 import threading
 import unittest
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -1194,22 +1194,120 @@ class FacebookPageTaskServiceTests(unittest.TestCase):
         self.assertEqual(saved["items"][0]["status"], "success")
         self.assertEqual(self.claim(task_id)["state"], "succeeded")
 
-    def test_fresh_page_heartbeat_with_registered_worker_is_not_stolen(self) -> None:
-        task_id, _ = self.facebook_task(state="reserved", stale=False)
+    def test_stale_page_heartbeat_with_live_registered_worker_is_not_stolen(self) -> None:
+        task_id, _ = self.facebook_task(state="reserved", stale=True)
         live_worker = SimpleNamespace(is_alive=lambda: True)
         with patch.dict(
             publish_service._active_threads,
             {task_id: live_worker},
             clear=True,
         ):
-            changed = task_service.reconcile_stale_controlled_task(
-                task_id,
-                lease_seconds=30,
-            )
+            controlled_publish.task_status(task_id)
 
-        self.assertFalse(changed)
         self.assertEqual(self.claim(task_id)["state"], "reserved")
         self.assertEqual(task_service.get_task(task_id)["status"], "running")
+
+    def test_concurrent_page_claim_insert_makes_delete_fail_safely_and_atomically(self) -> None:
+        formal_id, _ = self.facebook_task(state="safe_failed")
+        with database.connect() as conn:
+            claim = dict(
+                conn.execute(
+                    "SELECT * FROM facebook_page_publish_claims WHERE taskId = ?",
+                    (formal_id,),
+                ).fetchone()
+            )
+            conn.execute(
+                "DELETE FROM facebook_page_publish_claims WHERE taskId = ?",
+                (formal_id,),
+            )
+            conn.execute(
+                "UPDATE publish_task_items SET status = 'failed' WHERE taskId = ?",
+                (formal_id,),
+            )
+            conn.execute(
+                "UPDATE publish_tasks SET status = 'failed' WHERE id = ?",
+                (formal_id,),
+            )
+            conn.commit()
+
+        insert_started = threading.Event()
+        insert_finished = threading.Event()
+        insert_errors: list[BaseException] = []
+        insert_columns = [key for key in claim if key != "id"]
+        insert_sql = (
+            "INSERT INTO facebook_page_publish_claims ("
+            + ", ".join(insert_columns)
+            + ") VALUES ("
+            + ", ".join("?" for _ in insert_columns)
+            + ")"
+        )
+
+        def insert_claim() -> None:
+            self.assertTrue(insert_started.wait(timeout=5))
+            try:
+                with database.connect() as conn:
+                    conn.execute(insert_sql, tuple(claim[key] for key in insert_columns))
+                    conn.commit()
+            except BaseException as exc:
+                insert_errors.append(exc)
+            finally:
+                insert_finished.set()
+
+        writer = threading.Thread(target=insert_claim, daemon=True)
+        writer.start()
+        real_connect = task_service.connect
+
+        class CoordinatedConnection:
+            def __init__(self, conn) -> None:
+                self._conn = conn
+                self._began_immediate = False
+                self._released_after_precheck = False
+
+            def execute(self, sql, parameters=()):
+                normalized = " ".join(str(sql).split()).upper()
+                if normalized == "BEGIN IMMEDIATE":
+                    insert_started.set()
+                    self.assert_writer_finished()
+                    self._began_immediate = True
+                cursor = self._conn.execute(sql, parameters)
+                if (
+                    not self._began_immediate
+                    and not self._released_after_precheck
+                    and "FROM FACEBOOK_PAGE_PUBLISH_CLAIMS" in normalized
+                    and "TASKID IN" in normalized
+                ):
+                    self._released_after_precheck = True
+                    insert_started.set()
+                    self.assert_writer_finished()
+                return cursor
+
+            def assert_writer_finished(self) -> None:
+                if not insert_finished.wait(timeout=5):
+                    raise AssertionError("concurrent claim writer did not finish")
+
+            def __getattr__(self, name):
+                return getattr(self._conn, name)
+
+        @contextmanager
+        def coordinated_connect():
+            with real_connect() as conn:
+                yield CoordinatedConnection(conn)
+
+        expected = (
+            "Facebook Page 预检或正式任务已有 claim 历史，"
+            "不能删除，必须保留授权与防重复证据"
+        )
+        with (
+            patch.object(task_service, "connect", coordinated_connect),
+            self.assertRaisesRegex(ValueError, f"^{expected}$"),
+        ):
+            task_service.delete_tasks([formal_id])
+
+        writer.join(timeout=5)
+        self.assertFalse(writer.is_alive())
+        self.assertEqual(insert_errors, [])
+        self.assertIsNotNone(task_service.get_task(formal_id))
+        self.assertEqual(self.claim(formal_id)["state"], "safe_failed")
 
     def test_delete_page_claim_task_or_preflight_is_stable_and_batch_atomic(self) -> None:
         formal_id, _ = self.facebook_task(state="safe_failed")
