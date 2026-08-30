@@ -14,24 +14,24 @@ Facebook Page V1 的本地代码合同、离线自动测试和离屏客户端构
 - origin/main 与 merge base：36320e4cdc6fd5370ef7fd01c8c260b550cb7341
 - 设计提交：8127c78ff9947c826d4d4717f20e312700f605b1
 - 批准计划提交：112126e1abf4ec0474cbada42fe1b42d20bdf24b
-- 本次验证的实现 HEAD（文档提交前）：e1551d10314e4529475eb731a1150c737630c70a
-- 相对 origin/main 的提交数：32；其中设计/计划 2 个，Tasks 1–10 与最终 hardening 30 个。
-- 文档写入前，git status --porcelain=v1 --untracked-files=no 无输出，exit 0。
+- 本次验证的最终代码 HEAD（本报告刷新前）：7baa0d2aab4aff0d13d5dab9b30a4ab460e7d5ab
+- 最终代码 HEAD 相对 origin/main 的提交数：40；其中设计/计划 2 个、Tasks 1–10 与实现/hardening 37 个、上一轮 Task 11 文档提交 1 个。
+- 本报告刷新前，git status --porcelain=v1 --untracked-files=no 无输出，exit 0。
 
 ## 离线门禁
 
 | 门禁 | 精确结果 | unittest 用时 | 进程用时 | exit |
 | --- | --- | ---: | ---: | ---: |
-| 八组 Facebook Page 新测试 | 211/211 通过 | 31.741s | 31.92s | 0 |
-| 13 组受影响回归 | 374/374 通过 | 8.283s | 8.81s | 0 |
-| 全仓 unittest discover -v | 2930/2930 通过 | 125.954s | 126.59s | 0 |
-| 离屏源码客户端 | NATIVE_DESKTOP_UI_OK；仅有一条 Qt Sans Serif 字体别名提示 | — | 0.78s | 0 |
-| git diff --check | 无输出 | — | 0.00s | 0 |
-| git diff --check origin/main...HEAD | 无输出 | — | 0.01s | 0 |
-| 精确敏感词扫描 | 59 行命中，全部分类如下，没有实际密钥值 | — | 0.00s | 0 |
+| 八组 Facebook Page 新测试 | 224/224 通过 | 32.174s | 32.48s | 0 |
+| 13 组受影响回归 | 383/383 通过 | 10.834s | 11.59s | 0 |
+| 全仓 unittest discover -v | 2952/2952 通过 | 132.176s | 132.92s | 0 |
+| 离屏源码客户端 | NATIVE_DESKTOP_UI_OK；仅有一条 Qt Sans Serif 字体别名提示 | — | 0.91s | 0 |
+| git diff --check | 无输出 | — | 0.01s | 0 |
+| git diff --check origin/main...HEAD | 无输出 | — | 0.04s | 0 |
+| 精确敏感词扫描 | 59 行命中，全部分类如下，没有实际密钥值 | — | 0.01s | 0 |
 | 设计/计划占位词扫描 | 0 命中；rg 的“无匹配”返回码 | — | 0.00s | 1 |
-| 海外工作线范围检查 | 实现 HEAD：53 路径（11/17/25）；两份报告写入后：55 路径（11/17/27）；均 REVIEW_REQUIRED | — | 0.05s / 0.04s | 2 |
-| 默认关闭特性开关探针 | ENV_PRESENT=False；FACEBOOK_PAGE_V1_ENABLED=False | — | 0.03s | 0 |
+| 海外工作线范围检查 | 最终代码 HEAD：55 路径（11 owned / 17 shared / 27 outside）；刷新既有报告后路径计数不变；REVIEW_REQUIRED | — | 0.05s | 2 |
+| 默认关闭特性开关探针 | ENV_PRESENT=False；FACEBOOK_PAGE_V1_ENABLED=False | — | 0.04s | 0 |
 
 ### Gate 1：全部新增 Page 测试
 
@@ -47,7 +47,7 @@ Facebook Page V1 的本地代码合同、离线自动测试和离屏客户端构
   test_facebook_page_task_service
 ~~~
 
-结果：Ran 211 tests in 31.741s；OK；real 31.92s；exit 0。
+结果：Ran 224 tests in 32.174s；OK；real 32.48s；exit 0。
 
 ### Gate 2：受影响回归
 
@@ -68,7 +68,7 @@ Facebook Page V1 的本地代码合同、离线自动测试和离屏客户端构
   test_oneclick_mcp_server
 ~~~
 
-结果：Ran 374 tests in 8.283s；OK；real 8.81s；exit 0。
+结果：Ran 383 tests in 10.834s；OK；real 11.59s；exit 0。
 
 ### Gate 3：全仓离线测试
 
@@ -76,7 +76,7 @@ Facebook Page V1 的本地代码合同、离线自动测试和离屏客户端构
 ../../.venv/bin/python -m unittest discover -v
 ~~~
 
-结果：Ran 2930 tests in 125.954s；OK；real 126.59s；exit 0。测试输出中的登录状态文案来自离线测试夹具，不是本轮真实平台登录或回读。
+结果：Ran 2952 tests in 132.176s；OK；real 132.92s；exit 0。测试输出中的登录状态文案来自离线测试夹具，不是本轮真实平台登录或回读。
 
 ### Gate 4：离屏客户端
 
@@ -84,7 +84,7 @@ Facebook Page V1 的本地代码合同、离线自动测试和离屏客户端构
 QT_QPA_PLATFORM=offscreen ../../.venv/bin/python desktop_native_app.py --ui-test
 ~~~
 
-结果：NATIVE_DESKTOP_UI_OK；real 0.78s；exit 0。该路径只构造离屏主窗口，没有启动真实浏览器、登录或发布。
+结果：NATIVE_DESKTOP_UI_OK；real 0.91s；exit 0。唯一额外输出是 Qt 为缺失的 Sans Serif 字体建立别名的 57ms 提示。该路径只构造离屏主窗口，没有启动真实浏览器、登录或发布。
 
 ### Gate 5：静态检查
 
@@ -105,9 +105,9 @@ rg -n 'TO[D]O|TB[D]|PLACEHOL[D]ER|待[定]|待[补]' \
 
 | 文件与命中行 | 数量 | 分类 |
 | --- | ---: | --- |
-| app_core/controlled_publish.py:1517 | 1 | 本分支新增的禁止字段名 verificationCode；用于拒绝持久化敏感输入。 |
+| app_core/controlled_publish.py:1801 | 1 | 本分支新增的禁止字段名 verificationCode；用于拒绝持久化敏感输入。 |
 | test_facebook_page_identity.py:313,315 | 2 | 本分支新增的合成 qrCode/storageState 输入；测试安全投影必须丢弃。 |
-| test_facebook_page_task_service.py:365,539,540,542,554,561,562,576,591,710,911 | 11 | 本分支新增的合成验证码、Cookie、token、路径及否定断言；只用于证明消息、回执和事件会脱敏。 |
+| test_facebook_page_task_service.py:366,540,541,543,555,562,563,577,592,711,912 | 11 | 本分支新增的合成验证码、Cookie、token、路径及否定断言；只用于证明消息、回执和事件会脱敏。 |
 | app_core/overseas_youtube_credentials.py:24 | 1 | 既有系统凭据库协议参数名；没有凭据字面值。 |
 | app_core/overseas_youtube_login.py:46,342,356 | 3 | 既有短期运行时 token 字段、refresh_pending 哨兵和运行时赋值；没有真实 token。 |
 | app_core/overseas_youtube_oauth.py:59,519,541 | 3 | 既有 OAuth 运行时字段/解析；repr 已关闭，没有真实 token。 |
@@ -132,9 +132,9 @@ rg -n 'TO[D]O|TB[D]|PLACEHOL[D]ER|待[定]|待[补]' \
 ../../.venv/bin/python tools/check_workstream_scope.py --stream overseas --base origin/main
 ~~~
 
-在实现 HEAD e1551d1 上的结果：changed=53；scope-check: REVIEW_REQUIRED；real 0.05s；exit 2。两份 Task 11 报告写入后复跑：changed=55；11 owned / 17 shared / 27 outside；real 0.04s；exit 2。新增的两个 outside 路径正是 brief 唯一允许创建的验证报告和 SOURCE_OF_TRUTH 交接片段。exit 2 是批准设计中共享核心和接口文件需要转交集成线的预期结果，不是绿色范围通过。
+在最终代码 HEAD 7baa0d2 上的结果：changed=55；11 owned / 17 shared / 27 outside；scope-check: REVIEW_REQUIRED；real 0.05s；exit 2。当前 55 路径已经包含 brief 唯一允许的验证报告和 SOURCE_OF_TRUTH 交接片段；本轮只刷新这两个既有路径，因此文档提交后 changed 和三类计数均保持不变。exit 2 是批准设计中共享核心和接口文件需要转交集成线的预期结果，不是绿色范围通过。
 
-53 个路径已全部核对：
+55 个路径已全部核对：
 
 - owned（11）：app_core/overseas_browser_publish.py、app_core/overseas_meta_content.py、app_core/overseas_meta_errors.py、app_core/overseas_meta_page_identity.py、app_core/overseas_preflight.py、test_meta_browser_publish.py、test_overseas_integration.py、test_overseas_publish_routing.py、uploader/meta_uploader/content_list.py、uploader/meta_uploader/main.py、uploader/meta_uploader/page_form.py。
 - shared（17）：app_core/account_browser_service.py、app_core/account_service.py、app_core/controlled_publish.py、app_core/database.py、app_core/login_service.py、app_core/oneclick_authorization.py、app_core/publish_service.py、app_core/task_service.py、desktop_native_app.py、myUtils/login.py、test_account_detection_ui.py、test_controlled_publish.py、test_publish_service.py、test_task_service.py、ui/account_page.py、ui/login_dialog.py、ui/publish_page.py。
@@ -142,12 +142,12 @@ rg -n 'TO[D]O|TB[D]|PLACEHOL[D]ER|待[定]|待[补]' \
 
 outside 路径均有批准来源：6 个设计/架构/计划证据；Task 3 的 myUtils/auth.py 与 test_oneclick_authorization.py；Tasks 1–9 的 8 个 Facebook Page 测试和受控恢复测试；Task 8 的 publish observer；Task 10 的 Gateway、进程、MCP 及其接口测试。没有无关路径。
 
-最终 55 路径核对在上述 53 条基础上只增加：
+其中两条 Task 11 报告路径为：
 
 - docs/superpowers/reports/2026-08-30-facebook-page-publish-verification.md
 - docs/superpowers/reports/2026-08-30-facebook-page-publish-source-of-truth-handoff.md
 
-两者均由 Task 11 brief 明确要求；没有第三个产品、测试、状态、版本或打包路径。
+两者均由 Task 11 brief 明确要求；本轮刷新没有增加第三个产品、测试、状态、版本或打包路径。
 
 ### Gate 7：特性开关默认关闭
 
@@ -162,11 +162,11 @@ ENV_PRESENT=False
 FACEBOOK_PAGE_V1_ENABLED=False
 ~~~
 
-exit 0，real 0.03s。探针没有写环境配置、数据库或其他持久设置。
+exit 0，real 0.04s。探针没有写环境配置、数据库或其他持久设置。
 
 ## Tasks 1–10 与最终 hardening 的完整依赖顺序
 
-标记 S 表示提交触及 scope checker 的 shared 文件；O 表示只触及海外专属或计划明确的 outside 文件。下面 30 个提交是线性依赖顺序。集成线不能只摘取 S 子集，因为后续共享修复依赖其间的海外合同、执行器和测试。
+标记 S 表示提交触及 scope checker 的 shared 文件；O 表示只触及海外专属或计划明确的 outside 文件。下面 37 个实现、测试与 hardening 提交是依赖顺序。集成线不能只摘取 S 子集，因为后续共享修复依赖其间的海外合同、执行器和测试。分支历史中的上一轮 Task 11 文档提交 5ff02afaee64d1558191e45d00d4c1383a41c92b 位于第 30 与 31 项之间，只创建报告，不是生产依赖；其旧测试数字由本次刷新取代。
 
 | 顺序 | Task | 类别 | commit | subject |
 | ---: | --- | --- | --- | --- |
@@ -200,17 +200,27 @@ exit 0，real 0.03s。探针没有写环境配置、数据库或其他持久设�
 | 28 | hardening A | S | 732f7adc1e87de7e63db3263d2b977c29484fd5a | test(facebook): use verified Page form receipts |
 | 29 | hardening B | S | 669c654715ce701e4ea46668a23105865e36ba21 | fix(accounts): harden Facebook Page activation and backend launch |
 | 30 | hardening B | S | e1551d10314e4529475eb731a1150c737630c70a | fix(accounts): stop late Facebook backend workers safely |
+| 31 | final broad fix B | O | 6f238f23672a8b202ca7fccd5233cd3cc8b0e52f | fix(overseas): preserve Facebook Page video paths |
+| 32 | final broad fix A | S | 5f065669f73ac469e76065d24cbc71f2e38eec6f | fix(publish): close Facebook Page cross-entry gaps |
+| 33 | drift fixture | S（仅测试） | 4f5e234c95dddab17f4d055de966d911830cb577 | test(tiktok): freeze scheduled claim fixtures |
+| 34 | final broad fix A2 | S | 89dd690a7f27f696471cbfcac53b465d9c960205 | fix(facebook): reject malformed Page platform types |
+| 35 | final broad fix B2 | S | 922c0b16a80e573ff9184b179d0188bee480235a | fix(facebook): keep Page video paths ephemeral |
+| 36 | final broad fix B2 review | S | 651e2d4ee43e1fe3c4be3bba01974b6da68dc5a4 | fix(facebook): bind runtime media to Page snapshot |
+| 37 | final broad fix B2 review | S | 7baa0d2aab4aff0d13d5dab9b30a4ab460e7d5ab | fix(facebook): reject aliased Page runtime media |
 
-19 个 shared-touch 提交的相对顺序是：
+第 33 项 4f5e234 只修改 test_controlled_publish.py，把两个固定日期的 TikTok 排期 claim 夹具冻结到确定的上海时间；它修复全仓测试的时间漂移，没有任何生产代码改动，也不改变 Facebook Page 能力边界。scope checker 仍因该测试文件属于 shared 而将其标为 S。
+
+25 个 shared-touch 提交的相对顺序是：
 
 ~~~text
 f1d439b -> 8fe1437 -> 695f108 -> ffd3b21 -> 7d68b7a ->
 58a1083 -> b33cabc -> 7ead58a -> af62be5 -> bfd3417 ->
 8afb355 -> 43cb3ed -> 50ee3db -> 34f699a -> c3f8a4a ->
-2461015 -> 732f7ad -> 669c654 -> e1551d1
+2461015 -> 732f7ad -> 669c654 -> e1551d1 -> 5f06566 ->
+4f5e234 -> 89dd690 -> 922c0b1 -> 651e2d4 -> 7baa0d2
 ~~~
 
-这只是共享审查索引，不是可单独 cherry-pick 的精简列表；实际集成应按上表 30 个提交的完整顺序处理，随后再接收本验证文档提交。
+这只是共享审查索引，不是可单独 cherry-pick 的精简列表；实际集成应按上表 37 个提交的完整依赖顺序处理，并同时审查历史中的 Task 11 文档提交及本次最终刷新提交。
 
 ## 本地已验证的能力边界
 
@@ -219,11 +229,13 @@ f1d439b -> 8fe1437 -> 695f108 -> ffd3b21 -> 7d68b7a ->
 - 稳定 Page ID 选择、权限与同一 Page 核对合同，以及默认关闭的进程级特性开关；
 - 旧 type 9 记录的非破坏迁移、Page ID 唯一性与可发布账号过滤；
 - 单 Page、单视频、立即公开的输入拒绝门、最终 caption、内容/重放指纹；
+- 精确整数平台类型 9、跨桌面/CLI/Gateway/MCP 入口的一致元数据拒绝门，以及等价内容的跨入口防重合同；字符串、浮点、布尔或别名类型不会进入 Page 会话；
 - 预检回执哈希、一次性授权、正式任务和 Page claim 的原子合同；
 - Page 表单与内容列表的可注入离线适配器、完整基线、唯一新 Reel 匹配合同；
+- 视频绝对路径只在运行时从冻结 manifest 或受管 VIDEO_DIR 重新校验后传给上传边界；数据库和公共投影只保留 basename/hash/size，缺失、移动、变更或文件系统别名会在 Page 会话、claim 或授权消费前安全停止；
 - worker 租约、最终动作单击边界、结果不明、防重放、终态恢复和只读核对合同；
 - 桌面 UI、CLI、Gateway 和 MCP 的同一服务接线及安全任务投影；
-- 上述 211 项新增测试、374 项受影响测试、2930 项全仓测试与离屏窗口构造均通过。
+- 上述八组 Page 测试 224/224、13 组受影响测试 383/383、全仓测试 2952/2952 与离屏窗口构造均通过。
 
 下列层级仍未验证：
 
@@ -236,4 +248,4 @@ f1d439b -> 8fe1437 -> 695f108 -> ffd3b21 -> 7d68b7a ->
 
 ## 唯一下一步
 
-接下来由集成线按上述完整顺序审查/cherry-pick 30 个实现与 hardening 提交，再接收本验证文档提交；在集成线重新运行共享全量测试、离屏 UI、diff/敏感信息/范围门禁并确认无回归后，才可准备默认仍关闭的开发者专用真实平台验证构建。任何 Facebook 登录、平台预检、上传或公开发布都仍需到 Task 12 对应层级重新取得明确授权。
+接下来由集成线按上述完整依赖顺序审查/cherry-pick 37 个实现、测试与 hardening 提交，并审查两次 Task 11 文档提交；在集成线重新运行共享全量测试、离屏 UI、diff/敏感信息/范围门禁并确认无回归后，才可准备默认仍关闭的开发者专用真实平台验证构建。任何 Facebook 登录、平台预检、上传或公开发布都仍需到 Task 12 对应层级重新取得明确授权。
