@@ -283,6 +283,14 @@
 - 两端文件均已复制到 `/Users/andy/文件/一键发/`。本轮没有替换已安装 Mac 客户端，没有执行任何平台上传、最终提交、定时或公开发布。详见 `docs/superpowers/reports/2026-08-29-oneclick-0.5.24-macos-build-verification.md` 和 `docs/superpowers/reports/2026-08-29-oneclick-0.5.24-windows-build-verification.md`。
 - 当前 TikTok 测试账号仍没有 Scheduler；只证明客户端会安全识别不可用，不证明平台原生定时已经可用。
 
+## 2026-08-30 Facebook Page V1 本地集成验收
+
+- 最终代码候选为 `731abbe487a828f61257c5f0e8162980c8b4d8fa`，相对基线 `36320e4cdc6fd5370ef7fd01c8c260b550cb7341` 共 58 个提交、60 个变更文件。集成线已审查共享核心和跨入口依赖，独立最终审查为 Critical 0、Important 0，结论 `MERGE`。
+- 源码已具备精确 Page 身份、单 Page 单视频立即公开合同、一次性授权与原子 claim、最终点击前回读、人工验证等待、worker lease/失联恢复、共享会话安全清理，以及 UI、CLI、内容项目 Gateway、MCP 同一服务入口。特性开关默认关闭，关闭时所有 Page 操作入口均在核心服务层拒绝。
+- 完整离线回归 `3034/3034`、Python 语法检查和差异检查通过；离屏源码客户端返回 `NATIVE_DESKTOP_UI_OK`。范围检查为 60 路径（11 owned / 17 shared / 32 outside），按预期返回 `REVIEW_REQUIRED`，已由本地集成线逐项审查接受。
+- 本轮没有真实登录 Facebook、回读真实 Page 权限、上传、平台预检、最终点击、公开发布或取得 Reel ID/URL；也没有版本递增、Mac/Windows 打包、安装或远端推送。当前仍是 `0.5.24` 源码基线，不能据此宣称客户端已可真实发布 Facebook。
+- 详细证据见 `docs/superpowers/reports/2026-08-30-facebook-page-v1-integration-acceptance.md`。
+
 ## Worktree 布局
 
 四条工作线从包含本文件的同一治理提交创建：
@@ -310,4 +318,4 @@
 
 ## 当前唯一下一步
 
-`0.5.24` 双端候选已经生成、回下载并核验。下一个验收点是在真实 Windows 电脑双击 `YiJianFa_0.5.24_Windows_x64_20260829.zip` 中的客户端并回读版本与账号页；不得为客户端验收执行平台上传或最终提交。
+Facebook Page V1 已通过本地源码集成门。下一个验收点是在另行明确授权后，使用同一源码开发构建开启该功能，仅执行真实 Facebook Page 登录、精确 Page 身份和权限的重启回读；不得上传视频、运行正式预检或触发最终发布。`0.5.24` Windows 真机双击验收仍未完成，但不作为当前主线动作。
