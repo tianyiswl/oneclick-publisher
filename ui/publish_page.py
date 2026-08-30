@@ -1314,6 +1314,16 @@ class PublishPage(QWidget):
         self.platform_texts[platform_type] = text
         self.platform_tags[platform_type] = tags
 
+        if platform_type == 9:
+            page_limit_notice = QLabel(
+                "Facebook Page 首版仅支持单 Page、单 Reel、立即公开发布；"
+                "不支持封面、合集、定时、原创或 AI 声明。"
+            )
+            page_limit_notice.setObjectName("facebookPageV1LimitNotice")
+            page_limit_notice.setProperty("role", "warning")
+            page_limit_notice.setWordWrap(True)
+            body_layout.addWidget(page_limit_notice)
+
         publish_settings = QFrame()
         publish_settings.setProperty("subPanel", True)
         publish_settings_layout = QFormLayout(publish_settings)
@@ -1352,6 +1362,12 @@ class PublishPage(QWidget):
             collection_sync.setEnabled(False)
             collection_status.setText("首版不设置")
             collection_row.setToolTip("TikTok 合集尚未接入可靠回读，首版不会写入。")
+        elif platform_type == 9:
+            collection.setEnabled(False)
+            collection_sync.setEnabled(False)
+            collection_status.setText("首版不支持")
+            collection_row.setToolTip("Facebook Page 首版不设置合集。")
+            collection_row.hide()
 
         schedule_enabled = QCheckBox("单独设置")
         schedule_date = QDateEdit()
@@ -1372,6 +1388,11 @@ class PublishPage(QWidget):
             schedule_enabled.setToolTip(
                 f"{name} 首版只开放立即发布，定时发布将在真实账号回读验收后开放。"
             )
+        elif platform_type == 9:
+            schedule_enabled.setEnabled(False)
+            schedule_enabled.setToolTip(
+                "Facebook Page 首版只支持立即公开发布。"
+            )
         self.platform_schedule_enabled[platform_type] = schedule_enabled
         self.platform_schedule_dates[platform_type] = schedule_date
         self.platform_schedule_times[platform_type] = schedule_time
@@ -1385,6 +1406,8 @@ class PublishPage(QWidget):
         schedule_row_layout.addWidget(schedule_date, 1)
         schedule_row_layout.addWidget(schedule_time)
         publish_settings_layout.addRow("发布时间", schedule_row)
+        if platform_type == 9:
+            schedule_row.hide()
         body_layout.addWidget(publish_settings)
 
         if platform_type == 1:
@@ -1765,10 +1788,10 @@ class PublishPage(QWidget):
             body_layout.addWidget(self.wechat_location_panel)
 
         body_layout.addStretch()
-        editor_body_layout.addWidget(
-            self._build_platform_cover_panel(platform_type),
-            0,
-        )
+        platform_cover_panel = self._build_platform_cover_panel(platform_type)
+        if platform_type == 9:
+            platform_cover_panel.hide()
+        editor_body_layout.addWidget(platform_cover_panel, 0)
         editor_layout.addWidget(editor_body, 1)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -3508,6 +3531,41 @@ class PublishPage(QWidget):
         return menu
 
     def open_account_backend(self, account: dict) -> None:
+        if int(account.get("type") or 0) == 9:
+            if not facebook_page_v1_enabled():
+                message = "Facebook Page 后台入口尚未开启"
+                self.account_health_label.setText(message)
+                self.log.append(f"[warning] {message}")
+                return
+            account_id = int(account.get("id") or 0)
+            if account_id <= 0:
+                message = "Facebook Page 账号无法安全打开后台"
+                self.account_health_label.setText(message)
+                self.log.append(f"[warning] {message}")
+                return
+            task_key = f"publish_facebook_backend_{account_id}"
+            if self.account_health_tasks.is_running(task_key):
+                self.account_health_label.setText(
+                    "Facebook Page 后台正在打开…"
+                )
+                return
+            frozen_account = dict(account)
+            self.account_health_tasks.run(
+                task_key,
+                lambda: account_browser_service.open_account_backend(
+                    frozen_account
+                ),
+                on_started=lambda: self.account_health_label.setText(
+                    "Facebook Page 后台正在打开…"
+                ),
+                on_success=lambda reused: self._finish_facebook_page_backend_open(
+                    frozen_account,
+                    reused,
+                ),
+                on_error=self._show_facebook_page_backend_open_error,
+            )
+            return
+
         reused = account_browser_service.open_account_backend(account)
         platform_name = account.get("platformName") or account_service.PLATFORMS.get(
             int(account.get("type") or 0),
@@ -3520,6 +3578,25 @@ class PublishPage(QWidget):
         )
         self.account_health_label.setText(message)
         self.log.append(f"[info] {message}")
+
+    def _finish_facebook_page_backend_open(
+        self,
+        account: dict,
+        reused: object,
+    ) -> None:
+        platform_name = account.get("platformName") or "Facebook Reels"
+        message = (
+            f"已切换到现有后台：{platform_name}"
+            if bool(reused)
+            else f"已打开后台：{platform_name}"
+        )
+        self.account_health_label.setText(message)
+        self.log.append(f"[info] {message}")
+
+    def _show_facebook_page_backend_open_error(self, _message: str) -> None:
+        message = "Facebook Page 后台打开失败，请稍后重试"
+        self.account_health_label.setText(message)
+        self.log.append(f"[warning] {message}")
 
     def check_account_login(self, account: dict) -> None:
         account_id = int(account.get("id") or 0)
@@ -3866,6 +3943,7 @@ class PublishPage(QWidget):
             f"{account_count} 个账号 · {media_count} 个素材 · {type_label}"
         )
         self._update_account_health_label()
+        self._sync_facebook_page_v1_controls()
         if hasattr(self, "platform_nav"):
             self.refresh_platform_navigation()
         if hasattr(self, "xhs_location_panel"):
@@ -3876,6 +3954,28 @@ class PublishPage(QWidget):
             self._sync_wechat_location_visibility_and_context()
         if account_count:
             QTimer.singleShot(300, self.check_selected_account_health)
+
+    def _sync_facebook_page_v1_controls(self) -> None:
+        """Disable unsupported shared controls without clearing user choices."""
+
+        page_selected = any(
+            int(account.get("type") or 0) == 9
+            for account in self.selected_accounts()
+        )
+        shared_controls = (
+            self.common_cover_panel,
+            self.original_declaration,
+            self.ai_generated_content,
+            self.common_visibility,
+            self.common_schedule_enabled,
+        )
+        for control in shared_controls:
+            control.setEnabled(not page_selected)
+        schedule_fields_enabled = (
+            not page_selected and self.common_schedule_enabled.isChecked()
+        )
+        self.common_schedule_date.setEnabled(schedule_fields_enabled)
+        self.common_schedule_time.setEnabled(schedule_fields_enabled)
 
     def _update_account_health_label(self) -> None:
         selected = self.selected_accounts()
@@ -4195,8 +4295,12 @@ class PublishPage(QWidget):
             self._update_timer_status()
 
     def _common_schedule_toggled(self, checked: bool) -> None:
-        self.common_schedule_date.setEnabled(checked)
-        self.common_schedule_time.setEnabled(checked)
+        page_selected = any(
+            int(account.get("type") or 0) == 9
+            for account in self.selected_accounts()
+        )
+        self.common_schedule_date.setEnabled(checked and not page_selected)
+        self.common_schedule_time.setEnabled(checked and not page_selected)
         self._sync_common_schedule_values()
 
     def _sync_common_schedule_values(self, *_args) -> None:
@@ -4230,8 +4334,12 @@ class PublishPage(QWidget):
             self.common_schedule_time.setTime(parsed_time)
         enabled = bool(self.timer_values.get("enableTimer"))
         self.common_schedule_enabled.setChecked(enabled)
-        self.common_schedule_date.setEnabled(enabled)
-        self.common_schedule_time.setEnabled(enabled)
+        page_selected = any(
+            int(account.get("type") or 0) == 9
+            for account in self.selected_accounts()
+        )
+        self.common_schedule_date.setEnabled(enabled and not page_selected)
+        self.common_schedule_time.setEnabled(enabled and not page_selected)
         for control in controls:
             control.blockSignals(False)
         self._sync_common_schedule_values()
@@ -4517,7 +4625,11 @@ class PublishPage(QWidget):
                 "collectionName": self._platform_collection_name(platform_type),
                 "enableTimer": bool(schedule_time),
                 "scheduleTime": schedule_time or None,
-                "scheduleTimezone": wechat_publish_policy.local_timezone_name(),
+                "scheduleTimezone": (
+                    ""
+                    if platform_type == 9
+                    else wechat_publish_policy.local_timezone_name()
+                ),
                 "videosPerDay": 1,
                 "dailyTimes": [schedule_time[-5:]] if schedule_time else [],
                 "startDays": 0,
@@ -4808,6 +4920,7 @@ class PublishPage(QWidget):
         if len(payloads) != 1 or len(facebook_payloads) != 1:
             raise ValueError("Facebook Page 首版一次只支持一个 Page 和一个视频")
         payload = facebook_payloads[0]
+        controlled_publish.validate_facebook_page_v1_metadata(payload)
         account_ids = list(payload.get("accountIds") or [])
         files = list(payload.get("fileList") or [])
         if (
@@ -4817,20 +4930,6 @@ class PublishPage(QWidget):
             or type(account_ids[0]) is not int
         ):
             raise ValueError("Facebook Page 首版只支持单 Page、单 Reel 视频")
-        if (
-            str(payload.get("visibility") or "") != "public"
-            or bool(payload.get("enableTimer"))
-            or bool(str(payload.get("scheduleTime") or "").strip())
-            or bool(str(payload.get("scheduledAt") or "").strip())
-            or str(payload.get("scheduleMode") or "immediate") != "immediate"
-        ):
-            raise ValueError("Facebook Page 首版只支持立即公开发布")
-        if (
-            bool(payload.get("originalDeclaration"))
-            or bool(payload.get("aiGenerated"))
-            or bool(payload.get("aiDisclosure"))
-        ):
-            raise ValueError("Facebook Page 首版不支持当前原创或 AI 声明设置")
         matching_accounts = [
             account
             for account in self._account_rows
@@ -5719,6 +5818,9 @@ class PublishPage(QWidget):
                     )
                 if not facebook_page_v1_enabled():
                     raise ValueError("Facebook Page 发布功能尚未开启")
+                controlled_publish.validate_facebook_page_v1_metadata(
+                    facebook_payloads[0]
+                )
                 if not self.confirm_meta_browser_publish(facebook_payloads):
                     self.log.append("Facebook Page 最终发布已取消。")
                     self.task_status_label.setText(

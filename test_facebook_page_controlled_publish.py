@@ -220,16 +220,22 @@ class FacebookPageControlledPublishTests(unittest.TestCase):
                 accounts=[self.account()],
             )[0]
 
-        self.assertEqual(preflight["facebookFinalCaption"], formal["facebookFinalCaption"])
-        self.assertEqual(preflight["facebookCaptionSha256"], formal["facebookCaptionSha256"])
-        self.assertEqual(
-            publish_intent_fingerprint([preflight]),
-            publish_intent_fingerprint([formal]),
-        )
-        self.assertEqual(
-            facebook_replay_fingerprint([preflight]),
-            facebook_replay_fingerprint([formal]),
-        )
+            self.assertEqual(
+                preflight["facebookFinalCaption"],
+                formal["facebookFinalCaption"],
+            )
+            self.assertEqual(
+                preflight["facebookCaptionSha256"],
+                formal["facebookCaptionSha256"],
+            )
+            self.assertEqual(
+                publish_intent_fingerprint([preflight]),
+                publish_intent_fingerprint([formal]),
+            )
+            self.assertEqual(
+                facebook_replay_fingerprint([preflight]),
+                facebook_replay_fingerprint([formal]),
+            )
 
     def test_request_preflight_and_formal_share_one_canonical_caption_hash(self) -> None:
         expected_caption = (
@@ -260,17 +266,17 @@ class FacebookPageControlledPublishTests(unittest.TestCase):
                 accounts=[self.account()],
             )[0]
 
-        for current in (preflight, formal):
-            self.assertEqual(current["facebookFinalCaption"], expected_caption)
-            self.assertEqual(current["facebookCaptionSha256"], expected_hash)
-        self.assertEqual(
-            publish_intent_fingerprint([preflight]),
-            publish_intent_fingerprint([formal]),
-        )
-        self.assertEqual(
-            facebook_replay_fingerprint([preflight]),
-            facebook_replay_fingerprint([formal]),
-        )
+            for current in (preflight, formal):
+                self.assertEqual(current["facebookFinalCaption"], expected_caption)
+                self.assertEqual(current["facebookCaptionSha256"], expected_hash)
+            self.assertEqual(
+                publish_intent_fingerprint([preflight]),
+                publish_intent_fingerprint([formal]),
+            )
+            self.assertEqual(
+                facebook_replay_fingerprint([preflight]),
+                facebook_replay_fingerprint([formal]),
+            )
 
     def test_account_failures_use_facebook_specific_errors(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -318,10 +324,38 @@ class FacebookPageControlledPublishTests(unittest.TestCase):
             custom_cover = self.request(manifest)
             custom_cover["targets"][0]["settings"]["coverPath"] = "cover.png"
             cases.append(("cover", custom_cover))
+            override_cover_root = root / "override-cover"
+            override_cover_root.mkdir()
+            override_cover_manifest = self.manifest(override_cover_root)
+            override_cover_data = json.loads(
+                override_cover_manifest.read_text(encoding="utf-8")
+            )
+            override_cover_data["platformOverrides"]["Facebook"][
+                "coverPath"
+            ] = "cover.png"
+            override_cover_manifest.write_text(
+                json.dumps(override_cover_data, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            cases.append(
+                ("platform_override_cover", self.request(override_cover_manifest))
+            )
             private = self.request(manifest)
             private["targets"][0]["settings"]["visibility"] = "private"
             cases.append(("visibility", private))
             cases.append(("ai_statement", self.request(ai_manifest)))
+            original_root = root / "original"
+            original_root.mkdir()
+            original_manifest = self.manifest(original_root)
+            original_data = json.loads(
+                original_manifest.read_text(encoding="utf-8")
+            )
+            original_data["originalDeclaration"] = True
+            original_manifest.write_text(
+                json.dumps(original_data, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            cases.append(("original_declaration", self.request(original_manifest)))
             cases.append(("two_videos", self.request(two_videos)))
             two_accounts = self.request(manifest)
             two_accounts["targets"].append(
@@ -411,24 +445,113 @@ class FacebookPageControlledPublishTests(unittest.TestCase):
         self.assertEqual(raised.exception.error_code, "facebook_preflight_required")
         start.assert_not_called()
 
-    def test_intent_fingerprint_binds_page_account_content_and_video_bytes(self) -> None:
+    def test_replay_fingerprint_uses_only_the_canonical_publication_outcome(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            payload = self.build(root)
+            alternate_video = root / "renamed-source.mov"
+            alternate_video.write_bytes(Path(payload["fileList"][0]).read_bytes())
+            canonical_caption = str(payload["facebookFinalCaption"])
+            source_variant = {
+                **payload,
+                "title": "  Facebook title\u00a0 ",
+                "description": "Facebook body with raw @friend and #plain  ",
+                "tags": ["#TopicOne", "TopicOne", "#TopicTwo", "#TopicTwo"],
+                "fileList": [str(alternate_video)],
+                "accountIds": [99],
+                "accountDisplayNames": ["Another local display name"],
+                "controlledManifestPath": "/different/source/manifest.json",
+                "contentProjectId": "another-project",
+                "facebookManifestIntentSha256": "f" * 64,
+                "facebookFinalCaption": canonical_caption.replace(
+                    "\n", "  \r\n"
+                ).replace("Facebook body", "Facebook\u00a0body"),
+                "facebookCaptionSha256": "0" * 64,
+            }
+
+            expected_projection = {
+                "contentKind": "reel",
+                "pageId": "1001",
+                "videoSha256": hashlib.sha256(
+                    alternate_video.read_bytes()
+                ).hexdigest(),
+                "captionSha256": hashlib.sha256(
+                    canonical_caption.encode("utf-8")
+                ).hexdigest(),
+                "visibility": "public",
+                "publishIntent": "immediate_public",
+            }
+            expected = hashlib.sha256(
+                json.dumps(
+                    expected_projection,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+
+            self.assertEqual(facebook_replay_fingerprint([payload]), expected)
+            self.assertEqual(
+                facebook_replay_fingerprint([source_variant]),
+                expected,
+            )
+            self.assertNotEqual(
+                publish_intent_fingerprint([payload]),
+                publish_intent_fingerprint([source_variant]),
+            )
+
+            changed_page = {
+                **source_variant,
+                "facebookExpectedPageReference": "1002",
+            }
+            changed_caption = {
+                **source_variant,
+                "facebookFinalCaption": "meaningfully changed caption",
+            }
+            changed_video = root / "different-video.mp4"
+            changed_video.write_bytes(b"different-facebook-video-bytes")
+            changed_bytes = {**source_variant, "fileList": [str(changed_video)]}
+            for label, changed in (
+                ("page", changed_page),
+                ("caption", changed_caption),
+                ("video_bytes", changed_bytes),
+            ):
+                with self.subTest(label=label):
+                    self.assertNotEqual(
+                        expected,
+                        facebook_replay_fingerprint([changed]),
+                    )
+
+    def test_intent_fingerprint_remains_exact_while_replay_ignores_source_fields(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             payload = self.build(root)
             base = publish_intent_fingerprint([payload])
             replay = facebook_replay_fingerprint([payload])
-            mutations = (
+            canonical_outcome_mutations = (
                 ("page", {**payload, "facebookExpectedPageReference": "1002"}),
                 ("caption", {**payload, "facebookFinalCaption": "changed caption"}),
-                ("caption_hash", {**payload, "facebookCaptionSha256": "f" * 64}),
-                ("topics", {**payload, "tags": ["ChangedTopic"]}),
-                ("visibility", {**payload, "visibility": "private"}),
-                ("timing", {**payload, "scheduleMode": "platform_native"}),
             )
-            for label, changed in mutations:
+            for label, changed in canonical_outcome_mutations:
                 with self.subTest(label=label):
                     self.assertNotEqual(base, publish_intent_fingerprint([changed]))
                     self.assertNotEqual(replay, facebook_replay_fingerprint([changed]))
+
+            source_only_mutations = (
+                (
+                    "caption_hash",
+                    {**payload, "facebookCaptionSha256": "f" * 64},
+                ),
+                ("topics", {**payload, "tags": ["ChangedTopic"]}),
+                (
+                    "manifest",
+                    {**payload, "facebookManifestIntentSha256": "e" * 64},
+                ),
+            )
+            for label, changed in source_only_mutations:
+                with self.subTest(label=label):
+                    self.assertNotEqual(base, publish_intent_fingerprint([changed]))
+                    self.assertEqual(replay, facebook_replay_fingerprint([changed]))
 
             changed_account = {**payload, "accountIds": [99]}
             self.assertNotEqual(base, publish_intent_fingerprint([changed_account]))
@@ -444,19 +567,80 @@ class FacebookPageControlledPublishTests(unittest.TestCase):
             self.assertNotEqual(base, publish_intent_fingerprint([rebuilt]))
             self.assertNotEqual(replay, facebook_replay_fingerprint([rebuilt]))
 
+    def test_page_v1_metadata_gate_rejects_non_default_values_and_leaves_type_8_alone(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            payload = self.build(Path(temporary))
+            cases = (
+                ("cover_path", {"coverPath": "/tmp/selected-cover.png"}),
+                ("cover_paths", {"coverPaths": {"3:4": "selected.png"}}),
+                ("collection", {"collectionName": "Selected collection"}),
+                ("timer", {"enableTimer": True}),
+                ("schedule_time", {"scheduleTime": "2026-09-01 09:00"}),
+                ("scheduled_at", {"scheduledAt": "2026-09-01T09:00:00"}),
+                ("schedule_mode", {"scheduleMode": "platform_native"}),
+                ("schedule_timezone", {"scheduleTimezone": "Asia/Shanghai"}),
+                ("daily_times", {"dailyTimes": ["09:00"]}),
+                ("malformed_timer", {"enableTimer": {"enabled": False}}),
+                ("malformed_frequency", {"videosPerDay": []}),
+                ("visibility", {"visibility": "private"}),
+                ("original", {"originalDeclaration": True}),
+                ("ai_generated", {"aiGenerated": True}),
+                (
+                    "ai_confirmation",
+                    {"aiDeclarationExplicitlyConfirmed": True},
+                ),
+                (
+                    "ai_disclosure",
+                    {
+                        "aiDisclosure": {
+                            "containsAiGeneratedContent": True,
+                            "contentKinds": ["video"],
+                            "assetPaths": [],
+                            "allowPlatformAutoDeclaration": False,
+                        }
+                    },
+                ),
+                (
+                    "false_ai_disclosure_metadata",
+                    {"aiDisclosure": {"containsAiGeneratedContent": False}},
+                ),
+                ("nested_settings", {"settings": {"coverPath": "cover.png"}}),
+            )
+            for label, changes in cases:
+                with self.subTest(label=label), self.assertRaises(
+                    ControlledPublishError
+                ) as raised:
+                    controlled_publish.validate_facebook_page_v1_metadata(
+                        {**payload, **changes}
+                    )
+                self.assertEqual(
+                    raised.exception.error_code,
+                    "facebook_unsupported_publish_setting",
+                )
+
+            type_8 = {
+                **payload,
+                "type": 8,
+                "coverPath": "/tmp/instagram-cover.png",
+                "collectionName": "Instagram collection",
+                "visibility": "private",
+                "originalDeclaration": True,
+                "aiGenerated": True,
+            }
+            controlled_publish.validate_facebook_page_v1_metadata(type_8)
+
     def test_replay_fingerprint_cannot_be_bypassed_with_a_second_local_account_id(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             first = self.build(Path(temporary))
             second = {**first, "accountIds": [99]}
-
-        self.assertNotEqual(
-            publish_intent_fingerprint([first]),
-            publish_intent_fingerprint([second]),
-        )
-        self.assertEqual(
-            facebook_replay_fingerprint([first]),
-            facebook_replay_fingerprint([second]),
-        )
+            self.assertNotEqual(
+                publish_intent_fingerprint([first]),
+                publish_intent_fingerprint([second]),
+            )
+            self.assertEqual(
+                facebook_replay_fingerprint([first]),
+                facebook_replay_fingerprint([second]),
+            )
 
     def test_fingerprints_ignore_runtime_auth_session_credentials_and_old_meta_booleans(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -479,15 +663,14 @@ class FacebookPageControlledPublishTests(unittest.TestCase):
                 "metaBrowserAutomationAcknowledged": True,
                 "overseasVideoPublishConfirmed": True,
             }
-
-        self.assertEqual(
-            publish_intent_fingerprint([payload]),
-            publish_intent_fingerprint([changed]),
-        )
-        self.assertEqual(
-            facebook_replay_fingerprint([payload]),
-            facebook_replay_fingerprint([changed]),
-        )
+            self.assertEqual(
+                publish_intent_fingerprint([payload]),
+                publish_intent_fingerprint([changed]),
+            )
+            self.assertEqual(
+                facebook_replay_fingerprint([payload]),
+                facebook_replay_fingerprint([changed]),
+            )
 
 
 class FacebookPageFormalClaimTests(unittest.TestCase):
@@ -558,7 +741,7 @@ class FacebookPageFormalClaimTests(unittest.TestCase):
             "scheduleMode": "immediate",
             "scheduledAt": "",
             "scheduleTime": "",
-            "scheduleTimezone": "Asia/Shanghai",
+            "scheduleTimezone": "",
             "enableTimer": False,
         }
 

@@ -1,6 +1,8 @@
 import json
 import os
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -12,10 +14,17 @@ from PyQt6.QtWidgets import (
     QApplication,
     QDialog,
     QDialogButtonBox,
+    QLabel,
     QMessageBox,
+    QWidget,
 )
 
 from app_core import task_service
+from app_core.content_project_gateway import ContentProjectGateway, PublishProfileStore
+from app_core.controlled_publish import (
+    build_controlled_payloads,
+    facebook_replay_fingerprint,
+)
 from app_core.wechat_verification import verification_broker
 from test_controlled_publish_process import FacebookPagePublicEntryFixture
 from ui.publish_page import PublishPage
@@ -97,18 +106,38 @@ class PublishPageFacebookControlledTests(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication([])
 
     def setUp(self) -> None:
+        self._facebook_feature = patch.dict(
+            os.environ,
+            {"ONECLICK_ENABLE_FACEBOOK_PAGE_V1": "1"},
+            clear=False,
+        )
+        self._facebook_feature.start()
         self.temporary = tempfile.TemporaryDirectory()
         self.video = Path(self.temporary.name) / "facebook.mp4"
         self.video.write_bytes(b"facebook-page-ui-video")
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
+        self._facebook_feature.stop()
 
     def _dispose_page(self, page: PublishPage) -> None:
         page.wechat_draft_queue_timer.stop()
         page.task_timer.stop()
         page.close()
         page.deleteLater()
+        self.app.processEvents()
+
+    def _wait_for_background_task(
+        self,
+        page: PublishPage,
+        key: str,
+        *,
+        timeout: float = 1.0,
+    ) -> None:
+        deadline = time.monotonic() + timeout
+        while page.account_health_tasks.is_running(key) and time.monotonic() < deadline:
+            self.app.processEvents()
+            time.sleep(0.005)
         self.app.processEvents()
 
     @staticmethod
@@ -182,6 +211,167 @@ class PublishPageFacebookControlledTests(unittest.TestCase):
         self.assertNotIn("metaBrowserAutomationAcknowledged", payload)
         self._dispose_page(page)
 
+    def test_ui_manifest_and_gateway_equivalent_outcomes_share_replay_fingerprint(self) -> None:
+        root = Path(self.temporary.name)
+        manifest = root / "manifest.json"
+        (root / "body.md").write_text("Common body", encoding="utf-8")
+        (root / "cover.png").write_bytes(b"required-source-cover")
+        manifest.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": "oneclick-content/v1",
+                    "contentType": "video",
+                    "title": "Common title",
+                    "bodyFile": "body.md",
+                    "tags": ["common"],
+                    "assets": [self.video.name],
+                    "covers": {"3:4": "cover.png"},
+                    "preferredPlatforms": ["Facebook"],
+                    "platformOverrides": {
+                        "Facebook": {
+                            "title": "Facebook Page 标题",
+                            "body": "Facebook Page 正文",
+                            "tags": ["OneClick"],
+                        }
+                    },
+                    "aiDisclosure": {
+                        "containsAiGeneratedContent": False,
+                        "contentKinds": [],
+                        "assetPaths": [],
+                        "allowPlatformAutoDeclaration": False,
+                    },
+                    "debugDryRun": True,
+                    "publishAllowed": False,
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        account = self._account()
+        request = {
+            "projectId": "manifest-source",
+            "manifestPath": str(manifest),
+            "mode": "preflight",
+            "targets": [
+                {
+                    "platform": "Facebook",
+                    "accountId": 91,
+                    "schedule": None,
+                    "settings": {"visibility": "public"},
+                }
+            ],
+        }
+        manifest_payload = build_controlled_payloads(
+            request,
+            accounts=[account],
+        )[0]
+
+        gateway = ContentProjectGateway(
+            profile_store=PublishProfileStore(root / "profiles.json"),
+            accounts_provider=lambda: [account],
+            submitter=lambda gateway_request: build_controlled_payloads(
+                gateway_request,
+                accounts=[account],
+            )[0],
+            runtime_conflict_checker=lambda: False,
+            facebook_feature_enabled=lambda: True,
+        )
+        gateway.save_profile(
+            "gateway-source",
+            "Facebook Page",
+            [{"platform": "Facebook Reels", "accountId": 91}],
+        )
+        gateway_payload = gateway.preflight_content(
+            "gateway-source",
+            str(manifest),
+            settings={"Facebook Reels": {"visibility": "public"}},
+        )
+
+        page = PublishPage()
+        page._account_rows = [account]
+        ui_payload = {
+            **self._payload(),
+            "title": "Facebook Page 标题\u00a0  ",
+            "description": "Facebook\u00a0Page 正文  \r\n",
+            "tags": ["#OneClick", "OneClick"],
+            "controlledManifestPath": "/another/ui/source.json",
+            "contentProjectId": "ui-source",
+        }
+        with patch("ui.publish_page.facebook_page_v1_enabled", return_value=True):
+            page._prepare_facebook_page_payloads([ui_payload], "preflight")
+
+        fingerprints = {
+            facebook_replay_fingerprint([manifest_payload]),
+            facebook_replay_fingerprint([gateway_payload]),
+            facebook_replay_fingerprint([ui_payload]),
+        }
+        self.assertEqual(len(fingerprints), 1)
+        self._dispose_page(page)
+
+    def test_page_selection_disables_unsupported_controls_without_clearing_values(self) -> None:
+        page = PublishPage()
+        page.cover_34.addItem("selected-cover.png", "/tmp/selected-cover.png")
+        page.cover_34.setCurrentIndex(page.cover_34.count() - 1)
+        page.platform_collections[9].setEditText("Selected collection")
+        page.platform_schedule_enabled[9].setChecked(True)
+        page.original_declaration.setChecked(True)
+        page.ai_generated_content.setChecked(True)
+        page.common_visibility.setCurrentIndex(
+            page.common_visibility.findData("private")
+        )
+        page.common_schedule_enabled.setChecked(True)
+        page._account_rows = [self._account()]
+        page._selected_account_ids = {91}
+
+        page.update_selected_labels()
+
+        notice = page.findChild(QLabel, "facebookPageV1LimitNotice")
+        cover_panel = page.findChild(QWidget, "platformCoverPanel9")
+        self.assertIsNotNone(notice)
+        self.assertIn("仅支持", notice.text())
+        self.assertTrue(page.platform_collection_rows[9].isHidden())
+        self.assertFalse(page.platform_collections[9].isEnabled())
+        self.assertFalse(page.platform_schedule_enabled[9].isEnabled())
+        self.assertTrue(cover_panel.isHidden())
+        for control in (
+            page.common_cover_panel,
+            page.original_declaration,
+            page.ai_generated_content,
+            page.common_visibility,
+            page.common_schedule_enabled,
+            page.common_schedule_date,
+            page.common_schedule_time,
+        ):
+            self.assertFalse(control.isEnabled())
+        self.assertEqual(page.cover_34.currentData(), "/tmp/selected-cover.png")
+        self.assertEqual(
+            page.platform_collections[9].currentText(),
+            "Selected collection",
+        )
+        self.assertTrue(page.original_declaration.isChecked())
+        self.assertTrue(page.ai_generated_content.isChecked())
+        self.assertEqual(page.common_visibility.currentData(), "private")
+        self.assertTrue(page.common_schedule_enabled.isChecked())
+
+        page._selected_account_ids.clear()
+        page.update_selected_labels()
+        for control in (
+            page.common_cover_panel,
+            page.original_declaration,
+            page.ai_generated_content,
+            page.common_visibility,
+            page.common_schedule_enabled,
+            page.common_schedule_date,
+            page.common_schedule_time,
+        ):
+            self.assertTrue(control.isEnabled())
+        self.assertEqual(page.cover_34.currentData(), "/tmp/selected-cover.png")
+        self.assertTrue(page.original_declaration.isChecked())
+        self.assertTrue(page.ai_generated_content.isChecked())
+        self.assertEqual(page.common_visibility.currentData(), "private")
+        self.assertTrue(page.common_schedule_enabled.isChecked())
+        self._dispose_page(page)
+
     def test_facebook_ui_formal_uses_preflight_authorization_not_meta_flags(self) -> None:
         with FacebookPagePublicEntryFixture() as fixture:
             page = PublishPage()
@@ -242,21 +432,187 @@ class PublishPageFacebookControlledTests(unittest.TestCase):
         page = PublishPage()
         page.preflight.setChecked(True)
         page._account_rows = [self._account()]
-
-        with (
-            patch.object(page, "collect_payloads", return_value=[self._payload(enable_timer=True)]),
-            patch(
-                "ui.publish_page.facebook_page_v1_enabled",
-                return_value=True,
+        cases = (
+            ("cover_path", {"coverPath": "/tmp/selected-cover.png"}),
+            ("cover_paths", {"coverPaths": {"3:4": "selected-cover.png"}}),
+            ("collection", {"collectionName": "Selected collection"}),
+            ("schedule", {"enableTimer": True, "scheduleTime": "2026-09-01 09:00"}),
+            ("visibility", {"visibility": "private"}),
+            ("original", {"originalDeclaration": True}),
+            ("ai", {"aiGenerated": True}),
+            ("ai_confirmation", {"aiDeclarationExplicitlyConfirmed": True}),
+            (
+                "ai_disclosure",
+                {
+                    "aiDisclosure": {
+                        "containsAiGeneratedContent": True,
+                        "contentKinds": ["video"],
+                    }
+                },
             ),
+        )
+        with (
+            patch.object(page, "collect_payloads") as collect,
+            patch("ui.publish_page.facebook_page_v1_enabled", return_value=True),
             patch("ui.publish_page.PublishConfirmDialog.exec") as confirm,
             patch.object(QMessageBox, "warning") as warning,
         ):
-            page.create_task()
+            for label, changes in cases:
+                with self.subTest(label=label):
+                    collect.return_value = [{**self._payload(), **changes}]
+                    page.create_task()
+                    confirm.assert_not_called()
+                    warning.assert_called_once()
+                    self.assertIn(
+                        "Facebook Page",
+                        str(warning.call_args.args[-1]),
+                    )
+                    warning.reset_mock()
+
+        self._dispose_page(page)
+
+    def test_stored_page_metadata_rejects_before_confirmation_authorization_or_worker(self) -> None:
+        page = PublishPage()
+        task = {
+            "id": 17,
+            "payloadJson": json.dumps(
+                [
+                    {
+                        **self._payload(),
+                        "coverPath": "/tmp/legacy-selected-cover.png",
+                        "collectionName": "Legacy collection",
+                    }
+                ],
+                ensure_ascii=False,
+            ),
+        }
+        with (
+            patch("ui.publish_page.facebook_page_v1_enabled", return_value=True),
+            patch.object(page, "confirm_meta_browser_publish") as confirm,
+            patch("ui.publish_page.controlled_publish.authorize_completed_check") as authorize,
+            patch(
+                "ui.publish_page.controlled_publish_process.submit_authorized_preflight_task"
+            ) as submit,
+            patch.object(QMessageBox, "warning") as warning,
+        ):
+            page.start_formal_publish_from_task(task)
 
         confirm.assert_not_called()
+        authorize.assert_not_called()
+        submit.assert_not_called()
         warning.assert_called_once()
         self.assertIn("Facebook Page", str(warning.call_args.args[-1]))
+        self._dispose_page(page)
+
+    def test_page_backend_open_is_non_blocking_deduplicated_and_fails_safely_on_ui_thread(self) -> None:
+        page = PublishPage()
+        account = self._account()
+        entered = threading.Event()
+        release = threading.Event()
+        callback_threads: list[int] = []
+        ui_thread_id = threading.get_ident()
+
+        def blocked_open(_account: dict) -> bool:
+            entered.set()
+            if not release.wait(1.0):
+                raise AssertionError("test did not release Page backend open")
+            raise RuntimeError("secret-token-must-not-leak")
+
+        original_error = page._show_facebook_page_backend_open_error
+
+        def record_error(message: str) -> None:
+            callback_threads.append(threading.get_ident())
+            original_error(message)
+
+        with (
+            patch("ui.publish_page.facebook_page_v1_enabled", return_value=True),
+            patch(
+                "ui.publish_page.account_browser_service.open_account_backend",
+                side_effect=blocked_open,
+            ) as open_backend,
+            patch.object(
+                page,
+                "_show_facebook_page_backend_open_error",
+                side_effect=record_error,
+            ),
+        ):
+            before = time.monotonic()
+            page.open_account_backend(account)
+            elapsed = time.monotonic() - before
+            self.assertLess(elapsed, 0.1)
+            self.assertTrue(entered.wait(0.5))
+
+            page.open_account_backend(account)
+            self.assertEqual(open_backend.call_count, 1)
+            self.assertIn("正在打开", page.account_health_label.text())
+
+            release.set()
+            self._wait_for_background_task(
+                page,
+                "publish_facebook_backend_91",
+            )
+
+        self.assertEqual(callback_threads, [ui_thread_id])
+        self.assertIn("打开失败", page.account_health_label.text())
+        self.assertNotIn("secret-token", page.account_health_label.text())
+        self.assertNotIn("secret-token", page.log.toPlainText())
+        self._dispose_page(page)
+
+    def test_page_backend_open_success_returns_on_ui_thread(self) -> None:
+        page = PublishPage()
+        account = self._account()
+        worker_threads: list[int] = []
+        callback_threads: list[int] = []
+        ui_thread_id = threading.get_ident()
+
+        def open_backend(_account: dict) -> bool:
+            worker_threads.append(threading.get_ident())
+            return True
+
+        original_success = page._finish_facebook_page_backend_open
+
+        def record_success(current_account: dict, reused: object) -> None:
+            callback_threads.append(threading.get_ident())
+            original_success(current_account, reused)
+
+        with (
+            patch("ui.publish_page.facebook_page_v1_enabled", return_value=True),
+            patch(
+                "ui.publish_page.account_browser_service.open_account_backend",
+                side_effect=open_backend,
+            ),
+            patch.object(
+                page,
+                "_finish_facebook_page_backend_open",
+                side_effect=record_success,
+            ),
+        ):
+            page.open_account_backend(account)
+            self._wait_for_background_task(
+                page,
+                "publish_facebook_backend_91",
+            )
+
+        self.assertEqual(callback_threads, [ui_thread_id])
+        self.assertEqual(len(worker_threads), 1)
+        self.assertNotEqual(worker_threads[0], ui_thread_id)
+        self.assertIn("已切换到现有后台", page.account_health_label.text())
+        self._dispose_page(page)
+
+    def test_disabled_page_backend_entry_stops_before_background_work(self) -> None:
+        page = PublishPage()
+        with (
+            patch("ui.publish_page.facebook_page_v1_enabled", return_value=False),
+            patch.object(page.account_health_tasks, "run") as run,
+            patch(
+                "ui.publish_page.account_browser_service.open_account_backend"
+            ) as open_backend,
+        ):
+            page.open_account_backend(self._account())
+
+        run.assert_not_called()
+        open_backend.assert_not_called()
+        self.assertIn("尚未开启", page.account_health_label.text())
         self._dispose_page(page)
 
     def test_saved_page_name_and_id_tail_are_visible_but_default_off_hides_entry(self) -> None:

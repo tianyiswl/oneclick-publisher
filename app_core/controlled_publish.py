@@ -336,6 +336,11 @@ def build_controlled_payloads(
     except content_bundle.ContentBundleError as exc:
         if facebook_target_count:
             message = str(exc)
+            if "覆盖字段不支持" in message:
+                raise ControlledPublishError(
+                    "facebook_unsupported_publish_setting",
+                    "Facebook Page 平台覆盖包含首版不支持的设置。",
+                ) from exc
             if "视频包必须且只能包含一个视频素材" in message:
                 raise ControlledPublishError(
                     "facebook_unsupported_publish_setting",
@@ -397,6 +402,7 @@ def build_controlled_payloads(
             bundle.get("contentType") != "video"
             or len(bundle.get("assetPaths") or []) != 1
             or bool((bundle.get("publishSchedule") or {}).get("enabled"))
+            or bool(bundle.get("originalDeclaration"))
             or bool(disclosure.get("containsAiGeneratedContent"))
             or bool(disclosure.get("contentKinds"))
             or bool(disclosure.get("assetPaths"))
@@ -735,11 +741,15 @@ def build_controlled_payloads(
             payload.update(facebook_settings)
             payload.update(
                 {
+                    # Content bundles require a generic source cover, but Page
+                    # V1 does not select or transmit it.  Any explicit Page
+                    # payload/target cover is rejected by the shared gate.
                     "coverPath": "",
                     "coverPaths": {},
                     "backgroundMode": False,
                     "scheduleMode": "immediate",
                     "scheduledAt": None,
+                    "scheduleTimezone": "",
                     "facebookControlledPublish": True,
                     "facebookExpectedPageReference": (
                         facebook_expected_page_reference
@@ -752,6 +762,7 @@ def build_controlled_payloads(
                     ).hexdigest(),
                 }
             )
+            validate_facebook_page_v1_metadata(payload)
         payloads.append(payload)
     return payloads
 
@@ -789,6 +800,67 @@ def _facebook_video_sha256(path: Path) -> str:
             "Facebook Page 视频素材无法安全读取。",
         ) from exc
     return digest.hexdigest()
+
+
+def _facebook_metadata_has_value(value: object) -> bool:
+    """Treat only empty/default declaration metadata as absent."""
+
+    if value is None or value is False or value == "" or value == 0:
+        return False
+    if isinstance(value, Mapping):
+        return any(_facebook_metadata_has_value(item) for item in value.values())
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return bool(value)
+    return True
+
+
+def validate_facebook_page_v1_metadata(payload: Mapping[str, Any]) -> None:
+    """Reject every explicit Page setting outside the V1 immediate Reel contract."""
+
+    if payload.get("type") != 9:
+        return
+
+    cover_paths = payload.get("coverPaths")
+    has_cover_paths = (
+        any(bool(str(value or "").strip()) for value in cover_paths.values())
+        if isinstance(cover_paths, Mapping)
+        else cover_paths not in (None, "")
+    )
+    schedule_mode = str(payload.get("scheduleMode") or "").strip().lower()
+    videos_per_day = payload.get("videosPerDay")
+    schedule_timezone = str(payload.get("scheduleTimezone") or "").strip()
+    nested_settings = payload.get("settings")
+    unsupported = (
+        bool(str(payload.get("coverPath") or "").strip())
+        or has_cover_paths
+        or bool(str(payload.get("collectionName") or "").strip())
+        or str(payload.get("visibility") or "").strip().lower() != "public"
+        or payload.get("enableTimer") not in (None, False)
+        or bool(str(payload.get("scheduleTime") or "").strip())
+        or bool(str(payload.get("scheduledAt") or "").strip())
+        or schedule_mode not in {"", "immediate"}
+        or _facebook_metadata_has_value(payload.get("dailyTimes"))
+        or videos_per_day not in (None, "", 0, 1)
+        or payload.get("startDays") not in (None, "", 0)
+        or payload.get("timeJitterMinutes") not in (None, "", 0)
+        or bool(schedule_timezone)
+        or _facebook_metadata_has_value(payload.get("schedule"))
+        or payload.get("originalDeclaration") not in (None, False, "", 0)
+        or payload.get("declaration") not in (None, False, "", 0)
+        or payload.get("originality") not in (None, False, "", 0)
+        or payload.get("contentDeclaration") not in (None, False, "", 0)
+        or payload.get("aiGenerated") not in (None, False, "", 0)
+        or payload.get("aiDeclarationExplicitlyConfirmed")
+        not in (None, False, "", 0)
+        or payload.get("aiDisclosure") not in (None, {})
+        or nested_settings not in (None, {})
+    )
+    if unsupported:
+        raise ControlledPublishError(
+            "facebook_unsupported_publish_setting",
+            "Facebook Page 首版仅支持单 Page、单 Reel、立即公开发布，"
+            "不支持封面、合集、定时或声明设置。",
+        )
 
 
 def _publish_intent_projection(
@@ -905,7 +977,7 @@ def publish_intent_fingerprint(payloads: Iterable[Mapping[str, Any]]) -> str:
 def facebook_replay_fingerprint(
     payloads: Iterable[Mapping[str, Any]],
 ) -> str:
-    """Hash one Page intent while excluding only the local account row ID."""
+    """Hash only the canonical Page publication outcome."""
 
     payload_rows = [dict(payload) for payload in payloads]
     if len(payload_rows) != 1 or int(payload_rows[0].get("type") or 0) != 9:
@@ -913,12 +985,32 @@ def facebook_replay_fingerprint(
             "facebook_unsupported_publish_setting",
             "Facebook Page 重放指纹只支持单 Page 请求。",
         )
-    normalized = [
-        _publish_intent_projection(
-            payload_rows[0],
-            include_local_account_id=False,
+    payload = _single_facebook_page_payload(payload_rows)
+    page_id = str(payload.get("facebookExpectedPageReference") or "")
+    file_list = payload.get("fileList")
+    caption = payload.get("facebookFinalCaption")
+    if (
+        str(payload.get("contentType") or "") != "video"
+        or not page_id.isascii()
+        or not page_id.isdigit()
+        or not isinstance(file_list, list)
+        or len(file_list) != 1
+        or type(file_list[0]) is not str
+        or type(caption) is not str
+        or not caption
+    ):
+        raise ControlledPublishError(
+            "facebook_unsupported_publish_setting",
+            "Facebook Page 重放指纹只支持单 Page 和单 Reel 请求。",
         )
-    ]
+    normalized = {
+        "contentKind": "reel",
+        "pageId": page_id,
+        "videoSha256": _facebook_video_sha256(Path(file_list[0])),
+        "captionSha256": facebook_page_caption_sha256(caption),
+        "visibility": "public",
+        "publishIntent": "immediate_public",
+    }
     encoded = json.dumps(
         normalized,
         ensure_ascii=False,
@@ -970,6 +1062,7 @@ def _single_facebook_page_payload(
         or rows[0]["type"] != 9
     ):
         raise _facebook_authorization_invalid()
+    validate_facebook_page_v1_metadata(rows[0])
     return rows[0]
 
 

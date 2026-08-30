@@ -29,6 +29,7 @@ from app_core.controlled_publish_process import (
     submit_douyin_graphic_matrix_request_in_process,
     submit_request_in_process,
 )
+from app_core.overseas_meta_content import facebook_page_caption_sha256
 from uploader.meta_uploader.page_form import (
     FacebookPageFormExpectation,
     FacebookPageFormSnapshot,
@@ -160,9 +161,79 @@ class FacebookPagePublicEntryFixture:
             current.stop()
         self.temporary.cleanup()
 
-    def authorize(self) -> str:
+    def create_equivalent_preflight(self) -> int:
+        """Create a second exact preflight with different source representation."""
+
+        alternate_video = self.root / "renamed-facebook-source.mov"
+        alternate_video.write_bytes(self.video.read_bytes())
+        alternate_caption = (
+            "Facebook Page 标题  \r\n\r\n"
+            "Facebook\u00a0Page 正文  \r\n\r\n"
+            "#OneClick   "
+        )
+        payload = {
+            **self.payload,
+            "title": "Different raw source title",
+            "description": "Different raw source body",
+            "tags": ["#OneClick", "OneClick", "#OneClick"],
+            "fileList": [str(alternate_video)],
+            "accountDisplayNames": ["Another local display name"],
+            "controlledManifestPath": "/another/source/manifest.json",
+            "contentProjectId": "gateway-equivalent-source",
+            "facebookFinalCaption": alternate_caption,
+            "facebookCaptionSha256": facebook_page_caption_sha256(
+                alternate_caption
+            ),
+            "facebookManifestIntentSha256": "d" * 64,
+        }
+        preflight = task_service.create_pending_task(
+            [payload],
+            mode="oneclick_preflight",
+        )
+        task_id = int(preflight["id"])
+        task_service.mark_task_running(
+            task_id,
+            "Facebook Page equivalent public-entry fixture",
+        )
+        expectation = FacebookPageFormExpectation(
+            page_id=str(payload["facebookExpectedPageReference"]),
+            content_kind="reel",
+            video_name=alternate_video.name,
+            video_size=alternate_video.stat().st_size,
+            video_sha256=str(payload["facebookVideoSha256"]),
+            caption=str(payload["facebookFinalCaption"]),
+            visibility="public",
+        )
+        snapshot = FacebookPageFormSnapshot(
+            page_id=expectation.page_id,
+            content_kind=expectation.content_kind,
+            video_name=expectation.video_name,
+            video_count=1,
+            caption=expectation.caption,
+            visibility=expectation.visibility,
+            final_action_label="Publish",
+            final_action_ready=True,
+        )
+        receipt = overseas_browser_publish._public_form_receipt(
+            {"accountId": 91, "expectation": expectation},
+            snapshot,
+            phase="platform_form_verified",
+            final_action_triggered=False,
+        )
+        task_service.mark_platform_result(
+            task_id,
+            9,
+            ok=True,
+            message="Facebook Page equivalent form verified offline",
+            content_type="video",
+            event_type="facebook_platform_form_verified",
+            receipt=receipt,
+        )
+        return task_id
+
+    def authorize(self, task_id: int | None = None) -> str:
         authorization = controlled_publish.authorize_completed_check(
-            self.preflight_task_id
+            int(task_id or self.preflight_task_id)
         )
         return str(authorization["authorizationId"])
 
@@ -280,6 +351,54 @@ class ControlledPublishProcessTests(unittest.TestCase):
                 started,
                 authorization_id=authorization_id,
             )
+
+    def test_page_metadata_is_rejected_before_public_authorization_or_worker(self) -> None:
+        with FacebookPagePublicEntryFixture() as fixture:
+            unsupported = {
+                **fixture.payload,
+                "coverPath": "/tmp/legacy-selected-cover.png",
+                "collectionName": "Legacy collection",
+                "originalDeclaration": True,
+            }
+            with database.connect() as conn:
+                conn.execute(
+                    "UPDATE publish_tasks SET payloadJson = ? WHERE id = ?",
+                    (
+                        json.dumps([unsupported], ensure_ascii=False),
+                        fixture.preflight_task_id,
+                    ),
+                )
+                conn.commit()
+
+            with (
+                fixture.stop_at_worker_start() as started,
+                self.assertRaises(ControlledPublishError) as raised,
+            ):
+                controlled_publish.authorize_completed_check(
+                    fixture.preflight_task_id
+                )
+
+            self.assertEqual(
+                raised.exception.error_code,
+                "facebook_unsupported_publish_setting",
+            )
+            started.assert_not_called()
+            with database.connect() as conn:
+                table_exists = conn.execute(
+                    """
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'table'
+                      AND name = 'controlled_publish_authorizations'
+                    """
+                ).fetchone()
+                authorization_count = (
+                    conn.execute(
+                        "SELECT COUNT(*) FROM controlled_publish_authorizations"
+                    ).fetchone()[0]
+                    if table_exists
+                    else 0
+                )
+            self.assertEqual(int(authorization_count), 0)
 
     def test_feature_disabled_blocks_new_authorized_page_submission_before_claim(self) -> None:
         payload = self._facebook_payload()

@@ -371,7 +371,7 @@ class FacebookPageAuthorizedSubmitTests(unittest.TestCase):
             "scheduleMode": "immediate",
             "scheduledAt": "",
             "scheduleTime": "",
-            "scheduleTimezone": "Asia/Shanghai",
+            "scheduleTimezone": "",
             "enableTimer": False,
         }
 

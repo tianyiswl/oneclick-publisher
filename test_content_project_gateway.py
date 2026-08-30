@@ -5,11 +5,14 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from app_core import database
 from app_core.controlled_publish import ControlledPublishError
+from app_core.controlled_publish_process import submit_authorized_preflight_task
 from app_core.content_project_gateway import (
     ContentProjectGateway,
     ContentProjectGatewayError,
@@ -491,6 +494,101 @@ class ContentProjectGatewayTests(unittest.TestCase):
                 result,
                 started,
                 authorization_id=authorization_id,
+            )
+
+    def test_direct_service_and_gateway_race_for_one_global_page_replay_claim(self) -> None:
+        with FacebookPagePublicEntryFixture() as fixture:
+            equivalent_preflight_id = fixture.create_equivalent_preflight()
+            direct_authorization = fixture.authorize(fixture.preflight_task_id)
+            gateway_authorization = fixture.authorize(equivalent_preflight_id)
+            gateway = ContentProjectGateway(
+                profile_store=PublishProfileStore(
+                    fixture.root / "race-publish-profiles.json"
+                ),
+                runtime_conflict_checker=lambda: False,
+                formal_submitter=submit_authorized_preflight_task,
+            )
+            gate = threading.Barrier(3)
+            result_lock = threading.Lock()
+            results: list[dict] = []
+            errors: list[Exception] = []
+
+            def capture(callable_) -> None:
+                try:
+                    gate.wait(timeout=2)
+                    result = callable_()
+                except Exception as exc:  # Preserve thread assertions for the test.
+                    with result_lock:
+                        errors.append(exc)
+                else:
+                    with result_lock:
+                        results.append(result)
+
+            direct_thread = threading.Thread(
+                target=capture,
+                args=(
+                    lambda: submit_authorized_preflight_task(
+                        fixture.preflight_task_id,
+                        direct_authorization,
+                    ),
+                ),
+            )
+            gateway_thread = threading.Thread(
+                target=capture,
+                args=(
+                    lambda: gateway.formal_publish(
+                        preflight_task_id=equivalent_preflight_id,
+                        authorization_id=gateway_authorization,
+                    ),
+                ),
+            )
+            with fixture.stop_at_worker_start() as started:
+                direct_thread.start()
+                gateway_thread.start()
+                gate.wait(timeout=2)
+                direct_thread.join(timeout=3)
+                gateway_thread.join(timeout=3)
+
+            self.assertFalse(direct_thread.is_alive())
+            self.assertFalse(gateway_thread.is_alive())
+            self.assertEqual(len(results), 1)
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], ControlledPublishError)
+            self.assertEqual(
+                getattr(errors[0], "error_code", ""),
+                "facebook_duplicate_submit_blocked",
+            )
+            started.assert_called_once()
+            self.assertEqual(len(fixture.started_task_ids), 1)
+
+            with database.connect() as conn:
+                claims = conn.execute(
+                    """
+                    SELECT taskId, state, blocksReplay
+                    FROM facebook_page_publish_claims
+                    """
+                ).fetchall()
+                formal_count = conn.execute(
+                    "SELECT COUNT(*) FROM publish_tasks WHERE mode = 'oneclick_publish'"
+                ).fetchone()[0]
+                authorizations = conn.execute(
+                    """
+                    SELECT preflightTaskId, consumedAt
+                    FROM controlled_publish_authorizations
+                    WHERE preflightTaskId IN (?, ?)
+                    ORDER BY preflightTaskId
+                    """,
+                    (fixture.preflight_task_id, equivalent_preflight_id),
+                ).fetchall()
+
+            self.assertEqual(len(claims), 1)
+            self.assertEqual(claims[0]["state"], "reserved")
+            self.assertEqual(int(claims[0]["blocksReplay"]), 1)
+            self.assertEqual(int(formal_count), 1)
+            self.assertEqual(len(authorizations), 2)
+            self.assertEqual(
+                sum(bool(str(row["consumedAt"] or "")) for row in authorizations),
+                1,
             )
 
     def test_facebook_direct_requires_preflight_before_authorizer_or_submitter(self) -> None:
