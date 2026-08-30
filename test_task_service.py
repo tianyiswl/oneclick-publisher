@@ -2455,6 +2455,12 @@ class FacebookPageTaskPersistenceTests(unittest.TestCase):
             [self.payload()],
             mode="oneclick_preflight",
         )
+        worker_token = "facebook-task-persistence-worker"
+        self.assertTrue(
+            task_service.claim_facebook_worker(
+                int(task["id"]), worker_token, "test worker"
+            )
+        )
 
         task_service.mark_platform_result(
             task["id"],
@@ -2482,6 +2488,7 @@ class FacebookPageTaskPersistenceTests(unittest.TestCase):
                 "cookie": "must-not-persist",
                 "caption": "must-not-persist",
             },
+            worker_token=worker_token,
         )
 
         item = task_service.get_task(task["id"])["items"][0]

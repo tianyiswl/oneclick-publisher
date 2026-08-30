@@ -502,11 +502,10 @@ class ControlledPublishProcessTests(unittest.TestCase):
                     fixture.preflight_task_id,
                     first_grant,
                 )
-            task_service.mark_facebook_result(
+            controlled_publish.mark_facebook_page_checkpoint(
                 int(first["taskId"]),
-                ok=False,
-                message="Facebook Page worker stopped before final action",
-                error_code="facebook_worker_interrupted",
+                expected_state="reserved",
+                new_state="safe_failed",
                 receipt={
                     "pageId": str(
                         fixture.payload["facebookExpectedPageReference"]

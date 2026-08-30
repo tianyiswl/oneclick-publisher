@@ -401,6 +401,13 @@ class FacebookPageExecutorTests(unittest.TestCase):
                 preflight_task_id=int(preflight["id"]),
                 authorization_id=str(authorization["authorizationId"]),
             )
+        worker_token = "executor-test-worker"
+        self.assertTrue(
+            task_service.claim_facebook_worker(
+                int(task["id"]), worker_token, "executor test worker"
+            )
+        )
+        task["_workerToken"] = worker_token
         return task, payload
 
     @staticmethod
@@ -1154,6 +1161,7 @@ class FacebookPageExecutorTests(unittest.TestCase):
         self.assertEqual(
             self._facebook_event_types(task["id"]),
             [
+                "facebook_worker_claimed",
                 "facebook_final_action_claimed",
                 "facebook_final_action_clicked",
                 "facebook_platform_decision_observed",
@@ -1162,7 +1170,7 @@ class FacebookPageExecutorTests(unittest.TestCase):
             ],
         )
         self.assertEqual(legacy_event_writer.call_count, 0)
-        self.assertEqual(standalone_heartbeat.call_count, 0)
+        self.assertEqual(standalone_heartbeat.call_count, 1)
         saved = task_service.get_task(task["id"])
         self.assertEqual(saved["status"], "success")
         with database.connect() as conn:
@@ -1263,7 +1271,7 @@ class FacebookPageExecutorTests(unittest.TestCase):
         for persisted in persisted_safe_values:
             self.assertNotIn(str(self.video), persisted)
             self.assertNotIn(str(self.video.parent), persisted)
-        self.assertEqual(lifecycle_item_ids, [item_id] * 5)
+        self.assertEqual(lifecycle_item_ids, [item_id] * 6)
         self.assertIsNone(terminal["workerPid"])
         self.assertEqual(terminal["workerHeartbeatAt"], terminal["finishedAt"])
 
@@ -1741,11 +1749,7 @@ class FacebookPageExecutorTests(unittest.TestCase):
         )
         self.assertEqual(
             saved["items"][0]["message"],
-            (
-                "预检任务异常：FacebookPagePublishError："
-                "Facebook Page Reel 预检未能完成，已停止。"
-                "（错误码 facebook_page_preflight_failed）"
-            ),
+            "Facebook Page 发布未完成",
         )
 
     def test_baseline_failure_prevents_claim_and_click(self) -> None:
@@ -1927,6 +1931,16 @@ class FacebookPagePublishServiceTests(unittest.TestCase):
                 ).fetchone()
             )
 
+    def lease_worker(self, task: dict) -> dict:
+        worker_token = f"test-worker-{task['id']}"
+        self.assertTrue(
+            task_service.claim_facebook_worker(
+                int(task["id"]), worker_token, "test worker"
+            )
+        )
+        task["_workerToken"] = worker_token
+        return task
+
     def checkpoint_receipt(self, payload: dict) -> dict:
         return {
             "accountId": 91,
@@ -1992,6 +2006,25 @@ class FacebookPagePublishServiceTests(unittest.TestCase):
             "facebook_publish_authorization_invalid",
         )
         self.assertTrue(self.claim(task["id"])["workerStartedAt"])
+
+    def test_running_worker_requires_the_exact_persisted_token_for_formal_claim(self) -> None:
+        task, payload = self.claimed_task()
+        self.assertTrue(
+            task_service.claim_facebook_worker(
+                int(task["id"]), "owner-token", "test owner"
+            )
+        )
+        for token in ("", "replacement-token"):
+            with self.subTest(token=token), self.assertRaises(
+                controlled_publish.ControlledPublishError
+            ):
+                controlled_publish.require_facebook_page_execution_claim(
+                    int(task["id"]), [payload], worker_token=token
+                )
+        controlled_publish.require_facebook_page_execution_claim(
+            int(task["id"]), [payload], worker_token="owner-token"
+        )
+        self.assertTrue(self.claim(int(task["id"]))["workerStartedAt"])
 
     def test_recovered_task_without_runtime_video_path_fails_before_session(self) -> None:
         task, payload = self.claimed_task()
@@ -2163,6 +2196,7 @@ class FacebookPagePublishServiceTests(unittest.TestCase):
     def test_service_persists_claim_before_click_and_click_checkpoint_immediately(self) -> None:
         task, payload = self.claimed_task()
         controlled_publish.require_facebook_page_execution_claim(task["id"], [payload])
+        self.lease_worker(task)
         observed: list[str] = []
 
         def runner(current, *, task_id, progress):
@@ -2274,6 +2308,7 @@ class FacebookPagePublishServiceTests(unittest.TestCase):
                 controlled_publish.require_facebook_page_execution_claim(
                     task["id"], [payload]
                 )
+                self.lease_worker(task)
 
                 def runner(current, *, task_id, progress):
                     if location == "after":

@@ -587,7 +587,7 @@ def task_stats(limit: int = 20) -> dict:
                 COUNT(*) AS total,
                 SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS success,
                 SUM(CASE WHEN status IN ('failed', 'partial_failed') THEN 1 ELSE 0 END) AS failed,
-                SUM(CASE WHEN status IN ('pending', 'running') THEN 1 ELSE 0 END) AS active,
+                SUM(CASE WHEN status IN ('pending', 'running', 'waiting_user_verification') THEN 1 ELSE 0 END) AS active,
                 SUM(CASE WHEN createdAt LIKE ? THEN 1 ELSE 0 END) AS today
             FROM publish_tasks
             """,
@@ -2164,6 +2164,61 @@ def mark_task_running(
         conn.commit()
 
 
+def claim_facebook_worker(task_id: int, worker_token: str, message: str) -> bool:
+    """Atomically lease one pending Page task before its thread starts."""
+
+    from . import controlled_publish
+
+    token = str(worker_token or "").strip()
+    if not token:
+        raise ValueError("Facebook Page worker token 不能为空")
+    now = _now()
+    with connect() as conn:
+        controlled_publish._ensure_facebook_page_claim_schema(conn)
+        conn.commit()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            item = _facebook_task_item_in_transaction(
+                conn,
+                int(task_id),
+                allowed_modes=frozenset({"oneclick_preflight", "oneclick_publish"}),
+            )
+            if str(item["status"] or "") != "pending":
+                conn.rollback()
+                return False
+            updated = conn.execute(
+                """
+                UPDATE publish_tasks
+                SET status = 'running', startedAt = COALESCE(startedAt, ?),
+                    workerPid = ?, workerHeartbeatAt = ?, workerToken = ?
+                WHERE id = ? AND status = 'pending'
+                  AND COALESCE(workerToken, '') = ''
+                """,
+                (now, os.getpid(), now, token, int(task_id)),
+            )
+            if updated.rowcount != 1:
+                conn.rollback()
+                return False
+            conn.execute(
+                """
+                INSERT INTO publish_task_events
+                    (taskId, itemId, level, eventType, message, createdAt)
+                VALUES (?, ?, 'info', 'facebook_worker_claimed', ?, ?)
+                """,
+                (
+                    int(task_id),
+                    int(item["id"]),
+                    str(message or "Facebook Page worker 已启动"),
+                    now,
+                ),
+            )
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+
+
 def touch_task_heartbeat(task_id: int, *, worker_token: str | None = None) -> bool:
     """续租受控发布进程；不改变已经结束的任务。"""
 
@@ -2435,6 +2490,9 @@ def record_facebook_progress(
     _require_unleased: bool = False,
     _allow_stored_rejected_decision: bool = False,
     _allow_reconcile_idempotence: bool = False,
+    worker_token: str = "",
+    _error_code: str = "",
+    _trusted_reconciliation: bool = False,
 ) -> None:
     """Atomically persist one Page claim edge and its public task projection."""
 
@@ -2446,7 +2504,19 @@ def record_facebook_progress(
         conn.commit()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            _facebook_task_item_in_transaction(conn, int(task_id))
+            item = _facebook_task_item_in_transaction(conn, int(task_id))
+            stored_worker_token = str(item["taskWorkerToken"] or "")
+            if stored_worker_token and not _trusted_reconciliation and (
+                stored_worker_token != str(worker_token or "")
+                or str(item["taskStatus"] or "")
+                not in {"running", "waiting_user_verification"}
+                or str(item["status"] or "")
+                not in {"pending", "running", "waiting_user_verification"}
+            ):
+                raise controlled_publish.ControlledPublishError(
+                    "facebook_worker_lease_lost",
+                    "Facebook Page worker 进度租约已失效。",
+                )
             claim_row = conn.execute(
                 "SELECT * FROM facebook_page_publish_claims WHERE taskId = ?",
                 (int(task_id),),
@@ -2645,7 +2715,10 @@ def record_facebook_progress(
                 error_code=(
                     "facebook_publish_outcome_unknown"
                     if public_phase == "ambiguous"
-                    else "facebook_worker_interrupted"
+                    else (
+                        _stable_error_code(_error_code)
+                        or "facebook_worker_interrupted"
+                    )
                     if public_phase == "failed"
                     else ""
                 ),
@@ -2744,10 +2817,24 @@ def record_facebook_verification_state(
                         "Facebook Page 验证主体与 claim 不一致。",
                     )
                 if claim_state in {"final_action_claimed", "final_action_clicked"}:
+                    verification_timing = {
+                        key: values[key]
+                        for key in (
+                            "verificationStartedAt",
+                            "deadlineAt",
+                            "timeoutSeconds",
+                        )
+                        if key in values
+                    }
                     evidence = controlled_publish._validated_facebook_page_claim_evidence(
                         dict(claim_row)
                     )
                     values = dict(evidence["receipt"])
+                    values["baselineHash"] = str(claim_row["baselineHash"] or "")
+                    values["formSnapshotHash"] = str(
+                        claim_row["formSnapshotHash"] or ""
+                    )
+                    values.update(verification_timing)
                     resume_phase = claim_state
                 values["pageId"] = expected_page
             if waiting:
@@ -2790,6 +2877,8 @@ def mark_facebook_result(
     error_code: str = "",
     receipt: Mapping[str, object] | None = None,
     event_type: str | None = None,
+    worker_token: str = "",
+    _trusted_reconciliation: bool = False,
 ) -> None:
     """Close or repair a formal Page task from the claim authority."""
 
@@ -2802,6 +2891,16 @@ def mark_facebook_result(
         try:
             conn.execute("BEGIN IMMEDIATE")
             item = _facebook_task_item_in_transaction(conn, int(task_id))
+            stored_worker_token = str(item["taskWorkerToken"] or "")
+            if (
+                stored_worker_token
+                and not _trusted_reconciliation
+                and stored_worker_token != str(worker_token or "")
+            ):
+                raise controlled_publish.ControlledPublishError(
+                    "facebook_worker_lease_lost",
+                    "Facebook Page worker 结果租约已失效。",
+                )
             row = conn.execute(
                 "SELECT * FROM facebook_page_publish_claims WHERE taskId = ?",
                 (int(task_id),),
@@ -2810,6 +2909,18 @@ def mark_facebook_result(
                 raise ValueError("Facebook Page 任务缺少 claim")
             claim = dict(row)
             state = str(claim.get("state") or "")
+            if str(item["taskStatus"] or "") not in {
+                "running",
+                "waiting_user_verification",
+            } and not (
+                state == "succeeded"
+                and ok
+                and str(item["taskStatus"] or "") == "success"
+            ):
+                raise controlled_publish.ControlledPublishError(
+                    "facebook_worker_lease_lost",
+                    "Facebook Page 任务已终止，迟到结果已拒绝。",
+                )
             supplied_values = dict(supplied)
             expected_page = str(claim.get("pageReference") or "")
             if supplied_values.get("pageId") not in {None, expected_page}:
@@ -3238,6 +3349,50 @@ def fail_active_task(
         return changed
 
 
+def fail_facebook_worker(
+    task_id: int,
+    worker_token: str,
+    *,
+    error_code: str,
+    message: str,
+    event_type: str = "task_failed",
+    receipt: Mapping[str, object] | None = None,
+) -> bool:
+    """Close an active Page task only for the worker holding its DB token."""
+
+    with connect() as conn:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT status, workerToken FROM publish_tasks WHERE id = ?",
+                (int(task_id),),
+            ).fetchone()
+            if (
+                row is None
+                or str(row["workerToken"] or "") != str(worker_token or "")
+                or str(row["status"] or "")
+                not in {"pending", "running", "waiting_user_verification"}
+            ):
+                conn.rollback()
+                return False
+            changed = _fail_active_task_in_transaction(
+                conn,
+                int(task_id),
+                error_code=error_code,
+                message=message,
+                event_type=event_type,
+                receipt=receipt,
+            )
+            if changed:
+                conn.commit()
+            else:
+                conn.rollback()
+            return changed
+        except Exception:
+            conn.rollback()
+            raise
+
+
 def _reconcile_stale_controlled_task_in_transaction(
     conn,
     task_id: int,
@@ -3267,6 +3422,12 @@ def _reconcile_stale_controlled_task_in_transaction(
                      )
                ) AS tiktokFinalActionTriggered,
                task.payloadJson
+               ,(
+                   SELECT item.receiptJson
+                   FROM publish_task_items AS item
+                   WHERE item.taskId = task.id AND item.platformType = 9
+                   ORDER BY item.id LIMIT 1
+               ) AS facebookReceiptJson
         FROM publish_tasks AS task WHERE task.id = ?
         """,
         (int(task_id),),
@@ -3335,11 +3496,39 @@ def _reconcile_stale_controlled_task_in_transaction(
             int(task_id),
         )
     if is_facebook_page_task and str(row["status"] or "") == "waiting_user_verification":
+        deadline: datetime | None = None
+        try:
+            waiting_receipt = project_facebook_page_receipt(
+                json.loads(str(row["facebookReceiptJson"] or "{}"))
+            )
+            deadline_text = str(waiting_receipt.get("deadlineAt") or "")
+            deadline = datetime.fromisoformat(deadline_text.replace("Z", "+00:00"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            deadline = None
+        timed_out = False
+        if deadline is not None:
+            if deadline.tzinfo is not None:
+                current_comparable = (
+                    current.astimezone(deadline.tzinfo)
+                    if current.tzinfo is not None
+                    else current.astimezone().astimezone(deadline.tzinfo)
+                )
+            else:
+                current_comparable = current.replace(tzinfo=None)
+            timed_out = current_comparable >= deadline
         return _fail_active_task_in_transaction(
             conn,
             int(task_id),
-            error_code="facebook_verification_timeout",
-            message="Facebook Page 安全验证等待超时，预检已停止",
+            error_code=(
+                "facebook_verification_timeout"
+                if timed_out
+                else "facebook_worker_interrupted"
+            ),
+            message=(
+                "Facebook Page 安全验证等待超时，预检已停止"
+                if timed_out
+                else "Facebook Page worker 在验证期内失联，预检已安全停止"
+            ),
         )
     is_tiktok_task = (
         len(payloads) == 1 and int(payloads[0].get("type") or 0) == 6
@@ -3597,6 +3786,56 @@ def record_platform_progress(
         conn.commit()
 
 
+def _mark_facebook_preflight_result(
+    task_id: int,
+    *,
+    ok: bool,
+    message: str,
+    error_code: str,
+    receipt: Mapping[str, object],
+    event_type: str,
+    worker_token: str,
+) -> None:
+    """Close one Page preflight only for its currently leased worker."""
+
+    from . import controlled_publish
+
+    with connect() as conn:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            item = _facebook_task_item_in_transaction(
+                conn,
+                int(task_id),
+                allowed_modes=frozenset({"oneclick_preflight"}),
+            )
+            if (
+                str(item["taskWorkerToken"] or "") != str(worker_token or "")
+                or str(item["taskStatus"] or "")
+                not in {"running", "waiting_user_verification"}
+                or str(item["status"] or "")
+                not in {"pending", "running", "waiting_user_verification"}
+            ):
+                raise controlled_publish.ControlledPublishError(
+                    "facebook_worker_lease_lost",
+                    "Facebook Page 预检 worker 结果租约已失效。",
+                )
+            _write_facebook_task_projection_in_transaction(
+                conn,
+                int(task_id),
+                phase="platform_form_verified" if ok else "failed",
+                message=message,
+                error_code="" if ok else error_code,
+                receipt=receipt,
+                event_type=event_type,
+                status_override="success" if ok else "failed",
+                allowed_modes=frozenset({"oneclick_preflight"}),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+
 def mark_platform_result(
     task_id: int,
     platform_type: int,
@@ -3608,6 +3847,7 @@ def mark_platform_result(
     readback: dict | None = None,
     error_code: str = "",
     receipt: dict | None = None,
+    worker_token: str = "",
 ) -> None:
     """按平台与内容类型回填结果；事件类型必须准确表达预检或正式提交。"""
 
@@ -3625,6 +3865,18 @@ def mark_platform_result(
                 error_code=error_code,
                 receipt=receipt if receipt is not None else (readback or {}),
                 event_type=event_type,
+                worker_token=worker_token,
+            )
+            return
+        if task_mode is not None and str(task_mode["mode"] or "") == "oneclick_preflight":
+            _mark_facebook_preflight_result(
+                int(task_id),
+                ok=bool(ok),
+                message=message,
+                error_code=error_code,
+                receipt=receipt if receipt is not None else (readback or {}),
+                event_type=event_type,
+                worker_token=worker_token,
             )
             return
 

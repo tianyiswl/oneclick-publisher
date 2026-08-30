@@ -1922,6 +1922,8 @@ def _create_claimed_facebook_page_task(
 def require_facebook_page_execution_claim(
     task_id: int,
     payloads: Iterable[Mapping[str, Any]],
+    *,
+    worker_token: str = "",
 ) -> None:
     """Atomically grant one worker start for an exact reserved Page claim."""
 
@@ -1937,6 +1939,7 @@ def require_facebook_page_execution_claim(
         raise _facebook_authorization_invalid()
     publish_intent = publish_intent_fingerprint([payload])
     replay_fingerprint = facebook_replay_fingerprint([payload])
+    expected_worker_token = str(worker_token or "")
     from .database import connect
 
     with connect() as conn:
@@ -1958,7 +1961,14 @@ def require_facebook_page_execution_claim(
                       SELECT 1 FROM publish_tasks AS task
                       WHERE task.id = facebook_page_publish_claims.taskId
                         AND task.mode = 'oneclick_publish'
-                        AND task.status = 'pending'
+                        AND (
+                            (? = '' AND task.status = 'pending')
+                            OR (
+                                ? <> ''
+                                AND task.status = 'running'
+                                AND task.workerToken = ?
+                            )
+                        )
                   )
                   AND 1 = (
                       SELECT COUNT(*) FROM publish_task_items AS counted_item
@@ -1981,6 +1991,9 @@ def require_facebook_page_execution_claim(
                     page_reference,
                     publish_intent,
                     replay_fingerprint,
+                    expected_worker_token,
+                    expected_worker_token,
+                    expected_worker_token,
                     int(account_ids[0]),
                     publish_intent,
                 ),
@@ -2585,6 +2598,8 @@ def mark_facebook_page_checkpoint(
     new_state: str,
     receipt: Mapping[str, object],
     require_unleased: bool = False,
+    worker_token: str = "",
+    error_code: str = "",
 ) -> None:
     """Persist one Page edge with its task projection in one transaction."""
 
@@ -2604,6 +2619,8 @@ def mark_facebook_page_checkpoint(
         receipt=receipt,
         _expected_state=str(expected_state),
         _require_unleased=bool(require_unleased),
+        worker_token=str(worker_token or ""),
+        _error_code=str(error_code or ""),
     )
 
 
@@ -2929,6 +2946,7 @@ def reconcile_facebook_page_publish_outcome(task_id: int) -> dict[str, object]:
             message="Facebook Page 最终动作是否执行无法证明，需继续只读核对",
             receipt={"pageId": page_id, "phase": "ambiguous"},
             _expected_state="final_action_claimed",
+            _trusted_reconciliation=True,
         )
         return project_task(task_service.get_task(int(task_id)))
     try:
@@ -2941,6 +2959,7 @@ def reconcile_facebook_page_publish_outcome(task_id: int) -> dict[str, object]:
                 message="Facebook Page 只读列表未完整，结果保持未知",
                 receipt={"pageId": page_id, "phase": "ambiguous"},
                 _expected_state=state,
+                _trusted_reconciliation=True,
             )
         return project_task(task_service.get_task(int(task_id)))
     task7_types = _facebook_task7_reel_types()
@@ -2957,6 +2976,7 @@ def reconcile_facebook_page_publish_outcome(task_id: int) -> dict[str, object]:
             receipt={"pageId": page_id, "reelMatch": match},
             _expected_state=state,
             _allow_reconcile_idempotence=True,
+            _trusted_reconciliation=True,
         )
         task_service.mark_facebook_result(
             int(task_id),
@@ -2964,6 +2984,7 @@ def reconcile_facebook_page_publish_outcome(task_id: int) -> dict[str, object]:
             message="Facebook Page 新 Reel 已通过同页内容列表唯一回读",
             receipt=_load_succeeded_facebook_page_receipt(int(task_id)),
             event_type="facebook_publish_readback_confirmed",
+            _trusted_reconciliation=True,
         )
     elif (
         match.status == "none"
@@ -2984,6 +3005,7 @@ def reconcile_facebook_page_publish_outcome(task_id: int) -> dict[str, object]:
                 receipt={"pageId": page_id, "phase": "ambiguous"},
                 _expected_state="final_action_clicked",
                 _allow_reconcile_idempotence=True,
+                _trusted_reconciliation=True,
             )
             confirmation_state = "ambiguous"
         task_service.record_facebook_progress(
@@ -2994,6 +3016,7 @@ def reconcile_facebook_page_publish_outcome(task_id: int) -> dict[str, object]:
             _expected_state=confirmation_state,
             _allow_stored_rejected_decision=True,
             _allow_reconcile_idempotence=True,
+            _trusted_reconciliation=True,
         )
     elif state != "ambiguous":
         task_service.record_facebook_progress(
@@ -3002,6 +3025,7 @@ def reconcile_facebook_page_publish_outcome(task_id: int) -> dict[str, object]:
             message="Facebook Page 未唯一回读目标 Reel，结果保持未知",
             receipt={"pageId": page_id, "phase": "ambiguous"},
             _expected_state=state,
+            _trusted_reconciliation=True,
         )
     return project_task(task_service.get_task(int(task_id)))
 

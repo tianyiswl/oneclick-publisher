@@ -465,11 +465,19 @@ class FacebookPageAuthorizedSubmitTests(unittest.TestCase):
             "start_controlled_facebook_publish",
             side_effect=lease_without_thread,
         ):
-            return controlled_publish._create_claimed_facebook_page_task(
+            task = controlled_publish._create_claimed_facebook_page_task(
                 [formal_payload],
                 preflight_task_id=preflight_task_id,
                 authorization_id=authorization_id,
             )
+        worker_token = f"authorized-test-worker-{task['id']}"
+        self.assertTrue(
+            task_service.claim_facebook_worker(
+                int(task["id"]), worker_token, "authorized test worker"
+            )
+        )
+        task["_workerToken"] = worker_token
+        return task
 
     @staticmethod
     def _claim(task_id: int) -> dict:
@@ -1170,7 +1178,7 @@ class FacebookPageAuthorizedSubmitTests(unittest.TestCase):
         self.assertFalse(any(current.is_alive() for current in callers))
         self.assertEqual(outcomes.count(("ok", task["id"])), 1)
         self.assertEqual(
-            outcomes.count(("error", "facebook_publish_authorization_invalid")),
+            outcomes.count(("error", "facebook_worker_lease_lost")),
             1,
         )
         self.assertEqual(
@@ -1274,7 +1282,11 @@ class FacebookPageAuthorizedSubmitTests(unittest.TestCase):
                 self.assertFalse(loser.is_alive())
                 self.assertEqual(
                     outcomes.get("loser"),
-                    ("error", "", "offline loser constructor failure"),
+                    (
+                        "error",
+                        "facebook_publish_authorization_invalid",
+                        "Facebook Page 受控任务不存在或已开始执行。",
+                    ),
                 )
                 claim = self._claim(task["id"])
                 self.assertEqual(claim["state"], "reserved")
