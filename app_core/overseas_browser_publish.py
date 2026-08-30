@@ -133,9 +133,15 @@ def _validate_facebook_page_payload(
     page_id = str(sanitized.get("facebookExpectedPageReference") or "").strip()
     expected_runtime = "preflight" if mode == "preflight" else "publish"
     expected_dry_run = mode == "preflight"
+    from .controlled_publish import (
+        ControlledPublishError,
+        is_exact_facebook_page_platform_type,
+        validate_facebook_page_v1_metadata,
+    )
+
     if (
         not facebook_page_v1_enabled()
-        or int(sanitized.get("type") or 0) != 9
+        or not is_exact_facebook_page_platform_type(sanitized)
         or str(sanitized.get("contentType") or "") != "video"
         or str(sanitized.get("runtimeMode") or "") != expected_runtime
         or sanitized.get("debugDryRun") is not expected_dry_run
@@ -147,10 +153,6 @@ def _validate_facebook_page_payload(
             "Facebook Page 受控任务的运行模式或目标字段无效。",
             page_id=page_id,
         )
-    from .controlled_publish import (
-        ControlledPublishError,
-        validate_facebook_page_v1_metadata,
-    )
 
     try:
         validate_facebook_page_v1_metadata(sanitized)
@@ -716,7 +718,8 @@ def _schedule_time(payload: dict[str, Any]) -> str | None:
 def validate_meta_browser_publish_payload(payload: dict[str, Any]) -> dict[str, Any]:
     """只校验本地文件、会话和一次性确认，不启动浏览器。"""
 
-    platform_type = int(payload.get("type") or 0)
+    raw_platform_type = payload.get("type")
+    platform_type = raw_platform_type if type(raw_platform_type) is int else 0
     errors: list[str] = []
     if platform_type not in META_BROWSER_PLATFORM_TYPES:
         errors.append("当前载荷不是 Meta 浏览器发布目标")
@@ -773,7 +776,9 @@ def validate_meta_browser_publish_payload(payload: dict[str, Any]) -> dict[str, 
 def run_meta_browser_publish_sync(payload: dict[str, Any]) -> dict[str, Any]:
     """执行可见 Meta 浏览器发布，必须回读平台成功证据。"""
 
-    if int(payload.get("type") or 0) == 9:
+    from .controlled_publish import is_exact_facebook_page_platform_type
+
+    if is_exact_facebook_page_platform_type(payload):
         raise FacebookPagePublishError(
             "facebook_publish_authorization_invalid",
             "Facebook Page 正式发布只能由数据库 claim 的专用 worker 启动。",

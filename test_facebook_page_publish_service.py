@@ -1123,6 +1123,51 @@ class FacebookPageExecutorTests(unittest.TestCase):
         ):
             self.assertNotIn(key, prepared["payload"])
 
+    def test_page_v1_rejects_malformed_platform_types_before_session(self) -> None:
+        for label, malformed_type in (("string", "9"), ("float", 9.0)):
+            with self.subTest(label=label):
+                payload = {
+                    **self.payload("preflight"),
+                    "type": malformed_type,
+                    "coverPath": str(self.video.parent / "cover.png"),
+                }
+                session_calls: list[dict] = []
+
+                @asynccontextmanager
+                async def forbidden_session(prepared):
+                    session_calls.append(prepared)
+                    raise FacebookPagePublishError(
+                        "facebook_page_session_reached",
+                        "Malformed Page type reached the browser session.",
+                    )
+                    yield  # pragma: no cover - async context manager shape only
+
+                with patch.object(
+                    overseas_browser_publish,
+                    "_facebook_page_session",
+                    side_effect=forbidden_session,
+                ):
+                    with self.assertRaises(FacebookPagePublishError) as raised:
+                        overseas_preflight.run_facebook_page_preflight_sync(
+                            payload,
+                            task_id=690,
+                        )
+
+                self.assertEqual(
+                    raised.exception.error_code,
+                    "facebook_publish_authorization_invalid",
+                )
+                self.assertEqual(session_calls, [])
+                self.assertEqual(
+                    raised.exception.receipt,
+                    {
+                        "phase": "local_validation",
+                        "platformWriteOccurred": False,
+                        "finalActionTriggered": False,
+                        "pageId": self.page_id,
+                    },
+                )
+
     def test_page_v1_service_rejects_unsupported_metadata_before_session(self) -> None:
         cases = (
             ("cover_path", {"coverPath": str(self.video.parent / "cover.png")}),

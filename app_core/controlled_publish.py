@@ -814,10 +814,17 @@ def _facebook_metadata_has_value(value: object) -> bool:
     return True
 
 
+def is_exact_facebook_page_platform_type(payload: Mapping[str, Any]) -> bool:
+    """Return true only for the canonical integer Page platform discriminator."""
+
+    value = payload.get("type")
+    return type(value) is int and value == 9
+
+
 def validate_facebook_page_v1_metadata(payload: Mapping[str, Any]) -> None:
     """Reject every explicit Page setting outside the V1 immediate Reel contract."""
 
-    if payload.get("type") != 9:
+    if not is_exact_facebook_page_platform_type(payload):
         return
 
     cover_paths = payload.get("coverPaths")
@@ -1056,11 +1063,7 @@ def _single_facebook_page_payload(
     payloads: Iterable[Mapping[str, Any]],
 ) -> dict[str, Any]:
     rows = [dict(payload) for payload in payloads]
-    if (
-        len(rows) != 1
-        or type(rows[0].get("type")) is not int
-        or rows[0]["type"] != 9
-    ):
+    if len(rows) != 1 or not is_exact_facebook_page_platform_type(rows[0]):
         raise _facebook_authorization_invalid()
     validate_facebook_page_v1_metadata(rows[0])
     return rows[0]
