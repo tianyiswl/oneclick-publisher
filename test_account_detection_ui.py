@@ -182,6 +182,171 @@ class AccountDetectionUiTests(unittest.TestCase):
         self.assertIn("功能未开启", refresh.toolTip())
         page.close()
 
+    def test_feature_flag_off_disables_saved_page_single_account_detection(self) -> None:
+        account = {
+            "id": 91,
+            "type": 9,
+            "platformName": "Facebook Page",
+            "profileName": "Meta 主体",
+            "userName": "已保存 Page",
+            "status": 1,
+            "healthStatus": "normal",
+            "statusText": "正常",
+            "authMode": "browser",
+            "filePath": "page.json",
+            "accountReference": "1001",
+        }
+        page = AccountPage()
+
+        with patch.dict(os.environ, {}, clear=True):
+            disabled_actions = page._actions(account)
+        disabled_check = next(
+            action
+            for menu in disabled_actions.findChildren(QMenu)
+            for action in menu.actions()
+            if action.text() == "检测登录状态"
+        )
+
+        with patch.dict(
+            os.environ,
+            {"ONECLICK_ENABLE_FACEBOOK_PAGE_V1": "1"},
+            clear=True,
+        ):
+            enabled_actions = page._actions(account)
+        enabled_check = next(
+            action
+            for menu in enabled_actions.findChildren(QMenu)
+            for action in menu.actions()
+            if action.text() == "检测登录状态"
+        )
+
+        self.assertFalse(disabled_check.isEnabled())
+        self.assertIn("功能未开启", disabled_check.toolTip())
+        self.assertTrue(enabled_check.isEnabled())
+        with patch.object(page, "start_validation") as start:
+            disabled_check.trigger()
+            start.assert_not_called()
+            enabled_check.trigger()
+            start.assert_called_once_with([91])
+        page.close()
+
+    def test_feature_flag_off_bulk_detection_excludes_saved_pages(self) -> None:
+        accounts = [
+            {"id": 7, "type": 7},
+            {"id": 91, "type": 9},
+            {"id": 3, "type": 3},
+        ]
+        page = AccountPage()
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(
+                account_service,
+                "list_managed_accounts",
+                return_value=accounts,
+            ),
+            patch.object(page, "start_validation") as start,
+        ):
+            page.check_all()
+        start.assert_called_once_with([7, 3])
+
+        with (
+            patch.dict(
+                os.environ,
+                {"ONECLICK_ENABLE_FACEBOOK_PAGE_V1": "1"},
+                clear=True,
+            ),
+            patch.object(page, "start_validation") as start,
+        ):
+            page.check_all()
+        start.assert_called_once_with(None)
+        page.close()
+
+    def test_feature_flag_off_bulk_detection_does_not_fall_back_to_all_when_only_pages_exist(self) -> None:
+        page = AccountPage()
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(
+                account_service,
+                "list_managed_accounts",
+                return_value=[{"id": 91, "type": 9}],
+            ),
+            patch.object(page, "start_validation") as start,
+        ):
+            page.check_all()
+
+        start.assert_not_called()
+        self.assertIn("没有可检测", page.status_label.text())
+        page.close()
+
+    def test_feature_flag_off_automatic_recheck_excludes_saved_pages(self) -> None:
+        accounts = [
+            {"id": 7, "type": 7},
+            {"id": 91, "type": 9},
+        ]
+        page = AccountPage()
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(
+                account_service,
+                "list_managed_accounts",
+                return_value=accounts,
+            ),
+            patch.object(
+                account_service,
+                "accounts_requiring_check",
+                return_value=[7, 91],
+            ),
+            patch.object(page, "start_validation") as start,
+        ):
+            page.auto_check_stale_accounts()
+        start.assert_called_once_with([7], silent=True, invalid_status=2)
+
+        with (
+            patch.dict(
+                os.environ,
+                {"ONECLICK_ENABLE_FACEBOOK_PAGE_V1": "1"},
+                clear=True,
+            ),
+            patch.object(
+                account_service,
+                "accounts_requiring_check",
+                return_value=[7, 91],
+            ),
+            patch.object(page, "start_validation") as start,
+        ):
+            page.auto_check_stale_accounts()
+        start.assert_called_once_with(
+            [7, 91],
+            silent=True,
+            invalid_status=2,
+        )
+        page.close()
+
+    def test_feature_flag_off_automatic_recheck_skips_page_only_queue(self) -> None:
+        page = AccountPage()
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(
+                account_service,
+                "list_managed_accounts",
+                return_value=[{"id": 91, "type": 9}],
+            ),
+            patch.object(
+                account_service,
+                "accounts_requiring_check",
+                return_value=[91],
+            ),
+            patch.object(page, "start_validation") as start,
+        ):
+            page.auto_check_stale_accounts()
+
+        start.assert_not_called()
+        page.close()
+
     def test_feature_flag_off_rejects_saved_page_actions_before_dialog_or_worker(self) -> None:
         account = {
             "id": 91,
@@ -638,6 +803,8 @@ class AccountDetectionUiTests(unittest.TestCase):
         page = AccountPage()
         with patch.object(
             account_service, "accounts_requiring_check", return_value=[7, 8]
+        ), patch.object(
+            account_service, "facebook_page_v1_enabled", return_value=True
         ), patch.object(page, "start_validation") as start:
             page.auto_check_stale_accounts()
 

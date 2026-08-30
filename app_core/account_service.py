@@ -1021,6 +1021,13 @@ def validate_accounts(
     accounts = list_managed_accounts()
     wanted = {int(item) for item in account_ids or []}
     selected = [row for row in accounts if not wanted or row["id"] in wanted]
+    if not facebook_page_v1_enabled() and any(
+        int(row.get("type") or 0) == 9 for row in selected
+    ):
+        raise FacebookPagePublishError(
+            "facebook_page_feature_disabled",
+            "Facebook Page 功能未开启。",
+        )
     failures: list[str] = []
     auth_issues: dict[int, str] = {}
 

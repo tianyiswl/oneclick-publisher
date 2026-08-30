@@ -273,6 +273,25 @@ class FacebookPagePersistenceTimingTests(unittest.IsolatedAsyncioTestCase):
         finally:
             connection.close()
 
+    def _insert_saved_page_account(self) -> int:
+        connection = sqlite3.connect(self.database)
+        try:
+            account_id = int(
+                connection.execute(
+                    """
+                    INSERT INTO user_info
+                        (type, filePath, userName, status, profileName, authMode,
+                         accountReference)
+                    VALUES (9, 'page.json', '测试 Page', 1, 'Meta 主体',
+                            'browser', '1001')
+                    """
+                ).lastrowid
+            )
+            connection.commit()
+            return account_id
+        finally:
+            connection.close()
+
     async def _run_page_login(
         self,
         selection_callback,
@@ -480,6 +499,11 @@ class FacebookPagePersistenceTimingTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with (
+            patch.dict(
+                os.environ,
+                {"ONECLICK_ENABLE_FACEBOOK_PAGE_V1": "1"},
+                clear=True,
+            ),
             patch.object(account_service, "connect", self._connect),
             patch(
                 "app_core.oneclick_authorization.verify_saved_session",
@@ -497,6 +521,46 @@ class FacebookPagePersistenceTimingTests(unittest.IsolatedAsyncioTestCase):
             "facebook_page_identity_mismatch",
         )
         self.assertEqual(result["accounts"][0]["accountReference"], "1001")
+
+    async def test_saved_page_login_detection_is_rejected_while_feature_is_off(self) -> None:
+        account_id = self._insert_saved_page_account()
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(account_service, "connect", self._connect),
+            patch(
+                "app_core.oneclick_authorization.verify_saved_session",
+                return_value=True,
+            ) as verify,
+            self.assertRaises(FacebookPagePublishError) as raised,
+        ):
+            account_service.validate_accounts([account_id])
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "facebook_page_feature_disabled",
+        )
+        verify.assert_not_called()
+
+    async def test_saved_page_login_detection_keeps_existing_behavior_while_feature_is_on(self) -> None:
+        account_id = self._insert_saved_page_account()
+
+        with (
+            patch.dict(
+                os.environ,
+                {"ONECLICK_ENABLE_FACEBOOK_PAGE_V1": "1"},
+                clear=True,
+            ),
+            patch.object(account_service, "connect", self._connect),
+            patch(
+                "app_core.oneclick_authorization.verify_saved_session",
+                return_value=True,
+            ) as verify,
+        ):
+            result = account_service.validate_accounts([account_id])
+
+        self.assertEqual([row["id"] for row in result["normal"]], [account_id])
+        verify.assert_called_once()
 
     async def test_update_identity_failures_mark_the_original_abnormal_without_overwriting_it(self) -> None:
         connection = sqlite3.connect(self.database)

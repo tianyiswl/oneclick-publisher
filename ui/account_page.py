@@ -401,7 +401,13 @@ class AccountPage(QWidget):
             and int(row.get("oauthScopeVersion") or 1) < 2
         )
         facebook_page_disabled = self._facebook_page_feature_disabled(row)
-        menu.addAction("检测登录状态", lambda _checked=False, r=row: self.check_one(r))
+        check_action = menu.addAction(
+            "检测登录状态",
+            lambda _checked=False, r=row: self.check_one(r),
+        )
+        if facebook_page_disabled:
+            check_action.setEnabled(False)
+            check_action.setToolTip("Facebook Page 功能未开启。")
         relogin_action = menu.addAction(
             "升级 YouTube 发布权限"
             if needs_youtube_scope_upgrade
@@ -495,7 +501,10 @@ class AccountPage(QWidget):
         if facebook_page_disabled:
             open_action.setEnabled(False)
             open_action.setToolTip("Facebook Page 功能未开启。")
-        menu.addAction("检测登录", lambda: self.check_one(row))
+        check_action = menu.addAction("检测登录", lambda: self.check_one(row))
+        if facebook_page_disabled:
+            check_action.setEnabled(False)
+            check_action.setToolTip("Facebook Page 功能未开启。")
         refresh_action = menu.addAction(
             "刷新头像/登录信息",
             lambda: self.refresh_avatar(row),
@@ -548,7 +557,11 @@ class AccountPage(QWidget):
             self._set_status(dialog.lifecycle_message)
 
     def check_all(self) -> None:
-        self.start_validation(None)
+        account_ids = self._validation_account_ids(None)
+        if account_ids == []:
+            self._set_status("没有可检测的已启用平台账号。")
+            return
+        self.start_validation(account_ids)
 
     def check_one(self, row: dict) -> None:
         self.start_validation([row["id"]])
@@ -556,13 +569,29 @@ class AccountPage(QWidget):
     def auto_check_stale_accounts(self) -> None:
         """超过可信时限后先静默检测 Cookie，失败才标记为待检测。"""
 
-        stale_ids = account_service.accounts_requiring_check()
+        stale_ids = self._validation_account_ids(
+            account_service.accounts_requiring_check()
+        )
         if stale_ids:
             self.start_validation(
                 stale_ids,
                 silent=True,
                 invalid_status=2,
             )
+
+    @staticmethod
+    def _validation_account_ids(
+        account_ids: list[int] | None,
+    ) -> list[int] | None:
+        if account_service.facebook_page_v1_enabled():
+            return account_ids
+        wanted = None if account_ids is None else {int(item) for item in account_ids}
+        return [
+            int(row["id"])
+            for row in account_service.list_managed_accounts()
+            if int(row.get("type") or 0) != 9
+            and (wanted is None or int(row["id"]) in wanted)
+        ]
 
     def start_validation(
         self,
