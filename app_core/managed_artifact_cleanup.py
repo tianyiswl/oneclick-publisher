@@ -32,6 +32,8 @@ def _stored_candidate(
     *,
     managed_dir: Path,
 ) -> tuple[Path | None, bool]:
+    if raw_value is None:
+        return None, True
     if not isinstance(raw_value, str):
         return None, False
     value = raw_value.strip()
@@ -89,11 +91,12 @@ def _resolved_reference(
         return None, safe
     try:
         resolved = candidate.resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        return None, False
+    try:
         resolved.relative_to(managed_dir)
     except ValueError:
         return None, True
-    except (OSError, RuntimeError):
-        return None, False
     return resolved, True
 
 

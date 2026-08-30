@@ -12,7 +12,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from app_core import account_service, database, overseas_youtube_credentials
+from app_core import (
+    account_service,
+    database,
+    managed_artifact_cleanup,
+    overseas_youtube_credentials,
+)
 from app_core.overseas_meta_errors import FacebookPagePublishError
 from app_core.overseas_meta_page_identity import FacebookPageIdentity
 
@@ -454,7 +459,10 @@ class FacebookPageDatabaseTests(unittest.TestCase):
                      authMode, accountReference)
                 VALUES (8, ?, 'Malformed', 1, 'Meta 主体', ?, 'browser', '')
                 """,
-                (sqlite3.Binary(b"not-a-string"), "bad\x00avatar"),
+                (
+                    sqlite3.Binary(b"not-a-string"),
+                    sqlite3.Binary(b"not-an-avatar-string"),
+                ),
             )
 
         account_service.delete_account(account_id)
@@ -462,6 +470,79 @@ class FacebookPageDatabaseTests(unittest.TestCase):
         self.assertNotIn(account_id, [int(row["id"]) for row in self.all_accounts()])
         self.assertTrue(session.exists())
         self.assertTrue(avatar.exists())
+
+    def test_remaining_reference_resolve_value_error_conservatively_vetoes_cleanup(self):
+        session = self.cookie_dir / "shared.json"
+        session.write_text("session", encoding="utf-8")
+        account_id = self.insert_account(
+            type=9,
+            status=1,
+            account_reference="1001",
+            file_path="shared.json",
+            avatar_path=None,
+        )
+        self.insert_account(
+            type=8,
+            status=1,
+            account_reference="instagram",
+            file_path="alias.json",
+            avatar_path=None,
+        )
+        real_resolve = Path.resolve
+
+        def fail_reference(path: Path, *args, **kwargs):
+            if path.name == "alias.json":
+                raise ValueError("reference resolve failed")
+            return real_resolve(path, *args, **kwargs)
+
+        with patch.object(
+            Path,
+            "resolve",
+            autospec=True,
+            side_effect=fail_reference,
+        ):
+            account_service.delete_account(account_id)
+
+        self.assertNotIn(account_id, [int(row["id"]) for row in self.all_accounts()])
+        self.assertTrue(session.exists())
+
+    def test_null_remaining_avatar_is_safe_and_does_not_veto_last_reference_cleanup(self):
+        avatar = self.avatar_dir / "shared.png"
+        avatar.write_bytes(b"avatar")
+        account_id = self.insert_account(
+            type=9,
+            status=1,
+            account_reference="1001",
+            file_path="missing-page.json",
+            avatar_path="shared.png",
+        )
+        self.insert_account(
+            type=8,
+            status=1,
+            account_reference="instagram",
+            file_path="missing-instagram.json",
+            avatar_path=None,
+        )
+
+        account_service.delete_account(account_id)
+
+        self.assertFalse(avatar.exists())
+
+    def test_integer_remaining_reference_conservatively_vetoes_cleanup(self):
+        session = self.cookie_dir / "shared.json"
+        session.write_text("session", encoding="utf-8")
+        conn = MagicMock()
+        conn.execute.return_value = [(123,)]
+
+        removed = managed_artifact_cleanup.unlink_managed_artifact_if_unreferenced(
+            conn,
+            raw_target="shared.json",
+            managed_dir=self.cookie_dir,
+            reference_column="filePath",
+        )
+
+        self.assertFalse(removed)
+        self.assertTrue(session.exists())
 
     def test_malformed_deleted_references_do_not_block_row_deletion(self):
         session = self.cookie_dir / "sentinel.json"
