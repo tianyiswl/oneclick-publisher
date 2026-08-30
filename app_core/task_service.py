@@ -8,7 +8,7 @@ import os
 import re
 import uuid
 from collections.abc import Callable
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Mapping
 from zoneinfo import ZoneInfo
@@ -2279,7 +2279,10 @@ def claim_facebook_reconciliation_worker(
     if not token:
         raise ValueError("Facebook Page reconcile token 不能为空")
     current = now or datetime.now().astimezone()
-    changed_at = current.isoformat()
+    if current.tzinfo is None:
+        current = current.astimezone()
+    current_utc = current.astimezone(timezone.utc)
+    changed_at = _now()
     with connect() as conn:
         controlled_publish._ensure_facebook_page_claim_schema(conn)
         conn.commit()
@@ -2317,18 +2320,16 @@ def claim_facebook_reconciliation_worker(
                     try:
                         heartbeat = datetime.fromisoformat(heartbeat_text)
                     except ValueError:
-                        heartbeat = None
-                    if heartbeat is not None:
-                        comparable = current
-                        if heartbeat.tzinfo is not None and comparable.tzinfo is None:
-                            comparable = comparable.astimezone()
-                        if heartbeat.tzinfo is None and comparable.tzinfo is not None:
-                            comparable = comparable.replace(tzinfo=None)
-                        if (comparable - heartbeat).total_seconds() <= max(
-                            1, int(lease_seconds)
-                        ):
-                            conn.rollback()
-                            return False
+                        conn.rollback()
+                        return False
+                    if heartbeat.tzinfo is None:
+                        heartbeat = heartbeat.astimezone()
+                    heartbeat_utc = heartbeat.astimezone(timezone.utc)
+                    if (current_utc - heartbeat_utc).total_seconds() <= max(
+                        1, int(lease_seconds)
+                    ):
+                        conn.rollback()
+                        return False
             elif not (task_status == "failed" and item_status == "failed"):
                 conn.rollback()
                 return False
@@ -2363,6 +2364,60 @@ def claim_facebook_reconciliation_worker(
                     changed_at,
                 ),
             )
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def compensate_facebook_reconciliation_worker(
+    task_id: int,
+    worker_token: str,
+) -> bool:
+    """Close a claimed read-only worker without touching a replacement owner."""
+
+    from . import controlled_publish
+
+    token = str(worker_token or "").strip()
+    if not token:
+        return False
+    with connect() as conn:
+        controlled_publish._ensure_facebook_page_claim_schema(conn)
+        conn.commit()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            item = _facebook_task_item_in_transaction(
+                conn,
+                int(task_id),
+                allowed_modes=frozenset({"oneclick_publish"}),
+            )
+            if (
+                str(item["taskWorkerToken"] or "") != token
+                or str(item["taskStatus"] or "")
+                not in {"running", "waiting_user_verification"}
+                or str(item["status"] or "")
+                not in {"pending", "running", "waiting_user_verification"}
+            ):
+                conn.rollback()
+                return False
+            claim = conn.execute(
+                "SELECT state FROM facebook_page_publish_claims WHERE taskId = ?",
+                (int(task_id),),
+            ).fetchone()
+            if claim is None or str(claim["state"] or "") not in {
+                "final_action_claimed",
+                "final_action_clicked",
+            }:
+                conn.rollback()
+                return False
+            changed = _reconcile_stale_facebook_page_claim_in_transaction(
+                conn,
+                int(task_id),
+            )
+            if not changed:
+                conn.rollback()
+                return False
             conn.commit()
             return True
         except Exception:

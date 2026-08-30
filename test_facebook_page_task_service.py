@@ -929,6 +929,163 @@ class FacebookPageTaskServiceTests(unittest.TestCase):
             )
         )
 
+    def test_reconciliation_takeover_normalizes_naive_and_aware_heartbeats(self) -> None:
+        stale_values = (
+            "2026-08-30 01:00:00",
+            "2026-08-30T01:00:00+00:00",
+        )
+        for index, heartbeat in enumerate(stale_values):
+            with self.subTest(heartbeat=heartbeat):
+                task_id, _page_id = self.facebook_task(
+                    state="final_action_clicked"
+                )
+                with database.connect() as conn:
+                    conn.execute(
+                        "UPDATE publish_tasks SET status='running', workerToken=?, "
+                        "workerHeartbeatAt=? WHERE id=?",
+                        (f"old-owner-{index}", heartbeat, task_id),
+                    )
+                    conn.commit()
+                token = f"normalized-reconcile-{index}"
+                self.assertTrue(
+                    task_service.claim_facebook_reconciliation_worker(
+                        task_id,
+                        token,
+                        lease_seconds=30,
+                        now=datetime(2026, 8, 30, 2, 0, tzinfo=timezone.utc),
+                    )
+                )
+                with patch.dict(publish_service._active_threads, {}, clear=True):
+                    projected = controlled_publish.task_status(task_id)
+                self.assertEqual(projected["status"], "running")
+                self.assertEqual(
+                    task_service.get_task(task_id)["workerToken"], token
+                )
+
+        invalid_task, _page_id = self.facebook_task(
+            state="final_action_clicked"
+        )
+        with database.connect() as conn:
+            conn.execute(
+                "UPDATE publish_tasks SET status='running', workerToken=?, "
+                "workerHeartbeatAt=? WHERE id=?",
+                ("invalid-owner", "not-a-time", invalid_task),
+            )
+            conn.commit()
+        self.assertFalse(
+            task_service.claim_facebook_reconciliation_worker(
+                invalid_task,
+                "must-not-take-over-invalid-time",
+                lease_seconds=30,
+                now=datetime(2026, 8, 30, 2, 0, tzinfo=timezone.utc),
+            )
+        )
+        self.assertEqual(
+            task_service.get_task(invalid_task)["workerToken"], "invalid-owner"
+        )
+
+    def test_reconcile_reader_failures_compensate_exact_owner_and_reraise(self) -> None:
+        failures: tuple[BaseException, ...] = (
+            RuntimeError("offline reader failed"),
+            KeyboardInterrupt(),
+        )
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__):
+                task_id, _page_id = self.facebook_task(
+                    state="final_action_clicked", stale=True
+                )
+                baseline_hash = self.claim(task_id)["baselineHash"]
+                with patch.object(
+                    controlled_publish,
+                    "_read_facebook_page_reconciliation",
+                    side_effect=failure,
+                ):
+                    with self.assertRaises(type(failure)):
+                        controlled_publish.reconcile_facebook_page_publish_outcome(
+                            task_id
+                        )
+                saved = task_service.get_task(task_id)
+                self.assertEqual(saved["status"], "failed")
+                self.assertEqual(
+                    saved["items"][0]["errorCode"],
+                    "facebook_publish_outcome_unknown",
+                )
+                self.assertEqual(self.claim(task_id)["state"], "ambiguous")
+                self.assertEqual(self.claim(task_id)["baselineHash"], baseline_hash)
+
+    def test_reconcile_illegal_reader_result_compensates_and_reraises(self) -> None:
+        task_id, _page_id = self.facebook_task(
+            state="final_action_clicked", stale=True
+        )
+        with patch.object(
+            controlled_publish,
+            "_read_facebook_page_reconciliation",
+            return_value={"forged": True},
+        ):
+            with self.assertRaises(ControlledPublishError):
+                controlled_publish.reconcile_facebook_page_publish_outcome(task_id)
+        saved = task_service.get_task(task_id)
+        self.assertEqual(saved["status"], "failed")
+        self.assertEqual(
+            saved["items"][0]["errorCode"],
+            "facebook_publish_outcome_unknown",
+        )
+        self.assertEqual(self.claim(task_id)["state"], "ambiguous")
+
+    def test_reconcile_compensation_does_not_overwrite_replacement_owner(self) -> None:
+        task_id, _page_id = self.facebook_task(
+            state="final_action_clicked", stale=True
+        )
+
+        async def replace_owner_then_fail(_snapshot):
+            with database.connect() as conn:
+                conn.execute(
+                    "UPDATE publish_tasks SET workerToken=?, workerHeartbeatAt=? "
+                    "WHERE id=?",
+                    ("replacement-owner", datetime.now().isoformat(), task_id),
+                )
+                conn.commit()
+            raise RuntimeError("reader failed after owner replacement")
+
+        with patch.object(
+            controlled_publish,
+            "_read_facebook_page_reconciliation",
+            side_effect=replace_owner_then_fail,
+        ):
+            with self.assertRaises(RuntimeError):
+                controlled_publish.reconcile_facebook_page_publish_outcome(task_id)
+        saved = task_service.get_task(task_id)
+        self.assertEqual(saved["status"], "running")
+        self.assertEqual(saved["workerToken"], "replacement-owner")
+        self.assertEqual(self.claim(task_id)["state"], "final_action_clicked")
+
+    def test_cli_reconcile_keyboard_interrupt_is_compensated_by_service(self) -> None:
+        import desktop_native_app
+
+        task_id, _page_id = self.facebook_task(
+            state="final_action_clicked", stale=True
+        )
+        args = SimpleNamespace(
+            controlled_publish_action="reconcile",
+            controlled_publish_task_id=task_id,
+            controlled_publish_request=None,
+            controlled_publish_authorization_id="",
+        )
+        with patch.object(
+            controlled_publish,
+            "_read_facebook_page_reconciliation",
+            side_effect=KeyboardInterrupt(),
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                desktop_native_app.run_controlled_publish_cli(args)
+        saved = task_service.get_task(task_id)
+        self.assertEqual(saved["status"], "failed")
+        self.assertEqual(
+            saved["items"][0]["errorCode"],
+            "facebook_publish_outcome_unknown",
+        )
+        self.assertEqual(self.claim(task_id)["state"], "ambiguous")
+
     def test_public_reconcile_cannot_take_over_worker_refreshed_after_snapshot(self) -> None:
         task_id, _page_id = self.facebook_task(state="final_action_claimed")
         stale = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
@@ -2184,10 +2341,14 @@ class FacebookPageTaskServiceTests(unittest.TestCase):
         for label, outcome in cases:
             with self.subTest(label=label):
                 task_id, _ = self.facebook_task(state="ambiguous")
-                result, _calls, _sessions = self.read_only_reconcile(
-                    task_id, outcome
-                )
-                self.assertEqual(result["phase"], "ambiguous")
+                if isinstance(outcome, BaseException):
+                    with self.assertRaises(type(outcome)):
+                        self.read_only_reconcile(task_id, outcome)
+                else:
+                    result, _calls, _sessions = self.read_only_reconcile(
+                        task_id, outcome
+                    )
+                    self.assertEqual(result["phase"], "ambiguous")
                 self.assertEqual(
                     (self.claim(task_id)["state"], self.claim(task_id)["blocksReplay"]),
                     ("ambiguous", 1),

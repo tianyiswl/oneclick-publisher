@@ -2918,7 +2918,10 @@ async def _read_facebook_page_reconciliation(
         )
 
 
-def reconcile_facebook_page_publish_outcome(task_id: int) -> dict[str, object]:
+def _reconcile_facebook_page_publish_outcome_claimed(
+    task_id: int,
+    claimed_tokens: list[str],
+) -> dict[str, object]:
     """Read the same Page's complete list and reconcile without publishing."""
 
     from . import task_service
@@ -2939,6 +2942,7 @@ def reconcile_facebook_page_publish_outcome(task_id: int) -> dict[str, object]:
         int(task_id), reconcile_token
     ):
         return project_task(task_service.get_task(int(task_id)))
+    claimed_tokens.append(reconcile_token)
     page_id = str(snapshot.get("pageId") or "")
     if state == "final_action_claimed" and not str(snapshot.get("clickedAt") or ""):
         task_service.record_facebook_progress(
@@ -2954,17 +2958,7 @@ def reconcile_facebook_page_publish_outcome(task_id: int) -> dict[str, object]:
     try:
         match = asyncio.run(_read_facebook_page_reconciliation(snapshot))
     except FacebookPagePublishError:
-        if state in {"final_action_clicked"}:
-            task_service.record_facebook_progress(
-                int(task_id),
-                phase="ambiguous",
-                message="Facebook Page 只读列表未完整，结果保持未知",
-                receipt={"pageId": page_id, "phase": "ambiguous"},
-                _expected_state=state,
-                worker_token=reconcile_token,
-                _trusted_reconciliation=True,
-            )
-        return project_task(task_service.get_task(int(task_id)))
+        raise
     task7_types = _facebook_task7_reel_types()
     if task7_types is None or type(match) is not task7_types[0]:
         raise ControlledPublishError(
@@ -3036,6 +3030,29 @@ def reconcile_facebook_page_publish_outcome(task_id: int) -> dict[str, object]:
             _trusted_reconciliation=True,
         )
     return project_task(task_service.get_task(int(task_id)))
+
+
+def reconcile_facebook_page_publish_outcome(task_id: int) -> dict[str, object]:
+    """Atomically claim and read back one formal Page outcome."""
+
+    from . import task_service
+
+    claimed_tokens: list[str] = []
+    try:
+        return _reconcile_facebook_page_publish_outcome_claimed(
+            int(task_id), claimed_tokens
+        )
+    except BaseException:
+        if claimed_tokens:
+            try:
+                task_service.compensate_facebook_reconciliation_worker(
+                    int(task_id), claimed_tokens[-1]
+                )
+            except Exception:
+                # Preserve the reader/control-flow exception; compensation is
+                # token-CAS and may legitimately lose to a replacement owner.
+                pass
+        raise
 
 
 def _ensure_tiktok_claim_schema(conn: sqlite3.Connection) -> None:
