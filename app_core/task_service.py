@@ -2146,8 +2146,20 @@ def mark_task_running(
 ) -> None:
     """标记一键发本地预检开始执行。"""
 
+    from . import controlled_publish
+
     now = _now()
     with connect() as conn:
+        page_item = conn.execute(
+            "SELECT 1 FROM publish_task_items WHERE taskId = ? "
+            "AND platformType = 9 LIMIT 1",
+            (int(task_id),),
+        ).fetchone()
+        if page_item is not None:
+            raise controlled_publish.ControlledPublishError(
+                "facebook_worker_lease_lost",
+                "Facebook Page 任务必须通过专用 worker 租约启动。",
+            )
         conn.execute(
             """
             UPDATE publish_tasks
@@ -3033,6 +3045,8 @@ def mark_facebook_result(
 def _reconcile_stale_facebook_page_claim_in_transaction(
     conn,
     task_id: int,
+    *,
+    reserved_error_code: str = "facebook_worker_interrupted",
 ) -> bool:
     """Repair one already-proven stale Page task under the caller's lock."""
 
@@ -3105,10 +3119,14 @@ def _reconcile_stale_facebook_page_claim_in_transaction(
             conn,
             int(task_id),
             phase="failed",
-            message="Facebook Page worker 在最终动作前失联，未发布",
-            error_code="facebook_worker_interrupted",
+            message=(
+                "Facebook Page 安全验证等待超时，未发布"
+                if reserved_error_code == "facebook_verification_timeout"
+                else "Facebook Page worker 在最终动作前失联，未发布"
+            ),
+            error_code=str(reserved_error_code),
             receipt=dict(transition["receipt"]),
-            event_type="facebook_worker_interrupted",
+            event_type=str(reserved_error_code),
         )
     if state in {"final_action_claimed", "final_action_clicked"}:
         controlled_publish._validated_facebook_page_claim_evidence(claim)
@@ -3393,6 +3411,42 @@ def fail_facebook_worker(
             raise
 
 
+def facebook_reconciliation_owner_is_active(
+    task_id: int,
+    *,
+    lease_seconds: int = 30,
+    now: datetime | None = None,
+) -> bool:
+    """Return whether a Page worker still owns a live in-process/DB lease."""
+
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT status, workerToken, workerHeartbeatAt FROM publish_tasks "
+            "WHERE id = ?",
+            (int(task_id),),
+        ).fetchone()
+    if row is None or str(row["status"] or "") not in {
+        "pending",
+        "running",
+        "waiting_user_verification",
+    }:
+        return False
+    if not str(row["workerToken"] or ""):
+        return False
+    if _registered_worker_is_active(int(task_id)):
+        return True
+    try:
+        heartbeat = datetime.fromisoformat(str(row["workerHeartbeatAt"] or ""))
+    except ValueError:
+        return False
+    current = now or datetime.now(heartbeat.tzinfo)
+    if heartbeat.tzinfo is not None and current.tzinfo is None:
+        current = current.astimezone()
+    if heartbeat.tzinfo is None and current.tzinfo is not None:
+        current = current.replace(tzinfo=None)
+    return (current - heartbeat).total_seconds() <= max(1, int(lease_seconds))
+
+
 def _reconcile_stale_controlled_task_in_transaction(
     conn,
     task_id: int,
@@ -3449,6 +3503,7 @@ def _reconcile_stale_controlled_task_in_transaction(
         len(payloads) == 1 and int(payloads[0].get("type") or 0) == 9
     )
     has_facebook_page_claim = False
+    facebook_claim_state = ""
     if is_facebook_page_task:
         claim_table = conn.execute(
             """
@@ -3457,12 +3512,13 @@ def _reconcile_stale_controlled_task_in_transaction(
             """
         ).fetchone()
         if claim_table is not None:
-            has_facebook_page_claim = (
-                conn.execute(
-                    "SELECT 1 FROM facebook_page_publish_claims WHERE taskId = ?",
-                    (int(task_id),),
-                ).fetchone()
-                is not None
+            claim_row = conn.execute(
+                "SELECT state FROM facebook_page_publish_claims WHERE taskId = ?",
+                (int(task_id),),
+            ).fetchone()
+            has_facebook_page_claim = claim_row is not None
+            facebook_claim_state = (
+                str(claim_row["state"] or "") if claim_row is not None else ""
             )
     active_statuses = (
         {"pending", "running", "waiting_user_verification"}
@@ -3490,12 +3546,11 @@ def _reconcile_stale_controlled_task_in_transaction(
     if (current - reference).total_seconds() <= max(1, int(lease_seconds)):
         return False
     youtube_has_known_video = bool(row["youtubeHasKnownVideo"])
-    if has_facebook_page_claim:
-        return _reconcile_stale_facebook_page_claim_in_transaction(
-            conn,
-            int(task_id),
-        )
-    if is_facebook_page_task and str(row["status"] or "") == "waiting_user_verification":
+    if (
+        is_facebook_page_task
+        and str(row["status"] or "") == "waiting_user_verification"
+        and facebook_claim_state in {"", "reserved"}
+    ):
         deadline: datetime | None = None
         try:
             waiting_receipt = project_facebook_page_receipt(
@@ -3516,6 +3571,16 @@ def _reconcile_stale_controlled_task_in_transaction(
             else:
                 current_comparable = current.replace(tzinfo=None)
             timed_out = current_comparable >= deadline
+        if facebook_claim_state == "reserved":
+            return _reconcile_stale_facebook_page_claim_in_transaction(
+                conn,
+                int(task_id),
+                reserved_error_code=(
+                    "facebook_verification_timeout"
+                    if timed_out
+                    else "facebook_worker_interrupted"
+                ),
+            )
         return _fail_active_task_in_transaction(
             conn,
             int(task_id),
@@ -3529,6 +3594,11 @@ def _reconcile_stale_controlled_task_in_transaction(
                 if timed_out
                 else "Facebook Page worker 在验证期内失联，预检已安全停止"
             ),
+        )
+    if has_facebook_page_claim:
+        return _reconcile_stale_facebook_page_claim_in_transaction(
+            conn,
+            int(task_id),
         )
     is_tiktok_task = (
         len(payloads) == 1 and int(payloads[0].get("type") or 0) == 6

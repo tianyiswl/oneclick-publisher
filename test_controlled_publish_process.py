@@ -183,10 +183,13 @@ class FacebookPagePublicEntryFixture:
             mode="oneclick_preflight",
         )
         self.preflight_task_id = int(preflight["id"])
-        task_service.mark_task_running(
+        self.preflight_worker_token = f"public-entry-{self.preflight_task_id}"
+        if not task_service.claim_facebook_worker(
             self.preflight_task_id,
+            self.preflight_worker_token,
             "Facebook Page public-entry fixture",
-        )
+        ):
+            raise AssertionError("Facebook Page fixture worker claim failed")
         expectation = FacebookPageFormExpectation(
             page_id=str(self.payload["facebookExpectedPageReference"]),
             content_kind="reel",
@@ -220,6 +223,7 @@ class FacebookPagePublicEntryFixture:
             content_type="video",
             event_type="facebook_platform_form_verified",
             receipt=receipt,
+            worker_token=self.preflight_worker_token,
         )
         self.started_task_ids: list[int] = []
         return self
@@ -258,10 +262,13 @@ class FacebookPagePublicEntryFixture:
             mode="oneclick_preflight",
         )
         task_id = int(preflight["id"])
-        task_service.mark_task_running(
+        worker_token = f"equivalent-public-entry-{task_id}"
+        if not task_service.claim_facebook_worker(
             task_id,
+            worker_token,
             "Facebook Page equivalent public-entry fixture",
-        )
+        ):
+            raise AssertionError("equivalent Facebook Page worker claim failed")
         expectation = FacebookPageFormExpectation(
             page_id=str(payload["facebookExpectedPageReference"]),
             content_kind="reel",
@@ -295,6 +302,7 @@ class FacebookPagePublicEntryFixture:
             content_type="video",
             event_type="facebook_platform_form_verified",
             receipt=receipt,
+            worker_token=worker_token,
         )
         return task_id
 

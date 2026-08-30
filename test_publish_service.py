@@ -389,7 +389,12 @@ class FacebookPageAuthorizedSubmitTests(unittest.TestCase):
             [payload],
             mode="oneclick_preflight",
         )
-        task_service.mark_task_running(task["id"], "Facebook Page preflight")
+        preflight_worker_token = f"authorized-preflight-{task['id']}"
+        self.assertTrue(
+            task_service.claim_facebook_worker(
+                int(task["id"]), preflight_worker_token, "Facebook Page preflight"
+            )
+        )
         expectation = FacebookPageFormExpectation(
             page_id=str(payload["facebookExpectedPageReference"]),
             content_kind="reel",
@@ -424,6 +429,7 @@ class FacebookPageAuthorizedSubmitTests(unittest.TestCase):
             content_type="video",
             event_type="facebook_platform_form_verified",
             receipt=receipt,
+            worker_token=preflight_worker_token,
         )
         authorization = controlled_publish.authorize_completed_check(task["id"])
         return task["id"], str(authorization["authorizationId"]), payload
@@ -454,10 +460,18 @@ class FacebookPageAuthorizedSubmitTests(unittest.TestCase):
             )
             stored = task_service.get_task(int(task_id))
             payloads = json.loads(str(stored["payloadJson"]))
+            worker_token = f"authorized-test-worker-{task_id}"
+            self.assertTrue(
+                task_service.claim_facebook_worker(
+                    int(task_id), worker_token, "authorized test worker"
+                )
+            )
             controlled_publish.require_facebook_page_execution_claim(
                 int(task_id),
                 payloads,
+                worker_token=worker_token,
             )
+            stored["_workerToken"] = worker_token
             return stored
 
         with patch.object(
@@ -470,13 +484,6 @@ class FacebookPageAuthorizedSubmitTests(unittest.TestCase):
                 preflight_task_id=preflight_task_id,
                 authorization_id=authorization_id,
             )
-        worker_token = f"authorized-test-worker-{task['id']}"
-        self.assertTrue(
-            task_service.claim_facebook_worker(
-                int(task["id"]), worker_token, "authorized test worker"
-            )
-        )
-        task["_workerToken"] = worker_token
         return task
 
     @staticmethod

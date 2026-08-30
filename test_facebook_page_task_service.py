@@ -640,10 +640,12 @@ class FacebookPageTaskServiceTests(unittest.TestCase):
     def test_verification_callback_requires_the_current_worker_token(self) -> None:
         formal_task_id, page_id = self.facebook_task()
         preflight_task_id = int(self.claim(formal_task_id)["preflightTaskId"])
-        task_service.mark_task_running(
-            preflight_task_id,
-            "worker started",
-            worker_token="current-worker",
+        self.assertTrue(
+            task_service.claim_facebook_worker(
+                preflight_task_id,
+                "current-worker",
+                "worker started",
+            )
         )
 
         with self.assertRaises(ControlledPublishError):
@@ -688,6 +690,16 @@ class FacebookPageTaskServiceTests(unittest.TestCase):
             task_service.claim_facebook_worker(task_id, "replacement-token", "late")
         )
         self.assertEqual(task_service.get_task(task_id)["status"], "failed")
+
+        with self.assertRaises(ControlledPublishError):
+            task_service.mark_task_running(
+                task_id,
+                "replacement must not reopen Page task",
+                worker_token="replacement-token",
+            )
+        unchanged = task_service.get_task(task_id)
+        self.assertEqual(unchanged["status"], "failed")
+        self.assertEqual(unchanged["workerToken"], "current-token")
 
     def test_page_result_requires_current_worker_token_and_active_task(self) -> None:
         formal_task_id, page_id = self.facebook_task()
@@ -791,6 +803,77 @@ class FacebookPageTaskServiceTests(unittest.TestCase):
                     task_service.get_task(task_id)["items"][0]["errorCode"],
                     expected_code,
                 )
+
+    def test_stale_formal_reserved_wait_uses_persisted_deadline(self) -> None:
+        cases = (
+            (
+                datetime(2026, 8, 30, 5, 9, 59, tzinfo=timezone.utc),
+                "facebook_worker_interrupted",
+            ),
+            (
+                datetime(2026, 8, 30, 5, 10, 0, tzinfo=timezone.utc),
+                "facebook_verification_timeout",
+            ),
+        )
+        for now, expected_code in cases:
+            with self.subTest(expected_code=expected_code):
+                task_id, page_id = self.facebook_task(state="reserved")
+                task_service.record_facebook_verification_state(
+                    task_id,
+                    waiting=True,
+                    receipt={
+                        "pageId": page_id,
+                        "verificationStartedAt": "2026-08-30T05:00:00+00:00",
+                        "deadlineAt": "2026-08-30T05:10:00+00:00",
+                        "timeoutSeconds": 600,
+                    },
+                )
+                with database.connect() as conn:
+                    conn.execute(
+                        "UPDATE publish_tasks SET workerHeartbeatAt = ? WHERE id = ?",
+                        ("2026-08-30T04:59:00+00:00", task_id),
+                    )
+                    conn.commit()
+
+                self.assertTrue(
+                    task_service.reconcile_stale_controlled_task(
+                        task_id,
+                        lease_seconds=30,
+                        now=now,
+                    )
+                )
+                saved = task_service.get_task(task_id)
+                self.assertEqual(saved["items"][0]["errorCode"], expected_code)
+                self.assertEqual(self.claim(task_id)["state"], "safe_failed")
+
+    def test_read_only_reconcile_does_not_take_over_a_live_worker(self) -> None:
+        task_id, _page_id = self.facebook_task(state="final_action_claimed")
+        fresh = datetime.now(timezone.utc).isoformat()
+        with database.connect() as conn:
+            conn.execute(
+                "UPDATE publish_tasks SET status = 'running', workerToken = ?, "
+                "workerHeartbeatAt = ? WHERE id = ?",
+                ("live-owner", fresh, task_id),
+            )
+            conn.commit()
+
+        projected = controlled_publish.reconcile_facebook_page_publish_outcome(
+            task_id
+        )
+        self.assertEqual(projected["status"], "running")
+        self.assertEqual(self.claim(task_id)["state"], "final_action_claimed")
+
+        with database.connect() as conn:
+            conn.execute(
+                "UPDATE publish_tasks SET workerHeartbeatAt = ? WHERE id = ?",
+                ((datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat(), task_id),
+            )
+            conn.commit()
+        reconciled = controlled_publish.reconcile_facebook_page_publish_outcome(
+            task_id
+        )
+        self.assertEqual(reconciled["status"], "failed")
+        self.assertEqual(self.claim(task_id)["state"], "ambiguous")
 
     def test_waiting_verification_is_counted_as_active(self) -> None:
         formal_task_id, page_id = self.facebook_task()

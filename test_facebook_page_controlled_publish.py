@@ -2193,15 +2193,23 @@ class FacebookPageFormalClaimTests(unittest.TestCase):
     def test_execution_claim_is_single_start_and_matches_exact_intent(self) -> None:
         task_id, authorization_id, payload = self.authorized_preflight()
         task = self.create_formal(task_id, authorization_id, payload)
+        worker_token = f"formal-claim-{task['id']}"
+        self.assertTrue(
+            task_service.claim_facebook_worker(
+                int(task["id"]), worker_token, "formal claim test"
+            )
+        )
 
         controlled_publish.require_facebook_page_execution_claim(
             task["id"],
             [self.formal_payload(payload)],
+            worker_token=worker_token,
         )
         with self.assertRaises(ControlledPublishError) as repeated:
             controlled_publish.require_facebook_page_execution_claim(
                 task["id"],
                 [self.formal_payload(payload)],
+                worker_token=worker_token,
             )
         changed = self.formal_payload(payload)
         changed["facebookCaptionSha256"] = "e" * 64
@@ -2209,6 +2217,7 @@ class FacebookPageFormalClaimTests(unittest.TestCase):
             controlled_publish.require_facebook_page_execution_claim(
                 task["id"],
                 [changed],
+                worker_token=worker_token,
             )
         self.assertEqual(
             repeated.exception.error_code,

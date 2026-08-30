@@ -1427,15 +1427,20 @@ def _run_facebook_page_publish(
             "controlled_publish_busy",
             "已有发布任务正在执行，Facebook Page 未启动浏览器。",
         )
-        mark_facebook_page_checkpoint(
-            task_id,
-            expected_state="reserved",
-            new_state="safe_failed",
-            receipt=_facebook_failure_receipt(payload, busy),
-            worker_token=worker_token,
-            error_code=busy.error_code,
-        )
-        _active_threads.pop(task_id, None)
+        try:
+            mark_facebook_page_checkpoint(
+                task_id,
+                expected_state="reserved",
+                new_state="safe_failed",
+                receipt=_facebook_failure_receipt(payload, busy),
+                worker_token=worker_token,
+                error_code=busy.error_code,
+            )
+        except Exception as exc:
+            if getattr(exc, "error_code", "") != "facebook_worker_lease_lost":
+                raise
+        finally:
+            _active_threads.pop(task_id, None)
         return
 
     def progress(stage: str, receipt: Any) -> None:

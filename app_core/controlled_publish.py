@@ -1961,14 +1961,9 @@ def require_facebook_page_execution_claim(
                       SELECT 1 FROM publish_tasks AS task
                       WHERE task.id = facebook_page_publish_claims.taskId
                         AND task.mode = 'oneclick_publish'
-                        AND (
-                            (? = '' AND task.status = 'pending')
-                            OR (
-                                ? <> ''
-                                AND task.status = 'running'
-                                AND task.workerToken = ?
-                            )
-                        )
+                        AND ? <> ''
+                        AND task.status = 'running'
+                        AND task.workerToken = ?
                   )
                   AND 1 = (
                       SELECT COUNT(*) FROM publish_task_items AS counted_item
@@ -1991,7 +1986,6 @@ def require_facebook_page_execution_claim(
                     page_reference,
                     publish_intent,
                     replay_fingerprint,
-                    expected_worker_token,
                     expected_worker_token,
                     expected_worker_token,
                     int(account_ids[0]),
@@ -2929,6 +2923,8 @@ def reconcile_facebook_page_publish_outcome(task_id: int) -> dict[str, object]:
 
     from . import task_service
 
+    if task_service.facebook_reconciliation_owner_is_active(int(task_id)):
+        return project_task(task_service.get_task(int(task_id)))
     snapshot = _facebook_reconciliation_snapshot(int(task_id))
     state = str(snapshot.get("state") or "")
     if state in _FACEBOOK_PAGE_TERMINAL_STATES:

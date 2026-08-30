@@ -351,9 +351,13 @@ class FacebookPageExecutorTests(unittest.TestCase):
             [preflight_payload],
             mode="oneclick_preflight",
         )
-        task_service.mark_task_running(
-            int(preflight["id"]),
-            "Facebook Page preflight",
+        preflight_worker_token = "executor-preflight-worker"
+        self.assertTrue(
+            task_service.claim_facebook_worker(
+                int(preflight["id"]),
+                preflight_worker_token,
+                "Facebook Page preflight",
+            )
         )
         with self.patched_runtime(real_clicked_at=True, real_contracts=True):
             result = overseas_preflight.run_facebook_page_preflight_sync(
@@ -368,6 +372,7 @@ class FacebookPageExecutorTests(unittest.TestCase):
             content_type="video",
             event_type="platform_preflight",
             receipt=dict(result["receipt"]),
+            worker_token=preflight_worker_token,
         )
         authorization = controlled_publish.authorize_completed_check(
             int(preflight["id"])
@@ -385,10 +390,18 @@ class FacebookPageExecutorTests(unittest.TestCase):
             )
             stored = task_service.get_task(int(task_id))
             stored_payloads = json.loads(str(stored["payloadJson"]))
+            worker_token = f"executor-formal-{task_id}"
+            self.assertTrue(
+                task_service.claim_facebook_worker(
+                    int(task_id), worker_token, "executor formal worker"
+                )
+            )
             controlled_publish.require_facebook_page_execution_claim(
                 int(task_id),
                 stored_payloads,
+                worker_token=worker_token,
             )
+            stored["_workerToken"] = worker_token
             return stored
 
         with patch.object(
@@ -401,13 +414,6 @@ class FacebookPageExecutorTests(unittest.TestCase):
                 preflight_task_id=int(preflight["id"]),
                 authorization_id=str(authorization["authorizationId"]),
             )
-        worker_token = "executor-test-worker"
-        self.assertTrue(
-            task_service.claim_facebook_worker(
-                int(task["id"]), worker_token, "executor test worker"
-            )
-        )
-        task["_workerToken"] = worker_token
         return task, payload
 
     @staticmethod
@@ -1716,6 +1722,13 @@ class FacebookPageExecutorTests(unittest.TestCase):
         )
         sensitive_path = "/Users/andy/private/cookiesFile/facebook-session.json"
         raw_exception = f"browser context failed at {sensitive_path}"
+        worker_token = "preflight-exception-worker"
+        self.assertTrue(
+            task_service.claim_facebook_worker(
+                int(task["id"]), worker_token, "preflight exception test"
+            )
+        )
+        task["_workerToken"] = worker_token
 
         @asynccontextmanager
         async def failing_session(_prepared):
@@ -2009,6 +2022,10 @@ class FacebookPagePublishServiceTests(unittest.TestCase):
 
     def test_running_worker_requires_the_exact_persisted_token_for_formal_claim(self) -> None:
         task, payload = self.claimed_task()
+        with self.assertRaises(controlled_publish.ControlledPublishError):
+            controlled_publish.require_facebook_page_execution_claim(
+                int(task["id"]), [payload]
+            )
         self.assertTrue(
             task_service.claim_facebook_worker(
                 int(task["id"]), "owner-token", "test owner"
@@ -2025,6 +2042,25 @@ class FacebookPagePublishServiceTests(unittest.TestCase):
             int(task["id"]), [payload], worker_token="owner-token"
         )
         self.assertTrue(self.claim(int(task["id"]))["workerStartedAt"])
+
+    def test_busy_formal_worker_closes_its_owned_task_immediately(self) -> None:
+        task, payload = self.claimed_task()
+        self.lease_worker(task)
+        controlled_publish.require_facebook_page_execution_claim(
+            task["id"], [payload], worker_token=str(task["_workerToken"])
+        )
+        self.assertTrue(publish_service._publish_lock.acquire(blocking=False))
+
+        try:
+            publish_service._run_facebook_page_publish(task, [payload])
+        finally:
+            publish_service._publish_lock.release()
+
+        saved = task_service.get_task(int(task["id"]))
+        self.assertEqual(saved["status"], "failed")
+        self.assertEqual(saved["items"][0]["errorCode"], "controlled_publish_busy")
+        self.assertEqual(self.claim(int(task["id"]))["state"], "safe_failed")
+        self.assertNotIn(int(task["id"]), publish_service._active_threads)
 
     def test_recovered_task_without_runtime_video_path_fails_before_session(self) -> None:
         task, payload = self.claimed_task()
@@ -2195,8 +2231,10 @@ class FacebookPagePublishServiceTests(unittest.TestCase):
 
     def test_service_persists_claim_before_click_and_click_checkpoint_immediately(self) -> None:
         task, payload = self.claimed_task()
-        controlled_publish.require_facebook_page_execution_claim(task["id"], [payload])
         self.lease_worker(task)
+        controlled_publish.require_facebook_page_execution_claim(
+            task["id"], [payload], worker_token=str(task["_workerToken"])
+        )
         observed: list[str] = []
 
         def runner(current, *, task_id, progress):
@@ -2268,6 +2306,13 @@ class FacebookPagePublishServiceTests(unittest.TestCase):
         preflight_id = int(self.claim(formal["id"])["preflightTaskId"])
         preflight = task_service.get_task(preflight_id)
         payloads = json.loads(preflight["payloadJson"])
+        worker_token = f"preflight-resume-{preflight_id}"
+        self.assertTrue(
+            task_service.claim_facebook_worker(
+                preflight_id, worker_token, "preflight resume test"
+            )
+        )
+        preflight["_workerToken"] = worker_token
         observed: list[str] = []
 
         def runner(current, *, task_id, progress):
@@ -2305,10 +2350,12 @@ class FacebookPagePublishServiceTests(unittest.TestCase):
         for location in cases:
             with self.subTest(location=location):
                 task, payload = self.claimed_task()
-                controlled_publish.require_facebook_page_execution_claim(
-                    task["id"], [payload]
-                )
                 self.lease_worker(task)
+                controlled_publish.require_facebook_page_execution_claim(
+                    task["id"],
+                    [payload],
+                    worker_token=str(task["_workerToken"]),
+                )
 
                 def runner(current, *, task_id, progress):
                     if location == "after":
