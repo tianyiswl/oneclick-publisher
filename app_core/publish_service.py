@@ -1587,17 +1587,28 @@ def start_controlled_facebook_publish(
                 "Facebook Page 视频运行时引用不可用，请重新完成预检。",
             )
         runtime_path = Path(runtime_video_path)
+        if not runtime_path.is_absolute():
+            raise PublishServiceError(
+                "facebook_video_runtime_path_unavailable",
+                "Facebook Page 视频运行时引用不可用，请重新完成预检。",
+            )
+        try:
+            resolved_runtime_path = runtime_path.expanduser().resolve(strict=True)
+        except (OSError, RuntimeError):
+            raise PublishServiceError(
+                "facebook_video_runtime_path_unavailable",
+                "Facebook Page 视频运行时引用不可用，请重新完成预检。",
+            ) from None
         if (
-            not runtime_path.is_absolute()
-            or not runtime_path.is_file()
-            or runtime_path.name != stored_files[0]
+            not resolved_runtime_path.is_file()
+            or resolved_runtime_path.name != stored_files[0]
         ):
             raise PublishServiceError(
                 "facebook_video_runtime_path_unavailable",
                 "Facebook Page 视频运行时引用不可用，请重新完成预检。",
             )
         worker_payload = dict(stored_payload)
-        worker_payload["fileList"] = [runtime_video_path]
+        worker_payload["fileList"] = [str(resolved_runtime_path)]
         prepared = _validate_payloads([worker_payload])
         if str(prepared[0].get("runtimeMode") or "") != "publish":
             raise PublishServiceError(

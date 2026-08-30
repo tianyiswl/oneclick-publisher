@@ -1926,6 +1926,52 @@ class FacebookPagePublishServiceTests(unittest.TestCase):
         session.assert_not_called()
         self.assertFalse(self.claim(int(task["id"]))["workerStartedAt"])
 
+    def test_runtime_video_symlink_cannot_alias_the_persisted_basename(self) -> None:
+        task, payload = self.claimed_task()
+        renamed_target = self.video.with_name("renamed-target.mp4")
+        self.video.replace(renamed_target)
+        try:
+            self.video.symlink_to(renamed_target)
+        except (NotImplementedError, OSError) as exc:
+            self.skipTest(f"symlink creation is unavailable: {type(exc).__name__}")
+        runtime_payload = {
+            **payload,
+            "fileList": [str(self.video)],
+            "facebookVideoSize": renamed_target.stat().st_size,
+        }
+
+        with (
+            patch.object(
+                publish_service,
+                "_validate_payloads",
+                return_value=[runtime_payload],
+            ) as validate,
+            patch.object(
+                controlled_publish,
+                "require_facebook_page_execution_claim",
+            ) as lease,
+            patch.object(publish_service.threading, "Thread") as worker,
+            patch.object(
+                overseas_browser_publish,
+                "_facebook_page_session",
+            ) as session,
+            self.assertRaises(Exception) as raised,
+        ):
+            publish_service.start_controlled_facebook_publish(
+                int(task["id"]),
+                runtime_video_path=str(self.video),
+            )
+
+        self.assertEqual(
+            getattr(raised.exception, "error_code", ""),
+            "facebook_video_runtime_path_unavailable",
+        )
+        validate.assert_not_called()
+        worker.assert_not_called()
+        lease.assert_not_called()
+        session.assert_not_called()
+        self.assertFalse(self.claim(int(task["id"]))["workerStartedAt"])
+
     def test_worker_start_failure_becomes_safe_failed_and_cleans_registry(self) -> None:
         task, payload = self.claimed_task()
 
