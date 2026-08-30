@@ -3,13 +3,16 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
-from app_core import account_service, database
+from app_core import account_service, database, overseas_youtube_credentials
 from app_core.overseas_meta_errors import FacebookPagePublishError
 from app_core.overseas_meta_page_identity import FacebookPageIdentity
 
@@ -333,6 +336,325 @@ class FacebookPageDatabaseTests(unittest.TestCase):
         account_service.delete_account(second)
         self.assertFalse(session.exists())
         self.assertFalse(avatar.exists())
+
+    def test_delete_preserves_relative_and_absolute_aliases_across_meta_account_types(self):
+        session = self.cookie_dir / "shared.json"
+        avatar = self.avatar_dir / "shared.png"
+        session.write_text("session", encoding="utf-8")
+        avatar.write_bytes(b"avatar")
+        page_id = self.insert_account(
+            type=9,
+            status=1,
+            account_reference="1001",
+            file_path="shared.json",
+            avatar_path="shared.png",
+        )
+        relative_alias_id = self.insert_account(
+            type=8,
+            status=1,
+            account_reference="instagram",
+            file_path="  ./shared.json  ",
+            avatar_path="  ./shared.png  ",
+        )
+        absolute_alias_id = self.insert_account(
+            type=8,
+            status=1,
+            account_reference="instagram-absolute",
+            file_path=f"  {session.resolve()}  ",
+            avatar_path=f"  {avatar.resolve()}  ",
+        )
+
+        account_service.delete_account(page_id)
+        self.assertTrue(session.exists())
+        self.assertTrue(avatar.exists())
+
+        account_service.delete_account(relative_alias_id)
+        self.assertTrue(session.exists())
+        self.assertTrue(avatar.exists())
+
+        account_service.delete_account(absolute_alias_id)
+        self.assertFalse(session.exists())
+        self.assertFalse(avatar.exists())
+
+    def test_delete_preserves_target_referenced_through_a_symlink_alias(self):
+        session = self.cookie_dir / "shared.json"
+        alias = self.cookie_dir / "alias.json"
+        session.write_text("session", encoding="utf-8")
+        try:
+            alias.symlink_to(session)
+        except OSError as exc:
+            self.skipTest(f"symlink unavailable: {exc}")
+        target_id = self.insert_account(
+            type=9,
+            status=1,
+            account_reference="1001",
+            file_path="shared.json",
+            avatar_path=None,
+        )
+        alias_id = self.insert_account(
+            type=8,
+            status=1,
+            account_reference="instagram",
+            file_path="alias.json",
+            avatar_path=None,
+        )
+
+        account_service.delete_account(target_id)
+
+        self.assertTrue(session.exists())
+        self.assertTrue(alias.is_symlink())
+        account_service.delete_account(alias_id)
+        self.assertTrue(session.exists())
+        self.assertTrue(alias.is_symlink())
+
+    def test_delete_never_maps_an_outside_path_to_a_managed_same_basename(self):
+        managed_session = self.cookie_dir / "shared.json"
+        managed_avatar = self.avatar_dir / "shared.png"
+        outside_dir = self.root / "outside"
+        outside_dir.mkdir()
+        outside_session = outside_dir / "shared.json"
+        outside_avatar = outside_dir / "shared.png"
+        managed_session.write_text("managed", encoding="utf-8")
+        managed_avatar.write_bytes(b"managed")
+        outside_session.write_text("outside", encoding="utf-8")
+        outside_avatar.write_bytes(b"outside")
+        account_id = self.insert_account(
+            type=9,
+            status=1,
+            account_reference="1001",
+            file_path=str(outside_session),
+            avatar_path=str(outside_avatar),
+        )
+
+        account_service.delete_account(account_id)
+
+        self.assertEqual(self.all_accounts(), [])
+        self.assertTrue(managed_session.exists())
+        self.assertTrue(managed_avatar.exists())
+        self.assertTrue(outside_session.exists())
+        self.assertTrue(outside_avatar.exists())
+
+    def test_malformed_remaining_references_conservatively_veto_cleanup(self):
+        session = self.cookie_dir / "shared.json"
+        avatar = self.avatar_dir / "shared.png"
+        session.write_text("session", encoding="utf-8")
+        avatar.write_bytes(b"avatar")
+        account_id = self.insert_account(
+            type=9,
+            status=1,
+            account_reference="1001",
+            file_path="shared.json",
+            avatar_path="shared.png",
+        )
+        with sqlite3.connect(self.database_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO user_info
+                    (type, filePath, userName, status, profileName, avatarPath,
+                     authMode, accountReference)
+                VALUES (8, ?, 'Malformed', 1, 'Meta 主体', ?, 'browser', '')
+                """,
+                (sqlite3.Binary(b"not-a-string"), "bad\x00avatar"),
+            )
+
+        account_service.delete_account(account_id)
+
+        self.assertNotIn(account_id, [int(row["id"]) for row in self.all_accounts()])
+        self.assertTrue(session.exists())
+        self.assertTrue(avatar.exists())
+
+    def test_malformed_deleted_references_do_not_block_row_deletion(self):
+        session = self.cookie_dir / "sentinel.json"
+        avatar = self.avatar_dir / "sentinel.png"
+        session.write_text("keep", encoding="utf-8")
+        avatar.write_bytes(b"keep")
+        with sqlite3.connect(self.database_path) as conn:
+            account_id = int(
+                conn.execute(
+                    """
+                    INSERT INTO user_info
+                        (type, filePath, userName, status, profileName,
+                         avatarPath, authMode, accountReference)
+                    VALUES (9, ?, 'Malformed', 1, 'Meta 主体', ?,
+                            'browser', '1001')
+                    """,
+                    (sqlite3.Binary(b"sentinel.json"), "sentinel.png\x00"),
+                ).lastrowid
+            )
+
+        account_service.delete_account(account_id)
+
+        self.assertEqual(self.all_accounts(), [])
+        self.assertTrue(session.exists())
+        self.assertTrue(avatar.exists())
+
+    def test_resolution_or_stat_failure_keeps_file_but_still_deletes_account(self):
+        for index, method_name in enumerate(("resolve", "lstat"), start=1):
+            with self.subTest(method_name=method_name):
+                session = self.cookie_dir / f"{method_name}.json"
+                session.write_text("session", encoding="utf-8")
+                account_id = self.insert_account(
+                    type=9,
+                    status=1,
+                    account_reference=f"10{index}",
+                    file_path=session.name,
+                    avatar_path=None,
+                )
+                original = getattr(Path, method_name)
+
+                def fail_target(path: Path, *args, _original=original, **kwargs):
+                    if path.name == session.name:
+                        raise OSError(f"{method_name} failed")
+                    return _original(path, *args, **kwargs)
+
+                with patch.object(
+                    Path,
+                    method_name,
+                    autospec=True,
+                    side_effect=fail_target,
+                ):
+                    account_service.delete_account(account_id)
+
+                self.assertEqual(self.all_accounts(), [])
+                self.assertTrue(session.exists())
+                session.unlink()
+
+    def test_samefile_failure_keeps_file_but_still_deletes_account(self):
+        session = self.cookie_dir / "shared.json"
+        hardlink = self.cookie_dir / "hardlink.json"
+        session.write_text("session", encoding="utf-8")
+        try:
+            os.link(session, hardlink)
+        except OSError as exc:
+            self.skipTest(f"hardlink unavailable: {exc}")
+        account_id = self.insert_account(
+            type=9,
+            status=1,
+            account_reference="1001",
+            file_path="shared.json",
+            avatar_path=None,
+        )
+        self.insert_account(
+            type=8,
+            status=1,
+            account_reference="instagram",
+            file_path="hardlink.json",
+            avatar_path=None,
+        )
+
+        with patch.object(os.path, "samefile", side_effect=OSError("stat failed")):
+            account_service.delete_account(account_id)
+
+        self.assertNotIn(account_id, [int(row["id"]) for row in self.all_accounts()])
+        self.assertTrue(session.exists())
+
+    def test_unlink_failure_keeps_file_but_still_deletes_account(self):
+        session = self.cookie_dir / "shared.json"
+        session.write_text("session", encoding="utf-8")
+        account_id = self.insert_account(
+            type=9,
+            status=1,
+            account_reference="1001",
+            file_path="shared.json",
+            avatar_path=None,
+        )
+
+        with patch.object(Path, "unlink", side_effect=OSError("unlink failed")):
+            account_service.delete_account(account_id)
+
+        self.assertEqual(self.all_accounts(), [])
+        self.assertTrue(session.exists())
+
+    def test_delete_holds_write_lock_through_final_reference_scan_and_unlink(self):
+        session = self.cookie_dir / "shared.json"
+        session.write_text("session", encoding="utf-8")
+        account_id = self.insert_account(
+            type=9,
+            status=1,
+            account_reference="1001",
+            file_path="shared.json",
+            avatar_path=None,
+        )
+        insert_attempted = threading.Event()
+        insert_finished = threading.Event()
+        insert_errors: list[Exception] = []
+        writer: threading.Thread | None = None
+        real_unlink = Path.unlink
+
+        def insert_competing_reference() -> None:
+            try:
+                with sqlite3.connect(self.database_path, timeout=5) as conn:
+                    insert_attempted.set()
+                    conn.execute(
+                        """
+                        INSERT INTO user_info
+                            (type, filePath, userName, status, profileName,
+                             authMode, accountReference)
+                        VALUES (8, 'shared.json', 'Concurrent', 1, 'Meta 主体',
+                                'browser', 'instagram')
+                        """
+                    )
+            except Exception as exc:
+                insert_errors.append(exc)
+            finally:
+                insert_finished.set()
+
+        def observe_lock(path: Path, *args, **kwargs):
+            nonlocal writer
+            if path.name == session.name:
+                writer = threading.Thread(target=insert_competing_reference)
+                writer.start()
+                self.assertTrue(insert_attempted.wait(1))
+                time.sleep(0.1)
+                self.assertFalse(insert_finished.is_set())
+            return real_unlink(path, *args, **kwargs)
+
+        with patch.object(Path, "unlink", autospec=True, side_effect=observe_lock):
+            account_service.delete_account(account_id)
+
+        self.assertIsNotNone(writer)
+        writer.join(timeout=5)
+        self.assertFalse(writer.is_alive())
+        self.assertEqual(insert_errors, [])
+        self.assertTrue(insert_finished.is_set())
+        self.assertFalse(session.exists())
+
+    def test_shared_oauth_credential_is_removed_only_after_last_reference(self):
+        with sqlite3.connect(self.database_path) as conn:
+            first = int(
+                conn.execute(
+                    """
+                    INSERT INTO user_info
+                        (type, filePath, userName, status, profileName, avatarPath,
+                         authMode, accountReference)
+                    VALUES (7, 'youtube-oauth:shared', 'First', 1, 'YouTube',
+                            NULL, 'youtube_oauth', 'UC1')
+                    """
+                ).lastrowid
+            )
+            second = int(
+                conn.execute(
+                    """
+                    INSERT INTO user_info
+                        (type, filePath, userName, status, profileName, avatarPath,
+                         authMode, accountReference)
+                    VALUES (7, 'youtube-oauth:shared', 'Second', 1, 'YouTube',
+                            NULL, 'youtube_oauth', 'UC2')
+                    """
+                ).lastrowid
+            )
+        store = MagicMock()
+
+        with patch.object(
+            overseas_youtube_credentials,
+            "KeyringOAuthCredentialStore",
+            return_value=store,
+        ):
+            account_service.delete_account(first)
+            store.delete_refresh_token.assert_not_called()
+            account_service.delete_account(second)
+
+        store.delete_refresh_token.assert_called_once_with("youtube-oauth:shared")
 
     def test_page_save_never_inserts_an_instagram_row(self):
         database.ensure_schema()

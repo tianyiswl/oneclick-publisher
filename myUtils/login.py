@@ -9,6 +9,9 @@ from PIL import Image
 
 from app_core.database import open_connection
 from app_core import account_service
+from app_core.managed_artifact_cleanup import (
+    unlink_managed_artifact_if_unreferenced,
+)
 from app_core.overseas_meta_errors import FacebookPagePublishError
 from app_core.overseas_meta_page_identity import (
     FacebookPageIdentity,
@@ -484,69 +487,22 @@ def _remove_replaced_facebook_page_session(
 ) -> None:
     """Best-effort removal of one committed Page login's unreferenced old state."""
 
-    old_value = str(previous_account.get("filePath") or "").strip()
-    if (
-        not old_value
-        or old_value != Path(old_value).name
-        or old_value == Path(current_cookie).name
-    ):
+    old_value = previous_account.get("filePath")
+    if not old_value:
         return
     try:
-        managed_dir = Path(BASE_DIR / "cookiesFile").resolve(strict=True)
-        candidate = managed_dir / old_value
-        if candidate.is_symlink():
-            return
-        resolved_candidate = candidate.resolve(strict=False)
-        if resolved_candidate.parent != managed_dir:
-            return
-
         db_path = Path(BASE_DIR / "db" / "database.db")
         with open_connection(db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
-            for row in conn.execute("SELECT filePath FROM user_info"):
-                resolved_reference, safe = _resolve_managed_cookie_reference(
-                    row[0],
-                    managed_dir=managed_dir,
-                )
-                if not safe:
-                    return
-                if resolved_reference == resolved_candidate:
-                    return
-                if resolved_reference is not None and resolved_reference.exists():
-                    try:
-                        if os.path.samefile(resolved_reference, resolved_candidate):
-                            return
-                    except OSError:
-                        return
-            candidate.unlink(missing_ok=True)
+            unlink_managed_artifact_if_unreferenced(
+                conn,
+                raw_target=old_value,
+                managed_dir=Path(BASE_DIR / "cookiesFile"),
+                reference_column="filePath",
+            )
     except Exception:
         # The new account row has already committed; cleanup cannot invalidate it.
         return
-
-
-def _resolve_managed_cookie_reference(
-    raw_value,
-    *,
-    managed_dir: Path,
-) -> tuple[Path | None, bool]:
-    """Resolve one stored alias; unsafe values veto cleanup conservatively."""
-
-    if not isinstance(raw_value, str):
-        return None, False
-    value = raw_value.strip()
-    if not value:
-        return None, True
-    try:
-        stored_path = Path(value)
-        candidate = stored_path if stored_path.is_absolute() else managed_dir / stored_path
-        resolved = candidate.resolve(strict=False)
-    except (OSError, RuntimeError, ValueError):
-        return None, False
-    try:
-        resolved.relative_to(managed_dir)
-    except ValueError:
-        return None, True
-    return resolved, True
 
 
 def save_meta_login_accounts(cookie_file, profile_name, update_mode=False, record_id=None, avatar_path=None, display_name=None):

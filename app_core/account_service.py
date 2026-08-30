@@ -12,6 +12,7 @@ from typing import Any, Callable, Iterable
 from conf import DEBUG_SKIP_FINAL_PUBLISH
 
 from .database import connect
+from .managed_artifact_cleanup import unlink_managed_artifact_if_unreferenced
 from .overseas_meta_errors import FacebookPagePublishError
 from .overseas_meta_page_identity import (
     FacebookPageIdentity,
@@ -958,6 +959,7 @@ def accounts_requiring_check(account_ids: Iterable[int] | None = None) -> list[i
 
 def delete_account(account_id: int) -> None:
     with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             """
             SELECT filePath, avatarPath, COALESCE(authMode, 'browser') AS authMode
@@ -965,45 +967,40 @@ def delete_account(account_id: int) -> None:
             """,
             (account_id,),
         ).fetchone()
-        if row and str(row["authMode"]) == AUTH_MODE_YOUTUBE_OAUTH:
-            from .overseas_youtube_credentials import KeyringOAuthCredentialStore
-
-            KeyringOAuthCredentialStore().delete_refresh_token(
-                str(row["filePath"] or "")
-            )
+        if not row:
+            return
+        is_youtube_oauth = str(row["authMode"]) == AUTH_MODE_YOUTUBE_OAUTH
         conn.execute("DELETE FROM user_info WHERE id = ?", (account_id,))
-        remaining_file_refs = 0
-        remaining_avatar_refs = 0
-        if row and row["filePath"]:
-            remaining_file_refs = conn.execute(
-                "SELECT COUNT(*) FROM user_info WHERE filePath = ?",
-                (row["filePath"],),
-            ).fetchone()[0]
-        if row and row["avatarPath"]:
-            remaining_avatar_refs = conn.execute(
-                "SELECT COUNT(*) FROM user_info WHERE avatarPath = ?",
-                (row["avatarPath"],),
-            ).fetchone()[0]
-        conn.commit()
-    if not row:
-        return
-    if str(row["authMode"]) == AUTH_MODE_YOUTUBE_OAUTH:
-        if row["avatarPath"] and not remaining_avatar_refs:
-            avatar_path = AVATAR_DIR / Path(row["avatarPath"]).name
-            if avatar_path.exists():
-                avatar_path.unlink()
-        return
-    candidates = (
-        (COOKIE_DIR, row["filePath"], remaining_file_refs),
-        (AVATAR_DIR, row["avatarPath"], remaining_avatar_refs),
-    )
-    for base, value, remaining_refs in candidates:
-        if remaining_refs:
-            continue
-        if value:
-            path = base / Path(value).name
-            if path.exists():
-                path.unlink()
+        if is_youtube_oauth:
+            remaining_credential_ref = conn.execute(
+                """
+                SELECT 1 FROM user_info
+                WHERE COALESCE(authMode, 'browser') = ? AND filePath = ?
+                LIMIT 1
+                """,
+                (AUTH_MODE_YOUTUBE_OAUTH, row["filePath"]),
+            ).fetchone()
+            if not remaining_credential_ref:
+                from .overseas_youtube_credentials import (
+                    KeyringOAuthCredentialStore,
+                )
+
+                KeyringOAuthCredentialStore().delete_refresh_token(
+                    str(row["filePath"] or "")
+                )
+        else:
+            unlink_managed_artifact_if_unreferenced(
+                conn,
+                raw_target=row["filePath"],
+                managed_dir=COOKIE_DIR,
+                reference_column="filePath",
+            )
+        unlink_managed_artifact_if_unreferenced(
+            conn,
+            raw_target=row["avatarPath"],
+            managed_dir=AVATAR_DIR,
+            reference_column="avatarPath",
+        )
 
 
 def validate_accounts(
