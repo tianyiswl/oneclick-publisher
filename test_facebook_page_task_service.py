@@ -111,6 +111,7 @@ class FacebookPageTaskServiceTests(unittest.TestCase):
             "facebookExpectedPageReference": page_id,
             "facebookFinalCaption": "Exact caption",
             "facebookVideoSha256": "a" * 64,
+            "facebookVideoSize": 123,
             "facebookCaptionSha256": "b" * 64,
             "visibility": "public",
             "scheduleMode": "immediate",

@@ -47,6 +47,7 @@ class FacebookPagePublicEntryFixture:
         self._patches = [
             patch.object(database, "DB_PATH", self.db_path),
             patch.object(publish_tasks, "DB_PATH", self.db_path),
+            patch.object(controlled_publish, "VIDEO_DIR", self.root),
             patch.dict(
                 os.environ,
                 {
@@ -101,6 +102,7 @@ class FacebookPagePublicEntryFixture:
             "facebookVideoSha256": hashlib.sha256(
                 self.video.read_bytes()
             ).hexdigest(),
+            "facebookVideoSize": self.video.stat().st_size,
             "facebookManifestIntentSha256": "c" * 64,
             "visibility": "public",
             "enableTimer": False,
@@ -178,7 +180,6 @@ class FacebookPagePublicEntryFixture:
             "tags": ["#OneClick", "OneClick", "#OneClick"],
             "fileList": [str(alternate_video)],
             "accountDisplayNames": ["Another local display name"],
-            "controlledManifestPath": "/another/source/manifest.json",
             "contentProjectId": "gateway-equivalent-source",
             "facebookFinalCaption": alternate_caption,
             "facebookCaptionSha256": facebook_page_caption_sha256(
@@ -239,7 +240,17 @@ class FacebookPagePublicEntryFixture:
 
     @contextmanager
     def stop_at_worker_start(self):
-        def stop_before_worker(task_id: int) -> dict:
+        def stop_before_worker(
+            task_id: int,
+            *,
+            runtime_video_path: str,
+        ) -> dict:
+            runtime_path = Path(runtime_video_path)
+            if (
+                runtime_path.parent != self.root.resolve()
+                or not runtime_path.is_file()
+            ):
+                raise AssertionError("formal worker received the wrong runtime video")
             self.started_task_ids.append(int(task_id))
             return task_service.get_task(int(task_id))
 
@@ -261,7 +272,10 @@ class FacebookPagePublicEntryFixture:
         task_id = int(envelope["taskId"])
         case.assertEqual(envelope, controlled_publish.task_status(task_id))
         case.assertEqual(self.started_task_ids, [task_id])
-        start_spy.assert_called_once_with(task_id)
+        start_spy.assert_called_once_with(
+            task_id,
+            runtime_video_path=str(self.video.resolve()),
+        )
         with database.connect() as conn:
             authorizations = conn.execute(
                 """

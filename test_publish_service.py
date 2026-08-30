@@ -337,6 +337,13 @@ class FacebookPageAuthorizedSubmitTests(unittest.TestCase):
         )
         self.db_patch.start()
         self.addCleanup(self.db_patch.stop)
+        self.video_dir_patch = patch.object(
+            controlled_publish,
+            "VIDEO_DIR",
+            Path(self.tempdir.name),
+        )
+        self.video_dir_patch.start()
+        self.addCleanup(self.video_dir_patch.stop)
         database.ensure_schema()
         publish_service._active_threads.clear()
         self.addCleanup(publish_service._active_threads.clear)
@@ -366,6 +373,7 @@ class FacebookPageAuthorizedSubmitTests(unittest.TestCase):
             "facebookVideoSha256": hashlib.sha256(
                 self.video.read_bytes()
             ).hexdigest(),
+            "facebookVideoSize": self.video.stat().st_size,
             "facebookManifestIntentSha256": "d" * 64,
             "visibility": "public",
             "scheduleMode": "immediate",
@@ -435,7 +443,15 @@ class FacebookPageAuthorizedSubmitTests(unittest.TestCase):
         authorization_id: str,
         formal_payload: dict,
     ) -> dict:
-        def lease_without_thread(task_id: int) -> dict:
+        def lease_without_thread(
+            task_id: int,
+            *,
+            runtime_video_path: str,
+        ) -> dict:
+            self.assertEqual(
+                Path(runtime_video_path),
+                self.video.resolve(),
+            )
             stored = task_service.get_task(int(task_id))
             payloads = json.loads(str(stored["payloadJson"]))
             controlled_publish.require_facebook_page_execution_claim(
@@ -605,7 +621,15 @@ class FacebookPageAuthorizedSubmitTests(unittest.TestCase):
         )
         committed: list[dict] = []
 
-        def start_controlled(task_id: int) -> dict:
+        def start_controlled(
+            task_id: int,
+            *,
+            runtime_video_path: str,
+        ) -> dict:
+            self.assertEqual(
+                Path(runtime_video_path),
+                self.video.resolve(),
+            )
             with database.connect() as conn:
                 claim = conn.execute(
                     """
@@ -1087,7 +1111,9 @@ class FacebookPageAuthorizedSubmitTests(unittest.TestCase):
         with patch.object(
             publish_service,
             "start_controlled_facebook_publish",
-            side_effect=lambda task_id: task_service.get_task(int(task_id)),
+            side_effect=lambda task_id, *, runtime_video_path: (
+                task_service.get_task(int(task_id))
+            ),
         ):
             task = controlled_publish._create_claimed_facebook_page_task(
                 [payload],
@@ -1117,7 +1143,8 @@ class FacebookPageAuthorizedSubmitTests(unittest.TestCase):
             caller_barrier.wait(timeout=5)
             try:
                 returned = publish_service.start_controlled_facebook_publish(
-                    task["id"]
+                    task["id"],
+                    runtime_video_path=str(self.video.resolve()),
                 )
             except Exception as exc:
                 outcome = ("error", getattr(exc, "error_code", ""))
@@ -1172,7 +1199,9 @@ class FacebookPageAuthorizedSubmitTests(unittest.TestCase):
         with patch.object(
             publish_service,
             "start_controlled_facebook_publish",
-            side_effect=lambda task_id: task_service.get_task(int(task_id)),
+            side_effect=lambda task_id, *, runtime_video_path: (
+                task_service.get_task(int(task_id))
+            ),
         ):
             task = controlled_publish._create_claimed_facebook_page_task(
                 [payload],
@@ -1213,7 +1242,8 @@ class FacebookPageAuthorizedSubmitTests(unittest.TestCase):
         def caller(label: str) -> None:
             try:
                 returned = publish_service.start_controlled_facebook_publish(
-                    task["id"]
+                    task["id"],
+                    runtime_video_path=str(self.video.resolve()),
                 )
             except Exception as exc:
                 outcome = (

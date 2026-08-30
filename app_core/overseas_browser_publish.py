@@ -229,6 +229,18 @@ def _validate_facebook_page_payload(
             page_id=page_id,
             error_code="facebook_video_file_invalid",
         )
+    declared_video_size = sanitized.get("facebookVideoSize")
+    if declared_video_size is not None and (
+        type(declared_video_size) is not int
+        or declared_video_size < 0
+        or declared_video_size != video_size
+    ):
+        raise _facebook_validation_error(
+            "Facebook Page Reel 视频大小与授权快照不一致。",
+            page_id=page_id,
+            error_code="facebook_video_file_invalid",
+        )
+    sanitized["facebookVideoSize"] = video_size
     video_hash = str(sanitized.get("facebookVideoSha256") or "")
     if len(video_hash) != 64 or _stream_sha256(video_path) != video_hash:
         raise _facebook_validation_error(

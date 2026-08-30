@@ -1530,7 +1530,11 @@ def _run_facebook_page_publish(
         _active_threads.pop(task_id, None)
 
 
-def start_controlled_facebook_publish(task_id: int) -> dict[str, Any]:
+def start_controlled_facebook_publish(
+    task_id: int,
+    *,
+    runtime_video_path: str | None = None,
+) -> dict[str, Any]:
     """Start exactly one pre-created Page task after consuming its worker lease."""
 
     from .controlled_publish import require_facebook_page_execution_claim
@@ -1553,7 +1557,8 @@ def start_controlled_facebook_publish(task_id: int) -> dict[str, Any]:
         or not isinstance(raw_payloads, list)
         or len(raw_payloads) != 1
         or not isinstance(raw_payloads[0], dict)
-        or int(raw_payloads[0].get("type") or 0) != 9
+        or type(raw_payloads[0].get("type")) is not int
+        or raw_payloads[0].get("type") != 9
     ):
         raise PublishServiceError(
             "facebook_publish_authorization_invalid",
@@ -1561,6 +1566,12 @@ def start_controlled_facebook_publish(task_id: int) -> dict[str, Any]:
         )
     payload = dict(raw_payloads[0])
     try:
+        if type(runtime_video_path) is not str or not runtime_video_path.strip():
+            raise PublishServiceError(
+                "facebook_video_runtime_path_unavailable",
+                "Facebook Page 视频运行时引用不可用，请重新完成预检。",
+            )
+        payload["fileList"] = [runtime_video_path]
         prepared = _validate_payloads([payload])
         if str(prepared[0].get("runtimeMode") or "") != "publish":
             raise PublishServiceError(

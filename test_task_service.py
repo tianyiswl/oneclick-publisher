@@ -2445,6 +2445,7 @@ class FacebookPageTaskPersistenceTests(unittest.TestCase):
             "debugDryRun": True,
             "facebookExpectedPageReference": "1001",
             "facebookVideoSha256": "a" * 64,
+            "facebookVideoSize": 123,
             "facebookCaptionSha256": "b" * 64,
             "visibility": "public",
         }

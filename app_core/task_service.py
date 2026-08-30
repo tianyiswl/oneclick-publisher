@@ -757,6 +757,36 @@ def delete_tasks(task_ids: list[int]) -> int:
     return int(cursor.rowcount)
 
 
+def _persistent_task_payloads(payloads: list[dict]) -> list[dict]:
+    """Return DB-safe copies while leaving worker payloads untouched."""
+
+    persisted: list[dict] = []
+    for raw in payloads:
+        payload = dict(raw)
+        if type(payload.get("type")) is int and payload.get("type") == 9:
+            file_list = payload.get("fileList")
+            if (
+                not isinstance(file_list, list)
+                or len(file_list) != 1
+                or type(file_list[0]) is not str
+                or not Path(file_list[0]).name
+            ):
+                raise ValueError("Facebook Page 视频任务缺少安全素材引用")
+            source_path = Path(file_list[0])
+            video_size = payload.get("facebookVideoSize")
+            if type(video_size) is not int or video_size < 0:
+                try:
+                    video_size = source_path.stat().st_size
+                except OSError as exc:
+                    raise ValueError(
+                        "Facebook Page 视频任务缺少安全素材大小"
+                    ) from exc
+            payload["fileList"] = [source_path.name]
+            payload["facebookVideoSize"] = video_size
+        persisted.append(payload)
+    return persisted
+
+
 def _insert_pending_task(
     conn,
     payloads: list[dict],
@@ -765,6 +795,7 @@ def _insert_pending_task(
     resume_source_task_id: int | None = None,
     revision_source_task_id: int | None = None,
 ) -> dict:
+    payloads = _persistent_task_payloads(payloads)
     project_ids = {
         str(payload.get("contentProjectId") or "").strip().lower()
         for payload in payloads

@@ -36,6 +36,7 @@ from .overseas_meta_errors import (
     project_facebook_page_receipt,
 )
 from .overseas_meta_page_identity import facebook_page_v1_enabled
+from .paths import VIDEO_DIR
 from .tiktok_schedule_contract import (
     TikTokScheduleContractError,
     TikTokScheduleIntent,
@@ -470,6 +471,7 @@ def build_controlled_payloads(
         tiktok_video_sha256 = ""
         facebook_expected_page_reference = ""
         facebook_video_sha256 = ""
+        facebook_video_size = 0
         facebook_settings: dict[str, object] | None = None
         if platform_type == 9:
             if not str(account.get("filePath") or "").strip():
@@ -502,9 +504,15 @@ def build_controlled_payloads(
                     "facebook_unsupported_publish_setting",
                     "Facebook Page 首版必须明确选择立即公开发布。",
                 )
-            facebook_video_sha256 = _facebook_video_sha256(
-                Path(str(bundle["assetPaths"][0]))
-            )
+            facebook_video_path = Path(str(bundle["assetPaths"][0]))
+            facebook_video_sha256 = _facebook_video_sha256(facebook_video_path)
+            try:
+                facebook_video_size = facebook_video_path.stat().st_size
+            except OSError as exc:
+                raise ControlledPublishError(
+                    "facebook_video_file_invalid",
+                    "Facebook Page 视频素材无法安全读取。",
+                ) from exc
             facebook_settings = {"visibility": "public"}
         if platform_type == 6:
             tiktok_schedule_intent = _tiktok_target_schedule(
@@ -720,24 +728,6 @@ def build_controlled_payloads(
                 }
             )
         elif platform_type == 9 and facebook_settings is not None:
-            manifest_intent = {
-                "schemaVersion": str(bundle.get("schemaVersion") or ""),
-                "contentType": str(bundle.get("contentType") or ""),
-                "title": str(bundle.get("title") or ""),
-                "body": str(bundle.get("body") or ""),
-                "tags": [str(item) for item in bundle.get("tags") or []],
-                "preferredPlatforms": sorted(
-                    oneclick_capabilities.canonical_platform(item)
-                    for item in bundle.get("preferredPlatforms") or []
-                ),
-                "platformOverride": dict(override),
-            }
-            encoded_manifest_intent = json.dumps(
-                manifest_intent,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
             payload.update(facebook_settings)
             payload.update(
                 {
@@ -757,9 +747,10 @@ def build_controlled_payloads(
                     "facebookFinalCaption": facebook_final_caption,
                     "facebookCaptionSha256": facebook_caption_sha256,
                     "facebookVideoSha256": facebook_video_sha256,
-                    "facebookManifestIntentSha256": hashlib.sha256(
-                        encoded_manifest_intent.encode("utf-8")
-                    ).hexdigest(),
+                    "facebookVideoSize": facebook_video_size,
+                    "facebookManifestIntentSha256": (
+                        _facebook_manifest_intent_sha256(bundle, override)
+                    ),
                 }
             )
             validate_facebook_page_v1_metadata(payload)
@@ -800,6 +791,33 @@ def _facebook_video_sha256(path: Path) -> str:
             "Facebook Page 视频素材无法安全读取。",
         ) from exc
     return digest.hexdigest()
+
+
+def _facebook_manifest_intent_sha256(
+    bundle: Mapping[str, Any],
+    override: Mapping[str, Any],
+) -> str:
+    """Hash the exact safe bundle fields that authorize one Page publication."""
+
+    manifest_intent = {
+        "schemaVersion": str(bundle.get("schemaVersion") or ""),
+        "contentType": str(bundle.get("contentType") or ""),
+        "title": str(bundle.get("title") or ""),
+        "body": str(bundle.get("body") or ""),
+        "tags": [str(item) for item in bundle.get("tags") or []],
+        "preferredPlatforms": sorted(
+            oneclick_capabilities.canonical_platform(item)
+            for item in bundle.get("preferredPlatforms") or []
+        ),
+        "platformOverride": dict(override),
+    }
+    encoded = json.dumps(
+        manifest_intent,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def _facebook_metadata_has_value(value: object) -> bool:
@@ -996,6 +1014,8 @@ def facebook_replay_fingerprint(
     page_id = str(payload.get("facebookExpectedPageReference") or "")
     file_list = payload.get("fileList")
     caption = payload.get("facebookFinalCaption")
+    video_hash = payload.get("facebookVideoSha256")
+    video_size = payload.get("facebookVideoSize")
     if (
         str(payload.get("contentType") or "") != "video"
         or not page_id.isascii()
@@ -1003,6 +1023,10 @@ def facebook_replay_fingerprint(
         or not isinstance(file_list, list)
         or len(file_list) != 1
         or type(file_list[0]) is not str
+        or not Path(file_list[0]).name
+        or type(video_hash) is not str
+        or _SAFE_SHA256_RE.fullmatch(video_hash) is None
+        or (video_size is not None and (type(video_size) is not int or video_size < 0))
         or type(caption) is not str
         or not caption
     ):
@@ -1010,10 +1034,16 @@ def facebook_replay_fingerprint(
             "facebook_unsupported_publish_setting",
             "Facebook Page 重放指纹只支持单 Page 和单 Reel 请求。",
         )
+    video_path = Path(file_list[0])
+    replay_video_hash = (
+        _facebook_video_sha256(video_path)
+        if video_path.is_absolute() and video_path.is_file()
+        else video_hash
+    )
     normalized = {
         "contentKind": "reel",
         "pageId": page_id,
-        "videoSha256": _facebook_video_sha256(Path(file_list[0])),
+        "videoSha256": replay_video_hash,
         "captionSha256": facebook_page_caption_sha256(caption),
         "visibility": "public",
         "publishIntent": "immediate_public",
@@ -1067,6 +1097,134 @@ def _single_facebook_page_payload(
         raise _facebook_authorization_invalid()
     validate_facebook_page_v1_metadata(rows[0])
     return rows[0]
+
+
+def _facebook_video_runtime_path_unavailable() -> ControlledPublishError:
+    return ControlledPublishError(
+        "facebook_video_runtime_path_unavailable",
+        "Facebook Page 视频运行时引用不可用，请重新完成预检。",
+    )
+
+
+def _hydrate_facebook_page_runtime_payload(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Restore one Page video path without trusting or mutating task storage.
+
+    A controlled manifest is reloaded and re-fingerprinted.  Desktop-managed
+    media may instead resolve one safe basename inside ``VIDEO_DIR``.  The
+    returned absolute path exists only in the current call chain.
+    """
+
+    safe = _single_facebook_page_payload([payload])
+    file_list = safe.get("fileList")
+    video_hash = safe.get("facebookVideoSha256")
+    video_size = safe.get("facebookVideoSize")
+    manifest_hash = safe.get("facebookManifestIntentSha256")
+    caption = safe.get("facebookFinalCaption")
+    caption_hash = safe.get("facebookCaptionSha256")
+    if (
+        not isinstance(file_list, list)
+        or len(file_list) != 1
+        or type(file_list[0]) is not str
+        or not file_list[0]
+        or type(video_hash) is not str
+        or _SAFE_SHA256_RE.fullmatch(video_hash) is None
+        or type(manifest_hash) is not str
+        or _SAFE_SHA256_RE.fullmatch(manifest_hash) is None
+        or type(caption) is not str
+        or not caption
+        or type(caption_hash) is not str
+        or _SAFE_SHA256_RE.fullmatch(caption_hash) is None
+        or facebook_page_caption_sha256(caption) != caption_hash
+    ):
+        raise _facebook_video_runtime_path_unavailable()
+
+    raw_path = Path(file_list[0])
+    video_name = raw_path.name
+    if not video_name or video_name in {".", ".."}:
+        raise _facebook_video_runtime_path_unavailable()
+
+    manifest_path_value = str(safe.get("controlledManifestPath") or "").strip()
+    if raw_path.is_absolute():
+        candidate = raw_path
+    elif manifest_path_value:
+        try:
+            bundle = content_bundle.load_content_bundle(manifest_path_value)
+        except (content_bundle.ContentBundleError, OSError, TypeError, ValueError):
+            raise _facebook_video_runtime_path_unavailable() from None
+        asset_paths = bundle.get("assetPaths")
+        if (
+            str(bundle.get("contentType") or "") != "video"
+            or not isinstance(asset_paths, list)
+            or len(asset_paths) != 1
+            or type(asset_paths[0]) is not str
+        ):
+            raise _facebook_video_runtime_path_unavailable()
+        override: dict[str, Any] = {}
+        raw_overrides = bundle.get("platformOverrides")
+        if isinstance(raw_overrides, Mapping):
+            for platform_name, raw_override in raw_overrides.items():
+                if (
+                    oneclick_capabilities.canonical_platform(str(platform_name))
+                    == "Facebook Reels"
+                    and isinstance(raw_override, Mapping)
+                ):
+                    override = dict(raw_override)
+                    break
+        title = str(
+            override.get("title")
+            or bundle.get("commonTitle")
+            or bundle.get("title")
+            or ""
+        ).strip()
+        description = str(
+            override.get("body") or bundle.get("commonBody") or ""
+        ).strip()
+        tags = list(override.get("tags") or bundle.get("commonTags") or [])
+        rebuilt_caption = build_facebook_page_caption(
+            title=title,
+            body=description,
+            topics=tags,
+        )
+        if (
+            _facebook_manifest_intent_sha256(bundle, override) != manifest_hash
+            or title != str(safe.get("title") or "")
+            or description != str(safe.get("description") or "")
+            or tags != list(safe.get("tags") or [])
+            or rebuilt_caption != caption
+        ):
+            raise _facebook_video_runtime_path_unavailable()
+        candidate = Path(asset_paths[0])
+    else:
+        managed_root = VIDEO_DIR.expanduser().resolve()
+        candidate = (managed_root / video_name).resolve()
+        try:
+            candidate.relative_to(managed_root)
+        except ValueError:
+            raise _facebook_video_runtime_path_unavailable() from None
+
+    try:
+        resolved = candidate.expanduser().resolve(strict=True)
+        actual_size = resolved.stat().st_size
+        actual_hash = _facebook_video_sha256(resolved)
+    except (ControlledPublishError, OSError, RuntimeError):
+        raise _facebook_video_runtime_path_unavailable() from None
+    if resolved.name != video_name or actual_hash != video_hash:
+        raise _facebook_video_runtime_path_unavailable()
+    if type(video_size) is not int:
+        # Compatibility for already-running in-memory callers from before the
+        # safe-size field existed.  Sanitized task snapshots must carry it.
+        if not raw_path.is_absolute():
+            raise _facebook_video_runtime_path_unavailable()
+        video_size = actual_size
+    if video_size < 0 or actual_size != video_size:
+        raise _facebook_video_runtime_path_unavailable()
+
+    runtime = dict(safe)
+    runtime["fileList"] = [str(resolved)]
+    runtime["facebookVideoSize"] = actual_size
+    return runtime
 
 
 def facebook_form_snapshot_hash(evidence: Mapping[str, object]) -> str:
@@ -1216,18 +1374,26 @@ def facebook_preflight_receipt_hash(
     ):
         raise _facebook_authorization_invalid()
     video_path = Path(file_list[0])
+    video_name = video_path.name
+    current_video_size = preflight_payload.get("facebookVideoSize")
     try:
-        current_video_hash = _facebook_video_sha256(video_path)
-        current_video_size = video_path.stat().st_size
         expected_form_snapshot_hash = facebook_form_snapshot_hash(safe_receipt)
-    except (ControlledPublishError, OSError) as exc:
+    except ControlledPublishError as exc:
         raise _facebook_authorization_invalid() from exc
+    if type(current_video_size) is not int or current_video_size < 0:
+        if not video_path.is_absolute():
+            raise _facebook_authorization_invalid()
+        try:
+            current_video_size = video_path.stat().st_size
+        except OSError as exc:
+            raise _facebook_authorization_invalid() from exc
     if (
-        current_video_hash != video_hash
+        not video_name
+        or Path(str(item.get("filePath") or "")).name != video_name
         or safe_receipt.get("phase") != "platform_form_verified"
         or safe_receipt.get("platformWriteOccurred") is not True
         or safe_receipt.get("pageId") != page_reference
-        or safe_receipt.get("videoName") != video_path.name
+        or safe_receipt.get("videoName") != video_name
         or safe_receipt.get("videoSize") != current_video_size
         or safe_receipt.get("videoSha256") != video_hash
         or safe_receipt.get("captionSha256") != caption_hash
@@ -1474,7 +1640,7 @@ def _ensure_facebook_page_claim_schema(conn: sqlite3.Connection) -> None:
     )
 
 
-def _consume_facebook_authorization_in_transaction(
+def _validate_facebook_authorization_in_transaction(
     conn: sqlite3.Connection,
     authorization_id: str,
     preflight_task_id: int,
@@ -1482,7 +1648,9 @@ def _consume_facebook_authorization_in_transaction(
     publish_intent: str,
     preflight_receipt_hash: str,
     now: datetime | None = None,
-) -> None:
+) -> datetime:
+    """Validate one Page grant without consuming it."""
+
     _ensure_authorization_schema(conn)
     current = _utc(now)
     cursor = conn.execute(
@@ -1511,6 +1679,26 @@ def _consume_facebook_authorization_in_transaction(
         or current >= expires
     ):
         raise _facebook_authorization_invalid()
+    return current
+
+
+def _consume_facebook_authorization_in_transaction(
+    conn: sqlite3.Connection,
+    authorization_id: str,
+    preflight_task_id: int,
+    *,
+    publish_intent: str,
+    preflight_receipt_hash: str,
+    now: datetime | None = None,
+) -> None:
+    current = _validate_facebook_authorization_in_transaction(
+        conn,
+        authorization_id,
+        preflight_task_id,
+        publish_intent=publish_intent,
+        preflight_receipt_hash=preflight_receipt_hash,
+        now=now,
+    )
     updated = conn.execute(
         """
         UPDATE controlled_publish_authorizations
@@ -1631,6 +1819,14 @@ def _create_claimed_facebook_page_task(
                 int(preflight_task_id),
                 stored_payloads,
             )
+            _validate_facebook_authorization_in_transaction(
+                conn,
+                authorization_id,
+                int(preflight_task_id),
+                publish_intent=publish_intent,
+                preflight_receipt_hash=preflight_receipt_hash,
+            )
+            runtime_payload = _hydrate_facebook_page_runtime_payload(payload)
             _consume_facebook_authorization_in_transaction(
                 conn,
                 authorization_id,
@@ -1689,7 +1885,10 @@ def _create_claimed_facebook_page_task(
             raise
     from . import publish_service
 
-    return publish_service.start_controlled_facebook_publish(int(task["id"]))
+    return publish_service.start_controlled_facebook_publish(
+        int(task["id"]),
+        runtime_video_path=str(runtime_payload["fileList"][0]),
+    )
 
 
 def require_facebook_page_execution_claim(

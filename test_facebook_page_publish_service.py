@@ -23,6 +23,7 @@ from app_core import (
     publish_service,
     task_service,
 )
+from app_core.controlled_publish_process import submit_authorized_preflight_task
 from app_core.overseas_meta_errors import FacebookPagePublishError
 from uploader.meta_uploader.content_list import (
     FacebookPageContentBaseline,
@@ -133,6 +134,7 @@ class FacebookPageExecutorTests(unittest.TestCase):
             "facebookFinalCaption": self.caption,
             "facebookCaptionSha256": self.caption_hash,
             "facebookVideoSha256": self.video_hash,
+            "facebookVideoSize": self.video.stat().st_size,
             "facebookManifestIntentSha256": "d" * 64,
             "visibility": "public",
             "enableTimer": False,
@@ -356,7 +358,15 @@ class FacebookPageExecutorTests(unittest.TestCase):
         )
         payload = self.payload("publish")
 
-        def lease_without_thread(task_id: int) -> dict:
+        def lease_without_thread(
+            task_id: int,
+            *,
+            runtime_video_path: str,
+        ) -> dict:
+            self.assertEqual(
+                Path(runtime_video_path),
+                self.video.resolve(),
+            )
             stored = task_service.get_task(int(task_id))
             stored_payloads = json.loads(str(stored["payloadJson"]))
             controlled_publish.require_facebook_page_execution_claim(
@@ -718,6 +728,252 @@ class FacebookPageExecutorTests(unittest.TestCase):
         )
         self.assertNotIn(str(self.video), public_json)
         self.assertNotIn(str(self.video.parent), public_json)
+
+    def test_controlled_preflight_and_formal_keep_video_path_runtime_only(self) -> None:
+        """Catch any absolute-path persistence between the real service layers."""
+
+        body = self.video.parent / "facebook-body.md"
+        cover = self.video.parent / "facebook-cover.png"
+        manifest = self.video.parent / "manifest.json"
+        body.write_text("Exact Facebook caption", encoding="utf-8")
+        cover.write_bytes(b"bundle-cover")
+        manifest.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": "oneclick-content/v1",
+                    "contentType": "video",
+                    "title": "Exact Facebook title",
+                    "bodyFile": body.name,
+                    "tags": ["OneClick"],
+                    "assets": [self.video.name],
+                    "covers": {"3:4": cover.name},
+                    "preferredPlatforms": ["Facebook"],
+                    "platformOverrides": {
+                        "Facebook": {
+                            "title": "Exact Facebook title",
+                            "body": "Exact Facebook caption",
+                            "tags": ["OneClick"],
+                        }
+                    },
+                    "aiDisclosure": {
+                        "containsAiGeneratedContent": False,
+                        "contentKinds": [],
+                        "assetPaths": [],
+                        "allowPlatformAutoDeclaration": False,
+                    },
+                    "debugDryRun": True,
+                    "publishAllowed": False,
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        request = {
+            "projectId": "facebook-page-runtime-path-test",
+            "manifestPath": str(manifest),
+            "mode": "preflight",
+            "targets": [
+                {
+                    "platform": "Facebook",
+                    "accountId": 91,
+                    "schedule": None,
+                    "settings": {"visibility": "public"},
+                }
+            ],
+        }
+        account = {
+            "id": 91,
+            "type": 9,
+            "filePath": "facebook-page.json",
+            "profileName": "Saved Facebook Page",
+            "userName": "Saved Facebook Page",
+            "authMode": "browser",
+            "accountReference": self.page_id,
+            "status": 1,
+        }
+        payloads = controlled_publish.build_controlled_payloads(
+            request,
+            accounts=[account],
+        )
+        expected_path = str(self.video.resolve())
+        upload_inputs: list[str] = []
+        session_paths: list[str] = []
+
+        class ImmediateThread:
+            def __init__(self, *, target, args, daemon, name, kwargs=None) -> None:
+                self.target = target
+                self.args = args
+                self.kwargs = kwargs or {}
+                self.running = False
+
+            def start(self) -> None:
+                self.running = True
+                try:
+                    self.target(*self.args, **self.kwargs)
+                finally:
+                    self.running = False
+
+            def is_alive(self) -> bool:
+                return self.running
+
+        class Button:
+            async def click(self) -> None:
+                return None
+
+            async def inner_text(self) -> str:
+                return "Publish"
+
+            async def is_enabled(self) -> bool:
+                return True
+
+        class BoundaryOnlyAdapter(PageFormContract):
+            def __init__(self, page, *, wait_for_verification) -> None:
+                super().__init__(page, wait_for_verification=wait_for_verification)
+                self.caption = ""
+                self.uploaded = False
+                self.button = Button()
+
+            async def open_fresh_reel_composer(self, expected_page_id: str) -> None:
+                return None
+
+            async def _read_content_kind(self) -> str:
+                return "reel"
+
+            async def _read_restored_draft(self) -> bool:
+                return False
+
+            async def _read_video_previews(self):
+                return [(upload_inputs[-1], "completed")] if self.uploaded else []
+
+            async def _read_caption_editor(self) -> str:
+                return self.caption
+
+            async def _clear_caption_editor(self) -> None:
+                self.caption = ""
+
+            async def _upload_video_once(self, file_path: str) -> None:
+                upload_inputs.append(file_path)
+                self.uploaded = True
+
+            async def _write_caption_once(self, caption: str) -> None:
+                self.caption = caption
+
+            async def _select_public_visibility(self) -> None:
+                return None
+
+            async def _read_visibility(self) -> str:
+                return "public"
+
+            async def _recheck_expected_page(self, expected):
+                return SimpleNamespace(page_id=expected.page_id)
+
+            async def _final_action_buttons(self):
+                return [self.button]
+
+            async def _sleep(self) -> None:
+                return None
+
+        accepted_decision = self._sealed_accepted_decision(self.page_id)
+
+        class Reader:
+            def __init__(self, context, *, wait_for_verification) -> None:
+                return None
+
+            async def capture_baseline(self, expected_page_id):
+                return FacebookPageContentBaseline(
+                    page_id=expected_page_id,
+                    rows=(),
+                    captured_at="2026-08-30T00:00:00+00:00",
+                    snapshot_sha256="e" * 64,
+                )
+
+            async def read_platform_decision(self, expected_page_id, *, page):
+                return accepted_decision
+
+            async def readback_unique_reel(
+                self,
+                baseline,
+                expected_page_id,
+                expected_caption_sha256,
+                clicked_at,
+            ):
+                return FacebookReelMatch(
+                    status="unique",
+                    receipt=FacebookReelReceipt(
+                        page_id=expected_page_id,
+                        reel_id="runtime-path-reel",
+                        url="https://www.facebook.com/reel/runtime-path-reel",
+                        published_at=(
+                            datetime.fromisoformat(clicked_at)
+                            + timedelta(seconds=1)
+                        ).isoformat(),
+                    ),
+                    new_count=1,
+                    matching_count=1,
+                )
+
+        @asynccontextmanager
+        async def boundary_session(prepared):
+            session_paths.append(str(prepared["videoPath"]))
+
+            async def no_verification(_page) -> None:
+                return None
+
+            yield SimpleNamespace(), SimpleNamespace(), no_verification
+
+        publish_service._active_threads.clear()
+        self.addCleanup(publish_service._active_threads.clear)
+        with (
+            patch.object(publish_service.threading, "Thread", ImmediateThread),
+            patch.object(
+                overseas_browser_publish,
+                "_facebook_page_session",
+                side_effect=boundary_session,
+            ),
+            patch.object(
+                overseas_browser_publish,
+                "FacebookPageFormAdapter",
+                BoundaryOnlyAdapter,
+            ),
+            patch.object(
+                overseas_browser_publish,
+                "FacebookPageContentReader",
+                Reader,
+            ),
+        ):
+            preflight = publish_service.start_desktop_publish(payloads)
+            authorization = controlled_publish.authorize_completed_check(
+                int(preflight["id"])
+            )
+            formal = submit_authorized_preflight_task(
+                int(preflight["id"]),
+                str(authorization["authorizationId"]),
+            )
+
+        self.assertEqual(upload_inputs, [expected_path, expected_path])
+        self.assertEqual(session_paths, [expected_path, expected_path])
+        self.assertEqual(task_service.get_task(int(preflight["id"]))["status"], "success")
+        self.assertEqual(
+            task_service.get_task(int(formal["taskId"]))["status"],
+            "success",
+        )
+        for task_id in (int(preflight["id"]), int(formal["taskId"])):
+            stored = task_service.get_task(task_id)
+            stored_payload = json.loads(str(stored["payloadJson"]))[0]
+            self.assertEqual(stored_payload["fileList"], [self.video.name])
+            self.assertEqual(
+                stored_payload["facebookVideoSize"],
+                self.video.stat().st_size,
+            )
+            self.assertEqual(stored["items"][0]["filePath"], self.video.name)
+            persisted_json = json.dumps(stored, ensure_ascii=False, sort_keys=True)
+            public_json = json.dumps(
+                controlled_publish.project_task(stored),
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            self.assertNotIn(expected_path, persisted_json)
+            self.assertNotIn(expected_path, public_json)
 
     def test_missing_video_is_stable_and_stops_before_page_session(self) -> None:
         payload = self.payload("preflight")
@@ -1559,9 +1815,15 @@ class FacebookPagePublishServiceTests(unittest.TestCase):
             ),
             patch.object(publish_service.threading, "Thread", Worker),
         ):
-            returned = publish_service.start_controlled_facebook_publish(task["id"])
+            returned = publish_service.start_controlled_facebook_publish(
+                task["id"],
+                runtime_video_path=str(self.video.resolve()),
+            )
             with self.assertRaises(Exception) as repeated:
-                publish_service.start_controlled_facebook_publish(task["id"])
+                publish_service.start_controlled_facebook_publish(
+                    task["id"],
+                    runtime_video_path=str(self.video.resolve()),
+                )
 
         self.assertEqual(returned["id"], task["id"])
         self.assertEqual(len(starts), 1)
@@ -1570,6 +1832,57 @@ class FacebookPagePublishServiceTests(unittest.TestCase):
             "facebook_publish_authorization_invalid",
         )
         self.assertTrue(self.claim(task["id"])["workerStartedAt"])
+
+    def test_recovered_task_without_runtime_video_path_fails_before_session(self) -> None:
+        task, payload = self.claimed_task()
+        safe_payload = {
+            **payload,
+            "fileList": [self.video.name],
+            "facebookVideoSize": self.video.stat().st_size,
+        }
+        with database.connect() as conn:
+            conn.execute(
+                "UPDATE publish_tasks SET payloadJson = ? WHERE id = ?",
+                (json.dumps([safe_payload], ensure_ascii=False), int(task["id"])),
+            )
+            conn.execute(
+                "UPDATE publish_task_items SET filePath = ?, fileName = ? "
+                "WHERE taskId = ? AND platformType = 9",
+                (self.video.name, self.video.name, int(task["id"])),
+            )
+            conn.commit()
+        session_calls: list[dict] = []
+
+        @asynccontextmanager
+        async def forbidden_session(prepared):
+            session_calls.append(prepared)
+            raise AssertionError("recovered task must not open a Page session")
+            yield  # pragma: no cover - async context manager shape only
+
+        empty_managed_dir = Path(self.temporary.name) / "managed-video"
+        empty_managed_dir.mkdir()
+        with (
+            patch.dict(
+                os.environ,
+                {"ONECLICK_ENABLE_FACEBOOK_PAGE_V1": "1"},
+                clear=False,
+            ),
+            patch.object(publish_service, "VIDEO_DIR", empty_managed_dir),
+            patch.object(
+                overseas_browser_publish,
+                "_facebook_page_session",
+                side_effect=forbidden_session,
+            ),
+            self.assertRaises(Exception) as raised,
+        ):
+            publish_service.start_controlled_facebook_publish(int(task["id"]))
+
+        self.assertEqual(
+            getattr(raised.exception, "error_code", ""),
+            "facebook_video_runtime_path_unavailable",
+        )
+        self.assertEqual(session_calls, [])
+        self.assertNotIn(int(task["id"]), publish_service._active_threads)
 
     def test_worker_start_failure_becomes_safe_failed_and_cleans_registry(self) -> None:
         task, payload = self.claimed_task()
@@ -1590,7 +1903,10 @@ class FacebookPagePublishServiceTests(unittest.TestCase):
             patch.object(publish_service.threading, "Thread", Worker),
             self.assertRaisesRegex(RuntimeError, "offline worker startup failure"),
         ):
-            publish_service.start_controlled_facebook_publish(task["id"])
+            publish_service.start_controlled_facebook_publish(
+                task["id"],
+                runtime_video_path=str(self.video.resolve()),
+            )
 
         self.assertEqual(self.claim(task["id"])["state"], "safe_failed")
         self.assertNotIn(task["id"], publish_service._active_threads)

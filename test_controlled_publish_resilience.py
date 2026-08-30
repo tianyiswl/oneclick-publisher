@@ -232,6 +232,7 @@ class ControlledPublishResilienceTests(unittest.TestCase):
             "fileList": ["facebook.mp4"],
             "facebookExpectedPageReference": "1001",
             "facebookVideoSha256": "a" * 64,
+            "facebookVideoSize": 123,
             "facebookCaptionSha256": "b" * 64,
             "visibility": "public",
         }
@@ -324,6 +325,7 @@ class ControlledPublishResilienceTests(unittest.TestCase):
             "fileList": ["facebook.mp4"],
             "facebookExpectedPageReference": page_id,
             "facebookVideoSha256": "a" * 64,
+            "facebookVideoSize": 123,
             "facebookCaptionSha256": "b" * 64,
             "visibility": "public",
         }

@@ -237,6 +237,31 @@ class FacebookPageControlledPublishTests(unittest.TestCase):
                 facebook_replay_fingerprint([formal]),
             )
 
+    def test_managed_video_basename_hydrates_to_runtime_absolute_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            payload = self.build(root)
+            managed = root / "managed-video"
+            managed.mkdir()
+            managed_video = managed / Path(payload["fileList"][0]).name
+            managed_video.write_bytes(Path(payload["fileList"][0]).read_bytes())
+            safe_payload = {
+                **payload,
+                "fileList": [managed_video.name],
+                "facebookVideoSize": managed_video.stat().st_size,
+            }
+            safe_payload.pop("controlledManifestPath", None)
+
+            with patch.object(controlled_publish, "VIDEO_DIR", managed, create=True):
+                hydrate = getattr(
+                    controlled_publish,
+                    "_hydrate_facebook_page_runtime_payload",
+                    lambda _payload: {"fileList": []},
+                )
+                hydrated = hydrate(safe_payload)
+
+        self.assertEqual(hydrated["fileList"], [str(managed_video.resolve())])
+
     def test_request_preflight_and_formal_share_one_canonical_caption_hash(self) -> None:
         expected_caption = (
             "Facebook title\nsecond line\n\n"
@@ -694,8 +719,8 @@ class FacebookPageFormalClaimTests(unittest.TestCase):
         self.addCleanup(self.feature_patch.stop)
         self.worker_start_patch = patch(
             "app_core.publish_service.start_controlled_facebook_publish",
-            side_effect=lambda formal_task_id: task_service.get_task(
-                int(formal_task_id)
+            side_effect=lambda formal_task_id, *, runtime_video_path: (
+                task_service.get_task(int(formal_task_id))
             ),
         )
         self.worker_start = self.worker_start_patch.start()
@@ -731,6 +756,7 @@ class FacebookPageFormalClaimTests(unittest.TestCase):
             "facebookVideoSha256": hashlib.sha256(
                 self.video.read_bytes()
             ).hexdigest(),
+            "facebookVideoSize": self.video.stat().st_size,
             "facebookManifestIntentSha256": (
                 manifest_hash
                 or hashlib.sha256(
