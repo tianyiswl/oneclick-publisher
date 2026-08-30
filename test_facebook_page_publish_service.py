@@ -102,6 +102,7 @@ class FacebookPageExecutorTests(unittest.TestCase):
         self.click_error: BaseException | None = None
         self.snapshot_caption = self.caption
         self.snapshot_kind = "reel"
+        self.final_snapshot: FacebookPageFormSnapshot | None = None
         self.baseline_error: BaseException | None = None
         self.readback_error: BaseException | None = None
         self.match_status = "unique"
@@ -212,6 +213,20 @@ class FacebookPageExecutorTests(unittest.TestCase):
             async def final_action_button(self):
                 owner.log.append("button:resolved")
                 return self.button
+
+            async def verify_final_form(self, expected):
+                owner.log.append("form:final-verified")
+                snapshot = owner.final_snapshot or FacebookPageFormSnapshot(
+                    page_id=owner.page_id,
+                    content_kind=owner.snapshot_kind,
+                    video_name=owner.video.name,
+                    video_count=1,
+                    caption=owner.snapshot_caption,
+                    visibility="public",
+                    final_action_label="Publish",
+                    final_action_ready=True,
+                )
+                return snapshot, self.button
 
             @staticmethod
             async def _button_label(button) -> str:
@@ -1587,6 +1602,108 @@ class FacebookPageExecutorTests(unittest.TestCase):
         self.assertEqual(raised.exception.error_code, "facebook_page_form_readback_failed")
         self.assertNotIn("final_action_claimed", stages)
         self.assertEqual(self.click_count, 0)
+
+    def test_final_form_drift_after_claim_stops_before_click(self) -> None:
+        cases = (
+            (
+                "page_and_caption",
+                {
+                    "page_id": "1002",
+                    "caption": "A different Facebook caption\n\n#OneClick",
+                },
+            ),
+            ("video", {"video_name": "different-video.mp4"}),
+            ("visibility", {"visibility": "private"}),
+        )
+        for label, changes in cases:
+            with self.subTest(drift=label):
+                self.click_count = 0
+                self.final_snapshot = None
+                stages: list[str] = []
+
+                def progress(stage, receipt) -> None:
+                    stages.append(stage)
+                    if stage == "final_action_claimed":
+                        self.final_snapshot = FacebookPageFormSnapshot(
+                            page_id=changes.get("page_id", self.page_id),
+                            content_kind="reel",
+                            video_name=changes.get("video_name", self.video.name),
+                            video_count=1,
+                            caption=changes.get("caption", self.caption),
+                            visibility=changes.get("visibility", "public"),
+                            final_action_label="Publish",
+                            final_action_ready=True,
+                        )
+
+                with self.patched_runtime({"formSnapshotHash": "f" * 64}):
+                    with (
+                        patch.object(
+                            overseas_browser_publish,
+                            "_assert_authorized_form_snapshot",
+                            return_value=None,
+                            create=True,
+                        ),
+                        self.assertRaises(FacebookPagePublishError) as raised,
+                    ):
+                        overseas_browser_publish.run_facebook_page_publish_sync(
+                            self.payload("publish"),
+                            task_id=580,
+                            progress=progress,
+                        )
+
+                self.assertEqual(
+                    raised.exception.error_code,
+                    "facebook_page_form_readback_failed",
+                )
+                self.assertEqual(stages, ["final_action_claimed"])
+                self.assertEqual(self.click_count, 0)
+
+    def test_preflight_exception_is_sanitized_before_task_persistence(self) -> None:
+        task = task_service.create_pending_task(
+            [self.payload("preflight")],
+            mode="oneclick_preflight",
+        )
+        sensitive_path = "/Users/andy/private/cookiesFile/facebook-session.json"
+        raw_exception = f"browser context failed at {sensitive_path}"
+
+        @asynccontextmanager
+        async def failing_session(_prepared):
+            raise RuntimeError(raw_exception)
+            yield  # pragma: no cover - async context manager shape only
+
+        with patch.object(
+            overseas_browser_publish,
+            "_facebook_page_session",
+            side_effect=failing_session,
+        ):
+            publish_service._run_preflight(task, [self.payload("preflight")])
+
+        saved = task_service.get_task(int(task["id"]))
+        self.assertIsNotNone(saved)
+        serialized = json.dumps(
+            {
+                "item": saved["items"][0],
+                "lastError": saved["lastError"],
+                "events": saved["events"],
+                "taskProjection": saved,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        self.assertNotIn(sensitive_path, serialized)
+        self.assertNotIn(raw_exception, serialized)
+        self.assertEqual(
+            saved["items"][0]["errorCode"],
+            "facebook_page_preflight_failed",
+        )
+        self.assertEqual(
+            saved["items"][0]["message"],
+            (
+                "预检任务异常：FacebookPagePublishError："
+                "Facebook Page Reel 预检未能完成，已停止。"
+                "（错误码 facebook_page_preflight_failed）"
+            ),
+        )
 
     def test_baseline_failure_prevents_claim_and_click(self) -> None:
         self.baseline_error = FacebookPagePublishError(

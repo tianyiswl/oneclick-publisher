@@ -901,6 +901,36 @@ class FacebookPageFormTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(error.receipt["finalActionTriggered"])
         self.assertEqual(button.click_count, 0)
 
+    async def test_final_form_verifier_rechecks_page_caption_video_and_visibility(self) -> None:
+        cases = (
+            ("page", lambda adapter: setattr(adapter.page, "active_page_id", "1002")),
+            ("caption", lambda adapter: setattr(adapter, "editor_value", "changed")),
+            (
+                "video",
+                lambda adapter: setattr(adapter, "video_names", ["changed.mp4"]),
+            ),
+            (
+                "visibility",
+                lambda adapter: setattr(adapter, "visibility_value", "private"),
+            ),
+        )
+        expected = self.expectation()
+        for label, mutate in cases:
+            with self.subTest(drift=label):
+                adapter = self.adapter(
+                    pages=(("1001", "One"), ("1002", "Two")),
+                    active_page_id="1001",
+                )
+                await adapter.fill_and_readback(expected)
+                mutate(adapter)
+                with self.assertRaises(FacebookPagePublishError) as raised:
+                    await adapter.verify_final_form(expected)
+                self.assertEqual(
+                    raised.exception.error_code,
+                    "facebook_page_form_readback_failed",
+                )
+                self.assertEqual(self.final_button_click_count, 0)
+
     async def test_verification_pause_rechecks_the_same_exact_page_without_reselecting(self) -> None:
         wait_count = 0
 

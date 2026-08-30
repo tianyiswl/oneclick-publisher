@@ -376,27 +376,40 @@ def _public_form_receipt(
 async def _facebook_page_preflight_async(
     payload: Mapping[str, Any],
 ) -> dict[str, Any]:
-    prepared = _validate_facebook_page_payload(payload, mode="preflight")
-    async with _facebook_page_session(prepared) as (context, page, verifier):
-        adapter = FacebookPageFormAdapter(page, wait_for_verification=verifier)
-        snapshot = await adapter.fill_and_readback(prepared["expectation"])
-        receipt = _public_form_receipt(
-            prepared,
-            snapshot,
-            phase="platform_form_verified",
-            final_action_triggered=False,
-        )
-        publish_event(
-            "facebook_platform_form_verified",
-            "Facebook Page Reel 表单已逐字段回读，未点击最终发布按钮",
-        )
-        return {
-            "type": 9,
-            "ok": True,
-            "phase": "platform_form_verified",
-            "message": "Facebook Page Reel 表单已核对，停在最终发布按钮前。",
-            "receipt": receipt,
-        }
+    try:
+        prepared = _validate_facebook_page_payload(payload, mode="preflight")
+        async with _facebook_page_session(prepared) as (context, page, verifier):
+            adapter = FacebookPageFormAdapter(page, wait_for_verification=verifier)
+            snapshot = await adapter.fill_and_readback(prepared["expectation"])
+            receipt = _public_form_receipt(
+                prepared,
+                snapshot,
+                phase="platform_form_verified",
+                final_action_triggered=False,
+            )
+            publish_event(
+                "facebook_platform_form_verified",
+                "Facebook Page Reel 表单已逐字段回读，未点击最终发布按钮",
+            )
+            return {
+                "type": 9,
+                "ok": True,
+                "phase": "platform_form_verified",
+                "message": "Facebook Page Reel 表单已核对，停在最终发布按钮前。",
+                "receipt": receipt,
+            }
+    except FacebookPagePublishError as exc:
+        raise FacebookPagePublishError(
+            exc.error_code,
+            "Facebook Page Reel 预检未能完成，已停止。",
+            receipt=exc.receipt,
+            outcome_ambiguous=exc.outcome_ambiguous,
+        ) from exc
+    except Exception as exc:
+        raise FacebookPagePublishError(
+            "facebook_page_preflight_failed",
+            "Facebook Page Reel 预检未能完成，已停止。",
+        ) from exc
 
 
 def _run_facebook_page_preflight_form_sync(
@@ -574,6 +587,30 @@ def _outcome_receipt(
     return receipt
 
 
+def _assert_final_form_snapshot(
+    prepared: Mapping[str, Any],
+    before: FacebookPageFormSnapshot,
+    after: FacebookPageFormSnapshot,
+    baseline: FacebookPageContentBaseline,
+) -> None:
+    expected = prepared["expectation"]
+    if (
+        str(after.page_id) != str(expected.page_id)
+        or str(after.content_kind) != "reel"
+        or Path(str(after.video_name)).name != Path(str(expected.video_name)).name
+        or int(after.video_count) != 1
+        or str(after.caption) != str(expected.caption)
+        or str(after.visibility) != "public"
+        or str(after.final_action_label) != str(before.final_action_label)
+        or after.final_action_ready is not True
+    ):
+        raise FacebookPagePublishError(
+            "facebook_page_form_readback_failed",
+            "Facebook Page 最终提交前表单发生变化，已停止。",
+            receipt=_outcome_receipt(prepared, before, baseline),
+        )
+
+
 async def _facebook_page_formal_async(
     payload: Mapping[str, Any],
     *,
@@ -607,16 +644,15 @@ async def _facebook_page_formal_async(
         }
         progress("final_action_claimed", claim_receipt)
 
-        button = await adapter.final_action_button()
-        label = " ".join((await adapter._button_label(button)).split())
-        ready = bool(await adapter._button_ready(button))
-        if label != snapshot.final_action_label or not ready:
-            raise FacebookPagePublishError(
-                "facebook_page_form_readback_failed",
-                "Facebook Page 最终按钮在 claim 后发生变化，结果按未知处理。",
-                receipt=_outcome_receipt(prepared, snapshot, baseline),
-                outcome_ambiguous=True,
-            )
+        final_snapshot, button = await adapter.verify_final_form(
+            prepared["expectation"]
+        )
+        _assert_final_form_snapshot(
+            prepared,
+            snapshot,
+            final_snapshot,
+            baseline,
+        )
         await button.click()
         progress(
             "final_action_clicked",

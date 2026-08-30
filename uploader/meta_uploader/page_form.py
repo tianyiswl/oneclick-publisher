@@ -433,6 +433,68 @@ class FacebookPageFormAdapter:
             raise RuntimeError("Facebook Page Reel final action is not unique")
         return buttons[0]
 
+    async def verify_final_form(
+        self,
+        expected: FacebookPageFormExpectation,
+    ) -> tuple[FacebookPageFormSnapshot, Any]:
+        """Re-read the complete authorized form immediately before click."""
+
+        page_id, expected_caption = self._validate_expectation(expected)
+        self._current_expected = expected
+        try:
+            self._validate_local_video(expected)
+            await self._wait_for_verification(self.page)
+            selected = await self._recheck_expected_page(expected)
+            content_kind = str(await self._read_content_kind() or "").casefold()
+            restored_draft = bool(await self._read_restored_draft())
+            previews = await self._read_video_previews()
+            caption = canonical_meta_caption(await self._read_caption_editor())
+            visibility = str(await self._read_visibility() or "").casefold()
+            button = await self.final_action_button()
+            label = " ".join((await self._button_label(button)).split())
+            ready = bool(await self._button_ready(button))
+        except FacebookPagePublishError as exc:
+            if exc.error_code in {
+                "facebook_verification_required",
+                "facebook_verification_timeout",
+            }:
+                raise self._preserve_verification_error(exc, expected)
+            raise self._form_failure(expected) from exc
+        except Exception as exc:
+            raise self._form_failure(expected) from exc
+
+        if (
+            normalize_facebook_page_id(selected.page_id) != page_id
+            or content_kind != "reel"
+            or restored_draft
+            or len(previews) != 1
+            or Path(str(previews[0][0])).name != Path(expected.video_name).name
+            or str(previews[0][1] or "").casefold()
+            not in _COMPLETE_VIDEO_STATES
+            or caption != expected_caption
+            or visibility != "public"
+            or label not in _FINAL_ACTION_LABELS
+            or not ready
+        ):
+            raise self._form_failure(
+                expected,
+                final_button_enabled=ready,
+            )
+
+        return (
+            FacebookPageFormSnapshot(
+                page_id=page_id,
+                content_kind="reel",
+                video_name=Path(str(previews[0][0])).name,
+                video_count=1,
+                caption=caption,
+                visibility="public",
+                final_action_label=label,
+                final_action_ready=ready,
+            ),
+            button,
+        )
+
     async def _wait_for_completed_video(
         self,
         expected: FacebookPageFormExpectation,
