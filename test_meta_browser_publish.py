@@ -63,6 +63,51 @@ class MetaBrowserPolicyTests(unittest.TestCase):
                 "Create reel",
             )
         )
+
+    def test_page_security_wait_emits_shared_execution_lifecycle(self) -> None:
+        events: list[tuple[str, dict[str, object]]] = []
+
+        class Page:
+            url = "https://www.facebook.com/checkpoint/"
+
+        app = MetaReelVideo(
+            "",
+            "video.mp4",
+            [],
+            "facebook-page.json",
+            target_platform="facebook",
+            facebook_expected_page_id="1001",
+            execution_progress=lambda stage, receipt: events.append(
+                (stage, dict(receipt))
+            ),
+        )
+
+        async def exercise() -> None:
+            reasons = iter(("Meta 要求完成账号安全检查", None))
+            with (
+                patch(
+                    "uploader.meta_uploader.main.meta_security_intervention_reason",
+                    side_effect=lambda *_args: next(reasons),
+                ),
+                patch("uploader.meta_uploader.main._body_text", new=AsyncMock(return_value="")),
+                patch("uploader.meta_uploader.main.reveal_page_window", new=AsyncMock()),
+                patch("uploader.meta_uploader.main.asyncio.sleep", new=AsyncMock()),
+            ):
+                await app._wait_for_manual_intervention(Page())
+
+        asyncio.run(exercise())
+
+        self.assertEqual(
+            [stage for stage, _receipt in events],
+            [
+                "waiting_user_verification",
+                "verification_heartbeat",
+                "verification_resolved",
+            ],
+        )
+        self.assertTrue(
+            all(receipt == {"pageId": "1001"} for _stage, receipt in events)
+        )
         self.assertIsNotNone(
             meta_publish_success_signal(
                 url="https://business.facebook.com/latest/composer/",

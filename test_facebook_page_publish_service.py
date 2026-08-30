@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import tempfile
+import threading
 import unittest
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
@@ -284,7 +285,7 @@ class FacebookPageExecutorTests(unittest.TestCase):
                 )
 
         @asynccontextmanager
-        async def session(prepared):
+        async def session(prepared, *, progress=None):
             owner.log.append("session:open")
 
             async def verify(page) -> None:
@@ -636,7 +637,7 @@ class FacebookPageExecutorTests(unittest.TestCase):
                 return None
 
         @asynccontextmanager
-        async def boundary_session(prepared):
+        async def boundary_session(prepared, *, progress=None):
             prepared_rows.append(prepared)
 
             async def no_verification(_page) -> None:
@@ -928,7 +929,7 @@ class FacebookPageExecutorTests(unittest.TestCase):
                 )
 
         @asynccontextmanager
-        async def boundary_session(prepared):
+        async def boundary_session(prepared, *, progress=None):
             session_paths.append(str(prepared["videoPath"]))
 
             async def no_verification(_page) -> None:
@@ -997,7 +998,7 @@ class FacebookPageExecutorTests(unittest.TestCase):
         session_calls: list[dict] = []
 
         @asynccontextmanager
-        async def forbidden_session(prepared):
+        async def forbidden_session(prepared, *, progress=None):
             session_calls.append(prepared)
             raise FacebookPagePublishError(
                 "facebook_page_session_reached",
@@ -1044,7 +1045,7 @@ class FacebookPageExecutorTests(unittest.TestCase):
             return real_open(path, *args, **kwargs)
 
         @asynccontextmanager
-        async def forbidden_session(prepared):
+        async def forbidden_session(prepared, *, progress=None):
             session_calls.append(prepared)
             raise FacebookPagePublishError(
                 "facebook_page_session_reached",
@@ -1090,7 +1091,7 @@ class FacebookPageExecutorTests(unittest.TestCase):
         session_calls: list[dict] = []
 
         @asynccontextmanager
-        async def forbidden_session(prepared):
+        async def forbidden_session(prepared, *, progress=None):
             session_calls.append(prepared)
             raise FacebookPagePublishError(
                 "facebook_page_session_reached",
@@ -1405,7 +1406,7 @@ class FacebookPageExecutorTests(unittest.TestCase):
                 session_calls: list[dict] = []
 
                 @asynccontextmanager
-                async def forbidden_session(prepared):
+                async def forbidden_session(prepared, *, progress=None):
                     session_calls.append(prepared)
                     raise FacebookPagePublishError(
                         "facebook_page_session_reached",
@@ -1476,7 +1477,7 @@ class FacebookPageExecutorTests(unittest.TestCase):
                 session_calls: list[dict] = []
 
                 @asynccontextmanager
-                async def forbidden_session(prepared):
+                async def forbidden_session(prepared, *, progress=None):
                     session_calls.append(prepared)
                     raise FacebookPagePublishError(
                         "facebook_page_session_reached",
@@ -2013,7 +2014,7 @@ class FacebookPagePublishServiceTests(unittest.TestCase):
         session_calls: list[dict] = []
 
         @asynccontextmanager
-        async def forbidden_session(prepared):
+        async def forbidden_session(prepared, *, progress=None):
             session_calls.append(prepared)
             raise AssertionError("recovered task must not open a Page session")
             yield  # pragma: no cover - async context manager shape only
@@ -2165,6 +2166,11 @@ class FacebookPagePublishServiceTests(unittest.TestCase):
         observed: list[str] = []
 
         def runner(current, *, task_id, progress):
+            progress("waiting_user_verification", {"pageId": "1001"})
+            observed.append(task_service.get_task(task_id)["status"])
+            progress("verification_heartbeat", {"pageId": "1001"})
+            progress("verification_resolved", {"pageId": "1001"})
+            observed.append(task_service.get_task(task_id)["status"])
             progress("final_action_claimed", self.checkpoint_receipt(payload))
             observed.append(self.claim(task_id)["state"])
             progress("final_action_clicked", {"pageId": "1001"})
@@ -2211,9 +2217,54 @@ class FacebookPagePublishServiceTests(unittest.TestCase):
         ):
             publish_service._run_facebook_page_publish(task, [payload])
 
-        self.assertEqual(observed, ["final_action_claimed", "clicked:True"])
+        self.assertEqual(
+            observed,
+            [
+                "waiting_user_verification",
+                "running",
+                "final_action_claimed",
+                "clicked:True",
+            ],
+        )
         self.assertEqual(self.claim(task["id"])["state"], "succeeded")
         self.assertEqual(task_service.get_task(task["id"])["status"], "success")
+
+    def test_preflight_worker_persists_verification_wait_and_resumes(self) -> None:
+        formal, _payload = self.claimed_task()
+        preflight_id = int(self.claim(formal["id"])["preflightTaskId"])
+        preflight = task_service.get_task(preflight_id)
+        payloads = json.loads(preflight["payloadJson"])
+        observed: list[str] = []
+
+        def runner(current, *, task_id, progress):
+            progress("waiting_user_verification", {"pageId": "1001"})
+            observed.append(task_service.get_task(task_id)["status"])
+            progress("verification_heartbeat", {"pageId": "1001"})
+            progress("verification_resolved", {"pageId": "1001"})
+            observed.append(task_service.get_task(task_id)["status"])
+            return {
+                "ok": True,
+                "message": "Facebook Page form verified",
+                "receipt": {
+                    "pageId": "1001",
+                    "phase": "platform_form_verified",
+                    "platformWriteOccurred": True,
+                    "finalActionTriggered": False,
+                },
+            }
+
+        with patch.object(
+            publish_service.overseas_preflight,
+            "run_facebook_page_preflight_sync",
+            side_effect=runner,
+        ):
+            publish_service._active_threads[preflight_id] = threading.current_thread()
+            publish_service._run_preflight(preflight, payloads)
+
+        self.assertEqual(observed, ["waiting_user_verification", "running"])
+        saved = task_service.get_task(preflight_id)
+        self.assertEqual(saved["status"], "success")
+        self.assertEqual(saved["items"][0]["status"], "success")
 
     def test_preclaim_failure_is_safe_and_postclaim_failure_is_ambiguous(self) -> None:
         cases = ("before", "after")

@@ -169,6 +169,7 @@ _LOCATION_DIAGNOSTIC_COUNT_LIMITS = {
 _FACEBOOK_PUBLIC_PHASES = frozenset(
     {
         "local_validation_passed",
+        "checking",
         "waiting_user_verification",
         "platform_form_verified",
         "final_action_claimed",
@@ -182,6 +183,7 @@ _FACEBOOK_PUBLIC_PHASES = frozenset(
 )
 _FACEBOOK_PHASE_STATUS = {
     "local_validation_passed": "running",
+    "checking": "running",
     "waiting_user_verification": "waiting_user_verification",
     "platform_form_verified": "running",
     "final_action_claimed": "running",
@@ -194,6 +196,7 @@ _FACEBOOK_PHASE_STATUS = {
 }
 _FACEBOOK_PHASE_EVENT = {
     "local_validation_passed": "facebook_local_validation_passed",
+    "checking": "facebook_verification_checking",
     "waiting_user_verification": "facebook_waiting_user_verification",
     "platform_form_verified": "facebook_platform_form_verified",
     "final_action_claimed": "facebook_final_action_claimed",
@@ -224,6 +227,7 @@ _FACEBOOK_NONTRANSITION_PHASES_BY_CLAIM = {
     "reserved": frozenset(
         {
             "local_validation_passed",
+            "checking",
             "waiting_user_verification",
             "platform_form_verified",
         }
@@ -731,7 +735,8 @@ def delete_tasks(task_ids: list[int]) -> int:
             f"""
             SELECT taskNo, status
             FROM publish_tasks
-            WHERE id IN ({placeholders}) AND status IN ('pending', 'running')
+            WHERE id IN ({placeholders})
+              AND status IN ('pending', 'running', 'waiting_user_verification')
             ORDER BY id
             """,
             tuple(normalized_ids),
@@ -2163,7 +2168,8 @@ def touch_task_heartbeat(task_id: int) -> bool:
             """
             UPDATE publish_tasks
             SET workerPid = ?, workerHeartbeatAt = ?
-            WHERE id = ? AND status IN ('pending', 'running')
+            WHERE id = ?
+              AND status IN ('pending', 'running', 'waiting_user_verification')
             """,
             (os.getpid(), now, int(task_id)),
         )
@@ -2180,6 +2186,7 @@ _FACEBOOK_ERROR_PUBLIC_MESSAGES = {
 }
 _FACEBOOK_PHASE_PUBLIC_MESSAGES = {
     "local_validation_passed": "Facebook Page 本地校验已通过",
+    "checking": "Facebook Page 正在同一会话继续检查",
     "waiting_user_verification": "Facebook Page 需要在同一可见窗口完成安全验证",
     "platform_form_verified": "Facebook Page 表单已按授权快照回读",
     "final_action_claimed": "Facebook Page 最终动作 claim 已持久化",
@@ -2225,7 +2232,12 @@ def _facebook_public_phase(value: object) -> str:
     return phase
 
 
-def _facebook_task_item_in_transaction(conn, task_id: int):
+def _facebook_task_item_in_transaction(
+    conn,
+    task_id: int,
+    *,
+    allowed_modes: frozenset[str] = frozenset({"oneclick_publish"}),
+):
     rows = conn.execute(
         """
         SELECT item.*, task.mode AS taskMode, task.payloadJson AS taskPayloadJson,
@@ -2237,8 +2249,8 @@ def _facebook_task_item_in_transaction(conn, task_id: int):
         """,
         (int(task_id),),
     ).fetchall()
-    if len(rows) != 1 or str(rows[0]["taskMode"] or "") != "oneclick_publish":
-        raise ValueError("Facebook Page 正式任务不存在或目标不唯一")
+    if len(rows) != 1 or str(rows[0]["taskMode"] or "") not in allowed_modes:
+        raise ValueError("Facebook Page 任务不存在、模式不符或目标不唯一")
     return rows[0]
 
 
@@ -2282,6 +2294,7 @@ def _write_facebook_task_projection_in_transaction(
     event_type: str | None = None,
     now_text: str | None = None,
     status_override: str | None = None,
+    allowed_modes: frozenset[str] = frozenset({"oneclick_publish"}),
 ) -> bool:
     """Persist the Page item, parent, event and heartbeat in one transaction."""
 
@@ -2294,11 +2307,11 @@ def _write_facebook_task_projection_in_transaction(
         "failed",
     }:
         raise ValueError("Facebook Page 任务状态无效")
-    safe_error = "" if item_status in {
-        "running",
-        "waiting_user_verification",
-        "success",
-    } else _stable_error_code(error_code)
+    safe_error = (
+        ""
+        if item_status in {"running", "waiting_user_verification", "success"}
+        else _stable_error_code(error_code)
+    )
     if item_status == "failed" and not safe_error:
         safe_error = (
             "facebook_publish_rejected"
@@ -2317,7 +2330,11 @@ def _write_facebook_task_projection_in_transaction(
         sort_keys=True,
         separators=(",", ":"),
     )
-    item = _facebook_task_item_in_transaction(conn, int(task_id))
+    item = _facebook_task_item_in_transaction(
+        conn,
+        int(task_id),
+        allowed_modes=allowed_modes,
+    )
     terminal = item_status in {"success", "failed"}
     changed_at = str(now_text or _now())
     reel_id = str(safe_receipt.get("reelId") or "")
@@ -2386,7 +2403,7 @@ def _write_facebook_task_projection_in_transaction(
         conn,
         task_id=int(task_id),
         item_id=int(item["id"]),
-        level="error" if safe_error else "info",
+        level="error" if item_status == "failed" else "info",
         event_type=str(event_type or _FACEBOOK_PHASE_EVENT[public_phase]),
         message=public_message,
         receipt_json=receipt_json,
@@ -2637,6 +2654,91 @@ def record_facebook_progress(
             raise
 
 
+def record_facebook_verification_state(
+    task_id: int,
+    *,
+    waiting: bool,
+    receipt: Mapping[str, object],
+) -> None:
+    """Persist a Page verification pause/resume without changing its claim."""
+
+    from . import controlled_publish
+
+    allowed_modes = frozenset({"oneclick_preflight", "oneclick_publish"})
+    with connect() as conn:
+        controlled_publish._ensure_facebook_page_claim_schema(conn)
+        conn.commit()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            item = _facebook_task_item_in_transaction(
+                conn,
+                int(task_id),
+                allowed_modes=allowed_modes,
+            )
+            values = dict(receipt)
+            page_id = str(values.get("pageId") or "")
+            resume_phase = "checking"
+            if str(item["taskMode"] or "") == "oneclick_publish":
+                claim_row = conn.execute(
+                    "SELECT * FROM facebook_page_publish_claims "
+                    "WHERE taskId = ?",
+                    (int(task_id),),
+                ).fetchone()
+                claim_state = str(claim_row["state"] or "") if claim_row else ""
+                if claim_state not in {
+                    "reserved",
+                    "final_action_claimed",
+                    "final_action_clicked",
+                }:
+                    raise controlled_publish.ControlledPublishError(
+                        "facebook_claim_lifecycle_invalid",
+                        "Facebook Page 当前 claim 不接受验证等待。",
+                    )
+                expected_page = str(claim_row["pageReference"] or "")
+                if page_id not in {"", expected_page}:
+                    raise controlled_publish.ControlledPublishError(
+                        "facebook_claim_lifecycle_invalid",
+                        "Facebook Page 验证主体与 claim 不一致。",
+                    )
+                if claim_state in {"final_action_claimed", "final_action_clicked"}:
+                    evidence = controlled_publish._validated_facebook_page_claim_evidence(
+                        dict(claim_row)
+                    )
+                    values = dict(evidence["receipt"])
+                    resume_phase = claim_state
+                values["pageId"] = expected_page
+            if waiting:
+                try:
+                    stored = project_facebook_page_receipt(
+                        json.loads(str(item["receiptJson"] or "{}"))
+                    )
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    stored = {}
+                values = {**stored, **values}
+            _write_facebook_task_projection_in_transaction(
+                conn,
+                int(task_id),
+                phase=(
+                    "waiting_user_verification"
+                    if waiting
+                    else resume_phase
+                ),
+                message="",
+                error_code="",
+                receipt=values,
+                event_type=(
+                    "facebook_waiting_user_verification"
+                    if waiting
+                    else "facebook_user_verification_resolved"
+                ),
+                allowed_modes=allowed_modes,
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+
 def mark_facebook_result(
     task_id: int,
     *,
@@ -2740,11 +2842,13 @@ def mark_facebook_result(
                 )
                 authoritative = dict(transition["receipt"])
                 public_phase = "ambiguous"
-                safe_code = safe_code or "facebook_publish_outcome_unknown"
+                if safe_code in {"", "facebook_verification_timeout"}:
+                    safe_code = "facebook_publish_outcome_unknown"
             elif state == "ambiguous":
                 controlled_publish._validated_facebook_page_claim_evidence(claim)
                 public_phase = "ambiguous"
-                safe_code = safe_code or "facebook_publish_outcome_unknown"
+                if safe_code in {"", "facebook_verification_timeout"}:
+                    safe_code = "facebook_publish_outcome_unknown"
             elif state == "confirmed_not_published":
                 controlled_publish._validated_facebook_page_claim_evidence(claim)
                 public_phase = "confirmed_not_published"
@@ -3019,7 +3123,8 @@ def _fail_active_task_in_transaction(
             startedAt = COALESCE(startedAt, ?), finishedAt = ?,
             receiptJson = CASE WHEN ? <> '' THEN ? ELSE receiptJson END,
             publishedAt = CASE WHEN ? THEN '' ELSE publishedAt END
-        WHERE taskId = ? AND status IN ('pending', 'running')
+        WHERE taskId = ?
+          AND status IN ('pending', 'running', 'waiting_user_verification')
         """,
         (
             public_message,

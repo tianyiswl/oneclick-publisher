@@ -769,9 +769,34 @@ def _run_preflight(task: dict, payloads: list[dict[str, Any]]) -> None:
                         payload
                     )
                 elif platform_type == 9:
+                    def facebook_verification_progress(
+                        stage: str,
+                        receipt: Mapping[str, object],
+                    ) -> None:
+                        if stage == "waiting_user_verification":
+                            task_service.record_facebook_verification_state(
+                                int(task["id"]),
+                                waiting=True,
+                                receipt=receipt,
+                            )
+                        elif stage == "verification_heartbeat":
+                            if not task_service.touch_task_heartbeat(int(task["id"])):
+                                raise RuntimeError(
+                                    "Facebook Page 预检验证等待任务已失去执行租约"
+                                )
+                        elif stage == "verification_resolved":
+                            task_service.record_facebook_verification_state(
+                                int(task["id"]),
+                                waiting=False,
+                                receipt=receipt,
+                            )
+                        else:
+                            raise ValueError("未知的 Facebook Page 预检验证进度")
+
                     result = overseas_preflight.run_facebook_page_preflight_sync(
                         payload,
                         task_id=int(task["id"]),
+                        progress=facebook_verification_progress,
                     )
                 elif platform_type in {6, 7, 8}:
                     result = overseas_preflight.run_overseas_preflight_sync(payload)
@@ -1373,7 +1398,22 @@ def _run_facebook_page_publish(
     def progress(stage: str, receipt: Any) -> None:
         nonlocal claim_state, platform_decision
         evidence = dict(receipt) if isinstance(receipt, Mapping) else {}
-        if stage == "final_action_claimed":
+        if stage == "waiting_user_verification":
+            task_service.record_facebook_verification_state(
+                task_id,
+                waiting=True,
+                receipt=evidence,
+            )
+        elif stage == "verification_heartbeat":
+            if not task_service.touch_task_heartbeat(task_id):
+                raise RuntimeError("Facebook Page 验证等待任务已失去执行租约")
+        elif stage == "verification_resolved":
+            task_service.record_facebook_verification_state(
+                task_id,
+                waiting=False,
+                receipt=evidence,
+            )
+        elif stage == "final_action_claimed":
             mark_facebook_page_checkpoint(
                 task_id,
                 expected_state="reserved",

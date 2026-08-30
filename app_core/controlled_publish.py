@@ -3623,6 +3623,13 @@ def project_task(task: Mapping[str, Any] | None) -> dict[str, Any]:
         stage = "succeeded"
     elif task_status_value in {"failed", "partial_failed"}:
         stage = "failed"
+    elif task_status_value == "waiting_user_verification":
+        stage = "waiting_verification"
+        user_action = {
+            "code": "facebook_verification_required",
+            "type": "facebook_security_check",
+            "message": "请在同一可见窗口完成 Facebook 安全验证",
+        }
     elif phase == "preflight":
         stage = "checking"
     elif phase == "local_check":
@@ -3761,6 +3768,7 @@ def project_task(task: Mapping[str, Any] | None) -> dict[str, Any]:
                 receipt = dict(facebook_claim_receipt)
             approved_phases = {
                 "local_validation_passed",
+                "checking",
                 "waiting_user_verification",
                 "platform_form_verified",
                 "final_action_claimed",
@@ -3808,6 +3816,7 @@ def project_task(task: Mapping[str, Any] | None) -> dict[str, Any]:
             if status == "waiting_user_verification":
                 action_required = {
                     "code": "facebook_verification_required",
+                    "type": "facebook_security_check",
                     "message": "请在同一可见窗口完成 Facebook 安全验证",
                 }
             error_message = message if status == "failed" else ""

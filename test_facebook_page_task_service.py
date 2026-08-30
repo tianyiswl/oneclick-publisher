@@ -557,6 +557,70 @@ class FacebookPageTaskServiceTests(unittest.TestCase):
         self.assertNotIn("session-secret", serialized)
         self.assertNotIn("654321", serialized)
 
+    def test_preflight_verification_wait_projects_and_resumes_without_failure(self) -> None:
+        formal_task_id, page_id = self.facebook_task()
+        preflight_task_id = int(self.claim(formal_task_id)["preflightTaskId"])
+
+        task_service.record_facebook_verification_state(
+            preflight_task_id,
+            waiting=True,
+            receipt={"pageId": page_id},
+        )
+
+        waiting = self.projection(preflight_task_id)
+        self.assertEqual(waiting["status"], "waiting_user_verification")
+        self.assertEqual(waiting["phase"], "waiting_user_verification")
+        self.assertEqual(waiting["stage"], "waiting_verification")
+        self.assertEqual(waiting["errorCode"], "")
+        self.assertEqual(
+            waiting["actionRequired"]["code"],
+            "facebook_verification_required",
+        )
+        self.assertTrue(task_service.touch_task_heartbeat(preflight_task_id))
+        with self.assertRaisesRegex(ValueError, "不能删除"):
+            task_service.delete_tasks([preflight_task_id])
+
+        task_service.record_facebook_verification_state(
+            preflight_task_id,
+            waiting=False,
+            receipt={"pageId": page_id},
+        )
+
+        resumed = self.projection(preflight_task_id)
+        self.assertEqual(resumed["status"], "running")
+        self.assertEqual(resumed["phase"], "checking")
+        self.assertIsNone(resumed["actionRequired"])
+
+    def test_formal_verification_is_claim_preserving_overlay_before_and_after_click(self) -> None:
+        for claim_state, resumed_phase in (
+            ("reserved", "checking"),
+            ("final_action_claimed", "final_action_claimed"),
+            ("final_action_clicked", "final_action_clicked"),
+        ):
+            with self.subTest(claim_state=claim_state):
+                task_id, page_id = self.facebook_task(state=claim_state)
+
+                task_service.record_facebook_verification_state(
+                    task_id,
+                    waiting=True,
+                    receipt={"pageId": page_id},
+                )
+                self.assertEqual(self.claim(task_id)["state"], claim_state)
+                self.assertEqual(
+                    self.projection(task_id)["status"],
+                    "waiting_user_verification",
+                )
+
+                task_service.record_facebook_verification_state(
+                    task_id,
+                    waiting=False,
+                    receipt={"pageId": page_id},
+                )
+                resumed = self.projection(task_id)
+                self.assertEqual(self.claim(task_id)["state"], claim_state)
+                self.assertEqual(resumed["status"], "running")
+                self.assertEqual(resumed["phase"], resumed_phase)
+
     def test_raw_message_secrets_never_enter_item_event_or_ui_projection(self) -> None:
         task_id, page_id = self.facebook_task()
         unsafe_message = (
@@ -983,10 +1047,8 @@ class FacebookPageTaskServiceTests(unittest.TestCase):
     def test_nontransition_progress_must_match_the_live_claim_phase(self) -> None:
         incompatible = (
             ("reserved", "platform_accepted"),
-            ("final_action_claimed", "waiting_user_verification"),
             ("final_action_claimed", "platform_form_verified"),
             ("final_action_clicked", "local_validation_passed"),
-            ("final_action_clicked", "waiting_user_verification"),
             ("ambiguous", "platform_accepted"),
         )
         for state, phase in incompatible:
@@ -1398,6 +1460,69 @@ class FacebookPageTaskServiceTests(unittest.TestCase):
         saved = task_service.get_task(task_id)
         self.assertEqual(saved["status"], "failed")
         self.assertEqual(saved["items"][0]["errorCode"], "facebook_worker_interrupted")
+
+    def test_stale_post_click_verification_wait_becomes_ambiguous_not_retryable(self) -> None:
+        task_id, page_id = self.facebook_task(
+            state="final_action_clicked",
+            stale=True,
+        )
+        task_service.record_facebook_verification_state(
+            task_id,
+            waiting=True,
+            receipt={"pageId": page_id},
+        )
+        with database.connect() as conn:
+            stale = (datetime.now() - timedelta(minutes=5)).isoformat()
+            conn.execute(
+                "UPDATE publish_tasks SET workerHeartbeatAt = ? WHERE id = ?",
+                (stale, task_id),
+            )
+            conn.commit()
+
+        self.assertTrue(
+            task_service.reconcile_stale_controlled_task(
+                task_id,
+                lease_seconds=30,
+            )
+        )
+
+        saved = task_service.get_task(task_id)
+        self.assertEqual(self.claim(task_id)["state"], "ambiguous")
+        self.assertEqual(saved["status"], "failed")
+        self.assertEqual(
+            saved["items"][0]["errorCode"],
+            "facebook_publish_outcome_unknown",
+        )
+
+    def test_verification_timeout_is_retryable_only_before_final_boundary(self) -> None:
+        reserved_id, reserved_page = self.facebook_task(state="reserved")
+        clicked_id, clicked_page = self.facebook_task(
+            state="final_action_clicked"
+        )
+
+        task_service.mark_facebook_result(
+            reserved_id,
+            ok=False,
+            message="verification timed out",
+            error_code="facebook_verification_timeout",
+            receipt={"pageId": reserved_page},
+        )
+        task_service.mark_facebook_result(
+            clicked_id,
+            ok=False,
+            message="verification timed out after click",
+            error_code="facebook_verification_timeout",
+            receipt={"pageId": clicked_page},
+        )
+
+        self.assertEqual(
+            task_service.get_task(reserved_id)["items"][0]["errorCode"],
+            "facebook_verification_timeout",
+        )
+        self.assertEqual(
+            task_service.get_task(clicked_id)["items"][0]["errorCode"],
+            "facebook_publish_outcome_unknown",
+        )
 
     def test_two_stale_reconcilers_are_idempotent(self) -> None:
         task_id, _ = self.facebook_task(state="reserved", stale=True)

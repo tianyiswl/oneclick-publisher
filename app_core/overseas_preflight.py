@@ -10,7 +10,7 @@ YouTube 在上传后可能由平台保留私密内容，必须在结果中明确
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from myUtils.postVideo import (
     post_video_instagram,
@@ -49,6 +49,7 @@ def run_facebook_page_preflight_sync(
     payload: dict[str, Any],
     *,
     task_id: int,
+    progress: Callable[[str, Mapping[str, object]], None] | None = None,
 ) -> dict[str, Any]:
     """Run one Page form check with durable task context and no final click."""
 
@@ -61,7 +62,8 @@ def run_facebook_page_preflight_sync(
         background_mode=False,
     ):
         return overseas_browser_publish._run_facebook_page_preflight_form_sync(
-            payload
+            payload,
+            progress=progress,
         )
 
 

@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime
 from pathlib import Path
+from typing import Callable, Mapping
 
 from playwright.async_api import Playwright, async_playwright
 
@@ -176,6 +177,7 @@ class MetaReelVideo:
         facebook_expected_page_id=None,
         facebook_video_sha256=None,
         facebook_final_caption=None,
+        execution_progress: Callable[[str, Mapping[str, object]], None] | None = None,
     ):
         if target_platform not in {"instagram", "facebook"}:
             raise ValueError(f"不支持的 Meta 发布目标：{target_platform}")
@@ -200,6 +202,7 @@ class MetaReelVideo:
         self.facebook_expected_page_id = facebook_expected_page_id
         self.facebook_video_sha256 = facebook_video_sha256
         self.facebook_final_caption = facebook_final_caption
+        self.execution_progress = execution_progress
         self.publish_date = 0
         self.external_page = None
         self.external_context = None
@@ -326,6 +329,11 @@ class MetaReelVideo:
         if not reason:
             return
         await reveal_page_window(page)
+        safe_receipt = {
+            "pageId": str(self.facebook_expected_page_id or ""),
+        }
+        if self.execution_progress is not None:
+            self.execution_progress("waiting_user_verification", safe_receipt)
         publish_event(
             "meta_manual_intervention",
             f"{reason}；请在当前浏览器完成，程序会自动继续",
@@ -336,11 +344,15 @@ class MetaReelVideo:
         deadline = loop.time() + MANUAL_INTERVENTION_TIMEOUT_SECONDS
         while loop.time() < deadline:
             await asyncio.sleep(1)
+            if self.execution_progress is not None:
+                self.execution_progress("verification_heartbeat", safe_receipt)
             reason = meta_security_intervention_reason(
                 page.url,
                 await _body_text(page),
             )
             if not reason:
+                if self.execution_progress is not None:
+                    self.execution_progress("verification_resolved", safe_receipt)
                 publish_event(
                     "meta_manual_intervention_resolved",
                     "Meta 真人安全确认已完成，自动发布继续执行",

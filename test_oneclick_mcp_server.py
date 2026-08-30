@@ -11,6 +11,7 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from mcp import Client, StdioServerParameters
 
@@ -44,6 +45,12 @@ class _Gateway:
             "phase": "waiting_user_verification",
             "status": "waiting_user_verification",
             "errorCode": "",
+            "stage": "waiting_verification",
+            "actionRequired": {
+                "code": "facebook_verification_required",
+                "type": "facebook_security_check",
+                "message": "请在同一可见窗口完成 Facebook 安全验证",
+            },
             "receipt": {
                 "pageId": "1000000000001001",
                 "phase": "waiting_user_verification",
@@ -147,6 +154,50 @@ class _Gateway:
 
 
 class OneclickMcpServerTests(unittest.TestCase):
+    def test_cli_status_preserves_facebook_verification_action_without_failure(self) -> None:
+        import desktop_native_app
+
+        expected = _Gateway().task_status(7)
+        output = StringIO()
+        with (
+            patch.object(desktop_native_app, "ensure_schema"),
+            patch.object(
+                desktop_native_app.controlled_publish,
+                "task_status",
+                return_value=expected,
+            ),
+            redirect_stdout(output),
+        ):
+            exit_code = desktop_native_app.run_controlled_publish_cli(
+                SimpleNamespace(
+                    controlled_publish_action="status",
+                    controlled_publish_task_id=7,
+                )
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(json.loads(output.getvalue().strip()), expected)
+
+    def test_status_tool_preserves_facebook_verification_action_without_failure(self) -> None:
+        server = create_server(_Gateway())
+
+        result = asyncio.run(
+            server.call_tool("oneclick_task_status", {"task_id": 7})
+        ).structured_content["task"]
+
+        self.assertEqual(result["status"], "waiting_user_verification")
+        self.assertEqual(result["phase"], "waiting_user_verification")
+        self.assertEqual(result["stage"], "waiting_verification")
+        self.assertEqual(result["errorCode"], "")
+        self.assertEqual(
+            result["actionRequired"],
+            {
+                "code": "facebook_verification_required",
+                "type": "facebook_security_check",
+                "message": "请在同一可见窗口完成 Facebook 安全验证",
+            },
+        )
+
     def test_desktop_entrypoint_serves_mcp_over_stdio_without_opening_the_ui(self) -> None:
         async def inspect_entrypoint() -> tuple[set[str], str]:
             root = Path(__file__).resolve().parent

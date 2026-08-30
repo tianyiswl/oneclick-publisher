@@ -6,7 +6,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 from app_core import (
     overseas_preflight,
@@ -452,7 +452,7 @@ class PublishServiceRoutingTests(unittest.TestCase):
         ):
             publish_service._run_preflight({"id": 109}, [payload])
 
-        page_runner.assert_called_once_with(payload, task_id=109)
+        page_runner.assert_called_once_with(payload, task_id=109, progress=ANY)
         legacy.assert_not_called()
         self.assertEqual(mark.call_args.kwargs["receipt"], result["receipt"])
 

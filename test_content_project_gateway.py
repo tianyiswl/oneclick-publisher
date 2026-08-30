@@ -39,6 +39,23 @@ class _MetricsService:
 
 
 class ContentProjectGatewayTests(unittest.TestCase):
+    def test_gateway_preserves_facebook_verification_wait_projection(self) -> None:
+        expected = {
+            "taskId": 71,
+            "status": "waiting_user_verification",
+            "phase": "waiting_user_verification",
+            "stage": "waiting_verification",
+            "errorCode": "",
+            "actionRequired": {
+                "code": "facebook_verification_required",
+                "type": "facebook_security_check",
+                "message": "请在同一可见窗口完成 Facebook 安全验证",
+            },
+        }
+        gateway = ContentProjectGateway(status_reader=lambda _task_id: expected)
+
+        self.assertEqual(gateway.task_status(71), expected)
+
     @staticmethod
     def _accounts() -> list[dict]:
         return [

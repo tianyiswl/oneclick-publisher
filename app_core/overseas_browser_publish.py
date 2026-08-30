@@ -282,7 +282,11 @@ def _validate_facebook_page_payload(
 
 
 @asynccontextmanager
-async def _facebook_page_session(prepared: Mapping[str, Any]):
+async def _facebook_page_session(
+    prepared: Mapping[str, Any],
+    *,
+    progress: Callable[[str, Mapping[str, object]], None] | None = None,
+):
     """Open one isolated visible session shared by Page preflight and formal."""
 
     browser = None
@@ -309,6 +313,7 @@ async def _facebook_page_session(prepared: Mapping[str, Any]):
                     prepared["expectation"].video_sha256
                 ),
                 facebook_final_caption=str(prepared["expectation"].caption),
+                execution_progress=progress,
             )
             await page.goto(FACEBOOK_PAGE_HOME_URL, wait_until="domcontentloaded")
             await verifier_owner._wait_for_manual_intervention(page)
@@ -375,10 +380,16 @@ def _public_form_receipt(
 
 async def _facebook_page_preflight_async(
     payload: Mapping[str, Any],
+    *,
+    progress: Callable[[str, Mapping[str, object]], None] | None = None,
 ) -> dict[str, Any]:
     try:
         prepared = _validate_facebook_page_payload(payload, mode="preflight")
-        async with _facebook_page_session(prepared) as (context, page, verifier):
+        async with _facebook_page_session(prepared, progress=progress) as (
+            context,
+            page,
+            verifier,
+        ):
             adapter = FacebookPageFormAdapter(page, wait_for_verification=verifier)
             snapshot = await adapter.fill_and_readback(prepared["expectation"])
             receipt = _public_form_receipt(
@@ -414,8 +425,10 @@ async def _facebook_page_preflight_async(
 
 def _run_facebook_page_preflight_form_sync(
     payload: Mapping[str, Any],
+    *,
+    progress: Callable[[str, Mapping[str, object]], None] | None = None,
 ) -> dict[str, Any]:
-    return asyncio.run(_facebook_page_preflight_async(payload))
+    return asyncio.run(_facebook_page_preflight_async(payload, progress=progress))
 
 
 def _authorization_error() -> FacebookPagePublishError:
@@ -637,7 +650,11 @@ async def _facebook_page_formal_async(
 ) -> dict[str, Any]:
     prepared = _validate_facebook_page_payload(payload, mode="formal")
     authorized = _load_authorized_preflight_receipt(int(task_id), prepared["payload"])
-    async with _facebook_page_session(prepared) as (context, page, verifier):
+    async with _facebook_page_session(prepared, progress=progress) as (
+        context,
+        page,
+        verifier,
+    ):
         adapter = FacebookPageFormAdapter(page, wait_for_verification=verifier)
         snapshot = await adapter.fill_and_readback(prepared["expectation"])
         _assert_authorized_form_snapshot(prepared, snapshot, authorized)
