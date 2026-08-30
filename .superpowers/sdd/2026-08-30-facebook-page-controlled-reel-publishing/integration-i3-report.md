@@ -41,3 +41,23 @@ OK
 
 - No default flag, version, package, publish/form, task/authorization file, credential store, secret, login, Facebook browser, preflight, upload, final action, merge, push or real platform state was changed or exercised.
 - This is source and offline-test verification only. A separately authorized real Page account run is still required to verify the current Meta composer identity DOM and avatar CDN response shape; any unsupported avatar redirect or host fails safely without changing the stored display identity.
+
+## Fix round 1 — alias-safe cleanup and locked final deletion
+
+Review found that the initial cleanup queried only the prior `filePath` string and closed SQLite before unlinking. A non-Page account could therefore reference the same managed file through `./name`, an absolute managed path, surrounding whitespace or another abnormal alias without being counted. A competing writer could also add a reference after the query but before deletion.
+
+### TDD evidence
+
+Before the correction, two focused tests were RED:
+
+1. Relative, absolute-managed and whitespace aliases all left `False` file-existence results instead of the required `True`; the extended case also covers an unsafe NUL-bearing possible alias.
+2. A competing SQLite connection committed one new reference during the unlink hook, producing `(committed=True, fileExists=False, references=1)` instead of `(False, False, 0)`.
+
+### Correction
+
+- The cleanup now scans every account `filePath`, strips only for conservative alias recognition, resolves relative and absolute paths against the real managed credential root, compares resolved paths and existing-file identity, and vetoes deletion when a value cannot be normalized safely.
+- The final all-account reference scan and unlink now execute inside one `BEGIN IMMEDIATE` transaction. A competing reference write cannot commit inside that interval. Database/normalization/unlink failures remain best-effort and do not affect the already committed replacement account row.
+
+### Verification
+
+The four focused cleanup tests passed after the correction: zero-reference deletion, exact/shared/outside preservation, cleanup-failure isolation, alias preservation and locked concurrent-write coverage. The same five affected suites listed above then passed `140/140` in `0.973s`.

@@ -803,6 +803,131 @@ class FacebookPagePersistenceTimingTests(unittest.IsolatedAsyncioTestCase):
             (None, "new.json", True),
         )
 
+    def test_relogin_cleanup_preserves_managed_file_referenced_by_alias(self) -> None:
+        aliases: list[tuple[str, str]] = []
+        for index, old_name in enumerate(
+            (
+                "old-relative.json",
+                "old-absolute.json",
+                "old-whitespace.json",
+                "old-unsafe.json",
+            ),
+            start=1,
+        ):
+            old_state = self.root / "cookiesFile" / old_name
+            old_state.write_text('{"old": true}', encoding="utf-8")
+            if index == 1:
+                alias = f"./{old_name}"
+            elif index == 2:
+                alias = str(old_state.resolve())
+            elif index == 3:
+                alias = f"  {old_name}\t"
+            else:
+                alias = f"{old_name}\0"
+            aliases.append((old_name, alias))
+
+            connection = sqlite3.connect(self.database)
+            connection.execute(
+                """
+                INSERT INTO user_info
+                    (type, filePath, userName, status, profileName, authMode,
+                     accountReference)
+                VALUES (9, ?, 'Page', 1, 'Meta 主体', 'browser', ?)
+                """,
+                (f"new-{index}.json", str(5000 + index)),
+            )
+            connection.execute(
+                """
+                INSERT INTO user_info
+                    (type, filePath, userName, status, profileName, authMode,
+                     accountReference)
+                VALUES (8, ?, 'Instagram', 1, 'Meta 主体', 'browser', NULL)
+                """,
+                (alias,),
+            )
+            connection.commit()
+            connection.close()
+
+            with patch.object(recovered_login, "BASE_DIR", self.root):
+                recovered_login._remove_replaced_facebook_page_session(
+                    {"filePath": old_name},
+                    current_cookie=f"new-{index}.json",
+                )
+
+        self.assertEqual(
+            [
+                (self.root / "cookiesFile" / old_name).exists()
+                for old_name, _alias in aliases
+            ],
+            [True, True, True, True],
+        )
+
+    def test_relogin_cleanup_locks_final_reference_check_through_unlink(self) -> None:
+        old_state = self.root / "cookiesFile" / "old-race.json"
+        old_state.write_text('{"old": true}', encoding="utf-8")
+        connection = sqlite3.connect(self.database)
+        connection.execute(
+            """
+            INSERT INTO user_info
+                (type, filePath, userName, status, profileName, authMode,
+                 accountReference)
+            VALUES (9, 'new-race.json', 'Page', 1, 'Meta 主体',
+                    'browser', '5101')
+            """
+        )
+        connection.commit()
+        connection.close()
+
+        competing_write_committed = False
+        real_unlink = Path.unlink
+        old_resolved = old_state.resolve()
+
+        def race_reference_then_unlink(path: Path, *args, **kwargs):
+            nonlocal competing_write_committed
+            if path.resolve() == old_resolved:
+                competitor = sqlite3.connect(self.database, timeout=0.01)
+                try:
+                    competitor.execute(
+                        """
+                        INSERT INTO user_info
+                            (type, filePath, userName, status, profileName,
+                             authMode, accountReference)
+                        VALUES (8, 'old-race.json', 'Instagram', 1,
+                                'Meta 主体', 'browser', NULL)
+                        """
+                    )
+                    competitor.commit()
+                    competing_write_committed = True
+                except sqlite3.OperationalError:
+                    competitor.rollback()
+                finally:
+                    competitor.close()
+            return real_unlink(path, *args, **kwargs)
+
+        with (
+            patch.object(recovered_login, "BASE_DIR", self.root),
+            patch.object(
+                Path,
+                "unlink",
+                autospec=True,
+                side_effect=race_reference_then_unlink,
+            ),
+        ):
+            recovered_login._remove_replaced_facebook_page_session(
+                {"filePath": "old-race.json"},
+                current_cookie="new-race.json",
+            )
+
+        connection = sqlite3.connect(self.database)
+        remaining_references = connection.execute(
+            "SELECT COUNT(*) FROM user_info WHERE filePath = 'old-race.json'"
+        ).fetchone()[0]
+        connection.close()
+        self.assertEqual(
+            (competing_write_committed, old_state.exists(), remaining_references),
+            (False, False, 0),
+        )
+
     def test_feature_flag_off_rejects_direct_page_refresh_before_browser_work(self) -> None:
         connection = sqlite3.connect(self.database)
         account_id = connection.execute(

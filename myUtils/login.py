@@ -492,15 +492,6 @@ def _remove_replaced_facebook_page_session(
     ):
         return
     try:
-        db_path = Path(BASE_DIR / "db" / "database.db")
-        with open_connection(db_path) as conn:
-            referenced = conn.execute(
-                "SELECT 1 FROM user_info WHERE filePath = ? LIMIT 1",
-                (old_value,),
-            ).fetchone()
-        if referenced:
-            return
-
         managed_dir = Path(BASE_DIR / "cookiesFile").resolve(strict=True)
         candidate = managed_dir / old_value
         if candidate.is_symlink():
@@ -508,10 +499,54 @@ def _remove_replaced_facebook_page_session(
         resolved_candidate = candidate.resolve(strict=False)
         if resolved_candidate.parent != managed_dir:
             return
-        candidate.unlink(missing_ok=True)
+
+        db_path = Path(BASE_DIR / "db" / "database.db")
+        with open_connection(db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for row in conn.execute("SELECT filePath FROM user_info"):
+                resolved_reference, safe = _resolve_managed_cookie_reference(
+                    row[0],
+                    managed_dir=managed_dir,
+                )
+                if not safe:
+                    return
+                if resolved_reference == resolved_candidate:
+                    return
+                if resolved_reference is not None and resolved_reference.exists():
+                    try:
+                        if os.path.samefile(resolved_reference, resolved_candidate):
+                            return
+                    except OSError:
+                        return
+            candidate.unlink(missing_ok=True)
     except Exception:
         # The new account row has already committed; cleanup cannot invalidate it.
         return
+
+
+def _resolve_managed_cookie_reference(
+    raw_value,
+    *,
+    managed_dir: Path,
+) -> tuple[Path | None, bool]:
+    """Resolve one stored alias; unsafe values veto cleanup conservatively."""
+
+    if not isinstance(raw_value, str):
+        return None, False
+    value = raw_value.strip()
+    if not value:
+        return None, True
+    try:
+        stored_path = Path(value)
+        candidate = stored_path if stored_path.is_absolute() else managed_dir / stored_path
+        resolved = candidate.resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        return None, False
+    try:
+        resolved.relative_to(managed_dir)
+    except ValueError:
+        return None, True
+    return resolved, True
 
 
 def save_meta_login_accounts(cookie_file, profile_name, update_mode=False, record_id=None, avatar_path=None, display_name=None):
