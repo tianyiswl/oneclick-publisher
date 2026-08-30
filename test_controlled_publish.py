@@ -1564,6 +1564,17 @@ class ControlledPublishTests(unittest.TestCase):
             database,
             "DB_PATH",
             Path(temporary) / "database.db",
+        ), patch.object(
+            controlled_publish,
+            "_shanghai_now",
+            return_value=datetime(
+                2026,
+                8,
+                29,
+                14,
+                0,
+                tzinfo=ZoneInfo("Asia/Shanghai"),
+            ),
         ):
             database.ensure_schema()
             manifest, preflight, grants = self._seed_tiktok_preflight(
@@ -1643,6 +1654,17 @@ class ControlledPublishTests(unittest.TestCase):
             database,
             "DB_PATH",
             Path(temporary) / "database.db",
+        ), patch.object(
+            controlled_publish,
+            "_shanghai_now",
+            return_value=datetime(
+                2026,
+                8,
+                29,
+                14,
+                0,
+                tzinfo=ZoneInfo("Asia/Shanghai"),
+            ),
         ):
             database.ensure_schema()
             manifest, preflight, grants = self._seed_tiktok_preflight(
