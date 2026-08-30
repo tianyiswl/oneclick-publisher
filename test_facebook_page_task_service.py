@@ -80,6 +80,13 @@ class _ReadOnlyReader:
 
 class FacebookPageTaskServiceTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.feature_patch = patch.dict(
+            os.environ,
+            {"ONECLICK_ENABLE_FACEBOOK_PAGE_V1": "1"},
+            clear=False,
+        )
+        self.feature_patch.start()
+        self.addCleanup(self.feature_patch.stop)
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.db_path = Path(self.temporary.name) / "database.db"

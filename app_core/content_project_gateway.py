@@ -511,6 +511,7 @@ class ContentProjectGateway:
                 "content_project_task_id_invalid",
                 "taskId 必须是正整数",
             )
+        self._require_facebook_page_available()
         return self.reconciler(task_id)
 
     @staticmethod

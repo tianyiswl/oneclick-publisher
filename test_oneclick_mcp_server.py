@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -322,6 +323,30 @@ class OneclickMcpServerTests(unittest.TestCase):
 
         self.assertEqual(result.structured_content["task"]["taskId"], 18)
         self.assertEqual(gateway.calls, [("reconcile", 18)])
+
+    def test_feature_disabled_reconcile_tool_returns_stable_error_without_internal_call(self) -> None:
+        calls: list[int] = []
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {"ONECLICK_ENABLE_FACEBOOK_PAGE_V1": "false"}, clear=True
+        ):
+            gateway = ContentProjectGateway(
+                profile_store=PublishProfileStore(
+                    Path(directory) / "publish-profiles.json"
+                ),
+                reconciler=lambda task_id: calls.append(task_id) or {},
+            )
+            result = asyncio.run(
+                create_server(gateway).call_tool(
+                    "oneclick_reconcile_publish_outcome",
+                    {"task_id": 18},
+                )
+            )
+
+        self.assertEqual(
+            result.structured_content["errorCode"],
+            "facebook_page_feature_disabled",
+        )
+        self.assertEqual(calls, [])
 
     def test_status_tool_preserves_the_gateway_safe_receipt_shape(self) -> None:
         import desktop_native_app

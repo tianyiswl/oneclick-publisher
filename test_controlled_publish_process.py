@@ -424,6 +424,87 @@ class ControlledPublishProcessTests(unittest.TestCase):
             ["preflight_task_id", "authorization_id"],
         )
 
+    def test_feature_disabled_blocks_page_authorization_without_mutating_task(self) -> None:
+        for environment in ({}, {"ONECLICK_ENABLE_FACEBOOK_PAGE_V1": "0"}):
+            with self.subTest(environment=environment), FacebookPagePublicEntryFixture() as fixture:
+                before = task_service.get_task(fixture.preflight_task_id)
+                with database.connect() as conn:
+                    table_exists = conn.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' "
+                        "AND name='controlled_publish_authorizations'"
+                    ).fetchone()
+                    before_authorizations = (
+                        conn.execute(
+                            "SELECT COUNT(*) FROM controlled_publish_authorizations"
+                        ).fetchone()[0]
+                        if table_exists
+                        else 0
+                    )
+                with patch.dict(os.environ, environment, clear=True), self.assertRaises(
+                    ControlledPublishError
+                ) as raised:
+                    controlled_publish.authorize_completed_check(
+                        fixture.preflight_task_id
+                    )
+
+                self.assertEqual(
+                    raised.exception.error_code,
+                    "facebook_page_feature_disabled",
+                )
+                self.assertEqual(
+                    task_service.get_task(fixture.preflight_task_id), before
+                )
+                with database.connect() as conn:
+                    table_exists = conn.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' "
+                        "AND name='controlled_publish_authorizations'"
+                    ).fetchone()
+                    after_authorizations = (
+                        conn.execute(
+                            "SELECT COUNT(*) FROM controlled_publish_authorizations"
+                        ).fetchone()[0]
+                        if table_exists
+                        else 0
+                    )
+                self.assertEqual(after_authorizations, before_authorizations)
+
+    def test_feature_disabled_blocks_core_page_reconcile_before_claim_or_reader(self) -> None:
+        for environment in ({}, {"ONECLICK_ENABLE_FACEBOOK_PAGE_V1": "false"}):
+            with self.subTest(environment=environment), patch.dict(
+                os.environ, environment, clear=True
+            ), patch.object(
+                controlled_publish,
+                "_reconcile_facebook_page_publish_outcome_claimed",
+            ) as internal, self.assertRaises(ControlledPublishError) as raised:
+                controlled_publish.reconcile_facebook_page_publish_outcome(71)
+
+            self.assertEqual(
+                raised.exception.error_code,
+                "facebook_page_feature_disabled",
+            )
+            internal.assert_not_called()
+
+    def test_cli_feature_disabled_reconcile_returns_stable_error_without_internal_call(self) -> None:
+        import desktop_native_app
+
+        args = SimpleNamespace(
+            controlled_publish_action="reconcile",
+            controlled_publish_request=None,
+            controlled_publish_task_id=71,
+            controlled_publish_authorization_id=None,
+        )
+        output = StringIO()
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            controlled_publish,
+            "_reconcile_facebook_page_publish_outcome_claimed",
+        ) as internal, redirect_stdout(output):
+            exit_code = desktop_native_app.run_controlled_publish_cli(args)
+
+        envelope = json.loads(output.getvalue().strip())
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(envelope["errorCode"], "facebook_page_feature_disabled")
+        internal.assert_not_called()
+
     def test_authorized_facebook_submission_uses_real_db_claim_and_starts_once(self) -> None:
         with FacebookPagePublicEntryFixture() as fixture:
             authorization_id = fixture.authorize()

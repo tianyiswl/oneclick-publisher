@@ -677,7 +677,11 @@ class ContentProjectGatewayTests(unittest.TestCase):
                 "Facebook Page 预检任务不允许只读核对。",
             )
 
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ,
+            {"ONECLICK_ENABLE_FACEBOOK_PAGE_V1": "1"},
+            clear=False,
+        ):
             gateway = self._gateway(
                 Path(directory),
                 [],
@@ -691,6 +695,26 @@ class ContentProjectGatewayTests(unittest.TestCase):
             raised.exception.error_code,
             "facebook_claim_lifecycle_invalid",
         )
+
+    def test_feature_disabled_blocks_gateway_reconcile_before_internal_service(self) -> None:
+        calls: list[int] = []
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {}, clear=True
+        ):
+            gateway = ContentProjectGateway(
+                profile_store=PublishProfileStore(
+                    Path(directory) / "publish-profiles.json"
+                ),
+                reconciler=lambda task_id: calls.append(task_id) or {},
+            )
+            with self.assertRaises(ContentProjectGatewayError) as raised:
+                gateway.reconcile_publish_outcome(17)
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "facebook_page_feature_disabled",
+        )
+        self.assertEqual(calls, [])
 
     def test_direct_publish_creates_bound_authorization_without_preflight(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

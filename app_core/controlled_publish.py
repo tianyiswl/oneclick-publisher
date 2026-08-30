@@ -3037,6 +3037,11 @@ def reconcile_facebook_page_publish_outcome(task_id: int) -> dict[str, object]:
 
     from . import task_service
 
+    if not facebook_page_v1_enabled():
+        raise ControlledPublishError(
+            "facebook_page_feature_disabled",
+            "Facebook Page 发布功能尚未开启。",
+        )
     claimed_tokens: list[str] = []
     try:
         return _reconcile_facebook_page_publish_outcome_claimed(
@@ -4120,6 +4125,12 @@ def authorize_completed_check(
     if not isinstance(payloads, list) or not payloads:
         raise ControlledPublishError("controlled_preflight_invalid", "预检任务没有发布快照")
     normalized_payloads = [dict(item) for item in payloads if isinstance(item, dict)]
+    if any(int(item.get("type") or 0) == 9 for item in normalized_payloads):
+        if not facebook_page_v1_enabled():
+            raise ControlledPublishError(
+                "facebook_page_feature_disabled",
+                "Facebook Page 发布功能尚未开启。",
+            )
     _require_tiktok_local_preflight_task(task, normalized_payloads)
     with connect() as conn:
         preflight_receipt_hash = ""
