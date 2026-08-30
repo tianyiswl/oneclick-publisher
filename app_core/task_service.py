@@ -2401,21 +2401,47 @@ def compensate_facebook_reconciliation_worker(
             ):
                 conn.rollback()
                 return False
-            claim = conn.execute(
-                "SELECT state FROM facebook_page_publish_claims WHERE taskId = ?",
+            claim_row = conn.execute(
+                "SELECT * FROM facebook_page_publish_claims WHERE taskId = ?",
                 (int(task_id),),
             ).fetchone()
-            if claim is None or str(claim["state"] or "") not in {
+            if claim_row is None or str(claim_row["state"] or "") not in {
                 "final_action_claimed",
                 "final_action_clicked",
+                "succeeded",
             }:
                 conn.rollback()
                 return False
-            changed = _reconcile_stale_facebook_page_claim_in_transaction(
-                conn,
-                int(task_id),
-            )
+            claim_state = str(claim_row["state"] or "")
+            if claim_state == "succeeded":
+                evidence = controlled_publish._validated_facebook_page_claim_evidence(
+                    dict(claim_row)
+                )
+                changed = _write_facebook_task_projection_in_transaction(
+                    conn,
+                    int(task_id),
+                    phase="published_readback_confirmed",
+                    message="Facebook Page 新 Reel 已通过同页内容列表唯一回读",
+                    error_code="",
+                    receipt=dict(evidence["receipt"]),
+                    event_type="facebook_publish_readback_confirmed",
+                    status_override="success",
+                )
+            else:
+                changed = _reconcile_stale_facebook_page_claim_in_transaction(
+                    conn,
+                    int(task_id),
+                )
             if not changed:
+                conn.rollback()
+                return False
+            cleared = conn.execute(
+                "UPDATE publish_tasks SET workerToken = '' "
+                "WHERE id = ? AND workerToken = ? "
+                "AND status IN ('success', 'failed', 'partial_failed')",
+                (int(task_id), token),
+            )
+            if cleared.rowcount != 1:
                 conn.rollback()
                 return False
             conn.commit()

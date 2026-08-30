@@ -1086,6 +1086,115 @@ class FacebookPageTaskServiceTests(unittest.TestCase):
         )
         self.assertEqual(self.claim(task_id)["state"], "ambiguous")
 
+    def test_cli_unique_reconcile_interrupt_finalizes_authoritative_success(self) -> None:
+        import desktop_native_app
+
+        task_id, page_id = self.facebook_task(
+            state="final_action_clicked", stale=True
+        )
+        match = FacebookReelMatch(
+            status="unique",
+            receipt=FacebookReelReceipt(
+                page_id=page_id,
+                reel_id="compensated-reel",
+                url="https://www.facebook.com/reel/compensated-reel",
+                published_at="2026-08-30T02:00:01+00:00",
+            ),
+            new_count=1,
+            matching_count=1,
+        )
+        interruption = KeyboardInterrupt()
+
+        async def unique_reader(_snapshot):
+            return match
+
+        args = SimpleNamespace(
+            controlled_publish_action="reconcile",
+            controlled_publish_task_id=task_id,
+            controlled_publish_request=None,
+            controlled_publish_authorization_id="",
+        )
+        publish_service._active_threads[task_id] = threading.current_thread()
+        with (
+            patch.object(
+                controlled_publish,
+                "_read_facebook_page_reconciliation",
+                side_effect=unique_reader,
+            ),
+            patch.object(
+                task_service,
+                "mark_facebook_result",
+                side_effect=interruption,
+            ),
+        ):
+            with self.assertRaises(KeyboardInterrupt) as caught:
+                desktop_native_app.run_controlled_publish_cli(args)
+
+        self.assertIs(caught.exception, interruption)
+        saved = task_service.get_task(task_id)
+        self.assertEqual(saved["status"], "success")
+        self.assertEqual(saved["items"][0]["status"], "success")
+        self.assertEqual(saved["items"][0]["platformPostId"], "compensated-reel")
+        self.assertEqual(
+            saved["items"][0]["postUrl"],
+            "https://www.facebook.com/reel/compensated-reel",
+        )
+        self.assertEqual(self.claim(task_id)["state"], "succeeded")
+        self.assertEqual(saved["workerToken"], "")
+        self.assertNotIn(task_id, publish_service._active_threads)
+
+    def test_succeeded_claim_compensation_does_not_overwrite_replacement_owner(self) -> None:
+        task_id, page_id = self.facebook_task(
+            state="final_action_clicked", stale=True
+        )
+        match = FacebookReelMatch(
+            status="unique",
+            receipt=FacebookReelReceipt(
+                page_id=page_id,
+                reel_id="replacement-race-reel",
+                url="https://www.facebook.com/reel/replacement-race-reel",
+                published_at="2026-08-30T02:00:01+00:00",
+            ),
+            new_count=1,
+            matching_count=1,
+        )
+        interruption = KeyboardInterrupt()
+
+        async def unique_reader(_snapshot):
+            return match
+
+        def replace_owner_then_interrupt(*_args, **_kwargs):
+            with database.connect() as conn:
+                conn.execute(
+                    "UPDATE publish_tasks SET workerToken=?, workerHeartbeatAt=? "
+                    "WHERE id=?",
+                    ("replacement-after-success", datetime.now().isoformat(), task_id),
+                )
+                conn.commit()
+            raise interruption
+
+        with (
+            patch.object(
+                controlled_publish,
+                "_read_facebook_page_reconciliation",
+                side_effect=unique_reader,
+            ),
+            patch.object(
+                task_service,
+                "mark_facebook_result",
+                side_effect=replace_owner_then_interrupt,
+            ),
+        ):
+            with self.assertRaises(KeyboardInterrupt) as caught:
+                controlled_publish.reconcile_facebook_page_publish_outcome(task_id)
+
+        self.assertIs(caught.exception, interruption)
+        saved = task_service.get_task(task_id)
+        self.assertEqual(saved["status"], "running")
+        self.assertEqual(saved["items"][0]["status"], "running")
+        self.assertEqual(saved["workerToken"], "replacement-after-success")
+        self.assertEqual(self.claim(task_id)["state"], "succeeded")
+
     def test_public_reconcile_cannot_take_over_worker_refreshed_after_snapshot(self) -> None:
         task_id, _page_id = self.facebook_task(state="final_action_claimed")
         stale = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()

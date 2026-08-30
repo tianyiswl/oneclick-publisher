@@ -3043,15 +3043,20 @@ def reconcile_facebook_page_publish_outcome(task_id: int) -> dict[str, object]:
             int(task_id), claimed_tokens
         )
     except BaseException:
+        compensated = False
         if claimed_tokens:
             try:
-                task_service.compensate_facebook_reconciliation_worker(
+                compensated = task_service.compensate_facebook_reconciliation_worker(
                     int(task_id), claimed_tokens[-1]
                 )
             except Exception:
                 # Preserve the reader/control-flow exception; compensation is
                 # token-CAS and may legitimately lose to a replacement owner.
                 pass
+        if compensated:
+            from . import publish_service
+
+            publish_service._active_threads.pop(int(task_id), None)
         raise
 
 
