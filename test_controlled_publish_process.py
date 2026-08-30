@@ -40,6 +40,11 @@ from utils import publish_tasks
 class FacebookPagePublicEntryFixture:
     """One real DB-backed Page authorization, stopped only at worker start."""
 
+    def __init__(self, *, source_kind: str = "managed") -> None:
+        if source_kind not in {"managed", "manifest"}:
+            raise ValueError("unsupported Page fixture source")
+        self.source_kind = source_kind
+
     def __enter__(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
@@ -78,7 +83,7 @@ class FacebookPagePublicEntryFixture:
         self.video = self.root / "facebook.mp4"
         self.video.write_bytes(b"facebook-page-public-entry-video")
         self.caption = "Facebook Page 标题\n\nFacebook Page 正文\n\n#OneClick"
-        self.payload = {
+        managed_payload = {
             "type": 9,
             "contentType": "video",
             "runtimeMode": "preflight",
@@ -112,6 +117,67 @@ class FacebookPagePublicEntryFixture:
             "originalDeclaration": False,
             "aiGenerated": False,
         }
+        self.manifest: Path | None = None
+        if self.source_kind == "manifest":
+            body = self.root / "body.md"
+            cover = self.root / "cover.png"
+            self.manifest = self.root / "manifest.json"
+            body.write_text("Facebook Page 正文", encoding="utf-8")
+            cover.write_bytes(b"facebook-page-cover")
+            self.manifest.write_text(
+                json.dumps(
+                    {
+                        "schemaVersion": "oneclick-content/v1",
+                        "contentType": "video",
+                        "title": "Facebook Page 标题",
+                        "bodyFile": body.name,
+                        "tags": ["OneClick"],
+                        "assets": [self.video.name],
+                        "covers": {"3:4": cover.name},
+                        "preferredPlatforms": ["Facebook"],
+                        "platformOverrides": {
+                            "Facebook": {
+                                "title": "Facebook Page 标题",
+                                "body": "Facebook Page 正文",
+                                "tags": ["OneClick"],
+                            }
+                        },
+                        "debugDryRun": True,
+                        "publishAllowed": False,
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            self.payload = controlled_publish.build_controlled_payloads(
+                {
+                    "projectId": "facebook-page-public-entry",
+                    "manifestPath": str(self.manifest),
+                    "mode": "preflight",
+                    "targets": [
+                        {
+                            "platform": "Facebook",
+                            "accountId": 91,
+                            "schedule": None,
+                            "settings": {"visibility": "public"},
+                        }
+                    ],
+                },
+                accounts=[
+                    {
+                        "id": 91,
+                        "type": 9,
+                        "filePath": "facebook-page.json",
+                        "profileName": "Saved Facebook Page",
+                        "userName": "Saved Facebook Page",
+                        "authMode": "browser",
+                        "accountReference": "1000000000001001",
+                        "status": 1,
+                    }
+                ],
+            )[0]
+        else:
+            self.payload = managed_payload
         preflight = task_service.create_pending_task(
             [self.payload],
             mode="oneclick_preflight",
@@ -365,6 +431,53 @@ class ControlledPublishProcessTests(unittest.TestCase):
                 started,
                 authorization_id=authorization_id,
             )
+
+    def test_lost_runtime_sources_do_not_consume_or_create_formal_state(self) -> None:
+        for source_kind in ("manifest", "managed"):
+            with self.subTest(source_kind=source_kind), FacebookPagePublicEntryFixture(
+                source_kind=source_kind
+            ) as fixture:
+                authorization_id = fixture.authorize()
+                if fixture.manifest is not None:
+                    fixture.manifest.unlink()
+                else:
+                    fixture.video.unlink()
+
+                with (
+                    fixture.stop_at_worker_start() as started,
+                    patch.object(
+                        overseas_browser_publish,
+                        "_facebook_page_session",
+                    ) as session,
+                    self.assertRaises(ControlledPublishError) as raised,
+                ):
+                    submit_authorized_preflight_task(
+                        fixture.preflight_task_id,
+                        authorization_id,
+                    )
+
+                self.assertEqual(
+                    raised.exception.error_code,
+                    "facebook_video_runtime_path_unavailable",
+                )
+                started.assert_not_called()
+                session.assert_not_called()
+                with database.connect() as conn:
+                    authorization = conn.execute(
+                        "SELECT consumedAt FROM controlled_publish_authorizations "
+                        "WHERE authorizationId = ?",
+                        (authorization_id,),
+                    ).fetchone()
+                    formal_count = conn.execute(
+                        "SELECT COUNT(*) FROM publish_tasks "
+                        "WHERE mode = 'oneclick_publish'"
+                    ).fetchone()[0]
+                    claim_count = conn.execute(
+                        "SELECT COUNT(*) FROM facebook_page_publish_claims"
+                    ).fetchone()[0]
+                self.assertIsNone(authorization["consumedAt"])
+                self.assertEqual(int(formal_count), 0)
+                self.assertEqual(int(claim_count), 0)
 
     def test_page_metadata_is_rejected_before_public_authorization_or_worker(self) -> None:
         with FacebookPagePublicEntryFixture() as fixture:

@@ -1884,6 +1884,48 @@ class FacebookPagePublishServiceTests(unittest.TestCase):
         self.assertEqual(session_calls, [])
         self.assertNotIn(int(task["id"]), publish_service._active_threads)
 
+    def test_runtime_video_must_keep_the_persisted_basename_before_lease(self) -> None:
+        task, payload = self.claimed_task()
+        renamed_video = self.video.with_name("renamed-facebook.mp4")
+        renamed_video.write_bytes(self.video.read_bytes())
+        runtime_payload = {
+            **payload,
+            "fileList": [str(renamed_video.resolve())],
+            "facebookVideoSize": renamed_video.stat().st_size,
+        }
+
+        with (
+            patch.object(
+                publish_service,
+                "_validate_payloads",
+                return_value=[runtime_payload],
+            ) as validate,
+            patch.object(
+                controlled_publish,
+                "require_facebook_page_execution_claim",
+            ) as lease,
+            patch.object(publish_service.threading, "Thread") as worker,
+            patch.object(
+                overseas_browser_publish,
+                "_facebook_page_session",
+            ) as session,
+            self.assertRaises(Exception) as raised,
+        ):
+            publish_service.start_controlled_facebook_publish(
+                int(task["id"]),
+                runtime_video_path=str(renamed_video.resolve()),
+            )
+
+        self.assertEqual(
+            getattr(raised.exception, "error_code", ""),
+            "facebook_video_runtime_path_unavailable",
+        )
+        validate.assert_not_called()
+        worker.assert_not_called()
+        lease.assert_not_called()
+        session.assert_not_called()
+        self.assertFalse(self.claim(int(task["id"]))["workerStartedAt"])
+
     def test_worker_start_failure_becomes_safe_failed_and_cleans_registry(self) -> None:
         task, payload = self.claimed_task()
 

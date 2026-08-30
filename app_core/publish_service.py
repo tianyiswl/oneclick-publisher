@@ -1564,15 +1564,41 @@ def start_controlled_facebook_publish(
             "facebook_publish_authorization_invalid",
             "Facebook Page 受控任务只能包含一个 Page 和一个 Reel。",
         )
-    payload = dict(raw_payloads[0])
+    stored_payload = dict(raw_payloads[0])
+    stored_files = stored_payload.get("fileList")
+    if (
+        not isinstance(stored_files, list)
+        or len(stored_files) != 1
+        or type(stored_files[0]) is not str
+        or not stored_files[0]
+        or Path(stored_files[0]).is_absolute()
+        or Path(stored_files[0]).name != stored_files[0]
+        or "/" in stored_files[0]
+        or "\\" in stored_files[0]
+    ):
+        raise PublishServiceError(
+            "facebook_publish_authorization_invalid",
+            "Facebook Page 受控任务素材快照无效。",
+        )
     try:
         if type(runtime_video_path) is not str or not runtime_video_path.strip():
             raise PublishServiceError(
                 "facebook_video_runtime_path_unavailable",
                 "Facebook Page 视频运行时引用不可用，请重新完成预检。",
             )
-        payload["fileList"] = [runtime_video_path]
-        prepared = _validate_payloads([payload])
+        runtime_path = Path(runtime_video_path)
+        if (
+            not runtime_path.is_absolute()
+            or not runtime_path.is_file()
+            or runtime_path.name != stored_files[0]
+        ):
+            raise PublishServiceError(
+                "facebook_video_runtime_path_unavailable",
+                "Facebook Page 视频运行时引用不可用，请重新完成预检。",
+            )
+        worker_payload = dict(stored_payload)
+        worker_payload["fileList"] = [runtime_video_path]
+        prepared = _validate_payloads([worker_payload])
         if str(prepared[0].get("runtimeMode") or "") != "publish":
             raise PublishServiceError(
                 "facebook_publish_authorization_invalid",
@@ -1588,7 +1614,7 @@ def start_controlled_facebook_publish(
         try:
             _mark_facebook_worker_start_failed(
                 int(task_id),
-                payload,
+                stored_payload,
                 exc,
                 require_unleased=True,
             )
@@ -1601,13 +1627,13 @@ def start_controlled_facebook_publish(
     try:
         require_facebook_page_execution_claim(
             int(task_id),
-            [payload],
+            [stored_payload],
         )
     except Exception as exc:
         try:
             _mark_facebook_worker_start_failed(
                 int(task_id),
-                payload,
+                stored_payload,
                 exc,
                 require_unleased=True,
             )
@@ -1621,7 +1647,7 @@ def start_controlled_facebook_publish(
         worker.start()
     except Exception as exc:
         _active_threads.pop(int(task_id), None)
-        _mark_facebook_worker_start_failed(int(task_id), payload, exc)
+        _mark_facebook_worker_start_failed(int(task_id), stored_payload, exc)
         raise
     return task
 
