@@ -587,6 +587,24 @@ def _outcome_receipt(
     return receipt
 
 
+def _preclick_failure_receipt(
+    prepared: Mapping[str, Any],
+    snapshot: FacebookPageFormSnapshot,
+    baseline: FacebookPageContentBaseline,
+) -> dict[str, object]:
+    receipt = _public_form_receipt(
+        prepared,
+        snapshot,
+        phase="form_readback",
+        final_action_triggered=False,
+    )
+    receipt["baselineHash"] = _hash_json(_baseline_projection(baseline))
+    receipt["formSnapshotHash"] = _hash_json(
+        _claim_form_snapshot(prepared, snapshot)
+    )
+    return receipt
+
+
 def _assert_final_form_snapshot(
     prepared: Mapping[str, Any],
     before: FacebookPageFormSnapshot,
@@ -607,7 +625,7 @@ def _assert_final_form_snapshot(
         raise FacebookPagePublishError(
             "facebook_page_form_readback_failed",
             "Facebook Page 最终提交前表单发生变化，已停止。",
-            receipt=_outcome_receipt(prepared, before, baseline),
+            receipt=_preclick_failure_receipt(prepared, before, baseline),
         )
 
 
@@ -642,8 +660,6 @@ async def _facebook_page_formal_async(
             "formSnapshot": form_projection,
             "formSnapshotHash": _hash_json(form_projection),
         }
-        progress("final_action_claimed", claim_receipt)
-
         final_snapshot, button = await adapter.verify_final_form(
             prepared["expectation"]
         )
@@ -653,6 +669,7 @@ async def _facebook_page_formal_async(
             final_snapshot,
             baseline,
         )
+        progress("final_action_claimed", claim_receipt)
         await button.click()
         progress(
             "final_action_clicked",

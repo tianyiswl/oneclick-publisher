@@ -1603,7 +1603,7 @@ class FacebookPageExecutorTests(unittest.TestCase):
         self.assertNotIn("final_action_claimed", stages)
         self.assertEqual(self.click_count, 0)
 
-    def test_final_form_drift_after_claim_stops_before_click(self) -> None:
+    def test_final_form_drift_after_baseline_stops_before_click(self) -> None:
         cases = (
             (
                 "page_and_caption",
@@ -1618,22 +1618,20 @@ class FacebookPageExecutorTests(unittest.TestCase):
         for label, changes in cases:
             with self.subTest(drift=label):
                 self.click_count = 0
-                self.final_snapshot = None
+                self.final_snapshot = FacebookPageFormSnapshot(
+                    page_id=changes.get("page_id", self.page_id),
+                    content_kind="reel",
+                    video_name=changes.get("video_name", self.video.name),
+                    video_count=1,
+                    caption=changes.get("caption", self.caption),
+                    visibility=changes.get("visibility", "public"),
+                    final_action_label="Publish",
+                    final_action_ready=True,
+                )
                 stages: list[str] = []
 
                 def progress(stage, receipt) -> None:
                     stages.append(stage)
-                    if stage == "final_action_claimed":
-                        self.final_snapshot = FacebookPageFormSnapshot(
-                            page_id=changes.get("page_id", self.page_id),
-                            content_kind="reel",
-                            video_name=changes.get("video_name", self.video.name),
-                            video_count=1,
-                            caption=changes.get("caption", self.caption),
-                            visibility=changes.get("visibility", "public"),
-                            final_action_label="Publish",
-                            final_action_ready=True,
-                        )
 
                 with self.patched_runtime({"formSnapshotHash": "f" * 64}):
                     with (
@@ -1655,8 +1653,52 @@ class FacebookPageExecutorTests(unittest.TestCase):
                     raised.exception.error_code,
                     "facebook_page_form_readback_failed",
                 )
-                self.assertEqual(stages, ["final_action_claimed"])
+                self.assertEqual(raised.exception.receipt["phase"], "form_readback")
+                self.assertFalse(raised.exception.receipt["finalActionTriggered"])
+                self.assertNotEqual(raised.exception.receipt["phase"], "ambiguous")
+                self.assertEqual(stages, [])
                 self.assertEqual(self.click_count, 0)
+
+    def test_final_form_drift_safely_fails_claim_and_task_before_click(self) -> None:
+        task, payload = self._claimed_formal_task()
+        self.final_snapshot = FacebookPageFormSnapshot(
+            page_id="1002",
+            content_kind="reel",
+            video_name=self.video.name,
+            video_count=1,
+            caption="A different Facebook caption\n\n#OneClick",
+            visibility="public",
+            final_action_label="Publish",
+            final_action_ready=True,
+        )
+
+        with self.patched_runtime(real_clicked_at=True, real_contracts=True):
+            publish_service._run_facebook_page_publish(task, [payload])
+
+        saved = task_service.get_task(int(task["id"]))
+        self.assertIsNotNone(saved)
+        self.assertEqual(self.click_count, 0)
+        self.assertEqual(saved["status"], "failed")
+        self.assertEqual(saved["items"][0]["errorCode"], "facebook_page_form_readback_failed")
+        item_receipt = json.loads(str(saved["items"][0]["receiptJson"]))
+        with database.connect() as conn:
+            claim = conn.execute(
+                "SELECT state, receiptJson FROM facebook_page_publish_claims "
+                "WHERE taskId = ?",
+                (int(task["id"]),),
+            ).fetchone()
+        self.assertIsNotNone(claim)
+        self.assertEqual(claim["state"], "safe_failed")
+        claim_receipt = json.loads(str(claim["receiptJson"]))
+        self.assertEqual(item_receipt["phase"], "failed")
+        self.assertEqual(claim_receipt["phase"], "form_readback")
+        for receipt in (item_receipt, claim_receipt):
+            self.assertFalse(receipt["finalActionTriggered"])
+            self.assertNotEqual(receipt["phase"], "ambiguous")
+        self.assertNotIn(
+            "facebook_final_action_claimed",
+            self._facebook_event_types(int(task["id"])),
+        )
 
     def test_preflight_exception_is_sanitized_before_task_persistence(self) -> None:
         task = task_service.create_pending_task(
