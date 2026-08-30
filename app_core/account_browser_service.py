@@ -122,6 +122,8 @@ async def _open_backend(
         if _startup_abandoned(startup_results):
             return
         page = await context.new_page()
+        if _startup_abandoned(startup_results):
+            return
         await page.goto(plan.login_url, wait_until="domcontentloaded", timeout=45_000)
         if _startup_abandoned(startup_results):
             return
@@ -129,9 +131,13 @@ async def _open_backend(
             expected_page_id = account_service.validate_saved_facebook_page_account(
                 account
             )
+            if _startup_abandoned(startup_results):
+                return
             await activate_saved_facebook_page(page, expected_page_id)
             if _startup_abandoned(startup_results):
                 return
+        if _startup_abandoned(startup_results):
+            return
         await page.bring_to_front()
         if startup_results is not None:
             if not _report_startup_result(startup_results, True):
@@ -141,11 +147,15 @@ async def _open_backend(
         # 长驻窗口，必须一直保持到用户主动关闭页面。
         await page.wait_for_event("close", timeout=0)
     finally:
-        if context:
-            await context.close()
-        if browser:
-            await browser.close()
-        await playwright.stop()
+        try:
+            if context:
+                await context.close()
+        finally:
+            try:
+                if browser:
+                    await browser.close()
+            finally:
+                await playwright.stop()
 
 
 def _thread_target(

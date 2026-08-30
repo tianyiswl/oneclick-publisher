@@ -968,6 +968,116 @@ class FacebookPageSavedSessionTests(unittest.IsolatedAsyncioTestCase):
         activate.assert_awaited_once_with(page, "1001")
         page.bring_to_front.assert_awaited_once_with()
 
+    async def test_late_page_worker_stops_before_navigation_after_new_page_unblocks(self) -> None:
+        account = {
+            "id": 5,
+            "type": 9,
+            "status": 1,
+            "authMode": "browser",
+            "profileName": "Meta 主体",
+            "filePath": "page.json",
+            "accountReference": "1001",
+        }
+        new_page_entered = asyncio.Event()
+        release_new_page = asyncio.Event()
+        page = MagicMock()
+        page.goto = AsyncMock()
+        page.bring_to_front = AsyncMock()
+        page.wait_for_event = AsyncMock()
+
+        async def blocked_new_page():
+            new_page_entered.set()
+            await release_new_page.wait()
+            return page
+
+        context = MagicMock()
+        context.new_page = AsyncMock(side_effect=blocked_new_page)
+        context.close = AsyncMock()
+        browser = MagicMock()
+        browser.new_context = AsyncMock(return_value=context)
+        browser.close = AsyncMock()
+        playwright = MagicMock()
+        playwright.chromium.launch = AsyncMock(return_value=browser)
+        playwright.stop = AsyncMock()
+        startup = account_browser_service._BackendStartupSignal()
+
+        with tempfile.TemporaryDirectory() as raw:
+            (Path(raw) / "page.json").write_text("{}", encoding="utf-8")
+            with (
+                patch("app_core.account_browser_service.COOKIE_DIR", Path(raw)),
+                patch(
+                    "playwright.async_api.async_playwright",
+                    return_value=MagicMock(start=AsyncMock(return_value=playwright)),
+                ),
+                patch(
+                    "app_core.account_browser_service.activate_saved_facebook_page",
+                    new=AsyncMock(return_value=_identity("1001")),
+                    create=True,
+                ) as activate,
+            ):
+                worker = asyncio.create_task(
+                    account_browser_service._open_backend(account, startup)
+                )
+                await asyncio.wait_for(new_page_entered.wait(), timeout=0.2)
+                timed_out = await asyncio.to_thread(startup.wait, 0.001)
+                release_new_page.set()
+                await asyncio.wait_for(worker, timeout=0.2)
+
+        self.assertIsInstance(timed_out, FacebookPagePublishError)
+        self.assertEqual(timed_out.error_code, "facebook_page_identity_mismatch")
+        page.goto.assert_not_awaited()
+        activate.assert_not_awaited()
+        page.bring_to_front.assert_not_awaited()
+        page.wait_for_event.assert_not_awaited()
+        context.close.assert_awaited_once_with()
+        browser.close.assert_awaited_once_with()
+        playwright.stop.assert_awaited_once_with()
+
+    async def test_open_backend_attempts_all_cleanup_when_context_close_fails(self) -> None:
+        account = {
+            "id": 5,
+            "type": 9,
+            "status": 1,
+            "authMode": "browser",
+            "profileName": "Meta 主体",
+            "filePath": "page.json",
+            "accountReference": "1001",
+        }
+        page = MagicMock()
+        page.goto = AsyncMock()
+        page.bring_to_front = AsyncMock()
+        page.wait_for_event = AsyncMock()
+        context = MagicMock()
+        context.new_page = AsyncMock(return_value=page)
+        context.close = AsyncMock(side_effect=RuntimeError("context close failed"))
+        browser = MagicMock()
+        browser.new_context = AsyncMock(return_value=context)
+        browser.close = AsyncMock()
+        playwright = MagicMock()
+        playwright.chromium.launch = AsyncMock(return_value=browser)
+        playwright.stop = AsyncMock()
+
+        with tempfile.TemporaryDirectory() as raw:
+            (Path(raw) / "page.json").write_text("{}", encoding="utf-8")
+            with (
+                patch("app_core.account_browser_service.COOKIE_DIR", Path(raw)),
+                patch(
+                    "playwright.async_api.async_playwright",
+                    return_value=MagicMock(start=AsyncMock(return_value=playwright)),
+                ),
+                patch(
+                    "app_core.account_browser_service.activate_saved_facebook_page",
+                    new=AsyncMock(return_value=_identity("1001")),
+                    create=True,
+                ),
+                self.assertRaisesRegex(RuntimeError, "context close failed"),
+            ):
+                await account_browser_service._open_backend(account)
+
+        context.close.assert_awaited_once_with()
+        browser.close.assert_awaited_once_with()
+        playwright.stop.assert_awaited_once_with()
+
     def test_unbound_legacy_row_refuses_backend_open_before_thread_start(self) -> None:
         account = {
             "id": 5,
