@@ -889,6 +889,9 @@ class FacebookPageAuthorizedSubmitTests(unittest.TestCase):
         preflight_task_id, authorization_id, preflight_payload = (
             self._authorized_preflight()
         )
+        replay_authorization = controlled_publish.authorize_completed_check(
+            preflight_task_id
+        )
         payload = self._formal_payload(preflight_payload)
         task = self._create_leased_formal(
             preflight_task_id,
@@ -924,9 +927,6 @@ class FacebookPageAuthorizedSubmitTests(unittest.TestCase):
         self.assertEqual(self._claim(task["id"])["state"], "succeeded")
         self.assertEqual(saved["status"], "success")
 
-        replay_authorization = controlled_publish.authorize_completed_check(
-            preflight_task_id
-        )
         with self.assertRaises(controlled_publish.ControlledPublishError) as replayed:
             self._create_leased_formal(
                 preflight_task_id,
@@ -935,7 +935,7 @@ class FacebookPageAuthorizedSubmitTests(unittest.TestCase):
             )
         self.assertEqual(
             replayed.exception.error_code,
-            "facebook_duplicate_submit_blocked",
+            "facebook_preflight_already_used",
         )
 
     def test_task_success_uses_hashed_succeeded_claim_receipt_not_runner_copy(
@@ -975,6 +975,9 @@ class FacebookPageAuthorizedSubmitTests(unittest.TestCase):
     ) -> None:
         preflight_task_id, authorization_id, preflight_payload = (
             self._authorized_preflight()
+        )
+        replay_authorization = controlled_publish.authorize_completed_check(
+            preflight_task_id
         )
         payload = self._formal_payload(preflight_payload)
         task = self._create_leased_formal(
@@ -1018,9 +1021,6 @@ class FacebookPageAuthorizedSubmitTests(unittest.TestCase):
             repair_events[0]["message"],
         )
 
-        replay_authorization = controlled_publish.authorize_completed_check(
-            preflight_task_id
-        )
         with self.assertRaises(controlled_publish.ControlledPublishError) as replayed:
             self._create_leased_formal(
                 preflight_task_id,
@@ -1029,7 +1029,7 @@ class FacebookPageAuthorizedSubmitTests(unittest.TestCase):
             )
         self.assertEqual(
             replayed.exception.error_code,
-            "facebook_duplicate_submit_blocked",
+            "facebook_preflight_already_used",
         )
 
     def test_typed_decision_is_durable_before_readback_and_progress_events_are_unique(

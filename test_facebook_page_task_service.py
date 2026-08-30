@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import tempfile
 import threading
 import unittest
@@ -15,7 +16,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from app_core import controlled_publish, database, paths, task_service
+from app_core import controlled_publish, database, paths, publish_service, task_service
 from app_core.controlled_publish import ControlledPublishError, project_task
 from app_core.overseas_meta_errors import FacebookPagePublishError
 from uploader.meta_uploader.content_list import (
@@ -1157,6 +1158,113 @@ class FacebookPageTaskServiceTests(unittest.TestCase):
                 )
                 self.assertEqual(self.claim(task_id)["state"], "succeeded")
                 self.assertEqual(self.claim(task_id)["blocksReplay"], 1)
+
+    def test_stale_page_heartbeat_without_registered_worker_ignores_live_host_pid(self) -> None:
+        task_id, _ = self.facebook_task(state="succeeded", stale=True)
+        with database.connect() as conn:
+            conn.execute(
+                """
+                UPDATE publish_tasks
+                SET status = 'running', successCount = 0, finishedAt = NULL,
+                    workerPid = ?
+                WHERE id = ?
+                """,
+                (os.getpid(), task_id),
+            )
+            conn.execute(
+                """
+                UPDATE publish_task_items
+                SET status = 'running', receiptJson = '',
+                    platformPostId = '', postUrl = '', publishedAt = ''
+                WHERE taskId = ? AND platformType = 9
+                """,
+                (task_id,),
+            )
+            conn.commit()
+
+        with patch.dict(publish_service._active_threads, {}, clear=True):
+            changed = task_service.reconcile_stale_controlled_task(
+                task_id,
+                lease_seconds=30,
+            )
+
+        self.assertTrue(changed)
+        saved = task_service.get_task(task_id)
+        self.assertEqual(saved["status"], "success")
+        self.assertEqual(saved["items"][0]["status"], "success")
+        self.assertEqual(self.claim(task_id)["state"], "succeeded")
+
+    def test_fresh_page_heartbeat_with_registered_worker_is_not_stolen(self) -> None:
+        task_id, _ = self.facebook_task(state="reserved", stale=False)
+        live_worker = SimpleNamespace(is_alive=lambda: True)
+        with patch.dict(
+            publish_service._active_threads,
+            {task_id: live_worker},
+            clear=True,
+        ):
+            changed = task_service.reconcile_stale_controlled_task(
+                task_id,
+                lease_seconds=30,
+            )
+
+        self.assertFalse(changed)
+        self.assertEqual(self.claim(task_id)["state"], "reserved")
+        self.assertEqual(task_service.get_task(task_id)["status"], "running")
+
+    def test_delete_page_claim_task_or_preflight_is_stable_and_batch_atomic(self) -> None:
+        formal_id, _ = self.facebook_task(state="safe_failed")
+        claim = self.claim(formal_id)
+        preflight_id = int(claim["preflightTaskId"])
+        unrelated = task_service.create_pending_task(
+            [
+                {
+                    "type": 3,
+                    "contentType": "video",
+                    "title": "unrelated terminal task",
+                    "accountList": ["douyin.json"],
+                    "fileList": ["unrelated.mp4"],
+                }
+            ],
+            mode="desktop",
+        )
+        with database.connect() as conn:
+            protected_ids = (formal_id, preflight_id)
+            placeholders = ",".join("?" for _ in protected_ids)
+            conn.execute(
+                f"UPDATE publish_task_items SET status = 'failed' "
+                f"WHERE taskId IN ({placeholders})",
+                protected_ids,
+            )
+            conn.execute(
+                f"UPDATE publish_tasks SET status = 'failed' "
+                f"WHERE id IN ({placeholders})",
+                protected_ids,
+            )
+            conn.execute(
+                "UPDATE publish_task_items SET status = 'failed' WHERE taskId = ?",
+                (unrelated["id"],),
+            )
+            conn.execute(
+                "UPDATE publish_tasks SET status = 'failed' WHERE id = ?",
+                (unrelated["id"],),
+            )
+            conn.commit()
+
+        expected = (
+            "Facebook Page 预检或正式任务已有 claim 历史，"
+            "不能删除，必须保留授权与防重复证据"
+        )
+        with self.assertRaisesRegex(ValueError, f"^{expected}$"):
+            task_service.delete_tasks([int(unrelated["id"]), formal_id])
+
+        self.assertIsNotNone(task_service.get_task(int(unrelated["id"])))
+        self.assertIsNotNone(task_service.get_task(formal_id))
+        self.assertEqual(self.claim(formal_id)["state"], "safe_failed")
+
+        with self.assertRaisesRegex(ValueError, f"^{expected}$"):
+            task_service.delete_tasks([preflight_id])
+        self.assertIsNotNone(task_service.get_task(preflight_id))
+        self.assertEqual(self.claim(formal_id)["state"], "safe_failed")
 
     def test_generic_stale_route_closes_dead_waiting_facebook_worker(self) -> None:
         task_id, _ = self.facebook_task(state="reserved", stale=True)

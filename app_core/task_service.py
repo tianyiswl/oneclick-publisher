@@ -678,6 +678,27 @@ def delete_tasks(task_ids: list[int]) -> int:
 
     placeholders = ",".join("?" for _ in normalized_ids)
     with connect() as conn:
+        facebook_claim_table = conn.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'facebook_page_publish_claims'
+            """
+        ).fetchone()
+        if facebook_claim_table:
+            protected_facebook = conn.execute(
+                f"""
+                SELECT 1 FROM facebook_page_publish_claims
+                WHERE taskId IN ({placeholders})
+                   OR preflightTaskId IN ({placeholders})
+                LIMIT 1
+                """,
+                (*normalized_ids, *normalized_ids),
+            ).fetchone()
+            if protected_facebook:
+                raise ValueError(
+                    "Facebook Page 预检或正式任务已有 claim 历史，"
+                    "不能删除，必须保留授权与防重复证据"
+                )
         revision_descendant = conn.execute(
             f"""
             SELECT 1
@@ -2896,14 +2917,6 @@ def reconcile_stale_facebook_page_claim(
             }:
                 conn.rollback()
                 return False
-            worker_pid = int(row["workerPid"] or 0)
-            if worker_pid > 0:
-                try:
-                    os.kill(worker_pid, 0)
-                    conn.rollback()
-                    return False
-                except OSError:
-                    pass
             reference_text = str(
                 row["workerHeartbeatAt"] or row["startedAt"] or row["createdAt"] or ""
             )
@@ -2942,6 +2955,23 @@ def _fail_active_task_in_transaction(
     receipt: Mapping[str, object] | None = None,
 ) -> bool:
     """Close an active task without committing the caller's transaction."""
+
+    facebook_claim_table = conn.execute(
+        """
+        SELECT 1 FROM sqlite_master
+        WHERE type = 'table' AND name = 'facebook_page_publish_claims'
+        """
+    ).fetchone()
+    if facebook_claim_table is not None:
+        facebook_claim = conn.execute(
+            "SELECT 1 FROM facebook_page_publish_claims WHERE taskId = ?",
+            (int(task_id),),
+        ).fetchone()
+        if facebook_claim is not None:
+            return _reconcile_stale_facebook_page_claim_in_transaction(
+                conn,
+                int(task_id),
+            )
 
     code = str(error_code or "controlled_task_aborted").strip()
     public_message = f"{str(message).strip()}（错误码 {code}）"
@@ -3113,7 +3143,7 @@ def _reconcile_stale_controlled_task_in_transaction(
     if str(row["status"] or "") not in active_statuses:
         return False
     worker_pid = int(row["workerPid"] or 0) if "workerPid" in row.keys() else 0
-    if worker_pid > 0:
+    if not has_facebook_page_claim and worker_pid > 0:
         try:
             os.kill(worker_pid, 0)
             return False

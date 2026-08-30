@@ -1366,10 +1366,7 @@ class FacebookPageFormalClaimTests(unittest.TestCase):
         self.assertIsNone(self.read_authorization(authorization_id)["consumedAt"])
         with database.connect() as conn:
             claim_count = conn.execute(
-                """
-                SELECT COUNT(*) FROM sqlite_master
-                WHERE type = 'table' AND name = 'facebook_page_publish_claims'
-                """
+                "SELECT COUNT(*) FROM facebook_page_publish_claims"
             ).fetchone()[0]
         self.assertEqual(claim_count, 0)
 
@@ -1423,7 +1420,7 @@ class FacebookPageFormalClaimTests(unittest.TestCase):
         self.assertFalse(any(thread.is_alive() for thread in threads))
         self.assertEqual(sum(kind == "ok" for kind, _ in outcomes), 1)
         self.assertEqual(
-            outcomes.count(("error", "facebook_duplicate_submit_blocked")),
+            outcomes.count(("error", "facebook_preflight_already_used")),
             1,
         )
         self.assertEqual(formal_tasks, 1)
@@ -1538,14 +1535,22 @@ class FacebookPageFormalClaimTests(unittest.TestCase):
         self.assertEqual(claim["state"], "reserved")
         self.assertEqual(claim["blocksReplay"], 1)
 
-    def test_safe_failed_history_releases_active_slot_but_is_preserved(self) -> None:
+    def test_safe_failed_history_requires_a_new_preflight(self) -> None:
         task_id, authorization_id, payload = self.authorized_preflight()
         first = self.create_formal(task_id, authorization_id, payload)
         self.transition_to(first["id"], payload, "safe_failed")
-        second_authorization = authorize_completed_check(task_id)
 
+        with self.assertRaises(ControlledPublishError) as reused:
+            authorize_completed_check(task_id)
+        self.assertEqual(
+            reused.exception.error_code,
+            "facebook_preflight_already_used",
+        )
+
+        second_preflight = self.completed_preflight(payload=payload)
+        second_authorization = authorize_completed_check(second_preflight)
         second = self.create_formal(
-            task_id,
+            second_preflight,
             str(second_authorization["authorizationId"]),
             payload,
         )
@@ -1565,7 +1570,7 @@ class FacebookPageFormalClaimTests(unittest.TestCase):
             ],
         )
 
-    def test_confirmed_not_published_releases_active_slot_but_is_preserved(self) -> None:
+    def test_confirmed_not_published_requires_a_new_preflight(self) -> None:
         task7 = self.install_task7_evidence_types()
         task_id, authorization_id, payload = self.authorized_preflight()
         first = self.create_formal(task_id, authorization_id, payload)
@@ -1586,10 +1591,18 @@ class FacebookPageFormalClaimTests(unittest.TestCase):
             )
         except ControlledPublishError as exc:
             self.fail(f"trusted Task 7 platform decision rejected: {exc.error_code}")
-        second_authorization = authorize_completed_check(task_id)
 
+        with self.assertRaises(ControlledPublishError) as reused:
+            authorize_completed_check(task_id)
+        self.assertEqual(
+            reused.exception.error_code,
+            "facebook_preflight_already_used",
+        )
+
+        second_preflight = self.completed_preflight(payload=payload)
+        second_authorization = authorize_completed_check(second_preflight)
         second = self.create_formal(
-            task_id,
+            second_preflight,
             str(second_authorization["authorizationId"]),
             payload,
         )
@@ -1878,21 +1891,11 @@ class FacebookPageFormalClaimTests(unittest.TestCase):
                 )
                 first = self.create_formal(task_id, authorization_id, payload)
                 self.transition_to(first["id"], payload, state)
-                second_authorization = authorize_completed_check(task_id)
                 with self.assertRaises(ControlledPublishError) as raised:
-                    self.create_formal(
-                        task_id,
-                        str(second_authorization["authorizationId"]),
-                        payload,
-                    )
+                    authorize_completed_check(task_id)
                 self.assertEqual(
                     raised.exception.error_code,
-                    "facebook_duplicate_submit_blocked",
-                )
-                self.assertIsNone(
-                    self.read_authorization(
-                        str(second_authorization["authorizationId"])
-                    )["consumedAt"]
+                    "facebook_preflight_already_used",
                 )
 
     def test_checkpoint_persists_only_safe_json_and_recomputed_hashes(self) -> None:

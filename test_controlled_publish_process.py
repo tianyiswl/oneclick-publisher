@@ -432,6 +432,115 @@ class ControlledPublishProcessTests(unittest.TestCase):
                 authorization_id=authorization_id,
             )
 
+    def test_used_page_preflight_rejects_new_and_presigned_grants_after_safe_terminal(self) -> None:
+        for terminal_state in ("safe_failed", "confirmed_not_published"):
+            with self.subTest(terminal_state=terminal_state), FacebookPagePublicEntryFixture() as fixture:
+                first_grant = fixture.authorize()
+                presigned_grant = fixture.authorize()
+                with fixture.stop_at_worker_start():
+                    first = submit_authorized_preflight_task(
+                        fixture.preflight_task_id,
+                        first_grant,
+                    )
+                first_task_id = int(first["taskId"])
+                with database.connect() as conn:
+                    conn.execute(
+                        """
+                        UPDATE facebook_page_publish_claims
+                        SET state = ?, blocksReplay = 0
+                        WHERE taskId = ?
+                        """,
+                        (terminal_state, first_task_id),
+                    )
+                    conn.execute(
+                        "UPDATE publish_task_items SET status = 'failed' WHERE taskId = ?",
+                        (first_task_id,),
+                    )
+                    conn.execute(
+                        "UPDATE publish_tasks SET status = 'failed' WHERE id = ?",
+                        (first_task_id,),
+                    )
+                    conn.commit()
+
+                with self.assertRaises(ControlledPublishError) as new_grant_error:
+                    fixture.authorize()
+                with (
+                    fixture.stop_at_worker_start() as restarted,
+                    self.assertRaises(ControlledPublishError) as presigned_error,
+                ):
+                    submit_authorized_preflight_task(
+                        fixture.preflight_task_id,
+                        presigned_grant,
+                    )
+
+                self.assertEqual(
+                    new_grant_error.exception.error_code,
+                    "facebook_preflight_already_used",
+                )
+                self.assertEqual(
+                    presigned_error.exception.error_code,
+                    "facebook_preflight_already_used",
+                )
+                restarted.assert_not_called()
+                with database.connect() as conn:
+                    formal_count = conn.execute(
+                        "SELECT COUNT(*) FROM publish_tasks WHERE mode = 'oneclick_publish'"
+                    ).fetchone()[0]
+                    presigned = conn.execute(
+                        "SELECT consumedAt FROM controlled_publish_authorizations "
+                        "WHERE authorizationId = ?",
+                        (presigned_grant,),
+                    ).fetchone()
+                self.assertEqual(int(formal_count), 1)
+                self.assertIsNone(presigned["consumedAt"])
+
+    def test_new_page_preflight_and_authorization_can_follow_safe_failed_attempt(self) -> None:
+        with FacebookPagePublicEntryFixture() as fixture:
+            first_grant = fixture.authorize()
+            with fixture.stop_at_worker_start():
+                first = submit_authorized_preflight_task(
+                    fixture.preflight_task_id,
+                    first_grant,
+                )
+            task_service.mark_facebook_result(
+                int(first["taskId"]),
+                ok=False,
+                message="Facebook Page worker stopped before final action",
+                error_code="facebook_worker_interrupted",
+                receipt={
+                    "pageId": str(
+                        fixture.payload["facebookExpectedPageReference"]
+                    )
+                },
+            )
+
+            next_preflight_id = fixture.create_equivalent_preflight()
+            next_grant = fixture.authorize(next_preflight_id)
+            with fixture.stop_at_worker_start() as started:
+                second = submit_authorized_preflight_task(
+                    next_preflight_id,
+                    next_grant,
+                )
+
+            second_task_id = int(second["taskId"])
+            self.assertNotEqual(second_task_id, int(first["taskId"]))
+            started.assert_called_once()
+            with database.connect() as conn:
+                claims = conn.execute(
+                    """
+                    SELECT preflightTaskId, state
+                    FROM facebook_page_publish_claims
+                    ORDER BY taskId
+                    """
+                ).fetchall()
+            self.assertEqual(
+                [(int(row["preflightTaskId"]), row["state"]) for row in claims],
+                [
+                    (fixture.preflight_task_id, "safe_failed"),
+                    (next_preflight_id, "reserved"),
+                ],
+            )
+
     def test_lost_runtime_sources_do_not_consume_or_create_formal_state(self) -> None:
         for source_kind in ("manifest", "managed"):
             with self.subTest(source_kind=source_kind), FacebookPagePublicEntryFixture(
@@ -602,6 +711,111 @@ class ControlledPublishProcessTests(unittest.TestCase):
                 started,
                 authorization_id=authorization_id,
             )
+
+    def test_cli_interrupt_after_page_final_action_claim_converges_to_ambiguous(self) -> None:
+        import desktop_native_app
+
+        with FacebookPagePublicEntryFixture() as fixture:
+            authorization_id = fixture.authorize()
+            retry_grant = fixture.authorize()
+            page_id = str(fixture.payload["facebookExpectedPageReference"])
+            args = SimpleNamespace(
+                controlled_publish_action="formal",
+                controlled_publish_request=None,
+                controlled_publish_task_id=fixture.preflight_task_id,
+                controlled_publish_authorization_id=authorization_id,
+            )
+
+            def interrupt_after_claim(
+                task_id: int,
+                *,
+                interactive_verification: bool,
+            ) -> None:
+                self.assertTrue(interactive_verification)
+                task_service.record_facebook_progress(
+                    task_id,
+                    phase="final_action_claimed",
+                    message="Facebook Page final action claim persisted",
+                    receipt={
+                        "pageId": page_id,
+                        "baseline": {"pageId": page_id, "rows": []},
+                        "formSnapshot": {
+                            "pageId": page_id,
+                            "videoName": fixture.video.name,
+                            "videoSize": fixture.video.stat().st_size,
+                            "videoSha256": str(
+                                fixture.payload["facebookVideoSha256"]
+                            ),
+                            "captionSha256": str(
+                                fixture.payload["facebookCaptionSha256"]
+                            ),
+                            "visibility": "public",
+                            "finalButtonLabel": "Publish",
+                            "finalButtonReady": True,
+                        },
+                    },
+                )
+                raise KeyboardInterrupt
+
+            output = StringIO()
+            with (
+                fixture.stop_at_worker_start(),
+                patch.object(
+                    desktop_native_app,
+                    "_wait_for_controlled_task",
+                    side_effect=interrupt_after_claim,
+                ),
+                redirect_stdout(output),
+            ):
+                exit_code = desktop_native_app.run_controlled_publish_cli(args)
+
+            envelopes = [
+                json.loads(line)
+                for line in output.getvalue().splitlines()
+                if line.strip()
+            ]
+            final = envelopes[-1]
+            task_id = int(final["taskId"])
+            with database.connect() as conn:
+                claim = conn.execute(
+                    """
+                    SELECT state, blocksReplay
+                    FROM facebook_page_publish_claims WHERE taskId = ?
+                    """,
+                    (task_id,),
+                ).fetchone()
+
+            self.assertEqual(exit_code, 130)
+            self.assertEqual(final["status"], "failed")
+            self.assertEqual(final["phase"], "ambiguous")
+            self.assertEqual(final["items"][0]["status"], "failed")
+            self.assertEqual(
+                final["items"][0]["errorCode"],
+                "facebook_publish_outcome_unknown",
+            )
+            persisted = task_service.get_task(task_id)
+            self.assertEqual(
+                persisted["events"][-1]["eventType"],
+                "facebook_publish_outcome_ambiguous",
+            )
+            self.assertEqual(
+                (claim["state"], int(claim["blocksReplay"])),
+                ("ambiguous", 1),
+            )
+
+            with (
+                fixture.stop_at_worker_start() as restarted,
+                self.assertRaises(ControlledPublishError) as retry_error,
+            ):
+                submit_authorized_preflight_task(
+                    fixture.preflight_task_id,
+                    retry_grant,
+                )
+            self.assertEqual(
+                retry_error.exception.error_code,
+                "facebook_preflight_already_used",
+            )
+            restarted.assert_not_called()
 
     def test_shared_service_preserves_generic_ambiguous_duplicate_error(self) -> None:
         payload = {

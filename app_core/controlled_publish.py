@@ -1089,6 +1089,13 @@ def _facebook_authorization_invalid() -> ControlledPublishError:
     )
 
 
+def _facebook_preflight_already_used() -> ControlledPublishError:
+    return ControlledPublishError(
+        "facebook_preflight_already_used",
+        "Facebook Page 本次预检已经生成过正式任务，必须重新完成平台预检。",
+    )
+
+
 def _single_facebook_page_payload(
     payloads: Iterable[Mapping[str, Any]],
 ) -> dict[str, Any]:
@@ -1640,6 +1647,23 @@ def _ensure_facebook_page_claim_schema(conn: sqlite3.Connection) -> None:
     )
 
 
+def _require_unused_facebook_preflight(
+    conn: sqlite3.Connection,
+    preflight_task_id: int,
+) -> None:
+    _ensure_facebook_page_claim_schema(conn)
+    used = conn.execute(
+        """
+        SELECT 1 FROM facebook_page_publish_claims
+        WHERE preflightTaskId = ?
+        LIMIT 1
+        """,
+        (int(preflight_task_id),),
+    ).fetchone()
+    if used is not None:
+        raise _facebook_preflight_already_used()
+
+
 def _validate_facebook_authorization_in_transaction(
     conn: sqlite3.Connection,
     authorization_id: str,
@@ -1814,6 +1838,10 @@ def _create_claimed_facebook_page_task(
         conn.commit()
         try:
             conn.execute("BEGIN IMMEDIATE")
+            _require_unused_facebook_preflight(
+                conn,
+                int(preflight_task_id),
+            )
             preflight_receipt_hash = facebook_preflight_receipt_hash(
                 conn,
                 int(preflight_task_id),
@@ -4010,6 +4038,7 @@ def authorize_completed_check(
             len(normalized_payloads) == 1
             and int(normalized_payloads[0].get("type") or 0) == 9
         ):
+            _require_unused_facebook_preflight(conn, int(task_id))
             preflight_receipt_hash = facebook_preflight_receipt_hash(
                 conn,
                 int(task_id),
