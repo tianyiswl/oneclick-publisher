@@ -74,7 +74,6 @@ _LEGACY_META_CONFIRMATION_KEYS = frozenset(
     }
 )
 
-
 def _canonical_json(value: object) -> str:
     return json.dumps(
         value,
@@ -141,11 +140,6 @@ def _validate_facebook_page_payload(
         or str(sanitized.get("runtimeMode") or "") != expected_runtime
         or sanitized.get("debugDryRun") is not expected_dry_run
         or sanitized.get("facebookControlledPublish") is not True
-        or str(sanitized.get("visibility") or "") != "public"
-        or bool(sanitized.get("enableTimer"))
-        or str(sanitized.get("scheduleMode") or "immediate") != "immediate"
-        or bool(str(sanitized.get("scheduledAt") or "").strip())
-        or bool(str(sanitized.get("scheduleTime") or "").strip())
         or not page_id.isascii()
         or not page_id.isdigit()
     ):
@@ -153,6 +147,19 @@ def _validate_facebook_page_payload(
             "Facebook Page 受控任务的运行模式或目标字段无效。",
             page_id=page_id,
         )
+    from .controlled_publish import (
+        ControlledPublishError,
+        validate_facebook_page_v1_metadata,
+    )
+
+    try:
+        validate_facebook_page_v1_metadata(sanitized)
+    except ControlledPublishError as exc:
+        raise _facebook_validation_error(
+            exc.public_message,
+            page_id=page_id,
+            error_code=exc.error_code,
+        ) from exc
 
     account_ids = sanitized.get("accountIds")
     account_files = sanitized.get("accountList")
@@ -210,7 +217,11 @@ def _validate_facebook_page_payload(
             page_id=page_id,
         )
     video_path = Path(files[0])
-    if not video_path.is_file():
+    try:
+        video_size = video_path.stat().st_size
+    except OSError:
+        video_size = -1
+    if not video_path.is_absolute() or not video_path.is_file() or video_size < 0:
         raise _facebook_validation_error(
             "Facebook Page Reel 视频不存在。",
             page_id=page_id,
@@ -240,10 +251,11 @@ def _validate_facebook_page_payload(
         page_id=page_id,
         content_kind="reel",
         video_name=video_path.name,
-        video_size=video_path.stat().st_size,
+        video_size=video_size,
         video_sha256=video_hash,
         caption=caption,
         visibility="public",
+        video_path=str(video_path),
     )
     return {
         "payload": sanitized,
@@ -304,10 +316,11 @@ def _form_snapshot_projection(
     expected: FacebookPageFormExpectation,
     snapshot: FacebookPageFormSnapshot,
 ) -> dict[str, object]:
+    video_name = Path(str(snapshot.video_name)).name
     return {
         "pageId": str(snapshot.page_id),
         "contentKind": str(snapshot.content_kind),
-        "videoName": str(snapshot.video_name),
+        "videoName": video_name,
         "videoCount": int(snapshot.video_count),
         "videoSize": int(expected.video_size),
         "videoSha256": str(expected.video_sha256),
@@ -501,7 +514,7 @@ def _claim_form_snapshot(
     expected = prepared["expectation"]
     return {
         "pageId": snapshot.page_id,
-        "videoName": snapshot.video_name,
+        "videoName": Path(str(snapshot.video_name)).name,
         "videoSize": expected.video_size,
         "videoSha256": expected.video_sha256,
         "captionSha256": facebook_page_caption_sha256(snapshot.caption),

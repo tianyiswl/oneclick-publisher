@@ -6,7 +6,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal
 
@@ -49,6 +49,7 @@ class FacebookPageFormExpectation:
     video_sha256: str
     caption: str
     visibility: Literal["public"]
+    video_path: str | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,13 +226,26 @@ class FacebookPageFormAdapter:
             or expected.video_size < 0
             or type(expected.video_sha256) is not str
             or _SHA256.fullmatch(expected.video_sha256) is None
+            or (
+                expected.video_path is not None
+                and (
+                    type(expected.video_path) is not str
+                    or not expected.video_path
+                    or not Path(expected.video_path).is_absolute()
+                )
+            )
         ):
             raise _upload_failed(expected)
         return page_id, caption
 
     @staticmethod
-    def _validate_local_video(expected: FacebookPageFormExpectation) -> None:
-        path = Path(expected.video_name)
+    def _validate_local_video(expected: FacebookPageFormExpectation) -> str:
+        file_path = (
+            expected.video_path
+            if expected.video_path is not None
+            else expected.video_name
+        )
+        path = Path(file_path)
         try:
             if not path.is_file() or path.stat().st_size != expected.video_size:
                 raise _upload_failed(expected)
@@ -245,6 +259,7 @@ class FacebookPageFormAdapter:
             raise _upload_failed(expected) from exc
         if digest.hexdigest() != expected.video_sha256:
             raise _upload_failed(expected)
+        return file_path
 
     async def select_expected_page(
         self,
@@ -289,7 +304,7 @@ class FacebookPageFormAdapter:
         expected: FacebookPageFormExpectation,
     ) -> FacebookPageFormSnapshot:
         page_id, expected_caption = self._validate_expectation(expected)
-        self._validate_local_video(expected)
+        upload_file_path = self._validate_local_video(expected)
         self._current_expected = expected
 
         try:
@@ -328,7 +343,7 @@ class FacebookPageFormAdapter:
         self._upload_attempted = True
         try:
             await self._recheck_expected_page(expected)
-            await self._upload_video_once(expected.video_name)
+            await self._upload_video_once(upload_file_path)
             self._platform_write_occurred = True
             video_name, video_count = await self._wait_for_completed_video(
                 expected

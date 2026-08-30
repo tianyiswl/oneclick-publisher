@@ -118,8 +118,16 @@ class FacebookPageExecutorTests(unittest.TestCase):
             "description": "Exact Facebook caption",
             "tags": ["OneClick"],
             "fileList": [str(self.video)],
+            "coverPath": "",
+            "coverPaths": {},
+            "collectionName": "",
             "accountList": ["facebook-page.json"],
             "accountIds": [91],
+            "originalDeclaration": False,
+            "contentDeclaration": "",
+            "aiGenerated": False,
+            "aiDeclarationExplicitlyConfirmed": False,
+            "aiDisclosure": {},
             "facebookControlledPublish": True,
             "facebookExpectedPageReference": self.page_id,
             "facebookFinalCaption": self.caption,
@@ -130,7 +138,12 @@ class FacebookPageExecutorTests(unittest.TestCase):
             "enableTimer": False,
             "scheduleMode": "immediate",
             "scheduleTime": "",
+            "scheduleTimezone": "",
             "scheduledAt": "",
+            "dailyTimes": [],
+            "videosPerDay": 1,
+            "startDays": 0,
+            "timeJitterMinutes": 0,
         }
 
     def _prepared(self, payload: dict) -> dict:
@@ -148,6 +161,7 @@ class FacebookPageExecutorTests(unittest.TestCase):
                 video_sha256=self.video_hash,
                 caption=self.caption,
                 visibility="public",
+                video_path=str(self.video),
             ),
         }
 
@@ -517,6 +531,323 @@ class FacebookPageExecutorTests(unittest.TestCase):
             [],
         )
 
+    def test_external_absolute_video_reaches_real_form_adapter_with_safe_projections(
+        self,
+    ) -> None:
+        try:
+            self.video.relative_to(Path.cwd())
+        except ValueError:
+            pass
+        else:  # pragma: no cover - the fixture is deliberately outside cwd
+            self.fail("production wiring video must live outside process cwd")
+
+        upload_inputs: list[str] = []
+        prepared_rows: list[dict] = []
+        expected_rows: list[FacebookPageFormExpectation] = []
+        snapshot_rows: list[FacebookPageFormSnapshot] = []
+
+        class Button:
+            async def inner_text(self) -> str:
+                return "Publish"
+
+            async def is_enabled(self) -> bool:
+                return True
+
+        class BoundaryOnlyAdapter(PageFormContract):
+            """Keep production orchestration; replace only browser/page actions."""
+
+            def __init__(self, page, *, wait_for_verification) -> None:
+                super().__init__(page, wait_for_verification=wait_for_verification)
+                self.caption = ""
+                self.uploaded = False
+                self.button = Button()
+
+            async def fill_and_readback(self, expected):
+                expected_rows.append(expected)
+                snapshot = await super().fill_and_readback(expected)
+                snapshot_rows.append(snapshot)
+                return snapshot
+
+            async def open_fresh_reel_composer(self, expected_page_id: str) -> None:
+                return None
+
+            async def _read_content_kind(self) -> str:
+                return "reel"
+
+            async def _read_restored_draft(self) -> bool:
+                return False
+
+            async def _read_video_previews(self):
+                if not self.uploaded:
+                    return []
+                return [(upload_inputs[-1], "completed")]
+
+            async def _read_caption_editor(self) -> str:
+                return self.caption
+
+            async def _clear_caption_editor(self) -> None:
+                self.caption = ""
+
+            async def _upload_video_once(self, file_path: str) -> None:
+                upload_inputs.append(file_path)
+                self.uploaded = True
+
+            async def _write_caption_once(self, caption: str) -> None:
+                self.caption = caption
+
+            async def _select_public_visibility(self) -> None:
+                return None
+
+            async def _read_visibility(self) -> str:
+                return "public"
+
+            async def _recheck_expected_page(self, expected):
+                return SimpleNamespace(page_id=expected.page_id)
+
+            async def _final_action_buttons(self):
+                return [self.button]
+
+            async def _sleep(self) -> None:
+                return None
+
+        @asynccontextmanager
+        async def boundary_session(prepared):
+            prepared_rows.append(prepared)
+
+            async def no_verification(_page) -> None:
+                return None
+
+            yield SimpleNamespace(), SimpleNamespace(), no_verification
+
+        with (
+            patch.object(
+                overseas_browser_publish,
+                "_facebook_page_session",
+                side_effect=boundary_session,
+            ),
+            patch.object(
+                overseas_browser_publish,
+                "FacebookPageFormAdapter",
+                BoundaryOnlyAdapter,
+            ),
+        ):
+            try:
+                result = overseas_preflight.run_facebook_page_preflight_sync(
+                    self.payload("preflight"),
+                    task_id=601,
+                )
+            except FacebookPagePublishError as exc:
+                self.fail(
+                    "cwd-external absolute video did not reach the upload boundary: "
+                    f"{exc.error_code}"
+                )
+
+        formal_prepared = overseas_browser_publish._validate_facebook_page_payload(
+            self.payload("publish"),
+            mode="formal",
+        )
+
+        async def no_verification(_page) -> None:
+            return None
+
+        formal_adapter = BoundaryOnlyAdapter(
+            SimpleNamespace(),
+            wait_for_verification=no_verification,
+        )
+        formal_snapshot = asyncio.run(
+            formal_adapter.fill_and_readback(formal_prepared["expectation"])
+        )
+
+        self.assertEqual(upload_inputs, [str(self.video), str(self.video)])
+        self.assertEqual(len(prepared_rows), 1)
+        self.assertEqual(len(expected_rows), 2)
+        self.assertEqual(len(snapshot_rows), 2)
+        expected = expected_rows[0]
+        snapshot = snapshot_rows[0]
+        for current_expected in expected_rows:
+            self.assertEqual(
+                getattr(current_expected, "video_path", None),
+                str(self.video),
+            )
+            self.assertEqual(current_expected.video_name, self.video.name)
+            self.assertNotIn(str(self.video), repr(current_expected))
+        for current_snapshot in (snapshot, formal_snapshot):
+            self.assertEqual(current_snapshot.video_name, self.video.name)
+
+        absolute_snapshot = FacebookPageFormSnapshot(
+            page_id=snapshot.page_id,
+            content_kind=snapshot.content_kind,
+            video_name=str(self.video),
+            video_count=snapshot.video_count,
+            caption=snapshot.caption,
+            visibility=snapshot.visibility,
+            final_action_label=snapshot.final_action_label,
+            final_action_ready=snapshot.final_action_ready,
+        )
+        try:
+            projections = [
+                result["receipt"],
+                overseas_browser_publish._form_snapshot_projection(
+                    expected,
+                    absolute_snapshot,
+                ),
+                overseas_browser_publish._public_form_receipt(
+                    prepared_rows[0],
+                    absolute_snapshot,
+                    phase="platform_form_verified",
+                    final_action_triggered=False,
+                ),
+                overseas_browser_publish._claim_form_snapshot(
+                    prepared_rows[0],
+                    absolute_snapshot,
+                ),
+            ]
+        except Exception as exc:  # pragma: no cover - RED guard
+            self.fail(
+                "absolute local path escaped into a public projection: "
+                f"{type(exc).__name__}"
+            )
+        for projection in projections:
+            self.assertEqual(projection["videoName"], self.video.name)
+            self.assertEqual(projection["videoSize"], self.video.stat().st_size)
+            self.assertEqual(projection["videoSha256"], self.video_hash)
+        public_json = json.dumps(
+            {"result": result, "projections": projections},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        self.assertNotIn(str(self.video), public_json)
+        self.assertNotIn(str(self.video.parent), public_json)
+
+    def test_missing_video_is_stable_and_stops_before_page_session(self) -> None:
+        payload = self.payload("preflight")
+        missing = self.video.parent / "missing-video.mp4"
+        payload["fileList"] = [str(missing)]
+        session_calls: list[dict] = []
+
+        @asynccontextmanager
+        async def forbidden_session(prepared):
+            session_calls.append(prepared)
+            raise FacebookPagePublishError(
+                "facebook_page_session_reached",
+                "Missing local video reached the Page session.",
+            )
+            yield  # pragma: no cover - async context manager shape only
+
+        with (
+            patch.object(
+                overseas_browser_publish,
+                "_facebook_page_session",
+                side_effect=forbidden_session,
+            ),
+            self.assertRaises(FacebookPagePublishError) as raised,
+        ):
+            overseas_preflight.run_facebook_page_preflight_sync(
+                payload,
+                task_id=602,
+            )
+
+        self.assertEqual(raised.exception.error_code, "facebook_video_file_invalid")
+        self.assertEqual(session_calls, [])
+        safe_error_json = json.dumps(
+            {
+                "message": str(raised.exception),
+                "receipt": raised.exception.receipt,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        self.assertNotIn(str(missing), safe_error_json)
+        self.assertNotIn(str(missing.parent), safe_error_json)
+
+    def test_unreadable_video_is_stable_and_stops_before_page_session(self) -> None:
+        payload = self.payload("preflight")
+        session_calls: list[dict] = []
+        path_type = type(self.video)
+        real_open = path_type.open
+
+        def open_with_video_permission_denied(path, *args, **kwargs):
+            mode = args[0] if args else kwargs.get("mode", "r")
+            if path == self.video and mode == "rb":
+                raise PermissionError("simulated unreadable Page video")
+            return real_open(path, *args, **kwargs)
+
+        @asynccontextmanager
+        async def forbidden_session(prepared):
+            session_calls.append(prepared)
+            raise FacebookPagePublishError(
+                "facebook_page_session_reached",
+                "Unreadable local video reached the Page session.",
+            )
+            yield  # pragma: no cover - async context manager shape only
+
+        with (
+            patch.object(
+                path_type,
+                "open",
+                autospec=True,
+                side_effect=open_with_video_permission_denied,
+            ),
+            patch.object(
+                overseas_browser_publish,
+                "_facebook_page_session",
+                side_effect=forbidden_session,
+            ),
+            self.assertRaises(FacebookPagePublishError) as raised,
+        ):
+            overseas_preflight.run_facebook_page_preflight_sync(
+                payload,
+                task_id=604,
+            )
+
+        self.assertEqual(raised.exception.error_code, "facebook_video_file_invalid")
+        self.assertEqual(session_calls, [])
+        safe_error_json = json.dumps(
+            {
+                "message": str(raised.exception),
+                "receipt": raised.exception.receipt,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        self.assertNotIn(str(self.video), safe_error_json)
+        self.assertNotIn(str(self.video.parent), safe_error_json)
+
+    def test_relative_existing_video_is_rejected_before_page_session(self) -> None:
+        payload = self.payload("preflight")
+        payload["fileList"] = [self.video.name]
+        session_calls: list[dict] = []
+
+        @asynccontextmanager
+        async def forbidden_session(prepared):
+            session_calls.append(prepared)
+            raise FacebookPagePublishError(
+                "facebook_page_session_reached",
+                "Relative local video reached the Page session.",
+            )
+            yield  # pragma: no cover - async context manager shape only
+
+        previous_cwd = Path.cwd()
+        try:
+            os.chdir(self.video.parent)
+            with (
+                patch.object(
+                    overseas_browser_publish,
+                    "_facebook_page_session",
+                    side_effect=forbidden_session,
+                ),
+                self.assertRaises(FacebookPagePublishError) as raised,
+            ):
+                overseas_preflight.run_facebook_page_preflight_sync(
+                    payload,
+                    task_id=603,
+                )
+        finally:
+            os.chdir(previous_cwd)
+
+        self.assertEqual(raised.exception.error_code, "facebook_video_file_invalid")
+        self.assertEqual(session_calls, [])
+
     def test_real_formal_runner_persists_each_lifecycle_event_once(self) -> None:
         task, payload = self._claimed_formal_task()
         self.platform_decision = self._sealed_accepted_decision(self.page_id)
@@ -565,7 +896,8 @@ class FacebookPageExecutorTests(unittest.TestCase):
         with database.connect() as conn:
             item = conn.execute(
                 """
-                SELECT id, accountId, authorizationSnapshotHash
+                SELECT id, accountId, authorizationSnapshotHash,
+                       message, errorCode, receiptJson
                 FROM publish_task_items WHERE taskId = ?
                 """,
                 (int(task["id"]),),
@@ -594,17 +926,15 @@ class FacebookPageExecutorTests(unittest.TestCase):
                 (int(claim["preflightTaskId"]),),
             ).fetchone()
             item_id = int(item["id"])
-            lifecycle_item_ids = [
-                int(row["itemId"])
-                for row in conn.execute(
-                    """
-                    SELECT itemId FROM publish_task_events
-                    WHERE taskId = ? AND eventType LIKE 'facebook_%'
-                    ORDER BY id
-                    """,
-                    (int(task["id"]),),
-                ).fetchall()
-            ]
+            lifecycle_rows = conn.execute(
+                """
+                SELECT itemId, message, detailJson FROM publish_task_events
+                WHERE taskId = ? AND eventType LIKE 'facebook_%'
+                ORDER BY id
+                """,
+                (int(task["id"]),),
+            ).fetchall()
+            lifecycle_item_ids = [int(row["itemId"]) for row in lifecycle_rows]
             terminal = conn.execute(
                 """
                 SELECT workerPid, workerHeartbeatAt, finishedAt
@@ -645,6 +975,22 @@ class FacebookPageExecutorTests(unittest.TestCase):
             claim
         )
         self.assertEqual(evidence["formSnapshot"]["pageId"], self.page_id)
+        persisted_safe_values = [
+            preflight_receipt_json,
+            str(item["message"] or ""),
+            str(item["errorCode"] or ""),
+            str(item["receiptJson"] or ""),
+            str(claim["formSnapshotJson"] or ""),
+            str(claim["platformDecisionJson"] or ""),
+            *[
+                str(value or "")
+                for row in lifecycle_rows
+                for value in (row["message"], row["detailJson"])
+            ],
+        ]
+        for persisted in persisted_safe_values:
+            self.assertNotIn(str(self.video), persisted)
+            self.assertNotIn(str(self.video.parent), persisted)
         self.assertEqual(lifecycle_item_ids, [item_id] * 5)
         self.assertIsNone(terminal["workerPid"])
         self.assertEqual(terminal["workerHeartbeatAt"], terminal["finishedAt"])
@@ -776,6 +1122,86 @@ class FacebookPageExecutorTests(unittest.TestCase):
             "overseasVideoPublishConfirmed",
         ):
             self.assertNotIn(key, prepared["payload"])
+
+    def test_page_v1_service_rejects_unsupported_metadata_before_session(self) -> None:
+        cases = (
+            ("cover_path", {"coverPath": str(self.video.parent / "cover.png")}),
+            ("cover_paths", {"coverPaths": {"3:4": "cover.png"}}),
+            ("collection", {"collectionName": "Page collection"}),
+            ("schedule_object", {"schedule": {"localTime": "2026-09-01 10:00"}}),
+            ("schedule_mode", {"scheduleMode": "platform_native"}),
+            ("scheduled_at", {"scheduledAt": "2026-09-01 10:00"}),
+            ("schedule_time", {"scheduleTime": "2026-09-01 10:00"}),
+            ("schedule_timezone", {"scheduleTimezone": "Asia/Shanghai"}),
+            ("daily_times", {"dailyTimes": ["10:00"]}),
+            ("videos_per_day", {"videosPerDay": 2}),
+            ("malformed_enable_timer", {"enableTimer": {"enabled": False}}),
+            ("malformed_videos_per_day", {"videosPerDay": []}),
+            ("visibility", {"visibility": "private"}),
+            ("original", {"originalDeclaration": True}),
+            ("content_declaration", {"contentDeclaration": "原创内容"}),
+            ("ai_generated", {"aiGenerated": True}),
+            (
+                "ai_confirmation",
+                {"aiDeclarationExplicitlyConfirmed": True},
+            ),
+            (
+                "ai_disclosure",
+                {"aiDisclosure": {"containsAiGeneratedContent": False}},
+            ),
+            (
+                "nested_settings",
+                {"settings": {"coverPath": "cover.png"}},
+            ),
+        )
+        for index, (label, changes) in enumerate(cases):
+            with self.subTest(label=label):
+                payload = {**self.payload("preflight"), **changes}
+                session_calls: list[dict] = []
+
+                @asynccontextmanager
+                async def forbidden_session(prepared):
+                    session_calls.append(prepared)
+                    raise FacebookPagePublishError(
+                        "facebook_page_session_reached",
+                        "Unsupported metadata reached the Page session.",
+                    )
+                    yield  # pragma: no cover - async context manager shape only
+
+                with patch.object(
+                    overseas_browser_publish,
+                    "_facebook_page_session",
+                    side_effect=forbidden_session,
+                ):
+                    try:
+                        overseas_preflight.run_facebook_page_preflight_sync(
+                            payload,
+                            task_id=700 + index,
+                        )
+                    except FacebookPagePublishError as exc:
+                        raised_error = exc
+                    except Exception as exc:  # pragma: no cover - RED guard
+                        self.fail(
+                            "unsupported Facebook metadata leaked a non-stable "
+                            f"{type(exc).__name__}"
+                        )
+                    else:  # pragma: no cover - unsupported input must stop
+                        self.fail("unsupported Facebook metadata was accepted")
+
+                self.assertEqual(
+                    raised_error.error_code,
+                    "facebook_unsupported_publish_setting",
+                )
+                self.assertEqual(session_calls, [])
+                self.assertEqual(
+                    raised_error.receipt,
+                    {
+                        "phase": "local_validation",
+                        "platformWriteOccurred": False,
+                        "finalActionTriggered": False,
+                        "pageId": self.page_id,
+                    },
+                )
 
     def test_formal_rejects_malformed_persisted_evidence_before_session(self) -> None:
         task, payload = self._claimed_formal_task()
