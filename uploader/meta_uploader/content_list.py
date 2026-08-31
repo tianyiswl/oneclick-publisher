@@ -42,6 +42,7 @@ _CURRENT_TABLE_WAIT_MS = 500
 _READBACK_SETTLEMENT_WAIT_MS = 5_000
 _CURRENT_FILTER_WAIT_MS = 250
 _CURRENT_FILTER_SETTLEMENT_ATTEMPTS = 20
+_CURRENT_FILTER_REOPEN_AFTER_ATTEMPTS = 4
 _CONTENT_ROW_ID = re.compile(r"(?<!\d)(\d{6,32})(?!\d)")
 _CURRENT_REEL_MEDIA_LABELS = frozenset(
     {"reel", "reels", "video", "videos", "视频"}
@@ -1111,6 +1112,16 @@ class FacebookPageContentReader:
                 raise _baseline_failed()
             if len(found) == 1:
                 return found[0]
+            if attempt + 1 == _CURRENT_FILTER_REOPEN_AFTER_ATTEMPTS:
+                refreshed = await self._current_date_button(page)
+                if refreshed is None or refreshed[0] != "bounded":
+                    raise _baseline_failed()
+                date_button = refreshed[1]
+                expanded = canonical_meta_caption(
+                    await date_button.get_attribute("aria-expanded")
+                ).casefold()
+                if expanded not in {"true", "1"}:
+                    await date_button.click()
             if attempt + 1 < _CURRENT_FILTER_SETTLEMENT_ATTEMPTS:
                 await self._wait_current_filter(page)
         raise _baseline_failed()

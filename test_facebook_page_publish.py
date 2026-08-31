@@ -2083,6 +2083,47 @@ class FacebookPageContentListTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(baseline.rows, ())
 
+    async def test_current_posts_date_scope_retries_when_first_menu_click_is_ignored(
+        self,
+    ) -> None:
+        """Meta 吞掉首次只读点击时，应重新展开日期菜单后再读取基线。"""
+
+        with patch(
+            "uploader.meta_uploader.content_list._CURRENT_FILTER_WAIT_MS",
+            10,
+        ):
+            baseline = await self._capture_current_table_html(
+                '<div id="empty" role="status">No content yet</div>',
+                controls_html="""
+                  <button id="date-range" type="button"
+                          aria-label="过去90天：2026年6月1日–2026年8月29日"
+                          onclick="openAllTime()">
+                    过去90天：2026年6月1日–2026年8月29日
+                  </button>
+                  <button id="all-time" type="button" hidden
+                          onclick="selectAllTime()">创建至今</button>
+                """,
+                page_script="""
+                  let dateMenuClicks = 0;
+                  function openAllTime() {
+                    dateMenuClicks += 1;
+                    if (dateMenuClicks >= 2) {
+                      document.querySelector('#all-time').hidden = false;
+                    }
+                  }
+                  function selectAllTime() {
+                    const range = document.querySelector('#date-range');
+                    range.textContent = '创建至今：2026年8月30日';
+                    range.setAttribute('aria-label', '创建至今：2026年8月30日');
+                    document.querySelector('#all-time').hidden = true;
+                  }
+                """,
+                max_samples=2,
+                current_table_wait_ms=0,
+            )
+
+        self.assertEqual(baseline.rows, ())
+
     async def test_current_table_scroll_survives_row_replacement_during_scroll(
         self,
     ) -> None:
