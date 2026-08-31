@@ -111,6 +111,7 @@ class FacebookPageExecutorTests(unittest.TestCase):
         self.post_click_state = "unknown"
         self.platform_decision: object | None = None
         self.adapter_classes: list[type] = []
+        self.reader_timezones: list[str] = []
 
     def payload(self, mode: str) -> dict:
         return {
@@ -244,8 +245,14 @@ class FacebookPageExecutorTests(unittest.TestCase):
                 return await button.is_enabled()
 
         class Reader:
-            def __init__(self, context, *, wait_for_verification) -> None:
-                pass
+            def __init__(
+                self,
+                context,
+                *,
+                wait_for_verification,
+                trusted_display_timezone=None,
+            ) -> None:
+                owner.reader_timezones.append(str(trusted_display_timezone or ""))
 
             async def capture_baseline(self, expected_page_id):
                 owner.log.append("baseline:read")
@@ -535,6 +542,7 @@ class FacebookPageExecutorTests(unittest.TestCase):
         )
         self.assertEqual(len(result["receipt"]["formSnapshotHash"]), 64)
         self.assertEqual(len(self.adapter_classes), 2)
+        self.assertEqual(self.reader_timezones, ["Asia/Shanghai"])
         self.assertTrue(
             all(issubclass(adapter, PageFormContract) for adapter in self.adapter_classes)
         )
@@ -921,7 +929,13 @@ class FacebookPageExecutorTests(unittest.TestCase):
         accepted_decision = self._sealed_accepted_decision(self.page_id)
 
         class Reader:
-            def __init__(self, context, *, wait_for_verification) -> None:
+            def __init__(
+                self,
+                context,
+                *,
+                wait_for_verification,
+                trusted_display_timezone=None,
+            ) -> None:
                 return None
 
             async def capture_baseline(self, expected_page_id):

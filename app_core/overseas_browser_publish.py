@@ -16,6 +16,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Mapping
+from zoneinfo import ZoneInfo
 
 from playwright.async_api import async_playwright
 
@@ -60,6 +61,7 @@ from .wechat_publish_policy import local_timezone_name
 
 PLATFORM_NAMES = {8: "Instagram Reels", 9: "Facebook Reels"}
 HANDLERS = {8: post_video_instagram}
+_FACEBOOK_PAGE_CONTEXT_TIMEZONE = "Asia/Shanghai"
 
 
 class OverseasBrowserPublishError(RuntimeError):
@@ -297,6 +299,7 @@ async def _facebook_page_session(
             context = await new_publish_context(
                 browser,
                 storage_state=str(COOKIE_DIR / str(prepared["accountFile"])),
+                timezone_id=_FACEBOOK_PAGE_CONTEXT_TIMEZONE,
             )
             await set_init_script(context)
             page = await context.new_page()
@@ -667,6 +670,7 @@ async def _facebook_page_formal_async(
         reader = FacebookPageContentReader(
             context,
             wait_for_verification=verifier,
+            trusted_display_timezone=ZoneInfo(_FACEBOOK_PAGE_CONTEXT_TIMEZONE),
         )
         baseline = await reader.capture_baseline(str(prepared["pageId"]))
         adapter = FacebookPageFormAdapter(page, wait_for_verification=verifier)

@@ -1887,6 +1887,8 @@ class FacebookPageContentListTests(unittest.IsolatedAsyncioTestCase):
         page_script: str = "",
         detail_html: str = "",
         max_samples: int = 20,
+        current_table_wait_ms: int = 0,
+        trusted_display_timezone: ZoneInfo | None = None,
     ) -> FacebookPageContentBaseline:
         from playwright.async_api import async_playwright
 
@@ -1942,9 +1944,13 @@ class FacebookPageContentListTests(unittest.IsolatedAsyncioTestCase):
                         body=detail_html,
                     ),
                 )
+            reader_options = {}
+            if trusted_display_timezone is not None:
+                reader_options["trusted_display_timezone"] = trusted_display_timezone
             reader = FacebookPageContentReader(
                 context,
                 wait_for_verification=self.no_verification,
+                **reader_options,
             )
             try:
                 with (
@@ -1954,7 +1960,7 @@ class FacebookPageContentListTests(unittest.IsolatedAsyncioTestCase):
                     ),
                     patch(
                         "uploader.meta_uploader.content_list._CURRENT_TABLE_WAIT_MS",
-                        0,
+                        current_table_wait_ms,
                     ),
                     patch(
                         "uploader.meta_uploader.content_list._CURRENT_EMPTY_MIN_SETTLEMENT_MS",
@@ -1968,6 +1974,151 @@ class FacebookPageContentListTests(unittest.IsolatedAsyncioTestCase):
                     return await reader.capture_baseline(expected_page_id="1001")
             finally:
                 await context.close()
+                await browser.close()
+
+    async def test_current_posts_table_uses_trusted_context_timezone_when_meta_omits_it(
+        self,
+    ) -> None:
+        """受控浏览器已锁定时区时，Meta 可省略重复的页面时区标记。"""
+
+        baseline = await self._capture_current_table_html(
+            """
+            <tr role="row" data-index="0">
+              <td><input type="checkbox" aria-label="选择编号为823456789012345的项目"></td>
+              <td aria-colindex="2"><div>封面照片</div><span>照片</span></td>
+              <td aria-colindex="3">8月30日 18:50</td>
+            </tr>
+            """,
+            trusted_display_timezone=ZoneInfo("Asia/Shanghai"),
+        )
+
+        self.assertEqual(baseline.rows, ())
+
+    async def test_current_posts_table_waits_for_transient_incomplete_virtual_row(
+        self,
+    ) -> None:
+        """React 虚拟表格重绘中的半成品行不能让安全基线永久失败。"""
+
+        baseline = await self._capture_current_table_html(
+            '<div id="empty" role="status">No content yet</div>',
+            controls_html="""
+              <span data-meta-timezone="Asia/Shanghai" hidden></span>
+              <button id="date-range" type="button"
+                      aria-label="过去90天：2026年6月1日–2026年8月29日"
+                      onclick="document.querySelector('#all-time').hidden = false">
+                过去90天：2026年6月1日–2026年8月29日
+              </button>
+              <button id="all-time" type="button" hidden
+                      onclick="selectAllTime()">创建至今</button>
+            """,
+            page_script="""
+              function selectAllTime() {
+                const range = document.querySelector('#date-range');
+                range.textContent = '创建至今：2026年8月30日';
+                range.setAttribute('aria-label', '创建至今：2026年8月30日');
+                document.querySelector('#all-time').hidden = true;
+                document.querySelector('#empty').remove();
+                document.querySelector('tbody').insertAdjacentHTML(
+                  'beforeend',
+                  `<tr id="transient-row" role="row" data-index="0">
+                     <td><input type="checkbox" aria-label="选择编号为923456789012345的项目"></td>
+                     <td aria-colindex="2"><div>头像照片</div><span>照片</span></td>
+                   </tr>`
+                );
+                setTimeout(() => {
+                  document.querySelector('#transient-row').insertAdjacentHTML(
+                    'beforeend',
+                    '<td aria-colindex="3">8月30日 18:48</td>'
+                  );
+                }, 400);
+              }
+            """,
+            max_samples=6,
+            current_table_wait_ms=100,
+        )
+
+        self.assertEqual(baseline.rows, ())
+
+    async def test_current_posts_date_scope_waits_for_delayed_all_time_option(
+        self,
+    ) -> None:
+        """日期菜单异步渲染时必须等到唯一“创建至今”选项。"""
+
+        baseline = await self._capture_current_table_html(
+            '<div id="empty" role="status">No content yet</div>',
+            controls_html="""
+              <button id="date-range" type="button"
+                      aria-label="过去90天：2026年6月1日–2026年8月29日"
+                      onclick="showAllTimeLater()">
+                过去90天：2026年6月1日–2026年8月29日
+              </button>
+              <button id="all-time" type="button" hidden
+                      onclick="selectAllTime()">创建至今</button>
+            """,
+            page_script="""
+              function showAllTimeLater() {
+                setTimeout(() => {
+                  document.querySelector('#all-time').hidden = false;
+                }, 400);
+              }
+              function selectAllTime() {
+                const range = document.querySelector('#date-range');
+                range.textContent = '创建至今：2026年8月30日';
+                range.setAttribute('aria-label', '创建至今：2026年8月30日');
+                document.querySelector('#all-time').hidden = true;
+                document.querySelector('#empty').remove();
+                document.querySelector('tbody').insertAdjacentHTML(
+                  'beforeend',
+                  `<tr role="row" data-index="0">
+                     <td><input type="checkbox" aria-label="选择编号为723456789012345的项目"></td>
+                     <td aria-colindex="2"><div>历史照片</div><span>照片</span></td>
+                     <td aria-colindex="3"><time datetime="2026-08-30T10:50:00+00:00">8月30日 18:50</time></td>
+                   </tr>`
+                );
+              }
+            """,
+            max_samples=6,
+            current_table_wait_ms=25,
+        )
+
+        self.assertEqual(baseline.rows, ())
+
+    async def test_current_table_scroll_survives_row_replacement_during_scroll(
+        self,
+    ) -> None:
+        """滚动期间替换虚拟行时，滚动动作不能依赖已经失效的第 N 行。"""
+
+        from playwright.async_api import async_playwright
+
+        html = """
+        <!doctype html><html><body>
+          <div id="viewport" style="height:80px;overflow-y:auto">
+            <table><tbody id="rows"></tbody></table>
+          </div>
+          <script>
+            const rows = document.querySelector('#rows');
+            rows.innerHTML = Array.from({length: 12}, (_, index) =>
+              `<tr role="row" data-index="${index}"><td>row ${index}</td></tr>`
+            ).join('');
+            document.querySelector('#viewport').addEventListener('scroll', () => {
+              window.virtualRowsReplaced = true;
+              rows.innerHTML = '<tr role="row" data-index="12"><td>replacement</td></tr>';
+            }, {once: true});
+          </script>
+        </body></html>
+        """
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            page = await browser.new_page()
+            await page.set_content(html)
+            try:
+                at_bottom = await FacebookPageContentReader._scroll_current_table_to_bottom(
+                    page
+                )
+                await page.wait_for_timeout(50)
+                self.assertTrue(at_bottom)
+                self.assertTrue(await page.evaluate("window.virtualRowsReplaced"))
+            finally:
                 await browser.close()
 
     async def test_current_posts_table_accepts_one_explicit_empty_status(self) -> None:

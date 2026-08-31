@@ -41,6 +41,7 @@ _CONTENT_SURFACE_WAIT_MS = 250
 _CURRENT_TABLE_WAIT_MS = 500
 _READBACK_SETTLEMENT_WAIT_MS = 5_000
 _CURRENT_FILTER_WAIT_MS = 250
+_CURRENT_FILTER_SETTLEMENT_ATTEMPTS = 20
 _CONTENT_ROW_ID = re.compile(r"(?<!\d)(\d{6,32})(?!\d)")
 _CURRENT_REEL_MEDIA_LABELS = frozenset(
     {"reel", "reels", "video", "videos", "视频"}
@@ -626,13 +627,24 @@ class FacebookPageContentReader:
         context,
         *,
         wait_for_verification: Callable[..., Awaitable[None]],
+        trusted_display_timezone: tzinfo | None = None,
     ) -> None:
         if context is None or not callable(getattr(context, "new_page", None)):
             raise TypeError("context must be a browser context")
         if not callable(wait_for_verification):
             raise TypeError("wait_for_verification must be callable")
+        if trusted_display_timezone is not None:
+            try:
+                offset = datetime.now(trusted_display_timezone).utcoffset()
+            except Exception as exc:
+                raise TypeError(
+                    "trusted_display_timezone must be timezone-aware"
+                ) from exc
+            if offset is None:
+                raise TypeError("trusted_display_timezone must be timezone-aware")
         self.context = context
         self._wait_for_verification = wait_for_verification
+        self._trusted_display_timezone = trusted_display_timezone
         self._list_page: Any | None = None
         self._activated_page_id = ""
 
@@ -1024,7 +1036,7 @@ class FacebookPageContentReader:
         unique = {str(item) for item in resolved}
         if len(unique) > 1:
             raise _baseline_failed()
-        return resolved[0] if resolved else None
+        return resolved[0] if resolved else self._trusted_display_timezone
 
     async def _clear_current_posts_search(self, page: Any) -> None:
         candidates = await self._visible(
@@ -1077,26 +1089,31 @@ class FacebookPageContentReader:
         return matching[0] if matching else None
 
     async def _all_time_option(self, page: Any) -> Any:
-        for role in ("option", "menuitem", "button"):
-            found: list[Any] = []
+        for attempt in range(_CURRENT_FILTER_SETTLEMENT_ATTEMPTS):
+            for role in ("option", "menuitem", "button"):
+                found: list[Any] = []
+                for label in _CURRENT_DATE_ALL_TIME_LABELS:
+                    found.extend(
+                        await self._visible(
+                            page.get_by_role(role, name=label, exact=True)
+                        )
+                    )
+                if len(found) > 1:
+                    raise _baseline_failed()
+                if len(found) == 1:
+                    return found[0]
+            found = []
             for label in _CURRENT_DATE_ALL_TIME_LABELS:
                 found.extend(
-                    await self._visible(
-                        page.get_by_role(role, name=label, exact=True)
-                    )
+                    await self._visible(page.get_by_text(label, exact=True))
                 )
             if len(found) > 1:
                 raise _baseline_failed()
             if len(found) == 1:
                 return found[0]
-        found = []
-        for label in _CURRENT_DATE_ALL_TIME_LABELS:
-            found.extend(
-                await self._visible(page.get_by_text(label, exact=True))
-            )
-        if len(found) != 1:
-            raise _baseline_failed()
-        return found[0]
+            if attempt + 1 < _CURRENT_FILTER_SETTLEMENT_ATTEMPTS:
+                await self._wait_current_filter(page)
+        raise _baseline_failed()
 
     async def _normalize_current_posts_view(
         self,
@@ -1120,11 +1137,14 @@ class FacebookPageContentReader:
             )
             option = await self._all_time_option(page)
             await option.click()
-            await self._wait_current_filter(page)
-            await self._recheck_page(page, expected_page_id)
-            refreshed = await self._current_date_button(page)
-            if refreshed is None or refreshed[0] != "all_time":
-                raise _baseline_failed(expected_page_id)
+            for attempt in range(_CURRENT_FILTER_SETTLEMENT_ATTEMPTS):
+                await self._wait_current_filter(page)
+                await self._recheck_page(page, expected_page_id)
+                refreshed = await self._current_date_button(page)
+                if refreshed is not None and refreshed[0] == "all_time":
+                    break
+                if attempt + 1 == _CURRENT_FILTER_SETTLEMENT_ATTEMPTS:
+                    raise _baseline_failed(expected_page_id)
         return (
             await self._current_posts_display_timezone(page)
             or display_timezone
@@ -1157,7 +1177,7 @@ class FacebookPageContentReader:
         )
         observed_at = datetime.now(timezone.utc)
 
-        for _ in range(_CURRENT_TABLE_MAX_SAMPLES):
+        for sample_index in range(_CURRENT_TABLE_MAX_SAMPLES):
             await self._recheck_page(page, expected_page_id)
             if not _is_current_content_url(
                 _page_url(page),
@@ -1184,13 +1204,16 @@ class FacebookPageContentReader:
                     )
                 )
             if len(title_headers) != 1 or len(date_headers) != 1:
-                raise _baseline_failed(expected_page_id)
+                if sample_index + 1 == _CURRENT_TABLE_MAX_SAMPLES:
+                    raise _baseline_failed(expected_page_id)
+                await self._wait_current_table_sample(page)
+                continue
 
             data_rows = await self._visible(
                 page.locator('tr[role="row"][data-index]')
             )
-            signature: list[tuple[str, str, str]] = []
-            new_content_count = 0
+            parsed_rows: list[tuple[str, str, str]] = []
+            parse_failure: Exception | None = None
             for row in data_rows:
                 try:
                     checkboxes = await self._visible(
@@ -1228,15 +1251,24 @@ class FacebookPageContentReader:
                         if len(timestamps) == 1
                         else await date_cells[0].inner_text()
                     )
-                    timestamp_text = canonical_meta_caption(raw_timestamp)
                     published_at = _current_table_timestamp(
-                        timestamp_text,
+                        canonical_meta_caption(raw_timestamp),
                         observed_at=observed_at,
                         display_timezone=display_timezone,
                     )
-                except (FacebookPagePublishError, TypeError, ValueError) as exc:
-                    raise _baseline_failed(expected_page_id) from exc
+                    parsed_rows.append((content_id, media_kind, published_at))
+                except Exception as exc:
+                    parse_failure = exc
+                    break
+            if parse_failure is not None:
+                if sample_index + 1 == _CURRENT_TABLE_MAX_SAMPLES:
+                    raise _baseline_failed(expected_page_id) from parse_failure
+                await self._wait_current_table_sample(page)
+                continue
 
+            signature: list[tuple[str, str, str]] = []
+            new_content_count = 0
+            for content_id, media_kind, published_at in parsed_rows:
                 # Business Suite adds transient row actions (for example
                 # “创建广告”) after the content identity has rendered.  The
                 # exact ID, media kind and canonical publish time are stable;
@@ -1284,18 +1316,19 @@ class FacebookPageContentReader:
                     and settled_ms >= _CURRENT_EMPTY_MIN_SETTLEMENT_MS
                 ):
                     return ()
-                wait = getattr(page, "wait_for_timeout", None)
-                if callable(wait):
-                    await wait(_CURRENT_TABLE_WAIT_MS)
-                else:
-                    await asyncio.sleep(_CURRENT_TABLE_WAIT_MS / 1000)
+                await self._wait_current_table_sample(page)
                 continue
             stable_empty_status = 0
             empty_started_at = None
 
             signature_tuple = tuple(signature)
-            target = data_rows[-1] if data_rows else title_headers[0]
-            at_bottom = await self._scroll_current_table_to_bottom(target)
+            try:
+                at_bottom = await self._scroll_current_table_to_bottom(page)
+            except FacebookPagePublishError:
+                if sample_index + 1 == _CURRENT_TABLE_MAX_SAMPLES:
+                    raise
+                await self._wait_current_table_sample(page)
+                continue
             if (
                 at_bottom
                 and previous_signature == signature_tuple
@@ -1318,19 +1351,38 @@ class FacebookPageContentReader:
                     sorted(rows_by_id.values(), key=lambda item: item.reel_id)
                 )
             previous_signature = signature_tuple
-            wait = getattr(page, "wait_for_timeout", None)
-            if callable(wait):
-                await wait(_CURRENT_TABLE_WAIT_MS)
-            else:
-                await asyncio.sleep(_CURRENT_TABLE_WAIT_MS / 1000)
+            await self._wait_current_table_sample(page)
         raise _baseline_failed(expected_page_id)
 
     @staticmethod
-    async def _scroll_current_table_to_bottom(target: Any) -> bool:
+    async def _wait_current_table_sample(page: Any) -> None:
+        wait = getattr(page, "wait_for_timeout", None)
+        if callable(wait):
+            await wait(_CURRENT_TABLE_WAIT_MS)
+        else:
+            await asyncio.sleep(_CURRENT_TABLE_WAIT_MS / 1000)
+
+    @staticmethod
+    async def _scroll_current_table_to_bottom(page: Any) -> bool:
         try:
-            result = await target.evaluate(
+            result = await page.evaluate(
                 """
-                element => {
+                () => {
+                  const visible = element => {
+                    if (!(element instanceof HTMLElement)) return false;
+                    const style = getComputedStyle(element);
+                    return style.display !== 'none' &&
+                      style.visibility !== 'hidden' &&
+                      element.getClientRects().length > 0;
+                  };
+                  const rows = Array.from(
+                    document.querySelectorAll('tr[role="row"][data-index]')
+                  ).filter(visible);
+                  const headers = Array.from(
+                    document.querySelectorAll('[role="columnheader"]')
+                  ).filter(visible);
+                  const element = rows.at(-1) || headers[0];
+                  if (!element) return false;
                   const containers = [];
                   let node = element;
                   while (node && node.parentElement) {
