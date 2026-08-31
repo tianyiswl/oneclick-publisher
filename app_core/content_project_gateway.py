@@ -15,6 +15,7 @@ from typing import Any, Callable, Mapping, Sequence
 from . import account_service, content_bundle, controlled_publish, oneclick_capabilities
 from .paths import USER_DATA_DIR
 from .content_project_metrics import ContentProjectMetricsService
+from .overseas_meta_page_identity import facebook_page_v1_enabled
 from .source_live_runtime import source_live_data_active, source_live_session_active
 
 
@@ -135,7 +136,7 @@ class ContentProjectGateway:
         ] = account_service.list_publishable_accounts,
         submitter: Callable[[Mapping[str, Any]], dict[str, Any]] | None = None,
         status_reader: Callable[[int], dict[str, Any]] = controlled_publish.task_status,
-        authorizer: Callable[[int], dict[str, Any]] = controlled_publish.authorize_completed_preflight,
+        authorizer: Callable[[int], dict[str, Any]] = controlled_publish.authorize_completed_check,
         direct_authorizer: Callable[
             [Mapping[str, Any]], dict[str, Any]
         ] = controlled_publish.authorize_direct_request,
@@ -146,6 +147,11 @@ class ContentProjectGateway:
         ] = controlled_publish.authorize_silicon_evolution_direct_request,
         matrix_submitter: Callable[[Mapping[str, Any]], dict[str, Any]] | None = None,
         metrics_service: ContentProjectMetricsService | None = None,
+        formal_submitter: Callable[[int, str], dict[str, Any]] | None = None,
+        reconciler: Callable[[int], dict[str, Any]] = (
+            controlled_publish.reconcile_facebook_page_publish_outcome
+        ),
+        facebook_feature_enabled: Callable[[], bool] = facebook_page_v1_enabled,
     ) -> None:
         self.profile_store = profile_store or PublishProfileStore()
         self.accounts_provider = accounts_provider
@@ -174,6 +180,13 @@ class ContentProjectGateway:
             matrix_submitter = submit_douyin_graphic_matrix_request_in_process
         self.matrix_submitter = matrix_submitter
         self.metrics_service = metrics_service or ContentProjectMetricsService()
+        if formal_submitter is None:
+            from .controlled_publish_process import submit_authorized_preflight_task
+
+            formal_submitter = submit_authorized_preflight_task
+        self.formal_submitter = formal_submitter
+        self.reconciler = reconciler
+        self.facebook_feature_enabled = facebook_feature_enabled
 
     def _ensure_platform_work_available(self) -> None:
         if self.runtime_conflict_checker():
@@ -185,12 +198,35 @@ class ContentProjectGateway:
     def _account_rows(self) -> list[dict[str, Any]]:
         return [dict(row) for row in self.accounts_provider()]
 
+    def _facebook_page_available(self) -> bool:
+        return bool(self.facebook_feature_enabled())
+
+    @staticmethod
+    def _profile_has_facebook_page(profile: Mapping[str, Any]) -> bool:
+        return any(
+            oneclick_capabilities.canonical_platform(
+                str(target.get("platform") or "")
+            )
+            == "Facebook Reels"
+            for target in profile.get("targets") or []
+            if isinstance(target, Mapping)
+        )
+
+    def _require_facebook_page_available(self) -> None:
+        if not self._facebook_page_available():
+            raise ContentProjectGatewayError(
+                "facebook_page_feature_disabled",
+                "Facebook Page 发布功能尚未开启。",
+            )
+
     def list_accounts(self) -> list[dict[str, Any]]:
         accounts = []
         for row in self._account_rows():
             platform_type = int(row.get("type") or 0)
             account_id = int(row.get("id") or 0)
             if platform_type <= 0 or account_id <= 0:
+                continue
+            if platform_type == 9 and not self._facebook_page_available():
                 continue
             accounts.append(
                 {
@@ -256,6 +292,8 @@ class ContentProjectGateway:
                 raise ContentProjectGatewayError(
                     "content_project_target_invalid", "平台和 accountId 必须明确有效"
                 )
+            if platform_type == 9:
+                self._require_facebook_page_available()
             account = accounts_by_id.get(account_id)
             if not account or int(account.get("type") or 0) != platform_type:
                 raise ContentProjectGatewayError(
@@ -288,6 +326,13 @@ class ContentProjectGateway:
     ) -> dict[str, Any]:
         normalized_project_id = str(project_id or "").strip().lower()
         profile = self.profile_store.get(normalized_project_id)
+        if self._profile_has_facebook_page(profile):
+            self._require_facebook_page_available()
+            if mode == "direct":
+                raise ContentProjectGatewayError(
+                    "facebook_preflight_required",
+                    "Facebook Page 首版必须先完成受控预检。",
+                )
         normalized_schedules = {
             oneclick_capabilities.canonical_platform(str(platform)): schedule
             for platform, schedule in dict(schedules or {}).items()
@@ -387,38 +432,24 @@ class ContentProjectGateway:
 
     def formal_publish(
         self,
-        project_id: str,
-        manifest_path: str,
         *,
-        confirmed_preflight_task_id: int,
+        preflight_task_id: int,
         authorization_id: str,
-        schedules: Mapping[str, object] | None = None,
-        settings: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> dict[str, Any]:
         self._ensure_platform_work_available()
         if (
-            type(confirmed_preflight_task_id) is not int
-            or confirmed_preflight_task_id <= 0
+            type(preflight_task_id) is not int
+            or preflight_task_id <= 0
             or not str(authorization_id or "").strip()
         ):
             raise ContentProjectGatewayError(
                 "content_project_authorization_required",
                 "正式发布必须绑定全部成功的预检和一次性本地授权",
             )
-        request = self._request(
-            project_id,
-            manifest_path,
-            "formal",
-            schedules,
-            settings,
+        return self.formal_submitter(
+            preflight_task_id,
+            str(authorization_id).strip(),
         )
-        request.update(
-            {
-                "confirmedPreflightTaskId": confirmed_preflight_task_id,
-                "authorizationId": str(authorization_id).strip(),
-            }
-        )
-        return self.submitter(request)
 
     def direct_publish_content(
         self,
@@ -463,7 +494,25 @@ class ContentProjectGateway:
             raise ContentProjectGatewayError(
                 "content_project_task_id_invalid", "预检 taskId 必须是正整数"
             )
+        projection = self.status_reader(task_id)
+        if any(
+            int(item.get("platformType") or 0) == 9
+            for item in projection.get("platforms") or []
+            if isinstance(item, Mapping)
+        ):
+            self._require_facebook_page_available()
         return self.authorizer(task_id)
+
+    def reconcile_publish_outcome(self, task_id: int) -> dict[str, Any]:
+        """Read-only Page outcome reconciliation; no authorization is accepted."""
+
+        if type(task_id) is not int or task_id <= 0:
+            raise ContentProjectGatewayError(
+                "content_project_task_id_invalid",
+                "taskId 必须是正整数",
+            )
+        self._require_facebook_page_available()
+        return self.reconciler(task_id)
 
     @staticmethod
     def _matrix_schedule(value: object) -> str:

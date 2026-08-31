@@ -20,6 +20,7 @@ from .common import button, table_item
 STATUS_LABELS = {
     "pending": "等待执行",
     "running": "执行中",
+    "waiting_user_verification": "等待安全验证",
     "success": "成功",
     "partial_failed": "部分失败",
     "failed": "失败",
@@ -29,6 +30,7 @@ STATUS_LABELS = {
 STATUS_COLORS = {
     "pending": "#64748b",
     "running": "#2563eb",
+    "waiting_user_verification": "#d97706",
     "success": "#059669",
     "partial_failed": "#d97706",
     "failed": "#dc2626",
@@ -725,12 +727,16 @@ class TaskPage(QWidget):
         for row_idx, row in enumerate(rows):
             select_item = QTableWidgetItem()
             select_flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
-            is_active = row.get("status") in {"pending", "running"}
+            is_active = row.get("status") in {
+                "pending",
+                "running",
+                "waiting_user_verification",
+            }
             if not is_active:
                 select_flags |= Qt.ItemFlag.ItemIsUserCheckable
                 select_item.setCheckState(Qt.CheckState.Unchecked)
             else:
-                select_item.setToolTip("等待执行或执行中的任务不能删除")
+                select_item.setToolTip("等待执行、执行中或等待安全验证的任务不能删除")
             select_item.setFlags(select_flags)
             select_item.setData(Qt.ItemDataRole.UserRole, row.get("id"))
             select_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)

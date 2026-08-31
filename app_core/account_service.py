@@ -12,6 +12,14 @@ from typing import Any, Callable, Iterable
 from conf import DEBUG_SKIP_FINAL_PUBLISH
 
 from .database import connect
+from .managed_artifact_cleanup import unlink_managed_artifact_if_unreferenced
+from .overseas_meta_errors import FacebookPagePublishError
+from .overseas_meta_page_identity import (
+    FacebookPageIdentity,
+    facebook_page_v1_enabled,
+    normalize_facebook_page_id,
+    resolve_facebook_page_selection,
+)
 from .overseas_tiktok_identity import (
     TikTokIdentity,
     TikTokIdentityError,
@@ -44,7 +52,7 @@ LOGIN_PLATFORM_OPTIONS = [
     (10, "公众号"),
     (6, "TikTok"),
     (7, "YouTube"),
-    (8, "Instagram / Facebook（Meta）"),
+    (8, "Instagram Reels"),
 ]
 OVERSEAS_PLATFORM_TYPES = {6, 7, 8, 9}
 AUTH_MODE_BROWSER = "browser"
@@ -148,8 +156,18 @@ def _parse_datetime(value: str | None) -> datetime | None:
 
 
 def login_platform_type(platform_type: int) -> int:
-    """Instagram 与 Facebook 共用一次 Meta Business Suite 登录。"""
-    return 8 if int(platform_type) == 9 else int(platform_type)
+    """Keep each explicit publishing target on its own login route."""
+
+    return int(platform_type)
+
+
+def login_platform_options() -> tuple[tuple[int, str], ...]:
+    """Expose Facebook Page only for the process-local V1 opt-in."""
+
+    options = list(LOGIN_PLATFORM_OPTIONS)
+    if facebook_page_v1_enabled():
+        options.append((9, "Facebook Page"))
+    return tuple(options)
 
 
 def check_is_fresh(
@@ -205,13 +223,19 @@ def estimated_login_expiry(
 def _row_to_dict(row) -> dict:
     data = dict(row)
     raw_status = int(data.get("status") or 0)
+    needs_page_rebind = (
+        int(data.get("type") or 0) == 9
+        and not str(data.get("accountReference") or "").strip()
+    )
     needs_publish_scope_upgrade = (
         int(data.get("type") or 0) == 7
         and str(data.get("authMode") or AUTH_MODE_BROWSER)
         == AUTH_MODE_YOUTUBE_OAUTH
         and int(data.get("oauthScopeVersion") or 1) < 2
     )
-    if raw_status == 2:
+    if needs_page_rebind:
+        health_status = "abnormal"
+    elif raw_status == 2:
         health_status = "pending"
     elif raw_status != 1:
         health_status = "abnormal"
@@ -225,6 +249,7 @@ def _row_to_dict(row) -> dict:
     data["healthStatus"] = health_status
     data["isHealthy"] = health_status == "normal"
     data["needsPublishScopeUpgrade"] = needs_publish_scope_upgrade
+    data["needsPageRebind"] = needs_page_rebind
     data["statusText"] = (
         "需要升级发布权限"
         if raw_status == 1 and needs_publish_scope_upgrade
@@ -283,6 +308,14 @@ def list_managed_accounts() -> list[dict]:
     return _list_accounts(include_youtube_oauth=True)
 
 
+def _is_publishable_facebook_page_account(account: Mapping[str, Any]) -> bool:
+    try:
+        validate_saved_facebook_page_account(account)
+    except FacebookPagePublishError:
+        return False
+    return True
+
+
 def list_publishable_accounts() -> list[dict]:
     """Return browser accounts plus official YouTube OAuth publishing rows."""
 
@@ -297,6 +330,10 @@ def list_publishable_accounts() -> list[dict]:
                     int(row.get("status") or 0) == 1
                     and bool(normalize_tiktok_handle(row.get("accountReference")))
                 )
+            )
+            and (
+                int(row.get("type") or 0) != 9
+                or _is_publishable_facebook_page_account(row)
             )
         )
         or (
@@ -539,6 +576,235 @@ def save_tiktok_browser_account(
         return wanted_id
 
 
+def _facebook_page_identity_mismatch(message: str) -> FacebookPagePublishError:
+    return FacebookPagePublishError("facebook_page_identity_mismatch", message)
+
+
+def _normalize_facebook_session_basename(value: object) -> str:
+    raw = str(value or "").strip()
+    basename = Path(raw).name
+    if not raw or raw != basename or not basename.endswith(".json"):
+        raise _facebook_page_identity_mismatch("Facebook Page 会话文件名无效。")
+    return basename
+
+
+def _normalize_optional_facebook_avatar_basename(value: object) -> str | None:
+    if value is None:
+        return None
+    raw = str(value or "").strip()
+    basename = Path(raw).name
+    if not raw or raw != basename:
+        raise _facebook_page_identity_mismatch("Facebook Page 头像文件名无效。")
+    return basename
+
+
+def validate_saved_facebook_page_account(account: Mapping[str, Any]) -> str:
+    """Return the stable Page ID only for a usable saved Facebook Page row."""
+
+    if not isinstance(account, Mapping):
+        raise _facebook_page_identity_mismatch("Facebook Page 账号记录无效。")
+    try:
+        platform_type = int(account.get("type"))
+    except (TypeError, ValueError):
+        raise _facebook_page_identity_mismatch("Facebook Page 账号记录无效。") from None
+    if platform_type != 9:
+        raise _facebook_page_identity_mismatch("Facebook Page 账号记录类型不正确。")
+    try:
+        status = int(account.get("status") or 0)
+    except (TypeError, ValueError):
+        raise _facebook_page_identity_mismatch("Facebook Page 账号记录无效。") from None
+    if (
+        status != 1
+        or str(account.get("authMode") or AUTH_MODE_BROWSER) != AUTH_MODE_BROWSER
+        or not str(account.get("filePath") or "").strip()
+    ):
+        raise _facebook_page_identity_mismatch("Facebook Page 账号记录不可用。")
+    try:
+        return normalize_facebook_page_id(account.get("accountReference"))
+    except FacebookPagePublishError:
+        raise
+    except Exception as exc:
+        raise _facebook_page_identity_mismatch("Facebook Page 账号记录无效。") from exc
+
+
+_FACEBOOK_PAGE_ACCOUNT_COMPARE_FIELDS = (
+    "id",
+    "type",
+    "filePath",
+    "userName",
+    "status",
+    "profileName",
+    "avatarPath",
+    "remark",
+    "lastCheckedAt",
+    "lastLoginAt",
+    "authMode",
+    "accountReference",
+)
+
+
+def save_facebook_page_browser_account(
+    *,
+    profile_name: str,
+    storage_file_name: str,
+    identity: FacebookPageIdentity,
+    record_id: int | None = None,
+    expected_account: Mapping[str, Any] | None = None,
+    avatar_file_name: str | None = None,
+) -> int:
+    """Atomically upsert exactly one browser row for one stable Facebook Page."""
+
+    normalized_profile = str(profile_name or "").strip()
+    session_basename = _normalize_facebook_session_basename(storage_file_name)
+    avatar_basename = _normalize_optional_facebook_avatar_basename(avatar_file_name)
+    try:
+        page_id = normalize_facebook_page_id(getattr(identity, "page_id", None))
+    except FacebookPagePublishError:
+        raise
+    page_name = str(getattr(identity, "page_name", "") or "").strip()
+    if not normalized_profile or not page_name:
+        raise _facebook_page_identity_mismatch("Facebook Page 账号信息不完整。")
+
+    wanted_id = int(record_id) if record_id is not None else None
+    snapshot = dict(expected_account) if expected_account is not None else None
+    if snapshot is not None:
+        try:
+            snapshot_type = int(snapshot.get("type"))
+        except (TypeError, ValueError):
+            raise _facebook_page_identity_mismatch("Facebook Page 账号更新信息无效。") from None
+        if snapshot_type != 9:
+            raise _facebook_page_identity_mismatch("Facebook Page 账号更新信息无效。")
+        snapshot_id = snapshot.get("id")
+        if snapshot_id is not None:
+            try:
+                snapshot_id = int(snapshot_id)
+            except (TypeError, ValueError):
+                raise _facebook_page_identity_mismatch("Facebook Page 账号更新信息无效。") from None
+            if wanted_id is None:
+                wanted_id = snapshot_id
+            elif snapshot_id != wanted_id:
+                raise _facebook_page_identity_mismatch("Facebook Page 账号更新信息无效。")
+        snapshot_reference = str(snapshot.get("accountReference") or "").strip()
+        if snapshot_reference:
+            if normalize_facebook_page_id(snapshot_reference) != page_id:
+                raise _facebook_page_identity_mismatch(
+                    "保存的 Facebook Page 与当前页面不一致，已停止操作。"
+                )
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if wanted_id is None:
+            existing = conn.execute(
+                """
+                SELECT id, type, filePath, userName, status, profileName,
+                       avatarPath, COALESCE(remark, '') AS remark,
+                       lastCheckedAt, lastLoginAt,
+                       COALESCE(authMode, 'browser') AS authMode,
+                       accountReference
+                FROM user_info
+                WHERE type = 9 AND accountReference = ?
+                """,
+                (page_id,),
+            ).fetchone()
+        else:
+            existing = conn.execute(
+                """
+                SELECT id, type, filePath, userName, status, profileName,
+                       avatarPath, COALESCE(remark, '') AS remark,
+                       lastCheckedAt, lastLoginAt,
+                       COALESCE(authMode, 'browser') AS authMode,
+                       accountReference
+                FROM user_info
+                WHERE id = ?
+                """,
+                (wanted_id,),
+            ).fetchone()
+
+        if existing is None:
+            if wanted_id is not None:
+                raise _facebook_page_identity_mismatch(
+                    "Facebook Page 账号记录不存在或类型不正确。"
+                )
+            cursor = conn.execute(
+                """
+                INSERT INTO user_info
+                    (type, filePath, userName, status, profileName, avatarPath,
+                     avatarUpdatedAt, remark, lastLoginAt, lastCheckedAt,
+                     authMode, accountReference)
+                VALUES (9, ?, ?, 1, ?, ?, ?, '', ?, ?, ?, ?)
+                """,
+                (
+                    session_basename,
+                    page_name,
+                    normalized_profile,
+                    avatar_basename,
+                    now if avatar_basename else None,
+                    now,
+                    now,
+                    AUTH_MODE_BROWSER,
+                    page_id,
+                ),
+            )
+            account_id = int(cursor.lastrowid or 0)
+            if account_id <= 0:
+                raise _facebook_page_identity_mismatch("Facebook Page 账号保存失败。")
+            return account_id
+
+        current = dict(existing)
+        if int(current.get("type") or 0) != 9:
+            raise _facebook_page_identity_mismatch(
+                "Facebook Page 账号记录不存在或类型不正确。"
+            )
+        current_reference = str(current.get("accountReference") or "").strip()
+        if current_reference and normalize_facebook_page_id(current_reference) != page_id:
+            raise _facebook_page_identity_mismatch(
+                "保存的 Facebook Page 与当前页面不一致，已停止操作。"
+            )
+        if snapshot is not None:
+            compared_fields = tuple(
+                field
+                for field in _FACEBOOK_PAGE_ACCOUNT_COMPARE_FIELDS
+                if field in snapshot
+            )
+            if any(current.get(field) != snapshot.get(field) for field in compared_fields):
+                raise _facebook_page_identity_mismatch(
+                    "Facebook Page 账号记录在保存期间已变更。"
+                )
+
+        duplicate = conn.execute(
+            "SELECT id FROM user_info WHERE type = 9 AND accountReference = ? AND id != ?",
+            (page_id, int(current["id"])),
+        ).fetchone()
+        if duplicate:
+            raise _facebook_page_identity_mismatch("Facebook Page 已经绑定其他账号记录。")
+        conn.execute(
+            """
+            UPDATE user_info
+            SET type = 9, filePath = ?, userName = ?, status = 1,
+                profileName = ?, avatarPath = COALESCE(?, avatarPath),
+                avatarUpdatedAt = CASE WHEN ? IS NULL THEN avatarUpdatedAt ELSE ? END,
+                lastLoginAt = ?, lastCheckedAt = ?, authMode = ?,
+                accountReference = ?
+            WHERE id = ?
+            """,
+            (
+                session_basename,
+                page_name,
+                normalized_profile,
+                avatar_basename,
+                avatar_basename,
+                now,
+                now,
+                now,
+                AUTH_MODE_BROWSER,
+                page_id,
+                int(current["id"]),
+            ),
+        )
+        return int(current["id"])
+
+
 def save_youtube_oauth_account(
     *,
     profile_name: str,
@@ -693,6 +959,7 @@ def accounts_requiring_check(account_ids: Iterable[int] | None = None) -> list[i
 
 def delete_account(account_id: int) -> None:
     with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             """
             SELECT filePath, avatarPath, COALESCE(authMode, 'browser') AS authMode
@@ -700,45 +967,40 @@ def delete_account(account_id: int) -> None:
             """,
             (account_id,),
         ).fetchone()
-        if row and str(row["authMode"]) == AUTH_MODE_YOUTUBE_OAUTH:
-            from .overseas_youtube_credentials import KeyringOAuthCredentialStore
-
-            KeyringOAuthCredentialStore().delete_refresh_token(
-                str(row["filePath"] or "")
-            )
+        if not row:
+            return
+        is_youtube_oauth = str(row["authMode"]) == AUTH_MODE_YOUTUBE_OAUTH
         conn.execute("DELETE FROM user_info WHERE id = ?", (account_id,))
-        remaining_file_refs = 0
-        remaining_avatar_refs = 0
-        if row and row["filePath"]:
-            remaining_file_refs = conn.execute(
-                "SELECT COUNT(*) FROM user_info WHERE filePath = ?",
-                (row["filePath"],),
-            ).fetchone()[0]
-        if row and row["avatarPath"]:
-            remaining_avatar_refs = conn.execute(
-                "SELECT COUNT(*) FROM user_info WHERE avatarPath = ?",
-                (row["avatarPath"],),
-            ).fetchone()[0]
-        conn.commit()
-    if not row:
-        return
-    if str(row["authMode"]) == AUTH_MODE_YOUTUBE_OAUTH:
-        if row["avatarPath"] and not remaining_avatar_refs:
-            avatar_path = AVATAR_DIR / Path(row["avatarPath"]).name
-            if avatar_path.exists():
-                avatar_path.unlink()
-        return
-    candidates = (
-        (COOKIE_DIR, row["filePath"], remaining_file_refs),
-        (AVATAR_DIR, row["avatarPath"], remaining_avatar_refs),
-    )
-    for base, value, remaining_refs in candidates:
-        if remaining_refs:
-            continue
-        if value:
-            path = base / Path(value).name
-            if path.exists():
-                path.unlink()
+        if is_youtube_oauth:
+            remaining_credential_ref = conn.execute(
+                """
+                SELECT 1 FROM user_info
+                WHERE COALESCE(authMode, 'browser') = ? AND filePath = ?
+                LIMIT 1
+                """,
+                (AUTH_MODE_YOUTUBE_OAUTH, row["filePath"]),
+            ).fetchone()
+            if not remaining_credential_ref:
+                from .overseas_youtube_credentials import (
+                    KeyringOAuthCredentialStore,
+                )
+
+                KeyringOAuthCredentialStore().delete_refresh_token(
+                    str(row["filePath"] or "")
+                )
+        else:
+            unlink_managed_artifact_if_unreferenced(
+                conn,
+                raw_target=row["filePath"],
+                managed_dir=COOKIE_DIR,
+                reference_column="filePath",
+            )
+        unlink_managed_artifact_if_unreferenced(
+            conn,
+            raw_target=row["avatarPath"],
+            managed_dir=AVATAR_DIR,
+            reference_column="avatarPath",
+        )
 
 
 def validate_accounts(
@@ -756,6 +1018,13 @@ def validate_accounts(
     accounts = list_managed_accounts()
     wanted = {int(item) for item in account_ids or []}
     selected = [row for row in accounts if not wanted or row["id"] in wanted]
+    if not facebook_page_v1_enabled() and any(
+        int(row.get("type") or 0) == 9 for row in selected
+    ):
+        raise FacebookPagePublishError(
+            "facebook_page_feature_disabled",
+            "Facebook Page 功能未开启。",
+        )
     failures: list[str] = []
     auth_issues: dict[int, str] = {}
 
@@ -810,6 +1079,21 @@ def validate_accounts(
                 failures.append("TikTok：本地登录会话不存在，请重新登录。")
             else:
                 failures.append("TikTok：登录已失效，请重新登录。")
+        except FacebookPagePublishError as exc:
+            valid = False
+            error_code = str(
+                exc.error_code or "facebook_page_identity_mismatch"
+            )
+            if error_code not in {
+                "facebook_page_identity_mismatch",
+                "facebook_page_content_permission_missing",
+                "facebook_page_not_found",
+            }:
+                error_code = "facebook_page_identity_mismatch"
+            auth_issues[int(row["id"])] = error_code
+            failures.append(
+                "Facebook Page：保存的 Page 无法精确回读，请重新绑定。"
+            )
         except Exception as exc:
             valid = False
             reason = str(exc)
@@ -844,13 +1128,20 @@ def validate_accounts(
                     f"{row['platformName']}：检测失败（{type(exc).__name__}）。"
                 )
         else:
+            valid = bool(valid)
             if not valid:
                 failures.append(f"{row['platformName']}：未确认当前登录状态，请重新登录。")
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        failed_status = (
+            0
+            if int(row.get("type") or 0) == 9
+            and int(row["id"]) in auth_issues
+            else int(invalid_status)
+        )
         with connect() as conn:
             conn.execute(
                 "UPDATE user_info SET status = ?, lastCheckedAt = ? WHERE id = ?",
-                (1 if valid else int(invalid_status), now, int(row["id"])),
+                (1 if valid else failed_status, now, int(row["id"])),
             )
         report({**base_event, "phase": "checked", "valid": valid})
     refreshed_map = {row["id"]: row for row in list_managed_accounts()}
@@ -878,7 +1169,32 @@ def refresh_account_avatar(account_id: int) -> dict:
     account = get_managed_account(account_id)
     if not account:
         return {}
-    if str(account.get("authMode") or AUTH_MODE_BROWSER) == AUTH_MODE_YOUTUBE_OAUTH:
+    if int(account.get("type") or 0) == 9 and not facebook_page_v1_enabled():
+        raise FacebookPagePublishError(
+            "facebook_page_feature_disabled",
+            "Facebook Page 功能未开启。",
+        )
+    if int(account.get("type") or 0) == 9:
+        expected_page_id = validate_saved_facebook_page_account(account)
+        identity = _read_exact_facebook_page_identity(account)
+        selected = resolve_facebook_page_selection((identity,), expected_page_id)
+        avatar_file_name = _download_facebook_page_avatar(
+            selected,
+            account_id=account_id,
+        )
+        try:
+            _save_facebook_page_public_profile(
+                account,
+                selected,
+                avatar_file_name,
+            )
+        except Exception:
+            try:
+                (AVATAR_DIR / Path(avatar_file_name).name).unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+    elif str(account.get("authMode") or AUTH_MODE_BROWSER) == AUTH_MODE_YOUTUBE_OAUTH:
         from .overseas_youtube_profile import refresh_youtube_oauth_profile
 
         profile = refresh_youtube_oauth_profile(account, avatar_dir=AVATAR_DIR)
@@ -890,6 +1206,222 @@ def refresh_account_avatar(account_id: int) -> dict:
     else:
         run_async_capture_account_avatar(account_id)
     return get_managed_account(account_id) or {}
+
+
+def _read_exact_facebook_page_identity(
+    account: Mapping[str, Any],
+) -> FacebookPageIdentity:
+    """Activate and read back only the Page ID already bound to this row."""
+
+    import asyncio
+
+    from myUtils.auth import check_cookie
+
+    expected_page_id = validate_saved_facebook_page_account(account)
+
+    async def read_identity():
+        return await check_cookie(
+            9,
+            str(account.get("filePath") or ""),
+            account_reference=expected_page_id,
+        )
+
+    try:
+        identity = asyncio.run(read_identity())
+        if not isinstance(identity, FacebookPageIdentity):
+            raise _facebook_page_identity_mismatch(
+                "保存的 Facebook Page 无法精确回读，已停止操作。"
+            )
+        return resolve_facebook_page_selection((identity,), expected_page_id)
+    except FacebookPagePublishError:
+        raise
+    except Exception as exc:
+        raise _facebook_page_identity_mismatch(
+            "保存的 Facebook Page 无法精确回读，已停止操作。"
+        ) from exc
+
+
+_FACEBOOK_AVATAR_HOST_SUFFIXES = (
+    "fbcdn.net",
+    "fbsbx.com",
+    "facebook.com",
+)
+_FACEBOOK_AVATAR_MAX_BYTES = 5 * 1024 * 1024
+_FACEBOOK_AVATAR_MAX_PIXELS = 25_000_000
+
+
+def _download_facebook_page_avatar(
+    identity: FacebookPageIdentity,
+    *,
+    account_id: int,
+) -> str:
+    """Save one bounded public Page avatar without persisting its remote URL."""
+
+    from io import BytesIO
+    import os
+    from urllib.parse import urlsplit
+    import uuid
+
+    from PIL import Image, UnidentifiedImageError
+    import requests
+
+    avatar_url = str(getattr(identity, "avatar_url", "") or "").strip()
+    try:
+        parsed = urlsplit(avatar_url)
+        port = parsed.port
+    except (TypeError, ValueError):
+        parsed = None
+        port = None
+    host = (parsed.hostname or "").casefold().rstrip(".") if parsed else ""
+    trusted_host = any(
+        host == suffix or host.endswith(f".{suffix}")
+        for suffix in _FACEBOOK_AVATAR_HOST_SUFFIXES
+    )
+    if (
+        parsed is None
+        or parsed.scheme.casefold() != "https"
+        or not trusted_host
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in {None, 443}
+    ):
+        raise FacebookPagePublishError(
+            "facebook_page_profile_unavailable",
+            "Facebook Page 头像无法安全读取，未更新账号信息。",
+        )
+
+    response = None
+    try:
+        response = requests.get(
+            avatar_url,
+            timeout=15,
+            stream=True,
+            allow_redirects=False,
+        )
+        if response.status_code != 200:
+            raise ValueError("avatar response")
+        content_type = str(response.headers.get("Content-Type") or "").casefold()
+        if not content_type.startswith("image/"):
+            raise ValueError("avatar content type")
+        declared = str(response.headers.get("Content-Length") or "").strip()
+        if declared and int(declared) > _FACEBOOK_AVATAR_MAX_BYTES:
+            raise ValueError("avatar too large")
+        raw = bytearray()
+        for chunk in response.iter_content(chunk_size=64 * 1024):
+            if not isinstance(chunk, bytes):
+                raise ValueError("avatar chunk")
+            if len(raw) + len(chunk) > _FACEBOOK_AVATAR_MAX_BYTES:
+                raise ValueError("avatar too large")
+            raw.extend(chunk)
+        if not raw:
+            raise ValueError("avatar empty")
+        with Image.open(BytesIO(bytes(raw))) as decoded:
+            width, height = decoded.size
+            if width <= 0 or height <= 0 or width * height > _FACEBOOK_AVATAR_MAX_PIXELS:
+                raise ValueError("avatar dimensions")
+            decoded.load()
+            normalized = decoded.convert("RGBA")
+        output = BytesIO()
+        normalized.save(output, format="PNG", optimize=True)
+        png_bytes = output.getvalue()
+    except (FacebookPagePublishError, UnidentifiedImageError, OSError, TypeError, ValueError):
+        raise FacebookPagePublishError(
+            "facebook_page_profile_unavailable",
+            "Facebook Page 头像无法安全读取，未更新账号信息。",
+        ) from None
+    except Exception:
+        raise FacebookPagePublishError(
+            "facebook_page_profile_unavailable",
+            "Facebook Page 头像无法安全读取，未更新账号信息。",
+        ) from None
+    finally:
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
+
+    file_name = f"oneclick_facebook_page_{int(account_id)}_{uuid.uuid4().hex}.png"
+    destination = AVATAR_DIR / file_name
+    temporary = AVATAR_DIR / f".{file_name}.tmp"
+    try:
+        AVATAR_DIR.mkdir(parents=True, exist_ok=True)
+        with temporary.open("wb") as handle:
+            handle.write(png_bytes)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+    except OSError:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise FacebookPagePublishError(
+            "facebook_page_profile_unavailable",
+            "Facebook Page 头像无法保存，未更新账号信息。",
+        ) from None
+    return file_name
+
+
+def _save_facebook_page_public_profile(
+    account: Mapping[str, Any],
+    identity: FacebookPageIdentity,
+    avatar_file_name: str,
+) -> None:
+    """Conditionally replace display fields only for the same bound Page row."""
+
+    expected_page_id = validate_saved_facebook_page_account(account)
+    selected = resolve_facebook_page_selection((identity,), expected_page_id)
+    page_name = str(selected.page_name or "").strip()
+    avatar_basename = Path(str(avatar_file_name or "")).name
+    if not page_name or not avatar_basename or avatar_basename != avatar_file_name:
+        raise _facebook_page_identity_mismatch(
+            "Facebook Page 账号信息不完整，未更新。"
+        )
+
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        current = conn.execute(
+            """
+            SELECT id, type, filePath, userName, status, profileName, avatarPath,
+                   COALESCE(authMode, 'browser') AS authMode, accountReference
+            FROM user_info WHERE id = ?
+            """,
+            (int(account["id"]),),
+        ).fetchone()
+        if current is None:
+            raise _facebook_page_identity_mismatch(
+                "Facebook Page 账号在刷新期间已变更，未更新。"
+            )
+        current_data = dict(current)
+        compared_fields = (
+            "id",
+            "type",
+            "filePath",
+            "userName",
+            "status",
+            "profileName",
+            "avatarPath",
+            "authMode",
+            "accountReference",
+        )
+        if any(current_data.get(key) != account.get(key) for key in compared_fields):
+            raise _facebook_page_identity_mismatch(
+                "Facebook Page 账号在刷新期间已变更，未更新。"
+            )
+        conn.execute(
+            """
+            UPDATE user_info
+            SET userName = ?, avatarPath = ?, avatarUpdatedAt = ?
+            WHERE id = ?
+            """,
+            (
+                page_name,
+                avatar_basename,
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                int(account["id"]),
+            ),
+        )
 
 
 def _save_youtube_public_profile(

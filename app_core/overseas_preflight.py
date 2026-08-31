@@ -10,16 +10,16 @@ YouTube 在上传后可能由平台保留私密内容，必须在结果中明确
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from myUtils.postVideo import (
-    post_video_facebook,
     post_video_instagram,
     post_video_youtube,
 )
 from utils.publish_observer import publish_context
 
 from .paths import COOKIE_DIR
+from . import overseas_browser_publish
 from .overseas_tiktok_errors import TikTokPublishError
 from .overseas_tiktok_publish import (
     payload_has_tiktok_platform_signal,
@@ -38,12 +38,33 @@ PLATFORM_NAMES = {
 PREFLIGHT_HANDLERS: dict[int, Callable[..., Any]] = {
     7: post_video_youtube,
     8: post_video_instagram,
-    9: post_video_facebook,
 }
 
 
 class OverseasPreflightError(RuntimeError):
     """海外视频预检无法在安全边界内继续。"""
+
+
+def run_facebook_page_preflight_sync(
+    payload: dict[str, Any],
+    *,
+    task_id: int,
+    progress: Callable[[str, Mapping[str, object]], None] | None = None,
+) -> dict[str, Any]:
+    """Run one Page form check with durable task context and no final click."""
+
+    if type(task_id) is not int or task_id <= 0:
+        raise OverseasPreflightError("Facebook Page 预检缺少有效任务编号")
+    with publish_context(
+        task_id=task_id,
+        platform_type=9,
+        mode="preflight",
+        background_mode=False,
+    ):
+        return overseas_browser_publish._run_facebook_page_preflight_form_sync(
+            payload,
+            progress=progress,
+        )
 
 
 def validate_overseas_preflight_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -166,6 +187,11 @@ def run_overseas_preflight_sync(payload: dict[str, Any]) -> dict[str, Any]:
 
     if payload_has_tiktok_platform_signal(payload):
         return run_tiktok_local_preflight(payload)
+
+    if int(payload.get("type") or 0) == 9:
+        raise OverseasPreflightError(
+            "Facebook Page 预检必须由带任务编号的专用服务启动"
+        )
 
     checked = validate_overseas_preflight_payload(payload)
     if not checked["ok"]:

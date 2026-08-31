@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import tempfile
 import unittest
@@ -15,6 +16,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt6.QtWidgets import QApplication, QDialogButtonBox
 
 from app_core import overseas_browser_publish
+from app_core.overseas_meta_errors import FacebookPagePublishError
 from app_core.meta_browser_policy import (
     META_BROWSER_AUTOMATION_ACKNOWLEDGED,
     META_BROWSER_PUBLISH_CONFIRMED,
@@ -27,6 +29,7 @@ from uploader.meta_uploader.main import (
     meta_publish_success_signal,
     meta_security_intervention_reason,
 )
+from uploader.meta_uploader.page_form import FacebookPageFormSnapshot
 
 
 class MetaBrowserPolicyTests(unittest.TestCase):
@@ -60,6 +63,54 @@ class MetaBrowserPolicyTests(unittest.TestCase):
                 "Create reel",
             )
         )
+
+    def test_page_security_wait_emits_shared_execution_lifecycle(self) -> None:
+        events: list[tuple[str, dict[str, object]]] = []
+
+        class Page:
+            url = "https://www.facebook.com/checkpoint/"
+
+        app = MetaReelVideo(
+            "",
+            "video.mp4",
+            [],
+            "facebook-page.json",
+            target_platform="facebook",
+            facebook_expected_page_id="1001",
+            execution_progress=lambda stage, receipt: events.append(
+                (stage, dict(receipt))
+            ),
+        )
+
+        async def exercise() -> None:
+            reasons = iter(("Meta 要求完成账号安全检查", None))
+            with (
+                patch(
+                    "uploader.meta_uploader.main.meta_security_intervention_reason",
+                    side_effect=lambda *_args: next(reasons),
+                ),
+                patch("uploader.meta_uploader.main._body_text", new=AsyncMock(return_value="")),
+                patch("uploader.meta_uploader.main.reveal_page_window", new=AsyncMock()),
+                patch("uploader.meta_uploader.main.asyncio.sleep", new=AsyncMock()),
+            ):
+                await app._wait_for_manual_intervention(Page())
+
+        asyncio.run(exercise())
+
+        self.assertEqual(
+            [stage for stage, _receipt in events],
+            [
+                "waiting_user_verification",
+                "verification_heartbeat",
+                "verification_resolved",
+            ],
+        )
+        first_receipt = events[0][1]
+        self.assertEqual(first_receipt["pageId"], "1001")
+        self.assertEqual(first_receipt["timeoutSeconds"], 600)
+        self.assertIn("verificationStartedAt", first_receipt)
+        self.assertIn("deadlineAt", first_receipt)
+        self.assertTrue(all(receipt == first_receipt for _stage, receipt in events))
         self.assertIsNotNone(
             meta_publish_success_signal(
                 url="https://business.facebook.com/latest/composer/",
@@ -221,7 +272,7 @@ class MetaBrowserUploaderTests(unittest.TestCase):
             "/not/used.mp4",
             [],
             "/not/used.json",
-            target_platform="facebook",
+            target_platform="instagram",
             dry_run=False,
             publish_confirmed=True,
             automation_acknowledged=True,
@@ -234,6 +285,191 @@ class MetaBrowserUploaderTests(unittest.TestCase):
         )
         result = asyncio.run(app.main())
         self.assertEqual(result["status"], "published")
+
+    def test_facebook_type9_preflight_and_formal_share_form_adapter_only(self) -> None:
+        class ExplodingBoolean:
+            def __bool__(self):
+                raise AssertionError("type 9 must not read legacy confirmation flags")
+
+        with tempfile.TemporaryDirectory() as raw:
+            video = Path(raw) / "clip.mp4"
+            video.write_bytes(b"video")
+            expected_hash = hashlib.sha256(video.read_bytes()).hexdigest()
+            snapshot = FacebookPageFormSnapshot(
+                page_id="1001",
+                content_kind="reel",
+                video_name="clip.mp4",
+                video_count=1,
+                caption="正文 #标签",
+                visibility="public",
+                final_action_label="Publish",
+                final_action_ready=True,
+            )
+            for dry_run in (True, False):
+                with self.subTest(dry_run=dry_run):
+                    page = AsyncMock()
+                    page.url = "https://business.facebook.com/latest/home/"
+                    form = AsyncMock()
+                    form.fill_and_readback.return_value = snapshot
+                    app = MetaReelVideo(
+                        "ignored legacy title",
+                        str(video),
+                        ["ignored"],
+                        str(Path(raw) / "meta.json"),
+                        target_platform="facebook",
+                        description="ignored legacy description",
+                        dry_run=dry_run,
+                        publish_confirmed=ExplodingBoolean(),
+                        automation_acknowledged=ExplodingBoolean(),
+                        facebook_expected_page_id="1001",
+                        facebook_video_sha256=expected_hash,
+                        facebook_final_caption="正文 #标签",
+                    )
+                    app.external_page = page
+                    app.external_context = AsyncMock()
+                    app.external_browser = object()
+                    app._publish_formally = AsyncMock(
+                        side_effect=AssertionError(
+                            "type 9 must not use the generic final-click path"
+                        )
+                    )
+                    app._set_destination = AsyncMock(
+                        side_effect=AssertionError(
+                            "type 9 must not use generic destination text"
+                        )
+                    )
+                    with (
+                        patch(
+                            "uploader.meta_uploader.main.FacebookPageFormAdapter",
+                            return_value=form,
+                        ),
+                        patch(
+                            "uploader.meta_uploader.main.reveal_page_window",
+                            new=AsyncMock(),
+                        ),
+                        patch(
+                            "uploader.meta_uploader.main.meta_publish_success_signal",
+                            side_effect=AssertionError(
+                                "type 9 must not use generic success text or routes"
+                            ),
+                        ),
+                        patch("uploader.meta_uploader.main.meta_logger.success"),
+                    ):
+                        result = asyncio.run(app.upload(object()))
+                    self.assertEqual(result, snapshot)
+                    form.fill_and_readback.assert_awaited_once()
+                    expectation = form.fill_and_readback.await_args.args[0]
+                    self.assertEqual(expectation.page_id, "1001")
+                    self.assertEqual(expectation.content_kind, "reel")
+                    self.assertEqual(expectation.video_name, str(video))
+                    self.assertEqual(expectation.video_sha256, expected_hash)
+                    self.assertEqual(expectation.caption, "正文 #标签")
+                    app._publish_formally.assert_not_awaited()
+                    app._set_destination.assert_not_awaited()
+
+    def test_facebook_type9_generic_route_fails_before_browser(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            video = Path(raw) / "clip.mp4"
+            video.write_bytes(b"video")
+            app = MetaReelVideo(
+                "legacy title",
+                str(video),
+                [],
+                str(Path(raw) / "meta.json"),
+                target_platform="facebook",
+                dry_run=False,
+                publish_confirmed=True,
+                automation_acknowledged=True,
+            )
+            with patch(
+                "uploader.meta_uploader.main.launch_publish_browser",
+                side_effect=AssertionError("generic type 9 must stop before browser"),
+            ):
+                with self.assertRaises(FacebookPagePublishError) as raised:
+                    asyncio.run(app.upload(object()))
+        self.assertEqual(
+            raised.exception.error_code,
+            "facebook_page_form_readback_failed",
+        )
+
+    def test_facebook_type9_does_not_persist_session_after_form_readback(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            video = Path(raw) / "clip.mp4"
+            video.write_bytes(b"video")
+            snapshot = FacebookPageFormSnapshot(
+                page_id="1001",
+                content_kind="reel",
+                video_name="clip.mp4",
+                video_count=1,
+                caption="正文",
+                visibility="public",
+                final_action_label="Publish",
+                final_action_ready=True,
+            )
+            app = MetaReelVideo(
+                "ignored",
+                str(video),
+                [],
+                str(Path(raw) / "meta.json"),
+                target_platform="facebook",
+                dry_run=True,
+                dry_run_hold_browser=True,
+                facebook_expected_page_id="1001",
+                facebook_video_sha256=hashlib.sha256(
+                    video.read_bytes()
+                ).hexdigest(),
+                facebook_final_caption="正文",
+            )
+            browser = AsyncMock()
+            context = AsyncMock()
+            page = AsyncMock()
+            page.url = "https://business.facebook.com/latest/home/"
+            context.new_page.return_value = page
+            form = AsyncMock()
+            form.fill_and_readback.return_value = snapshot
+            with (
+                patch(
+                    "uploader.meta_uploader.main.launch_publish_browser",
+                    new=AsyncMock(return_value=browser),
+                ),
+                patch(
+                    "uploader.meta_uploader.main.new_publish_context",
+                    new=AsyncMock(return_value=context),
+                ),
+                patch(
+                    "uploader.meta_uploader.main.set_init_script",
+                    new=AsyncMock(return_value=context),
+                ),
+                patch(
+                    "uploader.meta_uploader.main.reveal_page_window",
+                    new=AsyncMock(),
+                ),
+                patch(
+                    "uploader.meta_uploader.main.FacebookPageFormAdapter",
+                    return_value=form,
+                ),
+                patch(
+                    "uploader.meta_uploader.main.keep_browser_open_for_dry_run",
+                    new=AsyncMock(
+                        side_effect=AssertionError(
+                            "type 9 must not persist or hold the session"
+                        )
+                    ),
+                ),
+                patch(
+                    "uploader.meta_uploader.main.save_context_storage_state",
+                    new=AsyncMock(
+                        side_effect=AssertionError(
+                            "type 9 must not write session state"
+                        )
+                    ),
+                ),
+                patch("uploader.meta_uploader.main.meta_logger.success"),
+            ):
+                result = asyncio.run(app.upload(object()))
+        self.assertEqual(result, snapshot)
+        context.close.assert_awaited_once()
+        browser.close.assert_awaited_once()
 
 
 class MetaBrowserDialogTests(unittest.TestCase):

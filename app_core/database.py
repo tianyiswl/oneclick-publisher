@@ -9,6 +9,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterable
 
+from .overseas_meta_errors import FacebookPagePublishError
+from .overseas_meta_page_identity import normalize_facebook_page_id
 from .paths import DB_PATH, ensure_runtime_dirs
 from .platform_data_comment_store import create_comment_schema
 
@@ -48,6 +50,49 @@ def _add_columns(conn: sqlite3.Connection, table: str, definitions: Iterable[tup
     for name, definition in definitions:
         if name not in existing:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+
+
+def _migrate_facebook_page_references(conn: sqlite3.Connection) -> None:
+    rows = conn.execute(
+        """
+        SELECT id, status, accountReference
+        FROM user_info
+        WHERE type = 9
+        ORDER BY id
+        """
+    ).fetchall()
+    seen_page_ids: set[str] = set()
+    changes: list[tuple[str, int | None, int]] = []
+    for account_id, status, raw_reference in rows:
+        try:
+            normalized = normalize_facebook_page_id(raw_reference)
+        except FacebookPagePublishError:
+            normalized = ""
+        if normalized in seen_page_ids:
+            normalized = ""
+        elif normalized:
+            seen_page_ids.add(normalized)
+        target_status = 0 if not normalized else status
+        if raw_reference != normalized or status != target_status:
+            changes.append((normalized, target_status, int(account_id)))
+
+    if changes:
+        # An older raw-value index can contain values that normalize to the same
+        # Page ID. Rebuild it inside this schema transaction around canonical data.
+        conn.execute("DROP INDEX IF EXISTS idx_user_info_facebook_page_reference")
+        conn.executemany(
+            "UPDATE user_info SET accountReference = ?, status = ? WHERE id = ?",
+            changes,
+        )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_user_info_facebook_page_reference
+        ON user_info(accountReference)
+        WHERE type = 9
+          AND accountReference IS NOT NULL
+          AND TRIM(accountReference) <> ''
+        """
+    )
 
 
 def _has_v2_metric_identity(conn: sqlite3.Connection) -> bool:
@@ -145,6 +190,7 @@ def ensure_schema() -> None:
                 ("oauthScopeVersion", "INTEGER NOT NULL DEFAULT 1"),
             ),
         )
+        _migrate_facebook_page_references(conn)
         conn.execute(
             "UPDATE user_info SET authMode = 'browser' "
             "WHERE authMode IS NULL OR TRIM(authMode) = ''"
@@ -503,6 +549,7 @@ def ensure_schema() -> None:
                 ("revisionSourceTaskId", "INTEGER"),
                 ("workerPid", "INTEGER"),
                 ("workerHeartbeatAt", "TEXT"),
+                ("workerToken", "TEXT"),
             ),
         )
         conn.execute(

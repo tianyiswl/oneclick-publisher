@@ -6,6 +6,7 @@ from playwright.async_api import async_playwright
 from xhs import XhsClient
 
 from conf import BASE_DIR
+from app_core.overseas_meta_page_identity import activate_saved_facebook_page
 from utils.base_social_media import launch_chromium_with_codecs, save_context_storage_state, set_init_script
 from utils.log import (
     tencent_logger,
@@ -329,7 +330,42 @@ async def cookie_auth_meta(account_file, platform_type: int, preview: bool = Fal
             await browser.close()
 
 
-async def check_cookie(type, file_path, preview: bool = False):
+async def cookie_auth_facebook_page(
+    account_file,
+    expected_page_id: str,
+    preview: bool = False,
+):
+    """Activate and return the exact saved Page identity from this session."""
+
+    async with async_playwright() as playwright:
+        browser = await launch_chromium_with_codecs(
+            playwright,
+            headless=not preview,
+            executable_path=None,
+        )
+        context = await browser.new_context(storage_state=account_file)
+        context = await set_init_script(context)
+        page = await context.new_page()
+        try:
+            await page.goto(
+                "https://business.facebook.com/latest/composer/",
+                wait_until="domcontentloaded",
+                timeout=30000,
+            )
+            await page.wait_for_timeout(3000)
+            return await activate_saved_facebook_page(page, expected_page_id)
+        finally:
+            await context.close()
+            await browser.close()
+
+
+async def check_cookie(
+    type,
+    file_path,
+    preview: bool = False,
+    *,
+    account_reference: str | None = None,
+):
     match type:
         # 小红书
         case 1:
@@ -352,9 +388,20 @@ async def check_cookie(type, file_path, preview: bool = False):
         # YouTube
         case 7:
             return await cookie_auth_youtube(Path(BASE_DIR / "cookiesFile" / file_path), preview)
-        # Instagram Reels / Facebook Reels 共用 Meta 登录态
-        case 8 | 9:
+        case 8:
             return await cookie_auth_meta(Path(BASE_DIR / "cookiesFile" / file_path), type, preview)
+        case 9:
+            if account_reference is not None:
+                return await cookie_auth_facebook_page(
+                    Path(BASE_DIR / "cookiesFile" / file_path),
+                    account_reference,
+                    preview,
+                )
+            return await cookie_auth_meta(
+                Path(BASE_DIR / "cookiesFile" / file_path),
+                type,
+                preview,
+            )
         case _:
             return False
 

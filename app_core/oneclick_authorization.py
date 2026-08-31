@@ -18,6 +18,11 @@ from urllib.parse import urljoin, urlsplit
 
 from . import account_service
 from .paths import COOKIE_DIR, USER_DATA_DIR, ensure_runtime_dirs
+from .overseas_meta_errors import FacebookPagePublishError
+from .overseas_meta_page_identity import (
+    FacebookPageIdentity,
+    resolve_facebook_page_selection,
+)
 
 
 @dataclass(frozen=True)
@@ -510,13 +515,23 @@ def start_authorization(
     return session
 
 
-async def _verify_saved_session_async(account: dict) -> bool:
+async def _verify_saved_session_async(account: dict) -> bool | FacebookPageIdentity:
     """在后台访问官方页面复核已保存会话。"""
 
     platform_type = int(account.get("type") or 0)
     plan = authorization_plan(platform_type, str(account.get("profileName") or ""))
+    expected_facebook_page_id = None
+    if platform_type == 9:
+        expected_facebook_page_id = (
+            account_service.validate_saved_facebook_page_account(account)
+        )
     state_file = COOKIE_DIR / Path(str(account.get("filePath") or "")).name
     if not state_file.is_file():
+        if platform_type == 9:
+            raise FacebookPagePublishError(
+                "facebook_page_identity_mismatch",
+                "Facebook Page 本地登录会话不存在，请重新绑定。",
+            )
         return False
 
     # 恢复的蚁小二海外平台代码已包含各自的官方后台判定。
@@ -524,6 +539,23 @@ async def _verify_saved_session_async(account: dict) -> bool:
     if platform_type in account_service.OVERSEAS_PLATFORM_TYPES:
         from myUtils.auth import check_cookie
 
+        if platform_type == 9:
+            expected_page_id = expected_facebook_page_id
+            identity = await check_cookie(
+                9,
+                state_file.name,
+                preview=False,
+                account_reference=expected_page_id,
+            )
+            if not isinstance(identity, FacebookPageIdentity):
+                raise FacebookPagePublishError(
+                    "facebook_page_identity_mismatch",
+                    "保存的 Facebook Page 无法精确回读，已停止操作。",
+                )
+            return resolve_facebook_page_selection(
+                (identity,),
+                expected_page_id,
+            )
         return bool(await check_cookie(platform_type, state_file.name, preview=False))
 
     from playwright.async_api import async_playwright
@@ -617,7 +649,7 @@ async def _verify_saved_session_async(account: dict) -> bool:
         await playwright.stop()
 
 
-def verify_saved_session(account: dict) -> bool:
+def verify_saved_session(account: dict) -> bool | FacebookPageIdentity:
     """同步封装；正常检测不显示浏览器。"""
 
-    return bool(asyncio.run(_verify_saved_session_async(dict(account))))
+    return asyncio.run(_verify_saved_session_async(dict(account)))

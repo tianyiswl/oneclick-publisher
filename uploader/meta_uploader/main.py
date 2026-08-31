@@ -4,10 +4,16 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Callable, Mapping
 
 from playwright.async_api import Playwright, async_playwright
+
+from app_core.overseas_meta_errors import (
+    FACEBOOK_VERIFICATION_TIMEOUT_SECONDS,
+    FacebookPagePublishError,
+)
 
 from utils.base_social_media import (
     keep_browser_open_for_dry_run,
@@ -20,15 +26,35 @@ from utils.base_social_media import (
 from utils.log import meta_logger
 from utils.publish_observer import publish_event
 
+from app_core.overseas_meta_page_identity import normalize_facebook_page_id
+from uploader.meta_uploader.page_form import (
+    FacebookPageFormAdapter,
+    FacebookPageFormExpectation,
+    FacebookPageFormSnapshot,
+    canonical_meta_caption,
+)
+
 
 COMPOSER_URL = "https://business.facebook.com/latest/composer/"
+FACEBOOK_PAGE_HOME_URL = "https://business.facebook.com/latest/home/"
 FORMAL_LOCK_MESSAGE = "Meta 浏览器正式发布缺少桌面端显式确认"
-MANUAL_INTERVENTION_TIMEOUT_SECONDS = 600
+MANUAL_INTERVENTION_TIMEOUT_SECONDS = FACEBOOK_VERIFICATION_TIMEOUT_SECONDS
 PUBLISH_RESULT_TIMEOUT_SECONDS = 120
 
 
-class MetaManualInterventionRequired(RuntimeError):
+class MetaManualInterventionRequired(FacebookPagePublishError):
     """Meta 要求验证码、双重验证或其他真人安全确认。"""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(
+            "facebook_verification_timeout",
+            message,
+            receipt={
+                "phase": "verification",
+                "platformWriteOccurred": False,
+                "finalActionTriggered": False,
+            },
+        )
 
 
 class MetaPublishResultUnverified(RuntimeError):
@@ -152,6 +178,10 @@ class MetaReelVideo:
         dry_run_hold_browser=True,
         publish_confirmed=False,
         automation_acknowledged=False,
+        facebook_expected_page_id=None,
+        facebook_video_sha256=None,
+        facebook_final_caption=None,
+        execution_progress: Callable[[str, Mapping[str, object]], None] | None = None,
     ):
         if target_platform not in {"instagram", "facebook"}:
             raise ValueError(f"不支持的 Meta 发布目标：{target_platform}")
@@ -165,8 +195,18 @@ class MetaReelVideo:
         self.thumbnail_paths = dict(thumbnail_paths or {})
         self.dry_run = bool(dry_run)
         self.dry_run_hold_browser = bool(dry_run_hold_browser)
-        self.publish_confirmed = bool(publish_confirmed)
-        self.automation_acknowledged = bool(automation_acknowledged)
+        if target_platform == "instagram":
+            self.publish_confirmed = bool(publish_confirmed)
+            self.automation_acknowledged = bool(automation_acknowledged)
+        else:
+            # Facebook Page V1 is authorized and submitted by the controlled
+            # Page service.  Legacy Meta confirmation booleans are irrelevant.
+            self.publish_confirmed = False
+            self.automation_acknowledged = False
+        self.facebook_expected_page_id = facebook_expected_page_id
+        self.facebook_video_sha256 = facebook_video_sha256
+        self.facebook_final_caption = facebook_final_caption
+        self.execution_progress = execution_progress
         self.publish_date = 0
         self.external_page = None
         self.external_context = None
@@ -293,6 +333,17 @@ class MetaReelVideo:
         if not reason:
             return
         await reveal_page_window(page)
+        started_at = datetime.now(timezone.utc)
+        safe_receipt = {
+            "pageId": str(self.facebook_expected_page_id or ""),
+            "verificationStartedAt": started_at.isoformat(),
+            "deadlineAt": (
+                started_at + timedelta(seconds=MANUAL_INTERVENTION_TIMEOUT_SECONDS)
+            ).isoformat(),
+            "timeoutSeconds": MANUAL_INTERVENTION_TIMEOUT_SECONDS,
+        }
+        if self.execution_progress is not None:
+            self.execution_progress("waiting_user_verification", safe_receipt)
         publish_event(
             "meta_manual_intervention",
             f"{reason}；请在当前浏览器完成，程序会自动继续",
@@ -303,11 +354,15 @@ class MetaReelVideo:
         deadline = loop.time() + MANUAL_INTERVENTION_TIMEOUT_SECONDS
         while loop.time() < deadline:
             await asyncio.sleep(1)
+            if self.execution_progress is not None:
+                self.execution_progress("verification_heartbeat", safe_receipt)
             reason = meta_security_intervention_reason(
                 page.url,
                 await _body_text(page),
             )
             if not reason:
+                if self.execution_progress is not None:
+                    self.execution_progress("verification_resolved", safe_receipt)
                 publish_event(
                     "meta_manual_intervention_resolved",
                     "Meta 真人安全确认已完成，自动发布继续执行",
@@ -489,7 +544,120 @@ class MetaReelVideo:
         )
         return {"status": mode, "evidence": signal}
 
-    async def upload(self, playwright: Playwright) -> dict[str, str] | None:
+    def _facebook_form_expectation(self) -> FacebookPageFormExpectation:
+        try:
+            page_id = normalize_facebook_page_id(
+                self.facebook_expected_page_id
+            )
+        except FacebookPagePublishError as exc:
+            raise FacebookPagePublishError(
+                "facebook_page_form_readback_failed",
+                "Facebook Page 发布缺少可验证的精确 Page 绑定，已停止。",
+                receipt={
+                    "phase": "form_readback",
+                    "platformWriteOccurred": False,
+                    "finalActionTriggered": False,
+                },
+            ) from exc
+        caption = canonical_meta_caption(self.facebook_final_caption)
+        video_sha256 = str(self.facebook_video_sha256 or "")
+        if (
+            type(self.facebook_final_caption) is not str
+            or not caption
+            or len(video_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in video_sha256)
+        ):
+            raise FacebookPagePublishError(
+                "facebook_page_form_readback_failed",
+                "Facebook Page 发布缺少受控表单预期，已停止。",
+                receipt={
+                    "pageId": page_id,
+                    "phase": "form_readback",
+                    "platformWriteOccurred": False,
+                    "finalActionTriggered": False,
+                },
+            )
+        path = Path(self.file_path)
+        try:
+            size = path.stat().st_size
+        except OSError as exc:
+            raise FacebookPagePublishError(
+                "facebook_upload_failed",
+                "Facebook Page Reel 视频无法安全读取，已停止。",
+                receipt={
+                    "pageId": page_id,
+                    "phase": "form_upload",
+                    "platformWriteOccurred": False,
+                    "finalActionTriggered": False,
+                },
+            ) from exc
+        return FacebookPageFormExpectation(
+            page_id=page_id,
+            content_kind="reel",
+            video_name=self.file_path,
+            video_size=size,
+            video_sha256=video_sha256,
+            caption=caption,
+            visibility="public",
+        )
+
+    async def _upload_facebook_page_form(
+        self,
+        playwright: Playwright,
+        expected: FacebookPageFormExpectation,
+    ) -> FacebookPageFormSnapshot:
+        owns_browser = self.external_browser is None
+        browser = self.external_browser or await launch_publish_browser(playwright)
+        context = self.external_context
+        page = self.external_page
+        if context is None:
+            context = await new_publish_context(
+                browser,
+                storage_state=self.account_file,
+            )
+            context = await set_init_script(context)
+        if page is None:
+            page = await context.new_page()
+
+        try:
+            if "business.facebook.com" not in str(page.url or "").casefold():
+                await page.goto(
+                    FACEBOOK_PAGE_HOME_URL,
+                    wait_until="domcontentloaded",
+                    timeout=60000,
+                )
+            await reveal_page_window(page)
+            adapter = FacebookPageFormAdapter(
+                page,
+                wait_for_verification=self._wait_for_manual_intervention,
+            )
+            snapshot = await adapter.fill_and_readback(expected)
+            meta_logger.success(
+                "[meta] Facebook Page Reel 表单已精确回读，未点击最终按钮"
+            )
+            if owns_browser:
+                await context.close()
+                await browser.close()
+            return snapshot
+        except Exception:
+            if owns_browser:
+                try:
+                    await context.close()
+                except Exception:
+                    pass
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+            raise
+
+    async def upload(
+        self,
+        playwright: Playwright,
+    ) -> dict[str, str] | FacebookPageFormSnapshot | None:
+        if self.target_platform == "facebook":
+            expected = self._facebook_form_expectation()
+            return await self._upload_facebook_page_form(playwright, expected)
         if not self.dry_run and (
             not self.publish_confirmed or not self.automation_acknowledged
         ):

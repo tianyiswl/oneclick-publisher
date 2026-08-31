@@ -8,6 +8,17 @@ from playwright.async_api import async_playwright
 from PIL import Image
 
 from app_core.database import open_connection
+from app_core import account_service
+from app_core.managed_artifact_cleanup import (
+    unlink_managed_artifact_if_unreferenced,
+)
+from app_core.overseas_meta_errors import FacebookPagePublishError
+from app_core.overseas_meta_page_identity import (
+    FacebookPageIdentity,
+    activate_saved_facebook_page,
+    discover_manageable_facebook_pages,
+    resolve_facebook_page_selection,
+)
 from app_core.overseas_tiktok_identity import (
     TikTokIdentityError,
     persist_tiktok_identity,
@@ -47,6 +58,8 @@ DOUYIN_AUTH_COOKIE_NAMES = frozenset(
         "uid_tt_ss",
     )
 )
+FACEBOOK_PAGE_DISCOVERY_TIMEOUT_SECONDS = 30.0
+FACEBOOK_PAGE_DISCOVERY_POLL_INTERVAL_SECONDS = 0.5
 
 
 async def launch_login_browser(playwright, background_mode=False, **options):
@@ -469,8 +482,33 @@ def _remove_replaced_tiktok_artifacts(
             pass
 
 
+def _remove_replaced_facebook_page_session(
+    previous_account: dict,
+    *,
+    current_cookie: str,
+) -> None:
+    """Best-effort removal of one committed Page login's unreferenced old state."""
+
+    old_value = previous_account.get("filePath")
+    if not old_value:
+        return
+    try:
+        db_path = Path(BASE_DIR / "db" / "database.db")
+        with open_connection(db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            unlink_managed_artifact_if_unreferenced(
+                conn,
+                raw_target=old_value,
+                managed_dir=Path(BASE_DIR / "cookiesFile"),
+                reference_column="filePath",
+            )
+    except Exception:
+        # The new account row has already committed; cleanup cannot invalidate it.
+        return
+
+
 def save_meta_login_accounts(cookie_file, profile_name, update_mode=False, record_id=None, avatar_path=None, display_name=None):
-    """用一份 Meta 登录态维护 Instagram 与 Facebook 两个平台账号。"""
+    """Persist only the explicitly selected Instagram target."""
     user_name = display_name or profile_name
     checked_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     db_path = Path(BASE_DIR / "db" / "database.db")
@@ -488,14 +526,14 @@ def save_meta_login_accounts(cookie_file, profile_name, update_mode=False, recor
         rows = conn.execute(
             """
             SELECT id, type FROM user_info
-            WHERE type IN (8, 9) AND (profileName = ? OR profileName = ?)
+            WHERE type = 8 AND (profileName = ? OR profileName = ?)
             ORDER BY id
             """,
             (old_profile, profile_name),
         ).fetchall()
         rows_by_type = {int(row["type"]): int(row["id"]) for row in rows}
 
-        for platform_type in (8, 9):
+        for platform_type in (8,):
             existing_id = rows_by_type.get(platform_type)
             if existing_id:
                 conn.execute(
@@ -546,8 +584,76 @@ def save_meta_login_accounts(cookie_file, profile_name, update_mode=False, recor
                 )
                 saved_ids.append(int(cursor.lastrowid))
         conn.commit()
-    print("[OK] Meta 登录状态已记录为 Instagram 与 Facebook 两个平台")
+    print("[OK] Meta 登录状态已记录为 Instagram")
     return saved_ids
+
+
+async def select_facebook_page_for_login(
+    page,
+    *,
+    selection_callback=None,
+    expected_page_id: str | None = None,
+) -> FacebookPageIdentity:
+    """Select and read back one exact manageable Page before saving anything."""
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + FACEBOOK_PAGE_DISCOVERY_TIMEOUT_SECONDS
+    pages: tuple[FacebookPageIdentity, ...] = ()
+    while True:
+        try:
+            pages = await discover_manageable_facebook_pages(page)
+        except FacebookPagePublishError as exc:
+            if exc.error_code != "facebook_page_not_found":
+                raise
+            pages = ()
+        if pages or loop.time() >= deadline:
+            break
+        await asyncio.sleep(FACEBOOK_PAGE_DISCOVERY_POLL_INTERVAL_SECONDS)
+    if expected_page_id:
+        selected = resolve_facebook_page_selection(pages, expected_page_id)
+    else:
+        try:
+            selected = resolve_facebook_page_selection(pages)
+        except FacebookPagePublishError as exc:
+            if exc.error_code != "facebook_page_selection_required":
+                raise
+            if selection_callback is None:
+                raise
+            chosen = await selection_callback(tuple(pages))
+            chosen_page_id = (
+                chosen.page_id
+                if isinstance(chosen, FacebookPageIdentity)
+                else chosen
+            )
+            selected = resolve_facebook_page_selection(pages, chosen_page_id)
+    return await activate_saved_facebook_page(page, selected.page_id)
+
+
+def _mark_failed_facebook_page_update(
+    *,
+    update_mode: bool,
+    record_id: int | None,
+    expected_account,
+    error: FacebookPagePublishError,
+) -> None:
+    """Invalidate only the original Page row after an identity/permission failure."""
+
+    if not update_mode or record_id is None or not expected_account:
+        return
+    if error.error_code not in {
+        "facebook_page_identity_mismatch",
+        "facebook_page_content_permission_missing",
+        "facebook_page_not_found",
+    }:
+        return
+    try:
+        expected_id = int(expected_account.get("id"))
+        expected_type = int(expected_account.get("type"))
+    except (AttributeError, TypeError, ValueError):
+        return
+    if expected_id != int(record_id) or expected_type != 9:
+        return
+    account_service.update_status(expected_id, 0)
 
 
 async def _visible(page, selector: str) -> bool:
@@ -599,10 +705,21 @@ async def _browser_login_state(page, platform_type: int) -> str:
         return "pending"
     composer_ready = any(
         marker in text
-        for marker in ("create post", "create reel", "add video", "创建帖子", "创建 reel", "添加视频")
+        for marker in (
+            "create post",
+            "create reel",
+            "add video",
+            "add photo/video",
+            "add photos/videos",
+            "创建帖子",
+            "创建 reel",
+            "发帖",
+            "添加视频",
+            "添加照片/视频",
+        )
     ) or await _visible(page, '[contenteditable="true"][role="textbox"]')
-    both_destinations = "instagram" in text and "facebook" in text
-    return "ready" if composer_ready and both_destinations else "pending"
+    destination = "facebook" if int(platform_type) == 9 else "instagram"
+    return "ready" if composer_ready and destination in text else "pending"
 
 
 async def _wait_for_browser_login(page, platform_type: int, cancel_event=None, timeout: int = 600) -> str:
@@ -717,6 +834,8 @@ async def _browser_cookie_gen(
     record_id=None,
     cancel_event=None,
     background_mode=False,
+    selection_callback=None,
+    expected_account=None,
 ):
     config = {
         6: (
@@ -729,7 +848,11 @@ async def _browser_cookie_gen(
         ),
         8: (
             "https://business.facebook.com/latest/composer/",
-            "请在打开的窗口登录 Meta，并确认 Instagram 专业账号与 Facebook Page 都出现在发布入口。",
+            "请在打开的窗口登录 Meta，并确认 Instagram 发布入口可用。",
+        ),
+        9: (
+            "https://business.facebook.com/latest/composer/",
+            "请在打开的窗口登录 Meta，并确认要绑定的 Facebook Page。",
         ),
     }
     url, instruction = config[int(platform_type)]
@@ -748,6 +871,7 @@ async def _browser_cookie_gen(
         tiktok_previous_account = None
         tiktok_login_succeeded = False
         tiktok_account_write_attempted = False
+        facebook_page_login_succeeded = False
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=60000)
             if platform_type == 6 and background_mode:
@@ -786,15 +910,46 @@ async def _browser_cookie_gen(
                 status_queue.put("CANCELLED")
                 return None
             if wait_result == "denied":
-                status_queue.put(
-                    "ERROR: Meta Business Suite 尚不可用。请先建立 Facebook Page，并把 Instagram 切换为专业账号后连接到该 Page。"
-                )
+                if platform_type == 9:
+                    status_queue.put("ERROR:facebook_page_business_access_denied")
+                else:
+                    status_queue.put(
+                        "ERROR: Meta Business Suite 尚不可用。请先建立 Facebook Page，并把 Instagram 切换为专业账号后连接到该 Page。"
+                    )
                 status_queue.put("500")
                 return None
             if wait_result != "ready":
                 status_queue.put("ERROR: 等待平台登录超时，未保存任何登录数据。")
                 status_queue.put("500")
                 return None
+
+            facebook_identity = None
+            if platform_type == 9:
+                expected_page_id = str(
+                    (expected_account or {}).get("accountReference") or ""
+                ).strip()
+                try:
+                    facebook_identity = await select_facebook_page_for_login(
+                        page,
+                        selection_callback=selection_callback,
+                        expected_page_id=expected_page_id or None,
+                    )
+                except asyncio.CancelledError:
+                    status_queue.put("CANCELLED")
+                    return None
+                except FacebookPagePublishError as exc:
+                    _mark_failed_facebook_page_update(
+                        update_mode=bool(update_mode),
+                        record_id=record_id,
+                        expected_account=expected_account,
+                        error=exc,
+                    )
+                    status_queue.put(f"ERROR:{exc.error_code}")
+                    status_queue.put("500")
+                    return None
+                if cancel_event is not None and cancel_event.is_set():
+                    status_queue.put("CANCELLED")
+                    return None
 
             status_queue.put("SCAN_CONFIRMED")
             identity = uuid.uuid4()
@@ -803,17 +958,45 @@ async def _browser_cookie_gen(
             await save_context_storage_state(
                 context,
                 cookie_path,
-                include_indexed_db=platform_type in (7, 8),
+                include_indexed_db=platform_type in (7, 8, 9),
             )
             os.chmod(cookie_path, 0o600)
 
-            checks = (8, 9) if platform_type == 8 else (platform_type,)
-            for check_type in checks:
-                if not await check_cookie(check_type, cookie_file):
+            if platform_type == 9:
+                try:
+                    checked_identity = await check_cookie(
+                        9,
+                        cookie_file,
+                        account_reference=facebook_identity.page_id,
+                    )
+                    if not isinstance(checked_identity, FacebookPageIdentity):
+                        raise FacebookPagePublishError(
+                            "facebook_page_identity_mismatch",
+                            "保存的 Facebook Page 无法精确回读，已停止操作。",
+                        )
+                    resolve_facebook_page_selection(
+                        (checked_identity,),
+                        facebook_identity.page_id,
+                    )
+                except FacebookPagePublishError as exc:
+                    _mark_failed_facebook_page_update(
+                        update_mode=bool(update_mode),
+                        record_id=record_id,
+                        expected_account=expected_account,
+                        error=exc,
+                    )
                     cookie_path.unlink(missing_ok=True)
-                    status_queue.put("ERROR: 登录页面已完成，但平台发布权限检查未通过。")
+                    status_queue.put(f"ERROR:{exc.error_code}")
                     status_queue.put("500")
                     return None
+                checks_ok = True
+            else:
+                checks_ok = bool(await check_cookie(platform_type, cookie_file))
+            if not checks_ok:
+                cookie_path.unlink(missing_ok=True)
+                status_queue.put("ERROR: 登录页面已完成，但平台发布权限检查未通过。")
+                status_queue.put("500")
+                return None
 
             tiktok_identity = None
             if platform_type == 6:
@@ -836,7 +1019,14 @@ async def _browser_cookie_gen(
                     status_queue.put("500")
                     return None
 
-            avatar_path, display_name = await capture_login_identity(page, platform_type, identity)
+            if platform_type == 9:
+                avatar_path, display_name = None, facebook_identity.page_name
+            else:
+                avatar_path, display_name = await capture_login_identity(
+                    page,
+                    platform_type,
+                    identity,
+                )
             if platform_type == 8:
                 account_ids = save_meta_login_accounts(
                     cookie_file,
@@ -848,6 +1038,37 @@ async def _browser_cookie_gen(
                 )
                 for account_id in account_ids:
                     status_queue.put(f"ACCOUNT_ID:{account_id}")
+            elif platform_type == 9:
+                if cancel_event is not None and cancel_event.is_set():
+                    cookie_path.unlink(missing_ok=True)
+                    status_queue.put("CANCELLED")
+                    return None
+                try:
+                    account_id = account_service.save_facebook_page_browser_account(
+                        profile_name=profile_name,
+                        storage_file_name=cookie_file,
+                        identity=facebook_identity,
+                        record_id=record_id if update_mode else None,
+                        expected_account=expected_account if update_mode else None,
+                    )
+                except FacebookPagePublishError as exc:
+                    _mark_failed_facebook_page_update(
+                        update_mode=bool(update_mode),
+                        record_id=record_id,
+                        expected_account=expected_account,
+                        error=exc,
+                    )
+                    cookie_path.unlink(missing_ok=True)
+                    status_queue.put(f"ERROR:{exc.error_code}")
+                    status_queue.put("500")
+                    return None
+                if update_mode and expected_account:
+                    _remove_replaced_facebook_page_session(
+                        dict(expected_account),
+                        current_cookie=cookie_file,
+                    )
+                facebook_page_login_succeeded = True
+                status_queue.put(f"ACCOUNT_ID:{account_id}")
             else:
                 account_id = None
                 try:
@@ -916,24 +1137,32 @@ async def _browser_cookie_gen(
             status_queue.put("500")
             return None
         finally:
-            if (
-                platform_type == 6
-                and cookie_path is not None
-                and not tiktok_login_succeeded
-            ):
-                try:
-                    _discard_failed_tiktok_login(
-                        account_id,
-                        update_mode=bool(update_mode),
-                        cookie_path=cookie_path,
-                        avatar_path=avatar_path,
-                        previous_account=tiktok_previous_account,
-                        account_write_attempted=tiktok_account_write_attempted,
-                    )
-                except Exception:
-                    # 登录主错误保持稳定；仍继续关闭浏览器资源。
-                    pass
-            await close_login_resources(page, context, browser)
+            try:
+                if (
+                    platform_type == 9
+                    and cookie_path is not None
+                    and not facebook_page_login_succeeded
+                ):
+                    cookie_path.unlink(missing_ok=True)
+                if (
+                    platform_type == 6
+                    and cookie_path is not None
+                    and not tiktok_login_succeeded
+                ):
+                    try:
+                        _discard_failed_tiktok_login(
+                            account_id,
+                            update_mode=bool(update_mode),
+                            cookie_path=cookie_path,
+                            avatar_path=avatar_path,
+                            previous_account=tiktok_previous_account,
+                            account_write_attempted=tiktok_account_write_attempted,
+                        )
+                    except Exception:
+                        # 登录主错误保持稳定；仍继续关闭浏览器资源。
+                        pass
+            finally:
+                await close_login_resources(page, context, browser)
 
 
 async def tiktok_cookie_gen(id, status_queue, update_mode=False, record_id=None, cancel_event=None, background_mode=False):
@@ -946,6 +1175,30 @@ async def youtube_cookie_gen(id, status_queue, update_mode=False, record_id=None
 
 async def meta_cookie_gen(id, status_queue, update_mode=False, record_id=None, cancel_event=None, background_mode=False):
     return await _browser_cookie_gen(8, id, status_queue, update_mode, record_id, cancel_event, background_mode)
+
+
+async def facebook_page_cookie_gen(
+    id,
+    status_queue,
+    update_mode=False,
+    record_id=None,
+    cancel_event=None,
+    background_mode=False,
+    *,
+    selection_callback=None,
+    expected_account=None,
+):
+    return await _browser_cookie_gen(
+        9,
+        id,
+        status_queue,
+        update_mode,
+        record_id,
+        cancel_event,
+        background_mode,
+        selection_callback=selection_callback,
+        expected_account=expected_account,
+    )
 
 # 抖音登录
 async def douyin_cookie_gen(

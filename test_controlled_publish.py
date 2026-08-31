@@ -28,6 +28,7 @@ from app_core.controlled_publish import (
     _find_successful_silicon_formal_task,
     _find_successful_formal_scope_task,
     project_task,
+    publish_intent_fingerprint,
     scope_fingerprint,
     submit_request,
 )
@@ -1563,6 +1564,17 @@ class ControlledPublishTests(unittest.TestCase):
             database,
             "DB_PATH",
             Path(temporary) / "database.db",
+        ), patch.object(
+            controlled_publish,
+            "_shanghai_now",
+            return_value=datetime(
+                2026,
+                8,
+                29,
+                14,
+                0,
+                tzinfo=ZoneInfo("Asia/Shanghai"),
+            ),
         ):
             database.ensure_schema()
             manifest, preflight, grants = self._seed_tiktok_preflight(
@@ -1642,6 +1654,17 @@ class ControlledPublishTests(unittest.TestCase):
             database,
             "DB_PATH",
             Path(temporary) / "database.db",
+        ), patch.object(
+            controlled_publish,
+            "_shanghai_now",
+            return_value=datetime(
+                2026,
+                8,
+                29,
+                14,
+                0,
+                tzinfo=ZoneInfo("Asia/Shanghai"),
+            ),
         ):
             database.ensure_schema()
             manifest, preflight, grants = self._seed_tiktok_preflight(
@@ -2472,6 +2495,33 @@ class ControlledPublishTests(unittest.TestCase):
         declaration_changed = [{**payloads[0], "aiGenerated": True}]
         self.assertNotEqual(
             scope_fingerprint(payloads), scope_fingerprint(declaration_changed)
+        )
+
+    def test_scope_fingerprint_wraps_order_independent_publish_intent(self) -> None:
+        payloads = [
+            {
+                "type": 3,
+                "accountIds": [31],
+                "title": "标题",
+                "description": "正文",
+                "tags": ["话题"],
+            },
+            {
+                "type": 1,
+                "accountIds": [11],
+                "title": "小红书标题",
+                "description": "小红书正文",
+                "tags": ["小红书话题"],
+            },
+        ]
+
+        self.assertEqual(
+            scope_fingerprint(payloads),
+            publish_intent_fingerprint(payloads),
+        )
+        self.assertEqual(
+            publish_intent_fingerprint(payloads),
+            publish_intent_fingerprint(reversed(payloads)),
         )
 
     def test_direct_authorization_is_bound_short_lived_and_single_use(self) -> None:

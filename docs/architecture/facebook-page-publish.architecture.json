@@ -1,0 +1,293 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Facebook Page 受控发布架构",
+    "output": "docs/architecture/facebook-page-publish.architecture.html",
+    "quality_profile": "showcase",
+    "viewBox": [1540, 790],
+    "views": [
+      {
+        "id": "publish-path",
+        "label": "统一发布主链",
+        "focus": ["content-package", "entrypoints", "controlled-publish", "publish-service", "page-executor", "visible-browser", "meta-suite", "content-readback", "task-receipt"],
+        "note": "桌面 UI、CLI 与 MCP 复用同一发布服务，平台结果必须回写同一任务。"
+      },
+      {
+        "id": "identity-boundary",
+        "label": "Page 身份边界",
+        "focus": ["entrypoints", "account-session-store", "page-identity-service", "controlled-publish", "authorization-gate", "page-executor"],
+        "note": "账号记录、浏览器会话、授权指纹和实际 Page ID 必须完全一致。"
+      },
+      {
+        "id": "safety-readback",
+        "label": "提交与安全回读",
+        "focus": ["authorization-gate", "publish-service", "task-receipt", "page-executor", "visible-browser", "meta-suite", "content-readback"],
+        "note": "正式点击只发生一次；唯一作品回读失败时进入结果不明，不自动重发。"
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "content-package",
+      "type": "external",
+      "label": "结构化内容包",
+      "sublabel": "视频、标题、正文与发布选项",
+      "pos": [40, 334],
+      "size": [170, 76]
+    },
+    {
+      "id": "entrypoints",
+      "type": "frontend",
+      "label": "桌面 UI / CLI / MCP",
+      "sublabel": "同一任务输入合同",
+      "pos": [270, 334],
+      "size": [180, 76]
+    },
+    {
+      "id": "controlled-publish",
+      "type": "security",
+      "label": "受控发布入口",
+      "sublabel": "accountId、模式与授权校验",
+      "pos": [510, 334],
+      "size": [180, 76]
+    },
+    {
+      "id": "publish-service",
+      "type": "backend",
+      "label": "统一发布服务",
+      "sublabel": "预检与正式发布共用路由",
+      "pos": [750, 334],
+      "size": [180, 76]
+    },
+    {
+      "id": "page-executor",
+      "type": "backend",
+      "label": "Facebook Page 执行器",
+      "sublabel": "表单写入、回读与一次提交",
+      "pos": [990, 334],
+      "size": [190, 76]
+    },
+    {
+      "id": "visible-browser",
+      "type": "frontend",
+      "label": "可见受控浏览器",
+      "sublabel": "复用本地 Meta 登录会话",
+      "pos": [1240, 334],
+      "size": [180, 76]
+    },
+    {
+      "id": "meta-suite",
+      "type": "external",
+      "label": "Meta Business Suite",
+      "sublabel": "指定 Page 的 Reel 发布页",
+      "pos": [1240, 570],
+      "size": [180, 76]
+    },
+    {
+      "id": "account-session-store",
+      "type": "database",
+      "label": "账号与会话存储",
+      "sublabel": "type=9、Page ID、会话路径",
+      "pos": [270, 110],
+      "size": [180, 76]
+    },
+    {
+      "id": "page-identity-service",
+      "type": "backend",
+      "label": "Page 身份服务",
+      "sublabel": "由 accountId 解析并核对 Page ID",
+      "pos": [510, 110],
+      "size": [180, 76]
+    },
+    {
+      "id": "authorization-gate",
+      "type": "security",
+      "label": "一次性授权门",
+      "sublabel": "短期令牌绑定预检与发布意图",
+      "pos": [750, 110],
+      "size": [180, 76]
+    },
+    {
+      "id": "task-receipt",
+      "type": "database",
+      "label": "任务、原子 Claim 与回执",
+      "sublabel": "唯一意图槽、状态、错误码与平台回执",
+      "pos": [750, 570],
+      "size": [210, 76]
+    },
+    {
+      "id": "content-readback",
+      "type": "backend",
+      "label": "Page 内容列表回读",
+      "sublabel": "点击前基线与点击后唯一 Reel 核对",
+      "pos": [990, 570],
+      "size": [190, 76]
+    },
+    {
+      "id": "human-confirmation",
+      "type": "external",
+      "label": "人工确认 / 安全验证",
+      "sublabel": "正式授权与验证码临界点",
+      "pos": [990, 110],
+      "size": [180, 76]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "一键发本机客户端",
+      "wraps": ["entrypoints", "controlled-publish", "publish-service", "page-executor", "visible-browser", "account-session-store", "page-identity-service", "authorization-gate", "task-receipt", "content-readback"]
+    },
+    {
+      "kind": "security-group",
+      "label": "正式发布安全边界",
+      "wraps": ["controlled-publish", "authorization-gate", "publish-service", "page-executor", "task-receipt"]
+    }
+  ],
+  "connections": [
+    {
+      "id": "package-to-entry",
+      "from": "content-package",
+      "to": "entrypoints",
+      "label": "manifest + accountId",
+      "variant": "emphasis",
+      "labelDy": -32
+    },
+    {
+      "id": "entry-to-control",
+      "from": "entrypoints",
+      "to": "controlled-publish",
+      "label": "创建任务"
+    },
+    {
+      "id": "control-to-service",
+      "from": "controlled-publish",
+      "to": "publish-service",
+      "label": "已验证请求",
+      "variant": "security",
+      "labelDy": -32
+    },
+    {
+      "id": "service-to-executor",
+      "from": "publish-service",
+      "to": "page-executor",
+      "label": "统一平台路由",
+      "labelDy": -32
+    },
+    {
+      "id": "executor-to-browser",
+      "from": "page-executor",
+      "to": "visible-browser",
+      "label": "受控操作"
+    },
+    {
+      "id": "browser-to-meta",
+      "from": "visible-browser",
+      "to": "meta-suite",
+      "label": "表单写入与唯一回读",
+      "variant": "emphasis",
+      "labelAt": [1468, 490]
+    },
+    {
+      "id": "store-to-identity",
+      "from": "account-session-store",
+      "to": "page-identity-service",
+      "label": "账号记录与会话引用",
+      "variant": "security",
+      "labelDy": -32
+    },
+    {
+      "id": "identity-to-control",
+      "from": "page-identity-service",
+      "to": "controlled-publish",
+      "label": "已核对 Page ID",
+      "variant": "security",
+      "labelAt": [600, 245],
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "auth-to-control",
+      "from": "authorization-gate",
+      "to": "controlled-publish",
+      "label": "已消费授权",
+      "variant": "security",
+      "labelAt": [680, 245],
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "human-to-auth",
+      "from": "human-confirmation",
+      "to": "authorization-gate",
+      "label": "正式发布确认",
+      "variant": "security",
+      "labelDy": -32
+    },
+    {
+      "id": "service-to-receipt",
+      "from": "publish-service",
+      "to": "task-receipt",
+      "label": "原子任务 / Claim 与阶段",
+      "variant": "security",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "executor-to-readback",
+      "from": "page-executor",
+      "to": "content-readback",
+      "label": "基线与结果核对",
+      "labelAt": [1085, 490],
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "meta-to-readback",
+      "from": "meta-suite",
+      "to": "content-readback",
+      "label": "同一 Page 内容列表",
+      "variant": "emphasis",
+      "labelAt": [1210, 670]
+    },
+    {
+      "id": "readback-to-receipt",
+      "from": "content-readback",
+      "to": "task-receipt",
+      "label": "Reel ID / URL 或结果不明",
+      "variant": "emphasis",
+      "labelAt": [975, 670]
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "身份合同",
+      "items": [
+        "每个 Facebook Page 单独保存为 type=9 账号",
+        "accountReference 保存稳定 Page ID，不能只靠名称猜测",
+        "调用方只传 accountId，由身份服务解析并回读实际 Page"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "人工临界点",
+      "items": [
+        "默认只允许预检，预检不得点击最终发布",
+        "正式发布必须使用短期一次性授权凭证",
+        "平台要求扫码或验证码时暂停并等待用户处理"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "回读与去重",
+      "items": [
+        "授权消费、任务和 Page 级 Claim 必须在同一事务创建",
+        "final_action_claimed 与实际点击分开记录",
+        "成功必须回读同一 Page 新增且唯一的 Reel ID 或 URL",
+        "结果不明时锁住自动重试，先做只读核对"
+      ]
+    }
+  ]
+}

@@ -3,15 +3,22 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from app_core import database
+from app_core.controlled_publish import ControlledPublishError
+from app_core.controlled_publish_process import submit_authorized_preflight_task
 from app_core.content_project_gateway import (
     ContentProjectGateway,
     ContentProjectGatewayError,
     PublishProfileStore,
 )
+from test_controlled_publish_process import FacebookPagePublicEntryFixture
 
 
 class _MetricsService:
@@ -32,6 +39,25 @@ class _MetricsService:
 
 
 class ContentProjectGatewayTests(unittest.TestCase):
+    def test_gateway_preserves_facebook_verification_wait_projection(self) -> None:
+        expected = {
+            "taskId": 71,
+            "status": "waiting_user_verification",
+            "phase": "waiting_user_verification",
+            "stage": "waiting_verification",
+            "errorCode": "",
+            "actionRequired": {
+                "code": "facebook_verification_required",
+                "type": "facebook_security_check",
+                "message": "请在同一可见窗口完成 Facebook 安全验证",
+                "timeoutSeconds": 600,
+                "deadlineAt": "2026-08-30T05:10:00+00:00",
+            },
+        }
+        gateway = ContentProjectGateway(status_reader=lambda _task_id: expected)
+
+        self.assertEqual(gateway.task_status(71), expected)
+
     @staticmethod
     def _accounts() -> list[dict]:
         return [
@@ -76,7 +102,14 @@ class ContentProjectGatewayTests(unittest.TestCase):
         direct_authorizer=None,
         silicon_direct_authorizer=None,
         accounts_provider=None,
+        formal_submitter=None,
+        reconciler=None,
     ) -> ContentProjectGateway:
+        optional = {}
+        if formal_submitter is not None:
+            optional["formal_submitter"] = formal_submitter
+        if reconciler is not None:
+            optional["reconciler"] = reconciler
         return ContentProjectGateway(
             profile_store=PublishProfileStore(root / "publish-profiles.json"),
             accounts_provider=accounts_provider or self._accounts,
@@ -146,7 +179,23 @@ class ContentProjectGatewayTests(unittest.TestCase):
                 else None
             ),
             metrics_service=metrics_service,
+            **optional,
         )
+
+    @staticmethod
+    def _facebook_account() -> dict:
+        return {
+            "id": 91,
+            "type": 9,
+            "filePath": "facebook-page.json",
+            "profileName": "品牌主体",
+            "userName": "Saved Facebook Page",
+            "healthStatus": "normal",
+            "statusText": "正常",
+            "status": 1,
+            "authMode": "browser",
+            "accountReference": "1000000000001001",
+        }
 
     @staticmethod
     def _article_bundle(root: Path) -> Path:
@@ -437,33 +486,235 @@ class ContentProjectGatewayTests(unittest.TestCase):
         self.assertEqual(raised.exception.error_code, "source_live_session_active")
 
     def test_formal_publish_cannot_bypass_preflight_and_one_time_authorization(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            submitted: list[dict] = []
-            gateway = self._gateway(Path(directory), submitted)
-            gateway.save_profile(
-                "silicon-exploration",
-                "硅基探索",
-                [{"platform": "抖音", "accountId": 31}],
+        with FacebookPagePublicEntryFixture() as fixture:
+            gateway = ContentProjectGateway(
+                profile_store=PublishProfileStore(
+                    fixture.root / "publish-profiles.json"
+                ),
             )
             with self.assertRaises(ContentProjectGatewayError) as missing:
                 gateway.formal_publish(
-                    "silicon-exploration",
-                    "/content/manifest.json",
-                    confirmed_preflight_task_id=0,
+                    preflight_task_id=0,
                     authorization_id="",
                 )
-            result = gateway.formal_publish(
-                "silicon-exploration",
-                "/content/manifest.json",
-                confirmed_preflight_task_id=41,
-                authorization_id="one-time-grant",
+            authorization_id = fixture.authorize()
+            with fixture.stop_at_worker_start() as started:
+                result = gateway.formal_publish(
+                    preflight_task_id=fixture.preflight_task_id,
+                    authorization_id=authorization_id,
+                )
+
+            self.assertEqual(
+                missing.exception.error_code,
+                "content_project_authorization_required",
+            )
+            fixture.assert_real_dispatch(
+                self,
+                result,
+                started,
+                authorization_id=authorization_id,
             )
 
-        self.assertEqual(missing.exception.error_code, "content_project_authorization_required")
-        self.assertEqual(result["taskId"], 42)
-        self.assertEqual(submitted[0]["mode"], "formal")
-        self.assertEqual(submitted[0]["confirmedPreflightTaskId"], 41)
-        self.assertEqual(submitted[0]["authorizationId"], "one-time-grant")
+    def test_direct_service_and_gateway_race_for_one_global_page_replay_claim(self) -> None:
+        with FacebookPagePublicEntryFixture() as fixture:
+            equivalent_preflight_id = fixture.create_equivalent_preflight()
+            direct_authorization = fixture.authorize(fixture.preflight_task_id)
+            gateway_authorization = fixture.authorize(equivalent_preflight_id)
+            gateway = ContentProjectGateway(
+                profile_store=PublishProfileStore(
+                    fixture.root / "race-publish-profiles.json"
+                ),
+                runtime_conflict_checker=lambda: False,
+                formal_submitter=submit_authorized_preflight_task,
+            )
+            gate = threading.Barrier(3)
+            result_lock = threading.Lock()
+            results: list[dict] = []
+            errors: list[Exception] = []
+
+            def capture(callable_) -> None:
+                try:
+                    gate.wait(timeout=2)
+                    result = callable_()
+                except Exception as exc:  # Preserve thread assertions for the test.
+                    with result_lock:
+                        errors.append(exc)
+                else:
+                    with result_lock:
+                        results.append(result)
+
+            direct_thread = threading.Thread(
+                target=capture,
+                args=(
+                    lambda: submit_authorized_preflight_task(
+                        fixture.preflight_task_id,
+                        direct_authorization,
+                    ),
+                ),
+            )
+            gateway_thread = threading.Thread(
+                target=capture,
+                args=(
+                    lambda: gateway.formal_publish(
+                        preflight_task_id=equivalent_preflight_id,
+                        authorization_id=gateway_authorization,
+                    ),
+                ),
+            )
+            with fixture.stop_at_worker_start() as started:
+                direct_thread.start()
+                gateway_thread.start()
+                gate.wait(timeout=2)
+                direct_thread.join(timeout=3)
+                gateway_thread.join(timeout=3)
+
+            self.assertFalse(direct_thread.is_alive())
+            self.assertFalse(gateway_thread.is_alive())
+            self.assertEqual(len(results), 1)
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], ControlledPublishError)
+            self.assertEqual(
+                getattr(errors[0], "error_code", ""),
+                "facebook_duplicate_submit_blocked",
+            )
+            started.assert_called_once()
+            self.assertEqual(len(fixture.started_task_ids), 1)
+
+            with database.connect() as conn:
+                claims = conn.execute(
+                    """
+                    SELECT taskId, state, blocksReplay
+                    FROM facebook_page_publish_claims
+                    """
+                ).fetchall()
+                formal_count = conn.execute(
+                    "SELECT COUNT(*) FROM publish_tasks WHERE mode = 'oneclick_publish'"
+                ).fetchone()[0]
+                authorizations = conn.execute(
+                    """
+                    SELECT preflightTaskId, consumedAt
+                    FROM controlled_publish_authorizations
+                    WHERE preflightTaskId IN (?, ?)
+                    ORDER BY preflightTaskId
+                    """,
+                    (fixture.preflight_task_id, equivalent_preflight_id),
+                ).fetchall()
+
+            self.assertEqual(len(claims), 1)
+            self.assertEqual(claims[0]["state"], "reserved")
+            self.assertEqual(int(claims[0]["blocksReplay"]), 1)
+            self.assertEqual(int(formal_count), 1)
+            self.assertEqual(len(authorizations), 2)
+            self.assertEqual(
+                sum(bool(str(row["consumedAt"] or "")) for row in authorizations),
+                1,
+            )
+
+    def test_facebook_direct_requires_preflight_before_authorizer_or_submitter(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ,
+            {"ONECLICK_ENABLE_FACEBOOK_PAGE_V1": "1"},
+            clear=False,
+        ):
+            submitted: list[dict] = []
+            authorized: list[dict] = []
+            gateway = self._gateway(
+                Path(directory),
+                submitted,
+                accounts_provider=lambda: [self._facebook_account()],
+                direct_authorizer=lambda request: authorized.append(dict(request))
+                or {"authorizationId": "must-not-be-created"},
+            )
+            gateway.save_profile(
+                "facebook-page",
+                "Facebook Page",
+                [{"platform": "Facebook Reels", "accountId": 91}],
+            )
+
+            with self.assertRaises(ContentProjectGatewayError) as raised:
+                gateway.direct_publish_content(
+                    "facebook-page",
+                    "/content/manifest.json",
+                    settings={"Facebook Reels": {"visibility": "public"}},
+                )
+
+        self.assertEqual(raised.exception.error_code, "facebook_preflight_required")
+        self.assertEqual(authorized, [])
+        self.assertEqual(submitted, [])
+
+    def test_default_off_hides_page_accounts_and_blocks_new_page_profiles(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ,
+            {},
+            clear=True,
+        ):
+            gateway = self._gateway(
+                Path(directory),
+                [],
+                accounts_provider=lambda: [self._facebook_account()],
+            )
+
+            self.assertEqual(gateway.list_accounts(), [])
+            with self.assertRaises(ContentProjectGatewayError) as raised:
+                gateway.save_profile(
+                    "facebook-page",
+                    "Facebook Page",
+                    [{"platform": "Facebook Reels", "accountId": 91}],
+                )
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "facebook_page_feature_disabled",
+        )
+
+    def test_read_only_reconcile_forwards_only_task_id_and_rejects_preflight(self) -> None:
+        calls: list[int] = []
+
+        def reconcile(task_id: int) -> dict:
+            calls.append(task_id)
+            raise ControlledPublishError(
+                "facebook_claim_lifecycle_invalid",
+                "Facebook Page 预检任务不允许只读核对。",
+            )
+
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ,
+            {"ONECLICK_ENABLE_FACEBOOK_PAGE_V1": "1"},
+            clear=False,
+        ):
+            gateway = self._gateway(
+                Path(directory),
+                [],
+                reconciler=reconcile,
+            )
+            with self.assertRaises(ControlledPublishError) as raised:
+                gateway.reconcile_publish_outcome(17)
+
+        self.assertEqual(calls, [17])
+        self.assertEqual(
+            raised.exception.error_code,
+            "facebook_claim_lifecycle_invalid",
+        )
+
+    def test_feature_disabled_blocks_gateway_reconcile_before_internal_service(self) -> None:
+        calls: list[int] = []
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {}, clear=True
+        ):
+            gateway = ContentProjectGateway(
+                profile_store=PublishProfileStore(
+                    Path(directory) / "publish-profiles.json"
+                ),
+                reconciler=lambda task_id: calls.append(task_id) or {},
+            )
+            with self.assertRaises(ContentProjectGatewayError) as raised:
+                gateway.reconcile_publish_outcome(17)
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "facebook_page_feature_disabled",
+        )
+        self.assertEqual(calls, [])
 
     def test_direct_publish_creates_bound_authorization_without_preflight(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

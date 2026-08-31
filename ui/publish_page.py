@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 from datetime import datetime
@@ -48,6 +49,8 @@ from app_core import (
     account_service,
     collection_service,
     content_bundle,
+    controlled_publish,
+    controlled_publish_process,
     douyin_commerce_draft_service,
     douyin_location_service,
     media_service,
@@ -68,6 +71,11 @@ from app_core.meta_browser_policy import (
     META_BROWSER_AUTOMATION_ACKNOWLEDGED,
     META_BROWSER_PUBLISH_CONFIRMED,
 )
+from app_core.overseas_meta_content import (
+    build_facebook_page_caption,
+    facebook_page_caption_sha256,
+)
+from app_core.overseas_meta_page_identity import facebook_page_v1_enabled
 from app_core.douyin_verification import (
     verification_broker as douyin_verification_broker,
 )
@@ -472,6 +480,8 @@ class PublishPage(QWidget):
         self.active_task_background_mode = True
         self.active_task_started_at: datetime | None = None
         self.seen_event_ids: set[int] = set()
+        self._rendered_controlled_actions: set[str] = set()
+        self._reported_controlled_projection_errors: set[int] = set()
         self._account_rows: list[dict] = []
         self._media_rows: list[dict] = []
         self._selected_account_ids: set[int] = set()
@@ -1304,6 +1314,16 @@ class PublishPage(QWidget):
         self.platform_texts[platform_type] = text
         self.platform_tags[platform_type] = tags
 
+        if platform_type == 9:
+            page_limit_notice = QLabel(
+                "Facebook Page 首版仅支持单 Page、单 Reel、立即公开发布；"
+                "不支持封面、合集、定时、原创或 AI 声明。"
+            )
+            page_limit_notice.setObjectName("facebookPageV1LimitNotice")
+            page_limit_notice.setProperty("role", "warning")
+            page_limit_notice.setWordWrap(True)
+            body_layout.addWidget(page_limit_notice)
+
         publish_settings = QFrame()
         publish_settings.setProperty("subPanel", True)
         publish_settings_layout = QFormLayout(publish_settings)
@@ -1342,6 +1362,12 @@ class PublishPage(QWidget):
             collection_sync.setEnabled(False)
             collection_status.setText("首版不设置")
             collection_row.setToolTip("TikTok 合集尚未接入可靠回读，首版不会写入。")
+        elif platform_type == 9:
+            collection.setEnabled(False)
+            collection_sync.setEnabled(False)
+            collection_status.setText("首版不支持")
+            collection_row.setToolTip("Facebook Page 首版不设置合集。")
+            collection_row.hide()
 
         schedule_enabled = QCheckBox("单独设置")
         schedule_date = QDateEdit()
@@ -1362,6 +1388,11 @@ class PublishPage(QWidget):
             schedule_enabled.setToolTip(
                 f"{name} 首版只开放立即发布，定时发布将在真实账号回读验收后开放。"
             )
+        elif platform_type == 9:
+            schedule_enabled.setEnabled(False)
+            schedule_enabled.setToolTip(
+                "Facebook Page 首版只支持立即公开发布。"
+            )
         self.platform_schedule_enabled[platform_type] = schedule_enabled
         self.platform_schedule_dates[platform_type] = schedule_date
         self.platform_schedule_times[platform_type] = schedule_time
@@ -1375,6 +1406,8 @@ class PublishPage(QWidget):
         schedule_row_layout.addWidget(schedule_date, 1)
         schedule_row_layout.addWidget(schedule_time)
         publish_settings_layout.addRow("发布时间", schedule_row)
+        if platform_type == 9:
+            schedule_row.hide()
         body_layout.addWidget(publish_settings)
 
         if platform_type == 1:
@@ -1755,10 +1788,10 @@ class PublishPage(QWidget):
             body_layout.addWidget(self.wechat_location_panel)
 
         body_layout.addStretch()
-        editor_body_layout.addWidget(
-            self._build_platform_cover_panel(platform_type),
-            0,
-        )
+        platform_cover_panel = self._build_platform_cover_panel(platform_type)
+        if platform_type == 9:
+            platform_cover_panel.hide()
+        editor_body_layout.addWidget(platform_cover_panel, 0)
         editor_layout.addWidget(editor_body, 1)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -3355,8 +3388,22 @@ class PublishPage(QWidget):
         history = douyin_commerce_draft_service.remove_tag_history(tag)
         self._refresh_topic_histories(history)
 
+    @staticmethod
+    def _facebook_page_display(account: dict) -> str:
+        page_name = str(
+            account.get("userName") or account.get("profileName") or "未命名 Page"
+        ).strip()
+        page_id = str(account.get("accountReference") or "").strip()
+        tail = page_id[-4:] if page_id else "----"
+        return f"Facebook Page：{page_name} · Page ID 尾号 {tail}"
+
     def refresh_accounts(self) -> None:
-        accounts = account_service.list_publishable_accounts()
+        accounts = [
+            account
+            for account in account_service.list_publishable_accounts()
+            if int(account.get("type") or 0) != 9
+            or facebook_page_v1_enabled()
+        ]
         self._account_rows = accounts
         valid_ids = {int(item["id"]) for item in accounts}
         self._selected_account_ids.intersection_update(valid_ids)
@@ -3396,12 +3443,20 @@ class PublishPage(QWidget):
             if platform_type is not None and account["type"] != platform_type:
                 continue
             remark = str(account.get("remark") or "").strip()
-            display_parts = [
-                account["platformName"],
-                account["profileName"],
-                account["userName"] or "未命名账号",
-                account["statusText"],
-            ]
+            if int(account.get("type") or 0) == 9:
+                display_parts = [
+                    account["platformName"],
+                    account["profileName"],
+                    self._facebook_page_display(account),
+                    account["statusText"],
+                ]
+            else:
+                display_parts = [
+                    account["platformName"],
+                    account["profileName"],
+                    account["userName"] or "未命名账号",
+                    account["statusText"],
+                ]
             if remark:
                 display_parts.append(f"备注：{remark}")
             text = " · ".join(display_parts)
@@ -3420,6 +3475,8 @@ class PublishPage(QWidget):
                     else "通道：一键发本地浏览器会话"
                 ),
             ]
+            if int(account.get("type") or 0) == 9:
+                tooltip_lines.append(self._facebook_page_display(account))
             if remark:
                 tooltip_lines.append(f"备注：{remark}")
             tooltip = "\n".join(tooltip_lines)
@@ -3474,6 +3531,41 @@ class PublishPage(QWidget):
         return menu
 
     def open_account_backend(self, account: dict) -> None:
+        if int(account.get("type") or 0) == 9:
+            if not facebook_page_v1_enabled():
+                message = "Facebook Page 后台入口尚未开启"
+                self.account_health_label.setText(message)
+                self.log.append(f"[warning] {message}")
+                return
+            account_id = int(account.get("id") or 0)
+            if account_id <= 0:
+                message = "Facebook Page 账号无法安全打开后台"
+                self.account_health_label.setText(message)
+                self.log.append(f"[warning] {message}")
+                return
+            task_key = f"publish_facebook_backend_{account_id}"
+            if self.account_health_tasks.is_running(task_key):
+                self.account_health_label.setText(
+                    "Facebook Page 后台正在打开…"
+                )
+                return
+            frozen_account = dict(account)
+            self.account_health_tasks.run(
+                task_key,
+                lambda: account_browser_service.open_account_backend(
+                    frozen_account
+                ),
+                on_started=lambda: self.account_health_label.setText(
+                    "Facebook Page 后台正在打开…"
+                ),
+                on_success=lambda reused: self._finish_facebook_page_backend_open(
+                    frozen_account,
+                    reused,
+                ),
+                on_error=self._show_facebook_page_backend_open_error,
+            )
+            return
+
         reused = account_browser_service.open_account_backend(account)
         platform_name = account.get("platformName") or account_service.PLATFORMS.get(
             int(account.get("type") or 0),
@@ -3486,6 +3578,25 @@ class PublishPage(QWidget):
         )
         self.account_health_label.setText(message)
         self.log.append(f"[info] {message}")
+
+    def _finish_facebook_page_backend_open(
+        self,
+        account: dict,
+        reused: object,
+    ) -> None:
+        platform_name = account.get("platformName") or "Facebook Reels"
+        message = (
+            f"已切换到现有后台：{platform_name}"
+            if bool(reused)
+            else f"已打开后台：{platform_name}"
+        )
+        self.account_health_label.setText(message)
+        self.log.append(f"[info] {message}")
+
+    def _show_facebook_page_backend_open_error(self, _message: str) -> None:
+        message = "Facebook Page 后台打开失败，请稍后重试"
+        self.account_health_label.setText(message)
+        self.log.append(f"[warning] {message}")
 
     def check_account_login(self, account: dict) -> None:
         account_id = int(account.get("id") or 0)
@@ -3832,6 +3943,7 @@ class PublishPage(QWidget):
             f"{account_count} 个账号 · {media_count} 个素材 · {type_label}"
         )
         self._update_account_health_label()
+        self._sync_facebook_page_v1_controls()
         if hasattr(self, "platform_nav"):
             self.refresh_platform_navigation()
         if hasattr(self, "xhs_location_panel"):
@@ -3842,6 +3954,28 @@ class PublishPage(QWidget):
             self._sync_wechat_location_visibility_and_context()
         if account_count:
             QTimer.singleShot(300, self.check_selected_account_health)
+
+    def _sync_facebook_page_v1_controls(self) -> None:
+        """Disable unsupported shared controls without clearing user choices."""
+
+        page_selected = any(
+            int(account.get("type") or 0) == 9
+            for account in self.selected_accounts()
+        )
+        shared_controls = (
+            self.common_cover_panel,
+            self.original_declaration,
+            self.ai_generated_content,
+            self.common_visibility,
+            self.common_schedule_enabled,
+        )
+        for control in shared_controls:
+            control.setEnabled(not page_selected)
+        schedule_fields_enabled = (
+            not page_selected and self.common_schedule_enabled.isChecked()
+        )
+        self.common_schedule_date.setEnabled(schedule_fields_enabled)
+        self.common_schedule_time.setEnabled(schedule_fields_enabled)
 
     def _update_account_health_label(self) -> None:
         selected = self.selected_accounts()
@@ -4161,8 +4295,12 @@ class PublishPage(QWidget):
             self._update_timer_status()
 
     def _common_schedule_toggled(self, checked: bool) -> None:
-        self.common_schedule_date.setEnabled(checked)
-        self.common_schedule_time.setEnabled(checked)
+        page_selected = any(
+            int(account.get("type") or 0) == 9
+            for account in self.selected_accounts()
+        )
+        self.common_schedule_date.setEnabled(checked and not page_selected)
+        self.common_schedule_time.setEnabled(checked and not page_selected)
         self._sync_common_schedule_values()
 
     def _sync_common_schedule_values(self, *_args) -> None:
@@ -4196,8 +4334,12 @@ class PublishPage(QWidget):
             self.common_schedule_time.setTime(parsed_time)
         enabled = bool(self.timer_values.get("enableTimer"))
         self.common_schedule_enabled.setChecked(enabled)
-        self.common_schedule_date.setEnabled(enabled)
-        self.common_schedule_time.setEnabled(enabled)
+        page_selected = any(
+            int(account.get("type") or 0) == 9
+            for account in self.selected_accounts()
+        )
+        self.common_schedule_date.setEnabled(enabled and not page_selected)
+        self.common_schedule_time.setEnabled(enabled and not page_selected)
         for control in controls:
             control.blockSignals(False)
         self._sync_common_schedule_values()
@@ -4483,7 +4625,11 @@ class PublishPage(QWidget):
                 "collectionName": self._platform_collection_name(platform_type),
                 "enableTimer": bool(schedule_time),
                 "scheduleTime": schedule_time or None,
-                "scheduleTimezone": wechat_publish_policy.local_timezone_name(),
+                "scheduleTimezone": (
+                    ""
+                    if platform_type == 9
+                    else wechat_publish_policy.local_timezone_name()
+                ),
                 "videosPerDay": 1,
                 "dailyTimes": [schedule_time[-5:]] if schedule_time else [],
                 "startDays": 0,
@@ -4753,6 +4899,102 @@ class PublishPage(QWidget):
             payloads.append(payload)
         return payloads
 
+    def _prepare_facebook_page_payloads(
+        self,
+        payloads: list[dict],
+        runtime_mode: str,
+    ) -> None:
+        """Freeze one UI Page preflight using the same controlled payload shape."""
+
+        facebook_payloads = [
+            payload
+            for payload in payloads
+            if int(payload.get("type") or 0) == 9
+        ]
+        if not facebook_payloads:
+            return
+        if not facebook_page_v1_enabled():
+            raise ValueError("Facebook Page 发布功能尚未开启")
+        if runtime_mode != "preflight":
+            raise ValueError("Facebook Page 必须先完成受控预检")
+        if len(payloads) != 1 or len(facebook_payloads) != 1:
+            raise ValueError("Facebook Page 首版一次只支持一个 Page 和一个视频")
+        payload = facebook_payloads[0]
+        controlled_publish.validate_facebook_page_v1_metadata(payload)
+        account_ids = list(payload.get("accountIds") or [])
+        files = list(payload.get("fileList") or [])
+        if (
+            str(payload.get("contentType") or "") != "video"
+            or len(files) != 1
+            or len(account_ids) != 1
+            or type(account_ids[0]) is not int
+        ):
+            raise ValueError("Facebook Page 首版只支持单 Page、单 Reel 视频")
+        matching_accounts = [
+            account
+            for account in self._account_rows
+            if int(account.get("id") or 0) == account_ids[0]
+            and int(account.get("type") or 0) == 9
+        ]
+        if len(matching_accounts) != 1:
+            raise ValueError("Facebook Page 已保存账号无法唯一匹配")
+        account = matching_accounts[0]
+        page_id = account_service.validate_saved_facebook_page_account(account)
+        video = Path(str(files[0]))
+        if not video.is_file():
+            raise ValueError("Facebook Page Reel 视频不存在")
+        caption = build_facebook_page_caption(
+            title=str(payload.get("title") or ""),
+            body=str(payload.get("description") or ""),
+            topics=[str(item) for item in payload.get("tags") or []],
+        )
+        video_digest = hashlib.sha256()
+        with video.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                video_digest.update(chunk)
+        video_sha256 = video_digest.hexdigest()
+        intent = {
+            "schemaVersion": "desktop-ui/facebook-page-v1",
+            "contentType": "video",
+            "title": str(payload.get("title") or ""),
+            "body": str(payload.get("description") or ""),
+            "tags": [str(item) for item in payload.get("tags") or []],
+            "videoSha256": video_sha256,
+            "pageId": page_id,
+        }
+        encoded_intent = json.dumps(
+            intent,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        payload.update(
+            {
+                "runtimeMode": "preflight",
+                "debugDryRun": True,
+                "debugDryRunHoldBrowser": False,
+                "backgroundMode": False,
+                "accountList": [Path(str(account.get("filePath") or "")).name],
+                "coverPath": "",
+                "coverPaths": {},
+                "visibility": "public",
+                "enableTimer": False,
+                "scheduleTime": None,
+                "scheduleMode": "immediate",
+                "scheduledAt": None,
+                "facebookControlledPublish": True,
+                "facebookExpectedPageReference": page_id,
+                "facebookFinalCaption": caption,
+                "facebookCaptionSha256": facebook_page_caption_sha256(caption),
+                "facebookVideoSha256": video_sha256,
+                "facebookManifestIntentSha256": hashlib.sha256(
+                    encoded_intent.encode("utf-8")
+                ).hexdigest(),
+            }
+        )
+        payload.pop(META_BROWSER_PUBLISH_CONFIRMED, None)
+        payload.pop(META_BROWSER_AUTOMATION_ACKNOWLEDGED, None)
+
     def create_task(self) -> None:
         if self.active_task_id and self.task_timer.isActive():
             QMessageBox.information(self, "发布中心", "当前发布任务正在执行，请等待完成后再启动新任务。")
@@ -4762,6 +5004,7 @@ class PublishPage(QWidget):
             runtime_mode = (
                 "preflight" if self.preflight.isChecked() else "publish"
             )
+            self._prepare_facebook_page_payloads(payloads, runtime_mode)
             summary = self.build_publish_summary(payloads, runtime_mode)
         except Exception as exc:
             QMessageBox.warning(self, "发布中心", str(exc))
@@ -4800,6 +5043,8 @@ class PublishPage(QWidget):
         )
         self.active_task_started_at = datetime.now()
         self.seen_event_ids.clear()
+        self._rendered_controlled_actions.clear()
+        self._reported_controlled_projection_errors.clear()
         self.log.clear()
         mode_text = "预发布检查" if self.active_task_is_preflight else "正式发布"
         self.log.append(f"已创建{mode_text}任务：{task['taskNo']}，共 {task['itemCount']} 个执行项。")
@@ -5356,6 +5601,34 @@ class PublishPage(QWidget):
             "导入本身不会上传、保存草稿或发表；请核对内容后再点击“开始预检”。",
         )
 
+    def render_controlled_task_action(self, projection: dict) -> bool:
+        """Render one safe Page action without turning a wait into a failure."""
+
+        actions = []
+        for item in projection.get("items") or projection.get("platforms") or []:
+            if not isinstance(item, dict) or int(item.get("platformType") or 0) != 9:
+                continue
+            action = item.get("actionRequired")
+            if (
+                isinstance(action, dict)
+                and not str(item.get("errorCode") or "")
+                and str(item.get("status") or "") != "failed"
+            ):
+                actions.append(action)
+        if len(actions) != 1:
+            return False
+        action = actions[0]
+        message = " ".join(str(action.get("message") or "").split())
+        code = str(action.get("code") or "action_required")
+        if not message:
+            return False
+        self.task_status_label.setText(f"需要处理：{message}")
+        identity = f"{int(projection.get('taskId') or 0)}:{code}"
+        if identity not in self._rendered_controlled_actions:
+            self._rendered_controlled_actions.add(identity)
+            self.log.append(f"[action] {message}")
+        return True
+
     def poll_task(self) -> None:
         if not self.active_task_id:
             self.task_timer.stop()
@@ -5369,6 +5642,19 @@ class PublishPage(QWidget):
             self._show_douyin_verification()
         status = task.get("status")
         self._update_task_progress(task)
+        try:
+            projection = controlled_publish.project_task(task)
+        except Exception:
+            projection = None
+            task_id = int(task.get("id") or self.active_task_id or 0)
+            if task_id not in self._reported_controlled_projection_errors:
+                self._reported_controlled_projection_errors.add(task_id)
+                self.log.append(
+                    "[diagnostic] 受控任务状态暂时无法安全解析；"
+                    "将继续轮询。"
+                )
+        if isinstance(projection, dict):
+            self.render_controlled_task_action(projection)
         for event in task.get("events", []):
             event_id = int(event["id"])
             if event_id in self.seen_event_ids:
@@ -5385,7 +5671,11 @@ class PublishPage(QWidget):
                 and douyin_verification_broker.request_for_task(self.active_task_id)
             ):
                 self._show_douyin_verification()
-        if task.get("status") not in ("pending", "running"):
+        if task.get("status") not in (
+            "pending",
+            "running",
+            "waiting_user_verification",
+        ):
             self.task_timer.stop()
             status_text = self._status_text(status)
             self.log.append(f"任务结束：{status_text}")
@@ -5513,61 +5803,127 @@ class PublishPage(QWidget):
         box.exec()
         return "formal" if box.clickedButton() == formal_btn else "manual"
 
-    def start_formal_publish_from_task(self, task: dict) -> None:
+    def start_formal_publish_from_task(self, task: dict) -> dict | None:
         try:
             payloads = json.loads(task.get("payloadJson") or "[]")
-            for payload in payloads:
-                payload["runtimeMode"] = "publish"
-                payload["debugDryRun"] = False
-                payload["debugDryRunHoldBrowser"] = False
-                if int(payload.get("type") or 0) == 6 or (
-                    int(payload.get("type") or 0) == 7
-                    and payload.get("youtubeOfficialApi") is not True
-                ):
-                    payload["overseasVideoPublishConfirmed"] = True
-                    payload["backgroundMode"] = False
-            meta_browser_payloads = [
+            if not isinstance(payloads, list) or not all(
+                isinstance(payload, dict) for payload in payloads
+            ):
+                raise ValueError("预检任务快照无法读取")
+            facebook_payloads = [
                 payload
                 for payload in payloads
-                if int(payload.get("type") or 0) in {8, 9}
+                if int(payload.get("type") or 0) == 9
             ]
-            if meta_browser_payloads and not self.confirm_meta_browser_publish(
-                meta_browser_payloads
-            ):
-                self.log.append("Meta 浏览器最终发布已取消。")
-                self.task_status_label.setText(
-                    "预发布检查完成：未启动 Meta 最终发布"
+            if facebook_payloads:
+                if len(payloads) != 1 or len(facebook_payloads) != 1:
+                    raise ValueError(
+                        "Facebook Page 首版正式发布只能绑定一条单 Page 预检"
+                    )
+                if not facebook_page_v1_enabled():
+                    raise ValueError("Facebook Page 发布功能尚未开启")
+                controlled_publish.validate_facebook_page_v1_metadata(
+                    facebook_payloads[0]
                 )
-                self.active_task_id = None
-                return
-            new_task = publish_service.start_desktop_publish(payloads)
+                if not self.confirm_meta_browser_publish(facebook_payloads):
+                    self.log.append("Facebook Page 最终发布已取消。")
+                    self.task_status_label.setText(
+                        "预发布检查完成：未启动 Facebook Page 最终发布"
+                    )
+                    self.active_task_id = None
+                    return
+                preflight_task_id = int(
+                    task.get("id") or task.get("taskId") or 0
+                )
+                if preflight_task_id <= 0:
+                    raise ValueError("预检 taskId 无效")
+                authorization = controlled_publish.authorize_completed_check(
+                    preflight_task_id
+                )
+                authorization_id = str(
+                    authorization.get("authorizationId") or ""
+                ).strip()
+                if not authorization_id:
+                    raise ValueError("本机未生成可用的一次性授权")
+                new_task = (
+                    controlled_publish_process.submit_authorized_preflight_task(
+                        preflight_task_id,
+                        authorization_id,
+                    )
+                )
+            else:
+                for payload in payloads:
+                    payload["runtimeMode"] = "publish"
+                    payload["debugDryRun"] = False
+                    payload["debugDryRunHoldBrowser"] = False
+                    if int(payload.get("type") or 0) == 6 or (
+                        int(payload.get("type") or 0) == 7
+                        and payload.get("youtubeOfficialApi") is not True
+                    ):
+                        payload["overseasVideoPublishConfirmed"] = True
+                        payload["backgroundMode"] = False
+                meta_browser_payloads = [
+                    payload
+                    for payload in payloads
+                    if int(payload.get("type") or 0) == 8
+                ]
+                if meta_browser_payloads and not self.confirm_meta_browser_publish(
+                    meta_browser_payloads
+                ):
+                    self.log.append("Meta 浏览器最终发布已取消。")
+                    self.task_status_label.setText(
+                        "预发布检查完成：未启动 Meta 最终发布"
+                    )
+                    self.active_task_id = None
+                    return
+                new_task = publish_service.start_desktop_publish(payloads)
         except Exception as exc:
             QMessageBox.warning(self, "正式发布", f"启动正式发布失败：{exc}")
             return
-        self.active_task_id = int(new_task["id"])
+        new_task_id = int(new_task.get("taskId") or new_task.get("id") or 0)
+        if new_task_id <= 0:
+            QMessageBox.warning(self, "正式发布", "受控服务未返回有效 taskId")
+            return
+        item_count = int(
+            new_task.get("itemCount")
+            or len(new_task.get("platforms") or [])
+            or len(payloads)
+        )
+        self.active_task_id = new_task_id
         self.active_task_is_preflight = False
         self.active_task_mode = "publish"
         self.active_task_background_mode = all(bool(payload.get("backgroundMode", True)) for payload in payloads)
         self.active_task_started_at = datetime.now()
         self.seen_event_ids.clear()
+        self._rendered_controlled_actions.clear()
+        self._reported_controlled_projection_errors.clear()
         self.log.append("")
-        self.log.append(f"已启动正式发布任务：{new_task['taskNo']}")
+        self.log.append(
+            f"已启动正式发布任务："
+            f"{new_task.get('taskNo') or new_task_id}"
+        )
         self.log.append(
             "正式发布将在无窗口后台执行，完成后会在这里显示结果。"
             if self.active_task_background_mode
             else "正式发布浏览器会显示在前台，完成后会在这里显示结果。"
         )
-        self._update_task_progress({"status": "pending", "dryRun": 0, "itemCount": new_task.get("itemCount", 0)})
-        self._set_running(True, f"正式发布运行中：{new_task['taskNo']}")
+        self._update_task_progress(
+            {"status": "pending", "dryRun": 0, "itemCount": item_count}
+        )
+        self._set_running(
+            True,
+            f"正式发布运行中：{new_task.get('taskNo') or new_task_id}",
+        )
         self.task_timer.start()
+        return new_task
 
     def confirm_meta_browser_publish(self, payloads: list[dict]) -> bool:
-        """一次性写入 Meta 浏览器发布的两项独立确认。"""
+        """保留最终确认；仅 Instagram type 8 写兼容字段。"""
 
         if MetaBrowserPublishConfirmDialog(self).exec() != QDialog.DialogCode.Accepted:
             return False
         for payload in payloads:
-            if int(payload.get("type") or 0) not in {8, 9}:
+            if int(payload.get("type") or 0) != 8:
                 continue
             payload[META_BROWSER_PUBLISH_CONFIRMED] = True
             payload[META_BROWSER_AUTOMATION_ACKNOWLEDGED] = True
@@ -5587,6 +5943,7 @@ class PublishPage(QWidget):
         return {
             "pending": "等待执行",
             "running": "执行中",
+            "waiting_user_verification": "等待用户完成验证",
             "success": "成功",
             "partial_failed": "部分失败",
             "failed": "失败",
@@ -5746,6 +6103,8 @@ class PublishPage(QWidget):
                 "官方 OAuth 频道"
                 if int(account.get("type") or 0) == 7
                 and str(account.get("authMode") or "") == "youtube_oauth"
+                else self._facebook_page_display(account)
+                if int(account.get("type") or 0) == 9
                 else "浏览器会话"
             )
             lines.append(

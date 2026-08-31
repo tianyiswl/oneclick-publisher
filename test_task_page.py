@@ -10,9 +10,10 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication, QComboBox, QLabel, QTableWidget, QTabWidget
 
-from ui.task_page import TaskDetailDialog
+from ui.task_page import STATUS_COLORS, STATUS_LABELS, TaskDetailDialog, TaskPage
 
 
 class TaskDetailDialogTests(unittest.TestCase):
@@ -63,6 +64,36 @@ class TaskDetailDialogTests(unittest.TestCase):
             "events": [],
             "payloadJson": "{}",
         }
+
+    def test_waiting_verification_has_label_filter_color_and_cannot_be_deleted(self) -> None:
+        row = {
+            "id": 91,
+            "taskNo": "T08300001-WAIT",
+            "taskNoDisplay": "T08300001-WAIT",
+            "contentTypeLabel": "视频",
+            "workflowLabel": "Facebook Page",
+            "status": "waiting_user_verification",
+            "title": "wait",
+            "accountSummary": "Page",
+            "platformSummary": "Facebook",
+            "itemCount": 1,
+            "successCount": 0,
+            "failedCount": 0,
+            "createdAt": "2026-08-30 00:01:00",
+        }
+        with patch("ui.task_page.task_service.list_tasks", return_value=[row]):
+            page = TaskPage()
+        self.addCleanup(page.close)
+
+        self.assertEqual(STATUS_LABELS["waiting_user_verification"], "等待安全验证")
+        self.assertIn("waiting_user_verification", STATUS_COLORS)
+        self.assertGreaterEqual(
+            page.status_filter.findData("waiting_user_verification"),
+            0,
+        )
+        select_item = page.table.item(0, 0)
+        self.assertFalse(select_item.flags() & Qt.ItemFlag.ItemIsUserCheckable)
+        self.assertIn("不能删除", select_item.toolTip())
 
     def _matrix_task(self) -> dict:
         matrix = {

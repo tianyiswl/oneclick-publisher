@@ -4,14 +4,17 @@
 import os
 import importlib.util
 import queue
+import threading
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtWidgets import QApplication, QMenu, QMessageBox, QPushButton
+from PyQt6.QtWidgets import QApplication, QInputDialog, QMenu, QMessageBox, QPushButton
 
-from app_core import account_browser_service, account_service
+from app_core import account_browser_service, account_service, login_service
+from app_core.overseas_meta_page_identity import FacebookPageIdentity
 from ui.account_page import AccountPage
 from ui.login_dialog import LoginDialog
 from ui.main_window import MainWindow
@@ -77,6 +80,409 @@ class AccountDetectionUiTests(unittest.TestCase):
         self.assertEqual(page.result_label.text(), "1 个账号")
         self.assertEqual(page.row_data(0)["accountReference"], "UC123")
         page.close()
+
+    def test_unbound_facebook_page_projects_rebind_as_red_abnormal(self) -> None:
+        projected = account_service._row_to_dict(
+            {
+                "id": 91,
+                "type": 9,
+                "filePath": "shared-meta.json",
+                "userName": "旧 Facebook Page",
+                "status": 1,
+                "profileName": "Meta 主体",
+                "avatarPath": None,
+                "avatarUpdatedAt": None,
+                "remark": "",
+                "lastCheckedAt": None,
+                "lastLoginAt": None,
+                "authMode": "browser",
+                "accountReference": "",
+                "oauthScopeVersion": 1,
+            }
+        )
+
+        self.assertTrue(projected["needsPageRebind"])
+        self.assertEqual(projected["healthStatus"], "abnormal")
+        with (
+            patch.object(account_service, "list_managed_accounts", return_value=[projected]),
+            patch.object(account_service, "list_profiles", return_value=["Meta 主体"]),
+        ):
+            page = AccountPage()
+            page.refresh()
+
+        self.assertEqual(page.row_data(0)["needsPageRebind"], True)
+        self.assertEqual(page.table.item(0, 2).foreground().color().name(), "#dc2626")
+        buttons = {
+            item.text(): item
+            for item in page.table.cellWidget(0, 5).findChildren(QPushButton)
+        }
+        self.assertFalse(buttons["打开后台"].isEnabled())
+        page.close()
+
+    def test_facebook_page_selection_prompt_uses_name_and_short_id_tail(self) -> None:
+        request = login_service.FacebookPageSelectionRequest(
+            (
+                FacebookPageIdentity("1234561001", "同名", can_manage_content=True),
+                FacebookPageIdentity("1234561002", "同名", can_manage_content=True),
+            )
+        )
+        labels = LoginDialog.facebook_page_selection_labels(request)
+
+        self.assertEqual(labels, ["同名 · …1001", "同名 · …1002"])
+        self.assertFalse(any("123456" in label for label in labels))
+
+    def test_facebook_page_login_entry_is_hidden_by_default_and_exposed_only_by_opt_in(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            default_dialog = LoginDialog()
+        self.assertLess(default_dialog.platform_combo.findData(9), 0)
+        default_dialog.close()
+
+        with patch.dict(
+            os.environ,
+            {"ONECLICK_ENABLE_FACEBOOK_PAGE_V1": "1"},
+            clear=True,
+        ):
+            enabled_dialog = LoginDialog()
+        self.assertGreaterEqual(enabled_dialog.platform_combo.findData(9), 0)
+        enabled_dialog.close()
+
+    def test_facebook_page_business_access_denied_shows_page_permission_guidance(self) -> None:
+        session = MagicMock()
+        session.manual_save_supported = False
+        session.queue = queue.Queue()
+        session.queue.put("ERROR:facebook_page_business_access_denied")
+        with patch.dict(
+            os.environ,
+            {"ONECLICK_ENABLE_FACEBOOK_PAGE_V1": "1"},
+            clear=True,
+        ):
+            dialog = LoginDialog(background_login=True)
+        dialog.platform_combo.setCurrentIndex(dialog.platform_combo.findData(9))
+        dialog.session = session
+
+        with patch.object(dialog, "reject") as reject:
+            dialog.poll_messages()
+
+        self.assertEqual(
+            dialog.lifecycle_message,
+            "登录失败：当前 Facebook 账号无法访问 Meta Business Suite。"
+            "请确认已创建 Facebook Page，并拥有该 Page 的内容管理权限；未保存账号。",
+        )
+        self.assertNotIn("YouTube", dialog.log.toPlainText())
+        reject.assert_called_once_with()
+        dialog.close()
+
+    def test_unknown_facebook_page_login_error_does_not_show_youtube_guidance(self) -> None:
+        session = MagicMock()
+        session.platform_type = 9
+        session.manual_save_supported = False
+        session.queue = queue.Queue()
+        session.queue.put("ERROR:unexpected_facebook_login_error")
+        with patch.dict(
+            os.environ,
+            {"ONECLICK_ENABLE_FACEBOOK_PAGE_V1": "1"},
+            clear=True,
+        ):
+            dialog = LoginDialog(background_login=True)
+        dialog.platform_combo.setCurrentIndex(dialog.platform_combo.findData(9))
+        dialog.session = session
+        dialog.platform_combo.setCurrentIndex(dialog.platform_combo.findData(7))
+
+        with patch.object(dialog, "reject") as reject:
+            dialog.poll_messages()
+
+        self.assertEqual(
+            dialog.lifecycle_message,
+            "登录失败：Facebook Page 登录未完成，账号没有发生变化。",
+        )
+        self.assertNotIn("YouTube", dialog.log.toPlainText())
+        reject.assert_called_once_with()
+        dialog.close()
+
+    def test_feature_flag_off_disables_saved_page_relogin_and_backend_actions(self) -> None:
+        account = {
+            "id": 91,
+            "type": 9,
+            "platformName": "Facebook Page",
+            "profileName": "Meta 主体",
+            "userName": "已保存 Page",
+            "status": 1,
+            "healthStatus": "normal",
+            "statusText": "正常",
+            "authMode": "browser",
+            "filePath": "page.json",
+            "accountReference": "1001",
+        }
+        page = AccountPage()
+
+        with patch.dict(os.environ, {}, clear=True):
+            actions = page._actions(account)
+
+        buttons = {item.text(): item for item in actions.findChildren(QPushButton)}
+        menu_actions = [
+            action
+            for menu in actions.findChildren(QMenu)
+            for action in menu.actions()
+        ]
+        relogin = next(action for action in menu_actions if action.text() == "重新登录")
+        refresh = next(
+            action for action in menu_actions if action.text() == "刷新账号信息"
+        )
+        self.assertFalse(buttons["打开后台"].isEnabled())
+        self.assertFalse(relogin.isEnabled())
+        self.assertFalse(refresh.isEnabled())
+        self.assertIn("功能未开启", buttons["打开后台"].toolTip())
+        self.assertIn("功能未开启", refresh.toolTip())
+        page.close()
+
+    def test_feature_flag_off_disables_saved_page_single_account_detection(self) -> None:
+        account = {
+            "id": 91,
+            "type": 9,
+            "platformName": "Facebook Page",
+            "profileName": "Meta 主体",
+            "userName": "已保存 Page",
+            "status": 1,
+            "healthStatus": "normal",
+            "statusText": "正常",
+            "authMode": "browser",
+            "filePath": "page.json",
+            "accountReference": "1001",
+        }
+        page = AccountPage()
+
+        with patch.dict(os.environ, {}, clear=True):
+            disabled_actions = page._actions(account)
+        disabled_check = next(
+            action
+            for menu in disabled_actions.findChildren(QMenu)
+            for action in menu.actions()
+            if action.text() == "检测登录状态"
+        )
+
+        with patch.dict(
+            os.environ,
+            {"ONECLICK_ENABLE_FACEBOOK_PAGE_V1": "1"},
+            clear=True,
+        ):
+            enabled_actions = page._actions(account)
+        enabled_check = next(
+            action
+            for menu in enabled_actions.findChildren(QMenu)
+            for action in menu.actions()
+            if action.text() == "检测登录状态"
+        )
+
+        self.assertFalse(disabled_check.isEnabled())
+        self.assertIn("功能未开启", disabled_check.toolTip())
+        self.assertTrue(enabled_check.isEnabled())
+        with patch.object(page, "start_validation") as start:
+            disabled_check.trigger()
+            start.assert_not_called()
+            enabled_check.trigger()
+            start.assert_called_once_with([91])
+        page.close()
+
+    def test_feature_flag_off_bulk_detection_excludes_saved_pages(self) -> None:
+        accounts = [
+            {"id": 7, "type": 7},
+            {"id": 91, "type": 9},
+            {"id": 3, "type": 3},
+        ]
+        page = AccountPage()
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(
+                account_service,
+                "list_managed_accounts",
+                return_value=accounts,
+            ),
+            patch.object(page, "start_validation") as start,
+        ):
+            page.check_all()
+        start.assert_called_once_with([7, 3])
+
+        with (
+            patch.dict(
+                os.environ,
+                {"ONECLICK_ENABLE_FACEBOOK_PAGE_V1": "1"},
+                clear=True,
+            ),
+            patch.object(page, "start_validation") as start,
+        ):
+            page.check_all()
+        start.assert_called_once_with(None)
+        page.close()
+
+    def test_feature_flag_off_bulk_detection_does_not_fall_back_to_all_when_only_pages_exist(self) -> None:
+        page = AccountPage()
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(
+                account_service,
+                "list_managed_accounts",
+                return_value=[{"id": 91, "type": 9}],
+            ),
+            patch.object(page, "start_validation") as start,
+        ):
+            page.check_all()
+
+        start.assert_not_called()
+        self.assertIn("没有可检测", page.status_label.text())
+        page.close()
+
+    def test_feature_flag_off_automatic_recheck_excludes_saved_pages(self) -> None:
+        accounts = [
+            {"id": 7, "type": 7},
+            {"id": 91, "type": 9},
+        ]
+        page = AccountPage()
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(
+                account_service,
+                "list_managed_accounts",
+                return_value=accounts,
+            ),
+            patch.object(
+                account_service,
+                "accounts_requiring_check",
+                return_value=[7, 91],
+            ),
+            patch.object(page, "start_validation") as start,
+        ):
+            page.auto_check_stale_accounts()
+        start.assert_called_once_with([7], silent=True, invalid_status=2)
+
+        with (
+            patch.dict(
+                os.environ,
+                {"ONECLICK_ENABLE_FACEBOOK_PAGE_V1": "1"},
+                clear=True,
+            ),
+            patch.object(
+                account_service,
+                "accounts_requiring_check",
+                return_value=[7, 91],
+            ),
+            patch.object(page, "start_validation") as start,
+        ):
+            page.auto_check_stale_accounts()
+        start.assert_called_once_with(
+            [7, 91],
+            silent=True,
+            invalid_status=2,
+        )
+        page.close()
+
+    def test_feature_flag_off_automatic_recheck_skips_page_only_queue(self) -> None:
+        page = AccountPage()
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(
+                account_service,
+                "list_managed_accounts",
+                return_value=[{"id": 91, "type": 9}],
+            ),
+            patch.object(
+                account_service,
+                "accounts_requiring_check",
+                return_value=[91],
+            ),
+            patch.object(page, "start_validation") as start,
+        ):
+            page.auto_check_stale_accounts()
+
+        start.assert_not_called()
+        page.close()
+
+    def test_feature_flag_off_rejects_saved_page_actions_before_dialog_or_worker(self) -> None:
+        account = {
+            "id": 91,
+            "type": 9,
+            "platformName": "Facebook Page",
+            "profileName": "Meta 主体",
+            "userName": "已保存 Page",
+            "status": 1,
+            "authMode": "browser",
+            "filePath": "page.json",
+            "accountReference": "1001",
+        }
+        page = AccountPage()
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("ui.account_page.LoginDialog") as login_dialog,
+            patch.object(
+                account_browser_service,
+                "open_account_backend",
+            ) as open_backend,
+            patch.object(page.tasks, "run") as run_task,
+            patch.object(QMessageBox, "warning") as warning,
+        ):
+            page.relogin(account)
+            self.assertEqual(warning.call_count, 1)
+            self.assertIn("功能未开启", warning.call_args.args[2])
+            warning.reset_mock()
+
+            page.open_backend(account)
+            self.assertEqual(warning.call_count, 1)
+            self.assertIn("功能未开启", warning.call_args.args[2])
+
+            warning.reset_mock()
+            page.refresh_avatar(account)
+            self.assertEqual(warning.call_count, 1)
+            self.assertIn("功能未开启", warning.call_args.args[2])
+
+        login_dialog.assert_not_called()
+        open_backend.assert_not_called()
+        run_task.assert_not_called()
+        page.close()
+
+    def test_facebook_page_prompt_selects_the_exact_id_behind_the_label(self) -> None:
+        request = login_service.FacebookPageSelectionRequest(
+            (
+                FacebookPageIdentity("1234561001", "同名", can_manage_content=True),
+                FacebookPageIdentity("1234561002", "同名", can_manage_content=True),
+            )
+        )
+        dialog = LoginDialog()
+        dialog.session = MagicMock()
+
+        with patch.object(
+            QInputDialog,
+            "getItem",
+            return_value=("同名 · …1002", True),
+        ):
+            dialog._handle_facebook_page_selection(request)
+
+        dialog.session.select_facebook_page.assert_called_once_with("1234561002")
+        dialog.close()
+
+    def test_facebook_page_prompt_cancel_is_clean_and_saves_nothing(self) -> None:
+        request = login_service.FacebookPageSelectionRequest(
+            (FacebookPageIdentity("1001", "Page", can_manage_content=True),)
+        )
+        dialog = LoginDialog()
+        dialog.session = MagicMock()
+        dialog.timer.start()
+
+        with (
+            patch.object(QInputDialog, "getItem", return_value=("", False)),
+            patch.object(dialog, "reject") as reject,
+        ):
+            dialog._handle_facebook_page_selection(request)
+
+        dialog.session.cancel.assert_called_once_with()
+        dialog.session.select_facebook_page.assert_not_called()
+        self.assertEqual(dialog.lifecycle_message, "登录已取消，未保存 Facebook Page。")
+        self.assertFalse(dialog.timer.isActive())
+        reject.assert_called_once_with()
+        dialog.close()
 
     def test_youtube_oauth_account_actions_stay_enabled(self) -> None:
         account = {
@@ -157,6 +563,67 @@ class AccountDetectionUiTests(unittest.TestCase):
         open_browser.assert_called_once_with(
             "https://studio.youtube.com/channel/UC_safe"
         )
+
+    def test_account_page_backend_open_is_non_blocking_deduplicated_and_reports_on_ui_thread(self) -> None:
+        account = {
+            "id": 9,
+            "type": 1,
+            "platformName": "小红书",
+            "profileName": "AI",
+            "userName": "海风",
+            "status": 1,
+            "authMode": "browser",
+            "filePath": "oneclick_1_test.json",
+        }
+        started = threading.Event()
+        release = threading.Event()
+        callback_threads: list[int] = []
+        ui_thread_id = threading.get_ident()
+
+        def blocked_open(_account: dict) -> bool:
+            started.set()
+            release.wait(0.5)
+            raise RuntimeError("受控后台启动失败")
+
+        page = AccountPage()
+        with (
+            patch.object(
+                account_browser_service,
+                "open_account_backend",
+                side_effect=blocked_open,
+            ) as open_backend,
+            patch.object(
+                QMessageBox,
+                "warning",
+                side_effect=lambda *_args: callback_threads.append(threading.get_ident()),
+            ) as warning,
+        ):
+            before = time.monotonic()
+            page.open_backend(account)
+            elapsed = time.monotonic() - before
+
+            self.assertLess(elapsed, 0.1)
+            self.assertTrue(started.wait(0.5))
+            page.open_backend(account)
+            self.assertEqual(open_backend.call_count, 1)
+            self.assertIn("正在打开后台", page.status_label.text())
+
+            release.set()
+            deadline = time.monotonic() + 1.0
+            while (
+                page.tasks.is_running("open_account_backend:9")
+                and time.monotonic() < deadline
+            ):
+                self.app.processEvents()
+                time.sleep(0.005)
+            self.app.processEvents()
+
+            self.assertFalse(page.tasks.is_running("open_account_backend:9"))
+            warning.assert_called_once()
+            self.assertIn("受控后台启动失败", warning.call_args.args[2])
+            self.assertEqual(callback_threads, [ui_thread_id])
+
+        page.close()
 
     def test_youtube_system_browser_login_disables_manual_save_fallback(self) -> None:
         class OAuthSession:
@@ -389,6 +856,8 @@ class AccountDetectionUiTests(unittest.TestCase):
         page = AccountPage()
         with patch.object(
             account_service, "accounts_requiring_check", return_value=[7, 8]
+        ), patch.object(
+            account_service, "facebook_page_v1_enabled", return_value=True
         ), patch.object(page, "start_validation") as start:
             page.auto_check_stale_accounts()
 

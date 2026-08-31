@@ -185,25 +185,29 @@ class OverseasAccountEntryTests(unittest.TestCase):
             )
         return result, list(status_queue.queue)
 
-    def test_login_options_expose_three_entries_for_four_targets(self) -> None:
-        entries = dict(account_service.LOGIN_PLATFORM_OPTIONS)
+    def test_login_options_keep_instagram_distinct_from_default_off_facebook_page(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            entries = dict(account_service.login_platform_options())
         self.assertEqual(entries[6], "TikTok")
         self.assertEqual(entries[7], "YouTube")
-        self.assertIn("Meta", entries[8])
+        self.assertEqual(entries[8], "Instagram Reels")
         self.assertNotIn(9, entries)
-        self.assertEqual(account_service.login_platform_type(9), 8)
+        self.assertEqual(account_service.login_platform_type(9), 9)
 
-    def test_login_service_routes_meta_to_recovered_shared_session(self) -> None:
-        with patch.object(
-            login_service.RecoveredOverseasLoginSession,
-            "start",
-        ) as start:
+    def test_login_service_routes_enabled_facebook_to_distinct_recovered_session(self) -> None:
+        with (
+            patch.dict("os.environ", {"ONECLICK_ENABLE_FACEBOOK_PAGE_V1": "1"}, clear=True),
+            patch.object(
+                login_service.RecoveredOverseasLoginSession,
+                "start",
+            ) as start,
+        ):
             session = login_service.start_login(9, "海外主体")
         self.assertIsInstance(
             session,
             login_service.RecoveredOverseasLoginSession,
         )
-        self.assertEqual(session.platform_type, 8)
+        self.assertEqual(session.platform_type, 9)
         start.assert_called_once_with()
 
     def test_login_service_routes_tiktok_to_system_browser_session(self) -> None:
@@ -1538,7 +1542,7 @@ class YouTubeOAuthAccountPersistenceTests(unittest.TestCase):
         connection.close()
         self.assertEqual(count, 0)
 
-    def test_meta_relogin_updates_shared_instagram_and_facebook_rows(self) -> None:
+    def test_explicit_instagram_relogin_updates_only_the_instagram_row(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             database = Path(raw) / "database.db"
             connection = sqlite3.connect(database)
@@ -1606,12 +1610,11 @@ class YouTubeOAuthAccountPersistenceTests(unittest.TestCase):
                 """
             ).fetchall()
             connection.close()
-            self.assertEqual(set(saved_ids), {int(row[0]) for row in rows})
-            self.assertEqual([row[1] for row in rows], [8, 9])
-            self.assertTrue(all(row[2] == "new.json" for row in rows))
-            self.assertTrue(all(row[3] == "Meta 新账号" for row in rows))
-            self.assertTrue(all(row[4] == 1 for row in rows))
-            self.assertTrue(all(row[5] == "新主体" for row in rows))
+            instagram = next(row for row in rows if row[1] == 8)
+            facebook = next(row for row in rows if row[1] == 9)
+            self.assertEqual(saved_ids, [int(instagram[0])])
+            self.assertEqual(instagram[2:], ("new.json", "Meta 新账号", 1, "新主体"))
+            self.assertEqual(facebook[2:], ("old.json", "旧账号", 0, "旧主体"))
 
 
 class OverseasPreflightTests(unittest.TestCase):
