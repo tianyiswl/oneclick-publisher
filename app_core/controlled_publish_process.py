@@ -101,10 +101,12 @@ def _formal_payloads_from_preflight(
         ):
             payload["overseasVideoPublishConfirmed"] = True
         if platform_type == 8:
-            # Instagram type 8 keeps its internal compatibility evidence.  It
-            # is derived from the one-time authorization, never public input.
-            payload[META_BROWSER_PUBLISH_CONFIRMED] = True
-            payload[META_BROWSER_AUTOMATION_ACKNOWLEDGED] = True
+            # Instagram V1 不再使用旧 Meta 布尔确认。正式动作将
+            # 由平台表单预检快照和数据库 claim 绑定。
+            payload.pop(META_BROWSER_PUBLISH_CONFIRMED, None)
+            payload.pop(META_BROWSER_AUTOMATION_ACKNOWLEDGED, None)
+            payload.pop("overseasVideoPublishConfirmed", None)
+            payload["instagramExecutionIntent"] = "formal_public"
         if platform_type == 9:
             # Page authorization is the database claim; legacy Meta booleans
             # are neither trusted nor persisted on the formal task.
@@ -128,6 +130,16 @@ def submit_authorized_preflight_task(
     platform_types = [int(item.get("type") or 0) for item in payloads]
     from . import controlled_publish, publish_service, task_service
 
+    if 8 in platform_types:
+        if len(payloads) != 1 or platform_types != [8]:
+            raise ControlledPublishError(
+                "instagram_target_invalid",
+                "Instagram V1 一次只支持一个专业账号和一个 Reel。",
+            )
+        raise ControlledPublishError(
+            "instagram_platform_preflight_required",
+            "Instagram 本地预检不是平台表单预检，不能据此消费正式发布授权。",
+        )
     if 9 in platform_types:
         if not facebook_page_v1_enabled():
             raise ControlledPublishError(

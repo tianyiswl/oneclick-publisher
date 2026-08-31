@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import ANY, MagicMock, patch
 
 from app_core import (
+    overseas_instagram_service,
     overseas_preflight,
     overseas_tiktok_publish,
     overseas_video_publish,
@@ -39,6 +40,25 @@ class PublishServiceRoutingTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp.cleanup()
+
+    def _instagram_payload(self, mode: str = "preflight") -> dict:
+        cover = Path(self.temp.name) / "cover.png"
+        cover.write_bytes(b"offline-cover")
+        return {
+            **_video_payload(self.video, 8, mode),
+            "debugDryRun": mode == "preflight",
+            "backgroundMode": mode == "preflight",
+            "accountIds": [81],
+            "instagramControlledPublish": True,
+            "instagramExpectedUserId": "17841400000000000",
+            "tags": ["oneclick"],
+            "coverPath": str(cover),
+            "visibility": "public",
+            "shareToFeed": True,
+            "scheduleMode": "immediate",
+            "scheduledAt": None,
+            "scheduleTimezone": "",
+        }
 
     def test_domestic_draft_validation_remains_available(self) -> None:
         for platform_type in (2, 5):
@@ -387,31 +407,70 @@ class PublishServiceRoutingTests(unittest.TestCase):
         self.assertEqual(progress.call_args.kwargs["event_type"], "youtube_uploaded_private")
         self.assertEqual(mark.call_args.kwargs["receipt"], final_receipt)
 
-    def test_meta_browser_routes_only_after_confirmation_contract(self) -> None:
-        payload = _video_payload(self.video, 8, "publish")
-        payload["debugDryRun"] = False
-        payload["metaBrowserPublishConfirmed"] = True
-        payload["metaBrowserAutomationAcknowledged"] = True
+    def test_instagram_local_preflight_routes_only_to_dedicated_service(self) -> None:
+        payload = self._instagram_payload()
         result = {
             "ok": True,
-            "published": True,
-            "scheduled": False,
-            "message": "Meta 平台回读成功",
+            "phase": "local_preflight_passed",
+            "message": "Instagram 本地预检通过",
+            "receipt": {
+                "phase": "local_preflight_passed",
+                "accountId": 81,
+                "instagramUserId": "17841400000000000",
+                "platformWriteOccurred": False,
+                "finalActionTriggered": False,
+                "blocksReplay": False,
+            },
         }
+        with (
+            patch.object(
+                overseas_instagram_service,
+                "run_instagram_local_preflight_sync",
+                return_value=result,
+            ) as dedicated,
+            patch.object(
+                publish_service.overseas_preflight,
+                "run_overseas_preflight_sync",
+            ) as legacy_preflight,
+            patch.object(
+                publish_service.overseas_browser_publish,
+                "run_meta_browser_publish_sync",
+            ) as legacy_publish,
+            patch.object(publish_service.task_service, "mark_task_running"),
+            patch.object(
+                publish_service.task_service, "record_task_event"
+            ) as record,
+            patch.object(publish_service.task_service, "mark_platform_result") as mark,
+            patch.object(publish_service.task_service, "fail_active_task"),
+        ):
+            publish_service._run_preflight({"id": 103}, [payload])
+
+        dedicated.assert_called_once_with(payload)
+        legacy_preflight.assert_not_called()
+        legacy_publish.assert_not_called()
+        record.assert_called_once_with(
+            103,
+            "instagram_local_preflight_started",
+            "开始执行 Instagram 素材、字段与已绑定主体的本地校验",
+        )
+        self.assertTrue(mark.call_args.kwargs["ok"])
+        self.assertEqual(mark.call_args.args[1], 8)
+        self.assertEqual(mark.call_args.kwargs["receipt"], result["receipt"])
+
+    def test_instagram_legacy_formal_payload_is_rejected_before_browser(self) -> None:
+        payload = self._instagram_payload("publish")
+        payload["metaBrowserPublishConfirmed"] = True
+        payload["metaBrowserAutomationAcknowledged"] = True
         with (
             patch.object(
                 publish_service.overseas_browser_publish,
                 "run_meta_browser_publish_sync",
-                return_value=result,
-            ) as runner,
-            patch.object(publish_service.task_service, "mark_task_running"),
-            patch.object(publish_service.task_service, "record_task_event"),
-            patch.object(publish_service.task_service, "mark_platform_result") as mark,
+            ) as legacy,
+            self.assertRaisesRegex(ValueError, "Instagram.*claim"),
         ):
-            publish_service._run_publish({"id": 103}, [payload])
-        runner.assert_called_once_with(payload)
-        self.assertTrue(mark.call_args.kwargs["ok"])
-        self.assertEqual(mark.call_args.args[1], 8)
+            publish_service._validate_payloads([payload])
+
+        legacy.assert_not_called()
 
     def test_facebook_preflight_routes_to_page_executor_with_task_id(self) -> None:
         payload = _video_payload(self.video, 9, "preflight")

@@ -27,6 +27,7 @@ from .silicon_evolution_publish_package import (
     load_frozen_wechat_publish_package,
 )
 from .overseas_tiktok_identity import normalize_tiktok_handle
+from .overseas_instagram_identity import normalize_instagram_user_id
 from .overseas_meta_content import (
     build_facebook_page_caption,
     facebook_page_caption_sha256,
@@ -222,6 +223,24 @@ def _youtube_settings(value: object, *, mode: str) -> dict[str, object]:
     }
 
 
+def _instagram_schedule(
+    value: object,
+) -> tuple[bool, str, str, str, str | None]:
+    enable_timer, local_time, timezone_name = _schedule(value)
+    if not enable_timer:
+        return False, "", "", "immediate", None
+    local = datetime.strptime(local_time, "%Y-%m-%d %H:%M").replace(
+        tzinfo=ZoneInfo(timezone_name)
+    )
+    return (
+        True,
+        local_time,
+        timezone_name,
+        "platform_native",
+        local.isoformat(),
+    )
+
+
 def build_controlled_payloads(
     request: Mapping[str, Any],
     *,
@@ -247,6 +266,19 @@ def build_controlled_payloads(
         if isinstance(raw_targets, list)
         else 0
     )
+    instagram_target_count = (
+        sum(
+            1
+            for item in raw_targets
+            if isinstance(item, Mapping)
+            and oneclick_capabilities.canonical_platform(
+                str(item.get("platform") or "")
+            )
+            == "Instagram Reels"
+        )
+        if isinstance(raw_targets, list)
+        else 0
+    )
     if facebook_target_count:
         if not facebook_page_v1_enabled():
             raise ControlledPublishError(
@@ -258,6 +290,13 @@ def build_controlled_payloads(
                 "facebook_unsupported_publish_setting",
                 "Facebook Page 首版一次只支持一个 Page 和一个视频。",
             )
+    if instagram_target_count and (
+        len(raw_targets) != 1 or instagram_target_count != 1
+    ):
+        raise ControlledPublishError(
+            "instagram_target_invalid",
+            "Instagram V1 一次只支持一个专业账号和一个 Reel。",
+        )
     has_tiktok_target = isinstance(raw_targets, list) and any(
         isinstance(item, Mapping)
         and oneclick_capabilities.canonical_platform(
@@ -298,10 +337,19 @@ def build_controlled_payloads(
             "facebook_unsupported_publish_setting",
             "Facebook Page 首版只支持 preflight 和 formal 受控流程。",
         )
-    if (
-        mode == "platform_form_check"
-        and request.get("platformFormCheckConfirmed") is not True
-    ):
+    if instagram_target_count and mode == "direct":
+        raise ControlledPublishError(
+            "instagram_preflight_required",
+            "Instagram V1 必须先完成本地预检和平台表单回读。",
+        )
+    if mode == "platform_form_check" and request.get(
+        "platformFormCheckConfirmed"
+    ) is not True:
+        if instagram_target_count:
+            raise ControlledPublishError(
+                "instagram_platform_form_check_confirmation_required",
+                "Instagram 平台表单检查会上传并填写，必须显式确认。",
+            )
         raise ControlledPublishError(
             "tiktok_platform_form_check_confirmation_required",
             "TikTok 平台表单检查会上传并填写，必须显式确认",
@@ -376,7 +424,7 @@ def build_controlled_payloads(
                 "tiktok_direct_mode_unsupported",
                 "TikTok 首版不支持 direct；必须由本地预检后进入 formal",
             )
-    elif mode == "platform_form_check":
+    elif mode == "platform_form_check" and not instagram_target_count:
         raise ControlledPublishError(
             "tiktok_target_invalid", "平台表单检查首版只支持单个 TikTok 账号"
         )
@@ -465,6 +513,9 @@ def build_controlled_payloads(
                 "controlled_platform_not_in_bundle", f"内容包没有声明目标平台：{platform}"
             )
         youtube_settings: dict[str, object] | None = None
+        instagram_expected_user_id = ""
+        instagram_settings: dict[str, object] | None = None
+        instagram_schedule: tuple[bool, str, str, str, str | None] | None = None
         tiktok_expected_reference = ""
         tiktok_schedule_intent: TikTokScheduleIntent | None = None
         tiktok_settings: dict[str, object] | None = None
@@ -514,6 +565,54 @@ def build_controlled_payloads(
                     "Facebook Page 视频素材无法安全读取。",
                 ) from exc
             facebook_settings = {"visibility": "public"}
+        if platform_type == 8:
+            if (
+                type(account.get("status")) is not int
+                or account.get("status") != 1
+                or str(account.get("authMode") or "") != "browser"
+                or not str(account.get("filePath") or "").strip()
+            ):
+                raise ControlledPublishError(
+                    "instagram_account_invalid",
+                    "Instagram 账号缺少可用本地会话或稳定主体绑定。",
+                )
+            try:
+                instagram_expected_user_id = normalize_instagram_user_id(
+                    account.get("accountReference")
+                )
+            except ValueError as exc:
+                raise ControlledPublishError(
+                    "instagram_account_invalid",
+                    "Instagram 账号缺少稳定主体标识。",
+                ) from exc
+            if bundle.get("contentType") != "video" or len(bundle["assetPaths"]) != 1:
+                raise ControlledPublishError(
+                    "instagram_unsupported_publish_setting",
+                    "Instagram V1 一次只支持一个本地视频。",
+                )
+            raw_settings = target.get("settings")
+            if not isinstance(raw_settings, Mapping) or set(raw_settings) != {
+                "visibility",
+                "shareToFeed",
+            }:
+                raise ControlledPublishError(
+                    "instagram_unsupported_publish_setting",
+                    "Instagram 必须明确公开范围和是否同时分享到动态。",
+                )
+            if (
+                str(raw_settings.get("visibility") or "").strip().lower()
+                != "public"
+                or type(raw_settings.get("shareToFeed")) is not bool
+            ):
+                raise ControlledPublishError(
+                    "instagram_unsupported_publish_setting",
+                    "Instagram V1 只支持可回读的公开 Reel。",
+                )
+            instagram_settings = {
+                "visibility": "public",
+                "shareToFeed": raw_settings["shareToFeed"],
+            }
+            instagram_schedule = _instagram_schedule(target.get("schedule"))
         if platform_type == 6:
             tiktok_schedule_intent = _tiktok_target_schedule(
                 target.get("schedule"),
@@ -624,7 +723,15 @@ def build_controlled_payloads(
                 "controlled_mentions_unsupported",
                 "抖音正文包含原始 @文字；当前内容包没有独立 mentions 字段和官方候选回读，不能冒充有效提及",
             )
-        if tiktok_schedule_intent is not None:
+        if instagram_schedule is not None:
+            (
+                enable_timer,
+                schedule_time,
+                schedule_timezone,
+                _instagram_schedule_mode,
+                _instagram_scheduled_at,
+            ) = instagram_schedule
+        elif tiktok_schedule_intent is not None:
             enable_timer = tiktok_schedule_intent.mode == "platform_native"
             schedule_time = tiktok_schedule_intent.local_time or ""
             schedule_timezone = tiktok_schedule_intent.timezone
@@ -641,6 +748,11 @@ def build_controlled_payloads(
                 )
         covers = dict(bundle["coverPaths"])
         cover_path = _preferred_cover(platform_type, covers)
+        if platform_type == 8 and not cover_path:
+            raise ControlledPublishError(
+                "instagram_cover_invalid",
+                "Instagram V1 必须选择可读取的本地封面。",
+            )
         display_name = str(account.get("profileName") or account.get("userName") or "")
         disclosure = dict(bundle.get("aiDisclosure") or {})
         payload: dict[str, Any] = {
@@ -725,6 +837,32 @@ def build_controlled_payloads(
                     "youtubeOfficialApi": True,
                     "youtubeExpectedChannelId": expected_channel_id,
                     "backgroundMode": True,
+                }
+            )
+        elif platform_type == 8 and instagram_settings is not None:
+            if bool(bundle.get("originalDeclaration")) or bool(
+                disclosure.get("containsAiGeneratedContent")
+            ):
+                raise ControlledPublishError(
+                    "instagram_unsupported_publish_setting",
+                    "Instagram V1 尚未接入可回读的原创或 AI 声明控件。",
+                )
+            payload.update(instagram_settings)
+            payload.update(
+                {
+                    "backgroundMode": mode == "preflight",
+                    "scheduleMode": instagram_schedule[3],
+                    "scheduledAt": instagram_schedule[4],
+                    "scheduleTimezone": instagram_schedule[2],
+                    "instagramControlledPublish": True,
+                    "instagramExpectedUserId": instagram_expected_user_id,
+                    "instagramExecutionIntent": (
+                        "platform_form_check"
+                        if mode == "platform_form_check"
+                        else "formal_public"
+                        if mode == "formal"
+                        else "local_preflight"
+                    ),
                 }
             )
         elif platform_type == 9 and facebook_settings is not None:

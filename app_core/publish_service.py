@@ -29,6 +29,8 @@ from . import (
     oneclick_capabilities,
     oneclick_preflight,
     overseas_browser_publish,
+    overseas_instagram_publish,
+    overseas_instagram_service,
     overseas_tiktok_publish,
     overseas_video_publish,
     overseas_youtube_publish,
@@ -84,6 +86,7 @@ def _failure_error_code(exc: BaseException, *, platform_type: int) -> str:
         3: "douyin_publish_failed",
         6: "tiktok_publish_failed",
         7: "youtube_publish_failed",
+        8: "instagram_publish_failed",
         9: "facebook_publish_failed",
         10: "wechat_publish_failed",
     }.get(int(platform_type), "platform_publish_failed")
@@ -221,6 +224,22 @@ def _validate_payloads(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
             ]
         runtime_mode = str(payload.get("runtimeMode") or "preflight")
         platform_type = int(payload.get("type") or 0)
+        if platform_type == 8:
+            for legacy_key in (
+                "metaBrowserPublishConfirmed",
+                "metaBrowserAutomationAcknowledged",
+                "overseasVideoPublishConfirmed",
+            ):
+                payload.pop(legacy_key, None)
+            if runtime_mode == "preflight":
+                overseas_instagram_publish.prepare_instagram_publish_intent(
+                    payload
+                )
+            elif runtime_mode in {"publish", "platform_form_check"}:
+                raise PublishServiceError(
+                    "instagram_publish_authorization_invalid",
+                    "Instagram formal/form-check 必须由专用受控任务 claim 启动。",
+                )
         if platform_type == 9:
             for untrusted_key in (
                 "metaBrowserPublishConfirmed",
@@ -438,12 +457,6 @@ def _validate_payloads(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     mode="formal",
                 )
                 payload["backgroundMode"] = False
-            elif platform_type == 8:
-                checked = overseas_browser_publish.validate_meta_browser_publish_payload(
-                    payload
-                )
-                if not checked["ok"]:
-                    raise ValueError("；".join(checked["errors"]))
             elif platform_type == 1:
                 if str(payload.get("contentType") or "") not in {"article", "video"}:
                     raise ValueError("小红书正式发布只支持图文或视频")
@@ -777,7 +790,18 @@ def _run_preflight(task: dict, payloads: list[dict[str, Any]]) -> None:
             )
         for payload in payloads:
             platform_type = int(payload["type"])
-            task_service.record_task_event(task["id"], "platform_started", f"开始检查{platform_type}号平台的素材上传与表单填写")
+            if platform_type == 8:
+                task_service.record_task_event(
+                    task["id"],
+                    "instagram_local_preflight_started",
+                    "开始执行 Instagram 素材、字段与已绑定主体的本地校验",
+                )
+            else:
+                task_service.record_task_event(
+                    task["id"],
+                    "platform_started",
+                    f"开始检查{platform_type}号平台的素材上传与表单填写",
+                )
             try:
                 if (
                     platform_type == 3
@@ -828,7 +852,13 @@ def _run_preflight(task: dict, payloads: list[dict[str, Any]]) -> None:
                         task_id=int(task["id"]),
                         progress=facebook_verification_progress,
                     )
-                elif platform_type in {6, 7, 8}:
+                elif platform_type == 8:
+                    result = (
+                        overseas_instagram_service.run_instagram_local_preflight_sync(
+                            payload
+                        )
+                    )
+                elif platform_type in {6, 7}:
                     result = overseas_preflight.run_overseas_preflight_sync(payload)
                 else:
                     result = oneclick_preflight.run_preflight_sync(payload)
@@ -1118,8 +1148,9 @@ def _run_publish(task: dict, payloads: list[dict[str, Any]]) -> None:
                         "Facebook Page 正式发布必须由数据库 claim 的专用 worker 启动。",
                     )
                 elif platform_type == 8:
-                    result = overseas_browser_publish.run_meta_browser_publish_sync(
-                        payload
+                    raise PublishServiceError(
+                        "instagram_publish_authorization_invalid",
+                        "Instagram 正式发布必须由专用受控任务 claim 启动。",
                     )
                 else:
                     raise ValueError(f"{platform_name}尚未接入受控正式发布执行器")

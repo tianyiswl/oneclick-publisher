@@ -424,6 +424,44 @@ class ControlledPublishProcessTests(unittest.TestCase):
             ["preflight_task_id", "authorization_id"],
         )
 
+    def test_instagram_local_preflight_cannot_consume_formal_authorization(self) -> None:
+        preflight = {
+            "id": 17,
+            "mode": "oneclick_preflight",
+            "status": "success",
+            "payloadJson": json.dumps(
+                [
+                    {
+                        "type": 8,
+                        "runtimeMode": "preflight",
+                        "instagramControlledPublish": True,
+                        "instagramExpectedUserId": "17841400000000000",
+                    }
+                ]
+            ),
+        }
+
+        @contextmanager
+        def fake_connect():
+            yield object()
+
+        with (
+            patch.object(task_service, "get_task", return_value=preflight),
+            patch.object(task_service, "list_tasks", return_value=[]),
+            patch("app_core.database.connect", side_effect=fake_connect),
+            patch.object(controlled_publish, "consume_authorization") as consume,
+            patch.object(publish_service, "start_desktop_publish") as start,
+            self.assertRaises(ControlledPublishError) as raised,
+        ):
+            submit_authorized_preflight_task(17, "single-use-grant")
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "instagram_platform_preflight_required",
+        )
+        consume.assert_not_called()
+        start.assert_not_called()
+
     def test_feature_disabled_blocks_page_authorization_without_mutating_task(self) -> None:
         for environment in ({}, {"ONECLICK_ENABLE_FACEBOOK_PAGE_V1": "0"}):
             with self.subTest(environment=environment), FacebookPagePublicEntryFixture() as fixture:

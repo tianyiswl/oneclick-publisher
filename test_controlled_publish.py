@@ -134,6 +134,40 @@ class ControlledPublishTests(unittest.TestCase):
         )
         return manifest
 
+    def _instagram_bundle(self, root: Path) -> Path:
+        (root / "instagram.mp4").write_bytes(b"instagram-video")
+        (root / "instagram-cover.png").write_bytes(b"instagram-cover")
+        (root / "instagram-body.md").write_text(
+            "Instagram body", encoding="utf-8"
+        )
+        manifest = root / "manifest.json"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": "oneclick-content/v1",
+                    "contentType": "video",
+                    "title": "Instagram title",
+                    "bodyFile": "instagram-body.md",
+                    "tags": ["oneclick"],
+                    "assets": ["instagram.mp4"],
+                    "covers": {"3:4": "instagram-cover.png"},
+                    "preferredPlatforms": ["Instagram Reels"],
+                    "platformOverrides": {
+                        "Instagram Reels": {
+                            "title": "Instagram title",
+                            "body": "Instagram body",
+                            "tags": ["oneclick"],
+                        }
+                    },
+                    "debugDryRun": True,
+                    "publishAllowed": False,
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        return manifest
+
     @staticmethod
     def _tiktok_account(**changes) -> dict:
         return {
@@ -144,6 +178,20 @@ class ControlledPublishTests(unittest.TestCase):
             "userName": "TikTok saved account",
             "authMode": "browser",
             "accountReference": "expected.user",
+            "status": 1,
+            **changes,
+        }
+
+    @staticmethod
+    def _instagram_account(**changes) -> dict:
+        return {
+            "id": 81,
+            "type": 8,
+            "filePath": "instagram-session.json",
+            "profileName": "Instagram Creator",
+            "userName": "creator.one",
+            "authMode": "browser",
+            "accountReference": "17841400000000000",
             "status": 1,
             **changes,
         }
@@ -160,6 +208,33 @@ class ControlledPublishTests(unittest.TestCase):
                     "accountId": 61,
                     "schedule": None,
                     "settings": {"visibility": "public"},
+                }
+            ],
+        }
+        request.update(changes)
+        return request
+
+    @staticmethod
+    def _instagram_request(
+        manifest: Path,
+        *,
+        mode: str = "preflight",
+        schedule: Mapping[str, str] | None = None,
+        **changes,
+    ) -> dict:
+        request = {
+            "projectId": "instagram-offline-test",
+            "manifestPath": str(manifest),
+            "mode": mode,
+            "targets": [
+                {
+                    "platform": "Instagram Reels",
+                    "accountId": 81,
+                    "schedule": dict(schedule) if schedule is not None else None,
+                    "settings": {
+                        "visibility": "public",
+                        "shareToFeed": True,
+                    },
                 }
             ],
         }
@@ -511,6 +586,59 @@ class ControlledPublishTests(unittest.TestCase):
         self.assertFalse(payload["overseasVideoPublishConfirmed"])
         self.assertEqual(payload["tiktokExpectedAccountReference"], "expected.user")
         self.assertEqual(payload["tiktokExecutionIntent"], "formal_public")
+
+    def test_instagram_preflight_builds_local_only_controlled_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest = self._instagram_bundle(Path(temporary))
+            payload = build_controlled_payloads(
+                self._instagram_request(manifest),
+                accounts=[self._instagram_account()],
+            )[0]
+            cover_exists = Path(payload["coverPath"]).is_file()
+
+        self.assertEqual(payload["type"], 8)
+        self.assertEqual(payload["runtimeMode"], "preflight")
+        self.assertTrue(payload["debugDryRun"])
+        self.assertTrue(payload["backgroundMode"])
+        self.assertTrue(payload["instagramControlledPublish"])
+        self.assertEqual(
+            payload["instagramExpectedUserId"], "17841400000000000"
+        )
+        self.assertEqual(payload["instagramExecutionIntent"], "local_preflight")
+        self.assertEqual(payload["visibility"], "public")
+        self.assertTrue(payload["shareToFeed"])
+        self.assertEqual(payload["scheduleMode"], "immediate")
+        self.assertIsNone(payload["scheduledAt"])
+        self.assertEqual(payload["scheduleTimezone"], "")
+        self.assertTrue(cover_exists)
+        self.assertNotIn("metaBrowserPublishConfirmed", payload)
+        self.assertNotIn("metaBrowserAutomationAcknowledged", payload)
+
+    def test_instagram_schedule_is_canonical_and_direct_mode_is_rejected(self) -> None:
+        schedule = {
+            "localTime": "2026-09-02 10:30",
+            "timezone": "Asia/Shanghai",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest = self._instagram_bundle(Path(temporary))
+            payload = build_controlled_payloads(
+                self._instagram_request(manifest, schedule=schedule),
+                accounts=[self._instagram_account()],
+            )[0]
+            with self.assertRaises(ControlledPublishError) as raised:
+                build_controlled_payloads(
+                    self._instagram_request(
+                        manifest,
+                        mode="direct",
+                        directAuthorizationId="must-not-be-used",
+                    ),
+                    accounts=[self._instagram_account()],
+                )
+
+        self.assertEqual(payload["scheduleMode"], "platform_native")
+        self.assertEqual(payload["scheduledAt"], "2026-09-02T10:30:00+08:00")
+        self.assertEqual(payload["scheduleTimezone"], "Asia/Shanghai")
+        self.assertEqual(raised.exception.error_code, "instagram_preflight_required")
 
     def test_tiktok_target_accepts_one_beijing_platform_schedule(self) -> None:
         now = datetime(2026, 8, 29, 14, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
