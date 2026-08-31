@@ -74,7 +74,9 @@ def _valid_time(value: object) -> str:
             "instagram_claim_invalid", "Instagram Claim 时间无效。"
         )
     try:
-        datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError
     except ValueError as exc:
         raise InstagramPublishError(
             "instagram_claim_invalid", "Instagram Claim 时间无效。"
@@ -248,6 +250,82 @@ def record_instagram_final_action_clicked(
         "instagram_claim_invalid",
         "Instagram Claim 尚未进入可点击状态。",
     )
+
+
+def mark_instagram_platform_accepted(
+    conn: sqlite3.Connection,
+    *,
+    task_id: int,
+    observed_at: str,
+) -> None:
+    observed_at = _valid_time(observed_at)
+    ensure_instagram_claim_schema(conn)
+    changed = conn.execute(
+        """
+        UPDATE instagram_controlled_publish_claims
+        SET state = 'platform_accepted', observedAt = ?, updatedAt = ?
+        WHERE taskId = ?
+          AND state = 'final_action_clicked'
+          AND finalActionTriggered = 1
+        """,
+        (observed_at, observed_at, task_id),
+    ).rowcount
+    if changed != 1:
+        raise InstagramPublishError(
+            "instagram_claim_invalid",
+            "Instagram Claim 当前状态不能记录平台受理。",
+        )
+
+
+def mark_instagram_safe_failed(
+    conn: sqlite3.Connection,
+    *,
+    task_id: int,
+    error_code: str,
+    platform_error_text: str,
+    observed_at: str,
+) -> None:
+    observed_at = _valid_time(observed_at)
+    if type(error_code) is not str or _SAFE_ERROR_CODE.fullmatch(error_code) is None:
+        raise InstagramPublishError(
+            "instagram_claim_invalid", "Instagram 安全失败错误码无效。"
+        )
+    if type(platform_error_text) is not str:
+        raise InstagramPublishError(
+            "instagram_claim_invalid", "Instagram 安全失败原文无效。"
+        )
+    public_error_text = " ".join(platform_error_text.split())
+    if not public_error_text or len(public_error_text) > 512 or any(
+        marker in public_error_text.casefold()
+        for marker in ("cookie=", "access_token", "authorization:")
+    ):
+        raise InstagramPublishError(
+            "instagram_claim_invalid", "Instagram 安全失败原文无效。"
+        )
+    ensure_instagram_claim_schema(conn)
+    changed = conn.execute(
+        """
+        UPDATE instagram_controlled_publish_claims
+        SET state = 'safe_failed', blocksReplay = 0,
+            errorCode = ?, platformErrorText = ?,
+            observedAt = ?, updatedAt = ?
+        WHERE taskId = ?
+          AND state = 'reserved'
+          AND finalActionTriggered = 0
+        """,
+        (
+            error_code,
+            public_error_text,
+            observed_at,
+            observed_at,
+            task_id,
+        ),
+    ).rowcount
+    if changed != 1:
+        raise InstagramPublishError(
+            "instagram_claim_invalid",
+            "Instagram Claim 已进入不可逆阶段，不能释放为安全失败。",
+        )
 
 
 def mark_instagram_outcome_unknown(

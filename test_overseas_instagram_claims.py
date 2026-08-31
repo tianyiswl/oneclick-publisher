@@ -102,6 +102,18 @@ class InstagramClaimTests(unittest.TestCase):
                 )
         self.assertEqual(duplicate.exception.error_code, "instagram_duplicate_blocked")
 
+    def test_claim_rejects_a_timezone_free_timestamp(self) -> None:
+        with self.assertRaises(InstagramPublishError) as raised:
+            claims.reserve_instagram_claim(
+                self.conn,
+                task_id=111,
+                preflight_task_id=110,
+                intent=self.intent,
+                preflight_receipt=self.preflight_receipt,
+                created_at="2026-08-31T15:10:00",
+            )
+        self.assertEqual(raised.exception.error_code, "instagram_claim_invalid")
+
     def test_unique_readback_closes_claim_with_media_receipt(self) -> None:
         with self.conn:
             claims.reserve_instagram_claim(

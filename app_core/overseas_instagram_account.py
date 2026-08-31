@@ -74,7 +74,11 @@ def save_instagram_account_binding(
             "Instagram 本地账号记录无效，已停止保存。",
         )
     try:
-        datetime.fromisoformat(str(observed_at).replace("Z", "+00:00"))
+        if type(observed_at) is not str:
+            raise ValueError
+        observed = datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+        if observed.tzinfo is None or observed.utcoffset() is None:
+            raise ValueError
     except (TypeError, ValueError) as exc:
         raise InstagramIdentityError(
             "instagram_identity_unavailable",

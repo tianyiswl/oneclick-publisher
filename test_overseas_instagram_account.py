@@ -7,7 +7,10 @@ import sqlite3
 import unittest
 
 from app_core import overseas_instagram_account as account_binding
-from app_core.overseas_instagram_identity import InstagramIdentity
+from app_core.overseas_instagram_identity import (
+    InstagramIdentity,
+    InstagramIdentityError,
+)
 
 
 class InstagramAccountBindingTests(unittest.TestCase):
@@ -73,6 +76,25 @@ class InstagramAccountBindingTests(unittest.TestCase):
         self.assertEqual(restored.avatar_url, "")
         dump = "\n".join(self.conn.iterdump())
         self.assertNotIn("must-not-persist", dump)
+
+    def test_binding_rejects_a_timezone_free_observation_time(self) -> None:
+        identity = InstagramIdentity(
+            user_id="17841400000000000",
+            username="creator.one",
+            display_name="Creator One",
+            avatar_url="",
+            account_type="business",
+            linked_page_id="1001",
+            linked_page_name="Main Page",
+            can_manage_content=True,
+        )
+        with self.assertRaises(InstagramIdentityError):
+            account_binding.save_instagram_account_binding(
+                self.conn,
+                account_id=1,
+                identity=identity,
+                observed_at="2026-08-31T16:00:00",
+            )
 
 
 if __name__ == "__main__":
