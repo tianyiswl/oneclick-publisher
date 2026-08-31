@@ -235,11 +235,14 @@ def record_instagram_final_action_clicked(
     if changed == 1:
         return
     current = get_instagram_claim(conn, task_id)
-    if int(current.get("finalActionTriggered") or 0) == 1:
+    if int(current.get("finalActionTriggered") or 0) == 1 or str(
+        current.get("state") or ""
+    ) == "ambiguous":
         raise InstagramPublishError(
             "instagram_final_action_already_triggered",
-            "Instagram 最终按钮已经触发，禁止再次点击。",
-            outcome_ambiguous=str(current.get("state") or "") == "ambiguous",
+            "Instagram 最终按钮已触发或结果无法确认，禁止再次点击。",
+            outcome_ambiguous=str(current.get("state") or "")
+            == "ambiguous",
         )
     raise InstagramPublishError(
         "instagram_claim_invalid",
@@ -280,8 +283,12 @@ def mark_instagram_outcome_unknown(
             errorCode = ?, platformErrorText = ?,
             observedAt = ?, updatedAt = ?
         WHERE taskId = ?
-          AND state IN ('final_action_clicked', 'platform_accepted')
-          AND finalActionTriggered = 1
+          AND (
+              (state = 'final_action_claimed' AND finalActionTriggered = 0)
+              OR
+              (state IN ('final_action_clicked', 'platform_accepted')
+               AND finalActionTriggered = 1)
+          )
         """,
         (
             error_code,
@@ -370,12 +377,16 @@ def mark_instagram_readback_success(
         """
         UPDATE instagram_controlled_publish_claims
         SET state = 'succeeded', blocksReplay = 1,
+            finalActionTriggered = 1,
             mediaId = ?, url = ?, publishedAt = ?, scheduledAt = ?,
             errorCode = '', platformErrorText = '',
             observedAt = ?, updatedAt = ?
         WHERE taskId = ?
-          AND state IN ('final_action_clicked', 'platform_accepted', 'ambiguous')
-          AND finalActionTriggered = 1
+          AND (
+              (state IN ('final_action_clicked', 'platform_accepted')
+               AND finalActionTriggered = 1)
+              OR state = 'ambiguous'
+          )
         """,
         (
             media_id,
