@@ -19,6 +19,14 @@ from app_core.overseas_meta_page_identity import (
     discover_manageable_facebook_pages,
     resolve_facebook_page_selection,
 )
+from app_core.overseas_instagram_account import save_instagram_browser_account
+from app_core.overseas_instagram_browser_identity import (
+    read_confirmed_instagram_identity,
+)
+from app_core.overseas_instagram_identity import (
+    InstagramIdentity,
+    InstagramIdentityError,
+)
 from app_core.overseas_tiktok_identity import (
     TikTokIdentityError,
     persist_tiktok_identity,
@@ -588,6 +596,31 @@ def save_meta_login_accounts(cookie_file, profile_name, update_mode=False, recor
     return saved_ids
 
 
+def save_confirmed_instagram_account(
+    cookie_file: str,
+    *,
+    identity: InstagramIdentity,
+    avatar_path: str | None = None,
+    record_id: int | None = None,
+) -> int:
+    """Persist one already-confirmed IG subject and its managed session file."""
+
+    db_path = Path(BASE_DIR / "db" / "database.db")
+    observed_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    with open_connection(db_path) as conn:
+        account_id = save_instagram_browser_account(
+            conn,
+            storage_file_name=Path(cookie_file).name,
+            identity=identity,
+            observed_at=observed_at,
+            avatar_file_name=Path(avatar_path).name if avatar_path else None,
+            record_id=record_id,
+        )
+        conn.commit()
+    print("[OK] Instagram 专业账号稳定主体已记录")
+    return account_id
+
+
 async def select_facebook_page_for_login(
     page,
     *,
@@ -872,6 +905,8 @@ async def _browser_cookie_gen(
         tiktok_login_succeeded = False
         tiktok_account_write_attempted = False
         facebook_page_login_succeeded = False
+        instagram_login_succeeded = False
+        instagram_identity = None
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=60000)
             if platform_type == 6 and background_mode:
@@ -922,6 +957,20 @@ async def _browser_cookie_gen(
                 status_queue.put("ERROR: 等待平台登录超时，未保存任何登录数据。")
                 status_queue.put("500")
                 return None
+
+            if platform_type == 8:
+                try:
+                    instagram_identity = await read_confirmed_instagram_identity(page)
+                except InstagramIdentityError as exc:
+                    status_queue.put(f"ERROR:{exc.error_code}")
+                    status_queue.put("500")
+                    return None
+                if cancel_event is not None and cancel_event.is_set():
+                    status_queue.put("CANCELLED")
+                    return None
+                status_queue.put(
+                    "Instagram 专业账号主体、账号类型和关联 Page 已完成双页面回读。"
+                )
 
             facebook_identity = None
             if platform_type == 9:
@@ -990,6 +1039,8 @@ async def _browser_cookie_gen(
                     status_queue.put("500")
                     return None
                 checks_ok = True
+            elif platform_type == 8:
+                checks_ok = True
             else:
                 checks_ok = bool(await check_cookie(platform_type, cookie_file))
             if not checks_ok:
@@ -1028,16 +1079,24 @@ async def _browser_cookie_gen(
                     identity,
                 )
             if platform_type == 8:
-                account_ids = save_meta_login_accounts(
-                    cookie_file,
-                    profile_name,
-                    update_mode,
-                    record_id,
-                    avatar_path,
-                    display_name,
-                )
-                for account_id in account_ids:
-                    status_queue.put(f"ACCOUNT_ID:{account_id}")
+                if instagram_identity is None:
+                    raise InstagramIdentityError(
+                        "instagram_identity_unavailable",
+                        "Instagram 页面没有返回稳定主体，已停止保存。",
+                    )
+                try:
+                    account_id = save_confirmed_instagram_account(
+                        cookie_file,
+                        identity=instagram_identity,
+                        avatar_path=avatar_path,
+                        record_id=record_id if update_mode else None,
+                    )
+                except InstagramIdentityError as exc:
+                    status_queue.put(f"ERROR:{exc.error_code}")
+                    status_queue.put("500")
+                    return None
+                instagram_login_succeeded = True
+                status_queue.put(f"ACCOUNT_ID:{account_id}")
             elif platform_type == 9:
                 if cancel_event is not None and cancel_event.is_set():
                     cookie_path.unlink(missing_ok=True)
@@ -1144,6 +1203,20 @@ async def _browser_cookie_gen(
                     and not facebook_page_login_succeeded
                 ):
                     cookie_path.unlink(missing_ok=True)
+                if (
+                    platform_type == 8
+                    and cookie_path is not None
+                    and not instagram_login_succeeded
+                ):
+                    cookie_path.unlink(missing_ok=True)
+                    if avatar_path:
+                        try:
+                            (
+                                Path(BASE_DIR / "avatars")
+                                / Path(str(avatar_path)).name
+                            ).unlink(missing_ok=True)
+                        except OSError:
+                            pass
                 if (
                     platform_type == 6
                     and cookie_path is not None

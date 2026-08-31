@@ -6,6 +6,17 @@ from playwright.async_api import async_playwright
 from xhs import XhsClient
 
 from conf import BASE_DIR
+from app_core.database import open_connection
+from app_core.overseas_instagram_account import load_instagram_account_binding
+from app_core.overseas_instagram_browser_identity import (
+    instagram_management_url,
+    navigate_and_read_instagram_identity,
+)
+from app_core.overseas_instagram_identity import (
+    InstagramIdentity,
+    InstagramIdentityError,
+    confirm_two_page_identity,
+)
 from app_core.overseas_meta_page_identity import activate_saved_facebook_page
 from utils.base_social_media import launch_chromium_with_codecs, save_context_storage_state, set_init_script
 from utils.log import (
@@ -330,6 +341,60 @@ async def cookie_auth_meta(account_file, platform_type: int, preview: bool = Fal
             await browser.close()
 
 
+def _saved_instagram_identity_for_session(file_name: str) -> InstagramIdentity:
+    db_path = Path(BASE_DIR / "db" / "database.db")
+    with open_connection(db_path, row_factory=True) as conn:
+        rows = conn.execute(
+            """
+            SELECT id,accountReference FROM user_info
+            WHERE type = 8 AND filePath = ?
+            ORDER BY id
+            """,
+            (Path(file_name).name,),
+        ).fetchall()
+        if len(rows) != 1:
+            raise InstagramIdentityError(
+                "instagram_account_invalid",
+                "Instagram 本地会话没有唯一稳定账号绑定。",
+            )
+        identity = load_instagram_account_binding(conn, int(rows[0]["id"]))
+        if str(rows[0]["accountReference"] or "").strip() != identity.user_id:
+            raise InstagramIdentityError(
+                "instagram_identity_mismatch",
+                "Instagram 本地账号与稳定主体绑定不一致。",
+            )
+        return identity
+
+
+async def cookie_auth_instagram(
+    account_file: Path,
+    expected_identity: InstagramIdentity,
+    preview: bool = False,
+) -> InstagramIdentity:
+    """Reopen one saved session and prove the exact IG subject read-only."""
+
+    async with async_playwright() as playwright:
+        browser = await launch_chromium_with_codecs(
+            playwright,
+            headless=not preview,
+            executable_path=None,
+        )
+        context = await browser.new_context(storage_state=str(account_file))
+        context = await set_init_script(context)
+        page = await context.new_page()
+        try:
+            observed = await navigate_and_read_instagram_identity(
+                page,
+                instagram_management_url(expected_identity),
+            )
+            confirmed = confirm_two_page_identity(expected_identity, observed)
+            meta_logger.success("[meta] Instagram 稳定主体与后台权限回读通过")
+            return confirmed
+        finally:
+            await context.close()
+            await browser.close()
+
+
 async def cookie_auth_facebook_page(
     account_file,
     expected_page_id: str,
@@ -389,7 +454,12 @@ async def check_cookie(
         case 7:
             return await cookie_auth_youtube(Path(BASE_DIR / "cookiesFile" / file_path), preview)
         case 8:
-            return await cookie_auth_meta(Path(BASE_DIR / "cookiesFile" / file_path), type, preview)
+            identity = _saved_instagram_identity_for_session(file_path)
+            return await cookie_auth_instagram(
+                Path(BASE_DIR / "cookiesFile" / file_path),
+                identity,
+                preview,
+            )
         case 9:
             if account_reference is not None:
                 return await cookie_auth_facebook_page(

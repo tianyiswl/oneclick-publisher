@@ -13,6 +13,7 @@ from conf import DEBUG_SKIP_FINAL_PUBLISH
 
 from .database import connect
 from .managed_artifact_cleanup import unlink_managed_artifact_if_unreferenced
+from .overseas_instagram_identity import InstagramIdentityError
 from .overseas_meta_errors import FacebookPagePublishError
 from .overseas_meta_page_identity import (
     FacebookPageIdentity,
@@ -1079,6 +1080,22 @@ def validate_accounts(
                 failures.append("TikTok：本地登录会话不存在，请重新登录。")
             else:
                 failures.append("TikTok：登录已失效，请重新登录。")
+        except InstagramIdentityError as exc:
+            valid = False
+            error_code = str(
+                exc.error_code or "instagram_identity_unavailable"
+            )
+            if error_code not in {
+                "instagram_account_invalid",
+                "instagram_identity_unavailable",
+                "instagram_identity_mismatch",
+                "instagram_identity_conflict",
+            }:
+                error_code = "instagram_identity_unavailable"
+            auth_issues[int(row["id"])] = error_code
+            failures.append(
+                "Instagram：保存的专业账号主体无法精确回读，请重新登录。"
+            )
         except FacebookPagePublishError as exc:
             valid = False
             error_code = str(
@@ -1134,7 +1151,7 @@ def validate_accounts(
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         failed_status = (
             0
-            if int(row.get("type") or 0) == 9
+            if int(row.get("type") or 0) in {8, 9}
             and int(row["id"]) in auth_issues
             else int(invalid_status)
         )

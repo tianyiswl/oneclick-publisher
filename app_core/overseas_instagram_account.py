@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import datetime
+from pathlib import Path
 
 from .overseas_instagram_identity import (
     InstagramIdentity,
@@ -196,3 +197,150 @@ def load_instagram_account_binding(
         linked_page_name=str(row["linkedPageName"]),
         can_manage_content=True,
     )
+
+
+def _managed_file_name(value: object, *, label: str) -> str:
+    if type(value) is not str:
+        raise InstagramIdentityError(
+            "instagram_account_invalid",
+            f"Instagram {label}文件名无效，已停止保存。",
+        )
+    normalized = value.strip()
+    if (
+        not normalized
+        or normalized in {".", ".."}
+        or Path(normalized).name != normalized
+    ):
+        raise InstagramIdentityError(
+            "instagram_account_invalid",
+            f"Instagram {label}文件名无效，已停止保存。",
+        )
+    return normalized
+
+
+def save_instagram_browser_account(
+    conn: sqlite3.Connection,
+    *,
+    storage_file_name: str,
+    identity: InstagramIdentity,
+    observed_at: str,
+    avatar_file_name: str | None = None,
+    record_id: int | None = None,
+) -> int:
+    """Atomically persist one browser session and its stable IG subject.
+
+    The storage-state contents remain in the managed credential file.  This
+    database boundary stores only its generated file name and public account
+    identity fields.
+    """
+
+    storage_name = _managed_file_name(storage_file_name, label="会话")
+    avatar_name = (
+        _managed_file_name(avatar_file_name, label="头像")
+        if avatar_file_name is not None
+        else None
+    )
+    normalized = _validated_identity(identity)
+    savepoint = "instagram_browser_account_save"
+    conn.execute(f"SAVEPOINT {savepoint}")
+    try:
+        ensure_instagram_account_binding_schema(conn)
+        account_id = 0
+        if record_id is not None:
+            if type(record_id) is not int or record_id <= 0:
+                raise InstagramIdentityError(
+                    "instagram_account_invalid",
+                    "Instagram 本地账号记录无效，已停止保存。",
+                )
+            account_cursor = conn.execute(
+                "SELECT id,type,accountReference FROM user_info WHERE id = ?",
+                (record_id,),
+            )
+            account = _row_dict(account_cursor, account_cursor.fetchone())
+            if account is None or int(account.get("type") or 0) != 8:
+                raise InstagramIdentityError(
+                    "instagram_account_invalid",
+                    "Instagram 本地账号记录无效，已停止保存。",
+                )
+            saved_reference = str(account.get("accountReference") or "").strip()
+            if saved_reference and saved_reference != normalized.user_id:
+                raise InstagramIdentityError(
+                    "instagram_identity_mismatch",
+                    "保存的 Instagram 主体与当前登录账号不一致。",
+                )
+            account_id = int(record_id)
+        else:
+            matches = conn.execute(
+                """
+                SELECT id FROM user_info
+                WHERE type = 8 AND accountReference = ?
+                ORDER BY id
+                """,
+                (normalized.user_id,),
+            ).fetchall()
+            if len(matches) > 1:
+                raise InstagramIdentityError(
+                    "instagram_identity_conflict",
+                    "这个 Instagram 主体对应多个本地账号，已停止保存。",
+                )
+            if matches:
+                account_id = int(matches[0][0])
+
+        if account_id:
+            conn.execute(
+                """
+                UPDATE user_info
+                SET filePath = ?, userName = ?, status = 1, profileName = ?,
+                    avatarPath = COALESCE(?, avatarPath),
+                    avatarUpdatedAt = CASE
+                        WHEN ? IS NOT NULL THEN ? ELSE avatarUpdatedAt END,
+                    lastCheckedAt = ?, lastLoginAt = ?, authMode = 'browser'
+                WHERE id = ? AND type = 8
+                """,
+                (
+                    storage_name,
+                    normalized.username,
+                    normalized.display_name,
+                    avatar_name,
+                    avatar_name,
+                    observed_at,
+                    observed_at,
+                    observed_at,
+                    account_id,
+                ),
+            )
+        else:
+            cursor = conn.execute(
+                """
+                INSERT INTO user_info (
+                    type,filePath,userName,status,profileName,avatarPath,
+                    avatarUpdatedAt,lastCheckedAt,lastLoginAt,authMode,
+                    accountReference
+                ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, 'browser', ?)
+                """,
+                (
+                    8,
+                    storage_name,
+                    normalized.username,
+                    normalized.display_name,
+                    avatar_name,
+                    observed_at if avatar_name else None,
+                    observed_at,
+                    observed_at,
+                    normalized.user_id,
+                ),
+            )
+            account_id = int(cursor.lastrowid)
+
+        save_instagram_account_binding(
+            conn,
+            account_id=account_id,
+            identity=normalized,
+            observed_at=observed_at,
+        )
+    except Exception:
+        conn.execute(f"ROLLBACK TO {savepoint}")
+        conn.execute(f"RELEASE {savepoint}")
+        raise
+    conn.execute(f"RELEASE {savepoint}")
+    return account_id

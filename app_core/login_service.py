@@ -52,7 +52,9 @@ class RecoveredOverseasLoginSession:
         self._active_selection_request: FacebookPageSelectionRequest | None = None
         self._complete = threading.Event()
         self._failure: BaseException | None = None
-        self.manual_save_supported = self.platform_type != 9
+        # Meta sessions save only after the stable platform subject and content
+        # permission are read back.  A manual button must never bypass that gate.
+        self.manual_save_supported = False
 
     def start(self) -> None:
         if self.platform_type == 9 and not facebook_page_v1_enabled():

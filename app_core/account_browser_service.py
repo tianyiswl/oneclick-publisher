@@ -14,6 +14,16 @@ from pathlib import Path
 
 from . import account_service
 from .oneclick_authorization import authorization_plan
+from .overseas_instagram_account import load_instagram_account_binding
+from .overseas_instagram_browser_identity import (
+    instagram_management_url,
+    navigate_and_read_instagram_identity,
+)
+from .overseas_instagram_identity import (
+    InstagramIdentity,
+    InstagramIdentityError,
+    confirm_two_page_identity,
+)
 from .overseas_meta_errors import FacebookPagePublishError
 from .overseas_meta_page_identity import activate_saved_facebook_page
 from .overseas_youtube_profile import youtube_studio_url
@@ -24,6 +34,7 @@ _session_lock = threading.Lock()
 _backend_threads: dict[int, threading.Thread] = {}
 _backend_startups: dict[int, "_BackendStartupSignal"] = {}
 FACEBOOK_PAGE_BACKEND_STARTUP_TIMEOUT_SECONDS = 90.0
+INSTAGRAM_BACKEND_STARTUP_TIMEOUT_SECONDS = 90.0
 _STARTUP_PENDING = object()
 
 
@@ -34,13 +45,21 @@ def _facebook_page_backend_startup_timeout() -> FacebookPagePublishError:
     )
 
 
+def _instagram_backend_startup_timeout() -> InstagramIdentityError:
+    return InstagramIdentityError(
+        "instagram_identity_unavailable",
+        "Instagram 后台启动超时，已安全停止。",
+    )
+
+
 class _BackendStartupSignal:
     """Atomically choose worker completion or the caller's bounded timeout."""
 
-    def __init__(self) -> None:
+    def __init__(self, timeout_error_factory=_facebook_page_backend_startup_timeout) -> None:
         self._lock = threading.Lock()
         self._ready = threading.Event()
         self._result: object = _STARTUP_PENDING
+        self._timeout_error_factory = timeout_error_factory
 
     def report(self, result: object) -> bool:
         with self._lock:
@@ -54,7 +73,7 @@ class _BackendStartupSignal:
         self._ready.wait(max(0.001, float(timeout_seconds)))
         with self._lock:
             if self._result is _STARTUP_PENDING:
-                self._result = _facebook_page_backend_startup_timeout()
+                self._result = self._timeout_error_factory()
                 self._ready.set()
             return self._result
 
@@ -92,6 +111,23 @@ def _account_key(account: dict) -> int:
     return account_id
 
 
+def _load_saved_instagram_identity(account_id: int) -> InstagramIdentity:
+    with account_service.connect() as conn:
+        return load_instagram_account_binding(conn, int(account_id))
+
+
+def _saved_instagram_backend_identity(account: dict) -> InstagramIdentity:
+    account_id = _account_key(account)
+    identity = _load_saved_instagram_identity(account_id)
+    saved_reference = str(account.get("accountReference") or "").strip()
+    if saved_reference != identity.user_id:
+        raise InstagramIdentityError(
+            "instagram_identity_mismatch",
+            "保存的 Instagram 主体与账号记录不一致，已停止打开后台。",
+        )
+    return identity
+
+
 async def _open_backend(
     account: dict,
     startup_results: queue.Queue[object] | _BackendStartupSignal | None = None,
@@ -105,6 +141,12 @@ async def _open_backend(
     state_file = COOKIE_DIR / Path(str(account.get("filePath") or "")).name
     if not state_file.is_file():
         raise RuntimeError("一键发本地登录会话不存在，请重新登录")
+    platform_type = int(account.get("type") or 0)
+    instagram_identity = (
+        _saved_instagram_backend_identity(account)
+        if platform_type == 8
+        else None
+    )
 
     from playwright.async_api import async_playwright
 
@@ -124,10 +166,21 @@ async def _open_backend(
         page = await context.new_page()
         if _startup_abandoned(startup_results):
             return
-        await page.goto(plan.login_url, wait_until="domcontentloaded", timeout=45_000)
+        if instagram_identity is not None:
+            observed_instagram = await navigate_and_read_instagram_identity(
+                page,
+                instagram_management_url(instagram_identity),
+            )
+            confirm_two_page_identity(instagram_identity, observed_instagram)
+        else:
+            await page.goto(
+                plan.login_url,
+                wait_until="domcontentloaded",
+                timeout=45_000,
+            )
         if _startup_abandoned(startup_results):
             return
-        if int(account.get("type") or 0) == 9:
+        if platform_type == 9:
             expected_page_id = account_service.validate_saved_facebook_page_account(
                 account
             )
@@ -193,6 +246,7 @@ def open_account_backend(account: dict) -> bool:
     account_id = _account_key(account)
     platform_type = int(account.get("type") or 0)
     is_facebook_page = platform_type == 9
+    is_instagram = platform_type == 8
     if is_facebook_page and not account_service.facebook_page_v1_enabled():
         raise RuntimeError("Facebook Page 功能未开启。")
     if str(account.get("authMode") or "browser") == "youtube_oauth":
@@ -203,6 +257,8 @@ def open_account_backend(account: dict) -> bool:
         return False
     if is_facebook_page:
         account_service.validate_saved_facebook_page_account(account)
+    if is_instagram:
+        _saved_instagram_backend_identity(account)
     # 在启动线程前完成本地参数校验，让界面能立即给出可理解的错误。
     authorization_plan(platform_type, str(account.get("profileName") or ""))
     state_file = COOKIE_DIR / Path(str(account.get("filePath") or "")).name
@@ -219,11 +275,13 @@ def open_account_backend(account: dict) -> bool:
                 if isinstance(startup_result, Exception):
                     raise startup_result
             return True
-        startup_results = (
-            _BackendStartupSignal()
-            if is_facebook_page
-            else None
-        )
+        startup_results = None
+        if is_facebook_page:
+            startup_results = _BackendStartupSignal()
+        elif is_instagram:
+            startup_results = _BackendStartupSignal(
+                _instagram_backend_startup_timeout
+            )
         worker = threading.Thread(
             target=_thread_target,
             args=(dict(account), account_id, startup_results),
@@ -240,8 +298,13 @@ def open_account_backend(account: dict) -> bool:
             _backend_startups.pop(account_id, None)
             raise
     if startup_results is not None:
-        startup_result = startup_results.wait(
+        timeout_seconds = (
             FACEBOOK_PAGE_BACKEND_STARTUP_TIMEOUT_SECONDS
+            if is_facebook_page
+            else INSTAGRAM_BACKEND_STARTUP_TIMEOUT_SECONDS
+        )
+        startup_result = startup_results.wait(
+            timeout_seconds
         )
         if isinstance(startup_result, Exception):
             raise startup_result
