@@ -7,11 +7,13 @@ import asyncio
 import hashlib
 import json
 import re
+import time
 import weakref
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from typing import Any, Awaitable, Callable, Iterable, Literal
 from urllib.parse import parse_qs, urljoin, urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app_core.overseas_meta_errors import FacebookPagePublishError
 from app_core.overseas_meta_page_identity import (
@@ -25,9 +27,27 @@ from uploader.meta_uploader.page_form import canonical_meta_caption
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _REEL_ID = re.compile(r"[A-Za-z0-9_-]{1,256}\Z")
 _CONTENT_HOME_URL = "https://business.facebook.com/latest/home/"
-_CONTENT_LIST_URL = "https://business.facebook.com/latest/content?asset_id={}"
+_LEGACY_CONTENT_LIST_URL = "https://business.facebook.com/latest/content?asset_id={}"
+_CURRENT_CONTENT_ENTRY_PATH = "/latest/posts"
+_CURRENT_CONTENT_LIST_PATH = "/latest/posts/published_posts"
+_CONTENT_ENTRY_LABELS = ("内容", "Content")
 _MAX_PAGES = 50
 _DEFAULT_SETTLEMENT_ATTEMPTS = 4
+_CURRENT_TABLE_MAX_SAMPLES = 20
+_CURRENT_TABLE_STABLE_SAMPLES = 2
+_CURRENT_EMPTY_MIN_SETTLEMENT_MS = 2_000
+_CONTENT_SURFACE_WAIT_ATTEMPTS = 120
+_CONTENT_SURFACE_WAIT_MS = 250
+_CURRENT_TABLE_WAIT_MS = 500
+_READBACK_SETTLEMENT_WAIT_MS = 5_000
+_CURRENT_FILTER_WAIT_MS = 250
+_CONTENT_ROW_ID = re.compile(r"(?<!\d)(\d{6,32})(?!\d)")
+_CURRENT_REEL_MEDIA_LABELS = frozenset(
+    {"reel", "reels", "video", "videos", "视频"}
+)
+_CURRENT_NON_REEL_MEDIA_LABELS = frozenset(
+    {"photo", "photos", "post", "posts", "照片", "帖子"}
+)
 _TERMINAL_STATUS_TEXTS = frozenset(
     {
         "no more results",
@@ -66,6 +86,32 @@ _REJECTED_DECISION_TEXTS = frozenset(
         "无法发布你的 reel",
     }
 )
+_CURRENT_SEARCH_HINTS = (
+    ("编号", "配文"),
+    ("id", "caption"),
+)
+_CURRENT_DATE_BOUNDED_PREFIXES = (
+    "过去90天",
+    "过去 90 天",
+    "past 90 days",
+)
+_CURRENT_DATE_ALL_TIME_PREFIXES = (
+    "创建至今",
+    "all time",
+    "lifetime",
+)
+_CURRENT_DATE_ALL_TIME_LABELS = (
+    "创建至今",
+    "All time",
+    "Lifetime",
+)
+_META_TIMEZONE_NAMES = {
+    "太平洋时间": "America/Los_Angeles",
+    "pacific time": "America/Los_Angeles",
+    "pacific standard time": "America/Los_Angeles",
+    "北京时间": "Asia/Shanghai",
+    "china standard time": "Asia/Shanghai",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,11 +288,117 @@ def _is_exact_content_url(value: object, *, expected_page_id: str) -> bool:
         and parsed.port is None
         and parsed.username is None
         and parsed.password is None
-        and parsed.path.rstrip("/") == "/latest/content"
+        and parsed.path.rstrip("/")
+        in {"/latest/content", _CURRENT_CONTENT_LIST_PATH}
         and set(query) == {"asset_id"}
         and query.get("asset_id") == [expected_page_id]
         and not parsed.fragment
     )
+
+
+def _is_exact_content_entry_url(value: object, *, expected_page_id: str) -> bool:
+    if type(value) is not str:
+        return False
+    try:
+        parsed = urlsplit(value)
+        query = parse_qs(parsed.query, keep_blank_values=True)
+    except ValueError:
+        return False
+    return (
+        parsed.scheme.casefold() == "https"
+        and parsed.hostname == "business.facebook.com"
+        and parsed.port is None
+        and parsed.username is None
+        and parsed.password is None
+        and parsed.path.rstrip("/") == _CURRENT_CONTENT_ENTRY_PATH
+        and set(query) == {"asset_id"}
+        and query.get("asset_id") == [expected_page_id]
+        and not parsed.fragment
+    )
+
+
+def _is_current_content_url(value: object, *, expected_page_id: str) -> bool:
+    if not _is_exact_content_url(value, expected_page_id=expected_page_id):
+        return False
+    return urlsplit(str(value)).path.rstrip("/") == _CURRENT_CONTENT_LIST_PATH
+
+
+def _current_table_media_kind(value: object) -> str:
+    text = canonical_meta_caption(value)
+    lines = {line.strip().casefold() for line in text.splitlines() if line.strip()}
+    if lines & _CURRENT_REEL_MEDIA_LABELS:
+        return "reel"
+    if lines & _CURRENT_NON_REEL_MEDIA_LABELS:
+        return "other"
+    return "unknown"
+
+
+def _current_table_row_id(value: object) -> str:
+    text = canonical_meta_caption(value)
+    matches = _CONTENT_ROW_ID.findall(text)
+    if len(matches) != 1:
+        raise ValueError("ambiguous content row identity")
+    return _normalized_reel_id(matches[0])
+
+
+def _current_table_timestamp(
+    value: object,
+    *,
+    observed_at: datetime | None = None,
+    display_timezone: tzinfo | None = None,
+) -> str:
+    text = canonical_meta_caption(value)
+    if not text:
+        raise ValueError("missing content timestamp")
+    try:
+        return _canonical_timestamp(text)
+    except ValueError:
+        pass
+
+    now = observed_at or datetime.now().astimezone()
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("content timestamp observation must be timezone-aware")
+    relative_anchor = now.replace(second=0, microsecond=0)
+    folded = text.casefold()
+    relative = re.fullmatch(r"(\d+)\s*(?:分钟|分鐘|min(?:ute)?s?)\s*(?:前|ago)?", folded)
+    if relative:
+        try:
+            relative_anchor -= timedelta(minutes=int(relative.group(1)))
+        except OverflowError as exc:
+            raise ValueError("unsupported content timestamp") from exc
+        return relative_anchor.astimezone(timezone.utc).isoformat()
+    relative = re.fullmatch(r"(\d+)\s*(?:小时|小時|h(?:ou)?rs?)\s*(?:前|ago)?", folded)
+    if relative:
+        try:
+            relative_anchor -= timedelta(hours=int(relative.group(1)))
+        except OverflowError as exc:
+            raise ValueError("unsupported content timestamp") from exc
+        return relative_anchor.astimezone(timezone.utc).isoformat()
+    if folded in {"刚刚", "剛剛", "just now"}:
+        return relative_anchor.astimezone(timezone.utc).isoformat()
+
+    chinese = re.fullmatch(
+        r"(?:(\d{4})年)?(\d{1,2})月(\d{1,2})日\s+(\d{1,2}):(\d{2})",
+        text,
+    )
+    if chinese:
+        if display_timezone is None:
+            raise ValueError("timezone-less content timestamp lacks page timezone")
+        explicit_year, month, day, hour, minute = chinese.groups()
+        local_now = now.astimezone(display_timezone)
+        year = int(explicit_year) if explicit_year else local_now.year
+        parsed = datetime(
+            year,
+            int(month),
+            int(day),
+            int(hour),
+            int(minute),
+            tzinfo=display_timezone,
+        )
+        if explicit_year is None and parsed - local_now > timedelta(days=2):
+            parsed = parsed.replace(year=year - 1)
+        return parsed.astimezone(timezone.utc).isoformat()
+    raise ValueError("unsupported content timestamp")
 
 
 def _canonical_timestamp(value: object) -> str:
@@ -433,7 +585,14 @@ def match_unique_new_facebook_reel(
             continue
         if (
             row.caption_sha256 == expected_caption
-            and published >= clicked
+            and (
+                published >= clicked
+                or (
+                    published.second == 0
+                    and published.microsecond == 0
+                    and published == clicked.replace(second=0, microsecond=0)
+                )
+            )
             and row.reel_id not in old_ids
         ):
             matching.append(row)
@@ -475,6 +634,7 @@ class FacebookPageContentReader:
         self.context = context
         self._wait_for_verification = wait_for_verification
         self._list_page: Any | None = None
+        self._activated_page_id = ""
 
     async def capture_baseline(
         self,
@@ -559,11 +719,22 @@ class FacebookPageContentReader:
                     clicked_at=clicked_at,
                 )
             except FacebookPagePublishError as exc:
-                if exc.error_code == "facebook_page_baseline_read_failed":
-                    raise
-                raise _baseline_failed(expected) from exc
+                failure = (
+                    exc
+                    if exc.error_code == "facebook_page_baseline_read_failed"
+                    else _baseline_failed(expected)
+                )
+                if attempt + 1 == _DEFAULT_SETTLEMENT_ATTEMPTS:
+                    if failure is exc:
+                        raise
+                    raise failure from exc
+                await self._bounded_pause()
+                continue
             except Exception as exc:
-                raise _baseline_failed(expected) from exc
+                if attempt + 1 == _DEFAULT_SETTLEMENT_ATTEMPTS:
+                    raise _baseline_failed(expected) from exc
+                await self._bounded_pause()
+                continue
             if match.status != "none" or attempt + 1 == _DEFAULT_SETTLEMENT_ATTEMPTS:
                 return match
             await self._bounded_pause()
@@ -645,6 +816,12 @@ class FacebookPageContentReader:
         expected_page_id: str,
     ) -> tuple[FacebookReelRow, ...]:
         page = await self._prepare_list_page(expected_page_id)
+        if _is_current_content_url(
+            _page_url(page),
+            expected_page_id=expected_page_id,
+        ):
+            return await self._read_current_posts_table(page, expected_page_id)
+
         rows_by_id: dict[str, FacebookReelRow] = {}
         previous_signature: tuple[tuple[str, str, str], ...] | None = None
         allow_persisted_prefix = False
@@ -774,6 +951,417 @@ class FacebookPageContentReader:
             await self._recheck_page(page, expected_page_id)
         raise _baseline_failed(expected_page_id)
 
+    @staticmethod
+    def _current_date_scope(value: object) -> str:
+        text = " ".join(canonical_meta_caption(value).casefold().split())
+        compact = text.replace(" ", "")
+        if any(
+            text.startswith(prefix) or compact.startswith(prefix.replace(" ", ""))
+            for prefix in _CURRENT_DATE_ALL_TIME_PREFIXES
+        ):
+            return "all_time"
+        if any(
+            text.startswith(prefix) or compact.startswith(prefix.replace(" ", ""))
+            for prefix in _CURRENT_DATE_BOUNDED_PREFIXES
+        ):
+            return "bounded"
+        return ""
+
+    async def _current_posts_display_timezone(self, page: Any) -> tzinfo | None:
+        candidates: set[str] = set()
+        timezone_nodes = await self._elements(
+            page.locator("[data-meta-timezone], [data-timezone]")
+        )
+        for node in timezone_nodes:
+            for attribute in ("data-meta-timezone", "data-timezone"):
+                value = canonical_meta_caption(await node.get_attribute(attribute))
+                if value:
+                    candidates.add(value)
+
+        body_text = ""
+        bodies = await self._visible(page.locator("body"))
+        if len(bodies) > 1:
+            raise _baseline_failed()
+        if bodies:
+            body_text = canonical_meta_caption(await bodies[0].inner_text()).casefold()
+        for marker, timezone_name in _META_TIMEZONE_NAMES.items():
+            if marker.casefold() in body_text:
+                candidates.add(timezone_name)
+
+        offset_matches = set(
+            re.findall(r"(?:utc|gmt)\s*([+-]\d{1,2})(?::?(\d{2}))?", body_text)
+        )
+        if len(offset_matches) > 1:
+            raise _baseline_failed()
+        if offset_matches:
+            hours_text, minutes_text = next(iter(offset_matches))
+            hours = int(hours_text)
+            minutes = int(minutes_text or "0")
+            if abs(hours) > 14 or minutes > 59:
+                raise _baseline_failed()
+            sign = -1 if hours < 0 else 1
+            offset = timedelta(hours=hours, minutes=sign * minutes)
+            offset_name = f"UTC{hours:+03d}:{minutes:02d}"
+            candidates.add(offset_name)
+
+        resolved: list[tzinfo] = []
+        for candidate in sorted(candidates):
+            if candidate.startswith("UTC+") or candidate.startswith("UTC-"):
+                matched = re.fullmatch(r"UTC([+-]\d{2}):(\d{2})", candidate)
+                if matched is None:
+                    raise _baseline_failed()
+                hours = int(matched.group(1))
+                minutes = int(matched.group(2))
+                sign = -1 if hours < 0 else 1
+                resolved.append(
+                    timezone(timedelta(hours=hours, minutes=sign * minutes))
+                )
+                continue
+            try:
+                resolved.append(ZoneInfo(candidate))
+            except ZoneInfoNotFoundError as exc:
+                raise _baseline_failed() from exc
+        unique = {str(item) for item in resolved}
+        if len(unique) > 1:
+            raise _baseline_failed()
+        return resolved[0] if resolved else None
+
+    async def _clear_current_posts_search(self, page: Any) -> None:
+        candidates = await self._visible(
+            page.locator('[role="searchbox"], input[type="search"]')
+        )
+        matching: list[Any] = []
+        for candidate in candidates:
+            hints = " ".join([
+                canonical_meta_caption(await candidate.get_attribute(attribute))
+                for attribute in ("aria-label", "placeholder")
+            ]).casefold()
+            if any(all(part in hints for part in pair) for pair in _CURRENT_SEARCH_HINTS):
+                matching.append(candidate)
+        if len(matching) > 1:
+            raise _baseline_failed()
+        if not matching:
+            return
+        search = matching[0]
+        input_value = getattr(search, "input_value", None)
+        value = (
+            canonical_meta_caption(await input_value())
+            if callable(input_value)
+            else canonical_meta_caption(await search.get_attribute("value"))
+        )
+        if not value:
+            return
+        fill = getattr(search, "fill", None)
+        if not callable(fill):
+            raise _baseline_failed()
+        await fill("")
+        await self._wait_current_filter(page)
+        value = (
+            canonical_meta_caption(await input_value())
+            if callable(input_value)
+            else canonical_meta_caption(await search.get_attribute("value"))
+        )
+        if value:
+            raise _baseline_failed()
+
+    async def _current_date_button(self, page: Any) -> tuple[str, Any] | None:
+        matching: list[tuple[str, Any]] = []
+        for button in await self._visible(page.get_by_role("button")):
+            label = canonical_meta_caption(await button.get_attribute("aria-label"))
+            text = canonical_meta_caption(await button.inner_text())
+            scope = self._current_date_scope(label or text)
+            if scope:
+                matching.append((scope, button))
+        if len(matching) > 1:
+            raise _baseline_failed()
+        return matching[0] if matching else None
+
+    async def _all_time_option(self, page: Any) -> Any:
+        for role in ("option", "menuitem", "button"):
+            found: list[Any] = []
+            for label in _CURRENT_DATE_ALL_TIME_LABELS:
+                found.extend(
+                    await self._visible(
+                        page.get_by_role(role, name=label, exact=True)
+                    )
+                )
+            if len(found) > 1:
+                raise _baseline_failed()
+            if len(found) == 1:
+                return found[0]
+        found = []
+        for label in _CURRENT_DATE_ALL_TIME_LABELS:
+            found.extend(
+                await self._visible(page.get_by_text(label, exact=True))
+            )
+        if len(found) != 1:
+            raise _baseline_failed()
+        return found[0]
+
+    async def _normalize_current_posts_view(
+        self,
+        page: Any,
+        expected_page_id: str,
+    ) -> tzinfo | None:
+        """Remove known search/date filters before treating the table as complete."""
+
+        await self._clear_current_posts_search(page)
+        date_control = await self._current_date_button(page)
+        display_timezone = await self._current_posts_display_timezone(page)
+        if date_control is None:
+            return display_timezone
+        scope, button = date_control
+        if scope == "bounded":
+            await button.click()
+            await self._wait_current_filter(page)
+            display_timezone = (
+                await self._current_posts_display_timezone(page)
+                or display_timezone
+            )
+            option = await self._all_time_option(page)
+            await option.click()
+            await self._wait_current_filter(page)
+            await self._recheck_page(page, expected_page_id)
+            refreshed = await self._current_date_button(page)
+            if refreshed is None or refreshed[0] != "all_time":
+                raise _baseline_failed(expected_page_id)
+        return (
+            await self._current_posts_display_timezone(page)
+            or display_timezone
+        )
+
+    @staticmethod
+    async def _wait_current_filter(page: Any) -> None:
+        wait = getattr(page, "wait_for_timeout", None)
+        if callable(wait):
+            await wait(_CURRENT_FILTER_WAIT_MS)
+        else:
+            await asyncio.sleep(_CURRENT_FILTER_WAIT_MS / 1000)
+
+    async def _read_current_posts_table(
+        self,
+        page: Any,
+        expected_page_id: str,
+    ) -> tuple[FacebookReelRow, ...]:
+        """Read Meta's current published-posts grid until its end is stable."""
+
+        rows_by_id: dict[str, FacebookReelRow] = {}
+        seen_content_rows: dict[str, tuple[str, str]] = {}
+        previous_signature: tuple[tuple[str, str, str], ...] | None = None
+        stable_at_bottom = 0
+        stable_empty_status = 0
+        empty_started_at: float | None = None
+        display_timezone = await self._normalize_current_posts_view(
+            page,
+            expected_page_id,
+        )
+        observed_at = datetime.now(timezone.utc)
+
+        for _ in range(_CURRENT_TABLE_MAX_SAMPLES):
+            await self._recheck_page(page, expected_page_id)
+            if not _is_current_content_url(
+                _page_url(page),
+                expected_page_id=expected_page_id,
+            ):
+                raise _baseline_failed(expected_page_id)
+
+            title_headers = await self._visible(
+                page.get_by_role("columnheader", name="标题", exact=True)
+            )
+            if not title_headers:
+                title_headers = await self._visible(
+                    page.get_by_role("columnheader", name="Title", exact=True)
+                )
+            date_headers = await self._visible(
+                page.get_by_role("columnheader", name="发布日期", exact=True)
+            )
+            if not date_headers:
+                date_headers = await self._visible(
+                    page.get_by_role(
+                        "columnheader",
+                        name="Publish date",
+                        exact=True,
+                    )
+                )
+            if len(title_headers) != 1 or len(date_headers) != 1:
+                raise _baseline_failed(expected_page_id)
+
+            data_rows = await self._visible(
+                page.locator('tr[role="row"][data-index]')
+            )
+            signature: list[tuple[str, str, str]] = []
+            new_content_count = 0
+            for row in data_rows:
+                try:
+                    checkboxes = await self._visible(
+                        row.locator('input[type="checkbox"][aria-label]')
+                    )
+                    title_cells = await self._visible(
+                        row.locator('td[aria-colindex="2"]')
+                    )
+                    date_cells = await self._visible(
+                        row.locator('td[aria-colindex="3"]')
+                    )
+                    if (
+                        len(checkboxes) != 1
+                        or len(title_cells) != 1
+                        or len(date_cells) != 1
+                    ):
+                        raise ValueError("ambiguous current content row")
+                    content_id = _current_table_row_id(
+                        await checkboxes[0].get_attribute("aria-label")
+                    )
+                    title_text = canonical_meta_caption(
+                        await title_cells[0].inner_text()
+                    )
+                    media_kind = _current_table_media_kind(title_text)
+                    if media_kind == "unknown":
+                        raise ValueError("unknown current content kind")
+
+                    timestamps = await self._visible(
+                        date_cells[0].locator("time[datetime]")
+                    )
+                    if len(timestamps) > 1:
+                        raise ValueError("ambiguous current content timestamp")
+                    raw_timestamp = (
+                        await timestamps[0].get_attribute("datetime")
+                        if len(timestamps) == 1
+                        else await date_cells[0].inner_text()
+                    )
+                    timestamp_text = canonical_meta_caption(raw_timestamp)
+                    published_at = _current_table_timestamp(
+                        timestamp_text,
+                        observed_at=observed_at,
+                        display_timezone=display_timezone,
+                    )
+                except (FacebookPagePublishError, TypeError, ValueError) as exc:
+                    raise _baseline_failed(expected_page_id) from exc
+
+                # Business Suite adds transient row actions (for example
+                # “创建广告”) after the content identity has rendered.  The
+                # exact ID, media kind and canonical publish time are stable;
+                # Reel captions are verified separately on the canonical
+                # public detail URL.
+                projection = (media_kind, published_at)
+                previous = seen_content_rows.get(content_id)
+                if previous is not None and previous != projection:
+                    raise _baseline_failed(expected_page_id)
+                if previous is None:
+                    seen_content_rows[content_id] = projection
+                    new_content_count += 1
+                signature.append((content_id, media_kind, published_at))
+                if media_kind == "reel":
+                    reel_url = f"https://www.facebook.com/reel/{content_id}"
+                    reel_row = FacebookReelRow(
+                        page_id=expected_page_id,
+                        reel_id=content_id,
+                        url=reel_url,
+                        caption_sha256="",
+                        published_at=published_at,
+                    )
+                    existing_reel = rows_by_id.get(content_id)
+                    if existing_reel is None:
+                        rows_by_id[content_id] = reel_row
+
+            statuses = await self._visible(page.get_by_role("status"))
+            empty_count = 0
+            for element in statuses:
+                status = canonical_meta_caption(
+                    await element.inner_text()
+                ).casefold()
+                empty_count += int(status in _EMPTY_STATUS_TEXTS)
+            if empty_count > 1:
+                raise _baseline_failed(expected_page_id)
+            if empty_count == 1:
+                if data_rows or seen_content_rows:
+                    raise _baseline_failed(expected_page_id)
+                if empty_started_at is None:
+                    empty_started_at = time.monotonic()
+                stable_empty_status += 1
+                settled_ms = (time.monotonic() - empty_started_at) * 1000
+                if (
+                    stable_empty_status >= _CURRENT_TABLE_STABLE_SAMPLES
+                    and settled_ms >= _CURRENT_EMPTY_MIN_SETTLEMENT_MS
+                ):
+                    return ()
+                wait = getattr(page, "wait_for_timeout", None)
+                if callable(wait):
+                    await wait(_CURRENT_TABLE_WAIT_MS)
+                else:
+                    await asyncio.sleep(_CURRENT_TABLE_WAIT_MS / 1000)
+                continue
+            stable_empty_status = 0
+            empty_started_at = None
+
+            signature_tuple = tuple(signature)
+            target = data_rows[-1] if data_rows else title_headers[0]
+            at_bottom = await self._scroll_current_table_to_bottom(target)
+            if (
+                at_bottom
+                and previous_signature == signature_tuple
+                and new_content_count == 0
+            ):
+                stable_at_bottom += 1
+            else:
+                stable_at_bottom = 0
+            # The current Business Suite table renders its headers before its
+            # data rows.  An empty signature therefore does not prove that the
+            # content list is complete; accepting it here can miss a Reel that
+            # appears a moment later.  Photo/post rows are still valid evidence
+            # that the table has hydrated, even when the resulting Reel
+            # baseline is intentionally empty.
+            if (
+                seen_content_rows
+                and stable_at_bottom >= _CURRENT_TABLE_STABLE_SAMPLES
+            ):
+                return tuple(
+                    sorted(rows_by_id.values(), key=lambda item: item.reel_id)
+                )
+            previous_signature = signature_tuple
+            wait = getattr(page, "wait_for_timeout", None)
+            if callable(wait):
+                await wait(_CURRENT_TABLE_WAIT_MS)
+            else:
+                await asyncio.sleep(_CURRENT_TABLE_WAIT_MS / 1000)
+        raise _baseline_failed(expected_page_id)
+
+    @staticmethod
+    async def _scroll_current_table_to_bottom(target: Any) -> bool:
+        try:
+            result = await target.evaluate(
+                """
+                element => {
+                  const containers = [];
+                  let node = element;
+                  while (node && node.parentElement) {
+                    node = node.parentElement;
+                    const style = getComputedStyle(node);
+                    if (
+                      node.scrollHeight > node.clientHeight + 2 &&
+                      /(auto|scroll)/.test(style.overflowY || '')
+                    ) {
+                      containers.push(node);
+                    }
+                  }
+                  for (const container of containers) {
+                    container.scrollTop = container.scrollHeight;
+                  }
+                  window.scrollTo(0, document.documentElement.scrollHeight);
+                  const allContainersAtBottom = containers.every(container =>
+                    container.scrollTop + container.clientHeight >=
+                    container.scrollHeight - 2
+                  );
+                  const documentAtBottom =
+                    window.scrollY + window.innerHeight >=
+                    document.documentElement.scrollHeight - 2;
+                  return allContainersAtBottom && documentAtBottom;
+                }
+                """
+            )
+            return result is True
+        except Exception as exc:
+            raise _baseline_failed() from exc
+
     async def _read_full_caption_hash(
         self,
         row: FacebookReelRow,
@@ -785,7 +1373,6 @@ class FacebookPageContentReader:
         try:
             await detail.goto(row.url, wait_until="domcontentloaded")
             await self._wait_for_verification(detail)
-            await self._recheck_page(detail, expected_page_id)
             if _canonical_reel_url(
                 _page_url(detail),
                 expected_reel_id=row.reel_id,
@@ -830,11 +1417,16 @@ class FacebookPageContentReader:
             selected = await activate_saved_facebook_page(page, expected_page_id)
             if _normalized_page_id(selected.page_id) != expected_page_id:
                 raise _baseline_failed(expected_page_id)
-            await page.goto(
-                _CONTENT_LIST_URL.format(expected_page_id),
-                wait_until="domcontentloaded",
+            self._activated_page_id = expected_page_id
+
+            destination = await self._wait_for_content_entry(
+                page,
+                expected_page_id,
             )
+
+            await page.goto(destination, wait_until="domcontentloaded")
             await self._wait_for_verification(page)
+            await self._wait_for_content_surface(page, expected_page_id)
             await self._recheck_page(page, expected_page_id)
             if not _is_exact_content_url(
                 _page_url(page),
@@ -848,6 +1440,96 @@ class FacebookPageContentReader:
             raise _baseline_failed(expected_page_id) from exc
         except Exception as exc:
             raise _baseline_failed(expected_page_id) from exc
+
+    async def _wait_for_content_entry(
+        self,
+        page: Any,
+        expected_page_id: str,
+    ) -> str:
+        """Wait for the exact Page-bound Content link rendered by Business Suite."""
+
+        for _ in range(_CONTENT_SURFACE_WAIT_ATTEMPTS):
+            entry_links: list[Any] = []
+            for label in _CONTENT_ENTRY_LABELS:
+                entry_links.extend(
+                    await self._visible(
+                        page.get_by_role("link", name=label, exact=True)
+                    )
+                )
+            if len(entry_links) > 1:
+                raise _baseline_failed(expected_page_id)
+            if len(entry_links) == 1:
+                entry_url = await entry_links[0].get_attribute("href")
+                if _is_exact_content_entry_url(
+                    entry_url,
+                    expected_page_id=expected_page_id,
+                ) or _is_exact_content_url(
+                    entry_url,
+                    expected_page_id=expected_page_id,
+                ):
+                    return str(entry_url)
+                raise _baseline_failed(expected_page_id)
+            wait = getattr(page, "wait_for_timeout", None)
+            if callable(wait):
+                await wait(_CONTENT_SURFACE_WAIT_MS)
+            else:
+                await asyncio.sleep(_CONTENT_SURFACE_WAIT_MS / 1000)
+        raise _baseline_failed(expected_page_id)
+
+    async def _wait_for_content_surface(
+        self,
+        page: Any,
+        expected_page_id: str,
+    ) -> None:
+        for _ in range(_CONTENT_SURFACE_WAIT_ATTEMPTS):
+            if _is_exact_content_url(
+                _page_url(page),
+                expected_page_id=expected_page_id,
+            ):
+                if _is_current_content_url(
+                    _page_url(page),
+                    expected_page_id=expected_page_id,
+                ):
+                    title_headers = await self._visible(
+                        page.get_by_role(
+                            "columnheader",
+                            name="标题",
+                            exact=True,
+                        )
+                    )
+                    if not title_headers:
+                        title_headers = await self._visible(
+                            page.get_by_role(
+                                "columnheader",
+                                name="Title",
+                                exact=True,
+                            )
+                        )
+                    date_headers = await self._visible(
+                        page.get_by_role(
+                            "columnheader",
+                            name="发布日期",
+                            exact=True,
+                        )
+                    )
+                    if not date_headers:
+                        date_headers = await self._visible(
+                            page.get_by_role(
+                                "columnheader",
+                                name="Publish date",
+                                exact=True,
+                            )
+                        )
+                    if len(title_headers) == 1 and len(date_headers) == 1:
+                        return
+                elif await self._visible(page.locator("main")):
+                    return
+            wait = getattr(page, "wait_for_timeout", None)
+            if callable(wait):
+                await wait(_CONTENT_SURFACE_WAIT_MS)
+            else:
+                await asyncio.sleep(_CONTENT_SURFACE_WAIT_MS / 1000)
+        raise _baseline_failed(expected_page_id)
 
     async def _get_list_page(self):
         if self._list_page is None:
@@ -871,6 +1553,15 @@ class FacebookPageContentReader:
             if _normalized_page_id(selected.page_id) != expected_page_id:
                 raise _baseline_failed(expected_page_id)
         except FacebookPagePublishError as exc:
+            if (
+                exc.error_code == "facebook_page_not_found"
+                and self._activated_page_id == expected_page_id
+                and _is_exact_content_url(
+                    _page_url(page),
+                    expected_page_id=expected_page_id,
+                )
+            ):
+                return
             if exc.error_code == "facebook_page_baseline_read_failed":
                 raise
             raise _baseline_failed(expected_page_id) from exc
@@ -881,9 +1572,9 @@ class FacebookPageContentReader:
         page = await self._get_list_page()
         wait = getattr(page, "wait_for_timeout", None)
         if callable(wait):
-            await wait(250)
+            await wait(_READBACK_SETTLEMENT_WAIT_MS)
         else:
-            await asyncio.sleep(0.25)
+            await asyncio.sleep(_READBACK_SETTLEMENT_WAIT_MS / 1000)
 
     @staticmethod
     async def _elements(locator: Any) -> list[Any]:

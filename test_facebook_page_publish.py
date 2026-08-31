@@ -11,9 +11,12 @@ from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 from app_core import overseas_meta_content
 from app_core.overseas_meta_errors import FacebookPagePublishError
+from app_core.overseas_meta_page_identity import FacebookPageIdentity
 from uploader.meta_uploader.main import MetaManualInterventionRequired
 from uploader.meta_uploader.page_form import (
     FacebookPageFormAdapter,
@@ -27,6 +30,7 @@ from uploader.meta_uploader.content_list import (
     FacebookReelMatch,
     FacebookReelReceipt,
     FacebookReelRow,
+    _current_table_timestamp,
     match_unique_new_facebook_reel,
 )
 
@@ -592,12 +596,13 @@ class FacebookPageFormTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(adapter.composer_open_count, 0)
         self.assertEqual(adapter.upload_count, 0)
 
-    async def test_unbound_generic_create_reel_entry_is_never_used(self) -> None:
+    async def test_ambiguous_generic_create_reel_entries_are_never_used(self) -> None:
         generic = _FakeButton(label="Create reel")
+        duplicate = _FakeButton(label="Create reel")
         page = _FakeFacebookPage(
             pages=(("1001", "One"),),
             active_page_id="1001",
-            generic_create_buttons=[generic],
+            generic_create_buttons=[generic, duplicate],
         )
         adapter = FacebookPageFormAdapter(
             page,
@@ -606,6 +611,7 @@ class FacebookPageFormTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError):
             await adapter._click_create_reel_entry("1001")
         self.assertEqual(generic.click_count, 0)
+        self.assertEqual(duplicate.click_count, 0)
 
     async def test_page_drift_after_open_fails_before_any_form_write(self) -> None:
         adapter = self.adapter(
@@ -722,6 +728,229 @@ class FacebookPageFormTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(page.public_select_count, 1)
         self.assertEqual(page.final_click_count, 0)
 
+    async def test_live_business_suite_reels_form_uses_current_controls_and_never_shares(
+        self,
+    ) -> None:
+        """真实 Meta 形状必须走创建 Reels、文件选择器和描述框。"""
+
+        from playwright.async_api import async_playwright
+
+        page_id = "1001"
+        identity = FacebookPageIdentity(
+            page_id=page_id,
+            page_name="墨白",
+            can_manage_content=True,
+        )
+
+        class LiveDomAdapter(FacebookPageFormAdapter):
+            async def select_expected_page(
+                self,
+                expected_page_id: str,
+            ) -> FacebookPageIdentity:
+                self.assert_expected_page_id = expected_page_id
+                return identity
+
+        async def exact_binding(page, account) -> FacebookPageIdentity:
+            self.assertEqual(account["accountReference"], page_id)
+            self.assertIn("/latest/reels_composer/", page.url)
+            self.assertIn(f"asset_id={page_id}", page.url)
+            return identity
+
+        html = """
+        <!doctype html>
+        <html lang="zh-CN">
+          <body>
+            <button id="create" type="button" onclick="openComposer()">创建 Reels</button>
+            <script>
+              window.createClicks = 0;
+              window.addVideoClicks = 0;
+              window.shareClicks = 0;
+              window.globalShareClicks = 0;
+              function openComposer() {
+                window.createClicks += 1;
+                history.pushState({}, '', '/latest/reels_composer/?asset_id=1001');
+                setTimeout(() => {
+                  document.body.innerHTML = `
+                    <main>
+                      <button id="global-share" type="button"
+                              onclick="window.globalShareClicks += 1">分享</button>
+                      <section id="reel-composer">
+                      <div role="combobox" aria-label="Facebook 墨白">Facebook 墨白</div>
+                      <h1>创建 Reels</h1>
+                      <input role="textbox" aria-label="为你的 Reels 添加标题" value="">
+                      <div role="textbox" contenteditable="true"
+                           aria-label="在对话框中输入内容，即可为帖子添加文字。"></div>
+                      <input id="unrelated-file" type="file" accept="image/*" hidden>
+                      <button id="add-video" type="button" onclick="chooseVideo()">添加视频</button>
+                      <div id="share" role="button" aria-disabled="true"
+                           onclick="if (this.getAttribute('aria-disabled') === 'false') window.shareClicks += 1">
+                        <span>分享</span><span>​</span>
+                      </div>
+                      </section>
+                    </main>`;
+                }, 75);
+              }
+              function chooseVideo() {
+                window.addVideoClicks += 1;
+                const input = document.createElement('input');
+                input.type = 'file';
+                input.accept = 'video/*';
+                input.hidden = true;
+                input.addEventListener('change', () => {
+                  const file = input.files[0];
+                  const row = document.createElement('div');
+                  row.className = 'media-row';
+                  row.innerHTML = `<span class="filename"></span><span class="progress">100%</span>`;
+                  row.querySelector('.filename').textContent = file.name;
+                  document.body.appendChild(row);
+                  document.querySelector('#share').setAttribute('aria-disabled', 'false');
+                });
+                document.body.appendChild(input);
+                input.click();
+              }
+            </script>
+          </body>
+        </html>
+        """
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            page = await browser.new_page()
+            await page.route(
+                "https://business.facebook.com/**",
+                lambda route: route.fulfill(
+                    status=200,
+                    headers={"Content-Type": "text/html; charset=utf-8"},
+                    body=html,
+                ),
+            )
+            await page.goto(
+                f"https://business.facebook.com/latest/home/?asset_id={page_id}"
+            )
+            adapter = LiveDomAdapter(
+                page,
+                wait_for_verification=self._no_verification,
+            )
+            with patch(
+                "uploader.meta_uploader.page_form.validate_facebook_page_binding",
+                side_effect=exact_binding,
+            ):
+                snapshot = await adapter.fill_and_readback(self.expectation())
+
+            self.assertEqual(snapshot.page_id, page_id)
+            self.assertEqual(snapshot.content_kind, "reel")
+            self.assertEqual(snapshot.video_name, "clip.mp4")
+            self.assertEqual(snapshot.video_count, 1)
+            self.assertEqual(snapshot.caption, "正文 #标签")
+            self.assertEqual(snapshot.visibility, "public")
+            self.assertEqual(snapshot.final_action_label, "分享")
+            self.assertTrue(snapshot.final_action_ready)
+            self.assertEqual(await page.evaluate("window.createClicks"), 1)
+            self.assertEqual(await page.evaluate("window.addVideoClicks"), 1)
+            self.assertEqual(await page.evaluate("window.shareClicks"), 0)
+            self.assertEqual(await page.evaluate("window.globalShareClicks"), 0)
+            self.assertEqual(
+                await page.get_by_role(
+                    "textbox",
+                    name="为你的 Reels 添加标题",
+                    exact=True,
+                ).input_value(),
+                "",
+            )
+            self.assertEqual(
+                await page.get_by_role(
+                    "textbox",
+                    name="在对话框中输入内容，即可为帖子添加文字。",
+                    exact=True,
+                ).inner_text(),
+                "正文 #标签",
+            )
+            await browser.close()
+
+    async def test_post_click_confirmation_is_observed_without_second_click(
+        self,
+    ) -> None:
+        from playwright.async_api import async_playwright
+
+        html = """
+        <!doctype html><html><body>
+          <main>
+            <h1>创建 Reels</h1>
+            <div role="textbox" contenteditable="true"
+                 aria-label="在对话框中输入内容，即可为帖子添加文字。">正文 #标签</div>
+            <button id="share" type="button" onclick="openConfirm()">分享</button>
+          </main>
+          <script>
+            window.finalClicks = 0;
+            window.confirmClicks = 0;
+            function openConfirm() {
+              window.finalClicks += 1;
+              document.body.insertAdjacentHTML('beforeend', `
+                <div role="dialog" aria-label="确认发布">
+                  <h2>确认发布</h2>
+                  <button type="button" onclick="window.confirmClicks += 1">发布</button>
+                </div>`);
+            }
+          </script>
+        </body></html>
+        """
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            page = await browser.new_page()
+            await page.route(
+                "https://business.facebook.com/**",
+                lambda route: route.fulfill(
+                    status=200,
+                    headers={"Content-Type": "text/html; charset=utf-8"},
+                    body=html,
+                ),
+            )
+            await page.goto(
+                "https://business.facebook.com/latest/reels_composer/?asset_id=1001"
+            )
+            adapter = FacebookPageFormAdapter(
+                page,
+                wait_for_verification=self._no_verification,
+            )
+            adapter._current_expected = self.expectation()
+            adapter._fresh_live_composer_page_id = "1001"
+            button = await adapter.final_action_button()
+            await button.click()
+
+            observation = await adapter.observe_post_click_state("1001")
+
+            self.assertEqual(observation, "confirmation_pending")
+            self.assertEqual(await page.evaluate("window.finalClicks"), 1)
+            self.assertEqual(await page.evaluate("window.confirmClicks"), 0)
+            await browser.close()
+
+    async def test_upload_wait_accepts_completion_after_legacy_six_second_window(
+        self,
+    ) -> None:
+        """慢网下第 25 次以后才完成也不能被旧 6 秒上限误杀。"""
+
+        class SlowUploadAdapter(_HarnessAdapter):
+            preview_reads = 0
+
+            async def _read_video_previews(self) -> list[tuple[str, str]]:
+                if self.upload_count == 0:
+                    return []
+                self.preview_reads += 1
+                state = "completed" if self.preview_reads >= 30 else "uploading"
+                return [("clip.mp4", state)]
+
+        page = _FakeFacebookPage(
+            pages=(("1001", "One"),),
+            active_page_id="1001",
+        )
+        adapter = SlowUploadAdapter(
+            page,
+            wait_for_verification=self._no_verification,
+        )
+        snapshot = await adapter.fill_and_readback(self.expectation())
+        self.assertEqual(snapshot.video_name, "clip.mp4")
+        self.assertGreaterEqual(adapter.preview_reads, 30)
+
     async def test_production_dom_page_drift_after_create_fails_before_write(self) -> None:
         page = _PlaywrightLikeFacebookPage(drift_after_create=True)
         adapter = FacebookPageFormAdapter(
@@ -739,7 +968,7 @@ class FacebookPageFormTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(page.set_input_files_calls, 0)
         self.assertEqual(page.caption_fill_count, 0)
 
-    async def test_production_dom_generic_create_selector_cannot_replace_page_bound_entry(self) -> None:
+    async def test_generic_create_requires_live_composer_route_before_any_write(self) -> None:
         page = _PlaywrightLikeFacebookPage(
             page_bound_create=False,
             generic_create=True,
@@ -750,7 +979,7 @@ class FacebookPageFormTests(unittest.IsolatedAsyncioTestCase):
         )
         with self.assertRaises(FacebookPagePublishError):
             await adapter.fill_and_readback(self.expectation())
-        self.assertEqual(page.create_click_count, 0)
+        self.assertEqual(page.create_click_count, 1)
         self.assertEqual(page.set_input_files_calls, 0)
 
     async def test_explicit_restored_draft_fails_even_when_fields_are_empty(self) -> None:
@@ -1136,6 +1365,10 @@ class _ContentPage:
 
     async def goto(self, url: str, **_kwargs) -> None:
         self.context.goto_urls.append(url)
+        remaining_failures = int(self.context.fail_url_counts.get(url, 0))
+        if remaining_failures > 0:
+            self.context.fail_url_counts[url] = remaining_failures - 1
+            raise RuntimeError("transient navigation failure")
         if url in self.context.fail_urls:
             raise RuntimeError("navigation failed")
         if "/latest/content" in url:
@@ -1247,6 +1480,22 @@ class _ContentPage:
         exact: bool = False,
     ) -> _FakeLocator:
         self.context.role_queries += 1
+        if (
+            self.mode == "generic"
+            and role == "link"
+            and exact
+            and name == "Content"
+        ):
+            return _FakeLocator(
+                [
+                    _ContentElement(
+                        self,
+                        attributes={
+                            "href": "https://business.facebook.com/latest/content?asset_id=1001"
+                        },
+                    )
+                ]
+            )
         if self.mode == "decision" and role in {"alert", "status"} and name is None:
             return _FakeLocator(
                 [
@@ -1297,6 +1546,7 @@ class _ContentContext:
         active_page_id: str = "1001",
         switch_mismatch: bool = False,
         fail_urls: set[str] | None = None,
+        fail_url_counts: dict[str, int] | None = None,
         content_reported_url: str = "",
         terminal_text: str = "No more results",
         empty_text: str = "No content yet",
@@ -1313,6 +1563,7 @@ class _ContentContext:
         self.active_page_id = active_page_id
         self.switch_mismatch = switch_mismatch
         self.fail_urls = set(fail_urls or set())
+        self.fail_url_counts = dict(fail_url_counts or {})
         self.content_reported_url = content_reported_url
         self.terminal_text = terminal_text
         self.empty_text = empty_text
@@ -1478,6 +1729,24 @@ class FacebookPageContentListTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(match.new_count, 1)
         self.assertEqual(match.matching_count, 1)
 
+    def test_minute_precision_timestamp_in_click_minute_is_success(self) -> None:
+        match = match_unique_new_facebook_reel(
+            baseline=self.baseline([]),
+            current_rows=[
+                self.row(
+                    "new",
+                    caption=self.expected_caption,
+                    published_at="2026-08-30T22:24:00+00:00",
+                )
+            ],
+            expected_page_id=self.page_id,
+            expected_caption_sha256=self.expected_caption_hash,
+            clicked_at="2026-08-30T22:24:02.710000+00:00",
+        )
+        self.assertEqual(match.status, "unique")
+        self.assertIsNotNone(match.receipt)
+        self.assertEqual(match.receipt.reel_id, "new")
+
     def test_real_reel_types_pass_task5_lazy_exact_type_gate(self) -> None:
         from app_core import controlled_publish
 
@@ -1609,6 +1878,751 @@ class FacebookPageContentListTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(baseline.page_id, "1001")
         self.assertEqual(baseline.rows, ())
         self.assertRegex(baseline.snapshot_sha256, r"^[0-9a-f]{64}$")
+
+    async def _capture_current_table_html(
+        self,
+        table_body: str,
+        *,
+        controls_html: str = "",
+        page_script: str = "",
+        detail_html: str = "",
+        max_samples: int = 20,
+    ) -> FacebookPageContentBaseline:
+        from playwright.async_api import async_playwright
+
+        home_html = """
+        <!doctype html><html><body>
+          <div data-page-id="1001" data-page-name="墨白"
+               data-can-manage-content="true" data-page-active="true">墨白</div>
+          <a role="link" aria-label="内容"
+             href="https://business.facebook.com/latest/posts?asset_id=1001">内容</a>
+        </body></html>
+        """
+        posts_html = f"""
+        <!doctype html><html><body>
+          <script>
+            history.replaceState({{}}, '',
+              '/latest/posts/published_posts/?asset_id=1001');
+            {page_script}
+          </script>
+          {controls_html}
+          <table>
+            <tr role="row">
+              <th role="columnheader">标题</th>
+              <th role="columnheader">发布日期</th>
+            </tr>
+            {table_body}
+          </table>
+        </body></html>
+        """
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            context = await browser.new_context()
+
+            async def serve(route) -> None:
+                body = (
+                    posts_html
+                    if "/latest/posts" in route.request.url
+                    else home_html
+                )
+                await route.fulfill(
+                    status=200,
+                    headers={"Content-Type": "text/html; charset=utf-8"},
+                    body=body,
+                )
+
+            await context.route("https://business.facebook.com/**", serve)
+            if detail_html:
+                await context.route(
+                    "https://www.facebook.com/reel/**",
+                    lambda route: route.fulfill(
+                        status=200,
+                        headers={"Content-Type": "text/html; charset=utf-8"},
+                        body=detail_html,
+                    ),
+                )
+            reader = FacebookPageContentReader(
+                context,
+                wait_for_verification=self.no_verification,
+            )
+            try:
+                with (
+                    patch(
+                        "uploader.meta_uploader.content_list._CURRENT_TABLE_MAX_SAMPLES",
+                        max_samples,
+                    ),
+                    patch(
+                        "uploader.meta_uploader.content_list._CURRENT_TABLE_WAIT_MS",
+                        0,
+                    ),
+                    patch(
+                        "uploader.meta_uploader.content_list._CURRENT_EMPTY_MIN_SETTLEMENT_MS",
+                        0,
+                    ),
+                    patch(
+                        "uploader.meta_uploader.content_list._READBACK_SETTLEMENT_WAIT_MS",
+                        0,
+                    ),
+                ):
+                    return await reader.capture_baseline(expected_page_id="1001")
+            finally:
+                await context.close()
+                await browser.close()
+
+    async def test_current_posts_table_accepts_one_explicit_empty_status(self) -> None:
+        baseline = await self._capture_current_table_html(
+            '<div role="status">No content yet</div>'
+        )
+        self.assertEqual(baseline.page_id, "1001")
+        self.assertEqual(baseline.rows, ())
+
+    async def test_current_posts_table_headers_without_empty_status_fail_closed(
+        self,
+    ) -> None:
+        with self.assertRaises(FacebookPagePublishError) as raised:
+            await self._capture_current_table_html("", max_samples=2)
+        self.assertEqual(
+            raised.exception.error_code,
+            "facebook_page_baseline_read_failed",
+        )
+
+    async def test_current_posts_table_rejects_duplicate_empty_status(self) -> None:
+        with self.assertRaises(FacebookPagePublishError) as raised:
+            await self._capture_current_table_html(
+                '<div role="status">No content yet</div>'
+                '<div role="status">No content yet</div>',
+                max_samples=2,
+            )
+        self.assertEqual(
+            raised.exception.error_code,
+            "facebook_page_baseline_read_failed",
+        )
+
+    def test_current_table_relative_timestamps_use_stable_minute_precision(
+        self,
+    ) -> None:
+        observed_at = datetime(
+            2026,
+            8,
+            30,
+            14,
+            24,
+            59,
+            987654,
+            tzinfo=timezone.utc,
+        )
+        cases = (
+            ("刚刚", "2026-08-30T14:24:00+00:00"),
+            ("1 分钟前", "2026-08-30T14:23:00+00:00"),
+            ("1 minute ago", "2026-08-30T14:23:00+00:00"),
+            ("1 hour ago", "2026-08-30T13:24:00+00:00"),
+        )
+        for raw, expected in cases:
+            with self.subTest(raw=raw):
+                self.assertEqual(
+                    _current_table_timestamp(raw, observed_at=observed_at),
+                    expected,
+                )
+
+    def test_meta_absolute_timestamp_uses_explicit_page_timezone_at_boundary(
+        self,
+    ) -> None:
+        observed_at = datetime(
+            2026,
+            8,
+            31,
+            0,
+            2,
+            tzinfo=ZoneInfo("Asia/Shanghai"),
+        )
+        self.assertEqual(
+            _current_table_timestamp(
+                "8月30日 08:55",
+                observed_at=observed_at,
+                display_timezone=ZoneInfo("America/Los_Angeles"),
+            ),
+            "2026-08-30T15:55:00+00:00",
+        )
+        with self.assertRaises(ValueError):
+            _current_table_timestamp(
+                "8月30日 08:55",
+                observed_at=observed_at,
+                display_timezone=None,
+            )
+
+    async def test_current_posts_search_is_cleared_before_empty_is_complete(
+        self,
+    ) -> None:
+        reel_id = "323456789012345"
+        caption = "搜索筛选清理验证\n#AI"
+        baseline = await self._capture_current_table_html(
+            '<div id="empty" role="status">No content yet</div>',
+            controls_html=(
+                '<input role="searchbox" aria-label="按编号或配文搜索" '
+                'placeholder="按编号或配文搜索" value="FB0526-P3">'
+            ),
+            page_script=f"""
+              document.addEventListener('input', event => {{
+                if (event.target.getAttribute('role') !== 'searchbox' ||
+                    event.target.value !== '') return;
+                document.querySelector('#empty').remove();
+                document.querySelector('tbody').insertAdjacentHTML(
+                  'beforeend',
+                  `<tr role="row" data-index="0">
+                     <td><input type="checkbox" aria-label="选择编号为{reel_id}的项目"></td>
+                     <td aria-colindex="2"><div>搜索筛选清理验证</div><span>Reels</span></td>
+                     <td aria-colindex="3"><time datetime="2026-08-30T15:55:00+00:00">8月30日 08:55</time></td>
+                   </tr>`
+                );
+              }});
+            """,
+            detail_html=f"""
+              <!doctype html><html><head>
+                <meta property="og:url" content="https://www.facebook.com/reel/{reel_id}">
+                <meta property="og:description" content="{caption}">
+              </head><body></body></html>
+            """,
+        )
+        self.assertEqual([row.reel_id for row in baseline.rows], [reel_id])
+
+    async def test_current_posts_date_scope_is_all_time_before_complete_read(
+        self,
+    ) -> None:
+        reel_id = "423456789012345"
+        caption = "日期范围归一验证\n#AI"
+        baseline = await self._capture_current_table_html(
+            '<div id="empty" role="status">No content yet</div>',
+            controls_html="""
+              <button id="date-range" type="button"
+                      aria-label="过去90天：2026年6月1日–2026年8月29日"
+                      onclick="document.querySelector('#all-time').hidden = false">
+                过去90天：2026年6月1日–2026年8月29日
+              </button>
+              <button id="all-time" type="button" hidden
+                      onclick="selectAllTime()">创建至今</button>
+            """,
+            page_script=f"""
+              function selectAllTime() {{
+                const range = document.querySelector('#date-range');
+                range.textContent = '创建至今：2026年8月30日';
+                range.setAttribute('aria-label', '创建至今：2026年8月30日');
+                document.querySelector('#all-time').hidden = true;
+                document.querySelector('#empty').remove();
+                document.querySelector('tbody').insertAdjacentHTML(
+                  'beforeend',
+                  `<tr role="row" data-index="0">
+                     <td><input type="checkbox" aria-label="选择编号为{reel_id}的项目"></td>
+                     <td aria-colindex="2"><div>日期范围归一验证</div><span>Reels</span></td>
+                     <td aria-colindex="3"><time datetime="2026-08-30T15:55:00+00:00">8月30日 08:55</time></td>
+                   </tr>`
+                );
+              }}
+            """,
+            detail_html=f"""
+              <!doctype html><html><head>
+                <meta property="og:url" content="https://www.facebook.com/reel/{reel_id}">
+                <meta property="og:description" content="{caption}">
+              </head><body></body></html>
+            """,
+        )
+        self.assertEqual([row.reel_id for row in baseline.rows], [reel_id])
+
+    async def test_current_table_relative_timestamp_is_stable_across_samples(
+        self,
+    ) -> None:
+        baseline = await self._capture_current_table_html(
+            """
+            <tr role="row" data-index="0">
+              <td><input type="checkbox" aria-label="选择编号为122093996289432772的项目"></td>
+              <td aria-colindex="2"><div>墨白更换了封面照片</div><span>照片</span></td>
+              <td aria-colindex="3"><div>刚刚</div></td>
+            </tr>
+            """
+        )
+        self.assertEqual(baseline.rows, ())
+
+    async def test_live_business_suite_current_posts_table_proves_empty_reel_baseline(
+        self,
+    ) -> None:
+        """当前 Meta 内容表只有照片时，Reel 基线必须明确为空。"""
+
+        from playwright.async_api import async_playwright
+
+        home_html = """
+        <!doctype html><html><body>
+          <div data-page-id="1001" data-page-name="墨白"
+               data-can-manage-content="true" data-page-active="true">墨白</div>
+          <a role="link" aria-label="内容"
+             href="https://business.facebook.com/latest/posts?asset_id=1001">内容</a>
+        </body></html>
+        """
+        posts_html = """
+        <!doctype html><html><body>
+          <span data-meta-timezone="Asia/Shanghai" hidden></span>
+          <script>
+            history.replaceState({}, '',
+              '/latest/posts/published_posts/?asset_id=1001');
+          </script>
+          <table>
+            <tr role="row">
+              <th role="columnheader">标题</th>
+              <th role="columnheader">发布日期</th>
+              <th role="columnheader">状态</th>
+            </tr>
+            <tr role="row" data-index="0">
+              <td><input type="checkbox" aria-label="选择编号为122093996289432772的项目"></td>
+              <td aria-colindex="2"><div>墨白更换了封面照片</div><span>照片</span></td>
+              <td aria-colindex="3"><div>8月30日 18:50</div></td>
+            </tr>
+            <tr role="row" data-index="1">
+              <td><input type="checkbox" aria-label="选择编号为122093995317432772的项目"></td>
+              <td aria-colindex="2"><div>墨白更换了头像。</div><span>照片</span></td>
+              <td aria-colindex="3"><div>8月30日 18:48</div></td>
+            </tr>
+          </table>
+        </body></html>
+        """
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            context = await browser.new_context()
+
+            async def serve(route) -> None:
+                body = posts_html if "/latest/posts" in route.request.url else home_html
+                await route.fulfill(
+                    status=200,
+                    headers={"Content-Type": "text/html; charset=utf-8"},
+                    body=body,
+                )
+
+            await context.route("https://business.facebook.com/**", serve)
+            reader = FacebookPageContentReader(
+                context,
+                wait_for_verification=self.no_verification,
+            )
+            try:
+                baseline = await reader.capture_baseline(expected_page_id="1001")
+            finally:
+                await context.close()
+                await browser.close()
+
+        self.assertEqual(baseline.page_id, "1001")
+        self.assertEqual(baseline.rows, ())
+
+    async def test_live_business_suite_waits_for_delayed_current_table_rows(
+        self,
+    ) -> None:
+        """表头先出现时，不能在延迟的 Reel 数据行渲染前判定列表为空。"""
+
+        from playwright.async_api import async_playwright
+
+        reel_id = "123456789012345"
+        caption = "延迟加载验证\n#AI"
+        home_html = """
+        <!doctype html><html><body>
+          <div data-page-id="1001" data-page-name="墨白"
+               data-can-manage-content="true" data-page-active="true">墨白</div>
+          <a role="link" aria-label="内容"
+             href="https://business.facebook.com/latest/posts?asset_id=1001">内容</a>
+        </body></html>
+        """
+        posts_html = f"""
+        <!doctype html><html><body>
+          <script>
+            history.replaceState({{}}, '',
+              '/latest/posts/published_posts/?asset_id=1001');
+            setTimeout(() => {{
+              document.querySelector('tbody').insertAdjacentHTML(
+                'beforeend',
+                `<tr role="row" data-index="0">
+                   <td><input type="checkbox" aria-label="选择编号为{reel_id}的项目"></td>
+                   <td aria-colindex="2"><div>延迟加载验证</div><span>Reels</span></td>
+                   <td aria-colindex="3"><time datetime="2026-08-30T14:24:00+00:00">8月30日 22:24</time></td>
+                 </tr>`
+              );
+            }}, 1200);
+          </script>
+          <table><tbody>
+            <tr role="row">
+              <th role="columnheader">标题</th>
+              <th role="columnheader">发布日期</th>
+            </tr>
+          </tbody></table>
+        </body></html>
+        """
+        detail_html = f"""
+        <!doctype html><html><head>
+          <meta property="og:url" content="https://www.facebook.com/reel/{reel_id}">
+          <meta property="og:description" content="{caption}">
+        </head><body></body></html>
+        """
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            context = await browser.new_context()
+
+            async def serve_business(route) -> None:
+                body = posts_html if "/latest/posts" in route.request.url else home_html
+                await route.fulfill(
+                    status=200,
+                    headers={"Content-Type": "text/html; charset=utf-8"},
+                    body=body,
+                )
+
+            async def serve_reel(route) -> None:
+                await route.fulfill(
+                    status=200,
+                    headers={"Content-Type": "text/html; charset=utf-8"},
+                    body=detail_html,
+                )
+
+            await context.route("https://business.facebook.com/**", serve_business)
+            await context.route("https://www.facebook.com/reel/**", serve_reel)
+            reader = FacebookPageContentReader(
+                context,
+                wait_for_verification=self.no_verification,
+            )
+            try:
+                baseline = await reader.capture_baseline(expected_page_id="1001")
+            finally:
+                await context.close()
+                await browser.close()
+
+        self.assertEqual(len(baseline.rows), 1)
+        self.assertEqual(baseline.rows[0].reel_id, reel_id)
+
+    async def test_current_table_waits_past_transient_empty_status_for_row(
+        self,
+    ) -> None:
+        """短暂的“暂无内容”不能覆盖随后完成渲染的已有 Reel。"""
+
+        from playwright.async_api import async_playwright
+
+        reel_id = "223456789012345"
+        caption = "空状态后延迟加载\n#AI"
+        home_html = """
+        <!doctype html><html><body>
+          <div data-page-id="1001" data-page-name="墨白"
+               data-can-manage-content="true" data-page-active="true">墨白</div>
+          <a role="link" aria-label="内容"
+             href="https://business.facebook.com/latest/posts?asset_id=1001">内容</a>
+        </body></html>
+        """
+        posts_html = f"""
+        <!doctype html><html><body>
+          <script>
+            history.replaceState({{}}, '',
+              '/latest/posts/published_posts/?asset_id=1001');
+            setTimeout(() => {{
+              document.querySelector('[role="status"]').remove();
+              document.querySelector('tbody').insertAdjacentHTML(
+                'beforeend',
+                `<tr role="row" data-index="0">
+                   <td><input type="checkbox" aria-label="选择编号为{reel_id}的项目"></td>
+                   <td aria-colindex="2"><div>空状态后延迟加载</div><span>Reels</span></td>
+                   <td aria-colindex="3"><time datetime="2026-08-30T14:24:00+00:00">8月30日 22:24</time></td>
+                 </tr>`
+              );
+            }}, 1200);
+          </script>
+          <div role="status">No content yet</div>
+          <table><tbody>
+            <tr role="row">
+              <th role="columnheader">标题</th>
+              <th role="columnheader">发布日期</th>
+            </tr>
+          </tbody></table>
+        </body></html>
+        """
+        detail_html = f"""
+        <!doctype html><html><head>
+          <meta property="og:url" content="https://www.facebook.com/reel/{reel_id}">
+          <meta property="og:description" content="{caption}">
+        </head><body></body></html>
+        """
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            context = await browser.new_context()
+
+            async def serve_business(route) -> None:
+                body = posts_html if "/latest/posts" in route.request.url else home_html
+                await route.fulfill(
+                    status=200,
+                    headers={"Content-Type": "text/html; charset=utf-8"},
+                    body=body,
+                )
+
+            async def serve_reel(route) -> None:
+                await route.fulfill(
+                    status=200,
+                    headers={"Content-Type": "text/html; charset=utf-8"},
+                    body=detail_html,
+                )
+
+            await context.route("https://business.facebook.com/**", serve_business)
+            await context.route("https://www.facebook.com/reel/**", serve_reel)
+            reader = FacebookPageContentReader(
+                context,
+                wait_for_verification=self.no_verification,
+            )
+            try:
+                baseline = await reader.capture_baseline(expected_page_id="1001")
+            finally:
+                await context.close()
+                await browser.close()
+
+        self.assertEqual(len(baseline.rows), 1)
+        self.assertEqual(baseline.rows[0].reel_id, reel_id)
+        self.assertEqual(
+            baseline.rows[0].caption_sha256,
+            hashlib.sha256(caption.encode("utf-8")).hexdigest(),
+        )
+
+    async def test_live_business_suite_waits_for_delayed_current_content_entry(
+        self,
+    ) -> None:
+        """Page 身份先出现时，不能因侧栏入口延迟而退回失效旧地址。"""
+
+        from playwright.async_api import async_playwright
+
+        home_html = """
+        <!doctype html><html><body>
+          <div data-page-id="1001" data-page-name="墨白"
+               data-can-manage-content="true" data-page-active="true">墨白</div>
+          <script>
+            setTimeout(() => {
+              const link = document.createElement('a');
+              link.setAttribute('role', 'link');
+              link.setAttribute('aria-label', '内容');
+              link.href = 'https://business.facebook.com/latest/posts?asset_id=1001';
+              link.textContent = '内容';
+              document.body.appendChild(link);
+            }, 500);
+          </script>
+        </body></html>
+        """
+        posts_html = """
+        <!doctype html><html><body>
+          <span data-meta-timezone="Asia/Shanghai" hidden></span>
+          <script>
+            history.replaceState({}, '',
+              '/latest/posts/published_posts/?asset_id=1001');
+          </script>
+          <table>
+            <tr role="row">
+              <th role="columnheader">标题</th>
+              <th role="columnheader">发布日期</th>
+            </tr>
+            <tr role="row" data-index="0">
+              <td><input type="checkbox" aria-label="选择编号为122093996289432772的项目"></td>
+              <td aria-colindex="2"><div>墨白更换了封面照片</div><span>照片</span></td>
+              <td aria-colindex="3"><div>8月30日 18:50</div></td>
+            </tr>
+          </table>
+        </body></html>
+        """
+        legacy_html = """
+        <!doctype html><html><body>
+          <script>history.replaceState({}, '', '/latest/home/?typo_redirect=1');</script>
+        </body></html>
+        """
+        requests: list[str] = []
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            context = await browser.new_context()
+
+            async def serve(route) -> None:
+                url = route.request.url
+                requests.append(url)
+                if "/latest/content" in url:
+                    body = legacy_html
+                elif "/latest/posts" in url:
+                    body = posts_html
+                else:
+                    body = home_html
+                await route.fulfill(
+                    status=200,
+                    headers={"Content-Type": "text/html; charset=utf-8"},
+                    body=body,
+                )
+
+            await context.route("https://business.facebook.com/**", serve)
+            reader = FacebookPageContentReader(
+                context,
+                wait_for_verification=self.no_verification,
+            )
+            try:
+                with (
+                    patch(
+                        "uploader.meta_uploader.content_list._CONTENT_SURFACE_WAIT_ATTEMPTS",
+                        200,
+                    ),
+                    patch(
+                        "uploader.meta_uploader.content_list._CONTENT_SURFACE_WAIT_MS",
+                        5,
+                    ),
+                ):
+                    baseline = await reader.capture_baseline(
+                        expected_page_id="1001"
+                    )
+            finally:
+                await context.close()
+                await browser.close()
+
+        self.assertEqual(baseline.rows, ())
+        self.assertTrue(any("/latest/posts?" in url for url in requests))
+        self.assertFalse(any("/latest/content?" in url for url in requests))
+
+    async def test_current_posts_table_ignores_late_row_action_text(self) -> None:
+        """异步出现的“创建广告”等操作文案不能被当成内容身份变化。"""
+
+        from playwright.async_api import async_playwright
+
+        home_html = """
+        <!doctype html><html><body>
+          <div data-page-id="1001" data-page-name="墨白"
+               data-can-manage-content="true" data-page-active="true">墨白</div>
+          <a role="link" aria-label="内容"
+             href="https://business.facebook.com/latest/posts?asset_id=1001">内容</a>
+        </body></html>
+        """
+        posts_html = """
+        <!doctype html><html><body>
+          <span data-meta-timezone="Asia/Shanghai" hidden></span>
+          <script>
+            history.replaceState({}, '',
+              '/latest/posts/published_posts/?asset_id=1001');
+            setTimeout(() => {
+              const action = document.createElement('div');
+              action.textContent = '创建广告';
+              document.querySelector('#title-cell').appendChild(action);
+            }, 250);
+          </script>
+          <table>
+            <tr role="row">
+              <th role="columnheader">标题</th>
+              <th role="columnheader">发布日期</th>
+            </tr>
+            <tr role="row" data-index="0">
+              <td><input type="checkbox" aria-label="选择编号为122093996289432772的项目"></td>
+              <td id="title-cell" aria-colindex="2"><div>墨白更换了封面照片</div><span>照片</span></td>
+              <td aria-colindex="3"><div>8月30日 18:50</div></td>
+            </tr>
+          </table>
+        </body></html>
+        """
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            context = await browser.new_context()
+
+            async def serve(route) -> None:
+                body = posts_html if "/latest/posts" in route.request.url else home_html
+                await route.fulfill(
+                    status=200,
+                    headers={"Content-Type": "text/html; charset=utf-8"},
+                    body=body,
+                )
+
+            await context.route("https://business.facebook.com/**", serve)
+            reader = FacebookPageContentReader(
+                context,
+                wait_for_verification=self.no_verification,
+            )
+            try:
+                baseline = await reader.capture_baseline(expected_page_id="1001")
+            finally:
+                await context.close()
+                await browser.close()
+
+        self.assertEqual(baseline.rows, ())
+
+    async def test_live_business_suite_current_posts_table_reads_one_reel_detail(
+        self,
+    ) -> None:
+        """新版内容表的 Reel 编号必须回到公开详情页核对完整文案。"""
+
+        from playwright.async_api import async_playwright
+
+        home_html = """
+        <!doctype html><html><body>
+          <div data-page-id="1001" data-page-name="墨白"
+               data-can-manage-content="true" data-page-active="true">墨白</div>
+          <a role="link" aria-label="内容"
+             href="https://business.facebook.com/latest/posts?asset_id=1001">内容</a>
+        </body></html>
+        """
+        posts_html = """
+        <!doctype html><html><body>
+          <span data-meta-timezone="Asia/Shanghai" hidden></span>
+          <script>
+            history.replaceState({}, '',
+              '/latest/posts/published_posts/?asset_id=1001');
+          </script>
+          <table>
+            <tr role="row">
+              <th role="columnheader">标题</th>
+              <th role="columnheader">发布日期</th>
+              <th role="columnheader">状态</th>
+            </tr>
+            <tr role="row" data-index="0">
+              <td><input type="checkbox" aria-label="选择编号为998877665544的项目"></td>
+              <td aria-colindex="2"><div>正文 #AI</div><span>Reel</span></td>
+              <td aria-colindex="3"><div>8月30日 20:02</div></td>
+            </tr>
+          </table>
+        </body></html>
+        """
+        detail_html = """
+        <!doctype html><html><head>
+          <meta property="og:url" content="https://www.facebook.com/reel/998877665544">
+          <meta property="og:description" content=" 正文\r\n#AI ">
+        </head><body></body></html>
+        """
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            context = await browser.new_context()
+
+            async def serve_business(route) -> None:
+                body = posts_html if "/latest/posts" in route.request.url else home_html
+                await route.fulfill(
+                    status=200,
+                    headers={"Content-Type": "text/html; charset=utf-8"},
+                    body=body,
+                )
+
+            await context.route("https://business.facebook.com/**", serve_business)
+            await context.route(
+                "https://www.facebook.com/reel/**",
+                lambda route: route.fulfill(
+                    status=200,
+                    headers={"Content-Type": "text/html; charset=utf-8"},
+                    body=detail_html,
+                ),
+            )
+            reader = FacebookPageContentReader(
+                context,
+                wait_for_verification=self.no_verification,
+            )
+            try:
+                baseline = await reader.capture_baseline(expected_page_id="1001")
+            finally:
+                await context.close()
+                await browser.close()
+
+        self.assertEqual([row.reel_id for row in baseline.rows], ["998877665544"])
+        self.assertEqual(
+            baseline.rows[0].url,
+            "https://www.facebook.com/reel/998877665544",
+        )
+        self.assertEqual(
+            baseline.rows[0].caption_sha256,
+            hashlib.sha256("正文\n#AI".encode("utf-8")).hexdigest(),
+        )
 
     async def test_reader_rejects_incomplete_wrong_page_duplicate_missing_id_and_url_failure(self) -> None:
         reel_url = "https://www.facebook.com/reel/old"
@@ -1946,6 +2960,33 @@ class FacebookPageContentListTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(match, FacebookReelMatch("none", None, 0, 0))
         self.assertEqual(context.wait_timeout_calls, 3)
         self.assertEqual(len(context.created_pages), 1)
+
+    async def test_post_click_readback_retries_one_transient_list_failure(self) -> None:
+        """A one-off list error must not tear down the post-click browser session."""
+
+        context = _ContentContext(
+            pages=[[self.list_row("new")]],
+            details={"new": {"caption": self.expected_caption}},
+            fail_url_counts={
+                "https://business.facebook.com/latest/home/": 1,
+            },
+        )
+        reader = FacebookPageContentReader(
+            context,
+            wait_for_verification=self.no_verification,
+        )
+
+        match = await reader.readback_unique_reel(
+            baseline=self.baseline([]),
+            expected_page_id="1001",
+            expected_caption_sha256=self.expected_caption_hash,
+            clicked_at=self.clicked_at,
+        )
+
+        self.assertEqual(match.status, "unique")
+        self.assertIsNotNone(match.receipt)
+        self.assertEqual(match.receipt.reel_id, "new")
+        self.assertEqual(context.wait_timeout_calls, 1)
 
     async def test_production_selectors_paginate_and_never_query_mutating_actions(self) -> None:
         context = _ContentContext(

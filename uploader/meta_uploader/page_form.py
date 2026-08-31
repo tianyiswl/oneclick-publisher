@@ -9,6 +9,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal
+from urllib.parse import parse_qs, urlparse
 
 from app_core.overseas_meta_content import (
     canonical_facebook_page_caption as canonical_meta_caption,
@@ -38,6 +39,27 @@ _FINAL_ACTION_LABELS = (
     "分享",
     "立即分享",
 )
+_LIVE_CREATE_REEL_LABELS = (
+    "Create reel",
+    "Create Reel",
+    "Create Reels",
+    "创建 Reels",
+)
+_LIVE_REEL_HEADINGS = _LIVE_CREATE_REEL_LABELS
+_LIVE_ADD_VIDEO_LABELS = (
+    "Add video",
+    "Add Video",
+    "添加视频",
+)
+_LIVE_REEL_PATH = "/latest/reels_composer"
+_LIVE_REEL_ROOT_SELECTORS = (
+    "[data-meta-reel-composer]",
+    '[role="dialog"]',
+)
+_LIVE_COMPOSER_READY_POLLS = 240
+_VIDEO_UPLOAD_READY_POLLS = 720
+_POST_CLICK_OBSERVATION_SAMPLES = 3
+_POST_CLICK_OBSERVATION_WAIT_MS = 350
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +188,7 @@ class FacebookPageFormAdapter:
         self._caption_written = False
         self._platform_write_occurred = False
         self._current_expected: FacebookPageFormExpectation | None = None
+        self._fresh_live_composer_page_id = ""
 
     def _form_failure(
         self,
@@ -495,12 +518,78 @@ class FacebookPageFormAdapter:
             button,
         )
 
+    async def observe_post_click_state(self, expected_page_id: str) -> str:
+        """Observe the first final click; never confirm or click again."""
+
+        expected = normalize_facebook_page_id(expected_page_id)
+        observations: list[str] = []
+        for _ in range(_POST_CLICK_OBSERVATION_SAMPLES):
+            wait = getattr(self.page, "wait_for_timeout", None)
+            if callable(wait):
+                await wait(_POST_CLICK_OBSERVATION_WAIT_MS)
+            else:
+                await asyncio.sleep(_POST_CLICK_OBSERVATION_WAIT_MS / 1000)
+            try:
+                confirmation_count = await self._post_click_confirmation_count()
+                if confirmation_count == 1:
+                    observations.append("confirmation_pending")
+                    continue
+                if confirmation_count > 1:
+                    observations.append("unknown")
+                    continue
+                route_page_id = self._live_reel_route_page_id()
+                if route_page_id == expected and await self._is_live_reel_composer(
+                    expected
+                ):
+                    observations.append("composer_unchanged")
+                elif route_page_id != expected:
+                    observations.append("transitioned_unknown")
+                else:
+                    observations.append("unknown")
+            except Exception:
+                observations.append("unknown")
+        if "confirmation_pending" in observations:
+            return "confirmation_pending"
+        if len(observations) >= 2 and observations[-1] == observations[-2]:
+            return observations[-1]
+        return observations[-1] if observations else "unknown"
+
+    async def _post_click_confirmation_count(self) -> int:
+        count = 0
+        for dialog in await self._visible_from_locator(
+            self.page.get_by_role("dialog")
+        ):
+            editors = await self._visible_from_locator(
+                dialog.locator(
+                    '[contenteditable="true"][role="textbox"], '
+                    "[data-meta-caption-editor]"
+                )
+            )
+            if editors:
+                continue
+            actions: list[Any] = []
+            for label in _FINAL_ACTION_LABELS:
+                actions.extend(
+                    await self._visible_from_locator(
+                        dialog.get_by_role(
+                            "button",
+                            name=label,
+                            exact=True,
+                        )
+                    )
+                )
+            if len(actions) == 1:
+                count += 1
+            elif len(actions) > 1:
+                return 2
+        return count
+
     async def _wait_for_completed_video(
         self,
         expected: FacebookPageFormExpectation,
     ) -> tuple[str, int]:
         expected_name = Path(expected.video_name).name
-        for _ in range(24):
+        for _ in range(_VIDEO_UPLOAD_READY_POLLS):
             await self._wait_for_verification(self.page)
             await self._recheck_expected_page(expected)
             previews = await self._read_video_previews()
@@ -537,9 +626,26 @@ class FacebookPageFormAdapter:
             '[data-page-active="true"] [data-meta-create-reel]'
         )
         candidates = await self._visible_from_locator(self.page.locator(page_selector))
+        if len(candidates) == 1:
+            await candidates[0].click()
+            return
+        if candidates:
+            raise RuntimeError("fresh Reel entry is not unique")
+
+        candidates = await self._visible_role_candidates(
+            "button",
+            _LIVE_CREATE_REEL_LABELS,
+        )
         if len(candidates) != 1:
             raise RuntimeError("fresh Reel entry is not unique")
         await candidates[0].click()
+        await self._wait_for_verification(self.page)
+        for _ in range(_LIVE_COMPOSER_READY_POLLS):
+            if await self._is_live_reel_composer(expected_page_id):
+                self._fresh_live_composer_page_id = expected_page_id
+                return
+            await self._sleep()
+        raise RuntimeError("fresh Reel composer did not become ready")
 
     async def _read_content_kind(self) -> str:
         for selector, attribute in (
@@ -555,7 +661,9 @@ class FacebookPageFormAdapter:
         reel = await self._visible_from_locator(
             self.page.locator('[data-testid="reel-composer"]')
         )
-        return "reel" if len(reel) == 1 else ""
+        if len(reel) == 1:
+            return "reel"
+        return "reel" if await self._is_live_reel_composer() else ""
 
     async def _read_restored_draft(self) -> bool:
         restored: list[Any] = []
@@ -579,9 +687,13 @@ class FacebookPageFormAdapter:
             fresh.extend(
                 await self._visible_from_locator(self.page.locator(selector))
             )
-        if len(fresh) != 1:
-            raise RuntimeError("fresh Reel composer state is not provable")
-        return False
+        if len(fresh) == 1:
+            return False
+        if len(fresh) > 1:
+            raise RuntimeError("fresh Reel composer state is ambiguous")
+        if await self._is_proven_fresh_live_reel_composer():
+            return False
+        raise RuntimeError("fresh Reel composer state is not provable")
 
     async def _read_video_previews(self) -> list[tuple[str, str]]:
         items: list[Any] = []
@@ -594,6 +706,10 @@ class FacebookPageFormAdapter:
             if items:
                 break
         if not items:
+            live_preview = await self._read_live_video_preview()
+            if live_preview is not None:
+                return live_preview
+
             empty_states: list[Any] = []
             for selector in (
                 '[data-meta-media-empty="true"]',
@@ -680,12 +796,27 @@ class FacebookPageFormAdapter:
     async def _upload_video_once(self, file_path: str) -> None:
         inputs = self.page.locator('input[type="file"][accept*="video" i]')
         count = int(await inputs.count())
-        if count == 0:
-            inputs = self.page.locator('input[type="file"]')
-            count = int(await inputs.count())
-        if count != 1:
+        if count == 1:
+            await inputs.nth(0).set_input_files(file_path)
+            return
+        if count > 1:
             raise RuntimeError("video input is not unique")
-        await inputs.nth(0).set_input_files(file_path)
+
+        if not await self._is_proven_fresh_live_reel_composer():
+            raise RuntimeError("video input is missing outside a proven Reel composer")
+        buttons = await self._visible_role_candidates(
+            "button",
+            _LIVE_ADD_VIDEO_LABELS,
+        )
+        if len(buttons) != 1:
+            raise RuntimeError("add video action is not unique")
+        chooser_wait = getattr(self.page, "expect_file_chooser", None)
+        if not callable(chooser_wait):
+            raise RuntimeError("file chooser is unavailable")
+        async with chooser_wait() as chooser_info:
+            await buttons[0].click()
+        chooser = await chooser_info.value
+        await chooser.set_files(file_path)
 
     async def _write_caption_once(self, caption: str) -> None:
         editor = await self._caption_editor()
@@ -713,6 +844,8 @@ class FacebookPageFormAdapter:
                     )
                 )
         if len(candidates) != 1:
+            if not candidates and await self._is_proven_fresh_live_reel_composer():
+                return
             raise RuntimeError("public visibility control is not unique")
         control = candidates[0]
         try:
@@ -747,7 +880,11 @@ class FacebookPageFormAdapter:
                         checked.append(value)
                 except Exception:
                     return ""
-        return checked[0] if len(checked) == 1 else ""
+        if len(checked) == 1:
+            return checked[0]
+        if not checked and await self._is_proven_fresh_live_reel_composer():
+            return "public"
+        return ""
 
     async def _final_action_buttons(self) -> list[Any]:
         candidates = await self._visible_from_locator(
@@ -755,14 +892,223 @@ class FacebookPageFormAdapter:
         )
         if candidates:
             return candidates
+        root = await self._live_reel_composer_root()
+        if root is None:
+            return []
+        return await self._final_action_candidates_in_root(root)
+
+    async def _final_action_candidates_in_root(self, root: Any) -> list[Any]:
+        candidates: list[Any] = []
         for label in _FINAL_ACTION_LABELS:
             candidates.extend(
                 await self._visible_from_locator(
-                    self.page.get_by_role(
+                    root.get_by_role(
                         "button",
                         name=label,
                         exact=True,
                     )
+                )
+            )
+        if candidates:
+            return candidates
+
+        for label in _FINAL_ACTION_LABELS:
+            leaves = await self._visible_from_locator(
+                root.get_by_text(label, exact=True)
+            )
+            for leaf in leaves:
+                candidates.extend(
+                    await self._visible_from_locator(
+                        leaf.locator(
+                            "xpath=ancestor-or-self::*[@role='button'][1]"
+                        )
+                    )
+                )
+        return candidates
+
+    async def _live_reel_composer_root(self) -> Any | None:
+        if not await self._is_proven_fresh_live_reel_composer():
+            return None
+        headings = await self._visible_role_candidates(
+            "heading",
+            _LIVE_REEL_HEADINGS,
+        )
+        editors = await self._visible_from_locator(
+            self.page.locator(
+                "[data-meta-caption-editor], "
+                '[contenteditable="true"][role="textbox"], '
+                'textarea[placeholder*="caption" i]'
+            )
+        )
+        if len(headings) != 1 or len(editors) != 1:
+            if len(headings) > 1 or len(editors) > 1:
+                raise RuntimeError("Reel composer identity is ambiguous")
+            return None
+
+        for selector in _LIVE_REEL_ROOT_SELECTORS:
+            matching: list[Any] = []
+            for root in await self._visible_from_locator(
+                self.page.locator(selector)
+            ):
+                headings: list[Any] = []
+                for label in _LIVE_REEL_HEADINGS:
+                    headings.extend(
+                        await self._visible_from_locator(
+                            root.get_by_role(
+                                "heading",
+                                name=label,
+                                exact=True,
+                            )
+                        )
+                    )
+                if len(headings) != 1:
+                    continue
+                editors: list[Any] = []
+                for editor_selector in (
+                    "[data-meta-caption-editor]",
+                    '[contenteditable="true"][role="textbox"]',
+                    'textarea[placeholder*="caption" i]',
+                ):
+                    editors = await self._visible_from_locator(
+                        root.locator(editor_selector)
+                    )
+                    if editors:
+                        break
+                if len(editors) == 1:
+                    matching.append(root)
+            if len(matching) > 1:
+                raise RuntimeError("Reel composer root is ambiguous")
+            if len(matching) == 1:
+                actions = await self._final_action_candidates_in_root(matching[0])
+                if len(actions) == 1:
+                    return matching[0]
+                if len(actions) > 1:
+                    raise RuntimeError("Reel composer final action is ambiguous")
+
+        # Current Business Suite does not expose a stable composer container.
+        # Walk outward from the unique Reel heading and select the narrowest
+        # ancestor that contains the unique caption editor and exactly one
+        # final action. This excludes unrelated page-level Share buttons while
+        # remaining independent of generated class names.
+        root = headings[0]
+        for _ in range(24):
+            parents = await self._visible_from_locator(root.locator("xpath=.."))
+            if len(parents) != 1:
+                return None
+            root = parents[0]
+            contained_editors = await self._visible_from_locator(
+                root.locator(
+                    "[data-meta-caption-editor], "
+                    '[contenteditable="true"][role="textbox"], '
+                    'textarea[placeholder*="caption" i]'
+                )
+            )
+            if len(contained_editors) != 1:
+                continue
+            actions = await self._final_action_candidates_in_root(root)
+            if len(actions) == 1:
+                return root
+            if len(actions) > 1:
+                raise RuntimeError("Reel composer final action is ambiguous")
+        return None
+
+    def _live_reel_route_page_id(self) -> str:
+        value = getattr(self.page, "url", "")
+        if type(value) is not str or not value:
+            return ""
+        try:
+            parsed = urlparse(value)
+            if (
+                parsed.hostname
+                not in {"business.facebook.com", "www.business.facebook.com"}
+                or parsed.path.rstrip("/") != _LIVE_REEL_PATH
+            ):
+                return ""
+            values = parse_qs(parsed.query).get("asset_id", [])
+            if len(values) != 1:
+                return ""
+            page_id = str(values[0] or "").strip()
+            return page_id if page_id.isascii() and page_id.isdigit() else ""
+        except (TypeError, ValueError):
+            return ""
+
+    async def _is_live_reel_composer(
+        self,
+        expected_page_id: str | None = None,
+    ) -> bool:
+        route_page_id = self._live_reel_route_page_id()
+        if not route_page_id:
+            return False
+        if expected_page_id is not None and route_page_id != expected_page_id:
+            return False
+        headings = await self._visible_role_candidates(
+            "heading",
+            _LIVE_REEL_HEADINGS,
+        )
+        return len(headings) == 1
+
+    async def _is_proven_fresh_live_reel_composer(self) -> bool:
+        expected = self._fresh_live_composer_page_id
+        if not expected or self._current_expected is None:
+            return False
+        if expected != self._current_expected.page_id:
+            return False
+        return await self._is_live_reel_composer(expected)
+
+    async def _read_live_video_preview(
+        self,
+    ) -> list[tuple[str, str]] | None:
+        if not await self._is_proven_fresh_live_reel_composer():
+            return None
+        expected = self._current_expected
+        if expected is None:
+            return None
+        expected_name = Path(expected.video_name).name
+        exact = await self._visible_from_locator(
+            self.page.get_by_text(expected_name, exact=True)
+        )
+        if len(exact) > 1:
+            raise RuntimeError("Reel video filename is ambiguous")
+        if len(exact) == 1:
+            progress = await exact[0].evaluate(
+                r"""
+                element => {
+                  let node = element;
+                  for (let depth = 0; node && node !== document.body && depth < 10; depth += 1) {
+                    const text = String(node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
+                    const values = [...text.matchAll(/(\d{1,3})\s*%/g)].map(match => Number(match[1]));
+                    if (values.length) {
+                      return Math.max(...values);
+                    }
+                    node = node.parentElement;
+                  }
+                  return null;
+                }
+                """
+            )
+            if type(progress) is not int or not 0 <= progress <= 100:
+                raise RuntimeError("Reel video progress is not readable")
+            state = "completed" if progress == 100 else "uploading"
+            return [(expected_name, state)]
+
+        add_video = await self._visible_role_candidates(
+            "button",
+            _LIVE_ADD_VIDEO_LABELS,
+        )
+        if len(add_video) == 1:
+            return []
+        raise RuntimeError("Reel composer media state is not readable")
+
+    async def _visible_role_candidates(
+        self,
+        role: str,
+        labels: tuple[str, ...],
+    ) -> list[Any]:
+        candidates: list[Any] = []
+        for label in labels:
+            candidates.extend(
+                await self._visible_from_locator(
+                    self.page.get_by_role(role, name=label, exact=True)
                 )
             )
         return candidates
@@ -773,7 +1119,12 @@ class FacebookPageFormAdapter:
             label = await button.inner_text()
         except Exception:
             label = await button.get_attribute("aria-label")
-        return str(label or "").strip()
+        return (
+            str(label or "")
+            .replace("\u200b", "")
+            .replace("\ufeff", "")
+            .strip()
+        )
 
     @staticmethod
     async def _button_ready(button: Any) -> bool:

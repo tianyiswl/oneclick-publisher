@@ -2348,7 +2348,14 @@ def _safe_facebook_reel_match(
             f"{safe_receipt.get('reelId') or ''}"
         )
         or safe_receipt.get("reelId") in old_reel_ids
-        or published.astimezone(timezone.utc) < clicked.astimezone(timezone.utc)
+        or (
+            published.astimezone(timezone.utc) < clicked.astimezone(timezone.utc)
+            and not (
+                published.second == 0
+                and published.microsecond == 0
+                and published == clicked.replace(second=0, microsecond=0)
+            )
+        )
     ):
         raise ControlledPublishError(
             "facebook_claim_lifecycle_invalid",
@@ -2460,7 +2467,7 @@ def _mark_facebook_page_checkpoint_in_transaction(
         receipt_hash,
     )
     if stored_receipt is not None:
-        _safe_stored_facebook_receipt(
+        stored_receipt = _safe_stored_facebook_receipt(
             stored_receipt,
             expected_page_reference=page_reference,
         )
@@ -2527,6 +2534,20 @@ def _mark_facebook_page_checkpoint_in_transaction(
             form_snapshot=stored_form,
             clicked_at=clicked_at,
         )
+    elif clicked_at and new_state == "ambiguous":
+        # clickedAt is durable proof that the irreversible action happened.
+        # A later generic failure receipt may add context, but cannot erase it.
+        authoritative_receipt = dict(stored_receipt or {})
+        authoritative_receipt.update(safe_receipt)
+        authoritative_receipt.update(
+            {
+                "pageId": page_reference,
+                "phase": "ambiguous",
+                "platformWriteOccurred": True,
+                "finalActionTriggered": True,
+            }
+        )
+        safe_receipt = project_facebook_page_receipt(authoritative_receipt)
     safe_receipt.pop("baselineHash", None)
     safe_receipt.pop("formSnapshotHash", None)
     if baseline_hash:
@@ -2681,6 +2702,19 @@ def _validated_facebook_page_claim_evidence(
             receipt,
             expected_page_reference=page_id,
         )
+    clicked_at = str(claim.get("clickedAt") or "")
+    if receipt is not None and clicked_at and state in {
+        "final_action_clicked",
+        "ambiguous",
+    }:
+        # Compatibility projection for historical rows whose hashed receipt
+        # predates the post-click invariant.  Do not mutate persisted evidence.
+        receipt = {
+            **receipt,
+            "phase": state,
+            "platformWriteOccurred": True,
+            "finalActionTriggered": True,
+        }
     if state in {
         "final_action_claimed",
         "final_action_clicked",
@@ -2732,7 +2766,7 @@ def _validated_facebook_page_claim_evidence(
         "formSnapshot": form_snapshot,
         "decision": decision,
         "receipt": receipt or {},
-        "clickedAt": str(claim.get("clickedAt") or ""),
+        "clickedAt": clicked_at,
     }
 
 
@@ -2747,7 +2781,7 @@ async def _facebook_page_read_only_session(account_file: str):
         set_init_script,
     )
 
-    from .overseas_browser_publish import meta_security_intervention_reason
+    from uploader.meta_uploader.main import meta_security_intervention_reason
     from .paths import COOKIE_DIR
 
     storage_state = Path(str(account_file))
@@ -3028,6 +3062,10 @@ def _reconcile_facebook_page_publish_outcome_claimed(
             _expected_state=state,
             worker_token=reconcile_token,
             _trusted_reconciliation=True,
+        )
+    if match.status in {"none", "mismatch"}:
+        task_service.release_facebook_reconciliation_unknown(
+            int(task_id), reconcile_token
         )
     return project_task(task_service.get_task(int(task_id)))
 
@@ -3825,6 +3863,17 @@ def project_task(task: Mapping[str, Any] | None) -> dict[str, Any]:
                 receipt = {}
             if facebook_claim_state == "succeeded":
                 receipt = dict(facebook_claim_receipt)
+            elif facebook_claim_state == "ambiguous":
+                receipt = {**receipt, **facebook_claim_receipt}
+            elif facebook_claim_state == "final_action_clicked":
+                for irreversible_key in (
+                    "platformWriteOccurred",
+                    "finalActionTriggered",
+                ):
+                    if irreversible_key in facebook_claim_receipt:
+                        receipt[irreversible_key] = facebook_claim_receipt[
+                            irreversible_key
+                        ]
             approved_phases = {
                 "local_validation_passed",
                 "checking",

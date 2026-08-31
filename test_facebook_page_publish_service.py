@@ -105,8 +105,10 @@ class FacebookPageExecutorTests(unittest.TestCase):
         self.snapshot_kind = "reel"
         self.final_snapshot: FacebookPageFormSnapshot | None = None
         self.baseline_error: BaseException | None = None
+        self.decision_error: BaseException | None = None
         self.readback_error: BaseException | None = None
         self.match_status = "unique"
+        self.post_click_state = "unknown"
         self.platform_decision: object | None = None
         self.adapter_classes: list[type] = []
 
@@ -229,6 +231,10 @@ class FacebookPageExecutorTests(unittest.TestCase):
                 )
                 return snapshot, self.button
 
+            async def observe_post_click_state(self, expected_page_id):
+                owner.log.append(f"post-click:{owner.post_click_state}")
+                return owner.post_click_state
+
             @staticmethod
             async def _button_label(button) -> str:
                 return await button.inner_text()
@@ -254,6 +260,8 @@ class FacebookPageExecutorTests(unittest.TestCase):
 
             async def read_platform_decision(self, expected_page_id, *, page):
                 owner.log.append("decision:accepted")
+                if owner.decision_error is not None:
+                    raise owner.decision_error
                 return owner.platform_decision or SimpleNamespace(kind="accepted")
 
             async def readback_unique_reel(
@@ -529,6 +537,14 @@ class FacebookPageExecutorTests(unittest.TestCase):
         self.assertEqual(len(self.adapter_classes), 2)
         self.assertTrue(
             all(issubclass(adapter, PageFormContract) for adapter in self.adapter_classes)
+        )
+        self.assertLess(
+            self.log.index("baseline:read"),
+            self.log.index("form:verified"),
+        )
+        self.assertLess(
+            self.log.index("form:verified"),
+            self.log.index("form:final-verified"),
         )
         self.assertLess(
             self.log.index("commit:final_action_claimed"),
@@ -1330,6 +1346,15 @@ class FacebookPageExecutorTests(unittest.TestCase):
         evidence = controlled_publish._validated_facebook_page_claim_evidence(claim)
         self.assertEqual(evidence["decision"]["kind"], "accepted")
         self.assertEqual(claim["state"], "ambiguous")
+        saved = task_service.get_task(int(task["id"]))
+        self.assertEqual(saved["status"], "failed")
+        self.assertEqual(
+            saved["items"][0]["errorCode"],
+            "facebook_publish_outcome_unknown",
+        )
+        item_receipt = json.loads(str(saved["items"][0]["receiptJson"]))
+        self.assertEqual(item_receipt["phase"], "ambiguous")
+        self.assertTrue(item_receipt["finalActionTriggered"])
         self.assertEqual(
             self._facebook_event_types(task["id"]).count(
                 "facebook_platform_decision_observed"
@@ -1337,6 +1362,34 @@ class FacebookPageExecutorTests(unittest.TestCase):
             1,
         )
         self.assertEqual(legacy_event_writer.call_count, 0)
+
+    def test_real_formal_runner_persists_post_click_confirmation_error_code(
+        self,
+    ) -> None:
+        task, payload = self._claimed_formal_task()
+        self.platform_decision = self._sealed_accepted_decision(self.page_id)
+        self.post_click_state = "confirmation_pending"
+        self.match_status = "none"
+
+        with self.patched_runtime(real_clicked_at=True, real_contracts=True):
+            publish_service._run_facebook_page_publish(task, [payload])
+
+        saved = task_service.get_task(int(task["id"]))
+        self.assertEqual(saved["status"], "failed")
+        self.assertEqual(
+            saved["items"][0]["errorCode"],
+            "facebook_post_click_confirmation_pending",
+        )
+        self.assertEqual(self.click_count, 1)
+        with database.connect() as conn:
+            claim = dict(
+                conn.execute(
+                    "SELECT * FROM facebook_page_publish_claims WHERE taskId = ?",
+                    (int(task["id"]),),
+                ).fetchone()
+            )
+        self.assertEqual(claim["state"], "ambiguous")
+        self.assertEqual(int(claim["blocksReplay"]), 1)
 
     def test_publish_context_rejects_invalid_and_nested_task_switches(self) -> None:
         for invalid in (0, -1, True, "501"):
@@ -1812,6 +1865,101 @@ class FacebookPageExecutorTests(unittest.TestCase):
         self.assertEqual(self.click_count, 1)
         self.assertEqual(self.log[-1], "session:closed")
 
+    def test_decision_read_failure_does_not_skip_unique_content_readback(self) -> None:
+        self.decision_error = RuntimeError("offline decision read failure")
+        stages: list[str] = []
+
+        with self.patched_runtime({"formSnapshotHash": "f" * 64}):
+            with patch.object(
+                overseas_browser_publish,
+                "_assert_authorized_form_snapshot",
+                return_value=None,
+                create=True,
+            ):
+                result = overseas_browser_publish.run_facebook_page_publish_sync(
+                    self.payload("publish"),
+                    task_id=508,
+                    progress=lambda stage, receipt: stages.append(stage),
+                )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["receipt"]["phase"], "published_readback_confirmed")
+        self.assertTrue(result["receipt"]["finalActionTriggered"])
+        self.assertEqual(self.click_count, 1)
+        self.assertLess(
+            self.log.index("decision:accepted"),
+            self.log.index("readback:unique"),
+        )
+        self.assertEqual(stages[-1], "readback_unique")
+
+    def test_post_click_verification_timeout_stays_ambiguous_and_blocks_readback(
+        self,
+    ) -> None:
+        self.decision_error = FacebookPagePublishError(
+            "facebook_verification_timeout",
+            "offline post-click verification timeout",
+            receipt={"phase": "verification"},
+        )
+        stages: list[str] = []
+
+        with self.patched_runtime({"formSnapshotHash": "f" * 64}):
+            with (
+                patch.object(
+                    overseas_browser_publish,
+                    "_assert_authorized_form_snapshot",
+                    return_value=None,
+                    create=True,
+                ),
+                self.assertRaises(FacebookPagePublishError) as raised,
+            ):
+                overseas_browser_publish.run_facebook_page_publish_sync(
+                    self.payload("publish"),
+                    task_id=510,
+                    progress=lambda stage, receipt: stages.append(stage),
+                )
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "facebook_publish_outcome_unknown",
+        )
+        self.assertTrue(raised.exception.outcome_ambiguous)
+        self.assertTrue(raised.exception.receipt["finalActionTriggered"])
+        self.assertEqual(self.click_count, 1)
+        self.assertNotIn("readback:unique", self.log)
+        self.assertEqual(stages[-1], "final_action_clicked")
+        self.assertEqual(self.log[-1], "session:closed")
+
+    def test_post_click_readback_exception_is_ambiguous_with_click_evidence(self) -> None:
+        self.readback_error = RuntimeError("offline content list read failure")
+        stages: list[str] = []
+
+        with self.patched_runtime({"formSnapshotHash": "f" * 64}):
+            with (
+                patch.object(
+                    overseas_browser_publish,
+                    "_assert_authorized_form_snapshot",
+                    return_value=None,
+                    create=True,
+                ),
+                self.assertRaises(FacebookPagePublishError) as raised,
+            ):
+                overseas_browser_publish.run_facebook_page_publish_sync(
+                    self.payload("publish"),
+                    task_id=509,
+                    progress=lambda stage, receipt: stages.append(stage),
+                )
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "facebook_publish_outcome_unknown",
+        )
+        self.assertTrue(raised.exception.outcome_ambiguous)
+        self.assertEqual(raised.exception.receipt["phase"], "ambiguous")
+        self.assertTrue(raised.exception.receipt["finalActionTriggered"])
+        self.assertEqual(self.click_count, 1)
+        self.assertEqual(stages[-1], "platform_decision_observed")
+        self.assertEqual(self.log[-1], "session:closed")
+
     def test_none_and_mismatch_readbacks_are_ambiguous(self) -> None:
         expected = {
             "none": "facebook_publish_outcome_unknown",
@@ -1840,6 +1988,37 @@ class FacebookPageExecutorTests(unittest.TestCase):
                 self.assertEqual(raised.exception.error_code, error_code)
                 self.assertEqual(self.click_count, 1)
                 self.assertEqual(stages[-1], f"readback_{status}")
+
+    def test_confirmation_pending_has_specific_error_and_never_clicks_twice(
+        self,
+    ) -> None:
+        self.post_click_state = "confirmation_pending"
+        self.match_status = "none"
+        stages: list[str] = []
+        with self.patched_runtime({"formSnapshotHash": "f" * 64}):
+            with (
+                patch.object(
+                    overseas_browser_publish,
+                    "_assert_authorized_form_snapshot",
+                    return_value=None,
+                    create=True,
+                ),
+                self.assertRaises(FacebookPagePublishError) as raised,
+            ):
+                overseas_browser_publish.run_facebook_page_publish_sync(
+                    self.payload("publish"),
+                    task_id=511,
+                    progress=lambda stage, receipt: stages.append(stage),
+                )
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "facebook_post_click_confirmation_pending",
+        )
+        self.assertTrue(raised.exception.outcome_ambiguous)
+        self.assertEqual(raised.exception.receipt["postClickState"], "confirmation_pending")
+        self.assertEqual(self.click_count, 1)
+        self.assertEqual(stages[-1], "readback_none")
 
 
 class FacebookPagePublishServiceTests(unittest.TestCase):

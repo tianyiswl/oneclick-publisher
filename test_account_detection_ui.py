@@ -146,6 +146,59 @@ class AccountDetectionUiTests(unittest.TestCase):
         self.assertGreaterEqual(enabled_dialog.platform_combo.findData(9), 0)
         enabled_dialog.close()
 
+    def test_facebook_page_business_access_denied_shows_page_permission_guidance(self) -> None:
+        session = MagicMock()
+        session.manual_save_supported = False
+        session.queue = queue.Queue()
+        session.queue.put("ERROR:facebook_page_business_access_denied")
+        with patch.dict(
+            os.environ,
+            {"ONECLICK_ENABLE_FACEBOOK_PAGE_V1": "1"},
+            clear=True,
+        ):
+            dialog = LoginDialog(background_login=True)
+        dialog.platform_combo.setCurrentIndex(dialog.platform_combo.findData(9))
+        dialog.session = session
+
+        with patch.object(dialog, "reject") as reject:
+            dialog.poll_messages()
+
+        self.assertEqual(
+            dialog.lifecycle_message,
+            "登录失败：当前 Facebook 账号无法访问 Meta Business Suite。"
+            "请确认已创建 Facebook Page，并拥有该 Page 的内容管理权限；未保存账号。",
+        )
+        self.assertNotIn("YouTube", dialog.log.toPlainText())
+        reject.assert_called_once_with()
+        dialog.close()
+
+    def test_unknown_facebook_page_login_error_does_not_show_youtube_guidance(self) -> None:
+        session = MagicMock()
+        session.platform_type = 9
+        session.manual_save_supported = False
+        session.queue = queue.Queue()
+        session.queue.put("ERROR:unexpected_facebook_login_error")
+        with patch.dict(
+            os.environ,
+            {"ONECLICK_ENABLE_FACEBOOK_PAGE_V1": "1"},
+            clear=True,
+        ):
+            dialog = LoginDialog(background_login=True)
+        dialog.platform_combo.setCurrentIndex(dialog.platform_combo.findData(9))
+        dialog.session = session
+        dialog.platform_combo.setCurrentIndex(dialog.platform_combo.findData(7))
+
+        with patch.object(dialog, "reject") as reject:
+            dialog.poll_messages()
+
+        self.assertEqual(
+            dialog.lifecycle_message,
+            "登录失败：Facebook Page 登录未完成，账号没有发生变化。",
+        )
+        self.assertNotIn("YouTube", dialog.log.toPlainText())
+        reject.assert_called_once_with()
+        dialog.close()
+
     def test_feature_flag_off_disables_saved_page_relogin_and_backend_actions(self) -> None:
         account = {
             "id": 91,

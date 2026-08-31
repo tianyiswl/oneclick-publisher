@@ -509,10 +509,26 @@ class LoginDialog(QDialog):
                         "credential_unavailable": "系统凭据库不可用，未保存 YouTube 登录凭据。",
                         "channel_identity_mismatch": "本次授权频道与原账号不一致，未覆盖原账号。",
                         "channel_identity_unavailable": "Google 未返回唯一 YouTube 频道，未保存账号。",
+                        "facebook_page_business_access_denied": "当前 Facebook 账号无法访问 Meta Business Suite。请确认已创建 Facebook Page，并拥有该 Page 的内容管理权限；未保存账号。",
                         "facebook_page_not_found": "当前会话没有可管理的 Facebook Page，未保存账号。",
                         "facebook_page_content_permission_missing": "当前 Facebook Page 没有内容管理权限，未保存账号。",
                         "facebook_page_identity_mismatch": "当前 Page 与所选或原绑定 Page 不一致，未保存账号。",
-                    }.get(reason, "YouTube 官方登录未完成，账号没有发生变化。")
+                    }.get(reason)
+                if message is None:
+                    session_platform_type = getattr(
+                        self.session,
+                        "platform_type",
+                        None,
+                    )
+                    if not isinstance(session_platform_type, int):
+                        session_platform_type = int(
+                            self.platform_combo.currentData() or 0
+                        )
+                    message = (
+                        "Facebook Page 登录未完成，账号没有发生变化。"
+                        if session_platform_type == 9
+                        else "YouTube 官方登录未完成，账号没有发生变化。"
+                    )
                 self.lifecycle_message = f"登录失败：{message}"
                 if (
                     reason == "tiktok_identity_probe_required"

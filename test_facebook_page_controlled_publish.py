@@ -1739,6 +1739,59 @@ class FacebookPageFormalClaimTests(unittest.TestCase):
             ).fetchone()
         self.assertEqual(tuple(claim), ("ambiguous", 1, "", ""))
 
+    def test_clicked_to_ambiguous_cannot_downgrade_irreversible_receipt_flags(
+        self,
+    ) -> None:
+        task_id, authorization_id, payload = self.authorized_preflight()
+        task = self.create_formal(task_id, authorization_id, payload)
+        page_id = str(payload["facebookExpectedPageReference"])
+        controlled_publish.mark_facebook_page_checkpoint(
+            task["id"],
+            expected_state="reserved",
+            new_state="final_action_claimed",
+            receipt=self.checkpoint_receipt(payload),
+        )
+        controlled_publish.mark_facebook_page_checkpoint(
+            task["id"],
+            expected_state="final_action_claimed",
+            new_state="final_action_clicked",
+            receipt=self.checkpoint_receipt(
+                payload,
+                phase="final_action_clicked",
+                finalActionTriggered=True,
+            ),
+        )
+
+        controlled_publish.mark_facebook_page_checkpoint(
+            task["id"],
+            expected_state="final_action_clicked",
+            new_state="ambiguous",
+            receipt={
+                "pageId": page_id,
+                "phase": "ambiguous",
+                "platformWriteOccurred": False,
+                "finalActionTriggered": False,
+            },
+        )
+
+        with database.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM facebook_page_publish_claims WHERE taskId = ?",
+                (task["id"],),
+            ).fetchone()
+        self.assertIsNotNone(row)
+        claim = dict(row)
+        persisted = json.loads(str(claim["receiptJson"]))
+        self.assertTrue(claim["clickedAt"])
+        self.assertEqual(persisted["phase"], "ambiguous")
+        self.assertIs(persisted["platformWriteOccurred"], True)
+        self.assertIs(persisted["finalActionTriggered"], True)
+        validated = controlled_publish._validated_facebook_page_claim_evidence(
+            claim
+        )["receipt"]
+        self.assertIs(validated["platformWriteOccurred"], True)
+        self.assertIs(validated["finalActionTriggered"], True)
+
     def test_trusted_task7_unique_reel_match_allows_succeeded(self) -> None:
         task7 = self.install_task7_evidence_types()
         task_id, authorization_id, payload = self.authorized_preflight()
@@ -1804,6 +1857,67 @@ class FacebookPageFormalClaimTests(unittest.TestCase):
             payload["facebookCaptionSha256"],
         )
         self.assertEqual(persisted_receipt["publishedAt"], published_at)
+
+    def test_minute_precision_match_commits_succeeded_claim(self) -> None:
+        from uploader.meta_uploader.content_list import (
+            FacebookReelRow,
+            _build_baseline,
+            match_unique_new_facebook_reel,
+        )
+
+        task_id, authorization_id, payload = self.authorized_preflight()
+        task = self.create_formal(task_id, authorization_id, payload)
+        clicked_at = datetime.fromisoformat(
+            "2026-08-30T22:24:02.710000+00:00"
+        )
+        with patch.object(controlled_publish, "_utc", return_value=clicked_at):
+            self.transition_to(task["id"], payload, "final_action_clicked")
+
+        baseline = _build_baseline(
+            page_id="1001",
+            rows=(
+                FacebookReelRow(
+                    page_id="1001",
+                    reel_id="old-reel",
+                    url="https://www.facebook.com/reel/old-reel",
+                    caption_sha256="a" * 64,
+                    published_at="2026-08-29T09:00:00+08:00",
+                ),
+            ),
+            captured_at="2026-08-30T22:23:59+00:00",
+        )
+        match = match_unique_new_facebook_reel(
+            baseline=baseline,
+            current_rows=(
+                *baseline.rows,
+                FacebookReelRow(
+                    page_id="1001",
+                    reel_id="new-reel",
+                    url="https://www.facebook.com/reel/new-reel",
+                    caption_sha256=str(payload["facebookCaptionSha256"]),
+                    published_at="2026-08-30T22:24:00+00:00",
+                ),
+            ),
+            expected_page_id="1001",
+            expected_caption_sha256=str(payload["facebookCaptionSha256"]),
+            clicked_at=clicked_at.isoformat(),
+        )
+        self.assertEqual(match.status, "unique")
+
+        controlled_publish.mark_facebook_page_checkpoint(
+            task["id"],
+            expected_state="final_action_clicked",
+            new_state="succeeded",
+            receipt={"reelMatch": match},
+        )
+
+        with database.connect() as conn:
+            claim = conn.execute(
+                "SELECT state, reelId FROM facebook_page_publish_claims "
+                "WHERE taskId = ?",
+                (task["id"],),
+            ).fetchone()
+        self.assertEqual(tuple(claim), ("succeeded", "new-reel"))
 
     def test_trusted_reel_match_must_bind_unique_new_page_and_click_time(
         self,

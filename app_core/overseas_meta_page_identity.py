@@ -7,6 +7,7 @@ import asyncio
 import os
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
+from urllib.parse import parse_qs, urlparse
 
 from .overseas_meta_errors import FacebookPagePublishError
 
@@ -57,6 +58,126 @@ def _identity_mismatch() -> FacebookPagePublishError:
     return FacebookPagePublishError(
         "facebook_page_identity_mismatch",
         "保存的 Facebook Page 与当前页面不一致，已停止操作。",
+    )
+
+
+def _active_facebook_page_id_from_url(value: object) -> str:
+    if type(value) is not str or not value.strip():
+        return ""
+    try:
+        parsed = urlparse(value)
+        if parsed.hostname not in {"business.facebook.com", "www.business.facebook.com"}:
+            return ""
+        values = parse_qs(parsed.query).get("asset_id", [])
+        if len(values) != 1:
+            return ""
+        return normalize_facebook_page_id(values[0])
+    except (TypeError, ValueError, FacebookPagePublishError):
+        return ""
+
+
+def _facebook_destination_page_name(
+    value: object,
+    *,
+    platform_marker_present: bool = False,
+) -> str:
+    if type(value) is not str:
+        return ""
+    text = " ".join(value.replace("\u200b", " ").split()).strip()
+    folded = text.casefold()
+    marker = "facebook"
+    index = folded.find(marker)
+    if index >= 0:
+        text = text[index + len(marker) :].strip(" \t\r\n\xb7·|-")
+    elif not platform_marker_present:
+        return ""
+    for prefix in (
+        "发布位置",
+        "发布到",
+        "publishing location",
+        "publish to",
+        "destination",
+    ):
+        if text.casefold().startswith(prefix.casefold()):
+            text = text[len(prefix) :].strip(" \t\r\n:\uff1a\xb7·|-")
+            break
+    return text
+
+
+async def _destination_has_facebook_marker(destination, *values: object) -> bool:
+    if any(type(value) is str and "facebook" in value.casefold() for value in values):
+        return True
+    try:
+        icons = destination.locator(
+            'img[alt*="Facebook" i], [aria-label*="Facebook" i]'
+        )
+        return int(await icons.count()) > 0
+    except Exception:
+        return False
+
+
+async def _live_composer_page_identity(page) -> FacebookPageIdentity | None:
+    """Read the active Page from Meta's real composer without test-only attrs."""
+
+    page_id = _active_facebook_page_id_from_url(getattr(page, "url", ""))
+    if not page_id:
+        return None
+    try:
+        destinations = page.locator('[role="combobox"]')
+        count = int(await destinations.count())
+    except Exception:
+        return None
+
+    page_name = ""
+    for index in range(count):
+        try:
+            destination = destinations.nth(index)
+            text = await destination.inner_text()
+            aria_label = await destination.get_attribute("aria-label")
+        except Exception:
+            continue
+        marker_present = await _destination_has_facebook_marker(
+            destination,
+            text,
+            aria_label,
+        )
+        page_name = _facebook_destination_page_name(
+            text,
+            platform_marker_present=marker_present,
+        )
+        if not page_name:
+            page_name = _facebook_destination_page_name(
+                aria_label,
+                platform_marker_present=marker_present,
+            )
+        if page_name:
+            break
+    if not page_name:
+        return None
+
+    has_content_control = False
+    for selector in (
+        'input[type="file"]',
+        'button:has-text("Add photo/video")',
+        'button:has-text("Add photos/videos")',
+        'button:has-text("添加照片/视频")',
+        '[role="button"]:has-text("添加照片/视频")',
+        '[contenteditable="true"][role="textbox"]',
+    ):
+        try:
+            controls = page.locator(selector)
+            if int(await controls.count()) > 0:
+                has_content_control = True
+                break
+        except Exception:
+            continue
+    if not has_content_control:
+        return None
+
+    return FacebookPageIdentity(
+        page_id=page_id,
+        page_name=page_name,
+        can_manage_content=True,
     )
 
 
@@ -131,6 +252,10 @@ async def discover_manageable_facebook_pages(page) -> tuple[FacebookPageIdentity
                 and permission.casefold() == "true",
             )
         )
+    if not discovered:
+        live_identity = await _live_composer_page_identity(page)
+        if live_identity is not None:
+            discovered.append(live_identity)
     return tuple(discovered)
 
 
@@ -147,15 +272,24 @@ async def validate_facebook_page_binding(
     selected = resolve_facebook_page_selection(pages, expected_page_id)
     try:
         active_rows = page.locator('[data-page-id][data-page-active="true"]')
-        if int(await active_rows.count()) != 1:
+        active_count = int(await active_rows.count())
+        if active_count > 1:
             raise _identity_mismatch()
-        active_page_id = normalize_facebook_page_id(
-            await active_rows.nth(0).get_attribute("data-page-id")
+        active_page_id = (
+            normalize_facebook_page_id(
+                await active_rows.nth(0).get_attribute("data-page-id")
+            )
+            if active_count == 1
+            else ""
         )
     except FacebookPagePublishError:
         raise
     except Exception as exc:
         raise _identity_mismatch() from exc
+    url_page_id = _active_facebook_page_id_from_url(getattr(page, "url", ""))
+    if active_page_id and url_page_id and active_page_id != url_page_id:
+        raise _identity_mismatch()
+    active_page_id = active_page_id or url_page_id
     if active_page_id != expected_page_id:
         raise _identity_mismatch()
     return selected
@@ -171,8 +305,29 @@ async def activate_saved_facebook_page(
     """Switch to one explicit Page and prove the active Page ID after the switch."""
 
     expected = normalize_facebook_page_id(expected_page_id)
-    pages = await discover_manageable_facebook_pages(page)
-    resolve_facebook_page_selection(pages, expected)
+
+    async def wait_for_selected_page() -> FacebookPageIdentity:
+        while True:
+            try:
+                pages = await discover_manageable_facebook_pages(page)
+                return resolve_facebook_page_selection(pages, expected)
+            except FacebookPagePublishError as exc:
+                if exc.error_code != "facebook_page_not_found":
+                    raise
+            await asyncio.sleep(max(0.0, float(poll_interval_seconds)))
+
+    try:
+        selected = await asyncio.wait_for(
+            wait_for_selected_page(),
+            timeout=max(0.001, float(timeout_seconds)),
+        )
+    except TimeoutError as exc:
+        raise _page_not_found() from exc
+    active_page_id = _active_facebook_page_id_from_url(getattr(page, "url", ""))
+    if active_page_id:
+        if active_page_id != expected:
+            raise _identity_mismatch()
+        return selected
     try:
         targets = page.locator(f'[data-page-id="{expected}"]')
         if int(await targets.count()) != 1:

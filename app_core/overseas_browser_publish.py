@@ -586,6 +586,8 @@ def _outcome_receipt(
     prepared: Mapping[str, Any],
     snapshot: FacebookPageFormSnapshot,
     baseline: FacebookPageContentBaseline,
+    *,
+    post_click_state: str | None = None,
 ) -> dict[str, object]:
     receipt = _public_form_receipt(
         prepared,
@@ -597,6 +599,13 @@ def _outcome_receipt(
     receipt["formSnapshotHash"] = _hash_json(
         _claim_form_snapshot(prepared, snapshot)
     )
+    if post_click_state in {
+        "confirmation_pending",
+        "composer_unchanged",
+        "transitioned_unknown",
+        "unknown",
+    }:
+        receipt["postClickState"] = post_click_state
     return receipt
 
 
@@ -655,14 +664,14 @@ async def _facebook_page_formal_async(
         page,
         verifier,
     ):
-        adapter = FacebookPageFormAdapter(page, wait_for_verification=verifier)
-        snapshot = await adapter.fill_and_readback(prepared["expectation"])
-        _assert_authorized_form_snapshot(prepared, snapshot, authorized)
         reader = FacebookPageContentReader(
             context,
             wait_for_verification=verifier,
         )
         baseline = await reader.capture_baseline(str(prepared["pageId"]))
+        adapter = FacebookPageFormAdapter(page, wait_for_verification=verifier)
+        snapshot = await adapter.fill_and_readback(prepared["expectation"])
+        _assert_authorized_form_snapshot(prepared, snapshot, authorized)
         baseline_projection = _baseline_projection(baseline)
         form_projection = _claim_form_snapshot(prepared, snapshot)
         claim_receipt: dict[str, object] = {
@@ -695,25 +704,103 @@ async def _facebook_page_formal_async(
                 "phase": "final_action_clicked",
             },
         )
-        clicked_at = _load_clicked_at(int(task_id))
+        try:
+            clicked_at = _load_clicked_at(int(task_id))
+        except Exception as exc:
+            raise FacebookPagePublishError(
+                "facebook_publish_outcome_unknown",
+                "Facebook Page 点击后未能读取持久化时间，结果保持未知。",
+                receipt=_outcome_receipt(prepared, snapshot, baseline),
+                outcome_ambiguous=True,
+            ) from exc
 
-        decision = await reader.read_platform_decision(
-            str(prepared["pageId"]),
-            page=page,
-        )
-        progress("platform_decision_observed", {"platformDecision": decision})
-        match = await reader.readback_unique_reel(
-            baseline=baseline,
-            expected_page_id=str(prepared["pageId"]),
-            expected_caption_sha256=str(
-                prepared["payload"]["facebookCaptionSha256"]
-            ),
-            clicked_at=clicked_at,
-        )
+        post_click_state = "unknown"
+        observe_post_click = getattr(adapter, "observe_post_click_state", None)
+        if callable(observe_post_click):
+            try:
+                observed = str(
+                    await observe_post_click(str(prepared["pageId"]))
+                    or "unknown"
+                )
+                if observed in {
+                    "confirmation_pending",
+                    "composer_unchanged",
+                    "transitioned_unknown",
+                    "unknown",
+                }:
+                    post_click_state = observed
+            except Exception:
+                post_click_state = "unknown"
+
+        decision: object | None = None
+        try:
+            decision = await reader.read_platform_decision(
+                str(prepared["pageId"]),
+                page=page,
+            )
+        except FacebookPagePublishError as exc:
+            if exc.error_code in {
+                "facebook_verification_required",
+                "facebook_verification_timeout",
+            }:
+                raise FacebookPagePublishError(
+                    "facebook_publish_outcome_unknown",
+                    "Facebook Page 最终点击后安全验证未完成，发布结果保持未知。",
+                    receipt=_outcome_receipt(
+                        prepared,
+                        snapshot,
+                        baseline,
+                        post_click_state=post_click_state,
+                    ),
+                    outcome_ambiguous=True,
+                ) from exc
+            # A composer transition can make the old page unreadable without
+            # proving success or rejection.  Keep the browser session alive
+            # and continue with the independent content-list contract.
+            pass
+        except Exception:
+            # The composer can disappear immediately after a successful click.
+            # A missing decision is not evidence that the Reel was rejected, so
+            # continue with the independent, read-only content-list contract.
+            pass
+        else:
+            progress(
+                "platform_decision_observed",
+                {
+                    "platformDecision": decision,
+                    "postClickState": post_click_state,
+                },
+            )
+
+        try:
+            match = await reader.readback_unique_reel(
+                baseline=baseline,
+                expected_page_id=str(prepared["pageId"]),
+                expected_caption_sha256=str(
+                    prepared["payload"]["facebookCaptionSha256"]
+                ),
+                clicked_at=clicked_at,
+            )
+        except Exception as exc:
+            raise FacebookPagePublishError(
+                "facebook_publish_outcome_unknown",
+                "Facebook Page 点击后内容列表读取失败，结果保持未知。",
+                receipt=_outcome_receipt(
+                    prepared,
+                    snapshot,
+                    baseline,
+                    post_click_state=post_click_state,
+                ),
+                outcome_ambiguous=True,
+            ) from exc
         if match.status == "unique" and match.receipt is not None:
             progress(
                 "readback_unique",
-                {"reelMatch": match, "platformDecision": decision},
+                {
+                    "reelMatch": match,
+                    "platformDecision": decision,
+                    "postClickState": post_click_state,
+                },
             )
             receipt = project_facebook_page_receipt(
                 {
@@ -732,12 +819,21 @@ async def _facebook_page_formal_async(
             }
 
         stage = "readback_mismatch" if match.status == "mismatch" else "readback_none"
-        progress(stage, {"platformDecision": decision})
-        error_code = (
-            "facebook_publish_readback_mismatch"
-            if match.status == "mismatch"
-            else "facebook_publish_outcome_unknown"
+        progress(
+            stage,
+            {
+                "platformDecision": decision,
+                "postClickState": post_click_state,
+            },
         )
+        if match.status == "mismatch":
+            error_code = "facebook_publish_readback_mismatch"
+        else:
+            error_code = {
+                "confirmation_pending": "facebook_post_click_confirmation_pending",
+                "composer_unchanged": "facebook_post_click_composer_unchanged",
+                "transitioned_unknown": "facebook_post_click_transition_unknown",
+            }.get(post_click_state, "facebook_publish_outcome_unknown")
         message = (
             "Facebook Page 出现新 Reel，但主体或文案哈希不匹配。"
             if match.status == "mismatch"
@@ -746,7 +842,12 @@ async def _facebook_page_formal_async(
         raise FacebookPagePublishError(
             error_code,
             message,
-            receipt=_outcome_receipt(prepared, snapshot, baseline),
+            receipt=_outcome_receipt(
+                prepared,
+                snapshot,
+                baseline,
+                post_click_state=post_click_state,
+            ),
             outcome_ambiguous=True,
         )
 

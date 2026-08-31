@@ -21,7 +21,11 @@ from PIL import Image
 from app_core import account_browser_service, account_service, login_service
 from app_core.oneclick_authorization import _verify_saved_session_async
 from app_core.overseas_meta_errors import FacebookPagePublishError
-from app_core.overseas_meta_page_identity import FacebookPageIdentity
+from app_core.overseas_meta_page_identity import (
+    FacebookPageIdentity,
+    activate_saved_facebook_page,
+    discover_manageable_facebook_pages,
+)
 from myUtils import login as recovered_login
 
 
@@ -80,6 +84,282 @@ class _FakePage:
             expected = selector.split('data-page-id="', 1)[1].split('"', 1)[0]
             records = [item for item in records if item["page_id"] == expected]
         return _FakeLocator([_FakePageRow(self, item) for item in records])
+
+
+class _RealComposerElement:
+    def __init__(
+        self,
+        *,
+        text: str = "",
+        attributes: dict[str, str] | None = None,
+        descendants: dict[str, list["_RealComposerElement"]] | None = None,
+        visible: bool = True,
+    ) -> None:
+        self.text = text
+        self.attributes = attributes or {}
+        self.descendants = descendants or {}
+        self.visible = visible
+
+    async def inner_text(self, **_kwargs) -> str:
+        return self.text
+
+    async def get_attribute(self, name: str):
+        return self.attributes.get(name)
+
+    async def is_visible(self) -> bool:
+        return self.visible
+
+    def locator(self, selector: str) -> "_RealComposerLocator":
+        return _RealComposerLocator(self.descendants.get(selector, []))
+
+
+class _RealComposerLocator:
+    def __init__(self, elements: list[_RealComposerElement]) -> None:
+        self.elements = elements
+
+    @property
+    def first(self) -> _RealComposerElement:
+        if self.elements:
+            return self.elements[0]
+        return _RealComposerElement(visible=False)
+
+    async def count(self) -> int:
+        return len(self.elements)
+
+    def nth(self, index: int) -> _RealComposerElement:
+        return self.elements[index]
+
+    async def inner_text(self, **kwargs) -> str:
+        return await self.first.inner_text(**kwargs)
+
+
+class _RealFacebookComposerPage:
+    """Minimal boundary fixture copied from the live Chinese Meta composer."""
+
+    def __init__(self) -> None:
+        self.url = (
+            "https://business.facebook.com/latest/composer/"
+            "?asset_id=123456789012345&nav_ref=biz_unified_f3_login_page_to_mbs"
+        )
+        self.body_text = (
+            "发帖\n发布位置\nFacebook\n测试主页\n影音内容\n"
+            "分享照片和视频。\n添加照片/视频\n帖子详情\n文字"
+        )
+
+    def locator(self, selector: str) -> _RealComposerLocator:
+        if selector == "body":
+            return _RealComposerLocator([_RealComposerElement(text=self.body_text)])
+        if selector == '[role="combobox"]':
+            return _RealComposerLocator(
+                [
+                    _RealComposerElement(
+                        text="发布位置\nFacebook\n测试主页",
+                        attributes={"aria-label": "发布位置"},
+                    )
+                ]
+            )
+        if selector == 'input[type="file"]':
+            return _RealComposerLocator([_RealComposerElement()])
+        return _RealComposerLocator([])
+
+
+class _RealFacebookIconOnlyComposerPage(_RealFacebookComposerPage):
+    """The live combobox exposes Facebook as an icon, not inner text."""
+
+    def locator(self, selector: str) -> _RealComposerLocator:
+        if selector == '[role="combobox"]':
+            facebook_icon_selector = (
+                'img[alt*="Facebook" i], [aria-label*="Facebook" i]'
+            )
+            return _RealComposerLocator(
+                [
+                    _RealComposerElement(
+                        text="测试主页",
+                        attributes={"aria-label": "发布位置 测试主页"},
+                        descendants={
+                            facebook_icon_selector: [
+                                _RealComposerElement(
+                                    attributes={"alt": "Facebook"}
+                                )
+                            ]
+                        },
+                    )
+                ]
+            )
+        return super().locator(selector)
+
+
+class _DelayedRealFacebookComposerPage(_RealFacebookComposerPage):
+    """The post shell can be ready before the Page destination finishes loading."""
+
+    def __init__(self, ready_on_destination_read: int = 3) -> None:
+        super().__init__()
+        self.ready_on_destination_read = ready_on_destination_read
+        self.destination_reads = 0
+
+    def locator(self, selector: str) -> _RealComposerLocator:
+        if selector == '[role="combobox"]':
+            self.destination_reads += 1
+            if self.destination_reads < self.ready_on_destination_read:
+                return _RealComposerLocator([])
+        return super().locator(selector)
+
+
+class _LiveRoleButtonFacebookComposerPage(_RealFacebookComposerPage):
+    """Exact safe shape captured from the live Meta composer on 2026-08-30."""
+
+    def locator(self, selector: str) -> _RealComposerLocator:
+        if selector == '[role="combobox"]':
+            facebook_icon_selector = (
+                'img[alt*="Facebook" i], [aria-label*="Facebook" i]'
+            )
+            return _RealComposerLocator(
+                [
+                    _RealComposerElement(
+                        text="测试主页",
+                        attributes={"role": "combobox"},
+                        descendants={
+                            facebook_icon_selector: [
+                                _RealComposerElement(
+                                    attributes={"alt": "Facebook"}
+                                )
+                            ]
+                        },
+                    ),
+                    _RealComposerElement(
+                        attributes={
+                            "role": "combobox",
+                            "aria-label": "在对话框中输入内容，即可为帖子添加文字。",
+                        }
+                    ),
+                    _RealComposerElement(
+                        text="无按钮",
+                        attributes={"role": "combobox"},
+                    ),
+                ]
+            )
+        if selector in {
+            'input[type="file"]',
+            'button:has-text("Add photo/video")',
+            'button:has-text("Add photos/videos")',
+            'button:has-text("添加照片/视频")',
+            '[contenteditable="true"][role="textbox"]',
+        }:
+            return _RealComposerLocator([])
+        if selector == '[role="button"]:has-text("添加照片/视频")':
+            return _RealComposerLocator(
+                [
+                    _RealComposerElement(
+                        text="添加照片/视频",
+                        attributes={"role": "button"},
+                    )
+                ]
+            )
+        return super().locator(selector)
+
+
+class FacebookPageRealComposerReadbackTests(unittest.IsolatedAsyncioTestCase):
+    async def test_live_chinese_composer_is_a_completed_facebook_login(self) -> None:
+        page = _RealFacebookComposerPage()
+
+        self.assertEqual(
+            await recovered_login._browser_login_state(page, 9),
+            "ready",
+        )
+
+    async def test_live_composer_reads_exact_active_page_identity(self) -> None:
+        page = _RealFacebookComposerPage()
+
+        pages = await discover_manageable_facebook_pages(page)
+
+        self.assertEqual(
+            pages,
+            (
+                FacebookPageIdentity(
+                    page_id="123456789012345",
+                    page_name="测试主页",
+                    can_manage_content=True,
+                ),
+            ),
+        )
+
+    async def test_live_composer_accepts_facebook_icon_separate_from_page_name(self) -> None:
+        page = _RealFacebookIconOnlyComposerPage()
+
+        pages = await discover_manageable_facebook_pages(page)
+
+        self.assertEqual(
+            pages,
+            (
+                FacebookPageIdentity(
+                    page_id="123456789012345",
+                    page_name="测试主页",
+                    can_manage_content=True,
+                ),
+            ),
+        )
+
+    async def test_login_waits_for_delayed_page_destination_before_rejecting_it(self) -> None:
+        page = _DelayedRealFacebookComposerPage(ready_on_destination_read=3)
+
+        with patch.object(
+            recovered_login.asyncio,
+            "sleep",
+            new=AsyncMock(),
+        ):
+            try:
+                selected = await recovered_login.select_facebook_page_for_login(page)
+            except FacebookPagePublishError:
+                selected = None
+
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected.page_id, "123456789012345")
+        self.assertEqual(selected.page_name, "测试主页")
+        self.assertGreaterEqual(page.destination_reads, 3)
+
+    async def test_live_role_button_media_control_proves_page_content_permission(self) -> None:
+        page = _LiveRoleButtonFacebookComposerPage()
+
+        pages = await discover_manageable_facebook_pages(page)
+
+        self.assertEqual(
+            pages,
+            (
+                FacebookPageIdentity(
+                    page_id="123456789012345",
+                    page_name="测试主页",
+                    can_manage_content=True,
+                ),
+            ),
+        )
+
+    async def test_matching_live_composer_is_already_the_requested_page(self) -> None:
+        page = _RealFacebookComposerPage()
+
+        selected = await activate_saved_facebook_page(
+            page,
+            "123456789012345",
+        )
+
+        self.assertEqual(selected.page_name, "测试主页")
+
+    async def test_saved_page_activation_waits_for_delayed_real_composer_controls(self) -> None:
+        page = _DelayedRealFacebookComposerPage(ready_on_destination_read=3)
+
+        with patch(
+            "app_core.overseas_meta_page_identity.asyncio.sleep",
+            new=AsyncMock(),
+        ):
+            selected = await activate_saved_facebook_page(
+                page,
+                "123456789012345",
+                timeout_seconds=0.1,
+                poll_interval_seconds=0,
+            )
+
+        self.assertEqual(selected.page_id, "123456789012345")
+        self.assertEqual(selected.page_name, "测试主页")
+        self.assertGreaterEqual(page.destination_reads, 3)
 
 
 def _identity(
@@ -297,6 +577,7 @@ class FacebookPagePersistenceTimingTests(unittest.IsolatedAsyncioTestCase):
         selection_callback,
         checked_identity=None,
         *,
+        wait_result: str = "ready",
         check_error: Exception | None = None,
         cancel_event=None,
         page_records: list[dict[str, object]] | None = None,
@@ -347,7 +628,11 @@ class FacebookPagePersistenceTimingTests(unittest.IsolatedAsyncioTestCase):
             patch.object(recovered_login, "launch_login_browser", new=AsyncMock(return_value=MagicMock())),
             patch.object(recovered_login, "new_login_context", new=AsyncMock(return_value=context)),
             patch.object(recovered_login, "set_init_script", new=AsyncMock(return_value=context)),
-            patch.object(recovered_login, "_wait_for_browser_login", new=AsyncMock(return_value="ready")),
+            patch.object(
+                recovered_login,
+                "_wait_for_browser_login",
+                new=AsyncMock(return_value=wait_result),
+            ),
             patch.object(recovered_login, "save_context_storage_state", new=AsyncMock(side_effect=save_state)),
             chmod_patch,
             patch.object(
@@ -377,6 +662,19 @@ class FacebookPagePersistenceTimingTests(unittest.IsolatedAsyncioTestCase):
                 expected_account=update_account,
             )
         return result, list(status_queue.queue)
+
+    async def test_meta_business_suite_denied_returns_a_stable_page_error_code(self) -> None:
+        result, messages = await self._run_page_login(
+            None,
+            wait_result="denied",
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(
+            [str(item) for item in messages if str(item).startswith("ERROR:")],
+            ["ERROR:facebook_page_business_access_denied"],
+        )
+        self.assertNotIn("YouTube", "\n".join(map(str, messages)))
 
     async def test_multiple_page_login_writes_nothing_until_selection_then_saves_only_type_9(self) -> None:
         request_seen = asyncio.Event()

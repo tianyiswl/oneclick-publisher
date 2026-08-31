@@ -101,6 +101,75 @@ class FacebookPageTaskServiceTests(unittest.TestCase):
         database.ensure_schema()
         self._page_sequence = 1000
 
+    def test_read_only_session_uses_the_shared_meta_security_detector(self) -> None:
+        session_file = self.cookie_dir / "facebook-page-session.json"
+        session_file.write_text("{}", encoding="utf-8")
+        browser = SimpleNamespace(close_count=0)
+        context = SimpleNamespace(close_count=0)
+
+        async def close_browser() -> None:
+            browser.close_count += 1
+
+        async def close_context() -> None:
+            context.close_count += 1
+
+        browser.close = close_browser
+        context.close = close_context
+
+        class PlaywrightContext:
+            async def __aenter__(self):
+                return SimpleNamespace()
+
+            async def __aexit__(self, *_args) -> None:
+                return None
+
+        async def launch(_playwright):
+            return browser
+
+        async def new_context(_browser, *, storage_state):
+            self.assertEqual(storage_state, str(session_file))
+            return context
+
+        async def init(current):
+            return current
+
+        class Body:
+            async def inner_text(self, *, timeout):
+                self.timeout = timeout
+                return ""
+
+        class Page:
+            url = "https://www.facebook.com/checkpoint/"
+
+            @staticmethod
+            def locator(selector):
+                if selector != "body":
+                    raise AssertionError(selector)
+                return Body()
+
+        async def scenario() -> None:
+            async with controlled_publish._facebook_page_read_only_session(
+                str(session_file)
+            ) as (actual_context, verifier):
+                self.assertIs(actual_context, context)
+                with self.assertRaises(ControlledPublishError) as raised:
+                    await verifier(Page())
+                self.assertEqual(
+                    raised.exception.error_code,
+                    "facebook_reconciliation_verification_required",
+                )
+
+        with (
+            patch("playwright.async_api.async_playwright", return_value=PlaywrightContext()),
+            patch("utils.base_social_media.launch_publish_browser", side_effect=launch),
+            patch("utils.base_social_media.new_publish_context", side_effect=new_context),
+            patch("utils.base_social_media.set_init_script", side_effect=init),
+        ):
+            asyncio.run(scenario())
+
+        self.assertEqual(context.close_count, 1)
+        self.assertEqual(browser.close_count, 1)
+
     def payload(self, *, page_id: str, account_id: int = 41) -> dict:
         account_file = f"facebook-page-{page_id}.json"
         (self.cookie_dir / account_file).write_text("{}", encoding="utf-8")
@@ -1454,6 +1523,48 @@ class FacebookPageTaskServiceTests(unittest.TestCase):
                     "Facebook Page 状态已更新" if status == "failed" else "",
                 )
 
+    def test_projection_repairs_historical_clicked_ambiguous_flags_without_db_write(
+        self,
+    ) -> None:
+        task_id, page_id = self.facebook_task(state="ambiguous")
+        historical_receipt = {
+            "pageId": page_id,
+            "phase": "ambiguous",
+            "platformWriteOccurred": False,
+            "finalActionTriggered": False,
+        }
+        historical_json = _canonical_json(historical_receipt)
+        with database.connect() as conn:
+            conn.execute(
+                """
+                UPDATE facebook_page_publish_claims
+                SET receiptJson = ?, receiptHash = ?
+                WHERE taskId = ?
+                """,
+                (historical_json, _canonical_hash(historical_receipt), task_id),
+            )
+            conn.execute(
+                """
+                UPDATE publish_task_items
+                SET status = 'failed', receiptJson = ?,
+                    errorCode = 'facebook_publish_outcome_unknown'
+                WHERE taskId = ? AND platformType = 9
+                """,
+                (historical_json, task_id),
+            )
+            conn.execute(
+                "UPDATE publish_tasks SET status = 'failed' WHERE id = ?",
+                (task_id,),
+            )
+            conn.commit()
+
+        item = self.projection(task_id)["items"][0]
+
+        self.assertEqual(item["phase"], "ambiguous")
+        self.assertIs(item["receipt"]["platformWriteOccurred"], True)
+        self.assertIs(item["receipt"]["finalActionTriggered"], True)
+        self.assertEqual(self.claim(task_id)["receiptJson"], historical_json)
+
     def test_progress_claim_item_event_and_heartbeat_roll_back_together(self) -> None:
         task_id, page_id = self.facebook_task()
         before = task_service.get_task(task_id)
@@ -2469,6 +2580,121 @@ class FacebookPageTaskServiceTests(unittest.TestCase):
                     (self.claim(task_id)["state"], self.claim(task_id)["blocksReplay"]),
                     ("ambiguous", 1),
                 )
+
+    def test_ambiguous_none_or_mismatch_reconcile_releases_only_its_lease(
+        self,
+    ) -> None:
+        outcomes = (
+            ("none", FacebookReelMatch("none", None, 0, 0)),
+            ("mismatch", FacebookReelMatch("mismatch", None, 2, 0)),
+        )
+        for label, outcome in outcomes:
+            with self.subTest(label=label):
+                task_id, _page_id = self.facebook_task(state="ambiguous")
+                with database.connect() as conn:
+                    conn.execute(
+                        """
+                        UPDATE publish_task_items
+                        SET status='failed', errorCode='facebook_publish_outcome_unknown'
+                        WHERE taskId=? AND platformType=9
+                        """,
+                        (task_id,),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE publish_tasks
+                        SET status='failed', workerToken='stale-formal-owner',
+                            workerPid=12345,
+                            workerHeartbeatAt='2026-08-30T01:00:00+00:00'
+                        WHERE id=?
+                        """,
+                        (task_id,),
+                    )
+                    conn.commit()
+
+                result, _calls, _sessions = self.read_only_reconcile(
+                    task_id, outcome
+                )
+
+                saved = task_service.get_task(task_id)
+                self.assertEqual((result["status"], result["phase"]), ("failed", "ambiguous"))
+                self.assertEqual(saved["workerToken"], "")
+                self.assertIsNone(saved["workerPid"])
+                self.assertIsNone(saved["workerHeartbeatAt"])
+                self.assertEqual(
+                    (self.claim(task_id)["state"], self.claim(task_id)["blocksReplay"]),
+                    ("ambiguous", 1),
+                )
+                unknown_events = [
+                    event
+                    for event in saved["events"]
+                    if event["eventType"]
+                    == "facebook_reconciliation_outcome_unknown"
+                ]
+                self.assertEqual(len(unknown_events), 1)
+
+    def test_ambiguous_reconcile_cleanup_does_not_clear_replacement_owner(
+        self,
+    ) -> None:
+        task_id, _page_id = self.facebook_task(state="ambiguous")
+        with database.connect() as conn:
+            conn.execute(
+                """
+                UPDATE publish_task_items
+                SET status='failed', errorCode='facebook_publish_outcome_unknown'
+                WHERE taskId=? AND platformType=9
+                """,
+                (task_id,),
+            )
+            conn.execute(
+                """
+                UPDATE publish_tasks
+                SET status='failed', workerToken='stale-formal-owner',
+                    workerPid=12345,
+                    workerHeartbeatAt='2026-08-30T01:00:00+00:00'
+                WHERE id=?
+                """,
+                (task_id,),
+            )
+            conn.commit()
+
+        async def replace_owner_then_return(_snapshot):
+            with database.connect() as conn:
+                conn.execute(
+                    """
+                    UPDATE publish_tasks
+                    SET workerToken='replacement-owner', workerPid=67890,
+                        workerHeartbeatAt='2026-08-30T03:00:00+00:00'
+                    WHERE id=?
+                    """,
+                    (task_id,),
+                )
+                conn.commit()
+            return FacebookReelMatch("mismatch", None, 1, 0)
+
+        with patch.object(
+            controlled_publish,
+            "_read_facebook_page_reconciliation",
+            side_effect=replace_owner_then_return,
+        ):
+            controlled_publish.reconcile_facebook_page_publish_outcome(task_id)
+
+        saved = task_service.get_task(task_id)
+        self.assertEqual(saved["workerToken"], "replacement-owner")
+        self.assertEqual(saved["workerPid"], 67890)
+        self.assertEqual(
+            saved["workerHeartbeatAt"], "2026-08-30T03:00:00+00:00"
+        )
+        self.assertEqual(
+            (self.claim(task_id)["state"], self.claim(task_id)["blocksReplay"]),
+            ("ambiguous", 1),
+        )
+        self.assertFalse(
+            any(
+                event["eventType"] == "facebook_reconciliation_outcome_unknown"
+                for event in saved["events"]
+            )
+        )
 
     def test_corrupted_snapshots_or_hashes_fail_closed_before_session(self) -> None:
         corruptions = (

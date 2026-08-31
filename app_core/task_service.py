@@ -2371,6 +2371,85 @@ def claim_facebook_reconciliation_worker(
             raise
 
 
+def release_facebook_reconciliation_unknown(
+    task_id: int,
+    worker_token: str,
+) -> bool:
+    """Release one inconclusive read-only lease by its exact owner token."""
+
+    from . import controlled_publish
+
+    token = str(worker_token or "").strip()
+    if not token:
+        return False
+    changed_at = _now()
+    with connect() as conn:
+        controlled_publish._ensure_facebook_page_claim_schema(conn)
+        conn.commit()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            item = _facebook_task_item_in_transaction(
+                conn,
+                int(task_id),
+                allowed_modes=frozenset({"oneclick_publish"}),
+            )
+            if (
+                str(item["taskWorkerToken"] or "") != token
+                or str(item["taskStatus"] or "") != "failed"
+                or str(item["status"] or "") != "failed"
+            ):
+                conn.rollback()
+                return False
+            claim_row = conn.execute(
+                "SELECT * FROM facebook_page_publish_claims WHERE taskId = ?",
+                (int(task_id),),
+            ).fetchone()
+            if (
+                claim_row is None
+                or str(claim_row["state"] or "") != "ambiguous"
+                or int(claim_row["blocksReplay"] or 0) != 1
+            ):
+                conn.rollback()
+                return False
+            evidence = controlled_publish._validated_facebook_page_claim_evidence(
+                dict(claim_row)
+            )
+            receipt = project_facebook_page_receipt(dict(evidence["receipt"]))
+            receipt["phase"] = "ambiguous"
+            receipt_json = json.dumps(
+                receipt,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            cleared = conn.execute(
+                """
+                UPDATE publish_tasks
+                SET workerToken = '', workerPid = NULL, workerHeartbeatAt = NULL
+                WHERE id = ? AND workerToken = ? AND status = 'failed'
+                """,
+                (int(task_id), token),
+            )
+            if cleared.rowcount != 1:
+                conn.rollback()
+                return False
+            _insert_facebook_task_event(
+                conn,
+                task_id=int(task_id),
+                item_id=int(item["id"]),
+                level="info",
+                event_type="facebook_reconciliation_outcome_unknown",
+                message="Facebook Page 发布结果尚未唯一确认",
+                receipt_json=receipt_json,
+                created_at=changed_at,
+            )
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+
+
 def compensate_facebook_reconciliation_worker(
     task_id: int,
     worker_token: str,
@@ -2458,6 +2537,15 @@ _FACEBOOK_ERROR_PUBLIC_MESSAGES = {
     "facebook_publish_rejected": "Facebook Page 已确认未创建目标 Reel",
     "facebook_publish_failed": "Facebook Page 发布未完成",
 }
+_FACEBOOK_AMBIGUOUS_ERROR_CODES = frozenset(
+    {
+        "facebook_publish_outcome_unknown",
+        "facebook_publish_readback_mismatch",
+        "facebook_post_click_confirmation_pending",
+        "facebook_post_click_composer_unchanged",
+        "facebook_post_click_transition_unknown",
+    }
+)
 _FACEBOOK_PHASE_PUBLIC_MESSAGES = {
     "local_validation_passed": "Facebook Page 本地校验已通过",
     "checking": "Facebook Page 正在同一会话继续检查",
@@ -2479,6 +2567,15 @@ def _facebook_public_message(phase: str, error_code: str) -> str:
     return _FACEBOOK_ERROR_PUBLIC_MESSAGES.get(
         error_code,
         _FACEBOOK_PHASE_PUBLIC_MESSAGES[phase],
+    )
+
+
+def _facebook_ambiguous_error_code(value: object) -> str:
+    code = _stable_error_code(value)
+    return (
+        code
+        if code in _FACEBOOK_AMBIGUOUS_ERROR_CODES
+        else "facebook_publish_outcome_unknown"
     )
 
 
@@ -2928,7 +3025,7 @@ def record_facebook_progress(
                 phase=public_phase,
                 message=message,
                 error_code=(
-                    "facebook_publish_outcome_unknown"
+                    _facebook_ambiguous_error_code(_error_code)
                     if public_phase == "ambiguous"
                     else (
                         _stable_error_code(_error_code)

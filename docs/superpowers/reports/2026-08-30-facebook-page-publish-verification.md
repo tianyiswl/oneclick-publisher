@@ -251,3 +251,34 @@ f1d439b -> 8fe1437 -> 695f108 -> ffd3b21 -> 7d68b7a ->
 ## 唯一下一步
 
 接下来由集成线按上述完整依赖顺序审查/cherry-pick 37 个实现、测试与 hardening 提交，并审查两次 Task 11 文档提交；在集成线重新运行共享全量测试、离屏 UI、diff/敏感信息/范围门禁并确认无回归后，才可准备默认仍关闭的开发者专用真实平台验证构建。任何 Facebook 登录、平台预检、上传或公开发布都仍需到 Task 12 对应层级重新取得明确授权。
+
+## 2026-08-30 0.5.25 安装后真实预检
+
+- 大帅要求继续真实测试后，使用已安装 `/Users/andy/文件/一键发/一键发.app` `0.5.25`，仅在本次 CLI 进程通过 `ONECLICK_ENABLE_FACEBOOK_PAGE_V1=1` 受控开启功能。
+- 新测试内容包为 `facebook-page-public-reel-verification-20260830-v2`；复用既有无害测试视频字节，但改用新标题、正文和发布指纹，没有重放任务 `89`。
+- 第一次请求因缺少内容包必填封面在本地返回 `controlled_manifest_invalid`，未创建任务、未打开浏览器、未上传；补入 3:4 封面后才执行一次平台预检。
+- 预检任务 `90 / T08302217-F23E` 成功，阶段为 `platform_form_verified`。同次回执确认账号 `14`、Page ID 尾号 `3807`、视频 `facebook-page-v2.mp4`、视频大小 `1796730`、视频 SHA256 `1a9313387ce2344ad22d77b70f8991293d8625486aae05257d6b69a68b2e7541`、文案 SHA256 `4d16982ed5755f892fd2236858d28eb031de6135bbb1df7e7409724910149c4d`、公开范围和唯一可用最终按钮。
+- 回执明确 `platformWriteOccurred=true`、`finalActionTriggered=false`；没有 Reel ID、URL 或发布时间，未执行公开发布。下一层必须展示精确 Page、视频、最终文案与公开范围，并重新取得一次正式发布授权。
+
+## 2026-08-30 0.5.25 正式任务 91 与只读收口
+
+- 大帅在查看任务 `90` 的 Page、视频、最终文案和公开范围后，明确授权公开发布这一条测试 Reel。正式任务 `91 / T08302223-B1A1` 消费一次性授权，并在 `22:24:02` 记录一次 `facebook_final_action_clicked`；没有第二次点击或重放。
+- 平台未返回 Reel ID、URL 或发布时间。Meta Business Suite“已发布、定时、草稿”、精确文案搜索和通知均未找到目标；公开 Page Reels 直达链接返回“页面无法显示”。任务只能保持 `facebook_publish_outcome_unknown / ambiguous`，`blocksReplay=1`。
+- 当前源码修复表头先于数据行导致的提前判空、短暂“暂无内容”覆盖延迟数据行、相对时间采样漂移、平台分钟级时间导致的同分钟误判、matcher 与 claim 二次校验不一致，以及未知结果核对后的 worker token 残留。修复后再次只读核对任务 `91`，仍未唯一命中 Reel；worker token、PID 和心跳已清空，防重锁未释放。
+- 内容列表整类 `39/39`、Facebook Page 八模块 `318/318`、完整仓库 `3068/3068` 通过；离屏客户端返回 `NATIVE_DESKTOP_UI_OK`，涉及文件编译检查和 `git diff --check` 也通过。
+- 当前不得宣称已发布或确定未发布，也不得重放任务 `91`。源码修复已进入 `0.5.26` Mac 包，并已在备份 `0.5.25` 后替换安装和启动；安装不改变任务 `91` 的结果不明与防重边界。
+
+## 2026-08-30 0.5.26 全新内容预检任务 92
+
+- 大帅明确要求“全新内容预检”后，新建内容包 `runtime/facebook-page-public-reel-verification-20260830-v3`。测试包复用既有无害视频字节，但使用新的项目编号、文件名、标题、正文和标签；新发布指纹 `a4002f18836748aaf1132e07fc4b217142838aa4a8cf51f918be2e489c7242ea` 与新重放指纹 `5f5a1de76e8061e50dd5b52b18c99912845c72e3c7323e5288ca7a65f06ed0b6` 均未命中任务 `89/91` 的防重锁。
+- 执行前确认账号 `14` 为正常 Facebook Page 主体“墨白”，没有活动发布任务、未消费预检授权或未消费直发授权；旧任务 `89/91` 继续保持 `ambiguous / blocksReplay=1`。
+- 安装版 `0.5.26` 预检任务 `92 / T08302346-D164` 于 `23:46:32` 创建，`23:47:19` 完成，状态为 `success / platform_form_verified`。回执确认 Page 尾号 `3807`、视频 `facebook-page-v3.mp4`、视频 SHA256 `1a9313387ce2344ad22d77b70f8991293d8625486aae05257d6b69a68b2e7541`、文案 SHA256 `27483e77bdb0fb0f2ab6dc333a1798ff25087aec8c8847e3fcaa024a52275e08`、公开范围和唯一可用最终按钮。
+- 回执明确 `platformWriteOccurred=true`、`finalActionTriggered=false`；没有 Reel ID、URL 或发布时间。数据库回读任务 `92` 没有最终动作事件、没有正式 claim，也没有生成一次性授权。
+- 任务结束后受控 CLI 和内置浏览器均已关闭，活动任务和有效授权均为 `0`。本节只证明平台表单预检成功，不代表已发布。
+
+## 2026-08-30/31 正式任务 93 与只读收口
+
+- 大帅在看到任务 `92` 的精确 Page、视频、文案和公开范围后，明确确认公开发布这一条测试 Reel。系统只创建并消费一次绑定任务 `92` 的短期授权；正式任务为 `93 / T08302355-84A9`。
+- 任务 `93` 在 `23:55:53` 记录一次 `facebook_final_action_clicked`，点击总数严格为 `1`。平台随后没有返回 Reel ID、URL 或发布时间，于 `23:56:47` 进入 `facebook_publish_outcome_unknown / ambiguous`；claim 为 `blocksReplay=1`。
+- 只执行一次受控 `reconcile`，仍返回无唯一命中。随后在已登录 Chrome 中把 Meta Business Suite 已发布列表日期范围扩大到太平洋时间 `2026-08-30`，按唯一编号 `FB0526-P3` 精确搜索仍无结果；Page Reels 直达页返回“页面无法显示”。
+- 当前只能确认“最终动作触发一次，但平台结果不明”。不能宣称已发布，也不能宣称确定未发布；不得再次提交同一内容。脱敏回执保存在 `runtime/facebook-page-public-reel-verification-20260830-v3/formal-result.json`。

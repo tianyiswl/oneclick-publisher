@@ -60,6 +60,11 @@ _PLATFORM_NAMES = {
 
 _DOUYIN_COMMERCE_BATCH_WORKFLOW = "douyin-commerce-batch"
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
+_FACEBOOK_POST_CLICK_ERROR_CODES = {
+    "confirmation_pending": "facebook_post_click_confirmation_pending",
+    "composer_unchanged": "facebook_post_click_composer_unchanged",
+    "transitioned_unknown": "facebook_post_click_transition_unknown",
+}
 
 
 class PublishServiceError(ValueError):
@@ -1504,12 +1509,21 @@ def _run_facebook_page_publish(
                 "pageId",
                 str(payload.get("facebookExpectedPageReference") or ""),
             )
+            error_code = (
+                "facebook_publish_readback_mismatch"
+                if stage == "readback_mismatch"
+                else _FACEBOOK_POST_CLICK_ERROR_CODES.get(
+                    str(evidence.get("postClickState") or ""),
+                    "facebook_publish_outcome_unknown",
+                )
+            )
             mark_facebook_page_checkpoint(
                 task_id,
                 expected_state="final_action_clicked",
                 new_state="ambiguous",
                 receipt=evidence,
                 worker_token=worker_token,
+                error_code=error_code,
             )
             claim_state = "ambiguous"
         elif stage == "platform_decision_observed":
@@ -1612,6 +1626,7 @@ def _run_facebook_page_publish(
                 new_state="ambiguous",
                 receipt=failure_receipt,
                 worker_token=worker_token,
+                error_code=_failure_error_code(exc, platform_type=9),
             )
             claim_state = "ambiguous"
     finally:

@@ -58,6 +58,8 @@ DOUYIN_AUTH_COOKIE_NAMES = frozenset(
         "uid_tt_ss",
     )
 )
+FACEBOOK_PAGE_DISCOVERY_TIMEOUT_SECONDS = 30.0
+FACEBOOK_PAGE_DISCOVERY_POLL_INTERVAL_SECONDS = 0.5
 
 
 async def launch_login_browser(playwright, background_mode=False, **options):
@@ -594,7 +596,19 @@ async def select_facebook_page_for_login(
 ) -> FacebookPageIdentity:
     """Select and read back one exact manageable Page before saving anything."""
 
-    pages = await discover_manageable_facebook_pages(page)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + FACEBOOK_PAGE_DISCOVERY_TIMEOUT_SECONDS
+    pages: tuple[FacebookPageIdentity, ...] = ()
+    while True:
+        try:
+            pages = await discover_manageable_facebook_pages(page)
+        except FacebookPagePublishError as exc:
+            if exc.error_code != "facebook_page_not_found":
+                raise
+            pages = ()
+        if pages or loop.time() >= deadline:
+            break
+        await asyncio.sleep(FACEBOOK_PAGE_DISCOVERY_POLL_INTERVAL_SECONDS)
     if expected_page_id:
         selected = resolve_facebook_page_selection(pages, expected_page_id)
     else:
@@ -691,7 +705,18 @@ async def _browser_login_state(page, platform_type: int) -> str:
         return "pending"
     composer_ready = any(
         marker in text
-        for marker in ("create post", "create reel", "add video", "创建帖子", "创建 reel", "添加视频")
+        for marker in (
+            "create post",
+            "create reel",
+            "add video",
+            "add photo/video",
+            "add photos/videos",
+            "创建帖子",
+            "创建 reel",
+            "发帖",
+            "添加视频",
+            "添加照片/视频",
+        )
     ) or await _visible(page, '[contenteditable="true"][role="textbox"]')
     destination = "facebook" if int(platform_type) == 9 else "instagram"
     return "ready" if composer_ready and destination in text else "pending"
@@ -885,9 +910,12 @@ async def _browser_cookie_gen(
                 status_queue.put("CANCELLED")
                 return None
             if wait_result == "denied":
-                status_queue.put(
-                    "ERROR: Meta Business Suite 尚不可用。请先建立 Facebook Page，并把 Instagram 切换为专业账号后连接到该 Page。"
-                )
+                if platform_type == 9:
+                    status_queue.put("ERROR:facebook_page_business_access_denied")
+                else:
+                    status_queue.put(
+                        "ERROR: Meta Business Suite 尚不可用。请先建立 Facebook Page，并把 Instagram 切换为专业账号后连接到该 Page。"
+                    )
                 status_queue.put("500")
                 return None
             if wait_result != "ready":

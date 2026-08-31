@@ -28,6 +28,7 @@ _PUBLIC_RECEIPT_KEYS = frozenset(
         "publishedAt",
         "baselineHash",
         "formSnapshotHash",
+        "postClickState",
         "verificationStartedAt",
         "deadlineAt",
         "timeoutSeconds",
@@ -96,6 +97,13 @@ def _safe_receipt_value(key: str, value: object) -> bool:
         return type(value) is str and value == "public"
     if key == "phase":
         return type(value) is str and _SAFE_PHASE.fullmatch(value) is not None
+    if key == "postClickState":
+        return value in {
+            "confirmation_pending",
+            "composer_unchanged",
+            "transitioned_unknown",
+            "unknown",
+        }
     if key in {
         "platformWriteOccurred",
         "finalActionTriggered",
