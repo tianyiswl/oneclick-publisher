@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "diagram_type": "lifecycle",
+  "meta": {
+    "title": "Instagram Reels 受控发布生命周期",
+    "output": "docs/architecture/instagram-publish-v1.lifecycle.html",
+    "quality_profile": "showcase",
+    "viewBox": [1900, 760],
+    "views": [
+      {"id": "reversible-gates", "label": "身份与可逆检查", "focus": ["account-bound", "form-verified", "verification-before-final", "safe-failed"], "note": "身份、上传、表单或基线无法回读时停在最终动作之前。"},
+      {"id": "atomic-final-boundary", "label": "原子认领与最终动作", "focus": ["form-verified", "formal-claim", "final-action-clicked"], "note": "授权、正式任务与唯一 Claim 原子创建；最终按钮最多点击一次。"},
+      {"id": "readback-reconciliation", "label": "平台回读与结果不明", "focus": ["final-action-clicked", "platform-accepted", "verification-after-final", "platform-rejected", "outcome-unknown", "readback-verified", "confirmed-not-published"], "note": "最终动作后只允许只读核对；缺少唯一媒体或定时条目时禁止重发。"}
+    ]
+  },
+  "lanes": [
+    {"id": "main", "label": "受控发布主链"},
+    {"id": "waiting", "label": "人工等待与平台事件"},
+    {"id": "terminal", "label": "失败、核对与回读终态"}
+  ],
+  "states": [
+    {"id": "account-bound", "type": "start", "label": "Instagram 主体已绑定", "sublabel": "稳定 ID、类型与 Page 一致", "lane": "main", "col": 0, "step": "01", "tag": "身份"},
+    {"id": "form-verified", "type": "decision", "label": "预检表单已回读", "sublabel": "正文、封面、范围与时间一致", "lane": "main", "col": 1, "step": "02", "tag": "finalActionTriggered=false"},
+    {"id": "formal-claim", "type": "decision", "label": "Formal Claim 就绪", "sublabel": "原子任务、意图槽与点击前基线", "lane": "main", "col": 2, "step": "03", "tag": "final_action_claimed"},
+    {"id": "final-action-clicked", "type": "external", "label": "最终点击已返回", "sublabel": "最多一次，只能进入结果核对", "lane": "main", "col": 3, "step": "04", "tag": "不可重放"},
+    {"id": "platform-accepted", "type": "active", "label": "平台已接受", "sublabel": "仍需同一主体的唯一内容回读", "lane": "main", "col": 4, "step": "05", "tag": "非成功终态"},
+    {"id": "verification-before-final", "type": "waiting", "label": "点击前等待 / 修正", "sublabel": "人工验证后按同一检查点继续", "lane": "waiting", "col": 0, "tag": "不重新上传"},
+    {"id": "verification-after-final", "type": "waiting", "label": "等待点击后验证", "sublabel": "完成后只恢复只读核对", "lane": "waiting", "col": 2, "tag": "禁止重点击"},
+    {"id": "platform-rejected", "type": "failure", "label": "平台明确拒绝", "sublabel": "完整核对无内容后记录失败", "lane": "waiting", "col": 1, "tag": "明确失败"},
+    {"id": "safe-failed", "type": "failure", "label": "点击前明确失败", "sublabel": "旧任务关闭，可创建新预检", "lane": "terminal", "col": 0, "tag": "safe_failed"},
+    {"id": "outcome-unknown", "type": "decision", "label": "结果不明 / 只读核对", "sublabel": "blocksReplay=true", "lane": "terminal", "col": 1, "tag": "ambiguous"},
+    {"id": "readback-verified", "type": "success", "label": "唯一内容回读成功", "sublabel": "媒体 ID / URL 或唯一定时条目", "lane": "terminal", "col": 2, "yOffset": -72, "tag": "published / scheduled"},
+    {"id": "confirmed-not-published", "type": "failure", "label": "确认没有发布", "sublabel": "旧任务关闭，重试需新授权", "lane": "terminal", "col": 2, "yOffset": 72, "tag": "confirmed_not_published"}
+  ],
+  "transitions": [
+    {"id": "verify-form", "from": "account-bound", "to": "form-verified", "variant": "emphasis"},
+    {"id": "create-formal-claim", "from": "form-verified", "to": "formal-claim", "variant": "security"},
+    {"id": "click-final-once", "from": "formal-claim", "to": "final-action-clicked", "variant": "security"},
+    {"id": "platform-accepts", "from": "final-action-clicked", "to": "platform-accepted"},
+    {"id": "preclick-pause", "from": "form-verified", "to": "verification-before-final", "variant": "security", "route": "left-channel", "channelX": 190},
+    {"id": "preclick-stop", "from": "verification-before-final", "to": "safe-failed", "variant": "security", "route": "straight", "fromSide": "bottom", "toSide": "top"},
+    {"id": "postclick-pause", "from": "final-action-clicked", "to": "verification-after-final", "variant": "security", "fromSide": "right", "toSide": "top", "via": [[630, 157], [630, 230], [710, 230]]},
+    {"id": "accepted-readback-wait", "from": "platform-accepted", "to": "verification-after-final", "variant": "security", "route": "straight", "fromSide": "bottom", "toSide": "top"},
+    {"id": "resume-readback-only", "from": "verification-after-final", "to": "outcome-unknown", "variant": "emphasis", "fromSide": "bottom", "toSide": "top", "via": [[710, 350], [630, 350], [630, 442], [556, 442]]},
+    {"id": "explicit-rejection", "from": "final-action-clicked", "to": "platform-rejected", "variant": "security", "route": "straight", "fromSide": "bottom", "toSide": "top"},
+    {"id": "accepted-readback-success", "from": "platform-accepted", "to": "readback-verified", "variant": "emphasis", "route": "right-channel", "channelX": 980},
+    {"id": "reconcile-found-content", "from": "outcome-unknown", "to": "readback-verified", "variant": "emphasis"},
+    {"id": "reconcile-confirmed-absent", "from": "outcome-unknown", "to": "confirmed-not-published", "variant": "security"}
+  ],
+  "cards": [
+    {"dot": "cyan", "title": "可逆检查", "items": ["Instagram 主体、视频、caption、封面、公开设置与时间必须逐项回读", "点击前人工验证完成后按任务检查点继续，不重复上传", "未进入 final_action_claimed 的失败可以安全关闭"]},
+    {"dot": "amber", "title": "不可逆临界点", "items": ["授权消费、正式任务和 Instagram 意图 Claim 在同一事务完成", "点击前基线失败时不得进入 final_action_claimed", "Claim 与实际点击分开记录，进程中断时保守核对"]},
+    {"dot": "rose", "title": "只读恢复", "items": ["平台接受不等于成功，仍需唯一媒体或定时条目", "点击后验证只恢复回读，绝不再次点击最终按钮", "确认未发布后也必须用新任务和新授权重新开始"]}
+  ]
+}

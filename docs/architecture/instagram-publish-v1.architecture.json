@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Instagram Reels 受控发布 V1",
+    "output": "docs/architecture/instagram-publish-v1.architecture.html",
+    "quality_profile": "showcase",
+    "viewBox": [1540, 790],
+    "views": [
+      {"id": "publish-path", "label": "统一发布主链", "focus": ["entrypoints", "controlled-publish", "publish-service", "instagram-executor", "visible-browser", "instagram-backend", "content-readback", "task-receipt"], "note": "桌面 UI 与 CLI 复用同一发布服务，平台结果回写同一任务。"},
+      {"id": "identity-path", "label": "Instagram 身份边界", "focus": ["account-session-store", "instagram-identity", "controlled-publish", "instagram-executor", "visible-browser", "instagram-backend"], "note": "稳定主体、专业账号类型和关联 Page 必须与实际后台一致。"},
+      {"id": "safety-readback", "label": "授权与唯一回读", "focus": ["human-confirmation", "authorization-gate", "publish-service", "instagram-executor", "content-readback", "task-receipt"], "note": "正式按钮最多点击一次；无法唯一回读时禁止重放。"}
+    ]
+  },
+  "components": [
+    {"id": "entrypoints", "type": "frontend", "label": "桌面 UI / CLI", "sublabel": "结构化 manifest 与 accountId", "pos": [40, 334], "size": [170, 76]},
+    {"id": "controlled-publish", "type": "security", "label": "受控发布入口", "sublabel": "模式、账号与任务校验", "pos": [270, 334], "size": [180, 76]},
+    {"id": "publish-service", "type": "backend", "label": "统一发布服务", "sublabel": "预检与正式发布共用路由", "pos": [510, 334], "size": [180, 76]},
+    {"id": "instagram-executor", "type": "backend", "label": "Instagram 执行器", "sublabel": "表单快照、认领与一次分享", "pos": [750, 334], "size": [190, 76]},
+    {"id": "visible-browser", "type": "frontend", "label": "可见受控浏览器", "sublabel": "复用本地 Meta 登录会话", "pos": [1000, 334], "size": [180, 76]},
+    {"id": "instagram-backend", "type": "external", "label": "Instagram 管理后台", "sublabel": "正确主体的 Reel 与内容列表", "pos": [1240, 570], "size": [190, 76]},
+    {"id": "account-session-store", "type": "database", "label": "账号与会话存储", "sublabel": "稳定 ID、账号类型、关联 Page", "pos": [270, 110], "size": [180, 76]},
+    {"id": "instagram-identity", "type": "backend", "label": "Instagram 身份服务", "sublabel": "双页面回读与精确主体激活", "pos": [510, 110], "size": [180, 76]},
+    {"id": "authorization-gate", "type": "security", "label": "一次性授权门", "sublabel": "令牌绑定成功预检与发布意图", "pos": [750, 110], "size": [180, 76]},
+    {"id": "human-confirmation", "type": "external", "label": "人工确认 / 安全验证", "sublabel": "登录、预检与正式发布分离", "pos": [990, 110], "size": [190, 76]},
+    {"id": "task-receipt", "type": "database", "label": "任务、Claim 与回执", "sublabel": "状态、错误、媒体 ID 与禁止重放", "pos": [750, 570], "size": [210, 76]},
+    {"id": "content-readback", "type": "backend", "label": "Instagram 内容回读", "sublabel": "点击前基线与点击后唯一媒体", "pos": [1000, 570], "size": [190, 76]}
+  ],
+  "boundaries": [
+    {"kind": "region", "label": "一键发本机客户端", "wraps": ["entrypoints", "controlled-publish", "publish-service", "instagram-executor", "visible-browser", "account-session-store", "instagram-identity", "authorization-gate", "task-receipt", "content-readback"]},
+    {"kind": "security-group", "label": "正式发布安全边界", "wraps": ["controlled-publish", "authorization-gate", "publish-service", "instagram-executor", "task-receipt"]}
+  ],
+  "connections": [
+    {"id": "entry-to-control", "from": "entrypoints", "to": "controlled-publish", "label": "创建受控任务", "variant": "emphasis", "labelDy": -32},
+    {"id": "control-to-service", "from": "controlled-publish", "to": "publish-service", "label": "已验证请求", "variant": "security", "labelDy": -32},
+    {"id": "service-to-executor", "from": "publish-service", "to": "instagram-executor", "label": "Instagram 专属路由", "labelDy": -32},
+    {"id": "executor-to-browser", "from": "instagram-executor", "to": "visible-browser", "label": "受控表单操作", "labelDy": -32},
+    {"id": "browser-to-instagram", "from": "visible-browser", "to": "instagram-backend", "label": "填写、回读、单次分享", "variant": "emphasis", "labelAt": [1468, 490]},
+    {"id": "store-to-identity", "from": "account-session-store", "to": "instagram-identity", "label": "会话引用与主体绑定", "variant": "security", "labelDy": -32},
+    {"id": "identity-to-control", "from": "instagram-identity", "to": "controlled-publish", "label": "已核对 Instagram 主体", "variant": "security", "labelAt": [600, 245], "fromSide": "bottom", "toSide": "top"},
+    {"id": "auth-to-control", "from": "authorization-gate", "to": "controlled-publish", "label": "已消费授权", "variant": "security", "labelAt": [680, 245], "fromSide": "bottom", "toSide": "top"},
+    {"id": "human-to-auth", "from": "human-confirmation", "to": "authorization-gate", "label": "任务级明确确认", "variant": "security", "labelDy": -32},
+    {"id": "service-to-receipt", "from": "publish-service", "to": "task-receipt", "label": "原子任务、Claim 与阶段", "variant": "security", "fromSide": "bottom", "toSide": "left", "via": [[600, 500], [700, 500], [700, 608]], "labelAt": [650, 486]},
+    {"id": "executor-to-readback", "from": "instagram-executor", "to": "content-readback", "label": "基线与结果核对", "labelAt": [1095, 490], "fromSide": "bottom", "toSide": "top"},
+    {"id": "instagram-to-readback", "from": "instagram-backend", "to": "content-readback", "label": "同一主体内容列表", "variant": "emphasis", "labelAt": [1210, 670]},
+    {"id": "readback-to-receipt", "from": "content-readback", "to": "task-receipt", "label": "媒体回执或结果不明", "variant": "emphasis", "labelAt": [975, 670]}
+  ],
+  "cards": [
+    {"dot": "cyan", "title": "身份合同", "items": ["账号记录包含稳定 Instagram ID、Business / Creator 类型与关联 Page", "双页面读到同一主体后才允许保存或恢复会话", "Facebook Page 只用于身份关系核对，不成为发布目的地"]},
+    {"dot": "amber", "title": "人工临界点", "items": ["登录授权、上传预检授权与正式分享授权彼此独立", "预检可以填写和回读表单，但 finalActionTriggered 必须为 false", "正式分享只消费绑定具体成功预检的一次性授权"]},
+    {"dot": "rose", "title": "回读与去重", "items": ["正式任务与 Instagram 意图 Claim 原子创建", "最终动作认领与实际点击分开记录，按钮最多点击一次", "没有唯一媒体 ID、链接或定时条目时禁止自动重放"]}
+  ]
+}
